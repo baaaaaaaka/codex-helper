@@ -787,6 +787,7 @@ type OutboxMessage struct {
 	DriveItemWebURL        string       `json:"drive_item_web_url,omitempty"`
 	DriveItemWebDav        string       `json:"drive_item_web_dav,omitempty"`
 	AckKind                string       `json:"ack_kind,omitempty"`
+	QuoteReplyToMessageID  string       `json:"quote_reply_to_message_id,omitempty"`
 	NotificationKind       string       `json:"notification_kind,omitempty"`
 	MentionOwner           bool         `json:"mention_owner,omitempty"`
 	MentionUserID          string       `json:"mention_user_id,omitempty"`

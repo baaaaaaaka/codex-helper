@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -384,6 +385,7 @@ type Bridge struct {
 	controlFallbackHelpContext        string
 	store                             *teamstore.Store
 	asyncTurns                        bool
+	groupChatGuardEnabled             bool
 	ownerMu                           sync.Mutex
 	owner                             teamstore.OwnerMetadata
 	ownerStaleAfter                   time.Duration
@@ -397,6 +399,8 @@ type Bridge struct {
 	lastPollErrorLogAt                time.Time
 	persistentPollFailureFirstAt      time.Time
 	persistentPollFailureCount        int
+	chatAudienceMu                    sync.Mutex
+	chatAudiences                     map[string]chatAudienceSnapshot
 	parkNoticeLookupMu                sync.Mutex
 	parkNoticeLookupPreferences       map[string]parkNoticeLookupPreference
 	lastAutoParkSweep                 time.Time
@@ -440,6 +444,27 @@ type runningTurnCancel struct {
 type acceptedOutboxRecovery struct {
 	TeamsMessageID string
 	AcceptedAt     time.Time
+}
+
+type chatAudienceMode int
+
+const (
+	chatAudienceUnknown chatAudienceMode = iota
+	chatAudienceSingleMember
+	chatAudienceMultiMember
+)
+
+const chatAudienceCacheTTL = 5 * time.Minute
+
+var (
+	codexPlainMentionPattern = regexp.MustCompile(`(?i)(^|[^[:alnum:]_])@codex\b`)
+	codexAtHTMLPattern       = regexp.MustCompile(`(?is)<at\b[^>]*>\s*@?codex\s*</at>`)
+)
+
+type chatAudienceSnapshot struct {
+	Mode      chatAudienceMode
+	Members   int
+	CheckedAt time.Time
 }
 
 type parkNoticeLookupPreference struct {
@@ -488,7 +513,7 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 	httpClient := graph.httpClient()
 	machine := MachineRecordForUser(user, scope)
 	applyMachineHostnameOverrideToRecord(&machine, reg.MachineHostnameOverride)
-	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, registryProjectionDirty: true, user: user, scope: scope, machine: machine, out: out, markAnswerChatsUnread: true}, nil
+	return &Bridge{graph: graph, readGraph: readGraph, httpClient: httpClient, registryPath: registryPath, reg: reg, registryProjectionDirty: true, user: user, scope: scope, machine: machine, out: out, markAnswerChatsUnread: true, groupChatGuardEnabled: true}, nil
 }
 
 func (b *Bridge) readClient() *GraphClient {
@@ -1724,6 +1749,26 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			b.markRegistrySeen(chatID, msg.ID)
 			continue
 		}
+		if role == inboundPollRoleWork {
+			var ignoreForAudience bool
+			msg, text, ignoreForAudience, err = b.prepareWorkChatMessageForAudience(ctx, chatID, msg, text)
+			if err != nil {
+				b.recordChatPollHandlerError(ctx, chatID, poll, err)
+				return result, err
+			}
+			if ignoreForAudience {
+				b.markRegistrySeen(chatID, msg.ID)
+				continue
+			}
+			if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
+				if err := b.sendToChat(ctx, chatID, "Mention received, but there is no Codex request text. Add the task after `@codex`."); err != nil {
+					b.recordChatPollHandlerError(ctx, chatID, poll, err)
+					return result, err
+				}
+				b.markRegistrySeen(chatID, msg.ID)
+				continue
+			}
+		}
 		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
 		if err != nil {
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
@@ -2948,6 +2993,188 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 	return false, nil
 }
 
+func (b *Bridge) prepareWorkChatMessageForAudience(ctx context.Context, chatID string, msg ChatMessage, text string) (ChatMessage, string, bool, error) {
+	if b == nil || !b.workChatRequiresCodexMention(ctx, chatID) {
+		return msg, text, false, nil
+	}
+	if teamsMessageHasCodexMention(msg, text) {
+		cleanMsg, cleanText := stripCodexMentionFromTeamsMessage(msg, text)
+		return cleanMsg, cleanText, false, nil
+	}
+	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	if messageAuthoredByCurrentUser(msg, b.user) {
+		if parsed := ParseDashboardCommand(ChatScopeWork, routeText); parsed.HelperCommand {
+			return msg, text, false, nil
+		}
+	}
+	if err := b.recordIgnoredGroupChatMessage(ctx, chatID, msg, "multi_member_without_codex_mention"); err != nil {
+		return msg, text, false, err
+	}
+	return msg, text, true, nil
+}
+
+func (b *Bridge) workChatRequiresCodexMention(ctx context.Context, chatID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return false
+	}
+	if !b.groupChatGuardEnabled {
+		return false
+	}
+	if snapshot, ok := b.cachedChatAudience(chatID); ok && snapshot.Mode != chatAudienceSingleMember {
+		return snapshot.Mode == chatAudienceMultiMember || snapshot.Mode == chatAudienceUnknown
+	}
+	graph := b.readClient()
+	if graph == nil {
+		b.cacheChatAudience(chatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, CheckedAt: time.Now()})
+		return true
+	}
+	members, err := graph.ListChatMembers(ctx, chatID)
+	if err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams chat audience check failed for %s; requiring @codex: %v\n", redactChatIDForLog(chatID), err)
+		}
+		b.cacheChatAudience(chatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, CheckedAt: time.Now()})
+		return true
+	}
+	mode := chatAudienceSingleMember
+	if len(members) != 1 {
+		mode = chatAudienceMultiMember
+	}
+	b.cacheChatAudience(chatID, chatAudienceSnapshot{Mode: mode, Members: len(members), CheckedAt: time.Now()})
+	return mode == chatAudienceMultiMember
+}
+
+func (b *Bridge) cachedWorkChatIsMultiMember(chatID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return false
+	}
+	b.chatAudienceMu.Lock()
+	defer b.chatAudienceMu.Unlock()
+	snapshot, ok := b.chatAudiences[chatID]
+	return ok && snapshot.Mode == chatAudienceMultiMember
+}
+
+func (b *Bridge) suppressIntermediateWorkChatOutbox(chatID string) bool {
+	return b.cachedWorkChatIsMultiMember(chatID)
+}
+
+func (b *Bridge) cachedChatAudience(chatID string) (chatAudienceSnapshot, bool) {
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return chatAudienceSnapshot{}, false
+	}
+	b.chatAudienceMu.Lock()
+	defer b.chatAudienceMu.Unlock()
+	snapshot, ok := b.chatAudiences[chatID]
+	if !ok {
+		return chatAudienceSnapshot{}, false
+	}
+	if chatAudienceCacheTTL > 0 && time.Since(snapshot.CheckedAt) > chatAudienceCacheTTL {
+		delete(b.chatAudiences, chatID)
+		return chatAudienceSnapshot{}, false
+	}
+	return snapshot, true
+}
+
+func (b *Bridge) cacheChatAudience(chatID string, snapshot chatAudienceSnapshot) {
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return
+	}
+	if snapshot.CheckedAt.IsZero() {
+		snapshot.CheckedAt = time.Now()
+	}
+	b.chatAudienceMu.Lock()
+	defer b.chatAudienceMu.Unlock()
+	if b.chatAudiences == nil {
+		b.chatAudiences = make(map[string]chatAudienceSnapshot)
+	}
+	b.chatAudiences[chatID] = snapshot
+}
+
+func (b *Bridge) recordIgnoredGroupChatMessage(ctx context.Context, chatID string, msg ChatMessage, reason string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" {
+		return nil
+	}
+	_, err := b.store.RecordMessageProvenance(ctx, teamstore.MessageProvenanceRecord{
+		TeamsChatID:    chatID,
+		TeamsMessageID: msg.ID,
+		Origin:         teamstore.MessageOriginUserInbound,
+		SessionID:      sessionIDForChat(b.reg.SessionByChatID(chatID)),
+		Kind:           "ignored_group_chat",
+		RenderedHash:   normalizedTextHash(promptTextFromTeamsMessageHTML(msg.Body.Content)),
+		Diagnostic:     strings.TrimSpace(firstNonEmptyString(reason, "ignored")),
+		CreatedAt:      chatMessageActivityTime(msg),
+		UpdatedAt:      time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func sessionIDForChat(session *Session) string {
+	if session == nil {
+		return ""
+	}
+	return strings.TrimSpace(session.ID)
+}
+
+func redactChatIDForLog(chatID string) string {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ""
+	}
+	return "{chat-id}:" + shortStableID(chatID)
+}
+
+func teamsMessageHasCodexMention(msg ChatMessage, fallbackText string) bool {
+	if codexAtHTMLPattern.MatchString(msg.Body.Content) || codexPlainMentionPattern.MatchString(PlainTextFromTeamsHTML(msg.Body.Content)) || codexPlainMentionPattern.MatchString(fallbackText) {
+		return true
+	}
+	for _, raw := range msg.Mentions {
+		var mention struct {
+			MentionText string `json:"mentionText"`
+		}
+		if err := json.Unmarshal(raw, &mention); err != nil {
+			continue
+		}
+		if isCodexMentionText(mention.MentionText) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripCodexMentionFromTeamsMessage(msg ChatMessage, fallbackText string) (ChatMessage, string) {
+	hadNativeMention := codexAtHTMLPattern.MatchString(msg.Body.Content)
+	msg.Body.Content = stripCodexMentionFromHTML(msg.Body.Content)
+	text := strings.TrimSpace(promptTextFromTeamsMessageHTML(msg.Body.Content))
+	if text == "" && !hadNativeMention {
+		text = stripCodexMentionFromText(fallbackText)
+	}
+	return msg, strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+}
+
+func stripCodexMentionFromHTML(content string) string {
+	content = codexAtHTMLPattern.ReplaceAllString(content, " ")
+	content = codexPlainMentionPattern.ReplaceAllString(content, "$1")
+	return content
+}
+
+func stripCodexMentionFromText(text string) string {
+	text = codexPlainMentionPattern.ReplaceAllString(text, "$1")
+	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
+}
+
+func isCodexMentionText(text string) bool {
+	text = strings.TrimSpace(strings.ToLower(text))
+	text = strings.TrimPrefix(text, "@")
+	return strings.TrimSpace(text) == "codex"
+}
+
 func (b *Bridge) hasDeliveredAttachmentOutboxEcho(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
 	incomingKey := comparableTeamsPlainText(promptTextFromTeamsMessageHTML(msg.Body.Content))
 	if incomingKey == "" {
@@ -3357,6 +3584,9 @@ func (b *Bridge) annotateIncomingUserMessage(ctx context.Context, chatID string,
 	if !b.annotateUserMessages {
 		return
 	}
+	if b.suppressIntermediateWorkChatOutbox(chatID) {
+		return
+	}
 	if hasSupportedTeamsMediaCardAttachment(msg.Attachments) {
 		return
 	}
@@ -3408,6 +3638,9 @@ func (b *Bridge) annotateIncomingUserMessageWithUserMarker(ctx context.Context, 
 
 func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Context, chatID string, msg ChatMessage, transcripts []ASRTranscript) {
 	if b == nil || !b.annotateUserMessages || b.graph == nil || len(transcripts) == 0 {
+		return
+	}
+	if b.suppressIntermediateWorkChatOutbox(chatID) {
 		return
 	}
 	if strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
@@ -7540,6 +7773,9 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 		AckKind:     "teams_prompt",
 		Body:        body,
 	}
+	if b.cachedWorkChatIsMultiMember(session.ChatID) && strings.TrimSpace(msg.ID) != "" {
+		outbox.QuoteReplyToMessageID = strings.TrimSpace(msg.ID)
+	}
 	if author, ok := chatMessageExternalAuthor(msg, b.user); ok {
 		applyOutboxMentionUser(&outbox, author)
 	}
@@ -9812,7 +10048,9 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	}
 	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
 		if plan.Action == beacon.TurnWaitAllocation {
-			_ = b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", formatBeaconTurnAllocationProgress(plan), outboxQueueOptions{})
+			if !b.suppressIntermediateWorkChatOutbox(chatID) {
+				_ = b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", formatBeaconTurnAllocationProgress(plan), outboxQueueOptions{})
+			}
 		}
 		executor = BeaconJobExecutor{Plan: plan}
 	}
@@ -10324,6 +10562,9 @@ func (b *Bridge) queueAndBestEffortQueuedTurnStartNotice(ctx context.Context, se
 	if b == nil || b.store == nil || session == nil || strings.TrimSpace(session.ChatID) == "" {
 		return nil
 	}
+	if b.suppressIntermediateWorkChatOutbox(session.ChatID) {
+		return nil
+	}
 	body, ok, err := b.formatQueuedTurnStartNotice(ctx, session.ID, claimed)
 	if err != nil || !ok {
 		return err
@@ -10631,6 +10872,9 @@ func (f *codexEventForwarder) flushPendingAgent() {
 }
 
 func (f *codexEventForwarder) sendIdleStatus(quietFor time.Duration) {
+	if f != nil && f.bridge != nil && f.bridge.suppressIntermediateWorkChatOutbox(f.chatID) {
+		return
+	}
 	if strings.TrimSpace(f.pendingAgent) != "" {
 		f.flushPendingAgent()
 		return
@@ -10700,6 +10944,9 @@ func (f *codexEventForwarder) send(kind string, text string) error {
 	if text == "" || f.bridge == nil || strings.TrimSpace(f.chatID) == "" {
 		return nil
 	}
+	if f.bridge.suppressIntermediateWorkChatOutbox(f.chatID) {
+		return nil
+	}
 	if !f.bridge.canQueueLiveTurnOutbox(f.ctx, f.sessionID, f.turnID) {
 		return nil
 	}
@@ -10730,6 +10977,9 @@ func (f *codexEventForwarder) sendStreamContent(kind string, text string) error 
 
 func (f *codexEventForwarder) tryLiveTranscriptBackfill() bool {
 	if f == nil || f.bridge == nil || f.liveContentSent {
+		return false
+	}
+	if f.bridge.suppressIntermediateWorkChatOutbox(f.chatID) {
 		return false
 	}
 	queued, err := f.bridge.queueRunningTurnTranscriptBackfill(f.ctx, f.sessionID, f.turnID, f.chatID, f.expectedThreadID, liveTranscriptBackfillMaxRecords)
@@ -12674,14 +12924,15 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	var msg ChatMessage
 	if outbox.DriveItemID != "" {
 		msg, err = b.graph.SendDriveItemAttachmentWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
-	} else if outbox.MentionOwner {
-		body, mentions := renderOutboxMentionHTML(outbox, b.user)
-		msg, err = b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
-	} else if user, ok := outboxMentionUser(outbox); ok {
-		body, mentions := renderOutboxUserMentionHTML(outbox, user)
-		msg, err = b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
+	} else if strings.TrimSpace(outbox.QuoteReplyToMessageID) != "" {
+		msg, err = b.sendOutboxQuoteReplyWithoutRateLimitRetry(ctx, outbox)
+		if err != nil && shouldFallbackFromQuoteReplyError(err) {
+			fallback := outbox
+			fallback.QuoteReplyToMessageID = ""
+			msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, fallback)
+		}
 	} else {
-		msg, err = b.graph.SendHTMLWithoutRateLimitRetry(ctx, outbox.TeamsChatID, renderOutboxHTML(outbox))
+		msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, outbox)
 	}
 	if err != nil {
 		_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
@@ -12709,6 +12960,46 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		b.recordSentOutboxSideEffectWithOptions(ctx, sent, msg, opts, sentOutboxSideEffectOptions{GlobalOutboundRecorded: globalOutboundRecorded})
 	}
 	return err
+}
+
+func (b *Bridge) sendOutboxQuoteReplyWithoutRateLimitRetry(ctx context.Context, outbox teamstore.OutboxMessage) (ChatMessage, error) {
+	if b == nil || b.graph == nil {
+		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
+	}
+	body, mentions := b.renderOutboxHTMLForSend(outbox)
+	return b.graph.SendHTMLReplyWithQuoteWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outbox.QuoteReplyToMessageID, body, mentions)
+}
+
+func (b *Bridge) sendOutboxHTMLWithoutRateLimitRetry(ctx context.Context, outbox teamstore.OutboxMessage) (ChatMessage, error) {
+	if b == nil || b.graph == nil {
+		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
+	}
+	body, mentions := b.renderOutboxHTMLForSend(outbox)
+	if len(mentions) > 0 {
+		return b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
+	}
+	return b.graph.SendHTMLWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body)
+}
+
+func (b *Bridge) renderOutboxHTMLForSend(outbox teamstore.OutboxMessage) (string, []ChatMention) {
+	if outbox.MentionOwner {
+		return renderOutboxMentionHTML(outbox, b.user)
+	}
+	if user, ok := outboxMentionUser(outbox); ok {
+		return renderOutboxUserMentionHTML(outbox, user)
+	}
+	return renderOutboxHTML(outbox), nil
+}
+
+func shouldFallbackFromQuoteReplyError(err error) bool {
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	if statusErr.StatusCode == http.StatusTooManyRequests {
+		return false
+	}
+	return statusErr.StatusCode >= 400 && statusErr.StatusCode < 500
 }
 
 func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox teamstore.OutboxMessage, opts outboxSendOptions) (bool, error) {
@@ -15481,6 +15772,9 @@ func linkedTranscriptLocalFromCheckpoint(session Session, checkpoint teamstore.I
 
 func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context, session *Session, turn teamstore.Turn) (int, error) {
 	if b == nil || session == nil || b.store == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(turn.ID) == "" {
+		return 0, nil
+	}
+	if b.suppressIntermediateWorkChatOutbox(session.ChatID) {
 		return 0, nil
 	}
 	if strings.TrimSpace(session.CodexThreadID) == "" {

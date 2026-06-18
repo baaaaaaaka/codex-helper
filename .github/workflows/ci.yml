@@ -157,6 +157,15 @@ jobs:
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridgeAnnotate(IncomingUserMessageDoesNotMirrorWhenGraphUpdateFails|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror|ASRPatchFailureDoesNotDisableTextAnnotations)$' -v
 
+      - name: Teams group chat guard regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          group_guard_pattern='Test(BridgeGroup(WorkChat|Guard).*|Graph(CreateGroupChatUsesConfiguredMembers|SendHTMLReplyWithQuoteUsesReplyAction))$'
+          bench_pattern='Test(ValidateMembersRequiresExactOwnerAndTestUser|BenchSummaryPredicates|SanitizeMarkerKeepsGraphBenchNonceStable)$'
+          go test ./internal/teams -count=1 -run "$group_guard_pattern" -v
+          go test ./cmd/teams-graph-bench -count=1 -run "$bench_pattern" -v
+
       - name: Responses adapter provider compatibility regressions
         shell: bash
         run: |

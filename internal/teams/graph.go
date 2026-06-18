@@ -137,6 +137,11 @@ type ChatMention struct {
 	User User
 }
 
+type GroupChatMemberBinding struct {
+	UserID string
+	Roles  []string
+}
+
 type OpenURLCardAction struct {
 	Title string
 	URL   string
@@ -223,16 +228,36 @@ func (g *GraphClient) ListChats(ctx context.Context, top int) ([]Chat, error) {
 }
 
 func (g *GraphClient) CreateSingleMemberGroupChat(ctx context.Context, userID string, topic string) (Chat, error) {
+	return g.CreateGroupChat(ctx, topic, []GroupChatMemberBinding{{
+		UserID: userID,
+		Roles:  []string{"owner"},
+	}})
+}
+
+func (g *GraphClient) CreateGroupChat(ctx context.Context, topic string, members []GroupChatMemberBinding) (Chat, error) {
+	if len(members) == 0 {
+		return Chat{}, fmt.Errorf("at least one group chat member is required")
+	}
+	graphMembers := make([]map[string]any, 0, len(members))
+	for _, member := range members {
+		userID := strings.TrimSpace(member.UserID)
+		if userID == "" {
+			return Chat{}, fmt.Errorf("group chat member user id is required")
+		}
+		roles := append([]string(nil), member.Roles...)
+		if len(roles) == 0 {
+			roles = []string{"owner"}
+		}
+		graphMembers = append(graphMembers, map[string]any{
+			"@odata.type":     "#microsoft.graph.aadUserConversationMember",
+			"roles":           roles,
+			"user@odata.bind": fmt.Sprintf("https://graph.microsoft.com/v1.0/users('%s')", userID),
+		})
+	}
 	body := map[string]any{
 		"chatType": "group",
 		"topic":    SanitizeTopic(topic),
-		"members": []map[string]any{
-			{
-				"@odata.type":     "#microsoft.graph.aadUserConversationMember",
-				"roles":           []string{"owner"},
-				"user@odata.bind": fmt.Sprintf("https://graph.microsoft.com/v1.0/users('%s')", userID),
-			},
-		},
+		"members":  graphMembers,
 	}
 	var chat Chat
 	err := g.do(ctx, http.MethodPost, "/chats", body, &chat)
@@ -323,6 +348,41 @@ func (g *GraphClient) SendHTMLWithMentionsWithoutRateLimitRetry(ctx context.Cont
 	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
 }
 
+func (g *GraphClient) SendHTMLReplyWithQuote(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention) (ChatMessage, error) {
+	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{})
+}
+
+func (g *GraphClient) SendHTMLReplyWithQuoteWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention) (ChatMessage, error) {
+	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) sendHTMLReplyWithQuoteWithOptions(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention, opts graphRequestOptions) (ChatMessage, error) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return ChatMessage{}, fmt.Errorf("quoted reply message id is required")
+	}
+	replyMessage := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     html,
+		},
+	}
+	if len(mentions) > 0 {
+		graphMentions, err := graphMentionPayloads(mentions)
+		if err != nil {
+			return ChatMessage{}, err
+		}
+		replyMessage["mentions"] = graphMentions
+	}
+	body := map[string]any{
+		"messageIds":   []string{messageID},
+		"replyMessage": replyMessage,
+	}
+	var msg ChatMessage
+	err := g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages/replyWithQuote", body, &msg, opts)
+	return msg, err
+}
+
 func (g *GraphClient) sendHTMLWithMentionsWithOptions(ctx context.Context, chatID string, html string, mentions []ChatMention, opts graphRequestOptions) (ChatMessage, error) {
 	body := map[string]any{
 		"body": map[string]any{
@@ -331,32 +391,40 @@ func (g *GraphClient) sendHTMLWithMentionsWithOptions(ctx context.Context, chatI
 		},
 	}
 	if len(mentions) > 0 {
-		graphMentions := make([]map[string]any, 0, len(mentions))
-		for _, mention := range mentions {
-			if strings.TrimSpace(mention.User.ID) == "" {
-				return ChatMessage{}, fmt.Errorf("mention user id is required")
-			}
-			text := strings.TrimSpace(mention.Text)
-			if text == "" {
-				text = firstNonEmptyString(mention.User.DisplayName, mention.User.UserPrincipalName, "owner")
-			}
-			graphMentions = append(graphMentions, map[string]any{
-				"id":          mention.ID,
-				"mentionText": text,
-				"mentioned": map[string]any{
-					"user": map[string]any{
-						"id":               mention.User.ID,
-						"displayName":      firstNonEmptyString(mention.User.DisplayName, text),
-						"userIdentityType": "aadUser",
-					},
-				},
-			})
+		graphMentions, err := graphMentionPayloads(mentions)
+		if err != nil {
+			return ChatMessage{}, err
 		}
 		body["mentions"] = graphMentions
 	}
 	var msg ChatMessage
 	err := g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, opts)
 	return msg, err
+}
+
+func graphMentionPayloads(mentions []ChatMention) ([]map[string]any, error) {
+	graphMentions := make([]map[string]any, 0, len(mentions))
+	for _, mention := range mentions {
+		if strings.TrimSpace(mention.User.ID) == "" {
+			return nil, fmt.Errorf("mention user id is required")
+		}
+		text := strings.TrimSpace(mention.Text)
+		if text == "" {
+			text = firstNonEmptyString(mention.User.DisplayName, mention.User.UserPrincipalName, "owner")
+		}
+		graphMentions = append(graphMentions, map[string]any{
+			"id":          mention.ID,
+			"mentionText": text,
+			"mentioned": map[string]any{
+				"user": map[string]any{
+					"id":               mention.User.ID,
+					"displayName":      firstNonEmptyString(mention.User.DisplayName, text),
+					"userIdentityType": "aadUser",
+				},
+			},
+		})
+	}
+	return graphMentions, nil
 }
 
 func (g *GraphClient) SendOpenURLAdaptiveCard(ctx context.Context, chatID string, title string, text string, actions []OpenURLCardAction) (ChatMessage, error) {
@@ -1156,6 +1224,10 @@ func isAllowedGraphRequest(method string, path string) bool {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
 	}
+	if method == http.MethodPost && isChatMessagesReplyWithQuotePath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && len(q) == 0
+	}
 	if method == http.MethodGet && isChatMessageHostedContentValuePath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
@@ -1555,6 +1627,14 @@ func allowedLastModifiedFilter(value string) bool {
 func isChatMessagesPath(path string) bool {
 	parts := strings.Split(path, "/")
 	if len(parts) != 4 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "messages" {
+		return false
+	}
+	return safeGraphDynamicID(parts[2])
+}
+
+func isChatMessagesReplyWithQuotePath(path string) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != "chats" || parts[2] == "" || parts[3] != "messages" || parts[4] != "replyWithQuote" {
 		return false
 	}
 	return safeGraphDynamicID(parts[2])

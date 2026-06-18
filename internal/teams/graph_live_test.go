@@ -34,6 +34,10 @@ const (
 	liveJasonWeiSafetyAckEnv   = "CODEX_HELPER_TEAMS_LIVE_JASON_WEI_ONLY"
 	liveJasonWeiSafetyAckValue = "jason-wei-only"
 	liveWriteOnceEnv           = "CODEX_HELPER_TEAMS_LIVE_WRITE_ONCE"
+	liveGroupGuardEnv          = "CODEX_HELPER_TEAMS_LIVE_GROUP_GUARD"
+	liveGroupGuardAckEnv       = "CODEX_HELPER_TEAMS_LIVE_GROUP_GUARD_ACK"
+	liveGroupGuardAckValue     = "create-group-chat-with-test-account"
+	liveGroupGuardTestUserEnv  = "CODEX_HELPER_TEAMS_LIVE_GROUP_TEST_USER_ID"
 )
 
 func TestLiveGraphSmokeOptIn(t *testing.T) {
@@ -80,6 +84,128 @@ func TestLiveGraphSmokeOptIn(t *testing.T) {
 		if _, err := graph.ListMessages(ctx, chatID, 20); err != nil {
 			t.Fatalf("Graph chat read smoke failed for configured chat: %v", err)
 		}
+	}
+}
+
+func TestLiveTeamsGroupGuardCreatedChatOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv(liveGroupGuardEnv)) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_GROUP_GUARD=1 to create a live two-member Teams chat and validate group guard behavior")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveGroupGuardAckEnv)); got != liveGroupGuardAckValue {
+		t.Fatalf("%s=%s is required before creating a live multi-member Teams chat", liveGroupGuardAckEnv, liveGroupGuardAckValue)
+	}
+	testUserID := strings.TrimSpace(os.Getenv(liveGroupGuardTestUserEnv))
+	if testUserID == "" {
+		t.Fatalf("%s=<test account user id> is required", liveGroupGuardTestUserEnv)
+	}
+	requireLiveWriteOnce(t, "teams-group-guard-created-chat")
+
+	cfg, err := DefaultAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(cfg.CachePath); err != nil {
+		t.Fatalf("read Teams chat token cache %s: %v", cfg.CachePath, err)
+	}
+	readCfg, err := DefaultReadAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultReadAuthConfig error: %v", err)
+	}
+	if _, err := readTokenCache(readCfg.CachePath); err != nil {
+		t.Fatalf("read Teams read token cache %s: %v", readCfg.CachePath, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	graph := NewGraphClient(NewAuthManager(cfg), io.Discard)
+	readGraph := NewGraphClient(NewAuthManager(readCfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	if strings.TrimSpace(me.ID) == "" || strings.TrimSpace(me.ID) == testUserID {
+		t.Fatalf("invalid live group guard users: me=%q test=%q", me.ID, testUserID)
+	}
+	nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+	title := "Codex Group Guard Live - " + nonce
+	chat, err := graph.CreateGroupChat(ctx, title, []GroupChatMemberBinding{
+		{UserID: me.ID, Roles: []string{"owner"}},
+		{UserID: testUserID, Roles: []string{"owner"}},
+	})
+	if err != nil {
+		t.Fatalf("create live group guard chat failed: %v", err)
+	}
+	chat = requireLiveCreatedGroupGuardChat(ctx, t, graph, chat.ID, me.ID, testUserID)
+	t.Logf("LIVE_GROUP_GUARD_CHAT_ID=%s", chat.ID)
+	t.Logf("LIVE_GROUP_GUARD_CHAT_URL=%s", chat.WebURL)
+	t.Logf("LIVE_GROUP_GUARD_CHAT_TOPIC=%s", chat.Topic)
+
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "live group guard final " + nonce,
+		CodexThreadID: "live-thread-" + nonce,
+		CodexTurnID:   "live-turn-" + nonce,
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.readGraph = readGraph
+	bridge.user = me
+	bridge.groupChatGuardEnabled = true
+	bridge.reg.Sessions[0].ChatID = chat.ID
+	bridge.reg.Sessions[0].ChatURL = chat.WebURL
+	bridge.reg.Sessions[0].Topic = title
+
+	plainText := "live group guard plain conversation " + nonce
+	plainMsg, err := graph.SendHTML(ctx, chat.ID, "<p>"+html.EscapeString(plainText)+"</p>")
+	if err != nil {
+		t.Fatalf("send live plain group message: %v", err)
+	}
+	waitForLiveMessageID(ctx, t, readGraph, chat.ID, plainMsg.ID)
+	if _, err := bridge.pollChat(ctx, chat.ID, 20, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, chat.ID, msg, text)
+	}); err != nil {
+		t.Fatalf("poll live plain group message: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("plain group message reached executor: %#v", executor.prompts)
+	}
+	if liveRecentPlainContains(ctx, t, readGraph, chat.ID, "Request accepted") {
+		t.Fatalf("plain group message unexpectedly produced accepted ack")
+	}
+
+	mentionText := "please @codex validate live group guard " + nonce
+	mentionMsg, err := graph.SendHTML(ctx, chat.ID, "<p>"+html.EscapeString(mentionText)+"</p>")
+	if err != nil {
+		t.Fatalf("send live @codex group message: %v", err)
+	}
+	waitForLiveMessageID(ctx, t, readGraph, chat.ID, mentionMsg.ID)
+	if _, err := bridge.pollChat(ctx, chat.ID, 20, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, chat.ID, msg, text)
+	}); err != nil {
+		t.Fatalf("poll live @codex group message: %v", err)
+	}
+	if len(executor.prompts) != 1 || strings.Contains(strings.ToLower(executor.prompts[0]), "@codex") || !strings.Contains(executor.prompts[0], "validate live group guard "+nonce) {
+		t.Fatalf("live executor prompts = %#v, want stripped @codex prompt", executor.prompts)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load live group guard store: %v", err)
+	}
+	var ack teamstore.OutboxMessage
+	for _, msg := range state.OutboxMessages {
+		if msg.AckKind == "teams_prompt" {
+			ack = msg
+			break
+		}
+	}
+	if ack.TeamsMessageID == "" || ack.QuoteReplyToMessageID != mentionMsg.ID {
+		t.Fatalf("live accepted ack = %#v, want quoted reply to %s", ack, mentionMsg.ID)
+	}
+	ackMsg := waitForLiveMessageID(ctx, t, readGraph, chat.ID, ack.TeamsMessageID)
+	if !liveMessageHasReferenceAttachment(ackMsg) {
+		t.Fatalf("live accepted ack did not include a messageReference attachment: %#v", ackMsg.Attachments)
+	}
+	if !liveRecentPlainContains(ctx, t, readGraph, chat.ID, "live group guard final "+nonce) {
+		t.Fatalf("live final answer was not visible in recent chat messages")
 	}
 }
 
@@ -2316,6 +2442,100 @@ func TestClaimLiveWriteOnceMarker(t *testing.T) {
 	if claimed, err := claimLiveWriteOnceMarker(base, "bridge/send file", "different nonce"); err != nil || !claimed {
 		t.Fatalf("different nonce claim = %v err=%v, want claimed", claimed, err)
 	}
+}
+
+func requireLiveCreatedGroupGuardChat(ctx context.Context, t *testing.T, graph *GraphClient, chatID string, ownerUserID string, testUserID string) Chat {
+	t.Helper()
+	chat, err := graph.GetChat(ctx, chatID)
+	if err != nil {
+		t.Fatalf("Graph chat safety check failed for created group guard chat: %v", err)
+	}
+	members, err := graph.ListChatMembers(ctx, chatID)
+	if err != nil {
+		t.Fatalf("Graph chat member safety check failed for created group guard chat: %v", err)
+	}
+	if err := validateLiveGroupGuardChat(chat, members, chatID, ownerUserID, testUserID); err != nil {
+		t.Fatalf("refusing live group guard operation: %v", err)
+	}
+	return chat
+}
+
+func validateLiveGroupGuardChat(chat Chat, members []ChatMember, chatID string, ownerUserID string, testUserID string) error {
+	if strings.TrimSpace(chat.ID) != strings.TrimSpace(chatID) {
+		return fmt.Errorf("chat id mismatch: got %q, want %q", chat.ID, chatID)
+	}
+	if strings.TrimSpace(chat.ChatType) != "group" {
+		return fmt.Errorf("chat %q is %q, want group", chatID, chat.ChatType)
+	}
+	if len(members) != 2 {
+		return fmt.Errorf("chat %q has %d member(s), want exactly 2", chatID, len(members))
+	}
+	want := map[string]bool{
+		strings.TrimSpace(ownerUserID): false,
+		strings.TrimSpace(testUserID):  false,
+	}
+	for _, member := range members {
+		userID := strings.TrimSpace(member.UserID)
+		if _, ok := want[userID]; !ok {
+			return fmt.Errorf("chat %q includes unexpected member userId %q displayName %q", chatID, member.UserID, member.DisplayName)
+		}
+		want[userID] = true
+	}
+	for userID, seen := range want {
+		if !seen {
+			return fmt.Errorf("chat %q is missing expected member %q", chatID, userID)
+		}
+	}
+	return nil
+}
+
+func waitForLiveMessageID(ctx context.Context, t *testing.T, graph *GraphClient, chatID string, messageID string) ChatMessage {
+	t.Helper()
+	deadline := time.Now().Add(45 * time.Second)
+	var lastErr error
+	for {
+		messages, err := graph.ListMessages(ctx, chatID, 20)
+		if err != nil {
+			lastErr = err
+		} else {
+			for _, msg := range messages {
+				if strings.TrimSpace(msg.ID) == strings.TrimSpace(messageID) {
+					return msg
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("message %s did not appear in live chat %s; lastErr=%v", messageID, chatID, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context expired waiting for live message %s: %v", messageID, ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func liveRecentPlainContains(ctx context.Context, t *testing.T, graph *GraphClient, chatID string, needle string) bool {
+	t.Helper()
+	messages, err := graph.ListMessages(ctx, chatID, 20)
+	if err != nil {
+		t.Fatalf("list recent live messages: %v", err)
+	}
+	for _, msg := range messages {
+		if strings.Contains(PlainTextFromTeamsHTML(msg.Body.Content), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func liveMessageHasReferenceAttachment(msg ChatMessage) bool {
+	for _, attachment := range msg.Attachments {
+		if strings.EqualFold(strings.TrimSpace(attachment.ContentType), "messageReference") {
+			return true
+		}
+	}
+	return false
 }
 
 func requireLiveJasonWeiSingleMemberChat(ctx context.Context, t *testing.T, graph *GraphClient, chatID string) User {

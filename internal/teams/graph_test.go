@@ -456,6 +456,9 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/chats/a/messages/message-id?$top=1"},
 		{http.MethodPatch, "/chats/a/messages/message-id?$top=1"},
 		{http.MethodPatch, "/chats/a/messages"},
+		{http.MethodPost, "/chats/a/messages/replyWithQuote?$top=1"},
+		{http.MethodPost, "/chats/a/messages/../replyWithQuote"},
+		{http.MethodPost, "/chats/a/messages/replyWithQuote/extra"},
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/../$value"},
 		{http.MethodGet, "/chats/a/messages/message-id/hostedContents/content-id/$value?$top=1"},
 		{http.MethodPost, "/chats/a/unhideForUser?$top=1"},
@@ -511,6 +514,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$skiptoken=abc123"},
 		{http.MethodPost, "/chats/chat-id/messages"},
+		{http.MethodPost, "/chats/chat-id/messages/replyWithQuote"},
 	}
 	for _, tc := range allowed {
 		if !isAllowedGraphRequest(tc.method, tc.path) {
@@ -587,6 +591,59 @@ func TestGraphCreateSingleMemberGroupChatUsesOwnerBindingAndSanitizedTopic(t *te
 		t.Fatalf("CreateSingleMemberGroupChat error: %v", err)
 	}
 	if !sawCreate || chat.ID != "chat-1" || chat.ChatType != "group" || chat.WebURL == "" {
+		t.Fatalf("unexpected created chat: %#v sawCreate=%v", chat, sawCreate)
+	}
+}
+
+func TestGraphCreateGroupChatUsesConfiguredMembers(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sawCreate bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.URL.Path != "/chats" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawCreate = true
+		var payload struct {
+			ChatType string `json:"chatType"`
+			Topic    string `json:"topic"`
+			Members  []struct {
+				ODataType string   `json:"@odata.type"`
+				Roles     []string `json:"roles"`
+				UserBind  string   `json:"user@odata.bind"`
+			} `json:"members"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode create chat payload: %v", err)
+		}
+		if payload.ChatType != "group" || payload.Topic != "Codex group live" {
+			t.Fatalf("unexpected create group payload header: %#v", payload)
+		}
+		if len(payload.Members) != 2 {
+			t.Fatalf("member count = %d, want 2", len(payload.Members))
+		}
+		if payload.Members[0].UserBind != "https://graph.microsoft.com/v1.0/users('owner-1')" || payload.Members[1].UserBind != "https://graph.microsoft.com/v1.0/users('test-2')" {
+			t.Fatalf("unexpected member binds: %#v", payload.Members)
+		}
+		if got := strings.Join(payload.Members[0].Roles, ","); got != "owner" {
+			t.Fatalf("owner roles = %q", got)
+		}
+		if got := strings.Join(payload.Members[1].Roles, ","); got != "owner" {
+			t.Fatalf("default test member roles = %q", got)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"chat-group","topic":"Codex group live","chatType":"group","webUrl":"https://teams.example/chat-group"}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	chat, err := graph.CreateGroupChat(context.Background(), "Codex group live", []GroupChatMemberBinding{
+		{UserID: "owner-1", Roles: []string{"owner"}},
+		{UserID: "test-2"},
+	})
+	if err != nil {
+		t.Fatalf("CreateGroupChat error: %v", err)
+	}
+	if !sawCreate || chat.ID != "chat-group" || chat.ChatType != "group" {
 		t.Fatalf("unexpected created chat: %#v sawCreate=%v", chat, sawCreate)
 	}
 }
@@ -946,6 +1003,64 @@ func TestGraphSendHTMLWithOwnerMention(t *testing.T) {
 	}
 	if msg.ID != "message-1" || !sawMessage {
 		t.Fatalf("message result mismatch: msg=%#v saw=%v", msg, sawMessage)
+	}
+}
+
+func TestGraphSendHTMLReplyWithQuoteUsesReplyAction(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var sawReply bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/chats/chat-1/messages/replyWithQuote" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		sawReply = true
+		var payload struct {
+			MessageIDs   []string `json:"messageIds"`
+			ReplyMessage struct {
+				Body struct {
+					ContentType string `json:"contentType"`
+					Content     string `json:"content"`
+				} `json:"body"`
+				Mentions []struct {
+					ID          int    `json:"id"`
+					MentionText string `json:"mentionText"`
+					Mentioned   struct {
+						User struct {
+							ID               string `json:"id"`
+							DisplayName      string `json:"displayName"`
+							UserIdentityType string `json:"userIdentityType"`
+						} `json:"user"`
+					} `json:"mentioned"`
+				} `json:"mentions"`
+			} `json:"replyMessage"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode replyWithQuote payload: %v", err)
+		}
+		if len(payload.MessageIDs) != 1 || payload.MessageIDs[0] != "message-original" {
+			t.Fatalf("messageIds = %#v, want original message", payload.MessageIDs)
+		}
+		if payload.ReplyMessage.Body.ContentType != "html" || !strings.Contains(payload.ReplyMessage.Body.Content, "Request accepted") {
+			t.Fatalf("unexpected reply body: %#v", payload.ReplyMessage.Body)
+		}
+		if len(payload.ReplyMessage.Mentions) != 1 || payload.ReplyMessage.Mentions[0].MentionText != "Alex" || payload.ReplyMessage.Mentions[0].Mentioned.User.ID != "user-2" {
+			t.Fatalf("unexpected reply mentions: %#v", payload.ReplyMessage.Mentions)
+		}
+		_, _ = fmt.Fprint(w, `{"id":"reply-1","messageType":"message"}`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	msg, err := graph.SendHTMLReplyWithQuote(context.Background(), "chat-1", "message-original", "<p>Request accepted</p>", []ChatMention{{
+		ID:   0,
+		Text: "Alex",
+		User: User{ID: "user-2", DisplayName: "Alex"},
+	}})
+	if err != nil {
+		t.Fatalf("SendHTMLReplyWithQuote error: %v", err)
+	}
+	if msg.ID != "reply-1" || !sawReply {
+		t.Fatalf("reply result mismatch: msg=%#v saw=%v", msg, sawReply)
 	}
 }
 

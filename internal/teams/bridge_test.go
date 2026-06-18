@@ -14938,6 +14938,390 @@ func TestBridgePollForwardsCoworkerWorkMessageAndMentionsReceipt(t *testing.T) {
 	}
 }
 
+func TestBridgeGroupWorkChatIgnoresUnmentionedConversation(t *testing.T) {
+	msg := bridgePollMessage("group-chat-talk", "2026-04-30T01:05:00Z", "Alex I will look at this later")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want ignored group conversation", executor.prompts)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("sent = %#v, want no visible response", *sent)
+	}
+	lookup, err := store.MessageLookup(context.Background(), "chat-1", "group-chat-talk")
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.Kind != "ignored_group_chat" {
+		t.Fatalf("ignored message provenance = %#v", lookup)
+	}
+}
+
+func TestBridgeGroupWorkChatAcceptsCodexMentionAnywhereWithQuotedAck(t *testing.T) {
+	msg := bridgePollMessage("group-codex-1", "2026-04-30T01:05:00Z", "please @codex debug this failure")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "group answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+	bridge.annotateUserMessages = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 1 || strings.Contains(strings.ToLower(executor.prompts[0]), "@codex") || !strings.Contains(executor.prompts[0], "debug this failure") {
+		t.Fatalf("executor prompts = %#v, want mention stripped", executor.prompts)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want quoted ack and final only", *sent)
+	}
+	if (*sent)[0].ReplyTo != "group-codex-1" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Request accepted") {
+		t.Fatalf("ack = %#v, want quoted accepted ack", (*sent)[0])
+	}
+	if !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "group answer") {
+		t.Fatalf("final = %#v, want group answer", (*sent)[1])
+	}
+}
+
+func TestBridgeGroupWorkChatCoworkerMentionQuotesAndDoesNotMirrorUserPrompt(t *testing.T) {
+	msg := bridgePollMessage("group-coworker-codex", "2026-04-30T01:05:00Z", "@codex debug this coworker failure")
+	msg.From.User.ID = "user-2"
+	msg.From.User.DisplayName = "Alex Kim"
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "coworker group answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+	bridge.annotateUserMessages = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	userPrompt := groupGuardExecutorUserPrompt(executor.prompts)
+	if strings.Contains(strings.ToLower(userPrompt), "@codex") || !strings.Contains(userPrompt, "debug this coworker failure") {
+		t.Fatalf("executor prompts = %#v, want coworker prompt without @codex", executor.prompts)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want quoted ack and final only without user mirror", *sent)
+	}
+	if (*sent)[0].ReplyTo != "group-coworker-codex" || (*sent)[0].Mentions != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Alex Kim") {
+		t.Fatalf("ack = %#v, want quoted coworker mention receipt", (*sent)[0])
+	}
+	if joined := sentPlainJoined(*sent); strings.Contains(joined, "🧑‍💻 User:") || !strings.Contains(joined, "coworker group answer") {
+		t.Fatalf("sent output mismatch, mirror should be suppressed:\n%s", joined)
+	}
+}
+
+func TestBridgeGroupWorkChatAcceptsNativeCodexMentionWithQuotedAck(t *testing.T) {
+	msg := bridgePollMessage("group-native-codex", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>please <at id="0">Codex</at> debug this failure</p>`
+	msg.Mentions = []json.RawMessage{json.RawMessage(`{"id":0,"mentionText":"Codex","mentioned":{"user":{"id":"codex-user","displayName":"Codex"}}}`)}
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "native mention answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	userPrompt := groupGuardExecutorUserPrompt(executor.prompts)
+	if strings.Contains(userPrompt, "Codex") || strings.Contains(strings.ToLower(userPrompt), "@codex") || !strings.Contains(userPrompt, "please") || !strings.Contains(userPrompt, "debug this failure") {
+		t.Fatalf("executor prompts = %#v, want native mention stripped", executor.prompts)
+	}
+	if len(*sent) != 2 || (*sent)[0].ReplyTo != "group-native-codex" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Request accepted") {
+		t.Fatalf("sent = %#v, want quoted accepted ack and final", *sent)
+	}
+}
+
+func TestBridgeGroupWorkChatEmptyCodexMentionDoesNotQueuePrompt(t *testing.T) {
+	msg := bridgePollMessage("group-empty-codex", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p><at id="0">Codex</at></p>`
+	msg.Mentions = []json.RawMessage{json.RawMessage(`{"id":0,"mentionText":"Codex","mentioned":{"user":{"id":"codex-user","displayName":"Codex"}}}`)}
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want none for empty @codex mention", executor.prompts)
+	}
+	if len(*sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Mention received") {
+		t.Fatalf("sent = %#v, want mention-received helper response", *sent)
+	}
+}
+
+func TestBridgeGroupGuardSingleMemberWorkChatDoesNotRequireCodexMention(t *testing.T) {
+	msg := bridgePollMessage("single-member-task", "2026-04-30T01:05:00Z", "run this single-member task")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "single member answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "single-member task") {
+		t.Fatalf("executor prompts = %#v, want single-member work prompt", executor.prompts)
+	}
+	if len(*sent) != 2 || (*sent)[0].ReplyTo != "" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Request accepted") || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "single member answer") {
+		t.Fatalf("sent = %#v, want normal ack and final for single-member work chat", *sent)
+	}
+}
+
+func TestBridgeGroupGuardRefreshesCachedSingleMemberBeforeAcceptingPlainText(t *testing.T) {
+	msg := bridgePollMessage("stale-single-member-cache", "2026-04-30T01:05:00Z", "this should be ignored after membership changes")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+	bridge.cacheChatAudience("chat-1", chatAudienceSnapshot{Mode: chatAudienceSingleMember, Members: 1, CheckedAt: time.Now()})
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 || len(*sent) != 0 {
+		t.Fatalf("stale cached single-member state should refresh and fail closed: prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+	if !bridge.cachedWorkChatIsMultiMember("chat-1") {
+		t.Fatalf("chat audience cache was not refreshed to multi-member")
+	}
+}
+
+func TestBridgeGroupWorkChatOwnerHelperCommandDoesNotRequireCodexMention(t *testing.T) {
+	msg := bridgePollMessage("group-owner-helper-status", "2026-04-30T01:05:00Z", "helper status")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want helper command handled locally", executor.prompts)
+	}
+	if len(*sent) == 0 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Session") {
+		t.Fatalf("sent = %#v, want helper status response", *sent)
+	}
+}
+
+func TestBridgeGroupWorkChatSuppressesQueuedStartStatus(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("test session missing")
+	}
+	bridge.cacheChatAudience("chat-1", chatAudienceSnapshot{Mode: chatAudienceMultiMember, Members: 2, CheckedAt: time.Now()})
+	if err := bridge.queueAndBestEffortQueuedTurnStartNotice(context.Background(), session, teamstore.Turn{
+		ID:        "turn:queued-start-suppressed",
+		SessionID: session.ID,
+		Status:    teamstore.TurnStatusRunning,
+	}); err != nil {
+		t.Fatalf("queueAndBestEffortQueuedTurnStartNotice error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("queued-start status leaked in multi-member group chat: %#v", *sent)
+	}
+}
+
+func TestBridgeGroupWorkChatQuotedAckFallsBackToPlainAck(t *testing.T) {
+	msg := bridgePollMessage("group-codex-fallback", "2026-04-30T01:05:00Z", "@codex debug this failure")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+		ReplyStatus: http.StatusForbidden,
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "fallback answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want fallback ack and final", *sent)
+	}
+	if (*sent)[0].ReplyTo != "" || !strings.Contains(PlainTextFromTeamsHTML((*sent)[0].Content), "Request accepted") {
+		t.Fatalf("fallback ack = %#v", (*sent)[0])
+	}
+}
+
+func TestBridgeGroupWorkChatSuppressesStreamingStatus(t *testing.T) {
+	msg := bridgePollMessage("group-streaming-1", "2026-04-30T01:05:00Z", "@codex stream this")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &streamingRecordingExecutor{
+		events: []codexrunner.StreamEvent{
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "checking status"},
+			{Kind: codexrunner.StreamEventCommandStarted, Command: "go test ./..."},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "still working"},
+			{Kind: codexrunner.StreamEventTurnCompleted},
+		},
+		result: ExecutionResult{Text: "streaming final", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if len(*sent) != 2 || !strings.Contains(joined, "Request accepted") || !strings.Contains(joined, "streaming final") {
+		t.Fatalf("sent = %#v, want ack and final only:\n%s", *sent, joined)
+	}
+	for _, leaked := range []string{"checking status", "still working", "Running command"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("streaming status leaked %q in:\n%s", leaked, joined)
+		}
+	}
+}
+
+func TestBridgeGroupWorkChatMemberLookupFailureRequiresMention(t *testing.T) {
+	msg := bridgePollMessage("group-member-error", "2026-04-30T01:05:00Z", "normal chat while members fail")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages:      []ChatMessage{msg},
+		MembersStatus: http.StatusForbidden,
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 || len(*sent) != 0 {
+		t.Fatalf("member lookup failure should fail closed: prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+}
+
 func TestBridgeRejectsCoworkerWorkHelperCommand(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -31246,6 +31630,7 @@ type bridgeSentMessage struct {
 	ChatID   string
 	Content  string
 	Mentions int
+	ReplyTo  string
 }
 
 func sentPlainText(sent []bridgeSentMessage) string {
@@ -31254,6 +31639,18 @@ func sentPlainText(sent []bridgeSentMessage) string {
 		parts = append(parts, PlainTextFromTeamsHTML(msg.Content))
 	}
 	return strings.Join(parts, "\n")
+}
+
+func groupGuardExecutorUserPrompt(prompts []string) string {
+	if len(prompts) == 0 {
+		return ""
+	}
+	text := prompts[0]
+	if before, _, ok := strings.Cut(text, "\n\nTeams helper safety:"); ok {
+		text = before
+	}
+	text = strings.TrimPrefix(text, "User message:\n")
+	return strings.TrimSpace(text)
 }
 
 func decodeTestOnlineMeetingSubject(t *testing.T, r *http.Request) string {
@@ -31323,6 +31720,105 @@ func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+}
+
+type bridgeGroupGuardGraphOptions struct {
+	Messages      []ChatMessage
+	Members       []ChatMember
+	MembersStatus int
+	ReplyStatus   int
+}
+
+func newBridgeGroupGuardGraph(t *testing.T, opts bridgeGroupGuardGraphOptions) (*GraphClient, *[]bridgeSentMessage) {
+	t.Helper()
+	var sent []bridgeSentMessage
+	var sentMu sync.Mutex
+	polled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			if polled {
+				t.Fatalf("unexpected extra Graph poll: %s", r.URL.String())
+			}
+			polled = true
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": opts.Messages}); err != nil {
+				t.Fatalf("encode poll response: %v", err)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/members":
+			if opts.MembersStatus != 0 && opts.MembersStatus != http.StatusOK {
+				w.WriteHeader(opts.MembersStatus)
+				_, _ = fmt.Fprint(w, `{"error":{"code":"Forbidden","message":"members unavailable"}}`)
+				return
+			}
+			members := opts.Members
+			if members == nil {
+				members = []ChatMember{{ID: "member-1", UserID: "user-1", DisplayName: "Owner"}}
+			}
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": members}); err != nil {
+				t.Fatalf("encode members response: %v", err)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages/replyWithQuote":
+			if opts.ReplyStatus != 0 && opts.ReplyStatus != http.StatusCreated && opts.ReplyStatus != http.StatusOK {
+				w.WriteHeader(opts.ReplyStatus)
+				_, _ = fmt.Fprint(w, `{"error":{"code":"Forbidden","message":"replyWithQuote unavailable"}}`)
+				return
+			}
+			var payload struct {
+				MessageIDs   []string `json:"messageIds"`
+				ReplyMessage struct {
+					Body struct {
+						Content string `json:"content"`
+					} `json:"body"`
+					Mentions []json.RawMessage `json:"mentions"`
+				} `json:"replyMessage"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode replyWithQuote request: %v", err)
+			}
+			replyTo := ""
+			if len(payload.MessageIDs) > 0 {
+				replyTo = payload.MessageIDs[0]
+			}
+			sentMu.Lock()
+			sent = append(sent, bridgeSentMessage{ChatID: "chat-1", Content: payload.ReplyMessage.Body.Content, Mentions: len(payload.ReplyMessage.Mentions), ReplyTo: replyTo})
+			id := len(sent)
+			sentMu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+			var payload struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode message request: %v", err)
+			}
+			sentMu.Lock()
+			sent = append(sent, bridgeSentMessage{ChatID: "chat-1", Content: payload.Body.Content, Mentions: len(payload.Mentions)})
+			id := len(sent)
+			sentMu.Unlock()
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, id)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(func() {
+		server.Close()
+		if !polled {
+			t.Fatal("Graph poll was not exercised")
+		}
+	})
+	return &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, &sent
 }
 
 func newIdleContinuationErrorRecoveryGraph(t *testing.T, pages []bridgePollPage, continuationStatus int, expectFreshContinuation bool) *GraphClient {
@@ -32309,6 +32805,13 @@ func countSentPlainContainingForChat(messages []bridgeSentMessage, chatID string
 		}
 	}
 	return count
+}
+
+func seedBridgeGroupGuardPollState(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
 }
 
 func seedIdleWorkPoll(t *testing.T, store *teamstore.Store, controlChatID string, workChatID string, oldActivity time.Time) {
