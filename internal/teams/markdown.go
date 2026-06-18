@@ -30,6 +30,8 @@ type teamsMarkdownBlock struct {
 	blocks  []teamsMarkdownBlock
 }
 
+const teamsCompactChatLinkLabel = "▶ Open chat"
+
 type teamsMarkdownListItem struct {
 	text     string
 	children []teamsMarkdownBlock
@@ -900,7 +902,7 @@ func renderTeamsMarkdownInlineLink(text string, start int, depth int) (string, i
 	labelHTML := renderTeamsInlineMarkdownDepth(label, depth+1)
 	if href, ok := safeTeamsMarkdownURL(dest); ok {
 		rendered := `<a href="` + html.EscapeString(href) + `">` + labelHTML + `</a>`
-		if strings.TrimSpace(label) != dest {
+		if strings.TrimSpace(label) != dest && !teamsMarkdownIsCompactChatLink(label, href) {
 			rendered += " (" + html.EscapeString(dest) + ")"
 		}
 		return rendered, destEnd + 1, true
@@ -1036,6 +1038,20 @@ func safeTeamsMarkdownURL(dest string) (string, bool) {
 		return "", false
 	}
 	return dest, true
+}
+
+func teamsMarkdownIsCompactChatLink(label string, href string) bool {
+	if strings.TrimSpace(label) != teamsCompactChatLinkLabel {
+		return false
+	}
+	parsed, err := url.Parse(href)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Hostname(), "teams.microsoft.com") {
+		return false
+	}
+	return strings.HasPrefix(parsed.Path, "/l/chat/")
 }
 
 func teamsMarkdownURLIsHTTP(dest string) bool {

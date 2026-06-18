@@ -195,6 +195,13 @@ jobs:
           row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
+      - name: Teams control status display regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          control_status_pattern='Test(BridgeControlStatus(ShowsNewestActiveChatLast|ChunkingKeepsNewestActiveChatLast|ShowsFolderLastUsedCompactLinkAndParkedResume)|BridgeDashboardSessionsShowLinkedChatAndParkedResume|RenderTeamsHTMLCompactTeamsChatLinkHidesVisibleURL)$'
+          go test ./internal/teams -count=1 -run "$control_status_pattern" -v
+
       - name: Teams manual park and continuation regressions
         shell: bash
         run: |
@@ -751,6 +758,7 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/light-user/pending-workflow-notifications$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUser(ChatPollError|OutboxSendError|OutboxDriveItem|ArtifactUpsert|TranscriptDelivery|TranscriptCheckpoint|TranscriptQueue)StageWrites$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams ./internal/teams/store -count=1 -run 'Test(GlobalOutboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|GlobalInboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|ControlChatHistory(MigratesLegacyJSONLWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|SQLiteSuppressOutboxOwnerMentionDoesNotLoadColdState)$' -v
           go test ./internal/appdirs ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(CleanupStaleMigrationTemps(RemovesOnlyOldMatchingFileTempsCI|RemovesOnlyOldMatchingDirTempsCI|DoesNotBlockMigrationOnRemoveFailureCI)|ResolveMigrated(File(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|Dir(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|DirWithRequired(RefreshesStaleRequiredFileCI|KeepsNewerRequiredFileCI|SkipsUnsafeLegacySideFilesCI|RejectsSymlinkRequiredFileCI)|RelatedFilesRequiresRegularSidecarsCI)|DefaultStorePathRefreshes(StaleMigratedStateCI|CorruptNewStateCI)|DefaultRegistryPath(ForScope)?RefreshesCorruptNewRegistryCI|DefaultAuthConfigRefreshesCorruptScopedCacheFromLegacyDefaultCI|TeamsServiceLocalSupervisorRuntimeDir(MigratesLegacyStatusWhenNewDirExists|Refreshes(StaleNewStatusCI|CorruptNewStatusCI))|TeamsBackgroundKeepaliveResolveStorePath(CompletesPartialNewScopeCI|FallsBackWhenPartialNewScopeCannotCompleteCI|RejectsNonRegularSQLiteSidecarCI|RepairsCorruptNewScope(CI|WithoutRegistryCI)|ConcurrentMigrationCI|SubprocessMigrationStressCI|MigratesLegacyGlobalStoreCI|CleansEligibleLegacyScopeFilesCI)|CleanupMigratedFileFamilySkips(FreshLegacyCI|NewerLegacyCI|LockedLegacyCI|SameFileAliasCI)|CleanupMigratedScopeLegacyFilesKeepsStoreWhenRegistryCleanupBlockedCI)$' -v
           go test ./internal/appdirs -count=1 -run 'Test(StateDir(ExpandsHomeAndPreservesSpacesCI|UsesConfigFallbackOnWindowsAndDarwinCI)|ResolveMigratedFile(Refreshes(StaleExistingNewCI|EqualMTimeDifferentExistingNewCI)|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|ResolveMigratedDirWithRequired(RefreshesEqualMTimeDifferentRequiredFileCI|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|CopyFileReplacingActiveTempDoesNotInheritOldSourceMTimeCI)$' -v

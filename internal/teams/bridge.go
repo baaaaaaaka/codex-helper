@@ -4130,7 +4130,7 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			}
 			return b.sendControl(ctx, message)
 		case DashboardCommandStatus:
-			return b.sendControl(ctx, b.formatSessionList())
+			return b.sendControl(ctx, b.formatSessionList(ctx))
 		case DashboardCommandCancel:
 			return b.cancelControlFallbackCommand(ctx, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandSkills:
@@ -13648,7 +13648,7 @@ func (b *Bridge) recordGraphRateLimit(ctx context.Context, chatID string, outbox
 	_, _ = b.store.SetChatRateLimitForOutbox(ctx, chatID, blockedUntil, graphErr.Error(), outboxID)
 }
 
-func (b *Bridge) formatSessionList() string {
+func (b *Bridge) formatSessionList(ctx context.Context) string {
 	active := b.reg.ActiveSessions()
 	for i, j := 0, len(active)-1; i < j; i, j = i+1, j-1 {
 		active[i], active[j] = active[j], active[i]
@@ -13666,12 +13666,25 @@ func (b *Bridge) formatSessionList() string {
 		return "Control status: no linked work chats yet.\n\n" + teamsASRStatusLine(b.asrTranscriber) + "\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat."
 	}
 	lines := []string{"## Active Work chats"}
+	polls := b.workChatPollsSnapshot(ctx)
 	for _, session := range active {
-		meta := []string{session.ID, session.ChatURL}
-		if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
-			meta = append(meta, "Model profile: "+label)
+		status := workChatDisplayStatus(session, polls)
+		title := fmt.Sprintf("**%s** [%s]", session.Topic, status)
+		if resume := workChatResumeHint(session, polls); resume != "" {
+			title += "  " + resume
 		}
-		lines = append(lines, fmt.Sprintf("- **%s** [%s]\n  %s", session.Topic, session.Status, strings.Join(meta, "\n  ")))
+		lines = append(lines, title)
+		meta := []string{"**Session:** " + dashboardInlineCode(session.ID)}
+		meta = append(meta, workChatFolderLine(session))
+		meta = append(meta, workChatLastUsedLine(session))
+		if chatLink := teamsCompactChatMarkdownLink(session.ChatURL); chatLink != "" {
+			meta = append(meta, "**Chat:** "+chatLink)
+		}
+		if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
+			meta = append(meta, "**Model profile:** "+label)
+		}
+		lines = append(lines, dashboardIndentedTextLines(meta...)...)
+		lines = append(lines, "---")
 	}
 	if closedCount > 0 {
 		lines = append(lines, fmt.Sprintf("%d closed work chat(s) hidden. The helper no longer reads or responds in closed chats.", closedCount))
@@ -13679,6 +13692,69 @@ func (b *Bridge) formatSessionList() string {
 	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
 	lines = append(lines, "Next: open one of these Teams chats to continue work, or send `new <directory>` to create another Work chat.")
 	return strings.Join(lines, "\n")
+}
+
+func (b *Bridge) workChatPollsSnapshot(ctx context.Context) map[string]teamstore.ChatPollState {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	state, err := b.store.PollScheduleSnapshot(ctx)
+	if err != nil {
+		return nil
+	}
+	return state.ChatPolls
+}
+
+func workChatDisplayStatus(session Session, polls map[string]teamstore.ChatPollState) string {
+	if workChatIsParked(session, polls) {
+		return "parked"
+	}
+	return firstNonEmptyString(session.Status, "active")
+}
+
+func workChatIsParked(session Session, polls map[string]teamstore.ChatPollState) bool {
+	chatID := strings.TrimSpace(session.ChatID)
+	if chatID == "" || polls == nil {
+		return false
+	}
+	poll, ok := polls[chatID]
+	return ok && strings.TrimSpace(poll.PollState) == inboundPollStateParked
+}
+
+func workChatResumeHint(session Session, polls map[string]teamstore.ChatPollState) string {
+	if !workChatIsParked(session, polls) {
+		return ""
+	}
+	sessionID := strings.TrimSpace(session.ID)
+	if sessionID == "" {
+		return ""
+	}
+	return "**To resume:** " + dashboardInlineCode("resume "+sessionID)
+}
+
+func workChatFolderLine(session Session) string {
+	if folder := dashboardInlineCode(session.Cwd); folder != "" {
+		return "**Folder:** " + folder
+	}
+	return "**Folder:** not recorded"
+}
+
+func workChatLastUsedLine(session Session) string {
+	if session.UpdatedAt.IsZero() {
+		return "**Last used:** not recorded"
+	}
+	return "**Last used:** " + session.UpdatedAt.Local().Format("2006-01-02 15:04")
+}
+
+func teamsCompactChatMarkdownLink(chatURL string) string {
+	chatURL = strings.TrimSpace(chatURL)
+	if chatURL == "" {
+		return ""
+	}
+	if href, ok := safeTeamsMarkdownURL(chatURL); ok && teamsMarkdownURLIsHTTP(href) {
+		return "[" + teamsCompactChatLinkLabel + "](" + href + ")"
+	}
+	return ""
 }
 
 func (b *Bridge) formatWorkSessionStatus(session *Session) string {
@@ -13868,7 +13944,7 @@ func (b *Bridge) formatOpenSessionMessage(session *Session, resumed bool) string
 func (b *Bridge) formatDetails(arg string) string {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
-		return b.formatSessionList()
+		return b.formatSessionList(context.Background())
 	}
 	session := b.reg.SessionByID(arg)
 	if session == nil {
@@ -17794,6 +17870,8 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 	for _, workspace := range dashboard.Workspaces {
 		workspaceByID[workspace.ID] = workspace
 	}
+	var polls map[string]teamstore.ChatPollState
+	pollsLoaded := false
 	displayed := 0
 	for _, item := range dashboard.CurrentView.Items {
 		session, ok := sessions[sessionKey(item.WorkspaceID, item.SessionID)]
@@ -17801,7 +17879,8 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 			continue
 		}
 		action := fmt.Sprintf("send `%d` or `c %d` to continue this session in Teams", item.Number, item.Number)
-		if linked := b.linkedSessionForLocalSessionID(session.ID); linked != nil {
+		linked := b.linkedSessionForLocalSessionID(session.ID)
+		if linked != nil {
 			if isActiveSessionStatus(linked.Status) {
 				action = fmt.Sprintf("send `%d` to open this Teams chat or import updates", item.Number)
 			} else {
@@ -17818,6 +17897,18 @@ func (b *Bridge) formatWorkspaceSessionsDashboard(ctx context.Context, target Da
 		body := []string{pathLine}
 		if meta := dashboardSessionListMeta(session); meta != "" {
 			body = append(body, meta)
+		}
+		if linked != nil && isActiveSessionStatus(linked.Status) {
+			if chatLink := teamsCompactChatMarkdownLink(linked.ChatURL); chatLink != "" {
+				body = append(body, "**Chat:** "+chatLink)
+			}
+			if !pollsLoaded {
+				polls = b.workChatPollsSnapshot(ctx)
+				pollsLoaded = true
+			}
+			if resume := workChatResumeHint(*linked, polls); resume != "" {
+				body = append(body, resume)
+			}
 		}
 		body = append(body, "", "**Next:** "+action)
 		lines = append(lines, dashboardIndentedTextLines(body...)...)

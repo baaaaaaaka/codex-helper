@@ -1949,6 +1949,108 @@ func BenchmarkCXPPerfModelSQLiteFullStateSaveSourceStageWrites(b *testing.B) {
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown(b *testing.B) {
+	const rowBurstUpdates = 512
+	stages := []string{
+		"row_poll_schedule_burst",
+		"checkpoint_after_row_burst",
+		"full_session_update",
+		"checkpoint_after_full_session_update",
+		"full_registry_projection_migration",
+		"checkpoint_after_registry_migration",
+	}
+	totals := make(map[string]cxpPerfProcIO, len(stages))
+	durations := make(map[string]time.Duration, len(stages))
+	walBefore := make(map[string]int64, len(stages))
+	walAfter := make(map[string]int64, len(stages))
+	storeBytes := int64(0)
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		storeBytes += cxpPerfSQLiteStoreBytes(b, store)
+		base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Hour)
+		runStage := func(name string, fn func() error) {
+			b.Helper()
+			walBefore[name] += cxpPerfSQLiteWALBytes(b, store)
+			b.StartTimer()
+			start := time.Now()
+			delta, err := cxpPerfMeasureProcIO(fn)
+			elapsed := time.Since(start)
+			b.StopTimer()
+			walAfter[name] += cxpPerfSQLiteWALBytes(b, store)
+			if err != nil {
+				b.Fatalf("%s: %v", name, err)
+			}
+			total := totals[name]
+			total.add(delta)
+			totals[name] = total
+			durations[name] += elapsed
+		}
+		runStage("row_poll_schedule_burst", func() error {
+			for j := 0; j < rowBurstUpdates; j++ {
+				chatID := cxpPerfChatID(j % 100)
+				if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+					ChatID:         chatID,
+					PollState:      inboundPollStateWarm,
+					NextPollAt:     base.Add(time.Duration(j) * time.Second),
+					LastActivityAt: base,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		runStage("checkpoint_after_row_burst", func() error {
+			_, err := store.CheckpointSQLiteWAL(ctx, 1)
+			return err
+		})
+		runStage("full_session_update", func() error {
+			sessionID := cxpPerfSessionID(0)
+			return store.UpdateSession(ctx, sessionID, func(state *teamstore.State) error {
+				session := state.Sessions[sessionID]
+				session.Cwd = fmt.Sprintf("/workspace/wal-spike/full-session-%06d", i)
+				session.UpdatedAt = time.Now()
+				state.Sessions[sessionID] = session
+				return nil
+			})
+		})
+		runStage("checkpoint_after_full_session_update", func() error {
+			bridge.lastSQLiteWALCheckpoint = time.Time{}
+			return bridge.maybeCheckpointSQLiteWAL(ctx, base.Add(6*time.Minute))
+		})
+		runStage("full_registry_projection_migration", func() error {
+			chatID := fmt.Sprintf("wal-spike-registry-chat-%06d", i)
+			if bridge.reg.Chats == nil {
+				bridge.reg.Chats = map[string]ChatState{}
+			}
+			bridge.reg.Chats[chatID] = ChatState{
+				SeenMessageIDs: []string{fmt.Sprintf("wal-spike-seen-%06d", i)},
+				SentMessageIDs: []string{fmt.Sprintf("wal-spike-sent-%06d", i)},
+			}
+			return bridge.migrateRegistryProjectionToStore(ctx)
+		})
+		runStage("checkpoint_after_registry_migration", func() error {
+			bridge.lastSQLiteWALCheckpoint = time.Time{}
+			return bridge.maybeCheckpointSQLiteWAL(ctx, base.Add(12*time.Minute))
+		})
+	}
+	for _, stage := range stages {
+		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		if b.N > 0 {
+			denom := float64(b.N)
+			b.ReportMetric(float64(durations[stage])/denom, stage+"_ns/op")
+			b.ReportMetric(float64(walBefore[stage])/denom, stage+"_wal_before_B/op")
+			b.ReportMetric(float64(walAfter[stage])/denom, stage+"_wal_after_B/op")
+		}
+	}
+	if b.N > 0 {
+		b.ReportMetric(float64(storeBytes)/float64(b.N), "sqlite_total_bytes/op")
+	}
+}
+
 func cxpPerfSourceMatrixDashboard(bridge *Bridge, index int) ControlDashboard {
 	now := time.Date(2026, 5, 23, 11, 45, 0, 0, time.UTC).Add(time.Duration(index) * time.Second)
 	workspaces := make([]DashboardWorkspaceInput, 0, 10)
@@ -3910,6 +4012,23 @@ func cxpPerfSQLiteStoreBytes(tb testing.TB, store *teamstore.Store) int64 {
 		}
 	}
 	return total
+}
+
+func cxpPerfSQLiteWALBytes(tb testing.TB, store *teamstore.Store) int64 {
+	tb.Helper()
+	if store == nil {
+		return 0
+	}
+	path := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName+"-wal")
+	info, err := os.Stat(path)
+	if err == nil {
+		return info.Size()
+	}
+	if os.IsNotExist(err) {
+		return 0
+	}
+	tb.Fatalf("stat sqlite WAL %s: %v", path, err)
+	return 0
 }
 
 func cxpPerfStripLinkedTranscriptCheckpointPositionMetadata(tb testing.TB, store *teamstore.Store) {

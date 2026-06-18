@@ -151,6 +151,25 @@ func TestRenderTeamsHTMLCodexMarkdownSubset(t *testing.T) {
 	}
 }
 
+func TestRenderTeamsHTMLCompactTeamsChatLinkHidesVisibleURL(t *testing.T) {
+	chatURL := TeamsChatURL("19:compact@thread.v2", "tenant-1")
+	got := RenderTeamsHTML(TeamsRenderInput{
+		Kind: TeamsRenderHelper,
+		Text: "**Chat:** [" + teamsCompactChatLinkLabel + "](" + chatURL + ")",
+	})
+	wantAnchor := `<a href="` + chatURL + `">` + teamsCompactChatLinkLabel + `</a>`
+	if !strings.Contains(got, wantAnchor) {
+		t.Fatalf("compact Teams chat link missing anchor %q in:\n%s", wantAnchor, got)
+	}
+	plain := PlainTextFromTeamsHTML(got)
+	if !strings.Contains(plain, "Chat: "+teamsCompactChatLinkLabel) {
+		t.Fatalf("plain text missing compact chat label:\n%s", plain)
+	}
+	if strings.Contains(plain, "teams.microsoft.com") {
+		t.Fatalf("plain text leaked full Teams chat URL:\n%s", plain)
+	}
+}
+
 func TestRenderTeamsHTMLCodexMarkdownPreservesFencedBlankLines(t *testing.T) {
 	got := RenderTeamsHTML(TeamsRenderInput{
 		Kind: TeamsRenderAssistant,

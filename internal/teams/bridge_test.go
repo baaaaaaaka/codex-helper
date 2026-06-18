@@ -7289,6 +7289,79 @@ func TestBridgeDashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent(t
 	}
 }
 
+func TestBridgeDashboardSessionsShowLinkedChatAndParkedResume(t *testing.T) {
+	workspacePath := "/home/user/project/alpha"
+	threadID := "thread-alpha-linked"
+	prevDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{
+			Key:  "alpha",
+			Path: workspacePath,
+			Sessions: []codexhistory.Session{{
+				SessionID:   threadID,
+				FirstPrompt: "linked alpha session",
+				ProjectPath: workspacePath,
+				ModifiedAt:  time.Date(2026, 5, 12, 14, 8, 0, 0, time.Local),
+			}},
+		}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = prevDiscover })
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	chatID := "19:linked-project@thread.v2"
+	now := time.Date(2026, 5, 12, 14, 30, 0, 0, time.UTC)
+	bridge.reg.Sessions = []Session{{
+		ID:            "s001",
+		ChatID:        chatID,
+		ChatURL:       TeamsChatURL(chatID, "tenant-1"),
+		Topic:         "linked project chat",
+		Status:        "active",
+		CodexThreadID: threadID,
+		Cwd:           workspacePath,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}}
+	if err := bridge.ensureDurableSession(context.Background(), &bridge.reg.Sessions[0]); err != nil {
+		t.Fatalf("ensure durable linked session: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:     chatID,
+		PollState:  inboundPollStateParked,
+		NextPollAt: time.Time{},
+	}); err != nil {
+		t.Fatalf("park linked chat poll: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-projects-linked"), "projects"); err != nil {
+		t.Fatalf("projects error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-sessions-linked"), "1"); err != nil {
+		t.Fatalf("sessions error: %v", err)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want projects and sessions", *sent)
+	}
+	sessionsHTML := (*sent)[1].Content
+	sessionsPlain := PlainTextFromTeamsHTML(sessionsHTML)
+	for _, want := range []string{
+		"1. linked alpha session",
+		"Chat: " + teamsCompactChatLinkLabel,
+		"To resume: resume s001",
+		"Next: send 1 to open this Teams chat or import updates",
+	} {
+		if !strings.Contains(sessionsPlain, want) {
+			t.Fatalf("sessions output missing %q:\n%s", want, sessionsPlain)
+		}
+	}
+	if strings.Contains(sessionsPlain, "teams.microsoft.com") {
+		t.Fatalf("sessions plain text leaked full Teams chat URL:\n%s", sessionsPlain)
+	}
+	if !strings.Contains(sessionsHTML, `<a href="`+TeamsChatURL(chatID, "tenant-1")+`">`+teamsCompactChatLinkLabel+`</a>`) {
+		t.Fatalf("sessions HTML missing compact Teams chat anchor:\n%s", sessionsHTML)
+	}
+}
+
 func TestBridgeStaleDashboardHiddenHelperSessionDoesNotLeak(t *testing.T) {
 	workspacePath := "/home/user/project/alpha"
 	workspaceID := workspaceIDForPath(workspacePath)
@@ -8021,6 +8094,74 @@ func TestBridgeControlStatusShowsNewestActiveChatLast(t *testing.T) {
 	}
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
 	requirePlainTextInOrder(t, got, "old chat", "middle chat", "new chat")
+}
+
+func TestBridgeControlStatusShowsFolderLastUsedCompactLinkAndParkedResume(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC)
+	activeChatID := "19:active-status@thread.v2"
+	parkedChatID := "19:parked-status@thread.v2"
+	bridge.reg.Sessions = []Session{
+		{
+			ID:        "s001",
+			ChatID:    activeChatID,
+			ChatURL:   TeamsChatURL(activeChatID, "tenant-1"),
+			Topic:     "active status chat",
+			Status:    "active",
+			Cwd:       "/workspace/active",
+			UpdatedAt: now.Add(-2 * time.Hour),
+		},
+		{
+			ID:        "s002",
+			ChatID:    parkedChatID,
+			ChatURL:   TeamsChatURL(parkedChatID, "tenant-1"),
+			Topic:     "parked status chat",
+			Status:    "active",
+			Cwd:       "/workspace/parked",
+			UpdatedAt: now.Add(-1 * time.Hour),
+		},
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:     parkedChatID,
+		PollState:  inboundPollStateParked,
+		NextPollAt: time.Time{},
+	}); err != nil {
+		t.Fatalf("park chat poll: %v", err)
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgePollMessage("control-status-detail", "2026-04-30T01:00:00Z", "status"), "status"); err != nil {
+		t.Fatalf("handleControlMessage status error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent messages = %d, want 1: %#v", len(*sent), *sent)
+	}
+	html := (*sent)[0].Content
+	plain := PlainTextFromTeamsHTML(html)
+	for _, want := range []string{
+		"active status chat [active]",
+		"parked status chat [parked]",
+		"Session: s001",
+		"Folder: /workspace/active",
+		"Last used: " + bridge.reg.Sessions[0].UpdatedAt.Local().Format("2006-01-02 15:04"),
+		"Chat: " + teamsCompactChatLinkLabel,
+		"To resume: resume s002",
+		"———",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("status output missing %q:\n%s", want, plain)
+		}
+	}
+	if got := strings.Count(plain, "To resume:"); got != 1 {
+		t.Fatalf("resume hint count = %d, want 1:\n%s", got, plain)
+	}
+	if strings.Contains(plain, "teams.microsoft.com") {
+		t.Fatalf("status plain text leaked full Teams chat URL:\n%s", plain)
+	}
+	if !strings.Contains(html, `<a href="`+TeamsChatURL(parkedChatID, "tenant-1")+`">`+teamsCompactChatLinkLabel+`</a>`) {
+		t.Fatalf("status HTML missing compact Teams chat anchor:\n%s", html)
+	}
 }
 
 func TestBridgeControlStatusChunkingKeepsNewestActiveChatLast(t *testing.T) {
