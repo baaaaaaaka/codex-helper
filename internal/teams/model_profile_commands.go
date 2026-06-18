@@ -280,15 +280,13 @@ func (b *Bridge) workModelProfileSwitchability(ctx context.Context, session *Ses
 func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot) error {
 	now := time.Now()
 	if b.store != nil {
-		if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-			current := state.Sessions[session.ID]
+		if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 			if current.ID == "" {
-				return fmt.Errorf("session %q not found", session.ID)
+				return current, false, fmt.Errorf("session %q not found", session.ID)
 			}
 			current.ModelProfile = snapshot
 			current.UpdatedAt = now
-			state.Sessions[session.ID] = current
-			return nil
+			return current, true, nil
 		}); err != nil {
 			return err
 		}

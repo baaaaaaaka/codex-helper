@@ -121,22 +121,20 @@ func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLF
 		}
 	}
 	var out teamstore.WorkflowNotificationConfig
-	err := b.store.Update(ctx, func(state *teamstore.State) error {
+	out, err := b.store.UpdateWorkflowConfig(ctx, func(current teamstore.WorkflowNotificationConfig, control teamstore.ControlChatBinding, now time.Time) (teamstore.WorkflowNotificationConfig, bool, error) {
 		next := teamstore.WorkflowNotificationConfig{UpdatedAt: time.Now()}
 		if enabled {
-			controlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+			controlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, control.TeamsChatID))
 			if controlChatID == "" {
-				return fmt.Errorf("Teams control chat must be configured before enabling workflow notifications")
+				return teamstore.WorkflowNotificationConfig{}, false, fmt.Errorf("Teams control chat must be configured before enabling workflow notifications")
 			}
-			next = state.Workflow
+			next = current
 			next.Enabled = true
 			next.ControlWebhookURLFile = webhookURLFile
 			next.ControlChatID = controlChatID
-			next.UpdatedAt = time.Now()
+			next.UpdatedAt = now
 		}
-		state.Workflow = next
-		out = next
-		return nil
+		return next, true, nil
 	})
 	if err != nil {
 		return out, err

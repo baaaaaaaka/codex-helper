@@ -134,6 +134,13 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestBridge(EnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams SQLite row-level migration regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
+          go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
+
       - name: Teams control status display regressions
         shell: bash
         run: |

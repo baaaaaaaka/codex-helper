@@ -2098,6 +2098,47 @@ func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error
 	return handled, err
 }
 
+func (s *Store) recordControlChatBindingSQLite(ctx context.Context, update ControlChatBindingUpdate) (bool, bool, error) {
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, err := loadSQLiteColdState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if err := overlaySQLiteRuntimeState(ctx, tx, &state); err != nil {
+			return err
+		}
+		changed = applyControlChatBindingUpdate(&state, update, time.Now())
+		if !changed {
+			return tx.Commit()
+		}
+		state.ensure(time.Now())
+		if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	return changed, handled, err
+}
+
 func (s *Store) historyWatchStateSQLite(ctx context.Context) (State, bool, error) {
 	var state State
 	handled := false
@@ -3030,6 +3071,57 @@ func (s *Store) createSessionSQLite(ctx context.Context, session SessionContext)
 	return out, created, handled, err
 }
 
+func (s *Store) updateSessionContextSQLite(ctx context.Context, sessionID string, fn func(SessionContext, bool, time.Time) (SessionContext, bool, error)) (SessionContext, bool, bool, error) {
+	var out SessionContext
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		current, found, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return err
+		}
+		out = next
+		handled = true
+		if !updateChanged {
+			return tx.Commit()
+		}
+		if strings.TrimSpace(next.ID) == "" {
+			next.ID = sessionID
+		}
+		if next.UpdatedAt.IsZero() {
+			next.UpdatedAt = now
+		}
+		if err := upsertSQLiteSessionTx(ctx, tx, next); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		out = next
+		changed = true
+		return nil
+	})
+	return out, changed, handled, err
+}
+
 func (s *Store) persistInboundSQLite(ctx context.Context, event InboundEvent) (InboundEvent, bool, bool, error) {
 	var out InboundEvent
 	created := false
@@ -3137,6 +3229,58 @@ func (s *Store) persistInboundSQLite(ctx context.Context, event InboundEvent) (I
 	}
 	err := run()
 	return out, created, handled, err
+}
+
+func (s *Store) updateInboundEventSQLite(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, bool, error) {
+	var out InboundEvent
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		current, found, err := loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundID)
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return err
+		}
+		out = next
+		handled = true
+		if !updateChanged {
+			return tx.Commit()
+		}
+		if strings.TrimSpace(next.ID) == "" {
+			next.ID = inboundID
+		}
+		if next.UpdatedAt.IsZero() {
+			next.UpdatedAt = now
+		}
+		if err := upsertSQLiteInboundTx(ctx, tx, next); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		s.invalidateMessageLookupCacheLocked()
+		out = next
+		changed = true
+		return nil
+	})
+	return out, changed, handled, err
 }
 
 func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, bool, error) {
@@ -3913,6 +4057,10 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 			now := time.Now()
 			next, err := fn(&state, current, now)
 			if err != nil {
+				if errors.Is(err, errStoreNoChange) {
+					out = current
+					return tx.Commit()
+				}
 				return err
 			}
 			next.UpdatedAt = now

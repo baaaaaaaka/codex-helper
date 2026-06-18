@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -285,6 +286,24 @@ type ControlChatBinding struct {
 	TitleSource    string    `json:"title_source,omitempty"`
 	BoundAt        time.Time `json:"bound_at,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+}
+
+type ControlChatBindingUpdate struct {
+	ScopeID              string
+	AccountID            string
+	UserPrincipal        string
+	Profile              string
+	MachineID            string
+	MachineLabel         string
+	MachineHostname      string
+	MachineKind          MachineKind
+	MachinePriority      int
+	TeamsChatID          string
+	TeamsChatURL         string
+	TeamsChatTopic       string
+	UserTitle            string
+	TitleSource          string
+	UpdateTitleIfPresent bool
 }
 
 type SkillPushReview struct {
@@ -3162,6 +3181,23 @@ func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, 
 	return out, changed, err
 }
 
+func (s *Store) RestoreHelperReloadDrain(ctx context.Context, previous ServiceControl) error {
+	update := func(state *State) error {
+		current := state.ServiceControl
+		if !current.Draining || current.Reason != HelperReloadReason {
+			return errStoreNoChange
+		}
+		restored := previous
+		restored.UpdatedAt = time.Now()
+		state.ServiceControl = restored
+		return nil
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
+}
+
 func upgradeNotificationTargetKey(target UpgradeNotificationTarget) string {
 	chatID := strings.TrimSpace(target.TeamsChatID)
 	turnID := strings.TrimSpace(target.TurnID)
@@ -3397,6 +3433,270 @@ func (s *Store) UpdateSession(ctx context.Context, sessionID string, fn func(*St
 	return s.withSessionLock(ctx, sessionID, func() error {
 		return s.Update(ctx, fn)
 	})
+}
+
+func (s *Store) UpdateSessionContext(ctx context.Context, sessionID string, fn func(SessionContext, bool, time.Time) (SessionContext, bool, error)) (SessionContext, bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return SessionContext{}, false, fmt.Errorf("session id is required")
+	}
+	if fn == nil {
+		return SessionContext{}, false, fmt.Errorf("session update function is required")
+	}
+	var out SessionContext
+	changed := false
+	err := s.withSessionLock(ctx, sessionID, func() error {
+		if next, updateChanged, handled, err := s.updateSessionContextSQLite(ctx, sessionID, fn); handled || err != nil {
+			out = next
+			changed = updateChanged
+			return err
+		}
+		return s.Update(ctx, func(state *State) error {
+			current, found := state.Sessions[sessionID]
+			now := time.Now()
+			next, updateChanged, err := fn(current, found, now)
+			if err != nil {
+				return err
+			}
+			out = next
+			if !updateChanged {
+				return errStoreNoChange
+			}
+			if strings.TrimSpace(next.ID) == "" {
+				next.ID = sessionID
+			}
+			if next.UpdatedAt.IsZero() {
+				next.UpdatedAt = now
+			}
+			state.Sessions[sessionID] = next
+			out = next
+			changed = true
+			return nil
+		})
+	})
+	return out, changed, err
+}
+
+func (s *Store) UpdateInboundEvent(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, error) {
+	inboundID = strings.TrimSpace(inboundID)
+	if inboundID == "" {
+		return InboundEvent{}, false, fmt.Errorf("inbound id is required")
+	}
+	if fn == nil {
+		return InboundEvent{}, false, fmt.Errorf("inbound update function is required")
+	}
+	if out, changed, handled, err := s.updateInboundEventSQLite(ctx, inboundID, fn); handled || err != nil {
+		return out, changed, err
+	}
+	var out InboundEvent
+	changed := false
+	err := s.Update(ctx, func(state *State) error {
+		current, found := state.InboundEvents[inboundID]
+		now := time.Now()
+		next, updateChanged, err := fn(current, found, now)
+		if err != nil {
+			return err
+		}
+		out = next
+		if !updateChanged {
+			return errStoreNoChange
+		}
+		if strings.TrimSpace(next.ID) == "" {
+			next.ID = inboundID
+		}
+		if next.UpdatedAt.IsZero() {
+			next.UpdatedAt = now
+		}
+		state.InboundEvents[inboundID] = next
+		out = next
+		changed = true
+		return nil
+	})
+	return out, changed, err
+}
+
+type DashboardStoreRecords struct {
+	Views      map[string]DashboardViewRecord
+	Numbers    map[string]DashboardNumberRecord
+	Workspaces map[string]WorkspaceRecord
+}
+
+func (s *Store) UpdateDashboardRecords(ctx context.Context, fn func(*DashboardStoreRecords, time.Time) (bool, error)) error {
+	if fn == nil {
+		return fmt.Errorf("dashboard update function is required")
+	}
+	update := func(state *State) error {
+		state.ensure(time.Time{})
+		records := DashboardStoreRecords{
+			Views:      state.DashboardViews,
+			Numbers:    state.DashboardNumbers,
+			Workspaces: state.Workspaces,
+		}
+		changed, err := fn(&records, time.Now())
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errStoreNoChange
+		}
+		state.DashboardViews = records.Views
+		state.DashboardNumbers = records.Numbers
+		state.Workspaces = records.Workspaces
+		return nil
+	}
+	if handled, err := s.updateSQLiteColdState(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
+}
+
+func (s *Store) UpdateWorkflowConfig(ctx context.Context, fn func(WorkflowNotificationConfig, ControlChatBinding, time.Time) (WorkflowNotificationConfig, bool, error)) (WorkflowNotificationConfig, error) {
+	if fn == nil {
+		return WorkflowNotificationConfig{}, fmt.Errorf("workflow update function is required")
+	}
+	var out WorkflowNotificationConfig
+	update := func(state *State) error {
+		next, changed, err := fn(state.Workflow, state.ControlChat, time.Now())
+		if err != nil {
+			return err
+		}
+		out = next
+		if !changed {
+			return errStoreNoChange
+		}
+		state.Workflow = next
+		return nil
+	}
+	if handled, err := s.updateSQLiteColdState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	err := s.Update(ctx, update)
+	return out, err
+}
+
+func (s *Store) UpsertModelProfileKeyIntake(ctx context.Context, intake ModelProfileKeyIntake) error {
+	if strings.TrimSpace(intake.ID) == "" {
+		return fmt.Errorf("model profile key intake id is required")
+	}
+	return s.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]ModelProfileKeyIntake, _ time.Time) (bool, error) {
+		current, ok := intakes[intake.ID]
+		if ok && reflect.DeepEqual(current, intake) {
+			return false, nil
+		}
+		intakes[intake.ID] = intake
+		return true, nil
+	})
+}
+
+func (s *Store) UpdateModelProfileKeyIntakes(ctx context.Context, fn func(map[string]ModelProfileKeyIntake, time.Time) (bool, error)) error {
+	if fn == nil {
+		return fmt.Errorf("model profile key intake update function is required")
+	}
+	update := func(state *State) error {
+		state.ensure(time.Time{})
+		changed, err := fn(state.ModelProfileKeyIntakes, time.Now())
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errStoreNoChange
+		}
+		return nil
+	}
+	if handled, err := s.updateSQLiteColdState(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
+}
+
+func (s *Store) RecordControlChatBinding(ctx context.Context, update ControlChatBindingUpdate) (bool, error) {
+	update.TeamsChatID = strings.TrimSpace(update.TeamsChatID)
+	if update.TeamsChatID == "" {
+		return false, nil
+	}
+	if changed, handled, err := s.recordControlChatBindingSQLite(ctx, update); handled || err != nil {
+		return changed, err
+	}
+	changed := false
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		changed = applyControlChatBindingUpdate(state, update, time.Now())
+		return changed, nil
+	})
+	return changed, err
+}
+
+func applyControlChatBindingUpdate(state *State, update ControlChatBindingUpdate, now time.Time) bool {
+	if state == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	changed := false
+	machineChanged := false
+	machineID := strings.TrimSpace(update.MachineID)
+	if state.MachineIdentity.ID == "" && machineID != "" {
+		state.MachineIdentity.ID = machineID
+		state.MachineIdentity.CreatedAt = now
+		changed = true
+	}
+	setMachineString := func(target *string, value string) {
+		if *target != value {
+			*target = value
+			machineChanged = true
+		}
+	}
+	setMachineString(&state.MachineIdentity.Label, update.MachineLabel)
+	setMachineString(&state.MachineIdentity.Hostname, update.MachineHostname)
+	setMachineString(&state.MachineIdentity.AccountID, update.AccountID)
+	setMachineString(&state.MachineIdentity.UserPrincipal, update.UserPrincipal)
+	setMachineString(&state.MachineIdentity.Profile, update.Profile)
+	setMachineString(&state.MachineIdentity.ScopeID, update.ScopeID)
+	if update.MachineKind != "" && state.MachineIdentity.Kind != update.MachineKind {
+		state.MachineIdentity.Kind = update.MachineKind
+		machineChanged = true
+	}
+	if state.MachineIdentity.Priority != update.MachinePriority {
+		state.MachineIdentity.Priority = update.MachinePriority
+		machineChanged = true
+	}
+	if state.MachineIdentity.UpdatedAt.IsZero() {
+		machineChanged = true
+	}
+	if machineChanged {
+		state.MachineIdentity.UpdatedAt = now
+		changed = true
+	}
+
+	controlChanged := false
+	if state.ControlChat.BoundAt.IsZero() {
+		state.ControlChat.BoundAt = now
+		controlChanged = true
+	}
+	if state.ControlChat.UpdatedAt.IsZero() {
+		controlChanged = true
+	}
+	setControlString := func(target *string, value string) {
+		if *target != value {
+			*target = value
+			controlChanged = true
+		}
+	}
+	setControlString(&state.ControlChat.MachineID, machineID)
+	setControlString(&state.ControlChat.ScopeID, update.ScopeID)
+	setControlString(&state.ControlChat.AccountID, update.AccountID)
+	setControlString(&state.ControlChat.TeamsChatID, update.TeamsChatID)
+	setControlString(&state.ControlChat.TeamsChatURL, update.TeamsChatURL)
+	setControlString(&state.ControlChat.TeamsChatTopic, update.TeamsChatTopic)
+	if update.UpdateTitleIfPresent && (update.UserTitle != "" || update.TitleSource != "") {
+		setControlString(&state.ControlChat.UserTitle, update.UserTitle)
+		setControlString(&state.ControlChat.TitleSource, update.TitleSource)
+	}
+	if controlChanged {
+		state.ControlChat.UpdatedAt = now
+		changed = true
+	}
+	return changed
 }
 
 func (s *Store) BindSessionCodexThread(ctx context.Context, sessionID string, turnID string, threadID string) (SessionContext, bool, error) {
@@ -4072,6 +4372,35 @@ func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason s
 		skipTransientOutboxForTurnLocked(state, turn.ID, "superseded by interrupted turn", now)
 		return turn, nil
 	})
+}
+
+func (s *Store) UpdateTurnRecoveryReasonIfMatches(ctx context.Context, turnID string, status TurnStatus, from string, to string) (Turn, bool, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return Turn{}, false, fmt.Errorf("turn id is required")
+	}
+	from = strings.TrimSpace(from)
+	to = strings.TrimSpace(to)
+	changed := false
+	apply := func(_ *State, turn Turn, _ time.Time) (Turn, error) {
+		if status != "" && turn.Status != status {
+			return turn, errStoreNoChange
+		}
+		if strings.TrimSpace(turn.RecoveryReason) != from {
+			return turn, errStoreNoChange
+		}
+		if from == to {
+			return turn, errStoreNoChange
+		}
+		turn.RecoveryReason = to
+		changed = true
+		return turn, nil
+	}
+	if out, handled, err := s.updateTurnSQLite(ctx, turnID, false, apply); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateTurn(ctx, turnID, apply)
+	return out, changed, err
 }
 
 func skipTransientOutboxForTurnLocked(state *State, turnID string, reason string, now time.Time) {
@@ -5593,6 +5922,10 @@ func (s *Store) updateTurn(ctx context.Context, turnID string, fn func(*State, T
 		now := time.Now()
 		next, err := fn(state, current, now)
 		if err != nil {
+			if errors.Is(err, errStoreNoChange) {
+				out = current
+				return nil
+			}
 			return err
 		}
 		next.UpdatedAt = now

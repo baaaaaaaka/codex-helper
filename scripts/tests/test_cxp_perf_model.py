@@ -217,6 +217,10 @@ class CXPPerfModelScriptTests(unittest.TestCase):
                 "sqlite-realistic-outbox-send-error",
                 "BenchmarkCXPPerfModelSQLiteRealisticMixedUserOutboxSendErrorStageWrites",
             ),
+            (
+                "sqlite-full-state-source",
+                "BenchmarkCXPPerfModelSQLiteFullStateSaveSourceStageWrites",
+            ),
         ]:
             with self.subTest(target=target):
                 with mock.patch.object(model.subprocess, "run", return_value=completed) as run:

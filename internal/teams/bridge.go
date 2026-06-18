@@ -4499,11 +4499,9 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 		return nil, err
 	}
 	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || (created.ModelProfile.IsZero() && !snapshot.IsZero()) || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
-		if err := b.store.UpdateSession(ctx, controlFallbackSessionID, func(state *teamstore.State) error {
-			current := state.Sessions[controlFallbackSessionID]
+		if _, _, err := b.store.UpdateSessionContext(ctx, controlFallbackSessionID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 			sanitizeControlFallbackSession(&current, model, snapshot, now)
-			state.Sessions[controlFallbackSessionID] = current
-			return nil
+			return current, true, nil
 		}); err != nil {
 			return nil, err
 		}
@@ -5216,16 +5214,7 @@ func (b *Bridge) restoreHelperReloadDrain(ctx context.Context, previous teamstor
 	if b == nil || b.store == nil {
 		return nil
 	}
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		current := state.ServiceControl
-		if !current.Draining || current.Reason != teamstore.HelperReloadReason {
-			return nil
-		}
-		restored := previous
-		restored.UpdatedAt = time.Now()
-		state.ServiceControl = restored
-		return nil
-	})
+	return b.store.RestoreHelperReloadDrain(ctx, previous)
 }
 
 func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
@@ -7926,16 +7915,8 @@ func (b *Bridge) markInterruptedAfterRestartNoticeSent(ctx context.Context, turn
 	if b == nil || b.store == nil || strings.TrimSpace(turn.ID) == "" || strings.TrimSpace(turn.SessionID) == "" {
 		return nil
 	}
-	return b.store.UpdateSession(ctx, turn.SessionID, func(state *teamstore.State) error {
-		current, ok := state.Turns[turn.ID]
-		if !ok || current.Status != teamstore.TurnStatusInterrupted || strings.TrimSpace(current.RecoveryReason) != recoveryReasonAmbiguousAfterHelperRestart {
-			return nil
-		}
-		current.RecoveryReason = recoveryReasonAmbiguousAfterHelperRestartNoticeSent
-		current.UpdatedAt = time.Now()
-		state.Turns[current.ID] = current
-		return nil
-	})
+	_, _, err := b.store.UpdateTurnRecoveryReasonIfMatches(ctx, turn.ID, teamstore.TurnStatusInterrupted, recoveryReasonAmbiguousAfterHelperRestart, recoveryReasonAmbiguousAfterHelperRestartNoticeSent)
+	return err
 }
 
 func (b *Bridge) processDeferredInbound(ctx context.Context) error {
@@ -8424,17 +8405,16 @@ func controlPublishTarget(text string) (DashboardCommandTarget, error) {
 }
 
 func (b *Bridge) markDeferredInboundIgnored(ctx context.Context, inboundID string, reason string) error {
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		inbound, ok := state.InboundEvents[inboundID]
-		if !ok || inbound.Status != teamstore.InboundStatusDeferred {
-			return nil
+	_, _, err := b.store.UpdateInboundEvent(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || inbound.Status != teamstore.InboundStatusDeferred {
+			return inbound, false, nil
 		}
 		inbound.Status = teamstore.InboundStatusIgnored
 		inbound.Source = strings.TrimSpace(inbound.Source + " " + reason)
-		inbound.UpdatedAt = time.Now()
-		state.InboundEvents[inbound.ID] = inbound
-		return nil
+		inbound.UpdatedAt = now
+		return inbound, true, nil
 	})
+	return err
 }
 
 func (b *Bridge) sessionForTurnState(state teamstore.State, turn teamstore.Turn) *Session {
@@ -9286,14 +9266,12 @@ func (b *Bridge) renameSessionChat(ctx context.Context, session *Session, title 
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.Sessions[session.ID]
+	if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 		current.TeamsTopic = topic
 		current.UserTitle = title
 		current.TitleSource = sessionTitleSourceUser
 		current.UpdatedAt = session.UpdatedAt
-		state.Sessions[session.ID] = current
-		return nil
+		return current, true, nil
 	}); err != nil {
 		return err
 	}
@@ -9699,16 +9677,14 @@ func (b *Bridge) maybeUpdateWorkChatTitleFromLocalSession(ctx context.Context, s
 		b.markRegistryProjectionDirty()
 	}
 	if b.store != nil {
-		if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-			current := state.Sessions[session.ID]
+		if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 			if current.ID == "" {
-				return nil
+				return current, false, nil
 			}
 			current.TeamsTopic = desiredTopic
 			current.TitleSource = sessionTitleSourceAuto
 			current.UpdatedAt = now
-			state.Sessions[session.ID] = current
-			return nil
+			return current, true, nil
 		}); err != nil {
 			return err
 		}
@@ -12006,73 +11982,24 @@ func (b *Bridge) recordControlChatBindingWithTitle(ctx context.Context, chat Cha
 	label := b.machine.Label
 	userTitle = SanitizeDashboardTitle(userTitle)
 	titleSource = strings.TrimSpace(titleSource)
-	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
-		now := time.Now()
-		changed := false
-		machineChanged := false
-		if state.MachineIdentity.ID == "" {
-			state.MachineIdentity.ID = machineID
-			state.MachineIdentity.CreatedAt = now
-			changed = true
-		}
-		setMachineString := func(target *string, value string) {
-			if *target != value {
-				*target = value
-				machineChanged = true
-			}
-		}
-		setMachineString(&state.MachineIdentity.Label, label)
-		setMachineString(&state.MachineIdentity.Hostname, label)
-		setMachineString(&state.MachineIdentity.AccountID, b.user.ID)
-		setMachineString(&state.MachineIdentity.UserPrincipal, b.user.UserPrincipalName)
-		setMachineString(&state.MachineIdentity.Profile, b.scope.Profile)
-		setMachineString(&state.MachineIdentity.ScopeID, b.scope.ID)
-		if state.MachineIdentity.Kind != b.machine.Kind {
-			state.MachineIdentity.Kind = b.machine.Kind
-			machineChanged = true
-		}
-		if state.MachineIdentity.Priority != b.machine.Priority {
-			state.MachineIdentity.Priority = b.machine.Priority
-			machineChanged = true
-		}
-		if state.MachineIdentity.UpdatedAt.IsZero() {
-			machineChanged = true
-		}
-		if machineChanged {
-			state.MachineIdentity.UpdatedAt = now
-			changed = true
-		}
-
-		controlChanged := false
-		if state.ControlChat.BoundAt.IsZero() {
-			state.ControlChat.BoundAt = now
-			controlChanged = true
-		}
-		if state.ControlChat.UpdatedAt.IsZero() {
-			controlChanged = true
-		}
-		setControlString := func(target *string, value string) {
-			if *target != value {
-				*target = value
-				controlChanged = true
-			}
-		}
-		setControlString(&state.ControlChat.MachineID, machineID)
-		setControlString(&state.ControlChat.ScopeID, b.scope.ID)
-		setControlString(&state.ControlChat.AccountID, b.user.ID)
-		setControlString(&state.ControlChat.TeamsChatID, chat.ID)
-		setControlString(&state.ControlChat.TeamsChatURL, chat.WebURL)
-		setControlString(&state.ControlChat.TeamsChatTopic, chat.Topic)
-		if userTitle != "" || titleSource != "" {
-			setControlString(&state.ControlChat.UserTitle, userTitle)
-			setControlString(&state.ControlChat.TitleSource, titleSource)
-		}
-		if controlChanged {
-			state.ControlChat.UpdatedAt = now
-			changed = true
-		}
-		return changed, nil
+	_, err := b.store.RecordControlChatBinding(ctx, teamstore.ControlChatBindingUpdate{
+		ScopeID:              b.scope.ID,
+		AccountID:            b.user.ID,
+		UserPrincipal:        b.user.UserPrincipalName,
+		Profile:              b.scope.Profile,
+		MachineID:            machineID,
+		MachineLabel:         label,
+		MachineHostname:      label,
+		MachineKind:          b.machine.Kind,
+		MachinePriority:      b.machine.Priority,
+		TeamsChatID:          chat.ID,
+		TeamsChatURL:         chat.WebURL,
+		TeamsChatTopic:       chat.Topic,
+		UserTitle:            userTitle,
+		TitleSource:          titleSource,
+		UpdateTitleIfPresent: true,
 	})
+	return err
 }
 
 func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) error {
@@ -12111,12 +12038,10 @@ func (b *Bridge) closeDurableSession(ctx context.Context, session *Session) erro
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.Sessions[session.ID]
+	if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 		current.Status = teamstore.SessionStatusClosed
 		current.UpdatedAt = session.UpdatedAt
-		state.Sessions[session.ID] = current
-		return nil
+		return current, true, nil
 	}); err != nil {
 		return err
 	}
@@ -14212,13 +14137,11 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return "", err
 	}
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.Sessions[session.ID]
+	if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 		current.Cwd = firstNonEmptyString(local.ProjectPath, project.Path)
 		current.CodexThreadID = local.SessionID
 		current.UpdatedAt = now
-		state.Sessions[session.ID] = current
-		return nil
+		return current, true, nil
 	}); err != nil {
 		return "", err
 	}
@@ -16322,11 +16245,10 @@ func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context,
 		updated.Status = importCheckpointStatusComplete
 	}
 	applied := false
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.ImportCheckpoints[updated.ID]
+	next, _, err := b.store.UpdateImportCheckpoint(ctx, updated.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if strings.TrimSpace(current.LastRecordID) != "" && strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) {
 			updated = current
-			return nil
+			return current, false, nil
 		}
 		if current.LastOffset == updated.LastOffset &&
 			current.SourceSize == updated.SourceSize &&
@@ -16334,9 +16256,9 @@ func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context,
 			current.LastSourceLine == updated.LastSourceLine {
 			updated = current
 			applied = true
-			return nil
+			return current, false, nil
 		}
-		if strings.TrimSpace(current.ID) != "" {
+		if found && strings.TrimSpace(current.ID) != "" {
 			updated.UpdatedAt = current.UpdatedAt
 			if strings.TrimSpace(updated.ImportTurnID) == "" {
 				updated.ImportTurnID = current.ImportTurnID
@@ -16347,11 +16269,17 @@ func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context,
 		} else {
 			updated.UpdatedAt = checkpoint.UpdatedAt
 		}
-		state.ImportCheckpoints[updated.ID] = updated
+		if updated.UpdatedAt.IsZero() {
+			updated.UpdatedAt = now
+		}
 		applied = true
-		return nil
-	}); err != nil {
+		return updated, true, nil
+	})
+	if err != nil {
 		return checkpoint, false, err
+	}
+	if strings.TrimSpace(next.ID) != "" {
+		updated = next
 	}
 	return updated, applied, nil
 }
@@ -18058,12 +17986,10 @@ func (b *Bridge) parkWorkChatSession(ctx context.Context, session *Session) (str
 	}
 	session.UpdatedAt = now
 	b.markRegistryProjectionDirty()
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.Sessions[session.ID]
+	if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 		current.Status = teamstore.SessionStatusActive
 		current.UpdatedAt = now
-		state.Sessions[session.ID] = current
-		return nil
+		return current, true, nil
 	}); err != nil {
 		return "", err
 	}
@@ -18176,11 +18102,9 @@ func (b *Bridge) resumeWorkChat(ctx context.Context, session *Session, now time.
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}
-	if err := b.store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
-		current := state.Sessions[session.ID]
+	if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 		current.UpdatedAt = now
-		state.Sessions[session.ID] = current
-		return nil
+		return current, true, nil
 	}); err != nil {
 		return err
 	}
@@ -18387,15 +18311,17 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 			Label:       item.DisplayTitle,
 		})
 	}
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		if state.DashboardNumbers == nil {
-			state.DashboardNumbers = make(map[string]teamstore.DashboardNumberRecord)
+	return b.store.UpdateDashboardRecords(ctx, func(records *teamstore.DashboardStoreRecords, now time.Time) (bool, error) {
+		if records.Views == nil {
+			records.Views = make(map[string]teamstore.DashboardViewRecord)
 		}
-		if state.Workspaces == nil {
-			state.Workspaces = make(map[string]teamstore.WorkspaceRecord)
+		if records.Numbers == nil {
+			records.Numbers = make(map[string]teamstore.DashboardNumberRecord)
 		}
-		now := time.Now()
-		state.DashboardViews[chatID] = teamstore.DashboardViewRecord{
+		if records.Workspaces == nil {
+			records.Workspaces = make(map[string]teamstore.WorkspaceRecord)
+		}
+		records.Views[chatID] = teamstore.DashboardViewRecord{
 			ID:          "dashboard:" + chatID,
 			ChatID:      chatID,
 			Kind:        string(view.Kind),
@@ -18407,7 +18333,7 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 		}
 		for _, workspace := range dashboard.Workspaces {
 			id := dashboardNumberRecordID(chatID, DashboardSelectionWorkspace, workspace.ID, "")
-			state.DashboardNumbers[id] = teamstore.DashboardNumberRecord{
+			records.Numbers[id] = teamstore.DashboardNumberRecord{
 				ID:          id,
 				ChatID:      chatID,
 				Kind:        string(DashboardSelectionWorkspace),
@@ -18416,7 +18342,7 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 				Label:       workspace.DisplayTitle,
 				UpdatedAt:   now,
 			}
-			record := state.Workspaces[workspace.ID]
+			record := records.Workspaces[workspace.ID]
 			record.ID = workspace.ID
 			record.Path = workspace.Path
 			record.Label = workspace.DisplayTitle
@@ -18425,11 +18351,11 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 				record.CreatedAt = now
 			}
 			record.UpdatedAt = now
-			state.Workspaces[workspace.ID] = record
+			records.Workspaces[workspace.ID] = record
 		}
 		for _, session := range dashboard.Sessions {
 			id := dashboardNumberRecordID(chatID, DashboardSelectionSession, session.WorkspaceID, session.ID)
-			state.DashboardNumbers[id] = teamstore.DashboardNumberRecord{
+			records.Numbers[id] = teamstore.DashboardNumberRecord{
 				ID:          id,
 				ChatID:      chatID,
 				Kind:        string(DashboardSelectionSession),
@@ -18440,7 +18366,7 @@ func (b *Bridge) persistControlDashboard(ctx context.Context, dashboard ControlD
 				UpdatedAt:   now,
 			}
 		}
-		return nil
+		return true, nil
 	})
 }
 
@@ -18452,11 +18378,11 @@ func (b *Bridge) clearControlDashboardView(ctx context.Context) error {
 	if chatID == "" {
 		return nil
 	}
-	return b.store.UpdateIfChanged(ctx, func(state *teamstore.State) (bool, error) {
-		if _, ok := state.DashboardViews[chatID]; !ok {
+	return b.store.UpdateDashboardRecords(ctx, func(records *teamstore.DashboardStoreRecords, _ time.Time) (bool, error) {
+		if _, ok := records.Views[chatID]; !ok {
 			return false, nil
 		}
-		delete(state.DashboardViews, chatID)
+		delete(records.Views, chatID)
 		return true, nil
 	})
 }

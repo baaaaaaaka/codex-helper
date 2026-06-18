@@ -208,10 +208,7 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 		ExpiresAt:        now.Add(modelProfileKeyIntakeTTL),
 	}
 	intake.CodeHash = modelProfileKeyIntakeCodeHash(code, intake)
-	if err := b.store.Update(ctx, func(state *teamstore.State) error {
-		state.ModelProfileKeyIntakes[intake.ID] = intake
-		return nil
-	}); err != nil {
+	if err := b.store.UpsertModelProfileKeyIntake(ctx, intake); err != nil {
 		return "", err
 	}
 	modelLabel := modelID
@@ -438,13 +435,13 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 	if saveErr != nil {
 		safeSaveErr = fmt.Errorf("%s", sanitizeModelProfileKeyIntakeError(saveErr, apiKey))
 	}
-	updateErr := b.store.Update(ctx, func(state *teamstore.State) error {
-		current := state.ModelProfileKeyIntakes[intake.ID]
+	updateErr := b.store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
+		current := intakes[intake.ID]
 		if current.ID == "" {
-			return nil
+			return false, nil
 		}
 		if current.Status != teamstore.ModelProfileKeyIntakeSaving {
-			return nil
+			return false, nil
 		}
 		current.UpdatedAt = now
 		if safeSaveErr != nil {
@@ -455,8 +452,8 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 			current.CompletedAt = now
 			current.LastError = ""
 		}
-		state.ModelProfileKeyIntakes[current.ID] = current
-		return nil
+		intakes[current.ID] = current
+		return true, nil
 	})
 	if updateErr != nil {
 		return "", updateErr
@@ -485,27 +482,27 @@ func (b *Bridge) updateModelProfileKeyIntakeByCode(ctx context.Context, msg Chat
 	}
 	chatID := firstNonEmptyString(msg.ChatID, b.reg.ControlChatID)
 	authorID := chatMessageAuthorUserID(msg)
-	return b.store.Update(ctx, func(state *teamstore.State) error {
-		for id, intake := range state.ModelProfileKeyIntakes {
+	return b.store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
+		for id, intake := range intakes {
 			if !modelProfileKeyIntakeMatches(intake, code, chatID, authorID) {
 				continue
 			}
 			if intake.Status != teamstore.ModelProfileKeyIntakeSaving && modelProfileKeyIntakeExpired(intake, now) {
 				intake.Status = teamstore.ModelProfileKeyIntakeExpired
 				intake.UpdatedAt = now
-				state.ModelProfileKeyIntakes[id] = intake
-				return nil
+				intakes[id] = intake
+				return true, nil
 			}
 			changed, err := fn(&intake)
 			if err != nil {
-				return err
+				return false, err
 			}
 			if changed {
-				state.ModelProfileKeyIntakes[id] = intake
+				intakes[id] = intake
 			}
-			return nil
+			return changed, nil
 		}
-		return nil
+		return false, nil
 	})
 }
 

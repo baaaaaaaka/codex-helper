@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,4 +256,89 @@ func BenchmarkGlobalOutboundLedgerRecord(b *testing.B) {
 		b.StopTimer()
 		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
 	})
+	b.Run("sqlite-full-live-sized", func(b *testing.B) {
+		path := filepath.Join(b.TempDir(), "teams", "global-outbound-ledger.json")
+		seed := make([]globalOutboundItem, 0, maxGlobalOutboundLedgerIDs)
+		for i := 0; i < maxGlobalOutboundLedgerIDs; i++ {
+			seed = append(seed, liveSizedGlobalOutboundItem(i, now))
+		}
+		if err := recordGlobalOutboundBatch(ctx, path, seed, now); err != nil {
+			b.Fatalf("seed live-sized global outbound ledger: %v", err)
+		}
+		truncateGlobalOutboundLedgerWALForBenchmark(b, path)
+		reportGlobalOutboundLedgerFiles(b, path)
+		probe := liveSizedGlobalOutboundItem(maxGlobalOutboundLedgerIDs, now)
+		if raw, err := json.Marshal(probe); err == nil {
+			b.ReportMetric(float64(len(raw)), "probe_item_json_bytes")
+		}
+		b.ReportAllocs()
+		beforeIO, beforeIOOK := cxpPerfReadProcSelfIO()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			item := liveSizedGlobalOutboundItem(maxGlobalOutboundLedgerIDs+i, now.Add(time.Duration(i)*time.Second))
+			if err := recordGlobalOutbound(ctx, path, item, item.RecordedAt); err != nil {
+				b.Fatalf("record live-sized full SQLite global outbound: %v", err)
+			}
+		}
+		b.StopTimer()
+		cxpPerfReportProcIODelta(b, beforeIO, beforeIOOK, b.N)
+		reportGlobalOutboundLedgerFiles(b, path)
+	})
+}
+
+func liveSizedGlobalOutboundItem(i int, now time.Time) globalOutboundItem {
+	suffix := fmt.Sprintf("%06d", i)
+	longScope := strings.Repeat("scope-segment-", 8)
+	longMachine := strings.Repeat("machine-segment-", 8)
+	longSession := strings.Repeat("session-segment-", 8)
+	longTurn := strings.Repeat("turn-segment-", 10)
+	return globalOutboundItem{
+		ChatID:         "19:chat-" + suffix + "-" + strings.Repeat("thread-", 12),
+		MessageID:      "message-" + suffix + "-" + strings.Repeat("graph-message-", 12),
+		ScopeID:        "scope-" + suffix + "-" + longScope,
+		MachineID:      "machine-" + suffix + "-" + longMachine,
+		OutboxID:       "outbox-" + suffix + "-" + strings.Repeat("queued-outbox-", 10),
+		SessionID:      "session-" + suffix + "-" + longSession,
+		TurnID:         "turn-" + suffix + "-" + longTurn,
+		Kind:           "status-progress",
+		Origin:         teamstore.MessageOriginHelperOutbox,
+		RecordedAt:     now,
+		TeamsCreatedAt: now.Add(-time.Second),
+		UpdatedAt:      now,
+	}
+}
+
+func truncateGlobalOutboundLedgerWALForBenchmark(b *testing.B, path string) {
+	b.Helper()
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if err != nil {
+		b.Fatalf("open live-sized outbound sqlite for checkpoint: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			b.Fatalf("close live-sized outbound sqlite: %v", err)
+		}
+	}()
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		b.Fatalf("checkpoint live-sized outbound sqlite: %v", err)
+	}
+}
+
+func reportGlobalOutboundLedgerFiles(b *testing.B, path string) {
+	b.Helper()
+	reportFileSize := func(metric string, filePath string) {
+		info, err := os.Stat(filePath)
+		if err == nil {
+			b.ReportMetric(float64(info.Size()), metric)
+			return
+		}
+		if !os.IsNotExist(err) {
+			b.Fatalf("stat %s: %v", filePath, err)
+		}
+	}
+	sqlitePath := teamsLedgerSQLitePath(path)
+	reportFileSize("legacy_json_bytes", path)
+	reportFileSize("sqlite_db_bytes", sqlitePath)
+	reportFileSize("sqlite_wal_bytes", sqlitePath+"-wal")
+	reportFileSize("sqlite_shm_bytes", sqlitePath+"-shm")
 }

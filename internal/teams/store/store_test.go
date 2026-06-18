@@ -1665,6 +1665,99 @@ func BenchmarkSQLiteManualWALCheckpointHotWrite(b *testing.B) {
 	}
 }
 
+func BenchmarkSQLiteManualWALCheckpointWriteAmplification(b *testing.B) {
+	ctx := context.Background()
+	cases := []struct {
+		name         string
+		rows         int
+		payloadBytes int
+	}{
+		{name: "wal-2MiB", rows: 512, payloadBytes: 4096},
+		{name: "wal-64MiB", rows: 8192, payloadBytes: 8192},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			var totalIO sqliteTestProcIO
+			var totalWALBefore int64
+			var totalWALAfter int64
+			var totalLogFrames int64
+			var totalCheckpointedFrames int64
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				store, err := Open(filepath.Join(b.TempDir(), "teams-state", "state.json"))
+				if err != nil {
+					b.Fatalf("Open error: %v", err)
+				}
+				if _, err := store.SetPaused(ctx, true, "seed sqlite checkpoint benchmark"); err != nil {
+					_ = store.Close()
+					b.Fatalf("seed legacy state: %v", err)
+				}
+				result, err := store.MigrateLargeStateToSQLite(ctx, 0)
+				if err != nil {
+					_ = store.Close()
+					b.Fatalf("migrate sqlite state: %v", err)
+				}
+				if err := store.withStateLock(ctx, func() error {
+					pointer, ok, err := store.currentSQLitePointerUnlocked()
+					if err != nil || !ok {
+						return err
+					}
+					db, err := store.sqliteDBUnlocked(pointer)
+					if err != nil {
+						return err
+					}
+					return seedLargeSQLiteWALTxForTest(ctx, db, tc.rows, tc.payloadBytes)
+				}); err != nil {
+					_ = store.Close()
+					b.Fatalf("seed sqlite WAL: %v", err)
+				}
+				walPath := result.Path + "-wal"
+				beforeInfo, err := os.Stat(walPath)
+				if err != nil {
+					_ = store.Close()
+					b.Fatalf("stat WAL before checkpoint: %v", err)
+				}
+				beforeIO, beforeIOOK := readSQLiteTestProcSelfIO()
+				b.StartTimer()
+				ran, err := store.CheckpointSQLiteWAL(ctx, 1)
+				b.StopTimer()
+				afterIO, afterIOOK := readSQLiteTestProcSelfIO()
+				if err != nil {
+					_ = store.Close()
+					b.Fatalf("manual checkpoint: %v", err)
+				}
+				if !ran.Attempted || ran.Busy != 0 {
+					_ = store.Close()
+					b.Fatalf("checkpoint result = %#v, want successful attempt", ran)
+				}
+				if beforeIOOK && afterIOOK {
+					totalIO.add(beforeIO.delta(afterIO))
+				}
+				afterSize := int64(0)
+				if afterInfo, err := os.Stat(walPath); err == nil {
+					afterSize = afterInfo.Size()
+				} else if !errors.Is(err, os.ErrNotExist) {
+					_ = store.Close()
+					b.Fatalf("stat WAL after checkpoint: %v", err)
+				}
+				totalWALBefore += beforeInfo.Size()
+				totalWALAfter += afterSize
+				totalLogFrames += int64(ran.LogFrames)
+				totalCheckpointedFrames += int64(ran.CheckpointedFrames)
+				_ = store.Close()
+			}
+			reportSQLiteTestProcIO(b, totalIO, b.N)
+			if b.N > 0 {
+				denom := float64(b.N)
+				b.ReportMetric(float64(totalWALBefore)/denom, "wal_before_bytes")
+				b.ReportMetric(float64(totalWALAfter)/denom, "wal_after_bytes")
+				b.ReportMetric(float64(totalLogFrames)/denom, "checkpoint_log_frames/op")
+				b.ReportMetric(float64(totalCheckpointedFrames)/denom, "checkpointed_frames/op")
+			}
+		})
+	}
+}
+
 func seedLargeSQLiteWALTxForTest(ctx context.Context, db *sql.DB, rows int, payloadBytes int) error {
 	if rows <= 0 {
 		rows = 1
@@ -1687,6 +1780,83 @@ func seedLargeSQLiteWALTxForTest(ctx context.Context, db *sql.DB, rows int, payl
 		}
 	}
 	return tx.Commit()
+}
+
+type sqliteTestProcIO struct {
+	rchar               uint64
+	wchar               uint64
+	readBytes           uint64
+	writeBytes          uint64
+	cancelledWriteBytes uint64
+}
+
+func readSQLiteTestProcSelfIO() (sqliteTestProcIO, bool) {
+	data, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		return sqliteTestProcIO{}, false
+	}
+	var ioState sqliteTestProcIO
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch key {
+		case "rchar":
+			ioState.rchar = n
+		case "wchar":
+			ioState.wchar = n
+		case "read_bytes":
+			ioState.readBytes = n
+		case "write_bytes":
+			ioState.writeBytes = n
+		case "cancelled_write_bytes":
+			ioState.cancelledWriteBytes = n
+		}
+	}
+	return ioState, true
+}
+
+func (ioState sqliteTestProcIO) delta(after sqliteTestProcIO) sqliteTestProcIO {
+	return sqliteTestProcIO{
+		rchar:               sqliteTestSaturatingSub(after.rchar, ioState.rchar),
+		wchar:               sqliteTestSaturatingSub(after.wchar, ioState.wchar),
+		readBytes:           sqliteTestSaturatingSub(after.readBytes, ioState.readBytes),
+		writeBytes:          sqliteTestSaturatingSub(after.writeBytes, ioState.writeBytes),
+		cancelledWriteBytes: sqliteTestSaturatingSub(after.cancelledWriteBytes, ioState.cancelledWriteBytes),
+	}
+}
+
+func (ioState *sqliteTestProcIO) add(other sqliteTestProcIO) {
+	ioState.rchar += other.rchar
+	ioState.wchar += other.wchar
+	ioState.readBytes += other.readBytes
+	ioState.writeBytes += other.writeBytes
+	ioState.cancelledWriteBytes += other.cancelledWriteBytes
+}
+
+func sqliteTestSaturatingSub(after, before uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
+}
+
+func reportSQLiteTestProcIO(b *testing.B, total sqliteTestProcIO, n int) {
+	b.Helper()
+	if n <= 0 {
+		return
+	}
+	denom := float64(n)
+	b.ReportMetric(float64(total.readBytes)/denom, "disk_read_B/op")
+	b.ReportMetric(float64(total.writeBytes)/denom, "disk_write_B/op")
+	b.ReportMetric(float64(total.cancelledWriteBytes)/denom, "cancelled_write_B/op")
+	b.ReportMetric(float64(total.rchar)/denom, "logical_read_B/op")
+	b.ReportMetric(float64(total.wchar)/denom, "logical_write_B/op")
 }
 
 func TestSQLiteFileURIWindowsPaths(t *testing.T) {
@@ -7064,6 +7234,298 @@ func TestSQLiteRecordTranscriptCheckpointDoesNotLoadColdStateAndTouchesOnlyCheck
 	}
 	if _, err := store.Load(ctx); err == nil {
 		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
+func TestSQLiteSessionAndInboundRowUpdatesDoNotTouchColdState(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 18, 9, 0, 0, 0, time.UTC)
+	if _, _, err := store.CreateSession(ctx, SessionContext{
+		ID:          "s1",
+		Status:      SessionStatusActive,
+		TeamsChatID: "chat-1",
+		TeamsTopic:  "before",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("CreateSession s1: %v", err)
+	}
+	if _, _, err := store.CreateSession(ctx, SessionContext{
+		ID:          "s-unrelated",
+		Status:      SessionStatusActive,
+		TeamsChatID: "chat-unrelated",
+		TeamsTopic:  "unrelated",
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("CreateSession unrelated: %v", err)
+	}
+	if _, _, err := store.PersistInbound(ctx, InboundEvent{
+		ID:             "inbound-1",
+		SessionID:      "s1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-1",
+		Status:         InboundStatusDeferred,
+		Source:         "teams",
+		Text:           "deferred",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("PersistInbound: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeUnrelated := sqliteRawSessionJSONForTest(t, store, "s-unrelated")
+	corruptState := []byte(`{"broken"`)
+	sqliteWriteRawStateJSONForTest(t, store, corruptState)
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	session, changed, err := store.UpdateSessionContext(ctx, "s1", func(current SessionContext, found bool, updateNow time.Time) (SessionContext, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("session missing")
+		}
+		current.TeamsTopic = "after"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	})
+	if err != nil || !changed || session.TeamsTopic != "after" {
+		t.Fatalf("UpdateSessionContext = %#v changed=%v err=%v, want updated", session, changed, err)
+	}
+	inbound, changed, err := store.UpdateInboundEvent(ctx, "inbound-1", func(current InboundEvent, found bool, updateNow time.Time) (InboundEvent, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("inbound missing")
+		}
+		if current.Status != InboundStatusDeferred {
+			return current, false, nil
+		}
+		current.Status = InboundStatusIgnored
+		current.Source = "teams row-update"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	})
+	if err != nil || !changed || inbound.Status != InboundStatusIgnored {
+		t.Fatalf("UpdateInboundEvent = %#v changed=%v err=%v, want ignored", inbound, changed, err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("row-level updates loaded full state %d times", got)
+	}
+	if afterState := sqliteRawStateJSONForTest(t, store); !bytes.Equal(corruptState, afterState) {
+		t.Fatalf("row-level updates rewrote cold state_json: %s", afterState)
+	}
+	if afterUnrelated := sqliteRawSessionJSONForTest(t, store, "s-unrelated"); !bytes.Equal(beforeUnrelated, afterUnrelated) {
+		t.Fatalf("row-level updates rewrote unrelated session row:\nbefore=%s\nafter=%s", beforeUnrelated, afterUnrelated)
+	}
+	var rawSession SessionContext
+	if raw := sqliteRawSessionJSONForTest(t, store, "s1"); json.Unmarshal(raw, &rawSession) != nil {
+		t.Fatalf("unmarshal session raw %s", raw)
+	}
+	if rawSession.TeamsTopic != "after" {
+		t.Fatalf("session topic = %q, want after", rawSession.TeamsTopic)
+	}
+	var rawInbound InboundEvent
+	if raw := sqliteRawInboundJSONForTest(t, store, "inbound-1"); json.Unmarshal(raw, &rawInbound) != nil {
+		t.Fatalf("unmarshal inbound raw %s", raw)
+	}
+	if rawInbound.Status != InboundStatusIgnored || rawInbound.Source != "teams row-update" {
+		t.Fatalf("inbound row = %#v, want ignored row-update", rawInbound)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
+func TestSQLiteColdMetadataUpdatesDoNotRewriteHotRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 18, 9, 30, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat", TeamsChatTopic: "control", UpdatedAt: now}
+		state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", TeamsTopic: "session", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-unrelated"] = InboundEvent{ID: "inbound-unrelated", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "m1", Status: InboundStatusPersisted, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeSession := sqliteRawSessionJSONForTest(t, store, "s1")
+	beforeInbound := sqliteRawInboundJSONForTest(t, store, "inbound-unrelated")
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	if err := store.UpdateDashboardRecords(ctx, func(records *DashboardStoreRecords, updateNow time.Time) (bool, error) {
+		records.Views["control-chat"] = DashboardViewRecord{ID: "dashboard:control-chat", ChatID: "control-chat", Kind: "sessions", CreatedAt: updateNow, UpdatedAt: updateNow}
+		records.Numbers["n1"] = DashboardNumberRecord{ID: "n1", ChatID: "control-chat", Kind: "session", Number: 1, SessionID: "s1", UpdatedAt: updateNow}
+		records.Workspaces["w1"] = WorkspaceRecord{ID: "w1", Path: "/workspace", Number: 1, UpdatedAt: updateNow}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("UpdateDashboardRecords: %v", err)
+	}
+	if _, err := store.UpdateWorkflowConfig(ctx, func(current WorkflowNotificationConfig, control ControlChatBinding, updateNow time.Time) (WorkflowNotificationConfig, bool, error) {
+		current.Enabled = true
+		current.ControlChatID = control.TeamsChatID
+		current.ControlWebhookURLFile = "/tmp/workflow-webhook-url"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("UpdateWorkflowConfig: %v", err)
+	}
+	if err := store.UpsertModelProfileKeyIntake(ctx, ModelProfileKeyIntake{
+		ID:           "intake-1",
+		TeamsChatID:  "control-chat",
+		AuthorUserID: "user-1",
+		ProfileName:  "openai",
+		Status:       ModelProfileKeyIntakePending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		t.Fatalf("UpsertModelProfileKeyIntake: %v", err)
+	}
+	if err := store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]ModelProfileKeyIntake, updateNow time.Time) (bool, error) {
+		intake := intakes["intake-1"]
+		intake.Status = ModelProfileKeyIntakeConfirmed
+		intake.UpdatedAt = updateNow
+		intakes[intake.ID] = intake
+		return true, nil
+	}); err != nil {
+		t.Fatalf("UpdateModelProfileKeyIntakes: %v", err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("cold metadata updates loaded full state %d times", got)
+	}
+	if afterSession := sqliteRawSessionJSONForTest(t, store, "s1"); !bytes.Equal(beforeSession, afterSession) {
+		t.Fatalf("cold metadata updates rewrote session row:\nbefore=%s\nafter=%s", beforeSession, afterSession)
+	}
+	if afterInbound := sqliteRawInboundJSONForTest(t, store, "inbound-unrelated"); !bytes.Equal(beforeInbound, afterInbound) {
+		t.Fatalf("cold metadata updates rewrote inbound row:\nbefore=%s\nafter=%s", beforeInbound, afterInbound)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after cold metadata updates: %v", err)
+	}
+	if _, ok := state.DashboardViews["control-chat"]; !ok {
+		t.Fatalf("dashboard view missing after cold update: %#v", state.DashboardViews)
+	}
+	if !state.Workflow.Enabled || state.Workflow.ControlChatID != "control-chat" {
+		t.Fatalf("workflow = %#v, want enabled control-chat", state.Workflow)
+	}
+	if got := state.ModelProfileKeyIntakes["intake-1"].Status; got != ModelProfileKeyIntakeConfirmed {
+		t.Fatalf("model key intake status = %q, want confirmed", got)
+	}
+}
+
+func TestSQLiteControlChatBindingDoesNotRewriteHotRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 6, 18, 9, 45, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", Status: SessionStatusActive, TeamsChatID: "chat-1", TeamsTopic: "session", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-1"] = InboundEvent{ID: "inbound-1", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "m1", Status: InboundStatusPersisted, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	beforeSession := sqliteRawSessionJSONForTest(t, store, "s1")
+	beforeInbound := sqliteRawInboundJSONForTest(t, store, "inbound-1")
+
+	var loads int64
+	prev := loadUnlockedTestHook
+	loadUnlockedTestHook = func() {
+		atomic.AddInt64(&loads, 1)
+	}
+	t.Cleanup(func() {
+		loadUnlockedTestHook = prev
+	})
+
+	changed, err := store.RecordControlChatBinding(ctx, ControlChatBindingUpdate{
+		ScopeID:              "scope-1",
+		AccountID:            "account-1",
+		UserPrincipal:        "user@example.test",
+		Profile:              "default",
+		MachineID:            "machine-1",
+		MachineLabel:         "machine label",
+		MachineHostname:      "machine label",
+		MachineKind:          MachineKindPrimary,
+		MachinePriority:      7,
+		TeamsChatID:          "control-chat",
+		TeamsChatURL:         "https://teams.example/control",
+		TeamsChatTopic:       "control topic",
+		UserTitle:            "Control title",
+		TitleSource:          "user",
+		UpdateTitleIfPresent: true,
+	})
+	if err != nil || !changed {
+		t.Fatalf("RecordControlChatBinding changed=%v err=%v, want changed", changed, err)
+	}
+	changed, err = store.RecordControlChatBinding(ctx, ControlChatBindingUpdate{
+		ScopeID:              "scope-1",
+		AccountID:            "account-1",
+		UserPrincipal:        "user@example.test",
+		Profile:              "default",
+		MachineID:            "machine-1",
+		MachineLabel:         "machine label",
+		MachineHostname:      "machine label",
+		MachineKind:          MachineKindPrimary,
+		MachinePriority:      7,
+		TeamsChatID:          "control-chat",
+		TeamsChatURL:         "https://teams.example/control",
+		TeamsChatTopic:       "control topic updated",
+		UpdateTitleIfPresent: true,
+	})
+	if err != nil || !changed {
+		t.Fatalf("RecordControlChatBinding topic-only changed=%v err=%v, want changed", changed, err)
+	}
+	changed, err = store.RecordControlChatBinding(ctx, ControlChatBindingUpdate{
+		ScopeID:              "scope-1",
+		AccountID:            "account-1",
+		UserPrincipal:        "user@example.test",
+		Profile:              "default",
+		MachineID:            "machine-1",
+		MachineLabel:         "machine label",
+		MachineHostname:      "machine label",
+		MachineKind:          MachineKindPrimary,
+		MachinePriority:      7,
+		TeamsChatID:          "control-chat",
+		TeamsChatURL:         "https://teams.example/control",
+		TeamsChatTopic:       "control topic updated",
+		UpdateTitleIfPresent: true,
+	})
+	if err != nil || changed {
+		t.Fatalf("RecordControlChatBinding no-op changed=%v err=%v, want no change", changed, err)
+	}
+	if got := atomic.LoadInt64(&loads); got != 0 {
+		t.Fatalf("control binding update loaded full state %d times", got)
+	}
+	if afterSession := sqliteRawSessionJSONForTest(t, store, "s1"); !bytes.Equal(beforeSession, afterSession) {
+		t.Fatalf("control binding rewrote session row:\nbefore=%s\nafter=%s", beforeSession, afterSession)
+	}
+	if afterInbound := sqliteRawInboundJSONForTest(t, store, "inbound-1"); !bytes.Equal(beforeInbound, afterInbound) {
+		t.Fatalf("control binding rewrote inbound row:\nbefore=%s\nafter=%s", beforeInbound, afterInbound)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after control binding: %v", err)
+	}
+	if state.MachineIdentity.ID != "machine-1" || state.MachineIdentity.Label != "machine label" || state.MachineIdentity.Kind != MachineKindPrimary || state.MachineIdentity.Priority != 7 {
+		t.Fatalf("machine identity = %#v, want recorded machine", state.MachineIdentity)
+	}
+	if state.ControlChat.TeamsChatID != "control-chat" || state.ControlChat.TeamsChatTopic != "control topic updated" || state.ControlChat.UserTitle != "Control title" || state.ControlChat.TitleSource != "user" {
+		t.Fatalf("control chat = %#v, want recorded binding/title", state.ControlChat)
 	}
 }
 
@@ -13488,6 +13950,74 @@ func assertOfficialReleaseHotPathsForTest(t *testing.T, store *Store, tag string
 	if _, err := store.RecordChatPollSuccess(ctx, "official-chat", now, true, false, 1); err != nil {
 		t.Fatalf("%s RecordChatPollSuccess after upgrade: %v", tag, err)
 	}
+	if session, changed, err := store.UpdateSessionContext(ctx, "official-session", func(current SessionContext, found bool, updateNow time.Time) (SessionContext, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("official-session missing")
+		}
+		current.TeamsTopic = "post-upgrade session topic"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	}); err != nil || !changed || session.TeamsTopic != "post-upgrade session topic" {
+		t.Fatalf("%s UpdateSessionContext after upgrade = %#v changed=%v err=%v", tag, session, changed, err)
+	}
+	if updatedInbound, changed, err := store.UpdateInboundEvent(ctx, inbound.ID, func(current InboundEvent, found bool, updateNow time.Time) (InboundEvent, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("%s missing", inbound.ID)
+		}
+		current.Source = "post-upgrade-row-update"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	}); err != nil || !changed || updatedInbound.Source != "post-upgrade-row-update" {
+		t.Fatalf("%s UpdateInboundEvent after upgrade = %#v changed=%v err=%v", tag, updatedInbound, changed, err)
+	}
+	if err := store.UpdateDashboardRecords(ctx, func(records *DashboardStoreRecords, updateNow time.Time) (bool, error) {
+		records.Views["official-control-chat"] = DashboardViewRecord{ID: "dashboard:official-control-chat", ChatID: "official-control-chat", Kind: "sessions", CreatedAt: updateNow, UpdatedAt: updateNow}
+		records.Numbers["official-dashboard-number"] = DashboardNumberRecord{ID: "official-dashboard-number", ChatID: "official-control-chat", Kind: "session", Number: 1, SessionID: "official-session", UpdatedAt: updateNow}
+		records.Workspaces["official-workspace"] = WorkspaceRecord{ID: "official-workspace", Path: "/workspace/official", Number: 1, UpdatedAt: updateNow}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("%s UpdateDashboardRecords after upgrade: %v", tag, err)
+	}
+	if _, err := store.UpdateWorkflowConfig(ctx, func(current WorkflowNotificationConfig, _ ControlChatBinding, updateNow time.Time) (WorkflowNotificationConfig, bool, error) {
+		current.Enabled = true
+		current.ControlChatID = "official-control-chat"
+		current.ControlWebhookURLFile = "/tmp/official-workflow-webhook"
+		current.UpdatedAt = updateNow
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("%s UpdateWorkflowConfig after upgrade: %v", tag, err)
+	}
+	if changed, err := store.RecordControlChatBinding(ctx, ControlChatBindingUpdate{
+		ScopeID:              "official-scope",
+		AccountID:            "official-account",
+		UserPrincipal:        "official@example.test",
+		Profile:              "default",
+		MachineID:            "official-machine",
+		MachineLabel:         "official-machine-label",
+		MachineHostname:      "official-machine-label",
+		MachineKind:          MachineKindPrimary,
+		MachinePriority:      11,
+		TeamsChatID:          "official-control-chat",
+		TeamsChatURL:         "https://teams.example/official-control",
+		TeamsChatTopic:       "official control",
+		UserTitle:            "Official control",
+		TitleSource:          "user",
+		UpdateTitleIfPresent: true,
+	}); err != nil || !changed {
+		t.Fatalf("%s RecordControlChatBinding after upgrade changed=%v err=%v", tag, changed, err)
+	}
+	if err := store.UpsertModelProfileKeyIntake(ctx, ModelProfileKeyIntake{ID: "post-upgrade-model-key", TeamsChatID: "official-control-chat", AuthorUserID: "official-user", ProfileName: "openai", Status: ModelProfileKeyIntakePending, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("%s UpsertModelProfileKeyIntake after upgrade: %v", tag, err)
+	}
+	if err := store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]ModelProfileKeyIntake, updateNow time.Time) (bool, error) {
+		intake := intakes["post-upgrade-model-key"]
+		intake.Status = ModelProfileKeyIntakeConfirmed
+		intake.UpdatedAt = updateNow
+		intakes[intake.ID] = intake
+		return true, nil
+	}); err != nil {
+		t.Fatalf("%s UpdateModelProfileKeyIntakes after upgrade: %v", tag, err)
+	}
 	if _, _, err := store.HotPollScheduleSnapshot(ctx); err != nil {
 		t.Fatalf("%s HotPollScheduleSnapshot after upgrade: %v", tag, err)
 	}
@@ -13627,6 +14157,24 @@ func assertOfficialReleaseHotPathsForTest(t *testing.T, store *Store, tag string
 	artifact := finalState.ArtifactRecords["post-upgrade-artifact"]
 	if artifact.OutboxID != artifactOutbox.ID || artifact.DriveItemID != "post-upgrade-drive-item" || artifact.Status != "message_failed" || artifact.Path != "post-upgrade-artifact.txt" || artifact.UploadName != "post-upgrade-artifact-upload.txt" {
 		t.Fatalf("%s post-upgrade artifact side effects = %#v", tag, artifact)
+	}
+	if finalState.Sessions["official-session"].TeamsTopic != "post-upgrade session topic" {
+		t.Fatalf("%s final session topic = %q", tag, finalState.Sessions["official-session"].TeamsTopic)
+	}
+	if finalState.InboundEvents[inbound.ID].Source != "post-upgrade-row-update" {
+		t.Fatalf("%s final inbound source = %q", tag, finalState.InboundEvents[inbound.ID].Source)
+	}
+	if _, ok := finalState.DashboardViews["official-control-chat"]; !ok {
+		t.Fatalf("%s post-upgrade dashboard view missing: %#v", tag, finalState.DashboardViews)
+	}
+	if !finalState.Workflow.Enabled || finalState.Workflow.ControlChatID != "official-control-chat" {
+		t.Fatalf("%s post-upgrade workflow = %#v", tag, finalState.Workflow)
+	}
+	if finalState.MachineIdentity.ID != "official-machine" || finalState.ControlChat.TeamsChatID != "official-control-chat" || finalState.ControlChat.UserTitle != "Official control" {
+		t.Fatalf("%s post-upgrade control binding machine=%#v control=%#v", tag, finalState.MachineIdentity, finalState.ControlChat)
+	}
+	if got := finalState.ModelProfileKeyIntakes["post-upgrade-model-key"].Status; got != ModelProfileKeyIntakeConfirmed {
+		t.Fatalf("%s post-upgrade model key status = %q", tag, got)
 	}
 }
 
@@ -14061,6 +14609,11 @@ func sqliteRawOutboxJSONForTest(t *testing.T, store *Store, outboxID string) []b
 func sqliteRawSessionJSONForTest(t *testing.T, store *Store, sessionID string) []byte {
 	t.Helper()
 	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM sessions WHERE id = ?`, sessionID, "session "+sessionID)
+}
+
+func sqliteRawInboundJSONForTest(t *testing.T, store *Store, inboundID string) []byte {
+	t.Helper()
+	return sqliteRawJSONByKeyForTest(t, store, `SELECT json FROM inbound_events WHERE id = ?`, inboundID, "inbound "+inboundID)
 }
 
 func sqliteRawTurnJSONForTest(t *testing.T, store *Store, turnID string) []byte {

@@ -1525,6 +1525,463 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserTranscriptQueueStageWrites(b *
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteFullStateSaveSourceStageWrites(b *testing.B) {
+	ctx := context.Background()
+	type sourceCase struct {
+		name  string
+		setup func(testing.TB, *teamstore.Store, *Bridge, int) func() error
+	}
+	cases := []sourceCase{
+		{
+			name: "row_chat_poll_schedule",
+			setup: func(tb testing.TB, store *teamstore.Store, _ *Bridge, i int) func() error {
+				tb.Helper()
+				chatID := cxpPerfChatID(i % 100)
+				return func() error {
+					_, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+						ChatID:         chatID,
+						PollState:      inboundPollStateWarm,
+						NextPollAt:     time.Date(2026, 5, 23, 11, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Second),
+						LastActivityAt: time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC),
+					})
+					return err
+				}
+			},
+		},
+		{
+			name: "row_outbox_queue",
+			setup: func(tb testing.TB, store *teamstore.Store, _ *Bridge, i int) func() error {
+				tb.Helper()
+				sessionID := cxpPerfSessionID(i % 100)
+				chatID := cxpPerfChatID(i % 100)
+				return func() error {
+					_, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+						ID:          fmt.Sprintf("source-matrix-outbox-%06d", i),
+						SessionID:   sessionID,
+						TeamsChatID: chatID,
+						Kind:        "status-progress",
+						Body:        "source matrix outbox row update",
+					})
+					return err
+				}
+			},
+		},
+		{
+			name: "full_update_session_raw",
+			setup: func(tb testing.TB, store *teamstore.Store, _ *Bridge, i int) func() error {
+				tb.Helper()
+				sessionID := cxpPerfSessionID(i % 100)
+				return func() error {
+					return store.UpdateSession(ctx, sessionID, func(state *teamstore.State) error {
+						session := state.Sessions[sessionID]
+						session.Cwd = fmt.Sprintf("/workspace/source-matrix/raw-%06d", i)
+						session.UpdatedAt = time.Now()
+						state.Sessions[sessionID] = session
+						return nil
+					})
+				}
+			},
+		},
+		{
+			name: "full_auto_title_from_result",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				session.TitleSource = sessionTitleSourceAuto
+				result := ExecutionResult{
+					Text:             "source matrix final",
+					CodexThreadID:    firstNonEmptyString(session.CodexThreadID, fmt.Sprintf("source-matrix-thread-%06d", i)),
+					CodexThreadTitle: fmt.Sprintf("Source Matrix Title %06d", i),
+					CodexTurnID:      fmt.Sprintf("source-matrix-turn-%06d", i),
+				}
+				return func() error {
+					updated, err := bridge.refreshWorkChatTitleFromExecutionResult(ctx, session, result)
+					if err != nil {
+						return err
+					}
+					if !updated {
+						return fmt.Errorf("auto title update was not applied")
+					}
+					return err
+				}
+			},
+		},
+		{
+			name: "full_checkpoint_position_backfill",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				threadID := fmt.Sprintf("source-matrix-thread-%06d", i)
+				session.CodexThreadID = threadID
+				session.Cwd = filepath.Join(tb.TempDir(), "project")
+				transcriptPath := filepath.Join(tb.TempDir(), "source-matrix-transcript.jsonl")
+				data := cxpPerfTranscriptContent(threadID, 8, 96)
+				if err := os.WriteFile(transcriptPath, []byte(data), 0o600); err != nil {
+					tb.Fatalf("write checkpoint backfill transcript: %v", err)
+				}
+				checkpointID := transcriptCheckpointID(session.ID)
+				lastRecordID := fmt.Sprintf("record-%s-%04d", threadID, 4)
+				checkpoint, changed, err := store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+					current.ID = checkpointID
+					current.SessionID = session.ID
+					current.SourcePath = transcriptPath
+					current.LastRecordID = lastRecordID
+					current.LastSourceLine = 0
+					current.LastOffset = 0
+					current.SourceSize = 0
+					current.SourceModTime = time.Time{}
+					current.Status = importCheckpointStatusComplete
+					current.UpdatedAt = now
+					return current, true, nil
+				})
+				if err != nil {
+					tb.Fatalf("seed checkpoint backfill row: %v", err)
+				}
+				if !changed {
+					tb.Fatalf("checkpoint backfill seed did not change")
+				}
+				local := codexhistory.Session{SessionID: threadID, FilePath: transcriptPath, ProjectPath: session.Cwd}
+				return func() error {
+					_, applied, err := bridge.backfillLinkedTranscriptCheckpointPosition(ctx, *session, local, checkpoint)
+					if err != nil {
+						return err
+					}
+					if !applied {
+						return fmt.Errorf("checkpoint position backfill was not applied")
+					}
+					return nil
+				}
+			},
+		},
+		{
+			name: "full_park_work_chat",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				return func() error {
+					_, err := bridge.parkWorkChatSession(ctx, session)
+					return err
+				}
+			},
+		},
+		{
+			name: "full_resume_work_chat",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				if _, err := bridge.parkWorkChatSession(ctx, session); err != nil {
+					tb.Fatalf("seed parked work chat: %v", err)
+				}
+				return func() error {
+					return bridge.resumeWorkChat(ctx, session, time.Date(2026, 5, 23, 11, 30, 0, 0, time.UTC).Add(time.Duration(i)*time.Second))
+				}
+			},
+		},
+		{
+			name: "full_control_dashboard_persist",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				dashboard := cxpPerfSourceMatrixDashboard(bridge, i)
+				return func() error {
+					return bridge.persistControlDashboard(ctx, dashboard)
+				}
+			},
+		},
+		{
+			name: "full_helper_reload_begin",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, _ int) func() error {
+				tb.Helper()
+				return func() error {
+					_, _, blocked, err := bridge.beginHelperReloadDrain(ctx, true)
+					if blocked {
+						return fmt.Errorf("helper reload drain unexpectedly blocked")
+					}
+					return err
+				}
+			},
+		},
+		{
+			name: "full_helper_reload_restore",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, _ int) func() error {
+				tb.Helper()
+				previous, _, blocked, err := bridge.beginHelperReloadDrain(ctx, true)
+				if err != nil {
+					tb.Fatalf("seed helper reload drain: %v", err)
+				}
+				if blocked {
+					tb.Fatalf("helper reload drain seed unexpectedly blocked")
+				}
+				return func() error {
+					return bridge.restoreHelperReloadDrain(ctx, previous)
+				}
+			},
+		},
+		{
+			name: "full_interrupted_restart_notice",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				sessionID := cxpPerfSessionID(i % 100)
+				turn := teamstore.Turn{
+					ID:             fmt.Sprintf("source-matrix-interrupted-%06d", i),
+					SessionID:      sessionID,
+					Status:         teamstore.TurnStatusInterrupted,
+					RecoveryReason: recoveryReasonAmbiguousAfterHelperRestart,
+					CreatedAt:      time.Now(),
+					UpdatedAt:      time.Now(),
+				}
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.Turns[turn.ID] = turn
+					return nil
+				}); err != nil {
+					tb.Fatalf("seed interrupted turn: %v", err)
+				}
+				return func() error {
+					return bridge.markInterruptedAfterRestartNoticeSent(ctx, turn)
+				}
+			},
+		},
+		{
+			name: "full_deferred_inbound_ignored",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				inboundID := fmt.Sprintf("source-matrix-deferred-%06d", i)
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					state.InboundEvents[inboundID] = teamstore.InboundEvent{
+						ID:             inboundID,
+						SessionID:      cxpPerfSessionID(i % 100),
+						TeamsChatID:    cxpPerfChatID(i % 100),
+						TeamsMessageID: fmt.Sprintf("source-matrix-deferred-message-%06d", i),
+						Text:           "deferred source matrix input",
+						Status:         teamstore.InboundStatusDeferred,
+						CreatedAt:      time.Now(),
+						UpdatedAt:      time.Now(),
+					}
+					return nil
+				}); err != nil {
+					tb.Fatalf("seed deferred inbound: %v", err)
+				}
+				return func() error {
+					return bridge.markDeferredInboundIgnored(ctx, inboundID, "source matrix unsupported input")
+				}
+			},
+		},
+		{
+			name: "full_rename_session_chat",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				return func() error {
+					return bridge.renameSessionChat(ctx, session, fmt.Sprintf("Source Matrix Rename %06d", i))
+				}
+			},
+		},
+		{
+			name: "full_registry_projection_migration",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				chatID := fmt.Sprintf("source-matrix-registry-chat-%06d", i)
+				if bridge.reg.Chats == nil {
+					bridge.reg.Chats = map[string]ChatState{}
+				}
+				bridge.reg.Chats[chatID] = ChatState{
+					SeenMessageIDs: []string{fmt.Sprintf("source-matrix-seen-%06d", i)},
+					SentMessageIDs: []string{fmt.Sprintf("source-matrix-sent-%06d", i)},
+				}
+				return func() error {
+					return bridge.migrateRegistryProjectionToStore(ctx)
+				}
+			},
+		},
+		{
+			name: "full_control_chat_binding",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				chat := Chat{
+					ID:     bridge.reg.ControlChatID,
+					Topic:  fmt.Sprintf("source matrix control %06d", i),
+					WebURL: fmt.Sprintf("https://teams.example/control-%06d", i),
+				}
+				return func() error {
+					return bridge.recordControlChatBindingWithTitle(ctx, chat, fmt.Sprintf("Control %06d", i), sessionTitleSourceUser)
+				}
+			},
+		},
+		{
+			name: "full_close_durable_session",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				session.UpdatedAt = time.Now()
+				return func() error {
+					return bridge.closeDurableSession(ctx, session)
+				}
+			},
+		},
+		{
+			name: "full_clear_dashboard_view",
+			setup: func(tb testing.TB, _ *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				if err := bridge.persistControlDashboard(ctx, cxpPerfSourceMatrixDashboard(bridge, i)); err != nil {
+					tb.Fatalf("seed dashboard view: %v", err)
+				}
+				return func() error {
+					return bridge.clearControlDashboardView(ctx)
+				}
+			},
+		},
+		{
+			name: "full_model_key_intake_pending",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				intake := teamstore.ModelProfileKeyIntake{
+					ID:               fmt.Sprintf("source-matrix-model-key-%06d", i),
+					ScopeID:          bridge.scope.ID,
+					TeamsChatID:      bridge.reg.ControlChatID,
+					RequestMessageID: fmt.Sprintf("source-matrix-model-key-message-%06d", i),
+					AuthorUserID:     bridge.user.ID,
+					ProfileName:      "source-matrix",
+					Provider:         "openai",
+					Model:            "gpt-5",
+					Status:           teamstore.ModelProfileKeyIntakePending,
+					CreatedAt:        time.Now(),
+					UpdatedAt:        time.Now(),
+					ExpiresAt:        time.Now().Add(time.Hour),
+				}
+				return func() error {
+					return store.UpsertModelProfileKeyIntake(ctx, intake)
+				}
+			},
+		},
+		{
+			name: "full_workflow_config",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				webhookPath := filepath.Join(tb.TempDir(), "workflow-webhook-url")
+				if err := os.WriteFile(webhookPath, []byte("https://workflow.example.test/source-matrix"), 0o600); err != nil {
+					tb.Fatalf("write workflow webhook fixture: %v", err)
+				}
+				return func() error {
+					_, err := store.UpdateWorkflowConfig(ctx, func(_ teamstore.WorkflowNotificationConfig, _ teamstore.ControlChatBinding, _ time.Time) (teamstore.WorkflowNotificationConfig, bool, error) {
+						return teamstore.WorkflowNotificationConfig{
+							Enabled:               true,
+							ControlWebhookURLFile: webhookPath,
+							ControlChatID:         bridge.reg.ControlChatID,
+							UpdatedAt:             time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Second),
+						}, true, nil
+					})
+					return err
+				}
+			},
+		},
+		{
+			name: "full_publish_session_metadata",
+			setup: func(tb testing.TB, store *teamstore.Store, bridge *Bridge, i int) func() error {
+				tb.Helper()
+				session := bridge.reg.SessionByID(cxpPerfSessionID(i % 100))
+				if session == nil {
+					tb.Fatalf("realistic session missing")
+				}
+				localThreadID := fmt.Sprintf("source-matrix-publish-thread-%06d", i)
+				projectPath := fmt.Sprintf("/workspace/source-matrix-publish-%06d", i)
+				return func() error {
+					_, _, err := store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, found bool, now time.Time) (teamstore.SessionContext, bool, error) {
+						if !found {
+							return current, false, fmt.Errorf("session %q not found", session.ID)
+						}
+						current.Cwd = projectPath
+						current.CodexThreadID = localThreadID
+						current.UpdatedAt = now
+						return current, true, nil
+					})
+					return err
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			var total cxpPerfProcIO
+			var duration time.Duration
+			var storeBytes int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+				op := tc.setup(b, store, bridge, i)
+				storeBytes += cxpPerfSQLiteStoreBytes(b, store)
+				b.StartTimer()
+				start := time.Now()
+				delta, err := cxpPerfMeasureProcIO(op)
+				elapsed := time.Since(start)
+				b.StopTimer()
+				if err != nil {
+					b.Fatalf("%s: %v", tc.name, err)
+				}
+				total.add(delta)
+				duration += elapsed
+			}
+			cxpPerfReportNamedProcIO(b, "source", total, b.N)
+			if b.N > 0 {
+				b.ReportMetric(float64(duration)/float64(b.N), "source_ns/op")
+				b.ReportMetric(float64(storeBytes)/float64(b.N), "sqlite_total_bytes/op")
+			}
+		})
+	}
+}
+
+func cxpPerfSourceMatrixDashboard(bridge *Bridge, index int) ControlDashboard {
+	now := time.Date(2026, 5, 23, 11, 45, 0, 0, time.UTC).Add(time.Duration(index) * time.Second)
+	workspaces := make([]DashboardWorkspaceInput, 0, 10)
+	for workspace := 0; workspace < 10; workspace++ {
+		input := DashboardWorkspaceInput{
+			ID:        fmt.Sprintf("source-matrix-workspace-%02d", workspace),
+			Path:      fmt.Sprintf("/workspace/source-matrix-%02d", workspace),
+			UpdatedAt: now.Add(-time.Duration(workspace) * time.Minute),
+		}
+		for sessionIndex := workspace * 10; sessionIndex < (workspace+1)*10 && sessionIndex < len(bridge.reg.Sessions); sessionIndex++ {
+			session := bridge.reg.Sessions[sessionIndex]
+			input.Sessions = append(input.Sessions, DashboardSessionInput{
+				ID:            session.ID,
+				WorkspaceID:   input.ID,
+				Cwd:           firstNonEmptyString(session.Cwd, fmt.Sprintf("/workspace/source-matrix-%02d", workspace)),
+				Topic:         session.Topic,
+				Status:        session.Status,
+				TeamsChatID:   session.ChatID,
+				TeamsChatURL:  session.ChatURL,
+				CodexThreadID: session.CodexThreadID,
+				CreatedAt:     session.CreatedAt,
+				UpdatedAt:     session.UpdatedAt,
+			})
+		}
+		workspaces = append(workspaces, input)
+	}
+	return BuildControlDashboard(ControlDashboard{}, ControlDashboardInput{
+		Workspaces:          workspaces,
+		ViewKind:            DashboardViewSessions,
+		SelectedWorkspaceID: workspaces[0].ID,
+	}, now)
+}
+
 func BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites(b *testing.B) {
 	stages := []string{"importing", "service_control", "duplicate", "queue_state", "prepare_local", "ensure", "inbound", "turn", "ack", "start", "complete"}
 	totals := make(map[string]cxpPerfProcIO, len(stages))
