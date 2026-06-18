@@ -7347,7 +7347,7 @@ func TestBridgeDashboardSessionsShowLinkedChatAndParkedResume(t *testing.T) {
 	for _, want := range []string{
 		"1. linked alpha session",
 		"Chat: " + teamsCompactChatLinkLabel,
-		"Send message: r s001",
+		"Resume parked chat: send r s001",
 		"Next: send 1 to open this Teams chat or import updates",
 	} {
 		if !strings.Contains(sessionsPlain, want) {
@@ -7359,6 +7359,12 @@ func TestBridgeDashboardSessionsShowLinkedChatAndParkedResume(t *testing.T) {
 	}
 	if !strings.Contains(sessionsHTML, `<a href="`+TeamsChatURL(chatID, "tenant-1")+`">`+teamsCompactChatLinkLabel+`</a>`) {
 		t.Fatalf("sessions HTML missing compact Teams chat anchor:\n%s", sessionsHTML)
+	}
+	if !strings.Contains(sessionsHTML, `<strong>Resume parked chat:</strong> send <code>r s001</code>`) {
+		t.Fatalf("sessions HTML should format only the resume command as code:\n%s", sessionsHTML)
+	}
+	if strings.Contains(sessionsHTML, `<code>send r s001</code>`) || strings.Contains(sessionsHTML, `<code>Resume parked chat`) {
+		t.Fatalf("sessions HTML should not format the full resume hint as code:\n%s", sessionsHTML)
 	}
 }
 
@@ -8146,19 +8152,19 @@ func TestBridgeControlStatusShowsFolderLastUsedCompactLinkAndParkedResume(t *tes
 		"Folder: /workspace/active",
 		"Last used: " + bridge.reg.Sessions[0].UpdatedAt.Local().Format("2006-01-02 15:04"),
 		"Chat: " + teamsCompactChatLinkLabel,
-		"Send message: r s002",
+		"Resume parked chat: send r s002",
 		"———",
 	} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("status output missing %q:\n%s", want, plain)
 		}
 	}
-	if got := strings.Count(plain, "Send message:"); got != 1 {
+	if got := strings.Count(plain, "Resume parked chat:"); got != 1 {
 		t.Fatalf("resume hint count = %d, want 1:\n%s", got, plain)
 	}
 	for _, line := range strings.Split(plain, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "parked status chat [🧊parked]") && strings.Contains(line, "Send message:") {
+		if strings.HasPrefix(line, "parked status chat [🧊parked]") && strings.Contains(line, "Resume parked chat:") {
 			t.Fatalf("resume hint should not be on the status title line:\n%s", plain)
 		}
 	}
@@ -8167,6 +8173,12 @@ func TestBridgeControlStatusShowsFolderLastUsedCompactLinkAndParkedResume(t *tes
 	}
 	if !strings.Contains(html, `<a href="`+TeamsChatURL(parkedChatID, "tenant-1")+`">`+teamsCompactChatLinkLabel+`</a>`) {
 		t.Fatalf("status HTML missing compact Teams chat anchor:\n%s", html)
+	}
+	if !strings.Contains(html, `<strong>Resume parked chat:</strong> send <code>r s002</code>`) {
+		t.Fatalf("status HTML should format only the resume command as code:\n%s", html)
+	}
+	if strings.Contains(html, `<code>send r s002</code>`) || strings.Contains(html, `<code>Resume parked chat`) {
+		t.Fatalf("status HTML should not format the full resume hint as code:\n%s", html)
 	}
 }
 

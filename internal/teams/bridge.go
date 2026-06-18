@@ -13729,7 +13729,7 @@ func workChatResumeHint(session Session, polls map[string]teamstore.ChatPollStat
 	if sessionID == "" {
 		return ""
 	}
-	return "**Send message:** " + dashboardInlineCode("r "+sessionID)
+	return "**Resume parked chat:** send " + dashboardInlineCode("r "+sessionID)
 }
 
 func workChatFolderLine(session Session) string {
