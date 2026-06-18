@@ -7347,7 +7347,7 @@ func TestBridgeDashboardSessionsShowLinkedChatAndParkedResume(t *testing.T) {
 	for _, want := range []string{
 		"1. linked alpha session",
 		"Chat: " + teamsCompactChatLinkLabel,
-		"To resume: resume s001",
+		"Send message: r s001",
 		"Next: send 1 to open this Teams chat or import updates",
 	} {
 		if !strings.Contains(sessionsPlain, want) {
@@ -8141,20 +8141,26 @@ func TestBridgeControlStatusShowsFolderLastUsedCompactLinkAndParkedResume(t *tes
 	plain := PlainTextFromTeamsHTML(html)
 	for _, want := range []string{
 		"active status chat [active]",
-		"parked status chat [parked]",
+		"parked status chat [🧊parked]",
 		"Session: s001",
 		"Folder: /workspace/active",
 		"Last used: " + bridge.reg.Sessions[0].UpdatedAt.Local().Format("2006-01-02 15:04"),
 		"Chat: " + teamsCompactChatLinkLabel,
-		"To resume: resume s002",
+		"Send message: r s002",
 		"———",
 	} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("status output missing %q:\n%s", want, plain)
 		}
 	}
-	if got := strings.Count(plain, "To resume:"); got != 1 {
+	if got := strings.Count(plain, "Send message:"); got != 1 {
 		t.Fatalf("resume hint count = %d, want 1:\n%s", got, plain)
+	}
+	for _, line := range strings.Split(plain, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "parked status chat [🧊parked]") && strings.Contains(line, "Send message:") {
+			t.Fatalf("resume hint should not be on the status title line:\n%s", plain)
+		}
 	}
 	if strings.Contains(plain, "teams.microsoft.com") {
 		t.Fatalf("status plain text leaked full Teams chat URL:\n%s", plain)

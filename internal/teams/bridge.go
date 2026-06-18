@@ -13670,15 +13670,15 @@ func (b *Bridge) formatSessionList(ctx context.Context) string {
 	for _, session := range active {
 		status := workChatDisplayStatus(session, polls)
 		title := fmt.Sprintf("**%s** [%s]", session.Topic, status)
-		if resume := workChatResumeHint(session, polls); resume != "" {
-			title += "  " + resume
-		}
 		lines = append(lines, title)
 		meta := []string{"**Session:** " + dashboardInlineCode(session.ID)}
 		meta = append(meta, workChatFolderLine(session))
 		meta = append(meta, workChatLastUsedLine(session))
 		if chatLink := teamsCompactChatMarkdownLink(session.ChatURL); chatLink != "" {
 			meta = append(meta, "**Chat:** "+chatLink)
+		}
+		if resume := workChatResumeHint(session, polls); resume != "" {
+			meta = append(meta, resume)
 		}
 		if label := modelProfileDisplayName(session.ModelProfile); label != "default" {
 			meta = append(meta, "**Model profile:** "+label)
@@ -13707,7 +13707,7 @@ func (b *Bridge) workChatPollsSnapshot(ctx context.Context) map[string]teamstore
 
 func workChatDisplayStatus(session Session, polls map[string]teamstore.ChatPollState) string {
 	if workChatIsParked(session, polls) {
-		return "parked"
+		return "🧊parked"
 	}
 	return firstNonEmptyString(session.Status, "active")
 }
@@ -13729,7 +13729,7 @@ func workChatResumeHint(session Session, polls map[string]teamstore.ChatPollStat
 	if sessionID == "" {
 		return ""
 	}
-	return "**To resume:** " + dashboardInlineCode("resume "+sessionID)
+	return "**Send message:** " + dashboardInlineCode("r "+sessionID)
 }
 
 func workChatFolderLine(session Session) string {

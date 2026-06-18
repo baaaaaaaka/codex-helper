@@ -22,6 +22,7 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "park s113", name: DashboardCommandPark, raw: "s113"},
 		{text: "helper park s113", name: DashboardCommandPark, raw: "s113"},
 		{text: "unpark s113", name: DashboardCommandResume, raw: "s113"},
+		{text: "r s113", name: DashboardCommandResume, raw: "s113"},
 		{text: "/publish session-def", name: DashboardCommandPublish, raw: "session-def"},
 		{text: "/new build the thing", name: DashboardCommandNew, raw: "build the thing"},
 		{text: "/ask what can this control chat do", name: DashboardCommandAsk, raw: "what can this control chat do"},
