@@ -22786,15 +22786,13 @@ func TestBridgeMigratesLegacyRegistryProjectionIntoDurableState(t *testing.T) {
 	if inbound := state.InboundEvents["inbound:legacy-work:seen-1"]; inbound.TeamsMessageID != "seen-1" || inbound.Source != "registry_migration" {
 		t.Fatalf("legacy seen id was not migrated: %#v", inbound)
 	}
-	foundSent := false
-	for _, outbox := range state.OutboxMessages {
-		if outbox.TeamsChatID == "legacy-work" && outbox.TeamsMessageID == "sent-1" && outbox.Status == teamstore.OutboxStatusSent {
-			foundSent = true
-			break
-		}
+	if !bridge.reg.HasSent("legacy-work", "sent-1") {
+		t.Fatalf("legacy sent id should remain in registry for local dedupe: %#v", bridge.reg.Chats)
 	}
-	if !foundSent {
-		t.Fatalf("legacy sent id was not migrated: %#v", state.OutboxMessages)
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID == "legacy-work" && outbox.TeamsMessageID == "sent-1" {
+			t.Fatalf("legacy registry sent id should not be migrated into durable outbox: %#v", outbox)
+		}
 	}
 }
 
@@ -33119,8 +33117,13 @@ func TestBridgeMigrateRegistryProjectionSkipsSaveWhenAlreadyMigrated(t *testing.
 	if _, ok := state.InboundEvents["inbound:chat-1:message-new"]; !ok {
 		t.Fatalf("migrated inbound event missing: %#v", state.InboundEvents)
 	}
-	if _, ok := state.OutboxMessages[migratedSentOutboxID("chat-1", "message-sent")]; !ok {
-		t.Fatalf("migrated sent outbox missing: %#v", state.OutboxMessages)
+	if !bridge.reg.HasSent("chat-1", "message-sent") {
+		t.Fatalf("registry sent id missing after migration: %#v", bridge.reg.Chats)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID == "chat-1" && outbox.TeamsMessageID == "message-sent" {
+			t.Fatalf("registry sent id should not be migrated into durable outbox: %#v", outbox)
+		}
 	}
 
 	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
@@ -33132,6 +33135,52 @@ func TestBridgeMigrateRegistryProjectionSkipsSaveWhenAlreadyMigrated(t *testing.
 	}
 	if !bytes.Equal(afterRepeatChange, afterChange) {
 		t.Fatal("migrateRegistryProjectionToStore rewrote already migrated registry chat state")
+	}
+}
+
+func TestBridgeMigrateRegistryProjectionSkipsSentOnlyRegistryHistoryStoreWrite(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("initial migrateRegistryProjectionToStore error: %v", err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after initial migration: %v", err)
+	}
+	bridge.reg.Chats = map[string]ChatState{}
+	for chat := 0; chat < 24; chat++ {
+		chatID := fmt.Sprintf("legacy-sent-chat-%02d", chat)
+		sent := make([]string, 0, maxTrackedMessageIDs)
+		for id := 0; id < maxTrackedMessageIDs; id++ {
+			sent = append(sent, fmt.Sprintf("legacy-sent-%02d-%03d", chat, id))
+		}
+		bridge.reg.Chats[chatID] = ChatState{SentMessageIDs: sent}
+	}
+
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("sent-only migrateRegistryProjectionToStore error: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read store after sent-only migration: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("sent-only registry history caused a durable store rewrite")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load migrated state: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind == "registry-sent" {
+			t.Fatalf("sent-only registry history created registry-sent outbox: %#v", outbox)
+		}
+	}
+	if !bridge.reg.HasSent("legacy-sent-chat-00", "legacy-sent-00-000") {
+		t.Fatalf("registry sent history was not retained for local dedupe: %#v", bridge.reg.Chats["legacy-sent-chat-00"])
 	}
 }
 

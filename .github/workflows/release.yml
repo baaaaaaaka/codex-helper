@@ -140,6 +140,7 @@ jobs:
           set -euo pipefail
           row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestBridgeMigrateRegistryProjectionSkips(SaveWhenAlreadyMigrated|SentOnlyRegistryHistoryStoreWrite)$' -v
 
       - name: Teams control status display regressions
         shell: bash

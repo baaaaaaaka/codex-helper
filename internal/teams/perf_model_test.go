@@ -2051,6 +2051,76 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown(b *testing.B
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn(b *testing.B) {
+	const (
+		registryChats       = 52
+		sentIDsPerChat      = 500
+		registrySentIDCount = registryChats * sentIDsPerChat
+	)
+	ctx := context.Background()
+	run := func(b *testing.B, prime bool) {
+		b.Helper()
+		var total cxpPerfProcIO
+		var duration time.Duration
+		var walBefore int64
+		var walAfter int64
+		var storeBytes int64
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+			if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+				b.Fatalf("prime base registry projection migration: %v", err)
+			}
+			if _, err := store.CheckpointSQLiteWAL(ctx, 1); err != nil {
+				b.Fatalf("checkpoint base registry projection WAL: %v", err)
+			}
+			cxpPerfSeedLargeRegistrySentHistory(bridge, registryChats, sentIDsPerChat, i)
+			if prime {
+				if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+					b.Fatalf("prime sent registry projection migration: %v", err)
+				}
+				if _, err := store.CheckpointSQLiteWAL(ctx, 1); err != nil {
+					b.Fatalf("checkpoint sent registry projection WAL: %v", err)
+				}
+			}
+			storeBytes += cxpPerfSQLiteStoreBytes(b, store)
+			walBefore += cxpPerfSQLiteWALBytes(b, store)
+			b.StartTimer()
+			start := time.Now()
+			delta, err := cxpPerfMeasureProcIO(func() error {
+				return bridge.migrateRegistryProjectionToStore(ctx)
+			})
+			elapsed := time.Since(start)
+			b.StopTimer()
+			if err != nil {
+				b.Fatalf("registry projection migration: %v", err)
+			}
+			walAfter += cxpPerfSQLiteWALBytes(b, store)
+			total.add(delta)
+			duration += elapsed
+		}
+		cxpPerfReportNamedProcIO(b, "migration", total, b.N)
+		if b.N > 0 {
+			denom := float64(b.N)
+			b.ReportMetric(float64(duration)/denom, "migration_ns/op")
+			b.ReportMetric(float64(walBefore)/denom, "wal_before_B/op")
+			b.ReportMetric(float64(walAfter)/denom, "wal_after_B/op")
+			b.ReportMetric(float64(storeBytes)/denom, "sqlite_total_bytes/op")
+			b.ReportMetric(float64(registryChats), "registry_chats")
+			b.ReportMetric(float64(sentIDsPerChat), "sent_ids_per_chat")
+			b.ReportMetric(float64(registrySentIDCount), "registry_sent_ids")
+		}
+	}
+	b.Run("first-sent-history-after-base-projection", func(b *testing.B) {
+		run(b, false)
+	})
+	b.Run("repeat-after-retention-prune", func(b *testing.B) {
+		run(b, true)
+	})
+}
+
 func cxpPerfSourceMatrixDashboard(bridge *Bridge, index int) ControlDashboard {
 	now := time.Date(2026, 5, 23, 11, 45, 0, 0, time.UTC).Add(time.Duration(index) * time.Second)
 	workspaces := make([]DashboardWorkspaceInput, 0, 10)
@@ -4905,6 +4975,23 @@ func cxpPerfSeedRealisticChatHistory(state *teamstore.State, chat int, sessionID
 			CreatedAt:      created,
 			UpdatedAt:      created,
 		}
+	}
+}
+
+func cxpPerfSeedLargeRegistrySentHistory(bridge *Bridge, chats int, sentIDsPerChat int, iteration int) {
+	if bridge == nil {
+		return
+	}
+	if bridge.reg.Chats == nil {
+		bridge.reg.Chats = map[string]ChatState{}
+	}
+	for chat := 0; chat < chats; chat++ {
+		chatID := fmt.Sprintf("registry-churn-chat-%03d", chat)
+		sent := make([]string, 0, sentIDsPerChat)
+		for id := 0; id < sentIDsPerChat; id++ {
+			sent = append(sent, fmt.Sprintf("registry-churn-sent-%06d-%03d-%03d", iteration, chat, id))
+		}
+		bridge.reg.Chats[chatID] = ChatState{SentMessageIDs: sent}
 	}
 }
 

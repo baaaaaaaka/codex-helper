@@ -11929,35 +11929,12 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				}
 				changed = true
 			}
-			for _, messageID := range chatState.SentMessageIDs {
-				messageID = strings.TrimSpace(messageID)
-				if messageID == "" {
-					continue
-				}
-				id := migratedSentOutboxID(chatID, messageID)
-				if _, ok := state.OutboxMessages[id]; ok {
-					continue
-				}
-				state.OutboxMessages[id] = teamstore.OutboxMessage{
-					ID:             id,
-					TeamsChatID:    chatID,
-					TeamsMessageID: messageID,
-					Kind:           "registry-sent",
-					Status:         teamstore.OutboxStatusSent,
-					CreatedAt:      now,
-					UpdatedAt:      now,
-					SentAt:         now,
-				}
-				changed = true
-			}
+			// Sent IDs stay in the registry for local dedupe. Projecting them
+			// into durable outbox fights sent-outbox retention and can recreate
+			// thousands of pruned rows on every startup.
 		}
 		return changed, nil
 	})
-}
-
-func migratedSentOutboxID(chatID string, messageID string) string {
-	sum := sha256.Sum256([]byte(chatID + "\x00" + messageID))
-	return "outbox:registry-sent:" + hex.EncodeToString(sum[:])
 }
 
 func (b *Bridge) recordControlChatBinding(ctx context.Context, chat Chat) error {
