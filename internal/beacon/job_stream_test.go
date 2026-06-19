@@ -42,7 +42,7 @@ func TestJobStreamWriterReaderIgnoresPartialAndOversizedLines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewJobStreamWriter: %v", err)
 	}
-	if err := writer.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: "first", ThreadID: "thread-1", TurnID: "codex-turn-1", Raw: []byte("raw must not persist")}); err != nil {
+	if err := writer.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Phase: "final_answer", Text: "first", ThreadID: "thread-1", TurnID: "codex-turn-1", Raw: []byte("raw must not persist")}); err != nil {
 		t.Fatalf("Append first: %v", err)
 	}
 	if err := writer.Close(); err != nil {
@@ -79,7 +79,7 @@ func TestJobStreamWriterReaderIgnoresPartialAndOversizedLines(t *testing.T) {
 		t.Fatalf("record metadata = %#v", records[0])
 	}
 	event := records[0].Event.StreamEvent()
-	if event.Kind != codexrunner.StreamEventAgentMessage || event.Text != "first" || len(event.Raw) != 0 {
+	if event.Kind != codexrunner.StreamEventAgentMessage || event.Phase != "final_answer" || event.Text != "first" || len(event.Raw) != 0 {
 		t.Fatalf("event = %#v", event)
 	}
 	if records, err = reader.ReadAvailable(); err != nil || len(records) != 0 {

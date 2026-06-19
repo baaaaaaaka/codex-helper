@@ -118,6 +118,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          go test ./internal/beacon -count=1 -run 'TestJobStreamWriterReaderIgnoresPartialAndOversizedLines$' -v
+          go test ./internal/teams -count=1 -run 'Test(CodexEventForwarder(DoesNotFlushFinalAnswerAsProgressOnIdle|TreatsTaskCompleteAgentMessageAsTerminal)|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
           go test ./internal/teams -count=1 -run 'TestBridgeCanQueueLiveTurnOutbox(ChecksTargetTurn|ChecksTargetTurnSQLite|IgnoresUnrelatedSQLiteCorruption)$' -v
 
       - name: Teams attachment filename and artifact upload regressions

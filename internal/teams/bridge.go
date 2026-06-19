@@ -10708,11 +10708,29 @@ type codexEventForwarder struct {
 	chatID                  string
 	events                  chan codexrunner.StreamEvent
 	done                    chan struct{}
-	pendingAgent            string
+	pendingAgent            pendingCodexAgentMessage
 	lastStreamRetryStatusAt time.Time
 	seq                     int
 	liveContentSent         bool
 	err                     error
+}
+
+type pendingCodexAgentMessage struct {
+	text     string
+	phase    string
+	terminal bool
+}
+
+func (p pendingCodexAgentMessage) empty() bool {
+	return strings.TrimSpace(p.text) == ""
+}
+
+func (p pendingCodexAgentMessage) progressEligible() bool {
+	return !p.terminal && !codexStreamPhaseIsFinalAnswer(p.phase)
+}
+
+func codexStreamPhaseIsFinalAnswer(phase string) bool {
+	return strings.EqualFold(strings.TrimSpace(phase), "final_answer")
 }
 
 func (b *Bridge) startCodexEventForwarder(ctx context.Context, session *Session, turn teamstore.Turn, chatID string) *codexEventForwarder {
@@ -10754,8 +10772,8 @@ func (f *codexEventForwarder) Close(finalText string) error {
 	}
 	close(f.events)
 	<-f.done
-	if strings.TrimSpace(f.pendingAgent) != "" && !sameCodexVisibleText(f.pendingAgent, finalText) {
-		_ = f.sendStreamContent("progress", f.pendingAgent)
+	if !f.pendingAgent.empty() && f.pendingAgent.progressEligible() && !sameCodexVisibleText(f.pendingAgent.text, finalText) {
+		_ = f.sendStreamContent("progress", f.pendingAgent.text)
 	}
 	return f.err
 }
@@ -10793,10 +10811,12 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 	}
 	switch event.Kind {
 	case codexrunner.StreamEventAgentMessage:
-		if strings.TrimSpace(f.pendingAgent) != "" {
-			_ = f.send("progress", f.pendingAgent)
+		if !f.pendingAgent.empty() && f.pendingAgent.progressEligible() {
+			_ = f.send("progress", f.pendingAgent.text)
 		}
-		f.pendingAgent = event.Text
+		f.pendingAgent = pendingCodexAgentMessage{text: event.Text, phase: event.Phase}
+	case codexrunner.StreamEventTurnCompleted:
+		f.markPendingAgentTerminal(event.Text)
 	case codexrunner.StreamEventCommandStarted:
 		f.flushPendingAgent()
 	case codexrunner.StreamEventCommandCompleted:
@@ -10835,23 +10855,38 @@ func (f *codexEventForwarder) observeEventThread(event codexrunner.StreamEvent) 
 			Source:    "stream_" + string(event.Kind),
 		}
 	}
-	f.pendingAgent = ""
+	f.pendingAgent = pendingCodexAgentMessage{}
 	return true
 }
 
-func (f *codexEventForwarder) flushPendingAgent() {
-	if strings.TrimSpace(f.pendingAgent) == "" {
+func (f *codexEventForwarder) markPendingAgentTerminal(finalText string) {
+	if f == nil || f.pendingAgent.empty() {
 		return
 	}
-	_ = f.sendStreamContent("progress", f.pendingAgent)
-	f.pendingAgent = ""
+	if codexStreamPhaseIsFinalAnswer(f.pendingAgent.phase) {
+		f.pendingAgent.terminal = true
+		return
+	}
+	if strings.TrimSpace(finalText) != "" && sameCodexVisibleText(f.pendingAgent.text, finalText) {
+		f.pendingAgent.terminal = true
+	}
+}
+
+func (f *codexEventForwarder) flushPendingAgent() {
+	if f.pendingAgent.empty() {
+		return
+	}
+	if f.pendingAgent.progressEligible() {
+		_ = f.sendStreamContent("progress", f.pendingAgent.text)
+		f.pendingAgent = pendingCodexAgentMessage{}
+	}
 }
 
 func (f *codexEventForwarder) sendIdleStatus(quietFor time.Duration) {
 	if f != nil && f.bridge != nil && f.bridge.suppressIntermediateWorkChatOutbox(f.chatID) {
 		return
 	}
-	if strings.TrimSpace(f.pendingAgent) != "" {
+	if !f.pendingAgent.empty() {
 		f.flushPendingAgent()
 		return
 	}

@@ -179,6 +179,8 @@ jobs:
           go test ./internal/responsesadapter -count=1 -run 'Test(FacadeStreams(TextLifecycleAndStoresCompletedResponse|MixedTextAndToolCallLifecycle|ReasoningLifecycleAndStoresCompletedResponse)|CodexCompatReasoningSSEMaintainsActiveReasoningItem|ParseInputFoldsRawReasoningWithoutVisibleSummaryIntoAssistantToolCallTurn)$' -v
           go test ./internal/codexrunner -count=1 -run 'TestParseStreamEventJSONL(StreamsAgentProgressForBothCodexFormats|FinalAnswerAndTaskComplete|DropsEmptyAndUnknownPhaseAgentMessages)$' -v
           go test ./internal/codexrunner -count=1 -run 'TestLaunchOutputRecorder(RecoverParseErrors(ContinuesToRecoveredFinal|WithoutTerminalReturnsFirstError)|OmitCommandOutputStillReportsInvalidJSON)$' -v
+          go test ./internal/beacon -count=1 -run 'TestJobStreamWriterReaderIgnoresPartialAndOversizedLines$' -v
+          go test ./internal/teams -count=1 -run 'Test(CodexEventForwarder(DoesNotFlushFinalAnswerAsProgressOnIdle|TreatsTaskCompleteAgentMessageAsTerminal)|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
           go test ./internal/teams -count=1 -run 'Test(ParseCodexTranscript(ClassifiesEventCommentaryAsStatus|SkipsRawReasoningWithoutVisibleSummary)|BridgeStreams(NewFormatCommentaryToTeams|UnphasedAgentMessagesToTeams)|BridgeCanQueueLiveTurnOutbox(ChecksTargetTurn|ChecksTargetTurnSQLite|IgnoresUnrelatedSQLiteCorruption)|BridgeRunningTurnTranscriptBackfill(SendsStatusWithoutAdvancingMainCheckpoint|SkipsWhenLiveProgressAlreadyQueued)|BridgeSyncLinkedTranscript(DedupesLiveStreamed(Commentary|FinalAnswerFragmentSentAsStatus)|SkipsRecentTeamsTurnAgentMessageMirrorByCodexTurnID|KeepsAgentMessageWithoutRecentMirrorEvidence))$' -v
 
       - name: Teams durable control binding regressions

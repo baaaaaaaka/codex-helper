@@ -530,19 +530,27 @@ func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stream writer: %v", err)
 	}
-	if err := streamWriter.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Text: "remote progress", ThreadID: "thread-remote", TurnID: "codex-turn-1"}); err != nil {
-		t.Fatalf("append stream event: %v", err)
+	if err := streamWriter.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Phase: "commentary", Text: "remote progress", ThreadID: "thread-remote", TurnID: "codex-turn-1"}); err != nil {
+		t.Fatalf("append progress stream event: %v", err)
+	}
+	if err := streamWriter.Append(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Phase: "final_answer", Text: "remote final fragment", ThreadID: "thread-remote", TurnID: "codex-turn-1"}); err != nil {
+		t.Fatalf("append final stream event: %v", err)
 	}
 	if err := streamWriter.Close(); err != nil {
 		t.Fatalf("close stream writer: %v", err)
 	}
-	select {
-	case event := <-events:
-		if event.Kind != codexrunner.StreamEventAgentMessage || event.Text != "remote progress" {
-			t.Fatalf("stream event = %#v", event)
+	for _, want := range []codexrunner.StreamEvent{
+		{Kind: codexrunner.StreamEventAgentMessage, Phase: "commentary", Text: "remote progress"},
+		{Kind: codexrunner.StreamEventAgentMessage, Phase: "final_answer", Text: "remote final fragment"},
+	} {
+		select {
+		case event := <-events:
+			if event.Kind != want.Kind || event.Phase != want.Phase || event.Text != want.Text {
+				t.Fatalf("stream event = %#v, want kind=%s phase=%q text=%q", event, want.Kind, want.Phase, want.Text)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for stream event before terminal")
 		}
-	case <-ctx.Done():
-		t.Fatal("timed out waiting for stream event before terminal")
 	}
 
 	if err := store.Update(func(st *beacon.State) error {

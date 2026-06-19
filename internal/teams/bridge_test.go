@@ -1134,6 +1134,80 @@ func TestBridgeStreamsNewFormatCommentaryToTeams(t *testing.T) {
 	}
 }
 
+func TestCodexEventForwarderDoesNotFlushFinalAnswerAsProgressOnIdle(t *testing.T) {
+	ctx := context.Background()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	seedBridgeCanQueueLiveTurnOutboxFixtures(t, ctx, store)
+	forwarder := &codexEventForwarder{
+		ctx:              ctx,
+		bridge:           bridge,
+		sessionID:        "session-1",
+		expectedThreadID: "thread-1",
+		turnID:           "turn-running",
+		chatID:           "chat-1",
+	}
+	final := "delayed final answer must not become progress"
+
+	forwarder.handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Phase: "commentary", ThreadID: "thread-1", TurnID: "codex-turn-1", Text: "checking before final"})
+	forwarder.handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, Phase: "final_answer", ThreadID: "thread-1", TurnID: "codex-turn-1", Text: final})
+	forwarder.handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventTurnCompleted, ThreadID: "thread-1", TurnID: "codex-turn-1", Text: final})
+
+	forwarder.sendIdleStatus(3 * time.Minute)
+
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "🤖 ⏳ Codex status:\nchecking before final") {
+		t.Fatalf("commentary should still stream as progress:\n%s", joined)
+	}
+	if strings.Contains(joined, final) {
+		t.Fatalf("final answer was sent by the live progress forwarder:\n%s", joined)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.HasPrefix(msg.Kind, "codex-progress-") && strings.Contains(msg.Body, final) {
+			t.Fatalf("final answer was queued as progress: %#v", msg)
+		}
+	}
+}
+
+func TestCodexEventForwarderTreatsTaskCompleteAgentMessageAsTerminal(t *testing.T) {
+	ctx := context.Background()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	seedBridgeCanQueueLiveTurnOutboxFixtures(t, ctx, store)
+	forwarder := &codexEventForwarder{
+		ctx:              ctx,
+		bridge:           bridge,
+		sessionID:        "session-1",
+		expectedThreadID: "thread-1",
+		turnID:           "turn-running",
+		chatID:           "chat-1",
+	}
+	final := "legacy final from task_complete"
+
+	forwarder.handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventAgentMessage, ThreadID: "thread-1", TurnID: "codex-turn-1", Text: final})
+	forwarder.handle(codexrunner.StreamEvent{Kind: codexrunner.StreamEventTurnCompleted, ThreadID: "thread-1", TurnID: "codex-turn-1", Text: final})
+	forwarder.sendIdleStatus(3 * time.Minute)
+
+	if joined := sentPlainJoined(*sent); strings.Contains(joined, final) {
+		t.Fatalf("task_complete final was sent by the live progress forwarder:\n%s", joined)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.HasPrefix(msg.Kind, "codex-progress-") && strings.Contains(msg.Body, final) {
+			t.Fatalf("task_complete final was queued as progress: %#v", msg)
+		}
+	}
+}
+
 func TestBridgeStreamsUnphasedAgentMessagesToTeams(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)

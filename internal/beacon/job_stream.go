@@ -47,6 +47,7 @@ type JobStreamCodexEvent struct {
 	TurnID    string                      `json:"turn_id,omitempty"`
 	ItemID    string                      `json:"item_id,omitempty"`
 	ItemType  string                      `json:"item_type,omitempty"`
+	Phase     string                      `json:"phase,omitempty"`
 	Text      string                      `json:"text,omitempty"`
 	Command   string                      `json:"command,omitempty"`
 	Status    string                      `json:"status,omitempty"`
@@ -192,6 +193,7 @@ func newJobStreamCodexEvent(event codexrunner.StreamEvent) JobStreamCodexEvent {
 		TurnID:    strings.TrimSpace(event.TurnID),
 		ItemID:    strings.TrimSpace(event.ItemID),
 		ItemType:  strings.TrimSpace(event.ItemType),
+		Phase:     strings.TrimSpace(event.Phase),
 		Text:      truncateStringBytes(event.Text, jobStreamMaxTextBytes),
 		Command:   truncateStringBytes(event.Command, jobStreamMaxCommandBytes),
 		Status:    strings.TrimSpace(event.Status),
@@ -214,6 +216,7 @@ func (event JobStreamCodexEvent) StreamEvent() codexrunner.StreamEvent {
 		TurnID:    event.TurnID,
 		ItemID:    event.ItemID,
 		ItemType:  event.ItemType,
+		Phase:     event.Phase,
 		Text:      event.Text,
 		Command:   event.Command,
 		Status:    event.Status,
