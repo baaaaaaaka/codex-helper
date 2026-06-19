@@ -37,8 +37,9 @@ const (
 	managedASRLlamaMMProjSHA256  = "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d"
 	managedASRLlamaMMProjSize    = int64(214392480)
 
-	managedASRFFmpegRuntimeVersion = "imageio-ffmpeg-0.6.0-runtime-v1"
-	managedASRFFmpegVersion        = "0.6.0"
+	managedASRFFmpegRuntimeVersion  = "imageio-ffmpeg-0.6.0-runtime-v1"
+	managedASRFFmpegVersion         = "0.6.0"
+	managedASRFFmpegValidateTimeout = 30 * time.Second
 )
 
 var (
@@ -759,7 +760,7 @@ func findManagedASRFFmpegExecutable(root string) (string, error) {
 }
 
 func validateManagedASRFFmpegBinary(ctx context.Context, command string) error {
-	validateCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	validateCtx, cancel := context.WithTimeout(ctx, managedASRFFmpegValidateTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(validateCtx, strings.TrimSpace(command), "-version")
 	cmd.Env = managedASRSetupBaseEnv()
