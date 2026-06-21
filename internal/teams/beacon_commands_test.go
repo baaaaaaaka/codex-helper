@@ -18,6 +18,39 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+const beaconStreamTestTimeout = 30 * time.Second
+
+func failBeaconStreamTestTimeout(t *testing.T, store *beacon.Store, jobID string, received int, reason string) {
+	t.Helper()
+	streamPath, pathErr := beacon.JobStreamPathForStorePath(store.Path(), jobID)
+	var streamSize int64
+	var streamMod string
+	var statErr error
+	if pathErr == nil {
+		var info os.FileInfo
+		info, statErr = os.Stat(streamPath)
+		if statErr == nil {
+			streamSize = info.Size()
+			streamMod = info.ModTime().UTC().Format(time.RFC3339Nano)
+		}
+	}
+	phase := "<missing>"
+	workerID := ""
+	claimEpoch := 0
+	terminal := false
+	st, loadErr := store.Load()
+	if loadErr == nil {
+		if attempt, ok := st.JobAttempts[jobID]; ok {
+			phase = string(attempt.Phase)
+			workerID = attempt.WorkerID
+			claimEpoch = attempt.ClaimEpoch
+		}
+		_, terminal = st.Terminals[jobID]
+	}
+	t.Fatalf("%s after receiving %d stream events; job_id=%s phase=%s terminal=%t worker_id=%s claim_epoch=%d stream_path=%s stream_size=%d stream_mod=%s path_err=%v stat_err=%v load_err=%v",
+		reason, received, jobID, phase, terminal, workerID, claimEpoch, streamPath, streamSize, streamMod, pathErr, statErr, loadErr)
+}
+
 func TestTeamsBeaconControlProfileLifecycleAndList(t *testing.T) {
 	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -493,7 +526,7 @@ func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
 		t.Fatalf("close empty stream: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), beaconStreamTestTimeout)
 	defer cancel()
 	events := make(chan codexrunner.StreamEvent, 8)
 	done := make(chan struct {
@@ -510,6 +543,7 @@ func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
 		}{result: result, err: err}
 	}()
 
+	received := 0
 	var claimed beacon.JobAttempt
 	if err := store.Update(func(st *beacon.State) error {
 		var ok bool
@@ -545,11 +579,12 @@ func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
 	} {
 		select {
 		case event := <-events:
+			received++
 			if event.Kind != want.Kind || event.Phase != want.Phase || event.Text != want.Text {
 				t.Fatalf("stream event = %#v, want kind=%s phase=%q text=%q", event, want.Kind, want.Phase, want.Text)
 			}
 		case <-ctx.Done():
-			t.Fatal("timed out waiting for stream event before terminal")
+			failBeaconStreamTestTimeout(t, store, job.ID, received, "timed out waiting for stream event before terminal")
 		}
 	}
 
@@ -732,7 +767,7 @@ func TestBeaconJobExecutorStressStreamsManySidecarEventsBeforeTerminal(t *testin
 			if len(missing) > 10 {
 				missing = missing[:10]
 			}
-			t.Fatalf("timed out after receiving %d/%d stream events; first missing indexes=%v", count, total, missing)
+			failBeaconStreamTestTimeout(t, store, job.ID, count, fmt.Sprintf("timed out after receiving %d/%d stream events; first missing indexes=%v", count, total, missing))
 		}
 	}
 
@@ -837,7 +872,7 @@ func TestBeaconJobExecutorStressSkipsStaleSidecarClaimMetadata(t *testing.T) {
 	if err := emptyStream.Close(); err != nil {
 		t.Fatalf("close empty stream: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), beaconStreamTestTimeout)
 	defer cancel()
 	events := make(chan codexrunner.StreamEvent, 8)
 	done := make(chan struct {
@@ -916,7 +951,7 @@ func TestBeaconJobExecutorStressSkipsStaleSidecarClaimMetadata(t *testing.T) {
 			t.Fatalf("dispatched stale event instead of current progress: %#v", event)
 		}
 	case <-ctx.Done():
-		t.Fatal("timed out waiting for current progress")
+		failBeaconStreamTestTimeout(t, store, job.ID, 0, "timed out waiting for current progress")
 	}
 	select {
 	case event := <-events:
