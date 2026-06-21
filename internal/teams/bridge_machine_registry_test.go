@@ -257,6 +257,9 @@ func TestBridgeMachineDelegationWorkerUsesRemoteThreadSessionID(t *testing.T) {
 	if prompt := executor.promptText(); !strings.Contains(prompt, "Thread policy: reuse") || !strings.Contains(prompt, delegationReuseRejectedPrefix) {
 		t.Fatalf("prompt = %q, want reuse instructions", prompt)
 	}
+	if !waitPublishersIdle(time.Second, publisher) {
+		t.Fatal("publisher did not finish delegation goroutine")
+	}
 	store, err := delegation.LoadStore(statePath)
 	if err != nil {
 		t.Fatalf("LoadStore: %v", err)
@@ -344,6 +347,9 @@ func TestBridgeMachineDelegationWorkerPublishesReuseRejected(t *testing.T) {
 	state := delegation.Reduce(delegation.RecordsForID(records, req.DelegationID), now)
 	if state.Status != delegation.StateReuseRejected || state.Terminal == nil || state.Terminal.Body != "wrong remote context" {
 		t.Fatalf("state = %#v, want reuse_rejected body", state)
+	}
+	if !waitPublishersIdle(time.Second, publisher) {
+		t.Fatal("publisher did not finish delegation goroutine")
 	}
 	store, err := delegation.LoadStore(statePath)
 	if err != nil {
