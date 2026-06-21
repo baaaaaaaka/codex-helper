@@ -207,6 +207,9 @@ codex-proxy proxy doctor
 | `codex-proxy teams service bootstrap` | 安装或修复后台 Teams helper service |
 | `codex-proxy teams service restart --force` | 恢复本地 active Teams state，然后从终端强制重启 service |
 | `codex-proxy teams control --print` | 打印配置好的 Teams control chat link |
+| `codex-proxy delegate resolve --query <text> --json` | 为 Codex 或诊断解析跨机器 delegation 候选机器 |
+| `codex-proxy delegate start --candidate-token <token> --task-file <path> --json` | 为选中的机器创建 idempotent delegation request |
+| `codex-proxy delegate status` / `wait` / `cancel` | 使用 `start` 保存的 route 检查、等待或取消 delegation |
 | `codex-proxy beacon profile list` | 列出 beacon execution profiles |
 | `codex-proxy beacon profile create <name>` | 创建 draft beacon execution profile |
 | `codex-proxy beacon profile update <name>` | 创建新的 profile revision，不破坏已绑定旧 revision 的 chats |
@@ -486,6 +489,16 @@ Teams chat，并在那里通知你。
 
 Teams 文件和图片 attachments 可在可用时传给 Codex。Codex artifact manifest 中列出的
 generated files 可在配置 file-write auth 后上传回 Teams。
+
+当同一个 Teams 用户在多台机器上运行 helper 时，Codex 可以为需要另一台机器上的
+repo、硬件或本地上下文的任务使用跨机器 delegation。用户侧触发仍然是 Work chat
+中的自然语言，例如“让另一台机器看一下这个 repo”或“让 GPU 机器检查这个失败”；
+Codex 会根据已安装的 `cxp` skill 判断是否调用 `cxp delegate` workflow。每个 active
+helper 会把紧凑的 machine card 和 heartbeat 发布到隐藏的每用户 Teams registry
+chat，并通过自己的隐藏 machine inbox chat 接收任务。registry 只用于 discovery 和
+liveness；delegation request、claim、progress、question 和 result 都保存在目标机器
+的 inbox 中。当前这个机制只在同一个 signed-in Teams user 的机器之间汇合；隐藏
+Teams chats 仍然受 tenant retention、eDiscovery 和 audit policy 约束。
 
 后台 service 会在 terminal close、SSH disconnect、WSL session exit、sleep/wake 或
 helper upgrade 后保持 listener 存活。Service bootstrap 会尽可能选择平台原生 per-user

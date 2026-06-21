@@ -216,6 +216,9 @@ walk through the normal flows in order.
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
 | `codex-proxy teams service restart --force` | Recover local active Teams state, then force a service restart from a terminal |
 | `codex-proxy teams control --print` | Print the configured Teams control chat link |
+| `codex-proxy delegate resolve --query <text> --json` | Resolve cross-machine delegation candidates for Codex or diagnostics |
+| `codex-proxy delegate start --candidate-token <token> --task-file <path> --json` | Create an idempotent delegation request for a selected machine |
+| `codex-proxy delegate status` / `wait` / `cancel` | Inspect, wait for, or cancel a delegation using the route saved by `start` |
 | `codex-proxy beacon profile list` | List beacon execution profiles |
 | `codex-proxy beacon profile create <name>` | Create a draft beacon execution profile |
 | `codex-proxy beacon profile update <name>` | Create a new profile revision without breaking chats already bound to the old revision |
@@ -515,6 +518,19 @@ link the matching Teams chat and notify you there as well.
 Teams file and image attachments can be passed through to Codex when available.
 Generated files listed in a Codex artifact manifest can be uploaded back to
 Teams when file-write auth is configured.
+
+When the same Teams user runs helpers on multiple machines, Codex can use
+cross-machine delegation for tasks that need another machine's repo, hardware,
+or local context. The user-facing trigger is natural language in a Work chat,
+for example "ask the other machine to inspect this repo" or "have the GPU box
+check this failure"; Codex decides whether to use the `cxp delegate` workflow
+from its installed skill. Each active helper publishes a compact machine card
+and heartbeat to a hidden per-user Teams registry chat, then receives work
+through its own hidden machine inbox chat. The registry is only for discovery
+and liveness; delegation requests, claims, progress, questions, and results stay
+in the target machine inbox. This currently converges only for machines signed
+in as the same Teams user, and hidden Teams chats remain subject to tenant
+retention, eDiscovery, and audit policy.
 
 The background service keeps the listener alive after terminal close, SSH
 disconnect, WSL session exit, sleep/wake, or helper upgrade. Service bootstrap
