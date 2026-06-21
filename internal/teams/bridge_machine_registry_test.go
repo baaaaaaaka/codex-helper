@@ -1234,6 +1234,7 @@ func waitPublishersIdle(timeout time.Duration, publishers ...*bridgeMachineRegis
 }
 
 type fakeBridgeMachineRegistryGraph struct {
+	mu        sync.Mutex
 	messages  map[string]machineregistry.ChatMessage
 	order     []string
 	chatOrder map[string][]string
@@ -1256,6 +1257,8 @@ func newFakeBridgeMachineRegistryGraph() *fakeBridgeMachineRegistryGraph {
 }
 
 func (g *fakeBridgeMachineRegistryGraph) CreateOrGetMeetingChatWindow(_ context.Context, topic string, externalID string, start time.Time, end time.Time) (machineregistry.Chat, machineregistry.OnlineMeeting, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.createCalls++
 	chatID := "chat-registry"
 	meetingID := "meeting-registry"
@@ -1290,12 +1293,16 @@ func (g *fakeBridgeMachineRegistryGraph) UpdateOnlineMeetingWindow(_ context.Con
 }
 
 func (g *fakeBridgeMachineRegistryGraph) SendHTML(_ context.Context, chatID string, html string) (machineregistry.ChatMessage, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.sendCount++
 	g.nextID++
-	return g.addMessage(chatID, fmt.Sprintf("message-%06d", g.nextID), html), nil
+	return g.addMessageLocked(chatID, fmt.Sprintf("message-%06d", g.nextID), html), nil
 }
 
 func (g *fakeBridgeMachineRegistryGraph) UpdateChatMessageHTML(_ context.Context, _ string, messageID string, html string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.patchCount++
 	if g.patchErr != nil {
 		err := g.patchErr
@@ -1312,6 +1319,12 @@ func (g *fakeBridgeMachineRegistryGraph) UpdateChatMessageHTML(_ context.Context
 }
 
 func (g *fakeBridgeMachineRegistryGraph) ListMessages(_ context.Context, chatID string, top int) ([]machineregistry.ChatMessage, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.listMessagesLocked(chatID, top), nil
+}
+
+func (g *fakeBridgeMachineRegistryGraph) listMessagesLocked(chatID string, top int) []machineregistry.ChatMessage {
 	order := g.chatOrder[strings.TrimSpace(chatID)]
 	if len(order) == 0 {
 		order = g.order
@@ -1323,26 +1336,34 @@ func (g *fakeBridgeMachineRegistryGraph) ListMessages(_ context.Context, chatID 
 	for i := 0; i < top; i++ {
 		out = append(out, g.messages[order[i]])
 	}
-	return out, nil
+	return out
 }
 
 func (g *fakeBridgeMachineRegistryGraph) ListMessagesExactTopWithoutRateLimitRetry(ctx context.Context, chatID string, top int) ([]machineregistry.ChatMessage, error) {
+	g.mu.Lock()
 	g.exactListCalls++
 	if g.exactErr != nil {
 		err := g.exactErr
 		g.exactErr = nil
+		g.mu.Unlock()
 		return nil, err
 	}
-	return g.ListMessages(ctx, chatID, top)
+	out := g.listMessagesLocked(chatID, top)
+	g.mu.Unlock()
+	return out, nil
 }
 
 func (g *fakeBridgeMachineRegistryGraph) ListMessagesWindow(ctx context.Context, chatID string, top int) (machineregistry.MessageWindow, error) {
+	g.mu.Lock()
 	if g.windowErrOnce != nil {
 		err := g.windowErrOnce
 		g.windowErrOnce = nil
+		g.mu.Unlock()
 		return machineregistry.MessageWindow{}, err
 	}
-	return g.listMessagesWindow(ctx, chatID, top, 0)
+	window := g.listMessagesWindowLocked(chatID, top, 0)
+	g.mu.Unlock()
+	return window, nil
 }
 
 func (g *fakeBridgeMachineRegistryGraph) ListMessagesWindowFromPath(ctx context.Context, path string) (machineregistry.MessageWindow, error) {
@@ -1352,14 +1373,14 @@ func (g *fakeBridgeMachineRegistryGraph) ListMessagesWindowFromPath(ctx context.
 	if _, err := fmt.Sscanf(path, "fake-window:%s %d %d", &chatID, &top, &offset); err != nil {
 		return machineregistry.MessageWindow{}, err
 	}
-	return g.listMessagesWindow(ctx, chatID, top, offset)
+	g.mu.Lock()
+	window := g.listMessagesWindowLocked(chatID, top, offset)
+	g.mu.Unlock()
+	return window, nil
 }
 
-func (g *fakeBridgeMachineRegistryGraph) listMessagesWindow(ctx context.Context, chatID string, top int, offset int) (machineregistry.MessageWindow, error) {
-	messages, err := g.ListMessages(ctx, chatID, 0)
-	if err != nil {
-		return machineregistry.MessageWindow{}, err
-	}
+func (g *fakeBridgeMachineRegistryGraph) listMessagesWindowLocked(chatID string, top int, offset int) machineregistry.MessageWindow {
+	messages := g.listMessagesLocked(chatID, 0)
 	if top <= 0 {
 		top = 50
 	}
@@ -1367,7 +1388,7 @@ func (g *fakeBridgeMachineRegistryGraph) listMessagesWindow(ctx context.Context,
 		offset = 0
 	}
 	if offset >= len(messages) {
-		return machineregistry.MessageWindow{}, nil
+		return machineregistry.MessageWindow{}
 	}
 	end := offset + top
 	if end > len(messages) {
@@ -1378,10 +1399,16 @@ func (g *fakeBridgeMachineRegistryGraph) listMessagesWindow(ctx context.Context,
 		window.Truncated = true
 		window.NextPath = fmt.Sprintf("fake-window:%s %d %d", strings.TrimSpace(chatID), top, end)
 	}
-	return window, nil
+	return window
 }
 
 func (g *fakeBridgeMachineRegistryGraph) addMessage(chatID string, id string, html string) machineregistry.ChatMessage {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.addMessageLocked(chatID, id, html)
+}
+
+func (g *fakeBridgeMachineRegistryGraph) addMessageLocked(chatID string, id string, html string) machineregistry.ChatMessage {
 	msg := machineregistry.ChatMessage{ID: id}
 	msg.Body.Content = html
 	g.messages[id] = msg
