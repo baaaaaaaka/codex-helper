@@ -160,6 +160,16 @@ jobs:
           go test ./internal/teams -count=1 -run "$group_guard_pattern" -v
           go test ./cmd/teams-graph-bench -count=1 -run "$bench_pattern" -v
 
+      - name: Teams cross-machine registry regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams/delegation -count=1 -v
+          go test ./internal/teams/machineregistry -count=1 -v
+          go test ./cmd/teams-registry-probe -count=1 -v
+          go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags)' -v
+          go test ./internal/teams -count=1 -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
+
       - name: Teams manual park and continuation regressions
         shell: bash
         run: |

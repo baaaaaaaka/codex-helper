@@ -29,6 +29,9 @@ func TestInstallBuiltinsPublishesCxpSkill(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(installed.TargetPath, "references", "commands.md")); err != nil {
 		t.Fatalf("installed command reference missing: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(installed.TargetPath, "references", "delegation.md")); err != nil {
+		t.Fatalf("installed delegation reference missing: %v", err)
+	}
 	manifest, ok, err := readExportManifest(filepath.Join(installed.TargetPath, manifestFilename))
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
@@ -98,8 +101,11 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 	files := builtinCxpSkillTestFiles(t)
 	skill := files["SKILL.md"]
 	reference := files["references/commands.md"]
+	delegation := files["references/delegation.md"]
 	for _, want := range []string{
 		"$CODEX_HELPER_CLI_PATH",
+		"references/delegation.md",
+		"cxp delegate resolve/start/status/wait/cancel --json",
 		"cxp beacon switch-profile <profile> --session <session-id> --after-current-turn",
 		"helper reload now",
 		"helper restart now",
@@ -132,6 +138,14 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp teams probe-chat --chat <teams-chat-id-or-link>",
 		"cxp teams pause",
 		"cxp teams chat recreate <session-id> --yes",
+		"cxp delegate resolve --query <text> --json",
+		"cxp delegate start --candidate-token <token> --task-file <path> --json",
+		"cxp delegate wait --id <delegation-id> --timeout <duration> --json",
+		"cxp delegate claim --id <delegation-id> --machine-id <machine>",
+		"cxp delegate progress --id <delegation-id> --claim-id <claim>",
+		"cxp delegate question --id <delegation-id> --claim-id <claim>",
+		"cxp delegate result --id <delegation-id> --claim-id <claim>",
+		"cxp delegate machine publish-once --machine-id <machine>",
 		"new <directory> --model <profile>",
 		"model status",
 		"helper update prerelease",
@@ -145,6 +159,23 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 			t.Fatalf("commands.md missing %q:\n%s", want, reference)
 		}
 	}
+	for _, want := range []string{
+		"Cross-Machine Delegation",
+		"cxp delegate resolve --query",
+		"cxp delegate start --candidate-token",
+		"cxp delegate claim --id",
+		"cxp delegate progress --id",
+		"cxp delegate question --id",
+		"cxp delegate result --id",
+		"cxp delegate machine publish-once",
+		"bounded task delegation",
+		"start is idempotent",
+		"Claims and terminal results are epoch-fenced",
+	} {
+		if !strings.Contains(delegation, want) {
+			t.Fatalf("delegation.md missing %q:\n%s", want, delegation)
+		}
+	}
 }
 
 func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloat(t *testing.T) {
@@ -156,6 +187,7 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 		"proxy/SSH profiles",
 		"model profiles/Responses adapter/YOLO mode",
 		"Teams helper/control/work chats",
+		"cross-machine delegation/remote agents",
 		"Codex history or skills",
 		"upgrades",
 		"beacon/execution target/profile switching",
@@ -173,7 +205,9 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 		"YOLO mode",
 		"execution target/profile switching",
 		"GPU/Slurm/LSF/local execution",
+		"cross-machine delegation/remote agents/asking another signed-in machine",
 		"For the command map and workflows, load `references/commands.md`",
+		"For natural-language cross-machine requests, load `references/delegation.md`",
 	} {
 		if !strings.Contains(skill, want) {
 			t.Fatalf("SKILL.md missing progressive trigger guidance %q:\n%s", want, skill)
@@ -186,7 +220,7 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 
 func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 	files := builtinCxpSkillTestFiles(t)
-	all := files["SKILL.md"] + "\n" + files["references/commands.md"]
+	all := files["SKILL.md"] + "\n" + files["references/commands.md"] + "\n" + files["references/delegation.md"]
 	scenarios := []struct {
 		name     string
 		required []string
@@ -261,6 +295,17 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			required: []string{
 				"If the command reports an incompatible execution signature, ask whether to fork before using `--fork`",
 				"cxp beacon switch-profile <name> --session <session-id> --fork",
+			},
+		},
+		{
+			name: "natural language cross machine delegation",
+			required: []string{
+				"cross-machine delegation/remote agents/asking another signed-in machine",
+				"cxp delegate resolve --query <text> --json",
+				"cxp delegate start --candidate-token <token> --task-file <path> --json",
+				"cxp delegate result --id <delegation-id> --claim-id <claim>",
+				"bounded task delegation",
+				"do not scan raw Teams registry messages",
 			},
 		},
 		{
@@ -341,8 +386,8 @@ func builtinCxpSkillTestFiles(t *testing.T) map[string]string {
 	for _, file := range tree.Files {
 		files[file.RelPath] = string(file.Data)
 	}
-	if files["SKILL.md"] == "" || files["references/commands.md"] == "" {
-		t.Fatalf("builtin cxp skill files = %v, want SKILL.md and references/commands.md", sortedBuiltinTestKeys(files))
+	if files["SKILL.md"] == "" || files["references/commands.md"] == "" || files["references/delegation.md"] == "" {
+		t.Fatalf("builtin cxp skill files = %v, want SKILL.md and references", sortedBuiltinTestKeys(files))
 	}
 	return files
 }

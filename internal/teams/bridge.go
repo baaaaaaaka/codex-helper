@@ -24,6 +24,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
+	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	xhtml "golang.org/x/net/html"
 )
@@ -183,29 +184,37 @@ type outboxQueueOptions struct {
 }
 
 type BridgeOptions struct {
-	RegistryPath               string
-	StorePath                  string
-	Store                      *teamstore.Store
-	HelperVersion              string
-	OwnerStaleAfter            time.Duration
-	Interval                   time.Duration
-	Once                       bool
-	Top                        int
-	MaxWorkChatPollsPerCycle   int
-	Executor                   Executor
-	ControlFallbackExecutor    Executor
-	ControlFallbackModel       string
-	ControlFallbackHelpContext string
-	ModelProfileResolver       ModelProfileResolver
-	ModelProfileManager        ModelProfileManager
-	ASRTranscriber             ASRTranscriber
-	Runner                     codexrunner.Runner
-	HelperRestarter            HelperRestarter
-	HelperPendingRestarter     HelperPendingRestarter
-	HelperReloader             HelperReloader
-	HelperAutoUpdater          HelperAutoUpdater
-	HelperAutoUpdatePrerelease bool
-	CodexUpgrader              CodexUpgrader
+	RegistryPath                       string
+	StorePath                          string
+	Store                              *teamstore.Store
+	HelperVersion                      string
+	OwnerStaleAfter                    time.Duration
+	Interval                           time.Duration
+	Once                               bool
+	Top                                int
+	MaxWorkChatPollsPerCycle           int
+	Executor                           Executor
+	ControlFallbackExecutor            Executor
+	ControlFallbackModel               string
+	ControlFallbackHelpContext         string
+	ModelProfileResolver               ModelProfileResolver
+	ModelProfileManager                ModelProfileManager
+	ASRTranscriber                     ASRTranscriber
+	Runner                             codexrunner.Runner
+	HelperRestarter                    HelperRestarter
+	HelperPendingRestarter             HelperPendingRestarter
+	HelperReloader                     HelperReloader
+	HelperAutoUpdater                  HelperAutoUpdater
+	HelperAutoUpdatePrerelease         bool
+	CodexUpgrader                      CodexUpgrader
+	MachineRegistryEnabled             bool
+	MachineRegistryGraph               machineregistry.Graph
+	MachineRegistryCachePath           string
+	MachineDelegationStatePath         string
+	MachineDelegationClaimRecheckDelay time.Duration
+	MachineRegistryInterval            time.Duration
+	MachineRegistryTTL                 time.Duration
+	MachineRegistryNow                 func() time.Time
 }
 
 type ModelProfileResolver func(context.Context, string) (modelprofile.Snapshot, error)
@@ -873,7 +882,13 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	ownerHeartbeatCtx, cancelOwnerHeartbeat := context.WithCancel(ctx)
 	ownerHeartbeatDone := b.startOwnerHeartbeat(ownerHeartbeatCtx)
+	machineRegistryCtx, cancelMachineRegistry := context.WithCancel(ctx)
+	machineRegistryDone := b.startMachineRegistryHeartbeat(machineRegistryCtx, opts)
 	defer func() {
+		cancelMachineRegistry()
+		if machineRegistryDone != nil {
+			<-machineRegistryDone
+		}
 		cancelOwnerHeartbeat()
 		if ownerHeartbeatDone != nil {
 			<-ownerHeartbeatDone

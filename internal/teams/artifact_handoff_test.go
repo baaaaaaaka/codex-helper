@@ -106,6 +106,8 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 		"`helper restart now`",
 		"`helper update now`",
 		"`helper reload now` only for source-checkout development reloads",
+		"cross-machine agent delegation",
+		"`cxp delegate`",
 		artifactHandoffInstructionLead,
 	} {
 		if !strings.Contains(got, want) {

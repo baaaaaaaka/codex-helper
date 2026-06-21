@@ -36,7 +36,8 @@ Teams helper safety:
 - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
 - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send ` + "`helper restart now`" + ` in the Teams control chat.
 - If the helper needs a release update, tell the user to send ` + "`helper update now`" + `, or ` + "`helper update prerelease`" + ` only when they asked for prereleases.
-- Tell the user to send ` + "`helper reload now`" + ` only for source-checkout development reloads when a local ` + "`codex-helper`" + ` source tree is available.`)
+- Tell the user to send ` + "`helper reload now`" + ` only for source-checkout development reloads when a local ` + "`codex-helper`" + ` source tree is available.
+- For cross-machine agent delegation, use the cxp skill and its ` + "`cxp delegate`" + ` workflow when the task needs another signed-in Teams machine.`)
 	instructions := strings.TrimSpace(`
 If you need to return generated files or images to the Teams user, write them under this local directory:
 ` + root + `

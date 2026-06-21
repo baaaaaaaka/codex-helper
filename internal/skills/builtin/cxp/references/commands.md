@@ -74,6 +74,21 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 
 From a Teams-launched Codex child turn, do not restart, reload, update, kill, replace, or background the running helper directly. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Use `helper reload now` only for source-checkout development reloads when the helper has access to a local `codex-helper` source tree.
 
+## Cross-Machine Delegation
+
+Use these from a Codex turn when the user naturally asks another signed-in Teams machine or remote agent to inspect part of the task. Load `references/delegation.md` for the full workflow.
+
+- `cxp delegate resolve --query <text> --json`: return a compact action and top candidates; add `--source-session <codex-thread> --workspace-fingerprint <key>` when available so the result can include a `new_thread_token` and reusable `thread_candidates`. Registry internals stay out of the model prompt.
+- `cxp delegate start --candidate-token <token> --task-file <path> --json`: create an idempotent delegation request for the selected machine. Add `--new-thread-token <token>` for a fresh remote thread or `--thread-token <token>` to continue a reusable remote thread when `resolve` returned one.
+- `cxp delegate status --id <delegation-id> --json`: inspect reduced state.
+- `cxp delegate wait --id <delegation-id> --timeout <duration> --json`: wait for a terminal result or a target-side question without tight polling. Add `--until terminal` to ignore intermediate questions.
+- `cxp delegate cancel --id <delegation-id> --json`: tombstone an open request.
+- `cxp delegate claim --id <delegation-id> --machine-id <machine> --worker-instance <worker> --json`: claim an open request from the target machine side; execute only when JSON returns `winning=true` and `should_execute=true`.
+- `cxp delegate progress --id <delegation-id> --claim-id <claim> --claim-epoch <n> --machine-id <machine> --worker-instance <worker> --body <text> --json`: publish sparse intermediate progress for the winning claim.
+- `cxp delegate question --id <delegation-id> --claim-id <claim> --claim-epoch <n> --machine-id <machine> --worker-instance <worker> --body <text> --json`: publish one sparse blocker question for the source agent/user.
+- `cxp delegate result --id <delegation-id> --claim-id <claim> --claim-epoch <n> --machine-id <machine> --worker-instance <worker> --status complete|blocked|reuse_rejected --body <text> --json`: publish the terminal result for the winning claim. Normal target helpers publish `reuse_rejected` automatically when Agent B replies with `CXP_REUSE_REJECTED: <reason>` for a bad reused thread.
+- `cxp delegate machine publish-once --machine-id <machine> --capability <cap> --json`: publish one machine capability heartbeat to the Teams registry for diagnostics; active `cxp teams run` helpers publish and patch their heartbeat automatically.
+
 ## Teams Chat Commands
 
 Control chat commands:

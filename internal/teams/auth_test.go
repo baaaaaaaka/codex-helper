@@ -596,6 +596,31 @@ func TestEffectiveAuthConfigsPreferDedicatedTokenCache(t *testing.T) {
 	}
 }
 
+func TestDefaultEffectiveAuthConfigUsesChatWriteCacheWhenFullCacheMissing(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	setTeamsAuthIDsForTest(t)
+	chatPath := teamsStatePathForTest(t, "teams", "profiles", "default", chatWriteTokenCacheName)
+	if err := writeTokenCache(chatPath, TokenCache{
+		AccessToken: "chat-access",
+		ExpiresAt:   time.Now().Add(time.Hour).Unix(),
+		Scope:       defaultScopes,
+	}); err != nil {
+		t.Fatalf("write chat token cache: %v", err)
+	}
+
+	cfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	if cfg.CachePath != chatPath {
+		t.Fatalf("effective chat cache path = %q, want chat cache %q", cfg.CachePath, chatPath)
+	}
+	if cfg.Scopes != defaultScopes {
+		t.Fatalf("effective chat scopes = %q, want %q", cfg.Scopes, defaultScopes)
+	}
+}
+
 func TestEffectiveAuthConfigsHonorExplicitTokenCacheOverride(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)

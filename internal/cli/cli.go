@@ -48,6 +48,7 @@ func newRootCmd() *cobra.Command {
 		newInternalNpmWrapperCmd(),
 		newAppCmd(opts),
 		newInitCmd(opts),
+		newDelegateCmd(opts),
 		newModelCmd(opts),
 		newModelProfileCmd(opts),
 		newRunCmd(opts),

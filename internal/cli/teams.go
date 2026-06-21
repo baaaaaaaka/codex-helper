@@ -669,6 +669,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var autoUpdatePrerelease bool
 	var autoService bool
 	var modelProfile string
+	var machineRegistry bool
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -734,26 +735,41 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if autoUpdate {
 					helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
 				}
+				var machineRegistryGraph teams.MachineRegistryGraphAdapter
+				machineRegistryEnabled := false
+				if !once && machineRegistry {
+					registryAuth, registryErr := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+					if registryErr == nil {
+						registryGraph := teams.NewGraphClientWithHTTPClient(registryAuth, io.Discard, httpClient.Client)
+						machineRegistryGraph = teams.NewMachineRegistryGraphAdapter(registryGraph)
+						machineRegistryEnabled = true
+					} else {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams machine registry heartbeat disabled: Teams write auth is unavailable: %v\n", registryErr)
+					}
+				}
 				return bridge.Listen(cmd.Context(), teams.BridgeOptions{
-					RegistryPath:               *registryPath,
-					HelperVersion:              buildVersion(),
-					Interval:                   interval,
-					Once:                       once,
-					Top:                        top,
-					OwnerStaleAfter:            ownerStaleAfter,
-					MaxWorkChatPollsPerCycle:   maxWorkChatPolls,
-					Executor:                   executor,
-					ControlFallbackExecutor:    controlFallbackExecutor,
-					ControlFallbackModel:       controlFallbackModel,
-					ControlFallbackHelpContext: teamsControlFallbackHelpContext(),
-					ModelProfileResolver:       newTeamsModelProfileResolver(root),
-					ModelProfileManager:        newTeamsModelProfileManager(root),
-					ASRTranscriber:             asrTranscriber,
-					HelperRestarter:            restartTeamsHelperFromTeams,
-					HelperPendingRestarter:     restartTeamsHelperFromTeamsAfterPendingReplacement,
-					HelperReloader:             reloadTeamsHelperFromTeams,
-					HelperAutoUpdater:          helperAutoUpdater,
-					HelperAutoUpdatePrerelease: autoUpdatePrerelease,
+					RegistryPath:                       *registryPath,
+					HelperVersion:                      buildVersion(),
+					Interval:                           interval,
+					Once:                               once,
+					Top:                                top,
+					OwnerStaleAfter:                    ownerStaleAfter,
+					MaxWorkChatPollsPerCycle:           maxWorkChatPolls,
+					Executor:                           executor,
+					ControlFallbackExecutor:            controlFallbackExecutor,
+					ControlFallbackModel:               controlFallbackModel,
+					ControlFallbackHelpContext:         teamsControlFallbackHelpContext(),
+					ModelProfileResolver:               newTeamsModelProfileResolver(root),
+					ModelProfileManager:                newTeamsModelProfileManager(root),
+					ASRTranscriber:                     asrTranscriber,
+					HelperRestarter:                    restartTeamsHelperFromTeams,
+					HelperPendingRestarter:             restartTeamsHelperFromTeamsAfterPendingReplacement,
+					HelperReloader:                     reloadTeamsHelperFromTeams,
+					HelperAutoUpdater:                  helperAutoUpdater,
+					HelperAutoUpdatePrerelease:         autoUpdatePrerelease,
+					MachineRegistryEnabled:             machineRegistryEnabled,
+					MachineRegistryGraph:               machineRegistryGraph,
+					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
 					CodexUpgrader: func(ctx context.Context) (teams.CodexUpgradeResult, error) {
 						return runTeamsCodexUpgradeFromBridge(ctx, root, cmd.ErrOrStderr(), codexPath)
 					},
@@ -787,6 +803,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().StringVar(&autoUpdateRepo, "auto-update-repo", "", "Override GitHub repo for Teams helper auto-update checks")
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
+	cmd.Flags().BoolVar(&machineRegistry, "machine-registry", true, "Enable cross-machine Teams registry heartbeat and delegation worker")
 	return cmd
 }
 

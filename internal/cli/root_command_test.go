@@ -22,7 +22,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "app", "beacon", "history", "init", "model", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "app", "beacon", "delegate", "history", "init", "model", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -171,6 +171,11 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	if runCmd.Flags().Lookup("auto-service") == nil {
 		t.Fatal("teams run should expose Teams helper background service auto-ensure flag")
+	}
+	if flag := runCmd.Flags().Lookup("machine-registry"); flag == nil {
+		t.Fatal("teams run should expose --machine-registry")
+	} else if flag.DefValue != "true" {
+		t.Fatalf("teams run --machine-registry default = %q, want true", flag.DefValue)
 	}
 	if flag := runCmd.Flags().Lookup("codex-timeout"); flag == nil {
 		t.Fatal("teams run should expose --codex-timeout")

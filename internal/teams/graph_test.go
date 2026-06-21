@@ -426,6 +426,15 @@ func TestGraphStatusErrorRedactsDynamicPathValues(t *testing.T) {
 	if strings.Contains(uploadErr, "private-file.txt") || !strings.Contains(uploadErr, "/me/drive/root:/{path}:/content") {
 		t.Fatalf("upload GraphStatusError path redaction mismatch: %q", uploadErr)
 	}
+	meetingErr := (&GraphStatusError{
+		Method:     http.MethodPatch,
+		Path:       "/me/onlineMeetings/meeting-secret-id",
+		StatusCode: http.StatusForbidden,
+		Code:       "Forbidden",
+	}).Error()
+	if strings.Contains(meetingErr, "meeting-secret-id") || !strings.Contains(meetingErr, "/me/onlineMeetings/{online-meeting-id}") {
+		t.Fatalf("online meeting GraphStatusError path redaction mismatch: %q", meetingErr)
+	}
 }
 
 func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
@@ -466,6 +475,14 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats/a/../unhideForUser"},
 		{http.MethodPost, "/chats/a/../markChatUnreadForUser"},
 		{http.MethodPost, "/me/onlineMeetings/createOrGet?$top=1"},
+		{http.MethodGet, "/me/onlineMeetings/meeting-id"},
+		{http.MethodGet, "/me/onlineMeetings/meeting-id?$select=*"},
+		{http.MethodGet, "/me/onlineMeetings/meeting-id?$top=1"},
+		{http.MethodGet, "/me/onlineMeetings/meeting-id/extra?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodGet, "/me/onlineMeetings/../meeting-id?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodGet, "/me/onlineMeetings/meeting%2Fid?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodPatch, "/me/onlineMeetings/meeting-id?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodPatch, "/me/onlineMeetings/meeting%2Fid"},
 		{http.MethodGet, "/shares/u!abc/driveItem?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content?$top=1"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content/extra"},
@@ -499,6 +516,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats"},
 		{http.MethodPost, "/me/onlineMeetings"},
 		{http.MethodPost, "/me/onlineMeetings/createOrGet"},
+		{http.MethodGet, "/me/onlineMeetings/meeting-id?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodPatch, "/me/onlineMeetings/meeting-id"},
 		{http.MethodGet, "/chats/chat-id?$select=id,topic,chatType,webUrl"},
 		{http.MethodGet, "/chats/chat-id/members"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50"},
@@ -685,6 +704,175 @@ func TestGraphCreateMeetingChatUsesOnlineMeetingThreadID(t *testing.T) {
 	}
 }
 
+func TestGraphCreateOrGetMeetingChatUsesStableExternalID(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access", tenantID: "tenant-1"}
+	var sawMe bool
+	var sawCreateOrGet bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.String() == "/me?$select=id,displayName,userPrincipalName":
+			sawMe = true
+			_, _ = fmt.Fprint(w, `{"id":"user-1","displayName":"User One","userPrincipalName":"user@example.test"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings/createOrGet":
+			sawCreateOrGet = true
+			var payload struct {
+				Subject                        string `json:"subject"`
+				ExternalID                     string `json:"externalId"`
+				StartDateTime                  string `json:"startDateTime"`
+				EndDateTime                    string `json:"endDateTime"`
+				AllowMeetingChat               string `json:"allowMeetingChat"`
+				ShareMeetingChatHistoryDefault string `json:"shareMeetingChatHistoryDefault"`
+				Participants                   struct {
+					Attendees []struct {
+						UPN      string `json:"upn"`
+						Role     string `json:"role"`
+						Identity struct {
+							User struct {
+								ID string `json:"id"`
+							} `json:"user"`
+						} `json:"identity"`
+					} `json:"attendees"`
+				} `json:"participants"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode createOrGet payload: %v", err)
+			}
+			if payload.Subject != "CXP Registry Probe" ||
+				payload.ExternalID != "cxp-registry-test-external-id" ||
+				payload.StartDateTime == "" ||
+				payload.EndDateTime == "" ||
+				payload.AllowMeetingChat != "enabled" ||
+				payload.ShareMeetingChatHistoryDefault != "all" {
+				t.Fatalf("unexpected createOrGet payload: %#v", payload)
+			}
+			if len(payload.Participants.Attendees) != 1 ||
+				payload.Participants.Attendees[0].UPN != "user@example.test" ||
+				payload.Participants.Attendees[0].Role != "attendee" ||
+				payload.Participants.Attendees[0].Identity.User.ID != "user-1" {
+				t.Fatalf("unexpected createOrGet attendee: %#v", payload.Participants.Attendees)
+			}
+			_, _ = fmt.Fprint(w, `{"id":"meeting-1","subject":"CXP Registry Probe","joinWebUrl":"https://teams.example/join","chatInfo":{"threadId":"19:meeting_registry@thread.v2"}}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	chat, meeting, err := graph.CreateOrGetMeetingChat(context.Background(), "CXP Registry Probe", "cxp-registry-test-external-id")
+	if err != nil {
+		t.Fatalf("CreateOrGetMeetingChat error: %v", err)
+	}
+	if !sawMe || !sawCreateOrGet {
+		t.Fatalf("missing Graph calls: sawMe=%v sawCreateOrGet=%v", sawMe, sawCreateOrGet)
+	}
+	if meeting.ID != "meeting-1" || meeting.ChatInfo.ThreadID != "19:meeting_registry@thread.v2" {
+		t.Fatalf("unexpected meeting: %#v", meeting)
+	}
+	if chat.ID != "19:meeting_registry@thread.v2" || chat.ChatType != "meeting" || chat.Topic != "CXP Registry Probe" {
+		t.Fatalf("unexpected meeting chat: %#v", chat)
+	}
+	if !strings.Contains(chat.WebURL, "tenantId=tenant-1") {
+		t.Fatalf("chat WebURL = %q, want tenant link", chat.WebURL)
+	}
+}
+
+func TestGraphCreateOrGetMeetingChatWindowUsesProvidedWindow(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	start := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	end := start.Add(45 * 24 * time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.String() == "/me?$select=id,displayName,userPrincipalName":
+			_, _ = fmt.Fprint(w, `{"id":"user-1","displayName":"User One","userPrincipalName":"user@example.test"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings/createOrGet":
+			var payload struct {
+				StartDateTime string `json:"startDateTime"`
+				EndDateTime   string `json:"endDateTime"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode createOrGet payload: %v", err)
+			}
+			if payload.StartDateTime != start.Format(time.RFC3339) || payload.EndDateTime != end.Format(time.RFC3339) {
+				t.Fatalf("meeting window = %s/%s, want %s/%s", payload.StartDateTime, payload.EndDateTime, start.Format(time.RFC3339), end.Format(time.RFC3339))
+			}
+			_, _ = fmt.Fprint(w, `{"id":"meeting-1","subject":"CXP Registry","joinWebUrl":"https://teams.example/join","chatInfo":{"threadId":"19:meeting_registry@thread.v2"}}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	if _, _, err := graph.CreateOrGetMeetingChatWindow(context.Background(), "CXP Registry", "external-id", start, end); err != nil {
+		t.Fatalf("CreateOrGetMeetingChatWindow error: %v", err)
+	}
+	if _, _, err := graph.CreateOrGetMeetingChatWindow(context.Background(), "CXP Registry", "external-id", end, start); err == nil {
+		t.Fatal("expected invalid window error")
+	}
+}
+
+func TestGraphOnlineMeetingWindowRefresh(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	start := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	end := start.Add(45 * 24 * time.Hour)
+	var sawGet, sawPatch bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/me/onlineMeetings/meeting-1":
+			sawGet = true
+			if r.URL.Query().Get("$select") != "id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo" {
+				t.Fatalf("meeting get query = %q", r.URL.RawQuery)
+			}
+			_, _ = fmt.Fprint(w, `{"id":"meeting-1","subject":"CXP Registry","startDateTime":"2026-06-20T10:00:00Z","endDateTime":"2026-08-04T10:00:00Z","expiryDateTime":"2026-08-05T10:00:00Z","chatInfo":{"threadId":"19:meeting_registry@thread.v2"}}`)
+		case r.Method == http.MethodPatch && r.URL.Path == "/me/onlineMeetings/meeting-1":
+			sawPatch = true
+			if r.URL.RawQuery != "" {
+				t.Fatalf("meeting patch query = %q", r.URL.RawQuery)
+			}
+			var payload struct {
+				StartDateTime string `json:"startDateTime"`
+				EndDateTime   string `json:"endDateTime"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode patch payload: %v", err)
+			}
+			if payload.StartDateTime != start.Format(time.RFC3339) || payload.EndDateTime != end.Format(time.RFC3339) {
+				t.Fatalf("refresh window = %s/%s, want %s/%s", payload.StartDateTime, payload.EndDateTime, start.Format(time.RFC3339), end.Format(time.RFC3339))
+			}
+			_, _ = fmt.Fprintf(w, `{"id":"meeting-1","subject":"CXP Registry","startDateTime":%q,"endDateTime":%q,"chatInfo":{"threadId":"19:meeting_registry@thread.v2"}}`, start.Format(time.RFC3339), end.Format(time.RFC3339))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	meeting, err := graph.GetOnlineMeeting(context.Background(), "meeting-1")
+	if err != nil {
+		t.Fatalf("GetOnlineMeeting error: %v", err)
+	}
+	if meeting.ID != "meeting-1" || meeting.ChatInfo.ThreadID == "" {
+		t.Fatalf("unexpected meeting: %#v", meeting)
+	}
+	refreshed, err := graph.UpdateOnlineMeetingWindow(context.Background(), "meeting-1", start, end)
+	if err != nil {
+		t.Fatalf("UpdateOnlineMeetingWindow error: %v", err)
+	}
+	if refreshed.EndDateTime != end.Format(time.RFC3339) {
+		t.Fatalf("refreshed end = %q, want %q", refreshed.EndDateTime, end.Format(time.RFC3339))
+	}
+	if !sawGet || !sawPatch {
+		t.Fatalf("missing meeting calls: sawGet=%v sawPatch=%v", sawGet, sawPatch)
+	}
+	if _, err := graph.GetOnlineMeeting(context.Background(), ""); err == nil {
+		t.Fatal("expected empty meeting id error")
+	}
+}
+
 func TestGraphAllowlistRejectsRawAndBytesBeforeToken(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	graph := &GraphClient{auth: auth}
@@ -710,6 +898,9 @@ func TestGraphAllowlistRejectsEncodedTraversalInDynamicIDs(t *testing.T) {
 		{http.MethodGet, "/chats/chat-id/messages/message%2Fid"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/%2e%2e/$value"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/content%2Fid/$value"},
+		{http.MethodGet, "/me/onlineMeetings/%2e%2e?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodGet, "/me/onlineMeetings/meeting%2Fid?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"},
+		{http.MethodPatch, "/me/onlineMeetings/meeting%2Fid"},
 	}
 	for _, tc := range rejected {
 		if isAllowedGraphRequest(tc.method, tc.path) {

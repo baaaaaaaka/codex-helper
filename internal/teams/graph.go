@@ -62,10 +62,13 @@ type Chat struct {
 }
 
 type OnlineMeeting struct {
-	ID         string `json:"id"`
-	Subject    string `json:"subject"`
-	JoinWebURL string `json:"joinWebUrl"`
-	ChatInfo   struct {
+	ID             string `json:"id"`
+	Subject        string `json:"subject"`
+	JoinWebURL     string `json:"joinWebUrl"`
+	StartDateTime  string `json:"startDateTime,omitempty"`
+	EndDateTime    string `json:"endDateTime,omitempty"`
+	ExpiryDateTime string `json:"expiryDateTime,omitempty"`
+	ChatInfo       struct {
 		ThreadID  string `json:"threadId"`
 		MessageID string `json:"messageId,omitempty"`
 	} `json:"chatInfo"`
@@ -290,6 +293,97 @@ func (g *GraphClient) CreateMeetingChat(ctx context.Context, topic string) (Chat
 		ChatType: "meeting",
 		WebURL:   webURL,
 	}, nil
+}
+
+func (g *GraphClient) CreateOrGetMeetingChat(ctx context.Context, topic string, externalID string) (Chat, OnlineMeeting, error) {
+	now := time.Now().UTC()
+	return g.CreateOrGetMeetingChatWindow(ctx, topic, externalID, now, now.Add(24*time.Hour))
+}
+
+func (g *GraphClient) CreateOrGetMeetingChatWindow(ctx context.Context, topic string, externalID string, start time.Time, end time.Time) (Chat, OnlineMeeting, error) {
+	subject := SanitizeTopic(topic)
+	externalID = strings.TrimSpace(externalID)
+	if externalID == "" {
+		return Chat{}, OnlineMeeting{}, fmt.Errorf("onlineMeeting external id is required")
+	}
+	start = start.UTC()
+	end = end.UTC()
+	if start.IsZero() || end.IsZero() || !end.After(start) {
+		return Chat{}, OnlineMeeting{}, fmt.Errorf("onlineMeeting window must have endDateTime after startDateTime")
+	}
+	me, err := g.Me(ctx)
+	if err != nil {
+		return Chat{}, OnlineMeeting{}, err
+	}
+	body := map[string]any{
+		"subject":       subject,
+		"externalId":    externalID,
+		"startDateTime": start.Format(time.RFC3339),
+		"endDateTime":   end.Format(time.RFC3339),
+		"participants": map[string]any{
+			"attendees": []map[string]any{
+				{
+					"upn":  strings.TrimSpace(me.UserPrincipalName),
+					"role": "attendee",
+					"identity": map[string]any{
+						"user": map[string]any{
+							"id": strings.TrimSpace(me.ID),
+						},
+					},
+				},
+			},
+		},
+		"allowMeetingChat":               "enabled",
+		"shareMeetingChatHistoryDefault": "all",
+	}
+	var meeting OnlineMeeting
+	if err := g.do(ctx, http.MethodPost, "/me/onlineMeetings/createOrGet", body, &meeting); err != nil {
+		return Chat{}, OnlineMeeting{}, err
+	}
+	threadID := strings.TrimSpace(meeting.ChatInfo.ThreadID)
+	if threadID == "" {
+		return Chat{}, meeting, fmt.Errorf("onlineMeeting response did not include chatInfo.threadId")
+	}
+	webURL := TeamsChatURL(threadID, g.tenantID())
+	if webURL == "" {
+		webURL = meeting.JoinWebURL
+	}
+	return Chat{
+		ID:       threadID,
+		Topic:    firstNonEmptyString(SanitizeTopic(meeting.Subject), subject),
+		ChatType: "meeting",
+		WebURL:   webURL,
+	}, meeting, nil
+}
+
+func (g *GraphClient) GetOnlineMeeting(ctx context.Context, meetingID string) (OnlineMeeting, error) {
+	meetingID = strings.TrimSpace(meetingID)
+	if meetingID == "" {
+		return OnlineMeeting{}, fmt.Errorf("onlineMeeting id is required")
+	}
+	var meeting OnlineMeeting
+	path := "/me/onlineMeetings/" + url.PathEscape(meetingID) + "?$select=id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"
+	err := g.do(ctx, http.MethodGet, path, nil, &meeting)
+	return meeting, err
+}
+
+func (g *GraphClient) UpdateOnlineMeetingWindow(ctx context.Context, meetingID string, start time.Time, end time.Time) (OnlineMeeting, error) {
+	meetingID = strings.TrimSpace(meetingID)
+	if meetingID == "" {
+		return OnlineMeeting{}, fmt.Errorf("onlineMeeting id is required")
+	}
+	start = start.UTC()
+	end = end.UTC()
+	if start.IsZero() || end.IsZero() || !end.After(start) {
+		return OnlineMeeting{}, fmt.Errorf("onlineMeeting window must have endDateTime after startDateTime")
+	}
+	body := map[string]any{
+		"startDateTime": start.Format(time.RFC3339),
+		"endDateTime":   end.Format(time.RFC3339),
+	}
+	var meeting OnlineMeeting
+	err := g.do(ctx, http.MethodPatch, "/me/onlineMeetings/"+url.PathEscape(meetingID), body, &meeting)
+	return meeting, err
 }
 
 type graphAuthWithTenant interface {
@@ -1196,6 +1290,14 @@ func isAllowedGraphRequest(method string, path string) bool {
 		}
 		return true
 	}
+	if method == http.MethodGet && isMeOnlineMeetingPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && allowedOnlineMeetingQuery(q)
+	}
+	if method == http.MethodPatch && isMeOnlineMeetingPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && len(q) == 0
+	}
 	if method == http.MethodPatch && isChatPath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
@@ -1288,6 +1390,10 @@ func redactGraphPath(path string) string {
 		case "hostedContents":
 			if parts[i] != "" && parts[i] != "$value" {
 				parts[i] = "{hosted-content-id}"
+			}
+		case "onlineMeetings":
+			if parts[i] != "" && parts[i] != "createOrGet" {
+				parts[i] = "{online-meeting-id}"
 			}
 		case "shares":
 			if parts[i] != "" {
@@ -1560,6 +1666,11 @@ func allowedDriveItemMetadataQuery(values url.Values) bool {
 		(selectValues[0] == "id,name,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,eTag,webUrl,webDavUrl,file")
 }
 
+func allowedOnlineMeetingQuery(values url.Values) bool {
+	selectValues := values["$select"]
+	return len(values) == 1 && len(selectValues) == 1 && selectValues[0] == "id,subject,joinWebUrl,startDateTime,endDateTime,expiryDateTime,chatInfo"
+}
+
 func allowedChatQuery(values url.Values) bool {
 	selectValues := values["$select"]
 	return len(values) == 1 && len(selectValues) == 1 && selectValues[0] == "id,topic,chatType,webUrl"
@@ -1702,6 +1813,14 @@ func isShareDriveItemMetadataPath(path string) bool {
 		return false
 	}
 	return safeGraphDynamicID(parts[2])
+}
+
+func isMeOnlineMeetingPath(path string) bool {
+	parts := strings.Split(path, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "me" || parts[2] != "onlineMeetings" || parts[3] == "" {
+		return false
+	}
+	return safeGraphDynamicID(parts[3])
 }
 
 func isMeDriveRootContentPath(path string) bool {
