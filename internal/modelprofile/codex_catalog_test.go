@@ -21,6 +21,7 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 			Priority         int      `json:"priority"`
 			InputModalities  []string `json:"input_modalities"`
 			ContextWindow    int      `json:"context_window"`
+			MaxContextWindow int      `json:"max_context_window"`
 			TruncationPolicy struct {
 				Mode  string `json:"mode"`
 				Limit int    `json:"limit"`
@@ -42,8 +43,51 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 	if decoded.Models[0].DisplayName == "" || decoded.Models[0].ContextWindow <= 0 {
 		t.Fatalf("first model metadata incomplete: %#v", decoded.Models[0])
 	}
+	for _, model := range decoded.Models {
+		if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
+			t.Fatalf("%s context window = %d/%d, want %d/%d", model.Slug, model.ContextWindow, model.MaxContextWindow, millionTokenContextWindow, millionTokenContextWindow)
+		}
+	}
 	if decoded.Models[0].TruncationPolicy.Mode != "tokens" || decoded.Models[0].TruncationPolicy.Limit <= 0 {
 		t.Fatalf("truncation policy = %#v", decoded.Models[0].TruncationPolicy)
+	}
+}
+
+func TestThirdPartyMillionTokenProviderCatalogWindows(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		models   []string
+	}{
+		{
+			provider: "deepseek",
+			models: []string{
+				"deepseek/deepseek-v4-flash",
+				"deepseek/deepseek-v4-pro",
+			},
+		},
+		{
+			provider: "mimo",
+			models: []string{
+				"mimo/mimo-v2.5",
+				"mimo/mimo-v2.5-pro",
+			},
+		},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			spec, err := MustLookupProvider(tc.provider)
+			if err != nil {
+				t.Fatalf("lookup provider: %v", err)
+			}
+			for _, modelID := range tc.models {
+				model, ok := spec.ResolveModel(modelID)
+				if !ok {
+					t.Fatalf("ResolveModel(%q) failed", modelID)
+				}
+				if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
+					t.Fatalf("%s context window = %d/%d, want %d/%d", modelID, model.ContextWindow, model.MaxContextWindow, millionTokenContextWindow, millionTokenContextWindow)
+				}
+			}
+		})
 	}
 }
 

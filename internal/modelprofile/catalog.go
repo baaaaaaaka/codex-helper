@@ -8,6 +8,8 @@ import (
 
 const DefaultProvider = "default"
 
+const millionTokenContextWindow = 1000000
+
 type ProviderSpec struct {
 	ID              string
 	DisplayName     string
@@ -435,8 +437,8 @@ var providerCatalog = map[string]ProviderSpec{
 			DisplayName:      "DeepSeek V4 Flash",
 			Description:      "Fast DeepSeek coding model routed by CXP.",
 			Aliases:          []string{"flash", "v4-flash", "default", "fast"},
-			ContextWindow:    128000,
-			MaxContextWindow: 128000,
+			ContextWindow:    millionTokenContextWindow,
+			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsReason:   true,
 			Priority:         0,
@@ -446,8 +448,8 @@ var providerCatalog = map[string]ProviderSpec{
 			DisplayName:      "DeepSeek V4 Pro",
 			Description:      "Higher-quality DeepSeek coding model routed by CXP.",
 			Aliases:          []string{"pro", "v4-pro"},
-			ContextWindow:    128000,
-			MaxContextWindow: 128000,
+			ContextWindow:    millionTokenContextWindow,
+			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsReason:   true,
 			Priority:         1,
@@ -470,8 +472,8 @@ var providerCatalog = map[string]ProviderSpec{
 			DisplayName:      "MiMo 2.5",
 			Description:      "MiMo 2.5 family model routed by CXP.",
 			Aliases:          []string{"base", "standard", "normal", "default", "mimo25"},
-			ContextWindow:    128000,
-			MaxContextWindow: 128000,
+			ContextWindow:    millionTokenContextWindow,
+			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsVision:   true,
 			Priority:         0,
@@ -481,8 +483,8 @@ var providerCatalog = map[string]ProviderSpec{
 			DisplayName:      "MiMo 2.5 Pro",
 			Description:      "MiMo 2.5 Pro family model routed by CXP.",
 			Aliases:          []string{"pro", "mimo25-pro"},
-			ContextWindow:    128000,
-			MaxContextWindow: 128000,
+			ContextWindow:    millionTokenContextWindow,
+			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsVision:   true,
 			Priority:         1,
