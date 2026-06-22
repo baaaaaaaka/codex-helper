@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -20,6 +23,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
+const millionTokenContextWindowForLaunchTest = 1000000
+
 func waitForProxyPrepareContext(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
@@ -27,6 +32,75 @@ func waitForProxyPrepareContext(ctx context.Context) error {
 	case <-time.After(2 * time.Second):
 		return fmt.Errorf("proxy prepare context was not canceled")
 	}
+}
+
+func legacyModelFingerprintV1ForLaunchTest(t *testing.T, provider modelprofile.ProviderSpec, modelRef string) string {
+	t.Helper()
+	model, ok := provider.ResolveModel(modelRef)
+	if !ok {
+		t.Fatalf("ResolveModel(%q) failed", modelRef)
+	}
+	material := strings.Join([]string{
+		strings.TrimSpace(provider.ID),
+		strings.TrimSpace(model.PublicID()),
+		strings.TrimSpace(model.UpstreamModel()),
+		fmt.Sprint(model.ContextWindow),
+		fmt.Sprint(model.MaxContextWindow),
+		fmt.Sprint(model.SupportsTools),
+		fmt.Sprint(model.SupportsVision),
+		fmt.Sprint(model.SupportsReason),
+		fmt.Sprint(model.SupportsSearch),
+	}, "\n")
+	sum := sha256.Sum256([]byte(material))
+	return "model:" + hex.EncodeToString(sum[:])[:24]
+}
+
+func providerWithLegacy128KContextForLaunchTest(provider modelprofile.ProviderSpec) modelprofile.ProviderSpec {
+	provider.Models = append([]modelprofile.ModelSpec(nil), provider.Models...)
+	for i := range provider.Models {
+		provider.Models[i].ContextWindow = 128000
+		provider.Models[i].MaxContextWindow = 128000
+	}
+	return provider
+}
+
+func assertLaunchArgsCatalogHasMillionTokenModel(t *testing.T, args []string, model string) {
+	t.Helper()
+	catalogPath := ""
+	const prefix = `model_catalog_json="`
+	for _, arg := range args {
+		if strings.HasPrefix(arg, prefix) && strings.HasSuffix(arg, `"`) {
+			catalogPath = strings.TrimSuffix(strings.TrimPrefix(arg, prefix), `"`)
+			break
+		}
+	}
+	if catalogPath == "" {
+		t.Fatalf("appserver args missing model_catalog_json path:\n%v", args)
+	}
+	raw, err := os.ReadFile(catalogPath)
+	if err != nil {
+		t.Fatalf("read model catalog %q: %v", catalogPath, err)
+	}
+	var catalog struct {
+		Models []struct {
+			Slug             string `json:"slug"`
+			ContextWindow    int    `json:"context_window"`
+			MaxContextWindow int    `json:"max_context_window"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatalf("decode model catalog %q: %v\n%s", catalogPath, err, raw)
+	}
+	for _, entry := range catalog.Models {
+		if entry.Slug != model {
+			continue
+		}
+		if entry.ContextWindow != millionTokenContextWindowForLaunchTest || entry.MaxContextWindow != millionTokenContextWindowForLaunchTest {
+			t.Fatalf("%s context window = %d/%d, want %d/%d", model, entry.ContextWindow, entry.MaxContextWindow, millionTokenContextWindowForLaunchTest, millionTokenContextWindowForLaunchTest)
+		}
+		return
+	}
+	t.Fatalf("model catalog missing %q:\n%s", model, raw)
 }
 
 func TestPrepareCodexModelProfileForRunStartsAdapterAndInjectsConfig(t *testing.T) {
@@ -235,6 +309,93 @@ func TestPrepareTeamsAppServerModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(
 		if !strings.Contains(joined, want) {
 			t.Fatalf("appserver args missing %q:\n%v", want, args)
 		}
+	}
+}
+
+func TestPrepareTeamsAppServerModelProfileAllowsLegacyDeepSeekContextFingerprintCI(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		provider string
+		model    string
+		keyRef   string
+	}{
+		{
+			name:     "deepseek-flash",
+			provider: "deepseek",
+			model:    "deepseek/deepseek-v4-flash",
+			keyRef:   "env:DEEPSEEK_API_KEY",
+		},
+		{
+			name:     "deepseek-pro",
+			provider: "deepseek",
+			model:    "deepseek/deepseek-v4-pro",
+			keyRef:   "env:DEEPSEEK_API_KEY",
+		},
+		{
+			name:     "mimo25",
+			provider: "mimo",
+			model:    "mimo/mimo-v2.5",
+			keyRef:   "env:MIMO_API_KEY",
+		},
+		{
+			name:     "mimo25-pro",
+			provider: "mimo",
+			model:    "mimo/mimo-v2.5-pro",
+			keyRef:   "env:MIMO_API_KEY",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+			if err != nil {
+				t.Fatalf("NewStore: %v", err)
+			}
+			disabled := false
+			if err := store.Save(config.Config{
+				Version:      config.CurrentVersion,
+				ProxyEnabled: &disabled,
+				ModelProfiles: map[string]config.ModelProfile{
+					tc.name: {
+						Provider:  tc.provider,
+						Model:     tc.model,
+						APIKeyRef: tc.keyRef,
+						Revision:  1,
+					},
+				},
+			}); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			envName := strings.TrimPrefix(tc.keyRef, "env:")
+			t.Setenv(envName, "sk-test")
+
+			spec, ok := modelprofile.LookupProvider(tc.provider)
+			if !ok {
+				t.Fatalf("%s provider missing", tc.provider)
+			}
+			oldSpec := providerWithLegacy128KContextForLaunchTest(spec)
+			snapshot := modelprofile.Snapshot{
+				Name:               tc.name,
+				Provider:           tc.provider,
+				Model:              tc.model,
+				APIKeyRef:          tc.keyRef,
+				Revision:           1,
+				BaseURLHash:        modelprofile.BaseURLHash(spec.BaseURL),
+				AdapterProfile:     spec.AdapterProfile,
+				DefaultModel:       tc.model,
+				ModelFingerprint:   legacyModelFingerprintV1ForLaunchTest(t, oldSpec, tc.model),
+				CatalogFingerprint: modelprofile.CatalogFingerprint(oldSpec),
+				CapturedAt:         time.Now().UTC(),
+			}
+
+			args, _, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "", snapshot, io.Discard)
+			if err != nil {
+				t.Fatalf("prepareTeamsAppServerModelProfile legacy context snapshot: %v", err)
+			}
+			want := `model="` + tc.model + `"`
+			if joined := strings.Join(args, "\n"); !strings.Contains(joined, want) {
+				t.Fatalf("appserver args missing pinned model %q:\n%v", want, args)
+			}
+			assertLaunchArgsCatalogHasMillionTokenModel(t, args, tc.model)
+		})
 	}
 }
 

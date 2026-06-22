@@ -65,6 +65,24 @@ func ModelFingerprint(provider ProviderSpec, modelRef string) string {
 		strings.TrimSpace(provider.ID),
 		strings.TrimSpace(model.PublicID()),
 		strings.TrimSpace(model.UpstreamModel()),
+	}, "\n")
+	sum := sha256.Sum256([]byte(material))
+	return "model:" + hex.EncodeToString(sum[:])[:24]
+}
+
+func legacyModelFingerprintV1(provider ProviderSpec, modelRef string) string {
+	model, ok := provider.ResolveModel(modelRef)
+	if !ok {
+		return ""
+	}
+	return legacyModelFingerprintV1ForModel(provider.ID, model)
+}
+
+func legacyModelFingerprintV1ForModel(providerID string, model ModelSpec) string {
+	material := strings.Join([]string{
+		strings.TrimSpace(providerID),
+		strings.TrimSpace(model.PublicID()),
+		strings.TrimSpace(model.UpstreamModel()),
 		fmt.Sprint(model.ContextWindow),
 		fmt.Sprint(model.MaxContextWindow),
 		fmt.Sprint(model.SupportsTools),

@@ -116,7 +116,7 @@ func ValidateSnapshotRuntime(snapshot Snapshot, resolved Resolved, apiKey string
 	if strings.TrimSpace(snapshot.DefaultModel) != "" && snapshot.DefaultModel != expected.DefaultModel {
 		return fmt.Errorf("model profile %q default model changed since the chat was pinned", snapshot.Name)
 	}
-	if strings.TrimSpace(snapshot.ModelFingerprint) != "" && snapshot.ModelFingerprint != expected.ModelFingerprint {
+	if strings.TrimSpace(snapshot.ModelFingerprint) != "" && snapshot.ModelFingerprint != expected.ModelFingerprint && !snapshotModelFingerprintStillCompatible(snapshot, resolved) {
 		return fmt.Errorf("model profile %q selected model mapping changed since the chat was pinned", snapshot.Name)
 	}
 	if strings.TrimSpace(snapshot.CatalogFingerprint) != "" && snapshot.CatalogFingerprint != expected.CatalogFingerprint && !snapshotSelectedModelStillCompatible(snapshot, resolved) {
@@ -283,6 +283,52 @@ func snapshotSelectedModelStillCompatible(snapshot Snapshot, resolved Resolved) 
 	}
 	model, ok := resolved.Provider.ResolveModel(modelRef)
 	return ok && strings.EqualFold(model.PublicID(), resolved.SelectedPublicModel())
+}
+
+func snapshotModelFingerprintStillCompatible(snapshot Snapshot, resolved Resolved) bool {
+	fingerprint := strings.TrimSpace(snapshot.ModelFingerprint)
+	if fingerprint == "" || !snapshotSelectedModelStillCompatible(snapshot, resolved) {
+		return false
+	}
+	modelRef := strings.TrimSpace(firstNonEmpty(snapshot.Model, snapshot.DefaultModel))
+	model, ok := resolved.Provider.ResolveModel(modelRef)
+	if !ok {
+		return false
+	}
+	if fingerprint == legacyModelFingerprintV1ForModel(resolved.Provider.ID, model) {
+		return true
+	}
+	for _, legacy := range legacyContextWindowModelVariants(model) {
+		if fingerprint == legacyModelFingerprintV1ForModel(resolved.Provider.ID, legacy) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyContextWindowModelVariants(model ModelSpec) []ModelSpec {
+	if !knownLegacyContextWindowCorrection(model) {
+		return nil
+	}
+	legacy := model
+	legacy.ContextWindow = 128000
+	legacy.MaxContextWindow = 128000
+	return []ModelSpec{legacy}
+}
+
+func knownLegacyContextWindowCorrection(model ModelSpec) bool {
+	if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(model.PublicID())) {
+	case "deepseek/deepseek-v4-flash",
+		"deepseek/deepseek-v4-pro",
+		"mimo/mimo-v2.5",
+		"mimo/mimo-v2.5-pro":
+		return true
+	default:
+		return false
+	}
 }
 
 func unknownModelForProfileError(name string, spec ProviderSpec, ref string) error {

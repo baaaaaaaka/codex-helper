@@ -155,6 +155,115 @@ func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
 	}
 }
 
+func TestRuntimeSnapshotAllowsLegacyContextWindowFingerprint(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		profile  string
+		provider string
+		model    string
+		keyRef   string
+	}{
+		{
+			name:     "deepseek-flash",
+			profile:  "deepseek-flash",
+			provider: "deepseek",
+			model:    "deepseek/deepseek-v4-flash",
+			keyRef:   "env:DEEPSEEK_API_KEY",
+		},
+		{
+			name:     "deepseek-pro",
+			profile:  "deepseek-pro",
+			provider: "deepseek",
+			model:    "deepseek/deepseek-v4-pro",
+			keyRef:   "env:DEEPSEEK_API_KEY",
+		},
+		{
+			name:     "mimo25",
+			profile:  "mimo25",
+			provider: "mimo",
+			model:    "mimo/mimo-v2.5",
+			keyRef:   "env:MIMO_API_KEY",
+		},
+		{
+			name:     "mimo25-pro",
+			profile:  "mimo25-pro",
+			provider: "mimo",
+			model:    "mimo/mimo-v2.5-pro",
+			keyRef:   "env:MIMO_API_KEY",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{
+				Version: config.CurrentVersion,
+				ModelProfiles: map[string]config.ModelProfile{
+					tc.profile: {
+						Provider:  tc.provider,
+						Model:     tc.model,
+						APIKeyRef: tc.keyRef,
+						Revision:  1,
+					},
+				},
+			}
+			resolved, err := Resolve(cfg, tc.profile)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			oldProvider := providerWithLegacy128KContext(resolved.Provider)
+			snapshot := resolved.Snapshot(time.Now())
+			snapshot.ModelFingerprint = legacyModelFingerprintV1(oldProvider, snapshot.Model)
+			snapshot.CatalogFingerprint = CatalogFingerprint(oldProvider)
+
+			if err := ValidateSnapshotRuntime(snapshot, resolved, "sk-test"); err != nil {
+				t.Fatalf("ValidateSnapshotRuntime legacy context fingerprint: %v", err)
+			}
+		})
+	}
+}
+
+func TestRuntimeSnapshotRejectsLegacyFingerprintWhenUpstreamMappingChanges(t *testing.T) {
+	cfg := config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"deepseek-pro": {
+				Provider:  "deepseek",
+				Model:     "deepseek/deepseek-v4-pro",
+				APIKeyRef: "env:DEEPSEEK_API_KEY",
+				Revision:  1,
+			},
+		},
+	}
+	resolved, err := Resolve(cfg, "deepseek-pro")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	oldProvider := providerWithLegacy128KContext(resolved.Provider)
+	snapshot := resolved.Snapshot(time.Now())
+	snapshot.ModelFingerprint = legacyModelFingerprintV1(oldProvider, snapshot.Model)
+	snapshot.CatalogFingerprint = CatalogFingerprint(oldProvider)
+
+	changed := resolved
+	changed.Provider.Models = append([]ModelSpec(nil), resolved.Provider.Models...)
+	for i := range changed.Provider.Models {
+		if changed.Provider.Models[i].PublicID() == snapshot.Model {
+			changed.Provider.Models[i].UpstreamID = "deepseek-v4-pro-next"
+		}
+	}
+
+	err = ValidateSnapshotRuntime(snapshot, changed, "sk-test")
+	if err == nil || !strings.Contains(err.Error(), "selected model mapping changed") {
+		t.Fatalf("ValidateSnapshotRuntime upstream change err=%v, want selected model mapping changed", err)
+	}
+}
+
+func providerWithLegacy128KContext(provider ProviderSpec) ProviderSpec {
+	provider.Models = append([]ModelSpec(nil), provider.Models...)
+	for i := range provider.Models {
+		provider.Models[i].ContextWindow = 128000
+		provider.Models[i].MaxContextWindow = 128000
+	}
+	return provider
+}
+
 func TestResolveModelProfileErrors(t *testing.T) {
 	cfg := config.Config{
 		Version: config.CurrentVersion,
