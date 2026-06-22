@@ -515,9 +515,17 @@ status updates, and posts the final answer back to the work chat. If a Codex
 answer is detected from another local entry point, the helper can create or
 link the matching Teams chat and notify you there as well.
 
-Teams file and image attachments can be passed through to Codex when available.
-Generated files listed in a Codex artifact manifest can be uploaded back to
-Teams when file-write auth is configured.
+Teams text, quoted messages, files, pasted images, and supported inline media
+can be passed through to Codex when available. Teams voice or video clips are
+transcribed locally before the turn starts, and Codex receives the transcript
+with a note that it came from automatic speech recognition. Generated files
+listed in a Codex artifact manifest can be uploaded back to Teams when
+file-write auth is configured.
+
+If you also use Codex from a local terminal on the same machine, Teams helper
+can notice the matching local answer, create or link the corresponding Teams
+chat, and post the visible result there. This keeps Teams usable as the shared
+conversation surface without forcing every Codex turn to start from Teams.
 
 When the same Teams user runs helpers on multiple machines, Codex can use
 cross-machine delegation for tasks that need another machine's repo, hardware,
@@ -874,6 +882,27 @@ turns use the new profile:
 ```bash
 codex-proxy beacon switch-profile gpu --session <session-id> --after-current-turn
 ```
+
+## Git-backed skill subscriptions
+
+Use git-backed skill subscriptions when you want your own Codex skills to live
+in a repo and stay synchronized across machines. A subscription installs the
+skills from that git source into `$HOME/.agents/skills`; later `sync` updates
+the local managed copy, and `push` lets you publish confirmed local edits back
+to the source.
+
+```bash
+codex-proxy skills add <git-url>
+codex-proxy skills list
+codex-proxy skills sync
+codex-proxy skills doctor
+codex-proxy skills push <name>
+codex-proxy skills remove <name>
+```
+
+This is the recommended path for personal or team-maintained skills. The
+built-in `cxp` skill below is maintained by the helper itself and is separate
+from these git-backed subscriptions.
 
 ## Built-in cxp skill
 
