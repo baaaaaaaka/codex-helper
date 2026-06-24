@@ -1393,6 +1393,7 @@ func officialReleaseUpgradeFixtureCasesForTest() []officialReleaseFixtureCase {
 		{tag: "v0.1.9", kind: officialReleaseFixtureSQLiteV5},
 		{tag: "v0.1.10", kind: officialReleaseFixtureSQLiteV5},
 		{tag: "v0.1.11", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.12", kind: officialReleaseFixtureSQLiteV5},
 	}
 }
 
