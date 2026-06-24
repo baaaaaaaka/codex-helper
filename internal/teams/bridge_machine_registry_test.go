@@ -97,8 +97,8 @@ func TestBridgeMachineRegistryPublisherFailureBackoffDoesNotAppend(t *testing.T)
 	delay := publisher.publishDelay(context.Background(), false, &backoff, func(err error) {
 		logged = append(logged, err.Error())
 	})
-	if delay != 5*time.Minute || backoff != 5*time.Minute {
-		t.Fatalf("delay=%v backoff=%v, want 5m", delay, backoff)
+	if delay < 150*time.Second || delay > 5*time.Minute || backoff != 5*time.Minute {
+		t.Fatalf("delay=%v backoff=%v, want random jitter in [2.5m, 5m] with stored 5m backoff", delay, backoff)
 	}
 	if graph.sendCount != 1 || graph.patchCount != 1 {
 		t.Fatalf("transient patch failure must not append: send=%d patch=%d", graph.sendCount, graph.patchCount)
@@ -108,6 +108,94 @@ func TestBridgeMachineRegistryPublisherFailureBackoffDoesNotAppend(t *testing.T)
 	}
 	if next := machineRegistryNextBackoff(backoff, 5*time.Minute); next != 10*time.Minute {
 		t.Fatalf("next backoff = %v, want 10m", next)
+	}
+}
+
+func TestBridgeMachineRegistryPublisherFailureBackoffRespectsRetryAfter(t *testing.T) {
+	now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+	graph := newFakeBridgeMachineRegistryGraph()
+	bridge := testBridgeForMachineRegistry()
+	publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+		MachineRegistryGraph:     graph,
+		MachineRegistryCachePath: filepath.Join(t.TempDir(), "machine-registry.json"),
+		MachineRegistryInterval:  5 * time.Minute,
+		MachineRegistryNow:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	if err := publisher.publish(context.Background(), false); err != nil {
+		t.Fatalf("initial publish: %v", err)
+	}
+	retryAfter := 2 * time.Minute
+	graph.patchErr = &machineregistry.StatusError{StatusCode: 429, RetryAfter: retryAfter, Err: errors.New("rate limited")}
+	backoff := 5 * time.Minute
+	delay := publisher.publishDelay(context.Background(), false, &backoff, nil)
+	if delay < retryAfter || delay > retryAfter+12*time.Second {
+		t.Fatalf("delay=%v, want Retry-After respected with random positive jitter in [%v, %v]", delay, retryAfter, retryAfter+12*time.Second)
+	}
+	if backoff != 0 {
+		t.Fatalf("backoff=%v, want Retry-After to reset local exponential backoff", backoff)
+	}
+}
+
+func TestMachineRegistryPublishRetryDelay(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		current         time.Duration
+		interval        time.Duration
+		minDelay        time.Duration
+		maxDelay        time.Duration
+		wantNextBackoff time.Duration
+	}{
+		{
+			name:            "registry status retry after",
+			err:             &machineregistry.StatusError{StatusCode: 429, RetryAfter: 2 * time.Minute, Err: errors.New("rate limited")},
+			current:         5 * time.Minute,
+			interval:        5 * time.Minute,
+			minDelay:        2 * time.Minute,
+			maxDelay:        2*time.Minute + 12*time.Second,
+			wantNextBackoff: 0,
+		},
+		{
+			name:            "direct graph status retry after",
+			err:             &GraphStatusError{StatusCode: 429, RetryAfter: 3 * time.Minute},
+			current:         10 * time.Minute,
+			interval:        5 * time.Minute,
+			minDelay:        3 * time.Minute,
+			maxDelay:        3*time.Minute + 18*time.Second,
+			wantNextBackoff: 0,
+		},
+		{
+			name:            "retry after jitter capped",
+			err:             &machineregistry.StatusError{StatusCode: 429, RetryAfter: 10 * time.Minute},
+			current:         10 * time.Minute,
+			interval:        5 * time.Minute,
+			minDelay:        10 * time.Minute,
+			maxDelay:        10*time.Minute + machineRegistryRetryAfterJitterMax,
+			wantNextBackoff: 0,
+		},
+		{
+			name:            "429 without retry after keeps exponential backoff",
+			err:             &machineregistry.StatusError{StatusCode: 429, Err: errors.New("rate limited")},
+			current:         0,
+			interval:        5 * time.Minute,
+			minDelay:        150 * time.Second,
+			maxDelay:        5 * time.Minute,
+			wantNextBackoff: 5 * time.Minute,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			delay, nextBackoff := machineRegistryPublishRetryDelay(tt.err, tt.current, tt.interval)
+			if delay < tt.minDelay || delay > tt.maxDelay {
+				t.Fatalf("delay=%v, want in [%v, %v]", delay, tt.minDelay, tt.maxDelay)
+			}
+			if nextBackoff != tt.wantNextBackoff {
+				t.Fatalf("nextBackoff=%v, want %v", nextBackoff, tt.wantNextBackoff)
+			}
+		})
 	}
 }
 

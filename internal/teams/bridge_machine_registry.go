@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -16,6 +17,7 @@ import (
 const (
 	machineRegistryDrainPublishTimeout = 10 * time.Second
 	machineRegistryMaxBackoff          = 30 * time.Minute
+	machineRegistryRetryAfterJitterMax = 30 * time.Second
 )
 
 var machineRegistryWorkerSeq atomic.Uint64
@@ -187,8 +189,9 @@ func (p *bridgeMachineRegistryPublisher) publishDelay(ctx context.Context, drain
 		if logError != nil {
 			logError(err)
 		}
-		*backoff = machineRegistryNextBackoff(*backoff, p.interval)
-		return *backoff
+		delay, nextBackoff := machineRegistryPublishRetryDelay(err, *backoff, p.interval)
+		*backoff = nextBackoff
+		return delay
 	}
 	*backoff = 0
 	return p.interval
@@ -280,6 +283,37 @@ func machineRegistryNextBackoff(current time.Duration, interval time.Duration) t
 		return machineRegistryMaxBackoff
 	}
 	return next
+}
+
+func machineRegistryPublishRetryDelay(err error, current time.Duration, interval time.Duration) (time.Duration, time.Duration) {
+	if retryAfter := machineRegistryRetryAfter(err); retryAfter > 0 {
+		return retryAfter + machineRegistryRetryAfterJitter(retryAfter), 0
+	}
+	nextBackoff := machineRegistryNextBackoff(current, interval)
+	return jitterDuration(nextBackoff), nextBackoff
+}
+
+func machineRegistryRetryAfter(err error) time.Duration {
+	var statusErr *machineregistry.StatusError
+	if errors.As(err, &statusErr) && statusErr.StatusCode == 429 && statusErr.RetryAfter > 0 {
+		return statusErr.RetryAfter
+	}
+	var graphErr *GraphStatusError
+	if errors.As(err, &graphErr) && graphErr.StatusCode == 429 && graphErr.RetryAfter > 0 {
+		return graphErr.RetryAfter
+	}
+	return 0
+}
+
+func machineRegistryRetryAfterJitter(retryAfter time.Duration) time.Duration {
+	maxJitter := retryAfter / 10
+	if maxJitter > machineRegistryRetryAfterJitterMax {
+		maxJitter = machineRegistryRetryAfterJitterMax
+	}
+	if maxJitter <= 0 {
+		return 0
+	}
+	return jitterDuration(maxJitter)
 }
 
 func firstPositiveDuration(value time.Duration, fallback time.Duration) time.Duration {
