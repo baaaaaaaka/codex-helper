@@ -114,6 +114,68 @@ func TestPrepareCodexSelfUpdateGuardEnvSkipsUnknownSource(t *testing.T) {
 	}
 }
 
+func TestPrepareCodexSelfUpdateGuardEnvDetectsSymlinkedManagedCodex(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip symlink source detection test on windows")
+	}
+	lockCLITestHooks(t)
+
+	prevLookPath := codexSelfUpdateLookPath
+	prevExecutable := codexSelfUpdateExecutable
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		codexSelfUpdateLookPath = prevLookPath
+		codexSelfUpdateExecutable = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+	restartArgv0 = func() string { return "" }
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	userBin := filepath.Join(home, ".local", "bin")
+	prefix := filepath.Join(root, "home-overflow", "codex-proxy", "npm-global")
+	codexDir := filepath.Join(prefix, "bin")
+	for _, dir := range []string{userBin, codexDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	targetCodex := writeProbeableCodex(t, codexDir, true)
+	symlinkCodex := filepath.Join(userBin, "codex")
+	if err := os.Symlink(targetCodex, symlinkCodex); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	privateNpmPath := filepath.Join(root, "codex-proxy", "node", "bin", "npm")
+	codexSelfUpdateLookPath = func(string) (string, error) {
+		return privateNpmPath, nil
+	}
+	codexSelfUpdateExecutable = func() (string, error) {
+		return "/usr/bin/codex-proxy", nil
+	}
+
+	updated, cleanup, err := prepareCodexSelfUpdateGuardEnv(
+		context.Background(),
+		symlinkCodex,
+		[]string{"HOME=" + home, "PATH=" + userBin},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("prepare guard env: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	if got := envValue(updated, envCodexProxyUpdateOrigin); got != string(codexInstallOriginManaged) {
+		t.Fatalf("expected managed origin, got %q", got)
+	}
+	if got := envValue(updated, envCodexProxyUpdateCodexPath); got != symlinkCodex {
+		t.Fatalf("expected symlink codex path %q, got %q", symlinkCodex, got)
+	}
+	if got := envValue(updated, envCodexProxyUpdateNPMPrefix); got != prefix {
+		t.Fatalf("expected managed prefix %q, got %q", prefix, got)
+	}
+}
+
 func TestPrepareCodexSelfUpdateGuardEnvFailsClosedForTransientHelperPath(t *testing.T) {
 	lockCLITestHooks(t)
 

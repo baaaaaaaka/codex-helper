@@ -550,6 +550,12 @@ jobs:
           go test . -count=1 -run 'TestInstallPs1(ChecksumDownloadFailureRemainsBestEffort|DiskSpaceFailureBanner|LatestViaAPI|KeepsPathSetupWhenInstallDirAlreadySet)'
           go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|CodexNPMInstallEnvClearsOptionalDependencyOmit|BootstrapWindowsScriptContains(SelfValidation|DiskAndNpmChecks))$'
 
+      - name: Codex upgrade source symlink regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(DetectCodexUpgradeSource(Managed|ManagedThroughUserBinSymlink|ManagedThroughSymlinkedPathDir|ManagedWithSymlinkedLocalDirPhysicalPath|SystemNpm|SystemNpmWithSymlinkedPrefixPhysicalPath|Unknown)|InferManagedPrefixFromPathRequiresBoundary|PrepareCodexSelfUpdateGuardEnvDetectsSymlinkedManagedCodex)$' -v
+
       - name: Recent run/installer/reuse regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash

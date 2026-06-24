@@ -541,6 +541,147 @@ func TestDetectCodexUpgradeSourceManaged(t *testing.T) {
 	}
 }
 
+func TestDetectCodexUpgradeSourceManagedThroughUserBinSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip symlink source detection test on windows")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	userBin := filepath.Join(home, ".local", "bin")
+	prefix := filepath.Join(root, "home-overflow", "codex-proxy", "npm-global")
+	codexDir := filepath.Join(prefix, "bin")
+	for _, dir := range []string{userBin, codexDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	targetCodex := writeProbeableCodex(t, codexDir, true)
+	symlinkCodex := filepath.Join(userBin, "codex")
+	if err := os.Symlink(targetCodex, symlinkCodex); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", userBin)
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginManaged {
+		t.Fatalf("expected managed origin, got %q", source.origin)
+	}
+	if source.codexPath != symlinkCodex {
+		t.Fatalf("expected symlink codex path %q, got %q", symlinkCodex, source.codexPath)
+	}
+	if source.npmPrefix != prefix {
+		t.Fatalf("expected npm prefix %q, got %q", prefix, source.npmPrefix)
+	}
+}
+
+func TestDetectCodexUpgradeSourceManagedThroughSymlinkedPathDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip symlink source detection test on windows")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	logicalBin := filepath.Join(home, ".local", "bin")
+	prefix := filepath.Join(root, "home-overflow", "codex-proxy", "npm-global")
+	codexDir := filepath.Join(prefix, "bin")
+	if err := os.MkdirAll(filepath.Dir(logicalBin), 0o755); err != nil {
+		t.Fatalf("mkdir logical bin parent: %v", err)
+	}
+	if err := os.MkdirAll(codexDir, 0o755); err != nil {
+		t.Fatalf("mkdir codex dir: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, codexDir, true)
+	if err := os.Symlink(codexDir, logicalBin); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", logicalBin)
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	logicalCodexPath := filepath.Join(logicalBin, "codex")
+	if source.origin != codexInstallOriginManaged {
+		t.Fatalf("expected managed origin, got %q", source.origin)
+	}
+	if source.codexPath != logicalCodexPath {
+		t.Fatalf("expected logical codex path %q, got %q", logicalCodexPath, source.codexPath)
+	}
+	if source.npmPrefix != prefix {
+		t.Fatalf("expected npm prefix %q, got %q (target codex %q)", prefix, source.npmPrefix, codexPath)
+	}
+}
+
+func TestDetectCodexUpgradeSourceManagedWithSymlinkedLocalDirPhysicalPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip symlink source detection test on windows")
+	}
+
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	localTarget := filepath.Join(root, "local-overflow")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(localTarget, 0o755); err != nil {
+		t.Fatalf("mkdir local target: %v", err)
+	}
+	if err := os.Symlink(localTarget, filepath.Join(home, ".local")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	logicalPrefix := filepath.Join(home, ".local", "share", "codex-proxy", "npm-global")
+	physicalPrefix := filepath.Join(localTarget, "share", "codex-proxy", "npm-global")
+	physicalBin := filepath.Join(physicalPrefix, "bin")
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	physicalCodex := writeProbeableCodex(t, physicalBin, true)
+
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", physicalBin)
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginManaged {
+		t.Fatalf("expected managed origin, got %q", source.origin)
+	}
+	if source.codexPath != physicalCodex {
+		t.Fatalf("expected physical codex path %q, got %q", physicalCodex, source.codexPath)
+	}
+	if source.npmPrefix != logicalPrefix {
+		t.Fatalf("expected logical npm prefix %q, got %q", logicalPrefix, source.npmPrefix)
+	}
+}
+
+func TestInferManagedPrefixFromPathRequiresBoundary(t *testing.T) {
+	root := t.TempDir()
+	nearMiss := filepath.Join(root, "codex-proxy", "npm-global-backup", "bin", "codex")
+	if prefix, ok := inferManagedPrefixFromPath(nearMiss); ok {
+		t.Fatalf("expected near-miss managed prefix to be rejected, got %q", prefix)
+	}
+
+	prefix := filepath.Join(root, "codex-proxy", "npm-global")
+	codexPath := filepath.Join(prefix, "bin", "codex")
+	got, ok := inferManagedPrefixFromPath(codexPath)
+	if !ok {
+		t.Fatal("expected managed prefix to be inferred")
+	}
+	if got != prefix {
+		t.Fatalf("expected prefix %q, got %q", prefix, got)
+	}
+}
+
 func TestDetectCodexUpgradeSourceSystemNpm(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based source detection test on windows")
@@ -578,6 +719,53 @@ func TestDetectCodexUpgradeSourceSystemNpm(t *testing.T) {
 	}
 	if source.npmPrefix != globalPrefix {
 		t.Fatalf("expected npm prefix %q, got %q", globalPrefix, source.npmPrefix)
+	}
+}
+
+func TestDetectCodexUpgradeSourceSystemNpmWithSymlinkedPrefixPhysicalPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip symlink source detection test on windows")
+	}
+
+	root := t.TempDir()
+	logicalPrefix := filepath.Join(root, "npm-global")
+	physicalPrefix := filepath.Join(root, "npm-overflow")
+	if err := os.MkdirAll(physicalPrefix, 0o755); err != nil {
+		t.Fatalf("mkdir physical prefix: %v", err)
+	}
+	if err := os.Symlink(physicalPrefix, logicalPrefix); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	physicalBin := filepath.Join(physicalPrefix, "bin")
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	physicalCodex := writeProbeableCodex(t, physicalBin, true)
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + logicalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{physicalBin, binDir}, string(os.PathListSeparator)))
+
+	source, err := detectCodexUpgradeSource(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("detectCodexUpgradeSource error: %v", err)
+	}
+	if source.origin != codexInstallOriginSystem {
+		t.Fatalf("expected system origin, got %q", source.origin)
+	}
+	if source.codexPath != physicalCodex {
+		t.Fatalf("expected physical codex path %q, got %q", physicalCodex, source.codexPath)
+	}
+	if source.npmPrefix != logicalPrefix {
+		t.Fatalf("expected logical npm prefix %q, got %q", logicalPrefix, source.npmPrefix)
 	}
 }
 

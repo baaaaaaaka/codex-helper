@@ -1579,7 +1579,7 @@ func detectCodexUpgradeSourceForPath(ctx context.Context, codexPath string, inst
 	}
 
 	systemPrefix, err := npmGlobalPrefix(ctx, installerEnv)
-	if err == nil && pathWithinDir(codexPath, systemPrefix) {
+	if err == nil && pathWithinDirResolvingSymlinks(codexPath, systemPrefix) {
 		return codexUpgradeSource{
 			origin:      codexInstallOriginSystem,
 			codexPath:   codexPath,
@@ -1848,12 +1848,19 @@ func findInstalledCodexWithoutProbe() (string, error) {
 }
 
 func managedCodexPrefixForPath(codexPath string, installerEnv []string) (string, bool) {
-	for _, prefix := range managedCodexPrefixCandidates(installerEnv) {
-		if pathWithinDir(codexPath, prefix) {
-			return filepath.Clean(prefix), true
+	for _, path := range pathSymlinkVariants(codexPath) {
+		for _, prefix := range managedCodexPrefixCandidates(installerEnv) {
+			if pathWithinDirResolvingSymlinks(path, prefix) {
+				return filepath.Clean(prefix), true
+			}
 		}
 	}
-	return inferManagedPrefixFromPath(codexPath)
+	for _, path := range pathSymlinkVariants(codexPath) {
+		if prefix, ok := inferManagedPrefixFromPath(path); ok {
+			return prefix, true
+		}
+	}
+	return "", false
 }
 
 func managedCodexPrefixCandidates(installerEnv []string) []string {
@@ -1911,16 +1918,24 @@ func inferManagedPrefixFromPath(path string) (string, bool) {
 	if runtime.GOOS == "windows" {
 		lookup = strings.ToLower(asSlash)
 	}
-	idx := strings.Index(lookup, search)
-	if idx < 0 {
-		return "", false
+
+	for start := 0; start < len(lookup); {
+		idx := strings.Index(lookup[start:], search)
+		if idx < 0 {
+			return "", false
+		}
+		idx += start
+		end := idx + len(search)
+		if end == len(lookup) || lookup[end] == '/' {
+			prefix := strings.TrimSpace(asSlash[:end])
+			if prefix == "" {
+				return "", false
+			}
+			return normalizeExecutablePath(filepath.FromSlash(prefix)), true
+		}
+		start = end
 	}
-	prefix := asSlash[:idx+len(search)]
-	prefix = strings.TrimSpace(prefix)
-	if prefix == "" {
-		return "", false
-	}
-	return normalizeExecutablePath(filepath.FromSlash(prefix)), true
+	return "", false
 }
 
 func npmGlobalPrefix(ctx context.Context, installerEnv []string) (string, error) {
@@ -1944,12 +1959,26 @@ func npmGlobalPrefix(ctx context.Context, installerEnv []string) (string, error)
 }
 
 func pathWithinDir(path string, dir string) bool {
+	return pathWithinDirLexical(path, dir)
+}
+
+func pathWithinDirResolvingSymlinks(path string, dir string) bool {
+	for _, p := range pathSymlinkVariants(path) {
+		for _, d := range pathSymlinkVariants(dir) {
+			if pathWithinDirLexical(p, d) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pathWithinDirLexical(path string, dir string) bool {
 	path = normalizeExecutablePath(path)
 	dir = normalizeExecutablePath(dir)
 	if path == "" || dir == "" {
 		return false
 	}
-
 	p := path
 	d := dir
 	if runtime.GOOS == "windows" {
@@ -1964,6 +1993,32 @@ func pathWithinDir(path string, dir string) bool {
 		d += string(os.PathSeparator)
 	}
 	return strings.HasPrefix(p, d)
+}
+
+func pathSymlinkVariants(path string) []string {
+	path = normalizeExecutablePath(path)
+	if path == "" {
+		return nil
+	}
+	out := []string{path}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return out
+	}
+	resolved = normalizeExecutablePath(resolved)
+	if resolved == "" {
+		return out
+	}
+	keyPath := path
+	keyResolved := resolved
+	if runtime.GOOS == "windows" {
+		keyPath = strings.ToLower(keyPath)
+		keyResolved = strings.ToLower(keyResolved)
+	}
+	if keyResolved != keyPath {
+		out = append(out, resolved)
+	}
+	return out
 }
 
 func setEnvValue(base []string, key, value string) []string {
