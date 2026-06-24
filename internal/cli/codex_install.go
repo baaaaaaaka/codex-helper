@@ -2000,25 +2000,74 @@ func pathSymlinkVariants(path string) []string {
 	if path == "" {
 		return nil
 	}
-	out := []string{path}
+	out := make([]string, 0, 4)
+	add := func(candidate string) {
+		candidate = normalizeExecutablePath(candidate)
+		if candidate == "" {
+			return
+		}
+		keyCandidate := candidate
+		if runtime.GOOS == "windows" {
+			keyCandidate = strings.ToLower(keyCandidate)
+		}
+		for _, existing := range out {
+			keyExisting := existing
+			if runtime.GOOS == "windows" {
+				keyExisting = strings.ToLower(keyExisting)
+			}
+			if keyExisting == keyCandidate {
+				return
+			}
+		}
+		out = append(out, candidate)
+	}
+	add(path)
+	if target, ok := pathReadlinkVariant(path); ok {
+		add(target)
+	}
+	if target, ok := nearestSymlinkComponentVariant(path); ok {
+		add(target)
+	}
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return out
 	}
-	resolved = normalizeExecutablePath(resolved)
-	if resolved == "" {
-		return out
-	}
-	keyPath := path
-	keyResolved := resolved
-	if runtime.GOOS == "windows" {
-		keyPath = strings.ToLower(keyPath)
-		keyResolved = strings.ToLower(keyResolved)
-	}
-	if keyResolved != keyPath {
-		out = append(out, resolved)
-	}
+	add(resolved)
 	return out
+}
+
+func nearestSymlinkComponentVariant(path string) (string, bool) {
+	path = normalizeExecutablePath(path)
+	if path == "" {
+		return "", false
+	}
+	for current := path; current != ""; current = filepath.Dir(current) {
+		target, ok := pathReadlinkVariant(current)
+		if ok {
+			rel, err := filepath.Rel(current, path)
+			if err != nil || rel == "." {
+				return target, true
+			}
+			return filepath.Join(target, rel), true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	return "", false
+}
+
+func pathReadlinkVariant(path string) (string, bool) {
+	target, err := os.Readlink(path)
+	if err != nil {
+		return "", false
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	target = normalizeExecutablePath(target)
+	return target, target != ""
 }
 
 func setEnvValue(base []string, key, value string) []string {

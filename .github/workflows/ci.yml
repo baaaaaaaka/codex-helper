@@ -554,7 +554,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(DetectCodexUpgradeSource(Managed|ManagedThroughUserBinSymlink|ManagedThroughSymlinkedPathDir|ManagedWithSymlinkedLocalDirPhysicalPath|SystemNpm|SystemNpmWithSymlinkedPrefixPhysicalPath|Unknown)|InferManagedPrefixFromPathRequiresBoundary|PrepareCodexSelfUpdateGuardEnvDetectsSymlinkedManagedCodex)$' -v
+          go test ./internal/cli -count=1 -run 'Test(DetectCodexUpgradeSource(Managed|ManagedThroughUserBinSymlink|ManagedThroughSymlinkedPathDir|ManagedWithSymlinkedAncestor|ManagedWithSymlinkedLocalDirPhysicalPath|SystemNpm|SystemNpmWithSymlinkedPrefixPhysicalPath|Unknown)|InferManagedPrefixFromPathRequiresBoundary|PrepareCodexSelfUpdateGuardEnvDetectsSymlinkedManagedCodex)$' -v
 
       - name: Recent run/installer/reuse regressions (Linux/macOS)
         if: runner.os != 'Windows'
