@@ -179,22 +179,21 @@ func TestEnsureProxyPreferencePromptsWhenNoProfiles(t *testing.T) {
 }
 
 func TestEnsureProxyPreferenceServiceDefaultsToDirectWithoutPrompt(t *testing.T) {
-	lockCLITestHooks(t)
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
 	store := newTempStore(t)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	prevStdin := os.Stdin
-	os.Stdin = reader
 	t.Cleanup(func() {
-		os.Stdin = prevStdin
 		_ = reader.Close()
 		_ = writer.Close()
 	})
 
-	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store)
+	if proxyPreferencePromptAllowedFor("1", reader) {
+		t.Fatal("service mode should not allow proxy preference prompts")
+	}
+
+	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store, false)
 	if err != nil {
 		t.Fatalf("ensureProxyPreference error: %v", err)
 	}
@@ -214,22 +213,21 @@ func TestEnsureProxyPreferenceServiceDefaultsToDirectWithoutPrompt(t *testing.T)
 }
 
 func TestEnsureProxyPreferenceNonTerminalDefaultsToDirectWithoutPrompt(t *testing.T) {
-	lockCLITestHooks(t)
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
 	store := newTempStore(t)
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
-	prevStdin := os.Stdin
-	os.Stdin = reader
 	t.Cleanup(func() {
-		os.Stdin = prevStdin
 		_ = reader.Close()
 		_ = writer.Close()
 	})
 
-	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store)
+	if proxyPreferencePromptAllowedFor("", reader) {
+		t.Fatal("non-terminal stdin should not allow proxy preference prompts")
+	}
+
+	got, cfg, err := runEnsureProxyPreferenceWithTimeout(t, store, false)
 	if err != nil {
 		t.Fatalf("ensureProxyPreference error: %v", err)
 	}
@@ -328,7 +326,7 @@ func TestEnsureProxyPreferenceWithReaderUsesProvidedInput(t *testing.T) {
 	}
 }
 
-func runEnsureProxyPreferenceWithTimeout(t *testing.T, store *config.Store) (bool, config.Config, error) {
+func runEnsureProxyPreferenceWithTimeout(t *testing.T, store *config.Store, allowPrompt bool) (bool, config.Config, error) {
 	t.Helper()
 	type result struct {
 		enabled bool
@@ -337,7 +335,7 @@ func runEnsureProxyPreferenceWithTimeout(t *testing.T, store *config.Store) (boo
 	}
 	done := make(chan result, 1)
 	go func() {
-		enabled, cfg, err := ensureProxyPreference(context.Background(), store, "", io.Discard)
+		enabled, cfg, err := ensureProxyPreferenceWithReaderMode(context.Background(), store, "", io.Discard, bufio.NewReader(&blockingProxyPreferenceReader{}), allowPrompt)
 		done <- result{enabled: enabled, cfg: cfg, err: err}
 	}()
 	select {
@@ -347,4 +345,10 @@ func runEnsureProxyPreferenceWithTimeout(t *testing.T, store *config.Store) (boo
 		t.Fatal("ensureProxyPreference blocked on stdin")
 		return false, config.Config{}, nil
 	}
+}
+
+type blockingProxyPreferenceReader struct{}
+
+func (*blockingProxyPreferenceReader) Read([]byte) (int, error) {
+	select {}
 }

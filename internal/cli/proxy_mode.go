@@ -12,10 +12,14 @@ import (
 )
 
 var proxyPreferencePromptAllowed = func() bool {
-	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
+	return proxyPreferencePromptAllowedFor(os.Getenv("CODEX_HELPER_TEAMS_SERVICE"), os.Stdin)
+}
+
+func proxyPreferencePromptAllowedFor(serviceEnv string, stdin *os.File) bool {
+	if strings.TrimSpace(serviceEnv) != "" {
 		return false
 	}
-	return isTerminalFile(os.Stdin)
+	return isTerminalFile(stdin)
 }
 
 func ensureProxyPreference(ctx context.Context, store *config.Store, profileRef string, out io.Writer) (bool, config.Config, error) {
