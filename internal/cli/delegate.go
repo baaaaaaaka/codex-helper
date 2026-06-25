@@ -410,20 +410,29 @@ func runDelegateResolve(opts *delegateOptions) (delegation.ResolveResult, error)
 	}
 	sortCandidates(candidates)
 	startable := make([]delegation.Candidate, 0, len(candidates))
+	available := make([]delegation.Candidate, 0, len(candidates))
 	var reasons []string
 	for _, candidate := range candidates {
 		if candidate.State == "online" && candidate.Accepting && candidate.Confidence >= 0.8 && candidate.CandidateToken != "" {
 			startable = append(startable, candidate)
+		}
+		if candidate.State == "online" && candidate.Accepting && candidate.CandidateToken != "" {
+			available = append(available, candidate)
 		} else if len(candidate.NotStartableReasons) > 0 {
 			reasons = append(reasons, candidate.MachineID+": "+strings.Join(candidate.NotStartableReasons, "; "))
 		}
 	}
-	result := delegation.ResolveResult{Query: query, Candidates: capCandidates(candidates, 5)}
+	result := delegation.ResolveResult{Query: query, Candidates: candidates}
 	switch len(startable) {
 	case 0:
-		result.Action = delegation.ActionDoNotDelegate
-		result.Reason = "no_online_matching_candidate"
-		result.NotStartableReasons = reasons
+		if len(available) > 0 {
+			result.Action = delegation.ActionAskUser
+			result.Reason = "online_candidates_available_no_confident_match"
+		} else {
+			result.Action = delegation.ActionDoNotDelegate
+			result.Reason = "no_online_matching_candidate"
+			result.NotStartableReasons = reasons
+		}
 	case 1:
 		result.Action = delegation.ActionStart
 		result.Reason = "single_online_matching_candidate"
@@ -1883,13 +1892,6 @@ func sortCandidates(candidates []delegation.Candidate) {
 			}
 		}
 	}
-}
-
-func capCandidates(candidates []delegation.Candidate, limit int) []delegation.Candidate {
-	if limit <= 0 || len(candidates) <= limit {
-		return candidates
-	}
-	return append([]delegation.Candidate(nil), candidates[:limit]...)
 }
 
 func appendMissing(values []string, value string) []string {

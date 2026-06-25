@@ -78,7 +78,7 @@ From a Teams-launched Codex child turn, do not restart, reload, update, kill, re
 
 Use these from a Codex turn when the user naturally asks another signed-in Teams machine or remote agent to inspect part of the task. Load `references/delegation.md` for the full workflow.
 
-- `cxp delegate resolve --query <text> --json`: return a compact action and top candidates; add `--source-session <codex-thread> --workspace-fingerprint <key>` when available so the result can include a `new_thread_token` and reusable `thread_candidates`. Registry internals stay out of the model prompt.
+- `cxp delegate resolve --query <text> --json`: return a compact action plus the visible registry candidates from the inspected window; add `--source-session <codex-thread> --workspace-fingerprint <key>` when available so the result can include a `new_thread_token` and reusable `thread_candidates`. Registry internals stay out of the model prompt.
 - `cxp delegate start --candidate-token <token> --task-file <path> --json`: create an idempotent delegation request for the selected machine. Add `--new-thread-token <token>` for a fresh remote thread or `--thread-token <token>` to continue a reusable remote thread when `resolve` returned one.
 - `cxp delegate status --id <delegation-id> --json`: inspect reduced state.
 - `cxp delegate wait --id <delegation-id> --timeout <duration> --json`: wait for a terminal result or a target-side question without tight polling. Add `--until terminal` to ignore intermediate questions.

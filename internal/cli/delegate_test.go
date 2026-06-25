@@ -65,6 +65,78 @@ func TestDelegateResolveAsksWhenMultipleMachinesMatch(t *testing.T) {
 	}
 }
 
+func TestDelegateResolveReturnsAllCandidatesWhenNoConfidentMatch(t *testing.T) {
+	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	var candidates []delegation.Candidate
+	for i := 0; i < 6; i++ {
+		candidates = append(candidates, delegation.Candidate{
+			MachineID: fmt.Sprintf("machine-%02d", i),
+			Label:     fmt.Sprintf("worker-%02d", i),
+			State:     "online",
+			Accepting: true,
+		})
+	}
+	candidates = append(candidates, delegation.Candidate{
+		MachineID: "machine-stale",
+		Label:     "stale-worker",
+		State:     "stale",
+		Accepting: true,
+	})
+	candidatesPath := writeJSONFile(t, "candidates.json", candidates)
+	result, err := runDelegateResolve(&delegateOptions{
+		query:         "需要另一台机器看一下这个问题",
+		candidateFile: candidatesPath,
+		now:           func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("runDelegateResolve: %v", err)
+	}
+	if result.Action != delegation.ActionAskUser || result.Reason != "online_candidates_available_no_confident_match" {
+		t.Fatalf("resolve result = %#v, want ask_user because online machines are available", result)
+	}
+	if len(result.Candidates) != len(candidates) {
+		t.Fatalf("candidates = %d, want all %d", len(result.Candidates), len(candidates))
+	}
+	onlineWithTokens := 0
+	staleWithReason := false
+	for _, candidate := range result.Candidates {
+		if candidate.State == "online" && candidate.Accepting && candidate.CandidateToken != "" {
+			onlineWithTokens++
+		}
+		if candidate.MachineID == "machine-stale" && strings.Contains(strings.Join(candidate.NotStartableReasons, " "), "not online") {
+			staleWithReason = true
+		}
+	}
+	if onlineWithTokens != 6 {
+		t.Fatalf("online candidates with tokens = %d, want 6: %#v", onlineWithTokens, result.Candidates)
+	}
+	if !staleWithReason {
+		t.Fatalf("stale candidate missing not-startable reason: %#v", result.Candidates)
+	}
+}
+
+func TestDelegateResolveDoesNotAskWhenNoMachineIsAvailable(t *testing.T) {
+	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	candidatesPath := writeJSONFile(t, "candidates.json", []delegation.Candidate{
+		{MachineID: "machine-stale", Label: "stale-worker", State: "stale", Accepting: true, Confidence: 0.95},
+		{MachineID: "machine-draining", Label: "draining-worker", State: "online", Accepting: false, Confidence: 0.95},
+	})
+	result, err := runDelegateResolve(&delegateOptions{
+		query:         "用 stale-worker 看一下",
+		candidateFile: candidatesPath,
+		now:           func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("runDelegateResolve: %v", err)
+	}
+	if result.Action != delegation.ActionDoNotDelegate || result.Reason != "no_online_matching_candidate" {
+		t.Fatalf("resolve result = %#v, want do_not_delegate when no online accepting machine is startable", result)
+	}
+	if len(result.Candidates) != 2 {
+		t.Fatalf("candidates = %#v, want unavailable machines visible for diagnosis", result.Candidates)
+	}
+}
+
 func TestDelegateResolveDefaultsToInjectedRegistryCandidateLoader(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
 	called := false
@@ -1233,6 +1305,42 @@ func TestDelegateCommandPrintsJSON(t *testing.T) {
 	}
 	if result.Action != delegation.ActionStart || result.CandidateToken == "" {
 		t.Fatalf("output = %#v", result)
+	}
+}
+
+func TestDelegateCommandResolvePrintsAllVisibleCandidates(t *testing.T) {
+	var candidates []delegation.Candidate
+	for i := 0; i < 7; i++ {
+		candidates = append(candidates, delegation.Candidate{
+			MachineID: fmt.Sprintf("machine-%02d", i),
+			Label:     fmt.Sprintf("worker-%02d", i),
+			State:     "online",
+			Accepting: true,
+		})
+	}
+	candidatesPath := writeJSONFile(t, "candidates.json", candidates)
+	cmd := newRootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"delegate", "resolve", "--query", "找一台可用机器", "--candidate-file", candidatesPath, "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v\n%s", err, out.String())
+	}
+	var result delegation.ResolveResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out.String())
+	}
+	if result.Action != delegation.ActionAskUser || result.Reason != "online_candidates_available_no_confident_match" {
+		t.Fatalf("output = %#v, want ask_user with online candidates", result)
+	}
+	if len(result.Candidates) != len(candidates) {
+		t.Fatalf("printed candidates = %d, want %d: %#v", len(result.Candidates), len(candidates), result.Candidates)
+	}
+	for i, candidate := range result.Candidates {
+		if candidate.MachineID != fmt.Sprintf("machine-%02d", i) || candidate.CandidateToken == "" {
+			t.Fatalf("candidate[%d] = %#v, want original order with token", i, candidate)
+		}
 	}
 }
 

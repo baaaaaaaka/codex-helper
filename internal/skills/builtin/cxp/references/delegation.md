@@ -14,9 +14,12 @@ cxp delegate resolve --query "<what needs the other machine>" --source-session "
 
 The result may include:
 
+- `candidates[]`: all currently visible registry candidates from the inspected window, including online machines that did not confidently match the query. The model should inspect this list when the user does not remember the exact machine name.
 - `candidate_token`: required for `start`.
 - `new_thread_token`: starts a fresh remote Codex thread on the target machine.
 - `thread_candidates[]`: reusable remote threads from recent related delegations on that same target machine.
+
+If the JSON action is `ask_user` with online accepting candidates, first decide whether the candidate list is enough to choose a target. Ask the user only when multiple plausible machines remain or the task would be risky on the wrong machine.
 
 The model decides whether to reuse a thread. Reuse only when the candidate summary clearly matches the current task, source session, workspace, and target machine. If there is doubt, prefer `new_thread_token`; do not ask the user to decide unless the target machine itself is ambiguous.
 
