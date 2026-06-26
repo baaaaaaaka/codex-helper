@@ -102,9 +102,37 @@ assert_version() {
   grep -Fq "$(version_no_v "$tag")" <<<"$output"
 }
 
+configure_managed_storage_layout() {
+  local scenario_base="$1"
+  local layout="$2"
+  local home="$3"
+
+  case "$layout" in
+    normal)
+      ;;
+    local-dir-symlink)
+      local physical_local="$scenario_base/local-overflow"
+      mkdir -p "$home" "$physical_local"
+      rm -rf "$home/.local"
+      ln -s "$physical_local" "$home/.local"
+      ;;
+    local-bin-symlink)
+      local physical_bin="$scenario_base/local-bin-overflow"
+      mkdir -p "$home/.local" "$physical_bin"
+      rm -rf "$home/.local/bin"
+      ln -s "$physical_bin" "$home/.local/bin"
+      ;;
+    *)
+      echo "unknown helper upgrade compatibility storage layout: $layout" >&2
+      exit 2
+      ;;
+  esac
+}
+
 run_upgrade_convergence_scenario() {
   local scenario="$1"
   local seed_mode="$2"
+  local storage_layout="${3:-normal}"
   local scenario_base="$base_root/$scenario"
   rm -rf "$scenario_base"
   mkdir -p "$scenario_base"
@@ -127,6 +155,8 @@ run_upgrade_convergence_scenario() {
   local managed="$HOME/.local/bin/codex-proxy"
   local managed_cxp="$HOME/.local/bin/cxp"
   local go_bin="$HOME/go/bin/codex-proxy"
+
+  configure_managed_storage_layout "$scenario_base" "$storage_layout" "$HOME"
 
   case "$os:$service_backend" in
     linux:local-supervisor)
@@ -153,7 +183,7 @@ SH
       ;;
   esac
 
-  echo "helper upgrade compatibility smoke: scenario=$scenario mode=$seed_mode os=$os service_backend=$service_backend repo=$repo old=$old_tag target=$target_tag"
+  echo "helper upgrade compatibility smoke: scenario=$scenario mode=$seed_mode storage=$storage_layout os=$os service_backend=$service_backend repo=$repo old=$old_tag target=$target_tag"
   download_binary "$old_tag" "$go_bin"
   case "$seed_mode" in
     copy)
@@ -337,5 +367,7 @@ run_upgrade_convergence_scenario "existing-managed-symlink" "symlink"
 run_upgrade_convergence_scenario "stale-managed-symlink" "stale-symlink"
 run_upgrade_convergence_scenario "missing-managed" "missing"
 run_upgrade_convergence_scenario "current-managed-missing-cxp" "current-missing-cxp"
+run_upgrade_convergence_scenario "symlinked-local-dir-managed-symlink" "symlink" "local-dir-symlink"
+run_upgrade_convergence_scenario "symlinked-local-bin-managed-symlink" "symlink" "local-bin-symlink"
 
 echo "helper upgrade compatibility smoke passed"

@@ -221,7 +221,7 @@ func teamsAutoUpdateShouldDeferActivation(stableInstallPath string) (bool, strin
 	if class.Transient {
 		return true, "helper update installed to " + stableInstallPath + ", but activation is pending because the running helper executable is transient: " + class.Reason
 	}
-	if strings.TrimSpace(stableInstallPath) != "" && !sameHelperExecutablePath(resolved.Path, stableInstallPath, teamsServiceGOOS()) {
+	if strings.TrimSpace(stableInstallPath) != "" && !sameHelperInstallLocation(resolved.Path, stableInstallPath, teamsServiceGOOS()) {
 		return true, "helper update installed to " + stableInstallPath + ", but activation is pending because the running helper executable is " + resolved.Path
 	}
 	return false, ""

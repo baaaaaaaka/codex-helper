@@ -849,6 +849,46 @@ func TestTeamsAutoUpdateActivationComparesWindowsPathsCaseInsensitively(t *testi
 	}
 }
 
+func TestTeamsAutoUpdateActivationComparesSymlinkedInstallLocation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked install location")
+	}
+	lockCLITestHooks(t)
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	physicalInstallPath := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstallPath := filepath.Join(home, ".local", "bin", "codex-proxy")
+	writeCLIFile(t, physicalInstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  physicalInstallPath,
+		cwd:  tmp,
+	})
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return physicalInstallPath, nil
+	}
+
+	pending, reason := teamsAutoUpdateShouldDeferActivation(logicalInstallPath)
+	if pending || reason != "" {
+		t.Fatalf("activation pending=%v reason=%q, want no pending for symlinked same install location", pending, reason)
+	}
+}
+
 func TestTeamsReleaseAutoUpdaterApplyUsesSharedInstallLock(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateTeamsUserDirsForTest(t, t.TempDir())

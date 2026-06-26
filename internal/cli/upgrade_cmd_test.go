@@ -484,6 +484,131 @@ func TestEnsureCXPShimForInstallPathRepairsStalePOSIXSymlink(t *testing.T) {
 	}
 }
 
+func TestRepairKnownHelperEntrypointsSkipsInstallPathThroughSymlinkedParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked parent alias repair")
+	}
+
+	for _, tc := range []struct {
+		name      string
+		linkLocal bool
+	}{
+		{name: "local directory", linkLocal: true},
+		{name: "local bin directory"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			home := filepath.Join(tmp, "home")
+			physicalLocal := filepath.Join(tmp, "local-overflow")
+			physicalBin := filepath.Join(physicalLocal, "bin")
+			if err := os.MkdirAll(filepath.Join(home, ".local"), 0o755); err != nil {
+				t.Fatalf("mkdir home local: %v", err)
+			}
+			if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+				t.Fatalf("mkdir physical bin: %v", err)
+			}
+			if tc.linkLocal {
+				if err := os.Remove(filepath.Join(home, ".local")); err != nil {
+					t.Fatalf("remove home local: %v", err)
+				}
+				if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+					t.Fatalf("symlink .local: %v", err)
+				}
+			} else if err := os.Symlink(physicalBin, filepath.Join(home, ".local", "bin")); err != nil {
+				t.Fatalf("symlink .local/bin: %v", err)
+			}
+			t.Setenv("HOME", home)
+
+			installPath := filepath.Join(physicalBin, "codex-proxy")
+			shimPath := filepath.Join(physicalBin, "cxp")
+			writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+			if err := os.Symlink(installPath, shimPath); err != nil {
+				t.Fatalf("create cxp shim: %v", err)
+			}
+
+			for _, err := range repairKnownHelperEntrypointsForInstallPath(installPath) {
+				t.Fatalf("repair known helper entrypoints: %v", err)
+			}
+			if info, err := os.Lstat(installPath); err != nil {
+				t.Fatalf("lstat install path: %v", err)
+			} else if info.Mode()&os.ModeSymlink != 0 {
+				target, _ := os.Readlink(installPath)
+				t.Fatalf("install path was replaced by symlink to %q", target)
+			}
+			if out, err := exec.Command(installPath, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+				t.Fatalf("install path after repair = %q err=%v, want 1.2.4", out, err)
+			}
+			if target, err := os.Readlink(shimPath); err != nil || target != installPath {
+				t.Fatalf("cxp shim = %q err=%v, want %s", target, err, installPath)
+			}
+		})
+	}
+}
+
+func TestSameHelperInstallLocationUsesResolvedParentForSelfSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX self-symlink")
+	}
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	installPath := filepath.Join(physicalBin, "codex-proxy")
+	logicalPath := filepath.Join(home, ".local", "bin", "codex-proxy")
+	if err := os.Symlink(installPath, installPath); err != nil {
+		t.Fatalf("create self symlink: %v", err)
+	}
+
+	if !sameHelperInstallLocation(logicalPath, installPath, "linux") {
+		t.Fatalf("sameHelperInstallLocation(%q, %q) = false, want true through resolved parent fallback", logicalPath, installPath)
+	}
+}
+
+func TestReplaceSymlinkAtomicallySkipsSameInstallLocationThroughSymlinkedParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink replacement")
+	}
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	installPath := filepath.Join(physicalBin, "codex-proxy")
+	logicalPath := filepath.Join(home, ".local", "bin", "codex-proxy")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	if err := replaceSymlinkAtomically(logicalPath, installPath); err != nil {
+		t.Fatalf("replaceSymlinkAtomically same install location: %v", err)
+	}
+	if info, err := os.Lstat(installPath); err != nil {
+		t.Fatalf("lstat install path: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		target, _ := os.Readlink(installPath)
+		t.Fatalf("install path was replaced by symlink to %q", target)
+	}
+	if out, err := exec.Command(installPath, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("install path after skipped replace = %q err=%v, want 1.2.4", out, err)
+	}
+}
+
 func upgradeCXPShimTestScript(version string) string {
 	return "#!/bin/sh\n" +
 		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ]; then exit 0; fi\n" +
@@ -711,6 +836,38 @@ func TestUpgradeCmdFallsBackToCacheLockWhenInstallPathLockUnavailable(t *testing
 	}
 	if performCalls != 1 {
 		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
+	}
+}
+
+func TestHelperInstallLockPathsUseSymlinkAwareCacheKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked install location")
+	}
+	tmp := t.TempDir()
+	t.Setenv("HOME", filepath.Join(tmp, "home"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
+	home := filepath.Join(tmp, "user-home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	logicalPath := filepath.Join(home, ".local", "bin", "codex-proxy")
+	physicalPath := filepath.Join(physicalBin, "codex-proxy")
+
+	logicalLocks := helperInstallLockPaths(logicalPath)
+	physicalLocks := helperInstallLockPaths(physicalPath)
+	if len(logicalLocks) < 2 || len(physicalLocks) < 2 {
+		t.Fatalf("helperInstallLockPaths returned too few paths: logical=%v physical=%v", logicalLocks, physicalLocks)
+	}
+	if logicalLocks[1] != physicalLocks[1] {
+		t.Fatalf("cache lock differs for same symlinked install location:\nlogical:  %s\nphysical: %s", logicalLocks[1], physicalLocks[1])
 	}
 }
 

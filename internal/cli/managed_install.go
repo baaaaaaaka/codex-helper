@@ -368,7 +368,7 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if err != nil {
 		return nil
 	}
-	if sameHelperExecutablePath(running.Path, target.Path, teamsServiceGOOS()) {
+	if sameHelperInstallLocation(running.Path, target.Path, teamsServiceGOOS()) {
 		return nil
 	}
 	runningProbe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
@@ -462,7 +462,7 @@ func knownHelperEntrypointAliasesForInstallPath(installPath string) []helperEntr
 		if path == "" {
 			return
 		}
-		if sameHelperExecutablePath(path, installPath, runtime.GOOS) {
+		if sameHelperInstallLocation(path, installPath, runtime.GOOS) {
 			return
 		}
 		out = append(out, helperEntrypointAlias{path: path, description: description, create: create})
@@ -472,7 +472,7 @@ func knownHelperEntrypointAliasesForInstallPath(installPath string) []helperEntr
 				shimName = "cxp.cmd"
 			}
 			shimPath := filepath.Join(filepath.Dir(path), shimName)
-			if !sameHelperExecutablePath(shimPath, installPath, runtime.GOOS) {
+			if !sameHelperInstallLocation(shimPath, installPath, runtime.GOOS) {
 				out = append(out, helperEntrypointAlias{path: shimPath, description: description + " shim", create: create})
 			}
 		}
@@ -519,7 +519,7 @@ func dedupeHelperEntrypointAliases(values []helperEntrypointAlias) []helperEntry
 
 func repairHelperEntrypointAlias(installPath string, alias helperEntrypointAlias) error {
 	path := strings.TrimSpace(alias.path)
-	if path == "" || sameHelperExecutablePath(path, installPath, runtime.GOOS) {
+	if path == "" || sameHelperInstallLocation(path, installPath, runtime.GOOS) {
 		return nil
 	}
 	probe := helperpath.ProbePath(path, helperpath.Options{GOOS: runtime.GOOS})
@@ -549,6 +549,45 @@ func repairWindowsHelperEntrypointAlias(installPath string, path string) error {
 		return os.WriteFile(path, []byte(windowsCXPShimContent()), 0o755)
 	}
 	return copyExecutableAtomically(installPath, path)
+}
+
+func sameHelperInstallLocation(a string, b string, goos string) bool {
+	if sameHelperExecutablePath(a, b, goos) {
+		return true
+	}
+	if sameExistingHelperFile(a, b) {
+		return true
+	}
+	aKey, aOK := helperInstallLocationKey(a, goos)
+	bKey, bOK := helperInstallLocationKey(b, goos)
+	return aOK && bOK && aKey == bKey
+}
+
+func sameExistingHelperFile(a string, b string) bool {
+	aInfo, aErr := os.Stat(strings.TrimSpace(a))
+	bInfo, bErr := os.Stat(strings.TrimSpace(b))
+	return aErr == nil && bErr == nil && os.SameFile(aInfo, bInfo)
+}
+
+func helperInstallLocationKey(path string, goos string) (string, bool) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if path == "" || path == "." {
+		return "", false
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if real, err := filepath.EvalSymlinks(path); err == nil && strings.TrimSpace(real) != "" {
+		return managedinstall.ComparisonKey(real, goos), true
+	}
+	parent := filepath.Dir(path)
+	if parent == "" || parent == "." || parent == path {
+		return managedinstall.ComparisonKey(path, goos), true
+	}
+	if realParent, err := filepath.EvalSymlinks(parent); err == nil && strings.TrimSpace(realParent) != "" {
+		return managedinstall.ComparisonKey(filepath.Join(realParent, filepath.Base(path)), goos), true
+	}
+	return managedinstall.ComparisonKey(path, goos), true
 }
 
 func saveCLIManagedInstallRecordBestEffort(installPath string, version string) {
@@ -610,7 +649,7 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 			if !filepath.IsAbs(resolvedTarget) {
 				resolvedTarget = filepath.Join(filepath.Dir(shimPath), resolvedTarget)
 			}
-			if sameHelperExecutablePath(resolvedTarget, installPath, goos) {
+			if sameHelperInstallLocation(resolvedTarget, installPath, goos) {
 				return nil
 			}
 			if err := replaceSymlinkAtomically(shimPath, installPath); err != nil {
@@ -647,6 +686,9 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 }
 
 func replaceSymlinkAtomically(linkPath string, targetPath string) error {
+	if sameHelperInstallLocation(linkPath, targetPath, runtime.GOOS) {
+		return nil
+	}
 	dir := filepath.Dir(linkPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -794,6 +836,9 @@ func copyExecutableAtomically(src string, dst string) error {
 	}
 	if srcInfo.IsDir() {
 		return fmt.Errorf("source is a directory: %s", src)
+	}
+	if dstInfo, err := os.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) {
+		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err

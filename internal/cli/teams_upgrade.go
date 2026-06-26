@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -408,8 +409,12 @@ func helperInstallLockPaths(resolvedInstallPath string) []string {
 	if err != nil || strings.TrimSpace(cacheDir) == "" {
 		return paths
 	}
-	sum := sha256.Sum256([]byte(resolvedInstallPath))
-	base := filepath.Base(resolvedInstallPath)
+	lockIdentity := resolvedInstallPath
+	if key, ok := helperInstallLocationKey(resolvedInstallPath, runtime.GOOS); ok {
+		lockIdentity = key
+	}
+	sum := sha256.Sum256([]byte(lockIdentity))
+	base := filepath.Base(lockIdentity)
 	if strings.TrimSpace(base) == "" || base == "." || base == string(filepath.Separator) {
 		base = "codex-proxy"
 	}

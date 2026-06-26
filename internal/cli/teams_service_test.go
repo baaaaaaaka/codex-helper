@@ -3215,6 +3215,60 @@ func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(
 	}
 }
 
+func TestTeamsServiceInstallSkipsMaterializingSameTargetThroughSymlinkedLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	physicalInstall := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstall := filepath.Join(home, ".local", "bin", "codex-proxy")
+	logicalCXP := filepath.Join(home, ".local", "bin", "cxp")
+	recordPath := filepath.Join(tmp, "install.json")
+	writeVersionedHelperForServiceTest(t, physicalInstall, "1.2.4")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  physicalInstall,
+		cwd:  tmp,
+	})
+
+	target := managedinstall.Target{
+		Path:       logicalInstall,
+		Source:     managedinstall.SourceDefault,
+		State:      managedinstall.StateManaged,
+		RecordPath: recordPath,
+	}
+	if err := defaultMaterializeManagedTeamsInstallTarget(context.Background(), target); err != nil {
+		t.Fatalf("materialize symlinked same target: %v", err)
+	}
+	if info, err := os.Lstat(physicalInstall); err != nil {
+		t.Fatalf("lstat physical install: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		target, _ := os.Readlink(physicalInstall)
+		t.Fatalf("physical install was replaced by symlink to %q", target)
+	}
+	if _, err := os.Lstat(logicalCXP); !os.IsNotExist(err) {
+		t.Fatalf("materialization should not create a cxp shim for the same symlinked target, err=%v", err)
+	}
+	if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
+		t.Fatalf("materialization should not write a record for the same symlinked target, err=%v", err)
+	}
+}
+
 func TestTeamsServiceInstallCreatesMissingManagedDefaultBeforeRepointingFromGoBin(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("managed target materialization is Unix-focused")
