@@ -284,19 +284,23 @@ func resolveRunnableHelperInstallCandidate(path string, source managedinstall.So
 }
 
 func legacyInstallDirCandidateForCLI(value string) string {
+	return legacyInstallDirCandidateForGOOS(value, runtime.GOOS, os.Stat)
+}
+
+func legacyInstallDirCandidateForGOOS(value string, goos string, stat func(string) (os.FileInfo, error)) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
 	}
 	base := filepath.Base(filepath.Clean(value))
-	probe := helperpath.ProbePath(value, helperpath.Options{GOOS: runtime.GOOS})
+	probe := helperpath.ProbePath(value, helperpath.Options{GOOS: goos, Stat: stat})
 	if probe.PlausibleHelperEntry ||
-		strings.EqualFold(base, helperpath.BinaryName(runtime.GOOS)) ||
+		strings.EqualFold(base, helperpath.BinaryName(goos)) ||
 		strings.EqualFold(base, "cxp") ||
 		strings.EqualFold(base, "cxp.exe") {
 		return value
 	}
-	return filepath.Join(value, helperpath.BinaryName(runtime.GOOS))
+	return filepath.Join(value, helperpath.BinaryName(goos))
 }
 
 func dedupeStrings(values []string) []string {
@@ -333,7 +337,14 @@ func resolveManagedInstallPathForTeamsAutoUpdate(explicit string) (string, error
 	if strings.TrimSpace(explicit) != "" {
 		return resolveManagedInstallPathForTeams(explicit)
 	}
+	if err := repairManagedTeamsInstallSelfLoopsBeforeAutoUpdate(); err != nil {
+		return "", err
+	}
 	if target, ok := resolveCurrentHelperInstallTargetForTeamsAutoUpdate(); ok {
+		var warnings []string
+		if canonical, ok := canonicalManagedTeamsInstallTargetForSameLocation(target.Path, target.RecordPath, &warnings); ok {
+			return canonical.Path, nil
+		}
 		return target.Path, nil
 	}
 	return resolveManagedInstallPathForTeams(explicit)
@@ -493,6 +504,91 @@ func teamsManagedInstallTargetShouldSkipNonRunnableEnv(target managedinstall.Tar
 	}
 	_, err := resolveRunnableHelperInstallCandidate(target.Path, target.Source, target.State, target.Reason, target.RecordPath, teamsServiceGOOS(), teamsServiceStat)
 	return err != nil
+}
+
+func canonicalManagedTeamsInstallTargetForSameLocation(installPath string, recordPath string, warnings *[]string) (managedinstall.Target, bool) {
+	for _, candidate := range managedTeamsInstallPathCandidates(recordPath) {
+		if !managedinstall.IsCanonicalTargetPath(candidate.path, teamsServiceGOOS()) {
+			continue
+		}
+		if !sameHelperInstallLocation(candidate.path, installPath, teamsServiceGOOS()) {
+			continue
+		}
+		target, err := resolveRunnableHelperInstallCandidate(candidate.path, candidate.source, candidate.state, candidate.reason, recordPath, teamsServiceGOOS(), teamsServiceStat)
+		if err != nil {
+			if warnings != nil {
+				*warnings = append(*warnings, fmt.Sprintf("install target %s is not a runnable codex-helper binary: %v", candidate.path, err))
+			}
+			continue
+		}
+		if warnings != nil {
+			target.Warnings = append(target.Warnings, (*warnings)...)
+		}
+		return target, true
+	}
+	return managedinstall.Target{}, false
+}
+
+func managedTeamsInstallPathCandidates(recordPath string) []managedInstallPathCandidate {
+	goos := teamsServiceGOOS()
+	var out []managedInstallPathCandidate
+	if defaultPath, err := managedinstall.DefaultInstallPath(managedinstall.Options{GOOS: goos}); err == nil {
+		out = append(out, managedInstallPathCandidate{
+			path:   defaultPath,
+			source: managedinstall.SourceDefault,
+			state:  managedinstall.StateManaged,
+			reason: "default per-user install target",
+		})
+	}
+	if strings.TrimSpace(recordPath) != "" {
+		if record, err := managedinstall.LoadRecord(recordPath); err == nil && strings.TrimSpace(record.TargetPath) != "" {
+			out = append(out, managedInstallPathCandidate{
+				path:   record.TargetPath,
+				source: managedinstall.SourceRecord,
+				state:  managedinstall.StateManaged,
+				reason: "install record",
+			})
+		}
+	}
+	if envPath := strings.TrimSpace(os.Getenv(update.EnvInstallPath)); envPath != "" {
+		out = append(out, managedInstallPathCandidate{
+			path:   envPath,
+			source: managedinstall.SourceEnvInstallPath,
+			state:  managedinstall.StateExplicit,
+			reason: update.EnvInstallPath,
+		})
+	}
+	if envDirCandidate := legacyInstallDirCandidateForGOOS(os.Getenv(update.EnvInstallDir), goos, teamsServiceStat); strings.TrimSpace(envDirCandidate) != "" {
+		out = append(out, managedInstallPathCandidate{
+			path:   envDirCandidate,
+			source: managedinstall.SourceEnvInstallDir,
+			state:  managedinstall.StateExplicit,
+			reason: update.EnvInstallDir,
+		})
+	}
+	return out
+}
+
+func repairManagedTeamsInstallSelfLoopsBeforeAutoUpdate() error {
+	recordPath, _ := managedinstall.DefaultRecordPath()
+	var errs []string
+	for _, candidate := range managedTeamsInstallPathCandidates(recordPath) {
+		repaired, err := repairHelperInstallSelfLoopFromPrevious(candidate.path, teamsServiceGOOS())
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		if repaired {
+			break
+		}
+	}
+	if len(errs) > 0 {
+		if _, ok := resolveCurrentHelperInstallTargetForTeamsAutoUpdate(); ok {
+			return nil
+		}
+		return fmt.Errorf("repair managed helper self-loop before update: %s", strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target managedinstall.Target) error {
@@ -761,6 +857,48 @@ func sameExistingHelperFile(a string, b string) bool {
 	aInfo, aErr := os.Stat(strings.TrimSpace(a))
 	bInfo, bErr := os.Stat(strings.TrimSpace(b))
 	return aErr == nil && bErr == nil && os.SameFile(aInfo, bInfo)
+}
+
+func repairHelperInstallSelfLoopFromPrevious(path string, goos string) (bool, error) {
+	path = managedinstall.CanonicalTargetPathForEntry(path, goos)
+	if path == "" || !managedinstall.IsCanonicalTargetPath(path, goos) {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, err
+	}
+	resolvedTarget := target
+	if !filepath.IsAbs(resolvedTarget) {
+		resolvedTarget = filepath.Join(filepath.Dir(path), resolvedTarget)
+	}
+	if !sameHelperInstallLocation(resolvedTarget, path, goos) {
+		return false, nil
+	}
+	previous := path + ".prev"
+	probe := helperpath.ProbePath(previous, helperpath.Options{GOOS: goos})
+	if !probe.Exists || probe.IsDir || !probe.Executable {
+		return true, fmt.Errorf("managed helper target %s is a self-referential symlink and previous binary %s is not usable", path, previous)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := update.ProbeBinaryVersion(ctx, previous, 5*time.Second); err != nil {
+		return true, fmt.Errorf("managed helper target %s is a self-referential symlink and previous binary %s is not runnable: %w", path, previous, err)
+	}
+	if err := copyExecutableAtomically(previous, path); err != nil {
+		return true, fmt.Errorf("repair managed helper self-loop %s from %s: %w", path, previous, err)
+	}
+	return true, nil
 }
 
 func helperInstallLocationKey(path string, goos string) (string, bool) {

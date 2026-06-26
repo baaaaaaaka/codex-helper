@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -884,6 +885,284 @@ func TestTeamsAutoUpdateActivationComparesSymlinkedInstallLocation(t *testing.T)
 	pending, reason := teamsAutoUpdateShouldDeferActivation(logicalInstallPath)
 	if pending || reason != "" {
 		t.Fatalf("activation pending=%v reason=%q, want no pending for symlinked same install location", pending, reason)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyPrefersLogicalDefaultThroughSymlinkedLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked install location")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevTeamsExecutable := teamsAutoUpdateExecutable
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevTeamsExecutable
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	isolateTeamsUserDirsForTest(t, home)
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+
+	physicalInstall := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstall := filepath.Join(home, ".local", "bin", "codex-proxy")
+	logicalCXP := filepath.Join(home, ".local", "bin", "cxp")
+	writeCLIFile(t, physicalInstall, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(logicalInstall, logicalCXP); err != nil {
+		t.Fatalf("symlink logical cxp: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  physicalInstall,
+		cwd:  tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return physicalInstall, nil
+	}
+	executablePath = func() (string, error) { return physicalInstall, nil }
+	restartArgv0 = func() string { return physicalInstall }
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if got.InstallPath != logicalInstall || res.InstallPath != logicalInstall {
+		t.Fatalf("install path got options=%q result=%q, want logical managed target %q", got.InstallPath, res.InstallPath, logicalInstall)
+	}
+	if res.ActivationPending || res.ActivationReason != "" {
+		t.Fatalf("activation = pending %v reason %q, want immediate activation for symlinked same install location", res.ActivationPending, res.ActivationReason)
+	}
+	if out, err := exec.Command(logicalInstall, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("logical install after auto-update = %q err=%v, want 1.2.4", out, err)
+	}
+	if out, err := exec.Command(logicalCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("cxp after auto-update = %q err=%v, want 1.2.4", out, err)
+	}
+	if info, err := os.Lstat(physicalInstall); err != nil {
+		t.Fatalf("lstat physical install: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		target, _ := os.Readlink(physicalInstall)
+		t.Fatalf("physical install became symlink to %q", target)
+	}
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if record.TargetPath != logicalInstall {
+		t.Fatalf("record target path = %q, want logical path %q", record.TargetPath, logicalInstall)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyRepairsSelfLoopedManagedTargetThroughSymlinkedLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked install location")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevTeamsExecutable := teamsAutoUpdateExecutable
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevTeamsExecutable
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	isolateTeamsUserDirsForTest(t, home)
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+
+	physicalInstall := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstall := filepath.Join(home, ".local", "bin", "codex-proxy")
+	logicalCXP := filepath.Join(home, ".local", "bin", "cxp")
+	if err := os.Symlink(physicalInstall, physicalInstall); err != nil {
+		t.Fatalf("create self-looped managed target: %v", err)
+	}
+	writeCLIFile(t, physicalInstall+".prev", upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(physicalInstall, logicalCXP); err != nil {
+		t.Fatalf("symlink cxp to self-looped target: %v", err)
+	}
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:   physicalInstall,
+		TargetSource: string(managedinstall.SourceCurrentExecutable),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      "1.2.4",
+		GOOS:         "linux",
+		GOARCH:       runtime.GOARCH,
+		Shims:        []string{logicalCXP},
+	}); err != nil {
+		t.Fatalf("save install record: %v", err)
+	}
+	deletedExecutable := physicalInstall + " (deleted)"
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:  "linux",
+		exe:   deletedExecutable,
+		argv0: deletedExecutable,
+		cwd:   tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return deletedExecutable, nil
+	}
+	executablePath = func() (string, error) { return deletedExecutable, nil }
+	restartArgv0 = func() string { return deletedExecutable }
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		if info, err := os.Lstat(physicalInstall); err != nil {
+			t.Fatalf("lstat repaired physical install before performUpdate: %v", err)
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			target, _ := os.Readlink(physicalInstall)
+			t.Fatalf("physical install should be repaired before performUpdate, still symlink to %q", target)
+		}
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if got.InstallPath != logicalInstall || res.InstallPath != logicalInstall {
+		t.Fatalf("install path got options=%q result=%q, want logical managed target %q", got.InstallPath, res.InstallPath, logicalInstall)
+	}
+	if out, err := exec.Command(logicalInstall, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("logical install after self-loop repair = %q err=%v, want 1.2.4", out, err)
+	}
+	if out, err := exec.Command(logicalCXP, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("cxp after self-loop repair = %q err=%v, want 1.2.4", out, err)
+	}
+	if info, err := os.Lstat(physicalInstall); err != nil {
+		t.Fatalf("lstat physical install after update: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		target, _ := os.Readlink(physicalInstall)
+		t.Fatalf("physical install remained symlink to %q", target)
+	}
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if record.TargetPath != logicalInstall {
+		t.Fatalf("record target path = %q, want logical path %q", record.TargetPath, logicalInstall)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterApplyIgnoresUnusableSelfLoopedEnvWhenCurrentExecutableIsRunnable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked install location")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	prevTeamsExecutable := teamsAutoUpdateExecutable
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+		teamsAutoUpdateExecutable = prevTeamsExecutable
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	isolateTeamsUserDirsForTest(t, home)
+	current := filepath.Join(tmp, "current", "codex-proxy")
+	staleEnv := filepath.Join(tmp, "stale-env", "codex-proxy")
+	if err := os.MkdirAll(filepath.Dir(current), 0o755); err != nil {
+		t.Fatalf("mkdir current: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(staleEnv), 0o755); err != nil {
+		t.Fatalf("mkdir stale env: %v", err)
+	}
+	writeCLIFile(t, current, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(staleEnv, staleEnv); err != nil {
+		t.Fatalf("create stale self-loop env path: %v", err)
+	}
+	t.Setenv(update.EnvInstallPath, staleEnv)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos: "linux",
+		exe:  current,
+		cwd:  tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = resolveManagedInstallPathForTeamsAutoUpdate
+	teamsAutoUpdateExecutable = func() (string, error) {
+		return current, nil
+	}
+	executablePath = func() (string, error) { return current, nil }
+	restartArgv0 = func() string { return current }
+	var got update.UpdateOptions
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if got.InstallPath != current || res.InstallPath != current {
+		t.Fatalf("install path got options=%q result=%q, want runnable current executable %q", got.InstallPath, res.InstallPath, current)
+	}
+	if out, err := exec.Command(current, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("current executable after auto-update = %q err=%v, want 1.2.4", out, err)
+	}
+	if out, err := exec.Command(staleEnv, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("stale env path after auto-update = %q err=%v, want repaired runnable 1.2.4 entrypoint", out, err)
+	}
+	if target, err := os.Readlink(staleEnv); err != nil || !sameHelperInstallLocation(target, current, runtime.GOOS) {
+		t.Fatalf("stale env symlink target = %q err=%v, want alias to current executable %q", target, err, current)
 	}
 }
 
