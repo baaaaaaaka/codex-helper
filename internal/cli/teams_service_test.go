@@ -3229,6 +3229,74 @@ func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(
 	}
 }
 
+func TestTeamsServiceInstallRepairsStaleManagedCXPShimWhenRepointingFromGoBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(tmp, ".local", "bin", "cxp")
+	goBin := filepath.Join(tmp, "go", "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, managed, "1.2.3")
+	writeVersionedHelperForServiceTest(t, goBin, "1.2.4")
+	if err := os.Symlink(goBin, cxp); err != nil {
+		t.Fatalf("symlink stale cxp: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     goBin,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	managedVersion, err := exec.Command(managed, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed helper --version failed: %v\n%s", err, managedVersion)
+	}
+	if !strings.Contains(string(managedVersion), "1.2.4") {
+		t.Fatalf("managed helper was not materialized from upgraded go/bin helper: %s", managedVersion)
+	}
+	cxpVersion, err := exec.Command(cxp, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed cxp --version failed: %v\n%s", err, cxpVersion)
+	}
+	if !strings.Contains(string(cxpVersion), "1.2.4") {
+		t.Fatalf("managed cxp shim was not repaired from upgraded go/bin helper: %s", cxpVersion)
+	}
+	if target, err := os.Readlink(cxp); err != nil || target != managed {
+		t.Fatalf("managed cxp shim = %q err=%v, want symlink to %s", target, err, managed)
+	}
+	record := loadManagedInstallRecordForServiceTest(t)
+	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
+		t.Fatalf("install record = %#v, want managed target %s at 1.2.4", record, managed)
+	}
+	if !slices.Contains(record.Shims, cxp) {
+		t.Fatalf("install record shims = %#v, want %s", record.Shims, cxp)
+	}
+	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
+	if err != nil {
+		t.Fatalf("read unit file: %v", err)
+	}
+	unit := string(data)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	}
+	if strings.Contains(unit, goBin) {
+		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
+	}
+}
+
 func TestTeamsServiceInstallSkipsMaterializingSameTargetThroughSymlinkedLocal(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("managed target materialization is Unix-focused")

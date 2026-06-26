@@ -904,6 +904,22 @@ func cxpShimNeedsRepair(installPath string, shimPath string) (bool, error) {
 
 func materializeManagedInstallShim(ctx context.Context, runningPath string, targetPath string, shimPath string, runningVersion string) error {
 	if info, err := os.Lstat(shimPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, readErr := os.Readlink(shimPath)
+		if readErr != nil {
+			return readErr
+		}
+		resolvedTarget := linkTarget
+		if !filepath.IsAbs(resolvedTarget) {
+			resolvedTarget = filepath.Join(filepath.Dir(shimPath), resolvedTarget)
+		}
+		if sameHelperInstallLocation(resolvedTarget, targetPath, teamsServiceGOOS()) {
+			return nil
+		}
+		if err := replaceSymlinkAtomically(shimPath, targetPath); err != nil {
+			if copyErr := copyExecutableAtomically(targetPath, shimPath); copyErr != nil {
+				return fmt.Errorf("repair managed Teams install shim %s -> %s: symlink failed: %v; copy failed: %w", shimPath, targetPath, err, copyErr)
+			}
+		}
 		return nil
 	}
 	probe := helperpath.ProbePath(shimPath, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
