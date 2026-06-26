@@ -503,7 +503,11 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if err != nil {
 		return nil
 	}
-	if sameHelperInstallLocation(running.Path, target.Path, teamsServiceGOOS()) {
+	targetIsSymlink := false
+	if info, err := os.Lstat(target.Path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		targetIsSymlink = true
+	}
+	if sameHelperInstallLocation(running.Path, target.Path, teamsServiceGOOS()) && !targetIsSymlink {
 		return nil
 	}
 	runningProbe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
@@ -520,7 +524,7 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if runningErr != nil {
 		return nil
 	}
-	shouldCopy := !targetProbe.Exists || !targetProbe.Executable
+	shouldCopy := targetIsSymlink || !targetProbe.Exists || !targetProbe.Executable
 	targetVersion := update.BinaryVersion{}
 	if !shouldCopy {
 		var targetErr error
@@ -989,7 +993,11 @@ func copyExecutableAtomically(src string, dst string) error {
 	if srcInfo.IsDir() {
 		return fmt.Errorf("source is a directory: %s", src)
 	}
-	if dstInfo, err := os.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) {
+	dstIsSymlink := false
+	if dstInfo, err := os.Lstat(dst); err == nil && dstInfo.Mode()&os.ModeSymlink != 0 {
+		dstIsSymlink = true
+	}
+	if dstInfo, err := os.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) && !dstIsSymlink {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
