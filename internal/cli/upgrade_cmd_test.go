@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -606,6 +608,127 @@ func TestReplaceSymlinkAtomicallySkipsSameInstallLocationThroughSymlinkedParent(
 	}
 	if out, err := exec.Command(installPath, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
 		t.Fatalf("install path after skipped replace = %q err=%v, want 1.2.4", out, err)
+	}
+}
+
+func TestResolveManagedInstallPathPrefersLogicalDefaultThroughSymlinkedLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked managed install path")
+	}
+	lockCLITestHooks(t)
+
+	prevExecutable := executablePath
+	prevArgv0 := restartArgv0
+	t.Cleanup(func() {
+		executablePath = prevExecutable
+		restartArgv0 = prevArgv0
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	physicalInstall := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstall := filepath.Join(home, ".local", "bin", "codex-proxy")
+	writeCLIFile(t, physicalInstall, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:   logicalInstall,
+		TargetSource: string(managedinstall.SourceDefault),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      "1.2.4",
+		GOOS:         "linux",
+		GOARCH:       runtime.GOARCH,
+		Shims:        []string{filepath.Join(home, ".local", "bin", "cxp")},
+	}); err != nil {
+		t.Fatalf("save install record: %v", err)
+	}
+	executablePath = func() (string, error) { return physicalInstall, nil }
+	restartArgv0 = func() string { return physicalInstall }
+
+	got, err := resolveManagedInstallPathForCLI("")
+	if err != nil {
+		t.Fatalf("resolve managed install path: %v", err)
+	}
+	if got != logicalInstall {
+		t.Fatalf("resolve managed install path = %q, want logical default %q", got, logicalInstall)
+	}
+}
+
+func TestFinalizeHelperEntrypointsPreservesLogicalRecordThroughSymlinkedLocal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlinked managed install record")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	home := filepath.Join(tmp, "home")
+	physicalLocal := filepath.Join(tmp, "local-overflow")
+	physicalBin := filepath.Join(physicalLocal, "bin")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(home, ".local")), 0o755); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := os.MkdirAll(physicalBin, 0o755); err != nil {
+		t.Fatalf("mkdir physical bin: %v", err)
+	}
+	if err := os.Symlink(physicalLocal, filepath.Join(home, ".local")); err != nil {
+		t.Fatalf("symlink .local: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	physicalInstall := filepath.Join(physicalBin, "codex-proxy")
+	logicalInstall := filepath.Join(home, ".local", "bin", "codex-proxy")
+	logicalCXP := filepath.Join(home, ".local", "bin", "cxp")
+	writeCLIFile(t, physicalInstall, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	if err := os.Symlink(logicalInstall, logicalCXP); err != nil {
+		t.Fatalf("symlink logical cxp: %v", err)
+	}
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:   logicalInstall,
+		TargetSource: string(managedinstall.SourceDefault),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      "1.2.3",
+		GOOS:         "linux",
+		GOARCH:       runtime.GOARCH,
+		Shims:        []string{logicalCXP},
+	}); err != nil {
+		t.Fatalf("save install record: %v", err)
+	}
+
+	finalizeHelperEntrypointsAfterUpgrade(physicalInstall, "1.2.4", io.Discard)
+
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if record.TargetPath != logicalInstall {
+		t.Fatalf("record target path = %q, want logical path %q", record.TargetPath, logicalInstall)
+	}
+	if !slices.Contains(record.Shims, logicalCXP) {
+		t.Fatalf("record shims = %#v, want logical cxp %s", record.Shims, logicalCXP)
+	}
+	if slices.Contains(record.Shims, filepath.Join(physicalBin, "cxp")) {
+		t.Fatalf("record shims should not drift to physical cxp path: %#v", record.Shims)
 	}
 }
 

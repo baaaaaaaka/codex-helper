@@ -43,6 +43,9 @@ func resolveManagedInstallTargetForCLI(explicit string) (managedinstall.Target, 
 
 	var warnings []string
 	if target, ok := resolveCurrentHelperInstallTargetForCLI(raw, restartArgv0(), recordPath, &warnings); ok {
+		if canonical, ok := canonicalManagedInstallTargetForSameLocation(target.Path, recordPath, &warnings); ok {
+			return canonical, nil
+		}
 		return target, nil
 	}
 	if target, ok := resolveKnownHelperInstallCandidateForCLI(os.Getenv(update.EnvInstallPath), managedinstall.SourceEnvInstallPath, managedinstall.StateExplicit, update.EnvInstallPath, false, recordPath, &warnings); ok {
@@ -92,6 +95,75 @@ func resolveCurrentHelperInstallTargetForCLI(raw string, argv0 string, recordPat
 		}
 	}
 	return managedinstall.Target{}, false
+}
+
+type managedInstallPathCandidate struct {
+	path         string
+	source       managedinstall.Source
+	state        managedinstall.TargetState
+	reason       string
+	allowMissing bool
+}
+
+func canonicalManagedInstallTargetForSameLocation(installPath string, recordPath string, warnings *[]string) (managedinstall.Target, bool) {
+	for _, candidate := range managedInstallPathCandidatesForCLI(recordPath) {
+		if !sameHelperInstallLocation(candidate.path, installPath, runtime.GOOS) {
+			continue
+		}
+		target, ok := resolveKnownHelperInstallCandidateForCLI(candidate.path, candidate.source, candidate.state, candidate.reason, candidate.allowMissing, recordPath, warnings)
+		if ok {
+			return target, true
+		}
+	}
+	return managedinstall.Target{}, false
+}
+
+func managedInstallPathCandidatesForCLI(recordPath string) []managedInstallPathCandidate {
+	var out []managedInstallPathCandidate
+	if defaultPath, err := managedinstall.DefaultInstallPath(managedinstall.Options{GOOS: runtime.GOOS}); err == nil {
+		out = append(out, managedInstallPathCandidate{
+			path:   defaultPath,
+			source: managedinstall.SourceDefault,
+			state:  managedinstall.StateManaged,
+			reason: "default per-user install target",
+		})
+	}
+	if strings.TrimSpace(recordPath) != "" {
+		if record, err := managedinstall.LoadRecord(recordPath); err == nil && strings.TrimSpace(record.TargetPath) != "" {
+			out = append(out, managedInstallPathCandidate{
+				path:   record.TargetPath,
+				source: managedinstall.SourceRecord,
+				state:  managedinstall.StateManaged,
+				reason: "install record",
+			})
+		}
+	}
+	if envPath := strings.TrimSpace(os.Getenv(update.EnvInstallPath)); envPath != "" {
+		out = append(out, managedInstallPathCandidate{
+			path:   envPath,
+			source: managedinstall.SourceEnvInstallPath,
+			state:  managedinstall.StateExplicit,
+			reason: update.EnvInstallPath,
+		})
+	}
+	if envDirCandidate := legacyInstallDirCandidateForCLI(os.Getenv(update.EnvInstallDir)); strings.TrimSpace(envDirCandidate) != "" {
+		out = append(out, managedInstallPathCandidate{
+			path:   envDirCandidate,
+			source: managedinstall.SourceEnvInstallDir,
+			state:  managedinstall.StateExplicit,
+			reason: update.EnvInstallDir,
+		})
+	}
+	return out
+}
+
+func canonicalManagedInstallPathForSameLocation(installPath string, recordPath string) string {
+	for _, candidate := range managedInstallPathCandidatesForCLI(recordPath) {
+		if sameHelperInstallLocation(candidate.path, installPath, runtime.GOOS) {
+			return strings.TrimSpace(candidate.path)
+		}
+	}
+	return installPath
 }
 
 func currentHelperInstallCandidatesForCLI(path string) []string {
@@ -595,6 +667,7 @@ func saveCLIManagedInstallRecordBestEffort(installPath string, version string) {
 	if err != nil {
 		return
 	}
+	installPath = canonicalManagedInstallPathForSameLocation(installPath, recordPath)
 	shims := []string{}
 	if !strings.EqualFold(runtime.GOOS, "windows") {
 		shims = append(shims, filepath.Join(filepath.Dir(installPath), "cxp"))
