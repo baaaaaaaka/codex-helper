@@ -408,7 +408,70 @@ func resolveManagedTeamsInstallTarget(explicit string, requireExisting bool, all
 		opts.EnvDir = ""
 		return managedinstall.Resolve(opts)
 	}
+	if teamsManagedInstallTargetShouldPreferDefaultOverGoBinRecord(target, explicit) {
+		if defaultTarget, ok := resolveManagedTeamsDefaultInstallTarget(requireExisting, allowMissingDefault, target.RecordPath); ok {
+			return defaultTarget, nil
+		}
+	}
 	return target, nil
+}
+
+func teamsManagedInstallTargetShouldPreferDefaultOverGoBinRecord(target managedinstall.Target, explicit string) bool {
+	if strings.TrimSpace(explicit) != "" {
+		return false
+	}
+	if target.Source != managedinstall.SourceRecord {
+		return false
+	}
+	if !teamsManagedInstallPathLooksLikeHomeGoBin(target.Path, teamsServiceGOOS()) {
+		return false
+	}
+	if strings.TrimSpace(target.RecordPath) == "" {
+		return true
+	}
+	record, err := managedinstall.LoadRecord(target.RecordPath)
+	if err != nil {
+		return true
+	}
+	source := strings.TrimSpace(record.TargetSource)
+	return source == "" || source == string(managedinstall.SourceCurrentExecutable)
+}
+
+func teamsManagedInstallPathLooksLikeHomeGoBin(path string, goos string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return false
+	}
+	return sameHelperExecutablePath(path, filepath.Join(home, "go", "bin", helperpath.BinaryName(goos)), goos)
+}
+
+func resolveManagedTeamsDefaultInstallTarget(requireExisting bool, allowMissingDefault bool, recordPath string) (managedinstall.Target, bool) {
+	goos := teamsServiceGOOS()
+	defaultPath, err := managedinstall.DefaultInstallPath(managedinstall.Options{GOOS: goos})
+	if err != nil {
+		return managedinstall.Target{}, false
+	}
+	resolved, err := helperpath.StableInstallTargetFromSources(defaultPath, "", "", "", helperpath.Options{GOOS: goos, Stat: teamsServiceStat})
+	if err != nil {
+		return managedinstall.Target{}, false
+	}
+	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: goos, Stat: teamsServiceStat})
+	if !probe.PlausibleHelperEntry {
+		return managedinstall.Target{}, false
+	}
+	if requireExisting || !allowMissingDefault {
+		if !probe.Exists || probe.IsDir || !probe.Executable {
+			return managedinstall.Target{}, false
+		}
+	}
+	return managedinstall.Target{
+		Path:          resolved.Path,
+		Source:        managedinstall.SourceDefault,
+		State:         managedinstall.StateManaged,
+		Reason:        "default per-user install target",
+		ComparisonKey: managedinstall.ComparisonKey(resolved.Path, goos),
+		RecordPath:    recordPath,
+	}, true
 }
 
 func teamsManagedInstallTargetShouldSkipNonRunnableEnv(target managedinstall.Target, explicit string) bool {

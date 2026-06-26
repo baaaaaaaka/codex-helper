@@ -3115,6 +3115,20 @@ func TestTeamsServiceInstallUsesManagedDefaultInsteadOfGoBinExecutable(t *testin
 			t.Fatalf("write %s: %v", path, err)
 		}
 	}
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:   goBin,
+		TargetSource: string(managedinstall.SourceCurrentExecutable),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      "1.2.4",
+		GOOS:         "linux",
+		GOARCH:       runtime.GOARCH,
+	}); err != nil {
+		t.Fatalf("save go/bin install record: %v", err)
+	}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     goBin,
