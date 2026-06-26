@@ -222,6 +222,46 @@ func TestResolveInstallPathUsesExactEnvInstallPathBeforeLegacyDir(t *testing.T) 
 	}
 }
 
+func TestResolveInstallPathMapsEnvCXPShimToManagedSibling(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, "cxp")
+	want := filepath.Join(dir, binaryName())
+	t.Setenv(EnvInstallPath, envPath)
+	t.Setenv(EnvInstallDir, "")
+
+	got, err := ResolveInstallPath("")
+	if err != nil {
+		t.Fatalf("ResolveInstallPath error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveInstallPath = %q, want managed sibling %q", got, want)
+	}
+}
+
+func TestResolveInstallPathMapsCurrentCXPEntrypointToManagedSibling(t *testing.T) {
+	t.Setenv(EnvInstallDir, "")
+	prevExecutablePath := executablePath
+	prevArgv0Path := argv0Path
+	t.Cleanup(func() {
+		executablePath = prevExecutablePath
+		argv0Path = prevArgv0Path
+	})
+
+	dir := t.TempDir()
+	cxp := filepath.Join(dir, "cxp")
+	want := filepath.Join(dir, binaryName())
+	executablePath = func() (string, error) { return cxp, nil }
+	argv0Path = func() string { return cxp }
+
+	got, err := ResolveInstallPath("")
+	if err != nil {
+		t.Fatalf("ResolveInstallPath error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ResolveInstallPath = %q, want managed sibling %q", got, want)
+	}
+}
+
 func TestResolveInstallPathRejectsExplicitNFSSillyRename(t *testing.T) {
 	dir := t.TempDir()
 	stable := filepath.Join(dir, binaryName())

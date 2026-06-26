@@ -291,6 +291,94 @@ func TestLoadRecordToleratesUTF8BOM(t *testing.T) {
 	}
 }
 
+func TestCanonicalTargetPathForEntryMapsCXPToManagedSibling(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		goos string
+		path string
+		want string
+	}{
+		{name: "posix cxp", goos: "linux", path: filepath.Join(dir, "cxp"), want: filepath.Join(dir, "codex-proxy")},
+		{name: "windows cmd", goos: "windows", path: filepath.Join(dir, "cxp.cmd"), want: filepath.Join(dir, "codex-proxy.exe")},
+		{name: "windows exe", goos: "windows", path: filepath.Join(dir, "cxp.exe"), want: filepath.Join(dir, "codex-proxy.exe")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanonicalTargetPathForEntry(tc.path, tc.goos); got != tc.want {
+				t.Fatalf("CanonicalTargetPathForEntry(%q, %q) = %q, want %q", tc.path, tc.goos, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveMapsCXPRecordToSiblingManagedTarget(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config")
+	managed := filepath.Join(home, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(home, ".local", "bin", "cxp")
+	writeExecutable(t, managed)
+	if err := SaveRecord(filepath.Join(configDir, "codex-helper", "install.json"), Record{TargetPath: cxp}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+
+	target, err := Resolve(Options{
+		HomeDir:   home,
+		ConfigDir: configDir,
+		GOOS:      "linux",
+		Stat:      executableStatForTest,
+	})
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if target.Path != managed || target.Source != SourceRecord {
+		t.Fatalf("target = %#v, want record sibling target %q", target, managed)
+	}
+}
+
+func TestResolveMapsCurrentCXPEntryToSiblingManagedTarget(t *testing.T) {
+	home := t.TempDir()
+	managed := filepath.Join(home, ".local", "bin", "codex-proxy")
+	cxp := filepath.Join(home, ".local", "bin", "cxp")
+	writeExecutable(t, managed)
+	if err := os.Symlink(managed, cxp); err != nil {
+		t.Fatalf("symlink cxp: %v", err)
+	}
+
+	target, err := Resolve(Options{
+		RawExecutable:   cxp,
+		HomeDir:         filepath.Join(home, "other-home"),
+		ConfigDir:       filepath.Join(home, "other-config"),
+		GOOS:            "linux",
+		RequireExisting: true,
+		Stat:            executableStatForTest,
+	})
+	if err != nil {
+		t.Fatalf("Resolve error: %v", err)
+	}
+	if target.Path != managed || target.Source != SourceCurrentExecutable {
+		t.Fatalf("target = %#v, want current cxp mapped to %q", target, managed)
+	}
+}
+
+func TestResolveRejectsCurrentCXPEntryWhenSiblingManagedTargetMissing(t *testing.T) {
+	home := t.TempDir()
+	cxp := filepath.Join(home, ".local", "bin", "cxp")
+	writeExecutable(t, cxp)
+
+	_, err := Resolve(Options{
+		RawExecutable:   cxp,
+		HomeDir:         filepath.Join(home, "other-home"),
+		ConfigDir:       filepath.Join(home, "other-config"),
+		GOOS:            "linux",
+		RequireExisting: true,
+		Stat:            executableStatForTest,
+	})
+	if err == nil {
+		t.Fatalf("Resolve succeeded for cxp without sibling codex-proxy")
+	}
+}
+
 func TestSaveRecordWritesJSONWithoutBOM(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "install.json")
 	if err := SaveRecord(path, Record{TargetPath: "/tmp/codex-proxy"}); err != nil {

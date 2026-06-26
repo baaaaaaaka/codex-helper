@@ -17,6 +17,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -212,6 +213,7 @@ func TestUpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP(t *testing.T) {
 	var got update.UpdateOptions
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
 		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.3"), 0o755)
 		return update.ApplyResult{Version: "1.2.3", InstallPath: opts.InstallPath}, nil
 	}
 
@@ -715,7 +717,9 @@ func TestFinalizeHelperEntrypointsPreservesLogicalRecordThroughSymlinkedLocal(t 
 		t.Fatalf("save install record: %v", err)
 	}
 
-	finalizeHelperEntrypointsAfterUpgrade(physicalInstall, "1.2.4", io.Discard)
+	if err := finalizeHelperEntrypointsAfterUpgrade(physicalInstall, "1.2.4", io.Discard); err != nil {
+		t.Fatalf("finalize helper entrypoints: %v", err)
+	}
 
 	record, err := managedinstall.LoadRecord(recordPath)
 	if err != nil {
@@ -729,6 +733,128 @@ func TestFinalizeHelperEntrypointsPreservesLogicalRecordThroughSymlinkedLocal(t 
 	}
 	if slices.Contains(record.Shims, filepath.Join(physicalBin, "cxp")) {
 		t.Fatalf("record shims should not drift to physical cxp path: %#v", record.Shims)
+	}
+}
+
+func TestFinalizeHelperEntrypointsRepairsAndVerifiesCXPEntrypointVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp entrypoint verification")
+	}
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	shimPath := filepath.Join(tmp, "bin", "cxp")
+	stalePath := filepath.Join(tmp, "old", "codex-proxy")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	writeCLIFile(t, stalePath, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	if err := os.Symlink(stalePath, shimPath); err != nil {
+		t.Fatalf("create stale cxp shim: %v", err)
+	}
+
+	if err := finalizeHelperEntrypointsAfterUpgrade(installPath, "1.2.4", io.Discard); err != nil {
+		t.Fatalf("finalize helper entrypoints: %v", err)
+	}
+	if out, err := exec.Command(shimPath, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
+		t.Fatalf("cxp after finalize = %q err=%v, want 1.2.4", out, err)
+	}
+	if target, err := os.Readlink(shimPath); err != nil || target != installPath {
+		t.Fatalf("cxp shim = %q err=%v, want %s", target, err, installPath)
+	}
+}
+
+func TestFinalizeHelperEntrypointsFailsWhenCXPEntrypointCannotBeVerified(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX cxp entrypoint verification")
+	}
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	shimPath := filepath.Join(tmp, "bin", "cxp")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	if err := os.MkdirAll(shimPath, 0o755); err != nil {
+		t.Fatalf("mkdir blocked cxp path: %v", err)
+	}
+
+	err := finalizeHelperEntrypointsAfterUpgrade(installPath, "1.2.4", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "cxp entrypoint") {
+		t.Fatalf("finalize error = %v, want cxp entrypoint verification failure", err)
+	}
+}
+
+func TestFinalizeHelperEntrypointsMigratesCXPRecordTargetToManagedBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX managed record migration")
+	}
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	shimPath := filepath.Join(tmp, "bin", "cxp")
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	if err := os.Symlink(installPath, shimPath); err != nil {
+		t.Fatalf("create cxp shim: %v", err)
+	}
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("default record path: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:   shimPath,
+		TargetSource: string(managedinstall.SourceRecord),
+		TargetState:  string(managedinstall.StateManaged),
+		Version:      "1.2.3",
+		GOOS:         "linux",
+		GOARCH:       runtime.GOARCH,
+		Shims:        []string{shimPath},
+	}); err != nil {
+		t.Fatalf("save install record: %v", err)
+	}
+
+	if err := finalizeHelperEntrypointsAfterUpgrade(installPath, "1.2.4", io.Discard); err != nil {
+		t.Fatalf("finalize helper entrypoints: %v", err)
+	}
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		t.Fatalf("load install record: %v", err)
+	}
+	if managedinstall.IsShimEntryPath(record.TargetPath, runtime.GOOS) || !managedinstall.IsCanonicalTargetPath(record.TargetPath, runtime.GOOS) {
+		t.Fatalf("record target path = %q, want canonical managed binary target", record.TargetPath)
+	}
+	hasCXPShim := false
+	for _, shim := range record.Shims {
+		if filepath.Base(shim) == "cxp" {
+			hasCXPShim = true
+		}
+	}
+	if !hasCXPShim {
+		t.Fatalf("record shims = %#v, want a cxp shim", record.Shims)
+	}
+}
+
+func TestReplaceSymlinkAtomicallyRejectsTargetChainThroughLinkPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX symlink loop prevention")
+	}
+	tmp := t.TempDir()
+	linkPath := filepath.Join(tmp, "cxp")
+	targetPath := filepath.Join(tmp, "codex-proxy")
+	if err := os.Symlink(linkPath, targetPath); err != nil {
+		t.Fatalf("create target chain through link: %v", err)
+	}
+
+	err := replaceSymlinkAtomically(linkPath, targetPath)
+	if err == nil || !strings.Contains(err.Error(), "target symlink chain references the link path") {
+		t.Fatalf("replaceSymlinkAtomically error = %v, want target-chain rejection", err)
+	}
+}
+
+func TestCurrentHelperInstallCandidatesTreatCXPAsShimOnly(t *testing.T) {
+	tmp := t.TempDir()
+	cxp := filepath.Join(tmp, "cxp")
+	managed := filepath.Join(tmp, helperpath.BinaryName("linux"))
+	writeCLIFile(t, cxp, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	got := currentHelperInstallCandidatesForGOOS(cxp, "linux", os.Stat)
+	if !slices.Equal(got, []string{managed}) {
+		t.Fatalf("current helper candidates = %#v, want only managed sibling %#v", got, []string{managed})
 	}
 }
 
@@ -817,6 +943,7 @@ func TestUpgradeCmdInstallsBundledSkillsWithUpdatedBinary(t *testing.T) {
 	marker := filepath.Join(root, "builtin-install-called")
 	helperPath := filepath.Join(root, "codex-proxy")
 	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version 1.2.3 (test)'; exit 0; fi\n" +
 		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ] && [ \"$3\" = \"--yes\" ]; then\n" +
 		"  printf called > \"" + marker + "\"\n" +
 		"  exit 0\n" +
@@ -862,6 +989,7 @@ func TestUpgradeCmdBuiltinSkillInstallFailureWarnsButUpgradeSucceeds(t *testing.
 	root := t.TempDir()
 	helperPath := filepath.Join(root, "codex-proxy")
 	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"--version\" ]; then echo 'codex-proxy version 1.2.3 (test)'; exit 0; fi\n" +
 		"if [ \"$1\" = \"skills\" ] && [ \"$2\" = \"install-builtin\" ] && [ \"$3\" = \"--yes\" ]; then\n" +
 		"  echo builtin install failed >&2\n" +
 		"  exit 42\n" +
@@ -1380,6 +1508,7 @@ func TestUpgradeCmdDefaultDoesNotTouchTeamsServiceOrRequestUAC(t *testing.T) {
 		return update.Status{}
 	}
 	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, helperPath, upgradeCXPShimTestScript("1.2.3"), 0o755)
 		return update.ApplyResult{Version: "1.2.3", InstallPath: helperPath}, nil
 	}
 

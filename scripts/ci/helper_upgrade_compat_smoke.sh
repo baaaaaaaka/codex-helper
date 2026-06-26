@@ -127,6 +127,45 @@ assert_missing_or_version() {
   assert_version "$path" "$tag"
 }
 
+assert_cxp_entrypoint_healthy() {
+  local managed="$1"
+  local cxp="$2"
+  local tag="$3"
+  assert_version "$managed" "$tag"
+  assert_version "$cxp" "$tag"
+  export CXP_HEALTH_MANAGED="$managed"
+  export CXP_HEALTH_CXP="$cxp"
+  python3 - <<'PY'
+import os
+from pathlib import Path
+
+managed = Path(os.environ["CXP_HEALTH_MANAGED"])
+cxp = Path(os.environ["CXP_HEALTH_CXP"])
+if not managed.exists():
+    raise SystemExit(f"managed target is missing: {managed}")
+if not cxp.exists() and not cxp.is_symlink():
+    raise SystemExit(f"cxp entrypoint is missing: {cxp}")
+if cxp.is_symlink():
+    seen = set()
+    current = cxp
+    for _ in range(64):
+        key = str(current)
+        if key in seen:
+            raise SystemExit(f"cxp symlink chain loops at {current}")
+        seen.add(key)
+        if not current.is_symlink():
+            break
+        target = os.readlink(current)
+        current = Path(target) if os.path.isabs(target) else current.parent / target
+    else:
+        raise SystemExit(f"cxp symlink chain is too deep: {cxp}")
+    if not current.exists():
+        raise SystemExit(f"cxp symlink chain is broken: {cxp} -> {current}")
+    if os.path.realpath(current) != os.path.realpath(managed):
+        raise SystemExit(f"cxp symlink resolves to {current}, want {managed}")
+PY
+}
+
 configure_managed_storage_layout() {
   local scenario_base="$1"
   local layout="$2"
@@ -152,6 +191,49 @@ configure_managed_storage_layout() {
       exit 2
       ;;
   esac
+}
+
+helper_config_home() {
+  case "$os" in
+    darwin)
+      printf '%s\n' "$HOME/Library/Application Support"
+      ;;
+    *)
+      printf '%s\n' "$XDG_CONFIG_HOME"
+      ;;
+  esac
+}
+
+helper_install_record_path() {
+  printf '%s\n' "$(helper_config_home)/codex-helper/install.json"
+}
+
+write_poisoned_cxp_install_record() {
+  local managed_cxp="$1"
+  local version="$2"
+  local record_path
+  record_path="$(helper_install_record_path)"
+  mkdir -p "$(dirname "$record_path")"
+  export HELPER_RECORD_PATH="$record_path"
+  export MANAGED_CXP="$managed_cxp"
+  export RECORD_VERSION="$(version_no_v "$version")"
+  export HELPER_GOOS="$os"
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+record_path = Path(os.environ["HELPER_RECORD_PATH"])
+record_path.write_text(json.dumps({
+    "schema_version": 1,
+    "target_path": os.environ["MANAGED_CXP"],
+    "target_source": "record",
+    "target_state": "managed",
+    "version": os.environ["RECORD_VERSION"],
+    "goos": os.environ["HELPER_GOOS"],
+    "shims": [os.environ["MANAGED_CXP"]],
+}, indent=2) + "\n")
+PY
 }
 
 run_upgrade_convergence_scenario() {
@@ -278,8 +360,7 @@ SH
 
   "$go_bin" teams service install
 
-  assert_version "$managed" "$target_tag"
-  assert_version "$managed_cxp" "$target_tag"
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
   case "$seed_mode" in
     symlink|stale-symlink|missing|current-missing-cxp)
       if [[ ! -L "$managed_cxp" ]]; then
@@ -297,8 +378,7 @@ SH
 
   echo "helper upgrade compatibility smoke: scenario=$scenario second-hop via managed cxp"
   retry 5 10 "$managed_cxp" upgrade --repo "$repo" --version "$target_tag"
-  assert_version "$managed" "$target_tag"
-  assert_version "$managed_cxp" "$target_tag"
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
 
   export MANAGED_TARGET="$managed"
   export MANAGED_CXP="$managed_cxp"
@@ -383,6 +463,54 @@ PY
   esac
 }
 
+run_legacy_recorded_cxp_upgrade_scenario() {
+  local scenario="$1"
+  local storage_layout="$2"
+  local scenario_base="$base_root/$scenario"
+  rm -rf "$scenario_base"
+  mkdir -p "$scenario_base"
+
+  export HOME="$scenario_base/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_CACHE_HOME="$HOME/.cache"
+  export CODEX_HOME="$HOME/.codex"
+  export CODEX_PROXY_SKIP_BUILTIN_SKILLS=1
+  export PATH="$original_path"
+
+  local managed="$HOME/.local/bin/codex-proxy"
+  local managed_cxp="$HOME/.local/bin/cxp"
+  configure_managed_storage_layout "$scenario_base" "$storage_layout" "$HOME"
+  mkdir -p "$(dirname "$managed")"
+  download_binary "$old_tag" "$managed"
+  ln -s "$managed" "$managed_cxp"
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$old_tag"
+
+  write_poisoned_cxp_install_record "$managed_cxp" "$old_tag"
+  echo "helper upgrade compatibility smoke: legacy recorded-cxp upgrade scenario=$scenario storage=$storage_layout"
+  retry 5 10 "$managed" upgrade --repo "$repo" --version "$target_tag"
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
+
+  # A second no-op run exercises the newly installed helper's finalizer and
+  # verifies that old records pointing at cxp are migrated back to codex-proxy.
+  retry 5 10 "$managed" upgrade --repo "$repo" --version "$target_tag"
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
+
+  export MANAGED_TARGET="$managed"
+  export MANAGED_CXP="$managed_cxp"
+  export TARGET_VERSION="$(version_no_v "$target_tag")"
+  export HELPER_RECORD_PATH="$(helper_install_record_path)"
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+record = json.loads(Path(os.environ["HELPER_RECORD_PATH"]).read_text())
+assert record["target_path"] == os.environ["MANAGED_TARGET"], record
+assert os.environ["MANAGED_CXP"] in record.get("shims", []), record
+assert record["version"].lstrip("v") == os.environ["TARGET_VERSION"], record
+PY
+}
+
 safe_old="${old_tag//[^A-Za-z0-9._-]/_}"
 safe_target="${target_tag//[^A-Za-z0-9._-]/_}"
 base_root="${RUNNER_TEMP:-/tmp}/codex-helper-upgrade-compat-${safe_old}-to-${safe_target}"
@@ -396,5 +524,7 @@ run_upgrade_convergence_scenario "missing-managed" "missing"
 run_upgrade_convergence_scenario "current-managed-missing-cxp" "current-missing-cxp"
 run_upgrade_convergence_scenario "symlinked-local-dir-managed-symlink" "symlink" "local-dir-symlink"
 run_upgrade_convergence_scenario "symlinked-local-bin-managed-symlink" "symlink" "local-bin-symlink"
+run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-dir" "local-dir-symlink"
+run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bin" "local-bin-symlink"
 
 echo "helper upgrade compatibility smoke passed"

@@ -64,7 +64,9 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 		return nil
 	}
 
-	finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr())
+	if err := finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr()); err != nil {
+		return err
+	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s. Restarting...\n", res.Version)
 	return restartSelf()
 }

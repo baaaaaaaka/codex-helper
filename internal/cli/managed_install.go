@@ -107,6 +107,9 @@ type managedInstallPathCandidate struct {
 
 func canonicalManagedInstallTargetForSameLocation(installPath string, recordPath string, warnings *[]string) (managedinstall.Target, bool) {
 	for _, candidate := range managedInstallPathCandidatesForCLI(recordPath) {
+		if !managedinstall.IsCanonicalTargetPath(candidate.path, runtime.GOOS) {
+			continue
+		}
 		if !sameHelperInstallLocation(candidate.path, installPath, runtime.GOOS) {
 			continue
 		}
@@ -158,7 +161,11 @@ func managedInstallPathCandidatesForCLI(recordPath string) []managedInstallPathC
 }
 
 func canonicalManagedInstallPathForSameLocation(installPath string, recordPath string) string {
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, runtime.GOOS)
 	for _, candidate := range managedInstallPathCandidatesForCLI(recordPath) {
+		if !managedinstall.IsCanonicalTargetPath(candidate.path, runtime.GOOS) {
+			continue
+		}
 		if sameHelperInstallLocation(candidate.path, installPath, runtime.GOOS) {
 			return strings.TrimSpace(candidate.path)
 		}
@@ -177,13 +184,14 @@ func currentHelperInstallCandidatesForGOOS(path string, goos string, stat func(s
 	}
 	resolved, err := helperpath.StableRunnablePathFromSources(path, "", helperpath.Options{GOOS: goos, Stat: stat})
 	if err != nil {
-		return []string{path}
+		return []string{managedinstall.CanonicalTargetPathForEntry(path, goos)}
 	}
 	candidate := resolved.Path
 	var out []string
 	base := filepath.Base(candidate)
-	if strings.EqualFold(base, "cxp") || strings.EqualFold(base, "cxp.exe") {
+	if managedinstall.IsShimEntryPath(candidate, goos) || strings.EqualFold(base, "cxp.exe") {
 		out = append(out, filepath.Join(filepath.Dir(candidate), helperpath.BinaryName(goos)))
+		return dedupeStringsForGOOS(out, goos)
 	}
 	out = append(out, candidate)
 	return dedupeStringsForGOOS(out, goos)
@@ -199,6 +207,7 @@ func resolveKnownHelperInstallCandidateForCLI(path string, source managedinstall
 		*warnings = append(*warnings, err.Error())
 		return managedinstall.Target{}, false
 	}
+	resolved.Path = managedinstall.CanonicalTargetPathForEntry(resolved.Path, runtime.GOOS)
 	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: runtime.GOOS})
 	if !probe.Exists {
 		if !allowMissing {
@@ -245,6 +254,7 @@ func resolveRunnableHelperInstallCandidate(path string, source managedinstall.So
 	if err != nil {
 		return managedinstall.Target{}, err
 	}
+	resolved.Path = managedinstall.CanonicalTargetPathForEntry(resolved.Path, goos)
 	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: goos, Stat: stat})
 	if !probe.Exists {
 		return managedinstall.Target{}, fmt.Errorf("install target %s does not exist", resolved.Path)
@@ -561,10 +571,11 @@ func materializedManagedInstallShims(targetPath string) []string {
 	if strings.EqualFold(teamsServiceGOOS(), "windows") {
 		return nil
 	}
+	targetPath = managedinstall.CanonicalTargetPathForEntry(targetPath, teamsServiceGOOS())
 	return []string{filepath.Join(filepath.Dir(targetPath), "cxp")}
 }
 
-func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, out io.Writer) {
+func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, out io.Writer) error {
 	if err := ensureCXPShimForInstallPath(installPath); err != nil {
 		_, _ = fmt.Fprintf(out, "Warning: failed to install cxp shim after upgrade: %v\n", err)
 	}
@@ -572,6 +583,10 @@ func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, o
 		_, _ = fmt.Fprintf(out, "Warning: failed to unify helper entrypoint after upgrade: %v\n", err)
 	}
 	saveCLIManagedInstallRecordBestEffort(installPath, version)
+	if err := verifyCXPEntrypointAfterUpgrade(installPath, version); err != nil {
+		return err
+	}
+	return nil
 }
 
 type helperEntrypointAlias struct {
@@ -702,6 +717,46 @@ func sameHelperInstallLocation(a string, b string, goos string) bool {
 	return aOK && bOK && aKey == bKey
 }
 
+func symlinkChainReferencesPath(start string, needle string, goos string) bool {
+	current := filepath.Clean(strings.TrimSpace(start))
+	needle = filepath.Clean(strings.TrimSpace(needle))
+	if current == "" || current == "." || needle == "" || needle == "." {
+		return false
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 64; i++ {
+		if sameHelperExecutablePath(current, needle, goos) {
+			return true
+		}
+		currentKey, currentOK := helperInstallLocationKey(current, goos)
+		needleKey, needleOK := helperInstallLocationKey(needle, goos)
+		if currentOK && needleOK && currentKey == needleKey {
+			return true
+		}
+		key := managedinstall.ComparisonKey(current, goos)
+		if seen[key] {
+			return true
+		}
+		seen[key] = true
+		info, err := os.Lstat(current)
+		if err != nil {
+			return false
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return false
+		}
+		target, err := os.Readlink(current)
+		if err != nil {
+			return true
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(current), target)
+		}
+		current = filepath.Clean(target)
+	}
+	return true
+}
+
 func sameExistingHelperFile(a string, b string) bool {
 	aInfo, aErr := os.Stat(strings.TrimSpace(a))
 	bInfo, bErr := os.Stat(strings.TrimSpace(b))
@@ -735,6 +790,7 @@ func saveCLIManagedInstallRecordBestEffort(installPath string, version string) {
 		return
 	}
 	installPath = canonicalManagedInstallPathForSameLocation(installPath, recordPath)
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, runtime.GOOS)
 	shims := []string{}
 	if !strings.EqualFold(runtime.GOOS, "windows") {
 		shims = append(shims, filepath.Join(filepath.Dir(installPath), "cxp"))
@@ -774,7 +830,7 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 	if strings.EqualFold(goos, "windows") {
 		return ensureWindowsCXPShimForInstallPath(installPath)
 	}
-	installPath = strings.TrimSpace(installPath)
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, goos)
 	if installPath == "" || !strings.EqualFold(filepath.Base(installPath), helperpath.BinaryName(goos)) {
 		return nil
 	}
@@ -806,7 +862,11 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 				return err
 			}
 			if repair {
-				return copyExecutableAtomically(installPath, shimPath)
+				if err := replaceSymlinkAtomically(shimPath, installPath); err != nil {
+					if copyErr := copyExecutableAtomically(installPath, shimPath); copyErr != nil {
+						return fmt.Errorf("repair cxp regular shim %s -> %s: symlink failed: %v; copy failed: %w", shimPath, installPath, err, copyErr)
+					}
+				}
 			}
 			return nil
 		}
@@ -817,7 +877,7 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 	if err := os.MkdirAll(filepath.Dir(shimPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.Symlink(installPath, shimPath); err != nil {
+	if err := replaceSymlinkAtomically(shimPath, installPath); err != nil {
 		if copyErr := copyExecutableAtomically(installPath, shimPath); copyErr != nil {
 			return fmt.Errorf("create cxp shim %s -> %s: symlink failed: %v; copy failed: %w", shimPath, installPath, err, copyErr)
 		}
@@ -828,6 +888,9 @@ func ensureCXPShimForInstallPathForGOOS(installPath string, goos string) error {
 func replaceSymlinkAtomically(linkPath string, targetPath string) error {
 	if sameHelperInstallLocation(linkPath, targetPath, runtime.GOOS) {
 		return nil
+	}
+	if symlinkChainReferencesPath(targetPath, linkPath, runtime.GOOS) {
+		return fmt.Errorf("refusing to create symlink %s -> %s because the target symlink chain references the link path", linkPath, targetPath)
 	}
 	dir := filepath.Dir(linkPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -857,7 +920,7 @@ func replaceSymlinkAtomically(linkPath string, targetPath string) error {
 }
 
 func ensureWindowsCXPShimForInstallPath(installPath string) error {
-	installPath = strings.TrimSpace(installPath)
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, "windows")
 	if installPath == "" || !strings.EqualFold(filepath.Base(installPath), helperpath.BinaryName("windows")) {
 		return nil
 	}
@@ -891,6 +954,47 @@ func windowsCXPShimContent() string {
 	return "@echo off\r\n\"%~dp0codex-proxy.exe\" %*\r\n"
 }
 
+func verifyCXPEntrypointAfterUpgrade(installPath string, targetVersion string) error {
+	return verifyCXPEntrypointAfterUpgradeForGOOS(installPath, targetVersion, runtime.GOOS)
+}
+
+func verifyCXPEntrypointAfterUpgradeForGOOS(installPath string, targetVersion string, goos string) error {
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, goos)
+	if !managedinstall.IsCanonicalTargetPath(installPath, goos) {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := verifyHelperEntrypointVersion(ctx, installPath, targetVersion, "managed helper target"); err != nil {
+		return err
+	}
+	shimName := "cxp"
+	if strings.EqualFold(goos, "windows") {
+		shimName = "cxp.cmd"
+	}
+	shimPath := filepath.Join(filepath.Dir(installPath), shimName)
+	if err := verifyHelperEntrypointVersion(ctx, shimPath, targetVersion, "cxp entrypoint"); err != nil {
+		if repairErr := ensureCXPShimForInstallPathForGOOS(installPath, goos); repairErr != nil {
+			return fmt.Errorf("%w; repair failed: %v", err, repairErr)
+		}
+		if retryErr := verifyHelperEntrypointVersion(ctx, shimPath, targetVersion, "cxp entrypoint"); retryErr != nil {
+			return fmt.Errorf("%w; after repair: %v", err, retryErr)
+		}
+	}
+	return nil
+}
+
+func verifyHelperEntrypointVersion(ctx context.Context, path string, targetVersion string, description string) error {
+	version, err := update.ProbeBinaryVersion(ctx, path, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("%s %s is not runnable after upgrade: %w", description, path, err)
+	}
+	if !update.VersionMatchesTarget(version.Version, targetVersion) {
+		return fmt.Errorf("%s %s version = %s, want %s", description, path, version.Version, strings.TrimPrefix(strings.TrimSpace(targetVersion), "v"))
+	}
+	return nil
+}
+
 func cxpShimNeedsRepair(installPath string, shimPath string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -907,6 +1011,7 @@ func cxpShimNeedsRepair(installPath string, shimPath string) (bool, error) {
 }
 
 func materializeManagedInstallShim(ctx context.Context, runningPath string, targetPath string, shimPath string, runningVersion string) error {
+	targetPath = managedinstall.CanonicalTargetPathForEntry(targetPath, teamsServiceGOOS())
 	if info, err := os.Lstat(shimPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		linkTarget, readErr := os.Readlink(shimPath)
 		if readErr != nil {
@@ -931,7 +1036,7 @@ func materializeManagedInstallShim(ctx context.Context, runningPath string, targ
 		if err := os.MkdirAll(filepath.Dir(shimPath), 0o755); err != nil {
 			return err
 		}
-		if err := os.Symlink(targetPath, shimPath); err != nil {
+		if err := replaceSymlinkAtomically(shimPath, targetPath); err != nil {
 			return fmt.Errorf("materialize managed Teams install shim %s -> %s: %w", shimPath, targetPath, err)
 		}
 		return nil
@@ -960,6 +1065,7 @@ func saveManagedInstallRecordBestEffort(target managedinstall.Target, version st
 	if strings.TrimSpace(target.RecordPath) == "" {
 		return
 	}
+	target.Path = managedinstall.CanonicalTargetPathForEntry(target.Path, teamsServiceGOOS())
 	record := managedinstall.Record{
 		TargetPath:   target.Path,
 		TargetSource: string(target.Source),

@@ -161,6 +161,14 @@ func Resolve(opts Options) (Target, error) {
 		if err != nil {
 			return Target{}, err
 		}
+		originalPath := resolved.Path
+		resolved.Path = CanonicalTargetPathForEntry(resolved.Path, opts.GOOS)
+		if resolved.Path != originalPath {
+			probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: opts.GOOS, Stat: opts.Stat})
+			if !probe.Exists || probe.IsDir || !probe.Executable {
+				return Target{}, fmt.Errorf("cannot map current helper shim %s to managed target %s: target is not an executable file", originalPath, resolved.Path)
+			}
+		}
 		key := ComparisonKey(resolved.Path, opts.GOOS)
 		return Target{
 			Path:          resolved.Path,
@@ -279,6 +287,39 @@ func DefaultInstallPath(opts Options) (string, error) {
 	return filepath.Join(home, ".local", "bin", helperpath.BinaryName(opts.GOOS)), nil
 }
 
+func CanonicalTargetPathForEntry(path string, goos string) string {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "" || clean == "." {
+		return strings.TrimSpace(path)
+	}
+	if IsShimEntryPath(clean, goos) {
+		return filepath.Join(filepath.Dir(clean), helperpath.BinaryName(goos))
+	}
+	return clean
+}
+
+func IsCanonicalTargetPath(path string, goos string) bool {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "" || clean == "." {
+		return false
+	}
+	return strings.EqualFold(filepath.Base(clean), helperpath.BinaryName(goos))
+}
+
+func IsShimEntryPath(path string, goos string) bool {
+	clean := filepath.Clean(strings.TrimSpace(path))
+	if clean == "" || clean == "." {
+		return false
+	}
+	base := filepath.Base(clean)
+	if strings.EqualFold(goos, "windows") {
+		return strings.EqualFold(base, "cxp") ||
+			strings.EqualFold(base, "cxp.exe") ||
+			strings.EqualFold(base, "cxp.cmd")
+	}
+	return base == "cxp"
+}
+
 func ComparisonKey(path string, goos string) string {
 	clean := filepath.Clean(strings.TrimSpace(path))
 	if abs, err := filepath.Abs(clean); err == nil {
@@ -330,6 +371,7 @@ func resolveCandidate(path string, source Source, state TargetState, reason stri
 	if err != nil {
 		return Target{}, err
 	}
+	resolved.Path = CanonicalTargetPathForEntry(resolved.Path, opts.GOOS)
 	probe := helperpath.ProbePath(resolved.Path, helperpath.Options{GOOS: opts.GOOS, Stat: opts.Stat})
 	if source != SourceExplicit && source != SourceEnvInstallPath && !probe.PlausibleHelperEntry {
 		return Target{}, fmt.Errorf("install target %s is not a known helper entry", resolved.Path)
@@ -362,8 +404,7 @@ func resolveLegacyInstallDirCandidate(value string, opts Options) string {
 	base := filepath.Base(filepath.Clean(value))
 	if helperpath.ProbePath(value, helperpath.Options{GOOS: opts.GOOS, Stat: opts.Stat}).PlausibleHelperEntry ||
 		strings.EqualFold(base, helperpath.BinaryName(opts.GOOS)) ||
-		strings.EqualFold(base, "cxp") ||
-		strings.EqualFold(base, "cxp.exe") {
+		IsShimEntryPath(base, opts.GOOS) {
 		return value
 	}
 	return filepath.Join(value, helperpath.BinaryName(opts.GOOS))

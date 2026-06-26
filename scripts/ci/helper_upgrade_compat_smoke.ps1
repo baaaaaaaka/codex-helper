@@ -121,6 +121,15 @@ function Expected-CXPShimBody() {
   return "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
 }
 
+function Assert-CXPEntrypointHealthy([string]$Helper, [string]$CXP, [string]$Tag) {
+  Assert-VersionOrActivatePending $Helper $Tag
+  Assert-Version $CXP $Tag
+  $shimBody = Get-Content -Raw -LiteralPath $CXP
+  if ($shimBody -ne (Expected-CXPShimBody)) {
+    throw "cxp.cmd was not repaired to the canonical relative shim. Actual:`n$shimBody"
+  }
+}
+
 function Configure-IsolatedEnvironment([string]$Root) {
   $env:USERPROFILE = Join-Path $Root "home"
   $env:APPDATA = Join-Path $env:USERPROFILE "AppData\Roaming"
@@ -211,12 +220,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
     }
   }
 
-  Assert-VersionOrActivatePending $helper $TargetTag
-  Assert-Version $cxp $TargetTag
-  $shimBody = Get-Content -Raw -LiteralPath $cxp
-  if ($shimBody -ne (Expected-CXPShimBody)) {
-    throw "cxp.cmd was not repaired to the canonical relative shim. Actual:`n$shimBody"
-  }
+  Assert-CXPEntrypointHealthy $helper $cxp $TargetTag
 
   $secondTarget = Join-Path $scenarioRoot "second-hop\codex-proxy.exe"
   Download-Binary $OldTag $secondTarget
@@ -227,8 +231,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
     & $cxp upgrade --repo $Repo --version $TargetTag --install-path $secondTarget
   }
   Assert-VersionOrActivatePending $secondTarget $TargetTag
-  Assert-VersionOrActivatePending $helper $TargetTag
-  Assert-Version $cxp $TargetTag
+  Assert-CXPEntrypointHealthy $helper $cxp $TargetTag
 }
 
 $safeOld = $OldTag -replace '[^A-Za-z0-9._-]', '_'

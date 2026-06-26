@@ -127,7 +127,7 @@ func ResolveInstallPath(explicit string) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			return resolved.Path, nil
+			return managedinstall.CanonicalTargetPathForEntry(resolved.Path, runtime.GOOS), nil
 		}
 	}
 	var exe string
@@ -142,7 +142,7 @@ func ResolveInstallPath(explicit string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resolved.Path, nil
+	return managedinstall.CanonicalTargetPathForEntry(resolved.Path, runtime.GOOS), nil
 }
 
 // StableInstallPathFromExecutable maps transient self-exec paths back to the

@@ -50,7 +50,9 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 							return err
 						}
 					}
-					finalizeHelperEntrypointsAfterUpgrade(resolvedInstallPath, version, cmd.ErrOrStderr())
+					if err := finalizeHelperEntrypointsAfterUpgrade(resolvedInstallPath, version, cmd.ErrOrStderr()); err != nil {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to verify cxp entrypoint while already up to date: %v\n", err)
+					}
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Already up to date.")
 					return nil
 				}
@@ -89,7 +91,9 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				return nil
 			}
 
-			finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr())
+			if err := finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr()); err != nil {
+				return err
+			}
 			installBundledSkillsFromHelper(ctx, res.InstallPath, cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s.\n", res.Version)
 			if !restartTeamsService {

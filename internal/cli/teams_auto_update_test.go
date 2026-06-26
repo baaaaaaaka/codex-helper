@@ -490,6 +490,7 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 	var got update.UpdateOptions
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
 		got = opts
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
@@ -607,7 +608,7 @@ func TestTeamsReleaseAutoUpdaterApplyCreatesMissingCXPShim(t *testing.T) {
 		return managed, nil
 	}
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
-		writeCLIFile(t, opts.InstallPath, "#!/bin/sh\nexit 0\n", 0o755)
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 
@@ -745,14 +746,13 @@ func TestTeamsReleaseAutoUpdaterApplyDefersActivationFromTransientExecutable(t *
 	})
 	dir := t.TempDir()
 	stable := filepath.Join(dir, "codex-proxy")
-	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
-		t.Fatalf("write stable: %v", err)
-	}
+	writeCLIFile(t, stable, upgradeCXPShimTestScript("1.2.3"), 0o755)
 	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
 	teamsAutoUpdateExecutable = func() (string, error) {
 		return filepath.Join(dir, ".nfs802014de01c482a800000492"), nil
 	}
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
@@ -778,12 +778,11 @@ func TestTeamsReleaseAutoUpdaterApplyKeepsImmediateActivationForStableExecutable
 	})
 	dir := t.TempDir()
 	stable := filepath.Join(dir, "codex-proxy")
-	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
-		t.Fatalf("write stable: %v", err)
-	}
+	writeCLIFile(t, stable, upgradeCXPShimTestScript("1.2.3"), 0o755)
 	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
 	teamsAutoUpdateExecutable = func() (string, error) { return stable, nil }
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
@@ -809,13 +808,12 @@ func TestTeamsReleaseAutoUpdaterChecksActivationBeforeReplacingStableExecutable(
 	})
 	dir := t.TempDir()
 	stable := filepath.Join(dir, "codex-proxy")
-	if err := os.WriteFile(stable, []byte("stable"), 0o755); err != nil {
-		t.Fatalf("write stable: %v", err)
-	}
+	writeCLIFile(t, stable, upgradeCXPShimTestScript("1.2.3"), 0o755)
 	rawExecutable := stable
 	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return stable, nil }
 	teamsAutoUpdateExecutable = func() (string, error) { return rawExecutable, nil }
 	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		writeCLIFile(t, opts.InstallPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		rawExecutable = stable + " (deleted)"
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
