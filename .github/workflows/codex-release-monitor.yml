@@ -221,7 +221,7 @@ jobs:
           CODEX_YOLO_PATCH_TEST: "1"
         run: |
           set -euo pipefail
-          go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+          go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
           go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
 
       - name: Teams app-server probe (Linux/macOS)
@@ -415,7 +415,7 @@ jobs:
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
           docker run --rm \
             -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \

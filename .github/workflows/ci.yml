@@ -652,7 +652,7 @@ jobs:
         run: |
           set -euo pipefail
           config_pattern='Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
-          cloudgate_pattern='Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|PatchCodexBinaryReportsMatchCounts)$'
+          cloudgate_pattern='Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|ApplyBestEffortBinaryPatchAllSkipsInvalidPatch|PatchCodexBinary(ReportsMatchCounts|TelemetryFingerprints(Only|PartialBestEffort|MissingDoesNotBlockCorePatch)))$'
           cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
           teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
@@ -668,7 +668,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $configPattern = 'Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
-          $cloudgatePattern = 'Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|PatchCodexBinaryReportsMatchCounts)$'
+          $cloudgatePattern = 'Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|ApplyBestEffortBinaryPatchAllSkipsInvalidPatch|PatchCodexBinary(ReportsMatchCounts|TelemetryFingerprints(Only|PartialBestEffort|MissingDoesNotBlockCorePatch)))$'
           $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
           $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v
@@ -1335,7 +1335,7 @@ jobs:
         run: |
           set -euo pipefail
           if command -v codex >/dev/null 2>&1; then
-            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
             go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
           else
             echo "Codex not available, skipping patch+yolo integration test"
@@ -1351,7 +1351,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           if (Get-Command codex -ErrorAction SilentlyContinue) {
-            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
+            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
             go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
           } else {
             Write-Host "Codex not available, skipping patch integration test"

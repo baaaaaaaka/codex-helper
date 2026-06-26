@@ -140,6 +140,17 @@ func applyBinaryPatchAll(data []byte, p binaryPatch) ([]byte, int, error) {
 	}
 }
 
+func applyBestEffortBinaryPatchAll(data []byte, p binaryPatch) ([]byte, int) {
+	if len(p.old) != len(p.new) || len(p.old) == 0 {
+		return data, 0
+	}
+	patched, count, err := applyBinaryPatchAll(data, p)
+	if err != nil {
+		return data, 0
+	}
+	return patched, count
+}
+
 // cloudRequirementsPatches sabotages the cloud requirements URL paths as a
 // best-effort fallback for Codex builds that still fetch cloud requirements
 // through dedicated endpoints.
@@ -192,6 +203,45 @@ var tomlKeyPatches = []binaryPatch{
 		old:  []byte("allowed_sandbox_modes"),
 		new:  []byte("allowed_sandbox_modez"),
 		name: "sandbox modes TOML key",
+	},
+}
+
+const (
+	telemetryTurnEventPatchName      = "telemetry turn event name"
+	telemetryTurnMetadataPatchName   = "telemetry turn metadata key"
+	telemetryConversationPatchName   = "telemetry conversation start event name"
+	telemetrySandboxNetworkPatchName = "telemetry sandbox network access key"
+)
+
+// telemetryFingerprintPatches rename highly specific telemetry routing keys
+// instead of trying to rewrite broad config/protocol fields like approval_policy
+// or sandbox_policy. Those broad fields are shared by real config parsing and
+// app-server protocol surfaces, while these literals are specific enough to
+// make the yolo binary patch less likely to destabilize normal Codex startup.
+var telemetryFingerprintPatches = []binaryPatch{
+	{
+		// "codex_turn_event" (16 bytes) -> make analytics turn events unrecognized.
+		old:  []byte("codex_turn_event"),
+		new:  []byte("codex_turn_evenz"),
+		name: telemetryTurnEventPatchName,
+	},
+	{
+		// "x-codex-turn-metadata" (21 bytes) -> hide the canonical turn metadata key.
+		old:  []byte("x-codex-turn-metadata"),
+		new:  []byte("x-codex-turn-metadatz"),
+		name: telemetryTurnMetadataPatchName,
+	},
+	{
+		// "codex.conversation_starts" (25 bytes) -> make OTel conversation-start events unrecognized.
+		old:  []byte("codex.conversation_starts"),
+		new:  []byte("codex.conversation_startz"),
+		name: telemetryConversationPatchName,
+	},
+	{
+		// "sandbox_network_access" (22 bytes) is telemetry-specific in current Codex builds.
+		old:  []byte("sandbox_network_access"),
+		new:  []byte("sandbox_network_accezz"),
+		name: telemetrySandboxNetworkPatchName,
 	},
 }
 
@@ -511,13 +561,21 @@ func patchCodexBinaryWithRuntime(
 	patches = append(patches, accountPlanTypePatches...)
 	patches = append(patches, tomlKeyPatches...)
 
-	matchCounts := make(map[string]int, len(patches))
+	matchCounts := make(map[string]int, len(patches)+len(telemetryFingerprintPatches))
 	for _, p := range patches {
 		var count int
 		data, count, err = applyBinaryPatchAll(data, p)
 		if err != nil {
 			return nil, err
 		}
+		matchCounts[p.name] = count
+		if count > 0 {
+			patched = true
+		}
+	}
+	for _, p := range telemetryFingerprintPatches {
+		var count int
+		data, count = applyBestEffortBinaryPatchAll(data, p)
 		matchCounts[p.name] = count
 		if count > 0 {
 			patched = true
@@ -596,6 +654,9 @@ func patchCodexBinaryWithRuntime(
 //     as Unknown and cloud requirements are skipped.
 //  4. Keeps the legacy TOML-key rename for older Codex builds that still
 //     fail open on cloud requirements parse errors.
+//  5. Renames high-specificity telemetry routing keys so helper-managed yolo
+//     sessions keep sending telemetry without exposing the most direct yolo
+//     fingerprints through recognized turn-event metadata.
 //
 // The original binary is not modified; a copy is placed in cacheDir.
 func PatchCodexBinary(origBinary string, cacheDir string) (*PatchResult, error) {

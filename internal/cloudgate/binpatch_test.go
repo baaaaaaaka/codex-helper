@@ -2,10 +2,12 @@ package cloudgate
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -81,6 +83,25 @@ func TestApplyBinaryPatchAllRejectsEmptyPattern(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for empty patch pattern")
+	}
+}
+
+func TestApplyBestEffortBinaryPatchAllSkipsInvalidPatch(t *testing.T) {
+	data := buildSyntheticBinary(t, "abc")
+	original := append([]byte(nil), data...)
+	got, count := applyBestEffortBinaryPatchAll(data, binaryPatch{
+		old:  []byte("abc"),
+		new:  []byte("xy"),
+		name: "invalid optional patch",
+	})
+	if count != 0 {
+		t.Fatalf("replacement count = %d, want 0", count)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatal("invalid optional patch should leave data unchanged")
+	}
+	if len(got) == 0 || &got[0] != &data[0] {
+		t.Fatal("expected optional patch to reuse the input buffer")
 	}
 }
 
@@ -351,6 +372,10 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		"chatgpt_plan_type",
 		"allowed_approval_policies",
 		"allowed_sandbox_modes",
+		"codex_turn_event",
+		"x-codex-turn-metadata",
+		"codex.conversation_starts",
+		"sandbox_network_access",
 	)
 	if err := os.WriteFile(origPath, data, 0o755); err != nil {
 		t.Fatalf("write: %v", err)
@@ -393,6 +418,18 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	if bytes.Contains(patched, []byte("allowed_sandbox_modes")) {
 		t.Error("patched binary still contains original sandbox modes key")
 	}
+	if bytes.Contains(patched, []byte("codex_turn_event")) {
+		t.Error("patched binary still contains original telemetry turn event name")
+	}
+	if bytes.Contains(patched, []byte("x-codex-turn-metadata")) {
+		t.Error("patched binary still contains original telemetry turn metadata key")
+	}
+	if bytes.Contains(patched, []byte("codex.conversation_starts")) {
+		t.Error("patched binary still contains original telemetry conversation start event name")
+	}
+	if bytes.Contains(patched, []byte("sandbox_network_access")) {
+		t.Error("patched binary still contains original sandbox network access key")
+	}
 
 	// Replacement paths should be present.
 	if !bytes.Contains(patched, []byte(mustPatchedReqPath(t))) {
@@ -414,6 +451,18 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 	}
 	if !bytes.Contains(patched, []byte("allowed_sandbox_modez")) {
 		t.Error("patched binary missing renamed sandbox modes key")
+	}
+	if !bytes.Contains(patched, []byte("codex_turn_evenz")) {
+		t.Error("patched binary missing renamed telemetry turn event name")
+	}
+	if !bytes.Contains(patched, []byte("x-codex-turn-metadatz")) {
+		t.Error("patched binary missing renamed telemetry turn metadata key")
+	}
+	if !bytes.Contains(patched, []byte("codex.conversation_startz")) {
+		t.Error("patched binary missing renamed telemetry conversation start event name")
+	}
+	if !bytes.Contains(patched, []byte("sandbox_network_accezz")) {
+		t.Error("patched binary missing renamed sandbox network access key")
 	}
 
 	// Requirements file should contain both original and patched key names.
@@ -437,6 +486,295 @@ func TestPatchCodexBinaryBasic(t *testing.T) {
 		if !strings.Contains(reqStr, key) {
 			t.Errorf("requirements missing key %q", key)
 		}
+	}
+}
+
+func TestPatchCodexBinaryTelemetryFingerprintsOnly(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t,
+		"codex_turn_event",
+		"x-codex-turn-metadata",
+		"codex.conversation_starts",
+		"sandbox_network_access",
+		"approval_policy",
+		"sandbox_policy",
+		"approvals_reviewer",
+	)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer cleanupRequirementsDir(result.RequirementsPath)
+
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary path")
+	}
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{telemetryTurnEventPatchName, 1},
+		{telemetryTurnMetadataPatchName, 1},
+		{telemetryConversationPatchName, 1},
+		{telemetrySandboxNetworkPatchName, 1},
+		{requirementsPatchName, 0},
+	} {
+		if got := result.MatchCounts[tc.name]; got != tc.want {
+			t.Fatalf("%s match count = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if result.RequirementsRedirected() {
+		t.Fatal("RequirementsRedirected should be false for telemetry-only patch")
+	}
+
+	patched, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+	for _, s := range []string{
+		"codex_turn_event",
+		"x-codex-turn-metadata",
+		"codex.conversation_starts",
+		"sandbox_network_access",
+	} {
+		if bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("patched binary still contains original telemetry fingerprint %q", s)
+		}
+	}
+	for _, s := range []string{
+		"codex_turn_evenz",
+		"x-codex-turn-metadatz",
+		"codex.conversation_startz",
+		"sandbox_network_accezz",
+	} {
+		if !bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("patched binary missing renamed telemetry fingerprint %q", s)
+		}
+	}
+	for _, s := range []string{
+		"approval_policy",
+		"sandbox_policy",
+		"approvals_reviewer",
+	} {
+		if !bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("broad config/protocol key %q should not be patched", s)
+		}
+	}
+}
+
+func TestPatchCodexBinaryTelemetryFingerprintsPartialBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t,
+		"codex_turn_event",
+		"sandbox_network_access",
+		"approval_policy",
+		"sandbox_policy",
+		"approvals_reviewer",
+	)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer cleanupRequirementsDir(result.RequirementsPath)
+
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary path")
+	}
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{telemetryTurnEventPatchName, 1},
+		{telemetryTurnMetadataPatchName, 0},
+		{telemetryConversationPatchName, 0},
+		{telemetrySandboxNetworkPatchName, 1},
+		{requirementsPatchName, 0},
+	} {
+		if got := result.MatchCounts[tc.name]; got != tc.want {
+			t.Fatalf("%s match count = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+	if result.RequirementsRedirected() {
+		t.Fatal("RequirementsRedirected should be false for telemetry-only patch")
+	}
+
+	patched, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+	for _, s := range []string{
+		"codex_turn_event",
+		"sandbox_network_access",
+	} {
+		if bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("patched binary still contains original telemetry fingerprint %q", s)
+		}
+	}
+	for _, s := range []string{
+		"codex_turn_evenz",
+		"sandbox_network_accezz",
+	} {
+		if !bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("patched binary missing renamed telemetry fingerprint %q", s)
+		}
+	}
+	for _, s := range []string{
+		"approval_policy",
+		"sandbox_policy",
+		"approvals_reviewer",
+	} {
+		if !bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("broad config/protocol key %q should not be patched", s)
+		}
+	}
+}
+
+func TestPatchCodexBinaryTelemetryFingerprintsMissingDoesNotBlockCorePatch(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := filepath.Join(dir, "cache")
+	origPath := filepath.Join(dir, "codex")
+
+	data := buildSyntheticBinary(t, origReqPath)
+	if err := os.WriteFile(origPath, data, 0o755); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer cleanupRequirementsDir(result.RequirementsPath)
+
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary path")
+	}
+	if got := result.MatchCounts[requirementsPatchName]; got != 1 {
+		t.Fatalf("requirements match count = %d, want 1", got)
+	}
+	for _, name := range []string{
+		telemetryTurnEventPatchName,
+		telemetryTurnMetadataPatchName,
+		telemetryConversationPatchName,
+		telemetrySandboxNetworkPatchName,
+	} {
+		if got := result.MatchCounts[name]; got != 0 {
+			t.Fatalf("%s match count = %d, want 0", name, got)
+		}
+	}
+	if !result.RequirementsRedirected() {
+		t.Fatal("RequirementsRedirected should be true after matching core patch")
+	}
+}
+
+func TestCodexTelemetryFingerprintPatchIntegration(t *testing.T) {
+	origPath := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEST_CODEX_BINARY"))
+	if origPath == "" {
+		if os.Getenv("CODEX_PATCH_TEST") != "1" {
+			t.Skip("set CODEX_HELPER_TEST_CODEX_BINARY or CODEX_PATCH_TEST=1 to verify real telemetry fingerprint matches")
+		}
+		wrapper, err := exec.LookPath("codex")
+		if err != nil {
+			t.Fatalf("codex not found in PATH: %v", err)
+		}
+		nativeBin, _, err := FindNativeBinary(wrapper)
+		if err != nil {
+			if targetTriple() == "" {
+				t.Skipf("FindNativeBinary: %v", err)
+			}
+			t.Fatalf("FindNativeBinary: %v", err)
+		}
+		origPath = nativeBin
+	}
+	t.Logf("native binary: %s", origPath)
+
+	original, err := os.ReadFile(origPath)
+	if err != nil {
+		t.Fatalf("read original binary: %v", err)
+	}
+	originalTelemetryCount := 0
+	for _, p := range telemetryFingerprintPatches {
+		originalTelemetryCount += bytes.Count(original, p.old)
+	}
+	if originalTelemetryCount == 0 {
+		t.Skip("installed Codex binary contains none of the known telemetry fingerprint literals")
+	}
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	result, err := PatchCodexBinary(origPath, cacheDir)
+	if err != nil {
+		t.Fatalf("PatchCodexBinary: %v", err)
+	}
+	defer result.Cleanup()
+	defer cleanupRequirementsDir(result.RequirementsPath)
+
+	if result.PatchedBinary == "" {
+		t.Fatal("expected patched binary path for installed Codex binary")
+	}
+
+	patched, err := os.ReadFile(result.PatchedBinary)
+	if err != nil {
+		t.Fatalf("read patched: %v", err)
+	}
+	for _, p := range telemetryFingerprintPatches {
+		origCount := bytes.Count(original, p.old)
+		got := result.MatchCounts[p.name]
+		t.Logf("%s: original=%d patched=%d", p.name, origCount, got)
+		if origCount == 0 {
+			if got != 0 {
+				t.Fatalf("%s match count = %d, want 0 when original literal is absent", p.name, got)
+			}
+			continue
+		}
+		if got != origCount {
+			t.Fatalf("%s match count = %d, want %d", p.name, got, origCount)
+		}
+		if bytes.Contains(patched, p.old) {
+			t.Fatalf("patched installed Codex binary still contains original telemetry fingerprint %q", p.old)
+		}
+		replacementCount := bytes.Count(patched, p.new)
+		if replacementCount < origCount {
+			t.Fatalf("patched installed Codex binary contains %d replacement %q entries, want at least %d", replacementCount, p.new, origCount)
+		}
+	}
+	for _, s := range []string{
+		"approval_policy",
+		"sandbox_policy",
+		"approvals_reviewer",
+	} {
+		if bytes.Contains(original, []byte(s)) && !bytes.Contains(patched, []byte(s)) {
+			t.Fatalf("broad config/protocol key %q should not be patched", s)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, result.PatchedBinary, "--version")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatal("patched installed Codex binary --version timed out")
+	}
+	if err != nil {
+		t.Fatalf("patched installed Codex binary --version failed: %v\n%s", err, out)
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		t.Fatal("patched installed Codex binary --version produced no output")
 	}
 }
 
@@ -766,6 +1104,11 @@ func TestPatchLengthConsistency(t *testing.T) {
 		}
 	}
 	for _, p := range tomlKeyPatches {
+		if len(p.old) != len(p.new) {
+			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
+		}
+	}
+	for _, p := range telemetryFingerprintPatches {
 		if len(p.old) != len(p.new) {
 			t.Errorf("%s: length mismatch: %d vs %d", p.name, len(p.old), len(p.new))
 		}
