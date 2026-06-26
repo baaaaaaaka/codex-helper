@@ -102,6 +102,31 @@ assert_version() {
   grep -Fq "$(version_no_v "$tag")" <<<"$output"
 }
 
+assert_version_any() {
+  local path="$1"
+  shift
+  local output
+  output="$("$path" --version)"
+  printf '%s\n' "$output"
+  local tag
+  for tag in "$@"; do
+    if grep -Fq "$(version_no_v "$tag")" <<<"$output"; then
+      return 0
+    fi
+  done
+  echo "$path version did not match any expected tag: $*" >&2
+  return 1
+}
+
+assert_missing_or_version() {
+  local path="$1"
+  local tag="$2"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  assert_version "$path" "$tag"
+}
+
 configure_managed_storage_layout() {
   local scenario_base="$1"
   local layout="$2"
@@ -225,19 +250,20 @@ SH
 
   assert_version "$go_bin" "$target_tag"
   # This first hop is executed by the old release binary, so only the invoked
-  # install path is guaranteed to be current before the new helper runs.
+  # install path is guaranteed to be current before the new helper runs. Some
+  # newer old releases also repair managed aliases during this hop.
   case "$seed_mode" in
     copy|symlink)
-      assert_version "$managed" "$old_tag"
-      assert_version "$managed_cxp" "$old_tag"
+      assert_version_any "$managed" "$old_tag" "$target_tag"
+      assert_version_any "$managed_cxp" "$old_tag" "$target_tag"
       ;;
     stale-symlink)
-      assert_version "$managed" "$old_tag"
+      assert_version_any "$managed" "$old_tag" "$target_tag"
       assert_version "$managed_cxp" "$target_tag"
       ;;
     missing)
-      [[ ! -e "$managed" ]]
-      [[ ! -e "$managed_cxp" ]]
+      assert_missing_or_version "$managed" "$target_tag"
+      assert_missing_or_version "$managed_cxp" "$target_tag"
       ;;
     current-missing-cxp)
       mkdir -p "$(dirname "$managed")"
