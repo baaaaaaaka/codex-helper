@@ -267,6 +267,7 @@ SH
       ;;
     current-missing-cxp)
       mkdir -p "$(dirname "$managed")"
+      rm -f "$managed"
       cp -f "$go_bin" "$managed"
       chmod 0755 "$managed"
       rm -f "$managed_cxp"
