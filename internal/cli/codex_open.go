@@ -192,7 +192,7 @@ func runCodexTUIInvocationViaBroker(
 	}
 	starter := codexrunner.PolicyAppServerStarter{
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-		ReadyHook:     runtimeMigrationReadyHook(store, log),
+		ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, log),
 	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
 		Starter: starter,

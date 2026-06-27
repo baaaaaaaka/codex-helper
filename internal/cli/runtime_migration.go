@@ -25,9 +25,9 @@ var runtimeMigrationMu sync.Mutex
 var runtimeMigrationTempDir = os.TempDir
 var runtimeMigrationRemoteProbe = codexRemoteTUICapable
 
-// prepareRuntimeMigration restores authentication and removes proven legacy
-// artifacts before Codex starts. This ordering matters because Codex caches its
-// initial auth state for the lifetime of the app-server process.
+// prepareRuntimeMigration verifies that no legacy session is still active and
+// restores authentication before Codex starts. Destructive cleanup of the
+// remaining proven assets is deferred until the initialize handshake succeeds.
 func prepareRuntimeMigration(store *config.Store, paths effectivePaths, codexPath string, log io.Writer) error {
 	runtimeMigrationMu.Lock()
 	defer runtimeMigrationMu.Unlock()
@@ -45,33 +45,45 @@ func prepareRuntimeMigration(store *config.Store, paths effectivePaths, codexPat
 	if !runtimeMigrationRemoteProbe(codexPath) {
 		return fmt.Errorf("Codex CLI does not support the standard remote runtime (minimum stable version 0.131.0)")
 	}
+	options := runtimeMigrationCleanupOptions(store, paths, codexPath)
+	report, err := migration.InspectLegacyRuntimeAssets(options)
+	if err != nil {
+		return fmt.Errorf("inspect standard runtime migration: %w", err)
+	}
+	if !report.Complete() {
+		return fmt.Errorf("standard runtime migration is waiting for %d active legacy session artifact(s); finish those sessions and retry", len(report.Blockers))
+	}
+	authReport, err := migration.PrepareLegacyAuthentication(options)
+	if err != nil {
+		return fmt.Errorf("prepare standard runtime authentication: %w", err)
+	}
+	if !authReport.Complete() {
+		return fmt.Errorf("standard runtime migration could not safely restore authentication")
+	}
+	if log != nil && len(authReport.Removed)+len(authReport.Restored)+len(report.Preserved) > 0 {
+		_, _ = fmt.Fprintf(log, "runtime migration prepared (%d authentication artifact(s) removed, %d restored, %d ambiguous file(s) preserved until activation)\n", len(authReport.Removed), len(authReport.Restored), len(report.Preserved))
+	}
+	return nil
+}
+
+func runtimeMigrationCleanupOptions(store *config.Store, paths effectivePaths, codexPath string) migration.CleanupOptions {
 	binaryPath := strings.TrimSpace(codexPath)
 	if native, _, nativeErr := codexbinary.FindNativeBinary(binaryPath); nativeErr == nil {
 		binaryPath = native
 	}
-	report, err := migration.CleanupLegacyRuntimeAssets(migration.CleanupOptions{
+	return migration.CleanupOptions{
 		ConfigDir:    filepath.Dir(store.Path()),
 		CodexHome:    paths.CodexDir,
 		TempDir:      runtimeMigrationTempDir(),
 		BinaryPath:   binaryPath,
 		ProcessAlive: proc.IsAlive,
-	})
-	if err != nil {
-		return fmt.Errorf("prepare standard runtime: %w", err)
 	}
-	if !report.Complete() {
-		return fmt.Errorf("standard runtime migration is waiting for %d active legacy session artifact(s); finish those sessions and retry", len(report.Blockers))
-	}
-	if log != nil && len(report.Removed)+len(report.Restored)+len(report.Preserved) > 0 {
-		_, _ = fmt.Fprintf(log, "runtime migration prepared (%d compatibility artifact(s) removed, %d restored, %d ambiguous file(s) preserved)\n", len(report.Removed), len(report.Restored), len(report.Preserved))
-	}
-	return nil
 }
 
-// runtimeMigrationReadyHook records activation only after the original
-// app-server has successfully initialized. Destructive cleanup and auth
-// restoration already completed before process launch.
-func runtimeMigrationReadyHook(store *config.Store, log io.Writer) func() {
+// runtimeMigrationReadyHook commits activation after the original app-server
+// has initialized successfully, then removes proven legacy assets. Cleanup is
+// explicitly retryable, while an activated runtime never falls back.
+func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexPath string, log io.Writer) func() {
 	return func() {
 		runtimeMigrationMu.Lock()
 		defer runtimeMigrationMu.Unlock()
@@ -79,29 +91,54 @@ func runtimeMigrationReadyHook(store *config.Store, log io.Writer) func() {
 			return
 		}
 		cfg, err := store.Load()
-		if err != nil || cfg.RuntimeGeneration >= currentRuntimeGeneration {
+		if err != nil {
 			return
 		}
-		transactionID, err := ids.New()
-		if err != nil {
+		if cfg.RuntimeGeneration >= currentRuntimeGeneration && !cfg.RuntimeCleanupPending {
+			return
+		}
+		if cfg.RuntimeGeneration < currentRuntimeGeneration {
+			transactionID, transactionErr := ids.New()
+			if transactionErr != nil {
+				if log != nil {
+					_, _ = fmt.Fprintf(log, "runtime migration transaction warning: %v\n", transactionErr)
+				}
+				return
+			}
+			if commitErr := store.Update(func(updated *config.Config) error {
+				updated.RuntimeGeneration = currentRuntimeGeneration
+				updated.RuntimeMigrationID = transactionID
+				updated.RuntimeMigratedAt = time.Now().UTC()
+				updated.RuntimeCleanupPending = true
+				return nil
+			}); commitErr != nil {
+				if log != nil {
+					_, _ = fmt.Fprintf(log, "runtime migration commit warning: %v\n", commitErr)
+				}
+				return
+			}
+		}
+
+		report, cleanupErr := migration.CleanupLegacyRuntimeAssets(runtimeMigrationCleanupOptions(store, paths, codexPath))
+		if cleanupErr != nil || !report.Complete() {
 			if log != nil {
-				_, _ = fmt.Fprintf(log, "runtime migration transaction warning: %v\n", err)
+				_, _ = fmt.Fprintf(log, "runtime migration cleanup pending: removed=%d restored=%d preserved=%d blockers=%d err=%v\n", len(report.Removed), len(report.Restored), len(report.Preserved), len(report.Blockers), cleanupErr)
 			}
 			return
 		}
-		if err := store.Update(func(updated *config.Config) error {
-			updated.RuntimeGeneration = currentRuntimeGeneration
-			updated.RuntimeMigrationID = transactionID
-			updated.RuntimeMigratedAt = time.Now().UTC()
+		if cleanupCommitErr := store.Update(func(updated *config.Config) error {
+			if updated.RuntimeGeneration >= currentRuntimeGeneration {
+				updated.RuntimeCleanupPending = false
+			}
 			return nil
-		}); err != nil {
+		}); cleanupCommitErr != nil {
 			if log != nil {
-				_, _ = fmt.Fprintf(log, "runtime migration commit warning: %v\n", err)
+				_, _ = fmt.Fprintf(log, "runtime migration cleanup commit warning: %v\n", cleanupCommitErr)
 			}
 			return
 		}
 		if log != nil {
-			_, _ = fmt.Fprintln(log, "runtime migration completed")
+			_, _ = fmt.Fprintf(log, "runtime migration completed (%d compatibility artifact(s) removed, %d restored, %d ambiguous file(s) preserved)\n", len(report.Removed), len(report.Restored), len(report.Preserved))
 		}
 	}
 }

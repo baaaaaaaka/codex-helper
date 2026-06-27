@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -185,38 +186,49 @@ func TestStoreSaveCommitsApprovalBrokerGeneration(t *testing.T) {
 }
 
 func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	if err := os.WriteFile(path, []byte(`{"version":2,"minReader":1,"proxyEnabled":true,"yoloEnabled":true,"profiles":[]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Contains(raw, []byte("yoloEnabled")) {
-		t.Fatalf("legacy field survived migration: %s", raw)
-	}
-	var header struct {
-		Version   int `json:"version"`
-		MinReader int `json:"minReader"`
-	}
-	if err := json.Unmarshal(raw, &header); err != nil {
-		t.Fatal(err)
-	}
-	if header.Version != 3 || header.MinReader != 1 {
-		t.Fatalf("migration header = %#v, want generation 3 readable by generation-1 readers", header)
+	for _, legacyField := range []string{`,"yoloEnabled":true`, `,"yoloEnabled":false`, ``} {
+		name := "missing"
+		if strings.Contains(legacyField, "true") {
+			name = "true"
+		} else if strings.Contains(legacyField, "false") {
+			name = "false"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			document := `{"version":2,"minReader":1,"proxyEnabled":true,"profiles":[]` + legacyField + `}`
+			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(raw, []byte("yoloEnabled")) {
+				t.Fatalf("legacy field survived migration: %s", raw)
+			}
+			var header struct {
+				Version   int `json:"version"`
+				MinReader int `json:"minReader"`
+			}
+			if err := json.Unmarshal(raw, &header); err != nil {
+				t.Fatal(err)
+			}
+			if header.Version != 3 || header.MinReader != 1 {
+				t.Fatalf("migration header = %#v, want generation 3 readable by generation-1 readers", header)
+			}
+		})
 	}
 }
 

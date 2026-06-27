@@ -26,17 +26,18 @@ type Config struct {
 	Version   int `json:"version"`
 	MinReader int `json:"minReader,omitempty"`
 	// RuntimeGeneration records that this installation has successfully
-	// initialized the generation-1 broker runtime and completed its one-time
-	// compatibility cleanup. It is deliberately independent from Version:
-	// schema reads must not claim that runtime activation succeeded.
-	RuntimeGeneration   int                     `json:"runtimeGeneration,omitempty"`
-	RuntimeMigrationID  string                  `json:"runtimeMigrationId,omitempty"`
-	RuntimeMigratedAt   time.Time               `json:"runtimeMigratedAt,omitempty"`
-	ProxyEnabled        *bool                   `json:"proxyEnabled,omitempty"`
-	Profiles            []Profile               `json:"profiles"`
-	Instances           []Instance              `json:"instances,omitempty"`
-	DefaultModelProfile string                  `json:"defaultModelProfile,omitempty"`
-	ModelProfiles       map[string]ModelProfile `json:"modelProfiles,omitempty"`
+	// initialized the generation-1 broker runtime. RuntimeCleanupPending keeps
+	// post-commit compatibility cleanup retryable without making an activated
+	// installation fall back to the retired runner.
+	RuntimeGeneration     int                     `json:"runtimeGeneration,omitempty"`
+	RuntimeMigrationID    string                  `json:"runtimeMigrationId,omitempty"`
+	RuntimeMigratedAt     time.Time               `json:"runtimeMigratedAt,omitempty"`
+	RuntimeCleanupPending bool                    `json:"runtimeCleanupPending,omitempty"`
+	ProxyEnabled          *bool                   `json:"proxyEnabled,omitempty"`
+	Profiles              []Profile               `json:"profiles"`
+	Instances             []Instance              `json:"instances,omitempty"`
+	DefaultModelProfile   string                  `json:"defaultModelProfile,omitempty"`
+	ModelProfiles         map[string]ModelProfile `json:"modelProfiles,omitempty"`
 }
 
 type Profile struct {

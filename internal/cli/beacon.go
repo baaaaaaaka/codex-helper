@@ -1285,7 +1285,7 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 	}
 	runner := &codexrunner.AppServerRunner{
 		Starter: configureAppServerStarter{base: codexrunner.PolicyAppServerStarter{
-			ReadyHook: runtimeMigrationReadyHook(store, nil),
+			ReadyHook: runtimeMigrationReadyHook(store, paths, command, nil),
 		}, configure: configureIdentity},
 		Command:            command,
 		AppServerArgs:      []string{"--analytics-default-enabled"},

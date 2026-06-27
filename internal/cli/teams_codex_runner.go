@@ -220,7 +220,7 @@ func (s teamsPolicyAppServerStarter) StartAppServer(ctx context.Context, request
 	}
 	return (codexrunner.PolicyAppServerStarter{
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-		ReadyHook:     runtimeMigrationReadyHook(s.store, s.log),
+		ReadyHook:     runtimeMigrationReadyHook(s.store, s.paths, command, s.log),
 	}).StartAppServer(ctx, request)
 }
 

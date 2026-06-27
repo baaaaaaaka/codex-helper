@@ -51,6 +51,57 @@ type CleanupReport struct {
 	Blockers  []string
 }
 
+// InspectLegacyRuntimeAssets performs the blocker and provenance checks used
+// before a candidate runtime starts, without deleting or rewriting files.
+// Ambiguous assets are reported as preserved; only a live or unsafe lease is a
+// blocker.
+func InspectLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
+	if options.ProcessAlive == nil {
+		return CleanupReport{}, fmt.Errorf("process liveness callback is required")
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	var report CleanupReport
+	cacheDirs := []string{options.ConfigDir}
+	if strings.TrimSpace(options.TempDir) != "" {
+		matches, _ := filepath.Glob(filepath.Join(options.TempDir, "codex-proxy-yolo-uid-*"))
+		cacheDirs = append(cacheDirs, matches...)
+	}
+	seen := make(map[string]bool)
+	for _, dir := range cacheDirs {
+		dir = filepath.Clean(strings.TrimSpace(dir))
+		if dir == "." || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		inspectLegacyBinaries(&report, dir, options.ProcessAlive)
+	}
+	inspectLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	sort.Strings(report.Preserved)
+	sort.Strings(report.Blockers)
+	return report, nil
+}
+
+// PrepareLegacyAuthentication restores the original authentication document
+// before the candidate Codex process starts. Other legacy assets remain in
+// place until the app-server initialize handshake succeeds.
+func PrepareLegacyAuthentication(options CleanupOptions) (CleanupReport, error) {
+	if options.ProcessAlive == nil {
+		return CleanupReport{}, fmt.Errorf("process liveness callback is required")
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	var report CleanupReport
+	cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	sort.Strings(report.Removed)
+	sort.Strings(report.Restored)
+	sort.Strings(report.Preserved)
+	sort.Strings(report.Blockers)
+	return report, nil
+}
+
 func (r CleanupReport) Complete() bool {
 	// Ambiguous files are intentionally preserved as reported orphans. They do
 	// not keep the old runtime reachable and must not strand an otherwise healthy
@@ -153,6 +204,28 @@ func cleanupLegacyBinaries(report *CleanupReport, dir string, alive func(int) bo
 			report.Removed = append(report.Removed, leasePath)
 		} else if !os.IsNotExist(removeErr) {
 			report.Blockers = append(report.Blockers, leasePath)
+		}
+	}
+}
+
+func inspectLegacyBinaries(report *CleanupReport, dir string, alive func(int) bool) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "codex-patched-*"))
+	for _, binary := range matches {
+		if strings.HasSuffix(binary, legacyBinaryLease) {
+			continue
+		}
+		info, err := os.Stat(binary)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(binary + legacyBinaryLease)
+		lease, valid := parseLegacyLease(data)
+		if err != nil || !valid {
+			report.Preserved = append(report.Preserved, binary)
+			continue
+		}
+		if alive(lease.PID) {
+			report.Blockers = append(report.Blockers, binary)
 		}
 	}
 }
@@ -261,6 +334,25 @@ func cleanupLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 		report.Removed = append(report.Removed, backupPath)
 	} else {
 		report.Blockers = append(report.Blockers, backupPath)
+	}
+}
+
+func inspectLegacyAuth(report *CleanupReport, codexHome string, alive func(int) bool, now time.Time) {
+	authPath := filepath.Join(codexHome, "auth.json")
+	leases, _ := filepath.Glob(authPath + legacyAuthLease + "*")
+	for _, path := range leases {
+		data, readErr := os.ReadFile(path)
+		lease, valid := parseLegacyLease(data)
+		if readErr == nil && valid {
+			if alive(lease.PID) {
+				report.Blockers = append(report.Blockers, path)
+			}
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr == nil && now.Sub(info.ModTime()) <= 24*time.Hour {
+			report.Blockers = append(report.Blockers, path)
+		}
 	}
 }
 

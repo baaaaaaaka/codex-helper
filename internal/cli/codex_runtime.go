@@ -586,7 +586,7 @@ func runCodexExecFacade(
 	runner := &codexrunner.AppServerRunner{
 		Starter: codexrunner.PolicyAppServerStarter{
 			ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-			ReadyHook:     runtimeMigrationReadyHook(store, runOptions.Log),
+			ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, runOptions.Log),
 		},
 		Command:       codexPath,
 		AppServerArgs: append([]string{"--analytics-default-enabled"}, options.AppServerArgs...),
