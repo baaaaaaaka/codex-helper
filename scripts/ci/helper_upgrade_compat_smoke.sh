@@ -654,6 +654,67 @@ run_legacy_existing_self_loop_safe_parent_recovery() {
   assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$target_tag"
 }
 
+run_legacy_linked_managed_target_upgrade() {
+  local scenario_base="$base_root/legacy-linked-managed-target"
+  rm -rf "$scenario_base"
+  mkdir -p "$scenario_base"
+
+  export HOME="$scenario_base/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_CACHE_HOME="$HOME/.cache"
+  export CODEX_HOME="$HOME/.codex"
+  export CODEX_PROXY_SKIP_BUILTIN_SKILLS=1
+  export PATH="$original_path"
+  unset CODEX_PROXY_INSTALL_PATH CODEX_PROXY_INSTALL_DIR
+  unset CODEX_HELPER_TEAMS_CHILD CODEX_HELPER_TEAMS_PARENT_PID
+
+  local parent="$scenario_base/physical/codex-proxy"
+  local managed="$HOME/.local/bin/codex-proxy"
+  local managed_cxp="$HOME/.local/bin/cxp"
+  download_binary "$old_tag" "$parent"
+  mkdir -p "$(dirname "$managed")"
+  ln -s "$parent" "$managed"
+  ln -s codex-proxy "$managed_cxp"
+  # Legacy alias convergence recorded the physical running helper while
+  # materializing the managed default as a symlink to that helper.
+  write_physical_target_install_record_without_shims "$parent" "$old_tag"
+
+  if [[ ! -L "$managed" || "$(readlink "$managed")" != "$parent" ]]; then
+    echo "legacy linked-target fixture is not the expected managed symlink" >&2
+    ls -l "$managed" "$parent" >&2 || true
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$old_tag"
+
+  echo "helper upgrade compatibility smoke: upgrade verified legacy managed-target symlink"
+  retry 5 10 "$parent" upgrade \
+    --repo "$repo" \
+    --version "$target_tag" \
+    --install-path "$managed"
+  if [[ -L "$managed" ]]; then
+    echo "legacy linked-target upgrade did not replace the managed symlink with the downloaded binary" >&2
+    ls -l "$managed" "$parent" >&2 || true
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
+  assert_version "$parent" "$target_tag"
+
+  export MANAGED_TARGET="$managed"
+  export MANAGED_CXP="$managed_cxp"
+  export TARGET_VERSION="$(version_no_v "$target_tag")"
+  export HELPER_RECORD_PATH="$(helper_install_record_path)"
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+record = json.loads(Path(os.environ["HELPER_RECORD_PATH"]).read_text())
+assert record["target_path"] == os.environ["MANAGED_TARGET"], record
+assert record["version"].lstrip("v") == os.environ["TARGET_VERSION"], record
+assert os.environ["MANAGED_CXP"] in record.get("shims", []), record
+PY
+}
+
 run_legacy_physical_record_bridge_success() {
   local storage_layout="$1"
   local scenario="legacy-physical-record-bridge-${storage_layout}"
@@ -738,6 +799,7 @@ run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bi
 if [[ "$os" == "linux" && "$old_tag" == "v0.1.12" && "$service_backend" == "local-supervisor" ]]; then
   run_legacy_existing_self_loop_vulnerable_parent_recovery
   run_legacy_existing_self_loop_safe_parent_recovery
+  run_legacy_linked_managed_target_upgrade
   run_legacy_physical_record_bridge_success "local-dir-symlink"
   run_legacy_physical_record_bridge_success "local-bin-symlink"
   run_legacy_physical_record_unsafe_env_rejection

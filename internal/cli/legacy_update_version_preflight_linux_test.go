@@ -313,6 +313,204 @@ func TestLegacyUpdaterVersionPreflightRecoversVerifiedSelfLoopForSafeParent(t *t
 	}
 }
 
+func TestLegacyUpdaterVersionPreflightAllowsVerifiedLinkedTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setupLink func(t *testing.T, fixture legacyPreflightFixture, parentPath string) string
+	}{
+		{
+			name: "absolute",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, parentPath string) string {
+				if err := os.Symlink(parentPath, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+				return parentPath
+			},
+		},
+		{
+			name: "relative",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, parentPath string) string {
+				relative, err := filepath.Rel(filepath.Dir(fixture.target), parentPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(relative, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+				return relative
+			},
+		},
+		{
+			name: "chain",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, parentPath string) string {
+				hop := filepath.Join(fixture.root, "helper-link-hop")
+				if err := os.Symlink(parentPath, hop); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(hop, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+				return hop
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newLegacyPreflightFixture(t, "local-symlink")
+			parentPath := filepath.Join(fixture.root, "running", "codex-proxy")
+			writeExecutableForLegacyPreflightTest(t, parentPath, "verified-running-helper")
+			if err := os.Remove(fixture.target); err != nil {
+				t.Fatal(err)
+			}
+			linkText := tc.setupLink(t, fixture, parentPath)
+			opts := fixture.opts
+			opts.parentExecutable = parentPath
+			opts.inspectParent = func(string, string) (bool, error) { return false, nil }
+			opts.verifyLinkedTarget = func(candidatePath string, actualParentPath string, targetPath string) error {
+				return verifyLegacyUpdaterLinkedTargetWithVersionReader(candidatePath, actualParentPath, targetPath, func(_ string, role string) (string, error) {
+					switch role {
+					case "downloaded candidate":
+						return "v0.1.13-rc.20", nil
+					case "direct parent", "linked helper target":
+						return "v0.1.13-rc.16", nil
+					default:
+						return "", errors.New("unexpected role " + role)
+					}
+				})
+			}
+
+			if err := legacyUpdaterVersionPreflightWithOptions(opts); err != nil {
+				t.Fatalf("linked-target preflight failed: %v", err)
+			}
+			got, err := os.Readlink(fixture.target)
+			if err != nil {
+				t.Fatalf("linked target was replaced during --version: %v", err)
+			}
+			if got != linkText {
+				t.Fatalf("linked target changed from %q to %q", linkText, got)
+			}
+			if _, err := os.Lstat(fixture.shim); !os.IsNotExist(err) {
+				t.Fatalf("safe linked-target preflight created cxp guard, err=%v", err)
+			}
+		})
+	}
+}
+
+func TestLegacyUpdaterLinkedTargetVerificationRejectsUnsafeLinks(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		setupLink func(t *testing.T, fixture legacyPreflightFixture, parentPath string)
+		version   func(path string, role string) (string, error)
+		wantError string
+	}{
+		{
+			name: "different helper file",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, _ string) {
+				other := filepath.Join(fixture.root, "other", "codex-proxy")
+				writeExecutableForLegacyPreflightTest(t, other, "different-helper")
+				if err := os.Symlink(other, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "does not reference the direct parent executable",
+		},
+		{
+			name: "different helper version",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, parentPath string) {
+				if err := os.Symlink(parentPath, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+			},
+			version: func(_ string, role string) (string, error) {
+				if role == "linked helper target" {
+					return "v0.1.12", nil
+				}
+				if role == "downloaded candidate" {
+					return "v0.1.13-rc.20", nil
+				}
+				return "v0.1.13-rc.16", nil
+			},
+			wantError: "does not match linked helper target version",
+		},
+		{
+			name: "unverified linked binary",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, parentPath string) {
+				if err := os.Symlink(parentPath, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+			},
+			version: func(_ string, role string) (string, error) {
+				if role == "linked helper target" {
+					return "", errors.New("linked target is not codex-helper")
+				}
+				return "v0.1.13-rc.20", nil
+			},
+			wantError: "not codex-helper",
+		},
+		{
+			name: "dangling link",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, _ string) {
+				if err := os.Symlink(filepath.Join(fixture.root, "missing", "codex-proxy"), fixture.target); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "resolve target symlink",
+		},
+		{
+			name: "link cycle",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, _ string) {
+				cxp := filepath.Join(filepath.Dir(fixture.target), "cxp")
+				if err := os.Symlink(cxp, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(fixture.target, cxp); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "resolve target symlink",
+		},
+		{
+			name: "linked directory",
+			setupLink: func(t *testing.T, fixture legacyPreflightFixture, _ string) {
+				dir := filepath.Join(fixture.root, "helper-directory")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(dir, fixture.target); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "not a regular executable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newLegacyPreflightFixture(t, "local-symlink")
+			parentPath := filepath.Join(fixture.root, "running", "codex-proxy")
+			writeExecutableForLegacyPreflightTest(t, parentPath, "running-helper")
+			if err := os.Remove(fixture.target); err != nil {
+				t.Fatal(err)
+			}
+			tc.setupLink(t, fixture, parentPath)
+			versionReader := tc.version
+			if versionReader == nil {
+				versionReader = func(_ string, role string) (string, error) {
+					if role == "downloaded candidate" {
+						return "v0.1.13-rc.20", nil
+					}
+					return "v0.1.13-rc.16", nil
+				}
+			}
+
+			err := verifyLegacyUpdaterLinkedTargetWithVersionReader(fixture.temporary, parentPath, fixture.target, versionReader)
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error=%v, want %q", err, tc.wantError)
+			}
+			if info, statErr := os.Lstat(fixture.target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("rejected linked target was mutated: info=%v err=%v", info, statErr)
+			}
+		})
+	}
+}
+
 func TestLegacyUpdaterSelfLoopRecoveryRejectsUnverifiedInputsWithoutMutation(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -756,7 +954,7 @@ func TestLegacyUpdaterTempTargetRejectsMalformedOrNonExecutableCandidates(t *tes
 	}
 }
 
-func TestLegacyUpdaterTempTargetRejectsNonSelfSymlinkTarget(t *testing.T) {
+func TestLegacyUpdaterTempTargetDefersNonSelfSymlinkTargetValidation(t *testing.T) {
 	fixture := newLegacyPreflightFixture(t, "local-symlink")
 	other := filepath.Join(fixture.root, "other", "codex-proxy")
 	writeExecutableForLegacyPreflightTest(t, other, "other-helper")
@@ -766,7 +964,8 @@ func TestLegacyUpdaterTempTargetRejectsNonSelfSymlinkTarget(t *testing.T) {
 	if err := os.Symlink(other, fixture.target); err != nil {
 		t.Fatal(err)
 	}
-	if _, candidate, err := legacyUpdaterTempTarget(fixture.temporary); !candidate || err == nil || !strings.Contains(err.Error(), "not a regular executable") {
-		t.Fatalf("non-self target candidate=%v err=%v, want rejection", candidate, err)
+	target, candidate, err := legacyUpdaterTempTarget(fixture.temporary)
+	if !candidate || err != nil || target != fixture.target {
+		t.Fatalf("non-self target=%q candidate=%v err=%v, want deferred validation for %q", target, candidate, err, fixture.target)
 	}
 }
