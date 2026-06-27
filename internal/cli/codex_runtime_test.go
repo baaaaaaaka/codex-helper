@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -167,6 +168,28 @@ func TestSplitCodexCLIInvocationPreservesInteractivePromptAndInputs(t *testing.T
 	}
 	if len(invocation.ImagePaths) != 1 || len(invocation.AdditionalDirs) != 1 {
 		t.Fatalf("inputs were not preserved: %#v", invocation)
+	}
+}
+
+func TestCodexExecAliasPreservesGlobalImagesAndAdditionalDirsInOrder(t *testing.T) {
+	invocation, err := splitCodexCLIInvocation([]string{
+		"--image", "first.png", "--image", "second.png",
+		"--add-dir", "/data/one", "--add-dir", "/data/two",
+		"e", "inspect",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if invocation.Command != "e" {
+		t.Fatalf("command = %q, want e", invocation.Command)
+	}
+	want := []string{
+		"--image", "first.png", "--image", "second.png",
+		"--add-dir", "/data/one", "--add-dir", "/data/two",
+		"inspect",
+	}
+	if got := codexFacadeArgsWithGlobalInputs(invocation, invocation.Args); !reflect.DeepEqual(got, want) {
+		t.Fatalf("facade args = %#v, want %#v", got, want)
 	}
 }
 

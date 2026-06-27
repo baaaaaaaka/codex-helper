@@ -2,8 +2,10 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +30,9 @@ func TestRuntimeMigrationPreparesBeforeReadyHookCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	hook := runtimeMigrationReadyHook(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/codex", nil)
-	hook()
+	if err := hook(); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -38,6 +42,34 @@ func TestRuntimeMigrationPreparesBeforeReadyHookCommits(t *testing.T) {
 	}
 	if cfg.RuntimeMigrationID == "" || cfg.RuntimeMigratedAt.IsZero() {
 		t.Fatalf("migration marker is incomplete: %#v", cfg)
+	}
+}
+
+func TestRuntimeMigrationReadyHookFailsClosedWhenGenerationCommitFails(t *testing.T) {
+	root := t.TempDir()
+	store, err := config.NewStore(filepath.Join(root, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	previousUpdate := runtimeMigrationStoreUpdate
+	runtimeMigrationStoreUpdate = func(*config.Store, func(*config.Config) error) error {
+		return errors.New("disk unavailable")
+	}
+	t.Cleanup(func() { runtimeMigrationStoreUpdate = previousUpdate })
+
+	err = runtimeMigrationReadyHook(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/codex", nil)()
+	if err == nil || !strings.Contains(err.Error(), "commit runtime migration") {
+		t.Fatalf("ready hook error = %v, want durable commit failure", err)
+	}
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if cfg.RuntimeGeneration != 0 || cfg.RuntimeCleanupPending {
+		t.Fatalf("failed commit changed activation state: %#v", cfg)
 	}
 }
 
@@ -85,7 +117,9 @@ func TestRuntimeMigrationDefersLegacyCleanupUntilReadyAndPreservesConfig(t *test
 	if cfg.RuntimeGeneration != 0 {
 		t.Fatalf("prepare committed generation %d before ready", cfg.RuntimeGeneration)
 	}
-	runtimeMigrationReadyHook(store, paths, "/codex", nil)()
+	if err := runtimeMigrationReadyHook(store, paths, "/codex", nil)(); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{history, binary, binary + ".lease"} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("ready hook did not remove %s: %v", path, err)
@@ -127,7 +161,9 @@ func TestRuntimeMigrationReadyCleanupBlockerCommitsAndRetriesWithoutFallback(t *
 	if err := os.WriteFile(binary+".lease", lease, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runtimeMigrationReadyHook(store, paths, "/codex", nil)()
+	if err := runtimeMigrationReadyHook(store, paths, "/codex", nil)(); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +180,9 @@ func TestRuntimeMigrationReadyCleanupBlockerCommitsAndRetriesWithoutFallback(t *
 	if err := os.Remove(binary + ".lease"); err != nil {
 		t.Fatal(err)
 	}
-	runtimeMigrationReadyHook(store, paths, "/codex", nil)()
+	if err := runtimeMigrationReadyHook(store, paths, "/codex", nil)(); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err = store.Load()
 	if err != nil {
 		t.Fatal(err)

@@ -19,7 +19,7 @@ type PolicyAppServerStarter struct {
 	// ReadyHook runs once after the original app-server successfully answers
 	// initialize. It is used for post-activation housekeeping and never changes
 	// protocol bytes or telemetry.
-	ReadyHook func()
+	ReadyHook func() error
 }
 
 func (s PolicyAppServerStarter) StartAppServer(ctx context.Context, request AppServerStartRequest) (AppServerLineTransport, error) {
@@ -91,8 +91,9 @@ type policyAppServerTransport struct {
 	policyServer  *responsespolicy.Server
 	closeOnce     sync.Once
 	closeErr      error
-	readyHook     func()
+	readyHook     func() error
 	readyOnce     sync.Once
+	readyErr      error
 	protocolMu    sync.Mutex
 	initializeIDs map[string]struct{}
 }
@@ -123,7 +124,10 @@ func (t *policyAppServerTransport) ReadLine(ctx context.Context) ([]byte, error)
 		}
 		t.protocolMu.Unlock()
 		if ready && t.readyHook != nil {
-			t.readyOnce.Do(t.readyHook)
+			t.readyOnce.Do(func() { t.readyErr = t.readyHook() })
+			if t.readyErr != nil {
+				return nil, t.readyErr
+			}
 		}
 	}
 	return line, nil

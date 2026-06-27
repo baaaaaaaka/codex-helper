@@ -7,6 +7,7 @@ toolchain go1.24.12
 require (
 	github.com/gdamore/tcell/v2 v2.13.7
 	github.com/gofrs/flock v0.13.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/spf13/cobra v1.9.1
 	golang.org/x/net v0.49.0
@@ -21,7 +22,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect

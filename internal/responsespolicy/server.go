@@ -39,6 +39,7 @@ type Server struct {
 	token    string
 	done     chan error
 	close    sync.Once
+	closeErr error
 }
 
 func StartServer(options ServerOptions) (*Server, error) {
@@ -166,9 +167,8 @@ func (s *Server) Close(ctx context.Context) error {
 	if s == nil || s.server == nil {
 		return nil
 	}
-	var err error
-	s.close.Do(func() { err = s.server.Shutdown(ctx) })
-	return err
+	s.close.Do(func() { s.closeErr = s.server.Shutdown(ctx) })
+	return s.closeErr
 }
 
 func (s *Server) Done() <-chan error {

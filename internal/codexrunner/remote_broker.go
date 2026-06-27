@@ -248,12 +248,12 @@ func (b *RemoteBroker) handleServerRequest(ctx context.Context, connection *webs
 
 	result, handled, err := b.handler.HandleServerRequest(ctx, request.Method, request.Params)
 	if err != nil {
-		b.finishApprovalState(state, nil)
+		b.finishApprovalState(key, state, nil)
 		sendBrokerError(ctx, done, err)
 		return
 	}
 	if !handled {
-		b.finishApprovalState(state, nil)
+		b.finishApprovalState(key, state, nil)
 		if err := b.writeClient(connection, raw); err != nil {
 			sendBrokerError(ctx, done, err)
 		}
@@ -262,11 +262,11 @@ func (b *RemoteBroker) handleServerRequest(ctx context.Context, connection *webs
 	response := appServerResultResponse{JSONRPC: "2.0", ID: request.ID, Result: result}
 	encoded, err := json.Marshal(response)
 	if err != nil {
-		b.finishApprovalState(state, nil)
+		b.finishApprovalState(key, state, nil)
 		sendBrokerError(ctx, done, err)
 		return
 	}
-	b.finishApprovalState(state, encoded)
+	b.finishApprovalState(key, state, encoded)
 	if err := b.writeTransport(ctx, encoded); err != nil {
 		sendBrokerError(ctx, done, err)
 	}
@@ -280,25 +280,21 @@ func (b *RemoteBroker) approvalState(key string) (*brokerApprovalState, bool) {
 	}
 	state := &brokerApprovalState{done: make(chan struct{})}
 	b.approvals[key] = state
-	b.approvalOrder = append(b.approvalOrder, key)
-	if len(b.approvalOrder) > 1024 {
-		drop := b.approvalOrder[0]
-		b.approvalOrder = b.approvalOrder[1:]
-		if previous := b.approvals[drop]; previous != state {
-			select {
-			case <-previous.done:
-				delete(b.approvals, drop)
-			default:
-			}
-		}
-	}
 	return state, true
 }
 
-func (b *RemoteBroker) finishApprovalState(state *brokerApprovalState, response []byte) {
+func (b *RemoteBroker) finishApprovalState(key string, state *brokerApprovalState, response []byte) {
 	b.approvalMu.Lock()
 	state.response = append([]byte(nil), response...)
 	close(state.done)
+	b.approvalOrder = append(b.approvalOrder, key)
+	for len(b.approvalOrder) > 1024 {
+		drop := b.approvalOrder[0]
+		b.approvalOrder = b.approvalOrder[1:]
+		if previous := b.approvals[drop]; previous != state {
+			delete(b.approvals, drop)
+		}
+	}
 	b.approvalMu.Unlock()
 }
 

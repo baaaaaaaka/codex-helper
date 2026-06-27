@@ -37,6 +37,7 @@ var (
 	ensureProxyPreferenceRunFn         = ensureProxyPreference
 	ensureProfileRunFn                 = ensureProfile
 	persistProxyPreferenceRunFn        = persistProxyPreference
+	runCodexCLIInvocationFn            = runCodexCLIInvocation
 	runTargetHealthCheckInterval       = 5 * time.Second
 )
 
@@ -131,7 +132,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		}
 		if len(after) > 0 && isCodexCommand(after[0]) {
 			runOpts.Log = cmd.ErrOrStderr()
-			return runCodexCLIInvocation(ctx, root, store, &profile, cfg.Instances, after, true, runOpts)
+			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfg.Instances, after, true, runOpts)
 		}
 		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
@@ -159,7 +160,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		}
 		if len(after) > 0 && isCodexCommand(after[0]) {
 			runOpts.Log = cmd.ErrOrStderr()
-			return runCodexCLIInvocation(ctx, root, store, &profile, cfgWithProfile.Instances, after, true, runOpts)
+			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfgWithProfile.Instances, after, true, runOpts)
 		}
 		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
@@ -173,7 +174,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	opts.UseProxy = false
 	opts.Log = log
 	if isCodexCommand(after[0]) {
-		return runCodexCLIInvocation(ctx, root, store, nil, nil, after, false, opts)
+		return runCodexCLIInvocationFn(ctx, root, store, nil, nil, after, false, opts)
 	}
 	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
 	if err != nil {

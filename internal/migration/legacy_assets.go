@@ -63,7 +63,10 @@ func InspectLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		options.Now = time.Now
 	}
 	var report CleanupReport
-	cacheDirs := []string{options.ConfigDir}
+	cacheDirs := []string{}
+	if strings.TrimSpace(options.ConfigDir) != "" {
+		cacheDirs = append(cacheDirs, options.ConfigDir)
+	}
 	if strings.TrimSpace(options.TempDir) != "" {
 		matches, _ := filepath.Glob(filepath.Join(options.TempDir, "codex-proxy-yolo-uid-*"))
 		cacheDirs = append(cacheDirs, matches...)
@@ -77,7 +80,9 @@ func InspectLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		seen[dir] = true
 		inspectLegacyBinaries(&report, dir, options.ProcessAlive)
 	}
-	inspectLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	if strings.TrimSpace(options.CodexHome) != "" {
+		inspectLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	}
 	sort.Strings(report.Preserved)
 	sort.Strings(report.Blockers)
 	return report, nil
@@ -94,7 +99,9 @@ func PrepareLegacyAuthentication(options CleanupOptions) (CleanupReport, error) 
 		options.Now = time.Now
 	}
 	var report CleanupReport
-	cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	if strings.TrimSpace(options.CodexHome) != "" {
+		cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+	}
 	sort.Strings(report.Removed)
 	sort.Strings(report.Restored)
 	sort.Strings(report.Preserved)
@@ -120,10 +127,15 @@ func CleanupLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		options.Now = time.Now
 	}
 	var report CleanupReport
-	removeKnownFile(&report, filepath.Join(options.ConfigDir, legacyHistoryFile))
-	removeKnownFile(&report, filepath.Join(options.ConfigDir, legacyHistoryFile+".lock"))
+	if strings.TrimSpace(options.ConfigDir) != "" {
+		removeKnownFile(&report, filepath.Join(options.ConfigDir, legacyHistoryFile))
+		removeKnownFile(&report, filepath.Join(options.ConfigDir, legacyHistoryFile+".lock"))
+	}
 
-	cacheDirs := []string{options.ConfigDir}
+	cacheDirs := []string{}
+	if strings.TrimSpace(options.ConfigDir) != "" {
+		cacheDirs = append(cacheDirs, options.ConfigDir)
+	}
 	if strings.TrimSpace(options.TempDir) != "" {
 		matches, _ := filepath.Glob(filepath.Join(options.TempDir, "codex-proxy-yolo-uid-*"))
 		cacheDirs = append(cacheDirs, matches...)
@@ -138,8 +150,10 @@ func CleanupLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		cleanupLegacyBinaries(&report, dir, options.ProcessAlive)
 	}
 	cleanupLegacyRequirements(&report, options.TempDir)
-	cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
-	cleanupLegacyCloudCache(&report, options.CodexHome, options.BinaryPath)
+	if strings.TrimSpace(options.CodexHome) != "" {
+		cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
+		cleanupLegacyCloudCache(&report, options.CodexHome, options.BinaryPath)
+	}
 
 	sort.Strings(report.Removed)
 	sort.Strings(report.Restored)
@@ -299,12 +313,29 @@ func cleanupLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 	if err != nil {
 		return
 	}
-	current, err := os.ReadFile(authPath)
-	if err != nil {
+	sanitized, changed, err := sanitizeLegacyAuth(backup)
+	if err != nil || !changed {
 		report.Preserved = append(report.Preserved, backupPath)
 		return
 	}
-	sanitized, changed, err := sanitizeLegacyAuth(backup)
+	current, err := os.ReadFile(authPath)
+	if os.IsNotExist(err) {
+		mode := os.FileMode(0o600)
+		if info, statErr := os.Stat(backupPath); statErr == nil {
+			mode = info.Mode().Perm()
+		}
+		if atomicWrite(authPath, backup, mode) != nil {
+			report.Preserved = append(report.Preserved, backupPath)
+			return
+		}
+		report.Restored = append(report.Restored, authPath)
+		if removeErr := os.Remove(backupPath); removeErr == nil {
+			report.Removed = append(report.Removed, backupPath)
+		} else {
+			report.Blockers = append(report.Blockers, backupPath)
+		}
+		return
+	}
 	if err != nil {
 		report.Preserved = append(report.Preserved, backupPath)
 		return
@@ -317,7 +348,7 @@ func cleanupLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 		}
 		return
 	}
-	if !changed || !bytes.Equal(current, sanitized) {
+	if !bytes.Equal(current, sanitized) {
 		report.Preserved = append(report.Preserved, backupPath)
 		return
 	}

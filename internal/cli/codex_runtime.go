@@ -208,32 +208,31 @@ func runCodexCLIInvocation(
 			tail = append([]string{invocation.Command}, invocation.Args...)
 		}
 		return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, opts.Log)
-	case "exec":
-		execArgs := append([]string(nil), invocation.Args...)
-		for _, image := range invocation.ImagePaths {
-			execArgs = append([]string{"--image", image}, execArgs...)
-		}
-		for _, dir := range invocation.AdditionalDirs {
-			execArgs = append([]string{"--add-dir", dir}, execArgs...)
-		}
+	case "exec", "e":
+		execArgs := codexFacadeArgsWithGlobalInputs(invocation, invocation.Args)
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, execArgs)
-	case "e":
-		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, invocation.Args)
 	case "review":
 		reviewArgs, err := codexReviewArgsToExecArgs(invocation.Args)
 		if err != nil {
 			return err
 		}
-		for _, dir := range invocation.AdditionalDirs {
-			reviewArgs = append([]string{"--add-dir", dir}, reviewArgs...)
-		}
-		for _, image := range invocation.ImagePaths {
-			reviewArgs = append([]string{"--image", image}, reviewArgs...)
-		}
+		reviewArgs = codexFacadeArgsWithGlobalInputs(invocation, reviewArgs)
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, reviewArgs)
 	default:
 		return runCodexNativeInvocation(ctx, store, profile, instances, cmdArgs, useProxy, opts)
 	}
+}
+
+func codexFacadeArgsWithGlobalInputs(invocation codexCLIInvocation, tail []string) []string {
+	capacity := len(tail) + 2*len(invocation.ImagePaths) + 2*len(invocation.AdditionalDirs)
+	args := make([]string, 0, capacity)
+	for _, image := range invocation.ImagePaths {
+		args = append(args, "--image", image)
+	}
+	for _, dir := range invocation.AdditionalDirs {
+		args = append(args, "--add-dir", dir)
+	}
+	return append(args, tail...)
 }
 
 func codexInvocationUsesNativeCLI(invocation codexCLIInvocation, rawArgs []string) bool {

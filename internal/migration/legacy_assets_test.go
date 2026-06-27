@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -103,6 +104,66 @@ func TestCleanupLegacyRuntimeAssetsPreservesLiveAndAmbiguousArtifacts(t *testing
 	for _, path := range []string{live, live + legacyBinaryLease, ambiguous} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("artifact should be preserved: %s: %v", path, err)
+		}
+	}
+}
+
+func TestPrepareLegacyAuthenticationRestoresValidBackupWhenAuthFileIsMissing(t *testing.T) {
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original, _ := testLegacyAuthPair(t)
+	authPath := filepath.Join(codexHome, "auth.json")
+	backupPath := authPath + legacyAuthBackup
+	writeTestFile(t, backupPath, original)
+
+	report, err := PrepareLegacyAuthentication(CleanupOptions{
+		CodexHome:    codexHome,
+		ProcessAlive: func(int) bool { return false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Complete() {
+		t.Fatalf("restore incomplete: %#v", report)
+	}
+	restored, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("read restored auth: %v", err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatalf("restored auth differs\ngot:  %s\nwant: %s", restored, original)
+	}
+	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
+		t.Fatalf("backup still exists after restoration: %v", err)
+	}
+}
+
+func TestCleanupLegacyRuntimeAssetsWithEmptyPathsDoesNotTouchWorkingDirectory(t *testing.T) {
+	root := t.TempDir()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	for _, name := range []string{legacyHistoryFile, "auth.json" + legacyAuthBackup, legacyCacheFile} {
+		writeTestFile(t, filepath.Join(root, name), []byte("user-owned"))
+	}
+	report, err := CleanupLegacyRuntimeAssets(CleanupOptions{ProcessAlive: func(int) bool { return false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Removed)+len(report.Restored)+len(report.Preserved)+len(report.Blockers) != 0 {
+		t.Fatalf("empty-path cleanup reported filesystem activity: %#v", report)
+	}
+	for _, name := range []string{legacyHistoryFile, "auth.json" + legacyAuthBackup, legacyCacheFile} {
+		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+			t.Fatalf("user-owned file %s was touched: %v", name, err)
 		}
 	}
 }

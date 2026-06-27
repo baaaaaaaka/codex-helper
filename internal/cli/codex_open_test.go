@@ -50,6 +50,39 @@ func TestNormalizeWorkingDirRejectsMissingDirectory(t *testing.T) {
 	}
 }
 
+func TestNormalizeWorkingDirRejectsRegularFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normalizeWorkingDir(path); err == nil {
+		t.Fatal("normalizeWorkingDir accepted a regular file")
+	}
+}
+
+func TestNormalizeWorkingDirResolvesRelativeDirectory(t *testing.T) {
+	root := t.TempDir()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "work")
+	if err := os.Mkdir(want, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(workingDir, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeWorkingDir(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("normalizeWorkingDir = %q, want %q", got, want)
+	}
+}
+
 type codexTUIBrokerFixture struct {
 	path          string
 	workDir       string

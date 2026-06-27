@@ -20,7 +20,7 @@ const MinReaderVersion = 1
 // config whose minReader exceeds it is rejected with ErrStaleReader (this build
 // is too old to read it). It moves together with MinReaderVersion when a
 // breaking change lands.
-const SupportedReaderVersion = 3
+const SupportedReaderVersion = MinReaderVersion
 
 type Config struct {
 	Version   int `json:"version"`

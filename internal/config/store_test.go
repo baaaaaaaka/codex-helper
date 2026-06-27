@@ -232,6 +232,35 @@ func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	// Writer generation 3 is additive and still advertises reader floor 1.
+	// A future file that raises the floor to 2 is a different contract: this
+	// build must reject it instead of assuming its writer generation implies
+	// support for unknown breaking semantics.
+	document := fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[]}`,
+		CurrentVersion+1, MinReaderVersion+1)
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(); err == nil {
+		t.Fatal("Load accepted a config with an unsupported breaking reader floor")
+	} else {
+		var stale *StaleReaderError
+		if !errors.As(err, &stale) {
+			t.Fatalf("Load error = %T %v, want StaleReaderError", err, err)
+		}
+		if stale.FileMinReader != MinReaderVersion+1 || stale.Supported != MinReaderVersion {
+			t.Fatalf("stale reader error = %#v", stale)
+		}
+	}
+}
+
 func TestDefaultPathForHome(t *testing.T) {
 	home := filepath.Join(string(filepath.Separator), "tmp", "test-home")
 

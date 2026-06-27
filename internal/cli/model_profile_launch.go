@@ -19,6 +19,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
+	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 const (
@@ -176,10 +177,7 @@ func startModelProfileAdapterForCodex(
 		storeCleanup()
 		return codexModelProfileLaunch{}, nil, err
 	}
-	server := &http.Server{Handler: &responsesadapter.Facade{
-		Router: registry,
-		Store:  responseStore,
-	}}
+	server := &http.Server{Handler: newCodexModelProfileFacade(registry, responseStore)}
 	done := make(chan error, 1)
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -215,6 +213,14 @@ func startModelProfileAdapterForCodex(
 		CatalogPath:  catalogPath,
 		CatalogJSON:  catalogJSON,
 	}, cleanup, nil
+}
+
+func newCodexModelProfileFacade(router responsesadapter.ProviderRouter, store responsesadapter.ResponseStore) *responsesadapter.Facade {
+	return &responsesadapter.Facade{
+		Router:      router,
+		Store:       store,
+		ShellPolicy: responsespolicy.NewShellEscalationPolicy(0),
+	}
 }
 
 func writeCodexModelProfileCatalog(store *config.Store, resolved modelprofile.Resolved, catalogJSON []byte) (string, error) {

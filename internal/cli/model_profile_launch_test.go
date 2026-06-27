@@ -21,6 +21,8 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
+	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
+	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 const millionTokenContextWindowForLaunchTest = 1000000
@@ -255,6 +257,17 @@ func TestStartModelProfileAdapterServesModels(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"slug": "mimo/mimo-v2.5"`) || !strings.Contains(string(raw), `"slug": "mimo/mimo-v2.5-pro"`) {
 		t.Fatalf("catalog missing MiMo public models:\n%s", raw)
+	}
+}
+
+func TestCodexModelProfileFacadeEnablesExecutionTargetShellPolicy(t *testing.T) {
+	facade := newCodexModelProfileFacade(nil, responsesadapter.NewMemoryStore())
+	if facade.ShellPolicy == nil {
+		t.Fatal("production model-profile facade omitted the execution-target shell policy")
+	}
+	prepared := facade.ShellPolicy.Prepare("call-gpu", responsespolicy.ShellCommandTool, `{"command":"nvidia-smi"}`)
+	if !strings.Contains(prepared, responsespolicy.EscalationPermission) {
+		t.Fatalf("prepared shell call = %s, want %q", prepared, responsespolicy.EscalationPermission)
 	}
 }
 

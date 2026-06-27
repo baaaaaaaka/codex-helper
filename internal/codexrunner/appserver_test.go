@@ -584,6 +584,39 @@ func TestAppServerRunnerFailsClosedWhenInitializationProbeFails(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerRetriesAfterCanceledInitialization(t *testing.T) {
+	first := newFakeAppServerTransport()
+	second := newFakeAppServerTransport(
+		`{"id":2,"result":{}}`,
+		`{"id":3,"result":{"data":[]}}`,
+		`{"id":4,"result":{"data":[{"id":"thread-after-retry"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return first, nil
+		}
+		return second, nil
+	})}
+	defer runner.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := runner.ListThreads(ctx, ListThreadsOptions{}); !IsKind(err, ErrorTimeout) {
+		t.Fatalf("first ListThreads error = %v, want timeout", err)
+	}
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil {
+		t.Fatalf("retry ListThreads error: %v", err)
+	}
+	if starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-retry" {
+		t.Fatalf("retry starts=%d threads=%#v", starts, threads)
+	}
+	if !first.closed {
+		t.Fatal("canceled initialization transport was not closed")
+	}
+}
+
 func TestAppServerRunnerSurfacesTransportCrashWithoutRealCodex(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
@@ -594,6 +627,51 @@ func TestAppServerRunnerSurfacesTransportCrashWithoutRealCodex(t *testing.T) {
 	_, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
 	if !IsKind(err, ErrorLaunch) {
 		t.Fatalf("expected launch error for closed app-server stream, got %v", err)
+	}
+}
+
+func TestAppServerRunnerRestartsOnNextRequestAfterTransportCrash(t *testing.T) {
+	first := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"data":[{"id":"thread-before-crash"}]}}`,
+	)
+	first.eofWhenDrained = true
+	second := newFakeAppServerTransport(
+		`{"id":4,"result":{}}`,
+		`{"id":5,"result":{"data":[]}}`,
+		`{"id":6,"result":{"data":[{"id":"thread-after-crash"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return first, nil
+		}
+		return second, nil
+	})}
+	defer runner.Close()
+
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil || len(threads) != 1 || threads[0].ID != "thread-before-crash" {
+		t.Fatalf("first ListThreads threads=%#v err=%v", threads, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		runner.protocolMu.Lock()
+		failed := runner.protocolErr != nil
+		runner.protocolMu.Unlock()
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("protocol crash was not recorded")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	threads, err = runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil || starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-crash" {
+		t.Fatalf("restarted ListThreads starts=%d threads=%#v err=%v", starts, threads, err)
 	}
 }
 

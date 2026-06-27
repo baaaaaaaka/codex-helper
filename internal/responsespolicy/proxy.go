@@ -205,6 +205,9 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, request *http.Request, app
 	dialer.Subprotocols = subprotocols
 	upstream, response, err := dialer.DialContext(request.Context(), upstreamURL.String(), headers)
 	if err != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
 		status := http.StatusBadGateway
 		if response != nil && response.StatusCode >= 400 {
 			status = response.StatusCode

@@ -70,10 +70,9 @@ type AppServerRunner struct {
 	// runner (for example a local third-party Responses adapter).
 	CloseHook func()
 
-	mu          sync.Mutex
-	writeMu     sync.Mutex
-	ready       bool
-	unavailable bool
+	mu      sync.Mutex
+	writeMu sync.Mutex
+	ready   bool
 
 	protocolCtx             context.Context
 	protocolCancel          context.CancelFunc
@@ -279,16 +278,20 @@ func (r *AppServerRunner) ensureReady(ctx context.Context) error {
 
 func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 	if r.ready {
-		return nil
-	}
-	if r.unavailable {
-		return &Error{Kind: ErrorUnsupported, Message: "codex app-server is unavailable"}
+		r.protocolMu.Lock()
+		failed := r.protocolErr != nil
+		r.protocolMu.Unlock()
+		if !failed {
+			return nil
+		}
+		// The previous protocol error is already the authoritative failure for
+		// that turn. A diagnostic process-wait error while closing the dead
+		// transport must not prevent a clean cold restart for the next turn.
+		_ = r.closeTransportLocked()
 	}
 	if r.Transport == nil {
 		if r.Starter == nil {
-			err := &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
-			r.unavailable = true
-			return err
+			return &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
 		}
 		transport, err := r.Starter.StartAppServer(ctx, AppServerStartRequest{
 			Command:    firstNonEmpty(r.Command, defaultCodexCommand),
@@ -298,7 +301,6 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 			Timeout:    r.Timeout,
 		})
 		if err != nil {
-			r.unavailable = true
 			return classifyLaunchError(err)
 		}
 		r.Transport = transport
@@ -306,7 +308,6 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 	r.startProtocolLoopLocked()
 	if err := r.initializeLocked(ctx); err != nil {
 		_ = r.closeTransportLocked()
-		r.unavailable = true
 		return err
 	}
 	r.ready = true
@@ -1004,10 +1005,12 @@ func (r *AppServerRunner) closeTransportLocked() error {
 	}
 	r.serverWG.Wait()
 	var err error
+	r.writeMu.Lock()
 	if r.Transport != nil {
 		err = r.Transport.Close()
 		r.Transport = nil
 	}
+	r.writeMu.Unlock()
 	r.protocolCtx = nil
 	r.protocolCancel = nil
 	r.protocolDone = nil

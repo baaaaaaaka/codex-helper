@@ -401,11 +401,9 @@ func modelProfileAdapterFacade(
 		storeCleanup()
 		return nil, nil, err
 	}
-	return &responsesadapter.Facade{
-		Router:     registry,
-		Store:      responseStore,
-		InstanceID: instanceID,
-	}, storeCleanup, nil
+	facade := newCodexModelProfileFacade(registry, responseStore)
+	facade.InstanceID = instanceID
+	return facade, storeCleanup, nil
 }
 
 func modelProfileAdapterListenHostForApp() string {

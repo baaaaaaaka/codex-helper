@@ -181,7 +181,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|FacadeCompletedUsageIncludesZeroCachedTokens|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*)|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
 
       - name: Codex streaming transcript visibility regressions
         shell: bash
@@ -562,7 +562,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
           go test ./internal/cli -count=1 -run 'Test(ParseCodexAppArgs|CodexDesktopPlatformForCurrentHost|CodexDesktopMacDownloadURLForArch|CodexDesktopAppLaunchOptionsConvertsWSLPaths|CodexDesktopWindowsScript(InstallsStorePackageAndLaunchesExe|ExplainsWindowsAppsAppPathFailure|OmitsProxyArgWithoutProxy|WaitForExitOption)|LaunchCodexDesktopAppWindowsRequiresPowerShell|PrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy|RunCodexApp(DirectLaunchesDesktopApp|ProxyLaunchUsesLongLivedProxy|ExplicitProfilePreservesDisabledPreference|DoesNotPersistProxyPreferenceWhenProfileSetupFails|LinuxFailsBeforeProxyPrompt)|FindCodexAppBundle|EnsureCodexDesktopAppMac(SkipsBrokenCandidate|SkipsUntrustedCandidate|ExplicitUntrustedAppFails)|VerifyCodexDesktopAppMacRejectsWrongTeamID|CodexDesktopMacInstallHomePrefersEffectiveUser|InstallCodexDesktopAppMac(VerifiesBeforeReplacing|KeepsExistingBundleWhenCopyFails)|StartCodexAppProxyDaemonCleansPlaceholderOnStartFailure|EnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut)$'
           go test ./internal/cli ./internal/codexrunner -count=1 -run 'Test(RunCodexAppDeviceCodeAuth.*|RunCodexAppAuth.*|CodexAppAuth.*|OpenCodexAppAuth.*|PrintCodexAppAuth.*|AppCommand.*|EnsureCodexAppAuth.*|AppServerProcessStarterConfigure.*)$' -v
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
@@ -574,7 +574,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
+          go test ./internal/cli -count=1 -run 'TestRunLike(UsesDirectModeWhenProxyDisabled|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner|UsesProxyPreferenceWhenEnabled|ExplicitProfileForcesProxy|PersistsProxyEnabledAfterProfileSetup|ExplicitProfilePersistsProxyEnabledAfterProfileSetup)$'
           go test ./internal/cli -count=1 -run 'Test(ParseCodexAppArgs|CodexDesktopPlatformForCurrentHost|CodexDesktopMacDownloadURLForArch|CodexDesktopAppLaunchOptionsConvertsWSLPaths|CodexDesktopWindowsScript(InstallsStorePackageAndLaunchesExe|ExplainsWindowsAppsAppPathFailure|OmitsProxyArgWithoutProxy|WaitForExitOption|DirectLaunchPassesProxyArgIntegration|WindowsAppsAppPathFailureIntegration)|LaunchCodexDesktopAppWindowsRequiresPowerShell|PrintCodexDesktopAppLaunchAdvisoriesWarnsForWSLProxy|RunCodexApp(DirectLaunchesDesktopApp|ProxyLaunchUsesLongLivedProxy|ExplicitProfilePreservesDisabledPreference|DoesNotPersistProxyPreferenceWhenProfileSetupFails|LinuxFailsBeforeProxyPrompt)|FindCodexAppBundle|EnsureCodexDesktopAppMac(SkipsBrokenCandidate|SkipsUntrustedCandidate|ExplicitUntrustedAppFails)|VerifyCodexDesktopAppMacRejectsWrongTeamID|CodexDesktopMacInstallHomePrefersEffectiveUser|InstallCodexDesktopAppMac(VerifiesBeforeReplacing|KeepsExistingBundleWhenCopyFails)|StartCodexAppProxyDaemonCleansPlaceholderOnStartFailure|EnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut)$'
           go test ./internal/cli ./internal/codexrunner -count=1 -run 'Test(RunCodexAppDeviceCodeAuth.*|RunCodexAppAuth.*|CodexAppAuth.*|OpenCodexAppAuth.*|PrintCodexAppAuth.*|AppCommand.*|EnsureCodexAppAuth.*|AppServerProcessStarterConfigure.*)$' -v
           go test ./internal/proc ./internal/manager ./internal/cli -count=1 -run 'Test(CommandLine|LooksLikeProxyDaemonCmdline|FindReusableInstance(PicksMostRecentHealthy|IgnoresWrongInstanceID|SkipsUnhealthy)|WithProfileInstallEnvSkipsLegacyInstance|RunWithProfileOptionsSkipsLegacyInstance)$'
@@ -635,11 +635,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          config_pattern='TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField)$'
-          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*)$'
-          runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
+          config_pattern='TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
+          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
+          runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
+          go test ./internal/migration -count=1 -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/cli ./internal/codexrunner -count=1 -run "$runtime_pattern" -v
           go test ./internal/responsespolicy -count=1 -v
@@ -652,11 +653,12 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $configPattern = 'TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField)$'
-          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*)$'
-          $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
+          $configPattern = 'TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
+          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
+          $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v
+          go test ./internal/migration -count=1 -v
           go test ./internal/cli -count=1 -run $cliPattern -v
           go test ./internal/cli ./internal/codexrunner -count=1 -run $runtimePattern -v
           go test ./internal/responsespolicy -count=1 -v
@@ -793,7 +795,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI)$' -v
+          go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI|CodexModelProfileFacadeEnablesExecutionTargetShellPolicy)$' -v
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
       - name: Model choice reusable credential regressions
@@ -944,7 +946,7 @@ jobs:
           npm_config_prefix: /tmp/codex-proxy-wrapper/npm-prefix
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix)|RunTargetOnceWithOptionsUsesPatchInfoForSelfUpdateGuard)$'
+          go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$'
 
       - name: Self-update env pollution regressions (Windows)
         if: runner.os == 'Windows'
@@ -979,7 +981,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix)|RunTargetOnceWithOptionsUsesPatchInfoForSelfUpdateGuard)$' -v
+          env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$' -v
 
       - name: Self-update clean-env regressions (Windows)
         if: runner.os == 'Windows'

@@ -2,6 +2,8 @@ package codexrunner
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -14,8 +16,11 @@ func TestPolicyTransportReadyHookRunsAfterSuccessfulInitializeResponse(t *testin
 	var calls atomic.Int32
 	transport := &policyAppServerTransport{
 		AppServerLineTransport: base,
-		readyHook:              func() { calls.Add(1) },
-		initializeIDs:          make(map[string]struct{}),
+		readyHook: func() error {
+			calls.Add(1)
+			return nil
+		},
+		initializeIDs: make(map[string]struct{}),
 	}
 	if err := transport.WriteLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":7,"method":"initialize","params":{}}`)); err != nil {
 		t.Fatal(err)
@@ -42,8 +47,11 @@ func TestPolicyTransportReadyHookSkipsFailedInitialize(t *testing.T) {
 	var calls atomic.Int32
 	transport := &policyAppServerTransport{
 		AppServerLineTransport: base,
-		readyHook:              func() { calls.Add(1) },
-		initializeIDs:          make(map[string]struct{}),
+		readyHook: func() error {
+			calls.Add(1)
+			return nil
+		},
+		initializeIDs: make(map[string]struct{}),
 	}
 	if err := transport.WriteLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`)); err != nil {
 		t.Fatal(err)
@@ -53,6 +61,23 @@ func TestPolicyTransportReadyHookSkipsFailedInitialize(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("hook calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestPolicyTransportReadyHookFailureRejectsInitialize(t *testing.T) {
+	base := newFakeAppServerTransport(`{"jsonrpc":"2.0","id":7,"result":{}}`)
+	transport := &policyAppServerTransport{
+		AppServerLineTransport: base,
+		readyHook: func() error {
+			return errors.New("migration commit failed")
+		},
+		initializeIDs: make(map[string]struct{}),
+	}
+	if err := transport.WriteLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":7,"method":"initialize","params":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transport.ReadLine(context.Background()); err == nil || !strings.Contains(err.Error(), "migration commit failed") {
+		t.Fatalf("ReadLine error = %v, want ready-hook failure", err)
 	}
 }
 

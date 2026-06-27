@@ -639,6 +639,89 @@ func TestRunLikeUsesProxyPreferenceWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestRunLikeUsesDefaultCodexCommandInDirectMode(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	disabled := false
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := runCodexCLIInvocationFn
+	t.Cleanup(func() { runCodexCLIInvocationFn = previous })
+	called := false
+	runCodexCLIInvocationFn = func(_ context.Context, _ *rootOptions, gotStore *config.Store, profile *config.Profile, _ []config.Instance, args []string, useProxy bool, opts runTargetOptions) error {
+		called = true
+		if gotStore.Path() != store.Path() || profile != nil || useProxy || opts.UseProxy {
+			t.Fatalf("direct broker dispatch store=%q profile=%#v useProxy=%v opts.UseProxy=%v", gotStore.Path(), profile, useProxy, opts.UseProxy)
+		}
+		if !reflect.DeepEqual(args, []string{"codex"}) {
+			t.Fatalf("direct broker args = %#v", args)
+		}
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLike(cmd, &rootOptions{configPath: store.Path()}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("default Codex command did not use the standard broker dispatch")
+	}
+}
+
+func TestRunLikeCodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	enabled := true
+	profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled, Profiles: []config.Profile{profile}}); err != nil {
+		t.Fatal(err)
+	}
+
+	previousBroker := runCodexCLIInvocationFn
+	previousLegacy := runWithProfileFn
+	t.Cleanup(func() {
+		runCodexCLIInvocationFn = previousBroker
+		runWithProfileFn = previousLegacy
+	})
+	runWithProfileFn = func(context.Context, *config.Store, config.Profile, []config.Instance, []string) error {
+		t.Fatal("Codex launch used the legacy generic profile runner")
+		return nil
+	}
+	called := false
+	runCodexCLIInvocationFn = func(_ context.Context, _ *rootOptions, _ *config.Store, gotProfile *config.Profile, _ []config.Instance, args []string, useProxy bool, _ runTargetOptions) error {
+		called = true
+		if gotProfile == nil || gotProfile.ID != profile.ID || !useProxy {
+			t.Fatalf("proxy broker dispatch profile=%#v useProxy=%v", gotProfile, useProxy)
+		}
+		if !reflect.DeepEqual(args, []string{"codex", "exec", "hello"}) {
+			t.Fatalf("proxy broker args = %#v", args)
+		}
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetContext(context.Background())
+	if err := cmd.Flags().Parse([]string{"--", "codex", "exec", "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runLike(cmd, &rootOptions{configPath: store.Path()}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("proxy Codex command did not use the standard broker dispatch")
+	}
+}
+
 func TestRunLikeExplicitProfileForcesProxy(t *testing.T) {
 	lockCLITestHooks(t)
 

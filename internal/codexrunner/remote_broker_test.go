@@ -3,6 +3,7 @@ package codexrunner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -76,6 +77,34 @@ func TestRemoteBrokerRelaysProtocolAndApprovesAfterDelay(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("approval response was not written")
+	}
+}
+
+func TestRemoteBrokerApprovalCacheBoundsPreviouslyConcurrentRequests(t *testing.T) {
+	broker := &RemoteBroker{approvals: make(map[string]*brokerApprovalState)}
+	type pending struct {
+		key   string
+		state *brokerApprovalState
+	}
+	requests := make([]pending, 0, 2048)
+	for index := 0; index < cap(requests); index++ {
+		key := fmt.Sprintf("%d\x00approval", index)
+		state, owner := broker.approvalState(key)
+		if !owner {
+			t.Fatalf("request %d unexpectedly reused approval state", index)
+		}
+		requests = append(requests, pending{key: key, state: state})
+	}
+	// Complete in reverse order so the first 1024 cache evictions exercise
+	// states that were all created while still in flight.
+	for index := len(requests) - 1; index >= 0; index-- {
+		broker.finishApprovalState(requests[index].key, requests[index].state, []byte(`{"ok":true}`))
+	}
+	if got := len(broker.approvals); got != 1024 {
+		t.Fatalf("approval cache size = %d, want 1024", got)
+	}
+	if got := len(broker.approvalOrder); got != 1024 {
+		t.Fatalf("approval order size = %d, want 1024", got)
 	}
 }
 

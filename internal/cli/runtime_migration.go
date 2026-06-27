@@ -24,6 +24,9 @@ const currentRuntimeGeneration = 1
 var runtimeMigrationMu sync.Mutex
 var runtimeMigrationTempDir = os.TempDir
 var runtimeMigrationRemoteProbe = codexRemoteTUICapable
+var runtimeMigrationStoreUpdate = func(store *config.Store, update func(*config.Config) error) error {
+	return store.Update(update)
+}
 
 // prepareRuntimeMigration verifies that no legacy session is still active and
 // restores authentication before Codex starts. Destructive cleanup of the
@@ -83,39 +86,33 @@ func runtimeMigrationCleanupOptions(store *config.Store, paths effectivePaths, c
 // runtimeMigrationReadyHook commits activation after the original app-server
 // has initialized successfully, then removes proven legacy assets. Cleanup is
 // explicitly retryable, while an activated runtime never falls back.
-func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexPath string, log io.Writer) func() {
-	return func() {
+func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexPath string, log io.Writer) func() error {
+	return func() error {
 		runtimeMigrationMu.Lock()
 		defer runtimeMigrationMu.Unlock()
 		if store == nil {
-			return
+			return nil
 		}
 		cfg, err := store.Load()
 		if err != nil {
-			return
+			return fmt.Errorf("load runtime migration state: %w", err)
 		}
 		if cfg.RuntimeGeneration >= currentRuntimeGeneration && !cfg.RuntimeCleanupPending {
-			return
+			return nil
 		}
 		if cfg.RuntimeGeneration < currentRuntimeGeneration {
 			transactionID, transactionErr := ids.New()
 			if transactionErr != nil {
-				if log != nil {
-					_, _ = fmt.Fprintf(log, "runtime migration transaction warning: %v\n", transactionErr)
-				}
-				return
+				return fmt.Errorf("create runtime migration transaction: %w", transactionErr)
 			}
-			if commitErr := store.Update(func(updated *config.Config) error {
+			if commitErr := runtimeMigrationStoreUpdate(store, func(updated *config.Config) error {
 				updated.RuntimeGeneration = currentRuntimeGeneration
 				updated.RuntimeMigrationID = transactionID
 				updated.RuntimeMigratedAt = time.Now().UTC()
 				updated.RuntimeCleanupPending = true
 				return nil
 			}); commitErr != nil {
-				if log != nil {
-					_, _ = fmt.Fprintf(log, "runtime migration commit warning: %v\n", commitErr)
-				}
-				return
+				return fmt.Errorf("commit runtime migration: %w", commitErr)
 			}
 		}
 
@@ -124,9 +121,9 @@ func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexP
 			if log != nil {
 				_, _ = fmt.Fprintf(log, "runtime migration cleanup pending: removed=%d restored=%d preserved=%d blockers=%d err=%v\n", len(report.Removed), len(report.Restored), len(report.Preserved), len(report.Blockers), cleanupErr)
 			}
-			return
+			return nil
 		}
-		if cleanupCommitErr := store.Update(func(updated *config.Config) error {
+		if cleanupCommitErr := runtimeMigrationStoreUpdate(store, func(updated *config.Config) error {
 			if updated.RuntimeGeneration >= currentRuntimeGeneration {
 				updated.RuntimeCleanupPending = false
 			}
@@ -135,11 +132,12 @@ func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexP
 			if log != nil {
 				_, _ = fmt.Fprintf(log, "runtime migration cleanup commit warning: %v\n", cleanupCommitErr)
 			}
-			return
+			return nil
 		}
 		if log != nil {
 			_, _ = fmt.Fprintf(log, "runtime migration completed (%d compatibility artifact(s) removed, %d restored, %d ambiguous file(s) preserved)\n", len(report.Removed), len(report.Restored), len(report.Preserved))
 		}
+		return nil
 	}
 }
 
