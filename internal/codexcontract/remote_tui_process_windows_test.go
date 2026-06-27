@@ -67,7 +67,7 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		return nil, fmt.Errorf("allocate ConPTY process attributes: %w", err)
 	}
 	defer attributes.Delete()
-	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(console), unsafe.Sizeof(console)); err != nil {
+	if err := attributes.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, windowsHandleValuePointer(console), unsafe.Sizeof(console)); err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
 		_ = windows.CloseHandle(outputRead)
@@ -156,6 +156,15 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		}
 	}()
 	return process, nil
+}
+
+// windowsHandleValuePointer preserves the pointer-sized HPCON value required
+// by PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE without treating the handle as an
+// address to Go memory. UpdateProcThreadAttribute consumes this PVOID by value.
+func windowsHandleValuePointer(handle windows.Handle) unsafe.Pointer {
+	var value unsafe.Pointer
+	*(*uintptr)(unsafe.Pointer(&value)) = uintptr(handle)
+	return value
 }
 
 type lockedWriter struct{ process *windowsRemoteTUIProcess }
