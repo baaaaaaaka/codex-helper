@@ -1,6 +1,7 @@
 package codexrunner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -587,6 +588,7 @@ func TestAppServerRunnerSurfacesTransportCrashWithoutRealCodex(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 	)
+	transport.eofWhenDrained = true
 	runner := NewAppServerRunner(transport)
 
 	_, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
@@ -655,14 +657,16 @@ func TestProbeAppServerCompatibilityRunsColdProbeRepeatedly(t *testing.T) {
 }
 
 type fakeAppServerTransport struct {
-	mu     sync.Mutex
-	reads  [][]byte
-	writes [][]byte
-	closed bool
+	mu             sync.Mutex
+	reads          [][]byte
+	writes         [][]byte
+	closed         bool
+	eofWhenDrained bool
+	notify         chan struct{}
 }
 
 func newFakeAppServerTransport(reads ...string) *fakeAppServerTransport {
-	transport := &fakeAppServerTransport{}
+	transport := &fakeAppServerTransport{notify: make(chan struct{}, 1)}
 	for _, read := range reads {
 		transport.reads = append(transport.reads, []byte(read))
 	}
@@ -671,27 +675,66 @@ func newFakeAppServerTransport(reads ...string) *fakeAppServerTransport {
 
 func (t *fakeAppServerTransport) WriteLine(_ context.Context, line []byte) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.writes = append(t.writes, append([]byte{}, line...))
+	t.mu.Unlock()
+	t.signal()
 	return nil
 }
 
-func (t *fakeAppServerTransport) ReadLine(context.Context) ([]byte, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if len(t.reads) == 0 {
-		return nil, io.EOF
+func (t *fakeAppServerTransport) ReadLine(ctx context.Context) ([]byte, error) {
+	for {
+		t.mu.Lock()
+		if len(t.reads) > 0 && t.readReadyLocked(t.reads[0]) {
+			line := t.reads[0]
+			t.reads = t.reads[1:]
+			t.mu.Unlock()
+			return append([]byte{}, line...), nil
+		}
+		if t.closed || (len(t.reads) == 0 && t.eofWhenDrained) {
+			t.mu.Unlock()
+			return nil, io.EOF
+		}
+		notify := t.notify
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-notify:
+		}
 	}
-	line := t.reads[0]
-	t.reads = t.reads[1:]
-	return append([]byte{}, line...), nil
 }
 
 func (t *fakeAppServerTransport) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.closed = true
+	t.mu.Unlock()
+	t.signal()
 	return nil
+}
+
+func (t *fakeAppServerTransport) readReadyLocked(line []byte) bool {
+	var message appServerMessage
+	if json.Unmarshal(line, &message) != nil || len(bytes.TrimSpace(message.ID)) == 0 || strings.TrimSpace(message.Method) != "" {
+		return true
+	}
+	id, ok := appServerNumericID(message.ID)
+	if !ok {
+		return true
+	}
+	for _, write := range t.writes {
+		var request appServerRequest
+		if json.Unmarshal(write, &request) == nil && request.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *fakeAppServerTransport) signal() {
+	select {
+	case t.notify <- struct{}{}:
+	default:
+	}
 }
 
 func (t *fakeAppServerTransport) decodedWrites(tb testing.TB) []map[string]any {

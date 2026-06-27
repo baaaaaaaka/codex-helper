@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +21,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -485,6 +488,146 @@ esac
 	if got := strings.TrimSpace(string(raw)); got != "http://127.0.0.1:18080|"+codexHome {
 		t.Fatalf("child runtime env = %q", got)
 	}
+}
+
+func TestTeamsStandardRuntimeRunsTwoSessionsConcurrentlyOnSharedProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX test-binary app-server wrapper")
+	}
+	lockCLITestHooks(t)
+	rootDir := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(rootDir, "codex-home"))
+	store, err := config.NewStore(filepath.Join(rootDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	testBinary, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(rootDir, "codex")
+	wrapper := `#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.142.3'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  app-server) CXP_TEAMS_PARALLEL_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsParallelAppServerHelperProcess$' -- ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(codexPath, []byte(wrapper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", 5*time.Second, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := executor.(teamsCodexExecutor)
+	defer managed.Close()
+
+	type outcome struct {
+		result teams.ExecutionResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	for index := range 2 {
+		index := index
+		go func() {
+			result, runErr := managed.Run(context.Background(), &teams.Session{Cwd: rootDir}, fmt.Sprintf("session %d", index+1))
+			results <- outcome{result: result, err: runErr}
+		}()
+	}
+	seen := map[string]bool{}
+	for range 2 {
+		out := <-results
+		if out.err != nil {
+			t.Fatalf("parallel Teams session failed: result=%#v err=%v", out.result, out.err)
+		}
+		seen[out.result.CodexThreadID] = strings.HasPrefix(out.result.Text, "done thread-")
+	}
+	if len(seen) != 2 || !seen["thread-1"] || !seen["thread-2"] {
+		t.Fatalf("parallel Teams results = %#v", seen)
+	}
+}
+
+func TestTeamsParallelAppServerHelperProcess(t *testing.T) {
+	if os.Getenv("CXP_TEAMS_PARALLEL_APP_SERVER") != "1" {
+		t.Skip("helper process only")
+	}
+	type message struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	type turn struct {
+		requestID int64
+		threadID  string
+		turnID    string
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	threadSequence := 0
+	turns := make([]turn, 0, 2)
+	approvalResponses := 0
+	write := func(format string, args ...any) {
+		_, _ = fmt.Fprintf(os.Stdout, format+"\n", args...)
+	}
+	for scanner.Scan() {
+		var request message
+		if json.Unmarshal(scanner.Bytes(), &request) != nil {
+			os.Exit(2)
+		}
+		if request.Method == "" {
+			approvalResponses++
+			if approvalResponses == 2 {
+				for _, turn := range turns {
+					write(`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":%q,"turnId":%q,"item":{"id":"final","type":"agentMessage","text":%q}}}`, turn.threadID, turn.turnID, "done "+turn.threadID)
+					write(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":%q,"turn":{"id":%q,"status":"completed","items":[]}}}`, turn.threadID, turn.turnID)
+				}
+			}
+			continue
+		}
+		var id int64
+		if len(request.ID) > 0 {
+			_ = json.Unmarshal(request.ID, &id)
+		}
+		switch request.Method {
+		case "initialized":
+		case "initialize":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{}}`, id)
+		case "thread/list":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"data":[]}}`, id)
+		case "thread/start":
+			threadSequence++
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":%q}}}`, id, "thread-"+strconv.Itoa(threadSequence))
+		case "thread/read":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(request.Params, &params)
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":%q,"name":%q}}}`, id, params.ThreadID, "Teams "+params.ThreadID)
+		case "turn/start":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(request.Params, &params)
+			turns = append(turns, turn{requestID: id, threadID: params.ThreadID, turnID: "turn-" + params.ThreadID})
+			if len(turns) == 2 {
+				for index := len(turns) - 1; index >= 0; index-- {
+					turn := turns[index]
+					write(`{"jsonrpc":"2.0","id":%d,"result":{"turn":{"id":%q,"status":"inProgress","items":[]}}}`, turn.requestID, turn.turnID)
+				}
+				for index, turn := range turns {
+					write(`{"jsonrpc":"2.0","id":%d,"method":"item/commandExecution/requestApproval","params":{"threadId":%q,"turnId":%q}}`, 900+index, turn.threadID, turn.turnID)
+				}
+			}
+		default:
+			os.Exit(3)
+		}
+	}
+	os.Exit(0)
 }
 
 func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServer(t *testing.T) {
