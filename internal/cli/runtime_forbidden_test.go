@@ -69,7 +69,14 @@ func TestRuntimeSourcesContainNoRetiredExecutionSignals(t *testing.T) {
 	}
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	for _, top := range []string{"cmd", "internal"} {
-		err := filepath.WalkDir(filepath.Join(repoRoot, top), func(path string, entry os.DirEntry, err error) error {
+		topPath := filepath.Join(repoRoot, top)
+		if _, err := os.Stat(topPath); err != nil {
+			if os.IsNotExist(err) {
+				t.Skipf("runtime source tree is unavailable in this binary-only smoke environment: %s", topPath)
+			}
+			t.Fatalf("stat runtime source tree %s: %v", topPath, err)
+		}
+		err := filepath.WalkDir(topPath, func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
