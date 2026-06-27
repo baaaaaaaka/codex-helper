@@ -32,6 +32,7 @@ type legacyUpdateVersionPreflightOptions struct {
 	envInstallPath   string
 	envInstallDir    string
 	inspectParent    func(parentPath string, targetPath string) (bool, error)
+	saveRecord       func(path string, record managedinstall.Record) error
 }
 
 func legacyUpdaterVersionPreflight() error {
@@ -119,7 +120,11 @@ func legacyUpdaterVersionPreflightWithOptions(opts legacyUpdateVersionPreflightO
 	record.GOARCH = runtime.GOARCH
 	record.UpdatedAt = ""
 	record.Shims = prependLegacyUpdaterGuardShim(shimPath, record.Shims)
-	if err := managedinstall.SaveRecord(opts.recordPath, record); err != nil {
+	saveRecord := opts.saveRecord
+	if saveRecord == nil {
+		saveRecord = managedinstall.SaveRecord
+	}
+	if err := saveRecord(opts.recordPath, record); err != nil {
 		return fmt.Errorf("save managed install record guard: %w", err)
 	}
 
@@ -164,6 +169,9 @@ func legacyUpdaterTempTarget(executable string) (string, bool, error) {
 	targetPath := filepath.Join(filepath.Dir(executable), helperpath.BinaryName(runtime.GOOS))
 	targetInfo, err := os.Lstat(targetPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return targetPath, true, nil
+		}
 		return "", true, fmt.Errorf("inspect legacy helper target %s: %w", targetPath, err)
 	}
 	if !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm()&0o111 == 0 {

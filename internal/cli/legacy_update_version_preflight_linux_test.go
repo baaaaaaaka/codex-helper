@@ -197,6 +197,24 @@ func TestLegacyUpdaterVersionPreflightOrdinaryVersionIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestLegacyUpdaterVersionPreflightAllowsMissingUnaliasedTarget(t *testing.T) {
+	fixture := newLegacyPreflightFixture(t, "local-symlink")
+	if err := os.Remove(fixture.target); err != nil {
+		t.Fatal(err)
+	}
+	opts := fixture.opts
+	opts.defaultTarget = filepath.Join(fixture.root, "unrelated", "bin", "codex-proxy")
+	if err := legacyUpdaterVersionPreflightWithOptions(opts); err != nil {
+		t.Fatalf("missing unaliased target preflight: %v", err)
+	}
+	if _, err := os.Lstat(fixture.shim); !os.IsNotExist(err) {
+		t.Fatalf("missing unaliased target created cxp guard, err=%v", err)
+	}
+	if _, err := os.Stat(fixture.recordPath); !os.IsNotExist(err) {
+		t.Fatalf("missing unaliased target created install record, err=%v", err)
+	}
+}
+
 func TestLegacyUpdaterVersionPreflightRejectsDangerousEnvironmentAlias(t *testing.T) {
 	fixture := newLegacyPreflightFixture(t, "local-symlink")
 	opts := fixture.opts
@@ -485,12 +503,11 @@ func TestLegacyUpdaterVersionPreflightRecordSaveFailureLeavesRunnableGuard(t *te
 	}); err != nil {
 		t.Fatal(err)
 	}
-	recordDir := filepath.Dir(fixture.recordPath)
-	if err := os.Chmod(recordDir, 0o500); err != nil {
-		t.Fatal(err)
+	opts := fixture.opts
+	opts.saveRecord = func(string, managedinstall.Record) error {
+		return errors.New("injected record save failure")
 	}
-	t.Cleanup(func() { _ = os.Chmod(recordDir, 0o700) })
-	err := legacyUpdaterVersionPreflightWithOptions(fixture.opts)
+	err := legacyUpdaterVersionPreflightWithOptions(opts)
 	if err == nil || !strings.Contains(err.Error(), "save managed install record guard") {
 		t.Fatalf("error = %v, want record save failure", err)
 	}
