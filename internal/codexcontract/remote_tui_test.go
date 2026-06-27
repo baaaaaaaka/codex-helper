@@ -20,12 +20,18 @@ func TestInstalledCodexRemoteTUIHandshake(t *testing.T) {
 	if os.Getenv("CODEX_REMOTE_TUI_CONTRACT_TEST") != "1" {
 		t.Skip("set CODEX_REMOTE_TUI_CONTRACT_TEST=1 to probe the installed Codex remote TUI")
 	}
-	if runtime.GOOS != "linux" {
-		t.Skip("the auth-free PTY handshake probe currently runs on Linux")
-	}
-	scriptPath, err := exec.LookPath("script")
-	if err != nil {
-		t.Fatal("util-linux script is required for the remote TUI contract probe")
+	var ptyCommand string
+	var err error
+	if runtime.GOOS == "windows" {
+		ptyCommand, err = exec.LookPath("winpty")
+		if err != nil {
+			t.Fatal("winpty is required for the Windows remote TUI contract probe")
+		}
+	} else {
+		ptyCommand, err = exec.LookPath("script")
+		if err != nil {
+			t.Fatal("script is required for the remote TUI contract probe")
+		}
 	}
 	command := strings.TrimSpace(os.Getenv("CXP_CONTRACT_CODEX"))
 	if command == "" {
@@ -62,7 +68,16 @@ func TestInstalledCodexRemoteTUIHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	commandLine := shellQuote(command) + " -c features.tui_app_server=true --remote " + shellQuote(remoteURL)
-	cmd := exec.CommandContext(ctx, scriptPath, "-qefc", commandLine, "/dev/null")
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		windowsCommandLine := windowsCmdQuote(command) + ` -c "features.tui_app_server=true" --remote ` + windowsCmdQuote(remoteURL)
+		cmd = exec.CommandContext(ctx, ptyCommand, "cmd.exe", "/d", "/s", "/c", windowsCommandLine)
+	case "darwin":
+		cmd = exec.CommandContext(ctx, ptyCommand, "-q", "/dev/null", "/bin/sh", "-lc", commandLine)
+	default:
+		cmd = exec.CommandContext(ctx, ptyCommand, "-qefc", commandLine, "/dev/null")
+	}
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
 		"CODEX_HOME="+t.TempDir(),
@@ -109,4 +124,8 @@ func TestInstalledCodexRemoteTUIHandshake(t *testing.T) {
 
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func windowsCmdQuote(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }

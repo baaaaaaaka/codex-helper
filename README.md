@@ -287,6 +287,19 @@ devices that the outer host, container, cgroup, Slurm job, or LSF job did not
 already provide. Telemetry remains enabled and is forwarded without payload
 mutation.
 
+The brokered surfaces are the Codex TUI/history launch paths, the `codex exec`
+facade, Teams turns, and Beacon workers. Contract CI uses the original Codex
+binary with analytics enabled and requires the emitted review to remain an
+ordinary `reviewer=user`, `status=approved`, `user_approved` event. CXP does not
+hide its app-server client identity or try to prevent server-side inference from
+timing and other normal telemetry.
+
+`codex-proxy app` still launches the official Desktop App directly. The Desktop
+App does not currently expose a stable external app-server attachment contract,
+so Desktop automatic approval remains a final-release blocker for any claim
+that every CXP surface is brokered; CXP does not silently fall back to a retired
+execution mode for that surface.
+
 ### Built-in model choices
 
 Use `model` when you want to choose from the built-in model/provider presets:

@@ -55,6 +55,7 @@ def select_targeted_versions(
     table_rows: dict[str, dict[str, str]],
     latest_version: str,
     alpha_version: str = "",
+    minimum_supported_version: str = "",
     platforms: list[str] | None = None,
     recent_stable_window: int = 3,
     revalidate_after: timedelta = timedelta(hours=72),
@@ -77,6 +78,9 @@ def select_targeted_versions(
     add_candidate(latest)
     if alpha and alpha != latest:
         add_candidate(alpha)
+    minimum_supported = normalize_version(minimum_supported_version) if minimum_supported_version else ""
+    if minimum_supported:
+        add_candidate(minimum_supported)
 
     stable_versions = sorted(
         {version for version in table_rows if "-" not in version} | {latest},
@@ -101,6 +105,12 @@ def select_targeted_versions(
         if row is None or last_tested is None or now - last_tested >= revalidate_after:
             force_revalidate.add(alpha)
 
+    if minimum_supported:
+        row = table_rows.get(minimum_supported)
+        last_tested = parse_timestamp(row.get("last_tested_utc", "")) if row else None
+        if row is None or last_tested is None or now - last_tested >= revalidate_after:
+            force_revalidate.add(minimum_supported)
+
     selected: list[str] = []
     for version in candidate_versions:
         row = table_rows.get(version)
@@ -119,6 +129,7 @@ def main() -> int:
     parser.add_argument("--table-path", default="docs/codex_compatibility.md")
     parser.add_argument("--latest-version", default="", help="Latest stable Codex version")
     parser.add_argument("--alpha-version", default="", help="Latest prerelease Codex version")
+    parser.add_argument("--minimum-supported-version", default="0.131.0", help="Pinned minimum supported Codex version")
     parser.add_argument("--versions", default="", help="Explicit versions (JSON array or comma/newline separated)")
     parser.add_argument("--min-version", default="", help="Inclusive min version for range mode")
     parser.add_argument("--max-version", default="", help="Inclusive max version for range mode")
@@ -143,6 +154,7 @@ def main() -> int:
             table_rows=parse_table(Path(args.table_path)),
             latest_version=args.latest_version,
             alpha_version=args.alpha_version,
+            minimum_supported_version=args.minimum_supported_version,
             recent_stable_window=args.recent_stable_window,
             revalidate_after=timedelta(hours=args.revalidate_after_hours),
             now=now,

@@ -1094,7 +1094,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional @openai/codex || true
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
+          command -v codex >/dev/null
+          codex app-server --help >/dev/null
 
       - name: Install Codex for integration (Windows)
         if: runner.os == 'Windows'
@@ -1103,20 +1105,22 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional '@openai/codex'
+          $winpty = Get-Command winpty -ErrorAction SilentlyContinue
+          if ($null -eq $winpty) {
+            $bundledWinpty = Join-Path $env:ProgramFiles "Git\usr\bin\winpty.exe"
+            if (-not (Test-Path -LiteralPath $bundledWinpty)) {
+              throw "winpty is required for the Windows remote TUI contract"
+            }
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $bundledWinpty)
+          }
 
       - name: Teams app-server probe (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v codex >/dev/null 2>&1; then
-            echo "Codex not available, skipping Teams app-server probe"
-            exit 0
-          fi
-          if ! codex app-server --help >/dev/null 2>&1; then
-            echo "Codex app-server is unavailable, skipping Teams app-server probe"
-            exit 0
-          fi
+          command -v codex >/dev/null
+          codex app-server --help >/dev/null
           export CODEX_HELPER_TEAMS_PROFILE=ci-appserver-probe
           export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant
           export CODEX_HELPER_TEAMS_CLIENT_ID=ci-client
@@ -1135,22 +1139,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
-          if (-not $codexCommand) {
-            Write-Host "Codex not available, skipping Teams app-server probe"
-            exit 0
-          }
-          $appServerAvailable = $false
-          try {
-            & codex app-server --help *> $null
-            $appServerAvailable = ($LASTEXITCODE -eq 0)
-          } catch {
-            $appServerAvailable = $false
-          }
-          if (-not $appServerAvailable) {
-            Write-Host "Codex app-server is unavailable, skipping Teams app-server probe"
-            exit 0
-          }
+          $codexCommand = Get-Command codex -ErrorAction Stop
+          & codex app-server --help *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Codex app-server probe failed with exit code $LASTEXITCODE" }
           $env:CODEX_HELPER_TEAMS_PROFILE = "ci-appserver-probe"
           $env:CODEX_HELPER_TEAMS_TENANT_ID = "ci-tenant"
           $env:CODEX_HELPER_TEAMS_CLIENT_ID = "ci-client"
@@ -1322,13 +1313,10 @@ jobs:
           CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           set -euo pipefail
-          if command -v codex >/dev/null 2>&1; then
-            go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
-            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
-            go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
-          else
-            echo "Codex not available, skipping standard approval runtime integration test"
-          fi
+          command -v codex >/dev/null
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
+          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
       - name: Codex standard approval runtime integration test (Windows)
         if: runner.os == 'Windows'
@@ -1341,13 +1329,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          if (Get-Command codex -ErrorAction SilentlyContinue) {
-            go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
-            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
-            go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
-          } else {
-            Write-Host "Codex not available, skipping standard approval runtime integration test"
-          }
+          $null = Get-Command codex -ErrorAction Stop
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
+          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
         if: runner.os != 'Windows'
@@ -1367,6 +1352,87 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
+
+  codex-runtime-contract:
+    name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        codex-version: ["0.131.0", "latest"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install exact Codex version (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ matrix.codex-version }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional "@openai/codex@${CODEX_VERSION}"
+          command -v codex >/dev/null
+          codex --version
+          codex app-server --help >/dev/null
+
+      - name: Install exact Codex version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CODEX_VERSION: ${{ matrix.codex-version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional "@openai/codex@$env:CODEX_VERSION"
+          $null = Get-Command codex -ErrorAction Stop
+          & codex --version
+          & codex app-server --help *> $null
+          if ($LASTEXITCODE -ne 0) { throw "Codex app-server probe failed with exit code $LASTEXITCODE" }
+          $winpty = Get-Command winpty -ErrorAction SilentlyContinue
+          if ($null -eq $winpty) {
+            $bundledWinpty = Join-Path $env:ProgramFiles "Git\usr\bin\winpty.exe"
+            if (-not (Test-Path -LiteralPath $bundledWinpty)) {
+              throw "winpty is required for the Windows remote TUI contract"
+            }
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $bundledWinpty)
+          }
+
+      - name: Run original-binary approval contracts
+        shell: bash
+        env:
+          CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_TEST: "1"
+          CODEX_RUNTIME_E2E_TEST: "1"
+        run: |
+          set -euo pipefail
+          command -v codex >/dev/null
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
+          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
+          printf '%s\n' \
+            '{"schema":1,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","cli-probe","standard-user-approval","analytics-user-approved","responses-websocket"]}' \
+            > "$RUNNER_TEMP/codex-runtime-contract.json"
+
+      - name: Upload runtime contract proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-runtime-contract-${{ matrix.os }}-${{ matrix.codex-version }}
+          path: ${{ runner.temp }}/codex-runtime-contract.json
 
   full-go-test:
     name: Full go test (${{ matrix.os }})

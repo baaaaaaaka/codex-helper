@@ -1,0 +1,67 @@
+name: Scheduler Runtime Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Scheduler provider configured on the self-hosted runner"
+        required: true
+        default: slurm
+        type: choice
+        options: [slurm, lsf]
+
+permissions:
+  contents: read
+
+jobs:
+  scheduler-runtime:
+    name: ${{ inputs.provider }} allocation and worker contract
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    env:
+      CODEX_HELPER_BEACON_LIVE: "1"
+      CODEX_HELPER_BEACON_LIVE_PROVIDER: ${{ inputs.provider }}
+      CODEX_HELPER_BEACON_SLURM_QUERY: ${{ vars.CODEX_HELPER_BEACON_SLURM_QUERY }}
+      CODEX_HELPER_BEACON_SLURM_SUBMIT: ${{ vars.CODEX_HELPER_BEACON_SLURM_SUBMIT }}
+      CODEX_HELPER_BEACON_SLURM_CANCEL: ${{ vars.CODEX_HELPER_BEACON_SLURM_CANCEL }}
+      CODEX_HELPER_BEACON_SLURM_RENEW: ${{ vars.CODEX_HELPER_BEACON_SLURM_RENEW }}
+      CODEX_HELPER_BEACON_LSF_QUERY: ${{ vars.CODEX_HELPER_BEACON_LSF_QUERY }}
+      CODEX_HELPER_BEACON_LSF_SUBMIT: ${{ vars.CODEX_HELPER_BEACON_LSF_SUBMIT }}
+      CODEX_HELPER_BEACON_LSF_CANCEL: ${{ vars.CODEX_HELPER_BEACON_LSF_CANCEL }}
+      CODEX_HELPER_BEACON_LSF_RENEW: ${{ vars.CODEX_HELPER_BEACON_LSF_RENEW }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Verify scheduler variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${CODEX_HELPER_BEACON_LIVE_PROVIDER}" in
+            slurm)
+              test -n "${CODEX_HELPER_BEACON_SLURM_QUERY}"
+              test -n "${CODEX_HELPER_BEACON_SLURM_SUBMIT}"
+              test -n "${CODEX_HELPER_BEACON_SLURM_CANCEL}"
+              ;;
+            lsf)
+              test -n "${CODEX_HELPER_BEACON_LSF_QUERY}"
+              test -n "${CODEX_HELPER_BEACON_LSF_SUBMIT}"
+              test -n "${CODEX_HELPER_BEACON_LSF_CANCEL}"
+              ;;
+          esac
+
+      - name: Run real provider submit/query/cancel contract
+        shell: bash
+        run: go test ./internal/beacon -run TestLiveSchedulerProfileAdapterSubmitCancel -count=1 -v -timeout=5m
+
+      - name: Run worker lifecycle and standard approval contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -run 'Test(RunBeaconWorkerJobUsesStandardAppServer|BeaconWorkerRunOnceClaimsJobAndWritesTerminal|BeaconWorkerRunOnceRegistersAllocationAndWaitsForJob|BeaconWorkerServeRegistersAndRunsOneJob)' -count=1 -v -timeout=5m

@@ -33,6 +33,26 @@ def compatibility_row(
 
 
 class CodexReleaseMonitorSelectTests(unittest.TestCase):
+    def test_targeted_versions_keep_minimum_supported_in_rotation(self) -> None:
+        rows = {
+            "0.131.0": {
+                "linux": "pass",
+                "mac": "pass",
+                "windows": "pass",
+                "centos7": "pass",
+                "rockylinux8": "pass",
+                "ubuntu20.04": "pass",
+                "last_tested_utc": "2026-03-01T00:00:00Z",
+            },
+        }
+        selected = monitor_select.select_targeted_versions(
+            table_rows=rows,
+            latest_version="0.142.0",
+            minimum_supported_version="0.131.0",
+            now=datetime(2026, 3, 10, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIn("0.131.0", selected)
+
     def test_select_targeted_versions_retests_stale_or_failed_recent_versions(self) -> None:
         rows = {
             "0.112.0": {

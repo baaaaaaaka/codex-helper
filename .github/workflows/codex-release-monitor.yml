@@ -186,6 +186,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional "@openai/codex@$env:CODEX_VERSION"
+          $winpty = Get-Command winpty -ErrorAction SilentlyContinue
+          if ($null -eq $winpty) {
+            $bundledWinpty = Join-Path $env:ProgramFiles "Git\usr\bin\winpty.exe"
+            if (-not (Test-Path -LiteralPath $bundledWinpty)) {
+              throw "winpty is required for the Windows remote TUI contract"
+            }
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $bundledWinpty)
+          }
 
       - name: Probe installed Codex wrapper (Linux/macOS)
         if: runner.os != 'Windows'
@@ -195,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           codex --version 2>&1
-          codex --help 2>&1 || true
+          codex --help 2>&1
 
       - name: Probe installed Codex wrapper (Windows)
         if: runner.os == 'Windows'
@@ -206,11 +214,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & codex --version 2>&1
-          try {
-            & codex --help 2>&1 | Out-Host
-          } catch {
-            $_ | Out-Host
-          }
+          & codex --help 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "codex --help failed with exit code $LASTEXITCODE" }
 
       - name: Run standard approval runtime contract tests
         id: smoke
@@ -235,8 +240,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! codex app-server --help >/dev/null 2>&1; then
-            echo "Codex app-server is unavailable for ${CODEX_VERSION}, skipping Teams app-server probe"
-            exit 0
+            echo "Codex app-server is unavailable for ${CODEX_VERSION}" >&2
+            exit 1
           fi
           export CODEX_HELPER_TEAMS_PROFILE=ci-appserver-probe
           export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant
@@ -266,8 +271,7 @@ jobs:
             $appServerAvailable = $false
           }
           if (-not $appServerAvailable) {
-            Write-Host "Codex app-server is unavailable for $env:CODEX_VERSION, skipping Teams app-server probe"
-            exit 0
+            throw "Codex app-server is unavailable for $env:CODEX_VERSION"
           }
           $env:CODEX_HELPER_TEAMS_PROFILE = "ci-appserver-probe"
           $env:CODEX_HELPER_TEAMS_TENANT_ID = "ci-tenant"
