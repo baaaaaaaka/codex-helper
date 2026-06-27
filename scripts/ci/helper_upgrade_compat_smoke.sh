@@ -608,6 +608,52 @@ run_legacy_physical_record_failure_control() {
   assert_version "$LEGACY_FIXTURE_TARGET.prev" "$old_tag"
 }
 
+run_legacy_existing_self_loop_vulnerable_parent_recovery() {
+  run_legacy_physical_record_failure_control
+
+  echo "helper upgrade compatibility smoke: recover generated self-loop through vulnerable $old_tag parent"
+  retry 5 10 "$LEGACY_FIXTURE_TARGET.prev" upgrade \
+    --repo "$repo" \
+    --version "$target_tag" \
+    --install-path "$LEGACY_FIXTURE_TARGET"
+  if [[ -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "vulnerable-parent recovery left managed target as a symlink" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_TARGET.prev" >&2 || true
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$target_tag"
+}
+
+run_legacy_existing_self_loop_safe_parent_recovery() {
+  local safe_parent_tag="v0.1.13-rc.16"
+  prepare_legacy_physical_record_fixture "legacy-existing-self-loop-safe-parent" "local-dir-symlink"
+  local safe_parent="$base_root/legacy-existing-self-loop-safe-parent/running-codex-proxy"
+  download_binary "$safe_parent_tag" "$safe_parent"
+  install -m 0755 "$safe_parent" "$LEGACY_FIXTURE_TARGET.prev"
+  rm -f "$LEGACY_FIXTURE_TARGET"
+  ln -s "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_TARGET"
+  write_physical_target_install_record_without_shims "$LEGACY_FIXTURE_TARGET" "$safe_parent_tag"
+
+  if [[ ! -L "$LEGACY_FIXTURE_TARGET" || "$(readlink "$LEGACY_FIXTURE_TARGET")" != "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "safe-parent recovery fixture is not the expected self-loop" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_TARGET.prev" >&2 || true
+    exit 1
+  fi
+  test "$(sha256sum "$safe_parent" | awk '{print $1}')" = "$(sha256sum "$LEGACY_FIXTURE_TARGET.prev" | awk '{print $1}')"
+
+  echo "helper upgrade compatibility smoke: recover existing self-loop through safe $safe_parent_tag parent"
+  retry 5 10 "$safe_parent" upgrade \
+    --repo "$repo" \
+    --version "$target_tag" \
+    --install-path "$LEGACY_FIXTURE_TARGET"
+  if [[ -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "safe-parent recovery left managed target as a symlink" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_TARGET.prev" >&2 || true
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$target_tag"
+}
+
 run_legacy_physical_record_bridge_success() {
   local storage_layout="$1"
   local scenario="legacy-physical-record-bridge-${storage_layout}"
@@ -690,7 +736,8 @@ run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-di
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bin" "local-bin-symlink"
 
 if [[ "$os" == "linux" && "$old_tag" == "v0.1.12" && "$service_backend" == "local-supervisor" ]]; then
-  run_legacy_physical_record_failure_control
+  run_legacy_existing_self_loop_vulnerable_parent_recovery
+  run_legacy_existing_self_loop_safe_parent_recovery
   run_legacy_physical_record_bridge_success "local-dir-symlink"
   run_legacy_physical_record_bridge_success "local-bin-symlink"
   run_legacy_physical_record_unsafe_env_rejection

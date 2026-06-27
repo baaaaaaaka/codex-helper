@@ -32,7 +32,14 @@ type legacyUpdateVersionPreflightOptions struct {
 	envInstallPath   string
 	envInstallDir    string
 	inspectParent    func(parentPath string, targetPath string) (bool, error)
+	repairSelfLoop   func(candidatePath string, parentPath string, targetPath string) (bool, error)
 	saveRecord       func(path string, record managedinstall.Record) error
+}
+
+type legacyUpdaterSelfLoopRepairOptions struct {
+	releaseVersion func(path string, role string) (string, error)
+	sameContents   func(left string, right string) (bool, error)
+	copyExecutable func(src string, dst string) error
 }
 
 func legacyUpdaterVersionPreflight() error {
@@ -67,6 +74,13 @@ func legacyUpdaterVersionPreflightWithOptions(opts legacyUpdateVersionPreflightO
 	}
 	if err != nil {
 		return err
+	}
+	repairSelfLoop := opts.repairSelfLoop
+	if repairSelfLoop == nil {
+		repairSelfLoop = repairLegacyUpdaterSelfLoop
+	}
+	if _, err := repairSelfLoop(opts.executable, opts.parentExecutable, targetPath); err != nil {
+		return fmt.Errorf("recover legacy helper self-loop: %w", err)
 	}
 
 	record, recordExists, recordErr := loadLegacyUpdaterInstallRecord(opts.recordPath)
@@ -175,9 +189,164 @@ func legacyUpdaterTempTarget(executable string) (string, bool, error) {
 		return "", true, fmt.Errorf("inspect legacy helper target %s: %w", targetPath, err)
 	}
 	if !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm()&0o111 == 0 {
+		selfLoop, selfLoopErr := legacyUpdaterSameEntrySelfLoop(targetPath)
+		if selfLoopErr != nil {
+			return "", true, fmt.Errorf("inspect legacy helper target %s: %w", targetPath, selfLoopErr)
+		}
+		if selfLoop {
+			return targetPath, true, nil
+		}
 		return "", true, fmt.Errorf("legacy helper target %s is not a regular executable", targetPath)
 	}
 	return targetPath, true, nil
+}
+
+func legacyUpdaterSameEntrySelfLoop(path string) (bool, error) {
+	path = cleanAbsolutePath(path)
+	if path == "" {
+		return false, nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, err
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(path), target)
+	}
+	target = cleanAbsolutePath(target)
+	if target == path {
+		return true, nil
+	}
+	if filepath.Base(target) != filepath.Base(path) {
+		return false, nil
+	}
+	pathParent, pathErr := filepath.EvalSymlinks(filepath.Dir(path))
+	targetParent, targetErr := filepath.EvalSymlinks(filepath.Dir(target))
+	if pathErr != nil || targetErr != nil {
+		return false, nil
+	}
+	if cleanAbsolutePath(pathParent) == cleanAbsolutePath(targetParent) {
+		return true, nil
+	}
+	pathParentInfo, pathStatErr := os.Stat(pathParent)
+	targetParentInfo, targetStatErr := os.Stat(targetParent)
+	return pathStatErr == nil && targetStatErr == nil && os.SameFile(pathParentInfo, targetParentInfo), nil
+}
+
+func repairLegacyUpdaterSelfLoop(candidatePath string, parentPath string, targetPath string) (bool, error) {
+	return repairLegacyUpdaterSelfLoopWithOptions(candidatePath, parentPath, targetPath, legacyUpdaterSelfLoopRepairOptions{
+		releaseVersion: verifiedLegacyUpdaterReleaseVersion,
+		sameContents:   sameFileContents,
+		copyExecutable: copyExecutableAtomically,
+	})
+}
+
+func repairLegacyUpdaterSelfLoopWithOptions(candidatePath string, parentPath string, targetPath string, opts legacyUpdaterSelfLoopRepairOptions) (bool, error) {
+	selfLoop, err := legacyUpdaterSameEntrySelfLoop(targetPath)
+	if err != nil {
+		return false, fmt.Errorf("inspect target %s: %w", targetPath, err)
+	}
+	if !selfLoop {
+		return false, nil
+	}
+	if opts.releaseVersion == nil || opts.sameContents == nil || opts.copyExecutable == nil {
+		return true, fmt.Errorf("self-loop recovery dependencies are unavailable")
+	}
+	if err := requireLegacyUpdaterRegularExecutable(candidatePath, "downloaded candidate", false); err != nil {
+		return true, err
+	}
+	if err := requireLegacyUpdaterRegularExecutable(parentPath, "direct parent", true); err != nil {
+		return true, err
+	}
+	previousPath := targetPath + ".prev"
+	if err := requireLegacyUpdaterRegularExecutable(previousPath, "previous helper", false); err != nil {
+		return true, err
+	}
+
+	candidateVersion, err := opts.releaseVersion(candidatePath, "downloaded candidate")
+	if err != nil {
+		return true, err
+	}
+	parentVersion, err := opts.releaseVersion(parentPath, "direct parent")
+	if err != nil {
+		return true, err
+	}
+	previousVersion, err := opts.releaseVersion(previousPath, "previous helper")
+	if err != nil {
+		return true, err
+	}
+	if cmp, ok := update.CompareVersions(parentVersion, previousVersion); !ok || cmp != 0 {
+		return true, fmt.Errorf("direct parent version %q does not match previous helper version %q", parentVersion, previousVersion)
+	}
+	same, err := opts.sameContents(parentPath, previousPath)
+	if err != nil {
+		return true, fmt.Errorf("compare direct parent with previous helper: %w", err)
+	}
+	if !same {
+		return true, fmt.Errorf("direct parent does not match previous helper contents")
+	}
+	if _, ok := update.CompareVersions(candidateVersion, candidateVersion); !ok {
+		return true, fmt.Errorf("downloaded candidate has unknown release version %q", candidateVersion)
+	}
+
+	if err := opts.copyExecutable(previousPath, targetPath); err != nil {
+		return true, fmt.Errorf("restore %s from %s: %w", targetPath, previousPath, err)
+	}
+	if err := requireLegacyUpdaterRegularExecutable(targetPath, "restored helper target", false); err != nil {
+		return true, err
+	}
+	restoredMatches, err := opts.sameContents(parentPath, targetPath)
+	if err != nil {
+		return true, fmt.Errorf("verify restored helper target: %w", err)
+	}
+	if !restoredMatches {
+		return true, fmt.Errorf("restored helper target does not match the direct parent contents")
+	}
+	return true, nil
+}
+
+func requireLegacyUpdaterRegularExecutable(path string, role string, followSymlink bool) error {
+	var (
+		info os.FileInfo
+		err  error
+	)
+	if followSymlink {
+		info, err = os.Stat(path)
+	} else {
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect %s %s: %w", role, path, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s %s is not a regular executable", role, path)
+	}
+	return nil
+}
+
+func verifiedLegacyUpdaterReleaseVersion(path string, role string) (string, error) {
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s Go build info: %w", role, err)
+	}
+	if info.Path != legacyUpdaterCommandPath || info.Main.Path != legacyUpdaterModulePath {
+		return "", fmt.Errorf("%s is not codex-helper: command=%q module=%q", role, info.Path, info.Main.Path)
+	}
+	version := strings.TrimSpace(info.Main.Version)
+	if _, ok := update.CompareVersions(version, version); !ok {
+		return "", fmt.Errorf("%s codex-helper build has unknown module version %q", role, version)
+	}
+	return version, nil
 }
 
 func legacyUpdaterTempNamePartSafe(value string, allowVersionPunctuation bool) bool {

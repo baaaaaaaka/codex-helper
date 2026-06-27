@@ -112,6 +112,42 @@ func writeExecutableForLegacyPreflightTest(t *testing.T, path string, contents s
 	}
 }
 
+func configureLegacySelfLoopRecovery(t *testing.T, fixture legacyPreflightFixture, linkTarget string, parentContents string) legacyUpdateVersionPreflightOptions {
+	t.Helper()
+	parentPath := filepath.Join(fixture.root, "running", "codex-proxy")
+	previousPath := fixture.target + ".prev"
+	writeExecutableForLegacyPreflightTest(t, parentPath, parentContents)
+	writeExecutableForLegacyPreflightTest(t, previousPath, parentContents)
+	if err := os.Remove(fixture.target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkTarget, fixture.target); err != nil {
+		t.Fatal(err)
+	}
+
+	versions := map[string]string{
+		filepath.Clean(fixture.temporary): "v0.1.13-rc.19",
+		filepath.Clean(parentPath):        "v0.1.13-rc.16",
+		filepath.Clean(previousPath):      "v0.1.13-rc.16",
+	}
+	opts := fixture.opts
+	opts.parentExecutable = parentPath
+	opts.repairSelfLoop = func(candidatePath string, actualParentPath string, targetPath string) (bool, error) {
+		return repairLegacyUpdaterSelfLoopWithOptions(candidatePath, actualParentPath, targetPath, legacyUpdaterSelfLoopRepairOptions{
+			releaseVersion: func(path string, role string) (string, error) {
+				version, ok := versions[filepath.Clean(path)]
+				if !ok {
+					return "", errors.New("unexpected " + role)
+				}
+				return version, nil
+			},
+			sameContents:   sameFileContents,
+			copyExecutable: copyExecutableAtomically,
+		})
+	}
+	return opts
+}
+
 func TestLegacyUpdaterVersionPreflightPreparesSymlinkedLocalLayouts(t *testing.T) {
 	for _, layout := range []string{"local-symlink", "local-relative-symlink", "local-symlink-chain", "bin-symlink"} {
 		t.Run(layout, func(t *testing.T) {
@@ -212,6 +248,188 @@ func TestLegacyUpdaterVersionPreflightAllowsMissingUnaliasedTarget(t *testing.T)
 	}
 	if _, err := os.Stat(fixture.recordPath); !os.IsNotExist(err) {
 		t.Fatalf("missing unaliased target created install record, err=%v", err)
+	}
+}
+
+func TestLegacyUpdaterVersionPreflightRecoversVerifiedSelfLoopBeforeBridge(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		linkTarget func(legacyPreflightFixture) string
+	}{
+		{name: "absolute-physical", linkTarget: func(f legacyPreflightFixture) string { return f.target }},
+		{name: "relative", linkTarget: func(legacyPreflightFixture) string { return "codex-proxy" }},
+		{name: "logical-parent-alias", linkTarget: func(f legacyPreflightFixture) string { return f.defaultTarget }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newLegacyPreflightFixture(t, "local-symlink")
+			opts := configureLegacySelfLoopRecovery(t, fixture, tc.linkTarget(fixture), "verified-running-helper")
+			if err := managedinstall.SaveRecord(fixture.recordPath, managedinstall.Record{
+				TargetPath: fixture.target,
+				Version:    "0.1.13-rc.16",
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := legacyUpdaterVersionPreflightWithOptions(opts); err != nil {
+				t.Fatalf("preflight failed: %v", err)
+			}
+			info, err := os.Lstat(fixture.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+				t.Fatalf("restored target mode = %s, want regular executable", info.Mode())
+			}
+			contents, err := os.ReadFile(fixture.target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(contents) != "verified-running-helper" {
+				t.Fatalf("restored target contents = %q", contents)
+			}
+			if target, err := os.Readlink(fixture.shim); err != nil || target != "codex-proxy" {
+				t.Fatalf("cxp guard target = %q err=%v", target, err)
+			}
+		})
+	}
+}
+
+func TestLegacyUpdaterVersionPreflightRecoversVerifiedSelfLoopForSafeParent(t *testing.T) {
+	fixture := newLegacyPreflightFixture(t, "local-symlink")
+	opts := configureLegacySelfLoopRecovery(t, fixture, fixture.target, "verified-safe-parent")
+	opts.inspectParent = func(string, string) (bool, error) { return false, nil }
+
+	if err := legacyUpdaterVersionPreflightWithOptions(opts); err != nil {
+		t.Fatalf("safe-parent preflight failed: %v", err)
+	}
+	if info, err := os.Lstat(fixture.target); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("safe-parent target was not restored: info=%v err=%v", info, err)
+	}
+	if _, err := os.Lstat(fixture.shim); !os.IsNotExist(err) {
+		t.Fatalf("safe parent created cxp guard, err=%v", err)
+	}
+	if _, err := os.Stat(fixture.recordPath); !os.IsNotExist(err) {
+		t.Fatalf("safe parent created install record, err=%v", err)
+	}
+}
+
+func TestLegacyUpdaterSelfLoopRecoveryRejectsUnverifiedInputsWithoutMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		parentContent string
+		previous      string
+		versions      map[string]string
+		versionError  string
+		copyError     bool
+		wantError     string
+	}{
+		{
+			name:          "candidate identity",
+			parentContent: "same",
+			previous:      "same",
+			versionError:  "downloaded candidate",
+			wantError:     "unverified downloaded candidate",
+		},
+		{
+			name:          "parent version",
+			parentContent: "same",
+			previous:      "same",
+			versions:      map[string]string{"candidate": "v0.1.13-rc.19", "parent": "v0.1.13-rc.16", "previous": "v0.1.12"},
+			wantError:     "does not match previous helper version",
+		},
+		{
+			name:          "parent contents",
+			parentContent: "running",
+			previous:      "different",
+			versions:      map[string]string{"candidate": "v0.1.13-rc.19", "parent": "v0.1.13-rc.16", "previous": "v0.1.13-rc.16"},
+			wantError:     "does not match previous helper contents",
+		},
+		{
+			name:          "atomic restore",
+			parentContent: "same",
+			previous:      "same",
+			versions:      map[string]string{"candidate": "v0.1.13-rc.19", "parent": "v0.1.13-rc.16", "previous": "v0.1.13-rc.16"},
+			copyError:     true,
+			wantError:     "injected copy failure",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newLegacyPreflightFixture(t, "local-symlink")
+			parentPath := filepath.Join(fixture.root, "running", "codex-proxy")
+			previousPath := fixture.target + ".prev"
+			writeExecutableForLegacyPreflightTest(t, parentPath, tc.parentContent)
+			writeExecutableForLegacyPreflightTest(t, previousPath, tc.previous)
+			if err := os.Remove(fixture.target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(fixture.target, fixture.target); err != nil {
+				t.Fatal(err)
+			}
+			copyExecutable := copyExecutableAtomically
+			if tc.copyError {
+				copyExecutable = func(string, string) error { return errors.New("injected copy failure") }
+			}
+			versionForRole := func(path string, role string) (string, error) {
+				if role == tc.versionError {
+					return "", errors.New("unverified " + role)
+				}
+				switch path {
+				case fixture.temporary:
+					return tc.versions["candidate"], nil
+				case parentPath:
+					return tc.versions["parent"], nil
+				case previousPath:
+					return tc.versions["previous"], nil
+				default:
+					return "", errors.New("unexpected path")
+				}
+			}
+
+			repaired, err := repairLegacyUpdaterSelfLoopWithOptions(fixture.temporary, parentPath, fixture.target, legacyUpdaterSelfLoopRepairOptions{
+				releaseVersion: versionForRole,
+				sameContents:   sameFileContents,
+				copyExecutable: copyExecutable,
+			})
+			if !repaired || err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("repaired=%v error=%v, want %q", repaired, err, tc.wantError)
+			}
+			if info, statErr := os.Lstat(fixture.target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("rejected recovery mutated target: info=%v err=%v", info, statErr)
+			}
+		})
+	}
+}
+
+func TestLegacyUpdaterSelfLoopRecoveryRequiresRegularPreviousBinary(t *testing.T) {
+	for _, previousState := range []string{"missing", "symlink"} {
+		t.Run(previousState, func(t *testing.T) {
+			fixture := newLegacyPreflightFixture(t, "local-symlink")
+			parentPath := filepath.Join(fixture.root, "running", "codex-proxy")
+			writeExecutableForLegacyPreflightTest(t, parentPath, "same")
+			if previousState == "symlink" {
+				if err := os.Symlink(parentPath, fixture.target+".prev"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Remove(fixture.target); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(fixture.target, fixture.target); err != nil {
+				t.Fatal(err)
+			}
+
+			repaired, err := repairLegacyUpdaterSelfLoopWithOptions(fixture.temporary, parentPath, fixture.target, legacyUpdaterSelfLoopRepairOptions{
+				releaseVersion: func(string, string) (string, error) { return "v0.1.13-rc.16", nil },
+				sameContents:   sameFileContents,
+				copyExecutable: copyExecutableAtomically,
+			})
+			if !repaired || err == nil || !strings.Contains(err.Error(), "previous helper") {
+				t.Fatalf("repaired=%v error=%v, want unusable previous rejection", repaired, err)
+			}
+			if info, statErr := os.Lstat(fixture.target); statErr != nil || info.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("rejected recovery mutated target: info=%v err=%v", info, statErr)
+			}
+		})
 	}
 }
 
@@ -535,5 +753,20 @@ func TestLegacyUpdaterTempTargetRejectsMalformedOrNonExecutableCandidates(t *tes
 	}
 	if _, candidate, err := legacyUpdaterTempTarget(fixture.temporary); !candidate || err == nil {
 		t.Fatalf("non-executable candidate = %v err=%v, want candidate error", candidate, err)
+	}
+}
+
+func TestLegacyUpdaterTempTargetRejectsNonSelfSymlinkTarget(t *testing.T) {
+	fixture := newLegacyPreflightFixture(t, "local-symlink")
+	other := filepath.Join(fixture.root, "other", "codex-proxy")
+	writeExecutableForLegacyPreflightTest(t, other, "other-helper")
+	if err := os.Remove(fixture.target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, fixture.target); err != nil {
+		t.Fatal(err)
+	}
+	if _, candidate, err := legacyUpdaterTempTarget(fixture.temporary); !candidate || err == nil || !strings.Contains(err.Error(), "not a regular executable") {
+		t.Fatalf("non-self target candidate=%v err=%v, want rejection", candidate, err)
 	}
 }
