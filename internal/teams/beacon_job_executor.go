@@ -147,7 +147,11 @@ func waitBeaconJobTerminalWithEventHandler(ctx context.Context, store *beacon.St
 	defer ticker.Stop()
 	var streamReader *beacon.JobStreamReader
 	if handler != nil {
-		reader, err := beacon.NewJobStreamReader(store.Path(), jobID, beacon.JobStreamReaderOptions{StartAtEnd: true})
+		// Read from the beginning and rely on the request/turn/worker/lease/claim
+		// metadata filter below to reject stale attempts. Starting at the current
+		// end races a fast worker: events written before this goroutine is first
+		// scheduled would otherwise be skipped permanently.
+		reader, err := beacon.NewJobStreamReader(store.Path(), jobID, beacon.JobStreamReaderOptions{})
 		if err != nil {
 			return ExecutionResult{}, err
 		}
