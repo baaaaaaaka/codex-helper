@@ -23,6 +23,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
+	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 const modelProfileAdapterInstancePrefix = "model-adapter:"
@@ -401,7 +402,12 @@ func modelProfileAdapterFacade(
 		storeCleanup()
 		return nil, nil, err
 	}
-	return &responsesadapter.Facade{Router: registry, Store: responseStore, InstanceID: instanceID}, storeCleanup, nil
+	return &responsesadapter.Facade{
+		Router:      registry,
+		Store:       responseStore,
+		InstanceID:  instanceID,
+		ShellPolicy: responsespolicy.NewShellEscalationPolicy(0),
+	}, storeCleanup, nil
 }
 
 func modelProfileAdapterListenHostForApp() string {

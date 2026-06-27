@@ -726,9 +726,15 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if closer, ok := executor.(interface{ Close() error }); ok {
+					defer func() { _ = closer.Close() }()
+				}
 				controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, modelProfile, controlFallbackModel, timeout, cmd.ErrOrStderr())
 				if err != nil {
 					return err
+				}
+				if closer, ok := controlFallbackExecutor.(interface{ Close() error }); ok {
+					defer func() { _ = closer.Close() }()
 				}
 				asrTranscriber := teamsASRTranscriberFromConfig(effectiveASRCommand, effectiveASRArgs)
 				var helperAutoUpdater teams.HelperAutoUpdater
@@ -785,7 +791,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&once, "once", false, "Poll once and exit")
 	cmd.Flags().IntVar(&top, "top", 20, "Messages to inspect per chat per poll")
 	cmd.Flags().StringVar(&executorName, "executor", "codex", "Executor for session messages: codex or echo")
-	cmd.Flags().StringVar(&runnerName, "runner", "exec", "Codex runner for --executor codex: exec or appserver")
+	cmd.Flags().StringVar(&runnerName, "runner", "appserver", "Codex runner compatibility selector")
+	_ = cmd.Flags().MarkHidden("runner")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
 	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")

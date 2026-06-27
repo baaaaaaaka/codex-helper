@@ -47,7 +47,6 @@ type Selection struct {
 	Session  codexhistory.Session
 	Cwd      string
 	UseProxy bool
-	UseYolo  bool
 }
 
 type Options struct {
@@ -57,10 +56,7 @@ type Options struct {
 	PreviewMessages int
 	ProxyEnabled    bool
 	ProxyConfigured bool
-	YoloEnabled     bool
-	ShowYoloToggle  bool
 	RefreshInterval time.Duration
-	PersistYolo     func(bool) error
 	DefaultCwd      string
 }
 
@@ -215,7 +211,6 @@ type uiState struct {
 
 	proxyEnabled    bool
 	proxyConfigured bool
-	yoloEnabled     bool
 
 	expandedSessions  map[string]bool
 	previewCache      map[string]previewCacheEntry
@@ -245,7 +240,6 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		lastListFocus:     "projects",
 		proxyEnabled:      opts.ProxyEnabled,
 		proxyConfigured:   opts.ProxyConfigured,
-		yoloEnabled:       opts.YoloEnabled,
 		expandedSessions:  map[string]bool{},
 		previewCache:      map[string]previewCacheEntry{},
 		previewError:      map[string]previewErrorEntry{},
@@ -513,15 +507,6 @@ func handleKey(
 			return nil, ProxyToggleRequested{Enable: true, RequireConfig: true}
 		}
 		return nil, ProxyToggleRequested{Enable: enable}
-	case tcell.KeyCtrlY:
-		enable := !state.yoloEnabled
-		if opts.PersistYolo != nil {
-			if err := opts.PersistYolo(enable); err != nil {
-				return nil, err
-			}
-		}
-		state.yoloEnabled = enable
-		return nil, nil
 	case tcell.KeyCtrlR:
 		if state.loadingProjects {
 			return nil, nil
@@ -672,18 +657,18 @@ func handleKey(
 
 	if ev.Key() == tcell.KeyCtrlN {
 		if cwd := newSessionCwd(selectedProject, opts.DefaultCwd); cwd != "" {
-			return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled, UseYolo: state.yoloEnabled}, nil
+			return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled}, nil
 		}
 		return nil, nil
 	}
 
 	if enterPressed {
 		if selectedSession != nil {
-			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled, UseYolo: state.yoloEnabled}, nil
+			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled}, nil
 		}
 		if selectedIsNew {
 			if cwd := newSessionCwd(selectedProject, opts.DefaultCwd); cwd != "" {
-				return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled, UseYolo: state.yoloEnabled}, nil
+				return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled}, nil
 			}
 		}
 	}
@@ -831,16 +816,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	if state.proxyEnabled {
 		proxyLabel = "Proxy mode (Ctrl+P): on"
 	}
-	showYoloToggle := opts.ShowYoloToggle || state.yoloEnabled
-	yoloLabel := "YOLO mode (Ctrl+Y): off"
-	if state.yoloEnabled {
-		yoloLabel = "[!] YOLO mode (Ctrl+Y): on"
-	}
 	baseStatusStyle := tcell.StyleDefault.Reverse(true)
-	yoloStatusStyle := baseStatusStyle
-	if state.yoloEnabled {
-		yoloStatusStyle = baseStatusStyle.Foreground(tcell.ColorYellow)
-	}
 	newSessionPath := newSessionCwd(selectedProject, opts.DefaultCwd)
 	openLabel := "Enter: open"
 	newHint := ""
@@ -854,26 +830,20 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		{text: "Tab/Left/Right: switch  /: search  Ctrl+O: subagents  " + openLabel + "  r: refresh" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 		{text: "  q: quit", style: baseStatusStyle},
 	}
-	statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
 	if state.loadingProjects {
 		statusSegments = []statusSegment{
 			{text: loadingStatusText(state) + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
-		statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
 	} else if state.inputMode != "" {
 		statusSegments = []statusSegment{
 			{text: "Type to search. Enter: apply  Esc: cancel  " + proxyLabel + "  ", style: baseStatusStyle},
-		}
-		if showYoloToggle {
-			statusSegments = append(statusSegments, statusSegment{text: yoloLabel, style: yoloStatusStyle})
 		}
 	} else if state.focus == "preview" {
 		statusSegments = []statusSegment{
 			{text: "PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
-		statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
 		if state.previewSearch != "" && len(state.previewMatches) > 0 {
 			statusSegments = append(statusSegments, statusSegment{text: "  n/N: next/prev", style: baseStatusStyle})
 		}
@@ -884,7 +854,6 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 				{text: "No history found. " + openLabel + "  " + proxyLabel + "  ", style: baseStatusStyle},
 				{text: "  q: quit", style: baseStatusStyle},
 			}
-			statusSegments = insertYoloStatus(statusSegments, showYoloToggle, yoloLabel, yoloStatusStyle)
 		} else {
 			statusSegments = []statusSegment{{text: fmt.Sprintf("Load error: %v", state.loadError), style: baseStatusStyle}}
 		}
@@ -2300,20 +2269,6 @@ type statusLine struct {
 	groups    []statusToken
 	right     string
 	rightBold bool
-}
-
-func insertYoloStatus(segments []statusSegment, showYoloToggle bool, yoloLabel string, yoloStatusStyle tcell.Style) []statusSegment {
-	if !showYoloToggle {
-		return segments
-	}
-	if len(segments) == 0 {
-		return []statusSegment{{text: yoloLabel, style: yoloStatusStyle}}
-	}
-	out := make([]statusSegment, 0, len(segments)+1)
-	out = append(out, segments[0])
-	out = append(out, statusSegment{text: yoloLabel, style: yoloStatusStyle})
-	out = append(out, segments[1:]...)
-	return out
 }
 
 func buildStatusLines(width int, left []statusSegment, right string, rightBold bool) []statusLine {

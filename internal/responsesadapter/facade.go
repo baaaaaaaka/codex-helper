@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 type ScopeResolver func(*http.Request, ResponsesRequest) Scope
@@ -34,6 +36,9 @@ type Facade struct {
 	ProfileVersion string
 	ScopeResolver  ScopeResolver
 	NewID          IDGenerator
+	// ShellPolicy applies execution-target escalation only at the local Codex
+	// boundary. Provider history and requests retain the original arguments.
+	ShellPolicy *responsespolicy.ShellEscalationPolicy
 }
 
 func (f *Facade) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -151,6 +156,7 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 		return
 	}
+	f.restoreProviderToolArguments(parsedInput.Messages)
 	parsedInput.Messages, err = applyCachedReasoning(store, scope, parsedInput.Messages)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
@@ -188,6 +194,30 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.completeResponse(w, r.Context(), responseID, req, providerReq, stream)
+}
+
+func (f *Facade) restoreProviderToolArguments(messages []ProviderMessage) {
+	if f == nil || f.ShellPolicy == nil {
+		return
+	}
+	for messageIndex := range messages {
+		for callIndex := range messages[messageIndex].ToolCalls {
+			call := &messages[messageIndex].ToolCalls[callIndex]
+			call.Arguments = f.ShellPolicy.Restore(call.ID, call.Name, call.Arguments)
+		}
+	}
+}
+
+func (f *Facade) prepareProviderToolCalls(records []ToolCallRecord) []ToolCallRecord {
+	if f == nil || f.ShellPolicy == nil || len(records) == 0 {
+		return records
+	}
+	prepared := append([]ToolCallRecord(nil), records...)
+	for index := range prepared {
+		call := &prepared[index]
+		call.Arguments = f.ShellPolicy.Prepare(call.ID, call.Name, call.Arguments)
+	}
+	return prepared
 }
 
 func beginTurnWithWait(ctx context.Context, store ResponseStore, scope Scope, responseID string) (func(), error) {

@@ -291,9 +291,12 @@ func TestPrepareTeamsAppServerModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(
 		return "http://127.0.0.1:23456", nil
 	}
 
-	args, env, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
+	args, env, cleanup, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
 	if err != nil {
 		t.Fatalf("prepareTeamsAppServerModelProfile: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 	if !slices.ContainsFunc(env, func(entry string) bool {
 		return strings.HasPrefix(entry, envCXPResponsesProxyKey+"=")
@@ -386,9 +389,12 @@ func TestPrepareTeamsAppServerModelProfileAllowsLegacyDeepSeekContextFingerprint
 				CapturedAt:         time.Now().UTC(),
 			}
 
-			args, _, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "", snapshot, io.Discard)
+			args, _, cleanup, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "", snapshot, io.Discard)
 			if err != nil {
 				t.Fatalf("prepareTeamsAppServerModelProfile legacy context snapshot: %v", err)
+			}
+			if cleanup != nil {
+				defer cleanup()
 			}
 			want := `model="` + tc.model + `"`
 			if joined := strings.Join(args, "\n"); !strings.Contains(joined, want) {
@@ -435,7 +441,7 @@ func TestPrepareTeamsAppServerModelProfileProxyPrepareTimesOutCI(t *testing.T) {
 	}
 
 	started := time.Now()
-	_, _, err = prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
+	_, _, _, err = prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
 	if err == nil {
 		t.Fatal("prepareTeamsAppServerModelProfile error = nil, want timeout")
 	}
@@ -484,7 +490,7 @@ func TestPrepareTeamsAppServerModelProfileUsesCallerCancellationCI(t *testing.T)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err = prepareTeamsAppServerModelProfileWithContext(ctx, &rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
+	_, _, _, err = prepareTeamsAppServerModelProfileWithContext(ctx, &rootOptions{configPath: store.Path()}, "deepseek-pro", modelprofile.Snapshot{}, io.Discard)
 	if err == nil {
 		t.Fatal("prepareTeamsAppServerModelProfileWithContext error = nil, want cancellation")
 	}
@@ -519,9 +525,12 @@ func TestPrepareTeamsAppServerModelProfileClearsIncompleteProxyPreferenceCI(t *t
 		return "", nil
 	}
 
-	args, _, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
+	args, _, cleanup, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "mimo25", modelprofile.Snapshot{}, io.Discard)
 	if err != nil {
 		t.Fatalf("prepareTeamsAppServerModelProfile: %v", err)
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 	if joined := strings.Join(args, "\n"); !strings.Contains(joined, `model="mimo/mimo-v2.5"`) {
 		t.Fatalf("appserver args missing selected model:\n%v", args)

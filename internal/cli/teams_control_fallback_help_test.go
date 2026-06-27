@@ -12,14 +12,13 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 	for _, want := range []string{
 		"cxp / codex-proxy CLI digest:",
 		"`cxp proxy reset`",
-		"`cxp run --yolo -- codex`",
+		"`cxp run -- codex`",
 		"`cxp run --model-profile <name> -- codex`",
 		"`cxp model` and `cxp model-profile`",
 		"`cxp model list`",
 		"`cxp model-profile setup [name]",
 		"`cxp responses serve`",
 		"`cxp app --model-profile <name>`",
-		"`Ctrl+Y`",
 		"`Ctrl+K`",
 		"`cxp teams status`",
 		"`cxp teams doctor`",
@@ -47,10 +46,9 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp beacon worker serve --allocation <request-id>`",
 		"--shared-store",
 		"--codex-path <codex-or-wrapper>",
-		"--no-yolo",
 		"--skip-git-repo-check",
 		"CXP_BEACON_CODEX_BIN",
-		"launch Codex in yolo mode by default",
+		"standard approval runtime inside the allocation",
 		"Teams service `--codex-arg` settings do not automatically reach remote beacon workers",
 		"Keep exactly one `exec`",
 		"`--adapter-shell direct`",
@@ -105,9 +103,9 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		docs     []string
 	}{
 		{
-			name:     "model profiles and yolo",
-			fallback: []string{"run --yolo -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+Y", "Ctrl+K"},
-			docs:     []string{"run --yolo -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+Y", "Ctrl+K"},
+			name:     "model profiles and standard approvals",
+			fallback: []string{"run -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+K"},
+			docs:     []string{"run -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+K"},
 		},
 		{
 			name:     "teams model commands",
@@ -146,8 +144,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		},
 		{
 			name:     "worker adapter troubleshooting",
-			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--no-yolo", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "launch Codex in yolo mode by default", "Keep exactly one `exec`", "`--adapter-shell direct`"},
-			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--no-yolo", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "launch Codex in yolo mode by default", "Keep exactly one `exec`", "`--adapter-shell direct`"},
+			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "standard approval runtime inside the allocation", "Keep exactly one `exec`", "`--adapter-shell direct`"},
+			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "standard approval runtime inside the allocation", "Keep exactly one `exec`", "`--adapter-shell direct`"},
 		},
 	}
 	for _, check := range checks {

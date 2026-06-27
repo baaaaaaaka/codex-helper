@@ -1,12 +1,12 @@
 # codex-helper documentation
 
 Start with the top-level [README](../README.md) for installation, first run,
-common commands, model selection, YOLO mode, Teams basics, and upgrade basics.
+common commands, model selection, standard approvals, Teams basics, and upgrade basics.
 
 ## Basic use
 
 - [Top-level README](../README.md): install, first run, common commands, local
-  TUI, model profiles, YOLO mode, Codex desktop app, Teams setup, and upgrade.
+  TUI, model profiles, standard approvals, Codex desktop app, Teams setup, and upgrade.
 
 ## Daily Teams and operator use
 

@@ -6,18 +6,18 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/migration"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
-const teamsCodexStderrCaptureBytes = 1 << 20
+var prepareTeamsAppServerModelProfileForRunner = prepareTeamsAppServerModelProfileWithContext
 
 type teamsCodexExecutor struct {
 	runner               codexrunner.Runner
@@ -32,6 +32,30 @@ type teamsCodexExecutor struct {
 	log                  io.Writer
 	runnerCacheMu        *sync.Mutex
 	runnersByProfile     map[string]codexrunner.Runner
+}
+
+func (e teamsCodexExecutor) Close() error {
+	if e.runnerCacheMu != nil {
+		e.runnerCacheMu.Lock()
+		defer e.runnerCacheMu.Unlock()
+	}
+	seen := make(map[*codexrunner.AppServerRunner]bool)
+	var errs []error
+	closeRunner := func(runner codexrunner.Runner) {
+		managed, ok := runner.(*codexrunner.AppServerRunner)
+		if !ok || managed == nil || seen[managed] {
+			return
+		}
+		seen[managed] = true
+		if err := managed.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	closeRunner(e.runner)
+	for _, runner := range e.runnersByProfile {
+		closeRunner(runner)
+	}
+	return errors.Join(errs...)
 }
 
 func newManagedTeamsCodexExecutor(
@@ -77,35 +101,34 @@ func newManagedTeamsCodexExecutorWithContext(
 	if command == "" {
 		command = "codex"
 	}
-	codexArgs = teamsCodexYoloSafeArgs(codexArgs)
-	launcher := teamsCodexLauncher{root: root, log: log, modelProfileRef: strings.TrimSpace(modelProfile), modelProfileSnapshot: snapshot}
-	execRunner := &codexrunner.ExecRunner{
-		Launcher:   launcher,
-		Command:    command,
-		ExtraArgs:  append([]string{}, codexArgs...),
-		WorkingDir: strings.TrimSpace(workDir),
-		Timeout:    timeout,
+	appServerExtraArgs, err := translateTeamsCodexArgsToAppServer(codexArgs)
+	if err != nil {
+		return nil, err
 	}
-	var runner codexrunner.Runner = execRunner
+	var runner codexrunner.Runner
+	store, paths, err := newRootStore(root, "")
+	if err != nil {
+		return nil, err
+	}
 	switch strings.ToLower(strings.TrimSpace(runnerName)) {
-	case "", "exec":
-	case "appserver", "app-server":
-		appServerModelArgs, appServerModelEnv, err := prepareTeamsAppServerModelProfileWithContext(ctx, root, modelProfile, snapshot, log)
+	case "", "exec", "appserver", "app-server":
+		appServerModelArgs, appServerModelEnv, modelCleanup, err := prepareTeamsAppServerModelProfileForRunner(ctx, root, modelProfile, snapshot, log)
 		if err != nil {
 			return nil, err
 		}
 		runner = &codexrunner.AppServerRunner{
-			Starter:       codexrunner.AppServerProcessStarter{},
-			Fallback:      execRunner,
+			Starter: codexrunner.PolicyAppServerStarter{
+				ReadyHook: runtimeMigrationReadyHook(store, paths, command, log),
+			},
 			Command:       command,
-			AppServerArgs: append([]string{}, appServerModelArgs...),
-			ExtraArgs:     append([]string{}, codexArgs...),
+			AppServerArgs: append(append([]string{"--analytics-default-enabled"}, appServerExtraArgs...), appServerModelArgs...),
 			ExtraEnv:      append(teamsCodexChildEnv(), appServerModelEnv...),
 			WorkingDir:    strings.TrimSpace(workDir),
 			Timeout:       timeout,
+			CloseHook:     modelCleanup,
 		}
 	default:
-		return nil, fmt.Errorf("unknown Teams codex runner %q (expected exec or appserver)", runnerName)
+		return nil, fmt.Errorf("unknown Teams codex runner %q", runnerName)
 	}
 	return teamsCodexExecutor{
 		runner:               runner,
@@ -277,148 +300,44 @@ func successfulTeamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) 
 	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexThreadTitle: strings.TrimSpace(result.ThreadName), CodexTurnID: result.TurnID}
 }
 
-type teamsCodexLauncher struct {
-	root                 *rootOptions
-	log                  io.Writer
-	modelProfileRef      string
-	modelProfileSnapshot modelprofile.Snapshot
-}
-
-func (l teamsCodexLauncher) Launch(ctx context.Context, req codexrunner.LaunchRequest) (codexrunner.LaunchResult, error) {
-	if req.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
-		defer cancel()
-	}
-	command := strings.TrimSpace(req.Command)
-	if command == "" {
-		command = "codex"
-	}
-	cmdArgs := append([]string{command}, req.Args...)
-	stderr := &limitedBuffer{max: teamsCodexStderrCaptureBytes}
-	stdout := codexrunner.NewLaunchOutputRecorderWithOptions(req.EventHandler, codexrunner.LaunchOutputOptions{IncludeCommandOutput: false, RecoverParseErrors: true})
-	launchResult := func(exitCode int) codexrunner.LaunchResult {
-		result := stdout.LaunchResult(stderr.Bytes(), exitCode)
-		result.StderrTruncated = stderr.Truncated()
-		return result
-	}
-
-	log := l.log
-	if log == nil {
-		log = io.Discard
-	}
-	store, _, err := newRootStore(l.root, "")
-	if err != nil {
-		return codexrunner.LaunchResult{}, err
-	}
-	proxyRef := ""
-	useProxy := false
-	if l.modelProfileRef != "" || !l.modelProfileSnapshot.IsZero() {
-		cfg, err := store.Load()
-		if err != nil {
-			return codexrunner.LaunchResult{}, err
-		}
-		var resolved modelprofile.Resolved
-		if l.modelProfileSnapshot.IsZero() {
-			resolved, err = modelprofile.Resolve(cfg, l.modelProfileRef)
-		} else {
-			resolved, err = modelprofile.ResolveSnapshot(cfg, l.modelProfileSnapshot)
-		}
-		if err != nil {
-			return codexrunner.LaunchResult{}, err
-		}
-		if resolved.SSHProfile != nil {
-			useProxy = true
-			proxyRef = resolved.SSHProfile.Name
+func translateTeamsCodexArgsToAppServer(args []string) ([]string, error) {
+	args = migration.RemoveLegacyCodexExecutionOverrides(args)
+	out := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := strings.TrimSpace(args[index])
+		switch arg {
+		case "":
+			continue
+		case "--skip-git-repo-check":
+			// app-server does not perform the exec subcommand's repository gate.
+			continue
+		case "--model", "-m":
+			if index+1 >= len(args) {
+				return nil, fmt.Errorf("%s requires a model", arg)
+			}
+			index++
+			out = append(out, "-c", `model="`+tomlEscapeString(args[index])+`"`)
+		case "--search":
+			out = append(out, "-c", `web_search="live"`)
+		case "-c", "--config", "--enable", "--disable":
+			if index+1 >= len(args) {
+				return nil, fmt.Errorf("%s requires a value", arg)
+			}
+			out = append(out, arg, args[index+1])
+			index++
+		case "--strict-config":
+			out = append(out, arg)
+		case "--sandbox", "-s", "--ask-for-approval", "-a":
+			if index+1 >= len(args) {
+				return nil, fmt.Errorf("%s requires a value", arg)
+			}
+			// The unified runtime owns these settings and appends its policy last.
+			index++
+		default:
+			return nil, fmt.Errorf("Teams Codex argument %q cannot be translated to app-server", arg)
 		}
 	}
-	if !useProxy {
-		useProxy, _, err = ensureProxyPreferenceRunFn(ctx, store, "", log)
-		if err != nil {
-			return codexrunner.LaunchResult{}, err
-		}
-	}
-
-	stdoutWriter := stdout.StdoutWriter()
-	opts := runTargetOptions{
-		Cwd:                  strings.TrimSpace(req.Dir),
-		ExtraEnv:             teamsCodexChildEnv(),
-		UseProxy:             useProxy,
-		Log:                  log,
-		Stdin:                strings.NewReader(req.Stdin),
-		Stdout:               stdoutWriter,
-		Stderr:               stderr,
-		YoloEnabled:          true,
-		RequireYolo:          true,
-		ModelProfileRef:      l.modelProfileRef,
-		ModelProfileSnapshot: l.modelProfileSnapshot,
-	}
-
-	var runErr error
-	if useProxy {
-		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, proxyRef, true, log)
-		if err != nil {
-			return launchResult(0), err
-		}
-		runErr = runWithProfileOptions(ctx, store, profile, cfgWithProfile.Instances, cmdArgs, opts)
-	} else {
-		runErr = runTeamsCodexDirect(ctx, store, cmdArgs, log, stdoutWriter, stderr, opts)
-	}
-
-	result := launchResult(0)
-	if runErr == nil {
-		return result, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(runErr, &exitErr) {
-		result.ExitCode = exitErr.ExitCode()
-		return result, nil
-	}
-	return result, runErr
-}
-
-func runTeamsCodexDirect(
-	ctx context.Context,
-	store *config.Store,
-	cmdArgs []string,
-	log io.Writer,
-	stdout io.Writer,
-	stderr io.Writer,
-	opts runTargetOptions,
-) error {
-	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, cmdArgs, log, codexInstallOptions{})
-	if err != nil {
-		return err
-	}
-	if isCodexCommand(resolvedCmd[0]) {
-		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
-			return err
-		}
-		var modelCleanup func()
-		resolvedCmd, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, resolvedCmd, &opts, "")
-		if err != nil {
-			return err
-		}
-		if modelCleanup != nil {
-			defer modelCleanup()
-		}
-		var cleanup func()
-		resolvedCmd, cleanup = prepareYoloCodexCommandForRun(store, resolvedCmd, &opts)
-		if cleanup != nil {
-			defer cleanup()
-		}
-		if err := requireYoloLaunchArgs(resolvedCmd, opts); err != nil {
-			return err
-		}
-	}
-	opts.UseProxy = false
-	opts.Stdout = stdout
-	opts.Stderr = stderr
-	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
-}
-
-func teamsCodexYoloSafeArgs(args []string) []string {
-	return stripYoloArgs(args)
+	return out, nil
 }
 
 func teamsStoreConfigForStatus(root *rootOptions) (*config.Store, error) {

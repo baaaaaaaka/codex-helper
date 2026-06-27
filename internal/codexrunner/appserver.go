@@ -53,7 +53,9 @@ type AppServerStartRequest struct {
 type AppServerRunner struct {
 	Transport AppServerLineTransport
 	Starter   AppServerTransportStarter
-	Fallback  Runner
+	// ServerRequestHandler handles app-server initiated requests. When nil, the
+	// runner uses AutomaticApprovalHandler with DefaultApprovalDelay.
+	ServerRequestHandler AppServerServerRequestHandler
 
 	Command       string
 	AppServerArgs []string
@@ -64,11 +66,30 @@ type AppServerRunner struct {
 	// BackfillThreadName reads thread metadata after completed turns when the
 	// completion stream did not carry a thread/name/updated notification.
 	BackfillThreadName bool
+	// CloseHook releases resources that must live exactly as long as this
+	// runner (for example a local third-party Responses adapter).
+	CloseHook func()
 
 	mu          sync.Mutex
+	writeMu     sync.Mutex
 	nextID      int64
 	ready       bool
 	unavailable bool
+
+	protocolCtx    context.Context
+	protocolCancel context.CancelFunc
+	protocolFrames chan []byte
+	protocolDone   chan struct{}
+	protocolMu     sync.Mutex
+	protocolErr    error
+	serverWG       sync.WaitGroup
+	serverRequests map[string]*appServerServerRequestState
+	closeHookOnce  sync.Once
+}
+
+type appServerServerRequestState struct {
+	done     chan struct{}
+	response []byte
 }
 
 func NewAppServerRunner(transport AppServerLineTransport) *AppServerRunner {
@@ -80,7 +101,7 @@ func (r *AppServerRunner) StartThread(ctx context.Context, input TurnInput) (Tur
 		return TurnResult{}, err
 	}
 	if err := r.validateAppServerArgs(input.ExtraArgs); err != nil {
-		return r.fallbackStartThread(ctx, input, err)
+		return TurnResult{}, err
 	}
 	ctx, cancel := withOptionalTimeout(ctx, firstDuration(input.Timeout, r.Timeout))
 	defer cancel()
@@ -88,7 +109,7 @@ func (r *AppServerRunner) StartThread(ctx context.Context, input TurnInput) (Tur
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		return r.fallbackStartThread(ctx, input, err)
+		return TurnResult{}, err
 	}
 	threadID, err := r.startThreadLocked(ctx, input)
 	if err != nil {
@@ -112,7 +133,7 @@ func (r *AppServerRunner) ResumeThread(ctx context.Context, threadID string, inp
 		return TurnResult{}, err
 	}
 	if err := r.validateAppServerArgs(input.ExtraArgs); err != nil {
-		return r.fallbackResumeThread(ctx, threadID, input, err)
+		return TurnResult{}, err
 	}
 	ctx, cancel := withOptionalTimeout(ctx, firstDuration(input.Timeout, r.Timeout))
 	defer cancel()
@@ -120,7 +141,7 @@ func (r *AppServerRunner) ResumeThread(ctx context.Context, threadID string, inp
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		return r.fallbackResumeThread(ctx, threadID, input, err)
+		return TurnResult{}, err
 	}
 	resumedThreadID, err := r.resumeThreadLocked(ctx, threadID)
 	if err != nil {
@@ -143,7 +164,7 @@ func (r *AppServerRunner) StartTurn(ctx context.Context, input StartTurnInput) (
 		return TurnResult{}, err
 	}
 	if err := r.validateAppServerArgs(input.ExtraArgs); err != nil {
-		return r.fallbackStartTurn(ctx, input, err)
+		return TurnResult{}, err
 	}
 	ctx, cancel := withOptionalTimeout(ctx, firstDuration(input.Timeout, r.Timeout))
 	defer cancel()
@@ -151,7 +172,7 @@ func (r *AppServerRunner) StartTurn(ctx context.Context, input StartTurnInput) (
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		return r.fallbackStartTurn(ctx, input, err)
+		return TurnResult{}, err
 	}
 	result, err := r.startTurnLocked(ctx, input)
 	r.mu.Unlock()
@@ -176,9 +197,6 @@ func (r *AppServerRunner) InterruptTurn(ctx context.Context, ref TurnRef) error 
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		if r.Fallback != nil {
-			return r.Fallback.InterruptTurn(ctx, ref)
-		}
 		return err
 	}
 	_, err := r.requestLocked(ctx, appServerMethodTurnInterrupt, map[string]string{
@@ -200,9 +218,6 @@ func (r *AppServerRunner) ReadThread(ctx context.Context, threadID string) (Thre
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		if r.Fallback != nil {
-			return r.Fallback.ReadThread(ctx, threadID)
-		}
 		return Thread{}, err
 	}
 	result, err := r.requestLocked(ctx, appServerMethodThreadRead, map[string]any{
@@ -227,9 +242,6 @@ func (r *AppServerRunner) ListThreads(ctx context.Context, opts ListThreadsOptio
 	r.mu.Lock()
 	if err := r.ensureReadyLocked(ctx); err != nil {
 		r.mu.Unlock()
-		if r.Fallback != nil {
-			return r.Fallback.ListThreads(ctx, opts)
-		}
 		return nil, err
 	}
 	result, err := r.requestLocked(ctx, appServerMethodThreadList, appServerListThreadsParams(opts), nil)
@@ -246,14 +258,13 @@ func (r *AppServerRunner) ListThreads(ctx context.Context, opts ListThreadsOptio
 
 func (r *AppServerRunner) Close() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.Transport == nil {
-		r.ready = false
-		return nil
-	}
-	err := r.Transport.Close()
-	r.Transport = nil
-	r.ready = false
+	err := r.closeTransportLocked()
+	r.mu.Unlock()
+	r.closeHookOnce.Do(func() {
+		if r.CloseHook != nil {
+			r.CloseHook()
+		}
+	})
 	return err
 }
 
@@ -283,8 +294,9 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 		}
 		r.Transport = transport
 	}
+	r.startProtocolLoopLocked()
 	if err := r.initializeLocked(ctx); err != nil {
-		r.closeTransportLocked()
+		_ = r.closeTransportLocked()
 		r.unavailable = true
 		return err
 	}
@@ -315,6 +327,9 @@ func (r *AppServerRunner) startThreadLocked(ctx context.Context, input TurnInput
 	params := map[string]any{}
 	if workingDir := firstNonEmpty(input.WorkingDir, r.WorkingDir); workingDir != "" {
 		params["cwd"] = workingDir
+	}
+	if len(input.AdditionalDirs) > 0 {
+		params["runtimeWorkspaceRoots"] = append([]string(nil), input.AdditionalDirs...)
 	}
 	result, err := r.requestLocked(ctx, appServerMethodThreadStart, params, nil)
 	if err != nil {
@@ -349,6 +364,9 @@ func (r *AppServerRunner) startTurnLocked(ctx context.Context, input StartTurnIn
 	}
 	if workingDir := firstNonEmpty(input.WorkingDir, r.WorkingDir); workingDir != "" {
 		params["cwd"] = workingDir
+	}
+	if len(input.OutputSchema) > 0 {
+		params["outputSchema"] = input.OutputSchema
 	}
 	var result TurnResult
 	raw, err := r.requestLocked(ctx, appServerMethodTurnStart, params, func(line []byte) error {
@@ -446,12 +464,6 @@ func (r *AppServerRunner) readTurnNotificationsUntilTerminalLocked(ctx context.C
 		if err := json.Unmarshal(line, &msg); err != nil {
 			return &Error{Kind: ErrorParse, Message: "invalid app-server JSON line", Err: err}
 		}
-		if appServerMessageIsServerRequest(msg) {
-			if err := r.writeUnsupportedServerRequestLocked(ctx, msg); err != nil {
-				return err
-			}
-			continue
-		}
 		if len(bytes.TrimSpace(msg.ID)) > 0 {
 			return &Error{Kind: ErrorParse, Message: fmt.Sprintf("unexpected app-server response id %s while waiting for turn completion", string(msg.ID))}
 		}
@@ -487,12 +499,6 @@ func (r *AppServerRunner) requestLocked(ctx context.Context, method string, para
 		if err := json.Unmarshal(line, &msg); err != nil {
 			return nil, &Error{Kind: ErrorParse, Message: "invalid app-server JSON line", Err: err}
 		}
-		if appServerMessageIsServerRequest(msg) {
-			if err := r.writeUnsupportedServerRequestLocked(ctx, msg); err != nil {
-				return nil, err
-			}
-			continue
-		}
 		if len(msg.ID) == 0 {
 			if onNotify != nil {
 				if err := onNotify(line); err != nil {
@@ -515,10 +521,32 @@ func appServerMessageIsServerRequest(msg appServerMessage) bool {
 	return strings.TrimSpace(msg.Method) != "" && len(bytes.TrimSpace(msg.ID)) > 0
 }
 
-func (r *AppServerRunner) writeUnsupportedServerRequestLocked(ctx context.Context, msg appServerMessage) error {
+func (r *AppServerRunner) serverRequestResponse(ctx context.Context, msg appServerMessage) []byte {
 	method := strings.TrimSpace(msg.Method)
 	if method == "" {
 		method = "server request"
+	}
+	handler := r.ServerRequestHandler
+	if handler == nil {
+		handler = AutomaticApprovalHandler{Delay: DefaultApprovalDelay}
+	}
+	result, handled, err := handler.HandleServerRequest(ctx, method, msg.Params)
+	if err != nil {
+		response := appServerErrorResponse{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Error:   appServerErrorField{Code: json.RawMessage(`-32000`), Message: "approval request was rejected"},
+		}
+		line, _ := json.Marshal(response)
+		return line
+	}
+	if handled {
+		response := appServerResultResponse{JSONRPC: "2.0", ID: msg.ID, Result: result}
+		line, err := json.Marshal(response)
+		if err != nil {
+			return nil
+		}
+		return line
 	}
 	response := appServerErrorResponse{
 		JSONRPC: "2.0",
@@ -530,9 +558,9 @@ func (r *AppServerRunner) writeUnsupportedServerRequestLocked(ctx context.Contex
 	}
 	line, err := json.Marshal(response)
 	if err != nil {
-		return &Error{Kind: ErrorParse, Message: "failed to encode app-server error response", Err: err}
+		return nil
 	}
-	return r.writeLineLocked(ctx, line)
+	return line
 }
 
 func (r *AppServerRunner) writeNotificationLocked(ctx context.Context, method string, params any) error {
@@ -544,6 +572,8 @@ func (r *AppServerRunner) writeNotificationLocked(ctx context.Context, method st
 }
 
 func (r *AppServerRunner) writeLineLocked(ctx context.Context, line []byte) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	if r.Transport == nil {
 		return &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
 	}
@@ -554,18 +584,130 @@ func (r *AppServerRunner) writeLineLocked(ctx context.Context, line []byte) erro
 }
 
 func (r *AppServerRunner) readLineLocked(ctx context.Context) ([]byte, error) {
-	if r.Transport == nil {
+	if r.Transport == nil || r.protocolFrames == nil {
 		return nil, &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
 	}
-	line, err := r.Transport.ReadLine(ctx)
-	if err != nil {
-		return nil, classifyTransportError(err)
+	select {
+	case line, ok := <-r.protocolFrames:
+		if !ok {
+			return nil, r.protocolFailure()
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil, &Error{Kind: ErrorParse, Message: "empty app-server JSON line"}
+		}
+		return line, nil
+	default:
 	}
-	line = bytes.TrimSpace(line)
-	if len(line) == 0 {
-		return nil, &Error{Kind: ErrorParse, Message: "empty app-server JSON line"}
+	select {
+	case line, ok := <-r.protocolFrames:
+		if !ok {
+			return nil, r.protocolFailure()
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			return nil, &Error{Kind: ErrorParse, Message: "empty app-server JSON line"}
+		}
+		return line, nil
+	case <-ctx.Done():
+		return nil, classifyTransportError(ctx.Err())
 	}
-	return line, nil
+}
+
+func (r *AppServerRunner) startProtocolLoopLocked() {
+	if r.protocolDone != nil || r.Transport == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.protocolCtx = ctx
+	r.protocolCancel = cancel
+	r.protocolFrames = make(chan []byte, 1024)
+	r.protocolDone = make(chan struct{})
+	r.serverRequests = make(map[string]*appServerServerRequestState)
+	r.protocolMu.Lock()
+	r.protocolErr = nil
+	r.protocolMu.Unlock()
+	transport := r.Transport
+	frames := r.protocolFrames
+	done := r.protocolDone
+	go func() {
+		defer close(done)
+		defer close(frames)
+		for {
+			line, err := transport.ReadLine(ctx)
+			if err != nil {
+				r.setProtocolFailure(err)
+				return
+			}
+			line = bytes.TrimSpace(line)
+			var message appServerMessage
+			if json.Unmarshal(line, &message) == nil && appServerMessageIsServerRequest(message) {
+				r.dispatchServerRequest(ctx, message)
+				continue
+			}
+			select {
+			case frames <- append([]byte(nil), line...):
+			case <-ctx.Done():
+				r.setProtocolFailure(ctx.Err())
+				return
+			}
+		}
+	}()
+}
+
+func (r *AppServerRunner) dispatchServerRequest(ctx context.Context, message appServerMessage) {
+	key := string(bytes.TrimSpace(message.ID)) + "\x00" + strings.TrimSpace(message.Method)
+	r.protocolMu.Lock()
+	if state, ok := r.serverRequests[key]; ok {
+		r.protocolMu.Unlock()
+		r.serverWG.Add(1)
+		go func() {
+			defer r.serverWG.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-state.done:
+				if len(state.response) > 0 {
+					_ = r.writeLineLocked(ctx, state.response)
+				}
+			}
+		}()
+		return
+	}
+	state := &appServerServerRequestState{done: make(chan struct{})}
+	r.serverRequests[key] = state
+	r.protocolMu.Unlock()
+
+	r.serverWG.Add(1)
+	go func() {
+		defer r.serverWG.Done()
+		response := r.serverRequestResponse(ctx, message)
+		r.protocolMu.Lock()
+		state.response = append([]byte(nil), response...)
+		close(state.done)
+		r.protocolMu.Unlock()
+		if len(response) > 0 {
+			_ = r.writeLineLocked(ctx, response)
+		}
+	}()
+}
+
+func (r *AppServerRunner) setProtocolFailure(err error) {
+	r.protocolMu.Lock()
+	defer r.protocolMu.Unlock()
+	if r.protocolErr == nil {
+		r.protocolErr = err
+	}
+}
+
+func (r *AppServerRunner) protocolFailure() error {
+	r.protocolMu.Lock()
+	err := r.protocolErr
+	r.protocolMu.Unlock()
+	if err == nil {
+		err = io.EOF
+	}
+	return classifyTransportError(err)
 }
 
 func (r *AppServerRunner) nextRequestIDLocked() int64 {
@@ -573,33 +715,25 @@ func (r *AppServerRunner) nextRequestIDLocked() int64 {
 	return r.nextID
 }
 
-func (r *AppServerRunner) closeTransportLocked() {
+func (r *AppServerRunner) closeTransportLocked() error {
+	if r.protocolCancel != nil {
+		r.protocolCancel()
+	}
+	if r.protocolDone != nil {
+		<-r.protocolDone
+	}
+	r.serverWG.Wait()
+	var err error
 	if r.Transport != nil {
-		_ = r.Transport.Close()
+		err = r.Transport.Close()
 		r.Transport = nil
 	}
+	r.protocolCtx = nil
+	r.protocolCancel = nil
+	r.protocolFrames = nil
+	r.protocolDone = nil
 	r.ready = false
-}
-
-func (r *AppServerRunner) fallbackStartThread(ctx context.Context, input TurnInput, cause error) (TurnResult, error) {
-	if r.Fallback != nil {
-		return r.Fallback.StartThread(ctx, input)
-	}
-	return TurnResult{}, cause
-}
-
-func (r *AppServerRunner) fallbackResumeThread(ctx context.Context, threadID string, input TurnInput, cause error) (TurnResult, error) {
-	if r.Fallback != nil {
-		return r.Fallback.ResumeThread(ctx, threadID, input)
-	}
-	return TurnResult{}, cause
-}
-
-func (r *AppServerRunner) fallbackStartTurn(ctx context.Context, input StartTurnInput, cause error) (TurnResult, error) {
-	if r.Fallback != nil {
-		return r.Fallback.StartTurn(ctx, input)
-	}
-	return TurnResult{}, cause
+	return err
 }
 
 type appServerRequest struct {
@@ -619,6 +753,12 @@ type appServerErrorResponse struct {
 	JSONRPC string              `json:"jsonrpc"`
 	ID      json.RawMessage     `json:"id"`
 	Error   appServerErrorField `json:"error"`
+}
+
+type appServerResultResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  json.RawMessage `json:"result"`
 }
 
 type appServerMessage struct {

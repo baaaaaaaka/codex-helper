@@ -12,12 +12,12 @@
 ## Codex Launching
 
 - `cxp`: open the local Codex history TUI.
-- `cxp tui`: open the local Codex history TUI explicitly. Press `Ctrl+Y` before opening/starting a session to toggle YOLO mode, and `Ctrl+K` to open the skills menu.
+- `cxp tui`: open the local Codex history TUI explicitly. Press `Ctrl+K` to open the skills menu.
 - `cxp app [profile]`: install the Codex desktop app if needed, use or configure proxy mode, and launch the desktop app on macOS, Windows, or WSL. Linux outside WSL has no official Codex desktop app. If a proxy profile is literally named `app` or `auth`, use `cxp tui app`, `cxp app --profile auth`, or `cxp app auth --profile auth` to avoid command-name ambiguity.
 - `cxp app auth [profile]`: complete ChatGPT auth for the Codex desktop app through a temporary Codex app-server using the same CODEX_HOME and proxy setup as `cxp app`.
 - `cxp app --model-profile <name>`: launch the desktop app with a saved model profile through an isolated CODEX_HOME; quit an already-running app first so the setting takes effect.
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
-- `cxp run --yolo -- codex`: launch Codex with YOLO mode enabled for this run.
+- `cxp run -- codex`: launch the original Codex TUI through CXP's standard approval broker.
 - `cxp run --model-profile <name> -- codex`: launch Codex with a saved model profile for this run.
 - `cxp init`: create or repair local proxy configuration interactively; when `~/.ssh/config` contains concrete `Host` entries, it can reuse and validate one before falling back to manual SSH host details.
 
@@ -171,7 +171,7 @@ Beacon adapter troubleshooting:
 - `exit 127` from the scheduler job often means the submitted command was malformed or PATH is different inside the allocation. Keep exactly one `exec` in the final worker command; if a site wrapper already prepends `exec`, remove the extra one from the adapter.
 - `allocation request ... not found` inside the worker usually means the worker is using the wrong state file. Custom Slurm/LSF submit adapters must accept `--shared-store` and pass it to the worker as `cxp beacon --store <shared-store> worker ...`.
 - If `$SHELL -lic` fails under tcsh/csh, update the profile with `--adapter-shell direct`; profile revisions apply to future turns.
-- Beacon workers launch Codex in yolo mode by default so scheduler/container devices and mounts stay visible; pass worker `--no-yolo` only when the worker must keep Codex sandboxing.
+- Beacon workers start the standard approval runtime inside the allocation, so approved commands inherit only the devices and mounts already granted by the scheduler or container.
 - If worker doctor reports `missing codex`, set scheduler PATH or pass worker `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is still useful for path resolution or extra Codex exec flags such as `--skip-git-repo-check`; Teams service `--codex-arg` settings do not automatically reach remote beacon workers. The generated templates honor `CXP_BEACON_CODEX_BIN` by passing it as worker `--codex-path`.
 
 The active Teams helper owner periodically queries existing provider jobs and renews due allocations through the configured `*_RENEW` adapter. Renewal is epoch-fenced and never updates a newer cancel, replacement, or provider job. During helper drain, renewal only protects allocations whose job may already have started; pre-start replacement is conservative and only resets a lost allocation when all jobs are still queued.

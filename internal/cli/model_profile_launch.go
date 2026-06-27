@@ -19,6 +19,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
+	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 const (
@@ -176,7 +177,11 @@ func startModelProfileAdapterForCodex(
 		storeCleanup()
 		return codexModelProfileLaunch{}, nil, err
 	}
-	server := &http.Server{Handler: &responsesadapter.Facade{Router: registry, Store: responseStore}}
+	server := &http.Server{Handler: &responsesadapter.Facade{
+		Router:      registry,
+		Store:       responseStore,
+		ShellPolicy: responsespolicy.NewShellEscalationPolicy(0),
+	}}
 	done := make(chan error, 1)
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -280,27 +285,27 @@ func modelProfileRequiresAdapter(root *rootOptions, ref string) (bool, error) {
 	return resolved.Provider.UsesAdapter, nil
 }
 
-func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, error) {
+func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, func(), error) {
 	return prepareTeamsAppServerModelProfileWithContext(context.Background(), root, ref, snapshot, log)
 }
 
-func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, error) {
+func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, func(), error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" && snapshot.IsZero() {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	ctx, cancel := withTeamsAppServerModelProfilePrepareTimeout(ctx)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	store, _, err := newRootStore(root, "")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	cfg, err := store.Load()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var resolved modelprofile.Resolved
 	if snapshot.IsZero() {
@@ -309,44 +314,44 @@ func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *roo
 		resolved, err = modelprofile.ResolveSnapshot(cfg, snapshot)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if resolved.IsDefault() {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	if resolved.SSHProfile == nil {
 		cfg, err = modelProfileConfigWithImplicitProxyPreference(store, cfg)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	upstreamProxyURL := ""
 	upstreamProfile, err := modelProfileUpstreamProxyProfile(cfg, resolved, "")
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if upstreamProfile != nil {
 		upstreamProxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *upstreamProfile, cfg.Instances, log)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	launch, _, err := startModelProfileAdapterForCodex(ctx, store, ref, snapshot, upstreamProxyURL, log)
+	launch, cleanup, err := startModelProfileAdapterForCodex(ctx, store, ref, snapshot, upstreamProxyURL, log)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if !launch.Enabled {
-		return nil, nil, nil
+		return nil, nil, cleanup, nil
 	}
 	args := appendCodexModelProfileArgs([]string{"codex"}, launch)
 	if len(args) > 0 {
 		args = args[1:]
 	}
 	env := []string{envCXPResponsesProxyKey + "=" + launch.ProxyKey}
-	return args, env, nil
+	return args, env, cleanup, nil
 }
 
 func withTeamsAppServerModelProfilePrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {

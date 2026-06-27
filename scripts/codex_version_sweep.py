@@ -18,14 +18,14 @@ from typing import Iterable
 VERSION_RE = re.compile(r"^0\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 PLATFORM_SUFFIX_RE = re.compile(r"-(?:darwin|linux|win32)-(?:arm64|x64)$")
 
-DEFAULT_CLOUDGATE_CMD = (
-    "go test ./internal/cloudgate "
-    "-run 'TestCodexPatchIntegration|TestCodexPatchedYoloLaunchIntegration' "
+DEFAULT_NATIVE_CMD = (
+    "go test ./internal/codexbinary "
+    "-run 'TestFindNativeBinary' "
     "-count=1 -v"
 )
 DEFAULT_CLI_CMD = (
     "go test ./internal/cli "
-    "-run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' "
+    "-run 'TestProbeCodexIntegration' "
     "-count=1 -v"
 )
 
@@ -126,7 +126,7 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
     summary: dict[str, object] = {
         "version": version,
         "status": "fail",
-        "cloudgate_rc": None,
+        "native_resolver_rc": None,
         "cli_rc": None,
         "duration_seconds": None,
     }
@@ -144,13 +144,12 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
 
         env = os.environ.copy()
         env["PATH"] = f"{prefix / 'bin'}{os.pathsep}{env['PATH']}"
-        env["CODEX_PATCH_TEST"] = "1"
-        env["CODEX_YOLO_PATCH_TEST"] = "1"
+        env["CODEX_RUNTIME_TEST"] = "1"
 
-        cloudgate = run_command(DEFAULT_CLOUDGATE_CMD, cwd=repo_root, env=env)
-        summary["cloudgate_rc"] = cloudgate.returncode
-        if cloudgate.returncode != 0:
-            summary["stderr_tail"] = ((cloudgate.stdout or "") + (cloudgate.stderr or ""))[-4000:]
+        native = run_command(DEFAULT_NATIVE_CMD, cwd=repo_root, env=env)
+        summary["native_resolver_rc"] = native.returncode
+        if native.returncode != 0:
+            summary["stderr_tail"] = ((native.stdout or "") + (native.stderr or ""))[-4000:]
             return summary
 
         cli = run_command(DEFAULT_CLI_CMD, cwd=repo_root, env=env)
@@ -217,7 +216,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     for version in versions:
         result = run_smoke_for_version(version, repo_root=repo_root)
         results.append(result)
-        print(f"{version}: {result['status']} (cloudgate={result['cloudgate_rc']} cli={result['cli_rc']})", flush=True)
+        print(f"{version}: {result['status']} (native={result['native_resolver_rc']} cli={result['cli_rc']})", flush=True)
         if args.output_json:
             write_json(Path(args.output_json), build_payload(versions, results))
         if result["status"] != "pass":

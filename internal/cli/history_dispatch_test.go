@@ -20,122 +20,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/tui"
 )
 
-func TestRunHistoryTuiHidesYoloToggleWithoutPatchHistory(t *testing.T) {
-	lockCLITestHooks(t)
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	prevEnsureProxy := ensureProxyPreferenceFunc
-	prevSelect := selectSession
-	t.Cleanup(func() {
-		ensureProxyPreferenceFunc = prevEnsureProxy
-		selectSession = prevSelect
-	})
-
-	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		return false, config.Config{Version: config.CurrentVersion}, nil
-	}
-
-	called := false
-	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
-		called = true
-		if opts.ShowYoloToggle {
-			t.Fatalf("expected yolo toggle to be hidden")
-		}
-		return nil, nil
-	}
-
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", "", "", 0); err != nil {
-		t.Fatalf("runHistoryTui error: %v", err)
-	}
-	if !called {
-		t.Fatal("expected selectSession to be called")
-	}
-}
-
-func TestRunHistoryTuiShowsYoloToggleWithPatchHistory(t *testing.T) {
-	lockCLITestHooks(t)
-	configDir := t.TempDir()
-	cfgPath := filepath.Join(configDir, "config.json")
-	prevEnsureProxy := ensureProxyPreferenceFunc
-	prevSelect := selectSession
-	t.Cleanup(func() {
-		ensureProxyPreferenceFunc = prevEnsureProxy
-		selectSession = prevSelect
-	})
-
-	phs, err := config.NewPatchHistoryStore(configDir)
-	if err != nil {
-		t.Fatalf("patch history: %v", err)
-	}
-	if err := phs.Upsert(config.PatchHistoryEntry{
-		Path:       "/tmp/codex",
-		OrigSHA256: "abc123",
-		PatchedAt:  time.Now(),
-	}); err != nil {
-		t.Fatalf("upsert patch history: %v", err)
-	}
-
-	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		return false, config.Config{Version: config.CurrentVersion}, nil
-	}
-
-	called := false
-	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
-		called = true
-		if !opts.ShowYoloToggle {
-			t.Fatalf("expected yolo toggle to be visible")
-		}
-		return nil, nil
-	}
-
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", "", "", 0); err != nil {
-		t.Fatalf("runHistoryTui error: %v", err)
-	}
-	if !called {
-		t.Fatal("expected selectSession to be called")
-	}
-}
-
-func TestRunHistoryTuiShowsYoloToggleWithPersistedFalse(t *testing.T) {
-	lockCLITestHooks(t)
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	prevEnsureProxy := ensureProxyPreferenceFunc
-	prevSelect := selectSession
-	t.Cleanup(func() {
-		ensureProxyPreferenceFunc = prevEnsureProxy
-		selectSession = prevSelect
-	})
-
-	disabled := false
-	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		return false, config.Config{
-			Version:     config.CurrentVersion,
-			YoloEnabled: &disabled,
-		}, nil
-	}
-
-	called := false
-	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
-		called = true
-		if !opts.ShowYoloToggle {
-			t.Fatalf("expected yolo toggle to stay visible when persisted false")
-		}
-		return nil, nil
-	}
-
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", "", "", 0); err != nil {
-		t.Fatalf("runHistoryTui error: %v", err)
-	}
-	if !called {
-		t.Fatal("expected selectSession to be called")
-	}
-}
-
 func TestRunHistoryTuiSkillsMenuReturnsToTuiLoop(t *testing.T) {
 	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
@@ -268,30 +152,6 @@ func historyDispatchTestTimeout(base time.Duration) time.Duration {
 	return base
 }
 
-func TestShouldShowYoloToggleReturnsTrueWhenPatchHistoryStoreInitFails(t *testing.T) {
-	blocker := filepath.Join(t.TempDir(), "blocked")
-	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
-		t.Fatalf("write blocker: %v", err)
-	}
-
-	got := shouldShowYoloToggle(config.Config{Version: config.CurrentVersion}, filepath.Join(blocker, "config.json"))
-	if !got {
-		t.Fatal("expected yolo toggle to remain visible when patch history store init fails")
-	}
-}
-
-func TestShouldShowYoloToggleReturnsTrueWhenPatchHistoryLoadFails(t *testing.T) {
-	configDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(configDir, "patch_history.json"), []byte("{invalid json"), 0o600); err != nil {
-		t.Fatalf("write patch history: %v", err)
-	}
-
-	got := shouldShowYoloToggle(config.Config{Version: config.CurrentVersion}, filepath.Join(configDir, "config.json"))
-	if !got {
-		t.Fatal("expected yolo toggle to remain visible when patch history load fails")
-	}
-}
-
 func TestRunHistoryTuiOpensNewSessionSelection(t *testing.T) {
 	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
@@ -313,7 +173,6 @@ func TestRunHistoryTuiOpensNewSessionSelection(t *testing.T) {
 		return &tui.Selection{
 			Cwd:      "/tmp/project",
 			UseProxy: true,
-			UseYolo:  true,
 		}, nil
 	}
 
@@ -328,7 +187,6 @@ func TestRunHistoryTuiOpensNewSessionSelection(t *testing.T) {
 		codexhistory.Project,
 		string,
 		string,
-		bool,
 		bool,
 		io.Writer,
 	) error {
@@ -345,15 +203,14 @@ func TestRunHistoryTuiOpensNewSessionSelection(t *testing.T) {
 		codexPath string,
 		codexDir string,
 		useProxy bool,
-		useYolo bool,
 		_ io.Writer,
 	) error {
 		called = true
 		if cwd != "/tmp/project" || codexPath != "codex-bin" || codexDir != "codex-home" {
 			t.Fatalf("unexpected selection args: cwd=%q codexPath=%q codexDir=%q", cwd, codexPath, codexDir)
 		}
-		if !useProxy || !useYolo {
-			t.Fatalf("expected selection flags to propagate, got useProxy=%v useYolo=%v", useProxy, useYolo)
+		if !useProxy {
+			t.Fatalf("expected proxy selection to propagate")
 		}
 		return nil
 	}
@@ -390,7 +247,6 @@ func TestRunHistoryTuiOpensExistingSessionSelection(t *testing.T) {
 			Session:  codexhistory.Session{SessionID: "sid"},
 			Project:  codexhistory.Project{Path: "/repo"},
 			UseProxy: false,
-			UseYolo:  true,
 		}, nil
 	}
 
@@ -403,7 +259,6 @@ func TestRunHistoryTuiOpensExistingSessionSelection(t *testing.T) {
 		string,
 		string,
 		string,
-		bool,
 		bool,
 		io.Writer,
 	) error {
@@ -423,7 +278,6 @@ func TestRunHistoryTuiOpensExistingSessionSelection(t *testing.T) {
 		codexPath string,
 		codexDir string,
 		useProxy bool,
-		useYolo bool,
 		_ io.Writer,
 	) error {
 		called = true
@@ -433,8 +287,8 @@ func TestRunHistoryTuiOpensExistingSessionSelection(t *testing.T) {
 		if codexPath != "codex-bin" || codexDir != "codex-home" {
 			t.Fatalf("unexpected codex args: %q %q", codexPath, codexDir)
 		}
-		if useProxy || !useYolo {
-			t.Fatalf("expected useProxy=false useYolo=true, got %v %v", useProxy, useYolo)
+		if useProxy {
+			t.Fatalf("expected direct selection")
 		}
 		return nil
 	}
@@ -477,7 +331,6 @@ func TestHistoryOpenReturnsSessionNotFound(t *testing.T) {
 		codexhistory.Project,
 		string,
 		string,
-		bool,
 		bool,
 		io.Writer,
 	) error {

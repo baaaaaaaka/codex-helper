@@ -14776,7 +14776,6 @@ func testSession() SessionContext {
 		Model:         "gpt-test",
 		Sandbox:       "workspace-write",
 		ProxyMode:     "on",
-		YoloMode:      "off",
 		CodexThreadID: "thread-0",
 	}
 }

@@ -2,6 +2,7 @@ package codexrunner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -19,6 +20,8 @@ type Runner interface {
 type TurnInput struct {
 	Prompt             string
 	ImagePaths         []string
+	AdditionalDirs     []string
+	OutputSchema       json.RawMessage
 	WorkingDir         string
 	ExtraArgs          []string
 	Timeout            time.Duration

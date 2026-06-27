@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -154,7 +155,7 @@ func TestStore_SaveStampsReaderFloor(t *testing.T) {
 	}
 }
 
-func TestStore_SaveKeepsFirstMinReaderGenerationRollbackCompatible(t *testing.T) {
+func TestStoreSaveCommitsApprovalBrokerGeneration(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	store, err := NewStore(path)
@@ -175,11 +176,37 @@ func TestStore_SaveKeepsFirstMinReaderGenerationRollbackCompatible(t *testing.T)
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("unmarshal config: %v", err)
 	}
-	if raw.Version != 2 {
-		t.Fatalf("first minReader-aware release must keep version=2 for v0.1.6 rollback, got %d", raw.Version)
+	if raw.Version != CurrentVersion {
+		t.Fatalf("Version=%d want %d", raw.Version, CurrentVersion)
 	}
 	if raw.MinReader != MinReaderVersion {
 		t.Fatalf("MinReader=%d want %d", raw.MinReader, MinReaderVersion)
+	}
+}
+
+func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"version":2,"minReader":1,"proxyEnabled":true,"yoloEnabled":true,"profiles":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("yoloEnabled")) {
+		t.Fatalf("legacy field survived migration: %s", raw)
 	}
 }
 

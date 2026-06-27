@@ -30,7 +30,7 @@ reuse the durable bridge state.
 - The local machine boundary, including WSL, Windows browser handoff, systemd
   user services, logs, filesystem permissions, and local malware risk.
 - The Codex CLI boundary. Teams mode must use the same managed install, proxy,
-  yolo, root/sudo, and `CODEX_HOME`/`CODEX_DIR` behavior as existing helper
+  standard approvals, root/sudo, and `CODEX_HOME`/`CODEX_DIR` behavior as existing helper
   commands.
 
 ## Authentication And Tokens

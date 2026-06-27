@@ -3,10 +3,10 @@ package codexrunner
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -46,6 +46,20 @@ func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerCloseHookRunsOnce(t *testing.T) {
+	var calls int
+	runner := &AppServerRunner{CloseHook: func() { calls++ }}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("close hook calls = %d, want 1", calls)
+	}
+}
+
 func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
@@ -66,7 +80,11 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 		Timeout:    time.Minute,
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	got, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:         "hello",
+		AdditionalDirs: []string{"/extra-a", "/extra-b"},
+		OutputSchema:   json.RawMessage(`{"type":"object"}`),
+	})
 	if err != nil {
 		t.Fatalf("StartThread error: %v", err)
 	}
@@ -83,11 +101,20 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[3], "thread/start")
 	assertParamString(t, writes[3], "cwd", "/work")
+	params := writes[3]["params"].(map[string]any)
+	roots, ok := params["runtimeWorkspaceRoots"].([]any)
+	if !ok || len(roots) != 2 || roots[0] != "/extra-a" || roots[1] != "/extra-b" {
+		t.Fatalf("runtimeWorkspaceRoots = %#v", params["runtimeWorkspaceRoots"])
+	}
 	assertParamAbsent(t, writes[3], "extra_args")
 	assertMethod(t, writes[4], "turn/start")
 	assertParamString(t, writes[4], "threadId", "thread-new")
 	assertTextInput(t, writes[4], "hello")
 	assertParamString(t, writes[4], "cwd", "/work")
+	turnParams := writes[4]["params"].(map[string]any)
+	if schema, ok := turnParams["outputSchema"].(map[string]any); !ok || schema["type"] != "object" {
+		t.Fatalf("outputSchema = %#v", turnParams["outputSchema"])
+	}
 	assertJSONRPC(t, writes[4])
 }
 
@@ -372,7 +399,7 @@ func TestAppServerRunnerHandlesNestedErrorNotification(t *testing.T) {
 	}
 }
 
-func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testing.T) {
+func TestAppServerRunnerApprovesInterleavedServerRequestAndKeepsWaiting(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
@@ -383,6 +410,7 @@ func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testin
 		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
 	)
 	runner := NewAppServerRunner(transport)
+	runner.ServerRequestHandler = AutomaticApprovalHandler{}
 
 	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
 	if err != nil {
@@ -391,13 +419,25 @@ func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testin
 	if got.FinalAgentMessage != "after request" {
 		t.Fatalf("final message = %q", got.FinalAgentMessage)
 	}
+	runner.serverWG.Wait()
 
 	writes := transport.decodedWrites(t)
-	if got := writes[5]["id"]; got != float64(99) {
-		t.Fatalf("server request response id = %#v, want 99 in %#v", got, writes[5])
+	var response map[string]any
+	for _, write := range writes {
+		if write["id"] == float64(99) {
+			response = write
+			break
+		}
 	}
-	if _, ok := writes[5]["error"].(map[string]any); !ok {
-		t.Fatalf("server request response missing error: %#v", writes[5])
+	if response == nil {
+		t.Fatalf("missing approval response in %#v", writes)
+	}
+	if got := response["id"]; got != float64(99) {
+		t.Fatalf("server request response id = %#v, want 99 in %#v", got, response)
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok || result["decision"] != "accept" {
+		t.Fatalf("server request response = %#v, want one-time accept", response)
 	}
 }
 
@@ -481,55 +521,41 @@ func TestAppServerRunnerBackfillsThreadNameAfterCompletedTurn(t *testing.T) {
 	assertParamAbsent(t, writes[5], "includeTurns")
 }
 
-func TestAppServerRunnerFallsBackWhenExtraArgsCannotBeTranslated(t *testing.T) {
+func TestAppServerRunnerFailsClosedWhenExtraArgsCannotBeTranslated(t *testing.T) {
 	transport := newFakeAppServerTransport()
-	fallback := &fakeRunner{
-		startResult: TurnResult{ThreadID: "fallback-thread", TurnID: "fallback-turn", Status: TurnStatusCompleted},
-	}
 	runner := &AppServerRunner{
 		Transport: transport,
-		Fallback:  fallback,
 		ExtraArgs: []string{"--model", "gpt-5"},
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatalf("StartThread fallback error: %v", err)
-	}
-	if got.ThreadID != "fallback-thread" || !fallback.startCalled {
-		t.Fatalf("fallback not used, result=%#v called=%v", got, fallback.startCalled)
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if !IsKind(err, ErrorUnsupported) {
+		t.Fatalf("StartThread error = %v, want unsupported", err)
 	}
 	if len(transport.writes) != 0 {
 		t.Fatalf("app-server was used despite unsupported extra args: %q", transport.writes)
 	}
 }
 
-func TestAppServerRunnerFallsBackWhenInitializationProbeFails(t *testing.T) {
+func TestAppServerRunnerFailsClosedWhenInitializationProbeFails(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"error":{"code":"unsupported","message":"thread list missing"}}`,
 	)
-	fallback := &fakeRunner{
-		startResult: TurnResult{ThreadID: "fallback-thread", TurnID: "fallback-turn", Status: TurnStatusCompleted},
-	}
 	var startReq AppServerStartRequest
 	runner := &AppServerRunner{
 		Starter: AppServerTransportStarterFunc(func(_ context.Context, req AppServerStartRequest) (AppServerLineTransport, error) {
 			startReq = req
 			return transport, nil
 		}),
-		Fallback: fallback,
 		Command:  "/managed/codex",
 		ExtraEnv: []string{"CODEX_HELPER_TEAMS_CHILD=1"},
 		Timeout:  time.Minute,
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatalf("StartThread fallback error: %v", err)
-	}
-	if got.ThreadID != "fallback-thread" || !fallback.startCalled {
-		t.Fatalf("fallback not used, result=%#v called=%v", got, fallback.startCalled)
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("StartThread error = %v, want app-server probe failure", err)
 	}
 	if startReq.Command != "/managed/codex" {
 		t.Fatalf("starter command = %q", startReq.Command)
@@ -617,6 +643,7 @@ func TestProbeAppServerCompatibilityRunsColdProbeRepeatedly(t *testing.T) {
 }
 
 type fakeAppServerTransport struct {
+	mu     sync.Mutex
 	reads  [][]byte
 	writes [][]byte
 	closed bool
@@ -631,11 +658,15 @@ func newFakeAppServerTransport(reads ...string) *fakeAppServerTransport {
 }
 
 func (t *fakeAppServerTransport) WriteLine(_ context.Context, line []byte) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.writes = append(t.writes, append([]byte{}, line...))
 	return nil
 }
 
 func (t *fakeAppServerTransport) ReadLine(context.Context) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if len(t.reads) == 0 {
 		return nil, io.EOF
 	}
@@ -645,12 +676,16 @@ func (t *fakeAppServerTransport) ReadLine(context.Context) ([]byte, error) {
 }
 
 func (t *fakeAppServerTransport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.closed = true
 	return nil
 }
 
 func (t *fakeAppServerTransport) decodedWrites(tb testing.TB) []map[string]any {
 	tb.Helper()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var writes []map[string]any
 	for _, line := range t.writes {
 		var decoded map[string]any
@@ -660,37 +695,6 @@ func (t *fakeAppServerTransport) decodedWrites(tb testing.TB) []map[string]any {
 		writes = append(writes, decoded)
 	}
 	return writes
-}
-
-type fakeRunner struct {
-	startCalled bool
-	startResult TurnResult
-	startErr    error
-}
-
-func (r *fakeRunner) StartThread(context.Context, TurnInput) (TurnResult, error) {
-	r.startCalled = true
-	return r.startResult, r.startErr
-}
-
-func (r *fakeRunner) ResumeThread(context.Context, string, TurnInput) (TurnResult, error) {
-	return TurnResult{}, errors.New("unexpected ResumeThread")
-}
-
-func (r *fakeRunner) StartTurn(context.Context, StartTurnInput) (TurnResult, error) {
-	return TurnResult{}, errors.New("unexpected StartTurn")
-}
-
-func (r *fakeRunner) InterruptTurn(context.Context, TurnRef) error {
-	return errors.New("unexpected InterruptTurn")
-}
-
-func (r *fakeRunner) ReadThread(context.Context, string) (Thread, error) {
-	return Thread{}, errors.New("unexpected ReadThread")
-}
-
-func (r *fakeRunner) ListThreads(context.Context, ListThreadsOptions) ([]Thread, error) {
-	return nil, errors.New("unexpected ListThreads")
 }
 
 func assertMethod(tb testing.TB, got map[string]any, want string) {

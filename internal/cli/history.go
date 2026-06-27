@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,24 +30,6 @@ var (
 )
 
 const defaultRefreshInterval = 5 * time.Second
-
-func shouldShowYoloToggle(cfg config.Config, configPath string) bool {
-	if cfg.YoloEnabled != nil {
-		return true
-	}
-
-	phs, err := config.NewPatchHistoryStore(filepath.Dir(configPath))
-	if err != nil {
-		return true
-	}
-
-	history, err := phs.Load()
-	if err != nil {
-		return true
-	}
-
-	return len(history.Entries) > 0
-}
 
 func newHistoryCmd(root *rootOptions) *cobra.Command {
 	var codexDir string
@@ -187,8 +168,6 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 				}
 				profile = &p
 			}
-			useYolo := resolveYoloEnabled(cfg)
-
 			sessionID := args[0]
 			session, project, err := findSessionWithProjectFunc(paths.CodexDir, sessionID)
 			if err != nil {
@@ -212,7 +191,6 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 				*codexPath,
 				*codexDir,
 				useProxy,
-				useYolo,
 				cmd.ErrOrStderr(),
 			)
 		},
@@ -235,8 +213,6 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		if err != nil {
 			return err
 		}
-		useYolo := resolveYoloEnabled(cfg)
-
 		var profile *config.Profile
 		if useProxy {
 			p, cfgWithProfile, err := ensureProfileFunc(ctx, store, profileRef, true, cmd.OutOrStdout())
@@ -255,7 +231,6 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		}
 
 		defaultCwd, _ := os.Getwd()
-		showYoloToggle := shouldShowYoloToggle(cfg, store.Path())
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
 				return codexhistory.DiscoverProjectsContext(ctx, paths.CodexDir)
@@ -263,13 +238,8 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			Version:         version,
 			ProxyEnabled:    useProxy,
 			ProxyConfigured: len(cfg.Profiles) > 0,
-			YoloEnabled:     useYolo,
-			ShowYoloToggle:  showYoloToggle,
 			RefreshInterval: refreshInterval,
 			DefaultCwd:      defaultCwd,
-			PersistYolo: func(enabled bool) error {
-				return persistYoloEnabled(store, enabled)
-			},
 			CheckUpdate: func(ctx context.Context) update.Status {
 				return update.CheckForUpdate(ctx, update.CheckOptions{
 					InstalledVersion: version,
@@ -320,7 +290,6 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 				codexPath,
 				codexDir,
 				selection.UseProxy,
-				selection.UseYolo,
 				cmd.ErrOrStderr(),
 			)
 		}
@@ -335,7 +304,6 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			codexPath,
 			codexDir,
 			selection.UseProxy,
-			selection.UseYolo,
 			cmd.ErrOrStderr(),
 		)
 	}

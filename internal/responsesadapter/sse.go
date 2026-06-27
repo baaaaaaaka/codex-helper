@@ -112,7 +112,8 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 		writeJSON(w, http.StatusBadGateway, errorBody("provider stream ended before completion"))
 		return
 	}
-	response := buildResponseObject(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, result.toolCalls)
+	visibleToolCalls := f.prepareProviderToolCalls(result.toolCalls)
+	response := buildResponseObject(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, visibleToolCalls)
 	if f.Store != nil {
 		if err := f.Store.Store(ResponseRecord{
 			ID:                 responseID,
@@ -272,14 +273,15 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				if !startedMessageItem && toolCalls.len() == 0 && !startedReasoningItem {
 					ensureMessageItem()
 				}
-				for _, doneItem := range buildDoneItems(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, toolCalls.records(), startedMessageItem, startedReasoningItem) {
+				records := toolCalls.records()
+				visibleRecords := f.prepareProviderToolCalls(records)
+				for _, doneItem := range buildDoneItems(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, visibleRecords, startedMessageItem, startedReasoningItem) {
 					writeEvent("response.output_item.done", map[string]any{
 						"output_index": doneItem.outputIndex,
 						"item":         doneItem.item,
 					})
 				}
-				records := toolCalls.records()
-				response := buildResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, records)
+				response := buildResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, visibleRecords)
 				if f.Store != nil {
 					if err := f.Store.Store(ResponseRecord{
 						ID:                 responseID,

@@ -320,7 +320,6 @@ func TestHistoryOpenPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 		string,
 		string,
 		bool,
-		bool,
 		io.Writer,
 	) error {
 		return nil
@@ -413,7 +412,6 @@ func TestHistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference(t *testing
 		_ string,
 		_ string,
 		useProxy bool,
-		_ bool,
 		_ io.Writer,
 	) error {
 		if gotProfile == nil || gotProfile.ID != profile.ID {
@@ -519,7 +517,6 @@ func TestRunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference(t *testi
 		_ string,
 		_ string,
 		useProxy bool,
-		_ bool,
 		_ io.Writer,
 	) error {
 		if gotProfile == nil || gotProfile.ID != profile.ID {
