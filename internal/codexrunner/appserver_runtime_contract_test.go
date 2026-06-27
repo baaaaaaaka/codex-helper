@@ -267,9 +267,22 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	if adapter.calls < 2 || !adapter.restoredHistory {
 		t.Fatalf("provider adapter state = calls:%d restored:%v", adapter.calls, adapter.restoredHistory)
 	}
-	providerMu.Lock()
-	analytics := bytes.Join(analyticsRequests, []byte("\n"))
-	providerMu.Unlock()
+	// Codex sends analytics asynchronously. Older supported builds can finish
+	// the turn before flushing the command-completion event even though the
+	// review event has already arrived. Wait only for the exact event required
+	// by this contract, with a short hard deadline so telemetry regressions still
+	// fail deterministically instead of becoming timing-dependent flakes.
+	analyticsDeadline := time.Now().Add(5 * time.Second)
+	var analytics []byte
+	for {
+		providerMu.Lock()
+		analytics = bytes.Join(analyticsRequests, []byte("\n"))
+		providerMu.Unlock()
+		if bytes.Contains(analytics, []byte(`"codex_command_execution_event"`)) || time.Now().After(analyticsDeadline) {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if len(analytics) == 0 {
 		t.Fatal("analytics was enabled but original Codex sent no analytics contract payload")
 	}

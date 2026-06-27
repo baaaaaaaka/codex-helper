@@ -67,17 +67,7 @@ func TestInstalledCodexRemoteTUIHandshake(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	commandLine := shellQuote(command) + " -c features.tui_app_server=true --remote " + shellQuote(remoteURL)
-	var cmd *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		windowsCommandLine := windowsCmdQuote(command) + ` -c "features.tui_app_server=true" --remote ` + windowsCmdQuote(remoteURL)
-		cmd = exec.CommandContext(ctx, ptyCommand, "cmd.exe", "/d", "/s", "/c", windowsCommandLine)
-	case "darwin":
-		cmd = exec.CommandContext(ctx, ptyCommand, "-q", "/dev/null", "/bin/sh", "-lc", commandLine)
-	default:
-		cmd = exec.CommandContext(ctx, ptyCommand, "-qefc", commandLine, "/dev/null")
-	}
+	cmd := remoteTUICommand(ctx, runtime.GOOS, ptyCommand, command, remoteURL)
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
 		"CODEX_HOME="+t.TempDir(),
@@ -119,6 +109,29 @@ func TestInstalledCodexRemoteTUIHandshake(t *testing.T) {
 			_ = cmd.Process.Kill()
 		}
 		<-done
+	}
+}
+
+func remoteTUICommand(ctx context.Context, goos, ptyCommand, command, remoteURL string) *exec.Cmd {
+	commandLine := shellQuote(command) + " -c features.tui_app_server=true --remote " + shellQuote(remoteURL)
+	switch goos {
+	case "windows":
+		windowsCommandLine := windowsCmdQuote(command) + ` -c "features.tui_app_server=true" --remote ` + windowsCmdQuote(remoteURL)
+		// GitHub Actions invokes winpty without an outer terminal. This explicit
+		// test-mode flag still allocates a real Windows PTY for Codex while
+		// allowing winpty's own stdin/stdout to be non-TTY CI pipes.
+		return exec.CommandContext(ctx, ptyCommand, "-Xallow-non-tty", "cmd.exe", "/d", "/s", "/c", windowsCommandLine)
+	case "darwin":
+		return exec.CommandContext(ctx, ptyCommand, "-q", "/dev/null", "/bin/sh", "-lc", commandLine)
+	default:
+		return exec.CommandContext(ctx, ptyCommand, "-qefc", commandLine, "/dev/null")
+	}
+}
+
+func TestRemoteTUICommandWindowsAllowsNonTTYCIHost(t *testing.T) {
+	cmd := remoteTUICommand(context.Background(), "windows", "winpty.exe", `C:\Program Files\Codex\codex.exe`, "ws://127.0.0.1:1234")
+	if len(cmd.Args) < 3 || cmd.Args[1] != "-Xallow-non-tty" || cmd.Args[2] != "cmd.exe" {
+		t.Fatalf("Windows remote TUI command = %#v, want winpty non-TTY mode before cmd.exe", cmd.Args)
 	}
 }
 
