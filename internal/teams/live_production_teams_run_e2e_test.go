@@ -264,7 +264,6 @@ func writeProductionThirdPartyModelConfig(t *testing.T, path string) {
 	cfg := config.Config{
 		Version:      config.CurrentVersion,
 		ProxyEnabled: boolPtr(false),
-		YoloEnabled:  boolPtr(true),
 		ModelProfiles: map[string]config.ModelProfile{
 			"deepseek-live": {
 				Provider:  "deepseek",

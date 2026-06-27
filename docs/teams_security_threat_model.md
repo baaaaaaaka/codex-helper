@@ -30,7 +30,7 @@ reuse the durable bridge state.
 - The local machine boundary, including WSL, Windows browser handoff, systemd
   user services, logs, filesystem permissions, and local malware risk.
 - The Codex CLI boundary. Teams mode must use the same managed install, proxy,
-  yolo, root/sudo, and `CODEX_HOME`/`CODEX_DIR` behavior as existing helper
+  standard approvals, root/sudo, and `CODEX_HOME`/`CODEX_DIR` behavior as existing helper
   commands.
 
 ## Authentication And Tokens
@@ -220,9 +220,10 @@ reuse the durable bridge state.
 - Helper upgrade integration drains new work, waits for active work to settle,
   flushes outbox/state, stops the active service around binary replacement, and
   restarts the service after the upgrade when it was active before.
-- Stable foreground exec turns cannot currently be interrupted mid-process by a
-  Teams `/cancel`. Running-turn cancellation is explicitly reported as
-  unsupported; queued turns can be canceled durably.
+- Running turns use the standard app-server interrupt contract for Teams
+  `/cancel`; queued turns remain cancelable through the durable queue. A
+  protocol failure is surfaced explicitly and never triggers a direct-exec
+  fallback.
 
 ## Residual Risks
 
@@ -233,7 +234,7 @@ reuse the durable bridge state.
 - `Files.Read`/`Files.ReadWrite` expands what the delegated token can read or
   write; it should remain opt-in and is required only for ordinary Teams file
   references and explicit outbound file send.
-- The experimental app-server runner remains optional until protocol
-  compatibility and performance probes across Codex versions are complete.
-- Streaming Teams output, automatic/rich outbound transfer UX, and true mid-turn
-  interrupt for the stable exec runner are deferred features.
+- The app-server approval broker is the standard runner. Protocol compatibility
+  and performance probes across supported Codex versions remain release gates.
+- Streaming Teams output and automatic/rich outbound transfer UX remain
+  deferred features.

@@ -121,7 +121,7 @@ Local cxp skills commands:
 - cxp skills migrate: migrate managed legacy skills from ~/.codex/skills to $HOME/.agents/skills
 
 Local cxp model/profile commands:
-- cxp run --yolo -- codex: launch Codex with YOLO mode enabled for one run
+- cxp run -- codex: launch the original Codex TUI through CXP's standard approval broker
 - cxp run --model-profile <name> -- codex: launch Codex with a saved model profile for one run
 - cxp model list/setup/use/doctor: list, configure, select, or validate built-in model choices
 - cxp model-profile setup/list/doctor/set-default/delete: create and manage named model profiles
@@ -238,7 +238,7 @@ func defaultControlFallbackHelpDigest() string {
 		controlAdvancedHelpText(),
 		"",
 		"Model/profile quick help:",
-		"`cxp run --yolo -- codex` - launch Codex with YOLO mode enabled for one run",
+		"`cxp run -- codex` - launch the original Codex TUI through CXP's standard approval broker",
 		"`cxp run --model-profile <name> -- codex` - launch Codex with a saved model profile for one run",
 		"`cxp model list` / `setup <model>` / `use <model>` / `doctor <model>` - manage built-in model choices",
 		"`cxp model-profile setup [name] --provider <provider> --model <model> --api-key-stdin --set-default` - create or update a named model profile",

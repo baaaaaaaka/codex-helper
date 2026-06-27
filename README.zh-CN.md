@@ -137,7 +137,7 @@ codex-proxy proxy doctor
 |------|------|
 | `codex-proxy` 或 `cxp` | 打开本地 Codex 历史 TUI |
 | `codex-proxy run -- <cmd> [args...]` | 使用当前直接/代理模式运行命令 |
-| `codex-proxy run --yolo -- codex` | 为本次运行启用 YOLO mode 启动 Codex |
+| `codex-proxy run -- codex` | 通过 CXP 标准审批 broker 启动原版 Codex TUI |
 | `codex-proxy run --model-profile <name> -- codex` | 使用保存的模型 profile 启动 Codex |
 | `codex-proxy model list` | 显示内置和已配置的模型选择 |
 | `codex-proxy model setup <model>` | 配置内置模型选择，例如 `deepseek`、`mimo`、`kimi`、`glm`、`minimax` 或 `qwen` |
@@ -165,7 +165,7 @@ codex-proxy proxy doctor
 | `codex-proxy completion <shell>` | 生成 shell completion |
 | `codex-proxy init` | 创建 SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | 使用当前模式运行命令；给出 profile 时强制使用代理（默认命令是 `codex`） |
-| `codex-proxy run --yolo -- codex` | 为本次运行启用 YOLO mode 启动 Codex |
+| `codex-proxy run -- codex` | 通过 CXP 标准审批 broker 启动原版 Codex TUI |
 | `codex-proxy run --model-profile <name> -- codex` | 使用保存的模型 profile 启动 Codex |
 | `codex-proxy tui` | 在终端 UI 中浏览 Codex 历史 |
 | `codex-proxy history tui` | 在终端 UI 中浏览 Codex 历史 |
@@ -244,8 +244,7 @@ codex-proxy proxy doctor
 常用 flags:
 
 - `--config /path/to/config.json` 覆盖 config file 路径
-- `run` 支持 `--yolo` 进行单次启动 YOLO mode；当命令是 Codex 时，也支持
-  `--model-profile <name>` 进行单次模型选择
+- 当命令是 Codex 时，`run` 支持 `--model-profile <name>` 进行单次模型选择
 - `app` 支持 `--model-profile <name>`，用于需要保存模型 profile 的桌面 App 启动
 - `tui` / `history tui` 支持 `--codex-dir`、`--codex-path`、`--profile` 和 `--refresh-interval`（默认 `5s`，用 `0` 禁用）
 - `history open` 支持 `--codex-dir`、`--codex-path` 和 `--profile`
@@ -255,20 +254,33 @@ codex-proxy proxy doctor
 
 </details>
 
-## 模型选择和 YOLO mode
+## 模型选择和标准审批
 
-### YOLO mode
+### 标准审批 runtime
 
-可以为单次 Codex 启动启用 YOLO mode:
+CXP 使用普通的 on-request 审批启动原版 Codex binary。本地 broker 收到支持的审批请求后
+固定等待 500 ms 再批准，因此用户不需要逐条手动操作：
 
 ```bash
-codex-proxy run --yolo -- codex
+codex-proxy run -- codex
 ```
 
-如果使用 history TUI，在打开或启动 session 前按 `Ctrl+Y`。状态栏会显示 YOLO
-mode 是否开启；再次按 `Ctrl+Y` 会为下一次启动关闭它。
+这套 runtime 要求 Codex CLI 0.131.0 或更高版本；较旧的 managed/PATH 安装会在
+第一次 broker turn 前自动升级。release compatibility sweep
+会同时验证 app-server handshake 和 remote TUI 能力。
 
-本地使用时，大多数用户只需要这个 flag 和 TUI toggle。
+Codex 内层 sandbox 在操作获批前仍保持受限。获批操作只能继承外层 host、container、
+cgroup、Slurm job 或 LSF job 已经授予的硬件和 mounts，不能突破外层隔离边界。Telemetry
+保持开启，并且 payload 不经过 CXP 修改。
+
+已接入 broker 的入口包括 Codex TUI/history、`codex exec` facade、Teams turn 和 Beacon
+worker。Contract CI 使用开启 analytics 的原版 Codex binary，并要求审批 telemetry 仍表现为
+普通的 `reviewer=user`、`status=approved`、`user_approved` 事件。CXP 不隐藏自己的
+app-server client identity，也不承诺服务端无法根据时序或其他正常 telemetry 推断自动化。
+
+`codex-proxy app` 仍然直接启动官方 Desktop App。Desktop App 目前没有稳定的外部
+app-server attachment contract，因此，在声称“所有 CXP surface 都已接入 broker”之前，
+Desktop 自动审批仍是 final release blocker；CXP 不会为这个入口静默回退到已经退役的执行机制。
 
 ### 内置模型选择
 
@@ -361,7 +373,6 @@ codex-proxy tui --codex-dir /path/to/.codex
 - New session: `(New Agent)` 条目或 `Ctrl+N`（在选中 project 或当前目录）
 - Expand/collapse subagents: `Ctrl+O`
 - Proxy mode: `Ctrl+P` toggle（状态显示 `Proxy mode (Ctrl+P): on/off`）
-- YOLO mode: 打开或启动 Codex session 前用 `Ctrl+Y` toggle
 - Skills menu: `Ctrl+K`
 - Refresh: `r`（或 `Ctrl+R`）
 - Quit: `q`、`Esc`、`Ctrl+C`
@@ -754,8 +765,8 @@ Beacon adapter troubleshooting:
   `cxp beacon --store <shared-store> worker ...`。
 - 如果 `$SHELL -lic` 在 tcsh/csh 下失败，用 `--adapter-shell direct` 更新 profile；profile
   revisions 会应用到未来 turns。
-- Beacon workers 默认以 yolo mode 启动 Codex，使 scheduler/container devices 和 mounts
-  保持可见；只有当 worker 必须保留 Codex sandboxing 时，才传 worker `--no-yolo`。
+- Beacon worker 会在 allocation 内启动标准审批 runtime，因此获批命令可以继承 scheduler
+  或 container 已授予的 devices 和 mounts，同时保留外层隔离边界。
 - 如果 worker doctor 报告 `missing codex`，设置 scheduler PATH 或从 adapter 传 worker
   `--codex-path <codex-or-wrapper>`。wrapper 对 path resolution 或额外 Codex exec flags
   仍有用，例如 `--skip-git-repo-check`；Teams service `--codex-arg` settings 不会自动到达

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,163 +50,16 @@ func TestBeaconHelpShowsRequiredOperationalFlags(t *testing.T) {
 	}
 }
 
-func TestRunBeaconWorkerJobTreatsFinalAnswerCanceledLaunchAsSuccess(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell fixture uses POSIX sh")
-	}
-	tempDir := t.TempDir()
-	readyPath := filepath.Join(tempDir, "ready")
-	codexPath := filepath.Join(tempDir, "codex")
-	finalText := "beacon final before canceled context"
-	script := fmt.Sprintf(`#!/bin/sh
-case "$1" in
-  --help)
-    echo 'usage codex --dangerously-bypass-approvals-and-sandbox'
-    exit 0
-    ;;
-esac
-printf '%%s\n' '{"type":"session_meta","payload":{"id":"thread-beacon"}}'
-printf '%%s\n' '{"type":"event_msg","payload":{"type":"agent_message","turn_id":"turn-beacon","phase":"final_answer","message":%q}}'
-printf '%%s\n' '{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-beacon","last_agent_message":%q}}'
-printf ready > %q
-exec sleep 30
-`, finalText, finalText, readyPath)
-	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write codex fixture: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	type runResult struct {
-		payload beacon.JobTerminalPayload
-		err     error
-	}
-	done := make(chan runResult, 1)
-	go func() {
-		payload, err := runBeaconWorkerJob(ctx, beacon.JobAttempt{
-			Payload: beacon.JobPayload{
-				Prompt:     "run remotely",
-				WorkingDir: tempDir,
-			},
-		}, codexPath, nil)
-		done <- runResult{payload: payload, err: err}
-	}()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(readyPath); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for codex fixture to emit terminal JSON")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	cancel()
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("runBeaconWorkerJob error = %v, want success", got.err)
-		}
-		if got.payload.Text != finalText || got.payload.CodexThreadID != "thread-beacon" || got.payload.CodexTurnID != "turn-beacon" || got.payload.Error != "" {
-			t.Fatalf("payload = %#v, want successful final terminal", got.payload)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for canceled worker job to return")
-	}
-}
-
-func TestRunBeaconWorkerJobPrependsDefaultYoloArgs(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell fixture uses POSIX sh")
-	}
-	tempDir := t.TempDir()
-	argsPath := filepath.Join(tempDir, "args")
-	codexPath := filepath.Join(tempDir, "codex")
-	finalText := "beacon yolo default"
-	script := fmt.Sprintf(`#!/bin/sh
-case "$1" in
-  --help)
-    echo 'usage codex --dangerously-bypass-approvals-and-sandbox'
-    exit 0
-    ;;
-esac
-printf '%%s\n' "$@" > %q
-cat >/dev/null
-printf '%%s\n' '{"type":"thread.started","thread_id":"thread-yolo"}'
-printf '%%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":%q}}'
-printf '%%s\n' '{"type":"turn.completed"}'
-`, argsPath, finalText)
-	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write codex fixture: %v", err)
-	}
-	payload, err := runBeaconWorkerJob(context.Background(), beacon.JobAttempt{
-		Payload: beacon.JobPayload{
-			Prompt:     "run remotely",
-			WorkingDir: tempDir,
-		},
-	}, codexPath, nil)
+func TestRunBeaconWorkerJobUsesStandardAppServer(t *testing.T) {
+	workDir := t.TempDir()
+	codexPath := writeBeaconCLICodexFixture(t, "beacon standard approval runtime")
+	payload, err := runBeaconWorkerJob(context.Background(), beacon.JobAttempt{Payload: beacon.JobPayload{
+		Prompt: "run remotely", WorkingDir: workDir,
+	}}, codexPath, nil)
 	if err != nil {
 		t.Fatalf("runBeaconWorkerJob: %v", err)
 	}
-	if payload.Text != finalText || payload.CodexThreadID != "thread-yolo" {
-		t.Fatalf("payload = %#v", payload)
-	}
-	rawArgs, err := os.ReadFile(argsPath)
-	if err != nil {
-		t.Fatalf("read args: %v", err)
-	}
-	args := strings.Fields(string(rawArgs))
-	wantPrefix := []string{"--dangerously-bypass-approvals-and-sandbox", "exec", "--json"}
-	if len(args) < len(wantPrefix) {
-		t.Fatalf("args too short: %q", rawArgs)
-	}
-	for i, want := range wantPrefix {
-		if args[i] != want {
-			t.Fatalf("args[%d] = %q, want %q; all args=%v", i, args[i], want, args)
-		}
-	}
-}
-
-func TestRunBeaconWorkerJobRequiresDefaultYoloUnlessDisabled(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell fixture uses POSIX sh")
-	}
-	tempDir := t.TempDir()
-	ranPath := filepath.Join(tempDir, "ran")
-	codexPath := filepath.Join(tempDir, "codex")
-	finalText := "beacon no yolo"
-	script := fmt.Sprintf(`#!/bin/sh
-case "$1" in
-  --help)
-    echo 'usage codex exec'
-    exit 0
-    ;;
-  --codex-helper-unsupported-flag-probe|--yolo|--dangerously-bypass-approvals-and-sandbox|--ask-for-approval)
-    echo "unknown option $1"
-    exit 2
-    ;;
-esac
-printf ran > %q
-cat >/dev/null
-printf '%%s\n' '{"type":"thread.started","thread_id":"thread-no-yolo"}'
-printf '%%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":%q}}'
-printf '%%s\n' '{"type":"turn.completed"}'
-`, ranPath, finalText)
-	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write codex fixture: %v", err)
-	}
-	job := beacon.JobAttempt{Payload: beacon.JobPayload{Prompt: "run remotely", WorkingDir: tempDir}}
-	payload, err := runBeaconWorkerJob(context.Background(), job, codexPath, nil)
-	if err == nil || !strings.Contains(err.Error(), "beacon worker yolo mode is required") {
-		t.Fatalf("runBeaconWorkerJob error = %v payload=%#v, want required yolo failure", err, payload)
-	}
-	if _, statErr := os.Stat(ranPath); !os.IsNotExist(statErr) {
-		t.Fatalf("codex should not run when required yolo is unsupported; statErr=%v", statErr)
-	}
-	payload, err = runBeaconWorkerJobWithOptions(context.Background(), job, codexPath, nil, beaconWorkerCodexOptions{Yolo: false})
-	if err != nil {
-		t.Fatalf("runBeaconWorkerJob --no-yolo option: %v", err)
-	}
-	if payload.Text != finalText || payload.CodexThreadID != "thread-no-yolo" {
+	if payload.Text != "beacon standard approval runtime" || payload.CodexThreadID != "thread-worker" || payload.Error != "" {
 		t.Fatalf("payload = %#v", payload)
 	}
 }
@@ -1052,53 +906,13 @@ func TestBeaconWorkerRunOnceClaimsJobAndWritesTerminal(t *testing.T) {
 	}
 }
 
-func TestBeaconWorkerRunOnceNoYoloFlagAllowsUnsupportedCodexYolo(t *testing.T) {
-	storePath := filepath.Join(t.TempDir(), "beacon.json")
-	store, err := beacon.NewStore(storePath)
+func TestBeaconWorkerHelpHasNoLegacyExecutionToggle(t *testing.T) {
+	out, err := runBeaconRootCommand(t, "beacon", "worker", "run-once", "--help")
 	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+		t.Fatal(err)
 	}
-	if err := store.Update(func(st *beacon.State) error {
-		st.Profiles["gpu"] = beacon.Profile{
-			Name:              "gpu",
-			Provider:          beacon.ProviderSlurm,
-			ProxyMode:         beacon.ProxyNone,
-			IsolationDefault:  beacon.IsolationShared,
-			SharedPath:        filepath.Dir(storePath),
-			Slurm:             beacon.SlurmProfile{Nodes: 1, GPUCount: 1, Partition: "interactive", Image: "image.sqsh", Duration: 4},
-			Confirmed:         true,
-			ProviderPreviewOK: true,
-			DoctorOK:          true,
-		}
-		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", Profile: "gpu", State: string(beacon.LeaseAccepting)}
-		req, _, err := beacon.EnsureAllocationRequest(st, "conv-1", "turn-1", beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"}, time.Unix(1, 0))
-		if err != nil {
-			return err
-		}
-		_, _, err = beacon.EnqueueJobAttempt(st, req.ID, st.Machines["machine-1"], beacon.JobPayload{Prompt: "remote prompt", WorkingDir: t.TempDir()}, time.Unix(2, 0))
-		return err
-	}); err != nil {
-		t.Fatalf("seed beacon job: %v", err)
-	}
-	codexPath := writeBeaconCLIUnsupportedYoloCodexFixture(t, "worker no yolo done")
-	out, err := runBeaconRootCommand(t, "beacon", "--store", storePath, "worker", "run-once", "--machine", "machine-1", "--worker", "worker-1", "--codex-path", codexPath, "--no-yolo")
-	if err != nil {
-		t.Fatalf("worker run-once --no-yolo: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "terminal=valid") || !strings.Contains(out, "outbox_queued=true") {
-		t.Fatalf("worker output = %s", out)
-	}
-	st, err := store.Load()
-	if err != nil {
-		t.Fatalf("load after worker: %v", err)
-	}
-	if len(st.Terminals) != 1 {
-		t.Fatalf("terminal count = %d, state=%#v", len(st.Terminals), st)
-	}
-	for _, terminal := range st.Terminals {
-		if !strings.Contains(terminal.Payload, "worker no yolo done") || !strings.Contains(terminal.Payload, "thread-worker-no-yolo") {
-			t.Fatalf("terminal payload = %#v", terminal)
-		}
+	if strings.Contains(out, "no-yolo") || strings.Contains(strings.ToLower(out), "yolo mode") {
+		t.Fatalf("worker help retained legacy execution mode:\n%s", out)
 	}
 }
 
@@ -1438,88 +1252,64 @@ func writeBeaconCLIProviderFixture(t *testing.T, output string) string {
 }
 
 func writeBeaconCLICodexFixture(t *testing.T, final string) string {
-	t.Helper()
-	if os.PathSeparator != '/' {
-		t.Skip("POSIX codex fixture script")
-	}
-	path := filepath.Join(t.TempDir(), "codex-fixture.sh")
-	body := strings.Join([]string{
-		"#!/bin/sh",
-		"case \"$1\" in",
-		"  --help)",
-		"    echo 'usage codex --dangerously-bypass-approvals-and-sandbox'",
-		"    exit 0",
-		"    ;;",
-		"esac",
-		"cat >/dev/null",
-		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-worker\"}'",
-		"printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":" + shellSingleQuoteForBeaconCLITestJSON(final) + "}}'",
-		"printf '%s\\n' '{\"type\":\"turn.completed\"}'",
-		"",
-	}, "\n")
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
-		t.Fatalf("write codex fixture: %v", err)
-	}
-	return path
-}
-
-func writeBeaconCLIUnsupportedYoloCodexFixture(t *testing.T, final string) string {
-	t.Helper()
-	if os.PathSeparator != '/' {
-		t.Skip("POSIX codex fixture script")
-	}
-	path := filepath.Join(t.TempDir(), "codex-no-yolo-fixture.sh")
-	body := strings.Join([]string{
-		"#!/bin/sh",
-		"case \"$1\" in",
-		"  --help)",
-		"    echo 'usage codex exec'",
-		"    exit 0",
-		"    ;;",
-		"  --codex-helper-unsupported-flag-probe|--yolo|--dangerously-bypass-approvals-and-sandbox|--ask-for-approval)",
-		"    echo \"unknown option $1\"",
-		"    exit 2",
-		"    ;;",
-		"esac",
-		"cat >/dev/null",
-		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-worker-no-yolo\"}'",
-		"printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":" + shellSingleQuoteForBeaconCLITestJSON(final) + "}}'",
-		"printf '%s\\n' '{\"type\":\"turn.completed\"}'",
-		"",
-	}, "\n")
-	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
-		t.Fatalf("write codex fixture: %v", err)
-	}
-	return path
+	return writeBeaconCLIAppServerFixture(t, []string{final})
 }
 
 func writeBeaconCLIStressCodexFixture(t *testing.T, total int) string {
+	messages := make([]string, 0, total)
+	for index := 0; index < total; index++ {
+		messages = append(messages, fmt.Sprintf("worker stress %d", index))
+	}
+	return writeBeaconCLIAppServerFixture(t, messages)
+}
+
+func writeBeaconCLIAppServerFixture(t *testing.T, messages []string) string {
 	t.Helper()
 	if os.PathSeparator != '/' {
-		t.Skip("POSIX codex fixture script")
+		t.Skip("POSIX app-server fixture script")
 	}
-	path := filepath.Join(t.TempDir(), "codex-stress-fixture.sh")
+	dir := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(dir, "codex-home"))
+	path := filepath.Join(dir, "codex-app-server-fixture.sh")
 	var body strings.Builder
 	body.WriteString("#!/bin/sh\n")
-	body.WriteString("case \"$1\" in\n")
-	body.WriteString("  --help)\n")
-	body.WriteString("    echo 'usage codex --dangerously-bypass-approvals-and-sandbox'\n")
-	body.WriteString("    exit 0\n")
-	body.WriteString("    ;;\n")
+	body.WriteString("case \"${1:-}\" in\n")
+	body.WriteString("  --version) echo 'codex-cli 0.133.0'; exit 0 ;;\n")
+	body.WriteString("  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;\n")
+	body.WriteString("  app-server) ;;\n")
+	body.WriteString("  *) exit 64 ;;\n")
 	body.WriteString("esac\n")
-	body.WriteString("cat >/dev/null\n")
-	body.WriteString("printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-worker\"}'\n")
-	for i := 0; i < total; i++ {
-		text := fmt.Sprintf("worker stress %d", i)
-		body.WriteString("printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"id\":\"item-")
-		body.WriteString(fmt.Sprintf("%d", i))
-		body.WriteString("\",\"type\":\"agent_message\",\"text\":")
-		body.WriteString(shellSingleQuoteForBeaconCLITestJSON(text))
-		body.WriteString("}}'\n")
+	body.WriteString("while IFS= read -r line; do\n")
+	body.WriteString("  id=$(printf %s \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n")
+	body.WriteString("  case \"$line\" in\n")
+	body.WriteString("    *'\"method\":\"initialize\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\n' \"$id\" ;;\n")
+	body.WriteString("    *'\"method\":\"thread/list\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"data\":[]}}\n' \"$id\" ;;\n")
+	body.WriteString("    *'\"method\":\"thread/start\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"thread-worker\"}}}\n' \"$id\" ;;\n")
+	body.WriteString("    *'\"method\":\"thread/resume\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"thread-worker\"}}}\n' \"$id\" ;;\n")
+	body.WriteString("    *'\"method\":\"thread/read\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"thread-worker\",\"name\":\"Worker thread\"}}}\n' \"$id\" ;;\n")
+	body.WriteString("    *'\"method\":\"turn/start\"'*)\n")
+	body.WriteString("      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"turn\":{\"id\":\"turn-worker\",\"status\":\"inProgress\",\"items\":[]}}}\n' \"$id\"\n")
+	for index, message := range messages {
+		event, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "item/completed",
+			"params": map[string]any{
+				"threadId": "thread-worker",
+				"turnId":   "turn-worker",
+				"item":     map[string]any{"id": fmt.Sprintf("item-%d", index), "type": "agentMessage", "text": message},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body.WriteString("      printf '%s\n' " + shellSingleQuoteForBeaconCLITest(string(event)) + "\n")
 	}
-	body.WriteString("printf '%s\\n' '{\"type\":\"turn.completed\"}'\n")
+	body.WriteString("      printf '%s\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-worker\",\"turn\":{\"id\":\"turn-worker\",\"status\":\"completed\",\"items\":[]}}}'\n")
+	body.WriteString("      ;;\n")
+	body.WriteString("  esac\n")
+	body.WriteString("done\n")
 	if err := os.WriteFile(path, []byte(body.String()), 0o700); err != nil {
-		t.Fatalf("write codex stress fixture: %v", err)
+		t.Fatalf("write app-server fixture: %v", err)
 	}
 	return path
 }
@@ -1528,11 +1318,11 @@ func waitForBeaconMachineByProviderJob(t *testing.T, store *beacon.Store, provid
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		st, err := store.Load()
+		state, err := store.Load()
 		if err != nil {
 			t.Fatalf("load beacon state while waiting for machine: %v", err)
 		}
-		for _, machine := range st.Machines {
+		for _, machine := range state.Machines {
 			if machine.ProviderJobID == providerJobID {
 				return machine
 			}

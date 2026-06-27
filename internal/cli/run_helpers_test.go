@@ -441,34 +441,6 @@ func TestRunTargetOnceWithOptionsFailures(t *testing.T) {
 	})
 }
 
-func TestRunTargetWithFallbackYoloRetry(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mockcmd")
-	if runtime.GOOS == "windows" {
-		path += ".cmd"
-	}
-	unix := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--yolo\" ]; then\n    echo \"yolo unknown\"\n    exit 1\n  fi\ndone\nexit 0\n"
-	win := "@echo off\r\nset has=0\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"%~1\"==\"--yolo\" set has=1\r\nshift\r\ngoto loop\r\n:done\r\nif \"%has%\"==\"1\" (\r\n  echo yolo unknown\r\n  exit /b 1\r\n)\r\nexit /b 0\r\n"
-	writeStub(t, dir, "mockcmd", unix, win)
-
-	called := false
-	opts := runTargetOptions{
-		UseProxy:    false,
-		YoloEnabled: true,
-		OnYoloFallback: func() error {
-			called = true
-			return nil
-		},
-	}
-	cmdArgs := []string{path, "--yolo"}
-	if err := runTargetWithFallbackWithOptions(context.Background(), cmdArgs, "", nil, nil, opts); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !called {
-		t.Fatalf("expected yolo fallback callback to be called")
-	}
-}
-
 func TestRunWithNewStackOptionsSuccess(t *testing.T) {
 	lockCLITestHooks(t)
 	shell := requireShell(t)

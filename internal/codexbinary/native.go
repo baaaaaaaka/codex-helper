@@ -1,4 +1,4 @@
-package cloudgate
+package codexbinary
 
 import (
 	"errors"
@@ -313,34 +313,4 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 		triple,
 		strings.Join(dedupePaths(candidates), ", "),
 	)
-}
-
-// PrepareYoloBinary finds the native Codex binary, patches it for yolo mode
-// (permissive system requirements), and returns the patched binary path plus
-// any extra environment variables.
-func PrepareYoloBinary(codexWrapperPath string, cacheDir string) (*PatchResult, []string, error) {
-	return PrepareYoloBinaryForIdentity(codexWrapperPath, cacheDir, "")
-}
-
-func PrepareYoloBinaryForIdentity(codexWrapperPath string, cacheDir string, reqIdentity string) (*PatchResult, []string, error) {
-	nativeBin, pathDir, err := FindNativeBinaryWithRetry(codexWrapperPath)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	result, err := PatchCodexBinaryForIdentity(nativeBin, cacheDir, reqIdentity)
-	if err != nil {
-		return nil, nil, fmt.Errorf("patch binary: %w", err)
-	}
-
-	var extraEnv []string
-	if pathDir != "" {
-		// Prepend the vendor path directory to PATH, mirroring the Node.js wrapper.
-		currentPath := os.Getenv("PATH")
-		extraEnv = append(extraEnv, "PATH="+pathDir+string(os.PathListSeparator)+currentPath)
-	}
-	// The Node.js wrapper sets this; some codex features may check for it.
-	extraEnv = append(extraEnv, "CODEX_MANAGED_BY_NPM=1")
-
-	return result, extraEnv, nil
 }

@@ -15,8 +15,53 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
+	"github.com/baaaaaaaka/codex-helper/internal/codexbinary"
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 )
+
+func TestEnsureCodexBrokerRuntimeUpgradesOldManagedCapability(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capability fixtures")
+	}
+	lockCLITestHooks(t)
+	oldPath := writeProbeScript(t, t.TempDir(), "codex-old", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.115.0';; --help) echo 'Codex CLI';; esac\n")
+	newPath := writeProbeScript(t, t.TempDir(), "codex-new", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.131.0';; --help) echo 'Options: --remote <ADDR>';; esac\n")
+	previousUpgrade := upgradeCodexForBrokerRuntime
+	t.Cleanup(func() { upgradeCodexForBrokerRuntime = previousUpgrade })
+	var upgraded bool
+	upgradeCodexForBrokerRuntime = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		upgraded = opts.upgradeCodex
+		return newPath, nil
+	}
+	resolved, err := ensureCodexBrokerRuntime(context.Background(), oldPath, io.Discard, codexInstallOptions{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !upgraded || resolved != newPath {
+		t.Fatalf("upgraded=%v resolved=%q, want %q", upgraded, resolved, newPath)
+	}
+}
+
+func TestEnsureCodexBrokerRuntimeRejectsOldExplicitBinaryWithoutMutatingIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capability fixture")
+	}
+	oldPath := writeProbeScript(t, t.TempDir(), "codex-old", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.115.0';; --help) echo 'Codex CLI';; esac\n")
+	before, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureCodexBrokerRuntime(context.Background(), oldPath, io.Discard, codexInstallOptions{}, false); err == nil || !strings.Contains(err.Error(), "0.131.0") {
+		t.Fatalf("error = %v", err)
+	}
+	after, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("explicit Codex binary was modified")
+	}
+}
 
 func containsPath(paths []string, target string) bool {
 	target = filepath.Clean(target)
@@ -3142,8 +3187,8 @@ func TestCodexProbeFailureHintForStatusDLLNotFound(t *testing.T) {
 }
 
 func TestProbeCodexIntegration(t *testing.T) {
-	if os.Getenv("CODEX_PATCH_TEST") != "1" {
-		t.Skip("skipping: set CODEX_PATCH_TEST=1 to run against real codex")
+	if os.Getenv("CODEX_RUNTIME_TEST") != "1" {
+		t.Skip("skipping: set CODEX_RUNTIME_TEST=1 to run against real codex")
 	}
 
 	path, err := exec.LookPath("codex")
@@ -3155,12 +3200,43 @@ func TestProbeCodexIntegration(t *testing.T) {
 	if !probeCodex(context.Background(), path) {
 		t.Fatalf("probeCodex returned false for %s", path)
 	}
+	helpCommand := exec.Command(path, "--help")
+	helpBytes, err := helpCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("codex --help: %v", err)
+	}
+	help := string(helpBytes)
+	if !strings.Contains(help, "--remote") {
+		t.Fatalf("Codex %s lacks the remote TUI transport required by the standard approval runtime", path)
+	}
 
 	found, err := findInstalledCodex(context.Background())
 	if err != nil {
 		t.Fatalf("findInstalledCodex error: %v", err)
 	}
 	t.Logf("findInstalledCodex returned: %s", found)
+
+	// Version support is defined by the app-server handshake, not merely by
+	// whether `codex --version` exits successfully. Keep this auth-free and
+	// isolated so the release sweep can exercise every supported package.
+	t.Setenv(envCodexHome, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	probe, err := codexrunner.ProbeAppServerCompatibility(ctx, codexrunner.AppServerProbeOptions{
+		Starter:    codexrunner.PolicyAppServerStarter{},
+		Command:    found,
+		Args:       []string{"--analytics-default-enabled"},
+		WorkingDir: t.TempDir(),
+		Timeout:    30 * time.Second,
+		Runs:       1,
+		Limit:      1,
+	})
+	if err != nil {
+		t.Fatalf("app-server compatibility probe: %v", err)
+	}
+	if len(probe.Runs) != 1 {
+		t.Fatalf("app-server probe runs = %d, want 1", len(probe.Runs))
+	}
 }
 
 func TestEnsureCodexInstalledIntegrationManagedNode(t *testing.T) {
@@ -3337,7 +3413,7 @@ func assertWindowsManagedCodexInstall(t *testing.T, npmPrefix string, installerO
 		t.Fatalf("codex.ps1 must not depend on a public node.cmd shim, got:\n%s", ps1Text)
 	}
 
-	nativeBin, _, err := cloudgate.FindNativeBinary(codexCmd)
+	nativeBin, _, err := codexbinary.FindNativeBinary(codexCmd)
 	if err != nil {
 		t.Fatalf("managed codex shim must remain compatible with native binary discovery: %v\nshim:\n%s", err, shimText)
 	}

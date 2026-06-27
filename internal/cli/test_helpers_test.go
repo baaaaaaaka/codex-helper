@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
@@ -44,6 +45,12 @@ func writeProbeScript(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+func setTestCodexHomeEnv(t *testing.T, codexDir string) {
+	t.Helper()
+	t.Setenv(codexhistory.EnvCodexDir, codexDir)
+	t.Setenv(envCodexHome, codexDir)
+}
+
 func writeStub(t *testing.T, dir, name, unix, win string) {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -55,15 +62,6 @@ func writeStub(t *testing.T, dir, name, unix, win string) {
 	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
-}
-
-func withCodexYoloRuntimeGOOS(t *testing.T, goos string) {
-	t.Helper()
-	previous := codexYoloRuntimeGOOS
-	codexYoloRuntimeGOOS = goos
-	t.Cleanup(func() {
-		codexYoloRuntimeGOOS = previous
-	})
 }
 
 func requireStringSlice(t *testing.T, got, want []string) {

@@ -1,6 +1,9 @@
 # Teams Integration Plan
 
-Status: active product and architecture plan; proof of concept succeeded, core implementation is in progress, and later product requirements are tracked here before implementation.
+Status: active product and architecture plan. Teams uses the standard
+`AppServerRunner` approval broker; historical implementation sequencing is
+retained below only for provenance. Protocol incompatibility fails closed and
+never selects the retired direct `ExecRunner` path.
 
 Implementation tracker: `docs/teams_integration_execution_plan.md`.
 
@@ -30,7 +33,7 @@ Implementation tracker: `docs/teams_integration_execution_plan.md`.
 
 ## Goal
 
-Add a Teams mode to `codex-helper` so the user can create and manage Codex conversations from Microsoft Teams while preserving existing `codex-helper` behavior, install paths, proxy behavior, yolo mode, history behavior, and upgrade flow.
+Add a Teams mode to `codex-helper` so the user can create and manage Codex conversations from Microsoft Teams while preserving existing `codex-helper` behavior, install paths, proxy behavior, standard approval runtime, history behavior, and upgrade flow.
 
 ## Recommended Shape
 
@@ -222,7 +225,7 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 - Preserve:
   - managed Codex install behavior
   - proxy setup and teardown
-  - yolo mode
+  - standard approval runtime
   - effective path resolution
   - root and sudo identity handling
   - `CODEX_HOME` / `CODEX_DIR`
@@ -235,7 +238,8 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   - `InterruptTurn`
   - `ReadThread`
   - `ListThreads`
-- Implement `ExecRunner` first as the stable fallback:
+- The original implementation introduced `ExecRunner` first as a bootstrap
+  path; it is now retired as an execution fallback:
   - use `codex exec --json` for new sessions
   - use `codex exec resume --json <thread-id>` for existing sessions
   - capture `thread.started`, `turn.started`, final assistant messages, failures, and token usage
@@ -246,13 +250,14 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
   Codex JSONL history discovered through the existing history code. Runner
   read/list data may enrich metadata, but must not replace local transcript
   ordering unless it exposes stable ordered transcript item ids.
-- Implement `AppServerRunner` as the preferred low-latency path behind an experimental gate:
+- Implement `AppServerRunner` as the standard approval path:
   - start and supervise `codex app-server`
   - initialize the newline-delimited app-server protocol
   - use `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, `thread/read`, and `thread/list`
   - align request/response structs with the generated Codex app-server schema for the installed Codex version; do not pass CLI args through as unknown protocol fields
   - treat `turn/completed` items as potentially empty and backfill via `thread/read includeTurns=true` or local JSONL before publishing final transcript output
-  - probe protocol compatibility at startup and automatically fall back to `ExecRunner` if unsupported
+  - probe protocol compatibility at startup and fail closed if unsupported;
+    never fall back to the retired direct runner
   - keep one warm app-server per compatible Codex environment instead of starting a new Codex process for every Teams message
 - Keep `codex mcp-server` as a compatibility/reference path only. It is useful when another MCP client wants to call Codex as a tool, but it does not provide the best durable UI/session-management surface for Teams mode.
 - Directly invoking the native Codex binary can be considered later as a small startup optimization, but only after preserving the Node wrapper's vendor `PATH` setup and managed-install environment behavior.
@@ -263,7 +268,7 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 - Persist the Codex `thread_id` as the durable session handle.
 - Persist the Codex session file/fingerprint and stable transcript item
   checkpoint when a Teams work chat is linked to a local Codex session.
-- Persist the Teams chat id, latest known Codex turn id, Codex version, cwd, effective Codex home, profile, model, sandbox, proxy/yolo mode, and runner kind.
+- Persist the Teams chat id, latest known Codex turn id, Codex version, cwd, effective Codex home, profile, model, sandbox, proxy/runtime mode, and runner kind.
 - On startup:
   - start or reconnect the selected runner
   - resume each active session by exact `thread_id`
@@ -290,7 +295,9 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 ## Latency And Cache Strategy
 
 - Prefer warm `AppServerRunner` for long-running Teams mode because it avoids per-message wrapper/native process startup and preserves more in-memory Codex session state.
-- Keep `ExecRunner` available for correctness, compatibility, and recovery when app-server protocol probing fails.
+- Treat app-server compatibility as a release contract. If probing fails, stop
+  with an actionable compatibility error; never recover by selecting the
+  retired direct execution path.
 - Keep model, provider, reasoning effort, profile, cwd, sandbox policy, permissions, and tool/MCP configuration stable within a Codex session.
 - Put only the user's new message into the Codex turn input.
 - Keep Teams metadata out of the prompt. Store Teams message ids, timestamps, URLs, and chat/thread metadata in helper state instead.

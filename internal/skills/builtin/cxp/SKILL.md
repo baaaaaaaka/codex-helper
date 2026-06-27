@@ -1,13 +1,13 @@
 ---
 name: cxp
-description: "Use when a user asks about cxp, codex-proxy, or codex-helper operations: proxy/SSH profiles, model profiles/Responses adapter/YOLO mode, Teams helper/control/work chats, cross-machine delegation/remote agents, Codex history or skills, upgrades, beacon/execution target/profile switching, Slurm/LSF/GPU/local execution, and safe handoffs for operations that can interrupt Codex."
+description: "CXP/codex-proxy/codex-helper operations: proxy/SSH profiles, model profiles/Responses adapter/standard approvals, Teams helper/control/work chats, cross-machine delegation/remote agents, Codex history or skills, upgrades, beacon/execution target/profile switching, Slurm/LSF/GPU/local execution, and safe handoffs that can interrupt Codex."
 ---
 
 # cxp
 
 Use the installed `cxp` command, falling back to `codex-proxy` if `cxp` is not on PATH. In Teams-launched Codex turns, prefer `$CODEX_HELPER_CLI_PATH` when it is set because the helper service may not inherit the user's interactive shell startup files.
 
-Trigger on related requests even when the user does not say `cxp`: model profiles, Responses adapter, YOLO mode, beacon mode, execution target/profile switching, GPU/Slurm/LSF/local execution, Teams helper/control/work chats, cross-machine delegation/remote agents/asking another signed-in machine, proxy/SSH profiles, history, skills, and upgrades.
+Trigger on related requests even when the user does not say `cxp`: model profiles, Responses adapter, standard approval runtime, beacon mode, execution target/profile switching, GPU/Slurm/LSF/local execution, Teams helper/control/work chats, cross-machine delegation/remote agents/asking another signed-in machine, proxy/SSH profiles, history, skills, and upgrades.
 
 Read live help before changing behavior: `cxp --help`, `cxp <command> --help`, and `cxp <command> <subcommand> --help`. For the command map and workflows, load `references/commands.md`.
 

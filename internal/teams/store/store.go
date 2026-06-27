@@ -718,7 +718,6 @@ type SessionContext struct {
 	ModelProfile      modelprofile.Snapshot `json:"model_profile,omitempty"`
 	Sandbox           string                `json:"sandbox,omitempty"`
 	ProxyMode         string                `json:"proxy_mode,omitempty"`
-	YoloMode          string                `json:"yolo_mode,omitempty"`
 	CreatedAt         time.Time             `json:"created_at,omitempty"`
 	UpdatedAt         time.Time             `json:"updated_at,omitempty"`
 }

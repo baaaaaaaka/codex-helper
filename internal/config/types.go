@@ -3,10 +3,10 @@ package config
 import "time"
 
 // CurrentVersion is the schema generation this binary stamps into configs it
-// writes. It stays at 2 for the first minReader-aware release so v0.1.6 can
-// still read config files after rollback; future additive schema changes can
-// bump this while keeping MinReaderVersion stable.
-const CurrentVersion = 2
+// writes. Generation 3 stops writing the legacy execution-mode toggle and adds
+// broker migration metadata. Both changes are reader-compatible: older readers
+// ignore the metadata and already treat an absent toggle as disabled.
+const CurrentVersion = 3
 
 // MinReaderVersion is the minimum reader generation required to SAFELY read a
 // config written by this binary. Raise it ONLY for breaking schema changes
@@ -20,17 +20,24 @@ const MinReaderVersion = 1
 // config whose minReader exceeds it is rejected with ErrStaleReader (this build
 // is too old to read it). It moves together with MinReaderVersion when a
 // breaking change lands.
-const SupportedReaderVersion = 1
+const SupportedReaderVersion = MinReaderVersion
 
 type Config struct {
-	Version             int                     `json:"version"`
-	MinReader           int                     `json:"minReader,omitempty"`
-	ProxyEnabled        *bool                   `json:"proxyEnabled,omitempty"`
-	YoloEnabled         *bool                   `json:"yoloEnabled,omitempty"`
-	Profiles            []Profile               `json:"profiles"`
-	Instances           []Instance              `json:"instances,omitempty"`
-	DefaultModelProfile string                  `json:"defaultModelProfile,omitempty"`
-	ModelProfiles       map[string]ModelProfile `json:"modelProfiles,omitempty"`
+	Version   int `json:"version"`
+	MinReader int `json:"minReader,omitempty"`
+	// RuntimeGeneration records that this installation has successfully
+	// initialized the generation-1 broker runtime. RuntimeCleanupPending keeps
+	// post-commit compatibility cleanup retryable without making an activated
+	// installation fall back to the retired runner.
+	RuntimeGeneration     int                     `json:"runtimeGeneration,omitempty"`
+	RuntimeMigrationID    string                  `json:"runtimeMigrationId,omitempty"`
+	RuntimeMigratedAt     time.Time               `json:"runtimeMigratedAt,omitempty"`
+	RuntimeCleanupPending bool                    `json:"runtimeCleanupPending,omitempty"`
+	ProxyEnabled          *bool                   `json:"proxyEnabled,omitempty"`
+	Profiles              []Profile               `json:"profiles"`
+	Instances             []Instance              `json:"instances,omitempty"`
+	DefaultModelProfile   string                  `json:"defaultModelProfile,omitempty"`
+	ModelProfiles         map[string]ModelProfile `json:"modelProfiles,omitempty"`
 }
 
 type Profile struct {

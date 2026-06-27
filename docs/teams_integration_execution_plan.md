@@ -1,6 +1,14 @@
 # Teams Integration Execution Plan
 
-Status: active implementation tracker.
+Status: historical implementation tracker with current-runtime corrections.
+
+Current runtime note: Teams now uses the standard `AppServerRunner` approval
+broker by default. The former direct `ExecRunner` fallback and experimental
+runner switch are retired. Protocol incompatibility fails closed and is caught
+by the minimum/latest Codex contract matrix; it never selects the old execution
+path. Historical module descriptions below are retained for implementation
+provenance, and the corrected M6 status is authoritative where older text
+conflicts with it.
 
 This document breaks the archived Teams research plan into implementation modules that can be assigned, reviewed, merged, and tested independently.
 
@@ -13,7 +21,8 @@ This document breaks the archived Teams research plan into implementation module
 - Every worker patch must include focused tests for the files it changes.
 - Do not silently replay a Codex turn after an ambiguous crash. Preserve explicit recovery semantics.
 - Treat Teams as a transport. Codex session ownership, locks, state, and recovery belong to `codex-helper`.
-- Keep `AppServerRunner` experimental until protocol compatibility probes and fallback behavior are tested.
+- Keep the standard `AppServerRunner` path fail-closed; protocol drift must be
+  detected by contract probes rather than hidden by a runner fallback.
 - Do not require Teams channel send, Azure Bot, or Slack app creation for the MVP.
 - Keep durable Teams identity and ledgers as the source of truth. The legacy
   cache registry may remain as a projection and compatibility source, but
@@ -38,7 +47,7 @@ This document breaks the archived Teams research plan into implementation module
 4. `M3`: Teams transport hardening.
 5. `M4`: bridge/orchestrator state machine.
 6. `M5`: CLI operations and operator UX.
-7. `M6`: experimental `AppServerRunner`.
+7. `M6`: standard approval `AppServerRunner`.
 8. `M7`: background service, upgrade drain/recover protocol.
 9. `M8`: broad verification matrix.
 10. `M9`: explicit outbound attachment send.
@@ -280,7 +289,7 @@ Responsibilities:
   user-facing references so the user can select by number without making Codex
   interpret the command.
 - Persist Teams chat id to Codex `thread_id` mapping.
-- Persist latest Codex turn id, runner kind, Codex version, cwd, Codex home, profile, model, sandbox, proxy mode, and yolo mode.
+- Persist latest Codex turn id, runner kind, Codex version, cwd, Codex home, profile, model, sandbox, proxy mode, and standard approval runtime state.
 - Persist stable dashboard view state for bare-number control-chat selections:
   view id, item mapping, source fingerprint, generated time, and expiry.
 - Persist session origin and sync state:
@@ -457,7 +466,7 @@ Responsibilities:
 Constraints:
 
 - The production runner must not call `exec.LookPath("codex")` directly as the only launch path.
-- The production runner must preserve managed install, proxy setup, yolo mode, effective path resolution, root/sudo identity, `CODEX_HOME`/`CODEX_DIR`, self-update guard, and proxy-health termination.
+- The production runner must preserve managed install, proxy setup, the standard approval runtime, effective path resolution, root/sudo identity, `CODEX_HOME`/`CODEX_DIR`, self-update guard, and proxy-health termination.
 - Avoid importing `internal/cli` from `internal/teams`; prevent cycles by keeping CLI-specific launch adaptation at the CLI boundary.
 - Direct OpenAI API calls are out of scope.
 - Do not make a direct native-binary path the default until wrapper environment behavior is preserved.
@@ -483,7 +492,7 @@ Tests:
 Status:
 
 - Completed first implementation slice.
-- Completed M2b CLI boundary adapter for existing managed install, proxy, yolo, effective path, and self-update behavior.
+- Completed M2b CLI boundary adapter for existing managed install, proxy, standard approval runtime, effective path, and self-update behavior.
 - Follow-up before AppServerRunner: add real `codex exec --json` fixtures,
   local session JSONL transcript fixtures, and compatibility probes.
 
@@ -767,7 +776,8 @@ Status:
   - `teams run` is the normal foreground entrypoint
   - `teams listen` remains a compatibility alias
   - `teams run --upgrade-codex` upgrades the managed Codex CLI once before polling starts, refuses `--codex-path`, and refuses to run while another Teams bridge owns the state
-  - `teams run --runner appserver` exposes the experimental app-server runner while `exec` remains the default
+  - `teams run` uses the standard app-server approval runtime; the legacy
+    `exec` runner name remains only as an input-compatible alias
   - `teams run --control-fallback-model` controls the model for unrecognized
     control-chat requests and defaults to `gpt-5.3-codex-spark`
   - `teams status`, `teams doctor`, `teams recover`, `teams auth status`, and `teams auth logout` are wired
@@ -775,7 +785,7 @@ Status:
   - `teams status` includes poll diagnostics for chat cursor health, poll errors, and full-window warnings
   - `teams doctor --live` explicitly opts into Graph `/me` and control-chat read checks; default doctor remains local-only
 
-## M6: Experimental AppServerRunner
+## M6: Standard Approval AppServerRunner
 
 Owner: app-server worker after `M2`.
 
@@ -807,13 +817,14 @@ Responsibilities:
     `ExecRunner`; do not forward raw CLI `extra_args` as unknown protocol
     fields
 - Probe compatibility at startup.
-- Fall back to `ExecRunner` if initialization or protocol probes fail.
+- Fail closed if initialization or protocol probes fail; never fall back to the
+  retired direct runner.
 - Keep one warm app-server per compatible Codex environment.
 
 Constraints:
 
-- Keep this path behind an experimental setting until tested across Codex versions.
-- Do not make app-server required for MVP correctness.
+- Keep minimum/latest Codex schema, remote-TUI, WebSocket, telemetry, and
+  approval contracts required in CI.
 - Use newline-delimited JSON-RPC 2.0 framing for current Codex app-server versions; verify generated schema compatibility before broadening support.
 
 Tests:
@@ -829,8 +840,12 @@ Tests:
 
 Status:
 
-- Partial: experimental `AppServerRunner` exists with JSON-RPC request framing, fake-protocol tests, initialization probe, request encoding, notification parsing, structured errors, transport crash handling, real stdio process transport, and fallback on initialization/probe failure.
-- Partial: CLI opt-in exists through `teams run --runner appserver`; default remains stable `exec`.
+- Completed: `AppServerRunner` is the production Teams runner with JSON-RPC
+  request multiplexing, cancellation, duplicate approval idempotency,
+  notification routing, structured errors, and real stdio transport.
+- Completed: `teams run` defaults to the app-server broker; `exec` and
+  `appserver` runner spellings resolve to the same implementation for upgrade
+  compatibility.
 - Completed current-install probe: `teams doctor --appserver-probe` performs a no-model app-server initialize/thread-list compatibility check and closes the warm process before returning. Local probe on this workstation passed in 582ms.
 - Completed P1 latency probe slice: `teams doctor --appserver-probe-runs N`
   now performs repeated cold app-server initialize/thread-list probes and
@@ -840,7 +855,10 @@ Status:
   immediate response plus later completion notifications, `turn/completed`
   failed/interrupted states, nested error notifications, token usage updates,
   and unsupported interleaved server requests.
-- Pending: broader real Codex protocol compatibility probes across versions and performance comparison before making app-server the default.
+- Completed: auth-free schema sweeps and authenticated synthetic approval
+  contracts cover the minimum supported and latest Codex versions across
+  Linux, macOS, and Windows. The release monitor continues probing future
+  versions.
 
 ## M7: Background Service And Upgrade Compatibility
 
@@ -1415,7 +1433,7 @@ Responsibilities:
 - Build a feature-level test matrix across:
   - direct mode
   - proxy mode
-  - yolo mode
+  - standard approval runtime
   - custom `CODEX_HOME` / `CODEX_DIR`
   - root/sudo identity behavior
   - WSL auth/browser handoff
@@ -1586,15 +1604,14 @@ Status:
 
 ## Current Blockers
 
-- `M6` depends on Codex app-server protocol compatibility and must stay optional until more versions are probed.
+- Codex app-server compatibility is a release gate; unsupported protocol drift
+  blocks the release monitor and requires a CXP update.
 - Threat-model decisions are documented in `docs/teams_security_threat_model.md`; keep that file updated before service mode becomes default.
 - Background service install/start/stop/restart exists for Linux systemd user services, and helper upgrade handles active-service stop/start around the binary replacement.
-- `AppServerRunner` remains optional and experimental; the current installed Codex app-server probe passes, but broader version compatibility and latency probes are still pending.
 - Explicit outbound upload transfer now has an MVP behind `teams send-file` and
   `/send-file`; automatic generated-artifact handoff is implemented for the
   narrow manifest contract under the Teams outbound root. Large-file upload
-  sessions, broad local-path upload UX, running-turn interrupt for the stable
-  exec runner, and streaming output remain deferred.
+  sessions, broad local-path upload UX, and streaming output remain deferred.
   Ordinary inbound Teams reference files are supported only through the narrow
   SharePoint/Graph `/shares` path with file scope enabled.
 - Long-message transport is now constrained by the measured Teams HTML body

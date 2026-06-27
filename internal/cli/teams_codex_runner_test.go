@@ -1,8 +1,9 @@
 package cli
 
 import (
+	"bufio"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,435 +21,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-func TestTeamsCodexLauncherUsesManagedRunPathHeadlessly(t *testing.T) {
-	lockCLITestHooks(t)
-	if os.PathSeparator != '/' {
-		t.Skip("shell stub test uses POSIX script")
-	}
-
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(false)}); err != nil {
-		t.Fatalf("Save config: %v", err)
-	}
-
-	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
-	codexDir := t.TempDir()
-	setTestCodexHomeEnv(t, codexDir)
-	writeFakeCache(t, codexDir)
-	originalAuth := writeTestAuthJSON(t, codexDir, true)
-
-	prevRun := runTargetWithFallbackWithOptionsFn
-	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRun })
-	var gotArgs []string
-	var gotOpts runTargetOptions
-	runTargetWithFallbackWithOptionsFn = func(_ context.Context, cmdArgs []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
-		gotArgs = append([]string{}, cmdArgs...)
-		gotOpts = opts
-		stdin, err := io.ReadAll(opts.Stdin)
-		if err != nil {
-			t.Fatalf("read stdin: %v", err)
-		}
-		if string(stdin) != "prompt text" {
-			t.Fatalf("stdin = %q", string(stdin))
-		}
-		if !cacheExists(t, codexDir) {
-			t.Fatal("Teams yolo launch should install a cloud requirements bypass cache before Codex starts")
-		}
-		cache := readTestCloudRequirementsCache(t, codexDir)
-		if cache.Signature == "" {
-			t.Fatal("Teams yolo launch should sign the cloud requirements bypass cache")
-		}
-		if cache.SignedPayload.ChatGPTUserID != "user_test" || cache.SignedPayload.AccountID != "org_test" {
-			t.Fatalf("cache identity = %#v", cache.SignedPayload)
-		}
-		if cache.SignedPayload.Contents != nil {
-			t.Fatalf("cache contents = %#v, want nil", *cache.SignedPayload.Contents)
-		}
-		authDuringRun, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
-		if err != nil {
-			t.Fatalf("read auth during run: %v", err)
-		}
-		if authJSONHasPlanClaim(t, authDuringRun) {
-			t.Fatal("Teams yolo launch should mask workspace plan auth before Codex starts")
-		}
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-managed"}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"turn.completed"}`)
-		return nil
-	}
-
-	launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard}
-	result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
-		Command: codexPath,
-		Args:    []string{"exec", "--json", "-"},
-		Dir:     t.TempDir(),
-		Stdin:   "prompt text",
-	})
-	if err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-	if !reflect.DeepEqual(gotArgs, []string{codexPath, "-c", `cli_auth_credentials_store="file"`, "--dangerously-bypass-approvals-and-sandbox", "exec", "--json", "-"}) {
-		t.Fatalf("cmd args = %#v", gotArgs)
-	}
-	if gotOpts.UseProxy {
-		t.Fatal("expected direct run options")
-	}
-	if gotOpts.PreserveTTY {
-		t.Fatal("Teams launcher must not preserve TTY")
-	}
-	if !gotOpts.YoloEnabled {
-		t.Fatal("Teams launcher should force yolo mode even when global config has yolo disabled")
-	}
-	if !gotOpts.RequireYolo {
-		t.Fatal("Teams launcher must not fall back to sandbox mode when yolo launch is rejected")
-	}
-	if gotOpts.Stdout == nil || gotOpts.Stderr == nil || gotOpts.Stdin == nil {
-		t.Fatalf("headless IO not configured: %#v", gotOpts)
-	}
-	if !hasExplicitCodexHomeEnv(gotOpts.ExtraEnv) {
-		t.Fatalf("expected Codex home env in launch options: %#v", gotOpts.ExtraEnv)
-	}
-	if !hasEnvValue(gotOpts.ExtraEnv, envTeamsCodexChild, "1") {
-		t.Fatalf("expected Teams child marker env in launch options: %#v", gotOpts.ExtraEnv)
-	}
-	if !hasEnvValue(gotOpts.ExtraEnv, envTeamsCodexParentPID, fmt.Sprint(os.Getpid())) {
-		t.Fatalf("expected Teams parent pid env in launch options: %#v", gotOpts.ExtraEnv)
-	}
-	if envValue(gotOpts.ExtraEnv, envTeamsHelperCLIPath) == "" {
-		t.Fatalf("expected Teams helper CLI path env in launch options: %#v", gotOpts.ExtraEnv)
-	}
-	if !strings.Contains(string(result.Stdout), "thread-managed") {
-		t.Fatalf("stdout was not captured: %s", string(result.Stdout))
-	}
-	authAfterRun, err := os.ReadFile(filepath.Join(codexDir, "auth.json"))
-	if err != nil {
-		t.Fatalf("read auth after run: %v", err)
-	}
-	if !reflect.DeepEqual(authAfterRun, originalAuth) {
-		t.Fatal("Teams yolo launch should restore auth after Codex exits")
-	}
-	if cacheExists(t, codexDir) {
-		t.Fatal("Teams yolo launch should remove the bypass cache after Codex exits")
-	}
-}
-
-func TestTeamsCodexLauncherCapsStderrCI(t *testing.T) {
-	lockCLITestHooks(t)
-	if os.PathSeparator != '/' {
-		t.Skip("shell stub test uses POSIX script")
-	}
-
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false), YoloEnabled: boolPtr(false)}); err != nil {
-		t.Fatalf("Save config: %v", err)
-	}
-
-	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
-	codexDir := t.TempDir()
-	setTestCodexHomeEnv(t, codexDir)
-	writeFakeCache(t, codexDir)
-	writeTestAuthJSON(t, codexDir, true)
-
-	prevRun := runTargetWithFallbackWithOptionsFn
-	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRun })
-	runTargetWithFallbackWithOptionsFn = func(_ context.Context, _ []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
-		_, _ = opts.Stderr.Write([]byte(strings.Repeat("x", teamsCodexStderrCaptureBytes+4096)))
-		_, _ = opts.Stderr.Write([]byte("tail-marker"))
-		return errors.New("codex exited after noisy stderr")
-	}
-
-	launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard}
-	result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
-		Command: codexPath,
-		Args:    []string{"exec", "--json", "-"},
-		Dir:     t.TempDir(),
-		Stdin:   "prompt text",
-	})
-	if err == nil {
-		t.Fatal("Launch error = nil, want noisy stderr helper error")
-	}
-	if !result.StderrTruncated {
-		t.Fatal("StderrTruncated = false, want true")
-	}
-	if len(result.Stderr) > teamsCodexStderrCaptureBytes {
-		t.Fatalf("stderr len = %d, want <= %d", len(result.Stderr), teamsCodexStderrCaptureBytes)
-	}
-	if !strings.Contains(string(result.Stderr), "tail-marker") {
-		t.Fatal("stderr tail marker missing after truncation")
-	}
-}
-
-func TestTeamsCodexLauncherModelProfileWithoutSSHRespectsDisabledProxyPreferenceCI(t *testing.T) {
-	lockCLITestHooks(t)
-	if os.PathSeparator != '/' {
-		t.Skip("shell stub test uses POSIX script")
-	}
-
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	disabled := false
-	if err := store.Save(config.Config{
-		Version:      config.CurrentVersion,
-		ProxyEnabled: &disabled,
-		ModelProfiles: map[string]config.ModelProfile{
-			"deepseek-live": {
-				Provider:  "deepseek",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				Revision:  1,
-			},
-		},
-	}); err != nil {
-		t.Fatalf("Save config: %v", err)
-	}
-	t.Setenv("DEEPSEEK_API_KEY", "sk-ci-deepseek")
-
-	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
-	setTestCodexHomeEnv(t, t.TempDir())
-
-	prevEnsureProxy := ensureProxyPreferenceRunFn
-	prevRunTarget := runTargetWithFallbackWithOptionsFn
-	t.Cleanup(func() {
-		ensureProxyPreferenceRunFn = prevEnsureProxy
-		runTargetWithFallbackWithOptionsFn = prevRunTarget
-	})
-	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		return false, config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}, nil
-	}
-
-	var gotArgs []string
-	var gotOpts runTargetOptions
-	runTargetWithFallbackWithOptionsFn = func(_ context.Context, cmdArgs []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
-		gotArgs = append([]string{}, cmdArgs...)
-		gotOpts = opts
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-model-profile"}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"turn.completed"}`)
-		return nil
-	}
-
-	launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard, modelProfileRef: "deepseek-live"}
-	result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
-		Command: codexPath,
-		Args:    []string{"exec", "--json", "-"},
-		Dir:     t.TempDir(),
-		Stdin:   "prompt text",
-	})
-	if err != nil {
-		t.Fatalf("Launch: %v", err)
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("exit code = %d", result.ExitCode)
-	}
-	if gotOpts.UseProxy {
-		t.Fatalf("UseProxy = true, want false when global proxy preference is disabled")
-	}
-	if envValue(gotOpts.ExtraEnv, envCXPResponsesProxyKey) == "" {
-		t.Fatalf("missing model profile proxy key env: %v", gotOpts.ExtraEnv)
-	}
-	if !strings.Contains(strings.Join(gotArgs, "\n"), `model_providers.`+cxpCodexModelProviderID+`.requires_openai_auth=false`) {
-		t.Fatalf("missing third-party codex config override: %v", gotArgs)
-	}
-}
-
-func TestTeamsCodexLauncherModelProfileWithoutSSHServiceDefaultsDirectWhenProxyUnsetCI(t *testing.T) {
-	lockCLITestHooks(t)
-	if os.PathSeparator != '/' {
-		t.Skip("shell stub test uses POSIX script")
-	}
-
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	if err := store.Save(config.Config{
-		Version: config.CurrentVersion,
-		ModelProfiles: map[string]config.ModelProfile{
-			"deepseek-live": {
-				Provider:  "deepseek",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				Revision:  1,
-			},
-		},
-	}); err != nil {
-		t.Fatalf("Save config: %v", err)
-	}
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	t.Setenv("DEEPSEEK_API_KEY", "sk-ci-deepseek")
-
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	prevStdin := os.Stdin
-	os.Stdin = reader
-	t.Cleanup(func() {
-		os.Stdin = prevStdin
-		_ = reader.Close()
-		_ = writer.Close()
-	})
-
-	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
-	setTestCodexHomeEnv(t, t.TempDir())
-
-	prevRunTarget := runTargetWithFallbackWithOptionsFn
-	t.Cleanup(func() { runTargetWithFallbackWithOptionsFn = prevRunTarget })
-
-	var gotArgs []string
-	var gotOpts runTargetOptions
-	runTargetWithFallbackWithOptionsFn = func(_ context.Context, cmdArgs []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
-		gotArgs = append([]string{}, cmdArgs...)
-		gotOpts = opts
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-model-profile-default-direct"}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"turn.completed"}`)
-		return nil
-	}
-
-	type launchResult struct {
-		result codexrunner.LaunchResult
-		err    error
-	}
-	done := make(chan launchResult, 1)
-	launchDir := t.TempDir()
-	go func() {
-		launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard, modelProfileRef: "deepseek-live"}
-		result, err := launcher.Launch(context.Background(), codexrunner.LaunchRequest{
-			Command: codexPath,
-			Args:    []string{"exec", "--json", "-"},
-			Dir:     launchDir,
-			Stdin:   "prompt text",
-		})
-		done <- launchResult{result: result, err: err}
-	}()
-
-	var result codexrunner.LaunchResult
-	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("Launch: %v", got.err)
-		}
-		result = got.result
-	case <-time.After(5 * time.Second):
-		t.Fatal("Teams model-profile launch blocked on stdin")
-	}
-	if result.ExitCode != 0 {
-		t.Fatalf("exit code = %d", result.ExitCode)
-	}
-	if gotOpts.UseProxy {
-		t.Fatalf("UseProxy = true, want service-mode default direct when proxy preference is unset")
-	}
-	if envValue(gotOpts.ExtraEnv, envCXPResponsesProxyKey) == "" {
-		t.Fatalf("missing model profile proxy key env: %v", gotOpts.ExtraEnv)
-	}
-	if !strings.Contains(strings.Join(gotArgs, "\n"), `model_providers.`+cxpCodexModelProviderID+`.requires_openai_auth=false`) {
-		t.Fatalf("missing third-party codex config override: %v", gotArgs)
-	}
-	updated, err := store.Load()
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if updated.ProxyEnabled == nil || *updated.ProxyEnabled {
-		t.Fatalf("expected service launch to persist ProxyEnabled=false, got %v", updated.ProxyEnabled)
-	}
-}
-
-func TestTeamsCodexLauncherModelProfileWithoutSSHUsesGlobalProxyPreferenceCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	for _, tc := range []struct {
-		name     string
-		snapshot modelprofile.Snapshot
-	}{
-		{
-			name:     "default",
-			snapshot: modelprofile.Snapshot{Name: "default", Provider: "default", Revision: 1},
-		},
-		{
-			name:     "third-party",
-			snapshot: modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "env:MIMO_KEY", Revision: 1},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfgPath := filepath.Join(t.TempDir(), "config.json")
-			store, err := config.NewStore(cfgPath)
-			if err != nil {
-				t.Fatalf("NewStore: %v", err)
-			}
-			enabled := true
-			profile := config.Profile{ID: "p1", Name: "primary", Host: "example.com", User: "coder", CreatedAt: time.Now()}
-			if err := store.Save(config.Config{
-				Version:      config.CurrentVersion,
-				ProxyEnabled: &enabled,
-				Profiles:     []config.Profile{profile},
-			}); err != nil {
-				t.Fatalf("Save config: %v", err)
-			}
-
-			prevEnsureProxy := ensureProxyPreferenceRunFn
-			prevEnsureProfile := ensureProfileRunFn
-			t.Cleanup(func() {
-				ensureProxyPreferenceRunFn = prevEnsureProxy
-				ensureProfileRunFn = prevEnsureProfile
-			})
-			ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-				return true, config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled, Profiles: []config.Profile{profile}}, nil
-			}
-			wantErr := errors.New("stop after proxy selection")
-			var gotProfileRef string
-			ensureProfileRunFn = func(_ context.Context, _ *config.Store, profileRef string, _ bool, _ io.Writer) (config.Profile, config.Config, error) {
-				gotProfileRef = profileRef
-				return config.Profile{}, config.Config{}, wantErr
-			}
-
-			launcher := teamsCodexLauncher{root: &rootOptions{configPath: cfgPath}, log: io.Discard, modelProfileSnapshot: tc.snapshot}
-			_, err = launcher.Launch(context.Background(), codexrunner.LaunchRequest{
-				Command: "codex",
-				Args:    []string{"exec", "--json", "-"},
-				Dir:     t.TempDir(),
-				Stdin:   "prompt text",
-			})
-			if !errors.Is(err, wantErr) {
-				t.Fatalf("Launch error = %v, want %v", err, wantErr)
-			}
-			if gotProfileRef != "" {
-				t.Fatalf("profile ref = %q, want generic global proxy profile selection", gotProfileRef)
-			}
-		})
-	}
-}
+// Legacy direct-exec launcher tests were replaced by app-server contract tests below.
 
 func TestTeamsCodexChildEnvExposesHelperCLIPathAndDir(t *testing.T) {
 	prevExecutablePath := teamsChildExecutablePath
@@ -808,7 +388,7 @@ func TestTeamsCodexExecutorPassesImageInputToRunner(t *testing.T) {
 	}
 }
 
-func TestNewManagedTeamsCodexExecutorCanUseExperimentalAppServerRunner(t *testing.T) {
+func TestNewManagedTeamsCodexExecutorUsesStandardAppServerRunner(t *testing.T) {
 	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{"--model", "gpt-test"}, "", time.Minute, io.Discard)
 	if err != nil {
 		t.Fatalf("newManagedTeamsCodexExecutor appserver error: %v", err)
@@ -821,21 +401,233 @@ func TestNewManagedTeamsCodexExecutorCanUseExperimentalAppServerRunner(t *testin
 	if !ok {
 		t.Fatalf("runner type = %T, want AppServerRunner", teamsExecutor.runner)
 	}
-	if runner.Starter == nil || runner.Fallback == nil {
-		t.Fatalf("appserver runner missing starter or fallback: %#v", runner)
+	if runner.Starter == nil {
+		t.Fatalf("appserver runner missing policy starter: %#v", runner)
 	}
 	if runner.Command != "/tmp/codex" || runner.WorkingDir != "/work" || runner.Timeout != time.Minute {
 		t.Fatalf("appserver runner config mismatch: %#v", runner)
 	}
-	if !reflect.DeepEqual(runner.ExtraArgs, []string{"--model", "gpt-test"}) {
-		t.Fatalf("appserver extra args = %#v", runner.ExtraArgs)
-	}
-	if len(runner.AppServerArgs) != 0 {
-		t.Fatalf("appserver process args should be separate from turn args: %#v", runner.AppServerArgs)
+	wantArgs := []string{"--analytics-default-enabled", "-c", `model="gpt-test"`}
+	if !reflect.DeepEqual(runner.AppServerArgs, wantArgs) {
+		t.Fatalf("appserver args = %#v, want %#v", runner.AppServerArgs, wantArgs)
 	}
 	if runner.BackfillThreadName {
 		t.Fatal("Teams appserver runner should request thread name backfill per turn, not globally")
 	}
+}
+
+func TestTeamsStandardRuntimeRestoresSavedProxyAndCodexHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX app-server fixture")
+	}
+	lockCLITestHooks(t)
+	rootDir := t.TempDir()
+	codexHome := filepath.Join(rootDir, "codex-home")
+	setTestCodexHomeEnv(t, codexHome)
+	store, err := config.NewStore(filepath.Join(rootDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:           config.CurrentVersion,
+		RuntimeGeneration: currentRuntimeGeneration,
+		ProxyEnabled:      &enabled,
+		Profiles:          []config.Profile{{ID: "proxy-1", Name: "proxy", Host: "host", Port: 22, User: "user"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previousProxy := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = previousProxy })
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		return "http://127.0.0.1:18080", nil
+	}
+	envPath := filepath.Join(rootDir, "child.env")
+	codexPath := filepath.Join(rootDir, "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.133.0'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  app-server)
+    printf '%%s|%%s\n' "${HTTP_PROXY:-}" "${CODEX_HOME:-}" > %s
+    while IFS= read -r line; do
+      id=$(printf %%s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      case "$line" in
+        *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{}}\n' "$id" ;;
+        *'"method":"thread/list"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"data":[]}}\n' "$id" ;;
+		*'"method":"thread/start"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"thread-teams"}}}\n' "$id" ;;
+		*'"method":"thread/read"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"thread-teams","name":"Teams thread","turns":[{"id":"turn-teams","status":"completed","items":[{"type":"agentMessage","text":"ok"}]}]}}}\n' "$id" ;;
+        *'"method":"turn/start"'*)
+          printf '{"jsonrpc":"2.0","id":%%s,"result":{"turn":{"id":"turn-teams","status":"inProgress","items":[]}}}\n' "$id"
+          printf '%%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-teams","turnId":"turn-teams","item":{"id":"final","type":"agentMessage","text":"ok"}}}'
+          printf '%%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-teams","turn":{"id":"turn-teams","status":"completed","items":[]}}}' ;;
+      esac
+    done ;;
+  *) exit 64 ;;
+esac
+`, shellSingleQuoteForBeaconCLITest(envPath))
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer executor.(teamsCodexExecutor).Close()
+	result, err := executor.Run(context.Background(), &teams.Session{Cwd: rootDir}, "reply ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "ok" {
+		t.Fatalf("result = %#v", result)
+	}
+	raw, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "http://127.0.0.1:18080|"+codexHome {
+		t.Fatalf("child runtime env = %q", got)
+	}
+}
+
+func TestTeamsStandardRuntimeRunsTwoSessionsConcurrentlyOnSharedProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX test-binary app-server wrapper")
+	}
+	lockCLITestHooks(t)
+	rootDir := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(rootDir, "codex-home"))
+	store, err := config.NewStore(filepath.Join(rootDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	testBinary, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(rootDir, "codex")
+	wrapper := `#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.142.3'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  app-server) CXP_TEAMS_PARALLEL_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsParallelAppServerHelperProcess$' -- ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(codexPath, []byte(wrapper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", 5*time.Second, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := executor.(teamsCodexExecutor)
+	defer managed.Close()
+
+	type outcome struct {
+		result teams.ExecutionResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	for index := range 2 {
+		index := index
+		go func() {
+			result, runErr := managed.Run(context.Background(), &teams.Session{Cwd: rootDir}, fmt.Sprintf("session %d", index+1))
+			results <- outcome{result: result, err: runErr}
+		}()
+	}
+	seen := map[string]bool{}
+	for range 2 {
+		out := <-results
+		if out.err != nil {
+			t.Fatalf("parallel Teams session failed: result=%#v err=%v", out.result, out.err)
+		}
+		seen[out.result.CodexThreadID] = strings.HasPrefix(out.result.Text, "done thread-")
+	}
+	if len(seen) != 2 || !seen["thread-1"] || !seen["thread-2"] {
+		t.Fatalf("parallel Teams results = %#v", seen)
+	}
+}
+
+func TestTeamsParallelAppServerHelperProcess(t *testing.T) {
+	if os.Getenv("CXP_TEAMS_PARALLEL_APP_SERVER") != "1" {
+		t.Skip("helper process only")
+	}
+	type message struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	type turn struct {
+		requestID int64
+		threadID  string
+		turnID    string
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64<<10), 16<<20)
+	threadSequence := 0
+	turns := make([]turn, 0, 2)
+	approvalResponses := 0
+	write := func(format string, args ...any) {
+		_, _ = fmt.Fprintf(os.Stdout, format+"\n", args...)
+	}
+	for scanner.Scan() {
+		var request message
+		if json.Unmarshal(scanner.Bytes(), &request) != nil {
+			os.Exit(2)
+		}
+		if request.Method == "" {
+			approvalResponses++
+			if approvalResponses == 2 {
+				for _, turn := range turns {
+					write(`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":%q,"turnId":%q,"item":{"id":"final","type":"agentMessage","text":%q}}}`, turn.threadID, turn.turnID, "done "+turn.threadID)
+					write(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":%q,"turn":{"id":%q,"status":"completed","items":[]}}}`, turn.threadID, turn.turnID)
+				}
+			}
+			continue
+		}
+		var id int64
+		if len(request.ID) > 0 {
+			_ = json.Unmarshal(request.ID, &id)
+		}
+		switch request.Method {
+		case "initialized":
+		case "initialize":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{}}`, id)
+		case "thread/list":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"data":[]}}`, id)
+		case "thread/start":
+			threadSequence++
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":%q}}}`, id, "thread-"+strconv.Itoa(threadSequence))
+		case "thread/read":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(request.Params, &params)
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":%q,"name":%q}}}`, id, params.ThreadID, "Teams "+params.ThreadID)
+		case "turn/start":
+			var params struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(request.Params, &params)
+			turns = append(turns, turn{requestID: id, threadID: params.ThreadID, turnID: "turn-" + params.ThreadID})
+			if len(turns) == 2 {
+				for index := len(turns) - 1; index >= 0; index-- {
+					turn := turns[index]
+					write(`{"jsonrpc":"2.0","id":%d,"result":{"turn":{"id":%q,"status":"inProgress","items":[]}}}`, turn.requestID, turn.turnID)
+				}
+				for index, turn := range turns {
+					write(`{"jsonrpc":"2.0","id":%d,"method":"item/commandExecution/requestApproval","params":{"threadId":%q,"turnId":%q}}`, 900+index, turn.threadID, turn.turnID)
+				}
+			}
+		default:
+			os.Exit(3)
+		}
+	}
+	os.Exit(0)
 }
 
 func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServer(t *testing.T) {
@@ -880,6 +672,14 @@ func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServe
 }
 
 func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
+	lockCLITestHooks(t)
+	previousPrepare := prepareTeamsAppServerModelProfileForRunner
+	defer func() { prepareTeamsAppServerModelProfileForRunner = previousPrepare }()
+	var capturedSnapshot modelprofile.Snapshot
+	prepareTeamsAppServerModelProfileForRunner = func(_ context.Context, _ *rootOptions, _ string, snapshot modelprofile.Snapshot, _ io.Writer) ([]string, []string, func(), error) {
+		capturedSnapshot = snapshot
+		return []string{"-c", `model="snapshot-model"`}, []string{"SNAPSHOT_PROFILE=1"}, nil, nil
+	}
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
@@ -912,16 +712,15 @@ func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runnerForSessionProfile: %v", err)
 	}
-	execRunner, ok := runner.(*codexrunner.ExecRunner)
+	appServerRunner, ok := runner.(*codexrunner.AppServerRunner)
 	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", runner)
+		t.Fatalf("runner type = %T, want AppServerRunner", runner)
 	}
-	launcher, ok := execRunner.Launcher.(teamsCodexLauncher)
-	if !ok {
-		t.Fatalf("launcher type = %T, want teamsCodexLauncher", execRunner.Launcher)
+	if capturedSnapshot.APIKeyRef != "env:OLD_MIMO_KEY" || capturedSnapshot.Revision != 3 {
+		t.Fatalf("prepared snapshot = %#v, want old pinned key/revision", capturedSnapshot)
 	}
-	if launcher.modelProfileSnapshot.APIKeyRef != "env:OLD_MIMO_KEY" || launcher.modelProfileSnapshot.Revision != 3 {
-		t.Fatalf("launcher snapshot = %#v, want old pinned key/revision", launcher.modelProfileSnapshot)
+	if !slices.Contains(appServerRunner.ExtraEnv, "SNAPSHOT_PROFILE=1") {
+		t.Fatalf("snapshot runtime env missing: %#v", appServerRunner.ExtraEnv)
 	}
 	again, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: oldSnapshot})
 	if err != nil {
@@ -1017,104 +816,13 @@ func TestModelProfileSnapshotKeyIncludesRuntimeIdentity(t *testing.T) {
 	}
 }
 
-func TestTeamsCodexExecutorSessionModelProfileLaunchInjectsAdapterCI(t *testing.T) {
-	lockCLITestHooks(t)
-	if os.PathSeparator != '/' {
-		t.Skip("shell stub test uses POSIX script")
-	}
-
-	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	disabled := false
-	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-	t.Setenv("MIMO_KEY_PINNED", "sk-ci-mimo")
-	setTestCodexHomeEnv(t, t.TempDir())
-
-	binDir := t.TempDir()
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte("#!/bin/sh\ncase \"$1\" in --version) exit 0 ;; --help) echo 'usage codex --dangerously-bypass-approvals-and-sandbox' ;; *) exit 0 ;; esac\n"), 0o700); err != nil {
-		t.Fatalf("write codex stub: %v", err)
-	}
-
-	prevEnsureProxy := ensureProxyPreferenceRunFn
-	prevRunTarget := runTargetWithFallbackWithOptionsFn
-	t.Cleanup(func() {
-		ensureProxyPreferenceRunFn = prevEnsureProxy
-		runTargetWithFallbackWithOptionsFn = prevRunTarget
-	})
-	ensureProxyPreferenceRunFn = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
-		return false, config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}, nil
-	}
-
-	var gotArgs []string
-	var gotOpts runTargetOptions
-	runTargetWithFallbackWithOptionsFn = func(_ context.Context, cmdArgs []string, _ string, _ func() error, _ <-chan error, opts runTargetOptions) error {
-		gotArgs = append([]string{}, cmdArgs...)
-		gotOpts = opts
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"thread.started","thread_id":"thread-session-profile"}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"item.completed","item":{"type":"agent_message","text":"done"}}`)
-		_, _ = fmt.Fprintln(opts.Stdout, `{"type":"turn.completed"}`)
-		return nil
-	}
-
-	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "exec", codexPath, "/work", []string{"--skip-git-repo-check", "-c", `model_reasoning_effort="high"`}, "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newManagedTeamsCodexExecutor: %v", err)
-	}
-	session := &teams.Session{
-		ID:  "s001",
-		Cwd: t.TempDir(),
-		ModelProfile: modelprofile.Snapshot{
-			Name:      "mimo25-live",
-			Provider:  "mimo",
-			APIKeyRef: "env:MIMO_KEY_PINNED",
-			Revision:  7,
-		},
-	}
-	result, err := executor.(teamsCodexExecutor).RunInput(context.Background(), session, teams.ExecutionInput{Prompt: "prompt text"})
-	if err != nil {
-		t.Fatalf("RunInput: %v", err)
-	}
-	if result.CodexThreadID != "thread-session-profile" {
-		t.Fatalf("thread id = %q", result.CodexThreadID)
-	}
-	if gotOpts.UseProxy {
-		t.Fatalf("UseProxy = true, want false when global proxy preference is disabled")
-	}
-	if gotOpts.ModelProfileRef != "" || gotOpts.ModelProfileSnapshot.Provider != "mimo" || gotOpts.ModelProfileSnapshot.APIKeyRef != "env:MIMO_KEY_PINNED" {
-		t.Fatalf("model profile opts = ref %q snapshot %#v", gotOpts.ModelProfileRef, gotOpts.ModelProfileSnapshot)
-	}
-	if envValue(gotOpts.ExtraEnv, envCXPResponsesProxyKey) == "" {
-		t.Fatalf("missing model profile proxy key env: %v", gotOpts.ExtraEnv)
-	}
-	execIndex := slices.Index(gotArgs, "exec")
-	providerIndex := codexConfigPairIndex(gotArgs, `model_provider="`+cxpCodexModelProviderID+`"`)
-	if execIndex < 0 || providerIndex < 0 || providerIndex <= execIndex {
-		t.Fatalf("model profile config must be injected after codex exec, exec=%d provider=%d:\n%v", execIndex, providerIndex, gotArgs)
-	}
-	reasoningIndex := codexConfigPairIndex(gotArgs, `model_reasoning_effort="high"`)
-	if reasoningIndex < 0 || providerIndex >= reasoningIndex {
-		t.Fatalf("model profile config should share exec config scope before reasoning override, provider=%d reasoning=%d:\n%v", providerIndex, reasoningIndex, gotArgs)
-	}
-	joined := strings.Join(gotArgs, "\n")
-	for _, want := range []string{
-		`model_provider="` + cxpCodexModelProviderID + `"`,
-		`model="mimo/mimo-v2.5"`,
-		`model_catalog_json="`,
-		`model_providers.` + cxpCodexModelProviderID + `.wire_api="responses"`,
-		`model_providers.` + cxpCodexModelProviderID + `.requires_openai_auth=false`,
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("session model profile codex args missing %q:\n%v", want, gotArgs)
-		}
-	}
-}
-
 func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *testing.T) {
+	lockCLITestHooks(t)
+	previousPrepare := prepareTeamsAppServerModelProfileForRunner
+	defer func() { prepareTeamsAppServerModelProfileForRunner = previousPrepare }()
+	prepareTeamsAppServerModelProfileForRunner = func(_ context.Context, _ *rootOptions, _ string, snapshot modelprofile.Snapshot, _ io.Writer) ([]string, []string, func(), error) {
+		return []string{"-c", fmt.Sprintf("snapshot_key=%q", modelProfileSnapshotKey(snapshot))}, nil, nil, nil
+	}
 	baseRunner := &fakeTeamsRunner{}
 	executor := teamsCodexExecutor{
 		runner:           baseRunner,
@@ -1144,18 +852,13 @@ func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *te
 				errs <- err
 				return
 			}
-			execRunner, ok := runner.(*codexrunner.ExecRunner)
+			appServerRunner, ok := runner.(*codexrunner.AppServerRunner)
 			if !ok {
-				errs <- fmt.Errorf("runner type = %T, want ExecRunner", runner)
+				errs <- fmt.Errorf("runner type = %T, want AppServerRunner", runner)
 				return
 			}
-			launcher, ok := execRunner.Launcher.(teamsCodexLauncher)
-			if !ok {
-				errs <- fmt.Errorf("launcher type = %T, want teamsCodexLauncher", execRunner.Launcher)
-				return
-			}
-			if modelProfileSnapshotKey(launcher.modelProfileSnapshot) != modelProfileSnapshotKey(snapshot) {
-				errs <- fmt.Errorf("launcher snapshot = %#v, want %#v", launcher.modelProfileSnapshot, snapshot)
+			if !strings.Contains(strings.Join(appServerRunner.AppServerArgs, "\n"), fmt.Sprintf("%q", modelProfileSnapshotKey(snapshot))) {
+				errs <- fmt.Errorf("app-server args %#v do not contain snapshot %#v", appServerRunner.AppServerArgs, snapshot)
 			}
 		}()
 	}
@@ -1185,135 +888,56 @@ func TestTeamsCodexExecutorProfileRunnerCacheIsConcurrentAndSnapshotScoped(t *te
 	}
 }
 
-func TestNewTeamsExecutorDefaultsSessionReasoningEffortToXHigh(t *testing.T) {
-	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "exec", "/tmp/codex", "/work", []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsExecutor error: %v", err)
+func TestTeamsExecutorUsesStandardAppServerPolicyArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		runnerName string
+		control    bool
+		args       []string
+		model      string
+		want       []string
+	}{
+		{name: "legacy runner alias", runnerName: "exec", args: []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, want: []string{`model="gpt-5"`, teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}},
+		{name: "native runner name", runnerName: "appserver", want: []string{teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}},
+		{name: "explicit effort", runnerName: "exec", args: []string{"-c", `model_reasoning_effort="medium"`}, want: []string{`model_reasoning_effort="medium"`}},
+		{name: "control defaults", runnerName: "exec", control: true, args: []string{"--model", "gpt-5", "--sandbox", "workspace-write", "-c", `model_reasoning_effort="xhigh"`}, want: []string{teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}},
+		{name: "control model", runnerName: "appserver", control: true, model: "gpt-control", want: []string{`model="gpt-control"`, teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}},
 	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
-	}
-	want := []string{"--model", "gpt-5", "-c", teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("session extra args = %#v, want %#v", runner.ExtraArgs, want)
-	}
-}
-
-func TestNewTeamsExecutorDefaultsSessionReasoningEffortToXHighForAppServer(t *testing.T) {
-	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "appserver", "/tmp/codex", "/work", nil, "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsExecutor error: %v", err)
-	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.AppServerRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want AppServerRunner", teamsExecutor.runner)
-	}
-	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("appserver session extra args = %#v, want %#v", runner.ExtraArgs, want)
-	}
-	fallback, ok := runner.Fallback.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("fallback type = %T, want ExecRunner", runner.Fallback)
-	}
-	if !reflect.DeepEqual(fallback.ExtraArgs, want) {
-		t.Fatalf("appserver fallback extra args = %#v, want %#v", fallback.ExtraArgs, want)
-	}
-}
-
-func TestNewTeamsExecutorPreservesExplicitSessionReasoningEffort(t *testing.T) {
-	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "exec", "/tmp/codex", "/work", []string{"-c", `model_reasoning_effort="medium"`}, "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsExecutor error: %v", err)
-	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
-	}
-	want := []string{"-c", `model_reasoning_effort="medium"`}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("session extra args = %#v, want %#v", runner.ExtraArgs, want)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var executor teams.Executor
+			var err error
+			if test.control {
+				executor, err = newTeamsControlFallbackExecutor(&rootOptions{}, test.runnerName, "/tmp/codex", "/work", test.args, "", test.model, time.Minute, io.Discard)
+			} else {
+				executor, err = newTeamsExecutor(&rootOptions{}, "codex", test.runnerName, "/tmp/codex", "/work", test.args, "", time.Minute, io.Discard)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner, ok := executor.(teamsCodexExecutor).runner.(*codexrunner.AppServerRunner)
+			if !ok {
+				t.Fatalf("runner type = %T, want AppServerRunner", executor.(teamsCodexExecutor).runner)
+			}
+			joined := strings.Join(runner.AppServerArgs, "\n")
+			if !strings.Contains(joined, "--analytics-default-enabled") {
+				t.Fatalf("analytics was not enabled: %#v", runner.AppServerArgs)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("app-server args missing %q: %#v", want, runner.AppServerArgs)
+				}
+			}
+			for _, forbidden := range []string{"workspace-write", "danger-full-access", "approval_policy=never"} {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("app-server args retained execution override %q: %#v", forbidden, runner.AppServerArgs)
+				}
+			}
+		})
 	}
 }
 
-func TestNewTeamsControlFallbackExecutorUsesLowEffortWithoutDefaultModel(t *testing.T) {
-	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", []string{"--model", "gpt-5", "--sandbox", "workspace-write", "-c", `model_reasoning_effort="xhigh"`}, "", "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
-	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
-	}
-	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
-	}
-}
-
-func TestNewTeamsControlFallbackExecutorUsesLowEffortForAppServer(t *testing.T) {
-	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{"--model", "gpt-5", "-c", `model_reasoning_effort="xhigh"`}, "", "", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
-	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.AppServerRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want AppServerRunner", teamsExecutor.runner)
-	}
-	want := []string{"-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("appserver control fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
-	}
-	fallback, ok := runner.Fallback.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("fallback type = %T, want ExecRunner", runner.Fallback)
-	}
-	if !reflect.DeepEqual(fallback.ExtraArgs, want) {
-		t.Fatalf("appserver fallback extra args = %#v, want %#v", fallback.ExtraArgs, want)
-	}
-}
-
-func TestNewTeamsControlFallbackExecutorHonorsExplicitFallbackModel(t *testing.T) {
-	executor, err := newTeamsControlFallbackExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", nil, "", "gpt-control", time.Minute, io.Discard)
-	if err != nil {
-		t.Fatalf("newTeamsControlFallbackExecutor error: %v", err)
-	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
-	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
-	}
-	want := []string{"--model", "gpt-control", "-c", teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("fallback extra args = %#v, want %#v", runner.ExtraArgs, want)
-	}
-}
-
-func TestNewManagedTeamsCodexExecutorStripsSandboxArgs(t *testing.T) {
+func TestNewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs(t *testing.T) {
 	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "exec", "/tmp/codex", "/work", []string{
 		"--model", "gpt-test",
 		"--sandbox=workspace-write",
@@ -1321,19 +945,43 @@ func TestNewManagedTeamsCodexExecutorStripsSandboxArgs(t *testing.T) {
 		"-s", "read-only",
 	}, "", time.Minute, io.Discard)
 	if err != nil {
-		t.Fatalf("newManagedTeamsCodexExecutor error: %v", err)
+		t.Fatal(err)
 	}
-	teamsExecutor, ok := executor.(teamsCodexExecutor)
-	if !ok {
-		t.Fatalf("executor type = %T, want teamsCodexExecutor", executor)
+	runner := executor.(teamsCodexExecutor).runner.(*codexrunner.AppServerRunner)
+	joined := strings.Join(runner.AppServerArgs, "\n")
+	if !strings.Contains(joined, `model="gpt-test"`) || strings.Contains(joined, "workspace-write") || strings.Contains(joined, "read-only") {
+		t.Fatalf("translated app-server args = %#v", runner.AppServerArgs)
 	}
-	runner, ok := teamsExecutor.runner.(*codexrunner.ExecRunner)
-	if !ok {
-		t.Fatalf("runner type = %T, want ExecRunner", teamsExecutor.runner)
+}
+
+func TestTeamsCodexArgsPreserveTurnScopedExecOptions(t *testing.T) {
+	dir := t.TempDir()
+	schema := filepath.Join(dir, "schema.json")
+	if err := os.WriteFile(schema, []byte(`{"type":"object"}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	want := []string{"--model", "gpt-test"}
-	if !reflect.DeepEqual(runner.ExtraArgs, want) {
-		t.Fatalf("runner extra args = %#v, want %#v", runner.ExtraArgs, want)
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{
+		"--ephemeral", "--add-dir=/data", "--image", "/tmp/input.png", "--output-schema", schema,
+	}, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := executor.(teamsCodexExecutor)
+	if !managed.ephemeral || !reflect.DeepEqual(managed.additionalDirs, []string{"/data"}) || !reflect.DeepEqual(managed.staticImages, []string{"/tmp/input.png"}) || !json.Valid(managed.outputSchema) {
+		t.Fatalf("turn options were not preserved: %#v", managed)
+	}
+}
+
+func TestTeamsCodexArgsRejectLoaderOnlyOptionsInsteadOfSilentlyChangingSemantics(t *testing.T) {
+	for _, args := range [][]string{
+		{"--profile", "work"},
+		{"--profile-v2", "work"},
+		{"--ignore-user-config"},
+		{"--ignore-rules"},
+	} {
+		if _, err := translateTeamsCodexArgsToAppServer(args); err == nil {
+			t.Fatalf("translateTeamsCodexArgsToAppServer(%#v) unexpectedly succeeded", args)
+		}
 	}
 }
 

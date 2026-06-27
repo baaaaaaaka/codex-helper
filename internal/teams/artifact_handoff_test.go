@@ -58,7 +58,7 @@ func TestControlFallbackPromptDefaultHelpHasCommandDigest(t *testing.T) {
 		"Relevant cxp / Teams helper help digest:",
 		"Control chat quick help:",
 		"Model/profile quick help:",
-		"cxp run --yolo -- codex",
+		"cxp run -- codex",
 		"cxp run --model-profile <name> -- codex",
 		"cxp model list",
 		"cxp model-profile setup",

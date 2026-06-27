@@ -1,12 +1,13 @@
 package codexrunner
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -32,7 +33,10 @@ func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[0], "initialize")
 	assertJSONRPC(t, writes[0])
-	assertParamNil(t, writes[0], "capabilities")
+	capabilities := writes[0]["params"].(map[string]any)["capabilities"].(map[string]any)
+	if capabilities["experimentalApi"] != true {
+		t.Fatalf("initialize capabilities = %#v", capabilities)
+	}
 	assertMethod(t, writes[1], "initialized")
 	assertJSONRPC(t, writes[1])
 	assertNoID(t, writes[1])
@@ -43,6 +47,20 @@ func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	assertParamNumber(t, writes[3], "limit", 2)
 	for _, write := range writes {
 		assertJSONRPC(t, write)
+	}
+}
+
+func TestAppServerRunnerCloseHookRunsOnce(t *testing.T) {
+	var calls int
+	runner := &AppServerRunner{CloseHook: func() { calls++ }}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("close hook calls = %d, want 1", calls)
 	}
 }
 
@@ -66,7 +84,12 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 		Timeout:    time.Minute,
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	got, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:         "hello",
+		AdditionalDirs: []string{"/extra-a", "/extra-b"},
+		OutputSchema:   json.RawMessage(`{"type":"object"}`),
+		Ephemeral:      true,
+	})
 	if err != nil {
 		t.Fatalf("StartThread error: %v", err)
 	}
@@ -83,11 +106,23 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[3], "thread/start")
 	assertParamString(t, writes[3], "cwd", "/work")
+	params := writes[3]["params"].(map[string]any)
+	roots, ok := params["runtimeWorkspaceRoots"].([]any)
+	if !ok || len(roots) != 2 || roots[0] != "/extra-a" || roots[1] != "/extra-b" {
+		t.Fatalf("runtimeWorkspaceRoots = %#v", params["runtimeWorkspaceRoots"])
+	}
+	if params["ephemeral"] != true {
+		t.Fatalf("ephemeral = %#v", params["ephemeral"])
+	}
 	assertParamAbsent(t, writes[3], "extra_args")
 	assertMethod(t, writes[4], "turn/start")
 	assertParamString(t, writes[4], "threadId", "thread-new")
 	assertTextInput(t, writes[4], "hello")
 	assertParamString(t, writes[4], "cwd", "/work")
+	turnParams := writes[4]["params"].(map[string]any)
+	if schema, ok := turnParams["outputSchema"].(map[string]any); !ok || schema["type"] != "object" {
+		t.Fatalf("outputSchema = %#v", turnParams["outputSchema"])
+	}
 	assertJSONRPC(t, writes[4])
 }
 
@@ -103,15 +138,20 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	)
 	runner := NewAppServerRunner(transport)
 
-	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", AdditionalDirs: []string{"/resume-extra"}})
 	if err != nil {
 		t.Fatalf("ResumeThread error: %v", err)
 	}
 	if got.ThreadID != "thread-existing" || got.TurnID != "turn-resume" || got.FinalAgentMessage != "resumed" {
 		t.Fatalf("unexpected result: %#v", got)
 	}
-
 	writes := transport.decodedWrites(t)
+	turnParams := writes[4]["params"].(map[string]any)
+	roots, ok := turnParams["runtimeWorkspaceRoots"].([]any)
+	if !ok || len(roots) != 1 || roots[0] != "/resume-extra" {
+		t.Fatalf("resume runtimeWorkspaceRoots = %#v", turnParams["runtimeWorkspaceRoots"])
+	}
+
 	assertMethod(t, writes[3], "thread/resume")
 	assertParamString(t, writes[3], "threadId", "thread-existing")
 	assertMethod(t, writes[4], "turn/start")
@@ -372,7 +412,7 @@ func TestAppServerRunnerHandlesNestedErrorNotification(t *testing.T) {
 	}
 }
 
-func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testing.T) {
+func TestAppServerRunnerApprovesInterleavedServerRequestAndKeepsWaiting(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
@@ -383,6 +423,7 @@ func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testin
 		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
 	)
 	runner := NewAppServerRunner(transport)
+	runner.ServerRequestHandler = AutomaticApprovalHandler{}
 
 	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
 	if err != nil {
@@ -391,13 +432,25 @@ func TestAppServerRunnerRejectsInterleavedServerRequestAndKeepsWaiting(t *testin
 	if got.FinalAgentMessage != "after request" {
 		t.Fatalf("final message = %q", got.FinalAgentMessage)
 	}
+	runner.serverWG.Wait()
 
 	writes := transport.decodedWrites(t)
-	if got := writes[5]["id"]; got != float64(99) {
-		t.Fatalf("server request response id = %#v, want 99 in %#v", got, writes[5])
+	var response map[string]any
+	for _, write := range writes {
+		if write["id"] == float64(99) {
+			response = write
+			break
+		}
 	}
-	if _, ok := writes[5]["error"].(map[string]any); !ok {
-		t.Fatalf("server request response missing error: %#v", writes[5])
+	if response == nil {
+		t.Fatalf("missing approval response in %#v", writes)
+	}
+	if got := response["id"]; got != float64(99) {
+		t.Fatalf("server request response id = %#v, want 99 in %#v", got, response)
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok || result["decision"] != "accept" {
+		t.Fatalf("server request response = %#v, want one-time accept", response)
 	}
 }
 
@@ -481,55 +534,41 @@ func TestAppServerRunnerBackfillsThreadNameAfterCompletedTurn(t *testing.T) {
 	assertParamAbsent(t, writes[5], "includeTurns")
 }
 
-func TestAppServerRunnerFallsBackWhenExtraArgsCannotBeTranslated(t *testing.T) {
+func TestAppServerRunnerFailsClosedWhenExtraArgsCannotBeTranslated(t *testing.T) {
 	transport := newFakeAppServerTransport()
-	fallback := &fakeRunner{
-		startResult: TurnResult{ThreadID: "fallback-thread", TurnID: "fallback-turn", Status: TurnStatusCompleted},
-	}
 	runner := &AppServerRunner{
 		Transport: transport,
-		Fallback:  fallback,
 		ExtraArgs: []string{"--model", "gpt-5"},
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatalf("StartThread fallback error: %v", err)
-	}
-	if got.ThreadID != "fallback-thread" || !fallback.startCalled {
-		t.Fatalf("fallback not used, result=%#v called=%v", got, fallback.startCalled)
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if !IsKind(err, ErrorUnsupported) {
+		t.Fatalf("StartThread error = %v, want unsupported", err)
 	}
 	if len(transport.writes) != 0 {
 		t.Fatalf("app-server was used despite unsupported extra args: %q", transport.writes)
 	}
 }
 
-func TestAppServerRunnerFallsBackWhenInitializationProbeFails(t *testing.T) {
+func TestAppServerRunnerFailsClosedWhenInitializationProbeFails(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"error":{"code":"unsupported","message":"thread list missing"}}`,
 	)
-	fallback := &fakeRunner{
-		startResult: TurnResult{ThreadID: "fallback-thread", TurnID: "fallback-turn", Status: TurnStatusCompleted},
-	}
 	var startReq AppServerStartRequest
 	runner := &AppServerRunner{
 		Starter: AppServerTransportStarterFunc(func(_ context.Context, req AppServerStartRequest) (AppServerLineTransport, error) {
 			startReq = req
 			return transport, nil
 		}),
-		Fallback: fallback,
 		Command:  "/managed/codex",
 		ExtraEnv: []string{"CODEX_HELPER_TEAMS_CHILD=1"},
 		Timeout:  time.Minute,
 	}
 
-	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
-	if err != nil {
-		t.Fatalf("StartThread fallback error: %v", err)
-	}
-	if got.ThreadID != "fallback-thread" || !fallback.startCalled {
-		t.Fatalf("fallback not used, result=%#v called=%v", got, fallback.startCalled)
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("StartThread error = %v, want app-server probe failure", err)
 	}
 	if startReq.Command != "/managed/codex" {
 		t.Fatalf("starter command = %q", startReq.Command)
@@ -545,15 +584,94 @@ func TestAppServerRunnerFallsBackWhenInitializationProbeFails(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerRetriesAfterCanceledInitialization(t *testing.T) {
+	first := newFakeAppServerTransport()
+	second := newFakeAppServerTransport(
+		`{"id":2,"result":{}}`,
+		`{"id":3,"result":{"data":[]}}`,
+		`{"id":4,"result":{"data":[{"id":"thread-after-retry"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return first, nil
+		}
+		return second, nil
+	})}
+	defer runner.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := runner.ListThreads(ctx, ListThreadsOptions{}); !IsKind(err, ErrorTimeout) {
+		t.Fatalf("first ListThreads error = %v, want timeout", err)
+	}
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil {
+		t.Fatalf("retry ListThreads error: %v", err)
+	}
+	if starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-retry" {
+		t.Fatalf("retry starts=%d threads=%#v", starts, threads)
+	}
+	if !first.closed {
+		t.Fatal("canceled initialization transport was not closed")
+	}
+}
+
 func TestAppServerRunnerSurfacesTransportCrashWithoutRealCodex(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 	)
+	transport.eofWhenDrained = true
 	runner := NewAppServerRunner(transport)
 
 	_, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
 	if !IsKind(err, ErrorLaunch) {
 		t.Fatalf("expected launch error for closed app-server stream, got %v", err)
+	}
+}
+
+func TestAppServerRunnerRestartsOnNextRequestAfterTransportCrash(t *testing.T) {
+	first := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"data":[{"id":"thread-before-crash"}]}}`,
+	)
+	first.eofWhenDrained = true
+	second := newFakeAppServerTransport(
+		`{"id":4,"result":{}}`,
+		`{"id":5,"result":{"data":[]}}`,
+		`{"id":6,"result":{"data":[{"id":"thread-after-crash"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return first, nil
+		}
+		return second, nil
+	})}
+	defer runner.Close()
+
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil || len(threads) != 1 || threads[0].ID != "thread-before-crash" {
+		t.Fatalf("first ListThreads threads=%#v err=%v", threads, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		runner.protocolMu.Lock()
+		failed := runner.protocolErr != nil
+		runner.protocolMu.Unlock()
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("protocol crash was not recorded")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	threads, err = runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil || starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-crash" {
+		t.Fatalf("restarted ListThreads starts=%d threads=%#v err=%v", starts, threads, err)
 	}
 }
 
@@ -617,13 +735,16 @@ func TestProbeAppServerCompatibilityRunsColdProbeRepeatedly(t *testing.T) {
 }
 
 type fakeAppServerTransport struct {
-	reads  [][]byte
-	writes [][]byte
-	closed bool
+	mu             sync.Mutex
+	reads          [][]byte
+	writes         [][]byte
+	closed         bool
+	eofWhenDrained bool
+	notify         chan struct{}
 }
 
 func newFakeAppServerTransport(reads ...string) *fakeAppServerTransport {
-	transport := &fakeAppServerTransport{}
+	transport := &fakeAppServerTransport{notify: make(chan struct{}, 1)}
 	for _, read := range reads {
 		transport.reads = append(transport.reads, []byte(read))
 	}
@@ -631,26 +752,73 @@ func newFakeAppServerTransport(reads ...string) *fakeAppServerTransport {
 }
 
 func (t *fakeAppServerTransport) WriteLine(_ context.Context, line []byte) error {
+	t.mu.Lock()
 	t.writes = append(t.writes, append([]byte{}, line...))
+	t.mu.Unlock()
+	t.signal()
 	return nil
 }
 
-func (t *fakeAppServerTransport) ReadLine(context.Context) ([]byte, error) {
-	if len(t.reads) == 0 {
-		return nil, io.EOF
+func (t *fakeAppServerTransport) ReadLine(ctx context.Context) ([]byte, error) {
+	for {
+		t.mu.Lock()
+		if len(t.reads) > 0 && t.readReadyLocked(t.reads[0]) {
+			line := t.reads[0]
+			t.reads = t.reads[1:]
+			t.mu.Unlock()
+			return append([]byte{}, line...), nil
+		}
+		if t.closed || (len(t.reads) == 0 && t.eofWhenDrained) {
+			t.mu.Unlock()
+			return nil, io.EOF
+		}
+		notify := t.notify
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-notify:
+		}
 	}
-	line := t.reads[0]
-	t.reads = t.reads[1:]
-	return append([]byte{}, line...), nil
 }
 
 func (t *fakeAppServerTransport) Close() error {
+	t.mu.Lock()
 	t.closed = true
+	t.mu.Unlock()
+	t.signal()
 	return nil
+}
+
+func (t *fakeAppServerTransport) readReadyLocked(line []byte) bool {
+	var message appServerMessage
+	if json.Unmarshal(line, &message) != nil || len(bytes.TrimSpace(message.ID)) == 0 || strings.TrimSpace(message.Method) != "" {
+		return true
+	}
+	id, ok := appServerNumericID(message.ID)
+	if !ok {
+		return true
+	}
+	for _, write := range t.writes {
+		var request appServerRequest
+		if json.Unmarshal(write, &request) == nil && request.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *fakeAppServerTransport) signal() {
+	select {
+	case t.notify <- struct{}{}:
+	default:
+	}
 }
 
 func (t *fakeAppServerTransport) decodedWrites(tb testing.TB) []map[string]any {
 	tb.Helper()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	var writes []map[string]any
 	for _, line := range t.writes {
 		var decoded map[string]any
@@ -660,37 +828,6 @@ func (t *fakeAppServerTransport) decodedWrites(tb testing.TB) []map[string]any {
 		writes = append(writes, decoded)
 	}
 	return writes
-}
-
-type fakeRunner struct {
-	startCalled bool
-	startResult TurnResult
-	startErr    error
-}
-
-func (r *fakeRunner) StartThread(context.Context, TurnInput) (TurnResult, error) {
-	r.startCalled = true
-	return r.startResult, r.startErr
-}
-
-func (r *fakeRunner) ResumeThread(context.Context, string, TurnInput) (TurnResult, error) {
-	return TurnResult{}, errors.New("unexpected ResumeThread")
-}
-
-func (r *fakeRunner) StartTurn(context.Context, StartTurnInput) (TurnResult, error) {
-	return TurnResult{}, errors.New("unexpected StartTurn")
-}
-
-func (r *fakeRunner) InterruptTurn(context.Context, TurnRef) error {
-	return errors.New("unexpected InterruptTurn")
-}
-
-func (r *fakeRunner) ReadThread(context.Context, string) (Thread, error) {
-	return Thread{}, errors.New("unexpected ReadThread")
-}
-
-func (r *fakeRunner) ListThreads(context.Context, ListThreadsOptions) ([]Thread, error) {
-	return nil, errors.New("unexpected ListThreads")
 }
 
 func assertMethod(tb testing.TB, got map[string]any, want string) {

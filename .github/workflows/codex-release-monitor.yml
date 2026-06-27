@@ -21,7 +21,7 @@ on:
       min_version:
         description: "Inclusive min version for range mode"
         required: false
-        default: "0.104.0"
+        default: "0.131.0"
         type: string
       max_version:
         description: "Inclusive max version for range mode; defaults to latest alpha or latest stable"
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           selection_mode="${INPUT_SELECTION_MODE:-targeted}"
-          input_min_version="${INPUT_MIN_VERSION:-0.104.0}"
+          input_min_version="${INPUT_MIN_VERSION:-0.131.0}"
           input_max_version="${INPUT_MAX_VERSION:-}"
           input_include_prerelease="${INPUT_INCLUDE_PRERELEASE:-true}"
           latest_version="$(bash scripts/ci/retry.sh 5 5 npm view @openai/codex version | tr -d '\r\n')"
@@ -186,6 +186,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional "@openai/codex@$env:CODEX_VERSION"
+          $winpty = Get-Command winpty -ErrorAction SilentlyContinue
+          if ($null -eq $winpty) {
+            $bundledWinpty = Join-Path $env:ProgramFiles "Git\usr\bin\winpty.exe"
+            if (-not (Test-Path -LiteralPath $bundledWinpty)) {
+              throw "winpty is required for the Windows remote TUI contract"
+            }
+            Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $bundledWinpty)
+          }
 
       - name: Probe installed Codex wrapper (Linux/macOS)
         if: runner.os != 'Windows'
@@ -195,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           codex --version 2>&1
-          codex --help 2>&1 || true
+          codex --help 2>&1
 
       - name: Probe installed Codex wrapper (Windows)
         if: runner.os == 'Windows'
@@ -206,23 +214,23 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           & codex --version 2>&1
-          try {
-            & codex --help 2>&1 | Out-Host
-          } catch {
-            $_ | Out-Host
-          }
+          & codex --help 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "codex --help failed with exit code $LASTEXITCODE" }
 
-      - name: Run Codex patch + yolo smoke tests
+      - name: Run standard approval runtime contract tests
         id: smoke
         continue-on-error: true
         shell: bash
         env:
-          CODEX_PATCH_TEST: "1"
-          CODEX_YOLO_PATCH_TEST: "1"
+          CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_TEST: "1"
+          CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           set -euo pipefail
-          go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
-          go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
+          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
       - name: Teams app-server probe (Linux/macOS)
         if: runner.os != 'Windows'
@@ -232,8 +240,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! codex app-server --help >/dev/null 2>&1; then
-            echo "Codex app-server is unavailable for ${CODEX_VERSION}, skipping Teams app-server probe"
-            exit 0
+            echo "Codex app-server is unavailable for ${CODEX_VERSION}" >&2
+            exit 1
           fi
           export CODEX_HELPER_TEAMS_PROFILE=ci-appserver-probe
           export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant
@@ -263,8 +271,7 @@ jobs:
             $appServerAvailable = $false
           }
           if (-not $appServerAvailable) {
-            Write-Host "Codex app-server is unavailable for $env:CODEX_VERSION, skipping Teams app-server probe"
-            exit 0
+            throw "Codex app-server is unavailable for $env:CODEX_VERSION"
           }
           $env:CODEX_HELPER_TEAMS_PROFILE = "ci-appserver-probe"
           $env:CODEX_HELPER_TEAMS_TENANT_ID = "ci-tenant"
@@ -306,7 +313,7 @@ jobs:
           {"platform":"${PLATFORM_NAME}","results":{"${CODEX_VERSION}":"${status}"}}
           EOF
 
-      - name: Upload patch+yolo results
+      - name: Upload standard runtime results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -317,7 +324,7 @@ jobs:
         if: steps.smoke.outcome != 'success' || (runner.os == 'Windows' && (steps.wrapper_probe_windows.outcome != 'success' || steps.appserver_probe_windows.outcome != 'success')) || (runner.os != 'Windows' && (steps.wrapper_probe_unix.outcome != 'success' || steps.appserver_probe_unix.outcome != 'success'))
         shell: bash
         run: |
-          echo "Codex wrapper probe, Teams app-server probe, or patch+yolo smoke failed on ${PLATFORM_NAME}" >&2
+          echo "Codex wrapper, app-server, schema contract, or standard approval runtime probe failed on ${PLATFORM_NAME}" >&2
           exit 1
 
   test-linux-distros:
@@ -347,14 +354,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_bin="$GITHUB_WORKSPACE/codex_cloudgate_test"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o "$test_bin"
-          chmod +x "$test_bin"
-          echo "TEST_BIN_PATH=$test_bin" >> "$GITHUB_ENV"
+          contract_test_bin="$GITHUB_WORKSPACE/codex_contract_test"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexcontract -c -o "$contract_test_bin"
+          chmod +x "$contract_test_bin"
+          echo "CONTRACT_TEST_BIN_PATH=$contract_test_bin" >> "$GITHUB_ENV"
           cli_test_bin="$GITHUB_WORKSPACE/codex_cli_test"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o "$cli_test_bin"
           chmod +x "$cli_test_bin"
           echo "CLI_TEST_BIN_PATH=$cli_test_bin" >> "$GITHUB_ENV"
+          runtime_test_bin="$GITHUB_WORKSPACE/codex_runtime_test"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexrunner -c -o "$runtime_test_bin"
+          chmod +x "$runtime_test_bin"
+          echo "RUNTIME_TEST_BIN_PATH=$runtime_test_bin" >> "$GITHUB_ENV"
 
       - name: Probe installed Codex wrapper (container)
         id: wrapper_probe
@@ -368,15 +379,15 @@ jobs:
           case "${PLATFORM_NAME}" in
             centos7)
               IMAGE="centos:7"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             rockylinux8)
               IMAGE="rockylinux:8"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             ubuntu20.04)
               IMAGE="ubuntu:20.04"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils util-linux"
               ;;
             *)
               echo "unsupported platform ${PLATFORM_NAME}" >&2
@@ -388,7 +399,7 @@ jobs:
             -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
 
-      - name: Run Codex patch + yolo smoke tests (container)
+      - name: Run standard approval runtime contract tests (container)
         id: smoke
         continue-on-error: true
         shell: bash
@@ -400,25 +411,26 @@ jobs:
           case "${PLATFORM_NAME}" in
             centos7)
               IMAGE="centos:7"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             rockylinux8)
               IMAGE="rockylinux:8"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             ubuntu20.04)
               IMAGE="ubuntu:20.04"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils util-linux"
               ;;
             *)
               echo "unsupported platform ${PLATFORM_NAME}" >&2
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cloudgate_test -test.v -test.count=1 -test.run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_PATCH_TEST=1 CODEX_YOLO_PATCH_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration'"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_REMOTE_TUI_CONTRACT_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_contract_test -test.v -test.count=1 -test.run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run TestProbeCodexIntegration && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_E2E_TEST=1 /codex_runtime_test -test.v -test.count=1 -test.run TestInstalledCodexStandardApprovalRuntime"
           docker run --rm \
-            -v "${TEST_BIN_PATH}:/codex_cloudgate_test:ro" \
+            -v "${CONTRACT_TEST_BIN_PATH}:/codex_contract_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \
+            -v "${RUNTIME_TEST_BIN_PATH}:/codex_runtime_test:ro" \
             -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
 
@@ -441,7 +453,7 @@ jobs:
           {"platform":"${PLATFORM_NAME}","results":{"${CODEX_VERSION}":"${status}"}}
           EOF
 
-      - name: Upload patch+yolo results
+      - name: Upload standard runtime results
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -452,7 +464,7 @@ jobs:
         if: steps.wrapper_probe.outcome != 'success' || steps.smoke.outcome != 'success'
         shell: bash
         run: |
-          echo "Codex wrapper probe or patch+yolo smoke failed on ${{ matrix.platform }}" >&2
+          echo "Codex wrapper, schema contract, or standard approval runtime probe failed on ${{ matrix.platform }}" >&2
           exit 1
 
   update:
@@ -467,7 +479,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Download patch+yolo results
+      - name: Download standard runtime results
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:

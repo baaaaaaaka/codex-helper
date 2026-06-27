@@ -1,12 +1,14 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -154,7 +156,7 @@ func TestStore_SaveStampsReaderFloor(t *testing.T) {
 	}
 }
 
-func TestStore_SaveKeepsFirstMinReaderGenerationRollbackCompatible(t *testing.T) {
+func TestStoreSaveCommitsApprovalBrokerGeneration(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	store, err := NewStore(path)
@@ -175,11 +177,87 @@ func TestStore_SaveKeepsFirstMinReaderGenerationRollbackCompatible(t *testing.T)
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("unmarshal config: %v", err)
 	}
-	if raw.Version != 2 {
-		t.Fatalf("first minReader-aware release must keep version=2 for v0.1.6 rollback, got %d", raw.Version)
+	if raw.Version != CurrentVersion {
+		t.Fatalf("Version=%d want %d", raw.Version, CurrentVersion)
 	}
 	if raw.MinReader != MinReaderVersion {
 		t.Fatalf("MinReader=%d want %d", raw.MinReader, MinReaderVersion)
+	}
+}
+
+func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
+	for _, legacyField := range []string{`,"yoloEnabled":true`, `,"yoloEnabled":false`, ``} {
+		name := "missing"
+		if strings.Contains(legacyField, "true") {
+			name = "true"
+		} else if strings.Contains(legacyField, "false") {
+			name = "false"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			document := `{"version":2,"minReader":1,"proxyEnabled":true,"profiles":[]` + legacyField + `}`
+			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(raw, []byte("yoloEnabled")) {
+				t.Fatalf("legacy field survived migration: %s", raw)
+			}
+			var header struct {
+				Version   int `json:"version"`
+				MinReader int `json:"minReader"`
+			}
+			if err := json.Unmarshal(raw, &header); err != nil {
+				t.Fatal(err)
+			}
+			if header.Version != 3 || header.MinReader != 1 {
+				t.Fatalf("migration header = %#v, want generation 3 readable by generation-1 readers", header)
+			}
+		})
+	}
+}
+
+func TestStoreRejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	// Writer generation 3 is additive and still advertises reader floor 1.
+	// A future file that raises the floor to 2 is a different contract: this
+	// build must reject it instead of assuming its writer generation implies
+	// support for unknown breaking semantics.
+	document := fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[]}`,
+		CurrentVersion+1, MinReaderVersion+1)
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(); err == nil {
+		t.Fatal("Load accepted a config with an unsupported breaking reader floor")
+	} else {
+		var stale *StaleReaderError
+		if !errors.As(err, &stale) {
+			t.Fatalf("Load error = %T %v, want StaleReaderError", err, err)
+		}
+		if stale.FileMinReader != MinReaderVersion+1 || stale.Supported != MinReaderVersion {
+			t.Fatalf("stale reader error = %#v", stale)
+		}
 	}
 }
 

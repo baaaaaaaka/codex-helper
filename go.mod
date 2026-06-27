@@ -7,6 +7,7 @@ toolchain go1.24.12
 require (
 	github.com/gdamore/tcell/v2 v2.13.7
 	github.com/gofrs/flock v0.13.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/spf13/cobra v1.9.1
 	golang.org/x/net v0.49.0

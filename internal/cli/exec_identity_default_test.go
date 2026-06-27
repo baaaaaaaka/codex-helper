@@ -121,42 +121,6 @@ func TestExecIdentityForHomeRejectsUnknownNonRootOwner(t *testing.T) {
 	}
 }
 
-func TestPrepareYoloAuthOverrideReownsAuthFilesForExecIdentity(t *testing.T) {
-	lockCLITestHooks(t)
-
-	prevChown := execIdentityChown
-	t.Cleanup(func() { execIdentityChown = prevChown })
-
-	codexDir := t.TempDir()
-	writeTestAuthJSON(t, codexDir, true)
-
-	var chowned []string
-	execIdentityChown = func(path string, uid, gid int) error {
-		chowned = append(chowned, path)
-		if uid != 1000 || gid != 1001 {
-			t.Fatalf("unexpected chown target %d:%d", uid, gid)
-		}
-		return nil
-	}
-
-	override, err := prepareYoloAuthOverride(codexDir, &execIdentity{
-		UID:      1000,
-		GID:      1001,
-		Username: "alice",
-		Home:     filepath.Dir(codexDir),
-	})
-	if err != nil {
-		t.Fatalf("prepareYoloAuthOverride: %v", err)
-	}
-	if override == nil {
-		t.Fatal("expected auth override")
-	}
-	if len(chowned) < 3 {
-		t.Fatalf("expected backup/auth/lease ownership fixes, got %v", chowned)
-	}
-	override.Cleanup()
-}
-
 func TestPrepareCodexSelfUpdateGuardEnvReownsWrapperForExecIdentity(t *testing.T) {
 	lockCLITestHooks(t)
 

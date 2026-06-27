@@ -12,7 +12,7 @@ Add an explicit Telegram mode to `codex-helper` so an allowlisted Telegram user 
 - Default to Telegram Bot API long polling. Keep webhook support as an advanced later option.
 - Treat Telegram as a remote-control surface and require explicit local pairing before any chat can drive local Codex.
 - Use a non-TTY Codex runner for Telegram, initially based on `codex exec --json` and `codex exec resume --json`.
-- Preserve the current proxy preference, Codex install, history, yolo, and effective-path behavior by reusing existing helpers instead of reimplementing them.
+- Preserve the current proxy preference, Codex install, history, standard approval runtime, and effective-path behavior by reusing existing helpers instead of reimplementing them.
 
 ## Command Sketch
 

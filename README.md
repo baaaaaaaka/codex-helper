@@ -145,7 +145,7 @@ These are the commands a normal install most often needs:
 |---------|-------------|
 | `codex-proxy` or `cxp` | Open the local Codex history TUI |
 | `codex-proxy run -- <cmd> [args...]` | Run a command using the current direct/proxy mode |
-| `codex-proxy run --yolo -- codex` | Launch Codex with YOLO mode enabled for this run |
+| `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
 | `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy model list` | Show built-in and configured model choices |
 | `codex-proxy model setup <model>` | Configure a built-in model choice such as `deepseek`, `mimo`, `kimi`, `glm`, `minimax`, or `qwen` |
@@ -174,7 +174,7 @@ walk through the normal flows in order.
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
-| `codex-proxy run --yolo -- codex` | Launch Codex with YOLO mode enabled for this run |
+| `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
 | `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history tui` | Browse Codex history in a terminal UI |
@@ -253,8 +253,8 @@ walk through the normal flows in order.
 Common flags:
 
 - `--config /path/to/config.json` overrides the config file location
-- `run` supports `--yolo` for per-launch YOLO mode and `--model-profile <name>`
-  for per-launch model selection when the command is Codex
+- `run` supports `--model-profile <name>` for per-launch model selection when
+  the command is Codex
 - `app` supports `--model-profile <name>` for desktop-app launches that should
   use a saved model profile
 - `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
@@ -265,22 +265,40 @@ Common flags:
 
 </details>
 
-## Model selection and YOLO mode
+## Model selection and standard approvals
 
-### YOLO mode
+### Standard approval runtime
 
-YOLO mode can be enabled per Codex launch:
+CXP launches the original Codex binary with ordinary on-request approvals. A
+local broker answers supported approval requests after a fixed 500 ms delay, so
+users do not need to approve each command manually:
 
 ```bash
-codex-proxy run --yolo -- codex
+codex-proxy run -- codex
 ```
 
-If you are using the history TUI, press `Ctrl+Y` before opening or starting a
-session. The status bar shows whether YOLO mode is on; press `Ctrl+Y` again to
-turn it off for the next launch.
+This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
+are upgraded automatically before the first brokered turn. The release compatibility
+sweep verifies both the app-server handshake and the remote TUI capability.
 
-For local use, this flag and the TUI toggle are the only YOLO controls most
-users need.
+The Codex inner sandbox remains restricted until an approved operation needs
+the execution target's assigned hardware or mounts. Approval cannot grant
+devices that the outer host, container, cgroup, Slurm job, or LSF job did not
+already provide. Telemetry remains enabled and is forwarded without payload
+mutation.
+
+The brokered surfaces are the Codex TUI/history launch paths, the `codex exec`
+facade, Teams turns, and Beacon workers. Contract CI uses the original Codex
+binary with analytics enabled and requires the emitted review to remain an
+ordinary `reviewer=user`, `status=approved`, `user_approved` event. CXP does not
+hide its app-server client identity or try to prevent server-side inference from
+timing and other normal telemetry.
+
+`codex-proxy app` still launches the official Desktop App directly. The Desktop
+App does not currently expose a stable external app-server attachment contract,
+so Desktop automatic approval remains a final-release blocker for any claim
+that every CXP surface is brokered; CXP does not silently fall back to a retired
+execution mode for that surface.
 
 ### Built-in model choices
 
@@ -375,7 +393,6 @@ Controls:
 - New session: `(New Agent)` entry or `Ctrl+N` (in selected project or current dir)
 - Expand/collapse subagents: `Ctrl+O`
 - Proxy mode: `Ctrl+P` toggle (status shows `Proxy mode (Ctrl+P): on/off`)
-- YOLO mode: `Ctrl+Y` toggle before opening or starting a Codex session
 - Skills menu: `Ctrl+K`
 - Refresh: `r` (or `Ctrl+R`)
 - Quit: `q`, `Esc`, `Ctrl+C`
@@ -818,9 +835,9 @@ Beacon adapter troubleshooting:
   `cxp beacon --store <shared-store> worker ...`.
 - If `$SHELL -lic` fails under tcsh/csh, update the profile with
   `--adapter-shell direct`; profile revisions apply to future turns.
-- Beacon workers launch Codex in yolo mode by default so scheduler/container
-  devices and mounts stay visible; pass worker `--no-yolo` only when the worker
-  must keep Codex sandboxing.
+- Beacon workers start the standard approval runtime inside the allocation, so
+  approved commands inherit the devices and mounts granted by the scheduler or
+  container while retaining the outer isolation boundary.
 - If worker doctor reports `missing codex`, set scheduler PATH or pass worker
   `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is still useful
   for path resolution or extra Codex exec flags such as

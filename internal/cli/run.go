@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,12 +16,12 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/baaaaaaaka/codex-helper/internal/cloudgate"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
+	"github.com/baaaaaaaka/codex-helper/internal/migration"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
@@ -38,11 +37,13 @@ var (
 	ensureProxyPreferenceRunFn         = ensureProxyPreference
 	ensureProfileRunFn                 = ensureProfile
 	persistProxyPreferenceRunFn        = persistProxyPreference
+	runCodexCLIInvocationFn            = runCodexCLIInvocation
 	runTargetHealthCheckInterval       = 5 * time.Second
 )
 
 func newRunCmd(root *rootOptions) *cobra.Command {
 	var modelProfile string
+	var legacyMode bool
 	cmd := &cobra.Command{
 		Use:   "run [profile] -- [cmd args...]",
 		Short: "Run a command using direct mode or an SSH-backed local proxy",
@@ -52,8 +53,9 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 			return runLike(cmd, root, true)
 		},
 	}
-	cmd.Flags().Bool("yolo", false, "Launch Codex with helper-managed yolo mode")
 	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
+	cmd.Flags().BoolVar(&legacyMode, migration.LegacyRunModeFlagName, false, "")
+	_ = cmd.Flags().MarkHidden(migration.LegacyRunModeFlagName)
 	return cmd
 }
 
@@ -128,7 +130,11 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfg.ProxyEnabled = &enabled
 		}
-		if runOpts.YoloEnabled || modelProfileLaunchRequested {
+		if len(after) > 0 && isCodexCommand(after[0]) {
+			runOpts.Log = cmd.ErrOrStderr()
+			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfg.Instances, after, true, runOpts)
+		}
+		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runWithProfileOptionsFn(ctx, store, profile, cfg.Instances, after, runOpts)
 		}
@@ -152,7 +158,11 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			}
 			cfgWithProfile.ProxyEnabled = &enabled
 		}
-		if runOpts.YoloEnabled || modelProfileLaunchRequested {
+		if len(after) > 0 && isCodexCommand(after[0]) {
+			runOpts.Log = cmd.ErrOrStderr()
+			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfgWithProfile.Instances, after, true, runOpts)
+		}
+		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runWithProfileOptionsFn(ctx, store, profile, cfgWithProfile.Instances, after, runOpts)
 		}
@@ -160,37 +170,15 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	}
 
 	log := cmd.ErrOrStderr()
-	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
-	if err != nil {
-		return err
-	}
-
 	opts := runOpts
 	opts.UseProxy = false
 	opts.Log = log
-	if isCodexCommand(resolvedCmd[0]) {
-		extraEnv, execIdentity, err := codexExecutionContextForRun("")
-		if err != nil {
-			return err
-		}
-		opts.ExtraEnv = append(opts.ExtraEnv, extraEnv...)
-		opts.ExecIdentity = execIdentity
-		var modelCleanup func()
-		resolvedCmd, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, resolvedCmd, &opts, "")
-		if err != nil {
-			return err
-		}
-		if modelCleanup != nil {
-			defer modelCleanup()
-		}
-		var cleanup func()
-		resolvedCmd, cleanup = prepareYoloCodexCommandForRun(store, resolvedCmd, &opts)
-		if cleanup != nil {
-			defer cleanup()
-		}
-		if err := requireYoloLaunchArgs(resolvedCmd, opts); err != nil {
-			return err
-		}
+	if isCodexCommand(after[0]) {
+		return runCodexCLIInvocationFn(ctx, root, store, nil, nil, after, false, opts)
+	}
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
+	if err != nil {
+		return err
 	}
 	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
 }
@@ -199,11 +187,6 @@ func runTargetOptionsFromRunFlags(cmd *cobra.Command) runTargetOptions {
 	opts := defaultRunTargetOptions()
 	if cmd == nil {
 		return opts
-	}
-	yolo, err := cmd.Flags().GetBool("yolo")
-	if err == nil && yolo {
-		opts.YoloEnabled = true
-		opts.RequireYolo = true
 	}
 	if flag := cmd.Flags().Lookup("model-profile"); flag != nil {
 		opts.ModelProfileRef = strings.TrimSpace(flag.Value.String())
@@ -263,14 +246,6 @@ func runWithExistingInstanceOptions(
 		if modelCleanup != nil {
 			defer modelCleanup()
 		}
-		var cleanup func()
-		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
-		if cleanup != nil {
-			defer cleanup()
-		}
-		if err := requireYoloLaunchArgs(cmdArgs, opts); err != nil {
-			return err
-		}
 	}
 
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
@@ -329,14 +304,6 @@ func runWithNewStackOptions(
 		}
 		if modelCleanup != nil {
 			defer modelCleanup()
-		}
-		var cleanup func()
-		cmdArgs, cleanup = prepareYoloCodexCommandForRun(store, cmdArgs, &opts)
-		if cleanup != nil {
-			defer cleanup()
-		}
-		if err := requireYoloLaunchArgs(cmdArgs, opts); err != nil {
-			return err
 		}
 	}
 
@@ -433,12 +400,7 @@ type runTargetOptions struct {
 	Stdout       io.Writer
 	Stderr       io.Writer
 	// PreserveTTY keeps the target in the foreground terminal process group for interactive CLIs.
-	PreserveTTY    bool
-	YoloEnabled    bool
-	RequireYolo    bool
-	OnYoloFallback func() error
-	// PatchInfo, when set, records patch failure on startup crash.
-	PatchInfo            *patchRunInfo
+	PreserveTTY          bool
 	ModelProfileRef      string
 	ModelProfileSnapshot modelprofile.Snapshot
 }
@@ -496,134 +458,8 @@ func isCodexResolveError(err error) bool {
 	return errors.As(err, &target)
 }
 
-// patchRunInfo carries context for recording patch failures.
-type patchRunInfo struct {
-	OrigBinaryPath string
-	OrigSHA256     string
-	ConfigDir      string
-}
-
 func defaultRunTargetOptions() runTargetOptions {
 	return runTargetOptions{UseProxy: true}
-}
-
-func prepareYoloCodexCommandForRun(store *config.Store, cmdArgs []string, opts *runTargetOptions) ([]string, func()) {
-	if opts == nil || !opts.YoloEnabled || len(cmdArgs) == 0 || !isCodexCommand(cmdArgs[0]) {
-		return cmdArgs, nil
-	}
-	log := opts.Log
-	if log == nil {
-		log = io.Discard
-	}
-	var cleanupFns []func()
-	addCleanup := func(fn func()) {
-		if fn != nil {
-			cleanupFns = append(cleanupFns, fn)
-		}
-	}
-	cleanup := func() {
-		for i := len(cleanupFns) - 1; i >= 0; i-- {
-			cleanupFns[i]()
-		}
-	}
-	codexHome := envValue(opts.ExtraEnv, envCodexHome)
-	if strings.TrimSpace(codexHome) == "" {
-		codexHome = envValue(opts.ExtraEnv, codexhistory.EnvCodexDir)
-	}
-	forceFileAuthStore := false
-	if strings.TrimSpace(codexHome) != "" {
-		authOverride, authErr := prepareYoloAuthOverride(codexHome, opts.ExecIdentity)
-		logYoloAuthStatus(log, authOverride, authErr)
-		if authOverride != nil {
-			forceFileAuthStore = true
-			addCleanup(authOverride.Cleanup)
-		}
-		if cacheBypass, err := cloudgate.InstallYoloCloudRequirementsBypass(codexHome, cmdArgs[0]); err != nil {
-			_, _ = fmt.Fprintf(log, "yolo cloud requirements bypass warning: %v\n", err)
-		} else if cacheBypass.Installed {
-			forceFileAuthStore = true
-			addCleanup(func() { _ = cloudgate.RemoveCloudRequirementsCache(codexHome) })
-		}
-	}
-	if store != nil {
-		historyDir := filepath.Dir(store.Path())
-		patchResult, patchEnv, info, skipped, patchErr := preparePatchedBinaryForLaunch(cmdArgs[0], historyDir, opts.ExecIdentity)
-		logYoloPatchStatus(log, patchResult, skipped, patchErr)
-		if !skipped && patchResult != nil && patchResult.PatchedBinary != "" {
-			cmdArgs = append([]string{}, cmdArgs...)
-			cmdArgs[0] = patchResult.PatchedBinary
-			opts.ExtraEnv = append(opts.ExtraEnv, patchEnv...)
-			opts.PatchInfo = info
-			addCleanup(patchResult.Cleanup)
-		}
-		if opts.OnYoloFallback == nil {
-			opts.OnYoloFallback = func() error {
-				return persistYoloEnabled(store, false)
-			}
-		}
-	}
-	if !commandArgsHaveYolo(cmdArgs[1:]) {
-		if yoloFlags := codexYoloLaunchArgsWithOptions(cmdArgs[0], yoloLaunchOptions{ForceFileAuthStore: forceFileAuthStore}); len(yoloFlags) > 0 {
-			out := make([]string, 0, 1+len(yoloFlags)+len(cmdArgs[1:]))
-			out = append(out, cmdArgs[0])
-			out = append(out, yoloFlags...)
-			out = append(out, cmdArgs[1:]...)
-			cmdArgs = out
-		}
-	} else if forceFileAuthStore && !commandArgsHaveFileAuthStoreConfig(cmdArgs[1:]) {
-		out := make([]string, 0, len(cmdArgs)+2)
-		out = append(out, cmdArgs[0], "-c", `cli_auth_credentials_store="file"`)
-		out = append(out, cmdArgs[1:]...)
-		cmdArgs = out
-	}
-	if len(cleanupFns) == 0 {
-		return cmdArgs, nil
-	}
-	return cmdArgs, cleanup
-}
-
-func commandArgsHaveFileAuthStoreConfig(args []string) bool {
-	for i, arg := range args {
-		trimmed := strings.TrimSpace(arg)
-		if (trimmed == "-c" || trimmed == "--config") && i+1 < len(args) && strings.TrimSpace(args[i+1]) == `cli_auth_credentials_store="file"` {
-			return true
-		}
-	}
-	return false
-}
-
-func commandArgsHaveYolo(args []string) bool {
-	for i, arg := range args {
-		switch strings.TrimSpace(arg) {
-		case "--yolo", "--dangerously-bypass-approvals-and-sandbox":
-			return true
-		case "--ask-for-approval":
-			if i+1 < len(args) && strings.TrimSpace(args[i+1]) == "never" {
-				return true
-			}
-		default:
-			if strings.TrimSpace(arg) == "--ask-for-approval=never" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func requireYoloLaunchArgs(cmdArgs []string, opts runTargetOptions) error {
-	if !opts.YoloEnabled || !opts.RequireYolo {
-		return nil
-	}
-	if len(cmdArgs) < 2 || !commandArgsHaveYolo(cmdArgs[1:]) {
-		return fmt.Errorf("yolo mode is required but no supported Codex yolo launch flag was detected")
-	}
-	// NOTE: we intentionally do NOT require the binary patch to have matched
-	// here. Yolo can also be enabled via the cloud-requirements cache bypass, so
-	// "binary patched" is not the right invariant. Whether yolo is actually
-	// effective is verified behaviorally by the runtime isYoloFailure fallback
-	// (and, later, the dedicated validation probe). PatchResult.MatchCounts is
-	// exposed for diagnostics.
-	return nil
 }
 
 func withProfileInstallEnv(
@@ -780,39 +616,9 @@ func runTargetWithFallbackWithOptions(
 	fatalCh <-chan error,
 	opts runTargetOptions,
 ) error {
-	yoloRetried := false
-	for {
-		stdoutBuf := &limitedBuffer{max: maxOutputCaptureBytes}
-		stderrBuf := &limitedBuffer{max: maxOutputCaptureBytes}
-		err := runTargetOnceWithOptions(ctx, cmdArgs, proxyURL, healthCheck, fatalCh, stdoutBuf, stderrBuf, opts)
-		if err == nil {
-			// A clean run clears any accumulated patch-failure count so a
-			// future transient blip can't push a good binary over the threshold.
-			if opts.PatchInfo != nil {
-				recordPatchSuccess(opts.PatchInfo)
-			}
-			return nil
-		}
-		out := stdoutBuf.String() + stderrBuf.String()
-		if opts.YoloEnabled && !yoloRetried && isYoloFailure(err, out) {
-			if opts.RequireYolo {
-				return fmt.Errorf("yolo mode is required but Codex rejected yolo launch: %w", err)
-			}
-			yoloRetried = true
-			if opts.OnYoloFallback != nil {
-				_ = opts.OnYoloFallback()
-			}
-			cmdArgs = stripYoloArgs(cmdArgs)
-			opts.YoloEnabled = false
-			continue
-		}
-		// Record patch failure only if the patched binary itself is broken —
-		// isPatchedBinaryStartupFailure already excludes transient kills.
-		if opts.PatchInfo != nil && isPatchedBinaryStartupFailure(err, out) {
-			recordPatchFailure(opts.PatchInfo, err, out)
-		}
-		return err
-	}
+	stdoutBuf := &limitedBuffer{max: maxOutputCaptureBytes}
+	stderrBuf := &limitedBuffer{max: maxOutputCaptureBytes}
+	return runTargetOnceWithOptions(ctx, cmdArgs, proxyURL, healthCheck, fatalCh, stdoutBuf, stderrBuf, opts)
 }
 
 func runTargetOnce(
@@ -853,8 +659,6 @@ func runTargetOnceWithOptions(
 	guardCodexPath := ""
 	if isCodexCommand(cmdArgs[0]) {
 		guardCodexPath = cmdArgs[0]
-	} else if opts.PatchInfo != nil && isCodexCommand(opts.PatchInfo.OrigBinaryPath) {
-		guardCodexPath = opts.PatchInfo.OrigBinaryPath
 	}
 	if guardCodexPath != "" {
 		guardEnv, cleanup, err := prepareCodexSelfUpdateGuardEnv(ctx, guardCodexPath, envVars, opts.ExecIdentity)
@@ -901,9 +705,8 @@ func runTargetOnceWithOptions(
 		if opts.Stderr != nil {
 			stderr = opts.Stderr
 		}
-		// Keep stderr capture in interactive mode so yolo fallback and startup
-		// failure classification still see early Codex errors. The TUI itself
-		// requires stdin/stdout to be terminals; stderr is only mirrored.
+		// The TUI requires stdin/stdout to be terminals; stderr is mirrored so
+		// launch diagnostics remain visible to the caller.
 		if stderrBuf != nil {
 			cmd.Stderr = io.MultiWriter(stderr, stderrBuf)
 		} else {
@@ -986,37 +789,4 @@ func isTerminalFile(f *os.File) bool {
 		return false
 	}
 	return term.IsTerminal(int(f.Fd()))
-}
-
-// recordPatchFailure increments the consecutive-failure count for the patched
-// binary. Patching is skipped only after PatchFailureThreshold consecutive
-// failures (see PatchHistoryStore.IsFailed), so a single crash does not latch.
-func recordPatchFailure(info *patchRunInfo, err error, output string) {
-	if info == nil || info.ConfigDir == "" {
-		return
-	}
-	phs, phsErr := config.NewPatchHistoryStore(info.ConfigDir)
-	if phsErr != nil {
-		return
-	}
-	_ = phs.RecordFailure(info.OrigBinaryPath, info.OrigSHA256, currentProxyVersion(), formatFailureReason(err, output))
-}
-
-// recordPatchSuccess marks the patched binary known-good after a clean run: it
-// clears any accumulated failure count (so transient failures never reach the
-// threshold) and records this codex version as a safe fallback target. The
-// codex --version probe runs only on the first clean run of a given hash (or
-// after a prior failure), so steady-state runs stay cheap.
-func recordPatchSuccess(info *patchRunInfo) {
-	if info == nil || info.ConfigDir == "" {
-		return
-	}
-	phs, phsErr := config.NewPatchHistoryStore(info.ConfigDir)
-	if phsErr != nil {
-		return
-	}
-	if e, _ := phs.Find(info.OrigBinaryPath, info.OrigSHA256); e != nil && e.KnownGood && !e.Failed && e.FailureCount == 0 {
-		return
-	}
-	_ = phs.RecordKnownGood(info.OrigBinaryPath, info.OrigSHA256, resolveCodexVersion(info.OrigBinaryPath))
 }

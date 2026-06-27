@@ -468,11 +468,9 @@ func TestProxyResetClearsSettingsAndPromptsOnNextLaunch(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)
 	enabled := true
-	yolo := true
 	if err := store.Save(config.Config{
 		Version:      config.CurrentVersion,
 		ProxyEnabled: &enabled,
-		YoloEnabled:  &yolo,
 		Profiles: []config.Profile{{
 			ID:   "p1",
 			Name: "dev",
@@ -515,10 +513,6 @@ func TestProxyResetClearsSettingsAndPromptsOnNextLaunch(t *testing.T) {
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("expected instances cleared, got %+v", cfg.Instances)
 	}
-	if cfg.YoloEnabled == nil || !*cfg.YoloEnabled {
-		t.Fatalf("expected unrelated yolo preference preserved, got %v", cfg.YoloEnabled)
-	}
-
 	got, _, err := ensureProxyPreferenceWithReader(context.Background(), store, "", io.Discard, bufio.NewReader(strings.NewReader("y\n")))
 	if err != nil {
 		t.Fatalf("ensureProxyPreference after reset: %v", err)
