@@ -61,11 +61,15 @@ func TestNormalizeWorkingDirRejectsRegularFile(t *testing.T) {
 }
 
 func TestNormalizeWorkingDirResolvesRelativeDirectory(t *testing.T) {
-	root := t.TempDir()
 	workingDir, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
+	root, err := os.MkdirTemp(workingDir, ".normalize-working-dir-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	want := filepath.Join(root, "work")
 	if err := os.Mkdir(want, 0o700); err != nil {
 		t.Fatal(err)
