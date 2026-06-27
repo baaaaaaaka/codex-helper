@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/spf13/cobra"
 )
 
@@ -16,6 +19,10 @@ type rootOptions struct {
 }
 
 func Execute() int {
+	if err := legacyUpdaterVersionPreflight(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: helper update compatibility check failed: %v\n", err)
+		return 1
+	}
 	cmd := newRootCmd()
 	if err := cmd.Execute(); err != nil {
 		return 1

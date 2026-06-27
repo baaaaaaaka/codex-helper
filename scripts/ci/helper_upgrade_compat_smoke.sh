@@ -236,6 +236,34 @@ record_path.write_text(json.dumps({
 PY
 }
 
+write_physical_target_install_record_without_shims() {
+  local managed_target="$1"
+  local version="$2"
+  local record_path
+  record_path="$(helper_install_record_path)"
+  mkdir -p "$(dirname "$record_path")"
+  export HELPER_RECORD_PATH="$record_path"
+  export MANAGED_TARGET="$managed_target"
+  export RECORD_VERSION="$(version_no_v "$version")"
+  export HELPER_GOOS="$os"
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+record_path = Path(os.environ["HELPER_RECORD_PATH"])
+record_path.write_text(json.dumps({
+    "schema_version": 1,
+    "target_path": os.environ["MANAGED_TARGET"],
+    "target_source": "current_executable",
+    "target_state": "managed",
+    "version": os.environ["RECORD_VERSION"],
+    "goos": os.environ["HELPER_GOOS"],
+    "shims": None,
+}, indent=2) + "\n")
+PY
+}
+
 run_upgrade_convergence_scenario() {
   local scenario="$1"
   local seed_mode="$2"
@@ -511,6 +539,140 @@ assert record["version"].lstrip("v") == os.environ["TARGET_VERSION"], record
 PY
 }
 
+prepare_legacy_physical_record_fixture() {
+  local scenario="$1"
+  local storage_layout="$2"
+  local scenario_base="$base_root/$scenario"
+  rm -rf "$scenario_base"
+  mkdir -p "$scenario_base"
+
+  export HOME="$scenario_base/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_CACHE_HOME="$HOME/.cache"
+  export CODEX_HOME="$HOME/.codex"
+  export CODEX_PROXY_SKIP_BUILTIN_SKILLS=1
+  export PATH="$original_path"
+  unset CODEX_PROXY_INSTALL_PATH CODEX_PROXY_INSTALL_DIR
+  unset CODEX_HELPER_TEAMS_CHILD CODEX_HELPER_TEAMS_PARENT_PID
+
+  configure_managed_storage_layout "$scenario_base" "$storage_layout" "$HOME"
+  local logical_target="$HOME/.local/bin/codex-proxy"
+  local physical_bin
+  mkdir -p "$(dirname "$logical_target")"
+  physical_bin="$(cd "$(dirname "$logical_target")" && pwd -P)"
+  LEGACY_FIXTURE_TARGET="$physical_bin/codex-proxy"
+  LEGACY_FIXTURE_CXP="$physical_bin/cxp"
+  LEGACY_FIXTURE_LOGICAL_TARGET="$logical_target"
+  LEGACY_FIXTURE_RECORD="$(helper_install_record_path)"
+
+  download_binary "$old_tag" "$LEGACY_FIXTURE_TARGET"
+  ln -s codex-proxy "$LEGACY_FIXTURE_CXP"
+  write_physical_target_install_record_without_shims "$LEGACY_FIXTURE_TARGET" "$old_tag"
+
+  if [[ "$LEGACY_FIXTURE_LOGICAL_TARGET" == "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "legacy bridge fixture did not preserve distinct logical and physical target paths" >&2
+    exit 1
+  fi
+  if [[ "$(realpath "$LEGACY_FIXTURE_LOGICAL_TARGET")" != "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "legacy bridge fixture logical target does not resolve to physical target" >&2
+    exit 1
+  fi
+  if [[ -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "legacy bridge fixture target unexpectedly starts as a symlink" >&2
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$old_tag"
+}
+
+run_legacy_physical_record_failure_control() {
+  local vulnerable_target="v0.1.13-rc.16"
+  prepare_legacy_physical_record_fixture "legacy-physical-record-failure-control" "local-dir-symlink"
+  local output="$base_root/legacy-physical-record-failure-control.log"
+  set +e
+  "$LEGACY_FIXTURE_TARGET" upgrade --repo "$repo" --version "$vulnerable_target" >"$output" 2>&1
+  local status=$?
+  set -e
+  printf 'legacy physical-record failure control exit status: %s\n' "$status"
+  cat "$output"
+
+  if [[ ! -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "v0.1.12 -> $vulnerable_target did not reproduce the managed target self-loop" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_TARGET.prev" >&2 || true
+    exit 1
+  fi
+  if [[ "$(readlink "$LEGACY_FIXTURE_TARGET")" != "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "failure control target is a symlink but not the expected self-loop" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" >&2
+    exit 1
+  fi
+  assert_version "$LEGACY_FIXTURE_TARGET.prev" "$old_tag"
+}
+
+run_legacy_physical_record_bridge_success() {
+  local storage_layout="$1"
+  local scenario="legacy-physical-record-bridge-${storage_layout}"
+  prepare_legacy_physical_record_fixture "$scenario" "$storage_layout"
+
+  retry 5 10 "$LEGACY_FIXTURE_TARGET" upgrade --repo "$repo" --version "$target_tag"
+  if [[ -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "bridge upgrade left managed target as a symlink" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" >&2
+    exit 1
+  fi
+  assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$target_tag"
+
+  export MANAGED_TARGET="$LEGACY_FIXTURE_TARGET"
+  export MANAGED_CXP="$LEGACY_FIXTURE_CXP"
+  export TARGET_VERSION="$(version_no_v "$target_tag")"
+  export HELPER_RECORD_PATH="$LEGACY_FIXTURE_RECORD"
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+record = json.loads(Path(os.environ["HELPER_RECORD_PATH"]).read_text())
+assert record["target_path"] == os.environ["MANAGED_TARGET"], record
+assert record["version"].lstrip("v") == os.environ["TARGET_VERSION"], record
+assert record.get("shims", [None])[0] == os.environ["MANAGED_CXP"], record
+PY
+
+  local record_checksum_before record_mtime_before shim_before
+  record_checksum_before="$(sha256sum "$LEGACY_FIXTURE_RECORD")"
+  record_mtime_before="$(stat -c '%y' "$LEGACY_FIXTURE_RECORD")"
+  shim_before="$(readlink "$LEGACY_FIXTURE_CXP")"
+  assert_version "$LEGACY_FIXTURE_TARGET" "$target_tag"
+  test "$(sha256sum "$LEGACY_FIXTURE_RECORD")" = "$record_checksum_before"
+  test "$(stat -c '%y' "$LEGACY_FIXTURE_RECORD")" = "$record_mtime_before"
+  test "$(readlink "$LEGACY_FIXTURE_CXP")" = "$shim_before"
+}
+
+run_legacy_physical_record_unsafe_env_rejection() {
+  prepare_legacy_physical_record_fixture "legacy-physical-record-unsafe-env" "local-dir-symlink"
+  local record_checksum_before output
+  record_checksum_before="$(sha256sum "$LEGACY_FIXTURE_RECORD")"
+  output="$base_root/legacy-physical-record-unsafe-env.log"
+  export CODEX_PROXY_INSTALL_PATH="$LEGACY_FIXTURE_LOGICAL_TARGET"
+  set +e
+  "$LEGACY_FIXTURE_TARGET" upgrade --repo "$repo" --version "$target_tag" >"$output" 2>&1
+  local status=$?
+  set -e
+  unset CODEX_PROXY_INSTALL_PATH
+  cat "$output"
+
+  if (( status == 0 )); then
+    echo "legacy bridge unexpectedly accepted an unsafe logical install environment alias" >&2
+    exit 1
+  fi
+  grep -Fq "unsafe environment alias" "$output"
+  if [[ -L "$LEGACY_FIXTURE_TARGET" ]]; then
+    echo "rejected unsafe-env upgrade changed the managed target into a symlink" >&2
+    ls -l "$LEGACY_FIXTURE_TARGET" >&2
+    exit 1
+  fi
+  test "$(sha256sum "$LEGACY_FIXTURE_RECORD")" = "$record_checksum_before"
+  assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$old_tag"
+}
+
 safe_old="${old_tag//[^A-Za-z0-9._-]/_}"
 safe_target="${target_tag//[^A-Za-z0-9._-]/_}"
 base_root="${RUNNER_TEMP:-/tmp}/codex-helper-upgrade-compat-${safe_old}-to-${safe_target}"
@@ -526,5 +688,12 @@ run_upgrade_convergence_scenario "symlinked-local-dir-managed-symlink" "symlink"
 run_upgrade_convergence_scenario "symlinked-local-bin-managed-symlink" "symlink" "local-bin-symlink"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-dir" "local-dir-symlink"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bin" "local-bin-symlink"
+
+if [[ "$os" == "linux" && "$old_tag" == "v0.1.12" && "$service_backend" == "local-supervisor" ]]; then
+  run_legacy_physical_record_failure_control
+  run_legacy_physical_record_bridge_success "local-dir-symlink"
+  run_legacy_physical_record_bridge_success "local-bin-symlink"
+  run_legacy_physical_record_unsafe_env_rejection
+fi
 
 echo "helper upgrade compatibility smoke passed"
