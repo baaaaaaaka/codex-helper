@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
+	"sort"
 	"strings"
 	"sync"
+	"unicode/utf16"
 	"unsafe"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexbinary"
 	"golang.org/x/sys/windows"
 )
 
@@ -72,27 +74,41 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		return nil, fmt.Errorf("attach ConPTY process attribute: %w", err)
 	}
 
-	cmdPath, err := exec.LookPath("cmd.exe")
+	nativeCommand, pathDir, err := codexbinary.FindNativeBinary(command)
 	if err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
 		_ = windows.CloseHandle(outputRead)
-		return nil, fmt.Errorf("find cmd.exe: %w", err)
+		return nil, fmt.Errorf("resolve native Codex command: %w", err)
 	}
-	inner := strings.Join([]string{
-		`set "TERM=xterm-256color"`,
-		`set "CODEX_HOME=` + strings.ReplaceAll(codexHome, `"`, `""`) + `"`,
-		`set "OPENAI_API_KEY=cxp-contract-key"`,
-		windowsCmdQuote(command) + ` -c "features.tui_app_server=true" --remote ` + windowsCmdQuote(remoteURL),
-	}, "&&")
-	application, err := windows.UTF16PtrFromString(cmdPath)
+	application, err := windows.UTF16PtrFromString(nativeCommand)
 	if err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
 		_ = windows.CloseHandle(outputRead)
 		return nil, err
 	}
-	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine([]string{cmdPath, "/d", "/s", "/c", inner}))
+	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine([]string{
+		nativeCommand,
+		"-c", "features.tui_app_server=true",
+		"--remote", remoteURL,
+	}))
+	if err != nil {
+		windows.ClosePseudoConsole(console)
+		_ = windows.CloseHandle(inputWrite)
+		_ = windows.CloseHandle(outputRead)
+		return nil, err
+	}
+	pathValue := os.Getenv("PATH")
+	if strings.TrimSpace(pathDir) != "" {
+		pathValue = pathDir + ";" + pathValue
+	}
+	environment, err := windowsEnvironmentBlock(map[string]string{
+		"TERM":           "xterm-256color",
+		"CODEX_HOME":     codexHome,
+		"OPENAI_API_KEY": "cxp-contract-key",
+		"PATH":           pathValue,
+	})
 	if err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
@@ -104,7 +120,7 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		ProcThreadAttributeList: attributes.List(),
 	}
 	var info windows.ProcessInformation
-	if err := windows.CreateProcess(application, commandLine, nil, nil, false, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT, nil, nil, &startup.StartupInfo, &info); err != nil {
+	if err := windows.CreateProcess(application, commandLine, nil, nil, false, windows.EXTENDED_STARTUPINFO_PRESENT|windows.CREATE_UNICODE_ENVIRONMENT, &environment[0], nil, &startup.StartupInfo, &info); err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
 		_ = windows.CloseHandle(outputRead)
@@ -184,6 +200,38 @@ func (p *windowsRemoteTUIProcess) Output() string {
 	return p.buffer.String()
 }
 
-func windowsCmdQuote(value string) string {
-	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+func windowsEnvironmentBlock(overrides map[string]string) ([]uint16, error) {
+	values := make(map[string]string)
+	names := make(map[string]string)
+	for _, entry := range os.Environ() {
+		index := strings.IndexByte(entry, '=')
+		if index <= 0 {
+			continue
+		}
+		name := entry[:index]
+		key := strings.ToUpper(name)
+		names[key] = name
+		values[key] = entry[index+1:]
+	}
+	for name, value := range overrides {
+		key := strings.ToUpper(name)
+		names[key] = name
+		values[key] = value
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	block := make([]uint16, 0, 4096)
+	for _, key := range keys {
+		entry := names[key] + "=" + values[key]
+		if strings.IndexByte(entry, 0) >= 0 {
+			return nil, fmt.Errorf("Windows environment entry %q contains NUL", names[key])
+		}
+		block = append(block, utf16.Encode([]rune(entry))...)
+		block = append(block, 0)
+	}
+	block = append(block, 0)
+	return block, nil
 }
