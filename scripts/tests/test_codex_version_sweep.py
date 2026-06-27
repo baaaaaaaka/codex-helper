@@ -48,14 +48,52 @@ class CodexVersionSweepTests(unittest.TestCase):
         self.assertEqual(result["status"], "fail")
         self.assertEqual(result["install_rc"], 42)
         self.assertIn("install failed", result["stderr_tail"])
-        self.assertIsNone(result["cloudgate_rc"])
+        self.assertIsNone(result["native_resolver_rc"])
+        self.assertIsNone(result["contract_rc"])
         self.assertIsNone(result["cli_rc"])
+        self.assertIsNone(result["runtime_rc"])
         self.assertIsInstance(result["duration_seconds"], float)
+
+    def test_contract_failure_stops_before_cli_and_runtime(self) -> None:
+        completed = [
+            subprocess.CompletedProcess(args=["npm"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["native"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["contract"], returncode=9, stdout="schema changed", stderr=""),
+        ]
+        with mock.patch.object(sweep.subprocess, "run", side_effect=completed) as run:
+            result = sweep.run_smoke_for_version("0.115.0", repo_root=Path.cwd())
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["native_resolver_rc"], 0)
+        self.assertEqual(result["contract_rc"], 9)
+        self.assertIsNone(result["cli_rc"])
+        self.assertIsNone(result["runtime_rc"])
+        self.assertIn("schema changed", result["stderr_tail"])
+
+    def test_success_runs_native_contract_cli_and_runtime_in_order(self) -> None:
+        completed = [
+            subprocess.CompletedProcess(args=["npm"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["native"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["contract"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["cli"], returncode=0, stdout="", stderr=""),
+            subprocess.CompletedProcess(args=["runtime"], returncode=0, stdout="", stderr=""),
+        ]
+        with mock.patch.object(sweep.subprocess, "run", side_effect=completed) as run:
+            result = sweep.run_smoke_for_version("0.116.0", repo_root=Path.cwd())
+
+        commands = [call.args[0] for call in run.call_args_list[1:]]
+        self.assertIn("internal/codexbinary", commands[0])
+        self.assertIn("internal/codexcontract", commands[1])
+        self.assertIn("internal/cli", commands[2])
+        self.assertIn("internal/codexrunner", commands[3])
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["runtime_rc"], 0)
 
     def test_output_json_updates_incrementally(self) -> None:
         results = [
-            {"version": "0.111.0", "status": "pass", "cloudgate_rc": 0, "cli_rc": 0, "duration_seconds": 0.1},
-            {"version": "0.112.0", "status": "fail", "cloudgate_rc": 1, "cli_rc": None, "duration_seconds": 0.2},
+            {"version": "0.111.0", "status": "pass", "native_resolver_rc": 0, "contract_rc": 0, "cli_rc": 0, "runtime_rc": 0, "duration_seconds": 0.1},
+            {"version": "0.112.0", "status": "fail", "native_resolver_rc": 0, "contract_rc": 1, "cli_rc": None, "runtime_rc": None, "duration_seconds": 0.2},
         ]
 
         def fake_smoke(version: str, *, repo_root: Path) -> dict[str, object]:

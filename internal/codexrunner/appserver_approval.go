@@ -112,6 +112,7 @@ func requestedPermissionGrant(params json.RawMessage) (map[string]json.RawMessag
 
 func isMCPToolApprovalRequest(params json.RawMessage) (bool, error) {
 	var envelope struct {
+		Meta    map[string]json.RawMessage `json:"_meta"`
 		Request struct {
 			Meta map[string]json.RawMessage `json:"_meta"`
 		} `json:"request"`
@@ -119,8 +120,12 @@ func isMCPToolApprovalRequest(params json.RawMessage) (bool, error) {
 	if err := json.Unmarshal(params, &envelope); err != nil {
 		return false, fmt.Errorf("decode MCP elicitation request: %w", err)
 	}
+	meta := envelope.Meta
+	if meta == nil {
+		meta = envelope.Request.Meta
+	}
 	var kind string
-	if raw, ok := envelope.Request.Meta["codex_approval_kind"]; ok {
+	if raw, ok := meta["codex_approval_kind"]; ok {
 		if err := json.Unmarshal(raw, &kind); err != nil {
 			return false, fmt.Errorf("decode MCP approval kind: %w", err)
 		}

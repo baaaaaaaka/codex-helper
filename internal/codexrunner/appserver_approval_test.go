@@ -21,8 +21,9 @@ func TestAutomaticApprovalResultMatrix(t *testing.T) {
 		{name: "permissions", method: appServerMethodPermissionsApproval, params: `{"permissions":{"network":{"enabled":true},"fileSystem":{"read":["/dev"]},"ignored":"value"}}`, want: `{"permissions":{"fileSystem":{"read":["/dev"]},"network":{"enabled":true}},"scope":"turn"}`, wantHandle: true},
 		{name: "legacy exec", method: appServerMethodLegacyExecApproval, params: `{}`, want: `{"decision":"approved"}`, wantHandle: true},
 		{name: "legacy patch", method: appServerMethodLegacyPatchApproval, params: `{}`, want: `{"decision":"approved"}`, wantHandle: true},
-		{name: "MCP approval", method: appServerMethodMCPElicitation, params: `{"request":{"_meta":{"codex_approval_kind":"mcp_tool_call"}}}`, want: `{"_meta":null,"action":"accept","content":null}`, wantHandle: true},
-		{name: "ordinary MCP elicitation", method: appServerMethodMCPElicitation, params: `{"request":{"_meta":{"purpose":"input"}}}`, wantHandle: false},
+		{name: "MCP approval with current flattened metadata", method: appServerMethodMCPElicitation, params: `{"threadId":"thread-1","serverName":"tools","mode":"form","_meta":{"codex_approval_kind":"mcp_tool_call"}}`, want: `{"_meta":null,"action":"accept","content":null}`, wantHandle: true},
+		{name: "MCP approval with legacy nested metadata", method: appServerMethodMCPElicitation, params: `{"request":{"_meta":{"codex_approval_kind":"mcp_tool_call"}}}`, want: `{"_meta":null,"action":"accept","content":null}`, wantHandle: true},
+		{name: "ordinary MCP elicitation", method: appServerMethodMCPElicitation, params: `{"threadId":"thread-1","serverName":"tools","mode":"form","_meta":{"purpose":"input"}}`, wantHandle: false},
 		{name: "unknown request", method: "item/tool/requestUserInput", params: `{}`, wantHandle: false},
 	}
 

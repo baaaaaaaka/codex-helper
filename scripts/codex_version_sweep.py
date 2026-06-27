@@ -23,9 +23,19 @@ DEFAULT_NATIVE_CMD = (
     "-run 'TestFindNativeBinary' "
     "-count=1 -v"
 )
+DEFAULT_CONTRACT_CMD = (
+    "go test ./internal/codexcontract "
+    "-run 'TestInstalledCodexRuntimeContract' "
+    "-count=1 -v"
+)
 DEFAULT_CLI_CMD = (
     "go test ./internal/cli "
     "-run 'TestProbeCodexIntegration' "
+    "-count=1 -v"
+)
+DEFAULT_RUNTIME_CMD = (
+    "go test ./internal/codexrunner "
+    "-run 'TestInstalledCodexStandardApprovalRuntime' "
     "-count=1 -v"
 )
 
@@ -127,7 +137,9 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
         "version": version,
         "status": "fail",
         "native_resolver_rc": None,
+        "contract_rc": None,
         "cli_rc": None,
+        "runtime_rc": None,
         "duration_seconds": None,
     }
     try:
@@ -144,7 +156,9 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
 
         env = os.environ.copy()
         env["PATH"] = f"{prefix / 'bin'}{os.pathsep}{env['PATH']}"
+        env["CODEX_RUNTIME_CONTRACT_TEST"] = "1"
         env["CODEX_RUNTIME_TEST"] = "1"
+        env["CODEX_RUNTIME_E2E_TEST"] = "1"
 
         native = run_command(DEFAULT_NATIVE_CMD, cwd=repo_root, env=env)
         summary["native_resolver_rc"] = native.returncode
@@ -152,10 +166,22 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
             summary["stderr_tail"] = ((native.stdout or "") + (native.stderr or ""))[-4000:]
             return summary
 
+        contract = run_command(DEFAULT_CONTRACT_CMD, cwd=repo_root, env=env)
+        summary["contract_rc"] = contract.returncode
+        if contract.returncode != 0:
+            summary["stderr_tail"] = ((contract.stdout or "") + (contract.stderr or ""))[-4000:]
+            return summary
+
         cli = run_command(DEFAULT_CLI_CMD, cwd=repo_root, env=env)
         summary["cli_rc"] = cli.returncode
         if cli.returncode != 0:
             summary["stderr_tail"] = ((cli.stdout or "") + (cli.stderr or ""))[-4000:]
+            return summary
+
+        runtime = run_command(DEFAULT_RUNTIME_CMD, cwd=repo_root, env=env)
+        summary["runtime_rc"] = runtime.returncode
+        if runtime.returncode != 0:
+            summary["stderr_tail"] = ((runtime.stdout or "") + (runtime.stderr or ""))[-4000:]
             return summary
 
         summary["status"] = "pass"
@@ -216,7 +242,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     for version in versions:
         result = run_smoke_for_version(version, repo_root=repo_root)
         results.append(result)
-        print(f"{version}: {result['status']} (native={result['native_resolver_rc']} cli={result['cli_rc']})", flush=True)
+        print(
+            f"{version}: {result['status']} "
+            f"(native={result['native_resolver_rc']} contract={result['contract_rc']} "
+            f"cli={result['cli_rc']} runtime={result['runtime_rc']})",
+            flush=True,
+        )
         if args.output_json:
             write_json(Path(args.output_json), build_payload(versions, results))
         if result["status"] != "pass":

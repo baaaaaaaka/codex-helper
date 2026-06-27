@@ -618,8 +618,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareYoloAuthOverrideReownsAuthFilesForExecIdentity|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|PreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity|RunWith(ExistingInstanceOptionsPreservesExplicitCodexHomeEnv|NewStackOptionsPreservesExplicitCodexHomeEnv)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
-          go test ./internal/cli ./internal/codexhistory ./internal/config ./internal/cloudgate -count=1 -run "$pattern"
+          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run "$pattern"
 
       - name: Root/home/identity regressions (Windows)
         if: runner.os == 'Windows'
@@ -627,54 +627,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareYoloAuthOverrideReownsAuthFilesForExecIdentity|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|PreparePatchedBinaryForLaunchUsesAccessibleArtifactsForExecIdentity|RunWith(ExistingInstanceOptionsPreservesExplicitCodexHomeEnv|NewStackOptionsPreservesExplicitCodexHomeEnv)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
-          go test ./internal/cli ./internal/codexhistory ./internal/config ./internal/cloudgate -count=1 -run $pattern
+          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run $pattern
 
-      - name: Yolo auth regressions (Linux/macOS)
+      - name: Config and standard runtime resilience regressions (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(WriteFileAtomicallyReplacesExistingFile|PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
-          go test ./internal/cli -count=1 -run "$pattern"
-
-      - name: Yolo auth regressions (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(WriteFileAtomicallyReplacesExistingFile|PrepareYoloAuthOverride(MasksPlanAndRestores|IgnoresAccessTokenOnlyPlan|IgnoresOpaqueThreePartAccessToken|RecoversMaskedAuthFromBackupAfterStaleLease|DropsStaleLeaseAndBackupWhenAuthAlreadyClean|WaitsForLastLeaseBeforeRestore)|RunCodex(NewSession(SanitizesAuthForChildProcess|SanitizesAuthForRelativeCodexDir|RestoresAuthOnContextCancel)|SessionSanitizesAuthForChildProcess))$'
-          go test ./internal/cli -count=1 -run $pattern
-
-      - name: Config and patch resilience regressions (Linux/macOS)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          config_pattern='Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
-          cloudgate_pattern='Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|ApplyBestEffortBinaryPatchAllSkipsInvalidPatch|PatchCodexBinary(ReportsMatchCounts|TelemetryFingerprints(Only|PartialBestEffort|MissingDoesNotBlockCorePatch)))$'
-          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
+          config_pattern='TestStore_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)$'
+          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigrationReadyHook.*|PrepareCodexSelfUpdateGuardEnv.*)$'
+          runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
-          go test ./internal/cloudgate -count=1 -run "$cloudgate_pattern" -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
+          go test ./internal/cli ./internal/codexrunner -count=1 -run "$runtime_pattern" -v
+          go test ./internal/responsespolicy -count=1 -v
           go test ./internal/teams -count=1 -run "$teams_pattern" -v
           go test ./internal/update -count=1 -run 'TestReplaceBinary(BacksUpPrevious|FirstInstallHasNoBackup)$' -v
 
-      - name: Config and patch resilience regressions (Windows)
+      - name: Config and standard runtime resilience regressions (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $configPattern = 'Test(Store_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|SaveKeepsFirstMinReaderGenerationRollbackCompatible|ErrorPaths)|PatchHistoryStore_(IsFailed|KnownGood|LastKnownGoodSkipsLatchedFailures))$'
-          $cloudgatePattern = 'Test(FindNativeBinaryWithRetry(SucceedsWhenBinaryAppears|Exhausts|DoesNotRetryHardError)|ApplyBestEffortBinaryPatchAllSkipsInvalidPatch|PatchCodexBinary(ReportsMatchCounts|TelemetryFingerprints(Only|PartialBestEffort|MissingDoesNotBlockCorePatch)))$'
-          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|PreparePatchedBinary(PreservesSubThresholdFailureCount|PreservesKnownGoodMetadata|SkipsOnFailed|RecordsHistory)|RecordPatchSuccessMarksKnownGood|IsPatchedBinaryStartupFailure_SignalKilledIsTransient|IsTransientLaunchFailure_InterruptAndTimeout)$'
+          $configPattern = 'TestStore_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)$'
+          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigrationReadyHook.*|PrepareCodexSelfUpdateGuardEnv.*)$'
+          $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v
-          go test ./internal/cloudgate -count=1 -run $cloudgatePattern -v
           go test ./internal/cli -count=1 -run $cliPattern -v
+          go test ./internal/cli ./internal/codexrunner -count=1 -run $runtimePattern -v
+          go test ./internal/responsespolicy -count=1 -v
           go test ./internal/teams -count=1 -run $teamsPattern -v
 
       - name: Teams background keepalive regressions (Linux/macOS)
@@ -1327,35 +1312,39 @@ jobs:
             throw "expected local npm codex under $localPrefix, got $upgradedPath"
           }
 
-      - name: Codex patch+yolo integration test (Linux/macOS)
+      - name: Codex standard approval runtime integration test (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         env:
-          CODEX_PATCH_TEST: "1"
-          CODEX_YOLO_PATCH_TEST: "1"
+          CODEX_RUNTIME_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_TEST: "1"
+          CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           set -euo pipefail
           if command -v codex >/dev/null 2>&1; then
-            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
-            go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
+            go test ./internal/codexcontract -run TestInstalledCodexRuntimeContract -count=1 -v
+            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+            go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
           else
-            echo "Codex not available, skipping patch+yolo integration test"
+            echo "Codex not available, skipping standard approval runtime integration test"
           fi
 
-      - name: Codex patch+yolo integration test (Windows)
+      - name: Codex standard approval runtime integration test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          CODEX_PATCH_TEST: "1"
-          CODEX_YOLO_PATCH_TEST: "1"
+          CODEX_RUNTIME_CONTRACT_TEST: "1"
+          CODEX_RUNTIME_TEST: "1"
+          CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           if (Get-Command codex -ErrorAction SilentlyContinue) {
-            go test ./internal/cloudgate -run 'TestCodexPatchIntegration|TestCodexTelemetryFingerprintPatchIntegration|TestCodexPatchedYoloLaunchIntegration' -count=1 -v
-            go test ./internal/cli -run 'TestProbeCodexIntegration|TestRunCodexNewSessionRealCodexYoloIntegration' -count=1 -v
+            go test ./internal/codexcontract -run TestInstalledCodexRuntimeContract -count=1 -v
+            go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+            go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
           } else {
-            Write-Host "Codex not available, skipping patch integration test"
+            Write-Host "Codex not available, skipping standard approval runtime integration test"
           }
 
       - name: Managed-node install integration (Linux/macOS)
@@ -1465,11 +1454,12 @@ jobs:
         shell: bash
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cli -c -o dist/codex_cli_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/cloudgate -c -o dist/codex_cloudgate_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexcontract -c -o dist/codex_contract_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexrunner -c -o dist/codex_runtime_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/proc -c -o dist/codex_proc_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams -c -o dist/codex_teams_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
-          chmod +x dist/codex_cli_test dist/codex_cloudgate_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
 
       - name: Upload Linux distro smoke binaries
         uses: actions/upload-artifact@v4
@@ -1526,7 +1516,8 @@ jobs:
           required=(
             dist/codex-proxy
             dist/codex_cli_test
-            dist/codex_cloudgate_test
+            dist/codex_contract_test
+            dist/codex_runtime_test
             dist/codex_proc_test
             dist/codex_teams_test
             dist/codex_teams_store_test
@@ -1783,9 +1774,12 @@ jobs:
           teams_resource_pattern='Test(BridgePollDrops(HelperAttachmentEchoWithoutDurableMatch|RenderedHelperLabelOutputInWorkChat)|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
           teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|CompletesTurnWithTranscriptFinalForCanonicalDedupe|StreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder|StreamingErrorDoesNotSuppressPendingFinalLikeProgress|TranscriptCanonicalFinal(PreservesObservedArtifactManifest|RequiresSameCodexTurn)|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|KnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
           img="$DISTRO_IMAGE"
-          echo "==> $img (cloudgate tests)"
+          echo "==> $img (Codex contract tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_cloudgate_test -test.v -test.count=1
+            /dist/codex_contract_test -test.v -test.count=1
+          echo "==> $img (Codex runtime tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_runtime_test -test.v -test.count=1
           echo "==> $img (cli tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_cli_test -test.v -test.count=1 -test.run='Test[^I]'
