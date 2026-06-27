@@ -1,17 +1,22 @@
 package responsesadapter
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
+	"github.com/gorilla/websocket"
 )
 
 type ScopeResolver func(*http.Request, ResponsesRequest) Scope
@@ -36,6 +41,9 @@ type Facade struct {
 	ProfileVersion string
 	ScopeResolver  ScopeResolver
 	NewID          IDGenerator
+	// WebSocketRequestHook observes request arrival without exposing payloads.
+	// It is intended for health/contract probes, not request logging.
+	WebSocketRequestHook func()
 	// ShellPolicy applies execution-target escalation only at the local Codex
 	// boundary. Provider history and requests retain the original arguments.
 	ShellPolicy *responsespolicy.ShellEscalationPolicy
@@ -44,6 +52,8 @@ type Facade struct {
 func (f *Facade) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch {
+	case websocket.IsWebSocketUpgrade(r) && (path == "/responses" || path == "/v1/responses"):
+		f.handleResponsesWebSocket(w, r, path)
 	case r.Method == http.MethodGet && (path == "/_codex_proxy/health" || path == "/_cxp/health" || path == "/v1/_cxp/health"):
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "ok", "instanceId": f.InstanceID})
 	case r.Method == http.MethodGet && (path == "/health" || path == "/v1/health"):
@@ -57,6 +67,185 @@ func (f *Facade) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]string{"message": "not found"}})
 	}
+}
+
+func (f *Facade) handleResponsesWebSocket(w http.ResponseWriter, r *http.Request, path string) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin:       func(*http.Request) bool { return true },
+		EnableCompression: true,
+	}
+	connection, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer connection.Close()
+	connection.SetReadLimit(64 << 20)
+	var warmupResponseID string
+	var warmupInput []any
+	for {
+		messageType, raw, err := connection.ReadMessage()
+		if err != nil {
+			return
+		}
+		if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+			continue
+		}
+		var requestBody map[string]any
+		if json.Unmarshal(raw, &requestBody) != nil {
+			_ = connection.WriteJSON(map[string]any{
+				"type":  "error",
+				"error": map[string]string{"message": "invalid request JSON"},
+			})
+			continue
+		}
+		if f.WebSocketRequestHook != nil {
+			f.WebSocketRequestHook()
+		}
+		if generate, ok := requestBody["generate"].(bool); ok && !generate {
+			responseID, err := f.newID("resp")
+			if err != nil {
+				return
+			}
+			warmupResponseID = responseID
+			warmupInput, _ = requestBody["input"].([]any)
+			warmupInput = append([]any(nil), warmupInput...)
+			if err := connection.WriteJSON(map[string]any{
+				"type":     "response.created",
+				"response": map[string]any{"id": responseID},
+			}); err != nil {
+				return
+			}
+			if err := connection.WriteJSON(map[string]any{
+				"type": "response.completed",
+				"response": map[string]any{
+					"id": responseID,
+					"usage": map[string]any{
+						"input_tokens": 0, "input_tokens_details": nil,
+						"output_tokens": 0, "output_tokens_details": nil,
+						"total_tokens": 0,
+					},
+				},
+			}); err != nil {
+				return
+			}
+			continue
+		}
+		if previous, _ := requestBody["previous_response_id"].(string); previous != "" && previous == warmupResponseID {
+			incremental, _ := requestBody["input"].([]any)
+			requestBody["input"] = append(append([]any(nil), warmupInput...), incremental...)
+			delete(requestBody, "previous_response_id")
+			warmupResponseID = ""
+			warmupInput = nil
+		}
+		delete(requestBody, "type")
+		requestBody["stream"] = true
+		encoded, err := json.Marshal(requestBody)
+		if err != nil {
+			return
+		}
+		request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, path, bytes.NewReader(encoded))
+		if err != nil {
+			return
+		}
+		request.Header = r.Header.Clone()
+		reader, writer := io.Pipe()
+		stream := newWebSocketStreamResponseWriter(writer)
+		handlerDone := make(chan struct{})
+		go func() {
+			defer close(handlerDone)
+			f.handleResponses(stream, request)
+			stream.finish()
+			_ = writer.Close()
+		}()
+		select {
+		case <-stream.ready:
+		case <-r.Context().Done():
+			_ = reader.CloseWithError(r.Context().Err())
+			<-handlerDone
+			return
+		}
+		if stream.statusCode() >= http.StatusBadRequest {
+			rawBody, _ := io.ReadAll(reader)
+			<-handlerDone
+			var body any
+			if json.Unmarshal(rawBody, &body) != nil {
+				body = map[string]string{"message": http.StatusText(stream.statusCode())}
+			}
+			if err := connection.WriteJSON(map[string]any{"type": "error", "error": body}); err != nil {
+				return
+			}
+			continue
+		}
+		if err := writeSSEAsWebSocketEvents(connection, reader); err != nil {
+			_ = reader.CloseWithError(err)
+			<-handlerDone
+			return
+		}
+		<-handlerDone
+	}
+}
+
+type websocketStreamResponseWriter struct {
+	header http.Header
+	pipe   *io.PipeWriter
+	ready  chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	status int
+}
+
+func newWebSocketStreamResponseWriter(pipe *io.PipeWriter) *websocketStreamResponseWriter {
+	return &websocketStreamResponseWriter{header: make(http.Header), pipe: pipe, ready: make(chan struct{})}
+}
+
+func (w *websocketStreamResponseWriter) Header() http.Header { return w.header }
+
+func (w *websocketStreamResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	if w.status == 0 {
+		w.status = status
+		w.once.Do(func() { close(w.ready) })
+	}
+	w.mu.Unlock()
+}
+
+func (w *websocketStreamResponseWriter) Write(payload []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.pipe.Write(payload)
+}
+
+func (w *websocketStreamResponseWriter) Flush() {}
+
+func (w *websocketStreamResponseWriter) finish() {
+	w.WriteHeader(http.StatusOK)
+}
+
+func (w *websocketStreamResponseWriter) statusCode() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func writeSSEAsWebSocketEvents(connection *websocket.Conn, stream io.Reader) error {
+	scanner := bufio.NewScanner(stream)
+	scanner.Buffer(make([]byte, 64<<10), 64<<20)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		if err := connection.WriteMessage(websocket.TextMessage, append([]byte(nil), payload...)); err != nil {
+			return err
+		}
+	}
+	return scanner.Err()
 }
 
 func (f *Facade) handleModels(w http.ResponseWriter) {

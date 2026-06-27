@@ -11,11 +11,15 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const maxBufferedJSONResponse = 64 << 20
+const (
+	maxBufferedJSONResponse = 64 << 20
+	maxWebSocketMessage     = 64 << 20
+)
 
 // Proxy transparently relays a Responses API endpoint and applies a
 // ShellEscalationPolicy only on Responses request/response payloads. Other
@@ -80,7 +84,7 @@ func firstProxy(proxies ...func(*http.Request) (*url.URL, error)) func(*http.Req
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
-		p.serveWebSocket(w, r)
+		p.serveWebSocket(w, r, isResponsesPath(r.URL.Path))
 		return
 	}
 	if isResponsesPath(r.URL.Path) && r.Body != nil && r.Method == http.MethodPost {
@@ -185,7 +189,7 @@ func splitLineEnding(line []byte) ([]byte, []byte) {
 	}
 }
 
-func (p *Proxy) serveWebSocket(w http.ResponseWriter, request *http.Request) {
+func (p *Proxy) serveWebSocket(w http.ResponseWriter, request *http.Request, applyResponsesPolicy bool) {
 	upstreamURL := *p.upstream
 	switch upstreamURL.Scheme {
 	case "https":
@@ -218,13 +222,41 @@ func (p *Proxy) serveWebSocket(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	defer downstream.Close()
+	upstream.SetReadLimit(maxWebSocketMessage)
+	downstream.SetReadLimit(maxWebSocketMessage)
+	installWebSocketControlRelay(upstream, downstream)
+	installWebSocketControlRelay(downstream, upstream)
 
 	ctx, cancel := context.WithCancel(request.Context())
 	defer cancel()
 	errors := make(chan error, 2)
-	go relayWebSocket(ctx, upstream, downstream, p.policy.RestoreRequest, errors)
-	go relayWebSocket(ctx, downstream, upstream, p.policy.RewriteResponseEvent, errors)
+	var restoreRequest, rewriteResponse func([]byte) ([]byte, bool)
+	if applyResponsesPolicy {
+		restoreRequest = p.policy.RestoreRequest
+		rewriteResponse = p.policy.RewriteResponseEvent
+	}
+	go relayWebSocket(ctx, upstream, downstream, restoreRequest, errors)
+	go relayWebSocket(ctx, downstream, upstream, rewriteResponse, errors)
 	<-errors
+	cancel()
+	_ = upstream.Close()
+	_ = downstream.Close()
+	select {
+	case <-errors:
+	case <-time.After(time.Second):
+	}
+}
+
+func installWebSocketControlRelay(source, destination *websocket.Conn) {
+	source.SetPingHandler(func(data string) error {
+		return destination.WriteControl(websocket.PingMessage, []byte(data), time.Now().Add(time.Second))
+	})
+	source.SetPongHandler(func(data string) error {
+		return destination.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+	})
+	source.SetCloseHandler(func(code int, text string) error {
+		return destination.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, text), time.Now().Add(time.Second))
+	})
 }
 
 func relayWebSocket(ctx context.Context, destination, source *websocket.Conn, mutate func([]byte) ([]byte, bool), done chan<- error) {
@@ -237,7 +269,7 @@ func relayWebSocket(ctx context.Context, destination, source *websocket.Conn, mu
 			}
 			return
 		}
-		if messageType == websocket.TextMessage {
+		if (messageType == websocket.TextMessage || messageType == websocket.BinaryMessage) && mutate != nil {
 			if rewritten, changed := mutate(payload); changed {
 				payload = rewritten
 			}

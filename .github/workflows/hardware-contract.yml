@@ -1,0 +1,54 @@
+name: Hardware Runtime Contract
+
+on:
+  workflow_dispatch:
+    inputs:
+      codex_version:
+        description: "Exact @openai/codex version or dist-tag"
+        required: false
+        default: latest
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  nvidia-runtime:
+    name: Original Codex approval runtime on NVIDIA host and container
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install exact Codex version
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ inputs.codex_version || 'latest' }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/retry.sh 5 5 npm install -g --include=optional "@openai/codex@${CODEX_VERSION}"
+          codex --version
+
+      - name: Run approved CUDA contract through original Codex
+        shell: bash
+        env:
+          CXP_GPU_RUNTIME_E2E_TEST: "1"
+        run: |
+          set -euo pipefail
+          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntimeCUDA -count=1 -v -timeout=3m
+
+      - name: Run host and NVIDIA Docker device contracts
+        shell: bash
+        run: bash scripts/ci/gpu_runtime_contract.sh all
