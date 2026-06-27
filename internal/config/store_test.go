@@ -208,6 +208,16 @@ func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
 	if bytes.Contains(raw, []byte("yoloEnabled")) {
 		t.Fatalf("legacy field survived migration: %s", raw)
 	}
+	var header struct {
+		Version   int `json:"version"`
+		MinReader int `json:"minReader"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		t.Fatal(err)
+	}
+	if header.Version != 3 || header.MinReader != 1 {
+		t.Fatalf("migration header = %#v, want generation 3 readable by generation-1 readers", header)
+	}
 }
 
 func TestDefaultPathForHome(t *testing.T) {

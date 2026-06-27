@@ -74,7 +74,11 @@ func writeCodexTUIBrokerFixture(t *testing.T) codexTUIBrokerFixture {
 set -eu
 case "${1:-}" in
   --version)
-    echo 'codex-cli 0.0-test'
+    echo 'codex-cli 0.133.0'
+    exit 0
+    ;;
+  --help)
+    echo 'Options: --remote <ADDR>'
     exit 0
     ;;
   app-server)
@@ -102,11 +106,13 @@ esac
 
 func newCodexOpenTestStore(t *testing.T) *config.Store {
 	t.Helper()
-	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	root := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(root, "codex-home"))
+	store, err := config.NewStore(filepath.Join(root, "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+	if err := store.Save(config.Config{Version: config.CurrentVersion, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
 		t.Fatal(err)
 	}
 	return store

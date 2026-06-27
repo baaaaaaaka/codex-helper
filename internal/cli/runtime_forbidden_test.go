@@ -44,6 +44,20 @@ func TestPublishedCLIContainsNoRetiredExecutionSignals(t *testing.T) {
 	}
 }
 
+func TestLegacyExecutionFlagsRemainHiddenCompatibilityOnly(t *testing.T) {
+	runFlag := newRunCmd(nil).Flags().Lookup("yolo")
+	if runFlag == nil || !runFlag.Hidden {
+		t.Fatalf("legacy run flag = %#v, want hidden compatibility flag", runFlag)
+	}
+	storePath := ""
+	for _, command := range []*cobra.Command{newBeaconWorkerRunOnceCmd(&storePath), newBeaconWorkerServeCmd(&storePath)} {
+		flag := command.Flags().Lookup("no-yolo")
+		if flag == nil || !flag.Hidden {
+			t.Fatalf("%s legacy worker flag = %#v, want hidden compatibility flag", command.Name(), flag)
+		}
+	}
+}
+
 func TestRuntimeSourcesContainNoRetiredExecutionSignals(t *testing.T) {
 	forbidden := []string{
 		"--yolo",

@@ -21,6 +21,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
+	"github.com/baaaaaaaka/codex-helper/internal/migration"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
@@ -41,6 +42,7 @@ var (
 
 func newRunCmd(root *rootOptions) *cobra.Command {
 	var modelProfile string
+	var legacyMode bool
 	cmd := &cobra.Command{
 		Use:   "run [profile] -- [cmd args...]",
 		Short: "Run a command using direct mode or an SSH-backed local proxy",
@@ -51,6 +53,8 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
+	cmd.Flags().BoolVar(&legacyMode, migration.LegacyRunModeFlagName, false, "")
+	_ = cmd.Flags().MarkHidden(migration.LegacyRunModeFlagName)
 	return cmd
 }
 
@@ -165,16 +169,15 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	}
 
 	log := cmd.ErrOrStderr()
-	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
-	if err != nil {
-		return err
-	}
-
 	opts := runOpts
 	opts.UseProxy = false
 	opts.Log = log
-	if isCodexCommand(resolvedCmd[0]) {
-		return runCodexCLIInvocation(ctx, root, store, nil, nil, resolvedCmd, false, opts)
+	if isCodexCommand(after[0]) {
+		return runCodexCLIInvocation(ctx, root, store, nil, nil, after, false, opts)
+	}
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
+	if err != nil {
+		return err
 	}
 	return runTargetWithFallbackWithOptionsFn(ctx, resolvedCmd, "", nil, nil, opts)
 }

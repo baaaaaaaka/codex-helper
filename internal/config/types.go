@@ -3,8 +3,9 @@ package config
 import "time"
 
 // CurrentVersion is the schema generation this binary stamps into configs it
-// writes. Generation 3 removes the persisted legacy execution-mode toggle;
-// every Codex surface now uses the standard approval broker.
+// writes. Generation 3 stops writing the legacy execution-mode toggle and adds
+// broker migration metadata. Both changes are reader-compatible: older readers
+// ignore the metadata and already treat an absent toggle as disabled.
 const CurrentVersion = 3
 
 // MinReaderVersion is the minimum reader generation required to SAFELY read a
@@ -13,7 +14,7 @@ const CurrentVersion = 3
 // unchanged so older binaries can still read newer configs — encoding/json
 // ignores unknown fields, so an additive change does not require a newer reader.
 // See (*Store).loadUnlocked for the gate.
-const MinReaderVersion = 3
+const MinReaderVersion = 1
 
 // SupportedReaderVersion is the newest reader floor this binary can satisfy. A
 // config whose minReader exceeds it is rejected with ErrStaleReader (this build

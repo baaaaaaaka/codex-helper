@@ -277,7 +277,8 @@ users do not need to approve each command manually:
 codex-proxy run -- codex
 ```
 
-This runtime requires Codex CLI 0.116.0 or newer; the release compatibility
+This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
+are upgraded automatically before the first brokered turn. The release compatibility
 sweep verifies both the app-server handshake and the remote TUI capability.
 
 The Codex inner sandbox remains restricted until an approved operation needs

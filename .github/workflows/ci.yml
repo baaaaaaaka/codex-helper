@@ -635,8 +635,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          config_pattern='TestStore_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)$'
-          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigrationReadyHook.*|PrepareCodexSelfUpdateGuardEnv.*)$'
+          config_pattern='TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField)$'
+          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*)$'
           runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
@@ -652,8 +652,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $configPattern = 'TestStore_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)$'
-          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigrationReadyHook.*|PrepareCodexSelfUpdateGuardEnv.*)$'
+          $configPattern = 'TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField)$'
+          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*)$'
           $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
           $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v

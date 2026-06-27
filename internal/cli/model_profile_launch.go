@@ -19,7 +19,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
-	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 const (
@@ -178,9 +177,8 @@ func startModelProfileAdapterForCodex(
 		return codexModelProfileLaunch{}, nil, err
 	}
 	server := &http.Server{Handler: &responsesadapter.Facade{
-		Router:      registry,
-		Store:       responseStore,
-		ShellPolicy: responsespolicy.NewShellEscalationPolicy(0),
+		Router: registry,
+		Store:  responseStore,
 	}}
 	done := make(chan error, 1)
 	go func() {

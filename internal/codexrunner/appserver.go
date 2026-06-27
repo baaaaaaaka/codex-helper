@@ -310,7 +310,10 @@ func (r *AppServerRunner) initializeLocked(ctx context.Context) error {
 			"name":    "codex-helper",
 			"version": "0",
 		},
-		"capabilities": nil,
+		// runtimeWorkspaceRoots is still experimental in current Codex builds.
+		// Advertising the capability is harmless for callers that do not use it
+		// and is required for exact `codex --add-dir` compatibility.
+		"capabilities": map[string]any{"experimentalApi": true},
 	}, nil); err != nil {
 		return err
 	}
@@ -330,6 +333,9 @@ func (r *AppServerRunner) startThreadLocked(ctx context.Context, input TurnInput
 	}
 	if len(input.AdditionalDirs) > 0 {
 		params["runtimeWorkspaceRoots"] = append([]string(nil), input.AdditionalDirs...)
+	}
+	if input.Ephemeral {
+		params["ephemeral"] = true
 	}
 	result, err := r.requestLocked(ctx, appServerMethodThreadStart, params, nil)
 	if err != nil {
@@ -364,6 +370,9 @@ func (r *AppServerRunner) startTurnLocked(ctx context.Context, input StartTurnIn
 	}
 	if workingDir := firstNonEmpty(input.WorkingDir, r.WorkingDir); workingDir != "" {
 		params["cwd"] = workingDir
+	}
+	if len(input.AdditionalDirs) > 0 {
+		params["runtimeWorkspaceRoots"] = append([]string(nil), input.AdditionalDirs...)
 	}
 	if len(input.OutputSchema) > 0 {
 		params["outputSchema"] = input.OutputSchema

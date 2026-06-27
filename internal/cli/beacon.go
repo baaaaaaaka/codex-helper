@@ -16,6 +16,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/migration"
 	"github.com/spf13/cobra"
 )
 
@@ -922,6 +923,7 @@ func newBeaconWorkerRunOnceCmd(storePath *string) *cobra.Command {
 	var workerID string
 	var codexPath string
 	var waitDuration time.Duration
+	var legacySandbox bool
 	cmd := &cobra.Command{
 		Use:   "run-once (--machine <machine-id> | --allocation <request-id>)",
 		Short: "Claim one queued beacon job, run Codex, and publish a terminal result",
@@ -1001,6 +1003,8 @@ remote beacon workers.`),
 	cmd.Flags().StringVar(&workerID, "worker", "", "Worker id to stamp terminal output with")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
 	cmd.Flags().DurationVar(&waitDuration, "wait", 0, "Wait for a queued job before exiting, for example 30m")
+	cmd.Flags().BoolVar(&legacySandbox, migration.LegacyBeaconSandboxFlagName, false, "")
+	_ = cmd.Flags().MarkHidden(migration.LegacyBeaconSandboxFlagName)
 	return cmd
 }
 
@@ -1014,6 +1018,7 @@ func newBeaconWorkerServeCmd(storePath *string) *cobra.Command {
 	var codexPath string
 	var idleTimeout time.Duration
 	var maxJobs int
+	var legacySandbox bool
 	cmd := &cobra.Command{
 		Use:   "serve --allocation <request-id>",
 		Short: "Register a beacon worker and serve queued jobs until idle or stopped",
@@ -1103,6 +1108,8 @@ remote beacon workers.`),
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Codex executable or wrapper path (default: codex)")
 	cmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "Exit after this long without a queued job")
 	cmd.Flags().IntVar(&maxJobs, "max-jobs", 0, "Maximum jobs to serve before exiting (0 means unlimited until idle)")
+	cmd.Flags().BoolVar(&legacySandbox, migration.LegacyBeaconSandboxFlagName, false, "")
+	_ = cmd.Flags().MarkHidden(migration.LegacyBeaconSandboxFlagName)
 	return cmd
 }
 
@@ -1253,19 +1260,36 @@ func startBeaconWorkerHeartbeat(ctx context.Context, store *beacon.Store, machin
 
 func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath string, handler codexrunner.EventHandler) (beacon.JobTerminalPayload, error) {
 	command := strings.TrimSpace(codexPath)
-	if command == "" {
-		command = "codex"
-	}
 	store, paths, storeErr := newRootStore(nil, "")
 	if storeErr != nil {
 		return beacon.JobTerminalPayload{}, storeErr
 	}
+	paths, storeErr = resolveEffectiveLaunchPaths(store.Path(), paths.CodexDir, job.Payload.WorkingDir)
+	if storeErr != nil {
+		return beacon.JobTerminalPayload{}, storeErr
+	}
+	command, storeErr = ensureCodexBrokerRuntime(ctx, command, nil, codexInstallOptions{}, codexPathAllowsAutomaticUpgrade(codexPath))
+	if storeErr != nil {
+		return beacon.JobTerminalPayload{Error: storeErr.Error()}, storeErr
+	}
+	if storeErr = prepareRuntimeMigration(store, paths, command, nil); storeErr != nil {
+		return beacon.JobTerminalPayload{Error: storeErr.Error()}, storeErr
+	}
+	configureIdentity := func(process *exec.Cmd) error {
+		updated, applyErr := applyExecIdentity(process, process.Env, paths.ExecIdentity)
+		if applyErr != nil {
+			return applyErr
+		}
+		process.Env = updated
+		return nil
+	}
 	runner := &codexrunner.AppServerRunner{
-		Starter: codexrunner.PolicyAppServerStarter{
-			ReadyHook: runtimeMigrationReadyHook(store, paths, command, nil),
-		},
+		Starter: configureAppServerStarter{base: codexrunner.PolicyAppServerStarter{
+			ReadyHook: runtimeMigrationReadyHook(store, nil),
+		}, configure: configureIdentity},
 		Command:            command,
 		AppServerArgs:      []string{"--analytics-default-enabled"},
+		ExtraEnv:           codexHomeEnv(paths.CodexDir),
 		WorkingDir:         job.Payload.WorkingDir,
 		BackfillThreadName: true,
 	}

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -27,15 +28,17 @@ type codexCLIInvocation struct {
 }
 
 var codexSubcommands = map[string]bool{
-	"exec": true, "resume": true, "fork": true, "review": true,
+	"exec": true, "e": true, "resume": true, "fork": true, "review": true,
 	"login": true, "logout": true, "mcp": true, "mcp-server": true,
 	"app-server": true, "completion": true, "cloud": true, "features": true,
 	"debug": true, "apply": true, "sandbox": true, "execpolicy": true,
-	"stdio-to-uds": true, "responses-api-proxy": true,
+	"stdio-to-uds": true, "responses-api-proxy": true, "plugin": true,
+	"remote-control": true, "update": true, "doctor": true,
+	"exec-server": true, "help": true, "a": true,
 }
 
 func splitCodexCLIInvocation(args []string) (codexCLIInvocation, error) {
-	args = migration.RemoveLegacyCodexExecutionOverrides(args)
+	args = expandCodexOptionEquals(migration.RemoveLegacyCodexExecutionOverrides(args))
 	var invocation codexCLIInvocation
 	for index := 0; index < len(args); index++ {
 		arg := strings.TrimSpace(args[index])
@@ -77,9 +80,27 @@ func splitCodexCLIInvocation(args []string) (codexCLIInvocation, error) {
 	return invocation, nil
 }
 
+func expandCodexOptionEquals(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		key, value, ok := strings.Cut(arg, "=")
+		if !ok {
+			out = append(out, arg)
+			continue
+		}
+		switch key {
+		case "--config", "--enable", "--disable", "--model", "--profile", "--profile-v2", "--local-provider", "--cd", "--add-dir", "--image", "--color", "--output-schema", "--output-last-message", "--remote", "--remote-auth-token-env":
+			out = append(out, key, value)
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
+}
+
 func codexGlobalOptionTakesValue(arg string) bool {
 	switch arg {
-	case "-c", "--config", "--enable", "--disable", "-m", "--model", "-p", "--profile", "--profile-v2", "--local-provider", "-C", "--cd", "--add-dir", "-i", "--image":
+	case "-c", "--config", "--enable", "--disable", "-m", "--model", "-p", "--profile", "--profile-v2", "--local-provider", "-C", "--cd", "--add-dir", "-i", "--image", "--remote", "--remote-auth-token-env":
 		return true
 	default:
 		return false
@@ -115,6 +136,16 @@ func translateCodexGlobalArgsToAppServer(args []string) ([]string, error) {
 			index++
 		case "--strict-config":
 			out = append(out, arg)
+		case "-p", "--profile", "--profile-v2":
+			if index+1 >= len(args) {
+				return nil, fmt.Errorf("%s requires a profile", arg)
+			}
+			// The remote TUI resolves its selected profile and sends the effective
+			// thread configuration to app-server. Exec profile calls use the native
+			// CLI because profile selection is a loader-level operation.
+			index++
+		case "--dangerously-bypass-hook-trust":
+			out = append(out, "-c", "bypass_hook_trust=true")
 		case "--no-alt-screen":
 			// This is a TUI-only presentation option.
 		case "-C", "--cd", "--add-dir", "-i", "--image":
@@ -145,6 +176,15 @@ func runCodexCLIInvocation(
 	invocation, err := splitCodexCLIInvocation(cmdArgs[1:])
 	if err != nil {
 		return err
+	}
+	if invocation.Command == "" && len(invocation.Args) > 0 {
+		if discovered := discoverCodexTopLevelCommands(ctx, cmdArgs[0]); discovered[invocation.Args[0]] {
+			invocation.Command = invocation.Args[0]
+			invocation.Args = invocation.Args[1:]
+		}
+	}
+	if codexInvocationUsesNativeCLI(invocation, cmdArgs[1:]) {
+		return runCodexNativeInvocation(ctx, store, profile, instances, cmdArgs, useProxy, opts)
 	}
 	appServerArgs, err := translateCodexGlobalArgsToAppServer(invocation.GlobalArgs)
 	if err != nil {
@@ -177,6 +217,8 @@ func runCodexCLIInvocation(
 			execArgs = append([]string{"--add-dir", dir}, execArgs...)
 		}
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, execArgs)
+	case "e":
+		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, invocation.Args)
 	case "review":
 		reviewArgs, err := codexReviewArgsToExecArgs(invocation.Args)
 		if err != nil {
@@ -190,35 +232,126 @@ func runCodexCLIInvocation(
 		}
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, reviewArgs)
 	default:
-		// Account, MCP, completion, and diagnostic commands do not execute an
-		// agent turn. Preserve the official CLI behavior for those commands.
-		installOptions := codexInstallOptions{}
-		if useProxy {
-			if profile == nil {
-				return fmt.Errorf("proxy mode enabled but no profile configured")
-			}
-			installOptions.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
-				return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
+		return runCodexNativeInvocation(ctx, store, profile, instances, cmdArgs, useProxy, opts)
+	}
+}
+
+func codexInvocationUsesNativeCLI(invocation codexCLIInvocation, rawArgs []string) bool {
+	for _, arg := range rawArgs {
+		switch strings.TrimSpace(arg) {
+		case "-h", "--help", "-V", "--version":
+			return true
+		}
+		if strings.HasPrefix(strings.TrimSpace(arg), "--remote") {
+			return true
+		}
+	}
+	switch invocation.Command {
+	case "", "resume", "fork", "exec", "e", "review":
+	default:
+		return true
+	}
+	if invocation.Command == "exec" || invocation.Command == "e" {
+		for _, arg := range append(append([]string{}, invocation.GlobalArgs...), invocation.Args...) {
+			switch strings.TrimSpace(arg) {
+			case "--ignore-user-config", "--ignore-rules", "-p", "--profile", "--profile-v2":
+				return true
 			}
 		}
-		resolved, err := ensureCodexInstalledWithOptions(ctx, cmdArgs[0], opts.Log, installOptions)
+	}
+	return false
+}
+
+func runCodexNativeInvocation(ctx context.Context, store *config.Store, profile *config.Profile, instances []config.Instance, cmdArgs []string, useProxy bool, opts runTargetOptions) error {
+	installOptions := codexInstallOptions{}
+	if useProxy {
+		if profile == nil {
+			return fmt.Errorf("proxy mode enabled but no profile configured")
+		}
+		installOptions.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
+			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
+		}
+	}
+	lookup := cmdArgs[0]
+	if codexPathAllowsAutomaticUpgrade(lookup) {
+		lookup = ""
+	}
+	resolved, err := ensureCodexInstalledWithOptions(ctx, lookup, opts.Log, installOptions)
+	if err != nil {
+		return err
+	}
+	cmdArgs = append([]string{resolved}, migration.RemoveLegacyCodexExecutionOverrides(cmdArgs[1:])...)
+	if err := applyDefaultCodexExecutionContext(&opts); err != nil {
+		return err
+	}
+	proxyURL := ""
+	if useProxy {
+		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, opts.Log)
 		if err != nil {
 			return err
 		}
-		cmdArgs[0] = resolved
-		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
-			return err
+	}
+	cmdArgs, cleanup, err := prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
+	if err != nil {
+		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	opts.UseProxy = useProxy
+	return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
+}
+
+func discoverCodexTopLevelCommands(ctx context.Context, codexPath string) map[string]bool {
+	commands := make(map[string]bool, len(codexSubcommands))
+	for command := range codexSubcommands {
+		commands[command] = true
+	}
+	probePath := codexPath
+	if codexPathAllowsAutomaticUpgrade(probePath) {
+		if resolved, err := exec.LookPath("codex"); err == nil {
+			probePath = resolved
+		} else if resolved, err := findInstalledCodexWithoutProbe(); err == nil {
+			probePath = resolved
 		}
-		proxyURL := ""
-		if useProxy {
-			proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, opts.Log)
-			if err != nil {
-				return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(probeCtx, probePath, "--help").Output()
+	if err != nil {
+		return commands
+	}
+	inCommands := false
+	for _, line := range strings.Split(string(output), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "Commands:" {
+			inCommands = true
+			continue
+		}
+		if !inCommands {
+			continue
+		}
+		if trimmed == "Arguments:" || trimmed == "Options:" {
+			break
+		}
+		// Clap renders command rows with exactly two leading spaces. Wrapped
+		// descriptions are indented further and must not become fake commands.
+		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "   ") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "[") {
+			continue
+		}
+		commands[fields[0]] = true
+		if marker := strings.Index(trimmed, "[aliases:"); marker >= 0 {
+			aliases := strings.TrimSuffix(strings.TrimSpace(trimmed[marker+len("[aliases:"):]), "]")
+			for _, alias := range strings.Split(aliases, ",") {
+				commands[strings.TrimSpace(alias)] = true
 			}
 		}
-		opts.UseProxy = useProxy
-		return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
 	}
+	return commands
 }
 
 type codexExecFacadeOptions struct {
@@ -226,6 +359,7 @@ type codexExecFacadeOptions struct {
 	Resume         bool
 	ThreadID       string
 	ResumeLast     bool
+	ResumeAll      bool
 	Prompt         string
 	ImagePaths     []string
 	WorkingDir     string
@@ -238,7 +372,7 @@ type codexExecFacadeOptions struct {
 }
 
 func parseCodexExecFacadeArgs(args []string, defaultCwd string) (codexExecFacadeOptions, error) {
-	args = migration.RemoveLegacyCodexExecutionOverrides(args)
+	args = expandCodexOptionEquals(migration.RemoveLegacyCodexExecutionOverrides(args))
 	options := codexExecFacadeOptions{WorkingDir: defaultCwd}
 	if len(args) > 0 && strings.TrimSpace(args[0]) == "resume" {
 		options.Resume = true
@@ -259,6 +393,11 @@ func parseCodexExecFacadeArgs(args []string, defaultCwd string) (codexExecFacade
 				return options, fmt.Errorf("--last requires exec resume")
 			}
 			options.ResumeLast = true
+		case "--all":
+			if !options.Resume {
+				return options, fmt.Errorf("--all requires exec resume")
+			}
+			options.ResumeAll = true
 		case "-i", "--image":
 			if index+1 >= len(args) {
 				return options, fmt.Errorf("%s requires a path", arg)
@@ -307,6 +446,16 @@ func parseCodexExecFacadeArgs(args []string, defaultCwd string) (codexExecFacade
 			}
 			index++
 			options.AppServerArgs = append(options.AppServerArgs, "-c", `model="`+tomlEscapeString(args[index])+`"`)
+		case "--oss":
+			options.AppServerArgs = append(options.AppServerArgs, "-c", `model_provider="ollama"`)
+		case "--local-provider":
+			if index+1 >= len(args) {
+				return options, fmt.Errorf("--local-provider requires a value")
+			}
+			index++
+			options.AppServerArgs = append(options.AppServerArgs, "-c", `model_provider="`+tomlEscapeString(args[index])+`"`)
+		case "--dangerously-bypass-hook-trust":
+			options.AppServerArgs = append(options.AppServerArgs, "-c", "bypass_hook_trust=true")
 		case "-c", "--config", "--enable", "--disable":
 			if index+1 >= len(args) {
 				return options, fmt.Errorf("%s requires a value", arg)
@@ -359,7 +508,8 @@ func runCodexExecFacade(
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(options.Prompt) == "" || strings.TrimSpace(options.Prompt) == "-" {
+	readStdin := strings.TrimSpace(options.Prompt) == "" || strings.TrimSpace(options.Prompt) == "-" || runOptions.Stdin != nil
+	if readStdin {
 		reader := runOptions.Stdin
 		if reader == nil {
 			reader = os.Stdin
@@ -368,7 +518,12 @@ func runCodexExecFacade(
 		if readErr != nil {
 			return readErr
 		}
-		options.Prompt = strings.TrimSpace(string(raw))
+		stdinText := strings.TrimSpace(string(raw))
+		if strings.TrimSpace(options.Prompt) == "" || strings.TrimSpace(options.Prompt) == "-" {
+			options.Prompt = stdinText
+		} else if stdinText != "" {
+			options.Prompt += "\n\n<stdin>\n" + stdinText + "\n</stdin>"
+		}
 	}
 	if options.Prompt == "" {
 		return fmt.Errorf("codex exec prompt is required")
@@ -383,7 +538,8 @@ func runCodexExecFacade(
 			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
 		}
 	}
-	codexPath, err = ensureCodexInstalledWithOptions(ctx, codexPath, runOptions.Log, installOptions)
+	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
+	codexPath, err = ensureCodexBrokerRuntime(ctx, codexPath, runOptions.Log, installOptions, allowAutomaticUpgrade)
 	if err != nil {
 		return err
 	}
@@ -393,6 +549,9 @@ func runCodexExecFacade(
 	}
 	paths, err := resolveEffectiveLaunchPaths(configPath, "", options.WorkingDir)
 	if err != nil {
+		return err
+	}
+	if err := prepareRuntimeMigration(store, paths, codexPath, runOptions.Log); err != nil {
 		return err
 	}
 	extraEnv := append(codexHomeEnv(paths.CodexDir), runOptions.ExtraEnv...)
@@ -427,7 +586,7 @@ func runCodexExecFacade(
 	runner := &codexrunner.AppServerRunner{
 		Starter: codexrunner.PolicyAppServerStarter{
 			ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-			ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, runOptions.Log),
+			ReadyHook:     runtimeMigrationReadyHook(store, runOptions.Log),
 		},
 		Command:       codexPath,
 		AppServerArgs: append([]string{"--analytics-default-enabled"}, options.AppServerArgs...),
@@ -465,12 +624,17 @@ func runCodexExecFacade(
 		OutputSchema:   options.OutputSchema,
 		WorkingDir:     options.WorkingDir,
 		EventHandler:   handler,
+		Ephemeral:      options.Ephemeral,
 	}
 	var result codexrunner.TurnResult
 	if options.Resume {
 		threadID := strings.TrimSpace(options.ThreadID)
+		resumeWorkingDir := options.WorkingDir
+		if options.ResumeAll {
+			resumeWorkingDir = ""
+		}
 		if options.ResumeLast {
-			threads, listErr := runner.ListThreads(ctx, codexrunner.ListThreadsOptions{WorkingDir: options.WorkingDir, Limit: 1})
+			threads, listErr := runner.ListThreads(ctx, codexrunner.ListThreadsOptions{WorkingDir: resumeWorkingDir, Limit: 1})
 			if listErr != nil {
 				return listErr
 			}
@@ -478,6 +642,20 @@ func runCodexExecFacade(
 				return fmt.Errorf("no Codex thread is available to resume")
 			}
 			threadID = threads[0].ID
+		}
+		if threadID != "" && !options.ResumeLast {
+			threads, listErr := runner.ListThreads(ctx, codexrunner.ListThreadsOptions{
+				WorkingDir: resumeWorkingDir,
+				Limit:      1000,
+			})
+			if listErr == nil {
+				for _, thread := range threads {
+					if thread.ID == threadID || thread.Name == threadID {
+						threadID = thread.ID
+						break
+					}
+				}
+			}
 		}
 		if threadID == "" {
 			return fmt.Errorf("codex exec resume requires a thread id or --last")
@@ -504,7 +682,7 @@ func runCodexExecFacade(
 }
 
 func codexReviewArgsToExecArgs(args []string) ([]string, error) {
-	args = migration.RemoveLegacyCodexExecutionOverrides(args)
+	args = expandCodexOptionEquals(migration.RemoveLegacyCodexExecutionOverrides(args))
 	var passthrough []string
 	var prompt []string
 	var target string

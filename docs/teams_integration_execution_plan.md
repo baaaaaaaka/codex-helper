@@ -280,7 +280,7 @@ Responsibilities:
   user-facing references so the user can select by number without making Codex
   interpret the command.
 - Persist Teams chat id to Codex `thread_id` mapping.
-- Persist latest Codex turn id, runner kind, Codex version, cwd, Codex home, profile, model, sandbox, proxy mode, and yolo mode.
+- Persist latest Codex turn id, runner kind, Codex version, cwd, Codex home, profile, model, sandbox, proxy mode, and standard approval runtime state.
 - Persist stable dashboard view state for bare-number control-chat selections:
   view id, item mapping, source fingerprint, generated time, and expiry.
 - Persist session origin and sync state:
@@ -457,7 +457,7 @@ Responsibilities:
 Constraints:
 
 - The production runner must not call `exec.LookPath("codex")` directly as the only launch path.
-- The production runner must preserve managed install, proxy setup, yolo mode, effective path resolution, root/sudo identity, `CODEX_HOME`/`CODEX_DIR`, self-update guard, and proxy-health termination.
+- The production runner must preserve managed install, proxy setup, the standard approval runtime, effective path resolution, root/sudo identity, `CODEX_HOME`/`CODEX_DIR`, self-update guard, and proxy-health termination.
 - Avoid importing `internal/cli` from `internal/teams`; prevent cycles by keeping CLI-specific launch adaptation at the CLI boundary.
 - Direct OpenAI API calls are out of scope.
 - Do not make a direct native-binary path the default until wrapper environment behavior is preserved.
@@ -483,7 +483,7 @@ Tests:
 Status:
 
 - Completed first implementation slice.
-- Completed M2b CLI boundary adapter for existing managed install, proxy, yolo, effective path, and self-update behavior.
+- Completed M2b CLI boundary adapter for existing managed install, proxy, standard approval runtime, effective path, and self-update behavior.
 - Follow-up before AppServerRunner: add real `codex exec --json` fixtures,
   local session JSONL transcript fixtures, and compatibility probes.
 
@@ -1415,7 +1415,7 @@ Responsibilities:
 - Build a feature-level test matrix across:
   - direct mode
   - proxy mode
-  - yolo mode
+  - standard approval runtime
   - custom `CODEX_HOME` / `CODEX_DIR`
   - root/sudo identity behavior
   - WSL auth/browser handoff

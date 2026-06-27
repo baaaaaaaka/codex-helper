@@ -30,7 +30,7 @@ Implementation tracker: `docs/teams_integration_execution_plan.md`.
 
 ## Goal
 
-Add a Teams mode to `codex-helper` so the user can create and manage Codex conversations from Microsoft Teams while preserving existing `codex-helper` behavior, install paths, proxy behavior, yolo mode, history behavior, and upgrade flow.
+Add a Teams mode to `codex-helper` so the user can create and manage Codex conversations from Microsoft Teams while preserving existing `codex-helper` behavior, install paths, proxy behavior, standard approval runtime, history behavior, and upgrade flow.
 
 ## Recommended Shape
 
@@ -222,7 +222,7 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 - Preserve:
   - managed Codex install behavior
   - proxy setup and teardown
-  - yolo mode
+  - standard approval runtime
   - effective path resolution
   - root and sudo identity handling
   - `CODEX_HOME` / `CODEX_DIR`
@@ -263,7 +263,7 @@ Add a Teams mode to `codex-helper` so the user can create and manage Codex conve
 - Persist the Codex `thread_id` as the durable session handle.
 - Persist the Codex session file/fingerprint and stable transcript item
   checkpoint when a Teams work chat is linked to a local Codex session.
-- Persist the Teams chat id, latest known Codex turn id, Codex version, cwd, effective Codex home, profile, model, sandbox, proxy/yolo mode, and runner kind.
+- Persist the Teams chat id, latest known Codex turn id, Codex version, cwd, effective Codex home, profile, model, sandbox, proxy/runtime mode, and runner kind.
 - On startup:
   - start or reconnect the selected runner
   - resume each active session by exact `thread_id`

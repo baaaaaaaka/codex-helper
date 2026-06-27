@@ -10,7 +10,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
-func TestRuntimeMigrationReadyHookCommitsOnlyAfterCleanup(t *testing.T) {
+func TestRuntimeMigrationPreparesBeforeReadyHookCommits(t *testing.T) {
 	root := t.TempDir()
 	previousTempDir := runtimeMigrationTempDir
 	previousProbe := runtimeMigrationRemoteProbe
@@ -24,7 +24,10 @@ func TestRuntimeMigrationReadyHookCommitsOnlyAfterCleanup(t *testing.T) {
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
-	hook := runtimeMigrationReadyHook(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "", nil)
+	if err := prepareRuntimeMigration(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/codex", nil); err != nil {
+		t.Fatal(err)
+	}
+	hook := runtimeMigrationReadyHook(store, nil)
 	hook()
 	cfg, err := store.Load()
 	if err != nil {
@@ -38,7 +41,7 @@ func TestRuntimeMigrationReadyHookCommitsOnlyAfterCleanup(t *testing.T) {
 	}
 }
 
-func TestRuntimeMigrationReadyHookDoesNotCommitWithLiveArtifact(t *testing.T) {
+func TestRuntimeMigrationPrepareRejectsLiveArtifact(t *testing.T) {
 	root := t.TempDir()
 	previousTempDir := runtimeMigrationTempDir
 	previousProbe := runtimeMigrationRemoteProbe
@@ -61,8 +64,9 @@ func TestRuntimeMigrationReadyHookDoesNotCommitWithLiveArtifact(t *testing.T) {
 	if err := os.WriteFile(binary+".lease", lease, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	hook := runtimeMigrationReadyHook(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "", nil)
-	hook()
+	if err := prepareRuntimeMigration(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/codex", nil); err == nil {
+		t.Fatal("prepareRuntimeMigration unexpectedly accepted live artifact")
+	}
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +76,7 @@ func TestRuntimeMigrationReadyHookDoesNotCommitWithLiveArtifact(t *testing.T) {
 	}
 }
 
-func TestRuntimeMigrationReadyHookDoesNotCommitWithoutRemoteTUI(t *testing.T) {
+func TestRuntimeMigrationPrepareRejectsCodexWithoutRemoteTUI(t *testing.T) {
 	root := t.TempDir()
 	previousTempDir := runtimeMigrationTempDir
 	previousProbe := runtimeMigrationRemoteProbe
@@ -86,7 +90,9 @@ func TestRuntimeMigrationReadyHookDoesNotCommitWithoutRemoteTUI(t *testing.T) {
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
-	runtimeMigrationReadyHook(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/old/codex", nil)()
+	if err := prepareRuntimeMigration(store, effectivePaths{CodexDir: filepath.Join(root, "codex")}, "/old/codex", nil); err == nil {
+		t.Fatal("prepareRuntimeMigration unexpectedly accepted unsupported Codex")
+	}
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)

@@ -27,6 +27,8 @@ type TurnInput struct {
 	Timeout            time.Duration
 	EventHandler       EventHandler
 	BackfillThreadName bool
+	// Ephemeral creates a pathless thread that is not persisted by Codex.
+	Ephemeral bool
 }
 
 type StartTurnInput struct {

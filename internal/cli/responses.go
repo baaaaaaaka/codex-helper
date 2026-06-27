@@ -15,7 +15,6 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
-	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
 type responsesServeOptions struct {
@@ -147,9 +146,8 @@ func responsesFacadeFromOptions(opts responsesServeOptions, apiKey string, store
 			return nil, err
 		}
 		return &responsesadapter.Facade{
-			Router:      registry,
-			Store:       store,
-			ShellPolicy: responsespolicy.NewShellEscalationPolicy(0),
+			Router: registry,
+			Store:  store,
 		}, nil
 	}
 	if strings.TrimSpace(opts.baseURL) == "" {
@@ -176,7 +174,6 @@ func responsesFacadeFromOptions(opts responsesServeOptions, apiKey string, store
 		KeyFingerprint: responsesadapter.KeyFingerprint(apiKey, opts.scopeSalt),
 		BaseURLHash:    responsesadapter.BaseURLHash(opts.baseURL),
 		ProfileVersion: strings.TrimSpace(opts.provider) + ":v1",
-		ShellPolicy:    responsespolicy.NewShellEscalationPolicy(0),
 	}, nil
 }
 

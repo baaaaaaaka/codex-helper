@@ -186,6 +186,7 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 			"-c", `model_provider="openai"`,
 			"-c", `features.responses_websockets=false`,
 			"-c", `features.responses_websockets_v2=false`,
+			"-c", `features.plugins=false`,
 		},
 		ExtraEnv: []string{
 			"CODEX_HOME=" + codexHome,

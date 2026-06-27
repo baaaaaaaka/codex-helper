@@ -32,7 +32,10 @@ func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[0], "initialize")
 	assertJSONRPC(t, writes[0])
-	assertParamNil(t, writes[0], "capabilities")
+	capabilities := writes[0]["params"].(map[string]any)["capabilities"].(map[string]any)
+	if capabilities["experimentalApi"] != true {
+		t.Fatalf("initialize capabilities = %#v", capabilities)
+	}
 	assertMethod(t, writes[1], "initialized")
 	assertJSONRPC(t, writes[1])
 	assertNoID(t, writes[1])
@@ -84,6 +87,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 		Prompt:         "hello",
 		AdditionalDirs: []string{"/extra-a", "/extra-b"},
 		OutputSchema:   json.RawMessage(`{"type":"object"}`),
+		Ephemeral:      true,
 	})
 	if err != nil {
 		t.Fatalf("StartThread error: %v", err)
@@ -105,6 +109,9 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	roots, ok := params["runtimeWorkspaceRoots"].([]any)
 	if !ok || len(roots) != 2 || roots[0] != "/extra-a" || roots[1] != "/extra-b" {
 		t.Fatalf("runtimeWorkspaceRoots = %#v", params["runtimeWorkspaceRoots"])
+	}
+	if params["ephemeral"] != true {
+		t.Fatalf("ephemeral = %#v", params["ephemeral"])
 	}
 	assertParamAbsent(t, writes[3], "extra_args")
 	assertMethod(t, writes[4], "turn/start")
@@ -130,15 +137,20 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	)
 	runner := NewAppServerRunner(transport)
 
-	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", AdditionalDirs: []string{"/resume-extra"}})
 	if err != nil {
 		t.Fatalf("ResumeThread error: %v", err)
 	}
 	if got.ThreadID != "thread-existing" || got.TurnID != "turn-resume" || got.FinalAgentMessage != "resumed" {
 		t.Fatalf("unexpected result: %#v", got)
 	}
-
 	writes := transport.decodedWrites(t)
+	turnParams := writes[4]["params"].(map[string]any)
+	roots, ok := turnParams["runtimeWorkspaceRoots"].([]any)
+	if !ok || len(roots) != 1 || roots[0] != "/resume-extra" {
+		t.Fatalf("resume runtimeWorkspaceRoots = %#v", turnParams["runtimeWorkspaceRoots"])
+	}
+
 	assertMethod(t, writes[3], "thread/resume")
 	assertParamString(t, writes[3], "threadId", "thread-existing")
 	assertMethod(t, writes[4], "turn/start")

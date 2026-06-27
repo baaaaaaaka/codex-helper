@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -412,6 +413,80 @@ func TestNewManagedTeamsCodexExecutorUsesStandardAppServerRunner(t *testing.T) {
 	}
 }
 
+func TestTeamsStandardRuntimeRestoresSavedProxyAndCodexHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX app-server fixture")
+	}
+	lockCLITestHooks(t)
+	rootDir := t.TempDir()
+	codexHome := filepath.Join(rootDir, "codex-home")
+	setTestCodexHomeEnv(t, codexHome)
+	store, err := config.NewStore(filepath.Join(rootDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	if err := store.Save(config.Config{
+		Version:           config.CurrentVersion,
+		RuntimeGeneration: currentRuntimeGeneration,
+		ProxyEnabled:      &enabled,
+		Profiles:          []config.Profile{{ID: "proxy-1", Name: "proxy", Host: "host", Port: 22, User: "user"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previousProxy := codexAppEnsureProxyURLFn
+	t.Cleanup(func() { codexAppEnsureProxyURLFn = previousProxy })
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		return "http://127.0.0.1:18080", nil
+	}
+	envPath := filepath.Join(rootDir, "child.env")
+	codexPath := filepath.Join(rootDir, "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.133.0'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  app-server)
+    printf '%%s|%%s\n' "${HTTP_PROXY:-}" "${CODEX_HOME:-}" > %s
+    while IFS= read -r line; do
+      id=$(printf %%s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      case "$line" in
+        *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{}}\n' "$id" ;;
+        *'"method":"thread/list"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"data":[]}}\n' "$id" ;;
+		*'"method":"thread/start"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"thread-teams"}}}\n' "$id" ;;
+		*'"method":"thread/read"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"thread-teams","name":"Teams thread","turns":[{"id":"turn-teams","status":"completed","items":[{"type":"agentMessage","text":"ok"}]}]}}}\n' "$id" ;;
+        *'"method":"turn/start"'*)
+          printf '{"jsonrpc":"2.0","id":%%s,"result":{"turn":{"id":"turn-teams","status":"inProgress","items":[]}}}\n' "$id"
+          printf '%%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-teams","turnId":"turn-teams","item":{"id":"final","type":"agentMessage","text":"ok"}}}'
+          printf '%%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-teams","turn":{"id":"turn-teams","status":"completed","items":[]}}}' ;;
+      esac
+    done ;;
+  *) exit 64 ;;
+esac
+`, shellSingleQuoteForBeaconCLITest(envPath))
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer executor.(teamsCodexExecutor).Close()
+	result, err := executor.Run(context.Background(), &teams.Session{Cwd: rootDir}, "reply ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "ok" {
+		t.Fatalf("result = %#v", result)
+	}
+	raw, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "http://127.0.0.1:18080|"+codexHome {
+		t.Fatalf("child runtime env = %q", got)
+	}
+}
+
 func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServer(t *testing.T) {
 	store := newTempStore(t)
 	if err := store.Save(config.Config{
@@ -733,6 +808,37 @@ func TestNewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs(t *testing.T) {
 	joined := strings.Join(runner.AppServerArgs, "\n")
 	if !strings.Contains(joined, `model="gpt-test"`) || strings.Contains(joined, "workspace-write") || strings.Contains(joined, "read-only") {
 		t.Fatalf("translated app-server args = %#v", runner.AppServerArgs)
+	}
+}
+
+func TestTeamsCodexArgsPreserveTurnScopedExecOptions(t *testing.T) {
+	dir := t.TempDir()
+	schema := filepath.Join(dir, "schema.json")
+	if err := os.WriteFile(schema, []byte(`{"type":"object"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{}, "appserver", "/tmp/codex", "/work", []string{
+		"--ephemeral", "--add-dir=/data", "--image", "/tmp/input.png", "--output-schema", schema,
+	}, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := executor.(teamsCodexExecutor)
+	if !managed.ephemeral || !reflect.DeepEqual(managed.additionalDirs, []string{"/data"}) || !reflect.DeepEqual(managed.staticImages, []string{"/tmp/input.png"}) || !json.Valid(managed.outputSchema) {
+		t.Fatalf("turn options were not preserved: %#v", managed)
+	}
+}
+
+func TestTeamsCodexArgsRejectLoaderOnlyOptionsInsteadOfSilentlyChangingSemantics(t *testing.T) {
+	for _, args := range [][]string{
+		{"--profile", "work"},
+		{"--profile-v2", "work"},
+		{"--ignore-user-config"},
+		{"--ignore-rules"},
+	} {
+		if _, err := translateTeamsCodexArgsToAppServer(args); err == nil {
+			t.Fatalf("translateTeamsCodexArgsToAppServer(%#v) unexpectedly succeeded", args)
+		}
 	}
 }
 

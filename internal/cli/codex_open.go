@@ -127,7 +127,8 @@ func runCodexTUIInvocationViaBroker(
 			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
 		}
 	}
-	codexPath, err = ensureCodexInstalledWithOptions(ctx, codexPath, log, installOptions)
+	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
+	codexPath, err = ensureCodexBrokerRuntime(ctx, codexPath, log, installOptions, allowAutomaticUpgrade)
 	if err != nil {
 		return err
 	}
@@ -143,6 +144,9 @@ func runCodexTUIInvocationViaBroker(
 	}
 	paths, err := resolveEffectiveLaunchPaths(configPath, codexDir, cwd)
 	if err != nil {
+		return err
+	}
+	if err := prepareRuntimeMigration(store, paths, codexPath, log); err != nil {
 		return err
 	}
 	extraEnv := codexHomeEnv(paths.CodexDir)
@@ -188,7 +192,7 @@ func runCodexTUIInvocationViaBroker(
 	}
 	starter := codexrunner.PolicyAppServerStarter{
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-		ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, log),
+		ReadyHook:     runtimeMigrationReadyHook(store, log),
 	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
 		Starter: starter,

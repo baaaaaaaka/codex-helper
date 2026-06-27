@@ -1268,10 +1268,17 @@ func writeBeaconCLIAppServerFixture(t *testing.T, messages []string) string {
 	if os.PathSeparator != '/' {
 		t.Skip("POSIX app-server fixture script")
 	}
-	path := filepath.Join(t.TempDir(), "codex-app-server-fixture.sh")
+	dir := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(dir, "codex-home"))
+	path := filepath.Join(dir, "codex-app-server-fixture.sh")
 	var body strings.Builder
 	body.WriteString("#!/bin/sh\n")
-	body.WriteString("[ \"$1\" = \"app-server\" ] || exit 64\n")
+	body.WriteString("case \"${1:-}\" in\n")
+	body.WriteString("  --version) echo 'codex-cli 0.133.0'; exit 0 ;;\n")
+	body.WriteString("  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;\n")
+	body.WriteString("  app-server) ;;\n")
+	body.WriteString("  *) exit 64 ;;\n")
+	body.WriteString("esac\n")
 	body.WriteString("while IFS= read -r line; do\n")
 	body.WriteString("  id=$(printf %s \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n")
 	body.WriteString("  case \"$line\" in\n")

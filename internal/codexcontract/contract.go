@@ -61,6 +61,27 @@ func Probe(ctx context.Context, command string) (Report, error) {
 	if !strings.Contains(help, "--remote") {
 		return Report{}, fmt.Errorf("Codex %s does not expose the required --remote TUI transport", strings.TrimSpace(version))
 	}
+	if err := requireHelpTokens("Codex top-level help", help, []string{
+		"exec", "review", "app-server", "resume", "fork", "--add-dir",
+	}); err != nil {
+		return Report{}, err
+	}
+	execHelp, err := commandOutput(ctx, command, "exec", "--help")
+	if err != nil {
+		return Report{}, fmt.Errorf("probe Codex exec help: %w", err)
+	}
+	if err := requireHelpTokens("Codex exec help", execHelp, []string{
+		"--ephemeral", "--output-schema", "--output-last-message", "--json", "--add-dir",
+	}); err != nil {
+		return Report{}, err
+	}
+	resumeHelp, err := commandOutput(ctx, command, "exec", "resume", "--help")
+	if err != nil {
+		return Report{}, fmt.Errorf("probe Codex exec resume help: %w", err)
+	}
+	if err := requireHelpTokens("Codex exec resume help", resumeHelp, []string{"--last", "--all", "--ephemeral"}); err != nil {
+		return Report{}, err
+	}
 	appServerHelp, err := commandOutput(ctx, command, "app-server", "--help")
 	if err != nil {
 		return Report{}, fmt.Errorf("probe Codex app-server help: %w", err)
@@ -76,7 +97,7 @@ func Probe(ctx context.Context, command string) (Report, error) {
 		return Report{}, fmt.Errorf("create Codex schema directory: %w", err)
 	}
 	defer os.RemoveAll(schemaDir)
-	if _, err := commandOutput(ctx, command, "app-server", "generate-json-schema", "--out", schemaDir); err != nil {
+	if _, err := commandOutput(ctx, command, "app-server", "generate-json-schema", "--experimental", "--out", schemaDir); err != nil {
 		return Report{}, fmt.Errorf("generate Codex app-server schema: %w", err)
 	}
 
@@ -102,6 +123,20 @@ func Probe(ctx context.Context, command string) (Report, error) {
 		return Report{}, err
 	}
 	if err := requireMethodParams("server notification", serverNotificationParams, requiredServerNotifications); err != nil {
+		return Report{}, err
+	}
+	threadStart, err := readSchema(filepath.Join(schemaDir, "v2", "ThreadStartParams.json"))
+	if err != nil {
+		return Report{}, err
+	}
+	if err := requireObjectShape("ThreadStartParams.json", threadStart, nil, []string{"cwd", "runtimeWorkspaceRoots", "ephemeral"}); err != nil {
+		return Report{}, err
+	}
+	turnStart, err := readSchema(filepath.Join(schemaDir, "v2", "TurnStartParams.json"))
+	if err != nil {
+		return Report{}, err
+	}
+	if err := requireObjectShape("TurnStartParams.json", turnStart, nil, []string{"threadId", "cwd", "runtimeWorkspaceRoots", "outputSchema"}); err != nil {
 		return Report{}, err
 	}
 
@@ -154,6 +189,15 @@ func Probe(ctx context.Context, command string) (Report, error) {
 		ServerMethods:       sortedKeys(serverMethodParams),
 		ServerNotifications: sortedKeys(serverNotificationParams),
 	}, nil
+}
+
+func requireHelpTokens(label string, help string, tokens []string) error {
+	for _, token := range tokens {
+		if !strings.Contains(help, token) {
+			return fmt.Errorf("%s no longer exposes required command or option %q", label, token)
+		}
+	}
+	return nil
 }
 
 func commandOutput(ctx context.Context, command string, args ...string) (string, error) {

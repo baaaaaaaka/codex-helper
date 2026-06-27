@@ -21,7 +21,7 @@ on:
       min_version:
         description: "Inclusive min version for range mode"
         required: false
-        default: "0.116.0"
+        default: "0.131.0"
         type: string
       max_version:
         description: "Inclusive max version for range mode; defaults to latest alpha or latest stable"
@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           selection_mode="${INPUT_SELECTION_MODE:-targeted}"
-          input_min_version="${INPUT_MIN_VERSION:-0.116.0}"
+          input_min_version="${INPUT_MIN_VERSION:-0.131.0}"
           input_max_version="${INPUT_MAX_VERSION:-}"
           input_include_prerelease="${INPUT_INCLUDE_PRERELEASE:-true}"
           latest_version="$(bash scripts/ci/retry.sh 5 5 npm view @openai/codex version | tr -d '\r\n')"

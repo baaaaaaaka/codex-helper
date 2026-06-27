@@ -25,7 +25,8 @@ func TestRunCodexExecFacadeUsesStandardApprovalAfterFixedDelay(t *testing.T) {
 	script := `#!/bin/sh
 set -eu
 case "${1:-}" in
-  --version) echo 'codex-cli 0.0-test'; exit 0 ;;
+  --version) echo 'codex-cli 0.133.0'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
   app-server)
     while IFS= read -r line; do
       id=$(printf %s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -194,5 +195,59 @@ func TestParseCodexExecFacadeOutputSchemaAndAdditionalDir(t *testing.T) {
 	}
 	if len(options.AdditionalDirs) != 1 || options.AdditionalDirs[0] != "/extra" || !json.Valid(options.OutputSchema) {
 		t.Fatalf("options = %#v", options)
+	}
+}
+
+func TestCodexInvocationPassesThroughCurrentAndFutureNativeCommands(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX command fixture")
+	}
+	dir := t.TempDir()
+	argsPath := filepath.Join(dir, "args")
+	codexPath := filepath.Join(dir, "codex")
+	script := fmt.Sprintf(`#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.133.0' ;;
+  --help) printf 'Commands:\n  plugin  Manage plugins\n  future-command  Future diagnostic that wraps\n                  onto another line\n\nOptions:\n' ;;
+  plugin|future-command) printf '%%s\n' "$@" > %s ;;
+  *) exit 64 ;;
+esac
+`, shellSingleQuoteForBeaconCLITest(argsPath))
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store := newCodexOpenTestStore(t)
+	for _, invocation := range [][]string{{codexPath, "plugin", "list"}, {codexPath, "future-command", "inspect"}} {
+		if err := runCodexCLIInvocation(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil, invocation, false, runTargetOptions{Cwd: dir, Log: io.Discard}); err != nil {
+			t.Fatalf("%v: %v", invocation, err)
+		}
+		got := readArgLines(t, argsPath)
+		if strings.Join(got, " ") != strings.Join(invocation[1:], " ") {
+			t.Fatalf("native args = %#v, want %#v", got, invocation[1:])
+		}
+	}
+	if commands := discoverCodexTopLevelCommands(context.Background(), codexPath); commands["onto"] {
+		t.Fatalf("wrapped help description was parsed as a command: %#v", commands)
+	}
+}
+
+func TestCodexInvocationRoutesLoaderOptionsAndHelpThroughNativeCLI(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"--help"}, want: true},
+		{args: []string{"exec", "--ignore-user-config", "prompt"}, want: true},
+		{args: []string{"exec", "--profile", "work", "prompt"}, want: true},
+		{args: []string{"exec", "prompt"}, want: false},
+	}
+	for _, test := range tests {
+		invocation, err := splitCodexCLIInvocation(test.args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := codexInvocationUsesNativeCLI(invocation, test.args); got != test.want {
+			t.Fatalf("args=%v native=%v want=%v", test.args, got, test.want)
+		}
 	}
 }

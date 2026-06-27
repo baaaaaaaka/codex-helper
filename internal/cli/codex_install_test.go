@@ -19,6 +19,50 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 )
 
+func TestEnsureCodexBrokerRuntimeUpgradesOldManagedCapability(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capability fixtures")
+	}
+	lockCLITestHooks(t)
+	oldPath := writeProbeScript(t, t.TempDir(), "codex-old", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.115.0';; --help) echo 'Codex CLI';; esac\n")
+	newPath := writeProbeScript(t, t.TempDir(), "codex-new", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.131.0';; --help) echo 'Options: --remote <ADDR>';; esac\n")
+	previousUpgrade := upgradeCodexForBrokerRuntime
+	t.Cleanup(func() { upgradeCodexForBrokerRuntime = previousUpgrade })
+	var upgraded bool
+	upgradeCodexForBrokerRuntime = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		upgraded = opts.upgradeCodex
+		return newPath, nil
+	}
+	resolved, err := ensureCodexBrokerRuntime(context.Background(), oldPath, io.Discard, codexInstallOptions{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !upgraded || resolved != newPath {
+		t.Fatalf("upgraded=%v resolved=%q, want %q", upgraded, resolved, newPath)
+	}
+}
+
+func TestEnsureCodexBrokerRuntimeRejectsOldExplicitBinaryWithoutMutatingIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capability fixture")
+	}
+	oldPath := writeProbeScript(t, t.TempDir(), "codex-old", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.115.0';; --help) echo 'Codex CLI';; esac\n")
+	before, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureCodexBrokerRuntime(context.Background(), oldPath, io.Discard, codexInstallOptions{}, false); err == nil || !strings.Contains(err.Error(), "0.131.0") {
+		t.Fatalf("error = %v", err)
+	}
+	after, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("explicit Codex binary was modified")
+	}
+}
+
 func containsPath(paths []string, target string) bool {
 	target = filepath.Clean(target)
 	for _, path := range paths {

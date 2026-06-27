@@ -1413,6 +1413,43 @@ func ensureCodexInstalled(ctx context.Context, codexPath string, out io.Writer) 
 	return ensureCodexInstalledWithOptions(ctx, codexPath, out, codexInstallOptions{})
 }
 
+var upgradeCodexForBrokerRuntime = upgradeCodexInstalledWithOptions
+
+// ensureCodexBrokerRuntime resolves a functional original Codex binary and,
+// for normal PATH/managed installs, upgrades an older build once when it lacks
+// the remote app-server contract required by the approval broker.
+func ensureCodexBrokerRuntime(ctx context.Context, codexPath string, out io.Writer, opts codexInstallOptions, allowAutomaticUpgrade bool) (string, error) {
+	lookup := codexPath
+	if allowAutomaticUpgrade && (strings.EqualFold(strings.TrimSpace(lookup), "codex") || strings.EqualFold(strings.TrimSpace(lookup), "codex.exe")) {
+		lookup = ""
+	}
+	resolved, err := ensureCodexInstalledWithOptions(ctx, lookup, out, opts)
+	if err != nil {
+		return "", err
+	}
+	if codexBrokerRuntimeCapable(resolved) {
+		return resolved, nil
+	}
+	if !allowAutomaticUpgrade {
+		return "", fmt.Errorf("codex at %s lacks the app-server workspace-root contract required by the standard approval runtime; install Codex 0.131.0 or newer", resolved)
+	}
+	upgradeOptions := opts
+	upgradeOptions.upgradeCodex = true
+	upgraded, err := upgradeCodexForBrokerRuntime(ctx, out, upgradeOptions)
+	if err != nil {
+		return "", fmt.Errorf("installed Codex lacks remote app-server support and automatic upgrade failed: %w", err)
+	}
+	if !codexBrokerRuntimeCapable(upgraded) {
+		return "", fmt.Errorf("upgraded codex at %s still lacks the app-server workspace-root contract required by the standard approval runtime", upgraded)
+	}
+	return upgraded, nil
+}
+
+func codexPathAllowsAutomaticUpgrade(codexPath string) bool {
+	value := strings.TrimSpace(codexPath)
+	return value == "" || strings.EqualFold(value, "codex") || strings.EqualFold(value, "codex.exe")
+}
+
 func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out io.Writer, opts codexInstallOptions) (string, error) {
 	if opts.upgradeCodex {
 		if strings.TrimSpace(codexPath) != "" {
