@@ -116,7 +116,10 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		return nil, err
 	}
 	startup := windows.StartupInfoEx{
-		StartupInfo:             windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfoEx{}))},
+		StartupInfo: windows.StartupInfo{
+			Cb:    uint32(unsafe.Sizeof(windows.StartupInfoEx{})),
+			Flags: windows.STARTF_USESTDHANDLES,
+		},
 		ProcThreadAttributeList: attributes.List(),
 	}
 	var info windows.ProcessInformation
