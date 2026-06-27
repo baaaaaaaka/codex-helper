@@ -217,12 +217,13 @@ jobs:
         continue-on-error: true
         shell: bash
         env:
+          CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
           CODEX_RUNTIME_CONTRACT_TEST: "1"
           CODEX_RUNTIME_TEST: "1"
           CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           set -euo pipefail
-          go test ./internal/codexcontract -run TestInstalledCodexRuntimeContract -count=1 -v
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
           go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
           go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
@@ -374,15 +375,15 @@ jobs:
           case "${PLATFORM_NAME}" in
             centos7)
               IMAGE="centos:7"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             rockylinux8)
               IMAGE="rockylinux:8"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             ubuntu20.04)
               IMAGE="ubuntu:20.04"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils util-linux"
               ;;
             *)
               echo "unsupported platform ${PLATFORM_NAME}" >&2
@@ -406,22 +407,22 @@ jobs:
           case "${PLATFORM_NAME}" in
             centos7)
               IMAGE="centos:7"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             rockylinux8)
               IMAGE="rockylinux:8"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz tar util-linux"
               ;;
             ubuntu20.04)
               IMAGE="ubuntu:20.04"
-              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils"
+              INSTALL_CMD="bash /ci/install_container_packages.sh ca-certificates curl xz-utils util-linux"
               ;;
             *)
               echo "unsupported platform ${PLATFORM_NAME}" >&2
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_CONTRACT_TEST=1 /codex_contract_test -test.v -test.count=1 -test.run TestInstalledCodexRuntimeContract && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run TestProbeCodexIntegration && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_E2E_TEST=1 /codex_runtime_test -test.v -test.count=1 -test.run TestInstalledCodexStandardApprovalRuntime"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_REMOTE_TUI_CONTRACT_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_contract_test -test.v -test.count=1 -test.run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run TestProbeCodexIntegration && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_E2E_TEST=1 /codex_runtime_test -test.v -test.count=1 -test.run TestInstalledCodexStandardApprovalRuntime"
           docker run --rm \
             -v "${CONTRACT_TEST_BIN_PATH}:/codex_contract_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \

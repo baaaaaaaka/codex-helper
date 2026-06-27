@@ -39,7 +39,7 @@ func TestRunCodexSessionPreservesResumeExperience(t *testing.T) {
 		t.Fatalf("runCodexSession: %v", err)
 	}
 	tuiArgs := readArgLines(t, fixture.tuiArgs)
-	if len(tuiArgs) != 4 || tuiArgs[0] != "--remote" || !strings.HasPrefix(tuiArgs[1], "ws://127.0.0.1:") || tuiArgs[2] != "resume" || tuiArgs[3] != "session-existing" {
+	if len(tuiArgs) != 6 || tuiArgs[0] != "-c" || tuiArgs[1] != codexRemoteTUIFeatureConfig || tuiArgs[2] != "--remote" || !strings.HasPrefix(tuiArgs[3], "ws://127.0.0.1:") || tuiArgs[4] != "resume" || tuiArgs[5] != "session-existing" {
 		t.Fatalf("TUI args = %#v", tuiArgs)
 	}
 }
@@ -115,7 +115,7 @@ func newCodexOpenTestStore(t *testing.T) *config.Store {
 func assertStandardBrokerLaunch(t *testing.T, fixture codexTUIBrokerFixture) {
 	t.Helper()
 	tuiArgs := readArgLines(t, fixture.tuiArgs)
-	if len(tuiArgs) != 2 || tuiArgs[0] != "--remote" || !strings.HasPrefix(tuiArgs[1], "ws://127.0.0.1:") || !strings.Contains(tuiArgs[1], "/_cxp/") {
+	if len(tuiArgs) != 4 || tuiArgs[0] != "-c" || tuiArgs[1] != codexRemoteTUIFeatureConfig || tuiArgs[2] != "--remote" || !strings.HasPrefix(tuiArgs[3], "ws://127.0.0.1:") || !strings.Contains(tuiArgs[3], "/_cxp/") {
 		t.Fatalf("TUI args = %#v", tuiArgs)
 	}
 	appArgs := strings.Join(readArgLines(t, fixture.appServerArgs), "\n")

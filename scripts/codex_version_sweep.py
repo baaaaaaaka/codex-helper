@@ -25,7 +25,7 @@ DEFAULT_NATIVE_CMD = (
 )
 DEFAULT_CONTRACT_CMD = (
     "go test ./internal/codexcontract "
-    "-run 'TestInstalledCodexRuntimeContract' "
+    "-run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' "
     "-count=1 -v"
 )
 DEFAULT_CLI_CMD = (
@@ -156,6 +156,7 @@ def run_smoke_for_version(version: str, *, repo_root: Path) -> dict[str, object]
 
         env = os.environ.copy()
         env["PATH"] = f"{prefix / 'bin'}{os.pathsep}{env['PATH']}"
+        env["CODEX_REMOTE_TUI_CONTRACT_TEST"] = "1"
         env["CODEX_RUNTIME_CONTRACT_TEST"] = "1"
         env["CODEX_RUNTIME_TEST"] = "1"
         env["CODEX_RUNTIME_E2E_TEST"] = "1"

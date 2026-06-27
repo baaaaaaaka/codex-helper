@@ -20,6 +20,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
+const codexRemoteTUIFeatureConfig = "features.tui_app_server=true"
+
 func normalizeWorkingDir(cwd string) (string, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -204,7 +206,7 @@ func runCodexTUIInvocationViaBroker(
 	}
 
 	args := append([]string{}, tuiGlobalArgs...)
-	args = append(args, "--remote", broker.URL())
+	args = append(args, "-c", codexRemoteTUIFeatureConfig, "--remote", broker.URL())
 	args = append(args, tuiTail...)
 	runErr := runTargetSupervisedWithOptions(ctx, append([]string{codexPath}, args...), "", nil, broker.Done(), runTargetOptions{
 		Cwd:          cwd,
