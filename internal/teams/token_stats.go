@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,13 +22,20 @@ import (
 const codexContextBaselineTokens int64 = 12000
 
 type CodexTokenStats struct {
-	SourcePath       string
-	SourceLine       int
-	Source           string
-	Info             CodexTokenUsageInfo
-	RateLimits       CodexRateLimits
-	Diagnostics      []TokenStatsDiagnostic
-	UsedFallbackOnly bool
+	SourcePath               string
+	SourceLine               int
+	Source                   string
+	Info                     CodexTokenUsageInfo
+	NativeLatestTotal        CodexTokenUsage
+	UsageEventCount          int
+	NonAdvancingUsageEvents  int
+	NativeCounterResets      int
+	NativeCounterRecoveries  int
+	MissingLastUsageEvents   int
+	UsageAggregationOverflow bool
+	RateLimits               CodexRateLimits
+	Diagnostics              []TokenStatsDiagnostic
+	UsedFallbackOnly         bool
 }
 
 type CodexTokenUsageInfo struct {
@@ -42,6 +50,201 @@ type CodexTokenUsage struct {
 	OutputTokens          int64
 	ReasoningOutputTokens int64
 	TotalTokens           int64
+}
+
+type codexTokenUsageAccumulator struct {
+	seen                    bool
+	total                   CodexTokenUsage
+	completedEpochTotal     CodexTokenUsage
+	last                    CodexTokenUsage
+	nativeLatestTotal       CodexTokenUsage
+	previousTotal           CodexTokenUsage
+	modelContextWindow      int64
+	usageEventCount         int
+	nonAdvancingUsageEvents int
+	nativeCounterResets     int
+	nativeCounterRecoveries int
+	nativeCounterGlobal     bool
+	missingLastUsageEvents  int
+	aggregationOverflow     bool
+}
+
+// observe returns whether the snapshot advanced usage and therefore consumed a
+// pending turn boundary. Non-advancing snapshots can be metadata replays before
+// the first real usage of a turn.
+func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnStart bool) bool {
+	nativeTotal := info.Total
+	if !nativeTotal.hasTokens() {
+		nativeTotal = info.Last
+	}
+	if !a.seen {
+		// Seed from the first cumulative snapshot so parsing also works when the
+		// reader starts after earlier model calls. Later cumulative snapshots are
+		// validation signals, never values to add together.
+		a.seen = true
+		a.total = nativeTotal
+		if !a.total.hasTokens() {
+			a.total = info.Last
+		}
+		a.last = info.Last
+		a.nativeLatestTotal = nativeTotal
+		a.previousTotal = nativeTotal
+		a.modelContextWindow = info.ModelContextWindow
+		a.usageEventCount = 1
+		a.nativeCounterGlobal = true
+		return true
+	}
+
+	progress := compareCodexTokenUsageTotals(nativeTotal, a.previousTotal)
+	componentResetAtTurnStart := atTurnStart && codexTokenUsageComponentDecreased(nativeTotal, a.previousTotal)
+	if progress == 0 && !componentResetAtTurnStart {
+		// Codex can repeat a cumulative snapshot while refreshing last usage or
+		// rate metadata. No cumulative progress means there is no new usage to add.
+		a.nonAdvancingUsageEvents++
+		if a.nativeCounterGlobal {
+			a.total = nativeTotal
+		}
+		if info.Last.hasTokens() {
+			a.last = info.Last
+		}
+		if info.ModelContextWindow > 0 {
+			a.modelContextWindow = info.ModelContextWindow
+		}
+		a.nativeLatestTotal = nativeTotal
+		a.previousTotal = nativeTotal
+		return false
+	}
+
+	a.usageEventCount++
+	resetAtTurnStart := componentResetAtTurnStart ||
+		(atTurnStart && progress > 0 && info.Last.hasTokens() && nativeTotal == info.Last)
+	if progress < 0 || resetAtTurnStart {
+		a.nativeCounterResets++
+		a.completedEpochTotal = a.total
+		// The first observed snapshot in a reset epoch may already include several
+		// model calls, so add the complete new epoch instead of only its latest call.
+		var overflow bool
+		a.total, overflow = addCodexTokenUsage(a.completedEpochTotal, nativeTotal)
+		a.aggregationOverflow = a.aggregationOverflow || overflow
+		a.nativeCounterGlobal = false
+	} else if a.nativeCounterGlobal {
+		// A monotonic cumulative counter is the most complete source and can bridge
+		// over a missing intermediate transcript event.
+		a.total = nativeTotal
+	} else {
+		// Within a reset epoch, the native counter is still the most complete view
+		// of that epoch. Prefix it with the completed epochs so missing intermediate
+		// transcript updates cannot lose usage. A future Codex fix may restore the
+		// conversation-global counter in place. Detect that transition only on the
+		// first usage snapshot of a new turn and only when the native snapshot
+		// exactly equals the previous reconstructed total plus last_token_usage; a
+		// >= check is unsafe because a local epoch can also jump after omitted
+		// intermediate updates.
+		if info.Last.hasTokens() {
+			recoveryCandidate, recoveryOverflow := addCodexTokenUsage(a.total, info.Last)
+			if atTurnStart && !recoveryOverflow && nativeTotal == recoveryCandidate {
+				a.total = nativeTotal
+				a.completedEpochTotal = CodexTokenUsage{}
+				a.nativeCounterGlobal = true
+				a.nativeCounterRecoveries++
+			} else {
+				var overflow bool
+				a.total, overflow = addCodexTokenUsage(a.completedEpochTotal, nativeTotal)
+				a.aggregationOverflow = a.aggregationOverflow || overflow
+			}
+		} else {
+			var overflow bool
+			a.total, overflow = addCodexTokenUsage(a.completedEpochTotal, nativeTotal)
+			a.aggregationOverflow = a.aggregationOverflow || overflow
+			a.missingLastUsageEvents++
+		}
+	}
+	if info.Last.hasTokens() {
+		a.last = info.Last
+	}
+	if info.ModelContextWindow > 0 {
+		a.modelContextWindow = info.ModelContextWindow
+	}
+	a.nativeLatestTotal = nativeTotal
+	a.previousTotal = nativeTotal
+	return true
+}
+
+func codexTokenUsageComponentDecreased(current CodexTokenUsage, previous CodexTokenUsage) bool {
+	currentValues := [...]int64{
+		current.InputTokens,
+		current.CachedInputTokens,
+		current.OutputTokens,
+		current.ReasoningOutputTokens,
+	}
+	previousValues := [...]int64{
+		previous.InputTokens,
+		previous.CachedInputTokens,
+		previous.OutputTokens,
+		previous.ReasoningOutputTokens,
+	}
+	for i, currentValue := range currentValues {
+		// A zero can mean that an older event schema omitted the component, so it
+		// is not sufficient evidence of a reset on its own.
+		if currentValue > 0 && previousValues[i] > 0 && currentValue < previousValues[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func (a codexTokenUsageAccumulator) info() CodexTokenUsageInfo {
+	return CodexTokenUsageInfo{
+		Total:              a.total,
+		Last:               a.last,
+		ModelContextWindow: a.modelContextWindow,
+	}
+}
+
+func compareCodexTokenUsageTotals(left CodexTokenUsage, right CodexTokenUsage) int {
+	leftTotal := effectiveCodexTokenUsageTotal(left)
+	rightTotal := effectiveCodexTokenUsageTotal(right)
+	switch {
+	case leftTotal < rightTotal:
+		return -1
+	case leftTotal > rightTotal:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func effectiveCodexTokenUsageTotal(usage CodexTokenUsage) int64 {
+	if usage.TotalTokens != 0 {
+		return usage.TotalTokens
+	}
+	total, _ := saturatingAddNonNegativeInt64(usage.InputTokens, usage.OutputTokens)
+	return total
+}
+
+func addCodexTokenUsage(left CodexTokenUsage, right CodexTokenUsage) (CodexTokenUsage, bool) {
+	input, inputOverflow := saturatingAddNonNegativeInt64(left.InputTokens, right.InputTokens)
+	cached, cachedOverflow := saturatingAddNonNegativeInt64(left.CachedInputTokens, right.CachedInputTokens)
+	output, outputOverflow := saturatingAddNonNegativeInt64(left.OutputTokens, right.OutputTokens)
+	reasoning, reasoningOverflow := saturatingAddNonNegativeInt64(left.ReasoningOutputTokens, right.ReasoningOutputTokens)
+	total, totalOverflow := saturatingAddNonNegativeInt64(left.TotalTokens, right.TotalTokens)
+	return CodexTokenUsage{
+		InputTokens:           input,
+		CachedInputTokens:     cached,
+		OutputTokens:          output,
+		ReasoningOutputTokens: reasoning,
+		TotalTokens:           total,
+	}, inputOverflow || cachedOverflow || outputOverflow || reasoningOverflow || totalOverflow
+}
+
+func saturatingAddNonNegativeInt64(left int64, right int64) (int64, bool) {
+	if left < 0 || right < 0 {
+		return left, true
+	}
+	if left > math.MaxInt64-right {
+		return math.MaxInt64, true
+	}
+	return left + right, false
 }
 
 type CodexRateLimits struct {
@@ -126,8 +329,13 @@ func ReadCodexTokenStats(filePath string) (CodexTokenStats, error) {
 }
 
 func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
-	var out CodexTokenStats
 	var fallback CodexTokenStats
+	var usage codexTokenUsageAccumulator
+	var rateLimits CodexRateLimits
+	var diagnostics []TokenStatsDiagnostic
+	var tokenSourceLine int
+	var lastTokenCountLine int
+	atTurnStart := false
 	reader := bufio.NewReader(r)
 	lineNo := 0
 	for {
@@ -136,7 +344,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 		if readErr != nil && readErr != io.EOF {
-			return out, fmt.Errorf("read Codex token stats: %w", readErr)
+			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine), fmt.Errorf("read Codex token stats: %w", readErr)
 		}
 		lineNo++
 		line = bytes.TrimSpace(line)
@@ -148,7 +356,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 		}
 		var event codexTokenStatsEvent
 		if err := json.Unmarshal(line, &event); err != nil {
-			out.Diagnostics = append(out.Diagnostics, TokenStatsDiagnostic{
+			diagnostics = append(diagnostics, TokenStatsDiagnostic{
 				SourceLine: lineNo,
 				Kind:       "invalid_json",
 				Message:    err.Error(),
@@ -158,34 +366,31 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			}
 			continue
 		}
+		if event.Type == "turn_context" {
+			// A fixed Codex can restore its conversation-global token counter only
+			// when a new turn starts. Retain this boundary until the first usage
+			// snapshot so an in-turn local-epoch jump cannot masquerade as recovery.
+			atTurnStart = true
+		}
 		if tokenCount, ok := parseCodexTokenCountEvent(event, line); ok {
-			diagnostics := out.Diagnostics
+			lastTokenCountLine = lineNo
+			if tokenCount.RateLimits.Present {
+				rateLimits = tokenCount.RateLimits
+			}
 			tokenCountHasUsage := tokenCount.Info.Total.hasTokens() || tokenCount.Info.Last.hasTokens()
-			if !tokenCountHasUsage && out.HasUsage() {
-				if tokenCount.RateLimits.Present {
-					out.RateLimits = tokenCount.RateLimits
+			if tokenCountHasUsage {
+				if usage.observe(tokenCount.Info, atTurnStart) {
+					atTurnStart = false
 				}
-				out.Diagnostics = diagnostics
-				if readErr == io.EOF {
-					break
-				}
-				continue
+				tokenSourceLine = lineNo
 			}
-			if !tokenCountHasUsage {
-				tokenCount.Info = out.Info
-			}
-			if !tokenCount.RateLimits.Present {
-				tokenCount.RateLimits = out.RateLimits
-			}
-			tokenCount.SourceLine = lineNo
-			tokenCount.Diagnostics = diagnostics
-			out = tokenCount
 			if readErr == io.EOF {
 				break
 			}
 			continue
 		}
 		if usage := normalizeCodexUsage(event.Usage); usage.hasTokens() {
+			atTurnStart = false
 			fallback = CodexTokenStats{
 				SourceLine:       lineNo,
 				Source:           "event usage",
@@ -197,17 +402,48 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 	}
-	if !out.HasUsage() && fallback.HasUsage() {
-		out.Info = fallback.Info
-		out.Source = fallback.Source
-		out.SourceLine = fallback.SourceLine
-		out.UsedFallbackOnly = true
+	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine), nil
+}
+
+func finishCodexTokenStats(
+	usage codexTokenUsageAccumulator,
+	fallback CodexTokenStats,
+	rateLimits CodexRateLimits,
+	diagnostics []TokenStatsDiagnostic,
+	tokenSourceLine int,
+	lastTokenCountLine int,
+) CodexTokenStats {
+	if usage.seen {
+		return CodexTokenStats{
+			SourceLine:               tokenSourceLine,
+			Source:                   "token_count",
+			Info:                     usage.info(),
+			NativeLatestTotal:        usage.nativeLatestTotal,
+			UsageEventCount:          usage.usageEventCount,
+			NonAdvancingUsageEvents:  usage.nonAdvancingUsageEvents,
+			NativeCounterResets:      usage.nativeCounterResets,
+			NativeCounterRecoveries:  usage.nativeCounterRecoveries,
+			MissingLastUsageEvents:   usage.missingLastUsageEvents,
+			UsageAggregationOverflow: usage.aggregationOverflow,
+			RateLimits:               rateLimits,
+			Diagnostics:              diagnostics,
+		}
 	}
-	if out.HasUsage() || out.RateLimits.Present {
-		return out, nil
+	if fallback.HasUsage() {
+		fallback.RateLimits = rateLimits
+		fallback.Diagnostics = diagnostics
+		return fallback
 	}
-	fallback.Diagnostics = append(fallback.Diagnostics, out.Diagnostics...)
-	return fallback, nil
+	if rateLimits.Present {
+		return CodexTokenStats{
+			SourceLine:  lastTokenCountLine,
+			Source:      "token_count",
+			RateLimits:  rateLimits,
+			Diagnostics: diagnostics,
+		}
+	}
+	fallback.Diagnostics = append(fallback.Diagnostics, diagnostics...)
+	return fallback
 }
 
 type codexTokenStatsEvent struct {
@@ -576,8 +812,21 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 	lines = append(lines, sourceLine)
 	if stats.UsedFallbackOnly {
 		lines = append(lines, "", "Reliability: using runner usage fallback because no `token_count` event was found; conversation totals and context-window analysis may be incomplete.")
+	} else if stats.HasUsage() {
+		lines = append(lines, "", fmt.Sprintf(
+			"Reliability: reconstructed conversation usage from %d unique Codex `token_count` update(s) in local history; malformed trailing JSONL lines are ignored and reported below.",
+			stats.UsageEventCount,
+		))
+		if stats.NonAdvancingUsageEvents > 0 || stats.NativeCounterResets > 0 || stats.NativeCounterRecoveries > 0 {
+			lines = append(lines, "", fmt.Sprintf(
+				"Aggregation: ignored %d non-advancing usage snapshot(s); observed %d native cumulative counter reset(s) and %d recovery event(s).",
+				stats.NonAdvancingUsageEvents,
+				stats.NativeCounterResets,
+				stats.NativeCounterRecoveries,
+			))
+		}
 	} else {
-		lines = append(lines, "", "Reliability: using Codex `token_count` event from local history; malformed trailing JSONL lines are ignored and reported below.")
+		lines = append(lines, "", "Reliability: Codex `token_count` metadata was found, but it did not contain a usage snapshot.")
 	}
 	if !stats.HasUsage() {
 		lines = append(lines, "", "Token usage unavailable: no Codex usage event was found in the linked transcript.")
@@ -604,7 +853,9 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 		lines = append(lines, "")
 		lines = append(lines, formatTokenUsageLines(stats.Info.Total)...)
 	}
-	if analysis := formatTokenUsageAnalysis(stats.Info); len(analysis) > 0 {
+	analysis := formatTokenUsageAnalysis(stats.Info)
+	analysis = append(analysis, formatTokenAggregationAnalysis(stats)...)
+	if len(analysis) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, "Analysis:")
 		lines = append(lines, "")
@@ -618,6 +869,27 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 	if diagnostics := formatTokenStatsDiagnostics(stats.Diagnostics); len(diagnostics) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, diagnostics...)
+	}
+	return lines
+}
+
+func formatTokenAggregationAnalysis(stats CodexTokenStats) []string {
+	var lines []string
+	if stats.NativeLatestTotal.hasTokens() && stats.NativeLatestTotal != stats.Info.Total {
+		lines = append(lines, fmt.Sprintf(
+			"native latest cumulative total: %s; reconstructed conversation total: %s",
+			formatTokenCount(stats.NativeLatestTotal.TotalTokens),
+			formatTokenCount(stats.Info.Total.TotalTokens),
+		))
+	}
+	if stats.MissingLastUsageEvents > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"could not verify native-counter recovery for %d advancing update(s) without `last_token_usage`; totals remain reconstructed as reset epochs",
+			stats.MissingLastUsageEvents,
+		))
+	}
+	if stats.UsageAggregationOverflow {
+		lines = append(lines, "usage reconstruction overflowed int64 and was saturated; reported totals are incomplete")
 	}
 	return lines
 }
