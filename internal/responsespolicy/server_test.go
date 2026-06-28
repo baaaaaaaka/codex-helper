@@ -10,10 +10,13 @@ import (
 	"time"
 )
 
-func TestServerRoutesOpenAIChatGPTAndLeavesAnalyticsUnchanged(t *testing.T) {
+func TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged(t *testing.T) {
 	openAIPaths := make(chan string, 1)
+	openAIBodies := make(chan string, 1)
 	openAI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		openAIPaths <- r.URL.Path
+		openAIBodies <- string(body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"ok":"openai"}`)
 	}))
@@ -25,21 +28,9 @@ func TestServerRoutesOpenAIChatGPTAndLeavesAnalyticsUnchanged(t *testing.T) {
 		_, _ = io.WriteString(w, `{"ok":"chatgpt-model"}`)
 	}))
 	defer chatGPTModel.Close()
-	chatGPTBodies := make(chan string, 1)
-	chatGPTPaths := make(chan string, 1)
-	chatGPT := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		chatGPTPaths <- r.URL.Path
-		chatGPTBodies <- string(body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"accepted":true}`)
-	}))
-	defer chatGPT.Close()
-
 	server, err := StartServer(ServerOptions{
 		OpenAIUpstream:       openAI.URL + "/v1",
 		ChatGPTModelUpstream: chatGPTModel.URL + "/backend-api/codex",
-		ChatGPTUpstream:      chatGPT.URL,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +49,7 @@ func TestServerRoutesOpenAIChatGPTAndLeavesAnalyticsUnchanged(t *testing.T) {
 	if got := <-openAIPaths; got != "/v1/models" {
 		t.Fatalf("OpenAI path = %q", got)
 	}
+	<-openAIBodies
 
 	request, _ := http.NewRequest(http.MethodPost, server.OpenAIBaseURL()+"/responses", strings.NewReader(`{"model":"gpt"}`))
 	request.Header.Set("ChatGPT-Account-ID", "account")
@@ -71,22 +63,34 @@ func TestServerRoutesOpenAIChatGPTAndLeavesAnalyticsUnchanged(t *testing.T) {
 	}
 
 	analytics := `{"events":[{"name":"conversation"}]}`
-	response, err = http.Post(server.ChatGPTBaseURL()+"/analytics-events/events", "application/json", strings.NewReader(analytics))
+	response, err = http.Post(server.OpenAIBaseURL()+"/analytics-events/events", "application/json", strings.NewReader(analytics))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if got := <-chatGPTPaths; got != "/analytics-events/events" {
-		t.Fatalf("ChatGPT path = %q", got)
+	if got := <-openAIPaths; got != "/v1/analytics-events/events" {
+		t.Fatalf("non-Responses path = %q", got)
 	}
-	if got := <-chatGPTBodies; got != analytics {
-		t.Fatalf("analytics body changed: %s", got)
+	if got := <-openAIBodies; got != analytics {
+		t.Fatalf("non-Responses body changed: %s", got)
 	}
 
 	args := strings.Join(server.CodexConfigArgs(), " ")
-	for _, want := range []string{"openai_base_url", "chatgpt_base_url", `approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
+	for _, want := range []string{"openai_base_url", `approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("config args missing %q: %s", want, args)
 		}
+	}
+	if strings.Contains(args, "chatgpt_base_url") {
+		t.Fatalf("config args must preserve the official ChatGPT HTTPS origin: %s", args)
+	}
+
+	response, err = http.Get(server.capabilityBaseURL() + "/chatgpt/api/codex/config/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("general ChatGPT reverse-proxy route status = %d, want 404", response.StatusCode)
 	}
 }

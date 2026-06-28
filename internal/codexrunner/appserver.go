@@ -1078,17 +1078,142 @@ type appServerMessage struct {
 type appServerErrorField struct {
 	Code    json.RawMessage `json:"code"`
 	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
 }
 
 func appServerResponseError(field *appServerErrorField) error {
-	message := strings.TrimSpace(field.Message)
+	message := sanitizeCodexErrorText(field.Message, 2048)
 	if message == "" {
 		message = "codex app-server returned an error response"
 	}
-	if code := appServerErrorCodeString(field.Code); code != "" {
+	if code := sanitizeCodexErrorText(appServerErrorCodeString(field.Code), 128); code != "" {
 		message = code + ": " + message
 	}
-	return &Error{Kind: ErrorCodex, Message: message}
+	details := decodeAppServerErrorDetails(field.Data)
+	if summary := formatCodexErrorDetails(details); summary != "" {
+		message += " (" + summary + ")"
+	}
+	return &Error{Kind: ErrorCodex, Message: message, Details: details}
+}
+
+func decodeAppServerErrorDetails(raw json.RawMessage) *CodexErrorDetails {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var payload struct {
+		Reason         string          `json:"reason"`
+		ErrorCode      string          `json:"errorCode"`
+		StatusCode     json.RawMessage `json:"statusCode"`
+		Detail         string          `json:"detail"`
+		RequestID      string          `json:"requestId"`
+		RequestIDSnake string          `json:"request_id"`
+		CloudflareRay  string          `json:"cfRay"`
+		CloudflareRay2 string          `json:"cf-ray"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	details := &CodexErrorDetails{
+		Reason:    sanitizeCodexErrorText(payload.Reason, 128),
+		ErrorCode: sanitizeCodexErrorText(payload.ErrorCode, 128),
+		Detail:    sanitizeCodexErrorText(payload.Detail, 512),
+		RequestID: sanitizeCodexErrorText(firstNonEmpty(payload.RequestID, payload.RequestIDSnake), 128),
+	}
+	if code := appServerErrorCodeString(payload.StatusCode); code != "" {
+		if parsed, err := strconv.Atoi(code); err == nil {
+			details.StatusCode = parsed
+		}
+	}
+	combined := strings.ToLower(strings.Join([]string{
+		payload.Detail,
+		payload.ErrorCode,
+		payload.Reason,
+		payload.CloudflareRay,
+		payload.CloudflareRay2,
+	}, " "))
+	details.Cloudflare = strings.Contains(combined, "cloudflare") ||
+		strings.Contains(combined, "cf_chl") ||
+		strings.Contains(combined, "challenge-error-text") ||
+		strings.TrimSpace(payload.CloudflareRay) != "" ||
+		strings.TrimSpace(payload.CloudflareRay2) != ""
+	if details.Cloudflare && looksLikeHTML(payload.Detail) {
+		details.Detail = "Cloudflare challenge response (HTML omitted)"
+	}
+	if details.Reason == "" && details.ErrorCode == "" && details.StatusCode == 0 && details.Detail == "" && details.RequestID == "" && !details.Cloudflare {
+		return nil
+	}
+	return details
+}
+
+func formatCodexErrorDetails(details *CodexErrorDetails) string {
+	if details == nil {
+		return ""
+	}
+	parts := make([]string, 0, 6)
+	if details.Reason != "" {
+		parts = append(parts, "reason="+details.Reason)
+	}
+	if details.ErrorCode != "" {
+		parts = append(parts, "errorCode="+details.ErrorCode)
+	}
+	if details.StatusCode != 0 {
+		parts = append(parts, "statusCode="+strconv.Itoa(details.StatusCode))
+	}
+	if details.RequestID != "" {
+		parts = append(parts, "requestId="+details.RequestID)
+	}
+	if details.Cloudflare {
+		parts = append(parts, "cloudflare=true")
+	}
+	if details.Detail != "" {
+		parts = append(parts, "detail="+details.Detail)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func sanitizeCodexErrorText(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = redactCXPToken(value)
+	if looksLikeHTML(value) {
+		value = "HTML response omitted"
+	}
+	// App-server error data is an untrusted upstream boundary. Keep public
+	// diagnostics on one line so control characters cannot forge log or Teams
+	// message structure while retaining the useful bounded text.
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if maxRunes > 0 && len(runes) > maxRunes {
+		value = string(runes[:maxRunes]) + "..."
+	}
+	return value
+}
+
+func redactCXPToken(value string) string {
+	const marker = "/_cxp/"
+	for offset := 0; ; {
+		index := strings.Index(value[offset:], marker)
+		if index < 0 {
+			return value
+		}
+		start := offset + index + len(marker)
+		end := strings.IndexByte(value[start:], '/')
+		if end < 0 {
+			return value[:start] + "<redacted>"
+		}
+		end += start
+		value = value[:start] + "<redacted>" + value[end:]
+		offset = start + len("<redacted>")
+	}
+}
+
+func looksLikeHTML(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "<!doctype html") ||
+		strings.Contains(lower, "<html") ||
+		strings.Contains(lower, "<script")
 }
 
 func appServerErrorCodeString(raw json.RawMessage) string {
@@ -1345,7 +1470,7 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 		var failure *TurnFailure
 		if params.Turn.Error != nil || params.Turn.Status == TurnStatusFailed || params.Turn.Status == TurnStatusInterrupted {
 			kind = StreamEventTurnFailed
-			failure = params.Turn.Error
+			failure = sanitizeTurnFailure(params.Turn.Error)
 			if failure == nil && params.Turn.Status == TurnStatusInterrupted {
 				failure = &TurnFailure{Message: "Codex turn was interrupted"}
 			}
@@ -1418,7 +1543,7 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 		}
 		failure := &TurnFailure{
 			Code:    firstNonEmpty(params.Error.Code, params.Code, codexErrorInfoCode(params.Error.CodexErrorInfo)),
-			Message: firstNonEmpty(params.Error.Message, params.Message, params.Error.AdditionalDetails),
+			Message: composeCodexFailureMessage(params.Error.Message, params.Message, params.Error.AdditionalDetails),
 		}
 		if failure.Message == "" {
 			if params.WillRetry {
@@ -1538,13 +1663,13 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 		result.FinalAgentMessage = message
 	}
 	if envelope.Failure != nil {
-		result.Failure = envelope.Failure
+		result.Failure = sanitizeTurnFailure(envelope.Failure)
 		if result.Status == TurnStatusUnknown {
 			result.Status = TurnStatusFailed
 		}
 	}
 	if envelope.Turn.Error != nil {
-		result.Failure = envelope.Turn.Error
+		result.Failure = sanitizeTurnFailure(envelope.Turn.Error)
 		if result.Status == TurnStatusUnknown {
 			result.Status = TurnStatusFailed
 		}
@@ -1686,7 +1811,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 				result.FinalAgentMessage = message
 			}
 			if params.Turn.Error != nil {
-				result.Failure = params.Turn.Error
+				result.Failure = sanitizeTurnFailure(params.Turn.Error)
 			}
 			mergeUsage(&result.Usage, params.Usage)
 			return true
@@ -1752,8 +1877,8 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			}
 			result.Status = TurnStatusFailed
 			result.Failure = &TurnFailure{
-				Code:    firstNonEmpty(params.Error.Code, params.Code),
-				Message: firstNonEmpty(params.Error.Message, params.Message, "Codex turn failed"),
+				Code:    sanitizeCodexErrorText(firstNonEmpty(params.Error.Code, params.Code), 128),
+				Message: sanitizeCodexErrorText(firstNonEmpty(params.Error.Message, params.Message, "Codex turn failed"), 2048),
 			}
 			return true
 		}
@@ -1905,7 +2030,7 @@ func isTerminalTurnStatus(status TurnStatus) bool {
 
 func turnResultError(result TurnResult) error {
 	if result.Failure != nil {
-		message := firstNonEmpty(result.Failure.Message, string(result.Status), "Codex turn failed")
+		message := sanitizeCodexErrorText(firstNonEmpty(result.Failure.Message, string(result.Status), "Codex turn failed"), 2048)
 		return &Error{Kind: ErrorCodex, Message: message}
 	}
 	switch result.Status {

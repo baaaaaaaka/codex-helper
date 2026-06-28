@@ -772,6 +772,8 @@ func codexExecJSONEvent(event codexrunner.StreamEvent) []byte {
 		value = map[string]any{"type": "item.completed", "item": map[string]any{"id": event.ItemID, "type": "command_execution", "command": event.Command, "aggregated_output": event.AggregatedOutput, "exit_code": event.ExitCode, "status": event.Status}}
 	case codexrunner.StreamEventTurnCompleted:
 		value = map[string]any{"type": "turn.completed", "thread_id": event.ThreadID, "turn_id": event.TurnID, "usage": event.Usage}
+	case codexrunner.StreamEventStreamRetry:
+		value = map[string]any{"type": "turn.retrying", "thread_id": event.ThreadID, "turn_id": event.TurnID, "error": event.Failure}
 	case codexrunner.StreamEventTurnFailed:
 		value = map[string]any{"type": "turn.failed", "thread_id": event.ThreadID, "turn_id": event.TurnID, "error": event.Failure}
 	default:

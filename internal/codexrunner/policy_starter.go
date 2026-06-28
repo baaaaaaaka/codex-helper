@@ -24,13 +24,10 @@ type PolicyAppServerStarter struct {
 
 func (s PolicyAppServerStarter) StartAppServer(ctx context.Context, request AppServerStartRequest) (AppServerLineTransport, error) {
 	serverOptions := s.ServerOptions
-	openAIUpstream, chatGPTUpstream := appServerBaseURLOverrides(request.Args)
+	openAIUpstream := appServerOpenAIBaseURLOverride(request.Args)
 	if serverOptions.OpenAIUpstream == "" && openAIUpstream != "" {
 		serverOptions.OpenAIUpstream = openAIUpstream
 		serverOptions.ChatGPTModelUpstream = openAIUpstream
-	}
-	if serverOptions.ChatGPTUpstream == "" && chatGPTUpstream != "" {
-		serverOptions.ChatGPTUpstream = chatGPTUpstream
 	}
 	policyServer, err := responsespolicy.StartServer(serverOptions)
 	if err != nil {
@@ -56,7 +53,8 @@ func (s PolicyAppServerStarter) StartAppServer(ctx context.Context, request AppS
 	}, nil
 }
 
-func appServerBaseURLOverrides(args []string) (openAI string, chatGPT string) {
+func appServerOpenAIBaseURLOverride(args []string) string {
+	var openAI string
 	for index := 0; index < len(args); index++ {
 		arg := strings.TrimSpace(args[index])
 		if arg != "-c" && arg != "--config" {
@@ -79,11 +77,9 @@ func appServerBaseURLOverrides(args []string) (openAI string, chatGPT string) {
 		switch strings.TrimSpace(key) {
 		case "openai_base_url":
 			openAI = value
-		case "chatgpt_base_url":
-			chatGPT = value
 		}
 	}
-	return openAI, chatGPT
+	return openAI
 }
 
 type policyAppServerTransport struct {

@@ -125,6 +125,20 @@ type Error struct {
 	Kind    ErrorKind
 	Message string
 	Err     error
+	Details *CodexErrorDetails
+}
+
+// CodexErrorDetails preserves the bounded, non-secret part of an app-server
+// JSON-RPC error data object. Keeping these fields structured lets CLI and
+// Teams callers explain setup failures without exposing an upstream HTML body,
+// authentication material, or CXP's loopback capability token.
+type CodexErrorDetails struct {
+	Reason     string
+	ErrorCode  string
+	StatusCode int
+	Detail     string
+	RequestID  string
+	Cloudflare bool
 }
 
 func (e *Error) Error() string {

@@ -90,6 +90,33 @@ func TestParseStreamEventJSONLRetryableStreamError(t *testing.T) {
 	}
 }
 
+func TestComposeCodexFailureMessageRedactsLoopbackCapabilityToken(t *testing.T) {
+	message := composeCodexFailureMessage(
+		"unexpected status 502, url: http://127.0.0.1:39653/_cxp/secret-capability/gateway/responses",
+		"",
+		"",
+	)
+	if strings.Contains(message, "secret-capability") {
+		t.Fatalf("failure message leaked capability token: %s", message)
+	}
+	if !strings.Contains(message, "/_cxp/<redacted>/gateway/responses") {
+		t.Fatalf("failure message lost bounded route context: %s", message)
+	}
+}
+
+func TestTurnResultErrorRedactsLoopbackCapabilityToken(t *testing.T) {
+	err := turnResultError(TurnResult{Status: TurnStatusFailed, Failure: &TurnFailure{
+		Code:    "other",
+		Message: "unexpected status 502, url: http://127.0.0.1:39653/_cxp/final-secret-capability/gateway/responses",
+	}})
+	if strings.Contains(err.Error(), "final-secret-capability") {
+		t.Fatalf("turn error leaked capability token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/_cxp/<redacted>/gateway/responses") {
+		t.Fatalf("turn error lost bounded route context: %v", err)
+	}
+}
+
 func TestParseStreamEventJSONLContextCompacted(t *testing.T) {
 	lines := [][]byte{
 		[]byte(`{"type":"context_compacted","thread_id":"thread-1","turn_id":"turn-1"}`),

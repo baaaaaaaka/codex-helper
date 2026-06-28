@@ -216,13 +216,16 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		Starter: PolicyAppServerStarter{ServerOptions: responsespolicy.ServerOptions{
 			OpenAIUpstream:       provider.URL + "/v1",
 			ChatGPTModelUpstream: provider.URL + "/v1",
-			ChatGPTUpstream:      provider.URL,
 		}},
 		Command: command,
 		AppServerArgs: []string{
 			"--analytics-default-enabled",
 			"-c", `model="gpt-5.4"`,
 			"-c", `model_provider="openai"`,
+			// The contract owns this synthetic ChatGPT origin. Production CXP no
+			// longer overrides chatgpt_base_url, so the test supplies its own URL
+			// explicitly to keep analytics local and deterministic.
+			"-c", `chatgpt_base_url="` + provider.URL + `"`,
 			"-c", `features.plugins=false`,
 		},
 		ExtraEnv: []string{

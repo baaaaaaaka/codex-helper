@@ -1,0 +1,105 @@
+name: Codex live cloud-config contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/codex-live-cloud-config.yml"
+      - "internal/codexrunner/**"
+      - "internal/responsespolicy/**"
+      - "go.mod"
+      - "go.sum"
+  workflow_dispatch:
+    inputs:
+      codex_version:
+        description: Official @openai/codex version to verify
+        required: true
+        default: latest
+        type: string
+  schedule:
+    - cron: "37 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  authenticated-cloud-config:
+    if: vars.CODEX_LIVE_CLOUD_CONFIG_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CODEX_VERSION: ${{ inputs.codex_version || 'latest' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install official Codex
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install -g --include=optional "@openai/codex@${CODEX_VERSION}"
+          codex --version
+
+      - name: Prepare auth-only Codex home
+        shell: bash
+        env:
+          CODEX_LIVE_AUTH_JSON: ${{ secrets.CODEX_LIVE_AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEX_LIVE_AUTH_JSON:-}" ]; then
+            echo "CODEX_LIVE_AUTH_JSON is required when the live canary is enabled" >&2
+            exit 1
+          fi
+          live_home="$RUNNER_TEMP/codex-live-source"
+          install -d -m 700 "$live_home"
+          printf '%s' "$CODEX_LIVE_AUTH_JSON" > "$live_home/auth.json"
+          chmod 600 "$live_home/auth.json"
+          {
+            echo "CXP_LIVE_CLOUD_CONFIG_TEST=1"
+            echo "CXP_LIVE_ACCOUNT_APPROVAL_TEST=1"
+            echo "CXP_LIVE_CODEX=$(command -v codex)"
+            echo "CXP_LIVE_CODEX_HOME=$live_home"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify workspace bundle and approval classification through CXP runtime
+        shell: bash
+        env:
+          CXP_LIVE_HTTP_PROXY: ${{ secrets.CXP_LIVE_HTTP_PROXY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CXP_LIVE_HTTP_PROXY:-}" ]; then
+            echo "CXP_LIVE_HTTP_PROXY is required when the live canary is enabled" >&2
+            exit 1
+          fi
+          go test ./internal/codexrunner \
+            -run 'TestLive(AuthenticatedCloudConfigPreservesOfficialChatGPTOrigin|AccountPolicyApprovesEveryRequiredRequestWithoutPromptingSafeTool)' \
+            -count=1 -v -timeout=4m
+
+      - name: Record sanitized contract proof
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "{\"schema\":1,\"codex_version\":\"${CODEX_VERSION}\",\"auth_home\":\"fresh\",\"official_chatgpt_origin\":true,\"configured_proxy_case\":true,\"safe_tool_without_approval\":true,\"required_tool_auto_approved\":true}" \
+            > "$RUNNER_TEMP/codex-live-cloud-config.json"
+
+      - name: Upload sanitized proof
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-live-cloud-config-${{ github.run_id }}
+          path: ${{ runner.temp }}/codex-live-cloud-config.json
+          retention-days: 14

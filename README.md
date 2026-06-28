@@ -295,6 +295,25 @@ ordinary `reviewer=user`, `status=approved`, `user_approved` event. CXP does not
 hide its app-server client identity or try to prevent server-side inference from
 timing and other normal telemetry.
 
+CXP's local policy gateway is intentionally limited to Responses traffic. It
+does not rewrite `chatgpt_base_url`: workspace configuration, MCP discovery,
+analytics, and other ChatGPT control-plane requests keep the official HTTPS
+origin and use the selected profile through standard `HTTP_PROXY` / `HTTPS_PROXY`
+environment variables. This preserves the official client's secure cookie and
+Cloudflare behavior while keeping the existing SSH/direct proxy choice intact.
+
+The normal CI and Codex release monitor assert this routing boundary without
+credentials. Maintainers can additionally enable the scheduled/dispatchable
+`Codex live cloud-config contract` by setting the repository variable
+`CODEX_LIVE_CLOUD_CONFIG_ENABLED=true` and the secrets
+`CODEX_LIVE_AUTH_JSON` and `CXP_LIVE_HTTP_PROXY`.
+The canary uses a fresh auth-only `CODEX_HOME`, so a cached workspace bundle
+cannot hide a regression. It runs the same account-backed check both directly
+and through the configured real proxy outlet. It also combines the real
+workspace policy with a deterministic local model provider to verify that a
+safe tool does not create an approval request while every approval-required
+shell call is accepted by the broker and completes its filesystem side effect.
+
 `codex-proxy app` still launches the official Desktop App directly. The Desktop
 App does not currently expose a stable external app-server attachment contract,
 so Desktop automatic approval remains a final-release blocker for any claim

@@ -6546,6 +6546,52 @@ func infraLaunchFailureNotice(err error) (string, bool) {
 	}, "\n"), true
 }
 
+func codexConfigurationFailureNotice(err error) (string, bool) {
+	var failure *codexrunner.Error
+	if !errors.As(err, &failure) || failure == nil || failure.Kind != codexrunner.ErrorCodex || failure.Details == nil {
+		return "", false
+	}
+	details := failure.Details
+	if !strings.EqualFold(strings.TrimSpace(details.Reason), "cloudConfigBundle") {
+		return "", false
+	}
+	status := "an upstream request error"
+	if details.StatusCode != 0 {
+		status = fmt.Sprintf("HTTP %d", details.StatusCode)
+	}
+	classification := ""
+	if details.Cloudflare {
+		classification = " The response was identified as a Cloudflare challenge."
+	}
+	diagnostic := trimTeamsCommandOutput(err.Error(), 600)
+	structured := make([]string, 0, 5)
+	if details.Reason != "" {
+		structured = append(structured, "reason="+details.Reason)
+	}
+	if details.ErrorCode != "" {
+		structured = append(structured, "errorCode="+details.ErrorCode)
+	}
+	if details.StatusCode != 0 {
+		structured = append(structured, fmt.Sprintf("statusCode=%d", details.StatusCode))
+	}
+	if details.RequestID != "" {
+		structured = append(structured, "requestId="+details.RequestID)
+	}
+	if len(structured) > 0 {
+		diagnostic += "\n" + strings.Join(structured, ", ")
+	}
+	return strings.Join([]string{
+		"⚠️ Codex could not load the workspace-managed configuration through the selected network route.",
+		"",
+		"The ChatGPT configuration request returned " + status + "." + classification,
+		"No Codex thread or user work was started, so retrying later will not duplicate work.",
+		"Once the network/proxy path is corrected, send `helper retry last` here.",
+		"",
+		"Diagnostic for the admin:",
+		diagnostic,
+	}, "\n"), true
+}
+
 func missingNodeRuntimeFailureNotice(err error) (string, bool) {
 	if err == nil {
 		return "", false
@@ -10216,6 +10262,15 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 				return upgradeErr
 			}
 			return nil
+		}
+		if configBody, ok := codexConfigurationFailureNotice(err); ok {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "codex configuration failure (network/proxy path): %v\n", err)
+			}
+			return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", configBody, outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "needs_attention",
+			})
 		}
 		if infraBody, ok := infraLaunchFailureNotice(err); ok {
 			// Setup/infrastructure failure: don't surface the raw internal error

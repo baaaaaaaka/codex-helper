@@ -531,7 +531,7 @@ func mergeUsage(dst *Usage, src codexUsage) {
 func failureFromEvent(event codexEvent) *TurnFailure {
 	failure := &TurnFailure{
 		Code:    firstNonEmpty(event.Error.Code, event.Code, codexErrorInfoCode(event.Error.CodexErrorInfo)),
-		Message: firstNonEmpty(event.Error.Message, event.Message, event.Error.AdditionalDetails),
+		Message: composeCodexFailureMessage(event.Error.Message, event.Message, event.Error.AdditionalDetails),
 	}
 	if failure.Message == "" {
 		if event.WillRetry {
@@ -541,6 +541,28 @@ func failureFromEvent(event codexEvent) *TurnFailure {
 		}
 	}
 	return failure
+}
+
+func composeCodexFailureMessage(primary, fallback, additional string) string {
+	message := sanitizeCodexErrorText(firstNonEmpty(primary, fallback), 2048)
+	detail := sanitizeCodexErrorText(additional, 512)
+	if message == "" {
+		return detail
+	}
+	if detail == "" || strings.Contains(message, detail) {
+		return message
+	}
+	return message + ": " + detail
+}
+
+func sanitizeTurnFailure(failure *TurnFailure) *TurnFailure {
+	if failure == nil {
+		return nil
+	}
+	result := *failure
+	result.Code = sanitizeCodexErrorText(result.Code, 128)
+	result.Message = sanitizeCodexErrorText(result.Message, 2048)
+	return &result
 }
 
 func codexErrorInfoCode(raw json.RawMessage) string {

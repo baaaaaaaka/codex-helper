@@ -230,7 +230,8 @@ jobs:
           set -euo pipefail
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
-          go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
+          go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunnerPreservesBoundedCloudConfigErrorData|AutomaticApprovalResultMatrix)' -count=1 -v
 
       - name: Teams app-server probe (Linux/macOS)
         if: runner.os != 'Windows'
@@ -426,7 +427,7 @@ jobs:
               exit 1
               ;;
           esac
-          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_REMOTE_TUI_CONTRACT_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_contract_test -test.v -test.count=1 -test.run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_E2E_TEST=1 /codex_runtime_test -test.v -test.count=1 -test.run TestInstalledCodexStandardApprovalRuntime"
+          run_cmd="${INSTALL_CMD} && NODE_MIN_MAJOR=16 NODE_MAJOR=22 NODE_BIN_DIR=\$(bash /ci/install_node_local.sh) && PATH=\"\${NODE_BIN_DIR}:\$PATH\" bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex@${CODEX_VERSION} && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_REMOTE_TUI_CONTRACT_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_contract_test -test.v -test.count=1 -test.run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_TEST=1 CODEX_RUNTIME_CONTRACT_TEST=1 /codex_cli_test -test.v -test.count=1 -test.run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' && PATH=\"\${NODE_BIN_DIR}:\$PATH\" CODEX_RUNTIME_E2E_TEST=1 /codex_runtime_test -test.v -test.count=1 -test.run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunnerPreservesBoundedCloudConfigErrorData|AutomaticApprovalResultMatrix)'"
           docker run --rm \
             -v "${CONTRACT_TEST_BIN_PATH}:/codex_contract_test:ro" \
             -v "${CLI_TEST_BIN_PATH}:/codex_cli_test:ro" \

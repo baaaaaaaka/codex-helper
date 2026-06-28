@@ -124,6 +124,87 @@ func TestInfraLaunchFailureNotice(t *testing.T) {
 	})
 }
 
+func TestCodexConfigurationFailureNotice(t *testing.T) {
+	err := &codexrunner.Error{
+		Kind:    codexrunner.ErrorCodex,
+		Message: "-32600: failed to load configuration",
+		Details: &codexrunner.CodexErrorDetails{
+			Reason:     "cloudConfigBundle",
+			ErrorCode:  "RequestFailed",
+			StatusCode: 403,
+			Detail:     "Cloudflare challenge response (HTML omitted)",
+			Cloudflare: true,
+		},
+	}
+	body, ok := codexConfigurationFailureNotice(err)
+	if !ok {
+		t.Fatal("expected cloud configuration failure to be reframed")
+	}
+	for _, want := range []string{"workspace-managed configuration", "HTTP 403", "Cloudflare challenge", "No Codex thread or user work was started", "helper retry last", "cloudConfigBundle"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("configuration notice missing %q:\n%s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"version mismatch", "usually means", "<!DOCTYPE"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("configuration notice leaked/misclassified %q:\n%s", forbidden, body)
+		}
+	}
+
+	if _, ok := codexConfigurationFailureNotice(&codexrunner.Error{Kind: codexrunner.ErrorCodex, Message: "model failed"}); ok {
+		t.Fatal("ordinary model error must not be reframed as a configuration failure")
+	}
+}
+
+func TestRunQueuedTurnReportsCloudConfigProxyFailure(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	session := (&Registry{
+		Sessions: []Session{{ID: "s001", ChatID: "chat-1", Status: "active"}},
+	}).SessionByChatID("chat-1")
+
+	configErr := &codexrunner.Error{
+		Kind:    codexrunner.ErrorCodex,
+		Message: "-32600: failed to load configuration (reason=cloudConfigBundle, errorCode=RequestFailed, statusCode=403, cloudflare=true)",
+		Details: &codexrunner.CodexErrorDetails{
+			Reason:     "cloudConfigBundle",
+			ErrorCode:  "RequestFailed",
+			StatusCode: 403,
+			Detail:     "Cloudflare challenge response (HTML omitted)",
+			Cloudflare: true,
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{err: configErr})
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	turn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{ID: "turn:cloud-config", SessionID: session.ID})
+	if err != nil {
+		t.Fatalf("QueueTurn error: %v", err)
+	}
+	if err := bridge.runQueuedTurn(context.Background(), session, turn, session.ChatID, "do something"); err != nil {
+		t.Fatalf("runQueuedTurn error: %v", err)
+	}
+
+	if len(*sent) != 1 {
+		t.Fatalf("sent count = %d, want 1: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].Mentions != 1 {
+		t.Fatalf("configuration error should mention owner, mentions = %d", (*sent)[0].Mentions)
+	}
+	body := PlainTextFromTeamsHTML((*sent)[0].Content)
+	for _, want := range []string{"workspace-managed configuration", "HTTP 403", "Cloudflare challenge", "No Codex thread or user work was started", "helper retry last"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("Teams configuration notice missing %q:\n%s", want, body)
+		}
+	}
+	for _, forbidden := range []string{"version mismatch", "usually means", "<!DOCTYPE", "setup issue on my side"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("Teams configuration notice was generic or leaked %q:\n%s", forbidden, body)
+		}
+	}
+}
+
 func TestRunQueuedTurnReportsSharedAuthMigrationBlocker(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)

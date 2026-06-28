@@ -14,7 +14,6 @@ import (
 const (
 	DefaultOpenAIUpstream       = "https://api.openai.com/v1"
 	DefaultChatGPTModelUpstream = "https://chatgpt.com/backend-api/codex"
-	DefaultChatGPTUpstream      = "https://chatgpt.com/backend-api"
 )
 
 type ServerOptions struct {
@@ -23,15 +22,14 @@ type ServerOptions struct {
 	// ChatGPTModelUpstream is the first-party Responses endpoint selected for
 	// requests that carry ChatGPT-Account-ID.
 	ChatGPTModelUpstream string
-	ChatGPTUpstream      string
 	Transport            http.RoundTripper
 	ProxyURL             string
 	Policy               *ShellEscalationPolicy
 }
 
-// Server hosts separate OpenAI and ChatGPT reverse-proxy routes on one
-// loopback listener. Non-Responses paths, including analytics, are forwarded
-// without payload mutation by Proxy.
+// Server hosts one capability-protected Responses gateway that selects the
+// API or ChatGPT model upstream from request headers. ChatGPT control-plane
+// traffic is intentionally not routed through this listener.
 type Server struct {
 	listener net.Listener
 	server   *http.Server
@@ -53,7 +51,6 @@ func StartServer(options ServerOptions) (*Server, error) {
 	}
 	openAIUpstream := firstNonEmpty(options.OpenAIUpstream, DefaultOpenAIUpstream)
 	chatGPTModelUpstream := firstNonEmpty(options.ChatGPTModelUpstream, DefaultChatGPTModelUpstream)
-	chatGPTUpstream := firstNonEmpty(options.ChatGPTUpstream, DefaultChatGPTUpstream)
 	transport, websocketProxy, err := policyProxyTransport(options.Transport, options.ProxyURL)
 	if err != nil {
 		return nil, err
@@ -63,10 +60,6 @@ func StartServer(options ServerOptions) (*Server, error) {
 		return nil, err
 	}
 	chatGPTModelProxy, err := NewProxy(ProxyOptions{Upstream: chatGPTModelUpstream, Policy: policy, Transport: transport, WebSocketProxy: websocketProxy})
-	if err != nil {
-		return nil, err
-	}
-	chatGPTProxy, err := NewProxy(ProxyOptions{Upstream: chatGPTUpstream, Policy: policy, Transport: transport, WebSocketProxy: websocketProxy})
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +80,6 @@ func StartServer(options ServerOptions) (*Server, error) {
 		}
 		openAIProxy.ServeHTTP(w, request)
 	})))
-	mux.Handle(prefix+"/chatgpt/", http.StripPrefix(prefix+"/chatgpt", chatGPTProxy))
 	mux.HandleFunc(prefix+"/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -149,14 +141,14 @@ func (s *Server) capabilityBaseURL() string {
 
 func (s *Server) OpenAIBaseURL() string { return s.capabilityBaseURL() + "/gateway" }
 
-func (s *Server) ChatGPTBaseURL() string { return s.capabilityBaseURL() + "/chatgpt" }
-
 // CodexConfigArgs returns ordinary config overrides. It intentionally does not
-// use full-access, bypass, or noninteractive approval flags.
+// use full-access, bypass, or noninteractive approval flags. ChatGPT control-
+// plane traffic deliberately keeps its original HTTPS origin so Codex can
+// retain secure Cloudflare infrastructure cookies; the child process still
+// reaches that origin through the selected CXP HTTP(S) proxy environment.
 func (s *Server) CodexConfigArgs() []string {
 	return []string{
 		"-c", `openai_base_url="` + tomlEscape(s.OpenAIBaseURL()) + `"`,
-		"-c", `chatgpt_base_url="` + tomlEscape(s.ChatGPTBaseURL()) + `"`,
 		"-c", `approval_policy="on-request"`,
 		"-c", `approvals_reviewer="user"`,
 		"-c", `sandbox_mode="read-only"`,

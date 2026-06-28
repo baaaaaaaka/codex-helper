@@ -14,8 +14,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
+
+func TestCodexExecJSONEventIncludesRetryDiagnostics(t *testing.T) {
+	raw := codexExecJSONEvent(codexrunner.StreamEvent{
+		Kind:     codexrunner.StreamEventStreamRetry,
+		ThreadID: "thread-1",
+		TurnID:   "turn-1",
+		Failure: &codexrunner.TurnFailure{
+			Code:    "responseStreamDisconnected",
+			Message: "Reconnecting... 1/5: upstream returned HTTP 502",
+		},
+	})
+	for _, want := range []string{`"type":"turn.retrying"`, `"thread_id":"thread-1"`, `"Code":"responseStreamDisconnected"`, "upstream returned HTTP 502"} {
+		if !bytes.Contains(raw, []byte(want)) {
+			t.Fatalf("retry JSON missing %q: %s", want, raw)
+		}
+	}
+}
 
 func TestRunCodexExecFacadeUsesStandardApprovalAfterFixedDelay(t *testing.T) {
 	if runtime.GOOS == "windows" {

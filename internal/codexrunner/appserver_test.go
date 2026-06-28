@@ -236,6 +236,76 @@ func TestAppServerRunnerResumeThreadFailureKeepsExistingThreadIDOnly(t *testing.
 	}
 }
 
+func TestAppServerRunnerPreservesBoundedCloudConfigErrorData(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"error":{"code":-32600,"message":"failed to load configuration","data":{"reason":"cloudConfigBundle","errorCode":"RequestFailed","detail":"Failed to load cloud config bundle (workspace-managed policies).","statusCode":403,"requestId":"request-123"}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "start"})
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Details == nil {
+		t.Fatalf("StartThread error = %v, want structured Codex details", err)
+	}
+	if got := failure.Details; got.Reason != "cloudConfigBundle" || got.ErrorCode != "RequestFailed" || got.StatusCode != 403 || got.RequestID != "request-123" {
+		t.Fatalf("details = %#v", got)
+	}
+	for _, want := range []string{"-32600", "reason=cloudConfigBundle", "errorCode=RequestFailed", "statusCode=403", "requestId=request-123"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error missing %q: %v", want, err)
+		}
+	}
+}
+
+func TestAppServerRunnerRedactsCloudflareHTMLAndCapabilityToken(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"error":{"code":-32600,"message":"failed to load configuration","data":{"reason":"cloudConfigBundle","errorCode":"RequestFailed","detail":"<!DOCTYPE html><script>window._cf_chl_opt={cUPMDTk:\"/_cxp/secret-capability/chatgpt/api/codex/config/bundle\"}</script>","statusCode":403,"cf-ray":"ray-123"}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "start"})
+	var failure *Error
+	if !errors.As(err, &failure) || failure.Details == nil {
+		t.Fatalf("StartThread error = %v, want structured Codex details", err)
+	}
+	if !failure.Details.Cloudflare || failure.Details.Detail != "Cloudflare challenge response (HTML omitted)" {
+		t.Fatalf("details = %#v", failure.Details)
+	}
+	for _, forbidden := range []string{"secret-capability", "_cf_chl_opt", "<!DOCTYPE"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("error leaked %q: %v", forbidden, err)
+		}
+	}
+}
+
+func TestSanitizeCodexErrorTextNormalizesControlWhitespace(t *testing.T) {
+	got := sanitizeCodexErrorText(" first\nsecond\tthird\r\nlast ", 512)
+	if got != "first second third last" {
+		t.Fatalf("sanitized error text = %q", got)
+	}
+}
+
+func TestAppServerRunnerRedactsTopLevelServerErrorMessage(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"error":{"code":-32600,"message":"upstream failed at /_cxp/top-level-secret/gateway/responses"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	_, err := runner.StartThread(context.Background(), TurnInput{Prompt: "start"})
+	if err == nil || strings.Contains(err.Error(), "top-level-secret") {
+		t.Fatalf("top-level app-server error was not redacted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/_cxp/<redacted>/gateway/responses") {
+		t.Fatalf("top-level app-server error lost route context: %v", err)
+	}
+}
+
 func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
@@ -328,7 +398,7 @@ func TestAppServerRunnerStreamsRetryableStreamErrorNotification(t *testing.T) {
 	if retry.Kind != StreamEventStreamRetry || !retry.WillRetry {
 		t.Fatalf("retry event = %#v", retry)
 	}
-	if retry.Failure == nil || retry.Failure.Message != "Reconnecting... 1/3" || retry.Failure.Code != "responseStreamDisconnected" {
+	if retry.Failure == nil || retry.Failure.Message != "Reconnecting... 1/3: stream disconnected before completion" || retry.Failure.Code != "responseStreamDisconnected" {
 		t.Fatalf("retry failure = %#v", retry.Failure)
 	}
 }

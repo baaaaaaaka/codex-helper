@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+type recordingPolicyStarter struct {
+	request AppServerStartRequest
+}
+
+func (s *recordingPolicyStarter) StartAppServer(_ context.Context, request AppServerStartRequest) (AppServerLineTransport, error) {
+	s.request = request
+	return newFakeAppServerTransport(), nil
+}
+
 func TestPolicyTransportReadyHookRunsAfterSuccessfulInitializeResponse(t *testing.T) {
 	base := newFakeAppServerTransport(
 		`{"jsonrpc":"2.0","id":7,"result":{"userAgent":"test"}}`,
@@ -81,14 +90,57 @@ func TestPolicyTransportReadyHookFailureRejectsInitialize(t *testing.T) {
 	}
 }
 
-func TestAppServerBaseURLOverridesUsesLastCLIValue(t *testing.T) {
-	openAI, chatGPT := appServerBaseURLOverrides([]string{
+func TestAppServerOpenAIBaseURLOverrideUsesLastCLIValueAndIgnoresChatGPT(t *testing.T) {
+	openAI := appServerOpenAIBaseURLOverride([]string{
 		"app-server",
 		"-c", `openai_base_url="https://first.example/v1"`,
 		"--config", `chatgpt_base_url='https://chat.example/backend-api'`,
 		"-c", `openai_base_url="https://last.example/v1"`,
 	})
-	if openAI != "https://last.example/v1" || chatGPT != "https://chat.example/backend-api" {
-		t.Fatalf("openAI=%q chatGPT=%q", openAI, chatGPT)
+	if openAI != "https://last.example/v1" {
+		t.Fatalf("openAI=%q", openAI)
+	}
+}
+
+func TestPolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway(t *testing.T) {
+	base := &recordingPolicyStarter{}
+	starter := PolicyAppServerStarter{Base: base}
+	transport, err := starter.StartAppServer(context.Background(), AppServerStartRequest{
+		Command: "codex",
+		Args: []string{
+			"app-server",
+			"-c", `chatgpt_base_url="https://chat.example/backend-api"`,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transport.Close()
+
+	var chatGPTValues, openAIValues []string
+	for index := 0; index+1 < len(base.request.Args); index++ {
+		if base.request.Args[index] != "-c" && base.request.Args[index] != "--config" {
+			continue
+		}
+		value := base.request.Args[index+1]
+		switch {
+		case strings.HasPrefix(value, "chatgpt_base_url="):
+			chatGPTValues = append(chatGPTValues, value)
+		case strings.HasPrefix(value, "openai_base_url="):
+			openAIValues = append(openAIValues, value)
+		}
+		index++
+	}
+	if len(chatGPTValues) != 1 || chatGPTValues[0] != `chatgpt_base_url="https://chat.example/backend-api"` {
+		t.Fatalf("chatgpt_base_url values = %#v, want the untouched user value", chatGPTValues)
+	}
+	if len(openAIValues) != 1 || !strings.Contains(openAIValues[0], "http://127.0.0.1:") || !strings.Contains(openAIValues[0], "/gateway") {
+		t.Fatalf("openai_base_url values = %#v, want one loopback Responses gateway", openAIValues)
+	}
+	joined := strings.Join(base.request.Args, " ")
+	for _, want := range []string{`approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("policy args missing %q: %s", want, joined)
+		}
 	}
 }
