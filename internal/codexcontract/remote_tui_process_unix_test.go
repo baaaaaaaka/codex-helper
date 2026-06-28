@@ -11,11 +11,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 )
 
 type unixRemoteTUIProcess struct {
 	cmd    *exec.Cmd
 	output bytes.Buffer
+	stop   sync.Once
 }
 
 func startRemoteTUIProcess(ctx context.Context, command, remoteURL, remoteAuthTokenEnv, remoteAuthToken, codexHome string) (remoteTUIProcess, error) {
@@ -33,6 +36,11 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, remoteAuthTo
 	} else {
 		cmd = exec.CommandContext(ctx, ptyCommand, "-qefc", commandLine, "/dev/null")
 	}
+	// script(1) is only the PTY supervisor. The shell and Codex processes are
+	// descendants, so killing only cmd.Process can let Codex keep writing to its
+	// temporary home after Wait returns. Give the complete PTY tree a dedicated
+	// process group and terminate that group in Stop.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	process := &unixRemoteTUIProcess{cmd: cmd}
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
@@ -55,7 +63,9 @@ func (p *unixRemoteTUIProcess) Wait() error { return p.cmd.Wait() }
 
 func (p *unixRemoteTUIProcess) Stop() {
 	if p != nil && p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
+		p.stop.Do(func() {
+			_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		})
 	}
 }
 
