@@ -153,13 +153,17 @@ func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexP
 }
 
 func codexRemoteTUICapable(codexPath string) bool {
+	return codexRemoteTUICapableWithEnv(codexPath, nil, nil)
+}
+
+func codexRemoteTUICapableWithEnv(codexPath string, environment []string, identity *execIdentity) bool {
 	codexPath = strings.TrimSpace(codexPath)
 	if codexPath == "" {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, codexPath, "--help").CombinedOutput()
+	output, err := runCodexProbeCommand(ctx, codexPath, []string{"--help"}, environment, identity)
 	if err != nil {
 		return false
 	}
@@ -178,12 +182,16 @@ func codexHelpHasOption(help string, option string) bool {
 }
 
 func codexBrokerRuntimeCapable(codexPath string) bool {
-	if !codexRemoteTUICapable(codexPath) {
+	return codexBrokerRuntimeCapableWithEnv(codexPath, nil, nil)
+}
+
+func codexBrokerRuntimeCapableWithEnv(codexPath string, environment []string, identity *execIdentity) bool {
+	if !codexRemoteTUICapableWithEnv(codexPath, environment, identity) {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, codexPath, "--version").CombinedOutput()
+	output, err := runCodexProbeCommand(ctx, codexPath, []string{"--version"}, environment, identity)
 	if err != nil {
 		return false
 	}
@@ -207,4 +215,22 @@ func codexBrokerRuntimeCapable(codexPath string) bool {
 		return true
 	}
 	return minor == 131 && prerelease == ""
+}
+
+func runCodexProbeCommand(ctx context.Context, codexPath string, args []string, environment []string, identity *execIdentity) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, codexPath, args...)
+	if len(environment) > 0 {
+		cmd.Env = append([]string(nil), environment...)
+	}
+	if identity != nil {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		updated, err := applyExecIdentity(cmd, cmd.Env, identity)
+		if err != nil {
+			return nil, err
+		}
+		cmd.Env = updated
+	}
+	return cmd.CombinedOutput()
 }

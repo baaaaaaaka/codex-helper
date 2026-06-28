@@ -267,19 +267,32 @@ func ensureCodexAppAuthCodexInstalled(ctx context.Context, codexPath string, out
 }
 
 func ensureCodexAppAuthCodexInstalledForIdentity(ctx context.Context, out io.Writer, opts codexInstallOptions, identity *execIdentity) (string, error) {
-	if path, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
-		return path, nil
+	if !opts.upgradeCodex {
+		if path, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
+			return path, nil
+		}
 	}
 	if out != nil {
-		_, _ = fmt.Fprintf(out, "codex not found for target user %s; installing for that user...\n", codexAppAuthIdentityLabel(identity))
+		if opts.upgradeCodex {
+			_, _ = fmt.Fprintf(out, "upgrading codex for target user %s...\n", codexAppAuthIdentityLabel(identity))
+		} else {
+			_, _ = fmt.Fprintf(out, "codex not found for target user %s; installing for that user...\n", codexAppAuthIdentityLabel(identity))
+		}
 	}
 	if err := withCodexInstallLock(ctx, out, func() error {
-		if _, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
-			return nil
+		if !opts.upgradeCodex {
+			if _, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
+				return nil
+			}
 		}
 		runInstall := func(installerEnv []string) error {
 			installerEnv = codexAppAuthInstallerEnvForIdentity(installerEnv, identity)
 			return runCodexInstallerWithOptions(ctx, out, installerEnv, func(cmd *exec.Cmd) error {
+				if opts.configureInstallerCommand != nil {
+					if err := opts.configureInstallerCommand(cmd); err != nil {
+						return err
+					}
+				}
 				updatedEnv, err := applyExecIdentity(cmd, cmd.Env, identity)
 				if err != nil {
 					return err
@@ -325,9 +338,6 @@ func codexAppAuthInstallerEnvForIdentity(base []string, identity *execIdentity) 
 
 func codexAppAuthRuntimeEnvForIdentity(base []string, identity *execIdentity) []string {
 	envVars := codexAppAuthInstallerEnvForIdentity(base, identity)
-	if identity == nil {
-		return envVars
-	}
 	nodeDirs := managedNodeBinCandidatesForEnv(
 		runtime.GOOS,
 		runtime.GOARCH,

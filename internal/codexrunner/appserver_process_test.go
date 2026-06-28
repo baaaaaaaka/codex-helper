@@ -73,6 +73,43 @@ func TestAppServerProcessStarterPassesExtraEnv(t *testing.T) {
 	}
 }
 
+func TestMergeAppServerProcessEnvEmitsUniqueKeysAndOverlayWins(t *testing.T) {
+	previousGOOS := appServerProcessRuntimeGOOS
+	appServerProcessRuntimeGOOS = func() string { return "linux" }
+	t.Cleanup(func() { appServerProcessRuntimeGOOS = previousGOOS })
+
+	got := mergeAppServerProcessEnv(
+		[]string{"PATH=/base", "HOME=/home/base", "PATH=/base-last"},
+		[]string{"PATH=/overlay", "HOME=/home/overlay"},
+	)
+	counts := map[string]int{}
+	values := map[string]string{}
+	for _, entry := range got {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			counts[key]++
+			values[key] = value
+		}
+	}
+	if counts["PATH"] != 1 || counts["HOME"] != 1 {
+		t.Fatalf("environment contains duplicate keys: %#v", got)
+	}
+	if values["PATH"] != "/overlay" || values["HOME"] != "/home/overlay" {
+		t.Fatalf("overlay did not win: %#v", got)
+	}
+}
+
+func TestMergeAppServerProcessEnvTreatsWindowsKeysCaseInsensitively(t *testing.T) {
+	previousGOOS := appServerProcessRuntimeGOOS
+	appServerProcessRuntimeGOOS = func() string { return "windows" }
+	t.Cleanup(func() { appServerProcessRuntimeGOOS = previousGOOS })
+
+	got := mergeAppServerProcessEnv([]string{"Path=C:\\base"}, []string{"PATH=C:\\overlay"})
+	if len(got) != 1 || got[0] != "PATH=C:\\overlay" {
+		t.Fatalf("Windows environment = %#v", got)
+	}
+}
+
 func TestAppServerProcessStarterConfiguresCommandBeforeStart(t *testing.T) {
 	command, args := appServerProcessHelperCommand("meta")
 

@@ -289,6 +289,22 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 		// transport must not prevent a clean cold restart for the next turn.
 		_ = r.closeTransportLocked()
 	}
+	for attempt := 0; attempt < 2; attempt++ {
+		err := r.startAndInitializeLocked(ctx)
+		if err == nil {
+			return nil
+		}
+		if attempt == 1 || r.Starter == nil || !IsKind(err, ErrorLaunch) || ctx.Err() != nil {
+			return err
+		}
+		// No thread or turn has been created at this point. One cold retry is
+		// therefore safe and recovers transient process-start and handshake
+		// failures without risking duplicate user work.
+	}
+	return &Error{Kind: ErrorLaunch, Message: "codex app-server initialization failed"}
+}
+
+func (r *AppServerRunner) startAndInitializeLocked(ctx context.Context) error {
 	if r.Transport == nil {
 		if r.Starter == nil {
 			return &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}

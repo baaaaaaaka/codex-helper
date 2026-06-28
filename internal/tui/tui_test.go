@@ -1289,6 +1289,7 @@ func TestApplyPreviewNavigation(t *testing.T) {
 }
 
 func TestEnsurePreview(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	longAnswer := strings.Repeat("long-answer-", 45) + "tail-marker"
@@ -1342,6 +1343,7 @@ func TestEnsurePreview(t *testing.T) {
 }
 
 func TestEnsurePreviewDefaultShowsCompleteVisibleHistory(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	var lines []string
@@ -1378,6 +1380,7 @@ func TestEnsurePreviewDefaultShowsCompleteVisibleHistory(t *testing.T) {
 }
 
 func TestEnsurePreviewHonorsExplicitMessageLimit(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	lines := []string{
@@ -1411,6 +1414,7 @@ func TestEnsurePreviewHonorsExplicitMessageLimit(t *testing.T) {
 }
 
 func TestEnsurePreviewInvalidatesCacheWhenSessionFileChanges(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	writePreviewSession := func(text string) {
@@ -1497,6 +1501,7 @@ func TestApplyPreviewEventKeepsStalePreviewOnRefreshError(t *testing.T) {
 }
 
 func TestEnsurePreviewSupersedesInFlightLoadWhenFileChanges(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	line := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}`
@@ -1546,6 +1551,7 @@ func TestEnsurePreviewSupersedesInFlightLoadWhenFileChanges(t *testing.T) {
 }
 
 func TestEnsurePreviewCachesEmptyVisiblePreview(t *testing.T) {
+	isolatePreviewPersistentCache(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	lines := []string{
@@ -1576,6 +1582,14 @@ func TestEnsurePreviewCachesEmptyVisiblePreview(t *testing.T) {
 		t.Fatalf("empty cached preview should not reload: %#v", ev)
 	default:
 	}
+}
+
+func isolatePreviewPersistentCache(t *testing.T) {
+	t.Helper()
+	cacheHome := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	t.Setenv("HOME", cacheHome)
+	t.Setenv("LOCALAPPDATA", cacheHome)
 }
 
 func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {

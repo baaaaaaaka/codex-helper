@@ -1268,10 +1268,19 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 	if storeErr != nil {
 		return beacon.JobTerminalPayload{}, storeErr
 	}
-	command, storeErr = ensureCodexBrokerRuntime(ctx, command, nil, codexInstallOptions{}, codexPathAllowsAutomaticUpgrade(codexPath))
+	runtimeContract, storeErr := resolveCodexBrokerRuntimeForLaunch(
+		ctx,
+		command,
+		nil,
+		codexInstallOptions{},
+		codexPathAllowsAutomaticUpgrade(codexPath),
+		paths.ExecIdentity,
+		codexHomeEnv(paths.CodexDir),
+	)
 	if storeErr != nil {
 		return beacon.JobTerminalPayload{Error: storeErr.Error()}, storeErr
 	}
+	command = runtimeContract.Command
 	if storeErr = prepareRuntimeMigration(store, paths, command, nil); storeErr != nil {
 		return beacon.JobTerminalPayload{Error: storeErr.Error()}, storeErr
 	}
@@ -1289,7 +1298,7 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 		}, configure: configureIdentity},
 		Command:            command,
 		AppServerArgs:      []string{"--analytics-default-enabled"},
-		ExtraEnv:           codexHomeEnv(paths.CodexDir),
+		ExtraEnv:           runtimeContract.Environment,
 		WorkingDir:         job.Payload.WorkingDir,
 		BackfillThreadName: true,
 	}

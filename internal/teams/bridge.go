@@ -6520,10 +6520,11 @@ func codexUpgradeTargetNoticeBody(succeeded bool, path string, cause error) stri
 
 // infraLaunchFailureNotice returns a user-facing, non-blaming, Teams-actionable
 // message for an infrastructure/setup launch failure (config or version
-// mismatch, missing native binary, patch unavailable, transport not
-// configured). It is classified structurally via the codexrunner ErrorLaunch
-// kind, so it does not depend on fragile error-text matching. The second return
-// is false for ordinary codex/content failures, which keep their own text.
+// mismatch, missing native binary, transport not configured). The primary
+// classification is structural via the codexrunner ErrorLaunch kind. Narrow
+// diagnostic matching is used only to make a known missing-Node failure more
+// actionable. The second return is false for ordinary codex/content failures,
+// which keep their own text.
 func infraLaunchFailureNotice(err error) (string, bool) {
 	if !codexrunner.IsKind(err, codexrunner.ErrorLaunch) {
 		return "", false
@@ -6531,14 +6532,42 @@ func infraLaunchFailureNotice(err error) (string, bool) {
 	if body, ok := runtimeMigrationFailureNotice(err); ok {
 		return body, true
 	}
+	if body, ok := missingNodeRuntimeFailureNotice(err); ok {
+		return body, true
+	}
 	return strings.Join([]string{
 		"⚠️ I couldn't start Codex due to a setup issue on my side — this is not a problem with your request.",
 		"",
-		"This usually means the Codex CLI or my own configuration needs attention (for example a version mismatch after an update). I did not retry automatically, to avoid duplicating work.",
+		"This usually means the Codex CLI or my own configuration needs attention (for example a version mismatch after an update). The helper will not automatically retry the user request after this failure, to avoid duplicating work.",
 		"Once it's sorted out, send `helper retry last` here.",
 		"",
 		"Diagnostic for the admin:",
 		trimTeamsCommandOutput(err.Error(), 600),
+	}, "\n"), true
+}
+
+func missingNodeRuntimeFailureNotice(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	detail := err.Error()
+	lower := strings.ToLower(detail)
+	missingNode := strings.Contains(lower, "‘node’: no such file or directory") ||
+		strings.Contains(lower, "'node': no such file or directory") ||
+		strings.Contains(lower, `"node": executable file not found`) ||
+		strings.Contains(lower, "node: not found") ||
+		strings.Contains(lower, "node.exe is not recognized")
+	if !missingNode {
+		return "", false
+	}
+	return strings.Join([]string{
+		"⚠️ Codex did not start because the helper process could not find its Node.js runtime.",
+		"",
+		"CXP normally manages this runtime automatically. It refreshed the managed runtime environment and retried the app-server startup once before creating any Codex thread or turn, but startup still failed.",
+		"No user work ran or was duplicated. An administrator should repair or update CXP, then send `helper retry last` here.",
+		"",
+		"Diagnostic for the admin:",
+		trimTeamsCommandOutput(detail, 600),
 	}, "\n"), true
 }
 

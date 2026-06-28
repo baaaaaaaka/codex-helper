@@ -1499,6 +1499,34 @@ jobs:
       - name: go test -race (Linux only)
         run: go test -race ./...
 
+  runtime-env-contract:
+    name: Runtime environment contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Managed Node and app-server environment contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|RefreshTeamsAppServerPATHUsesCurrentProcessPATH|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode)$'
+          process_pattern='Test(MergeAppServerProcessEnv.*|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+          go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
+          go test ./internal/teams -count=1 -run 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure|RunQueuedTurnReportsSharedAuthMigrationBlocker)$' -v
+
   linux-distro-smoke-build:
     name: Linux distro smoke build
     runs-on: ubuntu-latest
@@ -1989,6 +2017,7 @@ jobs:
       - targeted-test
       - full-go-test
       - race-test
+      - runtime-env-contract
       - linux-distro-smoke-build
       - linux-distro-smoke
     if: ${{ always() }}
@@ -2014,6 +2043,7 @@ jobs:
           check targeted-test "${{ needs.targeted-test.result }}"
           check full-go-test "${{ needs.full-go-test.result }}"
           check race-test "${{ needs.race-test.result }}"
+          check runtime-env-contract "${{ needs.runtime-env-contract.result }}"
           check linux-distro-smoke-build "${{ needs.linux-distro-smoke-build.result }}"
           check linux-distro-smoke "${{ needs.linux-distro-smoke.result }}"
           if [ "$failures" -ne 0 ]; then

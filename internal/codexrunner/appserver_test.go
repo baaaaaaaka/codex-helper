@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -556,8 +557,10 @@ func TestAppServerRunnerFailsClosedWhenInitializationProbeFails(t *testing.T) {
 		`{"id":2,"error":{"code":"unsupported","message":"thread list missing"}}`,
 	)
 	var startReq AppServerStartRequest
+	starts := 0
 	runner := &AppServerRunner{
 		Starter: AppServerTransportStarterFunc(func(_ context.Context, req AppServerStartRequest) (AppServerLineTransport, error) {
+			starts++
 			startReq = req
 			return transport, nil
 		}),
@@ -581,6 +584,64 @@ func TestAppServerRunnerFailsClosedWhenInitializationProbeFails(t *testing.T) {
 	}
 	if !transport.closed {
 		t.Fatalf("transport was not closed after failed probe")
+	}
+	if starts != 1 {
+		t.Fatalf("starter calls = %d, want no retry for a deterministic Codex error", starts)
+	}
+}
+
+func TestAppServerRunnerRetriesLaunchFailureBeforeInitialization(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"data":[{"id":"thread-after-launch-retry"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return nil, errors.New("transient process launch failure")
+		}
+		return transport, nil
+	})}
+	defer runner.Close()
+
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil {
+		t.Fatalf("ListThreads error: %v", err)
+	}
+	if starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-launch-retry" {
+		t.Fatalf("retry starts=%d threads=%#v", starts, threads)
+	}
+}
+
+func TestAppServerRunnerRetriesTransportFailureDuringInitialization(t *testing.T) {
+	first := newFakeAppServerTransport()
+	first.eofWhenDrained = true
+	second := newFakeAppServerTransport(
+		`{"id":2,"result":{}}`,
+		`{"id":3,"result":{"data":[]}}`,
+		`{"id":4,"result":{"data":[{"id":"thread-after-handshake-retry"}]}}`,
+	)
+	starts := 0
+	runner := &AppServerRunner{Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+		starts++
+		if starts == 1 {
+			return first, nil
+		}
+		return second, nil
+	})}
+	defer runner.Close()
+
+	threads, err := runner.ListThreads(context.Background(), ListThreadsOptions{})
+	if err != nil {
+		t.Fatalf("ListThreads error: %v", err)
+	}
+	if starts != 2 || len(threads) != 1 || threads[0].ID != "thread-after-handshake-retry" {
+		t.Fatalf("retry starts=%d threads=%#v", starts, threads)
+	}
+	if !first.closed {
+		t.Fatal("failed initialization transport was not closed before retry")
 	}
 }
 

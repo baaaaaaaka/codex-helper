@@ -652,7 +652,7 @@ func runTargetOnceWithOptions(
 		envVars = env.WithProxy(envVars, proxyURL)
 	}
 	if len(opts.ExtraEnv) > 0 {
-		envVars = append(envVars, opts.ExtraEnv...)
+		envVars = mergeCLIEnvironment(envVars, opts.ExtraEnv)
 	}
 	envVars = applyExecIdentityEnv(envVars, opts.ExecIdentity)
 	guardCleanup := func() {}
@@ -676,7 +676,7 @@ func runTargetOnceWithOptions(
 	if identityErr != nil {
 		return identityErr
 	}
-	cmd.Env = updatedEnv
+	cmd.Env = mergeCLIEnvironment(nil, updatedEnv)
 	preserveTTY := shouldPreserveTargetTTY(opts)
 	useProcessGroup := !preserveTTY
 	if useProcessGroup {

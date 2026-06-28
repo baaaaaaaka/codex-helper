@@ -38,6 +38,29 @@ func TestInfraLaunchFailureNotice(t *testing.T) {
 		}
 	})
 
+	t.Run("explains missing managed node runtime precisely", func(t *testing.T) {
+		err := &codexrunner.Error{Kind: codexrunner.ErrorLaunch, Err: fmt.Errorf("read app-server stdout: app-server stdout closed; stderr: /usr/bin/env: ‘node’: No such file or directory")}
+		body, ok := infraLaunchFailureNotice(err)
+		if !ok {
+			t.Fatal("expected missing Node launch failure to be reframed")
+		}
+		for _, want := range []string{
+			"could not find its Node.js runtime",
+			"retried the app-server startup once",
+			"before creating any Codex thread or turn",
+			"No user work ran or was duplicated",
+			"helper retry last",
+			"/usr/bin/env",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("missing-Node notice missing %q:\n%s", want, body)
+			}
+		}
+		if strings.Contains(body, "version mismatch") {
+			t.Fatalf("missing-Node notice retained misleading generic diagnosis:\n%s", body)
+		}
+	})
+
 	t.Run("explains shared auth migration blocker precisely", func(t *testing.T) {
 		heartbeat := time.Date(2026, 6, 28, 3, 4, 5, 0, time.UTC)
 		err := &codexrunner.Error{Kind: codexrunner.ErrorLaunch, Err: &migration.RuntimeBlockedError{Blockers: []migration.RuntimeBlocker{{

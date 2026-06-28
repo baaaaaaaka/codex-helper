@@ -32,6 +32,16 @@ func TestRunCodexNewSessionUsesOriginalTUIAndPolicyAppServer(t *testing.T) {
 	assertStandardBrokerLaunch(t, fixture)
 }
 
+func TestRunCodexNewSessionUsesManagedNodeWithoutSystemNode(t *testing.T) {
+	fixture := writeCodexTUIBrokerFixture(t)
+	wrapper := writeManagedNodeCodexWrapperFixture(t, fixture.path)
+	store := newCodexOpenTestStore(t)
+	if err := runCodexNewSession(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil, fixture.workDir, wrapper, "", false, io.Discard); err != nil {
+		t.Fatalf("runCodexNewSession through managed Node: %v", err)
+	}
+	assertStandardBrokerLaunch(t, fixture)
+}
+
 func TestRunCodexSessionPreservesResumeExperience(t *testing.T) {
 	fixture := writeCodexTUIBrokerFixture(t)
 	store := newCodexOpenTestStore(t)

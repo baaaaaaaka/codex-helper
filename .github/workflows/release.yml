@@ -109,6 +109,16 @@ jobs:
           go-version: "1.24.12"
           cache: true
 
+      - name: Managed Node and app-server environment contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|RefreshTeamsAppServerPATHUsesCurrentProcessPATH|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode)$'
+          process_pattern='Test(MergeAppServerProcessEnv.*|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+          go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
+          go test ./internal/teams -count=1 -run 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure|RunQueuedTurnReportsSharedAuthMigrationBlocker)$' -v
+
       - name: Ambiguous execution diagnostic regressions
         shell: bash
         run: |

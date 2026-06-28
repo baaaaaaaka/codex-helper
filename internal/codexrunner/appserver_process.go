@@ -52,7 +52,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 		cmd.Dir = req.WorkingDir
 	}
 	if len(req.ExtraEnv) > 0 {
-		cmd.Env = append(os.Environ(), req.ExtraEnv...)
+		cmd.Env = mergeAppServerProcessEnv(os.Environ(), req.ExtraEnv)
 	}
 	if req.ConfigureCommand != nil {
 		if cmd.Env == nil {
@@ -62,6 +62,9 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 			cancelProcess()
 			return nil, fmt.Errorf("configure app-server process %q: %w", command, err)
 		}
+	}
+	if cmd.Env != nil {
+		cmd.Env = mergeAppServerProcessEnv(nil, cmd.Env)
 	}
 
 	stdinRead, stdinWrite, err := os.Pipe()
@@ -127,6 +130,37 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 		return nil, err
 	}
 	return transport, nil
+}
+
+// mergeAppServerProcessEnv applies overlay using the same last-value-wins
+// semantics as an environment map while emitting each key exactly once. This
+// avoids depending on platform-specific handling of duplicate PATH/Path entries
+// when a long-lived runner refreshes its launch environment.
+func mergeAppServerProcessEnv(base []string, overlay []string) []string {
+	out := make([]string, 0, len(base)+len(overlay))
+	indexes := make(map[string]int, len(base)+len(overlay))
+	appendValues := func(values []string) {
+		for _, entry := range values {
+			key, _, ok := strings.Cut(entry, "=")
+			if !ok || strings.TrimSpace(key) == "" {
+				out = append(out, entry)
+				continue
+			}
+			normalized := key
+			if strings.EqualFold(appServerProcessRuntimeGOOS(), "windows") {
+				normalized = strings.ToLower(normalized)
+			}
+			if index, exists := indexes[normalized]; exists {
+				out[index] = entry
+				continue
+			}
+			indexes[normalized] = len(out)
+			out = append(out, entry)
+		}
+	}
+	appendValues(base)
+	appendValues(overlay)
+	return out
 }
 
 func appServerProcessExecutable(command string) string {

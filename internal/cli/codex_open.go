@@ -127,17 +127,6 @@ func runCodexTUIInvocationViaBroker(
 			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
 		}
 	}
-	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
-	codexPath, err = ensureCodexBrokerRuntime(ctx, codexPath, log, installOptions, allowAutomaticUpgrade)
-	if err != nil {
-		return err
-	}
-	identityPath := codexPath
-	if nativePath, _, nativeErr := codexbinary.FindNativeBinary(codexPath); nativeErr == nil {
-		identityPath = nativePath
-	}
-	originalHash, hashErr := hashFileSHA256(identityPath)
-
 	configPath := ""
 	if root != nil {
 		configPath = root.configPath
@@ -146,10 +135,22 @@ func runCodexTUIInvocationViaBroker(
 	if err != nil {
 		return err
 	}
+	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
+	runtimeContract, err := resolveCodexBrokerRuntimeForLaunch(ctx, codexPath, log, installOptions, allowAutomaticUpgrade, paths.ExecIdentity, nil)
+	if err != nil {
+		return err
+	}
+	codexPath = runtimeContract.Command
+	identityPath := codexPath
+	if nativePath, _, nativeErr := codexbinary.FindNativeBinary(codexPath); nativeErr == nil {
+		identityPath = nativePath
+	}
+	originalHash, hashErr := hashFileSHA256(identityPath)
+
 	if err := prepareRuntimeMigration(store, paths, codexPath, log); err != nil {
 		return err
 	}
-	extraEnv := codexHomeEnv(paths.CodexDir)
+	extraEnv := mergeCLIEnvironment(runtimeContract.Environment, codexHomeEnv(paths.CodexDir))
 	proxyURL := ""
 	if useProxy {
 		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, log)
@@ -174,7 +175,7 @@ func runCodexTUIInvocationViaBroker(
 	}
 
 	guardCleanup := func() {}
-	if guarded, cleanup, guardErr := prepareCodexSelfUpdateGuardEnv(ctx, codexPath, append(os.Environ(), extraEnv...), paths.ExecIdentity); guardErr == nil {
+	if guarded, cleanup, guardErr := prepareCodexSelfUpdateGuardEnv(ctx, codexPath, extraEnv, paths.ExecIdentity); guardErr == nil {
 		extraEnv = guarded
 		guardCleanup = cleanup
 	} else if log != nil {

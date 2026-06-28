@@ -490,6 +490,153 @@ esac
 	}
 }
 
+func TestTeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX env-node wrapper fixture")
+	}
+	lockCLITestHooks(t)
+	rootDir := t.TempDir()
+	home := filepath.Join(rootDir, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setTestCodexHomeEnv(t, filepath.Join(home, ".codex"))
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(rootDir, "cache"))
+	t.Setenv("CODEX_NODE_INSTALL_ROOT", filepath.Join(home, ".cache", "codex-proxy", "node"))
+
+	arch := nodeRuntimeArch(runtime.GOARCH)
+	if arch == "" {
+		t.Skip("unsupported managed-node architecture")
+	}
+	nodeBin := filepath.Join(home, ".cache", "codex-proxy", "node", "v22-"+runtime.GOOS+"-"+arch, "bin")
+	if err := os.MkdirAll(nodeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testBinary, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeScript := `#!/bin/sh
+shift
+case "${1:-}" in
+  --version) echo 'codex-cli 0.142.3'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
+  app-server) CXP_TEAMS_MANAGED_NODE_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsManagedNodeAppServerHelperProcess$' -- ;;
+  *) exit 64 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(nodeBin, "node"), []byte(nodeScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	codexPath := filepath.Join(rootDir, "codex")
+	if err := os.WriteFile(codexPath, []byte("#!/usr/bin/env node\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot the runner environment before managed Node is added to the
+	// process PATH. The app-server cold start must refresh PATH after resolving
+	// the runtime instead of replaying this stale value.
+	emptyPath := filepath.Join(rootDir, "empty-path")
+	if err := os.MkdirAll(emptyPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", emptyPath)
+	store, err := config.NewStore(filepath.Join(rootDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
+		t.Fatal(err)
+	}
+	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", 5*time.Second, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed := executor.(teamsCodexExecutor)
+	defer managed.Close()
+
+	result, err := managed.Run(context.Background(), &teams.Session{Cwd: rootDir}, "managed node turn")
+	if err != nil {
+		t.Fatalf("managed-node Teams turn: %v", err)
+	}
+	if result.Text != "managed node ok" || result.CodexThreadID != "thread-managed-node" {
+		t.Fatalf("result = %#v", result)
+	}
+	runner := managed.runner.(*codexrunner.AppServerRunner)
+	if err := runner.Close(); err != nil {
+		t.Fatalf("close first app-server: %v", err)
+	}
+	secondEmptyPath := filepath.Join(rootDir, "second-empty-path")
+	if err := os.MkdirAll(secondEmptyPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", secondEmptyPath)
+	result, err = managed.Run(context.Background(), &teams.Session{Cwd: rootDir}, "managed node cold restart")
+	if err != nil {
+		t.Fatalf("managed-node Teams cold restart: %v", err)
+	}
+	if result.Text != "managed node ok" {
+		t.Fatalf("cold restart result = %#v", result)
+	}
+}
+
+func TestRefreshTeamsAppServerPATHUsesCurrentProcessPATH(t *testing.T) {
+	previous := []string{
+		envTeamsHelperCLIDir + "=/opt/cxp",
+		"PATH=/stale/service",
+	}
+	t.Setenv("PATH", "/current/system")
+	got := refreshTeamsAppServerPATH(previous)
+	want := "/opt/cxp" + string(os.PathListSeparator) + "/current/system"
+	if envValue(got, "PATH") != want {
+		t.Fatalf("PATH = %q, want %q", envValue(got, "PATH"), want)
+	}
+}
+
+func TestTeamsManagedNodeAppServerHelperProcess(t *testing.T) {
+	if os.Getenv("CXP_TEAMS_MANAGED_NODE_APP_SERVER") != "1" {
+		t.Skip("helper process only")
+	}
+	type message struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	write := func(format string, args ...any) {
+		_, _ = fmt.Fprintf(os.Stdout, format+"\n", args...)
+	}
+	for scanner.Scan() {
+		var request message
+		if json.Unmarshal(scanner.Bytes(), &request) != nil {
+			os.Exit(2)
+		}
+		if request.Method == "" {
+			continue
+		}
+		var id int64
+		_ = json.Unmarshal(request.ID, &id)
+		switch request.Method {
+		case "initialized":
+		case "initialize":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{}}`, id)
+		case "thread/list":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"data":[]}}`, id)
+		case "thread/start":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":"thread-managed-node"}}}`, id)
+		case "thread/read":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"thread":{"id":"thread-managed-node","name":"managed node"}}}`, id)
+		case "turn/start":
+			write(`{"jsonrpc":"2.0","id":%d,"result":{"turn":{"id":"turn-managed-node","status":"inProgress","items":[]}}}`, id)
+			write(`{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-managed-node","turnId":"turn-managed-node","item":{"id":"final","type":"agentMessage","text":"managed node ok"}}}`)
+			write(`{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-managed-node","turn":{"id":"turn-managed-node","status":"completed","items":[]}}}`)
+		default:
+			os.Exit(3)
+		}
+	}
+	os.Exit(0)
+}
+
 func TestTeamsStandardRuntimeRunsTwoSessionsConcurrentlyOnSharedProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX test-binary app-server wrapper")

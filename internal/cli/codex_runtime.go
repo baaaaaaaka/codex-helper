@@ -275,14 +275,15 @@ func runCodexNativeInvocation(ctx context.Context, store *config.Store, profile 
 	if codexPathAllowsAutomaticUpgrade(lookup) {
 		lookup = ""
 	}
-	resolved, err := ensureCodexInstalledWithOptions(ctx, lookup, opts.Log, installOptions)
-	if err != nil {
-		return err
-	}
-	cmdArgs = append([]string{resolved}, migration.RemoveLegacyCodexExecutionOverrides(cmdArgs[1:])...)
 	if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 		return err
 	}
+	runtimeContract, err := resolveCodexInstalledRuntimeForLaunch(ctx, lookup, opts.Log, installOptions, opts.ExecIdentity, opts.ExtraEnv)
+	if err != nil {
+		return err
+	}
+	cmdArgs = append([]string{runtimeContract.Command}, migration.RemoveLegacyCodexExecutionOverrides(cmdArgs[1:])...)
+	opts.ExtraEnv = codexRuntimeEnvironmentOverlay(opts.ExtraEnv, runtimeContract.Environment)
 	proxyURL := ""
 	if useProxy {
 		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, opts.Log)
@@ -537,11 +538,6 @@ func runCodexExecFacade(
 			return withProfileInstallEnv(ctx, store, *profile, instances, runInstall)
 		}
 	}
-	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
-	codexPath, err = ensureCodexBrokerRuntime(ctx, codexPath, runOptions.Log, installOptions, allowAutomaticUpgrade)
-	if err != nil {
-		return err
-	}
 	configPath := ""
 	if root != nil {
 		configPath = root.configPath
@@ -550,10 +546,16 @@ func runCodexExecFacade(
 	if err != nil {
 		return err
 	}
+	allowAutomaticUpgrade := codexPathAllowsAutomaticUpgrade(codexPath)
+	runtimeContract, err := resolveCodexBrokerRuntimeForLaunch(ctx, codexPath, runOptions.Log, installOptions, allowAutomaticUpgrade, paths.ExecIdentity, runOptions.ExtraEnv)
+	if err != nil {
+		return err
+	}
+	codexPath = runtimeContract.Command
 	if err := prepareRuntimeMigration(store, paths, codexPath, runOptions.Log); err != nil {
 		return err
 	}
-	extraEnv := append(codexHomeEnv(paths.CodexDir), runOptions.ExtraEnv...)
+	extraEnv := mergeCLIEnvironment(runtimeContract.Environment, codexHomeEnv(paths.CodexDir))
 	proxyURL := ""
 	if useProxy {
 		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, runOptions.Log)

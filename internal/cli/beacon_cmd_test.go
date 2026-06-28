@@ -64,6 +64,21 @@ func TestRunBeaconWorkerJobUsesStandardAppServer(t *testing.T) {
 	}
 }
 
+func TestRunBeaconWorkerJobUsesManagedNodeWithoutSystemNode(t *testing.T) {
+	workDir := t.TempDir()
+	realCodexPath := writeBeaconCLICodexFixture(t, "beacon managed node runtime")
+	wrapper := writeManagedNodeCodexWrapperFixture(t, realCodexPath)
+	payload, err := runBeaconWorkerJob(context.Background(), beacon.JobAttempt{Payload: beacon.JobPayload{
+		Prompt: "run remotely", WorkingDir: workDir,
+	}}, wrapper, nil)
+	if err != nil {
+		t.Fatalf("runBeaconWorkerJob through managed Node: %v", err)
+	}
+	if payload.Text != "beacon managed node runtime" || payload.CodexThreadID != "thread-worker" || payload.Error != "" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
 func TestBeaconProfileCLIWorkflow(t *testing.T) {
 	t.Setenv(beacon.BeaconProviderShellModeEnv, "")
 	storePath := filepath.Join(t.TempDir(), "beacon.json")
