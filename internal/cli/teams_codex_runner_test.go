@@ -447,7 +447,7 @@ func TestTeamsStandardRuntimeRestoresSavedProxyAndCodexHome(t *testing.T) {
 	script := fmt.Sprintf(`#!/bin/sh
 case "${1:-}" in
   --version) echo 'codex-cli 0.133.0'; exit 0 ;;
-  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
   app-server)
     printf '%%s|%%s\n' "${HTTP_PROXY:-}" "${CODEX_HOME:-}" > %s
     while IFS= read -r line; do
@@ -512,7 +512,7 @@ func TestTeamsStandardRuntimeRunsTwoSessionsConcurrentlyOnSharedProcess(t *testi
 	wrapper := `#!/bin/sh
 case "${1:-}" in
   --version) echo 'codex-cli 0.142.3'; exit 0 ;;
-  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
   app-server) CXP_TEAMS_PARALLEL_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsParallelAppServerHelperProcess$' -- ;;
   *) exit 64 ;;
 esac

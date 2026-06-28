@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,7 +41,11 @@ func TestRemoteBrokerRelaysProtocolAndApprovesAfterDelay(t *testing.T) {
 		defer cancel()
 		_ = broker.Close(ctx)
 	}()
-	connection, _, err := websocket.DefaultDialer.Dial(broker.URL(), nil)
+	if strings.Contains(broker.URL(), "/_cxp/") || strings.TrimSpace(broker.AuthToken()) == "" {
+		t.Fatalf("broker endpoint must use a bare Codex-compatible URL with a separate capability token: url=%q", broker.URL())
+	}
+	headers := http.Header{"Authorization": []string{"Bearer " + broker.AuthToken()}}
+	connection, _, err := websocket.DefaultDialer.Dial(broker.URL(), headers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +83,76 @@ func TestRemoteBrokerRelaysProtocolAndApprovesAfterDelay(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("approval response was not written")
+	}
+}
+
+func TestRemoteBrokerRequiresBearerCapabilityAtRootURL(t *testing.T) {
+	transport := newChannelAppServerTransport()
+	broker, err := StartRemoteBroker(context.Background(), RemoteBrokerOptions{
+		Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+			return transport, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = broker.Close(ctx)
+	}()
+
+	for name, headers := range map[string]http.Header{
+		"missing": nil,
+		"wrong":   {"Authorization": []string{"Bearer wrong-token"}},
+		"raw":     {"Authorization": []string{broker.AuthToken()}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			connection, response, dialErr := websocket.DefaultDialer.Dial(broker.URL(), headers)
+			if connection != nil {
+				_ = connection.Close()
+			}
+			if dialErr == nil || response == nil || response.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("dial error=%v response=%v, want HTTP 401", dialErr, response)
+			}
+		})
+	}
+
+	connection, response, err := websocket.DefaultDialer.Dial(broker.URL()+"/not-supported", http.Header{
+		"Authorization": []string{"Bearer " + broker.AuthToken()},
+	})
+	if connection != nil {
+		_ = connection.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusNotFound {
+		t.Fatalf("path dial error=%v response=%v, want HTTP 404", err, response)
+	}
+}
+
+func TestRemoteBrokerIsServingBeforeStartReturns(t *testing.T) {
+	for range 50 {
+		transport := newChannelAppServerTransport()
+		broker, err := StartRemoteBroker(context.Background(), RemoteBrokerOptions{
+			Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+				return transport, nil
+			}),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		headers := http.Header{"Authorization": []string{"Bearer " + broker.AuthToken()}}
+		connection, response, dialErr := websocket.DefaultDialer.Dial(broker.URL(), headers)
+		if dialErr != nil {
+			_ = broker.Close(context.Background())
+			t.Fatalf("immediate authenticated dial failed: %v (response=%v)", dialErr, response)
+		}
+		_ = connection.Close()
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := broker.Close(closeCtx); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		cancel()
 	}
 }
 

@@ -279,7 +279,8 @@ codex-proxy run -- codex
 
 This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
 are upgraded automatically before the first brokered turn. The release compatibility
-sweep verifies both the app-server handshake and the remote TUI capability.
+sweep verifies the app-server handshake, the remote TUI capability, and the
+production broker's root WebSocket plus bearer-token attachment contract.
 
 The Codex inner sandbox remains restricted until an approved operation needs
 the execution target's assigned hardware or mounts. Approval cannot grant

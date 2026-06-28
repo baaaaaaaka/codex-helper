@@ -88,6 +88,12 @@ func TestCleanupLegacyRuntimeAssetsPreservesLiveAndAmbiguousArtifacts(t *testing
 	writeTestFile(t, live+legacyBinaryLease, lease)
 	ambiguous := filepath.Join(configDir, "codex-patched-unknown")
 	writeTestFile(t, ambiguous, []byte("unproven"))
+	reqDir := filepath.Join(tempDir, "cx123abc-456d")
+	if err := os.MkdirAll(reqDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	requirementsPath := filepath.Join(reqDir, "reqs.toml")
+	writeTestFile(t, requirementsPath, legacyRequirements)
 
 	report, err := CleanupLegacyRuntimeAssets(CleanupOptions{
 		ConfigDir:    configDir,
@@ -98,13 +104,53 @@ func TestCleanupLegacyRuntimeAssetsPreservesLiveAndAmbiguousArtifacts(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Complete() || len(report.Blockers) != 1 || len(report.Preserved) != 1 {
+	if report.Complete() || len(report.Blockers) != 1 || len(report.Preserved) != 1 || len(report.Deferred) != 1 || report.Deferred[0] != live {
 		t.Fatalf("report = %#v", report)
 	}
-	for _, path := range []string{live, live + legacyBinaryLease, ambiguous} {
+	for _, path := range []string{live, live + legacyBinaryLease, ambiguous, requirementsPath} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("artifact should be preserved: %s: %v", path, err)
 		}
+	}
+}
+
+func TestInspectLegacyRuntimeAssetsDefersPrivateBinaryButBlocksSharedAuth(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	codexHome := filepath.Join(root, "codex")
+	tempDir := filepath.Join(root, "tmp")
+	for _, dir := range []string{configDir, codexHome, tempDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	heartbeat := time.Now().UTC().Truncate(time.Second)
+	lease, _ := json.Marshal(legacyLease{Version: 1, PID: 999, HeartbeatUnix: heartbeat.Unix()})
+	binary := filepath.Join(configDir, "codex-patched-live")
+	writeTestFile(t, binary, []byte("private copy"))
+	writeTestFile(t, binary+legacyBinaryLease, lease)
+	authLease := filepath.Join(codexHome, "auth.json"+legacyAuthLease+"live")
+	writeTestFile(t, authLease, lease)
+
+	report, err := InspectLegacyRuntimeAssets(CleanupOptions{
+		ConfigDir:    configDir,
+		CodexHome:    codexHome,
+		TempDir:      tempDir,
+		ProcessAlive: func(pid int) bool { return pid == 999 },
+		Now:          func() time.Time { return heartbeat.Add(time.Second) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Deferred) != 1 || report.Deferred[0] != binary {
+		t.Fatalf("deferred = %#v, want live private binary", report.Deferred)
+	}
+	if len(report.Blockers) != 1 || report.Blockers[0] != authLease || len(report.RuntimeBlockers) != 1 {
+		t.Fatalf("report = %#v, want only shared auth blocker", report)
+	}
+	blocker := report.RuntimeBlockers[0]
+	if blocker.Kind != RuntimeBlockerSharedAuthLease || blocker.PID != 999 || blocker.HeartbeatUnix != heartbeat.Unix() {
+		t.Fatalf("runtime blocker = %#v", blocker)
 	}
 }
 

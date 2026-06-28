@@ -23,6 +23,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/migration"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -6527,6 +6528,9 @@ func infraLaunchFailureNotice(err error) (string, bool) {
 	if !codexrunner.IsKind(err, codexrunner.ErrorLaunch) {
 		return "", false
 	}
+	if body, ok := runtimeMigrationFailureNotice(err); ok {
+		return body, true
+	}
 	return strings.Join([]string{
 		"⚠️ I couldn't start Codex due to a setup issue on my side — this is not a problem with your request.",
 		"",
@@ -6536,6 +6540,50 @@ func infraLaunchFailureNotice(err error) (string, bool) {
 		"Diagnostic for the admin:",
 		trimTeamsCommandOutput(err.Error(), 600),
 	}, "\n"), true
+}
+
+func runtimeMigrationFailureNotice(err error) (string, bool) {
+	var blocked *migration.RuntimeBlockedError
+	if !errors.As(err, &blocked) || blocked == nil || len(blocked.Blockers) == 0 {
+		return "", false
+	}
+	lines := []string{
+		"⚠️ Codex did not start. CXP is waiting to safely restore shared authentication state left by an older runtime.",
+		"",
+		fmt.Sprintf("Blocking shared authentication leases: %d", len(blocked.Blockers)),
+	}
+	hasVerifiedOwner := false
+	for index, blocker := range blocked.Blockers {
+		if index >= 8 {
+			lines = append(lines, fmt.Sprintf("- … and %d more", len(blocked.Blockers)-index))
+			break
+		}
+		detail := "unverified owner"
+		if blocker.PID > 0 {
+			detail = fmt.Sprintf("PID %d", blocker.PID)
+			hasVerifiedOwner = true
+		}
+		if blocker.HeartbeatUnix > 0 {
+			detail += ", heartbeat " + time.Unix(blocker.HeartbeatUnix, 0).UTC().Format(time.RFC3339)
+		}
+		if reason := strings.TrimSpace(blocker.Reason); reason != "" {
+			detail += ", " + reason
+		}
+		if name := strings.TrimSpace(filepath.Base(blocker.Path)); name != "" && name != "." {
+			detail += ", artifact " + name
+		}
+		lines = append(lines, "- "+detail)
+	}
+	lines = append(lines,
+		"",
+		"Separate legacy patched binaries are not blocking the new runtime; they are left running and cleaned up later. Only the shared auth.json transition is waiting.",
+	)
+	if hasVerifiedOwner {
+		lines = append(lines, "No Codex turn was started, so retrying cannot duplicate work. Finish the listed older session(s), then send `helper retry last` here.")
+	} else {
+		lines = append(lines, "No Codex turn was started, so retrying cannot duplicate work. CXP could not verify the lease owner; confirm that no older session is using shared auth.json, then retry after the compatibility lease is retired.")
+	}
+	return strings.Join(lines, "\n"), true
 }
 
 func codexErrorRequiresUpgrade(err error) bool {

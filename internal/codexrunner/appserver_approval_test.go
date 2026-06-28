@@ -64,6 +64,12 @@ func TestAutomaticApprovalHandlerCancelsDelayWithTurnContext(t *testing.T) {
 	}
 }
 
+func TestDefaultApprovalDelayIsFixed(t *testing.T) {
+	if DefaultApprovalDelay != 500*time.Millisecond {
+		t.Fatalf("DefaultApprovalDelay = %s, want fixed 500ms", DefaultApprovalDelay)
+	}
+}
+
 func TestAutomaticApprovalRejectsMalformedPermissions(t *testing.T) {
 	_, handled, err := automaticApprovalResult(appServerMethodPermissionsApproval, json.RawMessage(`{"reason":"missing permissions"}`))
 	if !handled || err == nil {

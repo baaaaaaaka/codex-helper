@@ -25,12 +25,12 @@ DEFAULT_NATIVE_CMD = (
 )
 DEFAULT_CONTRACT_CMD = (
     "go test ./internal/codexcontract "
-    "-run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' "
+    "-run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' "
     "-count=1 -v"
 )
 DEFAULT_CLI_CMD = (
     "go test ./internal/cli "
-    "-run 'TestProbeCodexIntegration' "
+    "-run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' "
     "-count=1 -v"
 )
 DEFAULT_RUNTIME_CMD = (

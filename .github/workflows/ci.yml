@@ -1316,8 +1316,8 @@ jobs:
         run: |
           set -euo pipefail
           command -v codex >/dev/null
-          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
-          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
+          go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
       - name: Codex standard approval runtime integration test (Windows)
@@ -1332,8 +1332,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $null = Get-Command codex -ErrorAction Stop
-          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
-          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
+          go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
@@ -1423,11 +1423,11 @@ jobs:
         run: |
           set -euo pipefail
           command -v codex >/dev/null
-          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUIHandshake)' -count=1 -v
-          go test ./internal/cli -run TestProbeCodexIntegration -count=1 -v
+          go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
+          go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/codexrunner -run TestInstalledCodexStandardApprovalRuntime -count=1 -v
           printf '%s\n' \
-            '{"schema":1,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","cli-probe","standard-user-approval","analytics-user-approved","responses-websocket"]}' \
+            '{"schema":1,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","production-remote-broker-bearer","cli-probe","standard-user-approval","analytics-user-approved","responses-websocket"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof

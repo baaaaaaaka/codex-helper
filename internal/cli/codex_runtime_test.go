@@ -27,7 +27,7 @@ func TestRunCodexExecFacadeUsesStandardApprovalAfterFixedDelay(t *testing.T) {
 set -eu
 case "${1:-}" in
   --version) echo 'codex-cli 0.133.0'; exit 0 ;;
-  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
   app-server)
     while IFS= read -r line; do
       id=$(printf %s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')

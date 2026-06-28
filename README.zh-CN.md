@@ -267,7 +267,8 @@ codex-proxy run -- codex
 
 这套 runtime 要求 Codex CLI 0.131.0 或更高版本；较旧的 managed/PATH 安装会在
 第一次 broker turn 前自动升级。release compatibility sweep
-会同时验证 app-server handshake 和 remote TUI 能力。
+会同时验证 app-server handshake、remote TUI 能力，以及生产 broker 的根 WebSocket
+地址和 bearer-token attachment contract。
 
 Codex 内层 sandbox 在操作获批前仍保持受限。获批操作只能继承外层 host、container、
 cgroup、Slurm job 或 LSF job 已经授予的硬件和 mounts，不能突破外层隔离边界。Telemetry

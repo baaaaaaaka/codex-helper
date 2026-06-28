@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +33,7 @@ type windowsRemoteTUIProcess struct {
 	stopOnce sync.Once
 }
 
-func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome string) (remoteTUIProcess, error) {
+func startRemoteTUIProcess(ctx context.Context, command, remoteURL, remoteAuthTokenEnv, remoteAuthToken, codexHome string) (remoteTUIProcess, error) {
 	var inputRead, inputWrite, outputRead, outputWrite windows.Handle
 	security := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
 	if err := windows.CreatePipe(&inputRead, &inputWrite, security, 0); err != nil {
@@ -88,11 +89,15 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 		_ = windows.CloseHandle(outputRead)
 		return nil, err
 	}
-	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine([]string{
+	commandArgs := []string{
 		nativeCommand,
 		"-c", "features.tui_app_server=true",
 		"--remote", remoteURL,
-	}))
+	}
+	if strings.TrimSpace(remoteAuthTokenEnv) != "" {
+		commandArgs = append(commandArgs, "--remote-auth-token-env", remoteAuthTokenEnv)
+	}
+	commandLine, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(commandArgs))
 	if err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)
@@ -103,12 +108,17 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 	if strings.TrimSpace(pathDir) != "" {
 		pathValue = pathDir + ";" + pathValue
 	}
-	environment, err := windowsEnvironmentBlock(map[string]string{
-		"TERM":           "xterm-256color",
-		"CODEX_HOME":     codexHome,
-		"OPENAI_API_KEY": "cxp-contract-key",
-		"PATH":           pathValue,
-	})
+	environmentValues := map[string]string{
+		"TERM":              "xterm-256color",
+		"CODEX_HOME":        codexHome,
+		"CODEX_SQLITE_HOME": filepath.Join(codexHome, "remote-tui-sqlite"),
+		"OPENAI_API_KEY":    "cxp-contract-key",
+		"PATH":              pathValue,
+	}
+	if strings.TrimSpace(remoteAuthTokenEnv) != "" {
+		environmentValues[remoteAuthTokenEnv] = remoteAuthToken
+	}
+	environment, err := windowsEnvironmentBlock(environmentValues)
 	if err != nil {
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(inputWrite)

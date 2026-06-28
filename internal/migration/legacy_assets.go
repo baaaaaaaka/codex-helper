@@ -22,6 +22,11 @@ const (
 	legacyAuthLease   = ".yolo-auth-lease-"
 	legacyBinaryLease = ".lease"
 	legacyCacheKey    = "codex-cloud-requirements-cache-v3-064f8542-75b4-494c-a294-97d3ce597271"
+
+	// Legacy auth leases were refreshed every 15 seconds. A fresh lease protects
+	// shared auth.json state; a stale lease must not pin an upgrade merely because
+	// its numeric PID has since been reused by an unrelated process.
+	legacyAuthLeaseStaleAfter = 2 * time.Minute
 )
 
 var (
@@ -45,10 +50,61 @@ type CleanupOptions struct {
 }
 
 type CleanupReport struct {
-	Removed   []string
-	Restored  []string
-	Preserved []string
-	Blockers  []string
+	Removed         []string
+	Restored        []string
+	Preserved       []string
+	Deferred        []string
+	Blockers        []string
+	RuntimeBlockers []RuntimeBlocker
+}
+
+type RuntimeBlocker struct {
+	Kind          string
+	Path          string
+	PID           int
+	HeartbeatUnix int64
+	Reason        string
+}
+
+const RuntimeBlockerSharedAuthLease = "shared_auth_lease"
+
+// RuntimeBlockedError keeps migration failures machine-readable across the
+// codexrunner launch-error wrapper so CLI and Teams surfaces can explain the
+// exact shared-state conflict instead of reporting a generic setup problem.
+type RuntimeBlockedError struct {
+	Blockers []RuntimeBlocker
+}
+
+func (e *RuntimeBlockedError) Error() string {
+	count := 0
+	if e != nil {
+		count = len(e.Blockers)
+	}
+	message := fmt.Sprintf("standard runtime migration is waiting for %d shared legacy authentication lease(s); existing patched binaries may continue running", count)
+	if count == 0 {
+		return message
+	}
+	details := make([]string, 0, min(count, 4))
+	for index, blocker := range e.Blockers {
+		if index >= 4 {
+			break
+		}
+		owner := "unverified owner"
+		if blocker.PID > 0 {
+			owner = fmt.Sprintf("pid=%d", blocker.PID)
+		}
+		if blocker.HeartbeatUnix > 0 {
+			owner += ", heartbeat=" + time.Unix(blocker.HeartbeatUnix, 0).UTC().Format(time.RFC3339)
+		}
+		if name := filepath.Base(blocker.Path); name != "" && name != "." {
+			owner += ", artifact=" + name
+		}
+		details = append(details, owner)
+	}
+	if count > len(details) {
+		details = append(details, fmt.Sprintf("and %d more", count-len(details)))
+	}
+	return message + ": " + strings.Join(details, "; ")
 }
 
 // InspectLegacyRuntimeAssets performs the blocker and provenance checks used
@@ -84,7 +140,9 @@ func InspectLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		inspectLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
 	}
 	sort.Strings(report.Preserved)
+	sort.Strings(report.Deferred)
 	sort.Strings(report.Blockers)
+	sort.Slice(report.RuntimeBlockers, func(i, j int) bool { return report.RuntimeBlockers[i].Path < report.RuntimeBlockers[j].Path })
 	return report, nil
 }
 
@@ -105,7 +163,9 @@ func PrepareLegacyAuthentication(options CleanupOptions) (CleanupReport, error) 
 	sort.Strings(report.Removed)
 	sort.Strings(report.Restored)
 	sort.Strings(report.Preserved)
+	sort.Strings(report.Deferred)
 	sort.Strings(report.Blockers)
+	sort.Slice(report.RuntimeBlockers, func(i, j int) bool { return report.RuntimeBlockers[i].Path < report.RuntimeBlockers[j].Path })
 	return report, nil
 }
 
@@ -141,15 +201,24 @@ func CleanupLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 		cacheDirs = append(cacheDirs, matches...)
 	}
 	seen := make(map[string]bool)
+	hasLiveLegacyBinary := false
 	for _, dir := range cacheDirs {
 		dir = filepath.Clean(strings.TrimSpace(dir))
 		if dir == "." || seen[dir] {
 			continue
 		}
 		seen[dir] = true
-		cleanupLegacyBinaries(&report, dir, options.ProcessAlive)
+		if cleanupLegacyBinaries(&report, dir, options.ProcessAlive) {
+			hasLiveLegacyBinary = true
+		}
 	}
-	cleanupLegacyRequirements(&report, options.TempDir)
+	// A running patched Codex may read its redirected requirements file again
+	// on a later turn. Keep all proven legacy requirements until every live
+	// private binary has exited; RuntimeCleanupPending will retry this cleanup on
+	// a subsequent standard-runtime launch.
+	if !hasLiveLegacyBinary {
+		cleanupLegacyRequirements(&report, options.TempDir)
+	}
 	if strings.TrimSpace(options.CodexHome) != "" {
 		cleanupLegacyAuth(&report, options.CodexHome, options.ProcessAlive, options.Now())
 		cleanupLegacyCloudCache(&report, options.CodexHome, options.BinaryPath)
@@ -158,7 +227,9 @@ func CleanupLegacyRuntimeAssets(options CleanupOptions) (CleanupReport, error) {
 	sort.Strings(report.Removed)
 	sort.Strings(report.Restored)
 	sort.Strings(report.Preserved)
+	sort.Strings(report.Deferred)
 	sort.Strings(report.Blockers)
+	sort.Slice(report.RuntimeBlockers, func(i, j int) bool { return report.RuntimeBlockers[i].Path < report.RuntimeBlockers[j].Path })
 	return report, nil
 }
 
@@ -187,7 +258,35 @@ func parseLegacyLease(data []byte) (legacyLease, bool) {
 	return lease, true
 }
 
-func cleanupLegacyBinaries(report *CleanupReport, dir string, alive func(int) bool) {
+func legacyLeaseLastSeenAt(path string, lease legacyLease) time.Time {
+	lastSeen := time.Unix(lease.HeartbeatUnix, 0)
+	if info, err := os.Stat(path); err == nil && info.ModTime().After(lastSeen) {
+		lastSeen = info.ModTime()
+	}
+	return lastSeen
+}
+
+func legacyAuthLeaseIsActive(path string, lease legacyLease, alive func(int) bool, now time.Time) bool {
+	if !alive(lease.PID) {
+		return false
+	}
+	age := now.Sub(legacyLeaseLastSeenAt(path, lease))
+	return age < 0 || age <= legacyAuthLeaseStaleAfter
+}
+
+func appendSharedAuthBlocker(report *CleanupReport, path string, lease legacyLease, reason string) {
+	report.Blockers = append(report.Blockers, path)
+	report.RuntimeBlockers = append(report.RuntimeBlockers, RuntimeBlocker{
+		Kind:          RuntimeBlockerSharedAuthLease,
+		Path:          path,
+		PID:           lease.PID,
+		HeartbeatUnix: lease.HeartbeatUnix,
+		Reason:        reason,
+	})
+}
+
+func cleanupLegacyBinaries(report *CleanupReport, dir string, alive func(int) bool) bool {
+	hasLive := false
 	matches, _ := filepath.Glob(filepath.Join(dir, "codex-patched-*"))
 	for _, binary := range matches {
 		if strings.HasSuffix(binary, legacyBinaryLease) {
@@ -206,6 +305,8 @@ func cleanupLegacyBinaries(report *CleanupReport, dir string, alive func(int) bo
 		}
 		if alive(lease.PID) {
 			report.Blockers = append(report.Blockers, binary)
+			report.Deferred = append(report.Deferred, binary)
+			hasLive = true
 			continue
 		}
 		if os.Remove(binary) == nil {
@@ -220,6 +321,7 @@ func cleanupLegacyBinaries(report *CleanupReport, dir string, alive func(int) bo
 			report.Blockers = append(report.Blockers, leasePath)
 		}
 	}
+	return hasLive
 }
 
 func inspectLegacyBinaries(report *CleanupReport, dir string, alive func(int) bool) {
@@ -239,7 +341,10 @@ func inspectLegacyBinaries(report *CleanupReport, dir string, alive func(int) bo
 			continue
 		}
 		if alive(lease.PID) {
-			report.Blockers = append(report.Blockers, binary)
+			// The old executable and requirements are session-private. Keep them
+			// until their owner exits, but do not prevent the original Codex binary
+			// and the standard broker from starting alongside them.
+			report.Deferred = append(report.Deferred, binary)
 		}
 	}
 }
@@ -280,8 +385,8 @@ func cleanupLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 		data, readErr := os.ReadFile(path)
 		lease, valid := parseLegacyLease(data)
 		if readErr == nil && valid {
-			if alive(lease.PID) {
-				report.Blockers = append(report.Blockers, path)
+			if legacyAuthLeaseIsActive(path, lease, alive, now) {
+				appendSharedAuthBlocker(report, path, lease, "fresh heartbeat from a live process still owns shared auth.json state")
 				continue
 			}
 			if removeErr := os.Remove(path); removeErr == nil {
@@ -300,7 +405,7 @@ func cleanupLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 			}
 			continue
 		}
-		report.Blockers = append(report.Blockers, path)
+		appendSharedAuthBlocker(report, path, legacyLease{}, "recent legacy authentication lease has no verifiable owner metadata")
 	}
 	if len(report.Blockers) > 0 {
 		for _, blocker := range report.Blockers {
@@ -375,14 +480,14 @@ func inspectLegacyAuth(report *CleanupReport, codexHome string, alive func(int) 
 		data, readErr := os.ReadFile(path)
 		lease, valid := parseLegacyLease(data)
 		if readErr == nil && valid {
-			if alive(lease.PID) {
-				report.Blockers = append(report.Blockers, path)
+			if legacyAuthLeaseIsActive(path, lease, alive, now) {
+				appendSharedAuthBlocker(report, path, lease, "fresh heartbeat from a live process still owns shared auth.json state")
 			}
 			continue
 		}
 		info, statErr := os.Stat(path)
 		if statErr == nil && now.Sub(info.ModTime()) <= 24*time.Hour {
-			report.Blockers = append(report.Blockers, path)
+			appendSharedAuthBlocker(report, path, legacyLease{}, "recent legacy authentication lease has no verifiable owner metadata")
 		}
 	}
 }

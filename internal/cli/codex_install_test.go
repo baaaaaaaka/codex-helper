@@ -25,7 +25,7 @@ func TestEnsureCodexBrokerRuntimeUpgradesOldManagedCapability(t *testing.T) {
 	}
 	lockCLITestHooks(t)
 	oldPath := writeProbeScript(t, t.TempDir(), "codex-old", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.115.0';; --help) echo 'Codex CLI';; esac\n")
-	newPath := writeProbeScript(t, t.TempDir(), "codex-new", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.131.0';; --help) echo 'Options: --remote <ADDR>';; esac\n")
+	newPath := writeProbeScript(t, t.TempDir(), "codex-new", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.131.0';; --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>';; esac\n")
 	previousUpgrade := upgradeCodexForBrokerRuntime
 	t.Cleanup(func() { upgradeCodexForBrokerRuntime = previousUpgrade })
 	var upgraded bool
@@ -60,6 +60,16 @@ func TestEnsureCodexBrokerRuntimeRejectsOldExplicitBinaryWithoutMutatingIt(t *te
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatal("explicit Codex binary was modified")
+	}
+}
+
+func TestEnsureCodexBrokerRuntimeRejectsRemoteWithoutAuthTokenOption(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capability fixture")
+	}
+	path := writeProbeScript(t, t.TempDir(), "codex-incomplete", "#!/bin/sh\ncase \"$1\" in --version) echo 'codex-cli 0.131.0';; --help) echo 'Options: --remote <ADDR>';; esac\n")
+	if _, err := ensureCodexBrokerRuntime(context.Background(), path, io.Discard, codexInstallOptions{}, false); err == nil || !strings.Contains(err.Error(), "standard approval runtime") {
+		t.Fatalf("error = %v, want missing broker capability", err)
 	}
 }
 

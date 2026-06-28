@@ -28,9 +28,10 @@ var runtimeMigrationStoreUpdate = func(store *config.Store, update func(*config.
 	return store.Update(update)
 }
 
-// prepareRuntimeMigration verifies that no legacy session is still active and
-// restores authentication before Codex starts. Destructive cleanup of the
-// remaining proven assets is deferred until the initialize handshake succeeds.
+// prepareRuntimeMigration verifies that no legacy session still owns shared
+// authentication state and restores authentication before Codex starts. Live
+// session-private binaries may coexist with the new runtime. Destructive
+// cleanup of proven assets is deferred until the initialize handshake succeeds.
 func prepareRuntimeMigration(store *config.Store, paths effectivePaths, codexPath string, log io.Writer) error {
 	runtimeMigrationMu.Lock()
 	defer runtimeMigrationMu.Unlock()
@@ -54,17 +55,27 @@ func prepareRuntimeMigration(store *config.Store, paths effectivePaths, codexPat
 		return fmt.Errorf("inspect standard runtime migration: %w", err)
 	}
 	if !report.Complete() {
-		return fmt.Errorf("standard runtime migration is waiting for %d active legacy session artifact(s); finish those sessions and retry", len(report.Blockers))
+		return &migration.RuntimeBlockedError{Blockers: append([]migration.RuntimeBlocker(nil), report.RuntimeBlockers...)}
 	}
 	authReport, err := migration.PrepareLegacyAuthentication(options)
 	if err != nil {
 		return fmt.Errorf("prepare standard runtime authentication: %w", err)
 	}
 	if !authReport.Complete() {
-		return fmt.Errorf("standard runtime migration could not safely restore authentication")
+		blockers := append([]migration.RuntimeBlocker(nil), authReport.RuntimeBlockers...)
+		if len(blockers) == 0 {
+			for _, path := range authReport.Blockers {
+				blockers = append(blockers, migration.RuntimeBlocker{
+					Kind:   migration.RuntimeBlockerSharedAuthLease,
+					Path:   path,
+					Reason: "shared authentication state changed while migration was being prepared",
+				})
+			}
+		}
+		return &migration.RuntimeBlockedError{Blockers: blockers}
 	}
-	if log != nil && len(authReport.Removed)+len(authReport.Restored)+len(report.Preserved) > 0 {
-		_, _ = fmt.Fprintf(log, "runtime migration prepared (%d authentication artifact(s) removed, %d restored, %d ambiguous file(s) preserved until activation)\n", len(authReport.Removed), len(authReport.Restored), len(report.Preserved))
+	if log != nil && len(authReport.Removed)+len(authReport.Restored)+len(report.Preserved)+len(report.Deferred) > 0 {
+		_, _ = fmt.Fprintf(log, "runtime migration prepared (%d authentication artifact(s) removed, %d restored, %d live session-private binary file(s) deferred, %d ambiguous file(s) preserved until activation)\n", len(authReport.Removed), len(authReport.Restored), len(report.Deferred), len(report.Preserved))
 	}
 	return nil
 }
@@ -119,7 +130,7 @@ func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexP
 		report, cleanupErr := migration.CleanupLegacyRuntimeAssets(runtimeMigrationCleanupOptions(store, paths, codexPath))
 		if cleanupErr != nil || !report.Complete() {
 			if log != nil {
-				_, _ = fmt.Fprintf(log, "runtime migration cleanup pending: removed=%d restored=%d preserved=%d blockers=%d err=%v\n", len(report.Removed), len(report.Restored), len(report.Preserved), len(report.Blockers), cleanupErr)
+				_, _ = fmt.Fprintf(log, "runtime migration cleanup pending: removed=%d restored=%d deferred=%d preserved=%d blockers=%d err=%v\n", len(report.Removed), len(report.Restored), len(report.Deferred), len(report.Preserved), len(report.Blockers), cleanupErr)
 			}
 			return nil
 		}
@@ -135,7 +146,7 @@ func runtimeMigrationReadyHook(store *config.Store, paths effectivePaths, codexP
 			return nil
 		}
 		if log != nil {
-			_, _ = fmt.Fprintf(log, "runtime migration completed (%d compatibility artifact(s) removed, %d restored, %d ambiguous file(s) preserved)\n", len(report.Removed), len(report.Restored), len(report.Preserved))
+			_, _ = fmt.Fprintf(log, "runtime migration completed (%d compatibility artifact(s) removed, %d restored, %d deferred, %d ambiguous file(s) preserved)\n", len(report.Removed), len(report.Restored), len(report.Deferred), len(report.Preserved))
 		}
 		return nil
 	}
@@ -149,7 +160,21 @@ func codexRemoteTUICapable(codexPath string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, codexPath, "--help").CombinedOutput()
-	return err == nil && strings.Contains(string(output), "--remote")
+	if err != nil {
+		return false
+	}
+	help := string(output)
+	return codexHelpHasOption(help, "--remote") && codexHelpHasOption(help, "--remote-auth-token-env")
+}
+
+func codexHelpHasOption(help string, option string) bool {
+	for _, field := range strings.Fields(help) {
+		field = strings.Trim(field, "`,;:[](){}")
+		if field == option || strings.HasPrefix(field, option+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func codexBrokerRuntimeCapable(codexPath string) bool {

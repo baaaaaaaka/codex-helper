@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -17,12 +18,15 @@ type unixRemoteTUIProcess struct {
 	output bytes.Buffer
 }
 
-func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome string) (remoteTUIProcess, error) {
+func startRemoteTUIProcess(ctx context.Context, command, remoteURL, remoteAuthTokenEnv, remoteAuthToken, codexHome string) (remoteTUIProcess, error) {
 	ptyCommand, err := exec.LookPath("script")
 	if err != nil {
 		return nil, fmt.Errorf("script is required for the remote TUI contract probe: %w", err)
 	}
 	commandLine := shellQuote(command) + " -c features.tui_app_server=true --remote " + shellQuote(remoteURL)
+	if strings.TrimSpace(remoteAuthTokenEnv) != "" {
+		commandLine += " --remote-auth-token-env " + shellQuote(remoteAuthTokenEnv)
+	}
 	var cmd *exec.Cmd
 	if runtime.GOOS == "darwin" {
 		cmd = exec.CommandContext(ctx, ptyCommand, "-q", "/dev/null", "/bin/sh", "-lc", commandLine)
@@ -33,8 +37,12 @@ func startRemoteTUIProcess(ctx context.Context, command, remoteURL, codexHome st
 	cmd.Env = append(os.Environ(),
 		"TERM=xterm-256color",
 		"CODEX_HOME="+codexHome,
+		"CODEX_SQLITE_HOME="+filepath.Join(codexHome, "remote-tui-sqlite"),
 		"OPENAI_API_KEY=cxp-contract-key",
 	)
+	if strings.TrimSpace(remoteAuthTokenEnv) != "" {
+		cmd.Env = append(cmd.Env, remoteAuthTokenEnv+"="+remoteAuthToken)
+	}
 	cmd.Stdout = &process.output
 	cmd.Stderr = &process.output
 	if err := cmd.Start(); err != nil {

@@ -190,12 +190,38 @@ func runCodexTUIInvocationViaBroker(
 		command.Env = updated
 		return nil
 	}
+	codexDirCreated := false
+	if _, statErr := os.Stat(paths.CodexDir); os.IsNotExist(statErr) {
+		if err := os.MkdirAll(paths.CodexDir, 0o700); err != nil {
+			return fmt.Errorf("create Codex home for remote TUI: %w", err)
+		}
+		codexDirCreated = true
+	} else if statErr != nil {
+		return fmt.Errorf("inspect Codex home for remote TUI: %w", statErr)
+	}
+	if codexDirCreated {
+		if err := ensurePathOwnedByIdentity(paths.CodexDir, paths.ExecIdentity); err != nil {
+			return fmt.Errorf("prepare Codex home ownership for remote TUI: %w", err)
+		}
+	}
+	remoteTUISQLiteHome, err := os.MkdirTemp(paths.CodexDir, ".cxp-remote-tui-sqlite-*")
+	if err != nil {
+		return fmt.Errorf("create isolated remote TUI sqlite home: %w", err)
+	}
+	defer os.RemoveAll(remoteTUISQLiteHome)
+	if err := os.Chmod(remoteTUISQLiteHome, 0o700); err != nil {
+		return fmt.Errorf("secure isolated remote TUI sqlite home: %w", err)
+	}
+	if err := ensurePathOwnedByIdentity(remoteTUISQLiteHome, paths.ExecIdentity); err != nil {
+		return fmt.Errorf("prepare isolated remote TUI sqlite home ownership: %w", err)
+	}
 	starter := codexrunner.PolicyAppServerStarter{
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
 		ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, log),
 	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
 		Starter: starter,
+		Log:     log,
 		StartRequest: codexrunner.AppServerStartRequest{
 			Command:          codexPath,
 			Args:             appServerArgs,
@@ -208,9 +234,15 @@ func runCodexTUIInvocationViaBroker(
 	if err != nil {
 		return err
 	}
+	extraEnv = setEnvValue(extraEnv, codexrunner.RemoteBrokerAuthTokenEnv, broker.AuthToken())
+	extraEnv = setEnvValue(extraEnv, envCodexSQLiteHome, remoteTUISQLiteHome)
 
 	args := append([]string{}, tuiGlobalArgs...)
-	args = append(args, "-c", codexRemoteTUIFeatureConfig, "--remote", broker.URL())
+	args = append(args,
+		"-c", codexRemoteTUIFeatureConfig,
+		"--remote", broker.URL(),
+		"--remote-auth-token-env", codexrunner.RemoteBrokerAuthTokenEnv,
+	)
 	args = append(args, tuiTail...)
 	runErr := runTargetSupervisedWithOptions(ctx, append([]string{codexPath}, args...), "", nil, broker.Done(), runTargetOptions{
 		Cwd:          cwd,

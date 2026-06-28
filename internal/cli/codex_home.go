@@ -8,7 +8,10 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 )
 
-const envCodexHome = "CODEX_HOME"
+const (
+	envCodexHome       = "CODEX_HOME"
+	envCodexSQLiteHome = "CODEX_SQLITE_HOME"
+)
 
 func resolveCodexHome(override string, workingDir string) (string, error) {
 	paths, err := resolveEffectivePaths("", override, workingDir)

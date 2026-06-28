@@ -1275,7 +1275,7 @@ func writeBeaconCLIAppServerFixture(t *testing.T, messages []string) string {
 	body.WriteString("#!/bin/sh\n")
 	body.WriteString("case \"${1:-}\" in\n")
 	body.WriteString("  --version) echo 'codex-cli 0.133.0'; exit 0 ;;\n")
-	body.WriteString("  --help) echo 'Options: --remote <ADDR>'; exit 0 ;;\n")
+	body.WriteString("  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;\n")
 	body.WriteString("  app-server) ;;\n")
 	body.WriteString("  *) exit 64 ;;\n")
 	body.WriteString("esac\n")

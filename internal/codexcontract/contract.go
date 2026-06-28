@@ -58,8 +58,10 @@ func Probe(ctx context.Context, command string) (Report, error) {
 	if err != nil {
 		return Report{}, fmt.Errorf("probe Codex help: %w", err)
 	}
-	if !strings.Contains(help, "--remote") {
-		return Report{}, fmt.Errorf("Codex %s does not expose the required --remote TUI transport", strings.TrimSpace(version))
+	for _, required := range []string{"--remote", "--remote-auth-token-env"} {
+		if !helpHasOption(help, required) {
+			return Report{}, fmt.Errorf("Codex %s does not expose the required %s TUI transport option", strings.TrimSpace(version), required)
+		}
 	}
 	if err := requireHelpTokens("Codex top-level help", help, []string{
 		"exec", "review", "app-server", "resume", "fork", "--add-dir",
@@ -189,6 +191,16 @@ func Probe(ctx context.Context, command string) (Report, error) {
 		ServerMethods:       sortedKeys(serverMethodParams),
 		ServerNotifications: sortedKeys(serverNotificationParams),
 	}, nil
+}
+
+func helpHasOption(help string, option string) bool {
+	for _, field := range strings.Fields(help) {
+		field = strings.Trim(field, "`,;:[](){}")
+		if field == option || strings.HasPrefix(field, option+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func requireHelpTokens(label string, help string, tokens []string) error {

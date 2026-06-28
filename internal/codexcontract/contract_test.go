@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+func TestHelpHasOptionRequiresExactFlag(t *testing.T) {
+	help := "Options: --remote-auth-token-env <ENV_VAR>"
+	if helpHasOption(help, "--remote") {
+		t.Fatal("--remote-auth-token-env must not satisfy --remote")
+	}
+	if !helpHasOption(help, "--remote-auth-token-env") {
+		t.Fatal("expected exact remote auth flag")
+	}
+}
+
 func TestStringEnumsAndImmediateProperties(t *testing.T) {
 	schema := map[string]any{
 		"oneOf": []any{

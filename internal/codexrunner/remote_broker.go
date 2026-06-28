@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +18,8 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+const RemoteBrokerAuthTokenEnv = "CXP_CODEX_REMOTE_AUTH_TOKEN"
 
 // RemoteBroker exposes one original Codex app-server stdio transport as a
 // loopback WebSocket endpoint for the original Codex TUI. Approval requests
@@ -26,10 +30,12 @@ type RemoteBroker struct {
 	listener  net.Listener
 	server    *http.Server
 	url       string
-	path      string
+	authToken string
 	done      chan error
 	closeOnce sync.Once
 	closeErr  error
+	log       io.Writer
+	logMu     sync.Mutex
 
 	clientMu sync.Mutex
 	client   bool
@@ -51,6 +57,7 @@ type RemoteBrokerOptions struct {
 	StartRequest         AppServerStartRequest
 	ServerRequestHandler AppServerServerRequestHandler
 	ListenAddress        string
+	Log                  io.Writer
 }
 
 func StartRemoteBroker(ctx context.Context, options RemoteBrokerOptions) (*RemoteBroker, error) {
@@ -81,14 +88,14 @@ func StartRemoteBroker(ctx context.Context, options RemoteBrokerOptions) (*Remot
 		_ = transport.Close()
 		return nil, err
 	}
-	path := "/_cxp/" + token
 	broker := &RemoteBroker{
 		transport: transport,
 		handler:   handler,
 		listener:  listener,
-		url:       "ws://" + listener.Addr().String() + path,
-		path:      path,
+		url:       "ws://" + listener.Addr().String(),
+		authToken: token,
 		done:      make(chan error, 1),
+		log:       options.Log,
 		approvals: make(map[string]*brokerApprovalState),
 	}
 	broker.server = &http.Server{
@@ -114,6 +121,13 @@ func (b *RemoteBroker) URL() string {
 	return b.url
 }
 
+func (b *RemoteBroker) AuthToken() string {
+	if b == nil {
+		return ""
+	}
+	return b.authToken
+}
+
 func (b *RemoteBroker) Done() <-chan error {
 	if b == nil {
 		closed := make(chan error)
@@ -124,13 +138,29 @@ func (b *RemoteBroker) Done() <-chan error {
 }
 
 func (b *RemoteBroker) ServeHTTP(w http.ResponseWriter, request *http.Request) {
-	if request.URL.Path != b.path {
+	if request.URL.Path != "/" || request.URL.RawQuery != "" {
+		b.logf("remote broker rejected request with unsupported path=%q query_present=%t", request.URL.Path, request.URL.RawQuery != "")
 		http.NotFound(w, request)
+		return
+	}
+	presented := strings.TrimSpace(request.Header.Get("Authorization"))
+	if !strings.HasPrefix(presented, "Bearer ") {
+		b.logf("remote broker rejected request without bearer capability")
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized app-server broker client", http.StatusUnauthorized)
+		return
+	}
+	presented = strings.TrimSpace(strings.TrimPrefix(presented, "Bearer "))
+	if subtle.ConstantTimeCompare([]byte(presented), []byte(b.authToken)) != 1 {
+		b.logf("remote broker rejected request with invalid bearer capability")
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized app-server broker client", http.StatusUnauthorized)
 		return
 	}
 	b.clientMu.Lock()
 	if b.client {
 		b.clientMu.Unlock()
+		b.logf("remote broker rejected a second concurrent client")
 		http.Error(w, "app-server broker already has a client", http.StatusConflict)
 		return
 	}
@@ -151,10 +181,20 @@ func (b *RemoteBroker) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	}
 	connection, err := upgrader.Upgrade(w, request, nil)
 	if err != nil {
+		b.logf("remote broker WebSocket upgrade failed: %v", err)
 		return
 	}
 	defer connection.Close()
 	b.serveConnection(request.Context(), connection)
+}
+
+func (b *RemoteBroker) logf(format string, args ...any) {
+	if b == nil || b.log == nil {
+		return
+	}
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+	_, _ = fmt.Fprintf(b.log, format+"\n", args...)
 }
 
 func (b *RemoteBroker) serveConnection(parent context.Context, connection *websocket.Conn) {
@@ -163,7 +203,9 @@ func (b *RemoteBroker) serveConnection(parent context.Context, connection *webso
 	errors := make(chan error, 2)
 	go b.relayClientToAppServer(ctx, connection, errors)
 	go b.relayAppServerToClient(ctx, connection, errors)
-	<-errors
+	if err := <-errors; err != nil {
+		b.logf("remote broker connection ended: %v", err)
+	}
 }
 
 func (b *RemoteBroker) relayClientToAppServer(ctx context.Context, connection *websocket.Conn, done chan<- error) {
