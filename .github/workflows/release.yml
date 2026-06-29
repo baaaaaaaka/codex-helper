@@ -149,8 +149,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          go test ./cmd/codex-proxy -count=1 -run 'TestRunMain(RunsLegacyPreflightBeforeRuntimeDispatch|PreflightFailureStopsBeforeRuntimeDispatch)$' -v
           go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RuntimeProcessIdentity.*)$' -v
-          go test ./internal/update -count=1 -run 'TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive$' -v
+          go test ./internal/update -count=1 -run 'Test(PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
           go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
 
       - name: Actual CXP process identity (Linux/macOS)

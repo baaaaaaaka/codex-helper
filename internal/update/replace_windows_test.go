@@ -4,9 +4,41 @@ package update
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestReplaceBinaryReplacesIdleExistingDestinationWindows(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "codex-proxy.exe")
+	src := filepath.Join(dir, "candidate.exe")
+	if err := os.WriteFile(dest, []byte("old helper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("new helper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := replaceBinary(src, dest, replaceOptions{})
+	if err != nil {
+		t.Fatalf("replaceBinary error: %v", err)
+	}
+	if result.restartRequired || result.pendingReplacePath != "" {
+		t.Fatalf("replace result = %#v, want immediate replacement", result)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("candidate still exists after replacement: %v", err)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new helper" {
+		t.Fatalf("destination contents = %q, want new helper", data)
+	}
+}
 
 func TestWindowsDeferredMoveScriptWaitsRetriesAndEscapesPaths(t *testing.T) {
 	script := windowsDeferredMoveScript(`C:\Users\O'Brien\AppData\Local\Temp\codex.tmp`, `C:\Users\O'Brien\.local\bin\codex-proxy.exe`, 12345)

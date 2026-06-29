@@ -10,10 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 func replaceBinary(tmpPath, destPath string, opts replaceOptions) (replaceResult, error) {
-	if err := os.Rename(tmpPath, destPath); err == nil {
+	if err := replaceExistingWindows(tmpPath, destPath); err == nil {
 		return replaceResult{restartRequired: false}, nil
 	}
 	if opts.returnPendingOnly {
@@ -23,6 +25,18 @@ func replaceBinary(tmpPath, destPath string, opts replaceOptions) (replaceResult
 		return replaceResult{}, err
 	}
 	return replaceResult{restartRequired: true, pendingReplacePath: tmpPath}, nil
+}
+
+func replaceExistingWindows(srcPath string, destPath string) error {
+	src, err := windows.UTF16PtrFromString(srcPath)
+	if err != nil {
+		return err
+	}
+	dest, err := windows.UTF16PtrFromString(destPath)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(src, dest, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 }
 
 func scheduleWindowsMove(src, dest string) error {

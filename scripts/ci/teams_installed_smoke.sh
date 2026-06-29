@@ -3,7 +3,7 @@ set -euo pipefail
 
 base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-helper-teams-installed-smoke"
 rm -rf "$base"
-mkdir -p "$base/bin" "$base/codex-home" "$base/config" "$base/cache"
+mkdir -p "$base/bin" "$base/codex-home" "$base/config" "$base/cache" "$base/state"
 
 bin="$base/bin/codex-proxy"
 go build -trimpath -o "$bin" ./cmd/codex-proxy
@@ -11,6 +11,7 @@ go build -trimpath -o "$bin" ./cmd/codex-proxy
 export CODEX_HOME="$base/codex-home"
 export XDG_CONFIG_HOME="$base/config"
 export XDG_CACHE_HOME="$base/cache"
+export XDG_STATE_HOME="$base/state"
 export NO_COLOR=1
 export CODEX_HELPER_TEAMS_PROFILE=ci-installed-smoke
 export CODEX_HELPER_TEAMS_TENANT_ID=ci-tenant

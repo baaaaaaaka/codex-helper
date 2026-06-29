@@ -65,6 +65,14 @@ func legacyUpdaterVersionPreflight() error {
 	})
 }
 
+// LegacyUpdaterVersionPreflight must run before helperruntime.Launch. Older
+// updaters validate a downloaded helper without disabling runtime dispatch, so
+// a temporary candidate can otherwise re-exec an already-active cxp runtime
+// before the candidate has a chance to repair legacy install aliases.
+func LegacyUpdaterVersionPreflight() error {
+	return legacyUpdaterVersionPreflight()
+}
+
 func legacyUpdaterVersionPreflightWithOptions(opts legacyUpdateVersionPreflightOptions) error {
 	if len(opts.args) != 2 || opts.args[1] != "--version" {
 		return nil
