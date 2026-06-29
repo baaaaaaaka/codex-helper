@@ -1616,8 +1616,7 @@ func TestCollectTeamsServiceWatchdogSnapshotSQLiteResourceStability(t *testing.T
 				}
 			}
 
-			afterOpeners := waitForTeamsServiceWatchdogOpenDBOpenersAtMost(t, beforeOpeners)
-			_, afterOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			afterOpeners, afterOpenDBRefs := waitForTeamsServiceWatchdogOpenDBCountsAtMost(t, beforeOpeners, beforeOpenDBRefs)
 			if afterOpeners > beforeOpeners {
 				t.Fatalf("OpenDB connectionOpener goroutines grew from %d to %d", beforeOpeners, afterOpeners)
 			}
@@ -1660,8 +1659,7 @@ func BenchmarkTeamsServiceWatchdogSnapshotSQLiteResourceStability(b *testing.B) 
 			}
 			b.StopTimer()
 
-			afterOpeners := waitForTeamsServiceWatchdogOpenDBOpenersAtMost(b, beforeOpeners)
-			_, afterOpenDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+			afterOpeners, afterOpenDBRefs := waitForTeamsServiceWatchdogOpenDBCountsAtMost(b, beforeOpeners, beforeOpenDBRefs)
 			afterHeap := teamsServiceWatchdogHeapAllocForTest()
 			b.ReportMetric(float64(afterOpeners-beforeOpeners), "opendb_goroutines_delta")
 			b.ReportMetric(float64(afterOpenDBRefs-beforeOpenDBRefs), "opendb_refs_delta")
@@ -1777,13 +1775,13 @@ func teamsServiceWatchdogGoroutineStackForTest() string {
 	return buf.String()
 }
 
-func waitForTeamsServiceWatchdogOpenDBOpenersAtMost(tb testing.TB, maxOpeners int) int {
+func waitForTeamsServiceWatchdogOpenDBCountsAtMost(tb testing.TB, maxOpeners int, maxOpenDBRefs int) (int, int) {
 	tb.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		openers, _ := teamsServiceWatchdogOpenDBCountsForTest()
-		if openers <= maxOpeners || time.Now().After(deadline) {
-			return openers
+		openers, openDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
+		if (openers <= maxOpeners && openDBRefs <= maxOpenDBRefs) || time.Now().After(deadline) {
+			return openers, openDBRefs
 		}
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
