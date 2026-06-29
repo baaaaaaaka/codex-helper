@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -114,6 +115,10 @@ func writeCodexTUIBrokerFixture(t *testing.T) codexTUIBrokerFixture {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX app-server fixture")
 	}
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep is required by the asynchronous app-server fixture")
+	}
 	dir := t.TempDir()
 	workDir := filepath.Join(dir, "work")
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -153,10 +158,19 @@ case "${1:-}" in
     printf '%%s\n' "$@" > %s
     printf '%%s\n' "${%s:-}" > %s
     printf '%%s\n' "${%s:-}" > %s
+    attempt=0
+    while [ ! -f %s ]; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge 200 ]; then
+        echo 'app-server fixture did not start before remote TUI exit' >&2
+        exit 91
+      fi
+      %s 0.01
+    done
     exit 0
     ;;
 esac
-`, shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome))
+`, shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
