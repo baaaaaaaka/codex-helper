@@ -793,28 +793,31 @@ func TestBridgeMachineDelegationClaimRecheckDelayIsConfigurableAndCancellable(t 
 
 func TestBridgeMachineDelegationWorkerRaceExecutesOnlyWinningClaim(t *testing.T) {
 	now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+	claimRecheckDelay := 50 * time.Millisecond
 	graph := newFakeBridgeMachineRegistryGraph()
 	bridge := testBridgeForMachineRegistry()
 	firstExec := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "first"}}
 	secondExec := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "second"}}
 	first, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
-		MachineRegistryGraph:       graph,
-		MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry-a.json"),
-		MachineRegistryNow:         func() time.Time { return now },
-		MachineDelegationStatePath: filepath.Join(t.TempDir(), "delegation-worker-a.json"),
-		Interval:                   5 * time.Second,
-		Executor:                   firstExec,
+		MachineRegistryGraph:               graph,
+		MachineRegistryCachePath:           filepath.Join(t.TempDir(), "machine-registry-a.json"),
+		MachineRegistryNow:                 func() time.Time { return now },
+		MachineDelegationStatePath:         filepath.Join(t.TempDir(), "delegation-worker-a.json"),
+		MachineDelegationClaimRecheckDelay: claimRecheckDelay,
+		Interval:                           5 * time.Second,
+		Executor:                           firstExec,
 	})
 	if err != nil {
 		t.Fatalf("new first publisher: %v", err)
 	}
 	second, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
-		MachineRegistryGraph:       graph,
-		MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry-b.json"),
-		MachineRegistryNow:         func() time.Time { return now },
-		MachineDelegationStatePath: filepath.Join(t.TempDir(), "delegation-worker-b.json"),
-		Interval:                   5 * time.Second,
-		Executor:                   secondExec,
+		MachineRegistryGraph:               graph,
+		MachineRegistryCachePath:           filepath.Join(t.TempDir(), "machine-registry-b.json"),
+		MachineRegistryNow:                 func() time.Time { return now },
+		MachineDelegationStatePath:         filepath.Join(t.TempDir(), "delegation-worker-b.json"),
+		MachineDelegationClaimRecheckDelay: claimRecheckDelay,
+		Interval:                           5 * time.Second,
+		Executor:                           secondExec,
 	})
 	if err != nil {
 		t.Fatalf("new second publisher: %v", err)
