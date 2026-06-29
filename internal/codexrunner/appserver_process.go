@@ -47,7 +47,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 
 	processCtx, cancelProcess := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(processCtx, command, req.Args...)
-	configureBackgroundProcess(cmd)
+	configureAppServerProcess(cmd)
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
 	}
@@ -264,9 +264,7 @@ func (p *appServerProcessTransport) Close() error {
 		close(p.done)
 		_ = p.stdin.Close()
 		p.cancelProcess()
-		if p.cmd.Process != nil {
-			_ = p.cmd.Process.Kill()
-		}
+		terminateAppServerProcess(p.cmd)
 		<-p.waitDone
 		_ = p.stdout.Close()
 		_ = p.stderr.Close()
