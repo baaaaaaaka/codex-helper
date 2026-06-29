@@ -204,9 +204,21 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
     "existing-cmd" {
       Download-Binary $OldTag $runner
       Download-Binary $OldTag $helper
+      Download-Binary $OldTag $cxpExe
       Write-CXPShim $cxp (Expected-CXPShimBody)
       Assert-Version $helper $OldTag
       Assert-Version $cxp $OldTag
+      Invoke-Retry 5 10 {
+        & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
+      }
+    }
+    "existing-cmd-missing-exe" {
+      Download-Binary $OldTag $runner
+      Download-Binary $OldTag $helper
+      Remove-Item -Force -LiteralPath $cxpExe -ErrorAction SilentlyContinue
+      Write-CXPShim $cxp (Expected-CXPShimBody)
+      Assert-Version $helper $OldTag
+      if (Test-Path -LiteralPath $cxpExe) { throw "cxp.exe should be missing before canonical shim repair" }
       Invoke-Retry 5 10 {
         & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
       }
@@ -267,6 +279,7 @@ Remove-Item -Recurse -Force -LiteralPath $script:BaseRoot -ErrorAction SilentlyC
 New-Item -ItemType Directory -Force -Path $script:BaseRoot | Out-Null
 
 Run-UpgradeScenario "existing-cxp-cmd" "existing-cmd"
+Run-UpgradeScenario "existing-cxp-cmd-missing-exe" "existing-cmd-missing-exe"
 Run-UpgradeScenario "stale-helper-cxp-cmd" "stale-helper-cmd"
 Run-UpgradeScenario "missing-cxp-cmd" "missing-cxp"
 Run-UpgradeScenario "current-helper-missing-cxp-cmd" "current-missing-cxp"

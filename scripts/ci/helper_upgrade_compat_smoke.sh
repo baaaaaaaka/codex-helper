@@ -423,8 +423,16 @@ SH
       cp -f "$go_bin" "$managed"
       chmod 0755 "$managed"
       rm -f "$managed_cxp"
-      assert_version "$managed" "$target_tag"
       [[ ! -e "$managed_cxp" ]]
+      # Launching the current managed helper must repair the stable entry
+      # before normal CLI dispatch; this is the upgrade path used when an old
+      # installation never had cxp or a user removed it.
+      assert_version "$managed" "$target_tag"
+      if [[ -L "$managed_cxp" || ! -f "$managed_cxp" || ! -x "$managed_cxp" ]]; then
+        echo "current managed helper did not publish a stable cxp executable" >&2
+        ls -l "$managed_cxp" >&2 || true
+        exit 1
+      fi
       ;;
   esac
 
@@ -432,7 +440,7 @@ SH
 
   assert_cxp_entrypoint_healthy "$managed" "$managed_cxp" "$target_tag"
   case "$seed_mode" in
-    symlink|stale-symlink|missing|current-missing-cxp)
+    symlink|stale-symlink|missing)
       if [[ ! -L "$managed_cxp" ]]; then
         echo "managed cxp should be a symlink for seed mode $seed_mode" >&2
         ls -l "$managed_cxp" >&2 || true
@@ -440,6 +448,17 @@ SH
       fi
       if [[ "$(readlink "$managed_cxp")" != "$managed" ]]; then
         echo "managed cxp symlink should point to $managed for seed mode $seed_mode" >&2
+        ls -l "$managed_cxp" >&2 || true
+        exit 1
+      fi
+      ;;
+    current-missing-cxp)
+      # This scenario deliberately starts with only a current physical helper
+      # at the managed path. The current runtime owns recovery and publishes a
+      # self-contained stable cxp entry rather than reconstructing a legacy
+      # cxp -> codex-proxy alias.
+      if [[ -L "$managed_cxp" || ! -f "$managed_cxp" || ! -x "$managed_cxp" ]]; then
+        echo "managed cxp should be a stable executable for seed mode $seed_mode" >&2
         ls -l "$managed_cxp" >&2 || true
         exit 1
       fi
