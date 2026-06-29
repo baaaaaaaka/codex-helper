@@ -116,7 +116,7 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	}
 	active, activeErr := ReadActive(root)
 	if errors.Is(activeErr, os.ErrNotExist) {
-		if _, err := InstallVersion(root, physical, normalized, runtime.GOOS, runtime.GOOS != "windows"); err != nil {
+		if _, err := InstallVersion(root, physical, normalized, runtime.GOOS, runtime.GOOS == "linux"); err != nil {
 			return 0, false, err
 		}
 		if err := Activate(root, normalized); err != nil {
@@ -126,7 +126,7 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	} else if activeErr != nil {
 		return 0, false, activeErr
 	} else if semver.Compare(normalized, active) > 0 {
-		if _, err := InstallVersion(root, physical, normalized, runtime.GOOS, runtime.GOOS != "windows"); err != nil {
+		if _, err := InstallVersion(root, physical, normalized, runtime.GOOS, runtime.GOOS == "linux"); err != nil {
 			return 0, false, err
 		}
 		if err := Activate(root, normalized); err != nil {

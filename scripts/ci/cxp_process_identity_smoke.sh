@@ -53,7 +53,18 @@ wait_for_runtime() {
       exit 1
     fi
     if [[ -s "$active" ]]; then
-      return 0
+      case "$(uname -s)" in
+        Linux)
+          if [[ "$(readlink "/proc/$current_pid/exe" 2>/dev/null || true)" == *"/.cxp-runtime/versions/"* ]]; then
+            return 0
+          fi
+          ;;
+        Darwin)
+          if ps -p "$current_pid" -o command= 2>/dev/null | grep -Fq '/.cxp-runtime/versions/'; then
+            return 0
+          fi
+          ;;
+      esac
     fi
     sleep 0.05
   done

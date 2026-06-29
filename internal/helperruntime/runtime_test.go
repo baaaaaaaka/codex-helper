@@ -74,7 +74,7 @@ func TestInstallVersionAndActivate(t *testing.T) {
 	source := filepath.Join(root, "legacy-entry")
 	writeExecutable(t, source, "v1")
 
-	target, err := InstallVersion(filepath.Join(root, ".cxp-runtime"), source, "v1.2.3", runtime.GOOS, runtime.GOOS != "windows")
+	target, err := InstallVersion(filepath.Join(root, ".cxp-runtime"), source, "v1.2.3", runtime.GOOS, runtime.GOOS == "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,11 +88,17 @@ func TestInstallVersionAndActivate(t *testing.T) {
 	if err != nil || active != "v1.2.3" {
 		t.Fatalf("ReadActive = %q, %v", active, err)
 	}
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS == "linux" {
 		sourceInfo, _ := os.Stat(source)
 		targetInfo, _ := os.Stat(target)
 		if !os.SameFile(sourceInfo, targetInfo) {
-			t.Fatal("initial Unix runtime should use a zero-copy hardlink")
+			t.Fatal("initial Linux runtime should use a zero-copy hardlink")
+		}
+	} else {
+		sourceInfo, _ := os.Stat(source)
+		targetInfo, _ := os.Stat(target)
+		if os.SameFile(sourceInfo, targetInfo) {
+			t.Fatal("non-Linux runtime must use an independent file identity")
 		}
 	}
 }
