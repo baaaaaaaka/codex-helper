@@ -43,18 +43,32 @@ try {
     throw "timed out waiting for CXP runtime activation"
   }
 
-  $rows = @(Get-CimInstance Win32_Process | Where-Object {
-    $_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id
-  })
-  if ($rows.Count -lt 2) {
-    throw "expected stable cxp.exe parent and immutable runtime child; found $($rows.Count) process(es)"
+  $rows = @()
+  $related = @()
+  for ($attempt = 0; $attempt -lt 300; $attempt++) {
+    $related = @(Get-CimInstance Win32_Process | Where-Object {
+      $_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id
+    })
+    $rows = @($related | Where-Object {
+      $_.Name -ieq "cxp.exe" -and [IO.Path]::GetFileName($_.ExecutablePath) -ieq "cxp.exe"
+    })
+    if ($rows.Count -ge 2) {
+      break
+    }
+    Start-Sleep -Milliseconds 50
+    $process.Refresh()
   }
-  foreach ($row in $rows) {
+  if ($rows.Count -lt 2) {
+    throw "expected stable cxp.exe parent and immutable runtime child; found $($rows.Count) CXP process(es)"
+  }
+  foreach ($row in $related) {
     $observed = "$($row.Name)`n$($row.ExecutablePath)`n$($row.CommandLine)"
     Write-Host $observed
     if ($observed -match "(?i)codex") {
       throw "CXP-owned process metadata contains the forbidden compatibility keyword"
     }
+  }
+  foreach ($row in $rows) {
     if ([IO.Path]::GetFileName($row.ExecutablePath) -ine "cxp.exe") {
       throw "unexpected CXP process image: $($row.ExecutablePath)"
     }
@@ -63,7 +77,8 @@ try {
 } finally {
   if ($process) {
     $owned = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-      $_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id
+      ($_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id) -and
+      $_.Name -ieq "cxp.exe"
     } | Sort-Object { if ($_.ProcessId -eq $process.Id) { 1 } else { 0 } })
     foreach ($row in $owned) {
       Stop-Process -Id $row.ProcessId -Force -ErrorAction SilentlyContinue
