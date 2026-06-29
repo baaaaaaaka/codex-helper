@@ -1888,7 +1888,11 @@ func TestSelectSessionCancelsInitialLoadUnderPersistentCacheLockContention(t *te
 		t.Fatalf("write session file: %v", err)
 	}
 
-	cachePath := filepath.Join(cacheHome, "codex-proxy", "codexhistory", "session_meta_cache.json")
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("resolve user cache dir: %v", err)
+	}
+	cachePath := filepath.Join(userCacheDir, "codex-proxy", "codexhistory", "session_meta_cache.json")
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		t.Fatalf("mkdir cache dir: %v", err)
 	}
