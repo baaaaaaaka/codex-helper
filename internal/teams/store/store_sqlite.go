@@ -730,6 +730,99 @@ func loadSQLiteStateFile(path string) (State, error) {
 	return loadSQLiteState(context.Background(), db)
 }
 
+func loadSQLiteStateFileReadOnly(ctx context.Context, path string) (State, error) {
+	return loadSQLiteStateFileReadOnlyWithHook(ctx, path, nil)
+}
+
+type sqliteReadOnlyFileIdentity struct {
+	Exists  bool
+	Size    int64
+	ModTime int64
+}
+
+func sqliteReadOnlyFileIdentityForPath(path string) (sqliteReadOnlyFileIdentity, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return sqliteReadOnlyFileIdentity{}, nil
+	}
+	if err != nil {
+		return sqliteReadOnlyFileIdentity{}, err
+	}
+	return sqliteReadOnlyFileIdentity{Exists: true, Size: info.Size(), ModTime: info.ModTime().UnixNano()}, nil
+}
+
+func loadSQLiteStateFileReadOnlyWithHook(ctx context.Context, path string, afterSnapshot func(attempt int, immutable bool)) (State, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		if !dbBefore.Exists {
+			return State{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if _, err := os.Stat(path + "-shm"); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return State{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
+				}
+				return State{}, err
+			}
+		}
+		if afterSnapshot != nil {
+			afterSnapshot(attempt, immutable)
+		}
+		state, err := loadSQLiteStateFileReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return State{}, err
+		}
+		if !immutable {
+			return state, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return state, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable attempt %d", attempt+1)
+	}
+	return State{}, fmt.Errorf("read stable sqlite diagnostic snapshot after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteStateFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (State, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return State{}, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return State{}, err
+	}
+	if err := validateSQLiteRequiredTables(db); err != nil {
+		return State{}, err
+	}
+	return loadSQLiteStateRows(ctx, db)
+}
+
 func (s *Store) writeSQLiteStateFile(path string, state State) error {
 	db, err := openSQLiteStore(path, true)
 	if err != nil {
@@ -1314,6 +1407,10 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	if err := ensureSQLiteSchema(db); err != nil {
 		return State{}, err
 	}
+	return loadSQLiteStateRows(ctx, db)
+}
+
+func loadSQLiteStateRows(ctx context.Context, db *sql.DB) (State, error) {
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
 		return State{}, err

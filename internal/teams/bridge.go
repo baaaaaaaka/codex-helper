@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
@@ -369,6 +370,7 @@ type Bridge struct {
 	registryProjectionLastFingerprint string
 	registryProjectionLastSavedAt     time.Time
 	registryProjectionDirty           bool
+	durableProjectionVersionBySession map[string]durableSessionProjectionVersion
 	user                              User
 	scope                             teamstore.ScopeIdentity
 	machine                           teamstore.MachineRecord
@@ -482,6 +484,11 @@ type parkNoticeLookupPreference struct {
 	Until time.Time
 }
 
+type durableSessionProjectionVersion struct {
+	ChatID            string
+	UpdatedAtUnixNano int64
+}
+
 func NewBridge(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer) (*Bridge, error) {
 	graph := NewGraphClient(auth, out)
 	readGraph, err := NewReadGraphClient(out)
@@ -498,6 +505,66 @@ func NewBridgeWithHTTPClient(ctx context.Context, auth *AuthManager, registryPat
 		return nil, err
 	}
 	return newBridgeWithGraphClients(ctx, graph, readGraph, registryPath, out)
+}
+
+// NewBridgeForChatRecreateWithHTTPClient pins the existing authoritative store
+// before a recreate command drains the running listener. Unlike normal startup
+// resolution, this path deliberately does not migrate the selected store.
+func NewBridgeForChatRecreateWithHTTPClient(ctx context.Context, auth *AuthManager, registryPath string, out io.Writer, client *http.Client) (*Bridge, error) {
+	graph := NewGraphClientWithHTTPClient(auth, out, client)
+	readGraph, err := NewReadGraphClientWithHTTPClient(out, client)
+	if err != nil {
+		return nil, err
+	}
+	user, err := graph.Me(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scope, storePath, err := ResolveStorePathForMaintenance(ScopeIdentityForUser(user))
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(registryPath) == "" {
+		currentStorePath, pathErr := DefaultStorePathForScope(scope.ID)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		if samePath(storePath, currentStorePath) {
+			registryPath, err = appdirs.StatePath("teams", "scopes", safeScopePathPart(scope.ID), "registry.json")
+		} else {
+			registryPath, err = registryPathForResolvedScopeStore(scope.ID, storePath)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	reg, err := LoadRegistry(registryPath)
+	if err != nil {
+		return nil, err
+	}
+	store, err := teamstore.Open(storePath)
+	if err != nil {
+		return nil, err
+	}
+	reg.UserID = user.ID
+	reg.UserPrincipal = user.UserPrincipalName
+	machine := MachineRecordForUser(user, scope)
+	applyMachineHostnameOverrideToRecord(&machine, reg.MachineHostnameOverride)
+	return &Bridge{
+		graph:                   graph,
+		readGraph:               readGraph,
+		httpClient:              graph.httpClient(),
+		registryPath:            registryPath,
+		reg:                     reg,
+		registryProjectionDirty: true,
+		user:                    user,
+		scope:                   scope,
+		machine:                 machine,
+		out:                     out,
+		markAnswerChatsUnread:   true,
+		groupChatGuardEnabled:   true,
+		store:                   store,
+	}, nil
 }
 
 func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGraph *GraphClient, registryPath string, out io.Writer) (*Bridge, error) {
@@ -1302,6 +1369,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			continue
 		}
 		session = pollable
+		b.syncRegistrySessionProjection(session)
 		if transcriptImportIsActive(state, session.ID) {
 			continue
 		}
@@ -1326,6 +1394,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		})
 		if decision.ShouldPark {
 			if durableCandidatesHandled {
+				if update, ok := durableAutoParkHandoffScheduleUpdate(decision); ok {
+					pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+				}
 				continue
 			}
 			if !decision.ShouldNotifyPark && !poll.ParkedAt.IsZero() && inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
@@ -1376,7 +1447,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			RecoverStaleContinuation: true,
 		}
 		if _, err := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
-			return b.handleSessionMessageWithQueueState(ctx, s.ChatID, msg, text, &turns, nil)
+			return b.handleResolvedSessionMessageWithQueueState(ctx, &s, s.ChatID, msg, text, &turns, nil)
 		}); err != nil {
 			queueStateBySession[s.ID] = turns
 			if firstErr == nil {
@@ -1566,6 +1637,43 @@ func registrySessionFromDurable(durable teamstore.SessionContext) Session {
 		CreatedAt:     durable.CreatedAt,
 		UpdatedAt:     durable.UpdatedAt,
 	}
+}
+
+func (b *Bridge) syncRegistrySessionProjection(session Session) {
+	if b == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" {
+		return
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	version := durableSessionProjectionVersion{ChatID: session.ChatID, UpdatedAtUnixNano: session.UpdatedAt.UnixNano()}
+	if b.durableProjectionVersionBySession != nil && b.durableProjectionVersionBySession[session.ID] == version {
+		return
+	}
+	if b.durableProjectionVersionBySession == nil {
+		b.durableProjectionVersionBySession = make(map[string]durableSessionProjectionVersion)
+	}
+	b.durableProjectionVersionBySession[session.ID] = version
+	b.reg.ensureMaps()
+	if current := b.reg.SessionByID(session.ID); current != nil {
+		if registrySessionsEqual(*current, session) {
+			return
+		}
+		oldChatID := strings.TrimSpace(current.ChatID)
+		*current = session
+		if oldChatID != "" && oldChatID != session.ChatID {
+			delete(b.reg.Chats, oldChatID)
+		}
+		if _, ok := b.reg.Chats[session.ChatID]; !ok {
+			b.reg.Chats[session.ChatID] = ChatState{}
+		}
+		b.registryProjectionDirty = true
+		return
+	}
+	b.reg.Sessions = append(b.reg.Sessions, session)
+	if _, ok := b.reg.Chats[session.ChatID]; !ok {
+		b.reg.Chats[session.ChatID] = ChatState{}
+	}
+	b.registryProjectionDirty = true
 }
 
 func sanitizeControlFallbackSession(session *teamstore.SessionContext, model string, snapshot modelprofile.Snapshot, now time.Time) bool {
@@ -2088,13 +2196,17 @@ func (b *Bridge) recoverIdleWorkChatContinuationBeforePark(ctx context.Context, 
 	if strings.TrimSpace(poll.ContinuationPath) == "" {
 		return false, nil
 	}
+	// The poll window performs audience/provenance work before invoking the
+	// message handler. Heal the projection first so those pre-handler stages do
+	// not observe an old chat binding during auto-park recovery.
+	b.syncRegistrySessionProjection(session)
 	turns := pollSessionTurnQueueStates(state)[session.ID]
 	return b.pollChatWithRoleStateOptions(ctx, session.ChatID, effectiveOwnerPollTop(ownerPollMessageTop), inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{
 		AllowBacklogDrain:        true,
 		MaxBacklogActions:        1,
 		RecoverStaleContinuation: true,
 	}, func(ctx context.Context, msg ChatMessage, text string) error {
-		return b.handleSessionMessageWithQueueState(ctx, session.ChatID, msg, text, &turns, &state)
+		return b.handleResolvedSessionMessageWithQueueState(ctx, &session, session.ChatID, msg, text, &turns, &state)
 	})
 }
 
@@ -2182,6 +2294,19 @@ func inboundPollDecisionScheduleUpdate(decision inboundPollDecision) (teamstore.
 		ClearBlockedUntil:     decision.State != inboundPollStateBlocked,
 		ClearContinuationPath: decision.State == inboundPollStateParked,
 		ResetFailures:         decision.State == inboundPollStateParked,
+	}, true
+}
+
+func durableAutoParkHandoffScheduleUpdate(decision inboundPollDecision) (teamstore.ChatPollScheduleUpdate, bool) {
+	if !decision.ShouldPark || strings.TrimSpace(decision.ChatID) == "" {
+		return teamstore.ChatPollScheduleUpdate{}, false
+	}
+	return teamstore.ChatPollScheduleUpdate{
+		ChatID:            decision.ChatID,
+		PollState:         inboundPollStateCold,
+		NextPollAt:        decision.NextPollAt,
+		LastActivityAt:    decision.LastActivityAt,
+		ClearBlockedUntil: true,
 	}, true
 }
 
@@ -5216,6 +5341,7 @@ func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamst
 		next := previous
 		next.Draining = true
 		next.Reason = teamstore.HelperReloadReason
+		next.DrainOperationID = ""
 		next.UpdatedAt = now
 		state.ServiceControl = next
 		return nil
@@ -5247,6 +5373,7 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 
 func clearStaleHelperReloadControl(control teamstore.ServiceControl, now time.Time) teamstore.ServiceControl {
 	control.Draining = false
+	control.DrainOperationID = ""
 	if !control.Paused {
 		control.Reason = ""
 	}
@@ -7311,9 +7438,23 @@ func (b *Bridge) handleSessionMessage(ctx context.Context, chatID string, msg Ch
 }
 
 func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID string, msg ChatMessage, text string, knownTurns *sessionTurnQueueState, knownQueueSnapshot *teamstore.State) error {
-	session := b.reg.SessionByChatID(chatID)
+	return b.handleResolvedSessionMessageWithQueueState(ctx, nil, chatID, msg, text, knownTurns, knownQueueSnapshot)
+}
+
+func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context, session *Session, chatID string, msg ChatMessage, text string, knownTurns *sessionTurnQueueState, knownQueueSnapshot *teamstore.State) error {
+	if session != nil {
+		b.syncRegistrySessionProjection(*session)
+		if projected := b.reg.SessionByID(session.ID); projected != nil {
+			session = projected
+		}
+	} else {
+		session = b.reg.SessionByChatID(chatID)
+	}
 	if session == nil {
-		return nil
+		return fmt.Errorf("Teams work session not found for chat %q", strings.TrimSpace(chatID))
+	}
+	if strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(session.ChatID) != strings.TrimSpace(chatID) {
+		return fmt.Errorf("Teams work session %q binding does not match chat %q", session.ID, strings.TrimSpace(chatID))
 	}
 	if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
 		b.markRegistrySeen(chatID, msg.ID)
@@ -8085,9 +8226,9 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			}
 			continue
 		}
-		session := b.reg.SessionByID(inbound.SessionID)
-		if session == nil && inbound.TeamsChatID != "" {
-			session = b.reg.SessionByChatID(inbound.TeamsChatID)
+		session, err := b.sessionForInboundEvent(ctx, inbound)
+		if err != nil {
+			return err
 		}
 		if session == nil {
 			if err := b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input session is no longer available"); err != nil {
@@ -8405,9 +8546,9 @@ func queuedTurnBlockedReason(gate localCodexBeforeTeamsGate) string {
 }
 
 func (b *Bridge) rejectDeferredSessionInboundAfterUpgrade(ctx context.Context, inbound teamstore.InboundEvent) error {
-	session := b.reg.SessionByID(inbound.SessionID)
-	if session == nil && inbound.TeamsChatID != "" {
-		session = b.reg.SessionByChatID(inbound.TeamsChatID)
+	session, err := b.sessionForInboundEvent(ctx, inbound)
+	if err != nil {
+		return err
 	}
 	if session == nil {
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input session is no longer available")
@@ -8428,6 +8569,36 @@ func (b *Bridge) rejectDeferredSessionInboundAfterUpgrade(ctx context.Context, i
 		Kind:        "error",
 		Body:        reason,
 	})
+}
+
+func (b *Bridge) sessionForInboundEvent(ctx context.Context, inbound teamstore.InboundEvent) (*Session, error) {
+	if b == nil {
+		return nil, nil
+	}
+	sessionID := strings.TrimSpace(inbound.SessionID)
+	if b.store != nil && sessionID != "" {
+		sessions, err := b.store.SessionsByID(ctx, []string{sessionID})
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := sessions[sessionID]; ok {
+			return b.sessionForIDState(teamstore.State{Sessions: sessions}, sessionID), nil
+		}
+		hasSessions, err := b.store.HasSessions(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if hasSessions {
+			return nil, nil
+		}
+	}
+	if session := b.reg.SessionByID(sessionID); session != nil {
+		return session, nil
+	}
+	if chatID := strings.TrimSpace(inbound.TeamsChatID); chatID != "" {
+		return b.reg.SessionByChatID(chatID), nil
+	}
+	return nil, nil
 }
 
 func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
@@ -8560,36 +8731,25 @@ func (b *Bridge) sessionForTurnState(state teamstore.State, turn teamstore.Turn)
 }
 
 func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Session {
+	durable, ok := state.Sessions[sessionID]
+	if ok && sessionID == controlFallbackSessionID && b.reg.ControlChatID != "" {
+		return b.controlFallbackSessionFromState(durable)
+	}
+	if ok && strings.TrimSpace(durable.TeamsChatID) != "" {
+		session := registrySessionFromDurable(durable)
+		if strings.TrimSpace(session.ID) == "" {
+			session.ID = strings.TrimSpace(sessionID)
+		}
+		b.syncRegistrySessionProjection(session)
+		return b.reg.SessionByID(session.ID)
+	}
+	if ok || len(state.Sessions) > 0 {
+		return nil
+	}
 	if session := b.reg.SessionByID(sessionID); session != nil {
 		return session
 	}
-	durable, ok := state.Sessions[sessionID]
-	if !ok || durable.TeamsChatID == "" {
-		if ok && sessionID == controlFallbackSessionID && b.reg.ControlChatID != "" {
-			return b.controlFallbackSessionFromState(durable)
-		}
-		return nil
-	}
-	session := Session{
-		ID:            durable.ID,
-		ChatID:        durable.TeamsChatID,
-		ChatURL:       durable.TeamsChatURL,
-		Topic:         durable.TeamsTopic,
-		UserTitle:     durable.UserTitle,
-		TitleSource:   durable.TitleSource,
-		Status:        string(durable.Status),
-		CodexThreadID: durable.CodexThreadID,
-		Cwd:           durable.Cwd,
-		ModelProfile:  durable.ModelProfile,
-		CreatedAt:     durable.CreatedAt,
-		UpdatedAt:     durable.UpdatedAt,
-	}
-	if session.Status == "" {
-		session.Status = "active"
-	}
-	b.reg.Sessions = append(b.reg.Sessions, session)
-	b.markRegistryProjectionDirty()
-	return b.reg.SessionByID(session.ID)
+	return nil
 }
 
 func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn, state teamstore.State) error {
@@ -11784,6 +11944,23 @@ func (b *Bridge) ensureStore() error {
 	}
 	b.store = store
 	return nil
+}
+
+// PinStoreForMaintenance resolves and opens the authoritative store while the
+// running listener's owner metadata is still available. Maintenance commands
+// that drain the listener must call this before draining so a later path
+// resolution cannot switch to a retained migration mirror.
+func (b *Bridge) PinStoreForMaintenance() (string, error) {
+	if b == nil {
+		return "", fmt.Errorf("Teams bridge is not configured")
+	}
+	if err := b.ensureStore(); err != nil {
+		return "", err
+	}
+	if b.store == nil {
+		return "", fmt.Errorf("Teams store is not configured")
+	}
+	return b.store.Path(), nil
 }
 
 func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
@@ -16048,7 +16225,7 @@ func transcriptRecordIsFinalCheckpoint(record TranscriptRecord) bool {
 }
 
 func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, sessionID string, turnID string, chatID string, expectedThreadID string, maxRecords int) (int, error) {
-	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(turnID) == "" || strings.TrimSpace(chatID) == "" {
+	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(turnID) == "" {
 		return 0, nil
 	}
 	if maxRecords <= 0 {
@@ -16065,12 +16242,17 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 	if turnHasLiveStreamContentOutbox(state, turn.ID) {
 		return 0, nil
 	}
-	session := b.reg.SessionByID(sessionID)
+	session := b.sessionForIDState(state, sessionID)
 	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
 		return 0, nil
 	}
 	sessionCopy := *session
-	sessionCopy.ChatID = firstNonEmptyString(chatID, sessionCopy.ChatID)
+	// The caller may have captured a pre-recreate chat ID. Durable session state
+	// is authoritative; use the caller value only for legacy rows without one.
+	sessionCopy.ChatID = firstNonEmptyString(sessionCopy.ChatID, chatID)
+	if strings.TrimSpace(sessionCopy.ChatID) == "" {
+		return 0, nil
+	}
 	mainCheckpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionCopy.ID)]
 	if strings.TrimSpace(mainCheckpoint.LastRecordID) == "" {
 		return 0, nil

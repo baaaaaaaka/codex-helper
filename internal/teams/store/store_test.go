@@ -43,6 +43,228 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+func TestLoadPathReadOnlyJSONDoesNotCreateLockOrModifyFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := newState()
+	state.Sessions["s001"] = SessionContext{ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-1"}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal state: %v", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o640); err != nil {
+		t.Fatalf("write JSON store: %v", err)
+	}
+	mtime := time.Unix(1_700_000_000, 123_000_000)
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("Chtimes JSON store: %v", err)
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(path))
+
+	loaded, err := LoadPathReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("LoadPathReadOnly JSON: %v", err)
+	}
+	if loaded.Sessions["s001"].TeamsChatID != "chat-1" {
+		t.Fatalf("read-only JSON state = %#v", loaded.Sessions)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(path))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read-only JSON load changed files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if _, err := os.Stat(path + ".lock"); !os.IsNotExist(err) {
+		t.Fatalf("read-only JSON load created lock file: %v", err)
+	}
+}
+
+func TestLoadPathReadOnlySQLiteDoesNotModifyDatabaseFamily(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Sessions["s001"] = SessionContext{ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-1"}
+		state.ChatPolls["chat-1"] = ChatPollState{ChatID: "chat-1", PollState: "warm", Seeded: true}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed SQLite fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close SQLite fixture: %v", err)
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(path))
+	for i := 0; i < 5; i++ {
+		loaded, err := LoadPathReadOnly(context.Background(), path)
+		if err != nil {
+			t.Fatalf("LoadPathReadOnly SQLite iteration %d: %v", i, err)
+		}
+		if loaded.Sessions["s001"].TeamsChatID != "chat-1" || loaded.ChatPolls["chat-1"].PollState != "warm" {
+			t.Fatalf("read-only SQLite state iteration %d = sessions:%#v polls:%#v", i, loaded.Sessions, loaded.ChatPolls)
+		}
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(path))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read-only SQLite load changed files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestLoadPathReadOnlySQLiteSeesLiveWALWithoutModifyingPersistentFiles(t *testing.T) {
+	store := newTestStore(t)
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Sessions["s001"] = SessionContext{ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-before"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed SQLite fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *State) error {
+		session := state.Sessions["s001"]
+		session.TeamsChatID = "chat-in-wal"
+		state.Sessions["s001"] = session
+		return nil
+	}); err != nil {
+		t.Fatalf("update live SQLite fixture: %v", err)
+	}
+	pointer, ok, err := store.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		t.Fatalf("current SQLite pointer: ok=%v err=%v", ok, err)
+	}
+	dbPath, err := store.storeSQLitePath(pointer)
+	if err != nil {
+		t.Fatalf("resolve SQLite path: %v", err)
+	}
+	walInfo, err := os.Stat(dbPath + "-wal")
+	if err != nil {
+		t.Fatalf("stat live WAL: %v", err)
+	}
+	if walInfo.Size() == 0 {
+		t.Fatal("live WAL is empty; fixture did not exercise uncheckpointed state")
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(dbPath))
+	if _, ok := before[filepath.Base(dbPath)+"-shm"]; !ok {
+		t.Fatal("live fixture has no SHM; read-only WAL test requires an existing shared-memory index")
+	}
+	loaded, err := LoadPathReadOnly(context.Background(), store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathReadOnly live SQLite: %v", err)
+	}
+	if got := loaded.Sessions["s001"].TeamsChatID; got != "chat-in-wal" {
+		t.Fatalf("live SQLite chat = %q, want uncheckpointed WAL value", got)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(dbPath))
+	// A WAL reader updates transient read marks in the pre-existing SHM index.
+	// Those bytes are coordination state, not durable store data. Main DB, WAL,
+	// pointer, lock, and backup files must remain byte-for-byte unchanged.
+	delete(before, filepath.Base(dbPath)+"-shm")
+	delete(after, filepath.Base(dbPath)+"-shm")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("read-only live SQLite load changed files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestLoadPathReadOnlySQLiteRetriesWhenWALAppearsDuringImmutableRead(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s001"] = SessionContext{ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-before"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed SQLite fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+	}
+	if _, err := store.CheckpointSQLiteWAL(ctx, 0); err != nil {
+		t.Fatalf("CheckpointSQLiteWAL: %v", err)
+	}
+	pointer, ok, err := store.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		t.Fatalf("current SQLite pointer: ok=%v err=%v", ok, err)
+	}
+	dbPath, err := store.storeSQLitePath(pointer)
+	if err != nil {
+		t.Fatalf("resolve SQLite path: %v", err)
+	}
+	hookCalls := 0
+	loaded, err := loadSQLiteStateFileReadOnlyWithHook(ctx, dbPath, func(attempt int, immutable bool) {
+		if attempt != 0 || hookCalls != 0 {
+			return
+		}
+		hookCalls++
+		if !immutable {
+			t.Fatal("first diagnostic attempt should be immutable after checkpoint")
+		}
+		if updateErr := store.Update(ctx, func(state *State) error {
+			session := state.Sessions["s001"]
+			session.TeamsChatID = "chat-raced-into-wal"
+			state.Sessions["s001"] = session
+			return nil
+		}); updateErr != nil {
+			t.Fatalf("write WAL during diagnostic read: %v", updateErr)
+		}
+	})
+	if err != nil {
+		t.Fatalf("load raced SQLite snapshot: %v", err)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("snapshot hook calls = %d, want 1", hookCalls)
+	}
+	if got := loaded.Sessions["s001"].TeamsChatID; got != "chat-raced-into-wal" {
+		t.Fatalf("raced SQLite chat = %q, want latest WAL value", got)
+	}
+}
+
+func TestLoadPathReadOnlySQLiteLiveWALWithoutSHMFailsWithoutCreatingSidecar(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "store.sqlite")
+	if err := os.WriteFile(dbPath, []byte("database fixture"), 0o600); err != nil {
+		t.Fatalf("write database fixture: %v", err)
+	}
+	if err := os.WriteFile(dbPath+"-wal", []byte("uncheckpointed WAL"), 0o600); err != nil {
+		t.Fatalf("write WAL fixture: %v", err)
+	}
+	_, err := loadSQLiteStateFileReadOnly(context.Background(), dbPath)
+	if err == nil || !strings.Contains(err.Error(), "without creating SHM") {
+		t.Fatalf("missing-SHM live WAL error = %v", err)
+	}
+	if _, statErr := os.Stat(dbPath + "-shm"); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("read-only live WAL check created SHM: %v", statErr)
+	}
+}
+
+type readOnlyFileSnapshot struct {
+	Mode    os.FileMode
+	Size    int64
+	ModTime int64
+	SHA256  string
+}
+
+func snapshotRegularFilesForReadOnlyTest(t *testing.T, dir string) map[string]readOnlyFileSnapshot {
+	t.Helper()
+	out := make(map[string]readOnlyFileSnapshot)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir %s: %v", dir, err)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatalf("Info %s: %v", path, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", path, err)
+		}
+		out[entry.Name()] = readOnlyFileSnapshot{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime().UnixNano(), SHA256: sha256Bytes(data)}
+	}
+	return out
+}
+
 func TestSaveWritesCompactStateJSON(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -5451,6 +5673,88 @@ func TestServiceControlDrainSetAndClear(t *testing.T) {
 	}
 	if !sameControl(clearedAgain, cleared) {
 		t.Fatalf("idempotent drain clear changed control: got %#v want %#v", clearedAgain, cleared)
+	}
+}
+
+func TestServiceControlDrainOperationFence(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if backend == "sqlite" {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			acquired, err := store.SetDrainingOperation(ctx, "chat recreate", "operation-1")
+			if err != nil {
+				t.Fatalf("SetDrainingOperation: %v", err)
+			}
+			if !acquired.Draining || acquired.DrainOperationID != "operation-1" || acquired.LastDrainOperationID != "operation-1" || acquired.LastDrainOperationAt.IsZero() {
+				t.Fatalf("acquired control = %#v", acquired)
+			}
+			beforeIdempotent := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			idempotent, err := store.SetDrainingOperation(ctx, "chat recreate", "operation-1")
+			if err != nil {
+				t.Fatalf("idempotent SetDrainingOperation: %v", err)
+			}
+			if !sameControl(idempotent, acquired) {
+				t.Fatalf("idempotent fence changed control: got %#v want %#v", idempotent, acquired)
+			}
+			afterIdempotent := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			for name := range beforeIdempotent {
+				if strings.HasSuffix(name, "-shm") {
+					delete(beforeIdempotent, name)
+					delete(afterIdempotent, name)
+				}
+			}
+			if !reflect.DeepEqual(beforeIdempotent, afterIdempotent) {
+				t.Fatalf("idempotent fence rewrote persistent files:\nbefore=%#v\nafter=%#v", beforeIdempotent, afterIdempotent)
+			}
+			reopened, err := Open(store.Path())
+			if err != nil {
+				t.Fatalf("reopen fenced store: %v", err)
+			}
+			persisted, err := reopened.ReadControl(ctx)
+			if closeErr := reopened.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+			if err != nil {
+				t.Fatalf("read persisted fence: %v", err)
+			}
+			if !persisted.Draining || persisted.DrainOperationID != "operation-1" || persisted.LastDrainOperationID != "operation-1" || persisted.LastDrainOperationAt.IsZero() {
+				t.Fatalf("persisted fence = %#v", persisted)
+			}
+			if _, err := store.SetDrainingOperation(ctx, "chat recreate", "operation-2"); !errors.Is(err, ErrDrainOperationConflict) {
+				t.Fatalf("competing SetDrainingOperation error = %v", err)
+			}
+			if _, err := store.SetDraining(ctx, "upgrade"); !errors.Is(err, ErrDrainOperationConflict) {
+				t.Fatalf("unfenced SetDraining error = %v", err)
+			}
+			if _, err := store.BeginUpgrade(ctx, HelperUpgradeReason, time.Minute); !errors.Is(err, ErrDrainOperationConflict) {
+				t.Fatalf("BeginUpgrade while fenced error = %v", err)
+			}
+			if _, err := store.ClearDrainOperation(ctx, "operation-2"); !errors.Is(err, ErrDrainOperationConflict) {
+				t.Fatalf("stale ClearDrainOperation error = %v", err)
+			}
+			stillFenced, err := store.ReadControl(ctx)
+			if err != nil {
+				t.Fatalf("ReadControl: %v", err)
+			}
+			if !stillFenced.Draining || stillFenced.DrainOperationID != "operation-1" {
+				t.Fatalf("stale cleanup changed fence: %#v", stillFenced)
+			}
+			cleared, err := store.ClearDrainOperation(ctx, "operation-1")
+			if err != nil {
+				t.Fatalf("ClearDrainOperation owner: %v", err)
+			}
+			if cleared.Draining || cleared.DrainOperationID != "" || cleared.LastDrainOperationID != "operation-1" || cleared.LastDrainOperationAt.IsZero() {
+				t.Fatalf("cleared control = %#v", cleared)
+			}
+			if _, err := store.ClearDrainOperation(ctx, "operation-1"); err != nil {
+				t.Fatalf("idempotent ClearDrainOperation: %v", err)
+			}
+		})
 	}
 }
 
@@ -14809,6 +15113,9 @@ func sameControl(a ServiceControl, b ServiceControl) bool {
 	return a.Paused == b.Paused &&
 		a.Draining == b.Draining &&
 		a.Reason == b.Reason &&
+		a.DrainOperationID == b.DrainOperationID &&
+		a.LastDrainOperationID == b.LastDrainOperationID &&
+		a.LastDrainOperationAt.Equal(b.LastDrainOperationAt) &&
 		a.UpdatedAt.Equal(b.UpdatedAt)
 }
 

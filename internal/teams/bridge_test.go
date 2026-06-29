@@ -1005,6 +1005,54 @@ func TestBridgeSaveSkipsCleanProjectionUntilDirty(t *testing.T) {
 	}
 }
 
+func TestBridgeDurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams-registry.json")
+	session := Session{ID: "s001", ChatID: "chat-1", Topic: "work", Status: "active"}
+	bridge := &Bridge{
+		registryPath:            path,
+		registryProjectionDirty: true,
+		reg: Registry{
+			Version:  1,
+			Sessions: []Session{session},
+		},
+	}
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("initial Save: %v", err)
+	}
+	bridge.syncRegistrySessionProjection(session)
+	if bridge.registryProjectionDirty {
+		t.Fatal("equal durable projection marked registry dirty")
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		bridge.syncRegistrySessionProjection(session)
+	})
+	if allocs != 0 {
+		t.Fatalf("steady-state durable projection allocations = %v, want 0", allocs)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat registry before clean Save: %v", err)
+	}
+	beforeData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read registry before clean Save: %v", err)
+	}
+	if err := bridge.Save(); err != nil {
+		t.Fatalf("clean Save: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat registry after clean Save: %v", err)
+	}
+	afterData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read registry after clean Save: %v", err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) || !bytes.Equal(beforeData, afterData) {
+		t.Fatal("steady-state durable projection rewrote registry")
+	}
+}
+
 func TestCodexErrorRequiresUpgradeHeuristics(t *testing.T) {
 	matches := []string{
 		"Codex turn failed: The 'gpt-5.5' model requires a newer version of Codex.",
@@ -18471,6 +18519,422 @@ func TestBridgePollOnceSyncsRecreatedControlChatFromDurableBinding(t *testing.T)
 	}
 }
 
+func TestBridgePollOnceUsesDurableRecreatedWorkChatWhenRegistryIsStale(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	graph, sent := newBridgePollAndSendGraph(t, []bridgePollPage{{
+		messages: []ChatMessage{bridgePollMessage("recreated-work-message", now.Format(time.RFC3339Nano), "run on recreated binding")},
+		assert: func(t *testing.T, r *http.Request) {
+			t.Helper()
+			if r.URL.Path != "/chats/new-chat/messages" {
+				t.Fatalf("poll path = %s, want recreated work chat", r.URL.Path)
+			}
+		},
+	}})
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{result: ExecutionResult{
+		Text:          "reply on recreated binding",
+		CodexThreadID: "thread-recreated",
+		CodexTurnID:   "turn-recreated",
+	}})
+	bridge.readGraph = graph
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.asyncTurns = true
+	stale := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), stale); err != nil {
+		t.Fatalf("seed stale durable session: %v", err)
+	}
+	if _, _, err := store.UpdateSessionContext(context.Background(), "s001", func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		current.TeamsChatID = "new-chat"
+		current.TeamsChatURL = "https://teams.example/new-chat"
+		current.TeamsTopic = "recreated topic"
+		current.UpdatedAt = now
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("rebind durable session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "new-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed recreated work poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "new-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(-time.Second),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule recreated work poll: %v", err)
+	}
+	migration, err := store.MigrateLargeStateToSQLite(context.Background(), 0)
+	if err != nil || (!migration.Migrated && !migration.AlreadyDB) {
+		t.Fatalf("migrate incident fixture to SQLite: result=%#v err=%v", migration, err)
+	}
+	candidates, handled, err := store.HotPollWorkCandidatesExcludingIdle(context.Background(), "control-chat", time.Now().Add(-inboundPollParkAfter))
+	if err != nil || !handled || len(candidates) != 1 || candidates[0].TeamsChatID != "new-chat" {
+		t.Fatalf("durable poll candidates = %#v handled=%v err=%v", candidates, handled, err)
+	}
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	waitForBridgeAsyncTurns(t, bridge)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+
+	projected := bridge.reg.SessionByID("s001")
+	if projected == nil || projected.ChatID != "new-chat" || projected.ChatURL != "https://teams.example/new-chat" {
+		t.Fatalf("registry projection was not healed from durable binding: %#v", projected)
+	}
+	if got := len(*sent); got != 2 {
+		t.Fatalf("sent count = %d, want ack and final: %#v", got, *sent)
+	}
+	for _, message := range *sent {
+		if message.ChatID != "new-chat" {
+			t.Fatalf("outbound routed to %q, want new-chat", message.ChatID)
+		}
+	}
+	if joined := sentPlainJoined(*sent); !strings.Contains(joined, "Request accepted") || !strings.Contains(joined, "reply on recreated binding") {
+		t.Fatalf("recreated chat output missing ack/final:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if got := len(state.InboundEvents); got != 1 {
+		t.Fatalf("inbound events = %d, want 1", got)
+	}
+	for _, inbound := range state.InboundEvents {
+		if inbound.SessionID != "s001" || inbound.TeamsChatID != "new-chat" || inbound.TeamsMessageID != "recreated-work-message" {
+			t.Fatalf("inbound persisted against wrong binding: %#v", inbound)
+		}
+	}
+	if got := len(state.Turns); got != 1 {
+		t.Fatalf("turns = %d, want 1", got)
+	}
+	ledgerPath, ok := globalInboundLedgerPathForRegistry(bridge.registryPath)
+	if !ok {
+		t.Fatal("incident fixture should enable global inbound ledger")
+	}
+	ledger, err := readGlobalInboundLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("read global inbound ledger: %v", err)
+	}
+	if item := ledger.Items[globalInboundKey("new-chat", "recreated-work-message")]; item.Status != "done" {
+		t.Fatalf("global inbound completed before durable work was observable: %#v", item)
+	}
+}
+
+func TestBridgePollSessionResolutionFailureReleasesGlobalInboundForRetry(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "retried answer",
+		CodexThreadID: "thread-retry",
+		CodexTurnID:   "codex-turn-retry",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.Sessions = nil
+	bridge.reg.Chats = map[string]ChatState{"new-chat": {}}
+	msg := bridgePollMessage("retry-after-binding-failure", now.Format(time.RFC3339Nano), "retry after binding failure")
+	poll := teamstore.ChatPollState{ChatID: "new-chat", Seeded: true}
+	window := MessageWindow{Messages: []ChatMessage{msg}}
+
+	_, err := bridge.handlePollMessageWindow(context.Background(), "new-chat", inboundPollRoleWork, poll, true, window, 20, 1, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessageWithQueueState(ctx, "new-chat", msg, text, nil, nil)
+	})
+	if err == nil || !strings.Contains(err.Error(), "session not found") {
+		t.Fatalf("missing session error = %v", err)
+	}
+	ledgerPath, ok := globalInboundLedgerPathForRegistry(bridge.registryPath)
+	if !ok {
+		t.Fatal("fixture should enable global inbound ledger")
+	}
+	ledger, err := readGlobalInboundLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger after handler failure: %v", err)
+	}
+	if item, exists := ledger.Items[globalInboundKey("new-chat", msg.ID)]; exists {
+		t.Fatalf("failed handler left a terminal global inbound item: %#v", item)
+	}
+	if len(*sent) != 0 || len(executor.prompts) != 0 {
+		t.Fatalf("failed handler produced side effects: sent=%#v prompts=%#v", *sent, executor.prompts)
+	}
+
+	session := Session{
+		ID:        "s001",
+		ChatID:    "new-chat",
+		ChatURL:   "https://teams.example/new-chat",
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	bridge.reg.Sessions = append(bridge.reg.Sessions, session)
+	if err := bridge.ensureDurableSession(context.Background(), &bridge.reg.Sessions[0]); err != nil {
+		t.Fatalf("seed recovered durable session: %v", err)
+	}
+	result, err := bridge.handlePollMessageWindow(context.Background(), "new-chat", inboundPollRoleWork, poll, true, window, 20, 1, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessageWithQueueState(ctx, "new-chat", msg, text, nil, nil)
+	})
+	if err != nil || !result.Handled {
+		t.Fatalf("retry result = %#v err=%v", result, err)
+	}
+	if len(executor.prompts) != 1 || len(*sent) != 2 {
+		t.Fatalf("retry did not produce exactly one turn: prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+	ledger, err = readGlobalInboundLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("read ledger after retry: %v", err)
+	}
+	if item := ledger.Items[globalInboundKey("new-chat", msg.ID)]; item.Status != "done" {
+		t.Fatalf("successful retry did not complete global inbound: %#v", item)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after retry: %v", err)
+	}
+	if len(state.InboundEvents) != 1 || len(state.Turns) != 1 {
+		t.Fatalf("retry durable chain = inbound:%d turns:%d, want one each", len(state.InboundEvents), len(state.Turns))
+	}
+}
+
+func TestBridgeProcessDeferredInboundUsesDurableRecreatedWorkChatWhenRegistryIsStale(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "deferred answer on durable binding",
+		CodexThreadID: "thread-deferred",
+		CodexTurnID:   "codex-turn-deferred",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	stale := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), stale); err != nil {
+		t.Fatalf("seed stale durable session: %v", err)
+	}
+	if _, _, err := store.UpdateSessionContext(context.Background(), "s001", func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		current.TeamsChatID = "new-chat"
+		current.TeamsChatURL = "https://teams.example/new-chat"
+		current.UpdatedAt = now
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("rebind durable session: %v", err)
+	}
+	if _, created, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		ID:             "inbound-deferred-recreated",
+		SessionID:      "s001",
+		TeamsChatID:    "new-chat",
+		TeamsMessageID: "message-deferred-recreated",
+		Text:           "run deferred request",
+		Status:         teamstore.InboundStatusDeferred,
+		Source:         "teams",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil || !created {
+		t.Fatalf("persist deferred inbound created=%v err=%v", created, err)
+	}
+
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound: %v", err)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "run deferred request") {
+		t.Fatalf("executor prompts = %#v", executor.prompts)
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("sent count = %d, want ack and final: %#v", len(*sent), *sent)
+	}
+	for _, message := range *sent {
+		if message.ChatID != "new-chat" {
+			t.Fatalf("deferred output routed to %q, want new-chat", message.ChatID)
+		}
+	}
+	if projected := bridge.reg.SessionByID("s001"); projected == nil || projected.ChatID != "new-chat" {
+		t.Fatalf("deferred resolver did not heal registry: %#v", projected)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if len(state.Turns) != 1 {
+		t.Fatalf("deferred turn count = %d, want 1", len(state.Turns))
+	}
+}
+
+func TestBridgeProcessQueuedTurnsUsesDurableRecreatedWorkChatWhenRegistryIsStale(t *testing.T) {
+	now := time.Now().UTC().Round(0)
+	original := bridgePollMessage("message-queued-recreated", now.Format(time.RFC3339Nano), "run queued request")
+	graph, sent := newBridgeRetryGraphForChat(t, "new-chat", original)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "queued answer on durable binding",
+		CodexThreadID: "thread-queued",
+		CodexTurnID:   "codex-turn-queued",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	stale := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), stale); err != nil {
+		t.Fatalf("seed stale durable session: %v", err)
+	}
+	if _, _, err := store.UpdateSessionContext(context.Background(), "s001", func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		current.TeamsChatID = "new-chat"
+		current.TeamsChatURL = "https://teams.example/new-chat"
+		current.UpdatedAt = now
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("rebind durable session: %v", err)
+	}
+	inbound, created, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		ID:             "inbound-queued-recreated",
+		SessionID:      "s001",
+		TeamsChatID:    "new-chat",
+		TeamsMessageID: "message-queued-recreated",
+		Text:           "run queued request",
+		Status:         teamstore.InboundStatusPersisted,
+		Source:         "teams",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	if err != nil || !created {
+		t.Fatalf("persist queued inbound created=%v err=%v", created, err)
+	}
+	if _, created, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:             "turn-queued-recreated",
+		SessionID:      "s001",
+		InboundEventID: inbound.ID,
+		Status:         teamstore.TurnStatusQueued,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil || !created {
+		t.Fatalf("queue turn created=%v err=%v", created, err)
+	}
+
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns: %v", err)
+	}
+	waitForBridgeAsyncTurns(t, bridge)
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "run queued request") {
+		t.Fatalf("executor prompts = %#v", executor.prompts)
+	}
+	if len(*sent) != 2 || !strings.Contains(sentPlainJoined(*sent), "queued answer on durable binding") {
+		t.Fatalf("queued final did not use durable binding: %#v", *sent)
+	}
+	for _, message := range *sent {
+		if message.ChatID != "new-chat" {
+			t.Fatalf("queued output routed to %q, want new-chat", message.ChatID)
+		}
+	}
+	if projected := bridge.reg.SessionByID("s001"); projected == nil || projected.ChatID != "new-chat" {
+		t.Fatalf("queued resolver did not heal registry: %#v", projected)
+	}
+}
+
+func TestBridgeSessionForIDStatePrefersDurableBindingOverStaleRegistry(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+	now := time.Now()
+	resolved := bridge.sessionForIDState(teamstore.State{Sessions: map[string]teamstore.SessionContext{
+		"s001": {
+			ID:            "s001",
+			Status:        teamstore.SessionStatusActive,
+			TeamsChatID:   "new-chat",
+			TeamsChatURL:  "https://teams.example/new-chat",
+			TeamsTopic:    "durable topic",
+			CodexThreadID: "durable-thread",
+			CreatedAt:     now.Add(-time.Hour),
+			UpdatedAt:     now,
+		},
+	}}, "s001")
+	if resolved == nil || resolved.ChatID != "new-chat" || resolved.CodexThreadID != "durable-thread" {
+		t.Fatalf("resolved session = %#v, want durable binding", resolved)
+	}
+	if projected := bridge.reg.SessionByID("s001"); projected == nil || projected.ChatID != "new-chat" {
+		t.Fatalf("resolver should heal stale registry from durable state: %#v", projected)
+	}
+}
+
+func TestBridgeSessionForIDStateDoesNotFallbackWhenDurableAuthorityRejectsRegistrySession(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, newBridgeTestStore(t), &recordingExecutor{})
+	if resolved := bridge.sessionForIDState(teamstore.State{Sessions: map[string]teamstore.SessionContext{
+		"other": {ID: "other", Status: teamstore.SessionStatusActive, TeamsChatID: "other-chat"},
+	}}, "s001"); resolved != nil {
+		t.Fatalf("missing durable session fell back to stale registry: %#v", resolved)
+	}
+	if resolved := bridge.sessionForIDState(teamstore.State{Sessions: map[string]teamstore.SessionContext{
+		"s001": {ID: "s001", Status: teamstore.SessionStatusActive},
+	}}, "s001"); resolved != nil {
+		t.Fatalf("unbound durable session fell back to stale registry: %#v", resolved)
+	}
+	if resolved := bridge.sessionForIDState(teamstore.State{Sessions: map[string]teamstore.SessionContext{}}, "s001"); resolved == nil || resolved.ChatID != "chat-1" {
+		t.Fatalf("legacy empty durable store should retain registry fallback: %#v", resolved)
+	}
+}
+
+func TestBridgeProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(t *testing.T) {
+	testBridgeProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(t, false)
+}
+
+func TestBridgeProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistrySQLite(t *testing.T) {
+	testBridgeProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(t, true)
+}
+
+func testBridgeProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(t *testing.T, migrate bool) {
+	now := time.Now().UTC().Round(0)
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "must not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:          "other",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "other-chat",
+	}); err != nil {
+		t.Fatalf("seed durable authority: %v", err)
+	}
+	if _, created, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
+		ID:             "inbound-missing-durable-session",
+		SessionID:      "s001",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "message-missing-durable-session",
+		Text:           "do not route through stale registry",
+		Status:         teamstore.InboundStatusDeferred,
+		Source:         "teams",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil || !created {
+		t.Fatalf("persist deferred inbound created=%v err=%v", created, err)
+	}
+	if migrate {
+		if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+			t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+		}
+	}
+	if err := bridge.processDeferredInbound(context.Background()); err != nil {
+		t.Fatalf("processDeferredInbound: %v", err)
+	}
+	if len(executor.prompts) != 0 || len(*sent) != 0 {
+		t.Fatalf("missing durable session produced side effects: prompts=%#v sent=%#v", executor.prompts, *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	if got := state.InboundEvents["inbound-missing-durable-session"].Status; got != teamstore.InboundStatusIgnored {
+		t.Fatalf("missing durable session inbound status = %q, want ignored", got)
+	}
+}
+
 func TestBridgePollOnceDoesNotSyncForeignControlChatBinding(t *testing.T) {
 	readGraph := newBridgePollGraph(t, []bridgePollPage{{
 		messages: nil,
@@ -19205,6 +19669,73 @@ func TestBridgePollOnceSQLiteDefersIdleWorkChatAutoParkToSweeper(t *testing.T) {
 	}
 }
 
+func TestBridgePollOnceSQLitePersistsDynamicParkHandoffAndPreservesContinuation(t *testing.T) {
+	now := time.Now()
+	oldActivity := now.Add(-49 * time.Hour)
+	continuation := "/chats/chat-1/messages?$skiptoken=missed-page"
+	readGraph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("pollOnce should hand dynamic parking to the SQLite sweeper without a Graph read: %s %s", r.Method, r.URL.String())
+			return httptest.NewRecorder().Result(), nil
+		})},
+		baseURL: "https://graph.example.test",
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed control poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule control poll: %v", err)
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:          "s001",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "chat-1",
+		UpdatedAt:   oldActivity,
+	}); err != nil {
+		t.Fatalf("create durable session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccessWithContinuation(context.Background(), "chat-1", oldActivity, true, true, 20, continuation); err != nil {
+		t.Fatalf("seed continuation: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         "chat-1",
+		PollState:      inboundPollStateCool,
+		NextPollAt:     now.Add(-time.Minute),
+		LastActivityAt: oldActivity,
+	}); err != nil {
+		t.Fatalf("schedule stale cool poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce error: %v", err)
+	}
+	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
+	}
+	if poll.PollState != inboundPollStateCold || poll.ContinuationPath != continuation || !poll.ParkedAt.IsZero() || !poll.ParkNoticeSentAt.IsZero() {
+		t.Fatalf("dynamic park handoff lost state or continuation: %#v", poll)
+	}
+	candidates, handled, err := store.IdleWorkChatParkCandidates(context.Background(), "control-chat", now.Add(-inboundPollParkAfter), 10)
+	if err != nil || !handled || len(candidates) != 1 || candidates[0].Session.ID != "s001" {
+		t.Fatalf("auto-park candidates = %#v handled=%v err=%v", candidates, handled, err)
+	}
+}
+
 func TestBridgeIdleWorkChatAutoParkSweeperProcessesOneSQLiteCandidatePerInterval(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
@@ -19420,7 +19951,7 @@ func TestBridgeIdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuation
 	}
 	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
 		ChatID:         "chat-1",
-		PollState:      inboundPollStateCold,
+		PollState:      inboundPollStateCool,
 		NextPollAt:     now.Add(-time.Minute),
 		LastActivityAt: oldActivity,
 	}); err != nil {
@@ -19433,7 +19964,26 @@ func TestBridgeIdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuation
 	bridge := newBridgeTestBridge(writeGraph, store, executor)
 	bridge.readGraph = readGraph
 	bridge.reg.ControlChatURL = "https://teams.microsoft.com/l/chat/control/conversations"
+	bridge.reg.Sessions[0].ChatID = "stale-registry-chat"
+	bridge.reg.Sessions[0].ChatURL = "https://teams.example/stale-registry-chat"
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
+	bridge.reg.Chats = map[string]ChatState{"stale-registry-chat": {}}
+
+	// Exercise the real scheduler handoff first. The cool row must become a
+	// sweeper candidate without reading Graph or discarding the continuation.
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce handoff error: %v", err)
+	}
+	handoff, ok, err := store.ChatPoll(context.Background(), "chat-1")
+	if err != nil || !ok {
+		t.Fatalf("handoff ChatPoll ok=%v err=%v", ok, err)
+	}
+	if handoff.PollState != inboundPollStateCold || handoff.ContinuationPath == "" {
+		t.Fatalf("scheduler handoff did not preserve continuation: %#v", handoff)
+	}
+	if projected := bridge.reg.SessionByID("s001"); projected == nil || projected.ChatID != "chat-1" {
+		t.Fatalf("scheduler handoff did not heal stale registry: %#v", projected)
+	}
 
 	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
 		t.Fatalf("auto-park sweep error: %v", err)
@@ -22658,9 +23208,11 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
+	bridge.reg.Sessions[0].ChatID = "stale-registry-chat"
+	bridge.reg.Sessions[0].ChatURL = "https://teams.example/stale-registry-chat"
 	bridge.reg.Sessions[0].CodexThreadID = "thread-1"
 	bridge.reg.Sessions[0].Cwd = "/workspace/demo"
-	bridge.reg.Chats = map[string]ChatState{"chat-1": {SeenMessageIDs: []string{"seen-old"}}}
+	bridge.reg.Chats = map[string]ChatState{"stale-registry-chat": {SeenMessageIDs: []string{"seen-stale"}}}
 	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
 
 	recreated, err := bridge.RecreateSessionChat(context.Background(), "chat-1", RecreateSessionChatOptions{})
@@ -23735,6 +24287,15 @@ func TestBridgeRunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheck
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
+	if _, _, err := store.UpdateSessionContext(context.Background(), session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		current.TeamsChatID = "new-chat"
+		current.TeamsChatURL = "https://teams.example/new-chat"
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("rebind durable session for backfill: %v", err)
+	}
+	bridge.reg.Sessions[0].ChatID = "stale-registry-chat"
+	bridge.reg.Sessions[0].ChatURL = "https://teams.example/stale-registry-chat"
 	*sent = nil
 	beforeState, err := store.Load(context.Background())
 	if err != nil {
@@ -23762,13 +24323,16 @@ func TestBridgeRunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheck
 		sessionID:        session.ID,
 		expectedThreadID: "thread-1",
 		turnID:           "turn-active",
-		chatID:           session.ChatID,
+		chatID:           "stale-forwarder-chat",
 	}
 
 	forwarder.sendIdleStatus(3 * time.Minute)
 
 	if len(*sent) != 1 {
 		t.Fatalf("sent %d messages, want one transcript progress backfill: %#v", len(*sent), *sent)
+	}
+	if (*sent)[0].ChatID != "new-chat" {
+		t.Fatalf("transcript backfill routed to %q, want durable new-chat", (*sent)[0].ChatID)
 	}
 	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
 	if !strings.Contains(plain, "watchdog progress") || strings.Contains(plain, "Still working") || strings.Contains(plain, "final must wait") {
@@ -32166,13 +32730,18 @@ func newBridgePollAndSendGraph(t *testing.T, pages []bridgePollPage) (*GraphClie
 }
 
 func newBridgeRetryGraph(t *testing.T, original ChatMessage) (*GraphClient, *[]bridgeSentMessage) {
+	return newBridgeRetryGraphForChat(t, "chat-1", original)
+}
+
+func newBridgeRetryGraphForChat(t *testing.T, chatID string, original ChatMessage) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
 	gotOriginal := false
+	wantMessagePath := "/chats/" + strings.TrimSpace(chatID) + "/messages/" + strings.TrimSpace(original.ID)
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		w := httptest.NewRecorder()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/original-1":
+		case r.Method == http.MethodGet && r.URL.Path == wantMessagePath:
 			gotOriginal = true
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(original); err != nil {

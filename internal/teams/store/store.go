@@ -543,11 +543,16 @@ const (
 )
 
 type ServiceControl struct {
-	Paused    bool      `json:"paused,omitempty"`
-	Draining  bool      `json:"draining,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Paused               bool      `json:"paused,omitempty"`
+	Draining             bool      `json:"draining,omitempty"`
+	Reason               string    `json:"reason,omitempty"`
+	DrainOperationID     string    `json:"drain_operation_id,omitempty"`
+	LastDrainOperationID string    `json:"last_drain_operation_id,omitempty"`
+	LastDrainOperationAt time.Time `json:"last_drain_operation_at,omitempty"`
+	UpdatedAt            time.Time `json:"updated_at,omitempty"`
 }
+
+var ErrDrainOperationConflict = errors.New("teams drain is owned by another operation")
 
 type UpgradePhase string
 
@@ -1050,6 +1055,31 @@ func DefaultPath() (string, error) {
 	return resolveMigratedDefaultPath(path, legacyPath), nil
 }
 
+// DefaultPathReadOnly returns the best existing default store path without
+// migrating, copying, locking, chmodding, or otherwise mutating either path.
+// It is intended for status and diagnostic commands.
+func DefaultPathReadOnly() (string, error) {
+	path, err := appdirs.StatePath("teams", "state.json")
+	if err != nil {
+		return "", err
+	}
+	if ok, statErr := storePathExists(path); statErr != nil {
+		return "", statErr
+	} else if ok {
+		return path, nil
+	}
+	legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "state.json")
+	if legacyErr != nil {
+		return path, nil
+	}
+	if ok, statErr := storePathExists(legacyPath); statErr != nil {
+		return "", statErr
+	} else if ok {
+		return legacyPath, nil
+	}
+	return path, nil
+}
+
 func resolveMigratedDefaultPath(path string, legacyPath string) string {
 	if defaultPathMigrationComplete(path, legacyPath) {
 		return path
@@ -1246,6 +1276,44 @@ func (s *Store) Load(ctx context.Context) (State, error) {
 		return err
 	})
 	return state, err
+}
+
+// LoadPathReadOnly loads a JSON or SQLite-backed store without taking the
+// writable flock, creating lock files, running migrations, configuring WAL,
+// or changing file permissions. Callers get a point-in-time diagnostic
+// snapshot; normal runtime code should continue to use Store.Load.
+func LoadPathReadOnly(ctx context.Context, path string) (State, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return State{}, err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newState(), nil
+	}
+	if err != nil {
+		return State{}, err
+	}
+	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		store := &Store{path: path}
+		dbPath, err := store.storeSQLitePath(pointer)
+		if err != nil {
+			return State{}, err
+		}
+		return loadSQLiteStateFileReadOnly(ctx, dbPath)
+	}
+	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	return loadStateData(data)
 }
 
 func (s *Store) LoadLegacyJSONState(ctx context.Context) (State, bool, error) {
@@ -2420,17 +2488,43 @@ func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (Serv
 }
 
 func (s *Store) SetDraining(ctx context.Context, reason string) (ServiceControl, error) {
+	return s.setDrainingOperation(ctx, reason, "")
+}
+
+// SetDrainingOperation acquires a persisted maintenance fence. A different
+// operation cannot replace the fence until its owner releases it explicitly.
+func (s *Store) SetDrainingOperation(ctx context.Context, reason string, operationID string) (ServiceControl, error) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return ServiceControl{}, fmt.Errorf("drain operation id is required")
+	}
+	return s.setDrainingOperation(ctx, reason, operationID)
+}
+
+func (s *Store) setDrainingOperation(ctx context.Context, reason string, operationID string) (ServiceControl, error) {
 	var out ServiceControl
 	update := func(state *State) error {
 		next := state.ServiceControl
 		reason = strings.TrimSpace(reason)
-		if next.Draining && next.Reason == reason {
+		if next.Draining && next.DrainOperationID != operationID && (next.DrainOperationID != "" || operationID != "") {
 			out = next
-			return nil
+			return fmt.Errorf("%w: current=%q requested=%q", ErrDrainOperationConflict, next.DrainOperationID, operationID)
 		}
+		if next.Draining && next.Reason == reason && next.DrainOperationID == operationID {
+			out = next
+			return errStoreNoChange
+		}
+		now := time.Now()
 		next.Draining = true
 		next.Reason = reason
-		next.UpdatedAt = time.Now()
+		next.DrainOperationID = operationID
+		if operationID != "" {
+			// Retain the last fenced maintenance operation after drain release so
+			// a subsequent helper start does not select a richer stale mirror.
+			next.LastDrainOperationID = operationID
+			next.LastDrainOperationAt = now
+		}
+		next.UpdatedAt = now
 		state.ServiceControl = next
 		out = next
 		return nil
@@ -2443,14 +2537,33 @@ func (s *Store) SetDraining(ctx context.Context, reason string) (ServiceControl,
 }
 
 func (s *Store) ClearDrain(ctx context.Context) (ServiceControl, error) {
+	return s.clearDrainOperation(ctx, "", false)
+}
+
+// ClearDrainOperation releases a maintenance fence only when the operation ID
+// still matches, preventing stale cleanup from clearing a newer drain.
+func (s *Store) ClearDrainOperation(ctx context.Context, operationID string) (ServiceControl, error) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return ServiceControl{}, fmt.Errorf("drain operation id is required")
+	}
+	return s.clearDrainOperation(ctx, operationID, true)
+}
+
+func (s *Store) clearDrainOperation(ctx context.Context, operationID string, fenced bool) (ServiceControl, error) {
 	var out ServiceControl
 	update := func(state *State) error {
 		next := state.ServiceControl
 		if !next.Draining {
 			out = next
-			return nil
+			return errStoreNoChange
+		}
+		if fenced && next.DrainOperationID != operationID {
+			out = next
+			return fmt.Errorf("%w: current=%q requested=%q", ErrDrainOperationConflict, next.DrainOperationID, operationID)
 		}
 		next.Draining = false
+		next.DrainOperationID = ""
 		if !next.Paused {
 			next.Reason = ""
 		}
@@ -2726,6 +2839,9 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 			return ErrUpgradeInProgress
 		}
 		previous := state.ServiceControl
+		if previous.Draining && previous.DrainOperationID != "" {
+			return fmt.Errorf("%w: current=%q requested=upgrade", ErrDrainOperationConflict, previous.DrainOperationID)
+		}
 		req := UpgradeRequest{
 			ID:              upgradeID(reason, now),
 			Phase:           UpgradePhaseDraining,
@@ -2740,6 +2856,7 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 		control := previous
 		control.Draining = true
 		control.Reason = reason
+		control.DrainOperationID = ""
 		control.UpdatedAt = now
 		state.ServiceControl = control
 		state.Upgrade = &req
@@ -2773,6 +2890,9 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 			req = *state.Upgrade
 		} else {
 			previous := state.ServiceControl
+			if previous.Draining && previous.DrainOperationID != "" {
+				return fmt.Errorf("%w: current=%q requested=upgrade-rescue", ErrDrainOperationConflict, previous.DrainOperationID)
+			}
 			req = UpgradeRequest{
 				ID:              upgradeID(reason, now),
 				Phase:           UpgradePhaseRescuing,
@@ -2784,6 +2904,7 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 			control := previous
 			control.Draining = true
 			control.Reason = reason
+			control.DrainOperationID = ""
 			control.UpdatedAt = now
 			state.ServiceControl = control
 		}
@@ -3164,6 +3285,7 @@ func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, 
 		}
 		next := state.ServiceControl
 		next.Draining = false
+		next.DrainOperationID = ""
 		if !next.Paused {
 			next.Reason = ""
 		}

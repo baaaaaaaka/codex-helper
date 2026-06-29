@@ -3,9 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -69,6 +71,130 @@ func TestTeamsStatusReportsLocalStateWithoutCreatingDefaultState(t *testing.T) {
 	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
 		t.Fatalf("teams status should not create registry file, stat err = %v", err)
 	}
+}
+
+func TestTeamsStatusIsStrictlyReadOnlyAcrossLegacyRegistryAndStore(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "codex-proxy")
+	if runtime.GOOS == "windows" {
+		exe = filepath.Join(tmp, "codex-proxy.exe")
+	}
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-test'\n"), 0o700); err != nil {
+		t.Fatalf("write fake helper: %v", err)
+	}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    runtime.GOOS,
+		exe:     exe,
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{output: []byte("inactive\n")},
+	})
+	legacyStore := filepath.Join(configBase, "codex-helper", "teams", "state.json")
+	legacyRegistry := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
+	for path, body := range map[string]string{
+		legacyStore:    `{"schema_version":5,"control_chat":{"teams_chat_id":"legacy-control","teams_chat_url":"https://teams.example/legacy-control"},"sessions":{"s001":{"id":"s001","status":"active","teams_chat_id":"legacy-work"}},"chat_polls":{"legacy-work":{"chat_id":"legacy-work","poll_state":"warm","seeded":true}}}`,
+		legacyRegistry: `{"version":1,"control_chat_id":"legacy-control","sessions":[{"id":"s001","chat_id":"legacy-work","status":"active"}]}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o640); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	for i := 0; i < 2; i++ {
+		output := executeRootForTeamsTest(t, "teams", "status")
+		if !strings.Contains(output, "Control chat: configured") || !strings.Contains(output, "Authority diagnostics: healthy") {
+			t.Fatalf("read-only status iteration %d output:\n%s", i, output)
+		}
+	}
+	controlOutput := executeRootForTeamsTest(t, "teams", "control", "--print")
+	if !strings.Contains(controlOutput, "legacy-control") {
+		t.Fatalf("read-only control output:\n%s", controlOutput)
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("teams status changed filesystem:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestBuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles(t *testing.T) {
+	reg := teams.Registry{Sessions: []teams.Session{{ID: "s001", ChatID: "registry-old"}}}
+	storeA := teamsStatusStoreSnapshot{
+		Path:      "/state/live.json",
+		OwnerKind: teamsStatusOwnerLive,
+		State: teamsstore.State{
+			Sessions: map[string]teamsstore.SessionContext{
+				"s001": {ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "durable-new"},
+			},
+			ChatPolls: map[string]teamsstore.ChatPollState{
+				"orphan-chat": {ChatID: "orphan-chat", PollState: "warm"},
+				"parked-chat": {ChatID: "parked-chat", PollState: "parked", ContinuationPath: "/next"},
+			},
+		},
+	}
+	storeB := teamsStatusStoreSnapshot{
+		Path:      "/state/retained.json",
+		OwnerKind: teamsStatusOwnerStale,
+		State: teamsstore.State{Sessions: map[string]teamsstore.SessionContext{
+			"s001": {ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "retained-old"},
+		}},
+	}
+	got := buildTeamsAuthorityDiagnostics([]teamsStatusStoreSnapshot{storeA, storeB}, reg, "control-chat")
+	want := teamsAuthorityDiagnostics{
+		ActiveMissingPoll:          1,
+		RegistryBindingMismatches:  1,
+		CrossStoreBindingConflicts: 1,
+		ParkedContinuations:        1,
+		OrphanPollRows:             2,
+	}
+	if got != want {
+		t.Fatalf("authority diagnostics = %#v, want %#v", got, want)
+	}
+	if formatted := formatTeamsAuthorityDiagnostics(got); !strings.Contains(formatted, "registry_binding_mismatch=1") || !strings.Contains(formatted, "parked_continuations=1") {
+		t.Fatalf("formatted authority diagnostics = %q", formatted)
+	}
+}
+
+type cliReadOnlyFileSnapshot struct {
+	Mode    os.FileMode
+	Size    int64
+	ModTime int64
+	Data    string
+}
+
+func snapshotCLITreeForReadOnlyTest(t *testing.T, root string) map[string]cliReadOnlyFileSnapshot {
+	t.Helper()
+	out := make(map[string]cliReadOnlyFileSnapshot)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		out[rel] = cliReadOnlyFileSnapshot{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime().UnixNano(), Data: string(data)}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot tree %s: %v", root, err)
+	}
+	return out
 }
 
 func TestTeamsStoreAndRegistryPathsSkipMigratedLegacyMirrors(t *testing.T) {
@@ -1550,6 +1676,180 @@ func TestDrainTeamsBridgeForChatRecreateWaitsForOwnerAndClearsDrain(t *testing.T
 	}
 	if !strings.Contains(out.String(), "Waiting for active Teams listener") || !strings.Contains(out.String(), "Teams listener drained.") {
 		t.Fatalf("unexpected drain output:\n%s", out.String())
+	}
+}
+
+func TestBeginTeamsBridgeDrainForChatRecreateKeepsFencedUntilRelease(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner error: %v", err)
+	}
+	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
+	}
+	prevPollInterval := teamsUpgradePollInterval
+	teamsUpgradePollInterval = time.Millisecond
+	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.After(2 * time.Second)
+		for {
+			control, readErr := st.ReadControl(context.Background())
+			if readErr == nil && control.Draining && control.DrainOperationID != "" {
+				_ = st.ClearOwner(context.Background())
+				return
+			}
+			select {
+			case <-deadline:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, st.Path())
+	if err != nil {
+		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
+	}
+	<-done
+	control, err := st.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl while fenced: %v", err)
+	}
+	if !control.Draining || control.DrainOperationID != drain.operationID {
+		t.Fatalf("maintenance fence was released before recreate/save: %#v", control)
+	}
+	if _, err := st.ClearDrainOperation(context.Background(), "stale-operation"); !errors.Is(err, teamsstore.ErrDrainOperationConflict) {
+		t.Fatalf("stale cleanup error = %v", err)
+	}
+	if err := drain.Release(context.Background()); err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	control, err = st.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl after release: %v", err)
+	}
+	if control.Draining || control.DrainOperationID != "" {
+		t.Fatalf("maintenance fence remains after release: %#v", control)
+	}
+}
+
+func TestBeginTeamsBridgeDrainForChatRecreateOnlyFencesPinnedStore(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	primary, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("open primary store: %v", err)
+	}
+	t.Cleanup(func() { _ = primary.Close() })
+	secondaryPath := cliStatePathForTest(t, "teams", "scopes", "unrelated-scope", "state.json")
+	secondary, err := teamsstore.Open(secondaryPath)
+	if err != nil {
+		t.Fatalf("open secondary store: %v", err)
+	}
+	t.Cleanup(func() { _ = secondary.Close() })
+	if err := secondary.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope.ID = "unrelated-scope"
+		return nil
+	}); err != nil {
+		t.Fatalf("seed secondary store: %v", err)
+	}
+
+	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, primary.Path())
+	if err != nil {
+		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
+	}
+	primaryControl, err := primary.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl primary: %v", err)
+	}
+	secondaryControl, err := secondary.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl secondary: %v", err)
+	}
+	if !primaryControl.Draining || primaryControl.DrainOperationID != drain.operationID {
+		t.Fatalf("primary store was not fenced: %#v", primaryControl)
+	}
+	if secondaryControl.Draining || secondaryControl.DrainOperationID != "" {
+		t.Fatalf("unrelated store was fenced: %#v", secondaryControl)
+	}
+	if err := drain.Release(context.Background()); err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+}
+
+func TestTeamsChatRecreateDrainReleaseDoesNotClearNewerFence(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, st.Path())
+	if err != nil {
+		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
+	}
+	if _, err := st.ClearDrainOperation(context.Background(), drain.operationID); err != nil {
+		t.Fatalf("clear original fence: %v", err)
+	}
+	if _, err := st.SetDrainingOperation(context.Background(), "new maintenance", "newer-operation"); err != nil {
+		t.Fatalf("set newer fence: %v", err)
+	}
+	if err := drain.Release(context.Background()); !errors.Is(err, teamsstore.ErrDrainOperationConflict) {
+		t.Fatalf("stale Release error = %v", err)
+	}
+	control, err := st.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("ReadControl newer fence: %v", err)
+	}
+	if !control.Draining || control.DrainOperationID != "newer-operation" {
+		t.Fatalf("stale Release cleared newer fence: %#v", control)
+	}
+	if _, err := st.ClearDrainOperation(context.Background(), "newer-operation"); err != nil {
+		t.Fatalf("cleanup newer fence: %v", err)
+	}
+}
+
+func TestBeginTeamsBridgeDrainForChatRecreateDoesNotMigrateLegacyStore(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	legacyPath := filepath.Join(configBase, "codex-helper", "teams", "state.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o750); err != nil {
+		t.Fatalf("mkdir legacy store: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":5}`), 0o640); err != nil {
+		t.Fatalf("write legacy store: %v", err)
+	}
+	currentPath := cliStatePathForTest(t, "teams", "state.json")
+	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, legacyPath)
+	if err != nil {
+		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
+	}
+	if _, err := os.Stat(currentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recreate drain migrated legacy store to %s: %v", currentPath, err)
+	}
+	if err := drain.Release(context.Background()); err != nil {
+		t.Fatalf("Release error: %v", err)
+	}
+	if _, err := os.Stat(currentPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recreate release migrated legacy store to %s: %v", currentPath, err)
 	}
 }
 

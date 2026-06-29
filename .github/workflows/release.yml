@@ -147,6 +147,29 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestBridge(EnsureControlChatDoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding))$' -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams durable routing authority regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          durable_routing_pattern='TestBridge(DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|PollOnce(UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChatRebindsSessionAndRetiresOldRouting|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
+          scope_authority_pattern='TestResolveStorePathFor(Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
+          go test ./internal/teams -count=1 -run "$durable_routing_pattern" -v
+          go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
+
+      - name: Teams read-only diagnostics regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(TeamsStatusIsStrictlyReadOnlyAcrossLegacyRegistryAndStore|BuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles)$' -v
+          go test ./internal/teams/store -count=1 -run 'TestLoadPathReadOnly(JSONDoesNotCreateLockOrModifyFiles|SQLite(DoesNotModifyDatabaseFamily|SeesLiveWALWithoutModifyingPersistentFiles|RetriesWhenWALAppearsDuringImmutableRead|LiveWALWithoutSHMFailsWithoutCreatingSidecar))$' -v
+
+      - name: Teams recreate maintenance fence regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams/store -count=1 -run 'TestServiceControlDrainOperationFence$' -v
+          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|TeamsChatRecreateDrainReleaseDoesNotClearNewerFence|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
+
       - name: Teams SQLite row-level migration regressions
         shell: bash
         run: |

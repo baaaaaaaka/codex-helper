@@ -24,6 +24,14 @@ const (
 	envTeamsMachineKind     = "CODEX_HELPER_TEAMS_MACHINE_KIND"
 	envTeamsMachinePriority = "CODEX_HELPER_TEAMS_MACHINE_PRIORITY"
 	envTeamsProfile         = "CODEX_HELPER_TEAMS_PROFILE"
+
+	// Scope resolution runs outside the listener and therefore cannot reuse the
+	// listener's configured stale-after value. Five minutes matches the CLI's
+	// conservative owner-recovery default while still rejecting retained owner
+	// records from an old store.
+	scopeStoreOwnerFreshAfter = 5 * time.Minute
+	scopeStoreFreshOwnerScore = 1000000
+	scopeStoreFreshLeaseScore = 500000
 )
 
 var (
@@ -76,6 +84,32 @@ func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIde
 	return scope, currentPath, nil
 }
 
+// ResolveStorePathForMaintenance selects the authoritative existing store
+// without migrating it. Chat recreation uses this while a listener is still
+// alive so owner metadata continues to identify the exact store that must be
+// mutated after the listener drains.
+func ResolveStorePathForMaintenance(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
+	scope = normalizeScopeForResolution(scope)
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		return scope, "", err
+	}
+	resolved, path, ok, err := resolveExistingScopeStoreForMaintenance(scope, currentPath)
+	if err != nil {
+		return scope, "", err
+	}
+	if !ok {
+		return scope, currentPath, nil
+	}
+	if strings.TrimSpace(resolved.ID) != "" {
+		scope.ID = resolved.ID
+	}
+	if !resolved.CreatedAt.IsZero() {
+		scope.CreatedAt = resolved.CreatedAt
+	}
+	return scope, path, nil
+}
+
 func ResolveRegistryPathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
 	resolved, storePath, err := ResolveStorePathForScope(scope)
 	if err != nil {
@@ -114,13 +148,24 @@ func DefaultRegistryPathForScope(scopeID string) (string, error) {
 }
 
 type resolvedScopeStoreCandidate struct {
-	scope   teamstore.ScopeIdentity
-	path    string
-	score   int
-	updated time.Time
+	scope                teamstore.ScopeIdentity
+	path                 string
+	score                int
+	updated              time.Time
+	freshAuthority       bool
+	authorityUpdated     time.Time
+	maintenanceAuthority bool
 }
 
 func resolveExistingScopeStore(scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
+	return resolveExistingScopeStoreWithOptions(scope, currentPath, false)
+}
+
+func resolveExistingScopeStoreForMaintenance(scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
+	return resolveExistingScopeStoreWithOptions(scope, currentPath, true)
+}
+
+func resolveExistingScopeStoreWithOptions(scope teamstore.ScopeIdentity, currentPath string, preferFreshAuthority bool) (teamstore.ScopeIdentity, string, bool, error) {
 	paths, err := candidateScopeStorePaths(currentPath)
 	if err != nil {
 		return teamstore.ScopeIdentity{}, "", false, err
@@ -172,14 +217,23 @@ func resolveExistingScopeStore(scope teamstore.ScopeIdentity, currentPath string
 			candidateScope = scope
 		}
 		score := scopeStoreResolutionScore(state, path, currentPath, now)
+		freshAuthority := scopeStoreHasFreshOwner(state, now) || scopeStoreHasFreshControlLease(state, now)
+		if preferFreshAuthority {
+			score += scopeStoreFreshAuthorityScore(state, now)
+		}
 		if isDefaultGlobalStorePath(path) {
 			score -= 10000
 		}
 		candidate := resolvedScopeStoreCandidate{
-			scope:   candidateScope,
-			path:    path,
-			score:   score,
-			updated: candidateScope.UpdatedAt,
+			scope:            candidateScope,
+			path:             path,
+			score:            score,
+			updated:          candidateScope.UpdatedAt,
+			freshAuthority:   freshAuthority,
+			authorityUpdated: state.ServiceControl.LastDrainOperationAt,
+		}
+		if state.ServiceControl.LastDrainOperationAt.After(candidate.updated) {
+			candidate.updated = state.ServiceControl.LastDrainOperationAt
 		}
 		if info, err := os.Stat(path); err == nil && info.ModTime().After(candidate.updated) {
 			candidate.updated = info.ModTime()
@@ -192,7 +246,42 @@ func resolveExistingScopeStore(scope teamstore.ScopeIdentity, currentPath string
 		}
 		return teamstore.ScopeIdentity{}, "", false, nil
 	}
+	if preferFreshAuthority {
+		var freshPaths []string
+		for _, candidate := range candidates {
+			if candidate.freshAuthority {
+				freshPaths = append(freshPaths, candidate.path)
+			}
+		}
+		if len(freshPaths) > 1 {
+			sort.Strings(freshPaths)
+			return teamstore.ScopeIdentity{}, "", false, fmt.Errorf("multiple live Teams stores claim scope %q: %s", scope.ID, strings.Join(freshPaths, ", "))
+		}
+	}
+	for i := range candidates {
+		marker := candidates[i].authorityUpdated
+		if marker.IsZero() {
+			continue
+		}
+		newerCandidateExists := false
+		for j := range candidates {
+			if i != j && candidates[j].updated.After(marker) {
+				newerCandidateExists = true
+				break
+			}
+		}
+		candidates[i].maintenanceAuthority = !newerCandidateExists
+	}
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].freshAuthority != candidates[j].freshAuthority {
+			return candidates[i].freshAuthority
+		}
+		if candidates[i].maintenanceAuthority != candidates[j].maintenanceAuthority {
+			return candidates[i].maintenanceAuthority
+		}
+		if candidates[i].maintenanceAuthority && !candidates[i].authorityUpdated.Equal(candidates[j].authorityUpdated) {
+			return candidates[i].authorityUpdated.After(candidates[j].authorityUpdated)
+		}
 		if candidates[i].score != candidates[j].score {
 			return candidates[i].score > candidates[j].score
 		}
@@ -1060,10 +1149,14 @@ func scopeStoreResolutionScore(state teamstore.State, path string, currentPath s
 	if teamstore.HasUpgradeBlockingWork(state, now) {
 		score += 1000
 	}
-	if state.ServiceOwner != nil || state.LockOwner != nil {
+	if scopeStoreHasFreshOwner(state, now) {
+		score += scopeStoreFreshOwnerScore
+	} else if state.ServiceOwner != nil || state.LockOwner != nil {
 		score += 900
 	}
-	if state.ControlLease.HolderMachineID != "" {
+	if scopeStoreHasFreshControlLease(state, now) {
+		score += scopeStoreFreshLeaseScore
+	} else if state.ControlLease.HolderMachineID != "" {
 		score += 800
 	}
 	if strings.TrimSpace(state.ControlChat.TeamsChatID) != "" {
@@ -1072,6 +1165,43 @@ func scopeStoreResolutionScore(state teamstore.State, path string, currentPath s
 	score += len(state.Sessions) * 10
 	score += len(state.OutboxMessages)
 	return score
+}
+
+func scopeStoreFreshAuthorityScore(state teamstore.State, now time.Time) int {
+	// Maintenance resolution gives live evidence extra weight in addition to
+	// the normal resolver score. The explicit fresh-authority sort remains the
+	// final guard against a retained store with unusually many stale rows.
+	score := 0
+	if scopeStoreHasFreshOwner(state, now) {
+		score += scopeStoreFreshOwnerScore
+	}
+	if scopeStoreHasFreshControlLease(state, now) {
+		score += scopeStoreFreshLeaseScore
+	}
+	return score
+}
+
+func scopeStoreHasFreshOwner(state teamstore.State, now time.Time) bool {
+	for _, owner := range []*teamstore.OwnerMetadata{state.ServiceOwner, state.LockOwner} {
+		if owner == nil || owner.LastHeartbeat.IsZero() {
+			continue
+		}
+		if !teamstore.IsStale(*owner, scopeStoreOwnerFreshAfter, now) && !teamstore.OwnerAppearsLocallyDead(*owner) {
+			return true
+		}
+	}
+	return false
+}
+
+func scopeStoreHasFreshControlLease(state teamstore.State, now time.Time) bool {
+	lease := state.ControlLease
+	if strings.TrimSpace(lease.HolderMachineID) == "" || lease.Status != teamstore.ControlLeaseStatusActive || lease.LeaseUntil.IsZero() {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return lease.LeaseUntil.After(now)
 }
 
 func scopeStateMatches(current teamstore.ScopeIdentity, state teamstore.State) bool {

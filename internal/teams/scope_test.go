@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -150,6 +151,353 @@ func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testin
 	}
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("migrated state should exist: %v", err)
+	}
+}
+
+func TestResolveStorePathForMaintenancePinsLiveLegacyStoreWithoutMigrating(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	if _, err := legacyStore.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("record live legacy owner: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "original-chat"}); err != nil {
+		t.Fatalf("seed live legacy session: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "replacement-chat"}); err != nil {
+		t.Fatalf("seed retained current session: %v", err)
+	}
+	for i := 0; i < 25; i++ {
+		id := fmt.Sprintf("retained-%02d", i)
+		if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: id, Status: teamstore.SessionStatusActive, TeamsChatID: "retained-chat-" + id}); err != nil {
+			t.Fatalf("seed richer retained current session %s: %v", id, err)
+		}
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	resolved, path, err := ResolveStorePathForMaintenance(scope)
+	if err != nil {
+		t.Fatalf("ResolveStorePathForMaintenance: %v", err)
+	}
+	if resolved.ID != scope.ID || !samePath(path, legacyPath) {
+		t.Fatalf("maintenance resolution = %#v %q, want live legacy %q", resolved, path, legacyPath)
+	}
+	retained, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("reopen retained current store: %v", err)
+	}
+	state, err := retained.Load(context.Background())
+	closeErr := retained.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("load retained current store: load=%v close=%v", err, closeErr)
+	}
+	if got := state.Sessions["s014"].TeamsChatID; got != "replacement-chat" {
+		t.Fatalf("maintenance resolution migrated or rewrote retained store: got %q", got)
+	}
+}
+
+func TestResolveStorePathForScopeKeepsMaintenanceAuthorityAfterOwnerClears(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	if _, err := legacyStore.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("record live legacy owner: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "authoritative-chat"}); err != nil {
+		t.Fatalf("seed live legacy session: %v", err)
+	}
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "stale-chat"}); err != nil {
+		t.Fatalf("seed stale current session: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		id := fmt.Sprintf("retained-%02d", i)
+		if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: id, Status: teamstore.SessionStatusActive, TeamsChatID: "retained-chat-" + id}); err != nil {
+			t.Fatalf("seed richer current session %s: %v", id, err)
+		}
+	}
+	if err := currentStore.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceControl.LastDrainOperationID = "older-operation"
+		state.ServiceControl.LastDrainOperationAt = time.Now().Add(-time.Hour)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed older maintenance authority: %v", err)
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+	if _, err := legacyStore.SetDrainingOperation(context.Background(), "chat recreate", "operation-authority"); err != nil {
+		t.Fatalf("mark maintenance authority: %v", err)
+	}
+	if err := legacyStore.ClearOwner(context.Background()); err != nil {
+		t.Fatalf("clear owner after drain: %v", err)
+	}
+	if _, err := legacyStore.ClearDrainOperation(context.Background(), "operation-authority"); err != nil {
+		t.Fatalf("release maintenance fence: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if err != nil {
+		t.Fatalf("ResolveStorePathForScope: %v", err)
+	}
+	resolvedStore, err := teamstore.Open(resolvedPath)
+	if err != nil {
+		t.Fatalf("open resolved store: %v", err)
+	}
+	state, loadErr := resolvedStore.Load(context.Background())
+	closeErr := resolvedStore.Close()
+	if loadErr != nil || closeErr != nil {
+		t.Fatalf("load resolved store: load=%v close=%v", loadErr, closeErr)
+	}
+	if got := state.Sessions["s014"].TeamsChatID; got != "authoritative-chat" {
+		t.Fatalf("normal restart selected stale store %q at %s", got, resolvedPath)
+	}
+	if state.ServiceControl.LastDrainOperationID != "operation-authority" || state.ServiceControl.LastDrainOperationAt.IsZero() {
+		t.Fatalf("maintenance authority marker was not preserved: %#v", state.ServiceControl)
+	}
+}
+
+func TestResolveStorePathForScopeDoesNotLetOldMaintenanceMarkerOverrideNewerStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "old-chat"}); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if err := legacyStore.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceControl.LastDrainOperationID = "old-maintenance"
+		state.ServiceControl.LastDrainOperationAt = time.Now().Add(-2 * time.Hour)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old maintenance marker: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "new-chat"}); err != nil {
+		t.Fatalf("seed current session: %v", err)
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if err != nil {
+		t.Fatalf("ResolveStorePathForScope: %v", err)
+	}
+	resolvedStore, err := teamstore.Open(resolvedPath)
+	if err != nil {
+		t.Fatalf("open resolved store: %v", err)
+	}
+	state, loadErr := resolvedStore.Load(context.Background())
+	closeErr := resolvedStore.Close()
+	if loadErr != nil || closeErr != nil {
+		t.Fatalf("load resolved store: load=%v close=%v", loadErr, closeErr)
+	}
+	if got := state.Sessions["s014"].TeamsChatID; got != "new-chat" {
+		t.Fatalf("old maintenance marker overrode newer store: got %q from %s", got, resolvedPath)
+	}
+}
+
+func TestResolveStorePathForMaintenanceFreshOwnerBeatsStaleRicherStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	now := time.Now()
+	staleOwner, err := teamstore.CurrentOwner("v-stale", "", "", now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("CurrentOwner stale: %v", err)
+	}
+	staleOwner.LastHeartbeat = now.Add(-scopeStoreOwnerFreshAfter - time.Minute)
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open stale legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if err := legacyStore.Update(context.Background(), func(state *teamstore.State) error {
+		serviceOwner := staleOwner
+		lockOwner := staleOwner
+		state.ServiceOwner = &serviceOwner
+		state.LockOwner = &lockOwner
+		for i := 0; i < 40; i++ {
+			id := fmt.Sprintf("legacy-%02d", i)
+			state.Sessions[id] = teamstore.SessionContext{ID: id, Status: teamstore.SessionStatusActive, TeamsChatID: "legacy-chat-" + id}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale richer legacy store: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close stale legacy store: %v", err)
+	}
+
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open fresh current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	freshOwner, err := teamstore.CurrentOwner("v-fresh", "", "", now)
+	if err != nil {
+		t.Fatalf("CurrentOwner fresh: %v", err)
+	}
+	if _, err := currentStore.RecordOwnerHeartbeat(context.Background(), freshOwner, scopeStoreOwnerFreshAfter, now); err != nil {
+		t.Fatalf("record fresh current owner: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s014", Status: teamstore.SessionStatusActive, TeamsChatID: "live-current-chat"}); err != nil {
+		t.Fatalf("seed live current session: %v", err)
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close fresh current store: %v", err)
+	}
+
+	resolved, path, err := ResolveStorePathForMaintenance(scope)
+	if err != nil {
+		t.Fatalf("ResolveStorePathForMaintenance: %v", err)
+	}
+	if resolved.ID != scope.ID || !samePath(path, currentPath) {
+		t.Fatalf("maintenance resolution = %#v %q, want fresh current %q", resolved, path, currentPath)
+	}
+}
+
+func TestResolveStorePathForMaintenanceRejectsMultipleFreshAuthorities(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	for _, path := range []string{legacyPath, currentPath} {
+		st, err := teamstore.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		if _, err := st.RecordScope(context.Background(), scope); err != nil {
+			t.Fatalf("record scope %s: %v", path, err)
+		}
+		owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+		if err != nil {
+			t.Fatalf("CurrentOwner %s: %v", path, err)
+		}
+		if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, scopeStoreOwnerFreshAfter, time.Now()); err != nil {
+			t.Fatalf("record owner %s: %v", path, err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close %s: %v", path, err)
+		}
+	}
+
+	_, _, err = ResolveStorePathForMaintenance(scope)
+	if err == nil || !strings.Contains(err.Error(), "multiple live Teams stores claim scope") || !strings.Contains(err.Error(), legacyPath) || !strings.Contains(err.Error(), currentPath) {
+		t.Fatalf("multiple authority error = %v", err)
 	}
 }
 

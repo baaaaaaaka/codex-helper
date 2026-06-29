@@ -72,6 +72,31 @@ func DefaultRegistryPath() (string, error) {
 	return resolved, nil
 }
 
+// DefaultRegistryPathReadOnly resolves the existing default projection without
+// triggering the legacy migration/copy path. Status and diagnostics must not
+// mutate registry state merely by discovering it.
+func DefaultRegistryPathReadOnly() (string, error) {
+	path, err := appdirs.StatePath("teams", "registry.json")
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		return path, nil
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return "", statErr
+	}
+	legacyPath, legacyErr := appdirs.LegacyCachePath("teams-registry.json")
+	if legacyErr != nil {
+		return path, nil
+	}
+	if _, statErr := os.Stat(legacyPath); statErr == nil {
+		return legacyPath, nil
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return "", statErr
+	}
+	return path, nil
+}
+
 func LoadRegistry(path string) (Registry, error) {
 	if strings.TrimSpace(path) == "" {
 		var err error

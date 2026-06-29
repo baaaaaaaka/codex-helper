@@ -431,7 +431,16 @@ func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command 
 		Short: "Show or create the Teams control chat",
 		Long:  "Show, create, or recreate this machine's meeting-based Teams control chat. Without --no-create, this may call Microsoft Graph to create the chat, update its title, and send an @mention plus a ready message.",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) (runErr error) {
+			var recreateDrain *teamsChatRecreateDrain
+			defer func() {
+				if recreateDrain == nil {
+					return
+				}
+				if cleanupErr := recreateDrain.Release(context.Background()); cleanupErr != nil {
+					runErr = errors.Join(runErr, cleanupErr)
+				}
+			}()
 			if noCreate && recreate {
 				return fmt.Errorf("use only one of --no-create/--print or --recreate")
 			}
@@ -440,11 +449,6 @@ func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command 
 			}
 			if recreate && !yes {
 				return fmt.Errorf("recreating the control chat creates a new Teams chat and sends messages; rerun with --yes")
-			}
-			if recreate {
-				if err := drainTeamsBridgeForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout); err != nil {
-					return err
-				}
 			}
 			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 			if err != nil {
@@ -455,9 +459,24 @@ func newTeamsControlCmd(root *rootOptions, registryPath *string) *cobra.Command 
 			if err != nil {
 				return err
 			}
-			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			var bridge *teams.Bridge
+			if recreate {
+				bridge, err = teams.NewBridgeForChatRecreateWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			} else {
+				bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			}
 			if err != nil {
 				return err
+			}
+			if recreate {
+				maintenanceStorePath, err := bridge.PinStoreForMaintenance()
+				if err != nil {
+					return err
+				}
+				recreateDrain, err = beginTeamsBridgeDrainForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout, maintenanceStorePath)
+				if err != nil {
+					return err
+				}
 			}
 			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			var chat teams.Chat
@@ -516,12 +535,18 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 		Short: "Create a fresh Teams work chat for an existing session",
 		Long:  "Create a fresh meeting-based Teams work chat for an existing helper session and rebind local state. The old Teams chat is left untouched.",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			var recreateDrain *teamsChatRecreateDrain
+			defer func() {
+				if recreateDrain == nil {
+					return
+				}
+				if cleanupErr := recreateDrain.Release(context.Background()); cleanupErr != nil {
+					runErr = errors.Join(runErr, cleanupErr)
+				}
+			}()
 			if !yes {
 				return fmt.Errorf("recreating a work chat creates a new Teams chat and sends messages; rerun with --yes")
-			}
-			if err := drainTeamsBridgeForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout); err != nil {
-				return err
 			}
 			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 			if err != nil {
@@ -532,7 +557,15 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 			if err != nil {
 				return err
 			}
-			bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			bridge, err := teams.NewBridgeForChatRecreateWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			if err != nil {
+				return err
+			}
+			maintenanceStorePath, err := bridge.PinStoreForMaintenance()
+			if err != nil {
+				return err
+			}
+			recreateDrain, err = beginTeamsBridgeDrainForChatRecreate(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout, maintenanceStorePath)
 			if err != nil {
 				return err
 			}
@@ -558,49 +591,73 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 	return cmd
 }
 
-func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration) (err error) {
-	paths, err := existingTeamsStorePaths()
-	if err != nil {
-		return err
+type teamsChatRecreateStore struct {
+	Path string
+	St   *teamsstore.Store
+}
+
+type teamsChatRecreateDrain struct {
+	operationID string
+	stores      []teamsChatRecreateStore
+	released    bool
+}
+
+func (d *teamsChatRecreateDrain) Release(ctx context.Context) error {
+	if d == nil || d.released {
+		return nil
 	}
-	type recreateStore struct {
-		Path string
-		St   *teamsstore.Store
+	var releaseErrs []error
+	for _, item := range d.stores {
+		if _, err := item.St.ClearDrainOperation(ctx, d.operationID); err != nil {
+			releaseErrs = append(releaseErrs, fmt.Errorf("release recreate drain in %s: %w", item.Path, err))
+		}
+		if err := item.St.Close(); err != nil {
+			releaseErrs = append(releaseErrs, fmt.Errorf("close recreate store %s: %w", item.Path, err))
+		}
 	}
-	var stores []recreateStore
+	if len(releaseErrs) == 0 {
+		d.released = true
+		d.stores = nil
+	}
+	return errors.Join(releaseErrs...)
+}
+
+func beginTeamsBridgeDrainForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration, maintenanceStorePath string) (_ *teamsChatRecreateDrain, err error) {
+	maintenanceStorePath = strings.TrimSpace(maintenanceStorePath)
+	if maintenanceStorePath == "" {
+		maintenanceStorePath, err = teamsStorePathReadOnly()
+		if err != nil {
+			return nil, err
+		}
+	}
+	drain := &teamsChatRecreateDrain{
+		operationID: fmt.Sprintf("chat-recreate:%d:%d", os.Getpid(), time.Now().UnixNano()),
+	}
 	defer func() {
-		for _, item := range stores {
-			if closeErr := item.St.Close(); err == nil && closeErr != nil {
-				err = closeErr
+		if err != nil {
+			if cleanupErr := drain.Release(context.Background()); cleanupErr != nil {
+				err = errors.Join(err, cleanupErr)
 			}
 		}
 	}()
-	for _, path := range paths {
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return err
-		}
-		state, err := st.Load(ctx)
-		if err != nil {
-			return closeTeamsStoreWithPriorError(st, err)
-		}
-		owner, hasOwner := stateOwner(state)
-		if !hasOwner {
-			if err := st.Close(); err != nil {
-				return err
-			}
-			continue
-		}
-		if teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now()) {
-			return closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", path))
-		}
-		if _, err := st.SetDraining(ctx, "chat recreate"); err != nil {
-			return closeTeamsStoreWithPriorError(st, err)
-		}
-		stores = append(stores, recreateStore{Path: path, St: st})
+	st, err := teamsstore.Open(maintenanceStorePath)
+	if err != nil {
+		return nil, err
 	}
-	if len(stores) == 0 {
-		return nil
+	state, err := st.Load(ctx)
+	if err != nil {
+		return nil, closeTeamsStoreWithPriorError(st, err)
+	}
+	owner, hasOwner := stateOwner(state)
+	if hasOwner && teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now()) {
+		return nil, closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", maintenanceStorePath))
+	}
+	if _, err := st.SetDrainingOperation(ctx, "chat recreate", drain.operationID); err != nil {
+		return nil, closeTeamsStoreWithPriorError(st, err)
+	}
+	drain.stores = append(drain.stores, teamsChatRecreateStore{Path: maintenanceStorePath, St: st})
+	if len(drain.stores) == 0 {
+		return drain, nil
 	}
 	if timeout <= 0 {
 		timeout = defaultTeamsChatRecreateDrainTime
@@ -614,10 +671,10 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 	defer tick.Stop()
 	for {
 		drained := true
-		for _, item := range stores {
+		for _, item := range drain.stores {
 			itemDrained, err := teamsUpgradeStateDrained(ctx, item.St)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if !itemDrained {
 				drained = false
@@ -625,27 +682,28 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 			}
 		}
 		if drained {
-			for _, item := range stores {
-				if _, err := item.St.ClearDrain(ctx); err != nil {
-					return err
-				}
-			}
 			if out != nil {
 				_, _ = fmt.Fprintln(out, "Teams listener drained.")
+				_, _ = fmt.Fprintln(out, "Maintenance fence remains active until chat state is saved.")
 			}
-			return nil
+			return drain, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		case <-deadline.C:
-			for _, item := range stores {
-				_, _ = item.St.ClearDrain(context.Background())
-			}
-			return fmt.Errorf("timed out waiting for Teams listener to drain before recreating chat; run `codex-proxy teams status` or `codex-proxy teams recover --force` if the owner is gone")
+			return nil, fmt.Errorf("timed out waiting for Teams listener to drain before recreating chat; run `codex-proxy teams status` or `codex-proxy teams recover --force` if the owner is gone")
 		case <-tick.C:
 		}
 	}
+}
+
+func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration) error {
+	drain, err := beginTeamsBridgeDrainForChatRecreate(ctx, out, timeout, "")
+	if err != nil {
+		return err
+	}
+	return drain.Release(ctx)
 }
 
 func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
@@ -2003,11 +2061,11 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	for _, session := range reg.Sessions {
 		addStatusSession(statusSessions, session.ID, session.ChatID, session.Status)
 	}
-	defaultStatePath, err := teamsStorePath()
+	defaultStatePath, err := teamsStorePathReadOnly()
 	if err != nil {
 		return err
 	}
-	statePaths, err := existingTeamsStorePaths()
+	statePaths, err := existingTeamsStorePathsReadOnly()
 	if err != nil {
 		return err
 	}
@@ -2028,7 +2086,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	var serviceControls []teamsstore.ServiceControl
 	var controlLeases []string
 	for _, statePath := range statePaths {
-		state, err := loadTeamsStoreStateAndClose(cmd.Context(), statePath)
+		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
 		if err != nil {
 			return err
 		}
@@ -2075,6 +2133,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		}
 	}
 	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
+	authorityDiagnostics := buildTeamsAuthorityDiagnostics(statusStores, reg, controlChatID)
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
 	if controlChatID == "" {
@@ -2145,6 +2204,7 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	_, _ = fmt.Fprintf(out, "Active summary: %s\n", formatTeamsActiveSummary(statusSummary))
 	_, _ = fmt.Fprintf(out, "Work row layers: %s\n", formatTeamsWorkRowLayers(statusSummary))
 	_, _ = fmt.Fprintf(out, "Scope layers: %s\n", formatTeamsScopeLayers(statusSummary))
+	_, _ = fmt.Fprintf(out, "Authority diagnostics: %s\n", formatTeamsAuthorityDiagnostics(authorityDiagnostics))
 	if len(statusSummary.RunningTurns) > 0 {
 		_, _ = fmt.Fprintln(out, "Running turns:")
 		for _, turn := range statusSummary.RunningTurns {
@@ -2320,6 +2380,13 @@ func formatTeamsOSServiceStatus(ctx context.Context) string {
 }
 
 func printTeamsControlChatLocal(cmd *cobra.Command, registryPath string) error {
+	if strings.TrimSpace(registryPath) == "" {
+		var err error
+		registryPath, err = teams.DefaultRegistryPathReadOnly()
+		if err != nil {
+			return err
+		}
+	}
 	reg, err := teams.LoadRegistry(registryPath)
 	if err != nil {
 		return err
@@ -2329,12 +2396,12 @@ func printTeamsControlChatLocal(cmd *cobra.Command, registryPath string) error {
 		printTeamsControlChatExamples(cmd.OutOrStdout())
 		return nil
 	}
-	statePaths, err := existingTeamsStorePaths()
+	statePaths, err := existingTeamsStorePathsReadOnly()
 	if err != nil {
 		return err
 	}
 	for _, statePath := range statePaths {
-		state, err := loadTeamsStoreStateAndClose(cmd.Context(), statePath)
+		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
 		if err != nil {
 			return err
 		}
@@ -2411,6 +2478,72 @@ type teamsStatusStoreSnapshot struct {
 	State     teamsstore.State
 	Owner     teamsstore.OwnerMetadata
 	OwnerKind string
+}
+
+type teamsAuthorityDiagnostics struct {
+	ActiveMissingPoll          int
+	RegistryBindingMismatches  int
+	CrossStoreBindingConflicts int
+	ParkedContinuations        int
+	OrphanPollRows             int
+}
+
+func buildTeamsAuthorityDiagnostics(stores []teamsStatusStoreSnapshot, reg teams.Registry, controlChatID string) teamsAuthorityDiagnostics {
+	var out teamsAuthorityDiagnostics
+	bindings := make(map[string]string)
+	conflicted := make(map[string]bool)
+	for _, snapshot := range stores {
+		activeChats := make(map[string]bool)
+		for _, session := range snapshot.State.Sessions {
+			sessionID := strings.TrimSpace(session.ID)
+			chatID := strings.TrimSpace(session.TeamsChatID)
+			status := session.Status
+			if status == "" {
+				status = teamsstore.SessionStatusActive
+			}
+			if sessionID != "" && chatID != "" && !teamsStatusIsControlFallbackSession(session) {
+				if previous, ok := bindings[sessionID]; ok && previous != chatID && !conflicted[sessionID] {
+					out.CrossStoreBindingConflicts++
+					conflicted[sessionID] = true
+				} else if !ok {
+					bindings[sessionID] = chatID
+				}
+			}
+			if snapshot.OwnerKind != teamsStatusOwnerLive || status != teamsstore.SessionStatusActive || chatID == "" || chatID == strings.TrimSpace(controlChatID) || teamsStatusIsControlFallbackSession(session) {
+				continue
+			}
+			activeChats[chatID] = true
+			if _, ok := snapshot.State.ChatPolls[chatID]; !ok {
+				out.ActiveMissingPoll++
+			}
+			if projected := reg.SessionByID(sessionID); projected == nil || strings.TrimSpace(projected.ChatID) != chatID {
+				out.RegistryBindingMismatches++
+			}
+		}
+		for chatID, poll := range snapshot.State.ChatPolls {
+			chatID = strings.TrimSpace(chatID)
+			if strings.EqualFold(strings.TrimSpace(poll.PollState), "parked") && strings.TrimSpace(poll.ContinuationPath) != "" {
+				out.ParkedContinuations++
+			}
+			if snapshot.OwnerKind == teamsStatusOwnerLive && chatID != "" && chatID != strings.TrimSpace(controlChatID) && !activeChats[chatID] {
+				out.OrphanPollRows++
+			}
+		}
+	}
+	return out
+}
+
+func formatTeamsAuthorityDiagnostics(d teamsAuthorityDiagnostics) string {
+	if d == (teamsAuthorityDiagnostics{}) {
+		return "healthy"
+	}
+	return fmt.Sprintf("active_missing_poll=%d, registry_binding_mismatch=%d, cross_store_binding_conflicts=%d, parked_continuations=%d, orphan_poll_rows=%d",
+		d.ActiveMissingPoll,
+		d.RegistryBindingMismatches,
+		d.CrossStoreBindingConflicts,
+		d.ParkedContinuations,
+		d.OrphanPollRows,
+	)
 }
 
 type teamsStatusSummary struct {
@@ -2893,14 +3026,14 @@ func teamsRegistryPath(registryPath string) (string, error) {
 	if strings.TrimSpace(registryPath) != "" {
 		return registryPath, nil
 	}
-	return teams.DefaultRegistryPath()
+	return teams.DefaultRegistryPathReadOnly()
 }
 
 func loadTeamsStatusRegistry(registryPath string) (teams.Registry, error) {
 	if strings.TrimSpace(registryPath) != "" {
 		return teams.LoadRegistry(registryPath)
 	}
-	paths, err := existingTeamsRegistryPaths()
+	paths, err := existingTeamsRegistryPathsReadOnly()
 	if err != nil {
 		return teams.Registry{}, err
 	}
@@ -2980,10 +3113,24 @@ func activeStatusSessionCount(sessions map[string]string) int {
 }
 
 func teamsRegistryPaths(registryPath string) ([]string, error) {
+	return teamsRegistryPathsWithMode(registryPath, false)
+}
+
+func teamsRegistryPathsReadOnly(registryPath string) ([]string, error) {
+	return teamsRegistryPathsWithMode(registryPath, true)
+}
+
+func teamsRegistryPathsWithMode(registryPath string, readOnly bool) ([]string, error) {
 	if strings.TrimSpace(registryPath) != "" {
 		return []string{registryPath}, nil
 	}
-	defaultPath, err := teams.DefaultRegistryPath()
+	var defaultPath string
+	var err error
+	if readOnly {
+		defaultPath, err = teams.DefaultRegistryPathReadOnly()
+	} else {
+		defaultPath, err = teams.DefaultRegistryPath()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3016,7 +3163,21 @@ func teamsRegistryPaths(registryPath string) ([]string, error) {
 }
 
 func existingTeamsRegistryPaths() ([]string, error) {
-	paths, err := teamsRegistryPaths("")
+	return existingTeamsRegistryPathsWithMode(false)
+}
+
+func existingTeamsRegistryPathsReadOnly() ([]string, error) {
+	return existingTeamsRegistryPathsWithMode(true)
+}
+
+func existingTeamsRegistryPathsWithMode(readOnly bool) ([]string, error) {
+	var paths []string
+	var err error
+	if readOnly {
+		paths, err = teamsRegistryPathsReadOnly("")
+	} else {
+		paths, err = teamsRegistryPaths("")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3036,8 +3197,26 @@ func teamsStorePath() (string, error) {
 	return teamsstore.DefaultPath()
 }
 
+func teamsStorePathReadOnly() (string, error) {
+	return teamsstore.DefaultPathReadOnly()
+}
+
 func teamsStorePaths() ([]string, error) {
-	defaultPath, err := teamsstore.DefaultPath()
+	return teamsStorePathsWithMode(false)
+}
+
+func teamsStorePathsReadOnly() ([]string, error) {
+	return teamsStorePathsWithMode(true)
+}
+
+func teamsStorePathsWithMode(readOnly bool) ([]string, error) {
+	var defaultPath string
+	var err error
+	if readOnly {
+		defaultPath, err = teamsstore.DefaultPathReadOnly()
+	} else {
+		defaultPath, err = teamsstore.DefaultPath()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3181,7 +3360,21 @@ func uniquePaths(paths []string) []string {
 }
 
 func existingTeamsStorePaths() ([]string, error) {
-	paths, err := teamsStorePaths()
+	return existingTeamsStorePathsWithMode(false)
+}
+
+func existingTeamsStorePathsReadOnly() ([]string, error) {
+	return existingTeamsStorePathsWithMode(true)
+}
+
+func existingTeamsStorePathsWithMode(readOnly bool) ([]string, error) {
+	var paths []string
+	var err error
+	if readOnly {
+		paths, err = teamsStorePathsReadOnly()
+	} else {
+		paths, err = teamsStorePaths()
+	}
 	if err != nil {
 		return nil, err
 	}
