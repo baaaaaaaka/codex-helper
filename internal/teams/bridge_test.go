@@ -5996,16 +5996,24 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 		t.Fatalf("contender RecordOwnerHeartbeat error = %v, want ErrOwnerLive", err)
 	}
 	firstHeartbeat := activeOwner.LastHeartbeat
-	time.Sleep(20 * time.Millisecond)
-	read, ok, err := store.ReadOwner(context.Background())
-	if err != nil {
-		t.Fatalf("ReadOwner after heartbeat error: %v", err)
-	}
-	if !ok {
-		t.Fatal("owner missing during turn")
-	}
-	if !read.LastHeartbeat.After(firstHeartbeat) {
-		t.Fatalf("owner heartbeat did not advance during turn: before=%s after=%s", firstHeartbeat, read.LastHeartbeat)
+	heartbeatDeadline := time.Now().Add(2 * time.Second)
+	var read teamstore.OwnerMetadata
+	var ok bool
+	for {
+		read, ok, err = store.ReadOwner(context.Background())
+		if err != nil {
+			t.Fatalf("ReadOwner after heartbeat error: %v", err)
+		}
+		if !ok {
+			t.Fatal("owner missing during turn")
+		}
+		if read.LastHeartbeat.After(firstHeartbeat) {
+			break
+		}
+		if time.Now().After(heartbeatDeadline) {
+			t.Fatalf("owner heartbeat did not advance during turn: before=%s after=%s", firstHeartbeat, read.LastHeartbeat)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	close(executor.release)
