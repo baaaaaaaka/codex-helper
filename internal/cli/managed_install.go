@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -678,6 +679,11 @@ func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, o
 	if err := ensureCXPShimForInstallPath(installPath); err != nil {
 		_, _ = fmt.Fprintf(out, "Warning: failed to install cxp shim after upgrade: %v\n", err)
 	}
+	if strings.EqualFold(runtime.GOOS, "windows") {
+		if err := refreshWindowsStableCXPExecutable(installPath); err != nil {
+			return fmt.Errorf("refresh stable cxp executable after legacy upgrade: %w", err)
+		}
+	}
 	for _, err := range repairKnownHelperEntrypointsForInstallPath(installPath) {
 		_, _ = fmt.Fprintf(out, "Warning: failed to unify helper entrypoint after upgrade: %v\n", err)
 	}
@@ -1124,6 +1130,9 @@ func ensureWindowsCXPShimForInstallPath(installPath string) error {
 		if string(data) == expected {
 			return nil
 		}
+		if isManagedWindowsCXPShim(data) {
+			return os.WriteFile(shimPath, []byte(expected), 0o755)
+		}
 		if !strings.Contains(strings.ToLower(string(data)), "codex-proxy.exe") {
 			return nil
 		}
@@ -1137,8 +1146,87 @@ func ensureWindowsCXPShimForInstallPath(installPath string) error {
 	return os.WriteFile(shimPath, []byte(expected), 0o755)
 }
 
+// refreshWindowsStableCXPExecutable converges a stable cxp.exe that predates
+// the immutable runtime launcher. This is intentionally separate from
+// ensureWindowsCXPShimForInstallPath: runtime-owned upgrades only switch the
+// active immutable runtime and must not try to replace their running launcher.
+// A canonical cxp.cmd is the ownership marker that permits replacing cxp.exe;
+// custom user command shims and their executables remain untouched.
+func refreshWindowsStableCXPExecutable(installPath string) error {
+	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, "windows")
+	if installPath == "" || !strings.EqualFold(filepath.Base(installPath), helperpath.BinaryName("windows")) {
+		return nil
+	}
+	shimPath := filepath.Join(filepath.Dir(installPath), "cxp.cmd")
+	shimData, err := os.ReadFile(shimPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if string(shimData) != windowsCXPShimContent() {
+		return nil
+	}
+	stableExe := filepath.Join(filepath.Dir(installPath), helperruntime.BinaryName("windows"))
+	stableInfo, err := os.Stat(stableExe)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return copyExecutableAtomically(installPath, stableExe)
+		}
+		return err
+	}
+	if stableInfo.IsDir() {
+		return fmt.Errorf("stable cxp executable path is a directory: %s", stableExe)
+	}
+	same, err := filesHaveEqualSHA256(installPath, stableExe)
+	if err != nil {
+		return err
+	}
+	if same {
+		return nil
+	}
+	if err := copyExecutableAtomically(installPath, stableExe); err != nil {
+		return fmt.Errorf("replace stale stable cxp executable %s from %s: %w", stableExe, installPath, err)
+	}
+	return nil
+}
+
+func filesHaveEqualSHA256(leftPath string, rightPath string) (bool, error) {
+	left, err := fileSHA256Portable(leftPath)
+	if err != nil {
+		return false, err
+	}
+	right, err := fileSHA256Portable(rightPath)
+	if err != nil {
+		return false, err
+	}
+	return left == right, nil
+}
+
+func fileSHA256Portable(path string) ([sha256.Size]byte, error) {
+	var sum [sha256.Size]byte
+	file, err := os.Open(path)
+	if err != nil {
+		return sum, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return sum, err
+	}
+	copy(sum[:], hash.Sum(nil))
+	return sum, nil
+}
+
 func windowsCXPShimContent() string {
 	return "@echo off\r\n\"%~dp0cxp.exe\" %*\r\n"
+}
+
+func isManagedWindowsCXPShim(data []byte) bool {
+	content := strings.TrimPrefix(string(data), "\xef\xbb\xbf")
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	return strings.EqualFold(strings.TrimSpace(content), "@echo off\n\"%~dp0cxp.exe\" %*")
 }
 
 func migrateWindowsPowerShellCXPProfiles() []error {
@@ -1253,6 +1341,11 @@ func verifyCXPEntrypointAfterUpgradeForGOOS(installPath string, targetVersion st
 	if err := verifyHelperEntrypointVersion(ctx, shimPath, targetVersion, "cxp entrypoint"); err != nil {
 		if repairErr := ensureCXPShimForInstallPathForGOOS(installPath, goos); repairErr != nil {
 			return fmt.Errorf("%w; repair failed: %v", err, repairErr)
+		}
+		if strings.EqualFold(goos, "windows") {
+			if repairErr := refreshWindowsStableCXPExecutable(installPath); repairErr != nil {
+				return fmt.Errorf("%w; stable executable repair failed: %v", err, repairErr)
+			}
 		}
 		if retryErr := verifyHelperEntrypointVersion(ctx, shimPath, targetVersion, "cxp entrypoint"); retryErr != nil {
 			return fmt.Errorf("%w; after repair: %v", err, retryErr)
@@ -1413,7 +1506,7 @@ func copyExecutableAtomically(src string, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, dst); err != nil {
+	if err := replaceStagedFile(tmpPath, dst); err != nil {
 		return err
 	}
 	cleanup = false

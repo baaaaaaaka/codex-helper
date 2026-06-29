@@ -880,6 +880,99 @@ func TestEnsureCXPShimForInstallPathCreatesWindowsCmdShim(t *testing.T) {
 	if string(data) != windowsCXPShimContent() {
 		t.Fatalf("cxp.cmd = %q, want %q", data, windowsCXPShimContent())
 	}
+	stable, err := os.ReadFile(filepath.Join(tmp, "cxp.exe"))
+	if err != nil {
+		t.Fatalf("read stable cxp.exe: %v", err)
+	}
+	if string(stable) != "binary" {
+		t.Fatalf("stable cxp.exe = %q, want install binary", stable)
+	}
+}
+
+func TestRefreshWindowsStableCXPExecutableReplacesOwnedStaleBinary(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	stablePath := filepath.Join(tmp, "cxp.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	writeCLIFile(t, installPath, "new-binary", 0o755)
+	writeCLIFile(t, stablePath, "old-binary", 0o755)
+	writeCLIFile(t, shimPath, windowsCXPShimContent(), 0o755)
+
+	if err := refreshWindowsStableCXPExecutable(installPath); err != nil {
+		t.Fatalf("refresh stable cxp.exe: %v", err)
+	}
+	data, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new-binary" {
+		t.Fatalf("stable cxp.exe = %q, want refreshed install binary", data)
+	}
+}
+
+func TestRefreshWindowsStableCXPExecutableDoesNotReplaceMatchingBinary(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	stablePath := filepath.Join(tmp, "cxp.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	writeCLIFile(t, installPath, "same-binary", 0o755)
+	writeCLIFile(t, stablePath, "same-binary", 0o755)
+	writeCLIFile(t, shimPath, windowsCXPShimContent(), 0o755)
+	before, err := os.Stat(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := refreshWindowsStableCXPExecutable(installPath); err != nil {
+		t.Fatalf("refresh matching stable cxp.exe: %v", err)
+	}
+	after, err := os.Stat(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("matching stable cxp.exe was unnecessarily replaced")
+	}
+}
+
+func TestRefreshWindowsStableCXPExecutablePreservesCustomEntrypoint(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	stablePath := filepath.Join(tmp, "cxp.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	writeCLIFile(t, installPath, "new-binary", 0o755)
+	writeCLIFile(t, stablePath, "user-binary", 0o755)
+	writeCLIFile(t, shimPath, "@echo off\r\necho custom\r\n", 0o755)
+
+	if err := refreshWindowsStableCXPExecutable(installPath); err != nil {
+		t.Fatalf("refresh custom cxp entrypoint: %v", err)
+	}
+	data, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "user-binary" {
+		t.Fatalf("custom cxp.exe changed to %q", data)
+	}
+}
+
+func TestCopyExecutableAtomicallyReplacesExistingFile(t *testing.T) {
+	tmp := t.TempDir()
+	source := filepath.Join(tmp, "source")
+	target := filepath.Join(tmp, "target")
+	writeCLIFile(t, source, "replacement", 0o755)
+	writeCLIFile(t, target, "old", 0o755)
+
+	if err := copyExecutableAtomically(source, target); err != nil {
+		t.Fatalf("copy executable atomically: %v", err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "replacement" {
+		t.Fatalf("target = %q, want replacement", data)
+	}
 }
 
 func TestEnsureCXPShimForInstallPathRepairsWindowsCmdShim(t *testing.T) {
@@ -898,6 +991,25 @@ func TestEnsureCXPShimForInstallPathRepairsWindowsCmdShim(t *testing.T) {
 	}
 	if string(data) != windowsCXPShimContent() {
 		t.Fatalf("cxp.cmd = %q, want %q", data, windowsCXPShimContent())
+	}
+}
+
+func TestEnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	writeCLIFile(t, installPath, "binary", 0o755)
+	writeCLIFile(t, shimPath, "\xef\xbb\xbf@ECHO OFF\n\"%~dp0CXP.EXE\" %*\n", 0o755)
+
+	if err := ensureCXPShimForInstallPathForGOOS(installPath, "windows"); err != nil {
+		t.Fatalf("ensure windows cxp shim: %v", err)
+	}
+	data, err := os.ReadFile(shimPath)
+	if err != nil {
+		t.Fatalf("read cxp.cmd: %v", err)
+	}
+	if string(data) != windowsCXPShimContent() {
+		t.Fatalf("cxp.cmd = %q, want normalized %q", data, windowsCXPShimContent())
 	}
 }
 

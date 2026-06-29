@@ -35,16 +35,20 @@ func writeFileAtomicallyForIdentity(path string, data []byte, _ os.FileMode, _ *
 		return fmt.Errorf("close temp file: %w", err)
 	}
 
-	from, err := windows.UTF16PtrFromString(tmp)
-	if err != nil {
-		return err
-	}
-	to, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return err
-	}
-	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+	if err := replaceStagedFile(tmp, path); err != nil {
 		return fmt.Errorf("replace file: %w", err)
 	}
 	return nil
+}
+
+func replaceStagedFile(fromPath string, toPath string) error {
+	from, err := windows.UTF16PtrFromString(fromPath)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(toPath)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
 }

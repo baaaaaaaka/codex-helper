@@ -40,8 +40,12 @@ func writeFileAtomicallyForIdentity(path string, data []byte, perm os.FileMode, 
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close temp file: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceStagedFile(tmp, path); err != nil {
 		return fmt.Errorf("rename temp file: %w", err)
 	}
 	return nil
+}
+
+func replaceStagedFile(fromPath string, toPath string) error {
+	return os.Rename(fromPath, toPath)
 }
