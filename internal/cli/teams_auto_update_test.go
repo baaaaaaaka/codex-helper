@@ -704,6 +704,7 @@ func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacement
 	})
 	teamsServiceGOOS = func() string { return "windows" }
 	fakeInstallPath := filepath.Join(t.TempDir(), "codex-proxy.exe")
+	writeCLIFile(t, fakeInstallPath, "existing helper", 0o755)
 	teamsAutoUpdateResolveInstallPath = func(string) (string, error) {
 		return fakeInstallPath, nil
 	}

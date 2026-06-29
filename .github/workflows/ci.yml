@@ -1055,7 +1055,7 @@ jobs:
           go build -o "$RUNNER_TEMP/codex-proxy-skills-smoke" ./cmd/codex-proxy
           CODEX_HELPER_BIN="$RUNNER_TEMP/codex-proxy-skills-smoke" bash scripts/ci/skills_smoke.sh
           CODEX_HELPER_BIN="$RUNNER_TEMP/codex-proxy-skills-smoke" bash scripts/ci/skills_migration_smoke.sh
-          cp "$RUNNER_TEMP/codex-proxy-skills-smoke" "$RUNNER_TEMP/cxp"
+          test -x "$RUNNER_TEMP/cxp"
           CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_smoke.sh
           CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_migration_smoke.sh
 
@@ -1080,7 +1080,7 @@ jobs:
           .\scripts\ci\skills_smoke.ps1
           .\scripts\ci\skills_migration_smoke.ps1
           $cxp = Join-Path $env:RUNNER_TEMP "cxp.exe"
-          Copy-Item -LiteralPath $exe -Destination $cxp
+          if (!(Test-Path -LiteralPath $cxp -PathType Leaf)) { throw "runtime did not create the canonical cxp.exe entry" }
           $env:CODEX_HELPER_BIN = $cxp
           .\scripts\ci\skills_smoke.ps1
           .\scripts\ci\skills_migration_smoke.ps1
