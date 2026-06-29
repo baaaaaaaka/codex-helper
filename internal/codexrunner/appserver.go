@@ -53,8 +53,10 @@ type AppServerStartRequest struct {
 type AppServerRunner struct {
 	Transport AppServerLineTransport
 	Starter   AppServerTransportStarter
-	// ServerRequestHandler handles app-server initiated requests. When nil, the
-	// runner uses AutomaticApprovalHandler with DefaultApprovalDelay.
+	// ApprovalMode defaults to manual/fail-closed. Headless unattended callers
+	// must explicitly request automatic approval.
+	ApprovalMode ApprovalMode
+	// ServerRequestHandler overrides the handler selected by ApprovalMode.
 	ServerRequestHandler AppServerServerRequestHandler
 
 	Command       string
@@ -546,8 +548,20 @@ func (r *AppServerRunner) serverRequestResponse(ctx context.Context, msg appServ
 		method = "server request"
 	}
 	handler := r.ServerRequestHandler
-	if handler == nil {
+	if handler == nil && r.ApprovalMode == ApprovalModeAutomatic {
 		handler = AutomaticApprovalHandler{Delay: DefaultApprovalDelay}
+	}
+	if handler == nil {
+		response := appServerErrorResponse{
+			JSONRPC: "2.0",
+			ID:      msg.ID,
+			Error: appServerErrorField{
+				Code:    json.RawMessage(`-32001`),
+				Message: "request requires an interactive reviewer",
+			},
+		}
+		line, _ := json.Marshal(response)
+		return line
 	}
 	result, handled, err := handler.HandleServerRequest(ctx, method, msg.Params)
 	if err != nil {

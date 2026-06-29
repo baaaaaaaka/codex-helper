@@ -1629,6 +1629,53 @@ func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
 	}
 }
 
+func TestSelectSessionCtrlAUpdatesStatusPersistsAndCarriesSelection(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+	projectPath := t.TempDir()
+	projects := []codexhistory.Project{{
+		Key:  "proj-aaa",
+		Path: projectPath,
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-aaa",
+			ProjectPath: projectPath,
+			FilePath:    filepath.Join(projectPath, "sess-aaa.jsonl"),
+		}},
+	}}
+	persisted := make(chan bool, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		<-initDone
+		waitForScreenContains(t, screen, "sess-aaa")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyCtrlA, 0, 0))
+		waitForScreenContains(t, screen, "[!] AAA mode (Ctrl+A): on")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	}()
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(context.Context) ([]codexhistory.Project, error) { return projects, nil },
+		PersistAAA: func(enabled bool) error {
+			persisted <- enabled
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection == nil || selection.Session.SessionID != "sess-aaa" || !selection.UseAAA {
+		t.Fatalf("AAA selection = %#v", selection)
+	}
+	select {
+	case enabled := <-persisted:
+		if !enabled {
+			t.Fatal("Ctrl+A persisted disabled instead of enabled")
+		}
+	default:
+		t.Fatal("Ctrl+A did not persist the AAA preference")
+	}
+}
+
 func TestSelectSessionInitialLoadDoesNotBlockScreenInit(t *testing.T) {
 	screen, initDone := newSelectSessionTestScreen(t)
 
@@ -2092,6 +2139,69 @@ func TestHandleKeyProxyToggleDisablesProxy(t *testing.T) {
 	}
 }
 
+func TestHandleKeyCtrlATogglesAAAAndPersistsBeforeChangingState(t *testing.T) {
+	screen := newTestScreen(t, 80, 20)
+	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
+	var persisted []bool
+	opts := Options{PersistAAA: func(enabled bool) error {
+		persisted = append(persisted, enabled)
+		return nil
+	}}
+
+	if _, err := handleKey(context.Background(), screen, state, opts, tcell.NewEventKey(tcell.KeyCtrlA, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if !state.aaaEnabled || !reflect.DeepEqual(persisted, []bool{true}) {
+		t.Fatalf("AAA enable state=%t persisted=%v", state.aaaEnabled, persisted)
+	}
+	if _, err := handleKey(context.Background(), screen, state, opts, tcell.NewEventKey(tcell.KeyCtrlA, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if state.aaaEnabled || !reflect.DeepEqual(persisted, []bool{true, false}) {
+		t.Fatalf("AAA disable state=%t persisted=%v", state.aaaEnabled, persisted)
+	}
+}
+
+func TestHandleKeyCtrlAPersistenceFailureLeavesAAAOff(t *testing.T) {
+	screen := newTestScreen(t, 80, 20)
+	state := newTestState(nil)
+	wantErr := errors.New("save failed")
+	_, err := handleKey(context.Background(), screen, state, Options{PersistAAA: func(bool) error { return wantErr }}, tcell.NewEventKey(tcell.KeyCtrlA, 0, 0))
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Ctrl+A error = %v, want %v", err, wantErr)
+	}
+	if state.aaaEnabled {
+		t.Fatal("AAA state changed after persistence failed")
+	}
+}
+
+func TestHandleKeyCtrlAIgnoredWhileEnteringSearch(t *testing.T) {
+	screen := newTestScreen(t, 80, 20)
+	state := newTestState(nil)
+	state.inputMode = "projects"
+	called := false
+	if _, err := handleKey(context.Background(), screen, state, Options{PersistAAA: func(bool) error { called = true; return nil }}, tcell.NewEventKey(tcell.KeyCtrlA, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if called || state.aaaEnabled {
+		t.Fatal("Ctrl+A toggled AAA while search input was active")
+	}
+}
+
+func TestHandleKeySelectionCarriesAAA(t *testing.T) {
+	screen := newTestScreen(t, 80, 20)
+	dir := t.TempDir()
+	state := newTestState([]codexhistory.Project{{Key: "one", Path: dir}})
+	state.aaaEnabled = true
+	selection, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlN, 0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection == nil || !selection.UseAAA {
+		t.Fatalf("selection did not carry AAA: %#v", selection)
+	}
+}
+
 func TestPreviewPageDownScrollsWhenFocused(t *testing.T) {
 	screen := newTestScreen(t, 60, 12)
 	project := codexhistory.Project{
@@ -2284,6 +2394,41 @@ func TestDrawHidesYoloStatusByDefault(t *testing.T) {
 	line := readScreenLine(screen, h-1)
 	if strings.Contains(line, "YOLO mode (Ctrl+Y): off") {
 		t.Fatalf("expected yolo hint to be hidden, got %q", strings.TrimSpace(line))
+	}
+}
+
+func TestDrawShowsAAAStatusInBothModes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		enabled   bool
+		loadError error
+	}{
+		{name: "off", enabled: false},
+		{name: "on", enabled: true},
+		{name: "load-error-off", enabled: false, loadError: errors.New("history unavailable")},
+		{name: "load-error-on", enabled: true, loadError: errors.New("history unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			screen := newTestScreen(t, 240, 20)
+			state := newTestState([]codexhistory.Project{})
+			state.aaaEnabled = tc.enabled
+			state.loadError = tc.loadError
+			if err := draw(screen, state, Options{}, make(chan previewEvent, 1)); err != nil {
+				t.Fatal(err)
+			}
+			_, height := screen.Size()
+			var rendered strings.Builder
+			for y := 0; y < height; y++ {
+				rendered.WriteString(readScreenLine(screen, y))
+			}
+			want := "AAA mode (Ctrl+A): off"
+			if tc.enabled {
+				want = "[!] AAA mode (Ctrl+A): on"
+			}
+			if !strings.Contains(rendered.String(), want) {
+				t.Fatalf("AAA status missing %q", want)
+			}
+		})
 	}
 }
 

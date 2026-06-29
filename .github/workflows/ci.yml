@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
 
       - name: Check CI helper scripts (Linux only)
         if: runner.os == 'Linux'
@@ -137,8 +137,26 @@ jobs:
           go test ./internal/managedinstall -count=1 -v
           go test ./internal/update -count=1 -run 'TestResolveInstallPath(UsesExactEnvInstallPathBeforeLegacyDir|MapsEnvCXPShimToManagedSibling|MapsCurrentCXPEntrypointToManagedSibling)$' -v
           go test ./internal/cli -count=1 -run '^TestLegacyUpdater' -v
-          go test ./internal/cli -count=1 -run 'Test(UpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP|FinalizeHelperEntrypoints(RepairsAndVerifiesCXPEntrypointVersion|FailsWhenCXPEntrypointCannotBeVerified|MigratesCXPRecordTargetToManagedBinary|PreservesLogicalRecordThroughSymlinkedLocal)|ReplaceSymlinkAtomicallyRejectsTargetChainThroughLinkPath|CurrentHelperInstallCandidatesTreatCXPAsShimOnly|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|TeamsReleaseAutoUpdaterApply(UsesRunningGoBinAndUnifiesManagedDefault|PrefersLogicalDefaultThroughSymlinkedLocal|RepairsSelfLoopedManagedTargetThroughSymlinkedLocal|IgnoresUnusableSelfLoopedEnvWhenCurrentExecutableIsRunnable)|Teams(ServiceInstall(UsesManagedDefaultInsteadOfGoBinExecutable|MaterializesManagedDefaultBeforeRepointingFromGoBin|SkipsMaterializingSameTargetThroughSymlinkedLocal|CreatesMissingManagedDefaultBeforeRepointingFromGoBin|DoesNotTreatBlockedManagedDefaultAsInstallDir|RepairsCorruptManagedDefaultBeforeRepointingFromGoBin)|ServiceBootstrapDryRunDoesNotWriteOrStart))$' -v
+          go test ./internal/cli -count=1 -run 'Test(UpgradeCmdUsesManagedDefaultWhenLaunchedAsCXP|FinalizeHelperEntrypoints(RepairsAndVerifiesCXPEntrypointVersion|FailsWhenCXPEntrypointCannotBeVerified|MigratesCXPRecordTargetToManagedBinary|PreservesLogicalRecordThroughSymlinkedLocal)|ReplaceSymlinkAtomicallyRejectsTargetChainThroughLinkPath|CurrentHelperInstallCandidatesTreatCXPAsShimOnly|RewriteLegacyCXPProfile.*|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|TeamsReleaseAutoUpdaterApply(UsesRunningGoBinAndUnifiesManagedDefault|PrefersLogicalDefaultThroughSymlinkedLocal|RepairsSelfLoopedManagedTargetThroughSymlinkedLocal|IgnoresUnusableSelfLoopedEnvWhenCurrentExecutableIsRunnable)|Teams(ServiceInstall(UsesManagedDefaultInsteadOfGoBinExecutable|MaterializesManagedDefaultBeforeRepointingFromGoBin|SkipsMaterializingSameTargetThroughSymlinkedLocal|CreatesMissingManagedDefaultBeforeRepointingFromGoBin|DoesNotTreatBlockedManagedDefaultAsInstallDir|RepairsCorruptManagedDefaultBeforeRepointingFromGoBin)|ServiceBootstrapDryRunDoesNotWriteOrStart))$' -v
           go test . -count=1 -run 'TestInstall(Sh|Ps1)KeepsPathSetupWhenInstallDirAlreadySet$' -v
+
+      - name: CXP immutable runtime and process identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RuntimeProcessIdentity.*)$' -v
+          go test ./internal/update -count=1 -run 'TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive$' -v
+          go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime)$' -v
+
+      - name: Actual CXP process identity (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/ci/cxp_process_identity_smoke.sh
+
+      - name: Actual CXP process identity (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\ci\cxp_process_identity_smoke.ps1
 
       - name: Local proxy self-loop regressions
         shell: bash
@@ -653,8 +671,8 @@ jobs:
         run: |
           set -euo pipefail
           config_pattern='TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
-          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
-          runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
+          cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|AAAFlagIsPublicAndDefaultsOff|ResolveAAAEnabledDefaultsFalse|PersistAAAEnabledRoundTrip|LegacyYoloPreferenceDoesNotEnableAAA|RunHistoryTuiLoadsAndPersistsAAA|RunBeaconWorkerJobAutomaticallyApprovesRequiredRequests|NewManagedTeamsCodexExecutor(UsesStandardAppServerRunner|RemovesLegacyExecutionArgs)|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(AAAIsPerInvocationAndReachesOnlyCodexBroker|RejectsAAAForNonCodexCommand|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
+          runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit|RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay|RunCodexCLIInvocationRejectsAAAForNativeOnlySurface)$'
           teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
           go test ./internal/migration -count=1 -v
@@ -671,8 +689,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $configPattern = 'TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
-          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|NewManagedTeamsCodexExecutorRemovesLegacyExecutionArgs|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
-          $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay)$'
+          $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|AAAFlagIsPublicAndDefaultsOff|ResolveAAAEnabledDefaultsFalse|PersistAAAEnabledRoundTrip|LegacyYoloPreferenceDoesNotEnableAAA|RunHistoryTuiLoadsAndPersistsAAA|RunBeaconWorkerJobAutomaticallyApprovesRequiredRequests|NewManagedTeamsCodexExecutor(UsesStandardAppServerRunner|RemovesLegacyExecutionArgs)|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(AAAIsPerInvocationAndReachesOnlyCodexBroker|RejectsAAAForNonCodexCommand|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
+          $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit|RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay|RunCodexCLIInvocationRejectsAAAForNativeOnlySurface)$'
           $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v
           go test ./internal/migration -count=1 -v
@@ -1336,7 +1354,7 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunnerPreservesBoundedCloudConfigErrorData|AutomaticApprovalResultMatrix)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Codex standard approval runtime integration test (Windows)
         if: runner.os == 'Windows'
@@ -1353,7 +1371,7 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunnerPreservesBoundedCloudConfigErrorData|AutomaticApprovalResultMatrix)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
         if: runner.os != 'Windows'
@@ -1445,9 +1463,9 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunnerPreservesBoundedCloudConfigErrorData|AutomaticApprovalResultMatrix)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           printf '%s\n' \
-            '{"schema":1,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","production-remote-broker-bearer","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
+            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof

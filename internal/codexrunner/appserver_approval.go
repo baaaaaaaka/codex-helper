@@ -11,6 +11,16 @@ import (
 
 const DefaultApprovalDelay = 500 * time.Millisecond
 
+// ApprovalMode controls whether a headless app-server client may resolve
+// approval requests automatically. The zero value is deliberately manual so a
+// newly added call site cannot opt into automatic approval by omission.
+type ApprovalMode uint8
+
+const (
+	ApprovalModeManual ApprovalMode = iota
+	ApprovalModeAutomatic
+)
+
 const (
 	appServerMethodCommandExecutionApproval = "item/commandExecution/requestApproval"
 	appServerMethodFileChangeApproval       = "item/fileChange/requestApproval"

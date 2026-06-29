@@ -13,6 +13,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"cxp / codex-proxy CLI digest:",
 		"`cxp proxy reset`",
 		"`cxp run -- codex`",
+		"`cxp run --aaa -- codex`",
 		"`cxp run --model-profile <name> -- codex`",
 		"`cxp model` and `cxp model-profile`",
 		"`cxp model list`",
@@ -20,6 +21,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp responses serve`",
 		"`cxp app --model-profile <name>`",
 		"`Ctrl+K`",
+		"`Ctrl+A`",
 		"`cxp teams status`",
 		"`cxp teams doctor`",
 		"`cxp teams service bootstrap`",
@@ -104,8 +106,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 	}{
 		{
 			name:     "model profiles and standard approvals",
-			fallback: []string{"run -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+K"},
-			docs:     []string{"run -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+K"},
+			fallback: []string{"run -- codex", "run --aaa -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+A", "Ctrl+K"},
+			docs:     []string{"run -- codex", "run --aaa -- codex", "run --model-profile <name> -- codex", "model list", "model-profile setup [name]", "responses serve", "app --model-profile <name>", "Ctrl+A", "Ctrl+K"},
 		},
 		{
 			name:     "teams model commands",

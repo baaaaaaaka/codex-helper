@@ -59,7 +59,11 @@ func runCodexSession(
 	if strings.TrimSpace(session.SessionID) == "" {
 		return fmt.Errorf("missing session id")
 	}
-	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, session.SessionID, codexPath, codexDir, useProxy, "", log)
+	agentAutoApprove, err := aaaPreference(store)
+	if err != nil {
+		return err
+	}
+	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, session.SessionID, codexPath, codexDir, useProxy, agentAutoApprove, "", log)
 }
 
 func runCodexNewSession(
@@ -74,7 +78,29 @@ func runCodexNewSession(
 	useProxy bool,
 	log io.Writer,
 ) error {
-	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, "", codexPath, codexDir, useProxy, "", log)
+	agentAutoApprove, err := aaaPreference(store)
+	if err != nil {
+		return err
+	}
+	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, "", codexPath, codexDir, useProxy, agentAutoApprove, "", log)
+}
+
+func aaaPreference(store *config.Store) (bool, error) {
+	if store == nil {
+		return false, nil
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return false, err
+	}
+	return resolveAAAEnabled(cfg), nil
+}
+
+func approvalModeForAAA(enabled bool) codexrunner.ApprovalMode {
+	if enabled {
+		return codexrunner.ApprovalModeAutomatic
+	}
+	return codexrunner.ApprovalModeManual
 }
 
 func runCodexTUIViaBroker(
@@ -88,6 +114,7 @@ func runCodexTUIViaBroker(
 	codexPath string,
 	codexDir string,
 	useProxy bool,
+	agentAutoApprove bool,
 	modelProfileRef string,
 	log io.Writer,
 ) error {
@@ -95,7 +122,7 @@ func runCodexTUIViaBroker(
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
 		tail = []string{"resume", sessionID}
 	}
-	return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, modelProfileRef, nil, tail, nil, log)
+	return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, nil, tail, nil, log)
 }
 
 func runCodexTUIInvocationViaBroker(
@@ -108,6 +135,7 @@ func runCodexTUIInvocationViaBroker(
 	codexPath string,
 	codexDir string,
 	useProxy bool,
+	agentAutoApprove bool,
 	modelProfileRef string,
 	tuiGlobalArgs []string,
 	tuiTail []string,
@@ -221,8 +249,9 @@ func runCodexTUIInvocationViaBroker(
 		ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, log),
 	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
-		Starter: starter,
-		Log:     log,
+		Starter:      starter,
+		Log:          log,
+		ApprovalMode: approvalModeForAAA(agentAutoApprove),
 		StartRequest: codexrunner.AppServerStartRequest{
 			Command:          codexPath,
 			Args:             appServerArgs,

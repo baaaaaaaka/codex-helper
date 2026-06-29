@@ -89,6 +89,113 @@ func TestInstallShSuccessBanner(t *testing.T) {
 	}
 }
 
+func TestInstallShPreservesDirectoryAndMultiHopFileSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer symlink topology")
+	}
+	run := newInstallShRun(t, false, false)
+	logicalInstallDir := run.installDir
+	physicalInstallDir := filepath.Join(t.TempDir(), "physical install with spaces")
+	externalStorage := filepath.Join(t.TempDir(), "external payloads")
+	if err := os.RemoveAll(logicalInstallDir); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{physicalInstallDir, externalStorage} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(physicalInstallDir, logicalInstallDir); err != nil {
+		t.Fatal(err)
+	}
+	realCXP := filepath.Join(externalStorage, "cxp-payload")
+	realLegacy := filepath.Join(externalStorage, "legacy-payload")
+	for _, path := range []string{realCXP, realLegacy} {
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho old\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cxpHop := filepath.Join(physicalInstallDir, "cxp-hop")
+	legacyHop := filepath.Join(physicalInstallDir, "legacy-hop")
+	if err := os.Symlink(realCXP, cxpHop); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realLegacy, legacyHop); err != nil {
+		t.Fatal(err)
+	}
+	cxpEntry := filepath.Join(physicalInstallDir, "cxp")
+	legacyEntry := filepath.Join(physicalInstallDir, "codex-proxy")
+	if err := os.Symlink("cxp-hop", cxpEntry); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("legacy-hop", legacyEntry); err != nil {
+		t.Fatal(err)
+	}
+
+	links := []string{logicalInstallDir, cxpEntry, cxpHop, legacyEntry, legacyHop}
+	before := make(map[string]string, len(links))
+	for _, path := range links {
+		target, err := os.Readlink(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = target
+	}
+
+	runInstallShCommand(t, run)
+
+	for _, path := range links {
+		target, err := os.Readlink(path)
+		if err != nil {
+			t.Fatalf("link %s was replaced: %v", path, err)
+		}
+		if target != before[path] {
+			t.Fatalf("link %s changed from %q to %q", path, before[path], target)
+		}
+	}
+	for _, path := range []string{filepath.Join(logicalInstallDir, "cxp"), filepath.Join(logicalInstallDir, "codex-proxy")} {
+		out, err := exec.Command(path, "--version").CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s --version: %v\n%s", path, err, out)
+		}
+		if !strings.Contains(string(out), "1.2.3") {
+			t.Fatalf("%s did not receive new payload: %s", path, out)
+		}
+	}
+}
+
+func TestInstallShRejectsSymlinkLoopWithoutChangingLinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX installer symlink topology")
+	}
+	run := newInstallShRun(t, false, false)
+	cxp := filepath.Join(run.installDir, "cxp")
+	hop := filepath.Join(run.installDir, "cxp-loop-hop")
+	if err := os.Symlink("cxp-loop-hop", cxp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("cxp", hop); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", run.scriptPath)
+	cmd.Dir = run.repoRoot
+	cmd.Env = run.env
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("installer accepted symlink loop:\n%s", output)
+	}
+	if !strings.Contains(string(output), "symlink loop") {
+		t.Fatalf("installer did not explain symlink loop:\n%s", output)
+	}
+	for path, want := range map[string]string{cxp: "cxp-loop-hop", hop: "cxp"} {
+		got, readErr := os.Readlink(path)
+		if readErr != nil || got != want {
+			t.Fatalf("link %s changed: got %q err=%v, want %q", path, got, readErr, want)
+		}
+	}
+}
+
 func TestInstallShBuiltinSkillFailureWarnsButInstallSucceeds(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"skills\" ]; then\n  exit 42\nfi\nif [ \"$1\" = \"--version\" ]; then\n  echo codex-proxy 1.2.3\n  exit 0\nfi\nexit 0\n")
@@ -341,8 +448,8 @@ func TestInstallShUsesProfileWhenShellMissing(t *testing.T) {
 	if !strings.Contains(text, sourceLine) {
 		t.Fatalf("missing PATH source line in profile")
 	}
-	if !strings.Contains(text, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in profile")
+	if strings.Contains(text, "alias cxp='codex-proxy'") {
+		t.Fatalf("legacy cxp alias remained in profile")
 	}
 	assertUnixPathSnippet(t, run.homeDir, run.installDir)
 }
@@ -524,31 +631,35 @@ func TestInstallShWritesZshPathSources(t *testing.T) {
 	if !strings.Contains(zshrcText, sourceLine) {
 		t.Fatalf("missing PATH source line in zshrc")
 	}
-	if !strings.Contains(zshrcText, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in zshrc")
+	if strings.Contains(zshrcText, "alias cxp='codex-proxy'") {
+		t.Fatalf("legacy cxp alias remained in zshrc")
 	}
 
 	assertUnixPathSnippet(t, run.homeDir, run.installDir)
 }
 
-func TestInstallShWritesBashAliasToLoginAndInteractiveConfigs(t *testing.T) {
+func TestInstallShRemovesLegacyBashAliasFromLoginAndInteractiveConfigs(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "/bin/bash")
 	bashProfilePath := filepath.Join(run.homeDir, ".bash_profile")
-	if err := os.WriteFile(bashProfilePath, []byte("# existing bash profile\n"), 0o644); err != nil {
+	if err := os.WriteFile(bashProfilePath, []byte("# existing bash profile\nalias cxp='codex-proxy'\n"), 0o644); err != nil {
 		t.Fatalf("write bash_profile: %v", err)
+	}
+	bashrcPath := filepath.Join(run.homeDir, ".bashrc")
+	if err := os.WriteFile(bashrcPath, []byte("# existing bashrc\nalias cxp='codex-proxy'\n"), 0o644); err != nil {
+		t.Fatalf("write bashrc: %v", err)
 	}
 
 	runInstallShCommand(t, run)
 
-	for _, path := range []string{bashProfilePath, filepath.Join(run.homeDir, ".bashrc")} {
+	for _, path := range []string{bashProfilePath, bashrcPath} {
 		contents, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
 		text := string(contents)
-		if !strings.Contains(text, "alias cxp='codex-proxy'") {
-			t.Fatalf("missing cxp alias in %s", path)
+		if strings.Contains(text, "alias cxp='codex-proxy'") {
+			t.Fatalf("legacy cxp alias remained in %s", path)
 		}
 	}
 }
@@ -571,14 +682,21 @@ func TestInstallShUsesBashLoginWhenPresent(t *testing.T) {
 	if !strings.Contains(text, expectedPosixSourceLine(run.homeDir)) {
 		t.Fatalf("missing PATH source line in bash_login")
 	}
-	if !strings.Contains(text, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in bash_login")
+	if strings.Contains(text, "alias cxp='codex-proxy'") {
+		t.Fatalf("legacy cxp alias remained in bash_login")
 	}
 }
 
 func TestInstallShWritesFishPathSnippet(t *testing.T) {
 	run := newInstallShRun(t, false, false)
 	run.env = overrideEnv(run.env, "SHELL", "/usr/bin/fish")
+	fishConfigPath := filepath.Join(run.homeDir, ".config", "fish", "config.fish")
+	if err := os.MkdirAll(filepath.Dir(fishConfigPath), 0o755); err != nil {
+		t.Fatalf("mkdir fish config dir: %v", err)
+	}
+	if err := os.WriteFile(fishConfigPath, []byte("alias cxp \"codex-proxy\"\n"), 0o644); err != nil {
+		t.Fatalf("write fish config: %v", err)
+	}
 
 	runInstallShCommand(t, run)
 
@@ -595,14 +713,13 @@ func TestInstallShWritesFishPathSnippet(t *testing.T) {
 		t.Fatalf("missing managed CLI dir in fish PATH snippet")
 	}
 
-	fishConfigPath := filepath.Join(run.homeDir, ".config", "fish", "config.fish")
 	fishConfig, err := os.ReadFile(fishConfigPath)
 	if err != nil {
 		t.Fatalf("read fish config: %v", err)
 	}
 	fishConfigText := string(fishConfig)
-	if !strings.Contains(fishConfigText, "alias cxp \"codex-proxy\"") {
-		t.Fatalf("missing cxp alias in fish config")
+	if strings.Contains(fishConfigText, "alias cxp \"codex-proxy\"") {
+		t.Fatalf("legacy cxp alias remained in fish config")
 	}
 	if strings.Contains(fishConfigText, fmt.Sprintf("set -gx PATH \"%s\" $PATH", run.installDir)) {
 		t.Fatalf("unexpected legacy PATH update in fish config")
@@ -624,8 +741,8 @@ func TestInstallShWritesCshPathSnippet(t *testing.T) {
 	if !strings.Contains(cshrcText, expectedCshSourceLine(run.homeDir)) {
 		t.Fatalf("missing PATH source line in cshrc")
 	}
-	if !strings.Contains(cshrcText, "alias cxp codex-proxy") {
-		t.Fatalf("missing cxp alias in cshrc")
+	if strings.Contains(cshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("legacy cxp alias remained in cshrc")
 	}
 
 	assertCshPathSnippet(t, run.homeDir, run.installDir)
@@ -646,8 +763,8 @@ func TestInstallShWritesTcshPathSnippetToCshrcWhenTcshrcMissing(t *testing.T) {
 	if !strings.Contains(cshrcText, expectedCshSourceLine(run.homeDir)) {
 		t.Fatalf("missing PATH source line in cshrc for tcsh without tcshrc")
 	}
-	if !strings.Contains(cshrcText, "alias cxp codex-proxy") {
-		t.Fatalf("missing cxp alias in cshrc for tcsh without tcshrc")
+	if strings.Contains(cshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("legacy cxp alias remained in cshrc for tcsh without tcshrc")
 	}
 }
 
@@ -678,8 +795,8 @@ func TestInstallShWritesTcshPathSnippetWithoutChangingTcshrcPrecedence(t *testin
 	if !strings.Contains(tcshrcText, expectedCshSourceLine(run.homeDir)) {
 		t.Fatalf("missing PATH source line in tcshrc")
 	}
-	if !strings.Contains(tcshrcText, "alias cxp codex-proxy") {
-		t.Fatalf("missing cxp alias in tcshrc")
+	if strings.Contains(tcshrcText, "alias cxp codex-proxy") {
+		t.Fatalf("legacy cxp alias remained in tcshrc")
 	}
 
 	assertCshPathSnippet(t, run.homeDir, run.installDir)
@@ -855,8 +972,8 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if strings.Contains(bashrcText, fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)) {
 		t.Fatalf("unexpected legacy PATH update in bashrc")
 	}
-	if !strings.Contains(bashrcText, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in bashrc")
+	if strings.Contains(bashrcText, "alias cxp='codex-proxy'") {
+		t.Fatalf("legacy cxp alias remained in bashrc")
 	}
 
 	profilePath := filepath.Join(homeDir, ".profile")
@@ -871,8 +988,8 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if strings.Contains(profileText, fmt.Sprintf("export PATH=\"%s:$PATH\"", installDir)) {
 		t.Fatalf("unexpected legacy PATH update in profile")
 	}
-	if !strings.Contains(profileText, "alias cxp='codex-proxy'") {
-		t.Fatalf("missing cxp alias in profile")
+	if strings.Contains(profileText, "alias cxp='codex-proxy'") {
+		t.Fatalf("legacy cxp alias remained in profile")
 	}
 
 	assertUnixPathSnippet(t, homeDir, installDir)

@@ -280,6 +280,38 @@ resolve_legacy_target_path() {
   esac
 }
 
+resolve_entry_storage_path() {
+  current="$1"
+  seen="|"
+  hops=0
+  while [ -L "$current" ]; do
+    case "$seen" in
+      *"|$current|"*)
+        echo "Refusing to install through a symlink loop at $current" >&2
+        return 1
+        ;;
+    esac
+    seen="$seen$current|"
+    hops=$((hops + 1))
+    if [ "$hops" -gt 64 ]; then
+      echo "Refusing to install through a symlink chain deeper than 64 entries: $1" >&2
+      return 1
+    fi
+    target="$(readlink "$current")" || return 1
+    case "$target" in
+      /*) current="$target" ;;
+      *) current="$(dirname "$current")/$target" ;;
+    esac
+  done
+  parent="$(dirname "$current")"
+  base="$(basename "$current")"
+  if physical_parent="$(cd "$parent" 2>/dev/null && pwd -P)"; then
+    printf '%s/%s\n' "$physical_parent" "$base"
+    return 0
+  fi
+  printf '%s\n' "$current"
+}
+
 curl_supports() {
   curl --help all 2>/dev/null | grep -q -- "$1" || curl --help 2>/dev/null | grep -q -- "$1"
 }
@@ -579,7 +611,10 @@ update_shell_config() {
   legacy_path_line_resolved="export PATH=\"$install_dir_resolved:\$PATH\""
   legacy_fish_path_line="set -gx PATH \"$install_dir\" \$PATH"
   legacy_fish_path_line_resolved="set -gx PATH \"$install_dir_resolved\" \$PATH"
-  alias_line="alias cxp='codex-proxy'"
+  legacy_alias_line="alias cxp='codex-proxy'"
+  legacy_fish_alias_line='alias cxp "codex-proxy"'
+  legacy_csh_alias_line="alias cxp codex-proxy"
+  alias_line=""
   alias_file=""
   login_file=""
   interactive_file=""
@@ -603,7 +638,8 @@ update_shell_config() {
       remove_line "$interactive_file" "$legacy_path_line_resolved"
       ensure_line "$login_file" "$posix_source_line"
       ensure_line "$interactive_file" "$posix_source_line"
-      ensure_line "$login_file" "$alias_line"
+      remove_line "$login_file" "$legacy_alias_line"
+      remove_line "$interactive_file" "$legacy_alias_line"
       alias_file="$interactive_file"
       ;;
     zsh)
@@ -614,6 +650,8 @@ update_shell_config() {
       remove_line "$login_file" "$legacy_path_line_resolved"
       remove_line "$interactive_file" "$legacy_path_line"
       remove_line "$interactive_file" "$legacy_path_line_resolved"
+      remove_line "$login_file" "$legacy_alias_line"
+      remove_line "$interactive_file" "$legacy_alias_line"
       ensure_line "$login_file" "$posix_source_line"
       ensure_line "$interactive_file" "$posix_source_line"
       alias_file="$interactive_file"
@@ -621,7 +659,7 @@ update_shell_config() {
     fish)
       write_fish_path_snippet "$fish_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
       alias_file="$HOME/.config/fish/config.fish"
-      alias_line="alias cxp \"codex-proxy\""
+      remove_line "$alias_file" "$legacy_fish_alias_line"
       remove_line "$alias_file" "$legacy_fish_path_line"
       remove_line "$alias_file" "$legacy_fish_path_line_resolved"
       ;;
@@ -632,10 +670,11 @@ update_shell_config() {
       ensure_line "$cshrc_file" "$csh_source_line"
       if [ "$shell_name" = "tcsh" ] && [ -f "$tcshrc_file" ]; then
         ensure_line "$tcshrc_file" "$csh_source_line"
-        ensure_line "$tcshrc_file" "alias cxp codex-proxy"
+        remove_line "$tcshrc_file" "$legacy_csh_alias_line"
       else
-        ensure_line "$cshrc_file" "alias cxp codex-proxy"
+        remove_line "$cshrc_file" "$legacy_csh_alias_line"
       fi
+      remove_line "$cshrc_file" "$legacy_csh_alias_line"
       alias_file=""
       alias_line=""
       ;;
@@ -644,6 +683,7 @@ update_shell_config() {
       write_posix_path_snippet "$posix_path_snippet" "$install_dir_resolved" "$managed_bin_dir"
       remove_line "$login_file" "$legacy_path_line"
       remove_line "$login_file" "$legacy_path_line_resolved"
+      remove_line "$login_file" "$legacy_alias_line"
       ensure_line "$login_file" "$posix_source_line"
       alias_file="$login_file"
       ;;
@@ -670,19 +710,20 @@ install_builtin_skills() {
     BUILTIN_SKILL_DETAILS="Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"
     return 0
   fi
+  builtin_skill_helper="${cxp_dst:-$dst}"
   builtin_skill_err=""
-  if builtin_skill_err="$("$dst" skills install-builtin --yes 2>&1 >/dev/null)"; then
+  if builtin_skill_err="$("$builtin_skill_helper" skills install-builtin --yes 2>&1 >/dev/null)"; then
     if [ -n "${builtin_skill_err:-}" ]; then
       printf "%s\n" "$builtin_skill_err" >&2
     fi
     BUILTIN_SKILL_DETAILS="Built-in cxp skill installed/checked"
     return 0
   fi
-  echo "Warning: failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry." >&2
+  echo "Warning: failed to install built-in cxp skill; run '$builtin_skill_helper skills install-builtin --yes' to retry." >&2
   if [ -n "${builtin_skill_err:-}" ]; then
     printf "%s\n" "$builtin_skill_err" >&2
   fi
-  BUILTIN_SKILL_DETAILS="Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+  BUILTIN_SKILL_DETAILS="Built-in cxp skill install warning; retry with: $builtin_skill_helper skills install-builtin --yes"
   return 0
 }
 
@@ -816,18 +857,19 @@ ensure_write_space "install directory" "$install_dir"
 mkdir -p "$install_dir" || fail_write_or_disk "install directory" "$install_dir" "Failed to create install directory: $install_dir"
 chmod 0755 "$bin_tmp" 2>/dev/null || true
 
-dst="$install_dir/codex-proxy"
-ensure_write_space "codex-proxy binary install" "$dst"
-mv -f "$bin_tmp" "$dst" || fail_write_or_disk "codex-proxy binary install" "$dst" "Failed to move codex-proxy into $dst"
-
 cxp_dst="$install_dir/cxp"
-if have_cmd ln; then
-  ensure_write_space "cxp shim install" "$cxp_dst"
-  ln -sf "$dst" "$cxp_dst" 2>/dev/null || true
-fi
-if [ ! -f "$cxp_dst" ]; then
-  ensure_write_space "cxp shim install" "$cxp_dst"
-  cp -f "$dst" "$cxp_dst" 2>/dev/null || fail_write_or_disk "cxp shim install" "$cxp_dst" "Failed to install cxp shim: $cxp_dst"
+dst="$install_dir/codex-proxy"
+cxp_storage="$(resolve_entry_storage_path "$cxp_dst")" || fail_install "Failed to resolve cxp storage path without changing user symlinks: $cxp_dst"
+dst_storage="$(resolve_entry_storage_path "$dst")" || fail_install "Failed to resolve compatibility storage path without changing user symlinks: $dst"
+
+ensure_write_space "cxp executable install" "$cxp_storage"
+mkdir -p "$(dirname "$cxp_storage")" || fail_write_or_disk "cxp executable install" "$cxp_storage" "Failed to create cxp storage directory: $(dirname "$cxp_storage")"
+mv -f "$bin_tmp" "$cxp_storage" || fail_write_or_disk "cxp executable install" "$cxp_storage" "Failed to move cxp into $cxp_storage"
+
+if [ "$dst_storage" != "$cxp_storage" ]; then
+  ensure_write_space "codex-proxy compatibility install" "$dst_storage"
+  mkdir -p "$(dirname "$dst_storage")" || fail_write_or_disk "codex-proxy compatibility install" "$dst_storage" "Failed to create compatibility storage directory: $(dirname "$dst_storage")"
+  cp -f "$cxp_storage" "$dst_storage" 2>/dev/null || fail_write_or_disk "codex-proxy compatibility install" "$dst_storage" "Failed to install compatibility entry: $dst_storage"
 fi
 chmod 0755 "$cxp_dst" 2>/dev/null || true
 
@@ -884,7 +926,7 @@ write_install_record "$dst" "$cxp_dst"
 INSTALL_SUCCESS_DETAILS="$(cat <<EOF
 Installed: $dst
 ${INSTALL_RECORD_DETAIL:-}
-Run: $dst proxy doctor
+Run: $cxp_dst proxy doctor
 Shell config checked for future sessions; current shell PATH was not reloaded automatically.
 ${INSTALL_ACTIVATION_DETAIL:-Open a new shell to use 'cxp' directly.}
 $BUILTIN_SKILL_DETAILS

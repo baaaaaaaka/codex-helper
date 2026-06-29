@@ -225,8 +225,8 @@ func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
 			if err := json.Unmarshal(raw, &header); err != nil {
 				t.Fatal(err)
 			}
-			if header.Version != 3 || header.MinReader != 1 {
-				t.Fatalf("migration header = %#v, want generation 3 readable by generation-1 readers", header)
+			if header.Version != CurrentVersion || header.MinReader != MinReaderVersion {
+				t.Fatalf("migration header = %#v, want generation %d readable by generation-%d readers", header, CurrentVersion, MinReaderVersion)
 			}
 		})
 	}
@@ -235,7 +235,7 @@ func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
 func TestStoreRejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	// Writer generation 3 is additive and still advertises reader floor 1.
+	// The current writer generation is additive and still advertises reader floor 1.
 	// A future file that raises the floor to 2 is a different contract: this
 	// build must reject it instead of assuming its writer generation implies
 	// support for unknown breaking semantics.

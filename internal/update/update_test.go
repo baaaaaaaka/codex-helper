@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 func TestCheckForUpdateAvailable(t *testing.T) {
@@ -322,6 +324,57 @@ func TestPerformUpdateExplicitVersion(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("expected payload to be installed")
+	}
+}
+
+func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
+	requireRuntimeAsset(t)
+	tag := "v1.2.6"
+	ver := "1.2.6"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("runtime-v1.2.6")
+	server := newReleaseServer(t, tag, asset, payload)
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	base := t.TempDir()
+	root := filepath.Join(base, ".cxp-runtime")
+	entry := filepath.Join(base, helperruntime.BinaryName(runtime.GOOS))
+	if err := os.WriteFile(entry, []byte("stable-entry"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res, err := PerformUpdate(context.Background(), UpdateOptions{
+		Repo:             "owner/name",
+		Version:          tag,
+		Timeout:          time.Second,
+		RuntimeRoot:      root,
+		RuntimeEntryPath: entry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.RuntimeActivated || res.InstallPath != entry {
+		t.Fatalf("result = %#v", res)
+	}
+	wantRuntime := helperruntime.VersionPath(root, tag, runtime.GOOS)
+	if res.RuntimePath != wantRuntime {
+		t.Fatalf("runtime path = %q, want %q", res.RuntimePath, wantRuntime)
+	}
+	got, err := os.ReadFile(wantRuntime)
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("runtime payload = %q, %v", got, err)
+	}
+	active, err := helperruntime.ReadActive(root)
+	if err != nil || active != tag {
+		t.Fatalf("active = %q, %v", active, err)
+	}
+	entryData, err := os.ReadFile(entry)
+	if err != nil || string(entryData) != "stable-entry" {
+		t.Fatalf("stable entry changed: %q, %v", entryData, err)
 	}
 }
 

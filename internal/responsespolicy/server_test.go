@@ -84,6 +84,11 @@ func TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged(t *testing.T
 	if strings.Contains(args, "chatgpt_base_url") {
 		t.Fatalf("config args must preserve the official ChatGPT HTTPS origin: %s", args)
 	}
+	for _, forbidden := range []string{"--aaa", "agent_auto_approve", "auto_approve", "yolo", "danger-full-access", "approval_policy=\"never\""} {
+		if strings.Contains(strings.ToLower(args), forbidden) {
+			t.Fatalf("config args leaked local execution mode %q: %s", forbidden, args)
+		}
+	}
 
 	response, err = http.Get(server.capabilityBaseURL() + "/chatgpt/api/codex/config/bundle")
 	if err != nil {

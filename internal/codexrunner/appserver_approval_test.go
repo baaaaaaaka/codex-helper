@@ -64,6 +64,38 @@ func TestAutomaticApprovalHandlerCancelsDelayWithTurnContext(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerDefaultApprovalModeFailsClosed(t *testing.T) {
+	runner := &AppServerRunner{}
+	line := runner.serverRequestResponse(context.Background(), appServerMessage{
+		ID:     json.RawMessage(`17`),
+		Method: appServerMethodCommandExecutionApproval,
+		Params: json.RawMessage(`{}`),
+	})
+	var response appServerErrorResponse
+	if err := json.Unmarshal(line, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error.Code == nil || string(response.Error.Code) != `-32001` || response.Error.Message != "request requires an interactive reviewer" {
+		t.Fatalf("manual default response = %s", line)
+	}
+}
+
+func TestAppServerRunnerAutomaticApprovalModeIsExplicit(t *testing.T) {
+	runner := &AppServerRunner{ApprovalMode: ApprovalModeAutomatic}
+	line := runner.serverRequestResponse(context.Background(), appServerMessage{
+		ID:     json.RawMessage(`18`),
+		Method: appServerMethodCommandExecutionApproval,
+		Params: json.RawMessage(`{}`),
+	})
+	var response appServerResultResponse
+	if err := json.Unmarshal(line, &response); err != nil {
+		t.Fatal(err)
+	}
+	if string(response.Result) != `{"decision":"accept"}` {
+		t.Fatalf("automatic response = %s", line)
+	}
+}
+
 func TestDefaultApprovalDelayIsFixed(t *testing.T) {
 	if DefaultApprovalDelay != 500*time.Millisecond {
 		t.Fatalf("DefaultApprovalDelay = %s, want fixed 500ms", DefaultApprovalDelay)

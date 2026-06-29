@@ -217,7 +217,8 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 			OpenAIUpstream:       provider.URL + "/v1",
 			ChatGPTModelUpstream: provider.URL + "/v1",
 		}},
-		Command: command,
+		ApprovalMode: ApprovalModeAutomatic,
+		Command:      command,
 		AppServerArgs: []string{
 			"--analytics-default-enabled",
 			"-c", `model="gpt-5.4"`,
@@ -300,6 +301,9 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		[]byte(`bypasspermissions`),
 		[]byte(`automatic_review`),
 		[]byte(`automatic-review`),
+		[]byte(`--aaa`),
+		[]byte(`agent_auto_approve`),
+		[]byte(`auto_approve`),
 	} {
 		if bytes.Contains(lowerAnalytics, forbidden) {
 			t.Fatalf("analytics contains retired execution signal %q: %s", forbidden, analytics)
@@ -449,7 +453,8 @@ int main() {
 		Starter: PolicyAppServerStarter{ServerOptions: responsespolicy.ServerOptions{
 			OpenAIUpstream: provider.URL + "/v1",
 		}},
-		Command: command,
+		ApprovalMode: ApprovalModeAutomatic,
+		Command:      command,
 		AppServerArgs: []string{
 			"--analytics-default-enabled",
 			"-c", `model="gpt-5.4"`,

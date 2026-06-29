@@ -84,7 +84,7 @@ jobs:
             exit 1
           fi
           go test ./internal/codexrunner \
-            -run 'TestLive(AuthenticatedCloudConfigPreservesOfficialChatGPTOrigin|AccountPolicyApprovesEveryRequiredRequestWithoutPromptingSafeTool)' \
+            -run 'TestLive(AuthenticatedCloudConfigPreservesOfficialChatGPTOrigin|AccountPolicy(ApprovesEveryRequiredRequestWithoutPromptingSafeTool|DefaultsApprovalFailClosedWithoutAAA))' \
             -count=1 -v -timeout=4m
 
       - name: Record sanitized contract proof
@@ -93,7 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s\n' \
-            "{\"schema\":1,\"codex_version\":\"${CODEX_VERSION}\",\"auth_home\":\"fresh\",\"official_chatgpt_origin\":true,\"configured_proxy_case\":true,\"safe_tool_without_approval\":true,\"required_tool_auto_approved\":true}" \
+            "{\"schema\":2,\"codex_version\":\"${CODEX_VERSION}\",\"auth_home\":\"fresh\",\"official_chatgpt_origin\":true,\"configured_proxy_case\":true,\"safe_tool_without_approval\":true,\"manual_default_fail_closed\":true,\"aaa_required_tool_auto_approved\":true}" \
             > "$RUNNER_TEMP/codex-live-cloud-config.json"
 
       - name: Upload sanitized proof

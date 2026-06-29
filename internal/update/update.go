@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 )
 
@@ -69,6 +70,8 @@ type UpdateOptions struct {
 	ValidateBinary     bool
 	IncludePrerelease  bool
 	PendingReplacement PendingReplacementMode
+	RuntimeRoot        string
+	RuntimeEntryPath   string
 }
 
 type PendingReplacementMode int
@@ -85,6 +88,8 @@ type ApplyResult struct {
 	InstallPath        string
 	RestartRequired    bool
 	PendingReplacePath string
+	RuntimePath        string
+	RuntimeActivated   bool
 }
 
 type replaceResult struct {
@@ -282,9 +287,18 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		return ApplyResult{}, err
 	}
 
-	installPath, err := ResolveInstallPath(opts.InstallPath)
-	if err != nil {
-		return ApplyResult{}, err
+	installPath := ""
+	runtimeRoot := filepath.Clean(strings.TrimSpace(opts.RuntimeRoot))
+	if runtimeRoot != "" && runtimeRoot != "." {
+		installPath = helperruntime.VersionPath(runtimeRoot, verNoV, runtime.GOOS)
+		if installPath == "" {
+			return ApplyResult{}, fmt.Errorf("invalid runtime update version %q", verNoV)
+		}
+	} else {
+		installPath, err = ResolveInstallPath(opts.InstallPath)
+		if err != nil {
+			return ApplyResult{}, err
+		}
 	}
 
 	tmpPath, err := downloadReleaseAsset(ctx, repo, tag, asset, installPath, timeout)
@@ -296,6 +310,25 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 			_ = os.Remove(tmpPath)
 			return ApplyResult{}, err
 		}
+	}
+	if runtimeRoot != "" && runtimeRoot != "." {
+		runtimePath, publishErr := helperruntime.PublishDownloaded(runtimeRoot, tmpPath, verNoV, runtime.GOOS)
+		if publishErr != nil {
+			_ = os.Remove(tmpPath)
+			return ApplyResult{}, publishErr
+		}
+		entryPath := strings.TrimSpace(opts.RuntimeEntryPath)
+		if entryPath == "" {
+			entryPath = runtimePath
+		}
+		return ApplyResult{
+			Repo:             repo,
+			Version:          verNoV,
+			Asset:            asset,
+			InstallPath:      entryPath,
+			RuntimePath:      runtimePath,
+			RuntimeActivated: true,
+		}, nil
 	}
 
 	rep, err := replaceBinary(tmpPath, installPath, replaceOptions{
@@ -620,7 +653,9 @@ func validateDownloadedBinary(ctx context.Context, path string, version string, 
 		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	out, err := exec.CommandContext(cmdCtx, path, "--version").CombinedOutput()
+	cmd := exec.CommandContext(cmdCtx, path, "--version")
+	cmd.Env = append(os.Environ(), helperruntime.EnvDisable+"=1")
+	out, err := cmd.CombinedOutput()
 	output := trimValidationOutput(string(out))
 	if err != nil {
 		return fmt.Errorf("validate downloaded binary: %w: %s", err, output)

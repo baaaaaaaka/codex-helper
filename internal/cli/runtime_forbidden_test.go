@@ -58,6 +58,13 @@ func TestLegacyExecutionFlagsRemainHiddenCompatibilityOnly(t *testing.T) {
 	}
 }
 
+func TestAAAFlagIsPublicAndDefaultsOff(t *testing.T) {
+	flag := newRunCmd(nil).Flags().Lookup("aaa")
+	if flag == nil || flag.Hidden || flag.DefValue != "false" {
+		t.Fatalf("AAA flag = %#v, want public default-off flag", flag)
+	}
+}
+
 func TestRuntimeSourcesContainNoRetiredExecutionSignals(t *testing.T) {
 	forbidden := []string{
 		"--yolo",

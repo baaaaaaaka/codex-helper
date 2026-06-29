@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -678,11 +681,49 @@ func finalizeHelperEntrypointsAfterUpgrade(installPath string, version string, o
 	for _, err := range repairKnownHelperEntrypointsForInstallPath(installPath) {
 		_, _ = fmt.Fprintf(out, "Warning: failed to unify helper entrypoint after upgrade: %v\n", err)
 	}
+	if strings.EqualFold(runtime.GOOS, "windows") {
+		for _, err := range migrateWindowsPowerShellCXPProfiles() {
+			_, _ = fmt.Fprintf(out, "Warning: failed to migrate a legacy PowerShell cxp alias: %v\n", err)
+		}
+	}
 	saveCLIManagedInstallRecordBestEffort(installPath, version)
 	if err := verifyCXPEntrypointAfterUpgrade(installPath, version); err != nil {
 		return err
 	}
 	return nil
+}
+
+func finalizeHelperUpdateResult(res update.ApplyResult, out io.Writer) error {
+	if !res.RuntimeActivated {
+		return finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, out)
+	}
+	if strings.EqualFold(runtime.GOOS, "windows") {
+		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
+			return fmt.Errorf("finalize stable cxp compatibility entrypoint: %w", err)
+		}
+		for _, err := range migrateWindowsPowerShellCXPProfiles() {
+			_, _ = fmt.Fprintf(out, "Warning: failed to migrate a legacy PowerShell cxp alias: %v\n", err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := verifyHelperEntrypointVersion(ctx, res.RuntimePath, res.Version, "published cxp runtime"); err != nil {
+		return err
+	}
+	if err := verifyHelperEntrypointVersion(ctx, res.InstallPath, res.Version, "stable cxp entrypoint"); err != nil {
+		return err
+	}
+	// Keep the legacy install record valid for old updaters while all new
+	// executions converge through the stable cxp entry and active runtime.
+	saveCLIManagedInstallRecordBestEffort(res.InstallPath, res.Version)
+	return nil
+}
+
+func helperUpdateExecutionPath(res update.ApplyResult) string {
+	if strings.TrimSpace(res.RuntimePath) != "" {
+		return res.RuntimePath
+	}
+	return firstNonEmptyString(res.PendingReplacePath, res.InstallPath)
 }
 
 type helperEntrypointAlias struct {
@@ -1062,6 +1103,14 @@ func ensureWindowsCXPShimForInstallPath(installPath string) error {
 	if installPath == "" || !strings.EqualFold(filepath.Base(installPath), helperpath.BinaryName("windows")) {
 		return nil
 	}
+	stableExe := filepath.Join(filepath.Dir(installPath), helperruntime.BinaryName("windows"))
+	if _, err := os.Stat(stableExe); os.IsNotExist(err) {
+		if err := copyExecutableAtomically(installPath, stableExe); err != nil {
+			return fmt.Errorf("create stable cxp executable %s from %s: %w", stableExe, installPath, err)
+		}
+	} else if err != nil {
+		return err
+	}
 	shimPath := filepath.Join(filepath.Dir(installPath), "cxp.cmd")
 	expected := windowsCXPShimContent()
 	if info, err := os.Stat(shimPath); err == nil {
@@ -1089,7 +1138,97 @@ func ensureWindowsCXPShimForInstallPath(installPath string) error {
 }
 
 func windowsCXPShimContent() string {
-	return "@echo off\r\n\"%~dp0codex-proxy.exe\" %*\r\n"
+	return "@echo off\r\n\"%~dp0cxp.exe\" %*\r\n"
+}
+
+func migrateWindowsPowerShellCXPProfiles() []error {
+	const envProfile = "CODEX_PROXY_PROFILE_PATH"
+	var candidates []string
+	add := func(path string) {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path != "" && path != "." {
+			candidates = append(candidates, path)
+		}
+	}
+	add(os.Getenv(envProfile))
+	for _, root := range []string{os.Getenv("USERPROFILE"), os.Getenv("HOME"), os.Getenv("OneDrive"), os.Getenv("OneDriveConsumer")} {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		for _, family := range []string{"WindowsPowerShell", "PowerShell"} {
+			add(filepath.Join(root, "Documents", family, "Microsoft.PowerShell_profile.ps1"))
+			add(filepath.Join(root, "Documents", family, "profile.ps1"))
+		}
+	}
+	seen := map[string]bool{}
+	var errs []error
+	for _, path := range candidates {
+		key := managedinstall.ComparisonKey(path, "windows")
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if err := rewriteLegacyCXPProfile(path); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", path, err))
+		}
+	}
+	return errs
+}
+
+func rewriteLegacyCXPProfile(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	legacy := []byte("Set-Alias -Name cxp -Value codex-proxy")
+	updated, changed := replaceExactPowerShellProfileLine(data, legacy, []byte("Set-Alias -Name cxp -Value cxp.exe"))
+	if !changed {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(path, updated, info.Mode().Perm())
+}
+
+func replaceExactPowerShellProfileLine(data []byte, oldLine []byte, newLine []byte) ([]byte, bool) {
+	parts := bytes.SplitAfter(data, []byte{'\n'})
+	var out bytes.Buffer
+	out.Grow(len(data))
+	changed := false
+	for index, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		bodyEnd := len(part)
+		if bodyEnd > 0 && part[bodyEnd-1] == '\n' {
+			bodyEnd--
+		}
+		if bodyEnd > 0 && part[bodyEnd-1] == '\r' {
+			bodyEnd--
+		}
+		bodyStart := 0
+		if index == 0 && bodyEnd >= 3 && bytes.Equal(part[:3], []byte{0xef, 0xbb, 0xbf}) {
+			bodyStart = 3
+		}
+		if bytes.Equal(part[bodyStart:bodyEnd], oldLine) {
+			out.Write(part[:bodyStart])
+			out.Write(newLine)
+			out.Write(part[bodyEnd:])
+			changed = true
+			continue
+		}
+		out.Write(part)
+	}
+	if !changed {
+		return data, false
+	}
+	return out.Bytes(), true
 }
 
 func verifyCXPEntrypointAfterUpgrade(installPath string, targetVersion string) error {

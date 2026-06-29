@@ -229,6 +229,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			}
 			profile = &p
 		}
+		agentAutoApprove := resolveAAAEnabled(cfg)
 
 		defaultCwd, _ := os.Getwd()
 		selection, err := selectSession(ctx, tui.Options{
@@ -238,8 +239,12 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			Version:         version,
 			ProxyEnabled:    useProxy,
 			ProxyConfigured: len(cfg.Profiles) > 0,
+			AAAEnabled:      agentAutoApprove,
 			RefreshInterval: refreshInterval,
 			DefaultCwd:      defaultCwd,
+			PersistAAA: func(enabled bool) error {
+				return persistAAAEnabled(store, enabled)
+			},
 			CheckUpdate: func(ctx context.Context) update.Status {
 				return update.CheckForUpdate(ctx, update.CheckOptions{
 					InstalledVersion: version,

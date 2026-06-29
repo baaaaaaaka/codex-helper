@@ -78,7 +78,7 @@ esac
 	started := time.Now()
 	err := runCodexCLIInvocation(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil,
 		[]string{codexPath, "exec", "--json", "run hardware probe"}, false,
-		runTargetOptions{Cwd: dir, Stdin: strings.NewReader(""), Stdout: &output, Stderr: io.Discard, Log: io.Discard})
+		runTargetOptions{Cwd: dir, Stdin: strings.NewReader(""), Stdout: &output, Stderr: io.Discard, Log: io.Discard, AgentAutoApprove: true})
 	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("runCodexCLIInvocation: %v", err)
@@ -89,6 +89,15 @@ esac
 	text := output.String()
 	if !strings.Contains(text, `"type":"item.completed"`) || !strings.Contains(text, `"text":"runtime done"`) || !strings.Contains(text, `"type":"turn.completed"`) {
 		t.Fatalf("JSONL output = %s", text)
+	}
+}
+
+func TestRunCodexCLIInvocationRejectsAAAForNativeOnlySurface(t *testing.T) {
+	store := newCodexOpenTestStore(t)
+	err := runCodexCLIInvocation(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil,
+		[]string{"codex", "--help"}, false, runTargetOptions{AgentAutoApprove: true})
+	if err == nil || !strings.Contains(err.Error(), "--aaa is not supported for this native Codex subcommand") {
+		t.Fatalf("native AAA error = %v", err)
 	}
 }
 
@@ -141,7 +150,7 @@ func TestLiveCodexExecFacadeUsesOriginalBinaryAndAssignedGPU(t *testing.T) {
 	command = append(command, "exec", "Use shell_command to run exactly: nvidia-smi --query-gpu=name --format=csv,noheader. Report the exact command output.")
 	err = runCodexCLIInvocation(ctx, &rootOptions{configPath: store.Path()}, store, nil, nil,
 		command, false,
-		runTargetOptions{Cwd: t.TempDir(), Stdin: strings.NewReader(""), Stdout: &output, Stderr: io.Discard, Log: io.Discard})
+		runTargetOptions{Cwd: t.TempDir(), Stdin: strings.NewReader(""), Stdout: &output, Stderr: io.Discard, Log: io.Discard, AgentAutoApprove: true})
 	if err != nil {
 		t.Fatalf("live exec facade: %v", err)
 	}

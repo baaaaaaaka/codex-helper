@@ -14,11 +14,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
 var (
-	performUpdate            = update.PerformUpdate
+	performUpdate            = performUpdateWithRuntime
 	checkForUpdate           = update.CheckForUpdate
 	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
 	executablePath           = helperpath.RawExecutable
@@ -32,6 +33,32 @@ var (
 	exitFunc  = os.Exit
 	startSelf = startRestartProcess
 )
+
+func performUpdateWithRuntime(ctx context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+	if current, ok := helperruntime.Current(); ok && currentRuntimeOwnsUpdateTarget(current, opts.InstallPath) {
+		opts.RuntimeRoot = current.Root
+		opts.RuntimeEntryPath = current.EntryPath
+	}
+	return update.PerformUpdate(ctx, opts)
+}
+
+func currentRuntimeOwnsUpdateTarget(current helperruntime.Context, installPath string) bool {
+	installPath = strings.TrimSpace(installPath)
+	if installPath == "" {
+		return true
+	}
+	candidates := []string{
+		current.EntryPath,
+		current.RuntimePath,
+		filepath.Join(filepath.Dir(current.EntryPath), helperpath.BinaryName(runtime.GOOS)),
+	}
+	for _, candidate := range candidates {
+		if sameHelperInstallLocation(installPath, candidate, runtime.GOOS) {
+			return true
+		}
+	}
+	return false
+}
 
 func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 	installPath, err := resolveInstallPathForCLI("")
@@ -64,7 +91,7 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 		return nil
 	}
 
-	if err := finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr()); err != nil {
+	if err := finalizeHelperUpdateResult(res, cmd.ErrOrStderr()); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s. Restarting...\n", res.Version)
@@ -72,6 +99,9 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 }
 
 func restartSelf() error {
+	if current, ok := helperruntime.Current(); ok {
+		return restartSelfWithResolvedExecutableAndEnv(current.EntryPath, helperruntime.LauncherEnvironment(os.Environ()))
+	}
 	exe, err := executablePath()
 	if err != nil {
 		return err
@@ -96,6 +126,10 @@ func restartSelfWithExecutable(path string) error {
 }
 
 func restartSelfWithResolvedExecutable(exe string) error {
+	return restartSelfWithResolvedExecutableAndEnv(exe, os.Environ())
+}
+
+func restartSelfWithResolvedExecutableAndEnv(exe string, env []string) error {
 	args := append([]string{exe}, os.Args[1:]...)
 	if runtime.GOOS == "windows" {
 		if err := startSelf(exe, args[1:]); err != nil {
@@ -104,7 +138,7 @@ func restartSelfWithResolvedExecutable(exe string) error {
 		exitFunc(0)
 		return nil
 	}
-	return execSelf(exe, args, os.Environ())
+	return execSelf(exe, args, env)
 }
 
 func stableRestartExecutablePath(path string) string {

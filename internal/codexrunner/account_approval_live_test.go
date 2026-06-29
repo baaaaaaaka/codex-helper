@@ -251,3 +251,104 @@ func TestLiveAccountPolicyApprovesEveryRequiredRequestWithoutPromptingSafeTool(t
 		t.Fatal("original Codex command changed during live account approval contract")
 	}
 }
+
+// TestLiveAccountPolicyDefaultsApprovalFailClosedWithoutAAA exercises the same
+// managed-account and deterministic-provider path without installing an
+// automatic handler. The safe tool still runs, the approval-required command
+// is rejected, and its filesystem side effect must not happen.
+func TestLiveAccountPolicyDefaultsApprovalFailClosedWithoutAAA(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CXP_LIVE_ACCOUNT_APPROVAL_TEST")) != "1" {
+		t.Skip("set CXP_LIVE_ACCOUNT_APPROVAL_TEST=1 to exercise current-account approval classification")
+	}
+	command := strings.TrimSpace(os.Getenv("CXP_LIVE_CODEX"))
+	if command == "" {
+		var err error
+		command, err = exec.LookPath("codex")
+		if err != nil {
+			t.Fatalf("codex not found in PATH: %v", err)
+		}
+	}
+	sourceHome := strings.TrimSpace(os.Getenv("CXP_LIVE_CODEX_HOME"))
+	if sourceHome == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sourceHome = filepath.Join(home, ".codex")
+	}
+	auth, err := os.ReadFile(filepath.Join(sourceHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read live auth: %v", err)
+	}
+	originalHash := runtimeContractFileHash(t, command)
+
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex-home")
+	workingDir := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "auth.json"), auth, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(root, "must-not-exist.txt")
+	adapter := &accountApprovalAdapter{workingDir: workingDir, sentinel: sentinel}
+	provider := httptest.NewServer(&responsesadapter.Facade{
+		Adapter:      adapter,
+		Store:        responsesadapter.NewMemoryStore(),
+		DefaultModel: "gpt-5.4",
+		Models:       []responsesadapter.ModelInfo{{ID: "gpt-5.4", OwnedBy: "cxp-live-account-manual-contract"}},
+	})
+	defer provider.Close()
+	proxy := strings.TrimSpace(os.Getenv("CXP_LIVE_HTTP_PROXY"))
+	runner := &AppServerRunner{
+		Starter: PolicyAppServerStarter{ServerOptions: responsespolicy.ServerOptions{
+			OpenAIUpstream:       provider.URL + "/v1",
+			ChatGPTModelUpstream: provider.URL + "/v1",
+		}},
+		Command: command,
+		AppServerArgs: []string{
+			"-c", `model="gpt-5.4"`,
+			"-c", `model_provider="openai"`,
+		},
+		ExtraEnv: []string{
+			"CODEX_HOME=" + codexHome,
+			"CODEX_DIR=" + codexHome,
+			"HTTP_PROXY=" + proxy,
+			"HTTPS_PROXY=" + proxy,
+			"ALL_PROXY=",
+			"NO_PROXY=127.0.0.1,localhost,::1",
+		},
+		WorkingDir: workingDir,
+		Timeout:    60 * time.Second,
+	}
+	defer runner.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	result, err := runner.StartThread(ctx, TurnInput{
+		Prompt:     "Run the deterministic current-account manual approval contract.",
+		WorkingDir: workingDir,
+		Ephemeral:  true,
+	})
+	if err != nil {
+		t.Fatalf("current-account manual approval contract: %v", err)
+	}
+	if result.Status != TurnStatusCompleted || !strings.Contains(result.FinalAgentMessage, "account approval matrix complete") {
+		t.Fatalf("turn result = %#v", result)
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("approval-required command produced a side effect while AAA was off: %v", err)
+	}
+	adapter.mu.Lock()
+	calls, safeTool, shellTool, providerErr := adapter.calls, adapter.safeTool, adapter.shellTool, adapter.providerErr
+	adapter.mu.Unlock()
+	if calls < 3 || safeTool != "update_plan" || shellTool == "" || providerErr != nil {
+		t.Fatalf("provider state = calls:%d safe:%q shell:%q err:%v", calls, safeTool, shellTool, providerErr)
+	}
+	if currentHash := runtimeContractFileHash(t, command); currentHash != originalHash {
+		t.Fatal("original Codex command changed during manual approval contract")
+	}
+}

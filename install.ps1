@@ -180,8 +180,12 @@ function Get-CodexProxyProcessesForPath([string]$path) {
   } catch {
     return @()
   }
+  $processName = [IO.Path]::GetFileName($target)
+  if ($processName -ine "codex-proxy.exe" -and $processName -ine "cxp.exe") {
+    return @()
+  }
   try {
-    return @(Get-CimInstance Win32_Process -Filter "Name = 'codex-proxy.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    return @(Get-CimInstance Win32_Process -Filter "Name = '$processName'" -ErrorAction SilentlyContinue | Where-Object {
       try {
         -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)
       } catch {
@@ -541,8 +545,17 @@ Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultRea
   }
 }
 
+$cxpExe = Join-Path $installDirResolved "cxp.exe"
+if (@(Get-CodexProxyProcessesForPath $cxpExe).Count -gt 0) {
+  Stop-CodexProxyTeamsTasksForInstall
+  Wait-CodexProxyInstallPathReleased $cxpExe
+}
+Invoke-DiskWrite -Label "cxp executable install" -PathValue $cxpExe -DefaultReason "Failed to install cxp executable: $cxpExe" -Action {
+  Copy-Item -Force -LiteralPath $dst -Destination $cxpExe -ErrorAction Stop
+}
+
 $cxpCmd = Join-Path $installDirResolved "cxp.cmd"
-$cxpContent = "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
+$cxpContent = "@echo off`r`n`"%~dp0cxp.exe`" %*`r`n"
 Invoke-DiskWrite -Label "cxp shim install" -PathValue $cxpCmd -DefaultReason "Failed to install cxp shim: $cxpCmd" -Action {
   Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
 }
@@ -552,7 +565,7 @@ if ($env:CODEX_PROXY_SKIP_BUILTIN_SKILLS -eq "1") {
 } else {
   $builtinSkillErrFile = [IO.Path]::GetTempFileName()
   try {
-    & $dst skills install-builtin --yes 1>$null 2>$builtinSkillErrFile
+    & $cxpExe skills install-builtin --yes 1>$null 2>$builtinSkillErrFile
     $builtinSkillErr = ""
     if (Test-Path -LiteralPath $builtinSkillErrFile) {
       $builtinSkillErr = Get-Content -Raw -LiteralPath $builtinSkillErrFile -ErrorAction SilentlyContinue
@@ -563,15 +576,15 @@ if ($env:CODEX_PROXY_SKIP_BUILTIN_SKILLS -eq "1") {
       }
       $builtinSkillDetail = "Built-in cxp skill installed/checked"
     } else {
-      Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry."
+      Write-Warning "Failed to install built-in cxp skill; run '$cxpExe skills install-builtin --yes' to retry."
       if (-not [string]::IsNullOrWhiteSpace($builtinSkillErr)) {
         Write-Warning $builtinSkillErr.Trim()
       }
-      $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+      $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $cxpExe skills install-builtin --yes"
     }
   } catch {
-    Write-Warning "Failed to install built-in cxp skill; run '$dst skills install-builtin --yes' to retry. $($_.Exception.Message)"
-    $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $dst skills install-builtin --yes"
+    Write-Warning "Failed to install built-in cxp skill; run '$cxpExe skills install-builtin --yes' to retry. $($_.Exception.Message)"
+    $builtinSkillDetail = "Built-in cxp skill install warning; retry with: $cxpExe skills install-builtin --yes"
   } finally {
     Remove-Item -Force -LiteralPath $builtinSkillErrFile -ErrorAction SilentlyContinue
   }
@@ -598,7 +611,8 @@ $profilePath = $env:CODEX_PROXY_PROFILE_PATH
 if ([string]::IsNullOrWhiteSpace($profilePath)) {
   $profilePath = $PROFILE
 }
-$aliasLine = 'Set-Alias -Name cxp -Value codex-proxy'
+$legacyAliasLine = 'Set-Alias -Name cxp -Value codex-proxy'
+$aliasLine = 'Set-Alias -Name cxp -Value cxp.exe'
 
 foreach ($pathValue in $pathEntries) {
   $legacyLine = '$env:Path = "' + (Normalize-PathEntry $pathValue) + ';$env:Path"'
@@ -608,9 +622,10 @@ foreach ($pathValue in $pathEntries) {
     $null = Ensure-ProfileLine -path $profilePath -line $pathLine
   }
 }
+$null = Remove-ProfileLine -path $profilePath -line $legacyAliasLine
 $null = Ensure-ProfileLine -path $profilePath -line $aliasLine
 
-Write-InstallRecord -targetPath $dst -shimPath $cxpCmd -repo $Repo -version $tag -goarch $arch
+Write-InstallRecord -targetPath $dst -shimPath $cxpExe -repo $Repo -version $tag -goarch $arch
 
 # Clean up legacy command names when they can be positively identified as
 # codex-proxy-owned leftovers from earlier installs.

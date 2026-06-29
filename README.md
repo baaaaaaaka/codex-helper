@@ -32,9 +32,17 @@ process-scoped `RemoteSigned` policy so default script restrictions can still
 run the local temporary file. Group Policy script restrictions can still block
 execution.
 
-The installer drops a `cxp` shim alongside `codex-proxy`, tries to add the
-install directory plus the managed CLI directory to PATH, and also adds a `cxp`
-shell alias where applicable. Open a new shell if the command is not found.
+The installer puts a stable `cxp` executable alongside the legacy
+`codex-proxy` compatibility entry and adds the install directory plus the
+managed CLI directory to PATH. Exact legacy aliases that redirected `cxp` back
+to `codex-proxy` are removed. Existing user-managed directory and multi-hop
+file symlinks are preserved while their final payload is updated. Open a new
+shell if the command is not found.
+
+Released builds run through an immutable, versioned `cxp` runtime. Updates
+publish the new runtime before atomically switching the active version, so an
+already-running session keeps its old executable and new CXP-owned long-lived
+processes use `cxp` paths and process names.
 
 ### 2) **Run**
 
@@ -146,6 +154,7 @@ These are the commands a normal install most often needs:
 | `codex-proxy` or `cxp` | Open the local Codex history TUI |
 | `codex-proxy run -- <cmd> [args...]` | Run a command using the current direct/proxy mode |
 | `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
+| `codex-proxy run --aaa -- codex` | Enable agent-auto-approve for this Codex run |
 | `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy model list` | Show built-in and configured model choices |
 | `codex-proxy model setup <model>` | Configure a built-in model choice such as `deepseek`, `mimo`, `kimi`, `glm`, `minimax`, or `qwen` |
@@ -175,6 +184,7 @@ walk through the normal flows in order.
 | `codex-proxy init` | Create an SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
 | `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
+| `codex-proxy run --aaa -- codex` | Enable agent-auto-approve for this Codex run |
 | `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history tui` | Browse Codex history in a terminal UI |
@@ -269,13 +279,22 @@ Common flags:
 
 ### Standard approval runtime
 
-CXP launches the original Codex binary with ordinary on-request approvals. A
-local broker answers supported approval requests after a fixed 500 ms delay, so
-users do not need to approve each command manually:
+CXP launches the original Codex binary with ordinary on-request approvals.
+Local interactive launches default to manual review: the broker forwards each
+approval request byte-for-byte to the official Codex TUI. Press `Ctrl+A` in the
+CXP history TUI to persistently toggle Agent Auto Approve (AAA), or enable it for
+one command without changing the saved preference:
 
 ```bash
-codex-proxy run -- codex
+codex-proxy run --aaa -- codex
+codex-proxy run --aaa -- codex exec "..."
 ```
+
+AAA answers supported approval requests after a fixed 500 ms delay. Without
+AAA, non-interactive `codex exec` facade requests fail closed because no human
+reviewer is attached. Teams and Beacon are unattended surfaces and therefore
+enable the same automatic handler explicitly; they do not inherit the local TUI
+preference. The `--aaa` flag is consumed by CXP and is never passed to Codex.
 
 This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
 are upgraded automatically before the first brokered turn. The release compatibility
@@ -289,7 +308,9 @@ already provide. Telemetry remains enabled and is forwarded without payload
 mutation.
 
 The brokered surfaces are the Codex TUI/history launch paths, the `codex exec`
-facade, Teams turns, and Beacon workers. Contract CI uses the original Codex
+facade, Teams turns, and Beacon workers. Manual and AAA modes use the same
+original binary, on-request policy, Responses gateway, and proxy routing; only
+the reviewer changes. Contract CI uses the original Codex
 binary with analytics enabled and requires the emitted review to remain an
 ordinary `reviewer=user`, `status=approved`, `user_approved` event. CXP does not
 hide its app-server client identity or try to prevent server-side inference from
@@ -312,7 +333,8 @@ cannot hide a regression. It runs the same account-backed check both directly
 and through the configured real proxy outlet. It also combines the real
 workspace policy with a deterministic local model provider to verify that a
 safe tool does not create an approval request while every approval-required
-shell call is accepted by the broker and completes its filesystem side effect.
+shell call is accepted in explicit AAA mode and completes its filesystem side
+effect.
 
 `codex-proxy app` still launches the official Desktop App directly. The Desktop
 App does not currently expose a stable external app-server attachment contract,

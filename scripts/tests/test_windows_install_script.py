@@ -27,12 +27,15 @@ class WindowsInstallScriptTests(unittest.TestCase):
 
         for expected in [
             "function Get-CodexProxyProcessesForPath",
-            "Get-CimInstance Win32_Process -Filter \"Name = 'codex-proxy.exe'\"",
+            "$processName -ine \"codex-proxy.exe\" -and $processName -ine \"cxp.exe\"",
+            "Get-CimInstance Win32_Process -Filter \"Name = '$processName'\"",
             "Stop-CodexProxyTeamsTasksForInstall",
             "Codex Helper Teams Watchdog",
             "Codex Helper Teams Bridge",
             "Wait-CodexProxyInstallPathReleased $dst",
+            "Wait-CodexProxyInstallPathReleased $cxpExe",
             "Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop",
+            "Copy-Item -Force -LiteralPath $dst -Destination $cxpExe -ErrorAction Stop",
             "Pending codex-proxy binary still exists after Move-Item",
         ]:
             self.assertIn(expected, script)
@@ -40,6 +43,10 @@ class WindowsInstallScriptTests(unittest.TestCase):
         self.assertLess(
             script.index("Wait-CodexProxyInstallPathReleased $dst"),
             script.index("Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop"),
+        )
+        self.assertLess(
+            script.index("Wait-CodexProxyInstallPathReleased $cxpExe"),
+            script.index("Copy-Item -Force -LiteralPath $dst -Destination $cxpExe -ErrorAction Stop"),
         )
 
 

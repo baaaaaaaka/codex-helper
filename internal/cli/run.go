@@ -43,6 +43,7 @@ var (
 
 func newRunCmd(root *rootOptions) *cobra.Command {
 	var modelProfile string
+	var agentAutoApprove bool
 	var legacyMode bool
 	cmd := &cobra.Command{
 		Use:   "run [profile] -- [cmd args...]",
@@ -54,6 +55,7 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
+	cmd.Flags().BoolVar(&agentAutoApprove, "aaa", false, "Automatically approve Codex agent requests for this run")
 	cmd.Flags().BoolVar(&legacyMode, migration.LegacyRunModeFlagName, false, "")
 	_ = cmd.Flags().MarkHidden(migration.LegacyRunModeFlagName)
 	return cmd
@@ -83,6 +85,9 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	runOpts := runTargetOptionsFromRunFlags(cmd)
 	if strings.TrimSpace(runOpts.ModelProfileRef) != "" && (len(after) == 0 || !isCodexCommand(after[0])) {
 		return fmt.Errorf("--model-profile only applies to Codex launches")
+	}
+	if runOpts.AgentAutoApprove && (len(after) == 0 || !isCodexCommand(after[0])) {
+		return fmt.Errorf("--aaa only applies to Codex launches")
 	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -190,6 +195,9 @@ func runTargetOptionsFromRunFlags(cmd *cobra.Command) runTargetOptions {
 	}
 	if flag := cmd.Flags().Lookup("model-profile"); flag != nil {
 		opts.ModelProfileRef = strings.TrimSpace(flag.Value.String())
+	}
+	if flag := cmd.Flags().Lookup("aaa"); flag != nil {
+		opts.AgentAutoApprove = strings.EqualFold(strings.TrimSpace(flag.Value.String()), "true")
 	}
 	return opts
 }
@@ -403,6 +411,7 @@ type runTargetOptions struct {
 	PreserveTTY          bool
 	ModelProfileRef      string
 	ModelProfileSnapshot modelprofile.Snapshot
+	AgentAutoApprove     bool
 }
 
 type codexResolveError struct {

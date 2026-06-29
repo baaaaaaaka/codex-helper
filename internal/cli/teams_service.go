@@ -25,6 +25,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -2903,6 +2904,12 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 			return teamsServiceSpec{}, fmt.Errorf("managed Teams service executable %s is not available after materialization", exe)
 		}
 	}
+	if preferred := preferredCXPServiceEntry(exe); preferred != "" {
+		exe = preferred
+	}
+	if err := validateTeamsServiceExecutable(exe); err != nil {
+		return teamsServiceSpec{}, err
+	}
 	for name, value := range opts.Environment {
 		name = strings.TrimSpace(name)
 		value = strings.TrimSpace(value)
@@ -2919,6 +2926,21 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		RegistryPath: resolvedRegistryPath,
 		Environment:  env,
 	}, nil
+}
+
+func preferredCXPServiceEntry(managedPath string) string {
+	candidate := filepath.Join(filepath.Dir(managedPath), helperruntime.BinaryName(teamsServiceGOOS()))
+	probe := helperpath.ProbePath(candidate, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
+	if probe.Exists && !probe.IsDir && probe.Executable {
+		return candidate
+	}
+	if current, ok := helperruntime.Current(); ok && sameHelperInstallLocation(current.EntryPath, managedPath, teamsServiceGOOS()) {
+		probe := helperpath.ProbePath(current.EntryPath, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
+		if probe.Exists && !probe.IsDir && probe.Executable {
+			return current.EntryPath
+		}
+	}
+	return ""
 }
 
 func validateTeamsServiceExecutable(exe string) error {

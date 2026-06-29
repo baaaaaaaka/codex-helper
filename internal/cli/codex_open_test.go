@@ -191,7 +191,7 @@ func assertStandardBrokerLaunch(t *testing.T, fixture codexTUIBrokerFixture) {
 			t.Fatalf("app-server args missing %q:\n%s", want, appArgs)
 		}
 	}
-	for _, forbidden := range []string{"--yolo", "dangerously-bypass", "danger-full-access", "approval_policy=\"never\""} {
+	for _, forbidden := range []string{"--aaa", "agent_auto_approve", "auto_approve", "--yolo", "dangerously-bypass", "danger-full-access", "approval_policy=\"never\""} {
 		if strings.Contains(appArgs, forbidden) || strings.Contains(strings.Join(tuiArgs, "\n"), forbidden) {
 			t.Fatalf("launch retained forbidden execution signal %q", forbidden)
 		}

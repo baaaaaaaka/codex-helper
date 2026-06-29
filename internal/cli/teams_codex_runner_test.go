@@ -404,6 +404,9 @@ func TestNewManagedTeamsCodexExecutorUsesStandardAppServerRunner(t *testing.T) {
 	if runner.Starter == nil {
 		t.Fatalf("appserver runner missing policy starter: %#v", runner)
 	}
+	if runner.ApprovalMode != codexrunner.ApprovalModeAutomatic {
+		t.Fatalf("Teams runner approval mode = %v, want explicit automatic mode", runner.ApprovalMode)
+	}
 	if runner.Command != "/tmp/codex" || runner.WorkingDir != "/work" || runner.Timeout != time.Minute {
 		t.Fatalf("appserver runner config mismatch: %#v", runner)
 	}

@@ -67,7 +67,7 @@ func TestInstallPs1CurrentPowerShellPathAllowsBareCxp(t *testing.T) {
 $ErrorActionPreference = "Stop"
 & $env:TEST_INSTALL_SCRIPT -Repo $env:TEST_REPO -Version latest -InstallDir $env:TEST_INSTALL_DIR
 $cmd = Get-Command cxp -ErrorAction Stop
-$expected = [IO.Path]::GetFullPath((Join-Path $env:TEST_INSTALL_DIR "cxp.cmd"))
+$expected = [IO.Path]::GetFullPath((Join-Path $env:TEST_INSTALL_DIR "cxp.exe"))
 $actual = [IO.Path]::GetFullPath($cmd.Source)
 if ($actual -ine $expected) {
   throw "cxp resolved to $actual, expected $expected"
@@ -635,6 +635,14 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !bytes.Equal(got, assetData) {
 		t.Fatalf("installed payload mismatch")
 	}
+	cxpExe := filepath.Join(installDir, "cxp.exe")
+	cxpExeData, err := os.ReadFile(cxpExe)
+	if err != nil {
+		t.Fatalf("read cxp.exe: %v", err)
+	}
+	if !bytes.Equal(cxpExeData, assetData) {
+		t.Fatalf("cxp.exe payload mismatch")
+	}
 	cxpCmd := filepath.Join(installDir, "cxp.cmd")
 	cmdData, err := os.ReadFile(cxpCmd)
 	if err != nil {
@@ -642,7 +650,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	}
 	cmdText := strings.ReplaceAll(string(cmdData), "\r\n", "\n")
 	cmdText = strings.TrimRight(cmdText, "\n")
-	wantCxpCmd := "@echo off\n\"%~dp0codex-proxy.exe\" %*"
+	wantCxpCmd := "@echo off\n\"%~dp0cxp.exe\" %*"
 	if cmdText != wantCxpCmd {
 		t.Fatalf("cxp.cmd content mismatch\ngot:\n%q\nwant:\n%q", cmdText, wantCxpCmd)
 	}
@@ -668,7 +676,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		t.Fatalf("parse install record: %v\n%s", err, recordData)
 	}
 	expectedTarget := filepath.Join(installDirResolved, "codex-proxy.exe")
-	expectedShim := filepath.Join(installDirResolved, "cxp.cmd")
+	expectedShim := filepath.Join(installDirResolved, "cxp.exe")
 	if record.SchemaVersion != 1 ||
 		record.TargetPath != expectedTarget ||
 		record.TargetSource != "installer" ||
@@ -707,7 +715,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 		t.Fatalf("read profile: %v", err)
 	}
 	profileText := string(profile)
-	if !strings.Contains(profileText, "Set-Alias -Name cxp -Value codex-proxy") {
+	if !strings.Contains(profileText, "Set-Alias -Name cxp -Value cxp.exe") {
 		t.Fatalf("missing cxp alias in profile")
 	}
 	if strings.Contains(strings.ToLower(profileText), "clp") {

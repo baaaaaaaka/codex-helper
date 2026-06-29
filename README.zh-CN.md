@@ -30,9 +30,15 @@ Windows 命令会先把安装器下载到临时文件再执行。它避免把远
 pipe 进 PowerShell，同时使用仅作用于当前进程的 `RemoteSigned` 策略，
 让默认脚本限制仍能运行本地临时文件。Group Policy 脚本限制仍然可能阻止执行。
 
-安装器会在 `codex-proxy` 旁边放置一个 `cxp` shim，尝试把安装目录和托管
-CLI 目录加入 PATH，并在适用时添加 `cxp` shell alias。如果找不到命令，
-请打开一个新 shell。
+安装器会在旧的 `codex-proxy` 兼容入口旁放置稳定的 `cxp` executable，并尝试
+把安装目录和托管 CLI 目录加入 PATH。旧版中把 `cxp` 重定向回
+`codex-proxy` 的精确 shell alias 会被移除；用户自己创建的目录软链接和多跳
+文件软链接会保持原样，只更新最终 payload。如果找不到命令，请打开一个新
+shell。
+
+正式构建会通过不可变、按版本保存的 `cxp` runtime 运行。更新先发布新 runtime，
+再原子切换 active version；已经运行的 session 继续使用旧 executable，新的
+CXP 常驻进程则使用 `cxp` 的路径和进程名。
 
 ### 2) **运行**
 
@@ -138,6 +144,7 @@ codex-proxy proxy doctor
 | `codex-proxy` 或 `cxp` | 打开本地 Codex 历史 TUI |
 | `codex-proxy run -- <cmd> [args...]` | 使用当前直接/代理模式运行命令 |
 | `codex-proxy run -- codex` | 通过 CXP 标准审批 broker 启动原版 Codex TUI |
+| `codex-proxy run --aaa -- codex` | 为本次 Codex 运行开启 Agent Auto Approve |
 | `codex-proxy run --model-profile <name> -- codex` | 使用保存的模型 profile 启动 Codex |
 | `codex-proxy model list` | 显示内置和已配置的模型选择 |
 | `codex-proxy model setup <model>` | 配置内置模型选择，例如 `deepseek`、`mimo`、`kimi`、`glm`、`minimax` 或 `qwen` |
@@ -166,6 +173,7 @@ codex-proxy proxy doctor
 | `codex-proxy init` | 创建 SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | 使用当前模式运行命令；给出 profile 时强制使用代理（默认命令是 `codex`） |
 | `codex-proxy run -- codex` | 通过 CXP 标准审批 broker 启动原版 Codex TUI |
+| `codex-proxy run --aaa -- codex` | 为本次 Codex 运行开启 Agent Auto Approve |
 | `codex-proxy run --model-profile <name> -- codex` | 使用保存的模型 profile 启动 Codex |
 | `codex-proxy tui` | 在终端 UI 中浏览 Codex 历史 |
 | `codex-proxy history tui` | 在终端 UI 中浏览 Codex 历史 |
@@ -258,12 +266,19 @@ codex-proxy proxy doctor
 
 ### 标准审批 runtime
 
-CXP 使用普通的 on-request 审批启动原版 Codex binary。本地 broker 收到支持的审批请求后
-固定等待 500 ms 再批准，因此用户不需要逐条手动操作：
+CXP 使用普通的 on-request 审批启动原版 Codex binary。本地交互式入口默认由用户审批：
+broker 会把 approval 请求原样交给官方 Codex TUI。可以在 CXP 历史 TUI 中按 `Ctrl+A`
+持久切换 Agent Auto Approve（AAA），也可以只为一次命令开启而不修改保存的偏好：
 
 ```bash
-codex-proxy run -- codex
+codex-proxy run --aaa -- codex
+codex-proxy run --aaa -- codex exec "..."
 ```
+
+AAA 收到支持的 approval 请求后固定等待 500 ms 再批准。未开启 AAA 时，非交互式
+`codex exec` facade 因没有人工 reviewer 而 fail-closed。Teams 和 Beacon 是无人值守入口，
+因此会在代码中显式启用相同的自动批准 handler，并且不会继承本地 TUI 偏好。
+`--aaa` 只由 CXP 消费，不会传给 Codex。
 
 这套 runtime 要求 Codex CLI 0.131.0 或更高版本；较旧的 managed/PATH 安装会在
 第一次 broker turn 前自动升级。release compatibility sweep
@@ -275,7 +290,8 @@ cgroup、Slurm job 或 LSF job 已经授予的硬件和 mounts，不能突破外
 保持开启，并且 payload 不经过 CXP 修改。
 
 已接入 broker 的入口包括 Codex TUI/history、`codex exec` facade、Teams turn 和 Beacon
-worker。Contract CI 使用开启 analytics 的原版 Codex binary，并要求审批 telemetry 仍表现为
+worker。手动模式和 AAA 使用相同的原版 binary、on-request policy、Responses gateway 与
+proxy 路由，唯一差别是 reviewer。Contract CI 使用开启 analytics 的原版 Codex binary，并要求审批 telemetry 仍表现为
 普通的 `reviewer=user`、`status=approved`、`user_approved` 事件。CXP 不隐藏自己的
 app-server client identity，也不承诺服务端无法根据时序或其他正常 telemetry 推断自动化。
 

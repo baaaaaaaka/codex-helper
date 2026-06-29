@@ -23,10 +23,45 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
+
+func TestPreferredCXPServiceEntryDoesNotUseUnrelatedRuntime(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	runtimeDir := filepath.Join(tmp, "go-bin")
+	managedDir := filepath.Join(tmp, "managed-bin")
+	for _, dir := range []string{runtimeDir, managedDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	currentEntry := filepath.Join(runtimeDir, helperruntime.BinaryName(runtime.GOOS))
+	managedPath := filepath.Join(managedDir, helperpath.BinaryName(runtime.GOOS))
+	writeCLIFile(t, currentEntry, "runtime", 0o755)
+	writeCLIFile(t, managedPath, "managed", 0o755)
+	root := filepath.Join(runtimeDir, ".cxp-runtime")
+	if err := helperruntime.Activate(root, "v1.2.3"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvEntryPath, currentEntry)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: runtime.GOOS, stat: serviceExecutableStatForTest})
+
+	if got := preferredCXPServiceEntry(managedPath); got != "" {
+		t.Fatalf("unrelated runtime entry leaked into managed service spec: %q", got)
+	}
+	managedCXP := filepath.Join(managedDir, helperruntime.BinaryName(runtime.GOOS))
+	writeCLIFile(t, managedCXP, "stable", 0o755)
+	if got := preferredCXPServiceEntry(managedPath); got != managedCXP {
+		t.Fatalf("preferred entry = %q, want managed stable entry %q", got, managedCXP)
+	}
+}
 
 func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Helper()
@@ -3148,9 +3183,10 @@ func TestTeamsServiceInstallUsesManagedDefaultInsteadOfGoBinExecutable(t *testin
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
+	stableCXP := filepath.Join(filepath.Dir(managed), "cxp")
 	for _, want := range []string{
-		"ExecStart=" + systemdQuoteArg(managed) + " teams run --owner-stale-after 1m30s --auto-service=false",
-		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+managed),
+		"ExecStart=" + systemdQuoteArg(stableCXP) + " teams run --owner-stale-after 1m30s --auto-service=false",
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+stableCXP),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing %q:\n%s", want, unit)
@@ -3221,8 +3257,8 @@ func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
-		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(cxp)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at stable cxp entry:\n%s", unit)
 	}
 	if strings.Contains(unit, goBin) {
 		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
@@ -3289,8 +3325,8 @@ func TestTeamsServiceInstallRepairsStaleManagedCXPShimWhenRepointingFromGoBin(t 
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
-		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(cxp)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at stable cxp entry:\n%s", unit)
 	}
 	if strings.Contains(unit, goBin) {
 		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
@@ -3361,8 +3397,8 @@ func TestTeamsServiceInstallReplacesManagedDefaultSymlinkToGoBin(t *testing.T) {
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
-		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(cxp)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at stable cxp entry:\n%s", unit)
 	}
 	if strings.Contains(unit, goBin) {
 		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
@@ -3472,8 +3508,8 @@ func TestTeamsServiceInstallCreatesMissingManagedDefaultBeforeRepointingFromGoBi
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
-		t.Fatalf("unit did not point at managed helper:\n%s", unit)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(cxp)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit did not point at stable cxp entry:\n%s", unit)
 	}
 	if strings.Contains(unit, goBin) {
 		t.Fatalf("unit should not retain go/bin executable %q:\n%s", goBin, unit)
@@ -3660,8 +3696,8 @@ func TestTeamsServiceInstallSkipsBrokenEnvInstallPathAndRepairsManagedDefault(t 
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(managed)+" teams run --owner-stale-after 1m30s --auto-service=false") {
-		t.Fatalf("unit should point to repaired managed helper, not broken env target:\n%s", unit)
+	if !strings.Contains(unit, "ExecStart="+systemdQuoteArg(cxp)+" teams run --owner-stale-after 1m30s --auto-service=false") {
+		t.Fatalf("unit should point to repaired stable cxp entry, not broken env target:\n%s", unit)
 	}
 	record := loadManagedInstallRecordForServiceTest(t)
 	if record.TargetPath != managed || record.TargetState != string(managedinstall.StateManaged) || record.Version != "1.2.4" {
@@ -4290,6 +4326,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
+	stableCXP := filepath.Join(filepath.Dir(managed), "cxp")
 	for _, want := range []string{
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "beacon.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_AUTH_CONFIG="+filepath.Join(tmp, "auth.json")),
@@ -4299,7 +4336,7 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 		"Environment=" + systemdQuoteArg(beacon.BeaconLSFCancelCommandEnv+"="+filepath.Join(tmp, "lsf-cancel")),
 		"Environment=" + systemdQuoteArg(update.EnvRepo+"=owner/name"),
 		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://example.test/releases.json"),
-		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+managed),
+		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+stableCXP),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing env %q:\n%s", want, unit)

@@ -72,6 +72,51 @@ func TestRunHistoryTuiSkillsMenuReturnsToTuiLoop(t *testing.T) {
 	}
 }
 
+func TestRunHistoryTuiLoadsAndPersistsAAA(t *testing.T) {
+	lockCLITestHooks(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	proxyDisabled := false
+	if err := store.Save(config.Config{ProxyEnabled: &proxyDisabled, AgentAutoApproveEnabled: &enabled}); err != nil {
+		t.Fatal(err)
+	}
+	previousEnsure := ensureProxyPreferenceFunc
+	previousSelect := selectSession
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = previousEnsure
+		selectSession = previousSelect
+	})
+	ensureProxyPreferenceFunc = func(_ context.Context, gotStore *config.Store, _ string, _ io.Writer) (bool, config.Config, error) {
+		cfg, loadErr := gotStore.Load()
+		return false, cfg, loadErr
+	}
+	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
+		if !opts.AAAEnabled || opts.PersistAAA == nil {
+			t.Fatalf("AAA options = enabled:%t persist:%v", opts.AAAEnabled, opts.PersistAAA != nil)
+		}
+		if err := opts.PersistAAA(false); err != nil {
+			t.Fatal(err)
+		}
+		return nil, nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", t.TempDir(), "", 0); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentAutoApproveEnabled == nil || *cfg.AgentAutoApproveEnabled {
+		t.Fatalf("persisted AAA preference = %#v, want false", cfg.AgentAutoApproveEnabled)
+	}
+}
+
 func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) {
 	lockCLITestHooks(t)
 	setEffectivePathsHooksForTest(t)

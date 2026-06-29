@@ -186,9 +186,49 @@ configure_managed_storage_layout() {
       rm -rf "$home/.local/bin"
       ln -s "$physical_bin" "$home/.local/bin"
       ;;
+    local-dir-multihop)
+      local physical_local="$scenario_base/storage with spaces/physical-local"
+      local first_hop="$scenario_base/link-hop-one"
+      mkdir -p "$home" "$physical_local"
+      rm -rf "$home/.local" "$first_hop"
+      ln -s "$physical_local" "$first_hop"
+      ln -s "$first_hop" "$home/.local"
+      ;;
+    local-bin-multihop)
+      local physical_bin="$scenario_base/storage with spaces/physical-bin"
+      local first_hop="$scenario_base/link-hop-one-bin"
+      mkdir -p "$home/.local" "$physical_bin"
+      rm -rf "$home/.local/bin" "$first_hop"
+      ln -s "$physical_bin" "$first_hop"
+      ln -s "$first_hop" "$home/.local/bin"
+      ;;
     *)
       echo "unknown helper upgrade compatibility storage layout: $layout" >&2
       exit 2
+      ;;
+  esac
+}
+
+managed_storage_layout_snapshot() {
+  local scenario_base="$1"
+  local layout="$2"
+  local home="$3"
+  case "$layout" in
+    normal)
+      ;;
+    local-dir-symlink)
+      printf '.local=%s\n' "$(readlink "$home/.local")"
+      ;;
+    local-bin-symlink)
+      printf '.local/bin=%s\n' "$(readlink "$home/.local/bin")"
+      ;;
+    local-dir-multihop)
+      printf '.local=%s\n' "$(readlink "$home/.local")"
+      printf 'hop=%s\n' "$(readlink "$scenario_base/link-hop-one")"
+      ;;
+    local-bin-multihop)
+      printf '.local/bin=%s\n' "$(readlink "$home/.local/bin")"
+      printf 'hop=%s\n' "$(readlink "$scenario_base/link-hop-one-bin")"
       ;;
   esac
 }
@@ -292,6 +332,8 @@ run_upgrade_convergence_scenario() {
   local go_bin="$HOME/go/bin/codex-proxy"
 
   configure_managed_storage_layout "$scenario_base" "$storage_layout" "$HOME"
+  local storage_snapshot_before
+  storage_snapshot_before="$(managed_storage_layout_snapshot "$scenario_base" "$storage_layout" "$HOME")"
 
   case "$os:$service_backend" in
     linux:local-supervisor)
@@ -448,7 +490,7 @@ import json
 import os
 from pathlib import Path
 
-managed = os.environ["MANAGED_TARGET"]
+managed = os.environ["MANAGED_CXP"]
 config_home = Path(os.environ["XDG_CONFIG_HOME"])
 supervisor_path = config_home / "codex-helper" / "teams" / "local-supervisor.json"
 supervisor = json.loads(supervisor_path.read_text())
@@ -466,8 +508,8 @@ PY
           test -f "$unit"
           test -f "$watchdog_unit"
           test -f "$watchdog_timer"
-          grep -Fq "ExecStart=$managed teams run --owner-stale-after 1m30s --auto-service=false" "$unit"
-          grep -Fq "Environment=CODEX_PROXY_INSTALL_PATH=$managed" "$unit"
+          grep -Fq "ExecStart=$managed_cxp teams run --owner-stale-after 1m30s --auto-service=false" "$unit"
+          grep -Fq "Environment=CODEX_PROXY_INSTALL_PATH=$managed_cxp" "$unit"
           if grep -Fq "CODEX_PROXY_INSTALL_DIR" "$unit"; then
             echo "systemd unit should not preserve CODEX_PROXY_INSTALL_DIR" >&2
             cat "$unit" >&2
@@ -480,7 +522,7 @@ PY
     darwin)
       local plist="$HOME/Library/LaunchAgents/com.codex-helper.teams.plist"
       test -f "$plist"
-      grep -Fq "<string>$managed</string>" "$plist"
+      grep -Fq "<string>$managed_cxp</string>" "$plist"
       grep -Fq "<key>CODEX_PROXY_INSTALL_PATH</key>" "$plist"
       if grep -Fq "CODEX_PROXY_INSTALL_DIR" "$plist"; then
         echo "LaunchAgent plist should not preserve CODEX_PROXY_INSTALL_DIR" >&2
@@ -489,6 +531,14 @@ PY
       fi
       ;;
   esac
+
+  local storage_snapshot_after
+  storage_snapshot_after="$(managed_storage_layout_snapshot "$scenario_base" "$storage_layout" "$HOME")"
+  if [[ "$storage_snapshot_after" != "$storage_snapshot_before" ]]; then
+    echo "managed storage link topology changed during upgrade: layout=$storage_layout" >&2
+    printf 'before:\n%s\nafter:\n%s\n' "$storage_snapshot_before" "$storage_snapshot_after" >&2
+    exit 1
+  fi
 }
 
 run_legacy_recorded_cxp_upgrade_scenario() {
@@ -793,6 +843,8 @@ run_upgrade_convergence_scenario "missing-managed" "missing"
 run_upgrade_convergence_scenario "current-managed-missing-cxp" "current-missing-cxp"
 run_upgrade_convergence_scenario "symlinked-local-dir-managed-symlink" "symlink" "local-dir-symlink"
 run_upgrade_convergence_scenario "symlinked-local-bin-managed-symlink" "symlink" "local-bin-symlink"
+run_upgrade_convergence_scenario "multihop-local-dir-managed-symlink" "symlink" "local-dir-multihop"
+run_upgrade_convergence_scenario "multihop-local-bin-managed-symlink" "symlink" "local-bin-multihop"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-dir" "local-dir-symlink"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bin" "local-bin-symlink"
 

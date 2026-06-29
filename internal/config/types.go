@@ -3,10 +3,10 @@ package config
 import "time"
 
 // CurrentVersion is the schema generation this binary stamps into configs it
-// writes. Generation 3 stops writing the legacy execution-mode toggle and adds
-// broker migration metadata. Both changes are reader-compatible: older readers
-// ignore the metadata and already treat an absent toggle as disabled.
-const CurrentVersion = 3
+// writes. Generation 4 adds the agent-auto-approve preference. The field is
+// additive and keeps the reader floor unchanged, while the newer write
+// generation prevents an older helper from silently dropping the preference.
+const CurrentVersion = 4
 
 // MinReaderVersion is the minimum reader generation required to SAFELY read a
 // config written by this binary. Raise it ONLY for breaking schema changes
@@ -29,15 +29,16 @@ type Config struct {
 	// initialized the generation-1 broker runtime. RuntimeCleanupPending keeps
 	// post-commit compatibility cleanup retryable without making an activated
 	// installation fall back to the retired runner.
-	RuntimeGeneration     int                     `json:"runtimeGeneration,omitempty"`
-	RuntimeMigrationID    string                  `json:"runtimeMigrationId,omitempty"`
-	RuntimeMigratedAt     time.Time               `json:"runtimeMigratedAt,omitempty"`
-	RuntimeCleanupPending bool                    `json:"runtimeCleanupPending,omitempty"`
-	ProxyEnabled          *bool                   `json:"proxyEnabled,omitempty"`
-	Profiles              []Profile               `json:"profiles"`
-	Instances             []Instance              `json:"instances,omitempty"`
-	DefaultModelProfile   string                  `json:"defaultModelProfile,omitempty"`
-	ModelProfiles         map[string]ModelProfile `json:"modelProfiles,omitempty"`
+	RuntimeGeneration       int                     `json:"runtimeGeneration,omitempty"`
+	RuntimeMigrationID      string                  `json:"runtimeMigrationId,omitempty"`
+	RuntimeMigratedAt       time.Time               `json:"runtimeMigratedAt,omitempty"`
+	RuntimeCleanupPending   bool                    `json:"runtimeCleanupPending,omitempty"`
+	ProxyEnabled            *bool                   `json:"proxyEnabled,omitempty"`
+	AgentAutoApproveEnabled *bool                   `json:"agentAutoApproveEnabled,omitempty"`
+	Profiles                []Profile               `json:"profiles"`
+	Instances               []Instance              `json:"instances,omitempty"`
+	DefaultModelProfile     string                  `json:"defaultModelProfile,omitempty"`
+	ModelProfiles           map[string]ModelProfile `json:"modelProfiles,omitempty"`
 }
 
 type Profile struct {

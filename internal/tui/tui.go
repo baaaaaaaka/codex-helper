@@ -47,6 +47,7 @@ type Selection struct {
 	Session  codexhistory.Session
 	Cwd      string
 	UseProxy bool
+	UseAAA   bool
 }
 
 type Options struct {
@@ -56,7 +57,9 @@ type Options struct {
 	PreviewMessages int
 	ProxyEnabled    bool
 	ProxyConfigured bool
+	AAAEnabled      bool
 	RefreshInterval time.Duration
+	PersistAAA      func(bool) error
 	DefaultCwd      string
 }
 
@@ -211,6 +214,7 @@ type uiState struct {
 
 	proxyEnabled    bool
 	proxyConfigured bool
+	aaaEnabled      bool
 
 	expandedSessions  map[string]bool
 	previewCache      map[string]previewCacheEntry
@@ -240,6 +244,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		lastListFocus:     "projects",
 		proxyEnabled:      opts.ProxyEnabled,
 		proxyConfigured:   opts.ProxyConfigured,
+		aaaEnabled:        opts.AAAEnabled,
 		expandedSessions:  map[string]bool{},
 		previewCache:      map[string]previewCacheEntry{},
 		previewError:      map[string]previewErrorEntry{},
@@ -507,6 +512,15 @@ func handleKey(
 			return nil, ProxyToggleRequested{Enable: true, RequireConfig: true}
 		}
 		return nil, ProxyToggleRequested{Enable: enable}
+	case tcell.KeyCtrlA:
+		enable := !state.aaaEnabled
+		if opts.PersistAAA != nil {
+			if err := opts.PersistAAA(enable); err != nil {
+				return nil, err
+			}
+		}
+		state.aaaEnabled = enable
+		return nil, nil
 	case tcell.KeyCtrlR:
 		if state.loadingProjects {
 			return nil, nil
@@ -657,18 +671,18 @@ func handleKey(
 
 	if ev.Key() == tcell.KeyCtrlN {
 		if cwd := newSessionCwd(selectedProject, opts.DefaultCwd); cwd != "" {
-			return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled}, nil
+			return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled, UseAAA: state.aaaEnabled}, nil
 		}
 		return nil, nil
 	}
 
 	if enterPressed {
 		if selectedSession != nil {
-			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled}, nil
+			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled, UseAAA: state.aaaEnabled}, nil
 		}
 		if selectedIsNew {
 			if cwd := newSessionCwd(selectedProject, opts.DefaultCwd); cwd != "" {
-				return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled}, nil
+				return &Selection{Project: selectedProject, Cwd: cwd, UseProxy: state.proxyEnabled, UseAAA: state.aaaEnabled}, nil
 			}
 		}
 	}
@@ -816,6 +830,12 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	if state.proxyEnabled {
 		proxyLabel = "Proxy mode (Ctrl+P): on"
 	}
+	aaaLabel := "AAA mode (Ctrl+A): off"
+	aaaStyle := tcell.StyleDefault.Reverse(true)
+	if state.aaaEnabled {
+		aaaLabel = "[!] AAA mode (Ctrl+A): on"
+		aaaStyle = aaaStyle.Foreground(tcell.ColorYellow)
+	}
 	baseStatusStyle := tcell.StyleDefault.Reverse(true)
 	newSessionPath := newSessionCwd(selectedProject, opts.DefaultCwd)
 	openLabel := "Enter: open"
@@ -828,20 +848,24 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	}
 	statusSegments := []statusSegment{
 		{text: "Tab/Left/Right: switch  /: search  Ctrl+O: subagents  " + openLabel + "  r: refresh" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+		{text: aaaLabel + "  ", style: aaaStyle},
 		{text: "  q: quit", style: baseStatusStyle},
 	}
 	if state.loadingProjects {
 		statusSegments = []statusSegment{
 			{text: loadingStatusText(state) + "  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: aaaLabel + "  ", style: aaaStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
 	} else if state.inputMode != "" {
 		statusSegments = []statusSegment{
 			{text: "Type to search. Enter: apply  Esc: cancel  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: aaaLabel + "  ", style: aaaStyle},
 		}
 	} else if state.focus == "preview" {
 		statusSegments = []statusSegment{
 			{text: "PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: aaaLabel + "  ", style: aaaStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
 		if state.previewSearch != "" && len(state.previewMatches) > 0 {
@@ -852,10 +876,14 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		if len(state.projects) == 0 && newSessionPath != "" {
 			statusSegments = []statusSegment{
 				{text: "No history found. " + openLabel + "  " + proxyLabel + "  ", style: baseStatusStyle},
+				{text: aaaLabel + "  ", style: aaaStyle},
 				{text: "  q: quit", style: baseStatusStyle},
 			}
 		} else {
-			statusSegments = []statusSegment{{text: fmt.Sprintf("Load error: %v", state.loadError), style: baseStatusStyle}}
+			statusSegments = []statusSegment{
+				{text: fmt.Sprintf("Load error: %v", state.loadError), style: baseStatusStyle},
+				{text: aaaLabel, style: aaaStyle},
+			}
 		}
 	}
 
@@ -866,7 +894,10 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		time.Now().Before(state.updateErrorUntil)
 
 	if state.loadError == nil && showUpdateError && state.inputMode == "" {
-		statusSegments = []statusSegment{{text: fmt.Sprintf("Update check failed: %s", state.updateStatus.Error), style: baseStatusStyle}}
+		statusSegments = []statusSegment{
+			{text: fmt.Sprintf("Update check failed: %s", state.updateStatus.Error), style: baseStatusStyle},
+			{text: aaaLabel, style: aaaStyle},
+		}
 	}
 
 	updateRight := versionLabel(opts.Version)

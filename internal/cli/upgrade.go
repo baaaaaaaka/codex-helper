@@ -91,10 +91,10 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 				return nil
 			}
 
-			if err := finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, cmd.ErrOrStderr()); err != nil {
+			if err := finalizeHelperUpdateResult(res, cmd.ErrOrStderr()); err != nil {
 				return err
 			}
-			installBundledSkillsFromHelper(ctx, res.InstallPath, cmd.ErrOrStderr())
+			installBundledSkillsFromHelper(ctx, helperUpdateExecutionPath(res), cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated to v%s.\n", res.Version)
 			if !restartTeamsService {
 				printTeamsUpgradeManualActivationHint(cmd.OutOrStdout())

@@ -184,11 +184,11 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 			return teams.HelperAutoUpdateApplyResult{}, err
 		}
 	} else {
-		if err := finalizeHelperEntrypointsAfterUpgrade(res.InstallPath, res.Version, io.Discard); err != nil {
+		if err := finalizeHelperUpdateResult(res, io.Discard); err != nil {
 			return teams.HelperAutoUpdateApplyResult{}, err
 		}
 	}
-	installBundledSkillsFromHelper(ctx, firstNonEmptyString(res.PendingReplacePath, res.InstallPath), io.Discard)
+	installBundledSkillsFromHelper(ctx, helperUpdateExecutionPath(res), io.Discard)
 	return teams.HelperAutoUpdateApplyResult{
 		Version:            res.Version,
 		InstallPath:        res.InstallPath,

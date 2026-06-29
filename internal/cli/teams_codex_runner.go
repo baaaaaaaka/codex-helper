@@ -144,6 +144,7 @@ func newManagedTeamsCodexExecutorWithContext(
 		extraEnv = append(extraEnv, appServerModelEnv...)
 		runner = &codexrunner.AppServerRunner{
 			Starter:       teamsPolicyAppServerStarter{store: store, paths: paths, rawCommand: rawCommand, log: log},
+			ApprovalMode:  codexrunner.ApprovalModeAutomatic,
 			Command:       command,
 			AppServerArgs: append(append([]string{"--analytics-default-enabled"}, appServerExtraArgs...), appServerModelArgs...),
 			ExtraEnv:      extraEnv,

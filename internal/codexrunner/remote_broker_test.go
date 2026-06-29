@@ -86,6 +86,97 @@ func TestRemoteBrokerRelaysProtocolAndApprovesAfterDelay(t *testing.T) {
 	}
 }
 
+func TestRemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent(t *testing.T) {
+	transport := newChannelAppServerTransport()
+	broker, err := StartRemoteBroker(context.Background(), RemoteBrokerOptions{
+		Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+			return transport, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = broker.Close(ctx)
+	}()
+	headers := http.Header{"Authorization": []string{"Bearer " + broker.AuthToken()}}
+	connection, _, err := websocket.DefaultDialer.Dial(broker.URL(), headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+
+	request := []byte(`{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{"command":"touch sentinel"}}`)
+	for attempt := 0; attempt < 2; attempt++ {
+		transport.reads <- request
+		_, relayed, readErr := connection.ReadMessage()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(relayed) != string(request) {
+			t.Fatalf("manual request %d changed in transit: %s", attempt, relayed)
+		}
+	}
+	select {
+	case response := <-transport.writes:
+		t.Fatalf("manual mode synthesized an approval response: %s", response)
+	default:
+	}
+
+	response := []byte(`{"jsonrpc":"2.0","id":99,"result":{"decision":"accept"}}`)
+	if err := connection.WriteMessage(websocket.TextMessage, response); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case relayed := <-transport.writes:
+		if string(relayed) != string(response) {
+			t.Fatalf("manual response changed in transit: %s", relayed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manual approval response was not returned to app-server")
+	}
+}
+
+func TestRemoteBrokerAutomaticModeUsesFixedDelay(t *testing.T) {
+	transport := newChannelAppServerTransport()
+	broker, err := StartRemoteBroker(context.Background(), RemoteBrokerOptions{
+		Starter: AppServerTransportStarterFunc(func(context.Context, AppServerStartRequest) (AppServerLineTransport, error) {
+			return transport, nil
+		}),
+		ApprovalMode: ApprovalModeAutomatic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = broker.Close(ctx)
+	}()
+	connection, _, err := websocket.DefaultDialer.Dial(broker.URL(), http.Header{
+		"Authorization": []string{"Bearer " + broker.AuthToken()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	started := time.Now()
+	transport.reads <- []byte(`{"jsonrpc":"2.0","id":101,"method":"item/commandExecution/requestApproval","params":{}}`)
+	select {
+	case response := <-transport.writes:
+		if elapsed := time.Since(started); elapsed < DefaultApprovalDelay {
+			t.Fatalf("automatic approval arrived after %s, want at least %s", elapsed, DefaultApprovalDelay)
+		}
+		if !strings.Contains(string(response), `"decision":"accept"`) {
+			t.Fatalf("automatic approval response = %s", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("automatic approval did not arrive")
+	}
+}
+
 func TestRemoteBrokerRequiresBearerCapabilityAtRootURL(t *testing.T) {
 	transport := newChannelAppServerTransport()
 	broker, err := StartRemoteBroker(context.Background(), RemoteBrokerOptions{

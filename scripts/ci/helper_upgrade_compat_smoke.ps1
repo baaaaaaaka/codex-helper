@@ -118,13 +118,14 @@ function Copy-Binary([string]$Source, [string]$Destination) {
 }
 
 function Expected-CXPShimBody() {
-  return "@echo off`r`n`"%~dp0codex-proxy.exe`" %*`r`n"
+  return "@echo off`r`n`"%~dp0cxp.exe`" %*`r`n"
 }
 
-function Assert-CXPEntrypointHealthy([string]$Helper, [string]$CXP, [string]$Tag) {
+function Assert-CXPEntrypointHealthy([string]$Helper, [string]$CXPExe, [string]$CXPCommand, [string]$Tag) {
   Assert-VersionOrActivatePending $Helper $Tag
-  Assert-Version $CXP $Tag
-  $shimBody = Get-Content -Raw -LiteralPath $CXP
+  Assert-Version $CXPExe $Tag
+  Assert-Version $CXPCommand $Tag
+  $shimBody = Get-Content -Raw -LiteralPath $CXPCommand
   if ($shimBody -ne (Expected-CXPShimBody)) {
     throw "cxp.cmd was not repaired to the canonical relative shim. Actual:`n$shimBody"
   }
@@ -148,19 +149,29 @@ function Configure-IsolatedEnvironment([string]$Root) {
   New-Item -ItemType Directory -Force -Path $env:USERPROFILE,$env:APPDATA,$env:LOCALAPPDATA,$env:TEMP,$env:CODEX_HOME | Out-Null
 }
 
-function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
+function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$StorageLayout = "normal") {
   $scenarioRoot = Join-Path $script:BaseRoot $Scenario
   Remove-Item -Recurse -Force -LiteralPath $scenarioRoot -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $scenarioRoot | Out-Null
   Configure-IsolatedEnvironment $scenarioRoot
 
   $installDir = Join-Path $env:USERPROFILE ".local\bin"
+  $storageLinkTarget = $null
+  if ($StorageLayout -eq "junction") {
+    $storageLinkTarget = Join-Path $scenarioRoot "storage with spaces 演练\physical-bin"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installDir),$storageLinkTarget | Out-Null
+    Remove-Item -Recurse -Force -LiteralPath $installDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Junction -Path $installDir -Target $storageLinkTarget | Out-Null
+  } elseif ($StorageLayout -ne "normal") {
+    throw "unknown Windows storage layout: $StorageLayout"
+  }
   $helper = Join-Path $installDir "codex-proxy.exe"
+  $cxpExe = Join-Path $installDir "cxp.exe"
   $cxp = Join-Path $installDir "cxp.cmd"
   $runner = Join-Path $scenarioRoot "runner\codex-proxy.exe"
   $currentRunner = Join-Path $scenarioRoot "current-runner\codex-proxy.exe"
 
-  Write-Host "helper upgrade compatibility smoke: scenario=$Scenario mode=$SeedMode os=windows repo=$Repo old=$OldTag target=$TargetTag"
+  Write-Host "helper upgrade compatibility smoke: scenario=$Scenario mode=$SeedMode storage=$StorageLayout os=windows repo=$Repo old=$OldTag target=$TargetTag"
 
   switch ($SeedMode) {
     "current-missing-cxp" {
@@ -220,7 +231,21 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
     }
   }
 
-  Assert-CXPEntrypointHealthy $helper $cxp $TargetTag
+  Assert-VersionOrActivatePending $helper $TargetTag
+  Copy-Binary $helper $currentRunner
+  Invoke-Retry 5 10 {
+    & $currentRunner upgrade --repo $Repo --version $TargetTag --install-path $helper
+  }
+  Assert-CXPEntrypointHealthy $helper $cxpExe $cxp $TargetTag
+  if ($StorageLayout -eq "junction") {
+    $item = Get-Item -Force -LiteralPath $installDir
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+      throw "managed install directory junction was replaced during upgrade: $installDir"
+    }
+    if ([IO.Path]::GetFullPath($item.Target) -ine [IO.Path]::GetFullPath($storageLinkTarget)) {
+      throw "managed install directory junction target changed: $($item.Target), want $storageLinkTarget"
+    }
+  }
 
   $secondTarget = Join-Path $scenarioRoot "second-hop\codex-proxy.exe"
   Download-Binary $OldTag $secondTarget
@@ -231,7 +256,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode) {
     & $cxp upgrade --repo $Repo --version $TargetTag --install-path $secondTarget
   }
   Assert-VersionOrActivatePending $secondTarget $TargetTag
-  Assert-CXPEntrypointHealthy $helper $cxp $TargetTag
+  Assert-CXPEntrypointHealthy $helper $cxpExe $cxp $TargetTag
 }
 
 $safeOld = $OldTag -replace '[^A-Za-z0-9._-]', '_'
@@ -245,5 +270,6 @@ Run-UpgradeScenario "existing-cxp-cmd" "existing-cmd"
 Run-UpgradeScenario "stale-helper-cxp-cmd" "stale-helper-cmd"
 Run-UpgradeScenario "missing-cxp-cmd" "missing-cxp"
 Run-UpgradeScenario "current-helper-missing-cxp-cmd" "current-missing-cxp"
+Run-UpgradeScenario "junction-with-spaces-existing-cxp-cmd" "existing-cmd" "junction"
 
 Write-Host "helper upgrade compatibility smoke passed"

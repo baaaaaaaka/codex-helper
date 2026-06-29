@@ -14,9 +14,32 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 	"github.com/spf13/cobra"
 )
+
+func TestCurrentRuntimeOwnsUpdateTarget(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	legacy := filepath.Join(dir, helperpath.BinaryName(runtime.GOOS))
+	ctx := helperruntime.Context{
+		Root:        filepath.Join(dir, ".cxp-runtime"),
+		EntryPath:   entry,
+		RuntimePath: helperruntime.VersionPath(filepath.Join(dir, ".cxp-runtime"), "v1.2.3", runtime.GOOS),
+	}
+	for _, path := range []string{"", entry, legacy, ctx.RuntimePath} {
+		if !currentRuntimeOwnsUpdateTarget(ctx, path) {
+			t.Fatalf("current runtime should own %q", path)
+		}
+	}
+	other := filepath.Join(t.TempDir(), helperpath.BinaryName(runtime.GOOS))
+	if currentRuntimeOwnsUpdateTarget(ctx, other) {
+		t.Fatalf("current runtime must not capture explicit external install path %q", other)
+	}
+}
 
 func TestRestartSelfExecsSameBinaryWithCurrentArgs(t *testing.T) {
 	if runtime.GOOS == "windows" {

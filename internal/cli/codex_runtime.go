@@ -184,6 +184,9 @@ func runCodexCLIInvocation(
 		}
 	}
 	if codexInvocationUsesNativeCLI(invocation, cmdArgs[1:]) {
+		if opts.AgentAutoApprove {
+			return fmt.Errorf("--aaa is not supported for this native Codex subcommand")
+		}
 		return runCodexNativeInvocation(ctx, store, profile, instances, cmdArgs, useProxy, opts)
 	}
 	appServerArgs, err := translateCodexGlobalArgsToAppServer(invocation.GlobalArgs)
@@ -207,7 +210,7 @@ func runCodexCLIInvocation(
 		if invocation.Command != "" {
 			tail = append([]string{invocation.Command}, invocation.Args...)
 		}
-		return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, opts.Log)
+		return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.AgentAutoApprove, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, opts.Log)
 	case "exec", "e":
 		execArgs := codexFacadeArgsWithGlobalInputs(invocation, invocation.Args)
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, execArgs)
@@ -594,6 +597,9 @@ func runCodexExecFacade(
 		ExtraEnv:      extraEnv,
 		WorkingDir:    options.WorkingDir,
 		Timeout:       0,
+	}
+	if runOptions.AgentAutoApprove {
+		runner.ApprovalMode = codexrunner.ApprovalModeAutomatic
 	}
 	// AppServerRunner starts processes lazily and currently exposes no command
 	// hook. Bind the effective identity through a tiny starter wrapper.

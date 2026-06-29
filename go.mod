@@ -10,6 +10,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/spf13/cobra v1.9.1
+	golang.org/x/mod v0.32.0
 	golang.org/x/net v0.49.0
 	golang.org/x/sys v0.40.0
 	golang.org/x/term v0.39.0

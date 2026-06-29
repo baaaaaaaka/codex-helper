@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
@@ -25,17 +26,17 @@ func TestBeaconHelpShowsRequiredOperationalFlags(t *testing.T) {
 		{
 			name: "switch profile session",
 			args: []string{"beacon", "switch-profile", "--help"},
-			want: "Usage:\n  codex-proxy beacon switch-profile <name> --session <session-id>",
+			want: "Usage:\n  cxp beacon switch-profile <name> --session <session-id>",
 		},
 		{
 			name: "worker run once identity",
 			args: []string{"beacon", "worker", "run-once", "--help"},
-			want: "Usage:\n  codex-proxy beacon worker run-once (--machine <machine-id> | --allocation <request-id>)",
+			want: "Usage:\n  cxp beacon worker run-once (--machine <machine-id> | --allocation <request-id>)",
 		},
 		{
 			name: "worker serve allocation",
 			args: []string{"beacon", "worker", "serve", "--help"},
-			want: "Usage:\n  codex-proxy beacon worker serve --allocation <request-id>",
+			want: "Usage:\n  cxp beacon worker serve --allocation <request-id>",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -60,6 +61,24 @@ func TestRunBeaconWorkerJobUsesStandardAppServer(t *testing.T) {
 		t.Fatalf("runBeaconWorkerJob: %v", err)
 	}
 	if payload.Text != "beacon standard approval runtime" || payload.CodexThreadID != "thread-worker" || payload.Error != "" {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestRunBeaconWorkerJobAutomaticallyApprovesRequiredRequests(t *testing.T) {
+	workDir := t.TempDir()
+	codexPath := writeBeaconCLIApprovalCodexFixture(t)
+	started := time.Now()
+	payload, err := runBeaconWorkerJob(context.Background(), beacon.JobAttempt{Payload: beacon.JobPayload{
+		Prompt: "run an approval-required command", WorkingDir: workDir,
+	}}, codexPath, nil)
+	if err != nil {
+		t.Fatalf("runBeaconWorkerJob approval: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < codexrunner.DefaultApprovalDelay {
+		t.Fatalf("Beacon approval completed after %s, want at least %s", elapsed, codexrunner.DefaultApprovalDelay)
+	}
+	if payload.Text != "beacon approval accepted" || payload.CodexThreadID != "thread-worker" || payload.Error != "" {
 		t.Fatalf("payload = %#v", payload)
 	}
 }
@@ -1268,6 +1287,53 @@ func writeBeaconCLIProviderFixture(t *testing.T, output string) string {
 
 func writeBeaconCLICodexFixture(t *testing.T, final string) string {
 	return writeBeaconCLIAppServerFixture(t, []string{final})
+}
+
+func writeBeaconCLIApprovalCodexFixture(t *testing.T) string {
+	t.Helper()
+	if os.PathSeparator != '/' {
+		t.Skip("POSIX app-server fixture script")
+	}
+	dir := t.TempDir()
+	setTestCodexHomeEnv(t, filepath.Join(dir, "codex-home"))
+	path := filepath.Join(dir, "codex-app-server-approval-fixture.sh")
+	body := `#!/bin/sh
+case "${1:-}" in
+  --version) echo 'codex-cli 0.133.0'; exit 0 ;;
+  --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
+  app-server) ;;
+  *) exit 64 ;;
+esac
+approval_pending=0
+while IFS= read -r line; do
+  if [ "$approval_pending" = 1 ]; then
+    case "$line" in
+      *'"id":99'*'"decision":"accept"'*) ;;
+      *) exit 65 ;;
+    esac
+    approval_pending=0
+    printf '%s\n' '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-worker","turnId":"turn-worker","item":{"id":"final","type":"agentMessage","text":"beacon approval accepted"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-worker","turn":{"id":"turn-worker","status":"completed","items":[]}}}'
+    continue
+  fi
+  id=$(printf %s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"data":[]}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"thread-worker"}}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"thread-worker","name":"Worker thread"}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn-worker","status":"inProgress","items":[]}}}\n' "$id"
+      printf '%s\n' '{"jsonrpc":"2.0","id":99,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-worker","turnId":"turn-worker"}}'
+      approval_pending=1
+      ;;
+  esac
+done
+`
+	if err := os.WriteFile(path, []byte(body), 0o700); err != nil {
+		t.Fatalf("write approval app-server fixture: %v", err)
+	}
+	return path
 }
 
 func writeBeaconCLIStressCodexFixture(t *testing.T, total int) string {

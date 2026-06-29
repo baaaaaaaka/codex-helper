@@ -246,6 +246,7 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			name: "model profiles responses and standard approvals",
 			required: []string{
 				"cxp run -- codex",
+				"cxp run --aaa -- codex",
 				"cxp run --model-profile <name> -- codex",
 				"cxp model list",
 				"cxp model-profile setup [name]",
@@ -255,6 +256,7 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 				"model switch <profile>",
 				"model fork <profile>",
 				"Ctrl+K",
+				"Ctrl+A",
 			},
 		},
 		{

@@ -34,7 +34,7 @@ func newRootCmd() *cobra.Command {
 	opts := &rootOptions{}
 
 	cmd := &cobra.Command{
-		Use:           "codex-proxy [profile]",
+		Use:           "cxp [profile]",
 		Short:         "Browse Codex history in a terminal UI",
 		SilenceErrors: false,
 		SilenceUsage:  true,
@@ -71,6 +71,12 @@ func newRootCmd() *cobra.Command {
 	)
 
 	return cmd
+}
+
+// RuntimeVersion is the build identity used by the immutable cxp runtime
+// launcher before Cobra or any user configuration is initialized.
+func RuntimeVersion() string {
+	return buildVersion()
 }
 
 func buildVersion() string {

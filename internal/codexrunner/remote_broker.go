@@ -22,8 +22,9 @@ import (
 const RemoteBrokerAuthTokenEnv = "CXP_CODEX_REMOTE_AUTH_TOKEN"
 
 // RemoteBroker exposes one original Codex app-server stdio transport as a
-// loopback WebSocket endpoint for the original Codex TUI. Approval requests
-// are resolved locally; all other protocol messages remain byte-transparent.
+// loopback WebSocket endpoint for the original Codex TUI. In manual mode all
+// server requests remain byte-transparent so the official TUI is the reviewer;
+// automatic mode resolves supported approval requests locally.
 type RemoteBroker struct {
 	transport AppServerLineTransport
 	handler   AppServerServerRequestHandler
@@ -55,6 +56,7 @@ type brokerApprovalState struct {
 type RemoteBrokerOptions struct {
 	Starter              AppServerTransportStarter
 	StartRequest         AppServerStartRequest
+	ApprovalMode         ApprovalMode
 	ServerRequestHandler AppServerServerRequestHandler
 	ListenAddress        string
 	Log                  io.Writer
@@ -79,7 +81,7 @@ func StartRemoteBroker(ctx context.Context, options RemoteBrokerOptions) (*Remot
 		return nil, fmt.Errorf("listen for app-server broker: %w", err)
 	}
 	handler := options.ServerRequestHandler
-	if handler == nil {
+	if handler == nil && options.ApprovalMode == ApprovalModeAutomatic {
 		handler = AutomaticApprovalHandler{Delay: DefaultApprovalDelay}
 	}
 	token, err := newRemoteBrokerCapability()
@@ -237,6 +239,13 @@ func (b *RemoteBroker) relayAppServerToClient(ctx context.Context, connection *w
 		line = bytes.TrimSpace(line)
 		var message appServerMessage
 		if json.Unmarshal(line, &message) == nil && appServerMessageIsServerRequest(message) {
+			if b.handler == nil {
+				if err := b.writeClient(connection, line); err != nil {
+					sendBrokerError(ctx, done, err)
+					return
+				}
+				continue
+			}
 			approvalWrites.Add(1)
 			go func(request appServerMessage, raw []byte) {
 				defer approvalWrites.Done()

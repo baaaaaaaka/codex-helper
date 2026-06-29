@@ -921,6 +921,51 @@ func TestEnsureCXPShimForInstallPathKeepsNonHelperWindowsCmd(t *testing.T) {
 	}
 }
 
+func TestRewriteLegacyCXPProfilePreservesFormattingAndUnrelatedContent(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "Microsoft.PowerShell_profile.ps1")
+	before := []byte("# user content\r\nSet-Alias -Name cxp -Value codex-proxy\r\n$env:KEEP = 'yes'\r\n")
+	if err := os.WriteFile(profile, before, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteLegacyCXPProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("# user content\r\nSet-Alias -Name cxp -Value cxp.exe\r\n$env:KEEP = 'yes'\r\n")
+	if !bytes.Equal(after, want) {
+		t.Fatalf("profile rewrite changed unexpected bytes:\n got %q\nwant %q", after, want)
+	}
+	info, err := os.Stat(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
+		t.Fatalf("profile permissions = %o, want 640", info.Mode().Perm())
+	}
+}
+
+func TestRewriteLegacyCXPProfileOnlyChangesExactAliasLines(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "Microsoft.PowerShell_profile.ps1")
+	before := []byte("\xef\xbb\xbfSet-Alias -Name cxp -Value codex-proxy\r\n# Set-Alias -Name cxp -Value codex-proxy\r\nSet-Alias -Name cxp -Value codex-proxy -Scope Global\r\n$note = 'Set-Alias -Name cxp -Value codex-proxy'\r\n")
+	if err := os.WriteFile(profile, before, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteLegacyCXPProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("\xef\xbb\xbfSet-Alias -Name cxp -Value cxp.exe\r\n# Set-Alias -Name cxp -Value codex-proxy\r\nSet-Alias -Name cxp -Value codex-proxy -Scope Global\r\n$note = 'Set-Alias -Name cxp -Value codex-proxy'\r\n")
+	if !bytes.Equal(after, want) {
+		t.Fatalf("profile rewrite changed non-exact content\ngot:  %q\nwant: %q", after, want)
+	}
+}
+
 func TestUpgradeCmdInstallsBundledSkillsWithUpdatedBinary(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell script helper stub is POSIX-only")

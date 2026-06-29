@@ -799,6 +799,61 @@ func TestRunLikeRejectsModelProfileForNonCodexCommand(t *testing.T) {
 	}
 }
 
+func TestRunLikeRejectsAAAForNonCodexCommand(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := newRunCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--aaa", "--", "bash", "-lc", "true"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--aaa only applies to Codex launches") {
+		t.Fatalf("run command error = %v, want AAA non-Codex rejection", err)
+	}
+}
+
+func TestRunLikeAAAIsPerInvocationAndReachesOnlyCodexBroker(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	disabled := false
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &disabled}); err != nil {
+		t.Fatal(err)
+	}
+	previous := runCodexCLIInvocationFn
+	t.Cleanup(func() { runCodexCLIInvocationFn = previous })
+	called := false
+	runCodexCLIInvocationFn = func(_ context.Context, _ *rootOptions, _ *config.Store, _ *config.Profile, _ []config.Instance, args []string, _ bool, opts runTargetOptions) error {
+		called = true
+		if !opts.AgentAutoApprove {
+			t.Fatal("AAA flag did not reach the Codex broker options")
+		}
+		if !reflect.DeepEqual(args, []string{"codex", "exec", "hello"}) {
+			t.Fatalf("AAA leaked into Codex args: %#v", args)
+		}
+		return nil
+	}
+	cmd := newRunCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--aaa", "--", "codex", "exec", "hello"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("Codex broker was not called")
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentAutoApproveEnabled != nil {
+		t.Fatalf("per-invocation --aaa persisted a preference: %#v", cfg.AgentAutoApproveEnabled)
+	}
+}
+
 func codexOverrideValue(t *testing.T, args []string, key string) string {
 	t.Helper()
 	prefix := key + "="
