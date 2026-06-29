@@ -434,6 +434,8 @@ type Bridge struct {
 	markAnswerChatsUnread             bool
 	markAnswerUnreadWarned            bool
 	asyncTurnWG                       sync.WaitGroup
+	asyncTurnStateMu                  sync.Mutex
+	activeAsyncTurns                  int
 	helperRestartWG                   sync.WaitGroup
 	runningTurnMu                     sync.Mutex
 	runningTurnCancels                map[string]*runningTurnCancel
@@ -1643,9 +1645,31 @@ func (b *Bridge) syncRegistrySessionProjection(session Session) {
 	if b == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" {
 		return
 	}
+	version := durableSessionProjectionVersion{ChatID: session.ChatID, UpdatedAtUnixNano: session.UpdatedAt.UnixNano()}
+	// Keep the steady-state poll path to one short lock and one map lookup. The
+	// turn-start gate is needed only when a durable version actually changed.
+	b.regMu.Lock()
+	if b.durableProjectionVersionBySession != nil && b.durableProjectionVersionBySession[session.ID] == version {
+		b.regMu.Unlock()
+		return
+	}
+	b.regMu.Unlock()
+	// Service mode can have multiple queued-turn goroutines reading registry
+	// sessions. Do not rewrite the shared registry slice while those readers are
+	// active. Holding asyncTurnStateMu at zero prevents a new turn from starting
+	// until the short projection update finishes; active turns use the resolved
+	// durable Session directly and a later idle cycle heals the projection.
+	if b.asyncTurns {
+		b.asyncTurnStateMu.Lock()
+		defer b.asyncTurnStateMu.Unlock()
+		if b.activeAsyncTurns > 0 {
+			return
+		}
+	}
 	b.regMu.Lock()
 	defer b.regMu.Unlock()
-	version := durableSessionProjectionVersion{ChatID: session.ChatID, UpdatedAtUnixNano: session.UpdatedAt.UnixNano()}
+	// Another idle caller may have completed the projection while this caller
+	// waited for an active turn to finish.
 	if b.durableProjectionVersionBySession != nil && b.durableProjectionVersionBySession[session.ID] == version {
 		return
 	}
@@ -7444,9 +7468,6 @@ func (b *Bridge) handleSessionMessageWithQueueState(ctx context.Context, chatID 
 func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context, session *Session, chatID string, msg ChatMessage, text string, knownTurns *sessionTurnQueueState, knownQueueSnapshot *teamstore.State) error {
 	if session != nil {
 		b.syncRegistrySessionProjection(*session)
-		if projected := b.reg.SessionByID(session.ID); projected != nil {
-			session = projected
-		}
 	} else {
 		session = b.reg.SessionByChatID(chatID)
 	}
@@ -8741,7 +8762,7 @@ func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Ses
 			session.ID = strings.TrimSpace(sessionID)
 		}
 		b.syncRegistrySessionProjection(session)
-		return b.reg.SessionByID(session.ID)
+		return &session
 	}
 	if ok || len(state.Sessions) > 0 {
 		return nil
@@ -10818,9 +10839,17 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 	}
 	sessionSnapshot := *session
 	runCtx := ctx
+	b.asyncTurnStateMu.Lock()
+	b.activeAsyncTurns++
 	b.asyncTurnWG.Add(1)
+	b.asyncTurnStateMu.Unlock()
 	go func() {
-		defer b.asyncTurnWG.Done()
+		defer func() {
+			b.asyncTurnStateMu.Lock()
+			b.activeAsyncTurns--
+			b.asyncTurnStateMu.Unlock()
+			b.asyncTurnWG.Done()
+		}()
 		runSession := &sessionSnapshot
 		err := b.runClaimedQueuedTurn(runCtx, runSession, claimed, preferredTurnID, preferred)
 		if err != nil {

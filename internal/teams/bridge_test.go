@@ -1053,6 +1053,43 @@ func TestBridgeDurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite(t *te
 	}
 }
 
+func TestBridgeActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry(t *testing.T) {
+	bridge := &Bridge{
+		asyncTurns:       true,
+		activeAsyncTurns: 1,
+		reg: Registry{Sessions: []Session{{
+			ID:     "s001",
+			ChatID: "stale-chat",
+			Status: "active",
+		}}},
+	}
+	state := teamstore.State{Sessions: map[string]teamstore.SessionContext{
+		"s001": {
+			ID:          "s001",
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: "durable-chat",
+		},
+	}}
+	resolved := bridge.sessionForIDState(state, "s001")
+	if resolved == nil || resolved.ChatID != "durable-chat" {
+		t.Fatalf("async durable resolution = %#v, want durable-chat", resolved)
+	}
+	if got := bridge.reg.SessionByID("s001"); got == nil || got.ChatID != "stale-chat" {
+		t.Fatalf("async resolution mutated shared registry: %#v", got)
+	}
+	if bridge.registryProjectionDirty || bridge.durableProjectionVersionBySession != nil {
+		t.Fatalf("async resolution queued an unsafe projection mutation: dirty=%t versions=%#v", bridge.registryProjectionDirty, bridge.durableProjectionVersionBySession)
+	}
+	bridge.activeAsyncTurns = 0
+	resolved = bridge.sessionForIDState(state, "s001")
+	if resolved == nil || resolved.ChatID != "durable-chat" {
+		t.Fatalf("idle durable resolution = %#v, want durable-chat", resolved)
+	}
+	if got := bridge.reg.SessionByID("s001"); got == nil || got.ChatID != "durable-chat" {
+		t.Fatalf("idle resolution did not heal registry: %#v", got)
+	}
+}
+
 func TestCodexErrorRequiresUpgradeHeuristics(t *testing.T) {
 	matches := []string{
 		"Codex turn failed: The 'gpt-5.5' model requires a newer version of Codex.",
