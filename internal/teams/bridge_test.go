@@ -2224,6 +2224,7 @@ func TestBridgePollBatchQueuesLaterMessageAfterStartingFirst(t *testing.T) {
 		t.Fatal("queued second Codex turn did not start after first finished")
 	}
 	executor.release <- struct{}{}
+	waitForBridgeAsyncTurns(t, bridge)
 	waitForCompletedTurnCount(t, store, "s001", 2)
 	waitForNoActiveTurnsOrOutbox(t, store, "s001")
 }
