@@ -143,14 +143,16 @@ func newManagedTeamsCodexExecutorWithContext(
 		extraEnv := append(teamsCodexChildEnv(), codexHomeEnv(paths.CodexDir)...)
 		extraEnv = append(extraEnv, appServerModelEnv...)
 		runner = &codexrunner.AppServerRunner{
-			Starter:       teamsPolicyAppServerStarter{store: store, paths: paths, rawCommand: rawCommand, log: log},
-			ApprovalMode:  codexrunner.ApprovalModeAutomatic,
-			Command:       command,
-			AppServerArgs: append(append([]string{"--analytics-default-enabled"}, appServerExtraArgs...), appServerModelArgs...),
-			ExtraEnv:      extraEnv,
-			WorkingDir:    strings.TrimSpace(workDir),
-			Timeout:       timeout,
-			CloseHook:     modelCleanup,
+			Starter:              teamsPolicyAppServerStarter{store: store, paths: paths, rawCommand: rawCommand, log: log},
+			ApprovalMode:         codexrunner.ApprovalModeAutomatic,
+			Command:              command,
+			AppServerArgs:        append(append([]string{"--analytics-default-enabled"}, appServerExtraArgs...), appServerModelArgs...),
+			ExtraEnv:             extraEnv,
+			WorkingDir:           strings.TrimSpace(workDir),
+			Timeout:              timeout,
+			MetadataOnlyResume:   true,
+			RequireCompleteFinal: true,
+			CloseHook:            modelCleanup,
 		}
 	default:
 		return nil, fmt.Errorf("unknown Teams codex runner %q", runnerName)
@@ -292,6 +294,9 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 	if err != nil {
 		if teamsCodexTurnCompletedDespiteCanceledError(result, err) {
 			out := successfulTeamsExecutionResultFromCodexTurn(result)
+			if strings.TrimSpace(out.Text) == "" {
+				return out, teamsMissingFinalError(result, err)
+			}
 			if session != nil {
 				expectedThreadID := strings.TrimSpace(session.CodexThreadID)
 				if expectedThreadID != "" && out.CodexThreadID != "" && out.CodexThreadID != expectedThreadID {
@@ -301,12 +306,18 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 			return out, nil
 		}
 		out := teamsExecutionResultFromCodexTurn(result)
+		if result.Status == codexrunner.TurnStatusCompleted && result.Failure == nil && !result.FinalAgentMessageComplete {
+			return out, teamsMissingFinalError(result, err)
+		}
 		if teamsCodexTurnMayStillBeRunning(result) {
 			return out, &teams.AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: err}
 		}
 		return out, err
 	}
 	out := successfulTeamsExecutionResultFromCodexTurn(result)
+	if strings.TrimSpace(out.Text) == "" || (result.Status == codexrunner.TurnStatusCompleted && !result.FinalAgentMessageComplete) {
+		return out, teamsMissingFinalError(result, nil)
+	}
 	if session != nil {
 		expectedThreadID := strings.TrimSpace(session.CodexThreadID)
 		if expectedThreadID != "" && out.CodexThreadID != "" && out.CodexThreadID != expectedThreadID {
@@ -314,6 +325,18 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		}
 	}
 	return out, nil
+}
+
+func teamsMissingFinalError(result codexrunner.TurnResult, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("Codex turn completed without a final agent message")
+	} else {
+		cause = fmt.Errorf("Codex turn completed without a final agent message: %w", cause)
+	}
+	if strings.TrimSpace(result.TurnID) != "" {
+		return &teams.AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: cause}
+	}
+	return cause
 }
 
 func (e teamsCodexExecutor) runnerForSessionProfile(ctx context.Context, session *teams.Session) (codexrunner.Runner, error) {
@@ -369,6 +392,7 @@ func teamsCodexTurnCompletedDespiteCanceledError(result codexrunner.TurnResult, 
 	return err != nil &&
 		(errors.Is(err, context.Canceled) || codexrunner.IsKind(err, codexrunner.ErrorCanceled)) &&
 		result.Status == codexrunner.TurnStatusCompleted &&
+		result.FinalAgentMessageComplete &&
 		result.Failure == nil
 }
 
@@ -393,11 +417,7 @@ func teamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) teams.Exec
 }
 
 func successfulTeamsExecutionResultFromCodexTurn(result codexrunner.TurnResult) teams.ExecutionResult {
-	text := strings.TrimSpace(result.FinalAgentMessage)
-	if text == "" {
-		text = "(Codex finished without a final message.)"
-	}
-	return teams.ExecutionResult{Text: text, CodexThreadID: result.ThreadID, CodexThreadTitle: strings.TrimSpace(result.ThreadName), CodexTurnID: result.TurnID}
+	return teams.ExecutionResult{Text: strings.TrimSpace(result.FinalAgentMessage), CodexThreadID: result.ThreadID, CodexThreadTitle: strings.TrimSpace(result.ThreadName), CodexTurnID: result.TurnID}
 }
 
 func translateTeamsCodexArgsToAppServer(args []string) ([]string, error) {

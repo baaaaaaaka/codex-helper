@@ -10381,13 +10381,19 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return b.queueAndSendOutboxChunks(ctx, session.ID, turn.ID, chatID, "canceled", "Codex request canceled.")
 		}
-		if isCanceledExecutionError(err) {
+		if !cancelRequested && (isCanceledExecutionError(err) || IsAmbiguousExecutionError(err)) {
 			notifyCtx := ctx
 			if notifyCtx == nil || notifyCtx.Err() != nil {
 				notifyCtx = context.Background()
 			}
-			if recovered, ok := b.completedTurnResultFromCodexHistory(notifyCtx, session, turn, result); ok {
+			if recovered, ok := b.completedTurnResultAfterExecutionError(notifyCtx, session, turn, result); ok {
 				return b.completeQueuedTurnWithResult(notifyCtx, session, turn, chatID, plan, recovered)
+			}
+		}
+		if isCanceledExecutionError(err) {
+			notifyCtx := ctx
+			if notifyCtx == nil || notifyCtx.Err() != nil {
+				notifyCtx = context.Background()
 			}
 			reason := "helper context canceled before Codex result could be verified"
 			if _, markErr := b.store.MarkTurnInterrupted(notifyCtx, turn.ID, reason); markErr != nil {
@@ -10593,6 +10599,16 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 		ThreadID:  firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, local.SessionID, session.CodexThreadID),
 	}
 	return b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, previous)
+}
+
+func (b *Bridge) completedTurnResultAfterExecutionError(ctx context.Context, session *Session, turn teamstore.Turn, observed ExecutionResult) (ExecutionResult, bool) {
+	if recovered, ok := b.completedTurnResultFromLinkedTranscript(ctx, session, turn, observed); ok {
+		return executionResultWithTranscriptFinal(observed, recovered), true
+	}
+	if recovered, ok := b.completedTurnResultFromCodexHistory(ctx, session, turn, observed); ok {
+		return executionResultWithTranscriptFinal(observed, recovered), true
+	}
+	return ExecutionResult{}, false
 }
 
 func executionResultWithTranscriptFinal(observed ExecutionResult, transcriptResult ExecutionResult) ExecutionResult {
@@ -12633,7 +12649,8 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 		HardLimitBytes:   safeTeamsHTMLContentBytes,
 		TargetLimitBytes: teamsChunkHTMLContentBytes,
 	})
-	queued := make([]teamstore.OutboxMessage, 0, len(chunks))
+	isFinal := strings.EqualFold(strings.TrimSpace(kind), "final")
+	planned := make([]teamstore.OutboxMessage, 0, len(chunks))
 	leaseGeneration := b.currentLeaseGeneration()
 	for i, chunk := range chunks {
 		msgKind := kind
@@ -12666,13 +12683,62 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 		if msg.NotificationKind == "" && msg.MentionOwner {
 			msg.NotificationKind = "owner_notification"
 		}
+		if isFinal {
+			msg.ID = "outbox:" + turnID + ":" + msgKind
+		}
+		planned = append(planned, msg)
+	}
+	if isFinal && len(planned) > 1 {
+		if err := b.validateExistingFinalOutboxChunks(ctx, planned); err != nil {
+			return nil, err
+		}
+	}
+	for i, msg := range planned {
 		queuedMsg, err := b.queueOutbox(ctx, msg)
 		if err != nil {
 			return nil, err
 		}
-		queued = append(queued, queuedMsg)
+		if isFinal {
+			if err := validateFinalOutboxChunk(msg, queuedMsg); err != nil {
+				return nil, err
+			}
+		}
+		planned[i] = queuedMsg
 	}
-	return queued, nil
+	return planned, nil
+}
+
+func (b *Bridge) validateExistingFinalOutboxChunks(ctx context.Context, planned []teamstore.OutboxMessage) error {
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	state, err := b.store.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	for _, intended := range planned {
+		queued, ok := state.OutboxMessages[intended.ID]
+		if !ok {
+			continue
+		}
+		if err := validateFinalOutboxChunk(intended, queued); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateFinalOutboxChunk(intended teamstore.OutboxMessage, queued teamstore.OutboxMessage) error {
+	if queued.SessionID == intended.SessionID &&
+		queued.TeamsChatID == intended.TeamsChatID &&
+		queued.Kind == intended.Kind &&
+		queued.Body == intended.Body &&
+		queued.SourceTextHash == intended.SourceTextHash &&
+		queued.PartIndex == intended.PartIndex &&
+		queued.PartCount == intended.PartCount {
+		return nil
+	}
+	return fmt.Errorf("final outbox consistency conflict for turn %q part %d of %d", intended.TurnID, intended.PartIndex, intended.PartCount)
 }
 
 func (b *Bridge) queueAndSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions) error {

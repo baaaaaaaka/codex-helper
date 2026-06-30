@@ -63,14 +63,17 @@ const (
 )
 
 type TurnResult struct {
-	ThreadID            string
-	ThreadName          string
-	TurnID              string
-	Status              TurnStatus
-	FinalAgentMessage   string
-	Failure             *TurnFailure
-	Usage               Usage
-	RawCompletedMessage []byte
+	ThreadID          string
+	ThreadName        string
+	TurnID            string
+	Status            TurnStatus
+	FinalAgentMessage string
+	// FinalAgentMessageComplete distinguishes a terminal agent item from
+	// provisional deltas that happen to contain non-empty text.
+	FinalAgentMessageComplete bool `json:"-"`
+	Failure                   *TurnFailure
+	Usage                     Usage
+	RawCompletedMessage       []byte
 }
 
 type TurnFailure struct {

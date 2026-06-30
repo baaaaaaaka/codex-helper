@@ -834,6 +834,17 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI|CodexModelProfileFacadeEnablesExecutionTargetShellPolicy)$' -v
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
+      - name: Teams metadata-only resume and final integrity regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_pattern='Test(AppServerRunner(MetadataOnly(ResumeExcludesPersistedTurns|BackfillsExactCompletedTurnSummary|RejectsWrongTurnSummary|WrapsSummaryFailureAsIncompleteFinal|KeepsCompleteFinalWhenTitleBackfillFails)|LegacyTitleBackfillFailureRemainsError)|CompletedFinalAgentMessageForTurnsListRequiresExactCompletedTurn)$'
+          adapter_pattern='Test(NewManagedTeamsCodexExecutorUsesStandardAppServerRunner|TeamsCodexExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext)|RunnerExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext))$'
+          bridge_pattern='TestBridge(RecoversAmbiguousExecutionFromExactTranscriptFinal|FinalOutbox(RetryRequiresIdenticalChunkPlan|PreflightsAllChunksBeforeQueue)|StreamingErrorDoesNotSuppressPendingFinalLikeProgress)$'
+          go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
+          go test ./internal/cli ./internal/teams -count=1 -run "$adapter_pattern" -v
+          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
+
       - name: Model choice reusable credential regressions
         shell: bash
         run: |
@@ -1040,6 +1051,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles/many-long-chats$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/has-pending-workflow-notifications$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites$' -benchtime=1x -count=1
@@ -1355,7 +1367,7 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Codex standard approval runtime integration test (Windows)
         if: runner.os == 'Windows'
@@ -1372,7 +1384,7 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
         if: runner.os != 'Windows'
@@ -1464,9 +1476,9 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodexStandardApprovalRuntime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           printf '%s\n' \
-            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
+            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","metadata-only-resume","turn-summary-final-integrity","resume-context-preserved","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof

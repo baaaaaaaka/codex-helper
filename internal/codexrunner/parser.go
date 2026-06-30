@@ -354,6 +354,7 @@ func applyEvent(result *TurnResult, event codexEvent, raw []byte) {
 		if isAgentMessageItem(event.Item) {
 			if text := agentMessageText(event.Item); strings.TrimSpace(text) != "" {
 				result.FinalAgentMessage = text
+				result.FinalAgentMessageComplete = true
 				result.RawCompletedMessage = append(result.RawCompletedMessage[:0], raw...)
 			}
 		}
@@ -443,6 +444,7 @@ func parseTranscriptPayload(raw json.RawMessage) (codexTranscriptPayload, bool) 
 func completeTurnFromTranscriptPayload(result *TurnResult, text string, turnID string, raw []byte) {
 	if text = strings.TrimSpace(text); text != "" {
 		result.FinalAgentMessage = text
+		result.FinalAgentMessageComplete = true
 		result.RawCompletedMessage = append(result.RawCompletedMessage[:0], raw...)
 	}
 	if turnID = strings.TrimSpace(turnID); turnID != "" {

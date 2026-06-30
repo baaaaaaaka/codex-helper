@@ -155,9 +155,39 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 
 	assertMethod(t, writes[3], "thread/resume")
 	assertParamString(t, writes[3], "threadId", "thread-existing")
+	assertParamAbsent(t, writes[3], "excludeTurns")
 	assertMethod(t, writes[4], "turn/start")
 	assertParamString(t, writes[4], "threadId", "thread-existing")
 	assertTextInput(t, writes[4], "continue")
+}
+
+func TestAppServerRunnerMetadataOnlyResumeExcludesPersistedTurns(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing","turns":[]}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-resume","status":"inProgress","items":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-existing","turnId":"turn-resume","item":{"id":"item-1","type":"agentMessage","text":"resumed"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-resume","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.MetadataOnlyResume = true
+	runner.RequireCompleteFinal = true
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if err != nil {
+		t.Fatalf("ResumeThread error: %v", err)
+	}
+	if got.FinalAgentMessage != "resumed" {
+		t.Fatalf("final message = %q", got.FinalAgentMessage)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[3], "thread/resume")
+	assertParamBool(t, writes[3], "excludeTurns", true)
+	if len(writes) != 5 {
+		t.Fatalf("writes = %d, want no history backfill on complete item: %#v", len(writes), writes)
+	}
 }
 
 func TestAppServerRunnerCapturesResumeThreadIDBeforeTurnStart(t *testing.T) {
@@ -573,6 +603,189 @@ func TestAppServerRunnerBackfillsCompletedTurnItems(t *testing.T) {
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[5], "thread/read")
 	assertParamBool(t, writes[5], "includeTurns", true)
+}
+
+func TestAppServerRunnerMetadataOnlyBackfillsExactCompletedTurnSummary(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing","turns":[]}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-current","status":"inProgress","items":[]}}}`,
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-existing","turnId":"turn-current","delta":"partial"}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-current","status":"completed","items":[]}}}`,
+		`{"id":5,"result":{"data":[{"id":"turn-current","status":"completed","items":[{"id":"item-final","type":"agentMessage","text":"complete final"}]}]}}`,
+		`{"id":6,"result":{"thread":{"id":"thread-existing","name":"Metadata title"}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.MetadataOnlyResume = true
+	runner.RequireCompleteFinal = true
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", BackfillThreadName: true})
+	if err != nil {
+		t.Fatalf("ResumeThread error: %v", err)
+	}
+	if got.FinalAgentMessage != "complete final" || got.ThreadName != "Metadata title" {
+		t.Fatalf("result = %#v", got)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[5], "thread/turns/list")
+	assertParamString(t, writes[5], "threadId", "thread-existing")
+	assertParamNumber(t, writes[5], "limit", 1)
+	assertParamString(t, writes[5], "sortDirection", "desc")
+	assertParamString(t, writes[5], "itemsView", "summary")
+	assertMethod(t, writes[6], "thread/read")
+	assertParamAbsent(t, writes[6], "includeTurns")
+}
+
+func TestAppServerRunnerMetadataOnlyRejectsWrongTurnSummary(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing","turns":[]}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-current","status":"inProgress","items":[]}}}`,
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-existing","turnId":"turn-current","delta":"partial"}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-current","status":"completed","items":[]}}}`,
+		`{"id":5,"result":{"data":[{"id":"turn-older","status":"completed","items":[{"id":"item-final","type":"agentMessage","text":"wrong answer"}]}]}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.MetadataOnlyResume = true
+	runner.RequireCompleteFinal = true
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if !IsKind(err, ErrorParse) {
+		t.Fatalf("ResumeThread error = %v, want parse failure", err)
+	}
+	if got.ThreadID != "thread-existing" || got.TurnID != "turn-current" || got.Status != TurnStatusCompleted {
+		t.Fatalf("result lost recovery ids/status: %#v", got)
+	}
+	if got.FinalAgentMessage != "partial" {
+		t.Fatalf("provisional delta = %q, want retained for diagnostics only", got.FinalAgentMessage)
+	}
+	if got.FinalAgentMessageComplete {
+		t.Fatal("provisional delta was incorrectly marked as a complete final")
+	}
+	for _, write := range transport.decodedWrites(t) {
+		if write["method"] == appServerMethodThreadRead {
+			t.Fatalf("metadata-only final backfill must not read full turns: %#v", write)
+		}
+	}
+}
+
+func TestAppServerRunnerMetadataOnlyWrapsSummaryFailureAsIncompleteFinal(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing","turns":[]}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-current","status":"inProgress","items":[]}}}`,
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-existing","turnId":"turn-current","delta":"partial"}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-current","status":"completed","items":[]}}}`,
+		`{"id":5,"error":{"code":"transport_failure","message":"summary unavailable"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.MetadataOnlyResume = true
+	runner.RequireCompleteFinal = true
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue"})
+	if !IsKind(err, ErrorParse) {
+		t.Fatalf("ResumeThread error = %v, want incomplete-final parse error wrapping summary failure", err)
+	}
+	if cause := errors.Unwrap(err); cause == nil || !strings.Contains(cause.Error(), "summary unavailable") {
+		t.Fatalf("ResumeThread cause = %v, want summary failure", cause)
+	}
+	if got.ThreadID != "thread-existing" || got.TurnID != "turn-current" || got.Status != TurnStatusCompleted || got.FinalAgentMessage != "partial" {
+		t.Fatalf("result lost recovery evidence: %#v", got)
+	}
+}
+
+func TestAppServerRunnerMetadataOnlyKeepsCompleteFinalWhenTitleBackfillFails(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-existing","turns":[]}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-current","status":"inProgress","items":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-existing","turnId":"turn-current","item":{"id":"item-final","type":"agentMessage","text":"complete final"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-existing","turn":{"id":"turn-current","status":"completed","items":[]}}}`,
+		`{"id":5,"error":{"code":"transport_failure","message":"title unavailable"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	runner.MetadataOnlyResume = true
+	runner.RequireCompleteFinal = true
+
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", BackfillThreadName: true})
+	if err != nil {
+		t.Fatalf("ResumeThread discarded a verified final because optional title backfill failed: %v", err)
+	}
+	if got.FinalAgentMessage != "complete final" || !got.FinalAgentMessageComplete || got.Status != TurnStatusCompleted {
+		t.Fatalf("result = %#v, want verified complete final", got)
+	}
+	if got.ThreadName != "" {
+		t.Fatalf("thread name = %q, want empty after failed optional backfill", got.ThreadName)
+	}
+}
+
+func TestAppServerRunnerLegacyTitleBackfillFailureRemainsError(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-current","status":"inProgress","items":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-current","item":{"id":"item-final","type":"agentMessage","text":"complete final"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-new","turn":{"id":"turn-current","status":"completed","items":[]}}}`,
+		`{"id":5,"error":{"code":"transport_failure","message":"title unavailable"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	got, err := runner.StartThread(context.Background(), TurnInput{Prompt: "start", BackfillThreadName: true})
+	if !IsKind(err, ErrorCodex) || !strings.Contains(err.Error(), "title unavailable") {
+		t.Fatalf("legacy title backfill error = %v, want unchanged failure", err)
+	}
+	if got.FinalAgentMessage != "complete final" || !got.FinalAgentMessageComplete {
+		t.Fatalf("legacy result lost complete final diagnostics: %#v", got)
+	}
+}
+
+func TestCompletedFinalAgentMessageForTurnsListRequiresExactCompletedTurn(t *testing.T) {
+	raw := json.RawMessage(`{"data":[{"id":"turn-current","status":"inProgress","items":[{"type":"agentMessage","text":"not final"}]},{"id":"turn-other","status":"completed","items":[{"type":"agentMessage","text":"wrong"}]},{"id":"turn-current","status":"completed","items":[{"type":"agentMessage","text":"right"}]}]}`)
+	message, ok := completedFinalAgentMessageForTurnsList(raw, "turn-current")
+	if !ok || message != "right" {
+		t.Fatalf("message=%q ok=%v, want exact completed turn", message, ok)
+	}
+	if _, ok := completedFinalAgentMessageForTurnsList(raw, "turn-missing"); ok {
+		t.Fatal("unexpected match for missing turn")
+	}
+}
+
+func BenchmarkCompletedFinalAgentMessageForTurnsList(b *testing.B) {
+	raw := json.RawMessage(`{"data":[{"id":"turn-current","status":"completed","items":[{"id":"item-final","type":"agentMessage","text":"complete final"}]}]}`)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		message, ok := completedFinalAgentMessageForTurnsList(raw, "turn-current")
+		if !ok || message == "" {
+			b.Fatal("summary parse failed")
+		}
+	}
+}
+
+func BenchmarkAppServerProtocolFinalNotifications(b *testing.B) {
+	item := appServerMessage{
+		Method: "item/completed",
+		Params: json.RawMessage(`{"threadId":"thread-current","turnId":"turn-current","item":{"id":"item-final","type":"agentMessage","text":"complete final"}}`),
+	}
+	completed := appServerMessage{
+		Method: "turn/completed",
+		Params: json.RawMessage(`{"threadId":"thread-current","turn":{"id":"turn-current","status":"completed","items":[]}}`),
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		var result TurnResult
+		if !applyAppServerProtocolNotification(&result, item) || !applyAppServerProtocolNotification(&result, completed) {
+			b.Fatal("notification parse failed")
+		}
+		if result.FinalAgentMessage != "complete final" || !result.FinalAgentMessageComplete || result.Status != TurnStatusCompleted {
+			b.Fatalf("result = %#v", result)
+		}
+	}
 }
 
 func TestAppServerRunnerBackfillsThreadNameAfterCompletedTurn(t *testing.T) {

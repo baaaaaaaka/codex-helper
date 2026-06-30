@@ -20,6 +20,7 @@ const (
 	appServerMethodThreadResume    = "thread/resume"
 	appServerMethodThreadRead      = "thread/read"
 	appServerMethodThreadList      = "thread/list"
+	appServerMethodThreadTurnsList = "thread/turns/list"
 	appServerMethodTurnStart       = "turn/start"
 	appServerMethodTurnInterrupt   = "turn/interrupt"
 	appServerCompletedRequestLimit = 256
@@ -68,6 +69,12 @@ type AppServerRunner struct {
 	// BackfillThreadName reads thread metadata after completed turns when the
 	// completion stream did not carry a thread/name/updated notification.
 	BackfillThreadName bool
+	// MetadataOnlyResume avoids returning persisted turns from thread/resume.
+	// It is opt-in so non-Teams callers retain the legacy request contract.
+	MetadataOnlyResume bool
+	// RequireCompleteFinal fails closed when a completed turn has no final
+	// agent item, allowing callers to recover from the canonical transcript.
+	RequireCompleteFinal bool
 	// CloseHook releases resources that must live exactly as long as this
 	// runner (for example a local third-party Responses adapter).
 	CloseHook func()
@@ -377,7 +384,11 @@ func (r *AppServerRunner) startThread(ctx context.Context, input TurnInput) (str
 }
 
 func (r *AppServerRunner) resumeThread(ctx context.Context, threadID string) (string, error) {
-	result, err := r.request(ctx, appServerMethodThreadResume, map[string]string{"threadId": threadID})
+	params := map[string]any{"threadId": threadID}
+	if r.MetadataOnlyResume {
+		params["excludeTurns"] = true
+	}
+	result, err := r.request(ctx, appServerMethodThreadResume, params)
 	if err != nil {
 		return "", err
 	}
@@ -427,12 +438,23 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 			return result, err
 		}
 	}
-	needsBackfillMessage := strings.TrimSpace(result.FinalAgentMessage) == ""
+	needsBackfillMessage := strings.TrimSpace(result.FinalAgentMessage) == "" || (r.RequireCompleteFinal && !result.FinalAgentMessageComplete)
 	needsBackfillName := (r.BackfillThreadName || input.BackfillThreadName) && strings.TrimSpace(result.ThreadName) == ""
 	if result.Status == TurnStatusCompleted && (needsBackfillMessage || needsBackfillName) {
-		if err := r.backfillTurnResult(ctx, &result); err != nil {
+		if err := r.backfillTurnResult(ctx, &result, needsBackfillMessage, needsBackfillName); err != nil {
+			if r.RequireCompleteFinal && needsBackfillMessage && !result.FinalAgentMessageComplete {
+				return result, &Error{Kind: ErrorParse, Message: "Codex turn completed without a complete final agent message", Err: err}
+			}
+			if r.RequireCompleteFinal && needsBackfillName && result.FinalAgentMessageComplete {
+				// A generated thread title is optional metadata. Never discard an
+				// otherwise verified final answer only because title backfill failed.
+				return result, nil
+			}
 			return result, err
 		}
+	}
+	if result.Status == TurnStatusCompleted && r.RequireCompleteFinal && (!result.FinalAgentMessageComplete || strings.TrimSpace(result.FinalAgentMessage) == "") {
+		return result, &Error{Kind: ErrorParse, Message: "Codex turn completed without a complete final agent message"}
 	}
 	if result.Failure != nil || result.Status == TurnStatusFailed || result.Status == TurnStatusInterrupted {
 		return result, turnResultError(result)
@@ -466,12 +488,38 @@ func (r *AppServerRunner) validateAppServerArgs(inputArgs []string) error {
 	return &Error{Kind: ErrorUnsupported, Message: "codex app-server runner cannot safely translate raw codex CLI arguments yet"}
 }
 
-func (r *AppServerRunner) backfillTurnResult(ctx context.Context, result *TurnResult) error {
+func (r *AppServerRunner) backfillTurnResult(ctx context.Context, result *TurnResult, includeTurns bool, includeThreadName bool) error {
 	threadID := strings.TrimSpace(result.ThreadID)
 	if threadID == "" {
 		return nil
 	}
-	includeTurns := strings.TrimSpace(result.FinalAgentMessage) == ""
+	if r.MetadataOnlyResume {
+		if includeTurns {
+			raw, err := r.request(ctx, appServerMethodThreadTurnsList, map[string]any{
+				"threadId":      threadID,
+				"limit":         1,
+				"sortDirection": "desc",
+				"itemsView":     "summary",
+			})
+			if err != nil {
+				return err
+			}
+			if message, ok := completedFinalAgentMessageForTurnsList(raw, result.TurnID); ok {
+				result.FinalAgentMessage = message
+				result.FinalAgentMessageComplete = true
+			}
+		}
+		if includeThreadName && strings.TrimSpace(result.ThreadName) == "" {
+			raw, err := r.request(ctx, appServerMethodThreadRead, map[string]any{"threadId": threadID})
+			if err != nil {
+				return err
+			}
+			if thread, ok := decodeThread(raw); ok {
+				result.ThreadName = thread.Name
+			}
+		}
+		return nil
+	}
 	params := map[string]any{"threadId": threadID}
 	if includeTurns {
 		params["includeTurns"] = true
@@ -486,6 +534,7 @@ func (r *AppServerRunner) backfillTurnResult(ctx context.Context, result *TurnRe
 	if includeTurns {
 		if message := finalAgentMessageForTurn(raw, result.TurnID); strings.TrimSpace(message) != "" {
 			result.FinalAgentMessage = message
+			result.FinalAgentMessageComplete = true
 		}
 	}
 	return nil
@@ -1672,9 +1721,11 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 	}
 	if envelope.FinalAgentMessage != "" {
 		result.FinalAgentMessage = envelope.FinalAgentMessage
+		result.FinalAgentMessageComplete = true
 	}
 	if message := finalAgentMessageFromItems(envelope.Turn.Items); strings.TrimSpace(message) != "" {
 		result.FinalAgentMessage = message
+		result.FinalAgentMessageComplete = true
 	}
 	if envelope.Failure != nil {
 		result.Failure = sanitizeTurnFailure(envelope.Failure)
@@ -1799,6 +1850,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 				result.TurnID = params.TurnID
 			}
 			result.FinalAgentMessage += params.Delta
+			result.FinalAgentMessageComplete = false
 			return true
 		}
 	case "turn/completed":
@@ -1823,6 +1875,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			result.Status = firstTurnStatus(params.Turn.Status, TurnStatusCompleted)
 			if message := finalAgentMessageFromItems(params.Turn.Items); strings.TrimSpace(message) != "" {
 				result.FinalAgentMessage = message
+				result.FinalAgentMessageComplete = true
 			}
 			if params.Turn.Error != nil {
 				result.Failure = sanitizeTurnFailure(params.Turn.Error)
@@ -1846,6 +1899,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			if isAgentMessageItem(params.Item) {
 				if text := agentMessageText(params.Item); strings.TrimSpace(text) != "" {
 					result.FinalAgentMessage = text
+					result.FinalAgentMessageComplete = true
 				}
 			}
 			return true
@@ -2036,6 +2090,34 @@ func finalAgentMessageForTurn(raw json.RawMessage, turnID string) string {
 		}
 	}
 	return ""
+}
+
+func completedFinalAgentMessageForTurnsList(raw json.RawMessage, turnID string) (string, bool) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return "", false
+	}
+	var envelope struct {
+		Data []struct {
+			ID     string      `json:"id"`
+			Status TurnStatus  `json:"status"`
+			Items  []codexItem `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", false
+	}
+	for _, turn := range envelope.Data {
+		if strings.TrimSpace(turn.ID) != turnID || turn.Status != TurnStatusCompleted {
+			continue
+		}
+		message := finalAgentMessageFromItems(turn.Items)
+		if strings.TrimSpace(message) == "" {
+			return "", false
+		}
+		return message, true
+	}
+	return "", false
 }
 
 func isTerminalTurnStatus(status TurnStatus) bool {

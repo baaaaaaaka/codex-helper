@@ -5793,6 +5793,141 @@ func TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic(t *testing.T) {
 	}
 }
 
+func TestBridgeRecoversAmbiguousExecutionFromExactTranscriptFinal(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	threadID := "thread-ambiguous-recovery"
+	codexTurnID := "codex-turn-ambiguous-recovery"
+	initial := `{"type":"session_meta","payload":{"id":` + strconv.Quote(threadID) + `}}` + "\n" +
+		`{"timestamp":"2026-06-30T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","id":"old-final","turn_id":"old-turn","phase":"final_answer","message":"old answer"}}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, transcriptPath)
+	defer restoreDiscover()
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	finalText := "complete answer recovered from the exact Codex turn"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			line := `{"timestamp":` + strconv.Quote(time.Now().UTC().Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"new-final","thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(codexTurnID) + `,"phase":"final_answer","message":` + strconv.Quote(finalText) + `}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(initial+line), 0o600)
+		},
+		result: ExecutionResult{CodexThreadID: threadID, CodexTurnID: codexTurnID},
+		err: &AmbiguousExecutionError{
+			ThreadID: threadID,
+			TurnID:   codexTurnID,
+			Err:      errors.New("stream disconnected after Codex completed"),
+		},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, threadID)
+	*sent = nil
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgeTestMessage("message-ambiguous-recovery"), "produce a final"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, finalText) {
+		t.Fatalf("recovered final was not delivered:\n%s", joined)
+	}
+	if strings.Contains(joined, "could not confirm whether it finished") || strings.Contains(joined, "helper retry last") {
+		t.Fatalf("ambiguous diagnostic leaked after exact transcript recovery:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	var completed bool
+	for _, turn := range state.Turns {
+		if turn.CodexTurnID == codexTurnID && turn.Status == teamstore.TurnStatusCompleted {
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatalf("recovered turn was not completed: %#v", state.Turns)
+	}
+}
+
+func TestBridgeFinalOutboxRetryRequiresIdenticalChunkPlan(t *testing.T) {
+	t.Parallel()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	queued, err := bridge.queueOutboxChunksWithOptions(ctx, "s001", "turn:final-identical", "chat-1", "final", "same final", outboxQueueOptions{})
+	if err != nil || len(queued) != 1 {
+		t.Fatalf("initial final queue = %#v, err=%v", queued, err)
+	}
+	queued, err = bridge.queueOutboxChunksWithOptions(ctx, "s001", "turn:final-identical", "chat-1", "final", "same final", outboxQueueOptions{})
+	if err != nil || len(queued) != 1 || queued[0].Body != "same final" {
+		t.Fatalf("identical final retry = %#v, err=%v", queued, err)
+	}
+
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:turn:final-conflict:final",
+		SessionID:      "s001",
+		TurnID:         "turn:final-conflict",
+		TeamsChatID:    "chat-1",
+		Kind:           "final",
+		Body:           "stale final",
+		SourceTextHash: normalizedTextHash("stale final"),
+		PartIndex:      1,
+		PartCount:      1,
+	}); err != nil {
+		t.Fatalf("seed conflicting final: %v", err)
+	}
+	if _, err := bridge.queueOutboxChunksWithOptions(ctx, "s001", "turn:final-conflict", "chat-1", "final", "correct final", outboxQueueOptions{}); err == nil || !strings.Contains(err.Error(), "final outbox consistency conflict") {
+		t.Fatalf("conflicting final retry error = %v", err)
+	}
+}
+
+func TestBridgeFinalOutboxPreflightsAllChunksBeforeQueue(t *testing.T) {
+	t.Parallel()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	ctx := context.Background()
+	text := strings.Repeat("long final line that must remain complete across Teams chunks\n", 1400)
+	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    TeamsRenderAssistant,
+		Text:    text,
+	}, TeamsRenderOptions{
+		HardLimitBytes:   safeTeamsHTMLContentBytes,
+		TargetLimitBytes: teamsChunkHTMLContentBytes,
+	})
+	if len(chunks) < 2 {
+		t.Fatalf("test final produced %d chunks, want multiple", len(chunks))
+	}
+	turnID := "turn:final-multipart-conflict"
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:" + turnID + ":final-002",
+		SessionID:      "s001",
+		TurnID:         turnID,
+		TeamsChatID:    "chat-1",
+		Kind:           "final-002",
+		Body:           "stale second part",
+		SourceTextHash: normalizedTextHash("stale final"),
+		PartIndex:      2,
+		PartCount:      len(chunks),
+	}); err != nil {
+		t.Fatalf("seed stale second final chunk: %v", err)
+	}
+
+	if _, err := bridge.queueOutboxChunksWithOptions(ctx, "s001", turnID, "chat-1", "final", text, outboxQueueOptions{}); err == nil || !strings.Contains(err.Error(), "final outbox consistency conflict") {
+		t.Fatalf("multipart conflict error = %v", err)
+	}
+	state, err := store.OutboxStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("OutboxStateSnapshot: %v", err)
+	}
+	if _, ok := state.OutboxMessages["outbox:"+turnID+":final-001"]; ok {
+		t.Fatalf("first final chunk was queued before the later conflict was detected: %#v", state.OutboxMessages)
+	}
+}
+
 func TestBridgeChunkedNeedsAttentionMentionsOwnerOnlyOnLastPart(t *testing.T) {
 	t.Parallel()
 	graph, _ := newBridgeTestGraph(t)

@@ -61,6 +61,9 @@ func TestParseJSONLAllowsOfficialExecEventsWithoutTurnID(t *testing.T) {
 	if got.Status != TurnStatusCompleted || got.FinalAgentMessage != "done" || got.Usage.CachedInputTokens != 34 {
 		t.Fatalf("unexpected result: %#v", got)
 	}
+	if !got.FinalAgentMessageComplete {
+		t.Fatal("official item.completed final was not marked complete")
+	}
 }
 
 func TestParseJSONLExtractsThreadNameUpdates(t *testing.T) {
@@ -96,6 +99,9 @@ func TestParseJSONLExtractsFinalAnswerEventMessage(t *testing.T) {
 	if got.ThreadID != "thread-session" || got.TurnID != "turn-final" || got.Status != TurnStatusCompleted || got.FinalAgentMessage != "final from event msg" {
 		t.Fatalf("result = %#v, want completed final from event_msg", got)
 	}
+	if !got.FinalAgentMessageComplete {
+		t.Fatal("final_answer event was not marked complete")
+	}
 	if got.Usage.CachedInputTokens != 17 {
 		t.Fatalf("usage = %#v, want usage preserved from final event", got.Usage)
 	}
@@ -117,6 +123,9 @@ func TestParseJSONLExtractsFinalAnswerResponseItem(t *testing.T) {
 	if got.Status != TurnStatusCompleted || got.FinalAgentMessage != "response final" {
 		t.Fatalf("result = %#v, want completed final from response_item", got)
 	}
+	if !got.FinalAgentMessageComplete {
+		t.Fatal("final response_item was not marked complete")
+	}
 }
 
 func TestParseJSONLExtractsTaskCompleteLastAgentMessage(t *testing.T) {
@@ -132,6 +141,9 @@ func TestParseJSONLExtractsTaskCompleteLastAgentMessage(t *testing.T) {
 	if got.Status != TurnStatusCompleted || got.TurnID != "turn-1" || got.FinalAgentMessage != "final from task complete" {
 		t.Fatalf("result = %#v, want completed task_complete", got)
 	}
+	if !got.FinalAgentMessageComplete {
+		t.Fatal("task_complete final was not marked complete")
+	}
 }
 
 func TestParseJSONLDoesNotTreatLiteralFinalAnswerAsCompletion(t *testing.T) {
@@ -144,7 +156,7 @@ func TestParseJSONLDoesNotTreatLiteralFinalAnswerAsCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJSONL error: %v", err)
 	}
-	if got.Status != TurnStatusUnknown || got.FinalAgentMessage != "" {
+	if got.Status != TurnStatusUnknown || got.FinalAgentMessage != "" || got.FinalAgentMessageComplete {
 		t.Fatalf("result = %#v, want no completion", got)
 	}
 }

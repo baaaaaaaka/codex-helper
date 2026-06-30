@@ -168,7 +168,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/teams -count=1 -run 'TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic$' -v
+          go test ./internal/codexrunner -count=1 -run 'Test(AppServerRunner(MetadataOnly(ResumeExcludesPersistedTurns|BackfillsExactCompletedTurnSummary|RejectsWrongTurnSummary|WrapsSummaryFailureAsIncompleteFinal|KeepsCompleteFinalWhenTitleBackfillFails)|LegacyTitleBackfillFailureRemainsError)|CompletedFinalAgentMessageForTurnsListRequiresExactCompletedTurn)$' -v
+          go test ./internal/cli ./internal/teams -count=1 -run 'Test(NewManagedTeamsCodexExecutorUsesStandardAppServerRunner|TeamsCodexExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext)|RunnerExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext))$' -v
+          go test ./internal/teams -count=1 -run 'TestBridge(QueuedTurnAmbiguousErrorIncludesDiagnostic|RecoversAmbiguousExecutionFromExactTranscriptFinal|FinalOutbox(RetryRequiresIdenticalChunkPlan|PreflightsAllChunksBeforeQueue)|StreamingErrorDoesNotSuppressPendingFinalLikeProgress)$' -v
 
       - name: Teams live progress guard regressions
         shell: bash

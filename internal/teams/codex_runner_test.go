@@ -174,11 +174,12 @@ func TestRunnerExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.T) {
 func TestRunnerExecutorTreatsCompletedTurnWithCanceledContextAsSuccess(t *testing.T) {
 	runner := &fakeCodexRunner{
 		result: codexrunner.TurnResult{
-			ThreadID:          "thread-existing",
-			ThreadName:        "Existing thread title",
-			TurnID:            "turn-completed",
-			Status:            codexrunner.TurnStatusCompleted,
-			FinalAgentMessage: "final answer",
+			ThreadID:                  "thread-existing",
+			ThreadName:                "Existing thread title",
+			TurnID:                    "turn-completed",
+			Status:                    codexrunner.TurnStatusCompleted,
+			FinalAgentMessage:         "final answer",
+			FinalAgentMessageComplete: true,
 		},
 		err: context.Canceled,
 	}
@@ -192,13 +193,90 @@ func TestRunnerExecutorTreatsCompletedTurnWithCanceledContextAsSuccess(t *testin
 	}
 }
 
+func TestRunnerExecutorRejectsIncompleteCompletedTurnWithCanceledContext(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-existing",
+			TurnID:            "turn-completed",
+			Status:            codexrunner.TurnStatusCompleted,
+			FinalAgentMessage: "partial delta",
+		},
+		err: context.Canceled,
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if !IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want incomplete canceled turn to require recovery", err)
+	}
+	if got.Text != "partial delta" || got.CodexTurnID != "turn-completed" {
+		t.Fatalf("result = %#v, want partial diagnostic evidence and turn id", got)
+	}
+}
+
+func TestRunnerExecutorRejectsCompletedTurnWithoutFinalMessage(t *testing.T) {
+	runner := &fakeCodexRunner{result: codexrunner.TurnResult{
+		ThreadID: "thread-existing",
+		TurnID:   "turn-completed",
+		Status:   codexrunner.TurnStatusCompleted,
+	}}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if err == nil || !strings.Contains(err.Error(), "without a final agent message") {
+		t.Fatalf("Run error = %v, want missing final failure", err)
+	}
+	if !IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want read-only recovery classification", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-completed" || got.Text != "" {
+		t.Fatalf("result = %#v, want recovery ids without placeholder", got)
+	}
+}
+
+func TestRunnerExecutorTreatsIncompleteCompletedTurnAsAmbiguous(t *testing.T) {
+	runner := &fakeCodexRunner{
+		result: codexrunner.TurnResult{
+			ThreadID:          "thread-existing",
+			TurnID:            "turn-completed",
+			Status:            codexrunner.TurnStatusCompleted,
+			FinalAgentMessage: "partial delta",
+		},
+		err: &codexrunner.Error{Kind: codexrunner.ErrorParse, Message: "completed without a complete final"},
+	}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if !IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want read-only recovery classification", err)
+	}
+	if got.Text != "partial delta" || got.CodexTurnID != "turn-completed" {
+		t.Fatalf("result = %#v, want partial diagnostic evidence and turn id", got)
+	}
+}
+
+func TestRunnerExecutorRejectsSuccessfulPartialCompletedTurn(t *testing.T) {
+	runner := &fakeCodexRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-existing",
+		TurnID:            "turn-completed",
+		Status:            codexrunner.TurnStatusCompleted,
+		FinalAgentMessage: "partial delta",
+	}}
+	executor := RunnerExecutor{Runner: runner}
+	got, err := executor.Run(context.Background(), &Session{CodexThreadID: "thread-existing"}, "continue")
+	if !IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want read-only recovery classification", err)
+	}
+	if got.Text != "partial delta" || got.CodexTurnID != "turn-completed" {
+		t.Fatalf("result = %#v, want partial diagnostic evidence and turn id", got)
+	}
+}
+
 func TestRunnerExecutorPassesImageInputToCodexRunner(t *testing.T) {
 	runner := &fakeCodexRunner{
 		result: codexrunner.TurnResult{
-			ThreadID:          "thread-new",
-			TurnID:            "turn-1",
-			Status:            codexrunner.TurnStatusCompleted,
-			FinalAgentMessage: "saw image",
+			ThreadID:                  "thread-new",
+			TurnID:                    "turn-1",
+			Status:                    codexrunner.TurnStatusCompleted,
+			FinalAgentMessage:         "saw image",
+			FinalAgentMessageComplete: true,
 		},
 	}
 	executor := RunnerExecutor{Runner: runner}

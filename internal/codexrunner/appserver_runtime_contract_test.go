@@ -38,6 +38,57 @@ type runtimeContractAdapter struct {
 	restoredHistory   bool
 }
 
+type runtimeMetadataResumeAdapter struct {
+	mu               sync.Mutex
+	firstPrompt      string
+	firstFinal       string
+	resumePrompt     string
+	resumeFinal      string
+	firstSeen        bool
+	restoredOnResume bool
+}
+
+func (a *runtimeMetadataResumeAdapter) Stream(_ context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	requestText := runtimeProviderRequestText(request)
+	switch {
+	case strings.Contains(request.InputText, a.resumePrompt):
+		if !strings.Contains(requestText, a.firstPrompt) || !strings.Contains(requestText, a.firstFinal) {
+			return nil, fmt.Errorf("metadata-only resume lost prior model context: %s", requestText)
+		}
+		a.restoredOnResume = true
+		return runtimeContractEvents(
+			responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventTextDelta, Delta: a.resumeFinal},
+			responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventDone},
+		), nil
+	case strings.Contains(request.InputText, a.firstPrompt):
+		a.firstSeen = true
+		return runtimeContractEvents(
+			responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventTextDelta, Delta: a.firstFinal},
+			responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventDone},
+		), nil
+	default:
+		return nil, fmt.Errorf("unexpected metadata-only resume provider request: %s", requestText)
+	}
+}
+
+func runtimeProviderRequestText(request responsesadapter.ProviderRequest) string {
+	var out strings.Builder
+	out.WriteString(request.InputText)
+	for _, message := range request.Messages {
+		out.WriteByte('\n')
+		out.WriteString(message.Role)
+		out.WriteByte(':')
+		out.WriteString(message.Content)
+		for _, part := range message.ContentParts {
+			out.WriteByte('\n')
+			out.WriteString(part.Text)
+		}
+	}
+	return out.String()
+}
+
 func (a *runtimeContractAdapter) Stream(_ context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -341,6 +392,116 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	}
 	if currentHash := runtimeContractFileHash(t, command); currentHash != originalCommandHash {
 		t.Fatal("original Codex command changed during the standard approval contract")
+	}
+}
+
+func TestInstalledCodexMetadataOnlyResumeRuntime(t *testing.T) {
+	if os.Getenv("CODEX_RUNTIME_E2E_TEST") != "1" {
+		t.Skip("set CODEX_RUNTIME_E2E_TEST=1 to exercise metadata-only resume against the installed Codex binary")
+	}
+	command := strings.TrimSpace(os.Getenv("CXP_CONTRACT_CODEX"))
+	if command == "" {
+		var err error
+		command, err = exec.LookPath("codex")
+		if err != nil {
+			t.Fatalf("codex not found in PATH: %v", err)
+		}
+	}
+	preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer preflightCancel()
+	if _, err := codexcontract.Probe(preflightCtx, command); err != nil {
+		t.Fatalf("Codex runtime contract preflight: %v", err)
+	}
+
+	root := t.TempDir()
+	workingDir := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstPrompt := "Remember the exact marker METADATA_RESUME_CONTEXT_7319 and reply with FIRST_RESUME_FINAL."
+	firstFinal := "FIRST_RESUME_FINAL"
+	resumePrompt := "Return the marker from the previous turn, then append SECOND_RESUME_FINAL."
+	resumeFinal := "METADATA_RESUME_CONTEXT_7319 SECOND_RESUME_FINAL"
+	adapter := &runtimeMetadataResumeAdapter{
+		firstPrompt:  firstPrompt,
+		firstFinal:   firstFinal,
+		resumePrompt: resumePrompt,
+		resumeFinal:  resumeFinal,
+	}
+	providerFacade := &responsesadapter.Facade{
+		Adapter:      adapter,
+		Store:        responsesadapter.NewMemoryStore(),
+		DefaultModel: "gpt-5.4",
+		Models:       []responsesadapter.ModelInfo{{ID: "gpt-5.4", OwnedBy: "cxp-contract"}},
+	}
+	provider := httptest.NewServer(providerFacade)
+	defer provider.Close()
+	codexHome := filepath.Join(root, "codex-home")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeContractChatGPTAuth(t, codexHome)
+
+	newRunner := func() *AppServerRunner {
+		return &AppServerRunner{
+			Starter: PolicyAppServerStarter{ServerOptions: responsespolicy.ServerOptions{
+				OpenAIUpstream:       provider.URL + "/v1",
+				ChatGPTModelUpstream: provider.URL + "/v1",
+			}},
+			ApprovalMode:         ApprovalModeAutomatic,
+			Command:              command,
+			AppServerArgs:        []string{"-c", `model="gpt-5.4"`, "-c", `model_provider="openai"`, "-c", `chatgpt_base_url="` + provider.URL + `"`, "-c", `features.plugins=false`},
+			ExtraEnv:             []string{"CODEX_HOME=" + codexHome},
+			WorkingDir:           workingDir,
+			Timeout:              60 * time.Second,
+			MetadataOnlyResume:   true,
+			RequireCompleteFinal: true,
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	firstRunner := newRunner()
+	first, err := firstRunner.StartThread(ctx, TurnInput{Prompt: firstPrompt, WorkingDir: workingDir})
+	if err != nil {
+		_ = firstRunner.Close()
+		t.Fatalf("first metadata-only runtime turn: %v", err)
+	}
+	if first.ThreadID == "" || first.TurnID == "" || first.Status != TurnStatusCompleted || first.FinalAgentMessage != firstFinal || !first.FinalAgentMessageComplete {
+		_ = firstRunner.Close()
+		t.Fatalf("first metadata-only runtime result = %#v", first)
+	}
+	summary, err := firstRunner.request(ctx, appServerMethodThreadTurnsList, map[string]any{
+		"threadId":      first.ThreadID,
+		"limit":         1,
+		"sortDirection": "desc",
+		"itemsView":     "summary",
+	})
+	if err != nil {
+		_ = firstRunner.Close()
+		t.Fatalf("real thread/turns/list summary: %v", err)
+	}
+	if message, ok := completedFinalAgentMessageForTurnsList(summary, first.TurnID); !ok || message != firstFinal {
+		_ = firstRunner.Close()
+		t.Fatalf("real turn summary message=%q ok=%v raw=%s", message, ok, summary)
+	}
+	if err := firstRunner.Close(); err != nil {
+		t.Fatalf("close first app-server: %v", err)
+	}
+
+	resumeRunner := newRunner()
+	defer resumeRunner.Close()
+	resumed, err := resumeRunner.ResumeThread(ctx, first.ThreadID, TurnInput{Prompt: resumePrompt, WorkingDir: workingDir})
+	if err != nil {
+		t.Fatalf("metadata-only resume against restarted app-server: %v", err)
+	}
+	if resumed.ThreadID != first.ThreadID || resumed.TurnID == "" || resumed.Status != TurnStatusCompleted || resumed.FinalAgentMessage != resumeFinal || !resumed.FinalAgentMessageComplete {
+		t.Fatalf("resumed metadata-only runtime result = %#v", resumed)
+	}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if !adapter.firstSeen || !adapter.restoredOnResume {
+		t.Fatalf("provider context state first_seen=%v restored_on_resume=%v", adapter.firstSeen, adapter.restoredOnResume)
 	}
 }
 

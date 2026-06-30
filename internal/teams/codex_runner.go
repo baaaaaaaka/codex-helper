@@ -126,28 +126,50 @@ func (e RunnerExecutor) RunInputWithEventHandler(ctx context.Context, session *S
 	if err != nil {
 		if codexTurnCompletedDespiteCanceledError(result, err) {
 			out := successfulExecutionResultFromCodexTurn(result)
+			if strings.TrimSpace(out.Text) == "" {
+				return out, missingFinalExecutionError(result, err)
+			}
 			if threadID != "" && out.CodexThreadID != "" && out.CodexThreadID != threadID {
 				return out, fmt.Errorf("resume emitted Codex thread %q, expected %q", out.CodexThreadID, threadID)
 			}
 			return out, nil
 		}
 		out := executionResultFromCodexTurn(result)
+		if result.Status == codexrunner.TurnStatusCompleted && result.Failure == nil && !result.FinalAgentMessageComplete {
+			return out, missingFinalExecutionError(result, err)
+		}
 		if codexTurnMayStillBeRunning(result) {
 			return out, &AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: err}
 		}
 		return out, err
 	}
 	out := successfulExecutionResultFromCodexTurn(result)
+	if strings.TrimSpace(out.Text) == "" || (result.Status == codexrunner.TurnStatusCompleted && !result.FinalAgentMessageComplete) {
+		return out, missingFinalExecutionError(result, nil)
+	}
 	if threadID != "" && out.CodexThreadID != "" && out.CodexThreadID != threadID {
 		return out, fmt.Errorf("resume emitted Codex thread %q, expected %q", out.CodexThreadID, threadID)
 	}
 	return out, nil
 }
 
+func missingFinalExecutionError(result codexrunner.TurnResult, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("Codex turn completed without a final agent message")
+	} else {
+		cause = fmt.Errorf("Codex turn completed without a final agent message: %w", cause)
+	}
+	if strings.TrimSpace(result.TurnID) != "" {
+		return &AmbiguousExecutionError{ThreadID: result.ThreadID, TurnID: result.TurnID, Err: cause}
+	}
+	return cause
+}
+
 func codexTurnCompletedDespiteCanceledError(result codexrunner.TurnResult, err error) bool {
 	return err != nil &&
 		(errors.Is(err, context.Canceled) || codexrunner.IsKind(err, codexrunner.ErrorCanceled)) &&
 		result.Status == codexrunner.TurnStatusCompleted &&
+		result.FinalAgentMessageComplete &&
 		result.Failure == nil
 }
 
@@ -172,12 +194,8 @@ func executionResultFromCodexTurn(result codexrunner.TurnResult) ExecutionResult
 }
 
 func successfulExecutionResultFromCodexTurn(result codexrunner.TurnResult) ExecutionResult {
-	text := strings.TrimSpace(result.FinalAgentMessage)
-	if text == "" {
-		text = "(Codex finished without a final message.)"
-	}
 	return ExecutionResult{
-		Text:             text,
+		Text:             strings.TrimSpace(result.FinalAgentMessage),
 		CodexThreadID:    result.ThreadID,
 		CodexThreadTitle: strings.TrimSpace(result.ThreadName),
 		CodexTurnID:      result.TurnID,
