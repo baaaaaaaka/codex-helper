@@ -910,6 +910,59 @@ func TestRefreshWindowsStableCXPExecutableReplacesOwnedStaleBinary(t *testing.T)
 	}
 }
 
+func TestRefreshWindowsStableCXPExecutableFromPendingSource(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	stablePath := filepath.Join(tmp, "cxp.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	pendingPath := filepath.Join(tmp, ".codex-proxy_1.2.4_windows_amd64.exe.pending")
+	writeCLIFile(t, installPath, "old-binary", 0o755)
+	writeCLIFile(t, stablePath, "old-binary", 0o755)
+	writeCLIFile(t, shimPath, windowsCXPShimContent(), 0o755)
+	writeCLIFile(t, pendingPath, "new-binary", 0o755)
+
+	if err := refreshWindowsStableCXPExecutableFromSource(installPath, pendingPath); err != nil {
+		t.Fatalf("refresh stable cxp.exe from pending source: %v", err)
+	}
+	stable, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stable) != "new-binary" {
+		t.Fatalf("stable cxp.exe = %q, want pending binary", stable)
+	}
+	installed, err := os.ReadFile(installPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(installed) != "old-binary" {
+		t.Fatalf("pending cxp convergence changed primary install to %q", installed)
+	}
+}
+
+func TestRefreshWindowsStableCXPExecutableFromPendingPreservesCustomEntrypoint(t *testing.T) {
+	tmp := t.TempDir()
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	stablePath := filepath.Join(tmp, "cxp.exe")
+	shimPath := filepath.Join(tmp, "cxp.cmd")
+	pendingPath := filepath.Join(tmp, ".codex-proxy_1.2.4_windows_amd64.exe.pending")
+	writeCLIFile(t, installPath, "old-binary", 0o755)
+	writeCLIFile(t, stablePath, "custom-binary", 0o755)
+	writeCLIFile(t, shimPath, "@echo off\r\necho custom\r\n", 0o755)
+	writeCLIFile(t, pendingPath, "new-binary", 0o755)
+
+	if err := refreshWindowsStableCXPExecutableFromSource(installPath, pendingPath); err != nil {
+		t.Fatalf("preserve custom cxp.exe: %v", err)
+	}
+	stable, err := os.ReadFile(stablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stable) != "custom-binary" {
+		t.Fatalf("custom cxp.exe changed to %q", stable)
+	}
+}
+
 func TestRefreshWindowsStableCXPExecutableDoesNotReplaceMatchingBinary(t *testing.T) {
 	tmp := t.TempDir()
 	installPath := filepath.Join(tmp, "codex-proxy.exe")

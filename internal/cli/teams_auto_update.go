@@ -183,6 +183,12 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
 			return teams.HelperAutoUpdateApplyResult{}, err
 		}
+		if teamsServiceGOOS() == "windows" && strings.TrimSpace(res.PendingReplacePath) != "" {
+			// Best effort: the primary activation remains authoritative. A running
+			// legacy cxp.exe may still be locked, which must not invalidate an
+			// otherwise recoverable pending primary update.
+			_ = refreshWindowsStableCXPExecutableFromSource(res.InstallPath, res.PendingReplacePath)
+		}
 	} else {
 		if err := finalizeHelperUpdateResult(res, io.Discard); err != nil {
 			return teams.HelperAutoUpdateApplyResult{}, err

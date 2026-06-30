@@ -87,6 +87,11 @@ func handleUpdateAndRestart(ctx context.Context, cmd *cobra.Command) error {
 		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to install cxp shim after update: %v\n", err)
 		}
+		if strings.EqualFold(runtime.GOOS, "windows") && strings.TrimSpace(res.PendingReplacePath) != "" {
+			if err := refreshWindowsStableCXPExecutableFromSource(res.InstallPath, res.PendingReplacePath); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to stage the pending update for cxp.exe: %v\n", err)
+			}
+		}
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Update replacement for v%s is pending. Restart `codex-proxy`, then verify `codex-proxy --version` before treating the update as installed.\n", res.Version)
 		return nil
 	}

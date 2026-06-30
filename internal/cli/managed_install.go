@@ -1153,9 +1153,23 @@ func ensureWindowsCXPShimForInstallPath(installPath string) error {
 // A canonical cxp.cmd is the ownership marker that permits replacing cxp.exe;
 // custom user command shims and their executables remain untouched.
 func refreshWindowsStableCXPExecutable(installPath string) error {
+	return refreshWindowsStableCXPExecutableFromSource(installPath, installPath)
+}
+
+// refreshWindowsStableCXPExecutableFromSource converges an owned cxp.exe from
+// a validated helper binary that may not have reached installPath yet. Windows
+// upgrades can leave the primary replacement pending when a short-lived file
+// lock prevents MoveFileEx from replacing codex-proxy.exe. The downloaded
+// binary remains available until the upgrading process exits, so it is also
+// the safest source for keeping the stable cxp entrypoint on the same version.
+func refreshWindowsStableCXPExecutableFromSource(installPath string, sourcePath string) error {
 	installPath = managedinstall.CanonicalTargetPathForEntry(installPath, "windows")
 	if installPath == "" || !strings.EqualFold(filepath.Base(installPath), helperpath.BinaryName("windows")) {
 		return nil
+	}
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" {
+		return fmt.Errorf("stable cxp executable source is empty")
 	}
 	shimPath := filepath.Join(filepath.Dir(installPath), "cxp.cmd")
 	shimData, err := os.ReadFile(shimPath)
@@ -1172,22 +1186,22 @@ func refreshWindowsStableCXPExecutable(installPath string) error {
 	stableInfo, err := os.Stat(stableExe)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return copyExecutableAtomically(installPath, stableExe)
+			return copyExecutableAtomically(sourcePath, stableExe)
 		}
 		return err
 	}
 	if stableInfo.IsDir() {
 		return fmt.Errorf("stable cxp executable path is a directory: %s", stableExe)
 	}
-	same, err := filesHaveEqualSHA256(installPath, stableExe)
+	same, err := filesHaveEqualSHA256(sourcePath, stableExe)
 	if err != nil {
 		return err
 	}
 	if same {
 		return nil
 	}
-	if err := copyExecutableAtomically(installPath, stableExe); err != nil {
-		return fmt.Errorf("replace stale stable cxp executable %s from %s: %w", stableExe, installPath, err)
+	if err := copyExecutableAtomically(sourcePath, stableExe); err != nil {
+		return fmt.Errorf("replace stale stable cxp executable %s from %s: %w", stableExe, sourcePath, err)
 	}
 	return nil
 }
