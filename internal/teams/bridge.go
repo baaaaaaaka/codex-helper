@@ -5609,6 +5609,9 @@ func (b *Bridge) queuePendingHelperRestartNotice(ctx context.Context) error {
 			return nil
 		}
 		if tag == "" || !helperVersionMatchesTag(b.helperVersion, tag) {
+			if !notice.Manual {
+				return nil
+			}
 			if _, err := b.queuePendingHelperActivationAttentionNotice(ctx, notice); err != nil {
 				return err
 			}
@@ -5666,7 +5669,18 @@ func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context
 		return false, nil
 	}
 	if !ok {
-		return false, nil
+		// ActivationPending updates do not have a pending replacement file or an
+		// activation-status sidecar. If a helper starts, consumes the durable
+		// restart notice, and is still not running the target version, the
+		// installed-path restart did not converge. Treat that as an actionable
+		// mismatch instead of leaving the update silently pending forever.
+		if strings.TrimSpace(notice.PendingReplacePath) != "" || strings.TrimSpace(notice.InstallPath) == "" {
+			return false, nil
+		}
+		status = helperActivationStatus{
+			Status:  "mismatch",
+			Message: "the restarted helper is not running the requested version",
+		}
 	}
 	statusName := strings.ToLower(strings.TrimSpace(status.Status))
 	notificationKind := ""
@@ -5675,7 +5689,7 @@ func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context
 	case "failed":
 		kind = "failed-helper-upgrade-activation"
 		notificationKind = helperUpgradeActivationFailedNotificationKind
-	case "success":
+	case "success", "mismatch":
 		kind = "mismatched-helper-upgrade-activation"
 		notificationKind = helperUpgradeActivationActionRequiredNotificationKind
 	default:
@@ -5720,7 +5734,7 @@ func (b *Bridge) queuePendingHelperActivationAttentionNotice(ctx context.Context
 	return true, nil
 }
 
-func (b *Bridge) queueHelperUpgradeActivationPendingNotice(ctx context.Context, chatID string, commandMessageID string, tag string, reason string, installPath string, restartScheduled bool) error {
+func (b *Bridge) queueHelperUpgradeActivationActionRequiredNotice(ctx context.Context, chatID string, commandMessageID string, tag string) error {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return nil
@@ -5728,15 +5742,14 @@ func (b *Bridge) queueHelperUpgradeActivationPendingNotice(ctx context.Context, 
 	seed := strings.Join([]string{
 		strings.TrimSpace(commandMessageID),
 		strings.TrimSpace(tag),
-		strings.TrimSpace(installPath),
-		strings.TrimSpace(reason),
 	}, "\x00")
 	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
-		ID:           "outbox:control:helper-upgrade-activation-pending:" + shortStableID(seed),
-		TeamsChatID:  chatID,
-		Kind:         "control-helper-upgrade-activation-pending",
-		Body:         helperUpgradeActivationPendingNoticeBody(tag, reason, installPath, restartScheduled),
-		MentionOwner: true,
+		ID:               "outbox:control:helper-upgrade-activation-action-required:" + shortStableID(seed),
+		TeamsChatID:      chatID,
+		Kind:             "control-helper-upgrade-activation-action-required",
+		Body:             helperUpgradeActivationActionRequiredNoticeBody(tag),
+		MentionOwner:     true,
+		NotificationKind: helperUpgradeActivationActionRequiredNotificationKind,
 	})
 	if err != nil {
 		return err
@@ -5749,22 +5762,16 @@ func (b *Bridge) queueHelperUpgradeActivationPendingNotice(ctx context.Context, 
 	return nil
 }
 
-func helperUpgradeActivationPendingNoticeBody(tag string, reason string, installPath string, restartScheduled bool) string {
-	lines := []string{"⚠️ Helper update activation pending"}
+func helperUpgradeActivationActionRequiredNoticeBody(tag string) string {
+	lines := []string{"⚠️ Helper update needs attention"}
 	if tag := strings.TrimSpace(tag); tag != "" {
 		lines = append(lines, "", "Target: `"+tag+"`")
 	}
-	if installPath := strings.TrimSpace(installPath); installPath != "" {
-		lines = append(lines, "", "Installed helper: `"+installPath+"`")
-	}
-	if reason := strings.TrimSpace(reason); reason != "" {
-		lines = append(lines, "", "Reason: "+reason)
-	}
-	if restartScheduled {
-		lines = append(lines, "", "I will restart through the installed helper and verify the version after it comes back.")
-	} else {
-		lines = append(lines, "", "Send `helper restart now` after active work is idle, then send `st` to verify the running helper version.")
-	}
+	lines = append(lines,
+		"",
+		"The update was installed, but this helper could not activate it automatically.",
+		"Send `helper restart now` after active work is idle. I will verify the version after it comes back.",
+	)
 	return strings.Join(lines, "\n")
 }
 
@@ -5805,6 +5812,8 @@ func helperActivationNoticeKey(statusName string) string {
 		return "failed"
 	case "success":
 		return "success"
+	case "mismatch":
+		return "mismatch"
 	default:
 		return ""
 	}
@@ -6449,17 +6458,18 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		}
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
+		canRecoverAutomatically := opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != ""
 		if completionChatID != "" {
 			if err := b.writePendingHelperUpgradeNoticeWithReplacement(completionChatID, completionCommandID, tag, manualNotice, "", res.InstallPath); err != nil {
 				return err
 			}
-			if manualNotice {
-				if err := b.queueHelperUpgradeActivationPendingNotice(ctx, completionChatID, completionCommandID, tag, pendingReason, res.InstallPath, opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != ""); err != nil {
+			if manualNotice && !canRecoverAutomatically {
+				if err := b.queueHelperUpgradeActivationActionRequiredNotice(ctx, completionChatID, completionCommandID, tag); err != nil {
 					return err
 				}
 			}
 		}
-		if opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != "" {
+		if canRecoverAutomatically {
 			if err := opts.HelperPendingRestarter(ctx, "", res.InstallPath); err != nil {
 				return err
 			}

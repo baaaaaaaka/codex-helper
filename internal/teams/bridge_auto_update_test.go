@@ -576,9 +576,14 @@ func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestartsInstalledPa
 		t.Fatalf("pending restart path/install = %q/%q, want empty/%q", pendingRestartPath, pendingRestartInstallPath, managed)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{"Helper update scheduled", "Helper update activation pending", "v1.2.4-rc.1", "I will restart through the installed helper"} {
+	for _, want := range []string{"Helper update scheduled", "v1.2.4-rc.1"} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("manual pending activation messages missing %q in:\n%s", want, joined)
+			t.Fatalf("manual recoverable activation messages missing %q in:\n%s", want, joined)
+		}
+	}
+	for _, hidden := range []string{"Helper update activation pending", managed, goBin, "I will restart through the installed helper"} {
+		if strings.Contains(joined, hidden) {
+			t.Fatalf("recoverable activation exposed internal detail %q in:\n%s", hidden, joined)
 		}
 	}
 	state, err := st.Load(context.Background())
@@ -606,11 +611,27 @@ func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestartsInstalledPa
 	if notice.InstallPath != managed || notice.PendingReplacePath != "" || !notice.Manual {
 		t.Fatalf("pending notice = %#v, want install path and manual activation", notice)
 	}
+
+	restartedBridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedBridge.helperVersion = "v1.2.4-rc.1"
+	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice after installed-path restart: %v", err)
+	}
+	if err := restartedBridge.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush completion after installed-path restart: %v", err)
+	}
+	joined = sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update completed") {
+		t.Fatalf("verified installed-path restart did not report completion:\n%s", joined)
+	}
+	if strings.Contains(joined, "Helper update needs attention") || strings.Contains(joined, "Helper update activation needs attention") {
+		t.Fatalf("verified installed-path restart reported unnecessary attention:\n%s", joined)
+	}
 }
 
 func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestarterFailureKeepsNotice(t *testing.T) {
 	st := newBridgeTestStore(t)
-	graph, _ := newBridgeTestGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
 	bridge.helperVersion = "v1.2.3"
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
@@ -652,6 +673,129 @@ func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestarterFailureKee
 	}
 	if notice.InstallPath != managed || notice.Tag != "v1.2.4-rc.1" {
 		t.Fatalf("pending notice after restart failure = %#v, want install path and tag retained", notice)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "Helper update failed") || !strings.Contains(joined, "restart failed") {
+		t.Fatalf("restart failure did not notify the user after automatic recovery failed:\n%s", joined)
+	}
+	for _, hidden := range []string{"Helper update activation pending", managed, "running helper executable differs"} {
+		if strings.Contains(joined, hidden) {
+			t.Fatalf("restart failure exposed pre-recovery detail %q in:\n%s", hidden, joined)
+		}
+	}
+}
+
+func TestBridgeControlHelperUpdateActivationPendingWithoutRestarterRequestsAction(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	bridge.helperVersion = "v1.2.3"
+	bridge.helperRestarter = func(context.Context) error { return nil }
+	managed := "/home/me/.local/bin/codex-proxy"
+	bridge.helperAutoUpdater = &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			Candidate: &HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4",
+			InstallPath:       managed,
+			ActivationPending: true,
+			ActivationReason:  "running helper executable differs from " + managed,
+		},
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-update-pending-no-recovery"), "helper update now"); err != nil {
+		t.Fatalf("handleControlMessage error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Helper update scheduled", "Helper update needs attention", "helper restart now", "v1.2.4"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("unrecoverable activation message missing %q in:\n%s", want, joined)
+		}
+	}
+	for _, hidden := range []string{managed, "running helper executable differs", "Helper update activation pending"} {
+		if strings.Contains(joined, hidden) {
+			t.Fatalf("action-required notice exposed internal detail %q in:\n%s", hidden, joined)
+		}
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	var found bool
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind != "control-helper-upgrade-activation-action-required" {
+			continue
+		}
+		found = true
+		if !outbox.MentionOwner || outbox.NotificationKind != helperUpgradeActivationActionRequiredNotificationKind {
+			t.Fatalf("action-required outbox = %#v, want owner attention", outbox)
+		}
+	}
+	if !found {
+		t.Fatalf("action-required outbox missing: %#v", state.OutboxMessages)
+	}
+}
+
+func TestBridgeBackgroundHelperUpdateActivationPendingWithoutRestarterStaysSilent(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	managed := "/home/me/.local/bin/codex-proxy"
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			Candidate: &HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4",
+			InstallPath:       managed,
+			ActivationPending: true,
+			ActivationReason:  "running helper executable differs from " + managed,
+		},
+	}
+
+	if err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+	}); err != nil {
+		t.Fatalf("maybeRunHelperAutoUpdate error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if joined != "" {
+		t.Fatalf("background pending activation must stay silent, got:\n%s", joined)
+	}
+}
+
+func TestBridgeBackgroundHelperUpdateActivationRestartFailureStaysSilent(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	managed := "/home/me/.local/bin/codex-proxy"
+	updater := &fakeHelperAutoUpdater{
+		decision: HelperAutoUpdateDecision{
+			Candidate: &HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
+		},
+		applyResult: HelperAutoUpdateApplyResult{
+			Version:           "1.2.4",
+			InstallPath:       managed,
+			ActivationPending: true,
+			ActivationReason:  "running helper executable differs from " + managed,
+		},
+	}
+
+	err := bridge.maybeRunHelperAutoUpdate(context.Background(), BridgeOptions{
+		HelperVersion:     "v1.2.3",
+		HelperAutoUpdater: updater,
+		HelperPendingRestarter: func(context.Context, string, string) error {
+			return errors.New("restart failed")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "restart failed") {
+		t.Fatalf("maybeRunHelperAutoUpdate error = %v, want restart failure", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if joined != "" {
+		t.Fatalf("background restart failure must stay silent, got:\n%s", joined)
 	}
 }
 
@@ -1189,6 +1333,54 @@ func TestBridgeHelperAutoUpdatePendingReplacementFailureNotifiesOnce(t *testing.
 	}
 }
 
+func TestBridgeBackgroundHelperUpdatePendingReplacementFailureStaysSilent(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	tmp := t.TempDir()
+	pendingPath := filepath.Join(tmp, ".codex-proxy_1.2.4_windows_amd64.exe.123")
+	installPath := filepath.Join(tmp, "codex-proxy.exe")
+	status := helperActivationStatus{
+		Version: 1,
+		Status:  "failed",
+		Message: "formal helper remained locked",
+		Source:  pendingPath,
+		Dest:    installPath,
+		Want:    "1.2.4",
+	}
+	statusData, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("marshal activation status: %v", err)
+	}
+	if err := os.WriteFile(helperActivationStatusPath(pendingPath), statusData, 0o600); err != nil {
+		t.Fatalf("write activation status: %v", err)
+	}
+	if err := bridge.writePendingHelperUpgradeNoticeWithReplacement("control-chat", "", "v1.2.4", false, pendingPath, installPath); err != nil {
+		t.Fatalf("write background pending replacement notice: %v", err)
+	}
+
+	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedOld.helperVersion = "v1.2.3"
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush background replacement failure outbox: %v", err)
+	}
+	if joined := sentPlainJoined(*sent); joined != "" {
+		t.Fatalf("background pending replacement failure must stay silent, got:\n%s", joined)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after background replacement failure: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind == "failed-helper-upgrade-activation" || outbox.NotificationKind == helperUpgradeActivationFailedNotificationKind {
+			t.Fatalf("background replacement failure queued user attention: %#v", outbox)
+		}
+	}
+}
+
 func TestBridgeHelperAutoUpdateSuccessfulActivationWithOldRunningVersionNeedsAttention(t *testing.T) {
 	st := newBridgeTestStore(t)
 	graph, sent := newBridgeTestGraph(t)
@@ -1255,6 +1447,96 @@ func TestBridgeHelperAutoUpdateSuccessfulActivationWithOldRunningVersionNeedsAtt
 	}
 	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation needs attention"); got != 1 {
 		t.Fatalf("pruned activation mismatch notice duplicated, count = %d in:\n%s", got, sentPlainJoined(*sent))
+	}
+}
+
+func TestBridgeHelperAutoUpdateInstalledPathRestartMismatchNotifiesOnce(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	installPath := "/home/me/.local/bin/codex-proxy"
+	if err := bridge.writePendingHelperUpgradeNoticeWithReplacement("control-chat", "cmd-direct", "v1.2.4", true, "", installPath); err != nil {
+		t.Fatalf("write direct activation notice: %v", err)
+	}
+
+	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedOld.helperVersion = "v1.2.3"
+	for i := 0; i < 2; i++ {
+		if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+			t.Fatalf("queuePendingHelperRestartNotice #%d error: %v", i+1, err)
+		}
+		if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+			t.Fatalf("flush pending mismatch outbox #%d: %v", i+1, err)
+		}
+	}
+	joined := sentPlainJoined(*sent)
+	for _, want := range []string{"Helper update activation needs attention", "v1.2.4", "v1.2.3", "not running the requested version"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("installed-path mismatch notice missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, installPath) {
+		t.Fatalf("installed-path mismatch notice leaked local path:\n%s", joined)
+	}
+	if got := strings.Count(joined, "Helper update activation needs attention"); got != 1 {
+		t.Fatalf("installed-path mismatch notice count = %d, want 1 in:\n%s", got, joined)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after direct mismatch: %v", err)
+	}
+	var found bool
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind != "mismatched-helper-upgrade-activation" {
+			continue
+		}
+		found = true
+		if !outbox.MentionOwner || outbox.NotificationKind != helperUpgradeActivationActionRequiredNotificationKind {
+			t.Fatalf("direct mismatch outbox = %#v, want owner attention", outbox)
+		}
+	}
+	if !found {
+		t.Fatalf("direct mismatch outbox missing: %#v", state.OutboxMessages)
+	}
+	deleteOutboxByKind(t, st, "mismatched-helper-upgrade-activation")
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice after pruning mismatch outbox: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush after pruning mismatch outbox: %v", err)
+	}
+	if got := strings.Count(sentPlainJoined(*sent), "Helper update activation needs attention"); got != 1 {
+		t.Fatalf("pruned installed-path mismatch notice was resent, count = %d in:\n%s", got, sentPlainJoined(*sent))
+	}
+}
+
+func TestBridgeBackgroundHelperUpdateInstalledPathRestartMismatchStaysSilent(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	if err := bridge.writePendingHelperUpgradeNoticeWithReplacement("control-chat", "", "v1.2.4", false, "", "/home/me/.local/bin/codex-proxy"); err != nil {
+		t.Fatalf("write background direct activation notice: %v", err)
+	}
+
+	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedOld.helperVersion = "v1.2.3"
+	if err := restartedOld.queuePendingHelperRestartNotice(context.Background()); err != nil {
+		t.Fatalf("queuePendingHelperRestartNotice error: %v", err)
+	}
+	if err := restartedOld.flushPendingOutbox(context.Background(), "", ""); err != nil {
+		t.Fatalf("flush background mismatch outbox: %v", err)
+	}
+	if joined := sentPlainJoined(*sent); joined != "" {
+		t.Fatalf("background installed-path mismatch must stay silent, got:\n%s", joined)
+	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after background mismatch: %v", err)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.Kind == "mismatched-helper-upgrade-activation" || outbox.NotificationKind == helperUpgradeActivationActionRequiredNotificationKind {
+			t.Fatalf("background mismatch queued user attention: %#v", outbox)
+		}
 	}
 }
 
