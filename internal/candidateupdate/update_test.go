@@ -520,7 +520,7 @@ func TestStableReplacementTargetPreservesManagedSymlinkLeaf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target != managed {
+	if !samePath(target, managed) {
 		t.Fatalf("target = %q, want %q", target, managed)
 	}
 	newCandidate := filepath.Join(dir, "candidate")
