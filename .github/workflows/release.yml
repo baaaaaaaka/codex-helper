@@ -135,6 +135,19 @@ jobs:
           go-version: "1.24.12"
           cache: true
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Teams inline math release contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'Math|HostedContent' -v
+          bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_TEST_TEAMS_MATH_RUNTIME=1 \
+            go test ./internal/teams -count=1 -run '^TestManagedTeamsMathRendererLive$' -v
+
       - name: Managed Node and app-server environment contracts
         shell: bash
         run: |

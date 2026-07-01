@@ -12,6 +12,7 @@ import (
 )
 
 const ArtifactManifestFenceInfo = "codex-helper-artifacts"
+const TeamsMathPromptContract = "For rendered math, write exactly <m>TeX</m>; for literal TeX, use code. Math markers are not artifacts."
 const CodexReasoningEffortConfigKey = "model_reasoning_effort"
 const DefaultSessionReasoningEffort = "xhigh"
 const DefaultControlFallbackReasoningEffort = "low"
@@ -48,7 +49,7 @@ Then include this fenced manifest in your final answer:
 ` + "```" + `
 
 Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.`)
-	instructions = safety + "\n\n" + instructions
+	instructions = safety + "\n\n" + TeamsMathPromptContract + "\n\n" + instructions
 	if strings.TrimSpace(prompt) == "" {
 		return instructions
 	}
@@ -162,6 +163,7 @@ Do not claim that a helper command was executed unless you actually performed th
 		instructions += "\n\nRelevant cxp / Teams helper help digest:\n" + help
 	}
 	instructions += "\n</codex-helper-control-context>"
+	instructions += "\n\n" + TeamsMathPromptContract
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return instructions

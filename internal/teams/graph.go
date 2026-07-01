@@ -117,6 +117,13 @@ type HostedContentValue struct {
 	ContentType string
 }
 
+type OutboundHostedContent struct {
+	TemporaryID  string
+	Bytes        []byte
+	ContentType  string
+	validatedPNG bool
+}
+
 type DriveItem struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -442,12 +449,103 @@ func (g *GraphClient) SendHTMLWithMentionsWithoutRateLimitRetry(ctx context.Cont
 	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
 }
 
+func (g *GraphClient) SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx context.Context, chatID string, html string, mentions []ChatMention, hosted []OutboundHostedContent) (ChatMessage, error) {
+	body := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     html,
+		},
+	}
+	if len(mentions) > 0 {
+		graphMentions, err := graphMentionPayloads(mentions)
+		if err != nil {
+			return ChatMessage{}, err
+		}
+		body["mentions"] = graphMentions
+	}
+	payload, err := graphHostedContentPayloads(hosted)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if len(payload) > 0 {
+		body["hostedContents"] = payload
+	}
+	var msg ChatMessage
+	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return msg, err
+}
+
 func (g *GraphClient) SendHTMLReplyWithQuote(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention) (ChatMessage, error) {
 	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{})
 }
 
 func (g *GraphClient) SendHTMLReplyWithQuoteWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention) (ChatMessage, error) {
 	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention, hosted []OutboundHostedContent) (ChatMessage, error) {
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return ChatMessage{}, fmt.Errorf("quoted reply message id is required")
+	}
+	replyMessage := map[string]any{
+		"body": map[string]any{
+			"contentType": "html",
+			"content":     html,
+		},
+	}
+	if len(mentions) > 0 {
+		graphMentions, err := graphMentionPayloads(mentions)
+		if err != nil {
+			return ChatMessage{}, err
+		}
+		replyMessage["mentions"] = graphMentions
+	}
+	payload, err := graphHostedContentPayloads(hosted)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	if len(payload) > 0 {
+		replyMessage["hostedContents"] = payload
+	}
+	body := map[string]any{
+		"messageIds":   []string{messageID},
+		"replyMessage": replyMessage,
+	}
+	var msg ChatMessage
+	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages/replyWithQuote", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return msg, err
+}
+
+var outboundHostedContentIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)
+
+func graphHostedContentPayloads(hosted []OutboundHostedContent) ([]map[string]any, error) {
+	if len(hosted) > maxTeamsMathPerMessage {
+		return nil, fmt.Errorf("too many hosted contents: %d", len(hosted))
+	}
+	seen := make(map[string]bool, len(hosted))
+	payload := make([]map[string]any, 0, len(hosted))
+	for _, item := range hosted {
+		id := strings.TrimSpace(item.TemporaryID)
+		if !outboundHostedContentIDPattern.MatchString(id) || seen[id] {
+			return nil, fmt.Errorf("invalid or duplicate hosted content temporary id")
+		}
+		seen[id] = true
+		contentType := strings.ToLower(strings.TrimSpace(item.ContentType))
+		pngOK := plausibleTeamsMathPNG(item.Bytes)
+		if !item.validatedPNG {
+			pngOK = validTeamsMathPNG(item.Bytes)
+		}
+		if contentType != "image/png" || !pngOK {
+			return nil, fmt.Errorf("invalid hosted content %q", id)
+		}
+		payload = append(payload, map[string]any{
+			"@microsoft.graph.temporaryId": id,
+			"contentType":                  contentType,
+			"contentBytes":                 base64.StdEncoding.EncodeToString(item.Bytes),
+		})
+	}
+	return payload, nil
 }
 
 func (g *GraphClient) sendHTMLReplyWithQuoteWithOptions(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention, opts graphRequestOptions) (ChatMessage, error) {

@@ -108,10 +108,20 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 		"`helper reload now` only for source-checkout development reloads",
 		"cross-machine agent delegation",
 		"`cxp delegate`",
+		TeamsMathPromptContract,
 		artifactHandoffInstructionLead,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("TeamsCodexPrompt missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestControlFallbackPromptIncludesMathContract(t *testing.T) {
+	got := ControlFallbackCodexPrompt("explain attention")
+	for _, want := range []string{TeamsMathPromptContract} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ControlFallbackCodexPrompt missing %q:\n%s", want, got)
 		}
 	}
 }

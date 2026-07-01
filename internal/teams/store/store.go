@@ -781,49 +781,60 @@ type Turn struct {
 }
 
 type OutboxMessage struct {
-	ID                     string       `json:"id"`
-	SessionID              string       `json:"session_id,omitempty"`
-	TurnID                 string       `json:"turn_id,omitempty"`
-	CodexThreadID          string       `json:"codex_thread_id,omitempty"`
-	TeamsChatID            string       `json:"teams_chat_id"`
-	ScopeID                string       `json:"scope_id,omitempty"`
-	MachineID              string       `json:"machine_id,omitempty"`
-	LeaseGeneration        int64        `json:"lease_generation,omitempty"`
-	Kind                   string       `json:"kind,omitempty"`
-	Body                   string       `json:"body,omitempty"`
-	Sequence               int64        `json:"sequence,omitempty"`
-	PartIndex              int          `json:"part_index,omitempty"`
-	PartCount              int          `json:"part_count,omitempty"`
-	SourceTextHash         string       `json:"source_text_hash,omitempty"`
-	RenderedHash           string       `json:"rendered_hash,omitempty"`
-	RenderedBytes          int          `json:"rendered_bytes,omitempty"`
-	AttachmentPath         string       `json:"attachment_path,omitempty"`
-	AttachmentName         string       `json:"attachment_name,omitempty"`
-	AttachmentUploadName   string       `json:"attachment_upload_name,omitempty"`
-	AttachmentContentType  string       `json:"attachment_content_type,omitempty"`
-	AttachmentUploadFolder string       `json:"attachment_upload_folder,omitempty"`
-	AttachmentSize         int64        `json:"attachment_size,omitempty"`
-	AttachmentHash         string       `json:"attachment_hash,omitempty"`
-	DriveItemID            string       `json:"drive_item_id,omitempty"`
-	DriveItemName          string       `json:"drive_item_name,omitempty"`
-	DriveItemETag          string       `json:"drive_item_etag,omitempty"`
-	DriveItemWebURL        string       `json:"drive_item_web_url,omitempty"`
-	DriveItemWebDav        string       `json:"drive_item_web_dav,omitempty"`
-	AckKind                string       `json:"ack_kind,omitempty"`
-	QuoteReplyToMessageID  string       `json:"quote_reply_to_message_id,omitempty"`
-	NotificationKind       string       `json:"notification_kind,omitempty"`
-	MentionOwner           bool         `json:"mention_owner,omitempty"`
-	MentionUserID          string       `json:"mention_user_id,omitempty"`
-	MentionUserName        string       `json:"mention_user_name,omitempty"`
-	UpgradeNonBlocking     bool         `json:"upgrade_non_blocking,omitempty"`
-	ArtifactIDs            []string     `json:"artifact_ids,omitempty"`
-	Status                 OutboxStatus `json:"status"`
-	TeamsMessageID         string       `json:"teams_message_id,omitempty"`
-	CreatedAt              time.Time    `json:"created_at,omitempty"`
-	UpdatedAt              time.Time    `json:"updated_at,omitempty"`
-	SentAt                 time.Time    `json:"sent_at,omitempty"`
-	LastSendAttempt        time.Time    `json:"last_send_attempt,omitempty"`
-	LastSendError          string       `json:"last_send_error,omitempty"`
+	ID                     string           `json:"id"`
+	SessionID              string           `json:"session_id,omitempty"`
+	TurnID                 string           `json:"turn_id,omitempty"`
+	CodexThreadID          string           `json:"codex_thread_id,omitempty"`
+	TeamsChatID            string           `json:"teams_chat_id"`
+	ScopeID                string           `json:"scope_id,omitempty"`
+	MachineID              string           `json:"machine_id,omitempty"`
+	LeaseGeneration        int64            `json:"lease_generation,omitempty"`
+	Kind                   string           `json:"kind,omitempty"`
+	Body                   string           `json:"body,omitempty"`
+	Sequence               int64            `json:"sequence,omitempty"`
+	PartIndex              int              `json:"part_index,omitempty"`
+	PartCount              int              `json:"part_count,omitempty"`
+	SourceTextHash         string           `json:"source_text_hash,omitempty"`
+	RenderedHash           string           `json:"rendered_hash,omitempty"`
+	RenderedBytes          int              `json:"rendered_bytes,omitempty"`
+	AttachmentPath         string           `json:"attachment_path,omitempty"`
+	AttachmentName         string           `json:"attachment_name,omitempty"`
+	AttachmentUploadName   string           `json:"attachment_upload_name,omitempty"`
+	AttachmentContentType  string           `json:"attachment_content_type,omitempty"`
+	AttachmentUploadFolder string           `json:"attachment_upload_folder,omitempty"`
+	AttachmentSize         int64            `json:"attachment_size,omitempty"`
+	AttachmentHash         string           `json:"attachment_hash,omitempty"`
+	DriveItemID            string           `json:"drive_item_id,omitempty"`
+	DriveItemName          string           `json:"drive_item_name,omitempty"`
+	DriveItemETag          string           `json:"drive_item_etag,omitempty"`
+	DriveItemWebURL        string           `json:"drive_item_web_url,omitempty"`
+	DriveItemWebDav        string           `json:"drive_item_web_dav,omitempty"`
+	AckKind                string           `json:"ack_kind,omitempty"`
+	QuoteReplyToMessageID  string           `json:"quote_reply_to_message_id,omitempty"`
+	NotificationKind       string           `json:"notification_kind,omitempty"`
+	MentionOwner           bool             `json:"mention_owner,omitempty"`
+	MentionUserID          string           `json:"mention_user_id,omitempty"`
+	MentionUserName        string           `json:"mention_user_name,omitempty"`
+	TrustedMath            bool             `json:"trusted_math,omitempty"`
+	MathPlanVersion        int              `json:"math_plan_version,omitempty"`
+	MathSpans              []OutboxMathSpan `json:"math_spans,omitempty"`
+	MathMediaFallback      bool             `json:"math_media_fallback,omitempty"`
+	UpgradeNonBlocking     bool             `json:"upgrade_non_blocking,omitempty"`
+	ArtifactIDs            []string         `json:"artifact_ids,omitempty"`
+	Status                 OutboxStatus     `json:"status"`
+	TeamsMessageID         string           `json:"teams_message_id,omitempty"`
+	CreatedAt              time.Time        `json:"created_at,omitempty"`
+	UpdatedAt              time.Time        `json:"updated_at,omitempty"`
+	SentAt                 time.Time        `json:"sent_at,omitempty"`
+	LastSendAttempt        time.Time        `json:"last_send_attempt,omitempty"`
+	LastSendError          string           `json:"last_send_error,omitempty"`
+}
+
+type OutboxMathSpan struct {
+	Start  int    `json:"start"`
+	End    int    `json:"end"`
+	Index  int    `json:"index"`
+	Source string `json:"source"`
 }
 
 type PendingOutboxCursor struct {
@@ -4972,6 +4983,21 @@ func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string)
 	}
 	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		msg.MentionOwner = false
+		return msg, nil
+	})
+}
+
+func (s *Store) MarkOutboxMathMediaFallback(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		msg.MathMediaFallback = true
+		msg.LastSendError = ""
+		return msg, nil
+	}); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		msg.MathMediaFallback = true
+		msg.LastSendError = ""
 		return msg, nil
 	})
 }

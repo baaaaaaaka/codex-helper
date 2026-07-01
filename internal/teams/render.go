@@ -38,6 +38,7 @@ type TeamsRenderInput struct {
 	Kind         TeamsRenderKind
 	Text         string
 	CodeLanguage string
+	TrustedMath  bool
 }
 
 type TeamsRenderOptions struct {
@@ -123,13 +124,17 @@ func PlanTeamsHTMLChunks(input TeamsRenderInput, opts TeamsRenderOptions) []Team
 		partInput := input
 		partInput.Text = part
 		html := renderTeamsHTMLPart(partInput, i+1, total)
+		byteLength := len(html)
+		if input.TrustedMath {
+			byteLength = plannedTeamsMathHTMLLength(partInput, i+1, total)
+		}
 		chunks = append(chunks, TeamsRenderedChunk{
 			HTML:       html,
 			Text:       part,
 			Label:      teamsRenderLabel(input.Kind, i+1, total),
 			PartIndex:  i + 1,
 			PartCount:  total,
-			ByteLength: len(html),
+			ByteLength: byteLength,
 		})
 	}
 	return chunks
@@ -161,6 +166,11 @@ func normalizeTeamsRenderLimits(opts TeamsRenderOptions) (int, int) {
 }
 
 func splitTeamsRenderText(input TeamsRenderInput, text string, limitBytes int, plannedCount int) []string {
+	if input.TrustedMath {
+		if parts, ok := splitTeamsRenderTextWithMath(input, text, limitBytes, plannedCount); ok {
+			return parts
+		}
+	}
 	if teamsRenderKindUsesCodexMarkdown(input.Kind) {
 		if parts, ok := splitTeamsRenderMarkdownTables(input, text, limitBytes, plannedCount); ok {
 			return parts
@@ -498,12 +508,19 @@ func splitTeamsMarkdownTableLines(input TeamsRenderInput, lines []string, limitB
 }
 
 func renderTeamsHTMLPart(input TeamsRenderInput, partIndex int, partCount int) string {
+	return renderTeamsHTMLPartWithMathAssets(input, partIndex, partCount, nil)
+}
+
+func renderTeamsHTMLPartWithMathAssets(input TeamsRenderInput, partIndex int, partCount int, assets []teamsMathAsset) string {
 	label := teamsRenderLabel(input.Kind, partIndex, partCount)
 	text := normalizeTeamsRenderTextForKind(input.Kind, input.Text)
 	if input.Kind == TeamsRenderCode || input.Kind == TeamsRenderCommand {
 		return "<p><strong>" + html.EscapeString(label) + ":</strong></p><pre><code>" + html.EscapeString(text) + "</code></pre>"
 	}
 	if teamsRenderKindUsesCodexMarkdown(input.Kind) {
+		if input.TrustedMath {
+			return renderTeamsHTMLCodexMarkdownWithMathAfterLabelBreak(label, text, assets)
+		}
 		return renderTeamsHTMLCodexMarkdownAfterLabelBreak(label, text)
 	}
 	return renderTeamsHTMLParagraphs(label, text, "")

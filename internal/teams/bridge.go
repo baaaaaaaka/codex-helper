@@ -379,6 +379,7 @@ type Bridge struct {
 	out                               io.Writer
 	executor                          Executor
 	asrTranscriber                    ASRTranscriber
+	mathRenderer                      teamsMathPNGRenderer
 	controlFallbackExecutor           Executor
 	controlFallbackModel              string
 	helperRestarter                   HelperRestarter
@@ -12638,13 +12639,15 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 		return nil, nil
 	}
 	renderKind := renderKindForOutbox(kind)
+	trustedMath := outboxKindTrustsMath(kind)
 	if renderKind == TeamsRenderAssistant {
 		text = StripOAIMemoryCitationBlocks(text)
 	}
 	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
-		Surface: TeamsRenderSurfaceOutbox,
-		Kind:    renderKind,
-		Text:    text,
+		Surface:     TeamsRenderSurfaceOutbox,
+		Kind:        renderKind,
+		Text:        text,
+		TrustedMath: trustedMath,
 	}, TeamsRenderOptions{
 		HardLimitBytes:   safeTeamsHTMLContentBytes,
 		TargetLimitBytes: teamsChunkHTMLContentBytes,
@@ -12671,6 +12674,11 @@ func (b *Bridge) queueOutboxChunksWithOptions(ctx context.Context, sessionID str
 			PartIndex:       chunk.PartIndex,
 			PartCount:       chunk.PartCount,
 			RenderedBytes:   chunk.ByteLength,
+			TrustedMath:     trustedMath,
+		}
+		if trustedMath {
+			msg.MathPlanVersion = teamsMathPlanVersion
+			msg.MathSpans = storeTeamsMathPlan(parseTrustedTeamsMath(body))
 		}
 		mentionThisPart := opts.MentionOwner && i == 0
 		if opts.MentionOwner && shouldMentionOwnerOnLastOutboxPart(kind, opts.NotificationKind) {
@@ -12735,7 +12743,10 @@ func validateFinalOutboxChunk(intended teamstore.OutboxMessage, queued teamstore
 		queued.Body == intended.Body &&
 		queued.SourceTextHash == intended.SourceTextHash &&
 		queued.PartIndex == intended.PartIndex &&
-		queued.PartCount == intended.PartCount {
+		queued.PartCount == intended.PartCount &&
+		queued.TrustedMath == intended.TrustedMath &&
+		queued.MathPlanVersion == intended.MathPlanVersion &&
+		equalOutboxMathSpans(queued.MathSpans, intended.MathSpans) {
 		return nil
 	}
 	return fmt.Errorf("final outbox consistency conflict for turn %q part %d of %d", intended.TurnID, intended.PartIndex, intended.PartCount)
@@ -12767,13 +12778,15 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithOptions(ctx context.Context, s
 		return nil, nil
 	}
 	renderKind := renderKindForOutbox(kind)
+	trustedMath := outboxKindTrustsMath(kind)
 	if renderKind == TeamsRenderAssistant {
 		text = StripOAIMemoryCitationBlocks(text)
 	}
 	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
-		Surface: TeamsRenderSurfaceOutbox,
-		Kind:    renderKind,
-		Text:    text,
+		Surface:     TeamsRenderSurfaceOutbox,
+		Kind:        renderKind,
+		Text:        text,
+		TrustedMath: trustedMath,
 	}, TeamsRenderOptions{
 		HardLimitBytes:   safeTeamsHTMLContentBytes,
 		TargetLimitBytes: teamsChunkHTMLContentBytes,
@@ -12812,6 +12825,11 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithOptions(ctx context.Context, s
 			PartIndex:       chunk.PartIndex,
 			PartCount:       chunk.PartCount,
 			RenderedBytes:   chunk.ByteLength,
+			TrustedMath:     trustedMath,
+		}
+		if trustedMath {
+			msg.MathPlanVersion = teamsMathPlanVersion
+			msg.MathSpans = storeTeamsMathPlan(parseTrustedTeamsMath(body))
 		}
 		mentionThisPart := opts.MentionOwner && i == 0
 		if opts.MentionOwner && shouldMentionOwnerOnLastOutboxPart(kind, opts.NotificationKind) {
@@ -13282,13 +13300,31 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		msg, err = b.graph.SendDriveItemAttachmentWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
 	} else if strings.TrimSpace(outbox.QuoteReplyToMessageID) != "" {
 		msg, err = b.sendOutboxQuoteReplyWithoutRateLimitRetry(ctx, outbox)
-		if err != nil && shouldFallbackFromQuoteReplyError(err) {
+		if err != nil && shouldFallbackFromQuoteReplyError(err) && !shouldFallbackTeamsMathMediaError(err) {
 			fallback := outbox
 			fallback.QuoteReplyToMessageID = ""
 			msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, fallback)
 		}
 	} else {
 		msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, outbox)
+	}
+	if err != nil && shouldFallbackTeamsMathMediaError(err) {
+		fallbackOutbox, fallbackErr := b.store.MarkOutboxMathMediaFallback(ctx, outbox.ID)
+		if fallbackErr != nil {
+			err = fallbackErr
+		} else {
+			outbox = fallbackOutbox
+			if strings.TrimSpace(outbox.QuoteReplyToMessageID) != "" {
+				msg, err = b.sendOutboxQuoteReplyWithoutRateLimitRetry(ctx, outbox)
+				if err != nil && shouldFallbackFromQuoteReplyError(err) {
+					fallback := outbox
+					fallback.QuoteReplyToMessageID = ""
+					msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, fallback)
+				}
+			} else {
+				msg, err = b.sendOutboxHTMLWithoutRateLimitRetry(ctx, outbox)
+			}
+		}
 	}
 	if err != nil {
 		_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
@@ -13322,7 +13358,14 @@ func (b *Bridge) sendOutboxQuoteReplyWithoutRateLimitRetry(ctx context.Context, 
 	if b == nil || b.graph == nil {
 		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
 	}
-	body, mentions := b.renderOutboxHTMLForSend(outbox)
+	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	if len(hosted) > 0 {
+		msg, err := b.graph.SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outbox.QuoteReplyToMessageID, body, mentions, hosted)
+		if err != nil {
+			return ChatMessage{}, teamsMathHostedSendError{err: err}
+		}
+		return msg, nil
+	}
 	return b.graph.SendHTMLReplyWithQuoteWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outbox.QuoteReplyToMessageID, body, mentions)
 }
 
@@ -13330,21 +13373,31 @@ func (b *Bridge) sendOutboxHTMLWithoutRateLimitRetry(ctx context.Context, outbox
 	if b == nil || b.graph == nil {
 		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
 	}
-	body, mentions := b.renderOutboxHTMLForSend(outbox)
+	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	if len(hosted) > 0 {
+		msg, err := b.graph.SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions, hosted)
+		if err != nil {
+			return ChatMessage{}, teamsMathHostedSendError{err: err}
+		}
+		return msg, nil
+	}
 	if len(mentions) > 0 {
 		return b.graph.SendHTMLWithMentionsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions)
 	}
 	return b.graph.SendHTMLWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body)
 }
 
-func (b *Bridge) renderOutboxHTMLForSend(outbox teamstore.OutboxMessage) (string, []ChatMention) {
+func (b *Bridge) renderOutboxHTMLForSend(ctx context.Context, outbox teamstore.OutboxMessage) (string, []ChatMention, []OutboundHostedContent) {
+	assets, hosted := b.renderOutboxMathAssets(ctx, outbox)
 	if outbox.MentionOwner {
-		return renderOutboxMentionHTML(outbox, b.user)
+		html, mentions := renderOutboxMentionHTMLWithFallback(outbox, b.user, "owner", assets)
+		return html, mentions, hosted
 	}
 	if user, ok := outboxMentionUser(outbox); ok {
-		return renderOutboxUserMentionHTML(outbox, user)
+		html, mentions := renderOutboxMentionHTMLWithFallback(outbox, user, "user", assets)
+		return html, mentions, hosted
 	}
-	return renderOutboxHTML(outbox), nil
+	return renderOutboxHTMLWithMathAssets(outbox, assets), nil, hosted
 }
 
 func shouldFallbackFromQuoteReplyError(err error) bool {
@@ -13691,6 +13744,10 @@ func cloneCodexProjects(projects []codexhistory.Project) []codexhistory.Project 
 }
 
 func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
+	return renderOutboxHTMLWithMathAssets(outbox, nil)
+}
+
+func renderOutboxHTMLWithMathAssets(outbox teamstore.OutboxMessage, assets []teamsMathAsset) string {
 	if isChatMovedOutboxKind(outbox.Kind) {
 		rendered, _ := renderChatMovedOutboxHTML(outbox, User{}, false)
 		return rendered
@@ -13708,29 +13765,34 @@ func renderOutboxHTML(outbox teamstore.OutboxMessage) string {
 		return outbox.Body
 	}
 	if isCompletionNotificationOutbox(outbox) && renderKindForOutbox(outbox.Kind) == TeamsRenderAssistant {
-		rendered := renderFinalOutboxBodyHTML(outbox)
+		rendered := renderFinalOutboxBodyHTMLWithMathAssets(outbox, assets)
 		if isCompletionNotificationPart(outbox) {
 			rendered += `<p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>`
 		}
 		return rendered
 	}
-	rendered := renderTeamsHTMLPart(TeamsRenderInput{
+	input := TeamsRenderInput{
 		Surface: TeamsRenderSurfaceOutbox,
 		Kind:    renderKindForOutbox(outbox.Kind),
 		Text:    outbox.Body,
-	}, normalizedPartIndex(outbox), normalizedPartCount(outbox))
-	return rendered
+	}
+	if outbox.TrustedMath {
+		plan := trustedTeamsMathPlanForOutbox(outbox)
+		label := teamsRenderLabel(input.Kind, normalizedPartIndex(outbox), normalizedPartCount(outbox))
+		return renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label, plan, assets)
+	}
+	return renderTeamsHTMLPartWithMathAssets(input, normalizedPartIndex(outbox), normalizedPartCount(outbox), assets)
 }
 
 func renderOutboxMentionHTML(outbox teamstore.OutboxMessage, owner User) (string, []ChatMention) {
-	return renderOutboxMentionHTMLWithFallback(outbox, owner, "owner")
+	return renderOutboxMentionHTMLWithFallback(outbox, owner, "owner", nil)
 }
 
 func renderOutboxUserMentionHTML(outbox teamstore.OutboxMessage, user User) (string, []ChatMention) {
-	return renderOutboxMentionHTMLWithFallback(outbox, user, "user")
+	return renderOutboxMentionHTMLWithFallback(outbox, user, "user", nil)
 }
 
-func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner User, fallback string) (string, []ChatMention) {
+func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner User, fallback string, assets []teamsMathAsset) (string, []ChatMention) {
 	if isChatMovedOutboxKind(outbox.Kind) {
 		return renderChatMovedOutboxHTML(outbox, owner, true)
 	}
@@ -13746,8 +13808,14 @@ func renderOutboxMentionHTMLWithFallback(outbox teamstore.OutboxMessage, owner U
 	label := teamsRenderLabel(renderKindForOutbox(outbox.Kind), normalizedPartIndex(outbox), normalizedPartCount(outbox))
 	body := normalizeTeamsRenderTextForKind(renderKindForOutbox(outbox.Kind), outbox.Body)
 	rendered := renderTeamsHTMLParagraphs(label, body, mention)
+	if outbox.TrustedMath {
+		plan := trustedTeamsMathPlanForOutbox(outbox)
+		rendered = renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label, plan, assets)
+		labelHTML := "<p><strong>" + html.EscapeString(label) + ":</strong>"
+		rendered = strings.Replace(rendered, labelHTML, labelHTML+" "+mention, 1)
+	}
 	if isCompletionNotificationOutbox(outbox) && renderKindForOutbox(outbox.Kind) == TeamsRenderAssistant {
-		rendered = renderFinalOutboxBodyHTML(outbox)
+		rendered = renderFinalOutboxBodyHTMLWithMathAssets(outbox, assets)
 		if isCompletionNotificationPart(outbox) {
 			rendered += `<p><strong>🔧 Helper:</strong> ✅ Codex finished responding. ` + mention + `</p>`
 		}
@@ -13871,8 +13939,16 @@ func parseChatMovedNoticeBody(body string) (target string, href string) {
 }
 
 func renderFinalOutboxBodyHTML(outbox teamstore.OutboxMessage) string {
+	return renderFinalOutboxBodyHTMLWithMathAssets(outbox, nil)
+}
+
+func renderFinalOutboxBodyHTMLWithMathAssets(outbox teamstore.OutboxMessage, assets []teamsMathAsset) string {
 	label := teamsRenderLabel(TeamsRenderAssistant, normalizedPartIndex(outbox), normalizedPartCount(outbox))
 	body := normalizeTeamsRenderTextForKind(TeamsRenderAssistant, StripOAIMemoryCitationBlocks(outbox.Body))
+	if outbox.TrustedMath {
+		plan := trustedTeamsMathPlanForOutbox(outbox)
+		return renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label, plan, assets)
+	}
 	return renderTeamsHTMLCodexMarkdownAfterLabelBreak(label, body)
 }
 
@@ -13974,6 +14050,27 @@ func renderKindForOutbox(kind string) TeamsRenderKind {
 	default:
 		return TeamsRenderHelper
 	}
+}
+
+func outboxKindTrustsMath(kind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	return kind == "final" || strings.HasPrefix(kind, "final-") ||
+		kind == "codex-progress" || strings.HasPrefix(kind, "codex-progress-") ||
+		strings.HasPrefix(kind, "import-assistant-") ||
+		strings.HasPrefix(kind, "sync-assistant-") ||
+		strings.HasPrefix(kind, "codex-assistant-")
+}
+
+func equalOutboxMathSpans(left []teamstore.OutboxMathSpan, right []teamstore.OutboxMathSpan) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func isTranscriptImportBatchOutboxKind(kind string) bool {
@@ -15073,6 +15170,24 @@ func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, imp
 func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImportBatchRecord) error {
 	if b.budgetExhausted() {
 		return errTranscriptImportBudgetExhausted
+	}
+	if record.Record.Kind == TranscriptKindAssistant && len(parseTrustedTeamsMath(record.Body).Spans) > 0 {
+		if err := b.flush(ctx); err != nil {
+			return err
+		}
+		if b.budgetExhausted() {
+			return errTranscriptImportBudgetExhausted
+		}
+		local := codexhistory.Session{
+			SessionID:   b.session.CodexThreadID,
+			ProjectPath: b.session.Cwd,
+			FilePath:    b.filePath,
+		}
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, b.queueOnly); err != nil {
+			return err
+		}
+		b.queuedBatches++
+		return nil
 	}
 	html := renderTeamsHTMLPart(TeamsRenderInput{
 		Surface: TeamsRenderSurfaceOutbox,

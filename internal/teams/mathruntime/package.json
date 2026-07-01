@@ -1,0 +1,8 @@
+{
+  "name": "codex-helper-teams-math-runtime",
+  "private": true,
+  "dependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "mathjax": "4.1.2"
+  }
+}

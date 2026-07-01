@@ -9,6 +9,42 @@ permissions:
   contents: read
 
 jobs:
+  teams-math-runtime:
+    name: Teams inline math runtime (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.12"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Trusted TeX, Hosted Content, and cache regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'Math|HostedContent' -v
+
+      - name: Actual MathJax and resvg on-demand runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_TEST_TEAMS_MATH_RUNTIME=1 \
+            go test ./internal/teams -count=1 -run '^TestManagedTeamsMathRendererLive$' -v
+
   targeted-test:
     name: Targeted test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
