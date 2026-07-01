@@ -55,10 +55,10 @@ class HelperReleaseMatrixTests(unittest.TestCase):
 
     def test_rejects_matrix_that_would_exceed_github_limit(self):
         with self.assertRaisesRegex(ValueError, "split the workflow by platform"):
-            MODULE.validate_matrix_size([f"v0.1.{value}" for value in range(43)], 6, 256)
+            MODULE.validate_matrix_size([f"v0.1.{value}" for value in range(52)], 5, 256)
 
-    def test_accepts_current_six_target_capacity(self):
-        MODULE.validate_matrix_size([f"v0.1.{value}" for value in range(42)], 6, 256)
+    def test_accepts_current_five_target_capacity(self):
+        MODULE.validate_matrix_size([f"v0.1.{value}" for value in range(51)], 5, 256)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ jobs:
             --include v0.1.13-rc.33 \
             --include v0.1.13-rc.34 \
             --include v0.1.13-rc.35 \
-            --matrix-multiplier 6 \
+            --matrix-multiplier 5 \
             --max-jobs 256)"
           echo "old_tags=$old_tags" >> "$GITHUB_OUTPUT"
         id: matrix
@@ -131,7 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, macos-15-intel, windows-2022, windows-2025]
+        os: [ubuntu-latest, macos-15, windows-2022, windows-2025]
 
     steps:
       - name: Checkout
@@ -405,7 +405,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15, macos-15-intel, windows-2022, windows-2025]
+        os: [ubuntu-latest, macos-15, windows-2022, windows-2025]
 
     steps:
       - name: Checkout
@@ -569,8 +569,6 @@ jobs:
           - os: ubuntu-latest
             service_backend: systemd-user
           - os: macos-15
-            service_backend: launchd
-          - os: macos-15-intel
             service_backend: launchd
           - os: windows-2022
             service_backend: windows-task
