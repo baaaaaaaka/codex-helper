@@ -613,6 +613,7 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if err != nil {
 		return nil
 	}
+	materializationSource := managedTeamsMaterializationSource(raw, running.Path)
 	targetIsSymlink := false
 	if info, err := os.Lstat(target.Path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		targetIsSymlink = true
@@ -620,7 +621,11 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	if sameHelperInstallLocation(running.Path, target.Path, teamsServiceGOOS()) && !targetIsSymlink {
 		return nil
 	}
-	runningProbe := helperpath.ProbePath(running.Path, helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat})
+	probeOptions := helperpath.Options{GOOS: teamsServiceGOOS(), Stat: teamsServiceStat}
+	if !sameHelperExecutablePath(materializationSource, running.Path, teamsServiceGOOS()) {
+		probeOptions.BinaryName = helperruntime.BinaryName(teamsServiceGOOS())
+	}
+	runningProbe := helperpath.ProbePath(materializationSource, probeOptions)
 	if !runningProbe.Exists || runningProbe.IsDir || !runningProbe.Executable || !runningProbe.PlausibleHelperEntry {
 		return nil
 	}
@@ -630,7 +635,7 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	runningVersion, runningErr := update.ProbeBinaryVersion(probeCtx, running.Path, 5*time.Second)
+	runningVersion, runningErr := update.ProbeBinaryVersion(probeCtx, materializationSource, 5*time.Second)
 	if runningErr != nil {
 		return nil
 	}
@@ -655,16 +660,48 @@ func defaultMaterializeManagedTeamsInstallTarget(ctx context.Context, target man
 		}
 		return nil
 	}
-	if err := copyExecutableAtomically(running.Path, target.Path); err != nil {
-		return fmt.Errorf("materialize managed Teams install target %s from running helper %s: %w", target.Path, running.Path, err)
+	if err := copyExecutableAtomically(materializationSource, target.Path); err != nil {
+		return fmt.Errorf("materialize managed Teams install target %s from running helper %s: %w", target.Path, materializationSource, err)
 	}
 	for _, shim := range shims {
-		if err := materializeManagedInstallShim(ctx, running.Path, target.Path, shim, runningVersion.Version); err != nil {
+		if err := materializeManagedInstallShim(ctx, materializationSource, target.Path, shim, runningVersion.Version); err != nil {
 			return err
 		}
 	}
 	saveManagedInstallRecordBestEffort(target, runningVersion.Version, shims)
 	return nil
+}
+
+// managedTeamsMaterializationSource returns the immutable runtime that is
+// executing this process when rawExecutable proves that the runtime context
+// belongs to this invocation. The stable runnable path can intentionally be an
+// older compatibility launcher, so copying it would roll a managed Teams
+// install back after a candidate-owned update. The strict ownership checks
+// also prevent inherited CXP_RUNTIME_* variables from an unrelated parent
+// process from redirecting fixture or custom-install materialization.
+func managedTeamsMaterializationSource(rawExecutable string, stableRunnable string) string {
+	current, ok := helperruntime.Current()
+	if !ok {
+		return stableRunnable
+	}
+	goos := teamsServiceGOOS()
+	runtimeOwnsInvocation := sameHelperExecutablePath(rawExecutable, current.RuntimePath, goos) ||
+		sameExistingHelperFile(rawExecutable, current.RuntimePath) ||
+		sameHelperExecutablePath(stableRunnable, current.RuntimePath, goos) ||
+		sameExistingHelperFile(stableRunnable, current.RuntimePath) ||
+		sameHelperExecutablePath(stableRunnable, current.EntryPath, goos) ||
+		sameExistingHelperFile(stableRunnable, current.EntryPath)
+	if !runtimeOwnsInvocation {
+		return stableRunnable
+	}
+	info, err := teamsServiceStat(current.RuntimePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return stableRunnable
+	}
+	if !strings.EqualFold(goos, "windows") && info.Mode().Perm()&0o111 == 0 {
+		return stableRunnable
+	}
+	return current.RuntimePath
 }
 
 func materializedManagedInstallShims(targetPath string) []string {

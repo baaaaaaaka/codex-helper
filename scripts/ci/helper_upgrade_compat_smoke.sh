@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This script upgrades only disposable fixtures. Do not let a parent Teams
+# Codex turn redirect those explicit fixture upgrades back to the live helper.
+unset CODEX_HELPER_TEAMS_CHILD CODEX_HELPER_TEAMS_PARENT_PID
+unset CODEX_HELPER_CLI_PATH CODEX_HELPER_CLI_DIR CODEX_HELPER_TEAMS_LOCAL_SUPERVISOR_VERSION
+unset CXP_RUNTIME CXP_RUNTIME_ROOT CXP_RUNTIME_VERSION CXP_ENTRY_PATH CXP_RUNTIME_DISABLE CXP_RUNTIME_FORCE
+unset CODEX_PROXY_INSTALL_PATH CODEX_PROXY_INSTALL_DIR CODEX_DIR
+
 repo="${REPO:-${GITHUB_REPOSITORY:-}}"
 old_tag="${OLD_TAG:-}"
 target_tag="${TARGET_TAG:-${TAG:-${GITHUB_REF_NAME:-}}}"
@@ -420,7 +427,19 @@ SH
     current-missing-cxp)
       mkdir -p "$(dirname "$managed")"
       rm -f "$managed"
-      cp -f "$go_bin" "$managed"
+      local materialization_source="$go_bin"
+      local go_runtime_root="$(dirname "$go_bin")/.cxp-runtime"
+      if [[ -s "$go_runtime_root/active" ]]; then
+        local go_active
+        go_active="$(tr -d '\r\n' <"$go_runtime_root/active")"
+        local active_runtime="$go_runtime_root/versions/$go_active/cxp"
+        if [[ ! -f "$active_runtime" || ! -x "$active_runtime" ]]; then
+          echo "active immutable runtime is unavailable for managed materialization: $active_runtime" >&2
+          exit 1
+        fi
+        materialization_source="$active_runtime"
+      fi
+      cp -f "$materialization_source" "$managed"
       chmod 0755 "$managed"
       rm -f "$managed_cxp"
       [[ ! -e "$managed_cxp" ]]

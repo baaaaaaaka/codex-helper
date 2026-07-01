@@ -3265,6 +3265,94 @@ func TestTeamsServiceInstallMaterializesManagedDefaultBeforeRepointingFromGoBin(
 	}
 }
 
+func TestTeamsServiceInstallMaterializesCurrentImmutableRuntimeInsteadOfOldLauncher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd")
+	goBinDir := filepath.Join(tmp, "go", "bin")
+	launcher := filepath.Join(goBinDir, "codex-proxy")
+	entry := filepath.Join(goBinDir, "cxp")
+	runtimeRoot := filepath.Join(goBinDir, ".cxp-runtime")
+	immutableRuntime := helperruntime.VersionPath(runtimeRoot, "v1.2.4", runtime.GOOS)
+	managed := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+
+	writeVersionedHelperForServiceTest(t, launcher, "1.2.3")
+	writeVersionedHelperForServiceTest(t, entry, "1.2.3")
+	writeVersionedHelperForServiceTest(t, immutableRuntime, "1.2.4")
+	writeVersionedHelperForServiceTest(t, managed, "1.2.3")
+	if err := helperruntime.Activate(runtimeRoot, "v1.2.4"); err != nil {
+		t.Fatalf("activate immutable runtime: %v", err)
+	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, runtimeRoot)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.4")
+	t.Setenv(helperruntime.EnvEntryPath, entry)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    runtime.GOOS,
+		exe:     immutableRuntime,
+		argv0:   launcher,
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"install"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute service install: %v", err)
+	}
+
+	managedVersion, err := exec.Command(managed, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("managed helper --version failed: %v\n%s", err, managedVersion)
+	}
+	if !strings.Contains(string(managedVersion), "1.2.4") {
+		t.Fatalf("managed helper was copied from the old stable launcher instead of the immutable runtime: %s", managedVersion)
+	}
+	record := loadManagedInstallRecordForServiceTest(t)
+	if record.TargetPath != managed || record.Version != "1.2.4" {
+		t.Fatalf("install record = %#v, want immutable runtime version at %s", record, managed)
+	}
+}
+
+func TestManagedTeamsMaterializationIgnoresUnrelatedRuntimeEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed target materialization is Unix-focused")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	launcher := filepath.Join(tmp, "fixture", "codex-proxy")
+	unrelatedEntry := filepath.Join(tmp, "live", "cxp")
+	unrelatedRoot := filepath.Join(tmp, "live", ".cxp-runtime")
+	unrelatedRuntime := helperruntime.VersionPath(unrelatedRoot, "v9.9.9", runtime.GOOS)
+	writeVersionedHelperForServiceTest(t, launcher, "1.2.4")
+	writeVersionedHelperForServiceTest(t, unrelatedEntry, "9.9.9")
+	writeVersionedHelperForServiceTest(t, unrelatedRuntime, "9.9.9")
+	if err := helperruntime.Activate(unrelatedRoot, "v9.9.9"); err != nil {
+		t.Fatalf("activate unrelated runtime: %v", err)
+	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, unrelatedRoot)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v9.9.9")
+	t.Setenv(helperruntime.EnvEntryPath, unrelatedEntry)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:  runtime.GOOS,
+		exe:   launcher,
+		argv0: launcher,
+		stat:  serviceExecutableStatForTest,
+	})
+
+	if got := managedTeamsMaterializationSource(launcher, launcher); got != launcher {
+		t.Fatalf("materialization source = %q, want unrelated runtime environment ignored in favor of %q", got, launcher)
+	}
+}
+
 func TestTeamsServiceInstallRepairsStaleManagedCXPShimWhenRepointingFromGoBin(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("managed target materialization is Unix-focused")
