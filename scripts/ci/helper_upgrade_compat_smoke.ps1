@@ -40,6 +40,41 @@ function Invoke-Retry([int]$Attempts, [int]$SleepSeconds, [scriptblock]$Action) 
   }
 }
 
+function Invoke-LegacyExternalTargetUpgrade([string]$Runner, [string]$InstallPath) {
+  if ($OldTag -notmatch '^v0\.1\.13-rc\.(28|29)$') {
+    Invoke-Retry 5 10 {
+      & $Runner upgrade --repo $Repo --version $TargetTag --install-path $InstallPath
+    }
+    return
+  }
+
+  # rc.28/rc.29 can replace an external codex-proxy.exe but their old
+  # finalizer predates refreshWindowsStableCXPExecutable. It consequently
+  # reports failure when an existing cxp.cmd still reaches the old cxp.exe.
+  # Accept only that exact inherited post-replacement limitation, prove the
+  # physical target is already current without launching it, then let the
+  # common fresh-target convergence below repair the stable aliases.
+  $oldNativePreference = $PSNativeCommandUseErrorActionPreference
+  $upgradeStatus = -1
+  $output = ""
+  $PSNativeCommandUseErrorActionPreference = $false
+  try {
+    $output = (& $Runner upgrade --repo $Repo --version $TargetTag --install-path $InstallPath 2>&1 | Out-String)
+    $upgradeStatus = $LASTEXITCODE
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+  }
+  $output | Write-Host
+  if ($upgradeStatus -eq 0) {
+    return
+  }
+  if ($output -notmatch 'cxp entrypoint' -or $output -notmatch 'after repair') {
+    throw "legacy external-target update failed for an unexpected reason (exit=$upgradeStatus): $output"
+  }
+  Assert-PhysicalVersion $InstallPath $TargetTag
+  Write-Warning "accepted rc.28/rc.29 external-target alias finalizer limitation after verified binary replacement"
+}
+
 function Download-Binary([string]$Tag, [string]$Destination) {
   $asset = Asset-Name $Tag
   $url = "https://github.com/$Repo/releases/download/$Tag/$asset"
@@ -205,9 +240,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
       Remove-Item -Force -LiteralPath $cxp -ErrorAction SilentlyContinue
       Assert-Version $helper $OldTag
       if (Test-Path -LiteralPath $cxp) { throw "cxp.cmd should be missing before upgrade" }
-      Invoke-Retry 5 10 {
-        & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
-      }
+      Invoke-LegacyExternalTargetUpgrade $runner $helper
       Assert-VersionOrActivatePending $helper $TargetTag
       if (!(Test-Path -LiteralPath $cxp)) {
         Copy-Binary $helper $currentRunner
@@ -223,9 +256,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
       Write-CXPShim $cxp (Expected-CXPShimBody)
       Assert-Version $helper $OldTag
       Assert-Version $cxp $OldTag
-      Invoke-Retry 5 10 {
-        & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
-      }
+      Invoke-LegacyExternalTargetUpgrade $runner $helper
     }
     "existing-cmd-missing-exe" {
       Download-Binary $OldTag $runner
@@ -239,9 +270,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
       # until the actual external-target upgrade performs the repair.
       Assert-PhysicalVersion $helper $OldTag
       if (Test-Path -LiteralPath $cxpExe) { throw "physical version probe unexpectedly repaired cxp.exe" }
-      Invoke-Retry 5 10 {
-        & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
-      }
+      Invoke-LegacyExternalTargetUpgrade $runner $helper
     }
     "stale-helper-cmd" {
       Download-Binary $OldTag $runner
@@ -249,9 +278,7 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
       Write-CXPShim $cxp "@echo off`r`n`"$helper`" %*`r`n"
       Assert-Version $helper $OldTag
       Assert-Version $cxp $OldTag
-      Invoke-Retry 5 10 {
-        & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
-      }
+      Invoke-LegacyExternalTargetUpgrade $runner $helper
       Assert-VersionOrActivatePending $helper $TargetTag
       Copy-Binary $helper $currentRunner
       Invoke-Retry 5 10 {
