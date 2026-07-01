@@ -36,6 +36,15 @@ cp "$old_runtime" "$entry"
 chmod 700 "$old_runtime" "$entry" "$candidate"
 printf 'v0.1.13-rc.31\n' >"$root/active"
 
+# The candidate completes managed-install record reconciliation during its
+# version probe. Keep that real side effect inside the fixture so this smoke
+# cannot leave a dangling install record for later jobs on the same runner.
+export HOME="$tmp/home"
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_STATE_HOME="$HOME/.local/state"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
+
 env \
   CXP_RUNTIME=1 \
   CXP_RUNTIME_ROOT="$root" \
