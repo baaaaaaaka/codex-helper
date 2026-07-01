@@ -46,12 +46,13 @@ jobs:
             go test ./internal/teams -count=1 -run '^TestManagedTeamsMathRendererLive$' -v
 
   targeted-test:
-    name: Targeted test (${{ matrix.os }})
+    name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        shard: [core, platform-integration, state-perf]
 
     steps:
       - name: Checkout
@@ -64,14 +65,14 @@ jobs:
           cache: true
 
       - name: Workflow lint (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
 
       - name: Check CI helper scripts (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -80,14 +81,14 @@ jobs:
           done < <(find scripts/ci -name '*.sh' -print0)
 
       - name: Script unit tests (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'core' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       - name: Install PATH activation matrix (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -96,7 +97,7 @@ jobs:
           CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
 
       - name: Install PATH activation matrix (macOS only)
-        if: runner.os == 'macOS'
+        if: matrix.shard == 'platform-integration' && runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
@@ -114,14 +115,14 @@ jobs:
           CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
 
       - name: Teams auth bootstrap dry-run (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'core' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           python3 -m unittest scripts/tests/test_teams_auth_bootstrap_scripts.py
 
       - name: Script unit tests (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'core' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -129,7 +130,7 @@ jobs:
           py -3 -m unittest discover -s scripts/tests -p "test_*.py"
 
       - name: Check CI PowerShell scripts (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'core' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -139,7 +140,7 @@ jobs:
           }
 
       - name: Teams auth bootstrap dry-run (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'core' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -147,6 +148,7 @@ jobs:
           py -3 -m unittest scripts/tests/test_teams_auth_bootstrap_scripts.py
 
       - name: gofmt (verify)
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           bad="$(gofmt -l .)"
@@ -157,6 +159,7 @@ jobs:
           fi
 
       - name: go mod tidy (verify)
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           go mod tidy
@@ -167,6 +170,7 @@ jobs:
           fi
 
       - name: Managed install convergence regressions
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
@@ -177,6 +181,7 @@ jobs:
           go test . -count=1 -run 'TestInstall(Sh|Ps1)KeepsPathSetupWhenInstallDirAlreadySet$' -v
 
       - name: CXP immutable runtime and process identity
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
@@ -187,49 +192,53 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
 
       - name: Actual candidate-owned update and recovery (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: bash scripts/ci/candidate_owned_update_smoke.sh
 
       - name: Legacy rc.28-rc.35 runtime bridge (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: bash scripts/ci/legacy_runtime_bridge_smoke.sh
 
       - name: Legacy rc.28-rc.35 runtime bridge and restart recovery (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: .\scripts\ci\legacy_runtime_bridge_smoke.ps1
 
       - name: Actual CXP process identity (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: bash scripts/ci/cxp_process_identity_smoke.sh
 
       - name: Actual CXP process identity (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: .\scripts\ci\cxp_process_identity_smoke.ps1
 
       - name: Local proxy self-loop regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/localproxy -count=1 -run 'TestHTTPProxy(RejectsSelfLoopTargets|ServeHTTPRejectsSelfLoopTargets|SelfTargetDetection)$' -v
 
       - name: Teams control and work chat rename regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'Test(ChatTitlesUseDistinctLeadingEmoji|ParseControlDashboardCommandsDoNotRequireCodex|ParseRenameHostnameArgumentPreservesRegularRenameTitles|Bridge(ControlRenameUpdatesTeamsTopicAndDurableState|RenameHostnameUpdatesControlAndWorkChatTopics|EnsureControlChat(DoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|PreservesUserControlTitle|RestoresPersistedUserControlTitle|BackfillsUserControlTitleIntoPartialDurableBinding|RenamesOldControlTopic)|SessionRenameUpdatesTeamsTopicAndDurableState))$' -v
 
       - name: Teams user annotation failure isolation regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridgeAnnotate(IncomingUserMessageDoesNotMirrorWhenGraphUpdateFails|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror|ASRPatchFailureDoesNotDisableTextAnnotations)$' -v
 
       - name: Teams group chat guard regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -239,6 +248,7 @@ jobs:
           go test ./cmd/teams-graph-bench -count=1 -run "$bench_pattern" -v
 
       - name: Teams cross-machine registry regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -249,12 +259,14 @@ jobs:
           go test ./internal/teams -count=1 -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
 
       - name: Responses adapter provider compatibility regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*)|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
 
       - name: Codex streaming transcript visibility regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -266,6 +278,7 @@ jobs:
           go test ./internal/teams -count=1 -run 'Test(ParseCodexTranscript(ClassifiesEventCommentaryAsStatus|SkipsRawReasoningWithoutVisibleSummary)|BridgeStreams(NewFormatCommentaryToTeams|UnphasedAgentMessagesToTeams)|BridgeCanQueueLiveTurnOutbox(ChecksTargetTurn|ChecksTargetTurnSQLite|IgnoresUnrelatedSQLiteCorruption)|BridgeRunningTurnTranscriptBackfill(SendsStatusWithoutAdvancingMainCheckpoint|SkipsWhenLiveProgressAlreadyQueued)|BridgeSyncLinkedTranscript(DedupesLiveStreamed(Commentary|FinalAnswerFragmentSentAsStatus)|SkipsRecentTeamsTurnAgentMessageMirrorByCodexTurnID|KeepsAgentMessageWithoutRecentMirrorEvidence))$' -v
 
       - name: Teams durable routing authority regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -276,6 +289,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
       - name: Teams read-only diagnostics regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -283,6 +297,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestLoadPathReadOnly(JSONDoesNotCreateLockOrModifyFiles|SQLite(DoesNotModifyDatabaseFamily|SeesLiveWALWithoutModifyingPersistentFiles|RetriesWhenWALAppearsDuringImmutableRead|LiveWALWithoutSHMFailsWithoutCreatingSidecar))$' -v
 
       - name: Teams recreate maintenance fence regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -290,6 +305,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|TeamsChatRecreateDrainReleaseDoesNotClearNewerFence|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
 
       - name: Teams SQLite row-level migration regressions
+        if: matrix.shard == 'state-perf'
         shell: bash
         run: |
           set -euo pipefail
@@ -297,6 +313,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
       - name: Teams control status display regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -304,6 +321,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$control_status_pattern" -v
 
       - name: Teams manual park and continuation regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -315,6 +333,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
 
       - name: Teams helper attachment echo race regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -323,6 +342,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestMarkOutboxSentIsIdempotent$' -v
 
       - name: Teams watchdog lifecycle drain regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -334,6 +354,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$bridge_pattern" -v
 
       - name: Teams helper stats regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -341,6 +362,7 @@ jobs:
           go test ./internal/codexrunner -count=1 -run 'Test(ParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens|AppServerRunnerStartThreadEncodesThreadStartAndTurnStart)$' -v
 
       - name: Teams ASR input regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -349,7 +371,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
       - name: Teams managed ASR dependency availability (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -435,7 +457,7 @@ jobs:
           done
 
       - name: Teams managed ASR dependency availability (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -501,18 +523,21 @@ jobs:
           Test-ManagedASRAsset "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-cpu-x64.zip"
 
       - name: Teams managed ASR real runtime smoke
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
           CODEX_HELPER_ASR_REAL_ASSET_TEST=1 go test ./internal/teams -count=1 -run 'TestManagedASRRealPinnedLlamaAndFFmpegAssetsInstallAndValidate$' -v
 
       - name: Teams work chat creation info regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridge(ControlNewCreatesDirectoryBoundSession|PublishImportsExistingTranscriptInExactTeamsOrder|RecreateSessionChatRebindsSessionAndRetiresOldRouting)$' -v
 
       - name: Teams history watch Teams-origin regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -521,7 +546,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
 
       - name: Cross-compile check (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: |
           GOOS=darwin  GOARCH=arm64 go build ./...
@@ -530,7 +555,7 @@ jobs:
           GOOS=linux   GOARCH=arm64 go build ./...
 
       - name: Setup SSHD for integration tests (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -586,7 +611,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: SSH live integration regressions (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -595,12 +620,14 @@ jobs:
           SSH_TEST_ENABLED=1 SSH_CONFIG_PROFILE_INIT_TEST=1 go test ./internal/cli -count=1 -run 'TestInitProfileSSHConfigProfileIntegration$' -v
 
       - name: SSH accept-new client support
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
           SSH_ACCEPT_NEW_OPTION_TEST=1 go test ./internal/ssh -count=1 -run 'TestOpenSSHAcceptNewOptionSupported$' -v
 
       - name: SSH host-key fallback regressions
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
@@ -608,14 +635,14 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(InitProfileInteractiveWithDepsDoesNotPromptForHostKeyConfirmation|InstallPublicKeyAcceptsNewHostKeysByDefault|ClassifySSHProbeFailureDoesNotTreatBannerOffendingAsHostKey)$' -v
 
       - name: Installer shell matrix tests (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           go test . -count=1 -run 'Test(InstallSh|WindowsPowerShell)'
 
       - name: Installer PATH/profile tests (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -623,7 +650,7 @@ jobs:
           go test . -count=1 -run 'Test(InstallPs1|WindowsPowerShell)'
 
       - name: Recent install disk/npm regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -631,7 +658,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstall(edDoesNot(CacheProvidedPath|OverwriteCachedPathWithProvidedPath)|DiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets))|RunCodexInstallerDiskSpace(PrecheckFailsBeforeShell|RechecksDiskSpaceAfterShellFailure)|RunSystemNpmCodexUpgrade(DiskPrecheckFailsBeforeInstall|ReportsDiskSpaceAfterNpmFailure|ForcesOptionalDependencyEnv)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|CodexNPMInstallEnvClearsOptionalDependencyOmit|BootstrapScript(ContainsDiskSpacePreflight|ChecksNpmUsability|ContainsSelfValidation|RepairsMissingOptionalDependency)|BootstrapWindowsScriptContains(SelfValidation|DiskAndNpmChecks))$'
 
       - name: Recent install disk/npm regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -640,13 +667,14 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(EnsureCodexInstallDiskSpace(WarnsAndContinuesWhenUnknown|DeduplicatesTargets)|RunCodexUpgradeBySourceSystemIgnoresManagedDiskTargets|CodexNPMInstallEnvClearsOptionalDependencyOmit|BootstrapWindowsScriptContains(SelfValidation|DiskAndNpmChecks))$'
 
       - name: Codex upgrade source symlink regressions
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(DetectCodexUpgradeSource(Managed|ManagedThroughUserBinSymlink|ManagedThroughSymlinkedPathDir|ManagedWithSymlinkedAncestor|ManagedWithSymlinkedLocalDirPhysicalPath|SystemNpm|SystemNpmWithSymlinkedPrefixPhysicalPath|Unknown)|InferManagedPrefixFromPathRequiresBoundary|PrepareCodexSelfUpdateGuardEnvDetectsSymlinkedManagedCodex)$' -v
 
       - name: Recent run/installer/reuse regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -657,7 +685,7 @@ jobs:
           go test . -count=1 -run 'TestInstallSh(ReloadsPathWhenHomeContainsSpaces|RemovesLegacyCodexClp|RemovesLegacyCodexClaudeProxyAndClpSymlink|RemovesCodexOwnedClaudeProxyWithoutVersionOutput|PreservesExternalClpSymlinkToClaudeProxy)$'
 
       - name: Recent run/installer/reuse regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -669,32 +697,35 @@ jobs:
           go test . -count=1 -run 'TestInstallPs1(RemovesLegacyCodexClpExe|RemovesLegacyCodexClaudeProxyAndClpCmd|PreservesExternalClpCmdReferencingClaudeProxy)$'
 
       - name: Proxy reset critical regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(ProxyReset.*|RunLikeAfterProxyResetPromptsForProxyPreference|TeamsGraphHTTPClientUsesDirectAfterProxyReset|BeaconCLIProfileUsingProxyBecomesNotReadyAfterProxyReset)$' -v
 
       - name: Teams Graph proxy diagnostics regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(TeamsGraphProxyLocalStatus(DoesNotProbeTeamsConnect|HonorsCancellation)|TeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams|TeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon|TeamsServiceDoctorReportsTeamsGraphProxyLocalStatus)$' -v
 
       - name: Teams non-interactive stdin regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(EnsureProxyPreference(ServiceDefaultsToDirectWithoutPrompt|NonTerminalDefaultsToDirectWithoutPrompt|NonInteractiveUsesConfiguredProfiles|NonInteractiveResetsIncompleteStateToDirect)|TeamsCodexLauncherModelProfileWithoutSSHServiceDefaultsDirectWhenProxyUnsetCI|RunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI|RunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI|CodexInstallerCommandStdinDisabledFor(TeamsService|NonTerminal)|RunCodexInstallerDoesNotPassStdinInTeamsService|RunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService|ConfirmTeamsServiceUACPromptRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|InitProfileInteractiveRejects(TeamsServiceModeWithoutReading|NonTerminalStdinWithoutBlocking)|HistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference|RunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference)$' -v
 
       - name: Recent codexhistory shared-cache regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'core' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/codexhistory ./internal/tui -count=1
 
       - name: Recent codexhistory shared-cache regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'core' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -702,7 +733,7 @@ jobs:
           go test ./internal/codexhistory ./internal/tui -count=1
 
       - name: Root/home/identity regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -710,7 +741,7 @@ jobs:
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run "$pattern"
 
       - name: Root/home/identity regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -719,7 +750,7 @@ jobs:
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run $pattern
 
       - name: Config and standard runtime resilience regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -736,7 +767,7 @@ jobs:
           go test ./internal/update -count=1 -run 'TestReplaceBinary(BacksUpPrevious|FirstInstallHasNoBackup)$' -v
 
       - name: Config and standard runtime resilience regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -753,7 +784,7 @@ jobs:
           go test ./internal/teams -count=1 -run $teamsPattern -v
 
       - name: Teams background keepalive regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         env:
           CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-token.json
@@ -770,7 +801,7 @@ jobs:
           go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams background keepalive regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}\teams-missing-token.json
@@ -788,14 +819,14 @@ jobs:
           go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams native supervisor validation (Linux)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           sudo env "PATH=$PATH" CODEX_HELPER_SYSTEMD_ANALYZE_TEST=1 go test ./internal/cli -count=1 -run 'TestTeamsServiceSystemdUnitVerifiesWithSystemdAnalyzeCI$' -v
 
       - name: Teams local-supervisor upgrade activation regressions (Linux)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -803,14 +834,14 @@ jobs:
           go test ./internal/cli -count=1 -run "$activation_pattern" -v
 
       - name: Teams native supervisor validation (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.shard == 'platform-integration' && runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           CODEX_HELPER_PLUTIL_TEST=1 go test ./internal/cli -count=1 -run 'TestTeamsServiceLaunchAgentPlistLintsWithPlutilCI$' -v
 
       - name: Teams native supervisor validation (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -819,13 +850,14 @@ jobs:
           go test ./internal/cli -count=1 -run 'TestTeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)CI$' -v
 
       - name: Teams Graph 429 stress (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/teams_graph_429_stress.sh
 
       - name: Teams SQLite store migration and perf regressions
+        if: matrix.shard == 'state-perf'
         shell: bash
         run: |
           set -euo pipefail
@@ -862,6 +894,7 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
 
       - name: Teams Codex runner classification regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -880,6 +913,7 @@ jobs:
           go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run "$helper_upgrade_handoff_pattern" -v
 
       - name: Teams app-server model profile cancellation regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -887,6 +921,7 @@ jobs:
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
       - name: Teams metadata-only resume and final integrity regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -898,6 +933,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$bridge_pattern" -v
 
       - name: Model choice reusable credential regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -905,6 +941,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfileAllowsLegacyDeepSeekContextFingerprintCI|ModelListShows(NeedsSetupWhenFamilyCredentialExistsWithoutProfile|DisplayNamesAndCustomDefaultModel)|ModelDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice)|TeamsModelProfileDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice))$' -v
 
       - name: Teams user-marker compact and fallback regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -926,6 +963,7 @@ jobs:
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
 
       - name: Teams thread recovery and self-echo regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -937,6 +975,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$outbound_ledger_pattern" -v
 
       - name: Teams bridge scheduling and history sync regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -958,12 +997,14 @@ jobs:
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
       - name: Teams ambiguous execution diagnostic regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic$' -v
 
       - name: Beacon mode simulation regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -973,6 +1014,7 @@ jobs:
           go test ./internal/beacon/sim -count=1 -v
 
       - name: Teams control dashboard formatting regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -982,6 +1024,7 @@ jobs:
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
 
       - name: Teams skills command regressions
+        if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
@@ -989,7 +1032,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$skills_pattern" -v
 
       - name: Teams background keepalive race regressions (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         env:
           CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-token.json
@@ -1001,7 +1044,7 @@ jobs:
           go test -race ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
 
       - name: Teams supervisor smoke (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1014,26 +1057,26 @@ jobs:
           fi
 
       - name: Teams supervisor smoke (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           .\scripts\ci\teams_supervisor_smoke.ps1
 
       - name: Teams installed binary local smoke (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/teams_installed_smoke.sh
 
       - name: Teams installed binary local smoke (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           .\scripts\ci\teams_installed_smoke.ps1
 
       - name: Self-update env pollution regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         env:
           CODEX_PROXY_REAL_NPM: /tmp/codex-proxy-wrapper/npm
@@ -1048,7 +1091,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$'
 
       - name: Self-update env pollution regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_PROXY_REAL_NPM: C:\codex-proxy-wrapper\npm.cmd
@@ -1065,6 +1108,7 @@ jobs:
           go test ./internal/cli -count=1 -run $pattern
 
       - name: Helper path and service persistence regressions
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
@@ -1076,14 +1120,14 @@ jobs:
           go test ./internal/codexrunner -count=1 -v
 
       - name: Self-update clean-env regressions (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" go test ./internal/cli -count=1 -run 'Test(SanitizeCodexSelfUpdateEnvRestoresPath|RunInternalNpmWrapper(CleansBeforeGlobalInstall|ManagedInstallForcesManagedPrefixWithPrivateNpm|SkipsCleanupForOtherCommands|ReturnsFailureOnCleanupError|ManagedInstallRequiresPrefix))$' -v
 
       - name: Self-update clean-env regressions (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1097,10 +1141,11 @@ jobs:
           go test ./internal/cli -count=1 -run $pattern -v
 
       - name: go vet
+        if: matrix.shard == 'core'
         run: go vet ./...
 
       - name: Teams perf benchmark smoke
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
         shell: bash
         run: |
           go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
@@ -1111,7 +1156,7 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
 
       - name: Skills local git smoke (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1125,14 +1170,14 @@ jobs:
           CODEX_HELPER_BIN="$RUNNER_TEMP/cxp" bash scripts/ci/skills_migration_smoke.sh
 
       - name: Skills managed Git LFS download smoke (Linux only)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_GIT_LFS_DOWNLOAD_TEST=1 go test ./internal/skills -count=1 -run 'TestEnsureManagedGitLFSIntegrationDownload$' -v
 
       - name: Skills local git smoke (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1152,7 +1197,7 @@ jobs:
           Remove-Item Env:\CODEX_HELPER_BIN
 
       - name: Codex desktop app unsupported smoke (Linux)
-        if: runner.os == 'Linux'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1164,7 +1209,7 @@ jobs:
           grep -q "only available for macOS and Windows" "$RUNNER_TEMP/codex-desktop-unsupported.out"
 
       - name: Codex desktop app network install smoke (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.shard == 'platform-integration' && runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
@@ -1173,7 +1218,7 @@ jobs:
           bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy
 
       - name: Codex desktop app network install smoke (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1192,7 +1237,7 @@ jobs:
           }
 
       - name: Install Codex for integration (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1201,7 +1246,7 @@ jobs:
           codex app-server --help >/dev/null
 
       - name: Install Codex for integration (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1217,7 +1262,7 @@ jobs:
           }
 
       - name: Teams app-server probe (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1236,7 +1281,7 @@ jobs:
           go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path "$(command -v codex)" --workdir "$RUNNER_TEMP" --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Teams app-server probe (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1257,7 +1302,7 @@ jobs:
           go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path $codexCommand.Source --workdir $env:RUNNER_TEMP --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Codex upgrade integration (system npm, Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1291,7 +1336,7 @@ jobs:
           esac
 
       - name: Codex upgrade integration (local npm, Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1327,7 +1372,7 @@ jobs:
           esac
 
       - name: Codex upgrade integration (system npm, Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1365,7 +1410,7 @@ jobs:
           }
 
       - name: Codex upgrade integration (local npm, Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1406,7 +1451,7 @@ jobs:
           }
 
       - name: Codex standard approval runtime integration test (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         env:
           CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
@@ -1422,7 +1467,7 @@ jobs:
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Codex standard approval runtime integration test (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
@@ -1439,7 +1484,7 @@ jobs:
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         env:
           CODEX_INSTALL_TEST: "1"
@@ -1448,7 +1493,7 @@ jobs:
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
       - name: Native managed-node install integration (Windows)
-        if: runner.os == 'Windows'
+        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_INSTALL_TEST: "1"
