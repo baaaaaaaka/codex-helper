@@ -63,6 +63,21 @@ function Assert-Version([string]$Path, [string]$Tag) {
   }
 }
 
+function Assert-PhysicalVersion([string]$Path, [string]$Tag) {
+  $hadDisable = Test-Path Env:CXP_RUNTIME_DISABLE
+  $previousDisable = $env:CXP_RUNTIME_DISABLE
+  $env:CXP_RUNTIME_DISABLE = "1"
+  try {
+    Assert-Version $Path $Tag
+  } finally {
+    if ($hadDisable) {
+      $env:CXP_RUNTIME_DISABLE = $previousDisable
+    } else {
+      Remove-Item Env:CXP_RUNTIME_DISABLE -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 function Test-Version([string]$Path, [string]$Tag) {
   if (!(Test-Path -LiteralPath $Path)) {
     return $false
@@ -217,8 +232,13 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
       Download-Binary $OldTag $helper
       Remove-Item -Force -LiteralPath $cxpExe -ErrorAction SilentlyContinue
       Write-CXPShim $cxp (Expected-CXPShimBody)
-      Assert-Version $helper $OldTag
       if (Test-Path -LiteralPath $cxpExe) { throw "cxp.exe should be missing before canonical shim repair" }
+      # A normal version probe launches the old immutable runtime, whose
+      # launcher legitimately republishes cxp.exe. Probe the downloaded
+      # physical helper with dispatch disabled so this fixture remains missing
+      # until the actual external-target upgrade performs the repair.
+      Assert-PhysicalVersion $helper $OldTag
+      if (Test-Path -LiteralPath $cxpExe) { throw "physical version probe unexpectedly repaired cxp.exe" }
       Invoke-Retry 5 10 {
         & $runner upgrade --repo $Repo --version $TargetTag --install-path $helper
       }
