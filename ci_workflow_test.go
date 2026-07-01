@@ -17,7 +17,11 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	}
 
 	targetedJob := workflowJobBlock(t, workflow, "targeted-test")
-	requireStepContains(t, targetedJob, "name: Targeted test (${{ matrix.os }})")
+	requireStepContains(t, targetedJob,
+		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})",
+		"os: [ubuntu-latest, macos-latest, windows-latest]",
+		"shard: [core, platform-integration, state-perf]",
+	)
 	requireStepNotContains(t, targetedJob,
 		"go test (with coverage, Linux only)",
 		"go test (without coverage, non-Linux)",
@@ -27,13 +31,13 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	)
 	pathActivation := workflowStepBlock(t, targetedJob, "Install PATH activation matrix (Linux only)")
 	requireStepContains(t, pathActivation,
-		"if: runner.os == 'Linux'",
+		"if: matrix.shard == 'platform-integration' && runner.os == 'Linux'",
 		"apt-get install -y --no-install-recommends zsh fish csh tcsh",
 		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh",
 	)
 	macPathActivation := workflowStepBlock(t, targetedJob, "Install PATH activation matrix (macOS only)")
 	requireStepContains(t, macPathActivation,
-		"if: runner.os == 'macOS'",
+		"if: matrix.shard == 'platform-integration' && runner.os == 'macOS'",
 		"HOMEBREW_NO_AUTO_UPDATE=1 brew install fish",
 		"for attempt in 1 2 3",
 		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh",
