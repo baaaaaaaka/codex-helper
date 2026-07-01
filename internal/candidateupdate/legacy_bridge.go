@@ -52,9 +52,13 @@ func LegacyVersionBridge(args []string, buildVersion string) error {
 	if err != nil {
 		return err
 	}
-	expectedDir := filepath.Dir(helperruntime.VersionPath(current.Root, targetVersion, runtime.GOOS))
-	if !samePath(filepath.Dir(executable), expectedDir) {
-		return fmt.Errorf("legacy runtime bridge candidate directory %s, want %s", filepath.Dir(executable), expectedDir)
+	if !legacyBridgeOwnsCandidate(current, targetVersion, executable) {
+		// An affected runtime can also update a different installation target.
+		// Old Windows updaters download that candidate beside the external
+		// target while inheriting CXP_RUNTIME_* from their own launcher. The
+		// candidate must report its version normally, but it must not dispatch
+		// through, resume, or otherwise mutate the unrelated current runtime.
+		return detachLegacyExternalCandidateRuntime()
 	}
 	parent, err := directParentExecutable()
 	if err != nil {
@@ -114,6 +118,29 @@ func LegacyVersionBridge(args []string, buildVersion string) error {
 		}
 		return nil
 	})
+}
+
+func legacyBridgeOwnsCandidate(current helperruntime.Context, targetVersion string, executable string) bool {
+	expectedDir := filepath.Dir(helperruntime.VersionPath(current.Root, targetVersion, runtime.GOOS))
+	return samePath(filepath.Dir(executable), expectedDir)
+}
+
+func detachLegacyExternalCandidateRuntime() error {
+	for _, name := range []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvForce,
+	} {
+		if err := os.Unsetenv(name); err != nil {
+			return fmt.Errorf("detach external update candidate from %s: %w", name, err)
+		}
+	}
+	if err := os.Setenv(helperruntime.EnvDisable, "1"); err != nil {
+		return fmt.Errorf("disable runtime dispatch for external update candidate: %w", err)
+	}
+	return nil
 }
 
 func legacyRuntimeNeedsBridge(version string) bool {

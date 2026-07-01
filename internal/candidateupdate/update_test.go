@@ -499,6 +499,56 @@ func TestLegacyRuntimeNeedsBridgeUsesExactAffectedRange(t *testing.T) {
 	}
 }
 
+func TestLegacyBridgeOwnsOnlyCurrentRuntimeCandidate(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".cxp-runtime")
+	current := helperruntime.Context{Root: root}
+	targetVersion := "v0.1.13-rc.39"
+	expectedDir := filepath.Dir(helperruntime.VersionPath(root, targetVersion, runtime.GOOS))
+	owned := filepath.Join(expectedDir, ".codex-proxy_0.1.13-rc.39_candidate")
+	external := filepath.Join(filepath.Dir(root), "managed", ".codex-proxy_0.1.13-rc.39_candidate")
+
+	if !legacyBridgeOwnsCandidate(current, targetVersion, owned) {
+		t.Fatalf("candidate in current immutable runtime directory should be bridge-owned: %s", owned)
+	}
+	if legacyBridgeOwnsCandidate(current, targetVersion, external) {
+		t.Fatalf("candidate for an external install target must not mutate current runtime: %s", external)
+	}
+}
+
+func TestDetachLegacyExternalCandidateRuntimePreventsDispatchAndResume(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".cxp-runtime")
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v0.1.13-rc.31")
+	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(t.TempDir(), "cxp"))
+	t.Setenv(helperruntime.EnvForce, "1")
+	t.Setenv(helperruntime.EnvDisable, "")
+
+	if _, ok := helperruntime.Current(); !ok {
+		t.Fatal("test runtime context was not active before detach")
+	}
+	if err := detachLegacyExternalCandidateRuntime(); err != nil {
+		t.Fatalf("detach external candidate: %v", err)
+	}
+	if _, ok := helperruntime.Current(); ok {
+		t.Fatal("external candidate retained current runtime identity")
+	}
+	if got := os.Getenv(helperruntime.EnvDisable); got != "1" {
+		t.Fatalf("runtime disable = %q, want 1", got)
+	}
+	for _, name := range []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvForce,
+	} {
+		if value, ok := os.LookupEnv(name); ok {
+			t.Fatalf("%s remained set to %q after detach", name, value)
+		}
+	}
+}
+
 func TestStableReplacementTargetPreservesManagedSymlinkLeaf(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink fixture")
