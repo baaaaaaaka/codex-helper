@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 type BinaryVersion struct {
@@ -25,6 +27,32 @@ type PendingReplacement struct {
 }
 
 func ProbeBinaryVersion(ctx context.Context, path string, timeout time.Duration) (BinaryVersion, error) {
+	return probeBinaryVersion(ctx, path, timeout, binaryProbePhysical)
+}
+
+// ProbePhysicalBinaryVersion returns the build identity embedded in path. It
+// deliberately disables immutable-runtime dispatch and removes inherited CXP
+// runtime markers so a long-lived helper cannot make the child identify as the
+// parent's pinned runtime.
+func ProbePhysicalBinaryVersion(ctx context.Context, path string, timeout time.Duration) (BinaryVersion, error) {
+	return probeBinaryVersion(ctx, path, timeout, binaryProbePhysical)
+}
+
+// ProbeFreshEntryVersion exercises path as a user would from a fresh process.
+// Runtime, disable, and force markers are removed so the stable cxp entry can
+// dispatch through the active immutable runtime.
+func ProbeFreshEntryVersion(ctx context.Context, path string, timeout time.Duration) (BinaryVersion, error) {
+	return probeBinaryVersion(ctx, path, timeout, binaryProbeFreshEntry)
+}
+
+type binaryProbeMode int
+
+const (
+	binaryProbePhysical binaryProbeMode = iota
+	binaryProbeFreshEntry
+)
+
+func probeBinaryVersion(ctx context.Context, path string, timeout time.Duration, mode binaryProbeMode) (BinaryVersion, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return BinaryVersion{}, fmt.Errorf("binary path is empty")
@@ -42,7 +70,12 @@ func ProbeBinaryVersion(ctx context.Context, path string, timeout time.Duration)
 		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	out, err := exec.CommandContext(cmdCtx, path, "--version").CombinedOutput()
+	cmd := exec.CommandContext(cmdCtx, path, "--version")
+	cmd.Env = helperruntime.LauncherEnvironment(os.Environ())
+	if mode == binaryProbePhysical {
+		cmd.Env = append(cmd.Env, helperruntime.EnvDisable+"=1")
+	}
+	out, err := cmd.CombinedOutput()
 	output := trimValidationOutput(string(out))
 	if err != nil {
 		return BinaryVersion{Path: path, Output: output}, fmt.Errorf("probe binary version: %w: %s", err, output)

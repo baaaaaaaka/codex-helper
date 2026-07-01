@@ -6,7 +6,35 @@ import (
 	"os/exec"
 	"reflect"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
 )
+
+func TestRunMainHandlesCandidateUpdateBeforeRuntimeDispatch(t *testing.T) {
+	previousPreflight := runLegacyUpdaterVersionPreflight
+	previousLaunch := launchHelperRuntime
+	previousExecute := executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight = previousPreflight
+		launchHelperRuntime = previousLaunch
+		executeCLI = previousExecute
+	})
+	runLegacyUpdaterVersionPreflight = func() error {
+		t.Fatal("legacy preflight ran for internal candidate update")
+		return nil
+	}
+	launchHelperRuntime = func(string, []string) (int, bool, error) {
+		t.Fatal("runtime dispatch ran for internal candidate update")
+		return 0, false, nil
+	}
+	executeCLI = func() int {
+		t.Fatal("CLI ran for internal candidate update")
+		return 0
+	}
+	if got := runMain([]string{"candidate", candidateupdate.InternalCommand, "--unsupported"}); got != 2 {
+		t.Fatalf("runMain exit code = %d, want 2", got)
+	}
+}
 
 func TestRunMainRunsLegacyPreflightBeforeRuntimeDispatch(t *testing.T) {
 	previousPreflight := runLegacyUpdaterVersionPreflight

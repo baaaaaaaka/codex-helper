@@ -849,6 +849,46 @@ run_legacy_physical_record_unsafe_env_rejection() {
   assert_cxp_entrypoint_healthy "$LEGACY_FIXTURE_TARGET" "$LEGACY_FIXTURE_CXP" "$old_tag"
 }
 
+run_affected_runtime_rescue_upgrade() {
+  if [[ ! "$old_tag" =~ ^v0\.1\.13-rc\.(28|29|30|31|32|33|34|35)$ ]]; then
+    return 0
+  fi
+  # The Linux matrix has two service backends. This runtime-level contract is
+  # backend-independent, so run it once there and once on each macOS runner.
+  if [[ "$os" == "linux" && "$service_backend" != "local-supervisor" ]]; then
+    return 0
+  fi
+  local scenario="$base_root/affected-runtime-rescue"
+  rm -rf "$scenario"
+  mkdir -p "$scenario/home" "$scenario/install"
+  export HOME="$scenario/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export XDG_CACHE_HOME="$HOME/.cache"
+  export CODEX_HOME="$HOME/.codex"
+  export CODEX_PROXY_SKIP_BUILTIN_SKILLS=1
+  unset CXP_RUNTIME CXP_RUNTIME_ROOT CXP_RUNTIME_VERSION CXP_ENTRY_PATH CXP_RUNTIME_DISABLE CXP_RUNTIME_FORCE
+  unset CODEX_PROXY_INSTALL_PATH CODEX_PROXY_INSTALL_DIR
+
+  local entry="$scenario/install/cxp"
+  local root="$scenario/install/.cxp-runtime"
+  local old_runtime="$root/versions/$old_tag/cxp"
+  mkdir -p "$(dirname "$old_runtime")"
+  download_binary "$old_tag" "$entry"
+  install -m 0755 "$entry" "$old_runtime"
+  printf '%s\n' "$old_tag" >"$root/active"
+
+  echo "helper upgrade compatibility smoke: managed-runtime rescue $old_tag -> $target_tag"
+  retry 5 10 "$entry" upgrade \
+    --repo "$repo" \
+    --version "$target_tag" \
+    --install-path "$entry"
+
+  assert_version "$entry" "$target_tag"
+  test "$(tr -d '\r\n' <"$root/active")" = "$target_tag"
+  test "$(tr -d '\r\n' <"$root/previous")" = "$old_tag"
+  test ! -e "$root/pending-update.json"
+}
+
 safe_old="${old_tag//[^A-Za-z0-9._-]/_}"
 safe_target="${target_tag//[^A-Za-z0-9._-]/_}"
 base_root="${RUNNER_TEMP:-/tmp}/codex-helper-upgrade-compat-${safe_old}-to-${safe_target}"
@@ -866,6 +906,7 @@ run_upgrade_convergence_scenario "multihop-local-dir-managed-symlink" "symlink" 
 run_upgrade_convergence_scenario "multihop-local-bin-managed-symlink" "symlink" "local-bin-multihop"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-dir" "local-dir-symlink"
 run_legacy_recorded_cxp_upgrade_scenario "legacy-recorded-cxp-symlinked-local-bin" "local-bin-symlink"
+run_affected_runtime_rescue_upgrade
 
 if [[ "$os" == "linux" && "$old_tag" == "v0.1.12" && "$service_backend" == "local-supervisor" ]]; then
   run_legacy_existing_self_loop_vulnerable_parent_recovery

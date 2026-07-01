@@ -41,6 +41,30 @@ func TestCurrentRuntimeOwnsUpdateTarget(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateWithRuntimeDelegatesTransitionToCandidate(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+	t.Setenv(helperruntime.EnvEntryPath, entry)
+
+	previous := performDownloadedUpdate
+	t.Cleanup(func() { performDownloadedUpdate = previous })
+	var got update.UpdateOptions
+	performDownloadedUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		got = opts
+		return update.ApplyResult{}, nil
+	}
+	if _, err := performUpdateWithRuntime(context.Background(), update.UpdateOptions{InstallPath: entry}); err != nil {
+		t.Fatal(err)
+	}
+	if got.RuntimeRoot != root || got.RuntimeEntryPath != entry || !got.CandidateOwnedApply {
+		t.Fatalf("delegated options = %#v", got)
+	}
+}
+
 func TestRestartSelfExecsSameBinaryWithCurrentArgs(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("non-Windows restart uses exec; Windows is covered by service restart tests")

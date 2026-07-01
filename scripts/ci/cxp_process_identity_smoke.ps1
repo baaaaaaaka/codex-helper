@@ -8,6 +8,11 @@ $hadHome = Test-Path Env:\HOME
 $oldHome = $env:HOME
 $hadStateHome = Test-Path Env:\XDG_STATE_HOME
 $oldStateHome = $env:XDG_STATE_HOME
+$runtimeEnvironment = @{}
+foreach ($name in @("CXP_RUNTIME", "CXP_RUNTIME_ROOT", "CXP_RUNTIME_VERSION", "CXP_ENTRY_PATH", "CXP_RUNTIME_DISABLE", "CXP_RUNTIME_FORCE")) {
+  $runtimeEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+  Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+}
 
 try {
   New-Item -ItemType Directory -Force -Path $root | Out-Null
@@ -89,5 +94,13 @@ try {
   }
   if ($hadHome) { $env:HOME = $oldHome } else { Remove-Item Env:\HOME -ErrorAction SilentlyContinue }
   if ($hadStateHome) { $env:XDG_STATE_HOME = $oldStateHome } else { Remove-Item Env:\XDG_STATE_HOME -ErrorAction SilentlyContinue }
+  foreach ($name in $runtimeEnvironment.Keys) {
+    $value = $runtimeEnvironment[$name]
+    if ($null -eq $value) {
+      Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+    } else {
+      [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
+  }
   Remove-Item -Recurse -Force -LiteralPath $root -ErrorAction SilentlyContinue
 }

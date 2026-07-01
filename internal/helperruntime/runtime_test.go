@@ -1,6 +1,7 @@
 package helperruntime
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,45 @@ import (
 	"sync"
 	"testing"
 )
+
+func TestRecoverPreviousSwapsActiveWithoutRunningActiveRuntime(t *testing.T) {
+	dir := t.TempDir()
+	entry := filepath.Join(dir, BinaryName(runtime.GOOS))
+	writeExecutable(t, entry, "launcher")
+	root := filepath.Join(dir, ".cxp-runtime")
+	v1 := filepath.Join(dir, "v1")
+	v2 := filepath.Join(dir, "v2")
+	writeExecutable(t, v1, "v1")
+	writeExecutable(t, v2, "v2")
+	if _, err := InstallVersion(root, v1, "v1.0.0", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallVersion(root, v2, "v2.0.0", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := Activate(root, "v2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetPrevious(root, "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	previousExecutablePath := executablePath
+	executablePath = func() (string, error) { return entry, nil }
+	t.Cleanup(func() { executablePath = previousExecutablePath })
+	recovered, err := RecoverPrevious(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != "v1.0.0" {
+		t.Fatalf("recovered = %q", recovered)
+	}
+	if active, err := ReadActive(root); err != nil || active != "v1.0.0" {
+		t.Fatalf("active = %q, %v", active, err)
+	}
+	if previous, err := ReadPrevious(root); err != nil || previous != "v2.0.0" {
+		t.Fatalf("previous = %q, %v", previous, err)
+	}
+}
 
 func TestNormalizeVersion(t *testing.T) {
 	t.Parallel()
@@ -37,6 +77,8 @@ func TestLauncherEnvironmentRemovesRuntimeMarkersCaseInsensitively(t *testing.T)
 		"cxp_runtime_root=/tmp/runtime",
 		"Cxp_Runtime_Version=v1.2.3",
 		"Cxp_Entry_Path=/tmp/cxp",
+		"CXP_RUNTIME_DISABLE=1",
+		"cxp_runtime_force=1",
 		"KEEP=yes",
 	})
 	want := []string{"PATH=/bin", "KEEP=yes"}

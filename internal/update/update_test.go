@@ -378,6 +378,65 @@ func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateDelegatesManagedTransitionToCandidate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell candidate fixture is POSIX-only")
+	}
+	tag := "v0.1.13-rc.36"
+	ver := "0.1.13-rc.36"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, ".cxp-runtime")
+	entry := filepath.Join(base, helperruntime.BinaryName(runtime.GOOS))
+	runtimePath := helperruntime.VersionPath(root, tag, runtime.GOOS)
+	marker := filepath.Join(base, "candidate-applied")
+	payload := []byte(fmt.Sprintf(`#!/bin/sh
+set -eu
+case "${1-}" in
+  --version)
+    echo 'codex-proxy version %s'
+    ;;
+  __internal-update-apply)
+    mkdir -p %q
+    cp "$0" %q
+    chmod 700 %q
+    printf '%%s\n' %q >%q
+    : >%q
+    printf '{"version":"%s","runtime_path":"%s","entry_path":"%s","restart_required":false}\n'
+    ;;
+  *) exit 2 ;;
+esac
+`, ver, filepath.Dir(runtimePath), runtimePath, runtimePath, tag, filepath.Join(root, "active"), marker, ver, runtimePath, entry))
+	server := newReleaseServer(t, tag, asset, payload)
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+	if err := os.WriteFile(entry, []byte("stable-entry"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	res, err := PerformUpdate(context.Background(), UpdateOptions{
+		Repo:                "owner/name",
+		Version:             tag,
+		Timeout:             5 * time.Second,
+		ValidateBinary:      true,
+		RuntimeRoot:         root,
+		RuntimeEntryPath:    entry,
+		CandidateOwnedApply: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.RuntimeActivated || res.RuntimePath != runtimePath || res.InstallPath != entry {
+		t.Fatalf("result = %#v", res)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("candidate apply marker: %v", err)
+	}
+}
+
 func TestPerformUpdateUsesStableInstallTargetForTransientRuntimePath(t *testing.T) {
 	requireRuntimeAsset(t)
 	t.Setenv(EnvInstallDir, "")
@@ -460,6 +519,48 @@ func TestPerformUpdateChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestPerformUpdateKeepsCustomRepoCompatibilityWhenChecksumAssetIsMissing(t *testing.T) {
+	requireRuntimeAsset(t)
+	tag := "v2.0.1"
+	ver := "2.0.1"
+	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("binary-payload")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/checksums.txt"):
+			_, _ = fmt.Fprintln(w, strings.Repeat("a", 64)+"  another-asset")
+		case strings.Contains(r.URL.Path, "/"+asset):
+			_, _ = w.Write(payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	restore := overrideGitHubBases(server.URL)
+	defer restore()
+
+	dest := filepath.Join(t.TempDir(), "codex-proxy")
+	res, err := PerformUpdate(context.Background(), UpdateOptions{
+		Repo:        "owner/name",
+		Version:     tag,
+		InstallPath: dest,
+		Timeout:     time.Second,
+	})
+	if err != nil {
+		t.Fatalf("missing optional checksum rejected custom repository update: %v", err)
+	}
+	if res.InstallPath != dest {
+		t.Fatalf("install path = %q, want %q", res.InstallPath, dest)
+	}
+	got, readErr := os.ReadFile(dest)
+	if readErr != nil || string(got) != string(payload) {
+		t.Fatalf("installed payload = %q, %v", got, readErr)
+	}
+}
+
 func TestPerformUpdateValidateBinaryRejectsInvalidPayload(t *testing.T) {
 	requireRuntimeAsset(t)
 	tag := "v2.1.0"
@@ -510,6 +611,29 @@ func TestValidateDownloadedBinaryRejectsRCWhenFinalRequested(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `parsed as "0.1.0-rc.133"`) || !strings.Contains(err.Error(), `want "0.1.0"`) {
 		t.Fatalf("validation error = %v, want parsed exact-version mismatch", err)
+	}
+}
+
+func TestValidateDownloadedBinaryCleansInheritedRuntimeEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script validation fixture is POSIX-only")
+	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, "/stale/root")
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v0.0.1")
+	t.Setenv(helperruntime.EnvEntryPath, "/stale/cxp")
+	t.Setenv(helperruntime.EnvDisable, "stale")
+	t.Setenv(helperruntime.EnvForce, "1")
+	path := filepath.Join(t.TempDir(), "codex-proxy")
+	script := "#!/bin/sh\n" +
+		"test \"${CXP_RUNTIME-}${CXP_RUNTIME_ROOT-}${CXP_RUNTIME_VERSION-}${CXP_ENTRY_PATH-}${CXP_RUNTIME_FORCE-}\" = \"\" || exit 30\n" +
+		"test \"${CXP_RUNTIME_DISABLE-}\" = \"1\" || exit 31\n" +
+		"echo 'codex-proxy version 2.2.0'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDownloadedBinary(context.Background(), path, "v2.2.0", time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 

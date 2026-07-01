@@ -2276,7 +2276,7 @@ func formatTeamsHelperVersionStatus(ctx context.Context, owners []teamsstore.Own
 	pathStatus := resolveTeamsHelperExecutableStatus()
 	installPath := pathStatus.Stable
 	if installPath != "" {
-		if probed, err := update.ProbeBinaryVersion(ctx, installPath, 5*time.Second); err == nil {
+		if probed, err := update.ProbeFreshEntryVersion(ctx, installPath, 5*time.Second); err == nil {
 			entryVersionRaw = strings.TrimPrefix(strings.TrimSpace(probed.Version), "v")
 			entryVersion = "v" + entryVersionRaw
 			if entryVersionRaw != "" {

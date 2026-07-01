@@ -30,6 +30,29 @@ class HelperReleaseMatrixTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.select_tags([], "v0.1.0-rc.1", "")
 
+    def test_includes_fixed_vulnerable_prereleases(self):
+        affected = [f"v0.1.13-rc.{value}" for value in range(28, 36)]
+        releases = [
+            {"tagName": "v0.1.12", "isPrerelease": False, "isDraft": False},
+            *[
+                {"tagName": tag, "isPrerelease": True, "isDraft": False}
+                for tag in affected
+            ],
+        ]
+        self.assertEqual(
+            MODULE.select_tags(
+                releases,
+                "v0.1.12",
+                "",
+                affected,
+            ),
+            ["v0.1.12", *affected],
+        )
+
+    def test_rejects_missing_explicit_prerelease(self):
+        with self.assertRaisesRegex(ValueError, "not published"):
+            MODULE.select_tags([], "v0.1.12", "", ["v0.1.13-rc.31"])
+
     def test_rejects_matrix_that_would_exceed_github_limit(self):
         with self.assertRaisesRegex(ValueError, "split the workflow by platform"):
             MODULE.validate_matrix_size([f"v0.1.{value}" for value in range(43)], 6, 256)

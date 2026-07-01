@@ -20,6 +20,7 @@ import (
 
 var (
 	performUpdate            = performUpdateWithRuntime
+	performDownloadedUpdate  = update.PerformUpdate
 	checkForUpdate           = update.CheckForUpdate
 	resolveInstallPathForCLI = resolveManagedInstallPathForCLI
 	executablePath           = helperpath.RawExecutable
@@ -38,8 +39,9 @@ func performUpdateWithRuntime(ctx context.Context, opts update.UpdateOptions) (u
 	if current, ok := helperruntime.Current(); ok && currentRuntimeOwnsUpdateTarget(current, opts.InstallPath) {
 		opts.RuntimeRoot = current.Root
 		opts.RuntimeEntryPath = current.EntryPath
+		opts.CandidateOwnedApply = true
 	}
-	return update.PerformUpdate(ctx, opts)
+	return performDownloadedUpdate(ctx, opts)
 }
 
 func currentRuntimeOwnsUpdateTarget(current helperruntime.Context, installPath string) bool {

@@ -271,6 +271,66 @@ function Run-UpgradeScenario([string]$Scenario, [string]$SeedMode, [string]$Stor
   Assert-CXPEntrypointHealthy $helper $cxpExe $cxp $TargetTag
 }
 
+function Run-AffectedRuntimeRescueUpgrade() {
+  if ($OldTag -notmatch '^v0\.1\.13-rc\.(28|29|30|31|32|33|34|35)$') {
+    return
+  }
+  $scenarioRoot = Join-Path $script:BaseRoot "affected-runtime-rescue"
+  Remove-Item -Recurse -Force -LiteralPath $scenarioRoot -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $scenarioRoot | Out-Null
+  Configure-IsolatedEnvironment $scenarioRoot
+  foreach ($name in @("CXP_RUNTIME", "CXP_RUNTIME_ROOT", "CXP_RUNTIME_VERSION", "CXP_ENTRY_PATH", "CXP_RUNTIME_DISABLE", "CXP_RUNTIME_FORCE", "CODEX_PROXY_INSTALL_PATH", "CODEX_PROXY_INSTALL_DIR")) {
+    Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+  }
+
+  $entry = Join-Path $scenarioRoot "install\cxp.exe"
+  $runtimeRoot = Join-Path $scenarioRoot "install\.cxp-runtime"
+  $oldRuntime = Join-Path $runtimeRoot "versions\$OldTag\cxp.exe"
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $oldRuntime) | Out-Null
+  Download-Binary $OldTag $entry
+  Copy-Binary $entry $oldRuntime
+  Set-Content -LiteralPath (Join-Path $runtimeRoot "active") -Value $OldTag -NoNewline
+
+  Write-Host "helper upgrade compatibility smoke: managed-runtime Windows rescue $OldTag -> $TargetTag"
+  $oldNativePreference = $PSNativeCommandUseErrorActionPreference
+  $upgradeStatus = -1
+  $PSNativeCommandUseErrorActionPreference = $false
+  try {
+    & $entry upgrade --repo $Repo --version $TargetTag --install-path $entry
+    $upgradeStatus = $LASTEXITCODE
+  }
+  finally {
+    $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+  }
+  if ($upgradeStatus -eq 0) {
+    throw "affected Windows updater unexpectedly reported success before the locked launcher restart"
+  }
+  if ((Get-Content -Raw (Join-Path $runtimeRoot "active")).Trim() -ne $TargetTag) {
+    throw "candidate bridge did not activate $TargetTag"
+  }
+  if ((Get-Content -Raw (Join-Path $runtimeRoot "previous")).Trim() -ne $OldTag) {
+    throw "candidate bridge did not retain $OldTag as previous"
+  }
+
+  $env:CXP_RUNTIME = "1"
+  $env:CXP_RUNTIME_ROOT = $runtimeRoot
+  $env:CXP_RUNTIME_VERSION = $OldTag
+  $env:CXP_ENTRY_PATH = $entry
+  $env:CXP_RUNTIME_DISABLE = "1"
+  $physicalOutput = (& $entry --version | Out-String)
+  if ($physicalOutput -notmatch [regex]::Escape((Version-NoV $OldTag))) {
+    throw "locked stable launcher was unexpectedly replaced: $physicalOutput"
+  }
+  foreach ($name in @("CXP_RUNTIME", "CXP_RUNTIME_ROOT", "CXP_RUNTIME_VERSION", "CXP_ENTRY_PATH", "CXP_RUNTIME_DISABLE", "CXP_RUNTIME_FORCE")) {
+    Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+  }
+
+  Assert-Version $entry $TargetTag
+  if (Test-Path -LiteralPath (Join-Path $runtimeRoot "pending-update.json")) {
+    throw "fresh launcher restart did not finish pending reconciliation"
+  }
+}
+
 $safeOld = $OldTag -replace '[^A-Za-z0-9._-]', '_'
 $safeTarget = $TargetTag -replace '[^A-Za-z0-9._-]', '_'
 $root = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
@@ -284,5 +344,6 @@ Run-UpgradeScenario "stale-helper-cxp-cmd" "stale-helper-cmd"
 Run-UpgradeScenario "missing-cxp-cmd" "missing-cxp"
 Run-UpgradeScenario "current-helper-missing-cxp-cmd" "current-missing-cxp"
 Run-UpgradeScenario "junction-with-spaces-existing-cxp-cmd" "existing-cmd" "junction"
+Run-AffectedRuntimeRescueUpgrade
 
 Write-Host "helper upgrade compatibility smoke passed"

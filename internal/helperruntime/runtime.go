@@ -88,11 +88,7 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	if shouldSkipDevelopmentExecutable(raw) && os.Getenv(EnvForce) != "1" {
 		return 0, false, nil
 	}
-	physical := raw
-	if resolved, resolveErr := filepath.EvalSymlinks(raw); resolveErr == nil && strings.TrimSpace(resolved) != "" {
-		physical = resolved
-	}
-	physical, err = filepath.Abs(physical)
+	physical, err := physicalExecutablePath(raw)
 	if err != nil {
 		return 0, false, err
 	}
@@ -150,6 +146,56 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	return launchRuntime(target, launchArgs, env)
 }
 
+func RecoverPrevious(ctx context.Context) (string, error) {
+	raw, err := executablePath()
+	if err != nil {
+		return "", err
+	}
+	physical, err := physicalExecutablePath(raw)
+	if err != nil {
+		return "", err
+	}
+	root := filepath.Join(filepath.Dir(physical), ".cxp-runtime")
+	var recovered string
+	err = WithRootLock(ctx, root, func() error {
+		previous, err := ReadPrevious(root)
+		if err != nil {
+			return fmt.Errorf("read previous cxp runtime: %w", err)
+		}
+		target := VersionPath(root, previous, runtime.GOOS)
+		info, err := os.Stat(target)
+		if err != nil {
+			return fmt.Errorf("previous cxp runtime %s is unavailable: %w", target, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("previous cxp runtime %s is not a regular file", target)
+		}
+		active, activeErr := ReadActive(root)
+		if activeErr != nil && !errors.Is(activeErr, os.ErrNotExist) {
+			return activeErr
+		}
+		if err := Activate(root, previous); err != nil {
+			return err
+		}
+		if activeErr == nil && active != previous {
+			if err := SetPrevious(root, active); err != nil {
+				return err
+			}
+		}
+		recovered = previous
+		return nil
+	})
+	return recovered, err
+}
+
+func physicalExecutablePath(path string) (string, error) {
+	physical := path
+	if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil && strings.TrimSpace(resolved) != "" {
+		physical = resolved
+	}
+	return filepath.Abs(physical)
+}
+
 func NormalizeVersion(value string) (string, bool) {
 	fields := strings.Fields(strings.TrimSpace(value))
 	if len(fields) == 0 {
@@ -174,18 +220,34 @@ func VersionPath(root string, version string, goos string) string {
 }
 
 func ReadActive(root string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(filepath.Clean(root), "active"))
+	return readVersionPointer(root, "active")
+}
+
+func ReadPrevious(root string) (string, error) {
+	return readVersionPointer(root, "previous")
+}
+
+func readVersionPointer(root string, name string) (string, error) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Clean(root), name))
 	if err != nil {
 		return "", err
 	}
 	value, ok := NormalizeVersion(string(raw))
 	if !ok {
-		return "", fmt.Errorf("invalid cxp active runtime value %q", strings.TrimSpace(string(raw)))
+		return "", fmt.Errorf("invalid cxp %s runtime value %q", name, strings.TrimSpace(string(raw)))
 	}
 	return value, nil
 }
 
 func Activate(root string, version string) error {
+	return writeVersionPointer(root, "active", version)
+}
+
+func SetPrevious(root string, version string) error {
+	return writeVersionPointer(root, "previous", version)
+}
+
+func writeVersionPointer(root string, name string, version string) error {
 	normalized, ok := NormalizeVersion(version)
 	if !ok {
 		return fmt.Errorf("invalid cxp runtime version %q", version)
@@ -194,7 +256,7 @@ func Activate(root string, version string) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(root, ".active-")
+	tmp, err := os.CreateTemp(root, "."+name+"-")
 	if err != nil {
 		return err
 	}
@@ -216,11 +278,22 @@ func Activate(root string, version string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := replaceActiveFile(tmpPath, filepath.Join(root, "active")); err != nil {
+	if err := replaceActiveFile(tmpPath, filepath.Join(root, name)); err != nil {
 		return err
 	}
 	cleanup = false
 	return syncDir(root)
+}
+
+// WithRootLock serializes a complete managed-runtime state transition. The
+// callback must not call helpers that acquire the same runtime lock.
+func WithRootLock(ctx context.Context, root string, fn func() error) error {
+	lock, err := lockRoot(ctx, root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+	return fn()
 }
 
 func InstallVersion(root string, source string, version string, goos string, preferHardlink bool) (string, error) {
@@ -314,7 +387,7 @@ func LauncherEnvironment(env []string) []string {
 	for _, value := range env {
 		name, _, _ := strings.Cut(value, "=")
 		blocked := false
-		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath} {
+		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath, EnvDisable, EnvForce} {
 			if strings.EqualFold(name, runtimeName) {
 				blocked = true
 				break

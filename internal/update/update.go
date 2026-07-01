@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
@@ -63,15 +64,16 @@ type CheckOptions struct {
 }
 
 type UpdateOptions struct {
-	Repo               string
-	Version            string
-	InstallPath        string
-	Timeout            time.Duration
-	ValidateBinary     bool
-	IncludePrerelease  bool
-	PendingReplacement PendingReplacementMode
-	RuntimeRoot        string
-	RuntimeEntryPath   string
+	Repo                string
+	Version             string
+	InstallPath         string
+	Timeout             time.Duration
+	ValidateBinary      bool
+	IncludePrerelease   bool
+	PendingReplacement  PendingReplacementMode
+	RuntimeRoot         string
+	RuntimeEntryPath    string
+	CandidateOwnedApply bool
 }
 
 type PendingReplacementMode int
@@ -312,13 +314,56 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		}
 	}
 	if runtimeRoot != "" && runtimeRoot != "." {
+		entryPath := strings.TrimSpace(opts.RuntimeEntryPath)
+		if entryPath == "" {
+			entryPath = filepath.Join(filepath.Dir(runtimeRoot), helperruntime.BinaryName(runtime.GOOS))
+		}
+		if opts.CandidateOwnedApply && candidateupdate.SupportsProtocol(verNoV) {
+			requestID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+			result, applyErr := candidateupdate.Invoke(ctx, tmpPath, candidateupdate.Context{
+				SourceVersion: currentRuntimeVersion(runtimeRoot),
+				TargetVersion: verNoV,
+				RuntimeRoot:   runtimeRoot,
+				EntryPath:     entryPath,
+				RequestID:     requestID,
+			}, timeout)
+			_ = os.Remove(tmpPath)
+			if applyErr != nil {
+				return ApplyResult{}, applyErr
+			}
+			if !VersionMatchesTarget(result.Version, verNoV) {
+				return ApplyResult{}, fmt.Errorf("candidate-owned update returned version %q, want %q", result.Version, verNoV)
+			}
+			expectedRuntime := helperruntime.VersionPath(runtimeRoot, verNoV, runtime.GOOS)
+			if !sameCleanPath(result.RuntimePath, expectedRuntime) {
+				return ApplyResult{}, fmt.Errorf("candidate-owned update returned runtime path %q, want %q", result.RuntimePath, expectedRuntime)
+			}
+			if !sameCleanPath(result.EntryPath, entryPath) {
+				return ApplyResult{}, fmt.Errorf("candidate-owned update returned entry path %q, want %q", result.EntryPath, entryPath)
+			}
+			active, activeErr := helperruntime.ReadActive(runtimeRoot)
+			if activeErr != nil || !VersionMatchesTarget(active, verNoV) {
+				return ApplyResult{}, fmt.Errorf("candidate-owned update active runtime = %q, want %q: %v", active, verNoV, activeErr)
+			}
+			if info, statErr := os.Stat(expectedRuntime); statErr != nil || !info.Mode().IsRegular() {
+				return ApplyResult{}, fmt.Errorf("candidate-owned update runtime %s is unavailable after apply: %v", expectedRuntime, statErr)
+			}
+			return ApplyResult{
+				Repo:             repo,
+				Version:          result.Version,
+				Asset:            asset,
+				InstallPath:      result.EntryPath,
+				RuntimePath:      result.RuntimePath,
+				RuntimeActivated: true,
+				RestartRequired:  result.RestartRequired,
+			}, nil
+		}
 		runtimePath, publishErr := helperruntime.PublishDownloaded(runtimeRoot, tmpPath, verNoV, runtime.GOOS)
 		if publishErr != nil {
 			_ = os.Remove(tmpPath)
 			return ApplyResult{}, publishErr
 		}
-		entryPath := strings.TrimSpace(opts.RuntimeEntryPath)
-		if entryPath == "" {
+		if strings.TrimSpace(opts.RuntimeEntryPath) == "" {
 			entryPath = runtimePath
 		}
 		return ApplyResult{
@@ -346,6 +391,23 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		RestartRequired:    rep.restartRequired,
 		PendingReplacePath: rep.pendingReplacePath,
 	}, nil
+}
+
+func sameCleanPath(left string, right string) bool {
+	left = filepath.Clean(strings.TrimSpace(left))
+	right = filepath.Clean(strings.TrimSpace(right))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func currentRuntimeVersion(root string) string {
+	version, err := helperruntime.ReadActive(root)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(version, "v")
 }
 
 func fetchLatestSelectableRelease(ctx context.Context, repo string, timeout time.Duration, includePrerelease bool) (string, string, error) {
@@ -654,7 +716,7 @@ func validateDownloadedBinary(ctx context.Context, path string, version string, 
 	}
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, path, "--version")
-	cmd.Env = append(os.Environ(), helperruntime.EnvDisable+"=1")
+	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
 	out, err := cmd.CombinedOutput()
 	output := trimValidationOutput(string(out))
 	if err != nil {

@@ -109,3 +109,62 @@ func TestProbeBinaryVersionParsesCodexProxyVersion(t *testing.T) {
 		t.Fatalf("version = %q, want rc73; output=%q", got.Version, got.Output)
 	}
 }
+
+func TestProbeBinaryVersionUsesCleanPhysicalEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script probe fixture is POSIX-only")
+	}
+	t.Setenv("CXP_RUNTIME", "1")
+	t.Setenv("CXP_RUNTIME_ROOT", "/stale/root")
+	t.Setenv("CXP_RUNTIME_VERSION", "v0.0.1")
+	t.Setenv("CXP_ENTRY_PATH", "/stale/cxp")
+	t.Setenv("CXP_RUNTIME_DISABLE", "stale")
+	t.Setenv("CXP_RUNTIME_FORCE", "1")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex-proxy")
+	script := "#!/bin/sh\n" +
+		"test \"${CXP_RUNTIME-}\" = \"\" || exit 10\n" +
+		"test \"${CXP_RUNTIME_ROOT-}\" = \"\" || exit 11\n" +
+		"test \"${CXP_RUNTIME_VERSION-}\" = \"\" || exit 12\n" +
+		"test \"${CXP_ENTRY_PATH-}\" = \"\" || exit 13\n" +
+		"test \"${CXP_RUNTIME_FORCE-}\" = \"\" || exit 14\n" +
+		"test \"${CXP_RUNTIME_DISABLE-}\" = \"1\" || exit 15\n" +
+		"echo 'codex-proxy version 0.1.13-rc.36'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ProbePhysicalBinaryVersion(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatalf("ProbePhysicalBinaryVersion error: %v", err)
+	}
+	if got.Version != "0.1.13-rc.36" {
+		t.Fatalf("version = %q", got.Version)
+	}
+}
+
+func TestProbeFreshEntryVersionRemovesAllRuntimeControls(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script probe fixture is POSIX-only")
+	}
+	t.Setenv("CXP_RUNTIME", "1")
+	t.Setenv("CXP_RUNTIME_ROOT", "/stale/root")
+	t.Setenv("CXP_RUNTIME_VERSION", "v0.0.1")
+	t.Setenv("CXP_ENTRY_PATH", "/stale/cxp")
+	t.Setenv("CXP_RUNTIME_DISABLE", "1")
+	t.Setenv("CXP_RUNTIME_FORCE", "1")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cxp")
+	script := "#!/bin/sh\n" +
+		"test \"${CXP_RUNTIME-}${CXP_RUNTIME_ROOT-}${CXP_RUNTIME_VERSION-}${CXP_ENTRY_PATH-}${CXP_RUNTIME_DISABLE-}${CXP_RUNTIME_FORCE-}\" = \"\" || exit 20\n" +
+		"echo 'codex-proxy version 0.1.13-rc.36'\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ProbeFreshEntryVersion(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatalf("ProbeFreshEntryVersion error: %v", err)
+	}
+	if got.Version != "0.1.13-rc.36" {
+		t.Fatalf("version = %q", got.Version)
+	}
+}

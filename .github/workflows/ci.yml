@@ -180,10 +180,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./cmd/codex-proxy -count=1 -run 'TestRunMain(RunsLegacyPreflightBeforeRuntimeDispatch|PreflightFailureStopsBeforeRuntimeDispatch)$' -v
-          go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RuntimeProcessIdentity.*)$' -v
-          go test ./internal/update -count=1 -run 'Test(PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
+          go test ./cmd/codex-proxy -count=1 -run 'TestRunMain(HandlesCandidateUpdateBeforeRuntimeDispatch|RunsLegacyPreflightBeforeRuntimeDispatch|PreflightFailureStopsBeforeRuntimeDispatch)$' -v
+          go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*)$' -v
+          go test ./internal/candidateupdate -count=1 -v
+          go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
           go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
+
+      - name: Actual candidate-owned update and recovery (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/ci/candidate_owned_update_smoke.sh
+
+      - name: Legacy rc.28-rc.35 runtime bridge (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/ci/legacy_runtime_bridge_smoke.sh
+
+      - name: Legacy rc.28-rc.35 runtime bridge and restart recovery (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\ci\legacy_runtime_bridge_smoke.ps1
 
       - name: Actual CXP process identity (Linux/macOS)
         if: runner.os != 'Windows'

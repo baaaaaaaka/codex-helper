@@ -716,7 +716,7 @@ func finalizeHelperUpdateResult(res update.ApplyResult, out io.Writer) error {
 	if err := verifyHelperEntrypointVersion(ctx, res.RuntimePath, res.Version, "published cxp runtime"); err != nil {
 		return err
 	}
-	if err := verifyHelperEntrypointVersion(ctx, res.InstallPath, res.Version, "stable cxp entrypoint"); err != nil {
+	if err := verifyFreshHelperEntrypointVersion(ctx, res.InstallPath, res.Version, "stable cxp entrypoint"); err != nil {
 		return err
 	}
 	// Keep the legacy install record valid for old updaters while all new
@@ -1369,7 +1369,15 @@ func verifyCXPEntrypointAfterUpgradeForGOOS(installPath string, targetVersion st
 }
 
 func verifyHelperEntrypointVersion(ctx context.Context, path string, targetVersion string, description string) error {
-	version, err := update.ProbeBinaryVersion(ctx, path, 5*time.Second)
+	return verifyHelperVersionWithProbe(ctx, path, targetVersion, description, update.ProbePhysicalBinaryVersion)
+}
+
+func verifyFreshHelperEntrypointVersion(ctx context.Context, path string, targetVersion string, description string) error {
+	return verifyHelperVersionWithProbe(ctx, path, targetVersion, description, update.ProbeFreshEntryVersion)
+}
+
+func verifyHelperVersionWithProbe(ctx context.Context, path string, targetVersion string, description string, probe func(context.Context, string, time.Duration) (update.BinaryVersion, error)) error {
+	version, err := probe(ctx, path, 5*time.Second)
 	if err != nil {
 		return fmt.Errorf("%s %s is not runnable after upgrade: %w", description, path, err)
 	}
