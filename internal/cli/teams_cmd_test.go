@@ -1493,6 +1493,145 @@ func TestTeamsRecoverRefusesLiveOwnerUnlessForced(t *testing.T) {
 	}
 }
 
+func TestTeamsChatQuarantineDryRunAndUnquarantine(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	path := filepath.Join(tmp, "maintenance", "state.json")
+	store, err := teamsstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: "scope-test"}
+		state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}
+		state.Turns["turn-1"] = teamsstore.Turn{ID: "turn-1", SessionID: "s001", Status: teamsstore.TurnStatusQueued}
+		state.OutboxMessages["out-1"] = teamsstore.OutboxMessage{ID: "out-1", SessionID: "s001", TeamsChatID: "chat-1", Status: teamsstore.OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	out := executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--store", path, "--dry-run")
+	if !strings.Contains(out, "No files were modified") || !strings.Contains(out, "scope-test") {
+		t.Fatalf("dry-run output:\n%s", out)
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("dry-run changed filesystem:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	out = executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--store", path, "--yes", "--reason", "operator test")
+	if !strings.Contains(out, "Teams session quarantined: s001") {
+		t.Fatalf("quarantine output:\n%s", out)
+	}
+	state, err := teamsstore.LoadPathReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("read quarantined state: %v", err)
+	}
+	if state.Sessions["s001"].Status != teamsstore.SessionStatusQuarantined || state.Turns["turn-1"].Status != teamsstore.TurnStatusInterrupted || state.OutboxMessages["out-1"].Status != teamsstore.OutboxStatusSkipped {
+		t.Fatalf("quarantined state: %#v", state)
+	}
+	out = executeRootForTeamsTest(t, "teams", "chat", "unquarantine", "chat-1", "--store", path, "--yes")
+	if !strings.Contains(out, "Teams session unquarantined: s001") || !strings.Contains(out, "were not replayed") {
+		t.Fatalf("unquarantine output:\n%s", out)
+	}
+	state, err = teamsstore.LoadPathReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("read unquarantined state: %v", err)
+	}
+	if state.Sessions["s001"].Status != teamsstore.SessionStatusActive || state.Turns["turn-1"].Status != teamsstore.TurnStatusInterrupted || state.OutboxMessages["out-1"].Status != teamsstore.OutboxStatusSkipped {
+		t.Fatalf("unquarantine replayed work: %#v", state)
+	}
+}
+
+func TestTeamsChatQuarantineRejectsAmbiguousScopes(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	ctx := context.Background()
+	for _, scopeID := range []string{"scope-a", "scope-b"} {
+		path, err := teams.DefaultStorePathForScope(scopeID)
+		if err != nil {
+			t.Fatalf("DefaultStorePathForScope(%s): %v", scopeID, err)
+		}
+		store, err := teamsstore.Open(path)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", path, err)
+		}
+		if err := store.Update(ctx, func(state *teamsstore.State) error {
+			state.Scope = teamsstore.ScopeIdentity{ID: scopeID}
+			state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-" + scopeID}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed %s: %v", scopeID, err)
+		}
+		_ = store.Close()
+	}
+	out, err := executeRootForTeamsTestAllowError(t, "teams", "chat", "quarantine", "s001", "--dry-run")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "--scope or --store") {
+		t.Fatalf("ambiguous result: err=%v out=%s", err, out)
+	}
+	selected := executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--scope", "scope-a", "--dry-run")
+	if !strings.Contains(selected, "Scope: scope-a") {
+		t.Fatalf("scoped dry-run output:\n%s", selected)
+	}
+}
+
+func TestTeamsChatQuarantineRefusesLiveOwner(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	path := filepath.Join(tmp, "maintenance", "state.json")
+	store, err := teamsstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	ctx := context.Background()
+	if err := store.Update(ctx, func(state *teamsstore.State) error {
+		state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	owner, err := teamsstore.CurrentOwner("v-test", "s001", "turn-1", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, time.Now()); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	out, err := executeRootForTeamsTestAllowError(t, "teams", "chat", "quarantine", "s001", "--store", path, "--yes")
+	if err == nil || !strings.Contains(err.Error(), "Teams bridge owner is active") {
+		t.Fatalf("live-owner quarantine: err=%v out=%s", err, out)
+	}
+	state, err := teamsstore.LoadPathReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("LoadPathReadOnly: %v", err)
+	}
+	if state.Sessions["s001"].Status != teamsstore.SessionStatusActive {
+		t.Fatalf("refused quarantine mutated session: %#v", state.Sessions["s001"])
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("live-owner refusal modified the store before checking ownership:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestTeamsStatusSessionLayerReportsQuarantinedExplicitly(t *testing.T) {
+	session := teamsstore.SessionContext{ID: "s001", TeamsChatID: "chat-1", Status: teamsstore.SessionStatusQuarantined}
+	if got := teamsStatusSessionLayer(teamsStatusStoreSnapshot{}, session, "control-chat", ""); got != "quarantined" {
+		t.Fatalf("teamsStatusSessionLayer = %q, want quarantined", got)
+	}
+}
+
 func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
 	lockCLITestHooks(t)
 

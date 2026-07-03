@@ -3219,6 +3219,148 @@ func (s *Store) updateSessionContextSQLite(ctx context.Context, sessionID string
 	return out, changed, handled, err
 }
 
+func (s *Store) quarantineSessionSQLite(ctx context.Context, req SessionQuarantineRequest) (SessionQuarantineReport, bool, error) {
+	var report SessionQuarantineReport
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state := newState()
+		session, found, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, req.SessionID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("session %q not found", req.SessionID)
+		}
+		state.Sessions[session.ID] = session
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM turns WHERE session_id = ? AND status IN (?, ?)`, []any{req.SessionID, string(TurnStatusQueued), string(TurnStatusRunning)}, state.Turns, func(v Turn) string { return v.ID }); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM inbound_events WHERE session_id = ? AND status IN (?, ?, ?)`, []any{req.SessionID, string(InboundStatusPersisted), string(InboundStatusQueued), string(InboundStatusDeferred)}, state.InboundEvents, func(v InboundEvent) string { return v.ID }); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM outbox_messages WHERE session_id = ? AND status IN (?, ?)`, []any{req.SessionID, string(OutboxStatusQueued), string(OutboxStatusSending)}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+			return err
+		}
+		linkedArgs := []any{req.SessionID, string(OutboxStatusQueued), string(OutboxStatusSending)}
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM transcript_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM helper_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM artifact_records d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
+			return err
+		}
+		if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
+			if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID); err != nil {
+				return err
+			} else if ok {
+				state.ChatPolls[chatID] = poll
+			}
+		}
+		report, err = applySessionQuarantine(&state, req)
+		if err != nil {
+			return err
+		}
+		if !report.Changed {
+			return tx.Commit()
+		}
+		if err := upsertSQLiteSessionTx(ctx, tx, report.Session); err != nil {
+			return err
+		}
+		for _, id := range report.InterruptedTurnIDs {
+			if err := upsertSQLiteTurnTx(ctx, tx, state.Turns[id]); err != nil {
+				return err
+			}
+		}
+		for _, id := range report.IgnoredInboundIDs {
+			if err := upsertSQLiteInboundTx(ctx, tx, state.InboundEvents[id]); err != nil {
+				return err
+			}
+		}
+		for _, id := range report.SkippedOutboxIDs {
+			if err := upsertSQLiteOutboxTx(ctx, tx, state.OutboxMessages[id]); err != nil {
+				return err
+			}
+		}
+		if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+			return err
+		}
+		if poll, ok := state.ChatPolls[strings.TrimSpace(report.Session.TeamsChatID)]; ok {
+			if err := upsertSQLiteChatPollTx(ctx, tx, poll); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+	return report, handled, err
+}
+
+func (s *Store) unquarantineSessionSQLite(ctx context.Context, req SessionUnquarantineRequest) (SessionUnquarantineReport, bool, error) {
+	var report SessionUnquarantineReport
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state := newState()
+		session, found, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, req.SessionID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("session %q not found", req.SessionID)
+		}
+		state.Sessions[session.ID] = session
+		if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
+			if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID); err != nil {
+				return err
+			} else if ok {
+				state.ChatPolls[chatID] = poll
+			}
+		}
+		report, err = applySessionUnquarantine(&state, req)
+		if err != nil {
+			return err
+		}
+		if err := upsertSQLiteSessionTx(ctx, tx, report.Session); err != nil {
+			return err
+		}
+		if poll, ok := state.ChatPolls[strings.TrimSpace(report.Session.TeamsChatID)]; ok {
+			if err := upsertSQLiteChatPollTx(ctx, tx, poll); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+	return report, handled, err
+}
+
 func (s *Store) persistInboundSQLite(ctx context.Context, event InboundEvent) (InboundEvent, bool, bool, error) {
 	var out InboundEvent
 	created := false
@@ -3437,6 +3579,9 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 			}
 			if !ok {
 				return fmt.Errorf("session %q not found", turn.SessionID)
+			}
+			if session.Status == SessionStatusQuarantined {
+				return fmt.Errorf("session %q is quarantined", turn.SessionID)
 			}
 			now := time.Now()
 			if turn.Status == "" {
@@ -4020,11 +4165,18 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 				return err
 			}
 			defer tx.Rollback()
+			session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID)
+			if err != nil {
+				return err
+			}
+			handled = true
+			if !ok || !sessionStatusIsActive(session.Status) {
+				return tx.Commit()
+			}
 			var running int
 			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE session_id = ? AND status = ? LIMIT 1`, sessionID, string(TurnStatusRunning)).Scan(&running); err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			handled = true
 			if running == 1 {
 				return tx.Commit()
 			}
@@ -4035,12 +4187,7 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 				}
 				return tx.Commit()
 			}
-			state := State{SchemaVersion: SchemaVersion, Sessions: map[string]SessionContext{sessionID: {}}, Turns: map[string]Turn{turn.ID: turn}}
-			if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID); err != nil {
-				return err
-			} else if ok {
-				state.Sessions[sessionID] = session
-			}
+			state := State{SchemaVersion: SchemaVersion, Sessions: map[string]SessionContext{sessionID: session}, Turns: map[string]Turn{turn.ID: turn}}
 			now := time.Now()
 			turn.Status = TurnStatusRunning
 			if turn.StartedAt.IsZero() {
@@ -4552,7 +4699,7 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 	return out, handled, err
 }
 
-func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, teamsMessageID string, sent bool) (OutboxMessage, bool, error) {
+func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) (OutboxMessage, bool, error) {
 	var out OutboxMessage
 	handled := false
 	sessionID := ""
@@ -4593,6 +4740,10 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 			}
 			if !ok {
 				return fmt.Errorf("outbox message %q not found", outboxID)
+			}
+			if err := validateOutboxDeliveryAttempt(current, attemptToken, teamsMessageID, sent, requireClaim); err != nil {
+				out = current
+				return err
 			}
 			nextMessageID := firstStoreNonEmptyString(strings.TrimSpace(teamsMessageID), strings.TrimSpace(current.TeamsMessageID))
 			if nextMessageID != "" {
@@ -4823,6 +4974,59 @@ ORDER BY created_at, id`, chatID, string(OutboxStatusSent))
 			}
 		}
 		return rows.Err()
+	})
+	return out, handled, err
+}
+
+func (s *Store) recentOutboxEchoCandidatesSQLite(ctx context.Context, query OutboxEchoCandidateQuery) ([]OutboxMessage, bool, error) {
+	var out []OutboxMessage
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		for _, item := range []struct {
+			status OutboxStatus
+			order  string
+		}{
+			{status: OutboxStatusSending, order: "created_at ASC, id ASC"},
+			{status: OutboxStatusAccepted, order: "created_at DESC, id DESC"},
+			{status: OutboxStatusSent, order: "created_at DESC, id DESC"},
+		} {
+			rows, err := db.QueryContext(ctx, `SELECT json FROM outbox_messages
+WHERE status = ? AND teams_chat_id = ?
+ORDER BY `+item.order+`
+LIMIT ?`, string(item.status), query.TeamsChatID, query.LimitPerStatus)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var raw []byte
+				if err := rows.Scan(&raw); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				var msg OutboxMessage
+				if err := json.Unmarshal(raw, &msg); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				out = append(out, msg)
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return out, handled, err
 }

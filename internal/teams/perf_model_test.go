@@ -2051,6 +2051,46 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown(b *testing.B
 	}
 }
 
+func BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine(b *testing.B) {
+	var total cxpPerfProcIO
+	var duration time.Duration
+	var walGrowth int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		store, _ := newCXPPerfRealisticMixedUserFixture(b)
+		if _, err := store.CheckpointSQLiteWAL(context.Background(), 1); err != nil {
+			b.Fatalf("checkpoint before quarantine: %v", err)
+		}
+		walBefore := cxpPerfSQLiteWALBytes(b, store)
+		b.StartTimer()
+		start := time.Now()
+		delta, err := cxpPerfMeasureProcIO(func() error {
+			_, err := store.QuarantineSession(context.Background(), teamstore.SessionQuarantineRequest{
+				SessionID: cxpPerfSessionID(0),
+				Reason:    "self echo perf model",
+				Source:    "benchmark",
+				Now:       time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC),
+			})
+			return err
+		})
+		elapsed := time.Since(start)
+		b.StopTimer()
+		if err != nil {
+			b.Fatalf("quarantine session: %v", err)
+		}
+		total.add(delta)
+		duration += elapsed
+		walGrowth += cxpPerfSQLiteWALBytes(b, store) - walBefore
+	}
+	cxpPerfReportNamedProcIO(b, "quarantine", total, b.N)
+	if b.N > 0 {
+		b.ReportMetric(float64(duration)/float64(b.N), "quarantine_ns/op")
+		b.ReportMetric(float64(walGrowth)/float64(b.N), "quarantine_wal_growth_B/op")
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn(b *testing.B) {
 	const (
 		registryChats       = 52

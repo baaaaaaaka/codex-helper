@@ -223,6 +223,8 @@ walk through the normal flows in order.
 | `codex-proxy teams probe-chat --chat <chat-id-or-link>` | Read-only probe of an external Teams chat without binding helper state |
 | `codex-proxy teams pause` / `resume` / `drain` / `recover` | Pause, resume, drain, or recover Teams helper state from a terminal |
 | `codex-proxy teams chat recreate <session-id> --yes` | Create and bind a fresh Teams Work chat for an existing helper session |
+| `codex-proxy teams chat quarantine <session-or-chat> --dry-run\|--yes` | Atomically contain exactly one unsafe Work chat; terminal mutation refuses a live helper owner |
+| `codex-proxy teams chat unquarantine <session-or-chat> --dry-run\|--yes` | Resume only an explicitly quarantined session without replaying old work |
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
 | `codex-proxy teams service restart --force` | Recover local active Teams state, then force a service restart from a terminal |
 | `codex-proxy teams control --print` | Print the configured Teams control chat link |
@@ -668,6 +670,8 @@ codex-proxy teams resume
 codex-proxy teams drain
 codex-proxy teams recover
 codex-proxy teams chat recreate <session-id> --yes
+codex-proxy teams chat quarantine <session-or-chat> --dry-run
+codex-proxy teams chat unquarantine <session-or-chat> --dry-run
 ```
 
 In the Teams control chat, `helper reload now` is for source-checkout

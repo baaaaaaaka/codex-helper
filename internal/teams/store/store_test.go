@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15122,4 +15123,292 @@ func sameControl(a ServiceControl, b ServiceControl) bool {
 func (owner OwnerMetadata) withLastHeartbeat(lastHeartbeat time.Time) OwnerMetadata {
 	owner.LastHeartbeat = lastHeartbeat
 	return owner
+}
+
+func TestRecentOutboxEchoCandidatesAreBoundedPerStatus(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				for _, status := range []OutboxStatus{OutboxStatusSending, OutboxStatusAccepted, OutboxStatusSent} {
+					for i := 0; i < 20; i++ {
+						id := fmt.Sprintf("%s-%02d", status, i)
+						state.OutboxMessages[id] = OutboxMessage{ID: id, TeamsChatID: "chat-1", Status: status, CreatedAt: now.Add(time.Duration(i) * time.Second), LastSendAttempt: now.Add(time.Duration(i) * time.Second)}
+					}
+				}
+				state.OutboxMessages["other"] = OutboxMessage{ID: "other", TeamsChatID: "chat-2", Status: OutboxStatusSending, CreatedAt: now}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate SQLite: %v", err)
+				}
+			}
+			candidates, err := store.RecentOutboxEchoCandidates(ctx, OutboxEchoCandidateQuery{TeamsChatID: "chat-1", LimitPerStatus: 3})
+			if err != nil {
+				t.Fatalf("RecentOutboxEchoCandidates: %v", err)
+			}
+			if len(candidates) != 9 {
+				t.Fatalf("candidate count = %d, want 9", len(candidates))
+			}
+			counts := map[OutboxStatus]int{}
+			for _, candidate := range candidates {
+				if candidate.TeamsChatID != "chat-1" {
+					t.Fatalf("unexpected chat candidate: %#v", candidate)
+				}
+				counts[candidate.Status]++
+			}
+			for _, status := range []OutboxStatus{OutboxStatusSending, OutboxStatusAccepted, OutboxStatusSent} {
+				if counts[status] != 3 {
+					t.Fatalf("status %s count = %d, want 3", status, counts[status])
+				}
+			}
+		})
+	}
+}
+
+func TestQuarantineSessionIsTargetedAndFencesPendingWork(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 7, 3, 2, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+				state.Sessions["s2"] = SessionContext{ID: "s2", TeamsChatID: "chat-2", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+				state.Turns["turn-q"] = Turn{ID: "turn-q", SessionID: "s1", InboundEventID: "in-q", Status: TurnStatusQueued, CreatedAt: now, QueuedAt: now}
+				state.Turns["turn-r"] = Turn{ID: "turn-r", SessionID: "s1", InboundEventID: "in-r", Status: TurnStatusRunning, CreatedAt: now, StartedAt: now}
+				state.Turns["turn-other"] = Turn{ID: "turn-other", SessionID: "s2", Status: TurnStatusQueued, CreatedAt: now, QueuedAt: now}
+				state.InboundEvents["in-q"] = InboundEvent{ID: "in-q", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "m-q", Status: InboundStatusQueued, CreatedAt: now}
+				state.InboundEvents["in-r"] = InboundEvent{ID: "in-r", SessionID: "s1", TeamsChatID: "chat-1", TeamsMessageID: "m-r", Status: InboundStatusDeferred, CreatedAt: now}
+				queuedOutbox := OutboxMessage{ID: "out-q", SessionID: "s1", TeamsChatID: "chat-1", Kind: "codex-progress-001", Body: "queued helper delivery", Status: OutboxStatusQueued, ArtifactIDs: []string{"artifact-q"}, CreatedAt: now}
+				state.OutboxMessages["out-q"] = queuedOutbox
+				state.OutboxMessages["out-flight"] = OutboxMessage{ID: "out-flight", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusSending, SendAttemptToken: "attempt-flight", LastSendAttempt: now, CreatedAt: now}
+				state.OutboxMessages["out-accepted"] = OutboxMessage{ID: "out-accepted", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusAccepted, TeamsMessageID: "teams-accepted", CreatedAt: now}
+				state.OutboxMessages["out-sent"] = OutboxMessage{ID: "out-sent", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusSent, TeamsMessageID: "teams-sent", CreatedAt: now}
+				state.OutboxMessages["out-other"] = OutboxMessage{ID: "out-other", SessionID: "s2", TeamsChatID: "chat-2", Status: OutboxStatusQueued, CreatedAt: now}
+				state.TranscriptDeliveries["delivery-q"] = TranscriptDeliveryRecord{ID: "delivery-q", SessionID: "s1", OutboxID: "out-q", Status: TranscriptDeliveryStatusQueued, CreatedAt: now}
+				updateHelperDeliveryForOutboxLocked(state, queuedOutbox, HelperDeliveryStatusQueued, now)
+				state.ArtifactRecords["artifact-q"] = ArtifactRecord{ID: "artifact-q", SessionID: "s1", OutboxID: "out-q", Status: "queued", CreatedAt: now}
+				state.ChatPolls["chat-1"] = ChatPollState{ChatID: "chat-1", PollState: chatPollStateWarm, NextPollAt: now.Add(time.Minute), ContinuationPath: "/next", FailureCount: 2, LastError: "temporary"}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate SQLite: %v", err)
+				}
+			}
+			var coldStateBefore []byte
+			if sqliteMode {
+				pointer, ok, err := store.currentSQLitePointerUnlocked()
+				if err != nil || !ok {
+					t.Fatalf("currentSQLitePointerUnlocked: ok=%v err=%v", ok, err)
+				}
+				db, err := store.sqliteDBUnlocked(pointer)
+				if err != nil {
+					t.Fatalf("sqliteDBUnlocked: %v", err)
+				}
+				if err := db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&coldStateBefore); err != nil {
+					t.Fatalf("read cold state before quarantine: %v", err)
+				}
+			}
+			report, err := store.QuarantineSession(ctx, SessionQuarantineRequest{SessionID: "s1", Reason: "self echo", Source: "test", TriggerMessageIDs: []string{"m1", "m2", "m3"}, InFlightOutboxIDs: []string{"out-flight"}, Now: now.Add(time.Minute)})
+			if err != nil {
+				t.Fatalf("QuarantineSession: %v", err)
+			}
+			if !report.Changed || report.Session.Status != SessionStatusQuarantined || len(report.InterruptedTurnIDs) != 2 || len(report.SkippedOutboxIDs) != 1 {
+				t.Fatalf("unexpected quarantine report: %#v", report)
+			}
+			if !reflect.DeepEqual(report.PreservedOutboxIDs, []string{"out-flight"}) {
+				t.Fatalf("preserved outbox report differs by backend: %#v", report.PreservedOutboxIDs)
+			}
+			if sqliteMode {
+				pointer, _, _ := store.currentSQLitePointerUnlocked()
+				db, err := store.sqliteDBUnlocked(pointer)
+				if err != nil {
+					t.Fatalf("sqliteDBUnlocked after quarantine: %v", err)
+				}
+				var coldStateAfter []byte
+				if err := db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&coldStateAfter); err != nil {
+					t.Fatalf("read cold state after quarantine: %v", err)
+				}
+				if !bytes.Equal(coldStateBefore, coldStateAfter) {
+					t.Fatal("SQLite quarantine rewrote full cold state_json")
+				}
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if state.Sessions["s1"].Status != SessionStatusQuarantined || state.Sessions["s2"].Status != SessionStatusActive {
+				t.Fatalf("session statuses: %#v", state.Sessions)
+			}
+			if state.Turns["turn-q"].Status != TurnStatusInterrupted || state.Turns["turn-r"].Status != TurnStatusInterrupted || state.Turns["turn-other"].Status != TurnStatusQueued {
+				t.Fatalf("turn statuses: %#v", state.Turns)
+			}
+			if state.InboundEvents["in-q"].Status != InboundStatusIgnored || state.InboundEvents["in-r"].Status != InboundStatusIgnored {
+				t.Fatalf("inbound statuses: %#v", state.InboundEvents)
+			}
+			if state.OutboxMessages["out-q"].Status != OutboxStatusSkipped || state.OutboxMessages["out-flight"].Status != OutboxStatusSending || state.OutboxMessages["out-other"].Status != OutboxStatusQueued {
+				t.Fatalf("outbox statuses: %#v", state.OutboxMessages)
+			}
+			if state.OutboxMessages["out-accepted"].Status != OutboxStatusAccepted || state.OutboxMessages["out-sent"].Status != OutboxStatusSent {
+				t.Fatalf("settled outbox rows changed during quarantine: %#v", state.OutboxMessages)
+			}
+			helperSkipped := false
+			for _, delivery := range state.HelperDeliveries {
+				if delivery.OutboxID == "out-q" && delivery.Status == HelperDeliveryStatusSkipped {
+					helperSkipped = true
+				}
+			}
+			if state.TranscriptDeliveries["delivery-q"].Status != TranscriptDeliveryStatusSkipped || !helperSkipped || state.ArtifactRecords["artifact-q"].Status != "skipped" {
+				t.Fatalf("linked delivery rows not contained: transcript=%#v helper=%#v artifact=%#v", state.TranscriptDeliveries, state.HelperDeliveries, state.ArtifactRecords)
+			}
+			poll := state.ChatPolls["chat-1"]
+			if poll.PollState != chatPollStateParked || !poll.NextPollAt.IsZero() || poll.ContinuationPath != "" || poll.FailureCount != 0 {
+				t.Fatalf("quarantined poll: %#v", poll)
+			}
+			if _, claimed, err := store.ClaimNextQueuedTurn(ctx, "s1"); err != nil || claimed {
+				t.Fatalf("ClaimNextQueuedTurn quarantined: claimed=%v err=%v", claimed, err)
+			}
+			if _, created, err := store.QueueTurn(ctx, Turn{ID: "turn-late", SessionID: "s1", Status: TurnStatusQueued}); err == nil || created {
+				t.Fatalf("late quarantined turn: created=%v err=%v", created, err)
+			}
+			if late, created, err := store.QueueOutbox(ctx, OutboxMessage{ID: "out-late", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued}); err != nil || !created || late.Status != OutboxStatusSkipped {
+				t.Fatalf("late quarantined outbox: out=%#v created=%v err=%v", late, created, err)
+			}
+			lateTranscript, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+				Message:  OutboxMessage{ID: "out-late-transcript", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued},
+				Delivery: TranscriptDeliveryRecord{ID: "delivery-late", SessionID: "s1", Status: TranscriptDeliveryStatusQueued},
+			})
+			if err != nil || !created || alreadyDelivered || lateTranscript.Status != OutboxStatusSkipped {
+				t.Fatalf("late quarantined transcript outbox: out=%#v created=%v delivered=%v err=%v", lateTranscript, created, alreadyDelivered, err)
+			}
+			lateState, err := store.Load(ctx)
+			if err != nil || lateState.TranscriptDeliveries["delivery-late"].Status != TranscriptDeliveryStatusSkipped {
+				t.Fatalf("late transcript delivery was left queueable: status=%q err=%v", lateState.TranscriptDeliveries["delivery-late"].Status, err)
+			}
+			if _, err := store.MarkOutboxSendAttempt(ctx, "out-q"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("skipped outbox claim error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			if out, err := store.MarkOutboxSendErrorForAttempt(ctx, "out-flight", "attempt-flight", "ambiguous failure"); err != nil || out.Status != OutboxStatusSkipped {
+				t.Fatalf("quarantined in-flight send error: out=%#v err=%v", out, err)
+			}
+			unquarantined, err := store.UnquarantineSession(ctx, SessionUnquarantineRequest{SessionID: "s1", Now: now.Add(2 * time.Minute)})
+			if err != nil || unquarantined.Session.Status != SessionStatusActive {
+				t.Fatalf("UnquarantineSession: report=%#v err=%v", unquarantined, err)
+			}
+			state, err = store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after unquarantine: %v", err)
+			}
+			if state.OutboxMessages["out-q"].Status != OutboxStatusSkipped || state.Turns["turn-q"].Status != TurnStatusInterrupted {
+				t.Fatalf("unquarantine replayed old work: turns=%#v outbox=%#v", state.Turns, state.OutboxMessages)
+			}
+		})
+	}
+}
+
+func TestOutboxAttemptTokenRejectsStaleCompletion(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", Status: SessionStatusActive}
+		state.OutboxMessages["out-1"] = OutboxMessage{ID: "out-1", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	claimed, err := store.MarkOutboxSendAttempt(ctx, "out-1")
+	if err != nil || claimed.SendAttemptToken == "" {
+		t.Fatalf("MarkOutboxSendAttempt: out=%#v err=%v", claimed, err)
+	}
+	if _, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", "stale-token", "teams-1"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+		t.Fatalf("stale accepted error = %v, want ErrOutboxSendNotClaimed", err)
+	}
+	accepted, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-1")
+	if err != nil || accepted.Status != OutboxStatusAccepted {
+		t.Fatalf("matching accepted: out=%#v err=%v", accepted, err)
+	}
+	if _, err := store.MarkOutboxSentForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-other"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+		t.Fatalf("conflicting message id error = %v, want ErrOutboxSendNotClaimed", err)
+	}
+}
+
+func TestAmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["s1"] = SessionContext{ID: "s1", TeamsChatID: "chat-1", Status: SessionStatusActive}
+				state.OutboxMessages["out-1"] = OutboxMessage{ID: "out-1", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued, CreatedAt: time.Now()}
+				state.OutboxMessages["out-2"] = OutboxMessage{ID: "out-2", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued, CreatedAt: time.Now().Add(time.Second)}
+				state.OutboxMessages["out-3"] = OutboxMessage{ID: "out-3", SessionID: "s1", TeamsChatID: "chat-1", Status: OutboxStatusQueued, CreatedAt: time.Now().Add(2 * time.Second)}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed state: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate SQLite: %v", err)
+				}
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, "out-1")
+			if err != nil {
+				t.Fatalf("claim out-1: %v", err)
+			}
+			ambiguous, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, "out-1", claimed.SendAttemptToken, "unexpected EOF")
+			if err != nil || ambiguous.Status != OutboxStatusSending || ambiguous.SendAttemptToken != claimed.SendAttemptToken || !strings.Contains(ambiguous.LastSendError, "send lease") {
+				t.Fatalf("ambiguous state: out=%#v err=%v", ambiguous, err)
+			}
+			pending, err := store.PendingOutboxAt(ctx, ambiguous.LastSendAttempt.Add(time.Minute))
+			if err != nil {
+				t.Fatalf("PendingOutboxAt within lease: %v", err)
+			}
+			if slices.ContainsFunc(pending, func(msg OutboxMessage) bool { return msg.ID == "out-1" }) {
+				t.Fatalf("ambiguous outbox became immediately retryable: %#v", pending)
+			}
+			pending, err = store.PendingOutboxAt(ctx, ambiguous.LastSendAttempt.Add(3*time.Minute))
+			if err != nil || !slices.ContainsFunc(pending, func(msg OutboxMessage) bool { return msg.ID == "out-1" }) {
+				t.Fatalf("ambiguous outbox did not become recoverable after lease: pending=%#v err=%v", pending, err)
+			}
+			if _, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", "", "teams-1"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("empty strict attempt token error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			accepted, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-1")
+			if err != nil || accepted.Status != OutboxStatusAccepted {
+				t.Fatalf("recovered accepted outbox: out=%#v err=%v", accepted, err)
+			}
+
+			claimed2, err := store.MarkOutboxSendAttempt(ctx, "out-2")
+			if err != nil {
+				t.Fatalf("claim out-2: %v", err)
+			}
+			if _, err := store.MarkOutboxSendErrorForAttempt(ctx, "out-2", claimed2.SendAttemptToken, "definitive"); err != nil {
+				t.Fatalf("definitive send error: %v", err)
+			}
+			if _, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-2", claimed2.SendAttemptToken, "teams-late"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("late completion after claim release error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+
+			claimed3, err := store.MarkOutboxSendAttempt(ctx, "out-3")
+			if err != nil {
+				t.Fatalf("claim out-3: %v", err)
+			}
+			if _, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, "out-3", claimed3.SendAttemptToken, "timeout"); err != nil {
+				t.Fatalf("mark out-3 ambiguous: %v", err)
+			}
+			skipped, err := store.MarkOutboxSkippedForAttempt(ctx, "out-3", claimed3.SendAttemptToken, "superseded progress")
+			if err != nil || skipped.Status != OutboxStatusSkipped {
+				t.Fatalf("skip ambiguous out-3: out=%#v err=%v", skipped, err)
+			}
+		})
+	}
 }

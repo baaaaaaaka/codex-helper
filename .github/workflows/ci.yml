@@ -296,6 +296,25 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsStatusIsStrictlyReadOnlyAcrossLegacyRegistryAndStore|BuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles)$' -v
           go test ./internal/teams/store -count=1 -run 'TestLoadPathReadOnly(JSONDoesNotCreateLockOrModifyFiles|SQLite(DoesNotModifyDatabaseFamily|SeesLiveWALWithoutModifyingPersistentFiles|RetriesWhenWALAppearsDuringImmutableRead|LiveWALWithoutSHMFailsWithoutCreatingSidecar))$' -v
 
+      - name: Teams self-echo containment and quarantine regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          store_pattern='Test(RecentOutboxEchoCandidatesAreBoundedPerStatus|QuarantineSessionIsTargetedAndFencesPendingWork|OutboxAttemptTokenRejectsStaleCompletion|AmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends)$'
+          bridge_pattern='Test(BridgeWorkPollDropsFreshPlainHelperLifecycleOutput|BridgeControlStatusShowsQuarantinedSessionsSeparately|BridgeRepeatedFreshHelperEchoQuarantinesBeforeDispatch|OutboxEchoAttemptCacheRequiresUniqueInflightMatch|HelperEchoBreakerCountsDistinctIDsAndRequiresActiveDurableBinding|GraphSendChecksQuarantineFenceImmediatelyBeforePost|BridgeAmbiguousGraphPostKeepsOutboxUnderSendLease)$'
+          cli_pattern='Test(TeamsChatQuarantineDryRunAndUnquarantine|TeamsChatQuarantineRejectsAmbiguousScopes|TeamsChatQuarantineRefusesLiveOwner|TeamsStatusSessionLayerReportsQuarantinedExplicitly)$'
+          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
+          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+
+      - name: Teams containment platform recovery regressions
+        if: matrix.shard == 'platform-integration'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(RepairRecordedHelperEntrypointsConvergesLegacyGoBinOnly|RepairRecordedHelperEntrypointsSkipsNonManagedRecord|TeamsServiceDoctorUsesInstalledWSLStartupFallbackWithoutScheduledTaskRequirement|TeamsServiceWSLStartupFallbackDoctorRejectsMismatchedMarker)$' -v
+
       - name: Teams recreate maintenance fence regressions
         if: matrix.shard == 'core'
         shell: bash
@@ -1154,6 +1173,7 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
+          go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
 
       - name: Skills local git smoke (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'

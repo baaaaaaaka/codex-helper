@@ -73,6 +73,8 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 - `cxp teams probe-chat --chat <teams-chat-id-or-link>`: read-only probe of an external Teams chat without binding helper state unless `--send-test` is used.
 - `cxp teams pause`, `cxp teams resume`, `cxp teams drain`, and `cxp teams recover`: local helper lifecycle controls for diagnosis and recovery.
 - `cxp teams chat recreate <session-id> --yes`: create and bind a fresh Work chat for an existing helper session.
+- `cxp teams chat quarantine <session-or-chat> --dry-run|--yes`: resolve exactly one durable Work-chat session and atomically stop its polling, turns, pending inbound, and unsent outbox after unsafe helper behavior. Mutation refuses a live helper owner.
+- `cxp teams chat unquarantine <session-or-chat> --dry-run|--yes`: resume polling only for a session whose durable status is `quarantined`; interrupted turns and skipped messages are not replayed.
 
 From a Teams-launched Codex child turn, do not restart, reload, update, kill, replace, or background the running helper directly. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Use `helper reload now` only for source-checkout development reloads when the helper has access to a local `codex-helper` source tree.
 

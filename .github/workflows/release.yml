@@ -247,6 +247,22 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsStatusIsStrictlyReadOnlyAcrossLegacyRegistryAndStore|BuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles)$' -v
           go test ./internal/teams/store -count=1 -run 'TestLoadPathReadOnly(JSONDoesNotCreateLockOrModifyFiles|SQLite(DoesNotModifyDatabaseFamily|SeesLiveWALWithoutModifyingPersistentFiles|RetriesWhenWALAppearsDuringImmutableRead|LiveWALWithoutSHMFailsWithoutCreatingSidecar))$' -v
 
+      - name: Teams self-echo containment and quarantine regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          store_pattern='Test(RecentOutboxEchoCandidatesAreBoundedPerStatus|QuarantineSessionIsTargetedAndFencesPendingWork|OutboxAttemptTokenRejectsStaleCompletion|AmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends)$'
+          bridge_pattern='Test(BridgeWorkPollDropsFreshPlainHelperLifecycleOutput|BridgeControlStatusShowsQuarantinedSessionsSeparately|BridgeRepeatedFreshHelperEchoQuarantinesBeforeDispatch|OutboxEchoAttemptCacheRequiresUniqueInflightMatch|HelperEchoBreakerCountsDistinctIDsAndRequiresActiveDurableBinding|GraphSendChecksQuarantineFenceImmediatelyBeforePost|BridgeAmbiguousGraphPostKeepsOutboxUnderSendLease)$'
+          cli_pattern='Test(TeamsChatQuarantineDryRunAndUnquarantine|TeamsChatQuarantineRejectsAmbiguousScopes|TeamsChatQuarantineRefusesLiveOwner|TeamsStatusSessionLayerReportsQuarantinedExplicitly|RepairRecordedHelperEntrypointsConvergesLegacyGoBinOnly|RepairRecordedHelperEntrypointsSkipsNonManagedRecord|TeamsServiceDoctorUsesInstalledWSLStartupFallbackWithoutScheduledTaskRequirement|TeamsServiceWSLStartupFallbackDoctorRejectsMismatchedMarker)$'
+          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
+          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
+          go test ./internal/cli -count=1 -run "$cli_pattern" -v
+
+      - name: Teams targeted quarantine performance smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
+
       - name: Teams recreate maintenance fence regressions
         shell: bash
         run: |

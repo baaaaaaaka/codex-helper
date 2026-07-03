@@ -523,8 +523,206 @@ func newTeamsChatCmd(root *rootOptions, registryPath *string) *cobra.Command {
 		Short: "Developer maintenance for Teams work chats",
 		Long:  "Developer maintenance for Teams work chats. These commands may create Teams chats and send messages; they never delete old Teams chats.",
 	}
-	cmd.AddCommand(newTeamsChatRecreateCmd(root, registryPath))
+	cmd.AddCommand(
+		newTeamsChatRecreateCmd(root, registryPath),
+		newTeamsChatQuarantineCmd(),
+		newTeamsChatUnquarantineCmd(),
+	)
 	return cmd
+}
+
+type teamsChatMaintenanceOptions struct {
+	Yes       bool
+	DryRun    bool
+	Reason    string
+	ScopeID   string
+	StorePath string
+}
+
+type teamsChatMaintenanceTarget struct {
+	Path    string
+	ScopeID string
+	Session teamsstore.SessionContext
+	Owner   *teamsstore.OwnerMetadata
+}
+
+func newTeamsChatQuarantineCmd() *cobra.Command {
+	var opts teamsChatMaintenanceOptions
+	cmd := &cobra.Command{
+		Use:   "quarantine <session-id|codex-thread-id|teams-chat-id>",
+		Short: "Atomically stop one Teams work session after unsafe helper behavior",
+		Long:  "Atomically quarantine exactly one durable Teams work session. This interrupts queued/running turns, ignores pending inbound work, skips unsent outbox rows, and stops polling the Work chat. It never sends to the Work chat.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolveTeamsChatMaintenanceTarget(cmd.Context(), args[0], opts)
+			if err != nil {
+				return err
+			}
+			if opts.DryRun {
+				printTeamsChatMaintenanceTarget(cmd.OutOrStdout(), "quarantine", target)
+				return nil
+			}
+			if !opts.Yes {
+				return fmt.Errorf("quarantining a Teams work session interrupts active work and skips pending output; rerun with --yes or inspect with --dry-run")
+			}
+			st, err := openTeamsChatMaintenanceStore(cmd.Context(), target)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			report, err := st.QuarantineSession(cmd.Context(), teamsstore.SessionQuarantineRequest{
+				SessionID: target.Session.ID,
+				Reason:    firstNonEmptyString(strings.TrimSpace(opts.Reason), "manual Teams chat quarantine"),
+				Source:    "teams_chat_quarantine_cli",
+			})
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams session quarantined: %s\nStore: %s\nChat: %s\nInterrupted turns: %d\nIgnored inbound: %d\nSkipped outbox: %d\n", report.Session.ID, target.Path, report.Session.TeamsChatID, len(report.InterruptedTurnIDs), len(report.IgnoredInboundIDs), len(report.SkippedOutboxIDs))
+			return nil
+		},
+	}
+	bindTeamsChatMaintenanceFlags(cmd, &opts, true)
+	return cmd
+}
+
+func newTeamsChatUnquarantineCmd() *cobra.Command {
+	var opts teamsChatMaintenanceOptions
+	cmd := &cobra.Command{
+		Use:   "unquarantine <session-id|codex-thread-id|teams-chat-id>",
+		Short: "Resume polling for one explicitly quarantined Teams work session",
+		Long:  "Resume polling for exactly one session whose durable status is quarantined. Interrupted turns, ignored inbound messages, and skipped outbox rows are not replayed.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolveTeamsChatMaintenanceTarget(cmd.Context(), args[0], opts)
+			if err != nil {
+				return err
+			}
+			if target.Session.Status != teamsstore.SessionStatusQuarantined {
+				return fmt.Errorf("session %q has status %q; only quarantined sessions can be unquarantined", target.Session.ID, target.Session.Status)
+			}
+			if opts.DryRun {
+				printTeamsChatMaintenanceTarget(cmd.OutOrStdout(), "unquarantine", target)
+				return nil
+			}
+			if !opts.Yes {
+				return fmt.Errorf("unquarantining resumes Teams polling; rerun with --yes or inspect with --dry-run")
+			}
+			st, err := openTeamsChatMaintenanceStore(cmd.Context(), target)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			report, err := st.UnquarantineSession(cmd.Context(), teamsstore.SessionUnquarantineRequest{SessionID: target.Session.ID})
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams session unquarantined: %s\nStore: %s\nChat: %s\nPrevious inbound/turn/outbox records were not replayed.\n", report.Session.ID, target.Path, report.Session.TeamsChatID)
+			return nil
+		},
+	}
+	bindTeamsChatMaintenanceFlags(cmd, &opts, false)
+	return cmd
+}
+
+func bindTeamsChatMaintenanceFlags(cmd *cobra.Command, opts *teamsChatMaintenanceOptions, includeReason bool) {
+	cmd.Flags().BoolVar(&opts.Yes, "yes", false, "Confirm the durable session state change")
+	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Resolve and display the unique target without opening a writable store")
+	if includeReason {
+		cmd.Flags().StringVar(&opts.Reason, "reason", "", "Record an operator reason")
+	}
+	cmd.Flags().StringVar(&opts.ScopeID, "scope", "", "Require this durable Teams scope ID")
+	cmd.Flags().StringVar(&opts.StorePath, "store", "", "Inspect only this explicit Teams store path")
+}
+
+func resolveTeamsChatMaintenanceTarget(ctx context.Context, selector string, opts teamsChatMaintenanceOptions) (teamsChatMaintenanceTarget, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return teamsChatMaintenanceTarget{}, fmt.Errorf("session or chat selector is required")
+	}
+	var paths []string
+	if strings.TrimSpace(opts.StorePath) != "" {
+		paths = []string{filepath.Clean(opts.StorePath)}
+	} else {
+		var err error
+		paths, err = existingTeamsStorePathsReadOnly()
+		if err != nil {
+			return teamsChatMaintenanceTarget{}, err
+		}
+	}
+	var matches []teamsChatMaintenanceTarget
+	for _, path := range paths {
+		state, err := teamsstore.LoadPathReadOnly(ctx, path)
+		if err != nil {
+			return teamsChatMaintenanceTarget{}, fmt.Errorf("read Teams store %s: %w", path, err)
+		}
+		scopeID := strings.TrimSpace(state.Scope.ID)
+		if required := strings.TrimSpace(opts.ScopeID); required != "" && scopeID != required {
+			continue
+		}
+		var owner *teamsstore.OwnerMetadata
+		if state.ServiceOwner != nil {
+			copy := *state.ServiceOwner
+			owner = &copy
+		} else if state.LockOwner != nil {
+			copy := *state.LockOwner
+			owner = &copy
+		}
+		for _, session := range state.Sessions {
+			if selector != strings.TrimSpace(session.ID) && selector != strings.TrimSpace(session.CodexThreadID) && selector != strings.TrimSpace(session.TeamsChatID) {
+				continue
+			}
+			matches = append(matches, teamsChatMaintenanceTarget{Path: path, ScopeID: scopeID, Session: session, Owner: owner})
+		}
+	}
+	if len(matches) == 0 {
+		return teamsChatMaintenanceTarget{}, fmt.Errorf("Teams session or chat %q was not found in the selected durable store set", selector)
+	}
+	if len(matches) > 1 {
+		var details []string
+		for _, match := range matches {
+			details = append(details, fmt.Sprintf("scope=%s store=%s session=%s", firstNonEmptyString(match.ScopeID, "legacy"), match.Path, match.Session.ID))
+		}
+		sort.Strings(details)
+		return teamsChatMaintenanceTarget{}, fmt.Errorf("Teams selector %q is ambiguous; use --scope or --store:\n  %s", selector, strings.Join(details, "\n  "))
+	}
+	return matches[0], nil
+}
+
+func openTeamsChatMaintenanceStore(ctx context.Context, target teamsChatMaintenanceTarget) (*teamsstore.Store, error) {
+	if owner := target.Owner; owner != nil {
+		stale := teamsstore.IsStale(*owner, defaultTeamsOwnerStaleAfter, time.Now())
+		locallyDead := teamsstore.OwnerAppearsLocallyDead(*owner)
+		if !stale && !locallyDead {
+			return nil, fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s; stop the service first or use automatic in-process containment", target.Path, owner.PID, owner.Hostname)
+		}
+	}
+	st, err := teamsstore.Open(target.Path)
+	if err != nil {
+		return nil, err
+	}
+	owner, ok, err := st.ReadOwner(ctx)
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	if ok {
+		stale := teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now())
+		locallyDead := teamsstore.OwnerAppearsLocallyDead(owner)
+		if !stale && !locallyDead {
+			_ = st.Close()
+			return nil, fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s; stop the service first or use automatic in-process containment", target.Path, owner.PID, owner.Hostname)
+		}
+		if _, err := st.ClearOwnerIfSame(ctx, owner); err != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("clear stale Teams bridge owner in %s: %w", target.Path, err)
+		}
+	}
+	return st, nil
+}
+
+func printTeamsChatMaintenanceTarget(out io.Writer, action string, target teamsChatMaintenanceTarget) {
+	_, _ = fmt.Fprintf(out, "Teams chat %s dry run\nStore: %s\nScope: %s\nSession: %s\nChat: %s\nCurrent status: %s\nNo files were modified.\n", action, target.Path, firstNonEmptyString(target.ScopeID, "legacy"), target.Session.ID, target.Session.TeamsChatID, target.Session.Status)
 }
 
 func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Command {
@@ -2713,6 +2911,8 @@ func teamsStatusSessionLayer(snapshot teamsStatusStoreSnapshot, session teamssto
 		return "closed"
 	case teamsstore.SessionStatusArchived:
 		return "archived"
+	case teamsstore.SessionStatusQuarantined:
+		return "quarantined"
 	}
 	chatID := strings.TrimSpace(session.TeamsChatID)
 	if chatID == "" || (strings.TrimSpace(controlChatID) != "" && chatID == strings.TrimSpace(controlChatID)) {

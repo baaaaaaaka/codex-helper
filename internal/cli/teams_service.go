@@ -444,7 +444,20 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service backend: %s\n", backend.ID())
+			preferredBackend := backend.ID()
+			effectiveBackend := preferredBackend
+			wslStartupFallback := false
+			if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+				if installed, markerErr := wslBackend.startupFallbackMarkerInstalled(); markerErr != nil {
+					return markerErr
+				} else if installed {
+					effectiveBackend = "wsl-startup-watchdog"
+					wslStartupFallback = true
+				}
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service backend: %s\n", effectiveBackend)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service preferred backend: %s\n", preferredBackend)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service effective backend: %s\n", effectiveBackend)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service name: %s\n", backend.Name())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams service config: %s\n", path)
 			if exe, err := teamsServiceExecutable(); err != nil {
@@ -485,9 +498,16 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 			printTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
 			if teamsServiceGOOS() == "linux" && teamsServiceIsWSL() {
 				if backend.ID() == "wsl-windows-task-scheduler" {
-					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: detected. Teams service will use a per-user Windows Scheduled Task that launches wsl.exe, so it can survive closing the terminal without root.")
-					if err := runTeamsServiceWSLReadinessCheck(cmd.Context(), cmd.OutOrStdout()); err != nil {
-						return err
+					if wslStartupFallback {
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: the preferred Scheduled Task backend is unavailable or was not installable; the effective current-user Startup watchdog fallback is installed.")
+						if err := runTeamsServiceWSLStartupFallbackReadinessCheck(cmd.Context(), cmd.OutOrStdout(), backend.(teamsServiceWSLWindowsTaskBackend)); err != nil {
+							return err
+						}
+					} else {
+						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: detected. Teams service will use a per-user Windows Scheduled Task that launches wsl.exe, so it can survive closing the terminal without root.")
+						if err := runTeamsServiceWSLReadinessCheck(cmd.Context(), cmd.OutOrStdout()); err != nil {
+							return err
+						}
 					}
 				} else if backend.ID() == "local-supervisor" {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "WSL: local-supervisor was explicitly selected. It survives terminal close and helper crashes inside the running WSL instance, but Windows-login autostart still requires the Windows Scheduled Task backend.")
@@ -1172,6 +1192,48 @@ func runTeamsServiceWSLReadinessCheck(ctx context.Context, out io.Writer) error 
 	}
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "WSL supervisor readiness: powershell.exe, wsl.exe, and ScheduledTask cmdlets are available.")
+	}
+	return nil
+}
+
+func runTeamsServiceWSLStartupFallbackReadinessCheck(ctx context.Context, out io.Writer, backend teamsServiceWSLWindowsTaskBackend) error {
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		return err
+	}
+	config, ok := readTeamsServiceWSLStartupFallbackConfig(markerPath)
+	if !ok || strings.TrimSpace(config.TaskName) == "" || strings.TrimSpace(config.Command) == "" || strings.TrimSpace(config.Arguments) == "" {
+		return fmt.Errorf("WSL Startup watchdog fallback is degraded: config marker %s is missing TaskName, Command, or Arguments", markerPath)
+	}
+	if strings.TrimSpace(config.TaskName) != strings.TrimSpace(backend.Name()) {
+		return fmt.Errorf("WSL Startup watchdog fallback is degraded: config marker %s targets task %q, want %q", markerPath, config.TaskName, backend.Name())
+	}
+	if !strings.EqualFold(strings.TrimSpace(config.Command), "wsl.exe") {
+		return fmt.Errorf("WSL Startup watchdog fallback is degraded: config marker %s uses command %q, want wsl.exe", markerPath, config.Command)
+	}
+	if _, err := splitWindowsCommandLine(config.Arguments); err != nil {
+		return fmt.Errorf("WSL Startup watchdog fallback is degraded: config marker %s has invalid Arguments: %w", markerPath, err)
+	}
+	command := "Get-Command wsl.exe -ErrorAction Stop | Out-Null"
+	if _, err := teamsServiceRunPowerShell(ctx, command); err != nil {
+		return fmt.Errorf("WSL Startup watchdog fallback readiness check failed: %w", err)
+	}
+	active, err := backend.StartupFallbackMarkerExists()
+	if err != nil {
+		return err
+	}
+	state := "ready"
+	if !active {
+		state = "stopped"
+	}
+	if out != nil {
+		_, _ = fmt.Fprintf(out, "WSL Startup watchdog fallback: %s\n", state)
+		_, _ = fmt.Fprintf(out, "WSL Startup watchdog config: %s\n", markerPath)
+		_, _ = fmt.Fprintln(out, "WSL supervisor readiness: powershell.exe, wsl.exe, and the Startup watchdog config are available; ScheduledTask cmdlets are not required by the effective backend.")
+	}
+	probe := "if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) { if (Get-ScheduledTask -TaskName " + powershellSingleQuote(backend.Name()) + " -ErrorAction SilentlyContinue) { 'registered' } }"
+	if data, probeErr := teamsServiceRunPowerShell(ctx, probe); probeErr == nil && strings.Contains(strings.ToLower(string(data)), "registered") && out != nil {
+		_, _ = fmt.Fprintln(out, "WSL service warning: both the Scheduled Task and Startup watchdog fallback are installed; disable one backend to avoid split-brain starts.")
 	}
 	return nil
 }
@@ -2312,6 +2374,7 @@ func (b teamsServiceWSLWindowsTaskBackend) startupFallbackSuffix() (string, stri
 
 type teamsServiceWSLStartupFallbackConfig struct {
 	TaskName  string
+	Command   string
 	Arguments string
 }
 
@@ -2326,11 +2389,14 @@ func readTeamsServiceWSLStartupFallbackConfig(path string) (teamsServiceWSLStart
 		if value, ok := strings.CutPrefix(line, "TaskName="); ok {
 			cfg.TaskName = strings.TrimSpace(value)
 		}
+		if value, ok := strings.CutPrefix(line, "Command="); ok {
+			cfg.Command = strings.TrimSpace(value)
+		}
 		if value, ok := strings.CutPrefix(line, "Arguments="); ok {
 			cfg.Arguments = strings.TrimSpace(value)
 		}
 	}
-	return cfg, cfg.TaskName != "" || cfg.Arguments != ""
+	return cfg, cfg.TaskName != "" || cfg.Command != "" || cfg.Arguments != ""
 }
 
 func filterTeamsServiceWSLStartupFallbackArgs(args []string) []string {

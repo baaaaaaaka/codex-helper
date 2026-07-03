@@ -41,9 +41,10 @@ const (
 type SessionStatus string
 
 const (
-	SessionStatusActive   SessionStatus = "active"
-	SessionStatusArchived SessionStatus = "archived"
-	SessionStatusClosed   SessionStatus = "closed"
+	SessionStatusActive      SessionStatus = "active"
+	SessionStatusArchived    SessionStatus = "archived"
+	SessionStatusClosed      SessionStatus = "closed"
+	SessionStatusQuarantined SessionStatus = "quarantined"
 )
 
 type TurnStatus string
@@ -704,27 +705,31 @@ type OwnerMetadata struct {
 }
 
 type SessionContext struct {
-	ID                string                `json:"id"`
-	Status            SessionStatus         `json:"status"`
-	TeamsChatID       string                `json:"teams_chat_id"`
-	TeamsChatURL      string                `json:"teams_chat_url,omitempty"`
-	TeamsTopic        string                `json:"teams_topic,omitempty"`
-	UserTitle         string                `json:"user_title,omitempty"`
-	TitleSource       string                `json:"title_source,omitempty"`
-	CodexThreadID     string                `json:"codex_thread_id,omitempty"`
-	LatestCodexTurnID string                `json:"latest_codex_turn_id,omitempty"`
-	LatestTurnID      string                `json:"latest_turn_id,omitempty"`
-	RunnerKind        string                `json:"runner_kind,omitempty"`
-	CodexVersion      string                `json:"codex_version,omitempty"`
-	Cwd               string                `json:"cwd,omitempty"`
-	CodexHome         string                `json:"codex_home,omitempty"`
-	Profile           string                `json:"profile,omitempty"`
-	Model             string                `json:"model,omitempty"`
-	ModelProfile      modelprofile.Snapshot `json:"model_profile,omitempty"`
-	Sandbox           string                `json:"sandbox,omitempty"`
-	ProxyMode         string                `json:"proxy_mode,omitempty"`
-	CreatedAt         time.Time             `json:"created_at,omitempty"`
-	UpdatedAt         time.Time             `json:"updated_at,omitempty"`
+	ID                   string                `json:"id"`
+	Status               SessionStatus         `json:"status"`
+	TeamsChatID          string                `json:"teams_chat_id"`
+	TeamsChatURL         string                `json:"teams_chat_url,omitempty"`
+	TeamsTopic           string                `json:"teams_topic,omitempty"`
+	UserTitle            string                `json:"user_title,omitempty"`
+	TitleSource          string                `json:"title_source,omitempty"`
+	CodexThreadID        string                `json:"codex_thread_id,omitempty"`
+	LatestCodexTurnID    string                `json:"latest_codex_turn_id,omitempty"`
+	LatestTurnID         string                `json:"latest_turn_id,omitempty"`
+	RunnerKind           string                `json:"runner_kind,omitempty"`
+	CodexVersion         string                `json:"codex_version,omitempty"`
+	Cwd                  string                `json:"cwd,omitempty"`
+	CodexHome            string                `json:"codex_home,omitempty"`
+	Profile              string                `json:"profile,omitempty"`
+	Model                string                `json:"model,omitempty"`
+	ModelProfile         modelprofile.Snapshot `json:"model_profile,omitempty"`
+	Sandbox              string                `json:"sandbox,omitempty"`
+	ProxyMode            string                `json:"proxy_mode,omitempty"`
+	QuarantinedAt        time.Time             `json:"quarantined_at,omitempty"`
+	QuarantineReason     string                `json:"quarantine_reason,omitempty"`
+	QuarantineSource     string                `json:"quarantine_source,omitempty"`
+	QuarantineMessageIDs []string              `json:"quarantine_message_ids,omitempty"`
+	CreatedAt            time.Time             `json:"created_at,omitempty"`
+	UpdatedAt            time.Time             `json:"updated_at,omitempty"`
 }
 
 type InboundEvent struct {
@@ -827,7 +832,36 @@ type OutboxMessage struct {
 	UpdatedAt              time.Time        `json:"updated_at,omitempty"`
 	SentAt                 time.Time        `json:"sent_at,omitempty"`
 	LastSendAttempt        time.Time        `json:"last_send_attempt,omitempty"`
+	SendAttemptToken       string           `json:"send_attempt_token,omitempty"`
 	LastSendError          string           `json:"last_send_error,omitempty"`
+}
+
+type SessionQuarantineRequest struct {
+	SessionID         string
+	Reason            string
+	Source            string
+	TriggerMessageIDs []string
+	InFlightOutboxIDs []string
+	Now               time.Time
+}
+
+type SessionQuarantineReport struct {
+	Session            SessionContext
+	Changed            bool
+	InterruptedTurnIDs []string
+	IgnoredInboundIDs  []string
+	SkippedOutboxIDs   []string
+	PreservedOutboxIDs []string
+}
+
+type SessionUnquarantineRequest struct {
+	SessionID string
+	Now       time.Time
+}
+
+type SessionUnquarantineReport struct {
+	Session SessionContext
+	Changed bool
 }
 
 type OutboxMathSpan struct {
@@ -859,6 +893,15 @@ type PendingOutboxPage struct {
 	Messages   []OutboxMessage
 	NextCursor PendingOutboxCursor
 	More       bool
+}
+
+// OutboxEchoCandidateQuery bounds the exceptional rendered-content lookup used
+// to recover a helper message that reached Teams before its Graph message ID
+// was recorded locally. The normal inbound path must continue to use message
+// ID/provenance lookups instead.
+type OutboxEchoCandidateQuery struct {
+	TeamsChatID    string
+	LimitPerStatus int
 }
 
 type ModelProfileKeyIntakeStatus string
@@ -2339,6 +2382,65 @@ func (s *Store) TurnByID(ctx context.Context, turnID string) (Turn, bool, error)
 
 func (s *Store) OutboxStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, outboxStateSnapshotFields)
+}
+
+// RecentOutboxEchoCandidates returns a strictly bounded set of outbox rows for
+// rendered-content recovery. SQLite uses the existing
+// (status, teams_chat_id, created_at, id) index and never materializes the full
+// outbox. The JSON backend necessarily loads its single state file, but still
+// caps the returned and decoded comparison set.
+func (s *Store) RecentOutboxEchoCandidates(ctx context.Context, query OutboxEchoCandidateQuery) ([]OutboxMessage, error) {
+	query.TeamsChatID = strings.TrimSpace(query.TeamsChatID)
+	if query.TeamsChatID == "" {
+		return nil, nil
+	}
+	if query.LimitPerStatus <= 0 {
+		query.LimitPerStatus = 8
+	}
+	if query.LimitPerStatus > 32 {
+		query.LimitPerStatus = 32
+	}
+	if messages, handled, err := s.recentOutboxEchoCandidatesSQLite(ctx, query); handled || err != nil {
+		return messages, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byStatus := map[OutboxStatus][]OutboxMessage{
+		OutboxStatusSending:  nil,
+		OutboxStatusAccepted: nil,
+		OutboxStatusSent:     nil,
+	}
+	for _, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.TeamsChatID) != query.TeamsChatID {
+			continue
+		}
+		if _, ok := byStatus[msg.Status]; ok {
+			byStatus[msg.Status] = append(byStatus[msg.Status], msg)
+		}
+	}
+	var out []OutboxMessage
+	for _, status := range []OutboxStatus{OutboxStatusSending, OutboxStatusAccepted, OutboxStatusSent} {
+		messages := byStatus[status]
+		sort.Slice(messages, func(i, j int) bool {
+			if messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+				if status == OutboxStatusSending {
+					return messages[i].ID < messages[j].ID
+				}
+				return messages[i].ID > messages[j].ID
+			}
+			if status == OutboxStatusSending {
+				return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+			}
+			return messages[i].CreatedAt.After(messages[j].CreatedAt)
+		})
+		if len(messages) > query.LimitPerStatus {
+			messages = messages[:query.LimitPerStatus]
+		}
+		out = append(out, messages...)
+	}
+	return out, nil
 }
 
 func (s *Store) SentOutboxMessagesForChat(ctx context.Context, chatID string) ([]OutboxMessage, error) {
@@ -4239,6 +4341,10 @@ func outboxDeliveryProtected(msg OutboxMessage) bool {
 	return notificationKind == "turn_completed"
 }
 
+func OutboxDeliveryProtected(msg OutboxMessage) bool {
+	return outboxDeliveryProtected(msg)
+}
+
 func outboxDeliveryTransient(msg OutboxMessage) bool {
 	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
 	switch kind {
@@ -4256,6 +4362,10 @@ func outboxDeliveryTransient(msg OutboxMessage) bool {
 
 func OutboxDeliveryTransient(msg OutboxMessage) bool {
 	return outboxDeliveryTransient(msg)
+}
+
+func OutboxSendIsAmbiguous(msg OutboxMessage) bool {
+	return msg.Status == OutboxStatusSending && strings.HasPrefix(strings.TrimSpace(msg.LastSendError), "ambiguous Graph send;")
 }
 
 func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
@@ -4291,6 +4401,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		session, ok := state.Sessions[turn.SessionID]
 		if !ok {
 			return fmt.Errorf("session %q not found", turn.SessionID)
+		}
+		if session.Status == SessionStatusQuarantined {
+			return fmt.Errorf("session %q is quarantined", turn.SessionID)
 		}
 		now := time.Now()
 		if turn.Status == "" {
@@ -4329,35 +4442,34 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 
 func (s *Store) MarkTurnRunning(ctx context.Context, turnID string, codexThreadID string, codexTurnID string) (Turn, error) {
 	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), false, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		turn.Status = TurnStatusRunning
-		if turn.StartedAt.IsZero() {
-			turn.StartedAt = now
-		}
-		if codexThreadID != "" {
-			turn.CodexThreadID = codexThreadID
-		}
-		if codexTurnID != "" {
-			turn.CodexTurnID = codexTurnID
-		}
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
+		return markTurnRunningLocked(state, turn, codexThreadID, codexTurnID, now)
 	}); handled || err != nil {
 		return out, err
 	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		turn.Status = TurnStatusRunning
-		if turn.StartedAt.IsZero() {
-			turn.StartedAt = now
-		}
-		if codexThreadID != "" {
-			turn.CodexThreadID = codexThreadID
-		}
-		if codexTurnID != "" {
-			turn.CodexTurnID = codexTurnID
-		}
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
+		return markTurnRunningLocked(state, turn, codexThreadID, codexTurnID, now)
 	})
+}
+
+func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexTurnID string, now time.Time) (Turn, error) {
+	if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
+		return turn, fmt.Errorf("turn %q with status %q cannot start", turn.ID, turn.Status)
+	}
+	if session, ok := state.Sessions[strings.TrimSpace(turn.SessionID)]; ok && session.Status == SessionStatusQuarantined {
+		return turn, fmt.Errorf("session %q is quarantined", turn.SessionID)
+	}
+	turn.Status = TurnStatusRunning
+	if turn.StartedAt.IsZero() {
+		turn.StartedAt = now
+	}
+	if codexThreadID != "" {
+		turn.CodexThreadID = codexThreadID
+	}
+	if codexTurnID != "" {
+		turn.CodexTurnID = codexTurnID
+	}
+	updateSessionFromTurn(state, turn, now)
+	return turn, nil
 }
 
 func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn, bool, error) {
@@ -4371,6 +4483,9 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 	var out Turn
 	claimed := false
 	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
+		if session, ok := state.Sessions[sessionID]; !ok || !sessionStatusIsActive(session.Status) {
+			return nil
+		}
 		for _, turn := range state.Turns {
 			if turn.SessionID == sessionID && turn.Status == TurnStatusRunning {
 				return nil
@@ -4610,6 +4725,12 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 	if msg.Status == "" {
 		msg.Status = OutboxStatusQueued
 	}
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+		if session, ok := state.Sessions[sessionID]; ok && session.Status == SessionStatusQuarantined {
+			msg.Status = OutboxStatusSkipped
+			msg.LastSendError = firstStoreNonEmptyString(session.QuarantineReason, "session quarantined")
+		}
+	}
 	if outboxDeliveryTransient(msg) && !outboxDeliveryProtected(msg) {
 		msg.UpgradeNonBlocking = true
 	}
@@ -4725,7 +4846,9 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 			return OutboxMessage{}, false, false, err
 		}
 		existingDelivery.OutboxID = out.ID
-		if existingDelivery.Status == "" {
+		if out.Status == OutboxStatusSkipped {
+			existingDelivery.Status = TranscriptDeliveryStatusSkipped
+		} else if existingDelivery.Status == "" {
 			existingDelivery.Status = TranscriptDeliveryStatusQueued
 		}
 		existingDelivery.UpdatedAt = now
@@ -4738,7 +4861,9 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	}
 	normalized := normalizeTranscriptDeliveryRecord(delivery, now)
 	normalized.OutboxID = out.ID
-	if normalized.Status == "" {
+	if out.Status == OutboxStatusSkipped {
+		normalized.Status = TranscriptDeliveryStatusSkipped
+	} else if normalized.Status == "" {
 		normalized.Status = TranscriptDeliveryStatusQueued
 	}
 	state.TranscriptDeliveries[normalized.ID] = normalized
@@ -4941,37 +5066,42 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		switch msg.Status {
-		case OutboxStatusSent:
-			return msg, ErrOutboxSendNotClaimed
-		case OutboxStatusSending:
-			if !msg.LastSendAttempt.IsZero() && now.Sub(msg.LastSendAttempt) <= outboxSendLease {
-				return msg, ErrOutboxSendNotClaimed
-			}
-		}
-		msg.Status = OutboxStatusSending
-		msg.LastSendAttempt = now
-		msg.LastSendError = ""
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
-		return msg, nil
+		return claimOutboxSendAttemptLocked(state, msg, now)
 	}); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		switch msg.Status {
-		case OutboxStatusSent:
-			return msg, ErrOutboxSendNotClaimed
-		case OutboxStatusSending:
-			if !msg.LastSendAttempt.IsZero() && now.Sub(msg.LastSendAttempt) <= outboxSendLease {
-				return msg, ErrOutboxSendNotClaimed
-			}
-		}
-		msg.Status = OutboxStatusSending
-		msg.LastSendAttempt = now
-		msg.LastSendError = ""
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
-		return msg, nil
+		return claimOutboxSendAttemptLocked(state, msg, now)
 	})
+}
+
+func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+		session, ok := state.Sessions[sessionID]
+		if ok && !sessionStatusIsActive(session.Status) {
+			return msg, ErrOutboxSendNotClaimed
+		}
+	}
+	switch msg.Status {
+	case OutboxStatusQueued:
+	case OutboxStatusSending:
+		if !msg.LastSendAttempt.IsZero() && now.Sub(msg.LastSendAttempt) <= outboxSendLease {
+			return msg, ErrOutboxSendNotClaimed
+		}
+	default:
+		return msg, ErrOutboxSendNotClaimed
+	}
+	msg.Status = OutboxStatusSending
+	msg.LastSendAttempt = now
+	msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now)
+	msg.LastSendError = ""
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
+	return msg, nil
+}
+
+func outboxSendAttemptToken(outboxID string, now time.Time) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(outboxID) + "\x00" + now.UTC().Format(time.RFC3339Nano)))
+	return hex.EncodeToString(sum[:16])
 }
 
 func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string) (OutboxMessage, error) {
@@ -5033,24 +5163,112 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
+	return s.markOutboxSendError(ctx, outboxID, "", message, false)
+}
+
+func (s *Store) MarkOutboxSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
+	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true)
+}
+
+// MarkOutboxAmbiguousSendErrorForAttempt keeps an attempted message under its
+// send lease after Graph may have accepted the POST but failed to return a
+// usable response. Leaving the row in sending prevents an immediate duplicate
+// POST while inbound echo reconciliation or the normal Graph recovery read has
+// time to discover the accepted message.
+func (s *Store) MarkOutboxAmbiguousSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		msg.Status = OutboxStatusQueued
-		msg.LastSendError = trimDiagnostic(message, 240)
-		msg.LastSendAttempt = now
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
-		updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
-		return msg, nil
+		return markOutboxAmbiguousSendErrorLocked(state, msg, attemptToken, message, now)
 	}); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxAmbiguousSendErrorLocked(state, msg, attemptToken, message, now)
+	})
+}
+
+func (s *Store) MarkOutboxSkippedForAttempt(ctx context.Context, outboxID string, attemptToken string, reason string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxSkippedForAttemptLocked(state, msg, attemptToken, reason, now)
+	}); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxSkippedForAttemptLocked(state, msg, attemptToken, reason, now)
+	})
+}
+
+func markOutboxSkippedForAttemptLocked(state *State, msg OutboxMessage, attemptToken string, reason string, now time.Time) (OutboxMessage, error) {
+	attemptToken = strings.TrimSpace(attemptToken)
+	if msg.Status != OutboxStatusSending || attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	msg.Status = OutboxStatusSkipped
+	msg.LastSendError = trimDiagnostic(firstStoreNonEmptyString(reason, "ambiguous transient output superseded"), 240)
+	msg.UpdatedAt = now
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+	updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+	return msg, nil
+}
+
+func markOutboxAmbiguousSendErrorLocked(state *State, msg OutboxMessage, attemptToken string, message string, now time.Time) (OutboxMessage, error) {
+	attemptToken = strings.TrimSpace(attemptToken)
+	if msg.Status != OutboxStatusSending || attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" && state.Sessions[sessionID].Status == SessionStatusQuarantined {
+		msg.Status = OutboxStatusSkipped
+		msg.LastSendError = trimDiagnostic("session quarantined after ambiguous send: "+message, 240)
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+		msg.UpdatedAt = now
+		return msg, nil
+	}
+	msg.LastSendError = trimDiagnostic("ambiguous Graph send; retry held by send lease: "+message, 240)
+	msg.LastSendAttempt = now
+	msg.UpdatedAt = now
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+	updateArtifactRecordsForOutboxLocked(state, msg, now, "message_ambiguous", "", msg.LastSendError)
+	return msg, nil
+}
+
+func (s *Store) markOutboxSendError(ctx context.Context, outboxID string, attemptToken string, message string, requireClaim bool) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim)
+	}); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim)
+	})
+}
+
+func markOutboxSendErrorLocked(state *State, msg OutboxMessage, attemptToken string, message string, now time.Time, requireClaim bool) (OutboxMessage, error) {
+	if requireClaim && (msg.Status != OutboxStatusSending || strings.TrimSpace(attemptToken) != "" && strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken)) {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	if !requireClaim && msg.Status != OutboxStatusQueued && msg.Status != OutboxStatusSending {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	quarantined := false
+	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+		quarantined = state.Sessions[sessionID].Status == SessionStatusQuarantined
+	}
+	if quarantined {
+		msg.Status = OutboxStatusSkipped
+		msg.LastSendError = trimDiagnostic("session quarantined after send failure: "+message, 240)
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+	} else {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
-		msg.LastSendAttempt = now
 		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
-		updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
-		return msg, nil
-	})
+	}
+	msg.LastSendAttempt = now
+	msg.UpdatedAt = now
+	updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
+	return msg, nil
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
@@ -5079,10 +5297,21 @@ func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID
 }
 
 func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), teamsMessageID, false); handled || err != nil {
+	return s.markOutboxAccepted(ctx, outboxID, "", teamsMessageID, false)
+}
+
+func (s *Store) MarkOutboxAcceptedForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
+	return s.markOutboxAccepted(ctx, outboxID, attemptToken, teamsMessageID, true)
+}
+
+func (s *Store) markOutboxAccepted(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, false, requireClaim); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, false, requireClaim); err != nil {
+			return msg, err
+		}
 		if msg.Status == OutboxStatusSent {
 			recordOutboxProvenanceLocked(state, msg, now)
 			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
@@ -5102,10 +5331,21 @@ func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMe
 }
 
 func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), teamsMessageID, true); handled || err != nil {
+	return s.markOutboxSent(ctx, outboxID, "", teamsMessageID, false)
+}
+
+func (s *Store) MarkOutboxSentForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
+	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true)
+}
+
+func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, true, requireClaim); err != nil {
+			return msg, err
+		}
 		msg.Status = OutboxStatusSent
 		if msg.SentAt.IsZero() {
 			msg.SentAt = now
@@ -5119,6 +5359,29 @@ func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessag
 		updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
 		return msg, nil
 	})
+}
+
+func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) error {
+	attemptToken = strings.TrimSpace(attemptToken)
+	if requireClaim && (attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken) {
+		return ErrOutboxSendNotClaimed
+	}
+	if msg.Status == OutboxStatusSkipped {
+		return ErrOutboxSendNotClaimed
+	}
+	if requireClaim {
+		allowed := msg.Status == OutboxStatusSending
+		if sent {
+			allowed = allowed || msg.Status == OutboxStatusAccepted
+		}
+		if !allowed {
+			return ErrOutboxSendNotClaimed
+		}
+	}
+	if existing := strings.TrimSpace(msg.TeamsMessageID); existing != "" && strings.TrimSpace(teamsMessageID) != "" && existing != strings.TrimSpace(teamsMessageID) {
+		return ErrOutboxSendNotClaimed
+	}
+	return nil
 }
 
 func markTranscriptDeliveryForOutboxLocked(state *State, msg OutboxMessage, status TranscriptDeliveryStatus, now time.Time) {
@@ -6031,6 +6294,204 @@ func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 		return changed, nil
 	})
 	return report, err
+}
+
+func (s *Store) QuarantineSession(ctx context.Context, req SessionQuarantineRequest) (SessionQuarantineReport, error) {
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if req.SessionID == "" {
+		return SessionQuarantineReport{}, fmt.Errorf("session id is required")
+	}
+	req.Reason = trimDiagnostic(firstStoreNonEmptyString(req.Reason, "helper self-echo circuit breaker"), 240)
+	req.Source = trimDiagnostic(firstStoreNonEmptyString(req.Source, "teams_helper"), 80)
+	if req.Now.IsZero() {
+		req.Now = time.Now()
+	}
+	var report SessionQuarantineReport
+	err := s.withSessionLock(ctx, req.SessionID, func() error {
+		if out, handled, err := s.quarantineSessionSQLite(ctx, req); handled || err != nil {
+			report = out
+			return err
+		}
+		return s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+			var err error
+			report, err = applySessionQuarantine(state, req)
+			return report.Changed, err
+		})
+	})
+	return report, err
+}
+
+func applySessionQuarantine(state *State, req SessionQuarantineRequest) (SessionQuarantineReport, error) {
+	var report SessionQuarantineReport
+	session, ok := state.Sessions[req.SessionID]
+	if !ok {
+		return report, fmt.Errorf("session %q not found", req.SessionID)
+	}
+	if session.Status == SessionStatusQuarantined {
+		report.Session = session
+		return report, nil
+	}
+	if !sessionStatusIsActive(session.Status) {
+		return report, fmt.Errorf("session %q has status %q and cannot be quarantined", req.SessionID, session.Status)
+	}
+	now := req.Now
+	session.Status = SessionStatusQuarantined
+	session.QuarantinedAt = now
+	session.QuarantineReason = req.Reason
+	session.QuarantineSource = req.Source
+	session.QuarantineMessageIDs = boundedUniqueStrings(req.TriggerMessageIDs, 8)
+	session.UpdatedAt = now
+	state.Sessions[session.ID] = session
+	report.Session = session
+	report.Changed = true
+
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) != req.SessionID || turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
+			continue
+		}
+		turn.Status = TurnStatusInterrupted
+		turn.InterruptedAt = now
+		turn.RecoveryReason = req.Reason
+		turn.UpdatedAt = now
+		state.Turns[id] = turn
+		report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
+	}
+	for id, inbound := range state.InboundEvents {
+		if strings.TrimSpace(inbound.SessionID) != req.SessionID || inbound.Status != InboundStatusQueued && inbound.Status != InboundStatusDeferred && inbound.Status != InboundStatusPersisted {
+			continue
+		}
+		inbound.Status = InboundStatusIgnored
+		inbound.UpdatedAt = now
+		state.InboundEvents[id] = inbound
+		report.IgnoredInboundIDs = append(report.IgnoredInboundIDs, id)
+	}
+	inFlight := make(map[string]bool, len(req.InFlightOutboxIDs))
+	for _, id := range req.InFlightOutboxIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			inFlight[id] = true
+		}
+	}
+	for id, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.SessionID) != req.SessionID {
+			continue
+		}
+		if msg.Status == OutboxStatusSending && inFlight[id] {
+			report.PreservedOutboxIDs = append(report.PreservedOutboxIDs, id)
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusQueued, OutboxStatusSending:
+			msg.Status = OutboxStatusSkipped
+			msg.LastSendError = req.Reason
+			msg.UpdatedAt = now
+			state.OutboxMessages[id] = msg
+			markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", req.Reason, "")
+			report.SkippedOutboxIDs = append(report.SkippedOutboxIDs, id)
+		}
+	}
+	if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
+		poll := state.ChatPolls[chatID]
+		poll.ChatID = chatID
+		poll.PreviousPollState = poll.PollState
+		poll.PollState = chatPollStateParked
+		poll.NextPollAt = time.Time{}
+		poll.BlockedUntil = time.Time{}
+		poll.ContinuationPath = ""
+		poll.FailureCount = 0
+		poll.LastError = ""
+		poll.LastErrorAt = time.Time{}
+		poll.ParkedAt = now
+		poll.ParkNoticeSentAt = now
+		poll.UpdatedAt = now
+		state.ChatPolls[chatID] = poll
+	}
+	sort.Strings(report.InterruptedTurnIDs)
+	sort.Strings(report.IgnoredInboundIDs)
+	sort.Strings(report.SkippedOutboxIDs)
+	sort.Strings(report.PreservedOutboxIDs)
+	return report, nil
+}
+
+func (s *Store) UnquarantineSession(ctx context.Context, req SessionUnquarantineRequest) (SessionUnquarantineReport, error) {
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if req.SessionID == "" {
+		return SessionUnquarantineReport{}, fmt.Errorf("session id is required")
+	}
+	if req.Now.IsZero() {
+		req.Now = time.Now()
+	}
+	var report SessionUnquarantineReport
+	err := s.withSessionLock(ctx, req.SessionID, func() error {
+		if out, handled, err := s.unquarantineSessionSQLite(ctx, req); handled || err != nil {
+			report = out
+			return err
+		}
+		return s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+			var err error
+			report, err = applySessionUnquarantine(state, req)
+			return report.Changed, err
+		})
+	})
+	return report, err
+}
+
+func applySessionUnquarantine(state *State, req SessionUnquarantineRequest) (SessionUnquarantineReport, error) {
+	var report SessionUnquarantineReport
+	session, ok := state.Sessions[req.SessionID]
+	if !ok {
+		return report, fmt.Errorf("session %q not found", req.SessionID)
+	}
+	if session.Status != SessionStatusQuarantined {
+		return report, fmt.Errorf("session %q has status %q; only quarantined sessions can be unquarantined", req.SessionID, session.Status)
+	}
+	session.Status = SessionStatusActive
+	session.QuarantinedAt = time.Time{}
+	session.QuarantineReason = ""
+	session.QuarantineSource = ""
+	session.QuarantineMessageIDs = nil
+	session.UpdatedAt = req.Now
+	state.Sessions[session.ID] = session
+	if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
+		poll := state.ChatPolls[chatID]
+		poll.ChatID = chatID
+		poll.PreviousPollState = poll.PollState
+		poll.PollState = chatPollStateCold
+		poll.NextPollAt = req.Now
+		poll.BlockedUntil = time.Time{}
+		poll.ContinuationPath = ""
+		poll.FailureCount = 0
+		poll.ParkedAt = time.Time{}
+		poll.ParkNoticeSentAt = time.Time{}
+		poll.LastError = ""
+		poll.LastErrorAt = time.Time{}
+		poll.UpdatedAt = req.Now
+		state.ChatPolls[chatID] = poll
+	}
+	report.Session = session
+	report.Changed = true
+	return report, nil
+}
+
+func boundedUniqueStrings(values []string, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, min(limit, len(values)))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out
 }
 
 func markInboundIgnoredForInterruptedTurn(state *State, turn Turn, now time.Time) {

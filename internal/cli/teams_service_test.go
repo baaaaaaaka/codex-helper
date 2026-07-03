@@ -7032,6 +7032,108 @@ func TestTeamsServiceDoctorReportsWSLReadinessFailure(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceDoctorUsesInstalledWSLStartupFallbackWithoutScheduledTaskRequirement(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		unitDir:        filepath.Join(tmp, "systemd", "user"),
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	if err := os.WriteFile(markerPath, []byte(buildTeamsServiceWSLStartupFallbackConfig(backend.Name(), []string{"-d", "Ubuntu", "--", "true"})), 0o600); err != nil {
+		t.Fatalf("write fallback marker: %v", err)
+	}
+
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(filepath.Join(tmp, "registry.json")))
+	cmd.SetArgs([]string{"doctor"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute fallback doctor: %v\n%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Teams service preferred backend: wsl-windows-task-scheduler",
+		"Teams service effective backend: wsl-startup-watchdog",
+		"WSL Startup watchdog fallback: ready",
+		"ScheduledTask cmdlets are not required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback doctor output missing %q:\n%s", want, got)
+		}
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("fallback readiness calls = %#v, want wsl.exe check plus optional task probe", runner.calls)
+	}
+	first := strings.Join(runner.calls[0].args, " ")
+	if !strings.Contains(first, "Get-Command wsl.exe") || strings.Contains(first, "Get-ScheduledTask -ErrorAction Stop") {
+		t.Fatalf("effective fallback readiness incorrectly requires ScheduledTask cmdlets: %s", first)
+	}
+	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Register-ScheduledTask", "Start-ScheduledTask", "Enable-ScheduledTask")
+}
+
+func TestTeamsServiceWSLStartupFallbackDoctorRejectsMismatchedMarker(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		unitDir:        filepath.Join(tmp, "systemd", "user"),
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         runner,
+	})
+	backend := teamsServiceWSLWindowsTaskBackend{}
+	markerPath, err := backend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("startupFallbackMarkerPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
+		t.Fatalf("mkdir marker dir: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		marker string
+		want   string
+	}{
+		{name: "wrong task", marker: "Fallback=Windows Startup watchdog\nTaskName=other-task\nCommand=wsl.exe\nArguments=-d Ubuntu -- true\n", want: "want \"" + backend.Name() + "\""},
+		{name: "wrong command", marker: "Fallback=Windows Startup watchdog\nTaskName=" + backend.Name() + "\nCommand=powershell.exe\nArguments=-d Ubuntu -- true\n", want: "want wsl.exe"},
+		{name: "invalid arguments", marker: "Fallback=Windows Startup watchdog\nTaskName=" + backend.Name() + "\nCommand=wsl.exe\nArguments=\"unterminated\n", want: "invalid Arguments"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(markerPath, []byte(tc.marker), 0o600); err != nil {
+				t.Fatalf("write marker: %v", err)
+			}
+			err := runTeamsServiceWSLStartupFallbackReadinessCheck(context.Background(), io.Discard, backend)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("readiness error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("invalid markers should fail before PowerShell probes: %#v", runner.calls)
+	}
+}
+
 func TestTeamsServiceRunPowerShellCanUseExplicitExecutablePath(t *testing.T) {
 	lockCLITestHooks(t)
 

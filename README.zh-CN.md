@@ -212,6 +212,8 @@ codex-proxy proxy doctor
 | `codex-proxy teams probe-chat --chat <chat-id-or-link>` | 对外部 Teams chat 做只读探测，不绑定 helper state |
 | `codex-proxy teams pause` / `resume` / `drain` / `recover` | 从终端 pause、resume、drain 或 recover Teams helper state |
 | `codex-proxy teams chat recreate <session-id> --yes` | 为现有 helper session 创建并绑定新的 Teams Work chat |
+| `codex-proxy teams chat quarantine <session-or-chat> --dry-run\|--yes` | 精确隔离一个异常 Work chat，停止轮询并原子中断待处理工作；运行中的 service owner 存在时拒绝终端修改 |
+| `codex-proxy teams chat unquarantine <session-or-chat> --dry-run\|--yes` | 仅恢复明确处于 `quarantined` 状态的会话，不重放旧 turn、inbound 或 outbox |
 | `codex-proxy teams service bootstrap` | 安装或修复后台 Teams helper service |
 | `codex-proxy teams service restart --force` | 恢复本地 active Teams state，然后从终端强制重启 service |
 | `codex-proxy teams control --print` | 打印配置好的 Teams control chat link |
@@ -599,6 +601,8 @@ codex-proxy teams resume
 codex-proxy teams drain
 codex-proxy teams recover
 codex-proxy teams chat recreate <session-id> --yes
+codex-proxy teams chat quarantine <session-or-chat> --dry-run
+codex-proxy teams chat unquarantine <session-or-chat> --dry-run
 ```
 
 在 Teams control chat 中，`helper reload now` 只用于 source-checkout development

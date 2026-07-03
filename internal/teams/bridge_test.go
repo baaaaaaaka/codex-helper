@@ -16752,6 +16752,288 @@ func TestBridgeControlPollAllowsFreshHelperPrefixedQuestion(t *testing.T) {
 	}
 }
 
+func TestBridgeWorkPollDropsFreshPlainHelperLifecycleOutput(t *testing.T) {
+	msg := bridgePollMessage("fresh-work-helper-queued", "2026-07-03T01:05:00Z", "")
+	msg.Body.Content = "<p>🔧 Helper:</p><p>⚠️ Your request is queued.</p><p>Another Codex request is already running.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{msg}}})
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s001", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.Sessions = []Session{{ID: "s001", ChatID: "chat-1", Status: string(teamstore.SessionStatusActive)}}
+	bridge.reg.ControlChatID = ""
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("fresh helper lifecycle output reached handler: %#v", handled)
+	}
+	if !bridge.reg.HasSent("chat-1", msg.ID) {
+		t.Fatal("fresh helper lifecycle output was not marked sent")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(state.InboundEvents) != 0 || len(state.Turns) != 0 || state.Sessions["s001"].Status != teamstore.SessionStatusActive {
+		t.Fatalf("unexpected state after one helper echo: %#v", state)
+	}
+}
+
+func TestBridgeControlStatusShowsQuarantinedSessionsSeparately(t *testing.T) {
+	bridge := &Bridge{reg: Registry{Sessions: []Session{
+		{ID: "s-quarantine", Topic: "unsafe loop", Status: string(teamstore.SessionStatusQuarantined)},
+		{ID: "s-closed", Topic: "old chat", Status: string(teamstore.SessionStatusClosed)},
+	}}}
+	got := bridge.formatSessionList(context.Background())
+	for _, want := range []string{"Quarantined Work chats", "s-quarantine", "cxp teams chat unquarantine s-quarantine --yes", "1 closed work chat"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("control status missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestBridgeRepeatedFreshHelperEchoQuarantinesBeforeDispatch(t *testing.T) {
+	messages := []ChatMessage{
+		bridgePollMessage("fresh-helper-1", "2026-07-03T01:05:00Z", ""),
+		bridgePollMessage("fresh-helper-2", "2026-07-03T01:05:01Z", ""),
+		bridgePollMessage("fresh-helper-3", "2026-07-03T01:05:02Z", ""),
+		bridgePollMessage("fresh-user-after-trip", "2026-07-03T01:05:03Z", "new user task after containment"),
+	}
+	messages[0].Body.Content = "<p>🔧 Helper:</p><p>⚠️ Your request is queued.</p>"
+	messages[1].Body.Content = "<p>🔧 Helper:</p><p>Duplicate request ignored.</p>"
+	messages[2].Body.Content = "<p>🔧 Helper:</p><p>▶️ Codex is starting this queued request.</p>"
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: messages}})
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s001", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.Sessions = []Session{{ID: "s001", ChatID: "chat-1", Status: string(teamstore.SessionStatusActive)}}
+	bridge.reg.ControlChatID = ""
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat: %v", err)
+	}
+	if len(handled) != 0 {
+		t.Fatalf("helper echoes reached handler before breaker: %#v", handled)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	session := state.Sessions["s001"]
+	if session.Status != teamstore.SessionStatusQuarantined || session.QuarantineSource != "teams_self_echo_breaker" || len(session.QuarantineMessageIDs) != 3 {
+		t.Fatalf("session was not quarantined: %#v", session)
+	}
+	if poll := state.ChatPolls["chat-1"]; poll.PollState != "parked" || poll.ContinuationPath != "" || !poll.NextPollAt.IsZero() {
+		t.Fatalf("quarantined poll state was overwritten: %#v", poll)
+	} else if want := parseGraphTime(messages[len(messages)-1].LastModifiedDateTime); !poll.LastModifiedCursor.Equal(want) {
+		t.Fatalf("quarantine cursor = %s, want discarded-window cursor %s", poll.LastModifiedCursor, want)
+	}
+	if len(state.InboundEvents) != 0 || len(state.Turns) != 0 {
+		t.Fatalf("breaker allowed helper echo dispatch: inbound=%#v turns=%#v", state.InboundEvents, state.Turns)
+	}
+	if _, err := store.UnquarantineSession(context.Background(), teamstore.SessionUnquarantineRequest{SessionID: "s001"}); err != nil {
+		t.Fatalf("UnquarantineSession: %v", err)
+	}
+	restartedGraph := newBridgePollGraph(t, []bridgePollPage{{messages: messages}})
+	restarted := newBridgeTestBridge(restartedGraph, store, &recordingExecutor{})
+	restarted.registryPath = bridge.registryPath
+	persistedRegistry, err := LoadRegistry(bridge.registryPath)
+	if err != nil {
+		t.Fatalf("LoadRegistry: %v", err)
+	}
+	restarted.reg = persistedRegistry
+	if err := restarted.restoreRegistryFromStore(context.Background()); err != nil {
+		t.Fatalf("restore registry from durable store: %v", err)
+	}
+	var replayed []string
+	if _, err := restarted.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		replayed = append(replayed, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("poll after unquarantine: %v", err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("discarded breaker-window messages replayed after restart: %#v", replayed)
+	}
+}
+
+func TestOutboxEchoAttemptCacheRequiresUniqueInflightMatch(t *testing.T) {
+	bridge := &Bridge{}
+	now := time.Now()
+	body := "<p><strong>🔧 Helper:</strong></p><p>⚠️ Your request is queued.</p>"
+	plain := PlainTextFromTeamsHTML(body)
+	first := teamstore.OutboxMessage{ID: "out-1", TeamsChatID: "chat-1", LastSendAttempt: now}
+	second := teamstore.OutboxMessage{ID: "out-2", TeamsChatID: "chat-1", LastSendAttempt: now.Add(time.Millisecond)}
+	bridge.rememberOutboxEchoAttempt(first, body)
+	if match, ok := bridge.matchOutboxEchoAttempt("chat-1", plain, "teams-1", now); !ok || match.OutboxID != "out-1" {
+		t.Fatalf("single in-flight match = %#v ok=%v", match, ok)
+	}
+	bridge.rememberOutboxEchoAttempt(second, body)
+	if match, ok := bridge.matchOutboxEchoAttempt("chat-1", plain, "teams-2", now); ok {
+		t.Fatalf("ambiguous in-flight content matched %#v", match)
+	}
+	bridge.forgetOutboxEchoAttempt("out-1")
+	if match, ok := bridge.matchOutboxEchoAttempt("chat-1", plain, "teams-2", now); !ok || match.OutboxID != "out-2" {
+		t.Fatalf("remaining in-flight match = %#v ok=%v", match, ok)
+	}
+	bridge.retainAmbiguousOutboxEchoAttempt("out-2")
+	if ids := bridge.inFlightOutboxIDsForChat("chat-1"); len(ids) != 0 {
+		t.Fatalf("completed ambiguous attempt was treated as an active HTTP POST: %#v", ids)
+	}
+	if match, ok := bridge.matchOutboxEchoAttempt("chat-1", plain, "teams-2", now); !ok || match.OutboxID != "out-2" {
+		t.Fatalf("retained ambiguous attempt stopped matching inbound echo: %#v ok=%v", match, ok)
+	}
+	bounded := &Bridge{}
+	for i := 0; i < maxOutboxEchoAttempts+25; i++ {
+		bounded.rememberOutboxEchoAttempt(teamstore.OutboxMessage{ID: fmt.Sprintf("out-%04d", i), TeamsChatID: "chat-1", LastSendAttempt: now}, fmt.Sprintf("<p>body-%04d</p>", i))
+	}
+	if got := len(bounded.outboxEchoAttempts.Entries); got != maxOutboxEchoAttempts {
+		t.Fatalf("echo attempt cache size = %d, want hard cap %d", got, maxOutboxEchoAttempts)
+	}
+}
+
+func TestHelperEchoBreakerCountsDistinctIDsAndRequiresActiveDurableBinding(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{ID: "s001", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	bridge.reg.ControlChatID = ""
+	msg := bridgePollMessage("echo-1", "2026-07-03T01:05:00Z", "")
+	for i := 0; i < 4; i++ {
+		if suppress, err := bridge.noteUnprovenancedHelperEcho(ctx, "chat-1", msg); err != nil || !suppress {
+			t.Fatalf("duplicate observation %d: suppress=%v err=%v", i, suppress, err)
+		}
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after duplicates: %v", err)
+	}
+	if state.Sessions["s001"].Status != teamstore.SessionStatusActive {
+		t.Fatalf("duplicate Graph message IDs tripped breaker: %#v", state.Sessions["s001"])
+	}
+	for i := 2; i <= 3; i++ {
+		msg := bridgePollMessage(fmt.Sprintf("echo-%d", i), fmt.Sprintf("2026-07-03T01:05:0%dZ", i), "")
+		if suppress, err := bridge.noteUnprovenancedHelperEcho(ctx, "chat-1", msg); err != nil || !suppress {
+			t.Fatalf("distinct observation %d: suppress=%v err=%v", i, suppress, err)
+		}
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after distinct observations: %v", err)
+	}
+	if state.Sessions["s001"].Status != teamstore.SessionStatusQuarantined {
+		t.Fatalf("three distinct Graph IDs did not trip breaker: %#v", state.Sessions["s001"])
+	}
+
+	if _, err := store.UnquarantineSession(ctx, teamstore.SessionUnquarantineRequest{SessionID: "s001"}); err != nil {
+		t.Fatalf("UnquarantineSession: %v", err)
+	}
+	if err := store.UpdateSession(ctx, "s001", func(state *teamstore.State) error {
+		session := state.Sessions["s001"]
+		session.Status = teamstore.SessionStatusClosed
+		state.Sessions["s001"] = session
+		return nil
+	}); err != nil {
+		t.Fatalf("close durable session: %v", err)
+	}
+	bridge.setSessionQuarantineFence("s001", false)
+	if suppress, err := bridge.noteUnprovenancedHelperEcho(ctx, "chat-1", bridgePollMessage("echo-closed", "2026-07-03T01:06:00Z", "")); err != nil || suppress {
+		t.Fatalf("closed durable binding suppress=%v err=%v, want no breaker ownership", suppress, err)
+	}
+}
+
+func TestGraphSendChecksQuarantineFenceImmediatelyBeforePost(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	bridge := &Bridge{graph: graph}
+	bridge.setSessionQuarantineFence("s001", true)
+	_, err := bridge.sendOutboxHTMLWithoutRateLimitRetry(context.Background(), teamstore.OutboxMessage{
+		ID:          "out-1",
+		SessionID:   "s001",
+		TeamsChatID: "chat-1",
+		Body:        "must not send",
+	})
+	if err == nil || !strings.Contains(err.Error(), "quarantined before Graph send") {
+		t.Fatalf("send error = %v, want quarantine fence", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("Graph POST happened after quarantine fence: %#v", *sent)
+	}
+}
+
+func TestBridgeAmbiguousGraphPostKeepsOutboxUnderSendLease(t *testing.T) {
+	store := newBridgeTestStore(t)
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet {
+			w := httptest.NewRecorder()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"value":[]}`)
+			return w.Result(), nil
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages" {
+			return nil, errors.New("connection reset after request body")
+		}
+		t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		return nil, nil
+	})
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     &http.Client{Transport: transport},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	outbox, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{ID: "outbox:ambiguous", SessionID: "s001", TeamsChatID: "chat-1", Kind: "helper", Body: "ambiguous send"})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	if err := bridge.sendQueuedOutbox(context.Background(), outbox); err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("sendQueuedOutbox error = %v, want ambiguous transport error", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got := state.OutboxMessages[outbox.ID]
+	if got.Status != teamstore.OutboxStatusSending || got.SendAttemptToken == "" || !strings.Contains(got.LastSendError, "send lease") {
+		t.Fatalf("ambiguous outbox was not lease-fenced: %#v", got)
+	}
+	pending, err := store.PendingOutboxAt(context.Background(), got.LastSendAttempt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("PendingOutboxAt: %v", err)
+	}
+	for _, item := range pending {
+		if item.ID == outbox.ID {
+			t.Fatalf("ambiguous outbox became immediately retryable: %#v", pending)
+		}
+	}
+	rendered, _, _ := bridge.renderOutboxHTMLForSend(context.Background(), outbox)
+	if _, ok := bridge.matchOutboxEchoAttempt("chat-1", PlainTextFromTeamsHTML(rendered), "teams-recovered", time.Now()); !ok {
+		t.Fatal("ambiguous Graph send did not retain its bounded in-memory echo fingerprint")
+	}
+}
+
 func TestBridgeShouldIgnoreFreshStrongHelperControlOutput(t *testing.T) {
 	store := newBridgeTestStore(t)
 	graph, _ := newBridgeTestGraph(t)
@@ -31536,8 +31818,8 @@ func TestBridgeFlushPendingOutboxContinuesOtherChatsAfterSendFailure(t *testing.
 	if got := state.OutboxMessages["outbox:open"].Status; got != teamstore.OutboxStatusSent {
 		t.Fatalf("chat-2 outbox status = %q, want sent", got)
 	}
-	if got := state.OutboxMessages["outbox:failed"]; got.Status != teamstore.OutboxStatusQueued || got.LastSendError == "" {
-		t.Fatalf("chat-1 failed outbox = %#v, want queued with LastSendError", got)
+	if got := state.OutboxMessages["outbox:failed"]; got.Status != teamstore.OutboxStatusSending || !teamstore.OutboxSendIsAmbiguous(got) {
+		t.Fatalf("chat-1 failed outbox = %#v, want ambiguous sending lease", got)
 	}
 }
 

@@ -138,6 +138,8 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp teams probe-chat --chat <teams-chat-id-or-link>",
 		"cxp teams pause",
 		"cxp teams chat recreate <session-id> --yes",
+		"cxp teams chat quarantine <session-or-chat> --dry-run|--yes",
+		"cxp teams chat unquarantine <session-or-chat> --dry-run|--yes",
 		"cxp delegate resolve --query <text> --json",
 		"cxp delegate start --candidate-token <token> --task-file <path> --json",
 		"cxp delegate wait --id <delegation-id> --timeout <duration> --json",

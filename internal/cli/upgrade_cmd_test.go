@@ -736,6 +736,104 @@ func TestFinalizeHelperEntrypointsPreservesLogicalRecordThroughSymlinkedLocal(t 
 	}
 }
 
+func TestRepairRecordedHelperEntrypointsConvergesLegacyGoBinOnly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX managed alias convergence")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	home := filepath.Join(tmp, "home")
+	t.Setenv("HOME", home)
+	canonical := filepath.Join(home, ".local", "bin", "codex-proxy")
+	legacyTarget := filepath.Join(home, "go", "bin", "codex-proxy")
+	legacyCXP := filepath.Join(home, "go", "bin", "cxp")
+	unknown := filepath.Join(home, "bin", "cxp")
+	writeCLIFile(t, canonical, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	testExecutable, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	if err := copyExecutableAtomically(testExecutable, legacyTarget); err != nil {
+		t.Fatalf("copy legacy target fixture: %v", err)
+	}
+	if err := copyExecutableAtomically(testExecutable, legacyCXP); err != nil {
+		t.Fatalf("copy legacy cxp fixture: %v", err)
+	}
+	writeCLIFile(t, unknown, "#!/bin/sh\necho user-owned\n", 0o755)
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("DefaultRecordPath: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:  legacyTarget,
+		TargetState: string(managedinstall.StateManaged),
+		Version:     "1.2.3",
+		GOOS:        runtime.GOOS,
+		GOARCH:      runtime.GOARCH,
+		Shims:       []string{legacyCXP, unknown},
+	}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+	if errs := repairRecordedHelperEntrypointsForInstallPath(canonical); len(errs) != 0 {
+		t.Fatalf("repair errors: %v", errs)
+	}
+	for _, path := range []string{legacyTarget, legacyCXP} {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatalf("EvalSymlinks(%s): %v", path, err)
+		}
+		if resolvedCanonical, _ := filepath.EvalSymlinks(canonical); resolved != resolvedCanonical {
+			t.Fatalf("%s resolved to %s, want %s", path, resolved, resolvedCanonical)
+		}
+	}
+	data, err := os.ReadFile(unknown)
+	if err != nil {
+		t.Fatalf("read unknown binary: %v", err)
+	}
+	if !strings.Contains(string(data), "user-owned") {
+		t.Fatalf("recorded path repurposed by the user was modified: %q", data)
+	}
+}
+
+func TestRepairRecordedHelperEntrypointsSkipsNonManagedRecord(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX managed alias convergence")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	home := filepath.Join(tmp, "home")
+	t.Setenv("HOME", home)
+	canonical := filepath.Join(home, ".local", "bin", "codex-proxy")
+	explicit := filepath.Join(home, "custom", "codex-proxy")
+	writeCLIFile(t, canonical, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	writeCLIFile(t, explicit, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		t.Fatalf("DefaultRecordPath: %v", err)
+	}
+	if err := managedinstall.SaveRecord(recordPath, managedinstall.Record{
+		TargetPath:  explicit,
+		TargetState: string(managedinstall.StateExplicit),
+		Version:     "1.2.3",
+		GOOS:        runtime.GOOS,
+	}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+	if errs := repairRecordedHelperEntrypointsForInstallPath(canonical); len(errs) != 0 {
+		t.Fatalf("repair errors: %v", errs)
+	}
+	if info, err := os.Lstat(explicit); err != nil {
+		t.Fatalf("Lstat explicit target: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("explicit non-managed target was rewritten as a symlink: %s", explicit)
+	}
+	if out, err := exec.Command(explicit, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.3") {
+		t.Fatalf("explicit target changed: out=%q err=%v", out, err)
+	}
+}
+
 func TestFinalizeHelperEntrypointsRepairsAndVerifiesCXPEntrypointVersion(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX cxp entrypoint verification")

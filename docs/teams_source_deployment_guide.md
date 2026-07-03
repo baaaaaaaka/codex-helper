@@ -465,6 +465,36 @@ Use `recover --force` only when you are sure the old helper process is gone.
 For a single command that intentionally interrupts local active state before
 restarting, use `codex-proxy teams service restart --force`.
 
+For one Work chat that was contained after repeated helper self-echo, resolve
+the exact scope/store before changing it:
+
+```sh
+cxp teams chat quarantine <session-or-chat> --dry-run
+cxp teams chat quarantine <session-or-chat> --yes --reason "operator containment"
+cxp teams chat unquarantine <session-or-chat> --dry-run
+cxp teams chat unquarantine <session-or-chat> --yes
+```
+
+These commands refuse an active helper owner and require `--scope` or `--store`
+when the selector matches more than one durable store. Unquarantine resumes
+polling but never replays interrupted turns, ignored inbound events, or skipped
+outbox rows.
+
+The running bridge also contains self-echo automatically. It first uses exact
+Graph message provenance, then a bounded 1,024-entry in-memory fingerprint
+cache for a POST whose response is still in flight or ambiguous. There is no
+background scanner or cleanup ticker. Ambiguous background sends stay under
+the existing two-minute send lease so the next Graph recovery read can find an
+accepted message before any retry; explicit operator/user retries may supersede
+only non-critical output, while final answers and attachments remain fenced.
+
+If three distinct, fresh, unprovenanced helper-output messages appear in one
+Work chat within 60 seconds, the bridge quarantines only that durable session.
+The quarantine transaction interrupts queued/running turns, ignores pending
+inbound work, skips unsent output, parks polling, and preserves only a Graph
+POST that is actively in flight. A control-chat warning identifies the session;
+the unsafe Work chat receives no further warning message.
+
 ## 13. Troubleshooting
 
 No control chat in Teams:

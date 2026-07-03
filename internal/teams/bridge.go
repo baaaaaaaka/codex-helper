@@ -442,6 +442,12 @@ type Bridge struct {
 	runningTurnCancels                map[string]*runningTurnCancel
 	acceptedOutboxMu                  sync.Mutex
 	acceptedOutboxes                  map[string]acceptedOutboxRecovery
+	outboxEchoAttemptMu               sync.Mutex
+	outboxEchoAttempts                outboxEchoAttemptCache
+	helperEchoBreakerMu               sync.Mutex
+	helperEchoBreakers                map[string]helperEchoBreakerWindow
+	quarantinedSessionMu              sync.RWMutex
+	quarantinedSessions               map[string]bool
 	globalOutboundMu                  sync.Mutex
 	globalOutboundBackfilled          bool
 	deferredNoticeMu                  sync.Mutex
@@ -1846,6 +1852,25 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if handled && activityAt.IsZero() {
 		activityAt = time.Now()
 	}
+	if session := b.reg.SessionByChatID(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
+		_, err := b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, maxModified, true, false, fetched, "", func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
+			return teamstore.ChatPollScheduleUpdate{
+				ChatID:                chatID,
+				PollState:             inboundPollStateParked,
+				PreviousPollState:     poll.PreviousPollState,
+				ClearBlockedUntil:     true,
+				ClearContinuationPath: true,
+				ResetFailures:         true,
+			}, nil
+		})
+		if err == nil {
+			// Persist the bounded seen-ID projection immediately. The durable poll
+			// cursor plus this overlap ledger ensures messages discarded from the
+			// breaker window cannot be replayed after a crash or unquarantine.
+			err = b.Save()
+		}
+		return handled, err
+	}
 	_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, fetched, continuationPath, activityAt)
 	return handled, err
 }
@@ -1879,6 +1904,10 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 	}
 	actions := 0
 	for i, msg := range msgs {
+		if session := b.reg.SessionByChatID(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
+			b.markRegistrySeen(chatID, msg.ID)
+			continue
+		}
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
 		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
 		if err != nil {
@@ -3074,6 +3103,15 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 	if role != inboundPollRoleWork && !messageAuthoredByCurrentUser(msg, b.user) {
 		return true, nil
 	}
+	authoredByCurrentUser := messageAuthoredByCurrentUser(msg, b.user)
+	plainText := ""
+	renderedOutputCandidate := false
+	if authoredByCurrentUser {
+		plainText = PlainTextFromTeamsHTML(msg.Body.Content)
+		renderedOutputCandidate = looksLikeRenderedOutboxPlainText(plainText) ||
+			looksLikeRenderedHelperGeneratedOutputPlainText(plainText) ||
+			looksLikeRenderedHelperOutputMessage(msg, plainText)
+	}
 	if b.store != nil {
 		lookup, err := b.store.MessageLookup(ctx, chatID, msg.ID)
 		if err != nil {
@@ -3095,7 +3133,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			b.markRegistrySent(chatID, msg.ID)
 			return true, nil
 		}
-		if messageAuthoredByCurrentUser(msg, b.user) {
+		if authoredByCurrentUser {
 			delivered, err := b.hasGlobalOutboundMessage(ctx, chatID, msg.ID)
 			if err != nil {
 				return false, err
@@ -3115,15 +3153,20 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 					return true, nil
 				}
 			}
-		}
-		if legacyGeneratedOutputFallback {
-			delivered, err := b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg)
-			if err != nil {
-				return false, err
-			}
-			if delivered {
-				b.markRegistrySent(chatID, msg.ID)
-				return true, nil
+			if renderedOutputCandidate {
+				if attempt, ok := b.matchOutboxEchoAttempt(chatID, plainText, msg.ID, chatMessageActivityTime(msg)); ok {
+					b.markRegistrySent(chatID, msg.ID)
+					b.rememberAcceptedOutbox(attempt.OutboxID, msg.ID)
+					return true, nil
+				}
+				delivered, err := b.hasDeliveredOutboxMessageByRenderedContent(ctx, chatID, msg, plainText, legacyGeneratedOutputFallback)
+				if err != nil {
+					return false, err
+				}
+				if delivered {
+					b.markRegistrySent(chatID, msg.ID)
+					return true, nil
+				}
 			}
 		}
 	}
@@ -3131,22 +3174,42 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	plainText := PlainTextFromTeamsHTML(msg.Body.Content)
-	if messageAuthoredByCurrentUser(msg, b.user) && graphMessageContainsFreezeNotice(msg, "") {
+	if authoredByCurrentUser && graphMessageContainsFreezeNotice(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedOutboxOutputMessage(msg, plainText) {
+	if authoredByCurrentUser && looksLikeRenderedOutboxOutputMessage(msg, plainText) {
+		if !legacyGeneratedOutputFallback && role == inboundPollRoleWork {
+			if _, err := b.noteUnprovenancedHelperEcho(ctx, chatID, msg); err != nil {
+				return false, err
+			}
+		}
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if role == inboundPollRoleControl && messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
+	if authoredByCurrentUser && looksLikeRenderedHelperLifecycleOutputMessage(msg, plainText) {
+		suppress, err := b.shouldSuppressUnprovenancedHelperEcho(ctx, chatID, msg, role, legacyGeneratedOutputFallback)
+		if err != nil {
+			return false, err
+		}
+		if suppress {
+			b.markRegistrySent(chatID, msg.ID)
+			return true, nil
+		}
+	}
+	if role == inboundPollRoleControl && authoredByCurrentUser && looksLikeRenderedHelperOutputMessage(msg, plainText) {
 		b.markRegistrySent(chatID, msg.ID)
 		return true, nil
 	}
-	if role == inboundPollRoleControl && messageAuthoredByCurrentUser(msg, b.user) && looksLikeRenderedHelperOutputMessage(msg, plainText) {
-		b.markRegistrySent(chatID, msg.ID)
-		return true, nil
+	if authoredByCurrentUser && looksLikeRenderedHelperGeneratedOutputPlainText(plainText) {
+		suppress, err := b.shouldSuppressUnprovenancedHelperEcho(ctx, chatID, msg, role, legacyGeneratedOutputFallback)
+		if err != nil {
+			return false, err
+		}
+		if suppress {
+			b.markRegistrySent(chatID, msg.ID)
+			return true, nil
+		}
 	}
 	if legacyGeneratedOutputFallback && role == inboundPollRoleControl && looksLikeRenderedHelperOutputPlainText(plainText) {
 		b.markRegistrySent(chatID, msg.ID)
@@ -3412,8 +3475,7 @@ func normalizedTeamsAttachmentID(id string) string {
 	return strings.ToLower(strings.TrimSpace(id))
 }
 
-func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context, chatID string, msg ChatMessage) (bool, error) {
-	incomingPlain := PlainTextFromTeamsHTML(msg.Body.Content)
+func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context, chatID string, msg ChatMessage, incomingPlain string, allowSettled bool) (bool, error) {
 	if !looksLikeRenderedOutboxPlainText(incomingPlain) {
 		return false, nil
 	}
@@ -3421,25 +3483,46 @@ func (b *Bridge) hasDeliveredOutboxMessageByRenderedContent(ctx context.Context,
 	if incomingKey == "" {
 		return false, nil
 	}
-	state, err := b.store.OutboxStateSnapshot(ctx)
+	candidates, err := b.store.RecentOutboxEchoCandidates(ctx, teamstore.OutboxEchoCandidateQuery{
+		TeamsChatID:    chatID,
+		LimitPerStatus: 8,
+	})
 	if err != nil {
 		return false, err
 	}
-	for _, outbox := range state.OutboxMessages {
+	activityAt := chatMessageActivityTime(msg)
+	var matches []teamstore.OutboxMessage
+	for _, outbox := range candidates {
 		if outbox.TeamsChatID != chatID || !outboxMayHaveReachedTeams(outbox) {
 			continue
+		}
+		if !allowSettled && outbox.Status != teamstore.OutboxStatusSending {
+			continue
+		}
+		if outbox.Status == teamstore.OutboxStatusSending && !activityAt.IsZero() && !outbox.LastSendAttempt.IsZero() {
+			if activityAt.Before(outbox.LastSendAttempt.Add(-outboxEchoActivitySkew)) || activityAt.After(outbox.LastSendAttempt.Add(outboxEchoAttemptTTL)) {
+				continue
+			}
 		}
 		if !outboxRenderedPlainTextMatches(outbox, b.user, incomingKey) {
 			continue
 		}
-		if outbox.TeamsMessageID == "" && msg.ID != "" {
-			if _, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID); err != nil {
-				return false, err
-			}
-		}
-		return true, nil
+		matches = append(matches, outbox)
 	}
-	return false, nil
+	if len(matches) != 1 {
+		return false, nil
+	}
+	matched := matches[0]
+	if existing := strings.TrimSpace(matched.TeamsMessageID); existing != "" {
+		return existing == strings.TrimSpace(msg.ID), nil
+	}
+	if strings.TrimSpace(msg.ID) == "" {
+		return false, nil
+	}
+	if _, err := b.store.MarkOutboxSent(ctx, matched.ID, msg.ID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func outboxRenderedPlainTextMatches(outbox teamstore.OutboxMessage, owner User, incomingKey string) bool {
@@ -3598,6 +3681,7 @@ func looksLikeRenderedHelperLifecycleOutputPlainText(text string) bool {
 		"❓ Codex received your control-chat question.",
 		"⚠️ Your request is queued.",
 		"▶️ Codex is starting this queued request.",
+		"Duplicate request ignored.",
 		"💬 Work chat is ready.",
 		"✅ Codex finished responding.",
 		"🔁 Helper reload started",
@@ -7015,7 +7099,7 @@ func (b *Bridge) queueControlFallbackAck(ctx context.Context, session *Session, 
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams control ACK send error: %v\n", err)
 	}
 	return nil
@@ -8086,7 +8170,7 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams ACK send error: %v\n", err)
 	}
 	return nil
@@ -11862,7 +11946,7 @@ func (b *Bridge) sendDeferredServiceControlNotice(ctx context.Context, chatID st
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams deferred ACK send error: %v\n", err)
 	}
 	return nil
@@ -11897,7 +11981,7 @@ func (b *Bridge) sendExternalDeferredReceipt(ctx context.Context, chatID string,
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams external receipt send error: %v\n", err)
 	}
 	return nil
@@ -13038,11 +13122,12 @@ func (b *Bridge) flushPendingOutboxForChat(ctx context.Context, chatID string) e
 }
 
 func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID string, turnID string, chatID string) error {
-	return b.flushPendingOutboxFilteredWithOptions(ctx, sessionID, turnID, chatID, outboxFlushOptions{})
+	return b.flushPendingOutboxFilteredWithOptions(ctx, sessionID, turnID, chatID, outboxFlushOptions{AllowAmbiguousRetry: true})
 }
 
 type outboxFlushOptions struct {
-	MaxMessages int
+	MaxMessages         int
+	AllowAmbiguousRetry bool
 }
 
 func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, opts outboxFlushOptions) error {
@@ -13082,7 +13167,7 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
 			})
 			for _, msg := range pending {
-				if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, SentSideEffects: &sentSideEffects}); err != nil {
+				if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: opts.AllowAmbiguousRetry, SentSideEffects: &sentSideEffects}); err != nil {
 					if isOutboxDeliveryDeferred(err) {
 						if firstBlockedErr == nil {
 							firstBlockedErr = err
@@ -13125,12 +13210,13 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 }
 
 func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
-	return b.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true})
+	return b.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true})
 }
 
 type outboxSendOptions struct {
 	RespectRateLimitBlock bool
 	RecordRateLimit       bool
+	AllowAmbiguousRetry   bool
 	SentSideEffects       *[]sentOutboxSideEffect
 }
 
@@ -13251,6 +13337,20 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 		return err
 	}
+	if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(outbox) && !teamstore.OutboxDeliveryProtected(outbox) {
+		if teamstore.OutboxDeliveryTransient(outbox) {
+			if _, err := b.store.MarkOutboxSkippedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "ambiguous transient output superseded by explicit progress"); err != nil {
+				return err
+			}
+			b.forgetOutboxEchoAttempt(outbox.ID)
+			return nil
+		}
+		var err error
+		outbox, err = b.store.MarkOutboxSendErrorForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "explicit retry released ambiguous send lease")
+		if err != nil {
+			return err
+		}
+	}
 	if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
 		if err != nil && opts.RecordRateLimit {
 			b.recordGraphReadRateLimit(context.Background(), outbox.TeamsChatID, err)
@@ -13265,7 +13365,22 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	if earlier, ok, err := b.store.EarlierUnsentOutbox(ctx, outbox); err != nil {
 		return err
 	} else if ok {
-		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(earlier.LastSendAttempt, earlier.CreatedAt)}
+		if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(earlier) && isTranscriptImportBatchOutboxKind(earlier.Kind) {
+			if err := b.sendQueuedOutboxWithOptions(ctx, earlier, opts); err != nil {
+				return err
+			}
+		} else if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(earlier) && !teamstore.OutboxDeliveryProtected(earlier) {
+			reason := "ambiguous output superseded by explicit later outbox"
+			if teamstore.OutboxDeliveryTransient(earlier) {
+				reason = "ambiguous transient output superseded by later outbox"
+			}
+			if _, err := b.store.MarkOutboxSkippedForAttempt(ctx, earlier.ID, earlier.SendAttemptToken, reason); err != nil {
+				return err
+			}
+			b.forgetOutboxEchoAttempt(earlier.ID)
+		} else {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(earlier.LastSendAttempt, earlier.CreatedAt)}
+		}
 	}
 	if err := b.waitForOutboxSendPace(ctx, outbox.TeamsChatID); err != nil {
 		return err
@@ -13277,10 +13392,14 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	}
 	outbox = b.suppressQueuedOutboxOwnerMentionForWorkflow(ctx, claimed)
+	if b.sessionQuarantineFenced(outbox.SessionID) {
+		_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "session quarantined before Graph send")
+		return nil
+	}
 	if outbox.DriveItemID == "" && outbox.AttachmentPath != "" {
 		item, err := b.uploadQueuedOutboxAttachment(ctx, outbox)
 		if err != nil {
-			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+			_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
 			if opts.RecordRateLimit {
 				b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
 			}
@@ -13294,7 +13413,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	if outbox.DriveItemID != "" && driveItemAttachmentID(driveItemFromOutbox(outbox)) == "" {
 		item, err := b.refreshOutboxDriveItemMetadata(ctx, outbox)
 		if err != nil {
-			_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+			_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
 			if opts.RecordRateLimit {
 				b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
 			}
@@ -13304,6 +13423,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		if err != nil {
 			return err
 		}
+	}
+	if b.sessionQuarantineFenced(outbox.SessionID) {
+		_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "session quarantined before Graph POST")
+		return nil
 	}
 	var msg ChatMessage
 	if outbox.DriveItemID != "" {
@@ -13337,7 +13460,13 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 	}
 	if err != nil {
-		_, _ = b.store.MarkOutboxSendError(context.Background(), outbox.ID, err.Error())
+		if definitiveGraphSendFailure(err) {
+			b.forgetOutboxEchoAttempt(outbox.ID)
+			_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
+		} else {
+			b.retainAmbiguousOutboxEchoAttempt(outbox.ID)
+			_, _ = b.store.MarkOutboxAmbiguousSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
+		}
 		if opts.RecordRateLimit {
 			b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
 		}
@@ -13353,11 +13482,12 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	} else {
 		globalOutboundRecorded = true
 	}
-	if _, err := b.store.MarkOutboxAccepted(ctx, outbox.ID, msg.ID); err != nil {
+	if _, err := b.store.MarkOutboxAcceptedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID); err != nil {
 		return err
 	}
-	sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
+	sent, err := b.store.MarkOutboxSentForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID)
 	if err == nil {
+		b.forgetOutboxEchoAttempt(outbox.ID)
 		b.forgetAcceptedOutbox(outbox.ID)
 		b.recordSentOutboxSideEffectWithOptions(ctx, sent, msg, opts, sentOutboxSideEffectOptions{GlobalOutboundRecorded: globalOutboundRecorded})
 	}
@@ -13368,7 +13498,11 @@ func (b *Bridge) sendOutboxQuoteReplyWithoutRateLimitRetry(ctx context.Context, 
 	if b == nil || b.graph == nil {
 		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
 	}
+	if b.sessionQuarantineFenced(outbox.SessionID) {
+		return ChatMessage{}, fmt.Errorf("session %q quarantined before Graph quote reply", outbox.SessionID)
+	}
 	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	b.rememberOutboxEchoAttempt(outbox, body)
 	if len(hosted) > 0 {
 		msg, err := b.graph.SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outbox.QuoteReplyToMessageID, body, mentions, hosted)
 		if err != nil {
@@ -13383,7 +13517,11 @@ func (b *Bridge) sendOutboxHTMLWithoutRateLimitRetry(ctx context.Context, outbox
 	if b == nil || b.graph == nil {
 		return ChatMessage{}, fmt.Errorf("Graph client is not configured")
 	}
+	if b.sessionQuarantineFenced(outbox.SessionID) {
+		return ChatMessage{}, fmt.Errorf("session %q quarantined before Graph send", outbox.SessionID)
+	}
 	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	b.rememberOutboxEchoAttempt(outbox, body)
 	if len(hosted) > 0 {
 		msg, err := b.graph.SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions, hosted)
 		if err != nil {
@@ -13425,7 +13563,7 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 	if b == nil || b.store == nil || b.readClient() == nil || strings.TrimSpace(outbox.ID) == "" || strings.TrimSpace(outbox.TeamsChatID) == "" {
 		return false, nil
 	}
-	if outbox.Status != teamstore.OutboxStatusSending || strings.TrimSpace(outbox.LastSendError) != "" {
+	if outbox.Status != teamstore.OutboxStatusSending || strings.TrimSpace(outbox.LastSendError) != "" && !teamstore.OutboxSendIsAmbiguous(outbox) {
 		return false, nil
 	}
 	if strings.TrimSpace(outbox.TeamsMessageID) != "" || outbox.LastSendAttempt.IsZero() {
@@ -14192,14 +14330,24 @@ func (b *Bridge) formatSessionList(ctx context.Context) string {
 		active[i], active[j] = active[j], active[i]
 	}
 	closedCount := 0
+	var quarantined []Session
 	for _, session := range b.reg.Sessions {
-		if !isActiveSessionStatus(session.Status) {
+		if strings.TrimSpace(session.Status) == string(teamstore.SessionStatusQuarantined) {
+			quarantined = append(quarantined, session)
+		} else if !isActiveSessionStatus(session.Status) {
 			closedCount++
 		}
 	}
 	if len(active) == 0 {
-		if closedCount > 0 {
-			return fmt.Sprintf("Control status: no active linked work chats. %d closed work chat(s) are hidden because the helper no longer polls them.\n\n%s\n\nSend `projects` to choose a workspace, `new <directory>` to create a Work chat, or `sessions` then `continue <number>` to import an existing local Codex session.", closedCount, teamsASRStatusLine(b.asrTranscriber))
+		if len(quarantined) > 0 || closedCount > 0 {
+			lines := []string{"Control status: no active linked work chats."}
+			lines = append(lines, quarantinedSessionStatusLines(quarantined)...)
+			if closedCount > 0 {
+				lines = append(lines, fmt.Sprintf("%d closed work chat(s) are hidden because the helper no longer polls them.", closedCount))
+			}
+			lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
+			lines = append(lines, "Send `projects` to choose a workspace, `new <directory>` to create a Work chat, or `sessions` then `continue <number>` to import an existing local Codex session.")
+			return strings.Join(lines, "\n\n")
 		}
 		return "Control status: no linked work chats yet.\n\n" + teamsASRStatusLine(b.asrTranscriber) + "\n\nNext: send `projects` to choose a workspace, or `new <directory>` to create a Work chat."
 	}
@@ -14227,9 +14375,22 @@ func (b *Bridge) formatSessionList(ctx context.Context) string {
 	if closedCount > 0 {
 		lines = append(lines, fmt.Sprintf("%d closed work chat(s) hidden. The helper no longer reads or responds in closed chats.", closedCount))
 	}
+	lines = append(lines, quarantinedSessionStatusLines(quarantined)...)
 	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
 	lines = append(lines, "Next: open one of these Teams chats to continue work, or send `new <directory>` to create another Work chat.")
 	return strings.Join(lines, "\n")
+}
+
+func quarantinedSessionStatusLines(sessions []Session) []string {
+	if len(sessions) == 0 {
+		return nil
+	}
+	lines := []string{"## ⚠️ Quarantined Work chats"}
+	for _, session := range sessions {
+		label := strings.TrimSpace(firstNonEmptyString(session.UserTitle, session.Topic, session.ID))
+		lines = append(lines, fmt.Sprintf("- **%s** — session `%s`; inspect locally, then run `cxp teams chat unquarantine %s --yes` only when safe.", label, session.ID, session.ID))
+	}
+	return lines
 }
 
 func (b *Bridge) workChatPollsSnapshot(ctx context.Context) map[string]teamstore.ChatPollState {

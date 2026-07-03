@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"io"
@@ -756,10 +757,78 @@ func finalizeHelperUpdateResult(res update.ApplyResult, out io.Writer) error {
 	if err := verifyFreshHelperEntrypointVersion(ctx, res.InstallPath, res.Version, "stable cxp entrypoint"); err != nil {
 		return err
 	}
+	if !strings.EqualFold(runtime.GOOS, "windows") {
+		if errs := repairRecordedHelperEntrypointsForInstallPath(res.InstallPath); len(errs) > 0 {
+			for _, err := range errs {
+				_, _ = fmt.Fprintf(out, "Warning: failed to converge recorded legacy cxp entrypoint: %v\n", err)
+			}
+			return fmt.Errorf("updated helper runtime is active, but recorded legacy cxp entrypoint convergence failed: %w", errors.Join(errs...))
+		}
+	}
 	// Keep the legacy install record valid for old updaters while all new
 	// executions converge through the stable cxp entry and active runtime.
 	saveCLIManagedInstallRecordBestEffort(res.InstallPath, res.Version)
 	return nil
+}
+
+func repairRecordedHelperEntrypointsForInstallPath(installPath string) []error {
+	recordPath, err := managedinstall.DefaultRecordPath()
+	if err != nil {
+		return nil
+	}
+	record, err := managedinstall.LoadRecord(recordPath)
+	if err != nil {
+		return nil
+	}
+	if state := strings.TrimSpace(record.TargetState); state != "" && state != string(managedinstall.StateManaged) {
+		return nil
+	}
+	if goos := strings.TrimSpace(record.GOOS); goos != "" && !strings.EqualFold(goos, runtime.GOOS) {
+		return nil
+	}
+	var aliases []helperEntrypointAlias
+	if path := strings.TrimSpace(record.TargetPath); path != "" {
+		aliases = append(aliases, helperEntrypointAlias{path: path, description: "recorded legacy install target", create: true})
+		if strings.EqualFold(filepath.Base(path), helperpath.BinaryName(runtime.GOOS)) {
+			aliases = append(aliases, helperEntrypointAlias{path: filepath.Join(filepath.Dir(path), "cxp"), description: "recorded legacy install shim", create: true})
+		}
+	}
+	for _, shim := range record.Shims {
+		aliases = append(aliases, helperEntrypointAlias{path: shim, description: "recorded legacy install shim", create: true})
+	}
+	var errs []error
+	for _, alias := range dedupeHelperEntrypointAliases(aliases) {
+		if owned, err := recordedHelperEntrypointLooksManaged(alias.path); err != nil {
+			errs = append(errs, fmt.Errorf("verify %s %s before repair: %w", alias.description, alias.path, err))
+			continue
+		} else if !owned {
+			continue
+		}
+		if err := repairHelperEntrypointAlias(installPath, alias); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func recordedHelperEntrypointLooksManaged(path string) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, nil
+	}
+	probe := helperpath.ProbePath(path, helperpath.Options{GOOS: runtime.GOOS})
+	if !probe.Exists {
+		return true, nil
+	}
+	if probe.IsDir || !probe.Executable || !probe.PlausibleHelperEntry {
+		return false, nil
+	}
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	const modulePath = "github.com/baaaaaaaka/codex-helper"
+	return strings.HasPrefix(strings.TrimSpace(info.Path), modulePath+"/") || strings.TrimSpace(info.Main.Path) == modulePath, nil
 }
 
 func helperUpdateExecutionPath(res update.ApplyResult) string {
