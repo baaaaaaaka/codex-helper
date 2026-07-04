@@ -172,7 +172,7 @@ func TestBridgeSendsMathCodeAndInlineHostedPNGAtomically(t *testing.T) {
 		ID:               "outbox:turn-math:final",
 		TeamsChatID:      "chat-1",
 		Kind:             "final",
-		Body:             `Pythagoras: <m>x_i^2+y_i^2=r^2</m>`,
+		Body:             "Pythagoras:\n\n<m>x_i^2+y_i^2=r^2</m>",
 		NotificationKind: "turn_completed",
 		PartIndex:        1,
 		PartCount:        1,

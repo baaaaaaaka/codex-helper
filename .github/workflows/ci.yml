@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   teams-math-runtime:
-    name: Teams inline math runtime (${{ matrix.os }})
+    name: Teams math and managed font runtime (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -32,13 +32,13 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Trusted TeX, Hosted Content, and cache regressions
+      - name: Trusted TeX, Hosted Content, managed font, and cache regressions
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/teams -count=1 -run 'Math|HostedContent' -v
 
-      - name: Actual MathJax and resvg on-demand runtime
+      - name: Actual MathJax, resvg, and managed font runtime
         shell: bash
         run: |
           set -euo pipefail

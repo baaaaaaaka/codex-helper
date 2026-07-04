@@ -5,14 +5,26 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"hash/crc32"
+	"image"
 	"image/png"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+type offlineTeamsMathHTTPClient struct {
+	calls int
+}
+
+func (c *offlineTeamsMathHTTPClient) Do(*http.Request) (*http.Response, error) {
+	c.calls++
+	return nil, errors.New("network must not be used")
+}
 
 func TestManagedTeamsMathRendererLive(t *testing.T) {
 	if os.Getenv("CODEX_HELPER_TEST_TEAMS_MATH_RUNTIME") != "1" {
@@ -25,6 +37,8 @@ func TestManagedTeamsMathRendererLive(t *testing.T) {
 		{Index: 1, Source: `N_1=\operatorname{RMSNorm}(X)`},
 		{Index: 2, Source: `A_h=\frac{\widetilde{\exp}(\alpha S_h)}{\sum_j\widetilde{\exp}(\alpha S_{h,ij})}`},
 		{Index: 3, Source: `N_1=\operatorname{RMSNorm}(X)`},
+		{Index: 4, Source: `\text{中文}+x`},
+		{Index: 5, Source: `\phantom{\text{中文}}+x`},
 	}
 	assets := renderer.Render(ctx, spans)
 	if len(assets) != len(spans) {
@@ -34,21 +48,36 @@ func TestManagedTeamsMathRendererLive(t *testing.T) {
 		if asset.Error != "" || !validTeamsMathPNG(asset.PNG) {
 			t.Fatalf("asset %d failed: error=%q bytes=%d", i, asset.Error, len(asset.PNG))
 		}
-		image, err := png.Decode(bytes.NewReader(asset.PNG))
-		if err != nil || image.Bounds().Dx() <= 0 || image.Bounds().Dy() <= 0 {
+		decoded, err := png.Decode(bytes.NewReader(asset.PNG))
+		if err != nil || decoded.Bounds().Dx() <= 0 || decoded.Bounds().Dy() <= 0 {
 			t.Fatalf("asset %d is not a decodable non-empty PNG: %v", i, err)
 		}
+		nonWhiteBounds := image.Rectangle{}
 		nonWhite := 0
-		for y := image.Bounds().Min.Y; y < image.Bounds().Max.Y; y++ {
-			for x := image.Bounds().Min.X; x < image.Bounds().Max.X; x++ {
-				r, g, b, a := image.At(x, y).RGBA()
+		for y := decoded.Bounds().Min.Y; y < decoded.Bounds().Max.Y; y++ {
+			for x := decoded.Bounds().Min.X; x < decoded.Bounds().Max.X; x++ {
+				r, g, b, a := decoded.At(x, y).RGBA()
 				if a != 0 && (r < 0xffff || g < 0xffff || b < 0xffff) {
+					pixel := image.Rect(x, y, x+1, y+1)
+					if nonWhite == 0 {
+						nonWhiteBounds = pixel
+					} else {
+						nonWhiteBounds = nonWhiteBounds.Union(pixel)
+					}
 					nonWhite++
 				}
 			}
 		}
 		if nonWhite < 10 {
 			t.Fatalf("asset %d appears blank: non-white pixels=%d", i, nonWhite)
+		}
+		topMargin := nonWhiteBounds.Min.Y - decoded.Bounds().Min.Y
+		bottomMargin := decoded.Bounds().Max.Y - nonWhiteBounds.Max.Y
+		if decoded.Bounds().Dy() < 128 {
+			t.Fatalf("asset %d is too low-resolution: bounds=%v", i, decoded.Bounds())
+		}
+		if topMargin < 24 || bottomMargin < 24 {
+			t.Fatalf("asset %d has insufficient vertical padding: top=%d bottom=%d bounds=%v content=%v", i, topMargin, bottomMargin, decoded.Bounds(), nonWhiteBounds)
 		}
 	}
 	if bytes.Equal(assets[0].PNG, assets[1].PNG) {
@@ -57,12 +86,28 @@ func TestManagedTeamsMathRendererLive(t *testing.T) {
 	if !bytes.Equal(assets[0].PNG, assets[2].PNG) {
 		t.Fatal("duplicate TeX sources did not share the same rendered PNG")
 	}
+	if bytes.Equal(assets[3].PNG, assets[4].PNG) {
+		t.Fatal("Chinese glyphs rendered identically to a phantom; the managed font was not applied")
+	}
+	fontAsset := defaultTeamsMathFontAssets[0]
+	fontPath := filepath.Join(managedTeamsMathFontDir(renderer.cacheRoot, fontAsset), fontAsset.Filename)
+	fontInfo, err := os.Stat(fontPath)
+	if err != nil {
+		t.Fatalf("managed Chinese font was not installed: %v", err)
+	}
+	if fontInfo.Size() != fontAsset.Size || fontInfo.Size() > 12*1024*1024 {
+		t.Fatalf("managed Chinese font size=%d, want exact %d and no more than 12 MiB", fontInfo.Size(), fontAsset.Size)
+	}
+	licenseInfo, err := os.Stat(filepath.Join(managedTeamsMathFontDir(renderer.cacheRoot, fontAsset), "LICENSE.txt"))
+	if err != nil || !licenseInfo.Mode().IsRegular() || licenseInfo.Size() == 0 {
+		t.Fatalf("managed Chinese font license is missing: info=%v err=%v", licenseInfo, err)
+	}
 	entries, err := os.ReadDir(filepath.Join(renderer.cacheRoot, "png"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("cached PNG files = %d, want 2 unique sources", len(entries))
+	if len(entries) != 4 {
+		t.Fatalf("cached PNG files = %d, want 4 unique sources", len(entries))
 	}
 	second := renderer.Render(ctx, spans)
 	for i, asset := range second {
@@ -70,9 +115,19 @@ func TestManagedTeamsMathRendererLive(t *testing.T) {
 			t.Fatalf("cached asset %d failed: error=%q bytes=%d", i, asset.Error, len(asset.PNG))
 		}
 	}
+	offlineClient := &offlineTeamsMathHTTPClient{}
+	restarted := &managedTeamsMathRenderer{cacheRoot: renderer.cacheRoot, fontHTTPClient: offlineClient}
+	offline := restarted.Render(ctx, []teamsMathSpan{{Index: 7, Source: `\text{中文离线}+y`}})
+	if len(offline) != 1 || offline[0].Error != "" || !validTeamsMathPNG(offline[0].PNG) || offlineClient.calls != 0 {
+		t.Fatalf("restarted offline font reuse = %#v network_calls=%d", offline, offlineClient.calls)
+	}
 	invalid := renderer.Render(ctx, []teamsMathSpan{{Index: 3, Source: `\definitelyUnknownCommand{}`}})
 	if len(invalid) != 1 || invalid[0].Error == "" || len(invalid[0].PNG) != 0 {
 		t.Fatalf("invalid TeX result = %#v", invalid)
+	}
+	unsupported := renderer.Render(ctx, []teamsMathSpan{{Index: 6, Source: `\text{العربية}+x`}})
+	if len(unsupported) != 1 || unsupported[0].Error == "" || len(unsupported[0].PNG) != 0 {
+		t.Fatalf("unsupported external text must fail without a tofu PNG: %#v", unsupported)
 	}
 }
 
@@ -98,7 +153,7 @@ func TestManagedTeamsMathRendererRejectsTooManyFormulasBeforeRuntimeLookup(t *te
 			return "", os.ErrNotExist
 		},
 	}
-	spans := make([]teamsMathSpan, maxTeamsMathPerMessage+1)
+	spans := make([]teamsMathSpan, maxTeamsMathImagesPerMessage+1)
 	for i := range spans {
 		spans[i] = teamsMathSpan{Index: i + 1, Source: "x"}
 	}

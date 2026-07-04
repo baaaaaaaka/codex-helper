@@ -148,7 +148,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Teams inline math release contracts
+      - name: Teams math and managed font release contracts
         shell: bash
         run: |
           set -euo pipefail

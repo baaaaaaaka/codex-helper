@@ -4,18 +4,22 @@ import (
 	"html"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 const (
-	teamsMathOpenTag             = "<m>"
-	teamsMathCloseTag            = "</m>"
-	maxTeamsMathSourceBytes      = 8 * 1024
-	maxTeamsMathBraceDepth       = 64
-	maxTeamsMathEscapedHTMLBytes = 16 * 1024
-	maxTeamsMathPerMessage       = 5
-	teamsMathPlanVersion         = 1
+	teamsMathOpenTag              = "<m>"
+	teamsMathCloseTag             = "</m>"
+	maxTeamsMathSourceBytes       = 8 * 1024
+	maxTeamsMathTotalSourceBytes  = 32 * 1024
+	maxTeamsMathBraceDepth        = 64
+	maxTeamsMathEscapedHTMLBytes  = 16 * 1024
+	maxTeamsMathImagesPerMessage  = 5
+	maxTeamsMathMarkersPerMessage = 32
+	teamsMathLegacyPlanVersion    = 1
+	teamsMathPlanVersion          = 2
 )
 
 var (
@@ -30,11 +34,25 @@ var (
 	)
 )
 
+type teamsMathLayout uint8
+
+const (
+	teamsMathLayoutInlineCode teamsMathLayout = iota
+	teamsMathLayoutDisplayOwnLine
+	teamsMathLayoutDisplayPromoted
+	teamsMathLayoutContainerCode
+)
+
 type teamsMathSpan struct {
 	Start  int
 	End    int
 	Source string
 	Index  int
+	Layout teamsMathLayout
+}
+
+func (s teamsMathSpan) isDisplay() bool {
+	return s.Layout == teamsMathLayoutDisplayOwnLine || s.Layout == teamsMathLayoutDisplayPromoted
 }
 
 type teamsMathPlan struct {
@@ -54,12 +72,17 @@ func storeTeamsMathPlan(plan teamsMathPlan) []teamstore.OutboxMathSpan {
 
 func trustedTeamsMathPlanForOutbox(outbox teamstore.OutboxMessage) teamsMathPlan {
 	plan := teamsMathPlan{Text: outbox.Body}
-	if !outbox.TrustedMath || outbox.MathPlanVersion != teamsMathPlanVersion || len(outbox.MathSpans) > maxTeamsMathPerMessage {
+	if !outbox.TrustedMath || !supportedTeamsMathPlanVersion(outbox.MathPlanVersion) || len(outbox.MathSpans) > maxTeamsMathMarkersPerMessage {
 		return plan
 	}
 	last := 0
+	totalSourceBytes := 0
 	for i, stored := range outbox.MathSpans {
+		totalSourceBytes += len(stored.Source)
 		if stored.Start < last || stored.Start < 0 || stored.End > len(outbox.Body) || stored.Start >= stored.End || stored.Index != i+1 || !safeTeamsMathSource(stored.Source) {
+			return teamsMathPlan{Text: outbox.Body}
+		}
+		if totalSourceBytes > maxTeamsMathTotalSourceBytes {
 			return teamsMathPlan{Text: outbox.Body}
 		}
 		if outbox.Body[stored.Start:stored.End] != teamsMathOpenTag+stored.Source+teamsMathCloseTag {
@@ -70,7 +93,12 @@ func trustedTeamsMathPlanForOutbox(outbox teamstore.OutboxMessage) teamsMathPlan
 		})
 		last = stored.End
 	}
+	classifyTeamsMathLayouts(&plan)
 	return plan
+}
+
+func supportedTeamsMathPlanVersion(version int) bool {
+	return version == teamsMathLegacyPlanVersion || version == teamsMathPlanVersion
 }
 
 func parseTrustedTeamsMath(text string) teamsMathPlan {
@@ -127,7 +155,102 @@ func parseTrustedTeamsMath(text string) teamsMathPlan {
 		}
 		i = sourceStart
 	}
+	classifyTeamsMathLayouts(&plan)
 	return plan
+}
+
+func classifyTeamsMathLayouts(plan *teamsMathPlan) {
+	if plan == nil {
+		return
+	}
+	var tableMask []bool
+	if strings.Contains(plan.Text, "|") {
+		tableMask = teamsMathMarkdownTableMask(plan.Text)
+	}
+	for index := range plan.Spans {
+		span := &plan.Spans[index]
+		switch {
+		case span.Start < len(tableMask) && tableMask[span.Start]:
+			span.Layout = teamsMathLayoutContainerCode
+		case teamsMathMarkerOwnsLine(plan.Text, span.Start, span.End):
+			span.Layout = teamsMathLayoutDisplayOwnLine
+		case teamsMathMarkerIsInLineContainer(plan.Text, span.Start):
+			span.Layout = teamsMathLayoutContainerCode
+		case teamsMathSourceIsStructurallyComplex(span.Source):
+			span.Layout = teamsMathLayoutDisplayPromoted
+		default:
+			span.Layout = teamsMathLayoutInlineCode
+		}
+	}
+}
+
+func teamsMathMarkerOwnsLine(text string, start int, end int) bool {
+	if start < 0 || end < start || end > len(text) {
+		return false
+	}
+	lineStart := strings.LastIndex(text[:start], "\n") + 1
+	lineEnd := len(text)
+	if next := strings.Index(text[end:], "\n"); next >= 0 {
+		lineEnd = end + next
+	}
+	return strings.TrimSpace(text[lineStart:start]) == "" && strings.TrimSpace(text[end:lineEnd]) == ""
+}
+
+func teamsMathMarkerIsInLineContainer(text string, start int) bool {
+	if start < 0 || start > len(text) {
+		return false
+	}
+	lineStart := strings.LastIndex(text[:start], "\n") + 1
+	prefix := strings.TrimLeft(text[lineStart:start], " \t")
+	if strings.HasPrefix(prefix, ">") {
+		return true
+	}
+	if len(prefix) >= 2 && (prefix[0] == '-' || prefix[0] == '*' || prefix[0] == '+') && (prefix[1] == ' ' || prefix[1] == '\t') {
+		return true
+	}
+	index := 0
+	for index < len(prefix) && prefix[index] >= '0' && prefix[index] <= '9' {
+		index++
+	}
+	return index > 0 && index+1 < len(prefix) && (prefix[index] == '.' || prefix[index] == ')') && (prefix[index+1] == ' ' || prefix[index+1] == '\t')
+}
+
+func teamsMathSourceIsStructurallyComplex(source string) bool {
+	if strings.ContainsAny(source, "\r\n") {
+		return true
+	}
+	trimmed := strings.TrimSpace(source)
+	runeCount := utf8.RuneCountInString(trimmed)
+	if runeCount > 72 || (runeCount > 36 && strings.ContainsAny(trimmed, "=<>")) {
+		return true
+	}
+	for index := 0; index < len(source); index++ {
+		if source[index] != '\\' || index+1 >= len(source) {
+			continue
+		}
+		if source[index+1] == '\\' {
+			return true
+		}
+		end := index + 1
+		for end < len(source) && ((source[end] >= 'a' && source[end] <= 'z') || (source[end] >= 'A' && source[end] <= 'Z')) {
+			end++
+		}
+		if end == index+1 {
+			continue
+		}
+		command := source[index+1 : end]
+		switch command {
+		case "frac", "dfrac", "tfrac", "cfrac", "genfrac",
+			"binom", "dbinom", "tbinom",
+			"sum", "prod", "coprod", "bigcap", "bigcup", "bigoplus", "bigotimes", "bigsqcup", "bigvee", "bigwedge",
+			"int", "iint", "iiint", "iiiint", "oint", "oiint", "oiiint",
+			"lim", "liminf", "limsup", "argmin", "argmax",
+			"begin", "substack", "overset", "underset", "stackrel", "overbrace", "underbrace", "displaystyle":
+			return true
+		}
+		index = end - 1
+	}
+	return false
 }
 
 func protectedTeamsMathMask(text string) []bool {

@@ -12,7 +12,7 @@ import (
 )
 
 const ArtifactManifestFenceInfo = "codex-helper-artifacts"
-const TeamsMathPromptContract = "For rendered math, write exactly <m>TeX</m>; for literal TeX, use code. Math markers are not artifacts."
+const TeamsMathPromptContract = "Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \\(...\\). Math markers are not artifacts."
 const CodexReasoningEffortConfigKey = "model_reasoning_effort"
 const DefaultSessionReasoningEffort = "xhigh"
 const DefaultControlFallbackReasoningEffort = "low"

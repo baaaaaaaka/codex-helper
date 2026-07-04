@@ -115,6 +115,9 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 			t.Fatalf("TeamsCodexPrompt missing %q:\n%s", want, got)
 		}
 	}
+	if count := strings.Count(got, TeamsMathPromptContract); count != 1 {
+		t.Fatalf("TeamsCodexPrompt contains the math contract %d times, want exactly once", count)
+	}
 }
 
 func TestControlFallbackPromptIncludesMathContract(t *testing.T) {
@@ -123,6 +126,19 @@ func TestControlFallbackPromptIncludesMathContract(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("ControlFallbackCodexPrompt missing %q:\n%s", want, got)
 		}
+	}
+	if count := strings.Count(got, TeamsMathPromptContract); count != 1 {
+		t.Fatalf("ControlFallbackCodexPrompt contains the math contract %d times, want exactly once", count)
+	}
+}
+
+func TestTeamsMathPromptContractIsConciseAndLayoutSpecific(t *testing.T) {
+	const want = "Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \\(...\\). Math markers are not artifacts."
+	if TeamsMathPromptContract != want {
+		t.Fatalf("TeamsMathPromptContract = %q, want concise contract %q", TeamsMathPromptContract, want)
+	}
+	if len(TeamsMathPromptContract) > 256 {
+		t.Fatalf("TeamsMathPromptContract is too verbose: %d bytes", len(TeamsMathPromptContract))
 	}
 }
 

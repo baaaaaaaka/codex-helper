@@ -24,20 +24,21 @@ import (
 
 const (
 	teamsMathRuntimeKind         = "codex-helper-teams-math-runtime"
-	teamsMathRuntimeVersion      = "mathjax-4.1.2_resvg-js-2.6.2_v1"
+	teamsMathRuntimeVersion      = "mathjax-4.1.2_resvg-js-2.6.2_noto-serif-sc-2.003_v3"
 	teamsMathInstallTimeout      = 2 * time.Minute
+	teamsMathFontInstallTimeout  = 2 * time.Minute
 	teamsMathRenderTimeout       = 20 * time.Second
 	maxTeamsMathPNGBytes         = 4 * 1024 * 1024
 	maxTeamsMathPNGDimension     = 4096
 	maxTeamsMathPNGPixelCount    = 8 * 1024 * 1024
-	maxTeamsMathRenderOutput     = maxTeamsMathPerMessage*(maxTeamsMathPNGBytes*4/3+64*1024) + 64*1024
+	maxTeamsMathRenderOutput     = maxTeamsMathImagesPerMessage*(maxTeamsMathPNGBytes*4/3+64*1024) + 64*1024
 	maxTeamsMathDiagnosticOutput = 64 * 1024
 	maxTeamsMathInstallOutput    = 512 * 1024
 	maxTeamsMathPNGCacheBytes    = 128 * 1024 * 1024
 	targetTeamsMathPNGCacheBytes = 96 * 1024 * 1024
 )
 
-//go:embed mathruntime/package.json mathruntime/package-lock.json mathruntime/renderer.mjs
+//go:embed mathruntime/package.json mathruntime/package-lock.json mathruntime/renderer.mjs mathruntime/fonts/*.txt
 var teamsMathRuntimeFiles embed.FS
 
 type teamsMathPNGRenderer interface {
@@ -57,6 +58,11 @@ type managedTeamsMathRenderer struct {
 	maxPNGCacheBytes    int64
 	targetPNGCacheBytes int64
 	runtimeCleanupOnce  sync.Once
+	fontAssets          []teamsMathFontAsset
+	fontHTTPClient      teamsMathHTTPClient
+	verifiedFonts       map[string]teamsMathVerifiedFont
+	fontGlyphCoverage   map[string]map[rune]bool
+	fontCmaps           map[string][]teamsMathCmapSubtable
 }
 
 type teamsMathRuntimeMarker struct {
@@ -67,6 +73,7 @@ type teamsMathRuntimeMarker struct {
 
 type teamsMathRenderRequest struct {
 	Items []teamsMathRenderRequestItem `json:"items"`
+	Fonts []teamsMathRenderFont        `json:"fonts,omitempty"`
 }
 
 type teamsMathRenderRequestItem struct {
@@ -84,6 +91,7 @@ type teamsMathRenderResponseItem struct {
 	PNG    string                 `json:"png,omitempty"`
 	Width  int                    `json:"width,omitempty"`
 	Height int                    `json:"height,omitempty"`
+	Text   string                 `json:"text,omitempty"`
 	Error  *teamsMathRuntimeError `json:"error,omitempty"`
 }
 
@@ -135,7 +143,7 @@ func (r *managedTeamsMathRenderer) Render(ctx context.Context, spans []teamsMath
 	for i, span := range spans {
 		assets[i] = teamsMathAsset{Index: span.Index}
 	}
-	if len(spans) > maxTeamsMathPerMessage {
+	if len(spans) > maxTeamsMathImagesPerMessage {
 		setTeamsMathAssetErrors(assets, fmt.Errorf("too many formulas in one Teams message: %d", len(spans)))
 		return assets
 	}
@@ -170,50 +178,61 @@ func (r *managedTeamsMathRenderer) Render(ctx context.Context, spans []teamsMath
 		setTeamsMathAssetErrors(assets, err)
 		return assets
 	}
-	request := teamsMathRenderRequest{Items: make([]teamsMathRenderRequestItem, 0, len(missing))}
-	for _, span := range missing {
-		request.Items = append(request.Items, teamsMathRenderRequestItem{Index: span.Index, Source: span.Source})
-	}
-	payload, err := json.Marshal(request)
+	fonts := r.installedManagedMathFonts(runtimeRoot)
+	response, err := runTeamsMathRuntime(ctx, runtimeRoot, nodePath, missing, fonts)
 	if err != nil {
 		setTeamsMathAssetErrors(assets, err)
-		return assets
-	}
-	renderCtx, cancel := context.WithTimeout(ctx, teamsMathRenderTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(renderCtx, nodePath, filepath.Join(runtimeRoot, "renderer.mjs"))
-	cmd.Dir = runtimeRoot
-	cmd.Stdin = bytes.NewReader(payload)
-	stdout := newTeamsMathBoundedBuffer(maxTeamsMathRenderOutput)
-	stderr := newTeamsMathBoundedBuffer(maxTeamsMathDiagnosticOutput)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		if renderCtx.Err() != nil {
-			err = renderCtx.Err()
-		} else if stderr.Len() > 0 {
-			err = fmt.Errorf("math renderer failed: %w: %s", err, truncateTeamsMathError(stderr.String()))
-		}
-		setTeamsMathAssetErrors(assets, err)
-		return assets
-	}
-	if stdout.Truncated() {
-		setTeamsMathAssetErrors(assets, fmt.Errorf("math renderer response exceeded %d bytes", maxTeamsMathRenderOutput))
-		return assets
-	}
-	var response teamsMathRenderResponse
-	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
-		setTeamsMathAssetErrors(assets, fmt.Errorf("decode math renderer response: %w", err))
-		return assets
-	}
-	if response.Error != nil {
-		setTeamsMathAssetErrors(assets, fmt.Errorf("%s: %s", response.Error.Code, response.Error.Message))
 		return assets
 	}
 	byIndex := make(map[int]teamsMathRenderResponseItem, len(response.Results))
 	for _, item := range response.Results {
 		byIndex[item.Index] = item
 	}
+
+	var fontTexts []string
+	retry := make([]teamsMathSpan, 0, len(missing))
+	for _, span := range missing {
+		item, ok := byIndex[span.Index]
+		if !ok || item.Error != nil || strings.TrimSpace(item.Text) == "" {
+			continue
+		}
+		missingRunes, checkErr := r.missingManagedMathGlyphs(fonts, []string{item.Text})
+		if checkErr != nil || len(missingRunes) > 0 {
+			fontTexts = append(fontTexts, item.Text)
+			retry = append(retry, span)
+		}
+	}
+	var fontSetupErr error
+	if len(retry) > 0 {
+		fontCtx, cancel := context.WithTimeout(ctx, teamsMathFontInstallTimeout)
+		updatedFonts, added, setupErr := r.ensureManagedMathFonts(fontCtx, runtimeRoot, fonts, fontTexts)
+		cancel()
+		fonts = updatedFonts
+		fontSetupErr = setupErr
+		if added {
+			for _, span := range retry {
+				byIndex[span.Index] = teamsMathRenderResponseItem{
+					Index: span.Index,
+					Error: &teamsMathRuntimeError{Code: "font_render_retry_failed", Message: "renderer did not retry with the managed font"},
+				}
+			}
+			retryResponse, retryErr := runTeamsMathRuntime(ctx, runtimeRoot, nodePath, retry, fonts)
+			if retryErr != nil {
+				fontSetupErr = retryErr
+				for _, span := range retry {
+					byIndex[span.Index] = teamsMathRenderResponseItem{
+						Index: span.Index,
+						Error: &teamsMathRuntimeError{Code: "font_render_retry_failed", Message: retryErr.Error()},
+					}
+				}
+			} else {
+				for _, item := range retryResponse.Results {
+					byIndex[item.Index] = item
+				}
+			}
+		}
+	}
+
 	for _, span := range missing {
 		item, ok := byIndex[span.Index]
 		if !ok {
@@ -224,6 +243,14 @@ func (r *managedTeamsMathRenderer) Render(ctx context.Context, spans []teamsMath
 		}
 		if item.Error != nil {
 			message := strings.TrimSpace(item.Error.Code + ": " + item.Error.Message)
+			for _, position := range positions[span.Source] {
+				assets[position].Error = message
+			}
+			continue
+		}
+		missingRunes, checkErr := r.missingManagedMathGlyphs(fonts, []string{item.Text})
+		if checkErr != nil || len(missingRunes) > 0 {
+			message := formatTeamsMathMissingGlyphError(missingRunes, checkErr, fontSetupErr)
 			for _, position := range positions[span.Source] {
 				assets[position].Error = message
 			}
@@ -243,6 +270,45 @@ func (r *managedTeamsMathRenderer) Render(ctx context.Context, spans []teamsMath
 		_ = r.storeCachedPNG(span.Source, png)
 	}
 	return assets
+}
+
+func runTeamsMathRuntime(ctx context.Context, runtimeRoot string, nodePath string, spans []teamsMathSpan, fonts []teamsMathRenderFont) (teamsMathRenderResponse, error) {
+	request := teamsMathRenderRequest{Items: make([]teamsMathRenderRequestItem, 0, len(spans)), Fonts: fonts}
+	for _, span := range spans {
+		request.Items = append(request.Items, teamsMathRenderRequestItem{Index: span.Index, Source: span.Source})
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		return teamsMathRenderResponse{}, err
+	}
+	renderCtx, cancel := context.WithTimeout(ctx, teamsMathRenderTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(renderCtx, nodePath, filepath.Join(runtimeRoot, "renderer.mjs"))
+	cmd.Dir = runtimeRoot
+	cmd.Stdin = bytes.NewReader(payload)
+	stdout := newTeamsMathBoundedBuffer(maxTeamsMathRenderOutput)
+	stderr := newTeamsMathBoundedBuffer(maxTeamsMathDiagnosticOutput)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		if renderCtx.Err() != nil {
+			err = renderCtx.Err()
+		} else if stderr.Len() > 0 {
+			err = fmt.Errorf("math renderer failed: %w: %s", err, truncateTeamsMathError(stderr.String()))
+		}
+		return teamsMathRenderResponse{}, err
+	}
+	if stdout.Truncated() {
+		return teamsMathRenderResponse{}, fmt.Errorf("math renderer response exceeded %d bytes", maxTeamsMathRenderOutput)
+	}
+	var response teamsMathRenderResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		return teamsMathRenderResponse{}, fmt.Errorf("decode math renderer response: %w", err)
+	}
+	if response.Error != nil {
+		return teamsMathRenderResponse{}, fmt.Errorf("%s: %s", response.Error.Code, response.Error.Message)
+	}
+	return response, nil
 }
 
 func (r *managedTeamsMathRenderer) ensureRuntime(ctx context.Context) (string, string, error) {

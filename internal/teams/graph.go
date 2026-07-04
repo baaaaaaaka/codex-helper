@@ -520,7 +520,7 @@ func (g *GraphClient) SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRet
 var outboundHostedContentIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,80}$`)
 
 func graphHostedContentPayloads(hosted []OutboundHostedContent) ([]map[string]any, error) {
-	if len(hosted) > maxTeamsMathPerMessage {
+	if len(hosted) > maxTeamsMathImagesPerMessage {
 		return nil, fmt.Errorf("too many hosted contents: %d", len(hosted))
 	}
 	seen := make(map[string]bool, len(hosted))

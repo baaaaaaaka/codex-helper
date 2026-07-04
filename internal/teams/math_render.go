@@ -46,17 +46,23 @@ func (b *Bridge) renderOutboxMathAssets(ctx context.Context, outbox teamstore.Ou
 		return nil, nil
 	}
 	plan := trustedTeamsMathPlanForOutbox(outbox)
-	if len(plan.Spans) == 0 {
+	displaySpans := make([]teamsMathSpan, 0, len(plan.Spans))
+	for _, span := range plan.Spans {
+		if span.isDisplay() {
+			displaySpans = append(displaySpans, span)
+		}
+	}
+	if len(displaySpans) == 0 {
 		return nil, nil
 	}
 	renderer := b.mathRenderer
 	if renderer == nil {
 		renderer = teamsMathRenderer()
 	}
-	assets := renderer.Render(ctx, plan.Spans)
+	assets := renderer.Render(ctx, displaySpans)
 	hosted := make([]OutboundHostedContent, 0, len(assets))
-	spanSource := make(map[int]string, len(plan.Spans))
-	for _, span := range plan.Spans {
+	spanSource := make(map[int]string, len(displaySpans))
+	for _, span := range displaySpans {
 		spanSource[span.Index] = span.Source
 	}
 	hostedBySource := make(map[string]OutboundHostedContent, len(assets))
@@ -119,19 +125,23 @@ func renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label string, plan 
 			tail = tail[len(tail)-2:]
 		}
 	}
-	tableMask := teamsMathMarkdownTableMask(text)
+	var tableMask []bool
+	if strings.Contains(text, "|") {
+		tableMask = teamsMathMarkdownTableMask(text)
+	}
 	for _, span := range plan.Spans {
 		writeMarkdown(text[last:span.Start])
 		token := fmt.Sprintf("%s%06d\ue001", placeholderPrefix, span.Index)
 		tokens = append(tokens, token)
 		insideTable := span.Start < len(tableMask) && tableMask[span.Start]
-		if !insideTable {
+		display := span.isDisplay() && !insideTable
+		if display {
 			if markdown.Len() > 0 && tail != "\n\n" {
 				writeMarkdown("\n\n")
 			}
 		}
 		writeMarkdown(token)
-		if !insideTable {
+		if display {
 			writeMarkdown("\n\n")
 		}
 		last = span.End
@@ -140,7 +150,7 @@ func renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label string, plan 
 
 	rendered := renderTeamsHTMLCodexMarkdownAfterLabelBreak(label, markdown.String())
 	for i, span := range plan.Spans {
-		formulaHTML := renderTeamsMathNodeHTML(span.Source, assetByIndex[span.Index])
+		formulaHTML := renderTeamsMathNodeHTML(span.Source, assetByIndex[span.Index], span.isDisplay())
 		paragraphToken := "<p>" + tokens[i] + "</p>"
 		if strings.Contains(rendered, paragraphToken) {
 			rendered = strings.Replace(rendered, paragraphToken, formulaHTML, 1)
@@ -193,6 +203,9 @@ func teamsMathMarkdownTableMask(text string) []bool {
 func plannedTeamsMathAssets(plan teamsMathPlan) []teamsMathAsset {
 	assets := make([]teamsMathAsset, 0, len(plan.Spans))
 	for _, span := range plan.Spans {
+		if !span.isDisplay() {
+			continue
+		}
 		assets = append(assets, teamsMathAsset{
 			Index: span.Index, TemporaryID: "math-0000000000000000", PNG: []byte{1},
 		})
@@ -209,7 +222,10 @@ func plannedTeamsMathHTMLLength(input TeamsRenderInput, partIndex int, partCount
 	return len(renderTeamsHTMLCodexMarkdownWithMathPlanAfterLabelBreak(label, plan, plannedTeamsMathAssets(plan)))
 }
 
-func renderTeamsMathNodeHTML(source string, asset teamsMathAsset) string {
+func renderTeamsMathNodeHTML(source string, asset teamsMathAsset, display bool) string {
+	if !display {
+		return "<code>" + html.EscapeString(source) + "</code>"
+	}
 	var out strings.Builder
 	out.WriteString("<pre><code>")
 	out.WriteString(html.EscapeString(source))
@@ -224,8 +240,10 @@ func renderTeamsMathNodeHTML(source string, asset teamsMathAsset) string {
 }
 
 type teamsMathChunkUnit struct {
-	text   string
-	isMath bool
+	text        string
+	isMath      bool
+	isDisplay   bool
+	sourceBytes int
 }
 
 func splitTeamsRenderTextWithMath(input TeamsRenderInput, text string, limitBytes int, plannedCount int) ([]string, bool) {
@@ -239,7 +257,7 @@ func splitTeamsRenderTextWithMath(input TeamsRenderInput, text string, limitByte
 		if span.Start > last {
 			units = append(units, teamsMathChunkUnit{text: text[last:span.Start]})
 		}
-		units = append(units, teamsMathChunkUnit{text: text[span.Start:span.End], isMath: true})
+		units = append(units, teamsMathChunkUnit{text: text[span.Start:span.End], isMath: true, isDisplay: span.isDisplay(), sourceBytes: len(span.Source)})
 		last = span.End
 	}
 	if last < len(text) {
@@ -253,14 +271,18 @@ func splitTeamsRenderTextWithMath(input TeamsRenderInput, text string, limitByte
 	}
 	var parts []string
 	var current strings.Builder
-	mathCount := 0
+	markerCount := 0
+	displayCount := 0
+	sourceBytes := 0
 	flush := func() {
 		if current.Len() == 0 {
 			return
 		}
 		parts = append(parts, current.String())
 		current.Reset()
-		mathCount = 0
+		markerCount = 0
+		displayCount = 0
+		sourceBytes = 0
 	}
 	appendPlainOversize := func(value string) {
 		plainInput := input
@@ -281,14 +303,18 @@ func splitTeamsRenderTextWithMath(input TeamsRenderInput, text string, limitByte
 		if unit.text == "" {
 			continue
 		}
-		if unit.isMath && mathCount >= maxTeamsMathPerMessage {
+		if (unit.isMath && (markerCount >= maxTeamsMathMarkersPerMessage || sourceBytes+unit.sourceBytes > maxTeamsMathTotalSourceBytes)) || (unit.isDisplay && displayCount >= maxTeamsMathImagesPerMessage) {
 			flush()
 		}
 		candidate := current.String() + unit.text
 		if fits(candidate, len(parts)+1) {
 			current.WriteString(unit.text)
 			if unit.isMath {
-				mathCount++
+				markerCount++
+				sourceBytes += unit.sourceBytes
+			}
+			if unit.isDisplay {
+				displayCount++
 			}
 			continue
 		}
@@ -296,7 +322,11 @@ func splitTeamsRenderTextWithMath(input TeamsRenderInput, text string, limitByte
 		if fits(unit.text, len(parts)+1) {
 			current.WriteString(unit.text)
 			if unit.isMath {
-				mathCount = 1
+				markerCount = 1
+				sourceBytes = unit.sourceBytes
+			}
+			if unit.isDisplay {
+				displayCount = 1
 			}
 			continue
 		}
