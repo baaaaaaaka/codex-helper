@@ -17,6 +17,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 )
@@ -811,7 +812,7 @@ func startCodexDesktopProcess(ctx context.Context, executable string, opts codex
 	if err != nil {
 		return err
 	}
-	cmd.Env = updatedEnv
+	cmd.Env = helperruntime.WithoutRuntimeMarkers(updatedEnv)
 	configureTeamsServiceDetachedCommand(cmd)
 	if err := cmd.Start(); err != nil {
 		return err

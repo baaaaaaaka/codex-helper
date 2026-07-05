@@ -70,6 +70,9 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "helper update prerelease", name: DashboardCommandUpdate, raw: "prerelease"},
 		{text: "helper upgrade pre", name: DashboardCommandUpdate, raw: "pre"},
 		{text: "codex-helper service update now", name: DashboardCommandUpdate, raw: "update now"},
+		{text: "codex update", name: DashboardCommandCodexUpdate},
+		{text: "codex update now", name: DashboardCommandCodexUpdate, raw: "now"},
+		{text: "codex upgrade now", name: DashboardCommandCodexUpdate, raw: "now"},
 		{text: "helper webhook https://workflow.example.test/hook", name: DashboardCommandWebhook, raw: "https://workflow.example.test/hook"},
 		{text: "helper workflow off", name: DashboardCommandWebhook, raw: "off"},
 		{text: "helper status", name: DashboardCommandStatus},
@@ -120,11 +123,25 @@ func TestParseControlRestartRequiresHelperPrefix(t *testing.T) {
 }
 
 func TestParseControlUpdateRequiresHelperPrefix(t *testing.T) {
-	for _, text := range []string{"update", "update now", "upgrade", "upgrade prerelease", "codex update"} {
+	for _, text := range []string{"update", "update now", "upgrade", "upgrade prerelease"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeControl, text)
 			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
 				t.Fatalf("update text without helper prefix should go to Codex, got %#v", cmd)
+			}
+		})
+	}
+}
+
+func TestParseControlCodexUpdateNaturalLanguageFallsBackToCodex(t *testing.T) {
+	for _, text := range []string{
+		"codex update should we do this now",
+		"codex upgrade 为什么会失败",
+	} {
+		t.Run(text, func(t *testing.T) {
+			cmd := ParseDashboardCommand(ChatScopeControl, text)
+			if cmd.HelperCommand || !cmd.ForwardToCodex || !cmd.RequiresCodex {
+				t.Fatalf("natural Codex update text should go to Codex, got %#v", cmd)
 			}
 		})
 	}

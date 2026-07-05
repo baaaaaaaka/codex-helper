@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 const appServerProcessHelperMarker = "--appserver-process-helper"
@@ -165,6 +167,95 @@ func TestAppServerProcessStarterConfigureCommandInheritsParentEnv(t *testing.T) 
 	}
 	if got.Env["CODEX_HELPER_TEAMS_CHILD"] != "parent" || got.Env["CODEX_HELPER_CONFIGURED"] != "after" {
 		t.Fatalf("configure command did not inherit parent env before appending: %#v", got.Env)
+	}
+}
+
+func TestAppServerProcessStarterRemovesInheritedRuntimeMarkers(t *testing.T) {
+	for _, name := range appServerRuntimeEnvironmentNames() {
+		t.Setenv(name, "inherited")
+	}
+	t.Setenv("CODEX_HELPER_ENV_KEEP", "parent")
+	command, args := appServerProcessHelperCommand("meta")
+
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command: command,
+		Args:    args,
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	env := readAppServerProcessTestEnvironment(t, transport)
+	for _, name := range appServerRuntimeEnvironmentNames() {
+		if got := env[name]; got != "" {
+			t.Fatalf("%s leaked to app-server process: %q", name, got)
+		}
+	}
+	if got := env["CODEX_HELPER_ENV_KEEP"]; got != "parent" {
+		t.Fatalf("unrelated parent environment = %q, want parent", got)
+	}
+}
+
+func TestAppServerProcessStarterRemovesRuntimeMarkersAfterConfiguration(t *testing.T) {
+	command, args := appServerProcessHelperCommand("meta")
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command: command,
+		Args:    args,
+		ExtraEnv: []string{
+			helperruntime.EnvRuntime + "=1",
+			helperruntime.EnvRuntimeRoot + "=/runtime",
+			helperruntime.EnvRuntimeVersion + "=v1.2.3",
+			helperruntime.EnvEntryPath + "=/entry/cxp",
+			"CODEX_HELPER_ENV_KEEP=overlay",
+		},
+		ConfigureCommand: func(cmd *exec.Cmd) error {
+			cmd.Env = append(cmd.Env,
+				helperruntime.EnvDisable+"=1",
+				helperruntime.EnvForce+"=1",
+			)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	env := readAppServerProcessTestEnvironment(t, transport)
+	for _, name := range appServerRuntimeEnvironmentNames() {
+		if got := env[name]; got != "" {
+			t.Fatalf("configured %s leaked to app-server process: %q", name, got)
+		}
+	}
+	if got := env["CODEX_HELPER_ENV_KEEP"]; got != "overlay" {
+		t.Fatalf("unrelated configured environment = %q, want overlay", got)
+	}
+}
+
+func TestAppServerProcessStarterNilConfiguredEnvironmentKeepsSanitizedParent(t *testing.T) {
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv("CODEX_HELPER_ENV_KEEP", "parent")
+	command, args := appServerProcessHelperCommand("meta")
+	transport, err := (AppServerProcessStarter{}).StartAppServer(context.Background(), AppServerStartRequest{
+		Command: command,
+		Args:    args,
+		ConfigureCommand: func(cmd *exec.Cmd) error {
+			cmd.Env = nil
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartAppServer error: %v", err)
+	}
+	defer transport.Close()
+
+	env := readAppServerProcessTestEnvironment(t, transport)
+	if got := env[helperruntime.EnvRuntime]; got != "" {
+		t.Fatalf("%s leaked to app-server process: %q", helperruntime.EnvRuntime, got)
+	}
+	if got := env["CODEX_HELPER_ENV_KEEP"]; got != "parent" {
+		t.Fatalf("unrelated parent environment = %q, want parent", got)
 	}
 }
 
@@ -400,6 +491,29 @@ func readProcessTestLine(t *testing.T, transport AppServerLineTransport) []byte 
 	return line
 }
 
+func readAppServerProcessTestEnvironment(t *testing.T, transport AppServerLineTransport) map[string]string {
+	t.Helper()
+	line := readProcessTestLine(t, transport)
+	var got struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(line, &got); err != nil {
+		t.Fatalf("metadata line is not JSON: %s: %v", string(line), err)
+	}
+	return got.Env
+}
+
+func appServerRuntimeEnvironmentNames() []string {
+	return []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvDisable,
+		helperruntime.EnvForce,
+	}
+}
+
 func runAppServerProcessHelper(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "missing helper mode")
@@ -420,6 +534,13 @@ func runAppServerProcessHelper(args []string) int {
 				"CODEX_HELPER_TEAMS_PARENT_PID": os.Getenv("CODEX_HELPER_TEAMS_PARENT_PID"),
 				"CODEX_HELPER_BEFORE_CONFIGURE": os.Getenv("CODEX_HELPER_BEFORE_CONFIGURE"),
 				"CODEX_HELPER_CONFIGURED":       os.Getenv("CODEX_HELPER_CONFIGURED"),
+				"CODEX_HELPER_ENV_KEEP":         os.Getenv("CODEX_HELPER_ENV_KEEP"),
+				helperruntime.EnvRuntime:        os.Getenv(helperruntime.EnvRuntime),
+				helperruntime.EnvRuntimeRoot:    os.Getenv(helperruntime.EnvRuntimeRoot),
+				helperruntime.EnvRuntimeVersion: os.Getenv(helperruntime.EnvRuntimeVersion),
+				helperruntime.EnvEntryPath:      os.Getenv(helperruntime.EnvEntryPath),
+				helperruntime.EnvDisable:        os.Getenv(helperruntime.EnvDisable),
+				helperruntime.EnvForce:          os.Getenv(helperruntime.EnvForce),
 			},
 		})
 		time.Sleep(24 * time.Hour)

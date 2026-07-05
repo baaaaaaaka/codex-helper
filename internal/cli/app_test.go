@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
@@ -1038,6 +1039,9 @@ func TestCodexDesktopWindowsScriptWaitForExitOption(t *testing.T) {
 
 func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 	lockCLITestHooks(t)
+	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
+		t.Setenv(name, "inherited")
+	}
 
 	prevCommandContext := codexAppCommandContext
 	t.Cleanup(func() { codexAppCommandContext = prevCommandContext })
@@ -1055,7 +1059,11 @@ func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 	err := startCodexDesktopProcess(context.Background(), "/Applications/Codex.app/Contents/MacOS/Codex", codexDesktopAppOptions{
 		Cwd:      t.TempDir(),
 		ProxyURL: "http://127.0.0.1:61272",
-		ExtraEnv: []string{envCodexHome + "=" + filepath.Join(t.TempDir(), ".codex")},
+		ExtraEnv: []string{
+			envCodexHome + "=" + filepath.Join(t.TempDir(), ".codex"),
+			"CODEX_HELPER_ENV_KEEP=desktop",
+			helperruntime.EnvForce + "=configured",
+		},
 	})
 	if err != nil {
 		t.Fatalf("startCodexDesktopProcess error: %v", err)
@@ -1070,6 +1078,14 @@ func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 		if got := envValue(capturedCmd.Env, key); got != "http://127.0.0.1:61272" {
 			t.Fatalf("%s = %q, want proxy URL", key, got)
 		}
+	}
+	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
+		if _, ok := explicitEnvironmentValue(capturedCmd.Env, name); ok {
+			t.Fatalf("%s leaked to Codex desktop process", name)
+		}
+	}
+	if got := envValue(capturedCmd.Env, "CODEX_HELPER_ENV_KEEP"); got != "desktop" {
+		t.Fatalf("unrelated desktop environment = %q, want desktop", got)
 	}
 }
 

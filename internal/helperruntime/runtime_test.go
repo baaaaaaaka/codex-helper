@@ -71,7 +71,7 @@ func TestNormalizeVersion(t *testing.T) {
 
 func TestLauncherEnvironmentRemovesRuntimeMarkersCaseInsensitively(t *testing.T) {
 	t.Parallel()
-	got := LauncherEnvironment([]string{
+	input := []string{
 		"PATH=/bin",
 		"CXP_RUNTIME=1",
 		"cxp_runtime_root=/tmp/runtime",
@@ -80,10 +80,14 @@ func TestLauncherEnvironmentRemovesRuntimeMarkersCaseInsensitively(t *testing.T)
 		"CXP_RUNTIME_DISABLE=1",
 		"cxp_runtime_force=1",
 		"KEEP=yes",
-	})
+	}
 	want := []string{"PATH=/bin", "KEEP=yes"}
+	got := WithoutRuntimeMarkers(input)
 	if !slices.Equal(got, want) {
-		t.Fatalf("LauncherEnvironment = %#v, want %#v", got, want)
+		t.Fatalf("WithoutRuntimeMarkers = %#v, want %#v", got, want)
+	}
+	if launcher := LauncherEnvironment(input); !slices.Equal(launcher, want) {
+		t.Fatalf("LauncherEnvironment = %#v, want %#v", launcher, want)
 	}
 }
 

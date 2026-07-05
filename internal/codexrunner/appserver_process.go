@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 const defaultAppServerProcessStderrLimit = 32 * 1024
@@ -51,21 +53,17 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 	if req.WorkingDir != "" {
 		cmd.Dir = req.WorkingDir
 	}
-	if len(req.ExtraEnv) > 0 {
-		cmd.Env = mergeAppServerProcessEnv(os.Environ(), req.ExtraEnv)
-	}
+	cmd.Env = mergeAppServerProcessEnv(os.Environ(), req.ExtraEnv)
 	if req.ConfigureCommand != nil {
-		if cmd.Env == nil {
-			cmd.Env = os.Environ()
-		}
 		if err := req.ConfigureCommand(cmd); err != nil {
 			cancelProcess()
 			return nil, fmt.Errorf("configure app-server process %q: %w", command, err)
 		}
 	}
-	if cmd.Env != nil {
-		cmd.Env = mergeAppServerProcessEnv(nil, cmd.Env)
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
 	}
+	cmd.Env = helperruntime.WithoutRuntimeMarkers(mergeAppServerProcessEnv(nil, cmd.Env))
 
 	stdinRead, stdinWrite, err := os.Pipe()
 	if err != nil {

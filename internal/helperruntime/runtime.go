@@ -382,7 +382,10 @@ func PublishDownloaded(root string, candidate string, version string, goos strin
 	return target, nil
 }
 
-func LauncherEnvironment(env []string) []string {
+// WithoutRuntimeMarkers removes the launch-only environment contract used to
+// enter an immutable CXP runtime. These values belong to the helper process and
+// must not leak into user workloads that may invoke the stable CXP entrypoint.
+func WithoutRuntimeMarkers(env []string) []string {
 	out := make([]string, 0, len(env))
 	for _, value := range env {
 		name, _, _ := strings.Cut(value, "=")
@@ -399,6 +402,10 @@ func LauncherEnvironment(env []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func LauncherEnvironment(env []string) []string {
+	return WithoutRuntimeMarkers(env)
 }
 
 func EnsureStableEntry(source string, entry string, goos string) error {

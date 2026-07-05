@@ -799,6 +799,7 @@ func TestControlAdvancedHelpListsCancelSelectors(t *testing.T) {
 		"helper cancel queued",
 		"helper cancel running",
 		"helper cancel all",
+		"codex update now",
 	} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("control advanced help missing %q:\n%s", want, plain)
@@ -880,6 +881,133 @@ func TestBridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork(t *testing.T) 
 	if countSentPlainContainingForChat(*sent, "chat-1", "Codex CLI upgraded") != 1 {
 		t.Fatalf("work chat upgrade completion notice missing or duplicated: %#v", *sent)
 	}
+}
+
+func TestControlCodexUpdateRequiresConfirmation(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	upgrades := 0
+	bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+		upgrades++
+		return CodexUpgradeResult{Path: "/managed/codex"}, nil
+	}
+
+	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-codex-update-help"), "codex update"); err != nil {
+		t.Fatalf("handleControlMessage codex update help error: %v", err)
+	}
+	if upgrades != 0 {
+		t.Fatalf("Codex update without now ran upgrader %d times", upgrades)
+	}
+	if !sentPlainContains(*sent, "codex update now") || !sentPlainContains(*sent, "does not update cxp/codex-helper") {
+		t.Fatalf("Codex update confirmation help missing: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if state.Upgrade != nil || state.ServiceControl.Draining {
+		t.Fatalf("unconfirmed Codex update changed upgrade state: %#v", state.Upgrade)
+	}
+}
+
+func TestControlCodexUpdateWaitsForActiveWorkAndCompletes(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	upgrades := 0
+	bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+		upgrades++
+		return CodexUpgradeResult{Path: "/managed/codex"}, nil
+	}
+	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{ID: "s-running", Status: teamstore.SessionStatusActive}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{
+		ID:        "turn-running",
+		SessionID: "s-running",
+		Status:    teamstore.TurnStatusRunning,
+	}); err != nil {
+		t.Fatalf("QueueTurn: %v", err)
+	}
+	message := bridgeTestMessage("control-codex-update-now")
+	if err := bridge.handleControlMessage(context.Background(), message, "codex update now"); err != nil {
+		t.Fatalf("handleControlMessage codex update now error: %v", err)
+	}
+	if err := bridge.handleControlMessage(context.Background(), message, "codex update now"); err != nil {
+		t.Fatalf("duplicate codex update now error: %v", err)
+	}
+	if upgrades != 0 {
+		t.Fatalf("Codex update should wait for active work, got %d calls", upgrades)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Codex CLI update scheduled") != 1 {
+		t.Fatalf("Codex update schedule notice missing or duplicated: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if state.Upgrade == nil || state.Upgrade.Reason != teamstore.CodexUpgradeReason || !state.ServiceControl.Draining {
+		t.Fatalf("expected pending manual Codex update, state=%#v control=%#v", state.Upgrade, state.ServiceControl)
+	}
+	if _, err := store.MarkTurnCompleted(context.Background(), "turn-running", "", ""); err != nil {
+		t.Fatalf("MarkTurnCompleted: %v", err)
+	}
+	if err := bridge.maybeRunPendingCodexUpgrade(context.Background()); err != nil {
+		t.Fatalf("maybeRunPendingCodexUpgrade: %v", err)
+	}
+	if upgrades != 1 {
+		t.Fatalf("Codex update calls = %d, want 1", upgrades)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after update: %v", err)
+	}
+	if state.ServiceControl.Draining || state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted {
+		t.Fatalf("manual Codex update did not complete cleanly: state=%#v control=%#v", state.Upgrade, state.ServiceControl)
+	}
+	if countSentPlainContainingForChat(*sent, "control-chat", "Codex CLI upgraded") != 1 {
+		t.Fatalf("Codex update completion notice missing or duplicated: %#v", *sent)
+	}
+	if !sentPlainContains(*sent, "New Teams requests will use the updated Codex CLI") {
+		t.Fatalf("manual Codex update completion guidance missing: %#v", *sent)
+	}
+	if sentPlainContains(*sent, "Retry the failed Work chat request") {
+		t.Fatalf("manual Codex update should not claim a Work chat request failed: %#v", *sent)
+	}
+}
+
+func TestControlCodexUpdateUnavailableAndConflictingUpgrade(t *testing.T) {
+	t.Run("unavailable", func(t *testing.T) {
+		graph, sent := newBridgeTestGraph(t)
+		store := newBridgeTestStore(t)
+		bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+		bridge.codexUpgrader = nil
+		if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-codex-update-unavailable"), "codex update now"); err != nil {
+			t.Fatalf("handleControlMessage error: %v", err)
+		}
+		if !sentPlainContains(*sent, "Codex CLI update is not available") {
+			t.Fatalf("unavailable notice missing: %#v", *sent)
+		}
+	})
+
+	t.Run("helper update conflict", func(t *testing.T) {
+		graph, sent := newBridgeTestGraph(t)
+		store := newBridgeTestStore(t)
+		bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+		bridge.codexUpgrader = func(context.Context) (CodexUpgradeResult, error) {
+			return CodexUpgradeResult{Path: "/managed/codex"}, nil
+		}
+		if _, err := store.BeginUpgrade(context.Background(), teamstore.HelperUpgradeReason, time.Minute); err != nil {
+			t.Fatalf("BeginUpgrade: %v", err)
+		}
+		if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-codex-update-conflict"), "codex update now"); err != nil {
+			t.Fatalf("handleControlMessage error: %v", err)
+		}
+		if !sentPlainContains(*sent, "Helper upgrade is already in progress") {
+			t.Fatalf("helper update conflict notice missing: %#v", *sent)
+		}
+	})
 }
 
 func TestBridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat(t *testing.T) {

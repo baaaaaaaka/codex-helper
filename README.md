@@ -567,8 +567,8 @@ environment variables or script flags.
 The helper creates a **control chat** for machine-level commands and separate
 work chats for Codex sessions. Use the control chat to list projects, choose a
 project/session, start new Codex work, check status, recover stuck state,
-restart or update the installed helper, and reload only a source-checkout
-development helper.
+update the local Codex CLI, restart or update the installed helper, and reload
+only a source-checkout development helper.
 
 When a Teams work chat message is routed to Codex, the helper queues it,
 starts Codex with the selected session working directory, streams progress as
@@ -679,6 +679,11 @@ development reloads only. Normal installed helpers should use `helper restart
 now` after a local repair or `helper update now` for a release update. Use
 `helper update prerelease` only when you intentionally want the newest
 pre-release.
+
+Send `codex update now` in the control chat to update the local Codex CLI using
+its detected install source. The helper drains active Codex work first and posts
+the result back to the control chat. This command does not update cxp/codex-helper
+and does not automatically retry earlier failed requests.
 
 If a quick Codex question sent in the control chat gets stuck, send
 `helper cancel running` in that same control chat. Work chat requests are still

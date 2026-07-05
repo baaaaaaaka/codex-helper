@@ -37,6 +37,7 @@ const (
 	DashboardCommandRestart        DashboardCommandName = "restart"
 	DashboardCommandReload         DashboardCommandName = "reload"
 	DashboardCommandUpdate         DashboardCommandName = "update"
+	DashboardCommandCodexUpdate    DashboardCommandName = "codex-update"
 	DashboardCommandWebhook        DashboardCommandName = "webhook"
 	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
 	DashboardCommandClose          DashboardCommandName = "close"
@@ -247,6 +248,15 @@ func splitNaturalControlCommand(text string) (string, string, bool) {
 }
 
 func controlDashboardCommandName(syntax dashboardCommandSyntax, name string, arg string) (DashboardCommandName, bool) {
+	if syntax == dashboardCommandSyntaxCodex {
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "update", "upgrade":
+			arg = strings.TrimSpace(arg)
+			if arg == "" || strings.EqualFold(arg, "now") {
+				return DashboardCommandCodexUpdate, true
+			}
+		}
+	}
 	if commandName, ok := controlAdminCommandName(syntax, name, arg); ok {
 		return commandName, true
 	}

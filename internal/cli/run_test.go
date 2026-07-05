@@ -21,6 +21,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 	"github.com/spf13/cobra"
@@ -104,6 +105,64 @@ func TestRunTargetOnceWithOptionsNoProxyKeepsEnv(t *testing.T) {
 	}
 	if got := string(content); got != "http://example.com" {
 		t.Fatalf("expected HTTP_PROXY preserved, got %q", got)
+	}
+}
+
+func TestRunTargetOnceWithOptionsRemovesRuntimeMarkers(t *testing.T) {
+	lockCLITestHooks(t)
+	previousRunTargetCommand := runTargetCommand
+	t.Cleanup(func() { runTargetCommand = previousRunTargetCommand })
+	runTargetCommand = func(string, ...string) *exec.Cmd {
+		return exec.Command(os.Args[0], "-test.run=^TestRunTargetRuntimeEnvironmentHelper$")
+	}
+	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
+		t.Setenv(name, "inherited")
+	}
+
+	err := runTargetOnceWithOptions(
+		context.Background(),
+		[]string{"runtime-environment-helper"},
+		"",
+		nil,
+		nil,
+		nil,
+		nil,
+		runTargetOptions{
+			UseProxy: false,
+			ExtraEnv: []string{
+				"CODEX_HELPER_RUN_ENV_HELPER=1",
+				"CODEX_HELPER_ENV_KEEP=run-target",
+				helperruntime.EnvForce + "=configured",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("runTargetOnceWithOptions error: %v", err)
+	}
+}
+
+func TestRunTargetRuntimeEnvironmentHelper(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_RUN_ENV_HELPER") != "1" {
+		return
+	}
+	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
+		if value, ok := os.LookupEnv(name); ok {
+			t.Fatalf("%s leaked to run target with value %q", name, value)
+		}
+	}
+	if got := os.Getenv("CODEX_HELPER_ENV_KEEP"); got != "run-target" {
+		t.Fatalf("unrelated run target environment = %q, want run-target", got)
+	}
+}
+
+func runtimeMarkerEnvironmentNamesForTest() []string {
+	return []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvDisable,
+		helperruntime.EnvForce,
 	}
 }
 

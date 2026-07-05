@@ -604,6 +604,15 @@ func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out 
 	return teams.CodexUpgradeResult{Path: path}, nil
 }
 
+func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string) teams.CodexUpgrader {
+	if strings.TrimSpace(codexPath) != "" {
+		return nil
+	}
+	return func(ctx context.Context) (teams.CodexUpgradeResult, error) {
+		return runTeamsCodexUpgradeFromBridge(ctx, root, out, "")
+	}
+}
+
 func newTeamsModelProfileResolver(root *rootOptions) teams.ModelProfileResolver {
 	return func(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
 		store, _, err := newRootStore(root, "")

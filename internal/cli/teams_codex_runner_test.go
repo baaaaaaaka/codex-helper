@@ -1543,6 +1543,15 @@ func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testi
 	}
 }
 
+func TestTeamsCodexUpgraderForRunRejectsCustomCodexPathBeforeDrain(t *testing.T) {
+	if got := teamsCodexUpgraderForRun(&rootOptions{}, io.Discard, " /custom/codex "); got != nil {
+		t.Fatal("custom --codex-path must disable control-chat Codex updates")
+	}
+	if got := teamsCodexUpgraderForRun(&rootOptions{}, io.Discard, ""); got == nil {
+		t.Fatal("default Codex discovery should enable control-chat Codex updates")
+	}
+}
+
 type fakeTeamsRunner struct {
 	result   codexrunner.TurnResult
 	err      error

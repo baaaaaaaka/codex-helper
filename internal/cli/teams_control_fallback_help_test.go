@@ -67,6 +67,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`model list`",
 		"`model status`",
 		"`helper update prerelease`",
+		"`codex update now`",
 		"`helper cancel last`",
 		"`helper cancel all`",
 	} {

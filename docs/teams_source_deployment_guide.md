@@ -355,6 +355,7 @@ Advanced maintenance and recovery:
 helper cancel running
 helper update now
 helper update prerelease
+codex update now
 helper restart now
 helper reload now
 beacon status
@@ -366,6 +367,10 @@ beacon release
 rebuild from a local `codex-helper` source tree. Normal installed helpers should
 use `helper restart now` after a local binary repair or `helper update now` for
 a release update.
+
+`codex update now` updates the local Codex CLI through its detected install
+source after active Codex work drains. It does not update the helper or retry
+failed Work chat requests automatically.
 
 Normal work chat messages are sent to Codex. Helper commands start with
 `helper` or the supported short command form shown by `helper help`.

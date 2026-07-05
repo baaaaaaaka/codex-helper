@@ -160,11 +160,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|RefreshTeamsAppServerPATHUsesCurrentProcessPATH|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode)$'
-          process_pattern='Test(MergeAppServerProcessEnv.*|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
+          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|RefreshTeamsAppServerPATHUsesCurrentProcessPATH|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
+          process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
           go test ./internal/teams -count=1 -run 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure|RunQueuedTurnReportsSharedAuthMigrationBlocker)$' -v
+
+      - name: Control chat Codex update contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'Test(ControlCodexUpdate.*|BridgeCodexVersion(FailureSchedulesUpgradeAfterActiveWork|UpgradeFailureNotifiesOriginWorkChat))$' -v
+          go test ./internal/cli -count=1 -run 'Test(RunTeamsCodexUpgradeFromBridge.*|TeamsCodexUpgraderForRunRejectsCustomCodexPathBeforeDrain)$' -v
 
       - name: CXP immutable runtime and process identity
         shell: bash

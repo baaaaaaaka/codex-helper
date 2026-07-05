@@ -151,6 +151,7 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"new <directory> --model <profile>",
 		"model status",
 		"helper update prerelease",
+		"codex update now",
 		"cxp skills install-builtin",
 		"cxp skills migrate",
 		"cxp history tui",

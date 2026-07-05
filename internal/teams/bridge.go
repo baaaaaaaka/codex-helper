@@ -4399,6 +4399,8 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.reloadHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandUpdate:
 			return b.updateHelperFromControl(ctx, msg, parsed.Argument)
+		case DashboardCommandCodexUpdate:
+			return b.updateCodexFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandWebhook:
 			return b.workflowWebhookFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandSelect:
@@ -4838,10 +4840,11 @@ func controlAdvancedHelpText() string {
 		"- `helper restart now` - restart the local Teams helper after sending a confirmation",
 		"- `helper update now` - update to the latest stable helper release",
 		"- `helper update prerelease` - update to the newest helper release or pre-release",
+		"- `codex update now` - wait for active work, then update the local Codex CLI",
 		"- `helper webhook setup` - show a guided Workflow webhook setup flow",
 		"- `helper webhook <url>` - enable Workflow notification cards with a Teams Workflow webhook URL",
 		"- `helper webhook off` - disable Workflow notification cards",
-		"- `helper skills list` / `helper skills add <url>` / `helper skills sync [name]` / `helper skills push [name]` / `helper skills push confirm` - inspect, sync, or push skill subscriptions",
+		"- `helper skills list|add|sync|push` - manage skill subscriptions",
 		"",
 		"Beacon commands:",
 		"- `beacon list` - list beacon profiles and machines",
@@ -4852,7 +4855,7 @@ func controlAdvancedHelpText() string {
 		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
 		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
 		"- `beacon profile confirm <name>` - confirm review; incomplete profiles remain draft until doctor requirements pass",
-		"- `beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]` - preview and release a beacon resource",
+		"- `beacon release <target> [--force] [--confirm <token>]` - preview and release a beacon resource",
 		"- advanced: `beacon allocation ...` and `beacon machine ...` inspect internal state",
 		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
 		"- Beacon execution profiles are separate from SSH proxy profiles managed by `cxp proxy`.",
@@ -5126,6 +5129,60 @@ func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, a
 		return b.sendControl(ctx, "⚠️ Helper update failed\n\n"+err.Error())
 	}
 	return nil
+}
+
+func (b *Bridge) updateCodexFromControl(ctx context.Context, msg ChatMessage, arg string) error {
+	if !strings.EqualFold(strings.TrimSpace(arg), "now") {
+		return b.sendControl(ctx, codexUpdateHelpText())
+	}
+	if b.codexUpgrader == nil {
+		return b.sendControl(ctx, "⚠️ Codex CLI update is not available in this helper process. Start the normal Teams service without a custom Codex updater override, then try again.")
+	}
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_codex_update"); err != nil {
+		return err
+	} else if duplicate {
+		return nil
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if state.ServiceControl.Draining {
+		return b.sendControl(ctx, helperDrainBlockedMessage(state.ServiceControl, "Codex CLI update"))
+	}
+	if _, err := b.store.BeginUpgrade(ctx, teamstore.CodexUpgradeReason, 30*time.Minute); err != nil {
+		if errors.Is(err, teamstore.ErrUpgradeInProgress) || errors.Is(err, teamstore.ErrDrainOperationConflict) {
+			state, loadErr := b.store.Load(ctx)
+			if loadErr != nil {
+				return loadErr
+			}
+			return b.sendControl(ctx, helperDrainBlockedMessage(state.ServiceControl, "Codex CLI update"))
+		}
+		return b.sendControl(ctx, "⚠️ Codex CLI update could not be scheduled\n\n"+err.Error())
+	}
+	b.clearPendingCodexUpgradeProbeGate()
+	b.boostPolling(time.Now())
+	return b.sendControl(ctx, strings.Join([]string{
+		"⬆️ Codex CLI update scheduled",
+		"",
+		"I will wait for active Codex requests to finish, then update the local Codex CLI using its detected install source.",
+		"I will post the completion or failure here. Existing requests are not retried automatically.",
+	}, "\n"))
+}
+
+func codexUpdateHelpText() string {
+	return strings.Join([]string{
+		"## ⬆️ Codex CLI update",
+		"",
+		"This updates the local Codex CLI used by the Teams helper. It does not update cxp/codex-helper.",
+		"The helper waits for active Codex work to finish and keeps the detected Codex install source.",
+		"",
+		"Command:",
+		"- `codex update now` - update Codex CLI to the latest version available from its install source",
+	}, "\n")
 }
 
 func (b *Bridge) workflowWebhookFromControl(ctx context.Context, msg ChatMessage, arg string) error {
@@ -6709,7 +6766,11 @@ func (b *Bridge) maybeRunPendingCodexUpgrade(ctx context.Context) error {
 	if strings.TrimSpace(result.Path) != "" {
 		body += "\n\nPath: `" + strings.TrimSpace(result.Path) + "`"
 	}
-	body += "\n\nRetry the failed Work chat request with `helper retry last`."
+	if len(completed.NotificationTargets) > 0 {
+		body += "\n\nRetry the failed Work chat request with `helper retry last`."
+	} else {
+		body += "\n\nNew Teams requests will use the updated Codex CLI."
+	}
 	controlErr := b.sendControl(ctx, body)
 	targetErr := b.notifyCodexUpgradeTargets(ctx, completed.NotificationTargets, true, result.Path, nil)
 	if controlErr != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/migration"
@@ -685,7 +686,7 @@ func runTargetOnceWithOptions(
 	if identityErr != nil {
 		return identityErr
 	}
-	cmd.Env = mergeCLIEnvironment(nil, updatedEnv)
+	cmd.Env = helperruntime.WithoutRuntimeMarkers(mergeCLIEnvironment(nil, updatedEnv))
 	preserveTTY := shouldPreserveTargetTTY(opts)
 	useProcessGroup := !preserveTTY
 	if useProcessGroup {
