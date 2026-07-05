@@ -42,8 +42,16 @@ func TestAppServerProcessStarterLaunchesCommandArgsAndWorkingDir(t *testing.T) {
 	if err := json.Unmarshal(line, &got); err != nil {
 		t.Fatalf("metadata line is not JSON: %s: %v", string(line), err)
 	}
-	if got.Cwd != workingDir {
-		t.Fatalf("working dir = %q, want %q", got.Cwd, workingDir)
+	gotDir, err := os.Stat(got.Cwd)
+	if err != nil {
+		t.Fatalf("stat reported working dir %q: %v", got.Cwd, err)
+	}
+	wantDir, err := os.Stat(workingDir)
+	if err != nil {
+		t.Fatalf("stat requested working dir %q: %v", workingDir, err)
+	}
+	if !os.SameFile(gotDir, wantDir) {
+		t.Fatalf("working dir = %q, want same directory as %q", got.Cwd, workingDir)
 	}
 	if want := []string{"meta", "arg-one", "arg-two"}; !reflect.DeepEqual(got.Args, want) {
 		t.Fatalf("helper args = %#v, want %#v", got.Args, want)
