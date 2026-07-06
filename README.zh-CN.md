@@ -943,6 +943,30 @@ codex-proxy --upgrade-codex
   - managed/local npm install（`codex-proxy` prefix）-> managed reinstall path
 - 无法确定来源时 fail fast（避免意外改变 install topology）。
 
+### 审计或清理旧版 patched binaries（POSIX）
+
+源码 checkout 内提供了一个 fail-closed 清理工具，用于处理早期 `codex-helper` 或
+`claude-helper` 遗留的 patched copies。默认 audit 不会修改文件：
+
+```bash
+python3 scripts/cleanup_patched_binaries.py --audit
+```
+
+检查报告后，可在具有可读 Linux-style procfs 的系统上只清理由 helper provenance 明确证明的
+artifacts：
+
+```bash
+python3 scripts/cleanup_patched_binaries.py --purge --json cleanup-report.json
+```
+
+POSIX 系统都可执行 audit；purge 刻意要求 procfs，避免把 active executable 误判为 inactive
+artifact。该工具不会自动运行。它只操作经过验证的当前用户 home/XDG roots 和 `/tmp` 下由当前用户
+拥有的 helper namespace；遇到 symlink、hard link、其他用户 ownership、变化的 inode、nested mount 或
+ambiguous history 时会拒绝操作；对 in-place Claude patch 只恢复 executable，不会删除它。
+如果确认目标仍是 patched content、但没有 hash-verified original，则报告
+`repair_required`。运行中的进程默认保留；只有显式同时使用 `--purge` 和
+`--terminate-active` 才会尝试终止精确匹配的进程。
+
 ## 长期运行实例（可选）
 
 启动可复用 daemon instance:

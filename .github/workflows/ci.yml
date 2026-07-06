@@ -87,6 +87,13 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Patched-binary cleanup real HOME safety (Linux only)
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/tests/run_cleanup_patched_binaries_docker.sh
+
       - name: Install PATH activation matrix (Linux only)
         if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
@@ -157,6 +164,16 @@ jobs:
             echo "$bad"
             exit 1
           fi
+
+      - name: CXP TUI preview mirror and navigation regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|KeepsDistinctSameSourceIDsWithSameText|KeepsIdenticalCommentaryAndFinal)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID))$'
+          tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused)$'
+          go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
+          go test ./internal/tui -count=1 -run "$tui_pattern" -v
 
       - name: go mod tidy (verify)
         if: matrix.shard == 'core'

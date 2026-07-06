@@ -1066,6 +1066,33 @@ Behavior:
   - managed/local npm install (`codex-proxy` prefix) -> managed reinstall path
 - Fails fast when source cannot be determined (to avoid changing install topology unexpectedly).
 
+### Audit or clean legacy patched binaries (POSIX)
+
+A source checkout includes a fail-closed cleanup tool for old patched copies
+left by earlier `codex-helper` or `claude-helper` releases. Audit is the default
+and does not modify files:
+
+```bash
+python3 scripts/cleanup_patched_binaries.py --audit
+```
+
+After reviewing the report, remove only artifacts with proven helper
+provenance on a system with readable Linux-style procfs:
+
+```bash
+python3 scripts/cleanup_patched_binaries.py --purge --json cleanup-report.json
+```
+
+Audit works on POSIX systems; purge deliberately requires procfs so an active
+executable cannot be mistaken for an inactive artifact. The cleaner is not run
+automatically. It stays inside validated current-user
+home/XDG roots and current-user-owned helper namespaces under `/tmp`; refuses
+symlinks, hard links, foreign ownership, changed inodes, nested mounts, and
+ambiguous histories; and restores an in-place Claude patch instead of deleting
+the executable. A confirmed in-place patch without a hash-verified original is
+reported as `repair_required`. Running processes are preserved unless
+`--terminate-active` is explicitly combined with `--purge`.
+
 ## Long-lived instances (optional)
 
 Start a reusable daemon instance:
