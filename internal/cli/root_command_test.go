@@ -22,7 +22,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "app", "beacon", "delegate", "history", "init", "model", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "__user-path-probe", "app", "beacon", "delegate", "history", "init", "model", "model-profile", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -148,7 +148,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"auth", "chat", "control", "doctor", "drain", "pause", "probe-chat", "recover", "resume", "run", "send-file", "service", "setup", "status", "workflow"}
+	want := []string{"auth", "chat", "control", "doctor", "drain", "path", "pause", "probe-chat", "recover", "resume", "run", "send-file", "service", "setup", "status", "workflow"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected teams subcommands\n got: %#v\nwant: %#v", names, want)
 	}

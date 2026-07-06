@@ -29,7 +29,7 @@ import (
 
 // Legacy direct-exec launcher tests were replaced by app-server contract tests below.
 
-func TestTeamsCodexChildEnvExposesHelperCLIPathAndDir(t *testing.T) {
+func TestTeamsCodexChildEnvExposesHelperCLIPathAndDirWithoutMutatingPATH(t *testing.T) {
 	prevExecutablePath := teamsChildExecutablePath
 	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
 
@@ -48,13 +48,12 @@ func TestTeamsCodexChildEnvExposesHelperCLIPathAndDir(t *testing.T) {
 	if !hasEnvValue(got, envTeamsHelperCLIDir, dir) {
 		t.Fatalf("expected helper CLI dir env: %#v", got)
 	}
-	path := envValue(got, "PATH")
-	if !strings.HasPrefix(path, dir+string(os.PathListSeparator)) {
-		t.Fatalf("PATH = %q, want helper dir prepended", path)
+	if _, ok := sliceEnvValue(got, "PATH"); ok {
+		t.Fatalf("child environment must not override the user's PATH: %#v", got)
 	}
 }
 
-func TestTeamsCodexChildEnvDoesNotDuplicateHelperDirInPATH(t *testing.T) {
+func TestTeamsCodexChildEnvDoesNotCopyExistingPATH(t *testing.T) {
 	prevExecutablePath := teamsChildExecutablePath
 	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
 
@@ -63,8 +62,8 @@ func TestTeamsCodexChildEnvDoesNotDuplicateHelperDirInPATH(t *testing.T) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+"/usr/bin")
 
 	got := teamsCodexChildEnv()
-	if path := envValue(got, "PATH"); path != dir+string(os.PathListSeparator)+"/usr/bin" {
-		t.Fatalf("PATH = %q, want unchanged when helper dir is already present", path)
+	if _, ok := sliceEnvValue(got, "PATH"); ok {
+		t.Fatalf("child environment copied PATH: %#v", got)
 	}
 }
 
@@ -115,7 +114,7 @@ func TestTeamsCodexChildEnvExposesRecoveredStableHelperPath(t *testing.T) {
 	}
 }
 
-func TestTeamsCodexChildEnvMakesHelperDirDiscoverableOnPATH(t *testing.T) {
+func TestTeamsCodexChildEnvAbsoluteHelperPathRemainsRunnable(t *testing.T) {
 	prevExecutablePath := teamsChildExecutablePath
 	t.Cleanup(func() { teamsChildExecutablePath = prevExecutablePath })
 	if os.PathSeparator != '/' {
@@ -130,14 +129,15 @@ func TestTeamsCodexChildEnvMakesHelperDirDiscoverableOnPATH(t *testing.T) {
 	teamsChildExecutablePath = func() (string, error) { return exe, nil }
 	t.Setenv("PATH", "/usr/bin:/bin")
 
-	cmd := exec.Command("/bin/sh", "-c", "command -v cxp")
-	cmd.Env = []string{"PATH=" + envValue(teamsCodexChildEnv(), "PATH")}
+	helperPath := envValue(teamsCodexChildEnv(), envTeamsHelperCLIPath)
+	cmd := exec.Command(helperPath)
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("command -v cxp: %v", err)
+		t.Fatalf("run explicit helper path: %v", err)
 	}
-	if got := strings.TrimSpace(string(out)); got != exe {
-		t.Fatalf("command -v cxp = %q, want %q", got, exe)
+	if got := strings.TrimSpace(string(out)); got != "" {
+		t.Fatalf("helper output = %q, want empty", got)
 	}
 }
 
@@ -662,19 +662,6 @@ esac
 	}
 	if result.Text != "managed node ok" {
 		t.Fatalf("cold restart result = %#v", result)
-	}
-}
-
-func TestRefreshTeamsAppServerPATHUsesCurrentProcessPATH(t *testing.T) {
-	previous := []string{
-		envTeamsHelperCLIDir + "=/opt/cxp",
-		"PATH=/stale/service",
-	}
-	t.Setenv("PATH", "/current/system")
-	got := refreshTeamsAppServerPATH(previous)
-	want := "/opt/cxp" + string(os.PathListSeparator) + "/current/system"
-	if envValue(got, "PATH") != want {
-		t.Fatalf("PATH = %q, want %q", envValue(got, "PATH"), want)
 	}
 }
 

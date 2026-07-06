@@ -13,8 +13,10 @@ import (
 // PATH mutation surviving a lazy app-server start or an execution-identity
 // switch.
 type resolvedCodexRuntime struct {
-	Command     string
-	Environment []string
+	Command        string
+	WrapperCommand string
+	VendorPathDir  string
+	Environment    []string
 }
 
 func resolveCodexInstalledRuntimeForLaunch(
@@ -36,8 +38,9 @@ func resolveCodexInstalledRuntimeForLaunch(
 		return resolvedCodexRuntime{}, err
 	}
 	return resolvedCodexRuntime{
-		Command:     command,
-		Environment: codexRuntimeEnvironment(os.Environ(), overlay, identity),
+		Command:        command,
+		WrapperCommand: command,
+		Environment:    codexRuntimeEnvironment(os.Environ(), overlay, identity),
 	}, nil
 }
 
@@ -61,8 +64,9 @@ func resolveCodexBrokerRuntimeForLaunch(
 		return resolvedCodexRuntime{}, err
 	}
 	return resolvedCodexRuntime{
-		Command:     command,
-		Environment: codexRuntimeEnvironment(os.Environ(), overlay, identity),
+		Command:        command,
+		WrapperCommand: command,
+		Environment:    codexRuntimeEnvironment(os.Environ(), overlay, identity),
 	}, nil
 }
 

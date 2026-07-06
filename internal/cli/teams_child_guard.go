@@ -45,9 +45,6 @@ func teamsCodexChildEnv() []string {
 		return env
 	}
 	env = append(env, envTeamsHelperCLIDir+"="+dir)
-	if path := prependPathDir(dir, os.Getenv("PATH")); path != "" {
-		env = append(env, "PATH="+path)
-	}
 	return env
 }
 

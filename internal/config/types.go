@@ -3,10 +3,12 @@ package config
 import "time"
 
 // CurrentVersion is the schema generation this binary stamps into configs it
-// writes. Generation 4 adds the agent-auto-approve preference. The field is
+// writes. Generation 5 adds the Teams Codex user-PATH policy. The field is
 // additive and keeps the reader floor unchanged, while the newer write
-// generation prevents an older helper from silently dropping the preference.
-const CurrentVersion = 4
+// generation prevents an older helper from silently dropping the policy.
+const CurrentVersion = 5
+
+const teamsCodexPathIntroducedVersion = 5
 
 // MinReaderVersion is the minimum reader generation required to SAFELY read a
 // config written by this binary. Raise it ONLY for breaking schema changes
@@ -39,6 +41,17 @@ type Config struct {
 	Instances               []Instance              `json:"instances,omitempty"`
 	DefaultModelProfile     string                  `json:"defaultModelProfile,omitempty"`
 	ModelProfiles           map[string]ModelProfile `json:"modelProfiles,omitempty"`
+	TeamsCodexPath          TeamsCodexPathPolicy    `json:"teamsCodexPath,omitempty"`
+}
+
+// TeamsCodexPathPolicy controls which executable search path is exposed to
+// Codex processes launched by the Teams helper. Empty Mode means
+// account-default for generation-5 configs; older configs are migrated to an
+// explicit service mode so upgrades preserve their previous behavior.
+type TeamsCodexPathPolicy struct {
+	Mode          string `json:"mode,omitempty"`
+	ExplicitPath  string `json:"explicitPath,omitempty"`
+	ShellOverride string `json:"shellOverride,omitempty"`
 }
 
 type Profile struct {

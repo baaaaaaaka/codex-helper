@@ -66,6 +66,7 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsSendFileCmd(root, &registryPath),
 		newTeamsStatusCmd(&registryPath),
 		newTeamsDoctorCmd(root, &registryPath),
+		newTeamsPathCmd(root),
 		newTeamsServiceCmd(root, &registryPath),
 		newTeamsPauseCmd(),
 		newTeamsResumeCmd(),

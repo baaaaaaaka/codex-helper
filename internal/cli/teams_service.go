@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -90,6 +91,7 @@ var (
 	teamsServiceIsWSL                                                 = defaultTeamsServiceIsWSL
 	teamsServiceWSLDistroName                                         = defaultTeamsServiceWSLDistroName
 	teamsServiceWSLLinuxUserName                                      = defaultTeamsServiceWSLLinuxUserName
+	teamsServiceCurrentUser                                           = user.Current
 	teamsServicePowerShellExecutable                                  = defaultTeamsServicePowerShellExecutable
 	teamsServiceSystemctl                   teamsServiceCommandRunner = teamsServiceExecRunner{}
 	teamsServiceSystemdUserAvailable                                  = defaultTeamsServiceSystemdUserAvailable
@@ -4405,9 +4407,9 @@ func defaultTeamsServiceWSLDistroName() string {
 }
 
 func defaultTeamsServiceWSLLinuxUserName() string {
-	for _, name := range []string{"USER", "LOGNAME", "USERNAME"} {
-		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			return value
+	if current, err := teamsServiceCurrentUser(); err == nil && current != nil {
+		if username := strings.TrimSpace(current.Username); username != "" {
+			return username
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {

@@ -160,6 +160,32 @@ func TestFindNativeBinaryNotFound(t *testing.T) {
 	}
 }
 
+func TestPackageRootForWrapper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix symlink wrapper fixture")
+	}
+	root := filepath.Join(t.TempDir(), "lib", "node_modules", "@openai", "codex")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(binDir, "codex.js")
+	if err := os.WriteFile(entry, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "codex")
+	if err := os.Symlink(entry, wrapper); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PackageRootForWrapper(wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("package root = %q, want %q", got, root)
+	}
+}
+
 // TestFindNativeBinaryWithRetrySucceedsWhenBinaryAppears simulates the npm
 // reinstall race: the vendor binary is briefly absent, then appears. The retry
 // wrapper must ride out the gap instead of failing the launch.

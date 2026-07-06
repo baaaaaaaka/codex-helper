@@ -260,6 +260,26 @@ func FindNativeBinaryWithRetry(codexWrapperPath string) (nativeBin string, pathD
 	return "", "", err
 }
 
+// PackageRootForWrapper returns the package root whose bin/codex.js entrypoint
+// was resolved from an npm/Bun wrapper. Callers that launch the native binary
+// directly use this to preserve CODEX_MANAGED_PACKAGE_ROOT from the JavaScript
+// wrapper contract.
+func PackageRootForWrapper(codexWrapperPath string) (string, error) {
+	resolved, err := resolveWrapper(codexWrapperPath)
+	if err != nil {
+		return "", err
+	}
+	binDir := filepath.Dir(resolved)
+	if !strings.EqualFold(filepath.Base(binDir), "bin") {
+		return "", fmt.Errorf("resolved Codex wrapper %s is not under a bin directory", resolved)
+	}
+	root := filepath.Dir(binDir)
+	if strings.TrimSpace(root) == "" || root == "." {
+		return "", fmt.Errorf("cannot resolve package root from Codex wrapper %s", resolved)
+	}
+	return root, nil
+}
+
 // FindNativeBinary locates the native Codex binary given the path to the
 // codex wrapper (e.g. /home/user/.npm-global/bin/codex on Unix or
 // C:\Users\...\npm\codex.cmd on Windows).

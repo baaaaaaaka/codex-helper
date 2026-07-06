@@ -108,9 +108,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v fish >/dev/null 2>&1; then
+          if ! command -v fish >/dev/null 2>&1 || ! command -v nu >/dev/null 2>&1; then
             for attempt in 1 2 3; do
-              if HOMEBREW_NO_AUTO_UPDATE=1 brew install fish; then
+              if HOMEBREW_NO_AUTO_UPDATE=1 brew install fish nushell; then
                 break
               fi
               if [ "$attempt" = "3" ]; then
@@ -120,6 +120,19 @@ jobs:
             done
           fi
           CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
+
+      - name: Teams account-default PATH through real shells (Linux/macOS)
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          required_shells='sh bash zsh fish csh tcsh pwsh'
+          if [ "$RUNNER_OS" = macOS ]; then
+            required_shells="$required_shells nu"
+          fi
+          CODEX_HELPER_USER_PATH_LIVE=1 \
+            CODEX_HELPER_USER_PATH_LIVE_SHELLS="$required_shells" \
+            go test ./internal/userpath -count=1 -run '^TestAccountDefaultLiveShellMatrix$' -v
 
       - name: Teams auth bootstrap dry-run (Linux/macOS)
         if: matrix.shard == 'core' && runner.os != 'Windows'
@@ -883,7 +896,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
-          go test ./internal/cli -count=1 -run 'TestTeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)CI$' -v
+          $env:CODEX_HELPER_USER_PATH_WINDOWS_LIVE = "1"
+          go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)|TeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipal)CI$' -v
 
       - name: Teams Graph 429 stress (Linux only)
         if: matrix.shard == 'core' && runner.os == 'Linux'
@@ -1706,7 +1721,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|RefreshTeamsAppServerPATHUsesCurrentProcessPATH|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
+          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
           process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/codexrunner -count=1 -run "$process_pattern" -v

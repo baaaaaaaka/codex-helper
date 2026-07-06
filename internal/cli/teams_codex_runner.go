@@ -205,7 +205,11 @@ func (s teamsPolicyAppServerStarter) StartAppServer(ctx context.Context, request
 		}
 		request.ExtraEnv = env.WithProxy(request.ExtraEnv, proxyURL)
 	}
-	request.ExtraEnv = refreshTeamsAppServerPATH(request.ExtraEnv)
+	pathResult, err := resolveTeamsCodexUserPath(ctx, cfg, s.paths, request.ExtraEnv, request.WorkingDir)
+	if err != nil {
+		return nil, err
+	}
+	request.ExtraEnv = setEnvValue(request.ExtraEnv, "PATH", pathResult.Path)
 	runtimeContract, err := resolveCodexBrokerRuntimeForLaunch(
 		ctx,
 		s.rawCommand,
@@ -218,8 +222,9 @@ func (s teamsPolicyAppServerStarter) StartAppServer(ctx context.Context, request
 	if err != nil {
 		return nil, err
 	}
+	runtimeContract = applyTeamsUserPathRuntime(runtimeContract, pathResult, s.log)
 	request.ExtraEnv = runtimeContract.Environment
-	if err := prepareRuntimeMigration(s.store, s.paths, runtimeContract.Command, s.log); err != nil {
+	if err := prepareRuntimeMigration(s.store, s.paths, runtimeContract.WrapperCommand, s.log); err != nil {
 		return nil, err
 	}
 	request.Command = runtimeContract.Command
@@ -233,16 +238,8 @@ func (s teamsPolicyAppServerStarter) StartAppServer(ctx context.Context, request
 	}
 	return (codexrunner.PolicyAppServerStarter{
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
-		ReadyHook:     runtimeMigrationReadyHook(s.store, s.paths, runtimeContract.Command, s.log),
+		ReadyHook:     runtimeMigrationReadyHook(s.store, s.paths, runtimeContract.WrapperCommand, s.log),
 	}).StartAppServer(ctx, request)
-}
-
-func refreshTeamsAppServerPATH(environment []string) []string {
-	pathValue := os.Getenv("PATH")
-	if helperDir := strings.TrimSpace(envValue(environment, envTeamsHelperCLIDir)); helperDir != "" {
-		pathValue = prependPathDir(helperDir, pathValue)
-	}
-	return setEnvValue(environment, "PATH", pathValue)
 }
 
 func (e teamsCodexExecutor) Run(ctx context.Context, session *teams.Session, prompt string) (teams.ExecutionResult, error) {

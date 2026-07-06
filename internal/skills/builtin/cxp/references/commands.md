@@ -61,6 +61,9 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 - `cxp teams doctor`: local diagnostics.
 - `cxp teams doctor --live`: opt in to live Microsoft Graph checks.
 - `cxp teams control --print`: print the bound Teams control chat.
+- `cxp teams path status [--show-path]`: resolve the effective Teams Codex PATH; the full value stays redacted unless explicitly requested.
+- `cxp teams path mode account-default|captured-terminal|explicit|service`: select the PATH source for future cold starts.
+- `cxp teams path capture-terminal`: save the current terminal PATH; use `cxp teams path shell <absolute-path|default>` to set or clear an account-shell override.
 - `cxp teams service bootstrap`: install or repair the background service/watchdog.
 - `cxp teams service status`: inspect OS service/task state.
 - `cxp teams service restart --force`: recover active local Teams state, mark ambiguous turns interrupted, then restart or activate the pending helper. Use only from a local terminal when you accept interrupting active work.

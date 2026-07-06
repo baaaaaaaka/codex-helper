@@ -150,6 +150,7 @@ func (s *Store) loadUnlocked() (Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
+	fileVersion := cfg.Version
 
 	// Three-state gate. Compatibility is decided by the reader floor, not by
 	// version equality, so an additive future config (higher version, same
@@ -174,6 +175,13 @@ func (s *Store) loadUnlocked() (Config, error) {
 	// generations (Version > CurrentVersion) are left as-is and read tolerantly.
 	if cfg.Version == 0 || cfg.Version == 1 {
 		cfg.Version = CurrentVersion
+	}
+	// Existing installations predate the Teams user-PATH policy. Keep their
+	// service PATH behavior until the operator explicitly opts in, while configs
+	// first created by generation 5 continue to use account-default via the
+	// policy's empty-mode default.
+	if fileVersion < teamsCodexPathIntroducedVersion && strings.TrimSpace(cfg.TeamsCodexPath.Mode) == "" {
+		cfg.TeamsCodexPath.Mode = "service"
 	}
 
 	return cfg, nil

@@ -206,6 +206,9 @@ codex-proxy proxy doctor
 | `codex-proxy proxy doctor` | 报告环境问题和安装提示 |
 | `codex-proxy teams status` | 显示 Teams helper state、control chat、service、owner 和 queue 状态 |
 | `codex-proxy teams doctor` | 检查本地 Teams helper auth 和 service readiness |
+| `codex-proxy teams path status` | 解析 Teams Codex 使用的账号 PATH；加 `--show-path` 才打印完整值 |
+| `codex-proxy teams path mode <mode>` | 选择 `account-default`、`captured-terminal`、`explicit` 或兼容模式 `service` |
+| `codex-proxy teams path capture-terminal` | 显式保存当前终端 PATH，供之后的 Teams Codex cold start 使用 |
 | `codex-proxy teams workflow status` | 显示可选 Teams Workflow notification 配置 |
 | `codex-proxy teams workflow enable --webhook-url-file <path>` | 用私有本地 webhook URL 文件启用 Workflow cards |
 | `codex-proxy teams send-file <path> --session <id>` | 上传本地 outbound 文件并作为 Teams attachment 发送 |
@@ -593,6 +596,9 @@ model fork deepseek
 codex-proxy teams service doctor
 codex-proxy teams service status
 codex-proxy teams service bootstrap
+codex-proxy teams path status
+codex-proxy teams path mode account-default
+codex-proxy teams path capture-terminal
 codex-proxy teams workflow status
 codex-proxy teams send-file relative/path.ext --session <session-id>
 codex-proxy teams probe-chat --chat <teams-chat-id-or-link>
@@ -604,6 +610,26 @@ codex-proxy teams chat recreate <session-id> --yes
 codex-proxy teams chat quarantine <session-or-chat> --dry-run
 codex-proxy teams chat unquarantine <session-or-chat> --dry-run
 ```
+
+Teams 启动的 Codex app-server 默认使用目标账号的默认 PATH，而不是直接复制后台
+service PATH。由旧版 helper 写入的现有配置会迁移到显式 `service` 模式，避免升级时
+无提示改变一个已经工作的环境；准备好后可运行 `codex-proxy teams path mode
+account-default`。Unix 和 WSL 会从账号数据库解析 shell，并以 Codex 相同的 UID、GID、
+supplementary groups 和 HOME 运行带逐次随机 nonce 的私有 framed Unix socket 探测。
+Windows 会读取当前 Scheduled Task token 的账号环境，并校验注册任务的 principal SID。
+除兼容用的 `service` 模式外，managed Node 只用于安装和 wrapper discovery；存在 packaged
+native Codex binary 时会直接启动它，避免改变用户对 `node`、`npm` 等命令的解析结果。
+
+`account-default` 不会复制 venv、direnv 或项目 shell 等仅属于当前终端的激活状态。
+需要精确保存当前终端时使用 `teams path capture-terminal`，维护固定值时使用 `teams path
+explicit <PATH>`，兼容回退则使用 `teams path mode service`。未知 shell 会明确报错，
+不会伪装成 bash。`teams path status` 默认只显示来源、entry 数和 fingerprint；只有
+`--show-path` 才显示完整 PATH。此前设置过 shell override 时，可用 `teams path shell
+default` 恢复账号数据库中的默认 shell。
+
+Generation 5 没有提高 reader floor，因此旧 helper 仍能读取配置，但会主动拒绝覆盖由
+新版本写入的配置；如果需要 downgrade，应恢复匹配版本的配置备份，或先回到新 helper
+再修改设置。
 
 在 Teams control chat 中，`helper reload now` 只用于 source-checkout development
 reload。普通安装的 helper 在本地 repair 后应使用 `helper restart now`，release update
@@ -617,9 +643,10 @@ Beacon profile setup 是本地 `codex-proxy beacon ...` CLI workflow。可以在
 control chat 里询问它，但 profile mutation commands 应在本地运行，除非 helper 打印了
 明确支持的 Teams command。
 
-Control-chat Codex fallback 在 Teams helper service environment 下运行，不一定是你的
-interactive shell。如果它需要检查本地 helper binary，child process 会收到
-`CODEX_HELPER_CLI_PATH`；该环境中缺少 `cxp` alias 并不意味着已安装 helper 缺失。
+Control-chat Codex fallback 使用配置的 Teams Codex PATH policy；新配置默认取目标账号
+环境，旧配置升级时保留显式 `service` 模式。child process 同时会收到绝对路径
+`CODEX_HELPER_CLI_PATH`；helper 不会为了暴露 `cxp` 而修改用户 PATH，因此缺少 `cxp`
+alias 并不意味着已安装 helper 缺失。
 
 如果从 Teams control chat 更新 helper，helper 会先 drain 当前 work，并把完成或失败通知
 发回 Teams。本地 `codex-proxy upgrade` 只安装 helper binary 和匹配的 `cxp` entry

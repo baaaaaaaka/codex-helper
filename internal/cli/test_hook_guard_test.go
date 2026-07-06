@@ -1,13 +1,21 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/update"
+	"github.com/baaaaaaaka/codex-helper/internal/userpath"
 )
+
+type cliTestUserPathResolverFunc func(context.Context, userpath.Request) (userpath.Result, error)
+
+func (f cliTestUserPathResolverFunc) Resolve(ctx context.Context, request userpath.Request) (userpath.Result, error) {
+	return f(ctx, request)
+}
 
 var cliTestHookGuard sync.Mutex
 
@@ -25,6 +33,7 @@ func lockCLITestHooks(t testing.TB) {
 	prevRestartArgv0 := restartArgv0
 	prevTeamsServiceArgv0 := teamsServiceArgv0
 	prevTeamsUpdatePendingHelperActivationOwned := teamsUpdatePendingHelperActivationOwned
+	prevTeamsUserPathResolver := teamsUserPathResolver
 	type envValue struct {
 		value string
 		set   bool
@@ -51,11 +60,16 @@ func lockCLITestHooks(t testing.TB) {
 	restartArgv0 = func() string { return installPath }
 	teamsServiceArgv0 = func() string { return installPath }
 	teamsUpdatePendingHelperActivationOwned = func(string, string) bool { return true }
+	teamsUserPathResolver = cliTestUserPathResolverFunc(func(_ context.Context, request userpath.Request) (userpath.Result, error) {
+		pathValue, _ := userpath.EnvironmentValue(request.ServiceEnvironment, "PATH", false)
+		return userpath.Result{Path: pathValue, Mode: userpath.ModeService, Source: "test-service-environment"}, nil
+	})
 	t.Cleanup(func() {
 		resolveInstallPathForCLI = prevResolveInstallPathForCLI
 		restartArgv0 = prevRestartArgv0
 		teamsServiceArgv0 = prevTeamsServiceArgv0
 		teamsUpdatePendingHelperActivationOwned = prevTeamsUpdatePendingHelperActivationOwned
+		teamsUserPathResolver = prevTeamsUserPathResolver
 		for _, key := range []string{
 			update.EnvInstallPath,
 			update.EnvInstallDir,

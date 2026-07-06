@@ -19,6 +19,13 @@ type rootOptions struct {
 }
 
 func Execute() int {
+	if handled, err := runEarlyUserPathProbe(os.Args[1:]); handled {
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if err := legacyUpdaterVersionPreflight(); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Error: helper update compatibility check failed: %v\n", err)
 		return 1
@@ -53,6 +60,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd.AddCommand(
 		newInternalNpmWrapperCmd(),
+		newInternalUserPathProbeCmd(),
 		newAppCmd(opts),
 		newInitCmd(opts),
 		newDelegateCmd(opts),

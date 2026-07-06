@@ -217,6 +217,9 @@ walk through the normal flows in order.
 | `codex-proxy proxy doctor` | Report environment issues and installation hints |
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
 | `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
+| `codex-proxy teams path status` | Resolve the account PATH used by Teams Codex; add `--show-path` to print it |
+| `codex-proxy teams path mode <mode>` | Select `account-default`, `captured-terminal`, `explicit`, or compatibility `service` PATH mode |
+| `codex-proxy teams path capture-terminal` | Explicitly snapshot the current terminal PATH for future Teams Codex cold starts |
 | `codex-proxy teams workflow status` | Show optional Teams Workflow notification configuration |
 | `codex-proxy teams workflow enable --webhook-url-file <path>` | Enable Workflow cards using a private local webhook URL file |
 | `codex-proxy teams send-file <path> --session <id>` | Upload a local outbound file and send it as a Teams attachment |
@@ -606,6 +609,35 @@ disconnect, WSL session exit, sleep/wake, or helper upgrade. Service bootstrap
 chooses the native per-user service mechanism for the platform where possible
 and repairs old helper service definitions when it can do so safely.
 
+Codex app-servers launched for Teams use the target account's default PATH by
+default instead of copying the background service PATH. Config files written by
+helper generations before this policy was introduced are migrated to explicit
+`service` mode so an upgrade does not silently change a working installation;
+select `teams path mode account-default` when ready. On Unix and WSL, cxp
+resolves the account shell from the account database, starts it under the same
+UID, GID, groups, and HOME as Codex, and receives only PATH through a framed
+private Unix socket with a per-probe nonce. On Windows, cxp reads the
+environment block for the current Scheduled Task user token. Managed Node
+remains private to Codex installation and wrapper discovery in non-`service`
+modes; when the packaged native Codex binary is available, it
+is launched directly so `node`, `npm`, and other tools still resolve from the
+user PATH.
+
+`account-default` intentionally does not reproduce terminal-only activation
+such as venv, direnv, or a project-specific shell. Use `teams path
+capture-terminal` when that exact snapshot is desired, `teams path explicit
+<PATH>` for a maintained explicit value, or `teams path mode service` as a
+compatibility rollback. Unknown account shells fail with a diagnostic instead
+of silently being treated as bash. `teams path status` reports identity, shell,
+source, entry count, and a fingerprint without printing the complete PATH
+unless `--show-path` is supplied. Use `teams path shell default` to clear a
+previous shell override and return to the account database value.
+
+Generation 5 remains readable by older helpers because the reader floor is
+unchanged, but older helpers deliberately refuse to overwrite a newer config;
+downgrade workflows should restore a matching config backup or return to the
+newer helper before changing settings.
+
 On non-WSL Linux, bootstrap uses `systemd --user` when the user manager is
 available. If `systemd --user` is not usable, it falls back to a local
 supervisor that detaches with `setsid`, uses a file lock to prevent duplicate
@@ -694,10 +726,11 @@ ask questions about it in the Teams control chat, but profile mutation commands
 should be run locally unless the helper prints a specific supported Teams
 command.
 
-Control-chat Codex fallback runs under the Teams helper service environment,
-not necessarily your interactive shell. If it needs to inspect the local helper
-binary, the child process receives `CODEX_HELPER_CLI_PATH`; a missing `cxp`
-alias in that environment does not mean the installed helper is missing.
+Control-chat Codex fallback receives the configured Teams Codex PATH policy,
+which defaults to the target account environment for newly written policy
+configs; migrated older configs retain explicit `service` mode. It also receives
+the absolute `CODEX_HELPER_CLI_PATH`; cxp is not added to the user PATH, so a
+missing `cxp` alias does not mean the installed helper is missing.
 
 If you update the helper from the Teams control chat, the helper drains current
 work first and sends a completion or failure notice back to Teams. A local

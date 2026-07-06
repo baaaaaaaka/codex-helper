@@ -40,6 +40,11 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	in := Config{
 		Version: CurrentVersion,
+		TeamsCodexPath: TeamsCodexPathPolicy{
+			Mode:          "explicit",
+			ExplicitPath:  "/home/alice/.local/bin:/usr/bin",
+			ShellOverride: "/bin/zsh",
+		},
 		Profiles: []Profile{
 			{ID: "p1", Name: "n1", Host: "h", Port: 22, User: "u", CreatedAt: now},
 		},
@@ -76,6 +81,9 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
 		t.Fatalf("ModelProfiles round trip failed: %#v", out.ModelProfiles)
 	}
+	if out.TeamsCodexPath != in.TeamsCodexPath {
+		t.Fatalf("TeamsCodexPath = %#v, want %#v", out.TeamsCodexPath, in.TeamsCodexPath)
+	}
 }
 
 func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
@@ -95,6 +103,9 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	if cfg.Version != CurrentVersion {
 		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion)
 	}
+	if cfg.TeamsCodexPath.Mode != "service" {
+		t.Fatalf("legacy TeamsCodexPath mode = %q, want service", cfg.TeamsCodexPath.Mode)
+	}
 	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "n1" {
 		t.Fatalf("Profiles=%#v", cfg.Profiles)
 	}
@@ -103,6 +114,42 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	}
 	if got, ok := cfg.FindModelProfile(""); !ok || got.SSHProxy != "" {
 		t.Fatalf("built-in default model profile should not inherit an ssh proxy: ok=%v profile=%#v", ok, got)
+	}
+}
+
+func TestStore_LoadKeepsPrePathPolicyInstallationsOnServiceMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"version":4,"minReader":1,"profiles":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TeamsCodexPath.Mode != "service" {
+		t.Fatalf("legacy TeamsCodexPath mode = %q, want service", cfg.TeamsCodexPath.Mode)
+	}
+}
+
+func TestStore_NewGenerationConfigKeepsAccountDefaultZeroValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[]}`, CurrentVersion, MinReaderVersion)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TeamsCodexPath.Mode != "" {
+		t.Fatalf("generation-%d zero-value TeamsCodexPath mode = %q, want empty account-default", CurrentVersion, cfg.TeamsCodexPath.Mode)
 	}
 }
 
