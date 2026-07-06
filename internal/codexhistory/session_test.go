@@ -1058,6 +1058,7 @@ func TestReadSessionPreviewMessagesDefaultKeepsCompleteCachedHistory(t *testing.
 }
 
 func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendJSON)
 	setTestUserCacheDir(t)
 	cachePath, err := sessionPreviewCacheFile()
 	if err != nil {
@@ -1207,6 +1208,7 @@ func TestReadSessionPreviewTextAppendDeduplicatesMirroredMessage(t *testing.T) {
 }
 
 func TestReadSessionPreviewTextColdCacheRetainsSkippedMirrorSourceID(t *testing.T) {
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendJSON)
 	setTestUserCacheDir(t)
 	f := filepath.Join(t.TempDir(), "preview-text-cold-cache-mirror.jsonl")
 	initial := strings.Join([]string{

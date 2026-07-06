@@ -17,6 +17,16 @@ import (
 const sessionPreviewFilterVersion = "status-answer-v3"
 const sessionPreviewPrefixHashBytes int64 = 64 * 1024
 
+// envSessionPreviewCacheBackend is a temporary rollback switch. SQLite is the
+// default; "json" retains the previous writer and "off" reads source JSONL only.
+const envSessionPreviewCacheBackend = "CODEX_HELPER_PREVIEW_CACHE_BACKEND"
+
+const (
+	sessionPreviewBackendSQLite = "sqlite"
+	sessionPreviewBackendJSON   = "json"
+	sessionPreviewBackendOff    = "off"
+)
+
 type persistentSessionPreviewCache struct {
 	Version int                                      `json:"version"`
 	Entries map[string]persistentSessionPreviewEntry `json:"entries"`
@@ -84,6 +94,34 @@ func readSessionPreviewTextCached(filePath string) (string, error) {
 }
 
 func readSessionPreviewCacheValue(filePath string, wantMessages bool) ([]Message, string, error) {
+	switch sessionPreviewCacheBackend() {
+	case sessionPreviewBackendJSON:
+		return readSessionPreviewCacheValueJSON(filePath, wantMessages)
+	case sessionPreviewBackendOff:
+		return readSessionPreviewUncached(filePath)
+	default:
+		messages, text, err := readSessionPreviewCacheValueSQLite(filePath, wantMessages)
+		if err == nil {
+			return messages, text, nil
+		}
+		// Preview state is disposable acceleration. A database open, migration,
+		// lock, or corruption failure must never hide the source session.
+		return readSessionPreviewUncached(filePath)
+	}
+}
+
+func sessionPreviewCacheBackend() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envSessionPreviewCacheBackend))) {
+	case sessionPreviewBackendJSON:
+		return sessionPreviewBackendJSON
+	case sessionPreviewBackendOff:
+		return sessionPreviewBackendOff
+	default:
+		return sessionPreviewBackendSQLite
+	}
+}
+
+func readSessionPreviewCacheValueJSON(filePath string, wantMessages bool) ([]Message, string, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		_ = deletePersistentSessionPreview(filePath)

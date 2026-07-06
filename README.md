@@ -430,6 +430,13 @@ Default data dir is `~/.codex`. You can override it with:
 codex-proxy tui --codex-dir /path/to/.codex
 ```
 
+Session JSONL files remain authoritative. The TUI keeps only rebuildable
+preview acceleration in a per-user SQLite cache under the platform cache
+directory; WAL batching avoids rewriting the full cache on every refresh. For
+diagnosis or rollback, set `CODEX_HELPER_PREVIEW_CACHE_BACKEND=json` to use the
+legacy JSON cache, or `CODEX_HELPER_PREVIEW_CACHE_BACKEND=off` to read session
+files without a persistent preview cache.
+
 Controls:
 
 - Navigation: Up/Down

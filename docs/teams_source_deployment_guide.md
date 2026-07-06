@@ -14,7 +14,8 @@ secret store only.
 - A machine where you can run user-level commands. Root/admin is not required for
   the helper service path.
 - Git.
-- Go 1.22 or newer.
+- Go 1.25 or newer. The repository pins Go 1.25.11 so local source builds use
+  the same toolchain as CI and the bundled pure-Go SQLite runtime.
 - Network access to GitHub, Microsoft login, Microsoft Graph, and the Codex API.
 - The Microsoft Teams Graph tenant/client IDs approved for your environment:
   - tenant ID

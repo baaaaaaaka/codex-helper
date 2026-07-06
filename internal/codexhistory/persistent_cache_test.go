@@ -23,10 +23,15 @@ func setTestUserCacheDir(t *testing.T) string {
 	t.Setenv("HOME", dir)
 	t.Setenv("LOCALAPPDATA", dir)
 	resetPersistentCacheStatesForTest()
+	// TempDir cleanup cannot remove an open SQLite database on Windows. Register
+	// this after TempDir/Setenv so LIFO cleanup closes cache handles first.
+	t.Cleanup(resetPersistentCacheStatesForTest)
 	return dir
 }
 
 func resetPersistentCacheStatesForTest() {
+	resetSessionPreviewSQLiteForTest()
+
 	persistentSessionMetaState.mu.Lock()
 	persistentSessionMetaState.path = ""
 	persistentSessionMetaState.cacheFilePresent = false

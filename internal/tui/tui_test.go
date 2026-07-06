@@ -1589,6 +1589,10 @@ func isolatePreviewPersistentCache(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", cacheHome)
 	t.Setenv("HOME", cacheHome)
 	t.Setenv("LOCALAPPDATA", cacheHome)
+	// These tests exercise the TUI's asynchronous in-memory preview cache. Keep
+	// the persistent backend out of scope so Windows can remove TempDir without
+	// an imported codexhistory package retaining an open SQLite handle.
+	t.Setenv("CODEX_HELPER_PREVIEW_CACHE_BACKEND", "off")
 }
 
 func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
@@ -2679,6 +2683,25 @@ func TestBuildPreviewLinesForSubagent(t *testing.T) {
 	}
 	if !strings.Contains(joined, "Parent: sess-1") {
 		t.Fatalf("expected parent id, got %q", joined)
+	}
+}
+
+func BenchmarkBuildWrappedLinesLargePreview(b *testing.B) {
+	var preview strings.Builder
+	payload := strings.Repeat("preview payload ", 16)
+	for index := 0; index < 8800; index++ {
+		preview.WriteString("Codex answer:\n")
+		preview.WriteString(payload)
+		preview.WriteString("\n\n")
+	}
+	lines := []string{preview.String()}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		wrapped := buildWrappedLines(lines, 100)
+		if len(wrapped) == 0 {
+			b.Fatal("wrapped preview is empty")
+		}
 	}
 }
 

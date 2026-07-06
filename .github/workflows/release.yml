@@ -58,7 +58,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Managed ASR focused regressions
@@ -90,7 +90,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Model profile cancellation regressions
@@ -140,7 +140,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Setup Node
@@ -205,6 +205,19 @@ jobs:
           tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
+
+      - name: CXP preview SQLite correctness, concurrency, and write budgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexhistory -count=1 -run '^TestSessionPreview(SQLite|CacheOff)' -v
+
+      - name: CXP preview SQLite actual syscall write budget (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/session_preview_sqlite_io_smoke.sh
 
       - name: Patched-binary cleanup real HOME safety (Linux only)
         if: runner.os == 'Linux'
@@ -415,7 +428,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Run GoReleaser
