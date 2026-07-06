@@ -1589,6 +1589,10 @@ func isolatePreviewPersistentCache(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", cacheHome)
 	t.Setenv("HOME", cacheHome)
 	t.Setenv("LOCALAPPDATA", cacheHome)
+	// These tests exercise the TUI's asynchronous in-memory preview cache. Keep
+	// the persistent backend out of scope so Windows can remove TempDir without
+	// an imported codexhistory package retaining an open SQLite handle.
+	t.Setenv("CODEX_HELPER_PREVIEW_CACHE_BACKEND", "off")
 }
 
 func TestSelectSessionReturnsSelectionOnEnter(t *testing.T) {
