@@ -2682,6 +2682,25 @@ func TestBuildPreviewLinesForSubagent(t *testing.T) {
 	}
 }
 
+func BenchmarkBuildWrappedLinesLargePreview(b *testing.B) {
+	var preview strings.Builder
+	payload := strings.Repeat("preview payload ", 16)
+	for index := 0; index < 8800; index++ {
+		preview.WriteString("Codex answer:\n")
+		preview.WriteString(payload)
+		preview.WriteString("\n\n")
+	}
+	lines := []string{preview.String()}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		wrapped := buildWrappedLines(lines, 100)
+		if len(wrapped) == 0 {
+			b.Fatal("wrapped preview is empty")
+		}
+	}
+}
+
 func readScreenLine(screen tcell.Screen, y int) string {
 	w, _ := screen.Size()
 	var buf strings.Builder

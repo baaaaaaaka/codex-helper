@@ -27,6 +27,8 @@ func setTestUserCacheDir(t *testing.T) string {
 }
 
 func resetPersistentCacheStatesForTest() {
+	resetSessionPreviewSQLiteForTest()
+
 	persistentSessionMetaState.mu.Lock()
 	persistentSessionMetaState.path = ""
 	persistentSessionMetaState.cacheFilePresent = false
