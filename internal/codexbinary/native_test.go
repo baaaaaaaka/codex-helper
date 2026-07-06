@@ -181,8 +181,12 @@ func TestPackageRootForWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != root {
-		t.Fatalf("package root = %q, want %q", got, root)
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("package root = %q, want physical root %q (logical %q)", got, want, root)
 	}
 }
 
