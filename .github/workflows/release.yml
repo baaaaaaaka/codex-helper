@@ -58,7 +58,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Managed ASR focused regressions
@@ -90,7 +90,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Model profile cancellation regressions
@@ -140,7 +140,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Setup Node
@@ -415,7 +415,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24.12"
+          go-version: "1.25.11"
           cache: true
 
       - name: Run GoReleaser
