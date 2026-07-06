@@ -1212,8 +1212,11 @@ func TestIsPreviewNavKey(t *testing.T) {
 	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyEnd, 0, 0)) {
 		t.Fatalf("expected KeyEnd to be preview nav key")
 	}
-	if isPreviewNavKey(tcell.NewEventKey(tcell.KeyUp, 0, 0)) {
-		t.Fatalf("expected KeyUp to be non-nav key")
+	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyUp, 0, 0)) {
+		t.Fatalf("expected KeyUp to be preview nav key")
+	}
+	if !isPreviewNavKey(tcell.NewEventKey(tcell.KeyDown, 0, 0)) {
+		t.Fatalf("expected KeyDown to be preview nav key")
 	}
 	if isPreviewNavKey(tcell.NewEventKey(tcell.KeyRune, 'j', 0)) {
 		t.Fatalf("expected rune j to be non-nav key")
@@ -1268,6 +1271,8 @@ func TestApplyPreviewNavigation(t *testing.T) {
 		ev   *tcell.EventKey
 		want int
 	}{
+		{tcell.NewEventKey(tcell.KeyUp, 0, 0), 0},
+		{tcell.NewEventKey(tcell.KeyDown, 0, 0), 2},
 		{tcell.NewEventKey(tcell.KeyPgUp, 0, 0), 0},
 		{tcell.NewEventKey(tcell.KeyPgDn, 0, 0), 3},
 		{tcell.NewEventKey(tcell.KeyHome, 0, 0), 0},
@@ -1279,12 +1284,6 @@ func TestApplyPreviewNavigation(t *testing.T) {
 		if state.scroll != tc.want {
 			t.Fatalf("expected scroll %d, got %d", tc.want, state.scroll)
 		}
-	}
-
-	state = &previewState{scroll: 1}
-	applyPreviewNavigation(state, 10, 2, tcell.NewEventKey(tcell.KeyUp, 0, 0))
-	if state.scroll != 1 {
-		t.Fatalf("expected scroll to remain unchanged")
 	}
 }
 
@@ -2227,6 +2226,38 @@ func TestPreviewPageDownScrollsWhenFocused(t *testing.T) {
 	}
 	if state.previewState.scroll == 0 {
 		t.Fatalf("expected preview scroll to move")
+	}
+}
+
+func TestPreviewArrowKeysScrollWhenFocused(t *testing.T) {
+	screen := newTestScreen(t, 60, 12)
+	project := codexhistory.Project{
+		Key:  "one",
+		Path: "/tmp/one",
+		Sessions: []codexhistory.Session{
+			{SessionID: "sess-arrow", Summary: "long summary to force wrapping and scrolling"},
+		},
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.focus = "preview"
+	state.lastListFocus = "sessions"
+	state.sessionState.selected = 1
+	state.previewCache[previewCacheKey(&project.Sessions[0], nil)] = previewCacheEntry{text: strings.Repeat("line ", 80)}
+
+	_, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyDown, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey KeyDown error: %v", err)
+	}
+	if state.previewState.scroll != 1 {
+		t.Fatalf("expected KeyDown to scroll preview by one line, got %d", state.previewState.scroll)
+	}
+
+	_, err = handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyUp, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey KeyUp error: %v", err)
+	}
+	if state.previewState.scroll != 0 {
+		t.Fatalf("expected KeyUp to scroll preview back to the top, got %d", state.previewState.scroll)
 	}
 }
 

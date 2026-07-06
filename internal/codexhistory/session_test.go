@@ -798,9 +798,9 @@ func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
 func TestReadSessionPreviewMessagesDeduplicatesMirroredCodexEvents(t *testing.T) {
 	lines := []string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}`,
-		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"status-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
 		`{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"done"}}`,
-		`{"timestamp":"2026-01-01T00:00:01.004Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01.004Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
 	}
 	f := filepath.Join(t.TempDir(), "preview-mirrored.jsonl")
 	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
@@ -825,6 +825,63 @@ func TestReadSessionPreviewMessagesDeduplicatesMirroredCodexEvents(t *testing.T)
 		if msgs[i].Role != want[i].role || msgs[i].Content != want[i].text {
 			t.Fatalf("msg[%d] = %#v, want role=%q text=%q", i, msgs[i], want[i].role, want[i].text)
 		}
+	}
+}
+
+func TestReadSessionPreviewMessagesDeduplicatesMirrorsWithDifferentSourceKinds(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"id":"event-1","type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"response-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-mirrored-source-kinds.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "working" {
+		t.Fatalf("messages = %#v, want cross-source mirror deduplicated", msgs)
+	}
+}
+
+func TestReadSessionPreviewMessagesKeepsDistinctSameSourceIDsWithSameText(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"response-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"response-2","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-same-source-repeated-text.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %#v, want distinct response IDs preserved", msgs)
+	}
+}
+
+func TestReadSessionPreviewMessagesKeepsIdenticalCommentaryAndFinal(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"commentary-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"same text"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"final-1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"same text"}]}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-identical-commentary-final.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Role != "assistant_commentary" || msgs[1].Role != "assistant" {
+		t.Fatalf("messages = %#v, want semantically distinct commentary and final preserved", msgs)
 	}
 }
 
@@ -1085,12 +1142,11 @@ func TestReadSessionPreviewTextAppendDeduplicatesMirroredMessage(t *testing.T) {
 	if strings.Count(first, "working") != 1 {
 		t.Fatalf("initial text = %q, want one status", first)
 	}
-
 	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("open append: %v", err)
 	}
-	mirror := `{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}` + "\n"
+	mirror := `{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"status-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}` + "\n"
 	if _, err := file.WriteString(mirror); err != nil {
 		_ = file.Close()
 		t.Fatalf("append: %v", err)
@@ -1126,6 +1182,79 @@ func TestReadSessionPreviewTextAppendDeduplicatesMirroredMessage(t *testing.T) {
 	}
 	if strings.Count(third, "working") != 2 {
 		t.Fatalf("second appended text = %q, want later repeated message preserved", third)
+	}
+
+	file, err = os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open source-id repeat append: %v", err)
+	}
+	sourceIDRepeat := `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"status-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}` + "\n"
+	if _, err := file.WriteString(sourceIDRepeat); err != nil {
+		_ = file.Close()
+		t.Fatalf("source-id repeat append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close source-id repeat append: %v", err)
+	}
+
+	fourth, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText source-id repeat append: %v", err)
+	}
+	if strings.Count(fourth, "working") != 2 {
+		t.Fatalf("source-id repeat text = %q, want skipped mirror source id to remain deduplicated", fourth)
+	}
+}
+
+func TestReadSessionPreviewTextColdCacheRetainsSkippedMirrorSourceID(t *testing.T) {
+	setTestUserCacheDir(t)
+	f := filepath.Join(t.TempDir(), "preview-text-cold-cache-mirror.jsonl")
+	initial := strings.Join([]string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"status-cold-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(f, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText initial: %v", err)
+	}
+	if strings.Count(first, "working") != 1 {
+		t.Fatalf("initial text = %q, want one status", first)
+	}
+	cachePath, err := sessionPreviewCacheFile()
+	if err != nil {
+		t.Fatalf("sessionPreviewCacheFile: %v", err)
+	}
+	entry, ok := readPersistentSessionPreviewEntry(cachePath, f)
+	if !ok {
+		t.Fatal("cold preview cache entry was not written")
+	}
+	if len(entry.SeenSourceIDs) != 1 || entry.SeenSourceIDs[0] != "message:status-cold-1" {
+		t.Fatalf("seen source IDs = %#v, want only skipped mirror identity", entry.SeenSourceIDs)
+	}
+
+	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	replay := `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"status-cold-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}` + "\n"
+	if _, err := file.WriteString(replay); err != nil {
+		_ = file.Close()
+		t.Fatalf("append replay: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close append: %v", err)
+	}
+
+	second, err := ReadSessionPreviewText(f, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewText replay: %v", err)
+	}
+	if strings.Count(second, "working") != 1 {
+		t.Fatalf("replayed text = %q, want skipped cold-cache source id to remain deduplicated", second)
 	}
 }
 

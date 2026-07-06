@@ -11319,6 +11319,14 @@ func (f *codexEventForwarder) handle(event codexrunner.StreamEvent) {
 	}
 	switch event.Kind {
 	case codexrunner.StreamEventAgentMessage:
+		// Keep a deliberate one-message look-behind for legacy agent-message
+		// streams that do not provide a phase. Their last agent message may be
+		// the final answer, so sending the newest message eagerly could expose
+		// final text as Teams progress. A later agent/work event proves that the
+		// pending text was intermediate; TurnCompleted or Close can instead mark
+		// or suppress terminal text. Explicitly phased commentary currently shares
+		// this ordering path, but any future eager path must retain the unphased
+		// pending behavior and the final/terminal guards.
 		if !f.pendingAgent.empty() && f.pendingAgent.progressEligible() {
 			_ = f.send("progress", f.pendingAgent.text)
 		}

@@ -24,14 +24,16 @@ var sessionPreviewTailInitialBytes int64 = 256 * 1024
 const fallbackMessageDedupWindow = 100 * time.Millisecond
 
 type messageSeenState struct {
-	sourceKeys    map[string]bool
-	fallbackTimes map[string]time.Time
+	sourceKeys         map[string]bool
+	fallbackTimes      map[string]time.Time
+	fallbackSourceKind map[string]string
 }
 
 func newMessageSeenState() *messageSeenState {
 	return &messageSeenState{
-		sourceKeys:    map[string]bool{},
-		fallbackTimes: map[string]time.Time{},
+		sourceKeys:         map[string]bool{},
+		fallbackTimes:      map[string]time.Time{},
+		fallbackSourceKind: map[string]string{},
 	}
 }
 
@@ -201,16 +203,23 @@ func markMessageSeen(msg Message, seen *messageSeenState) bool {
 			return false
 		}
 		seen.sourceKeys[key] = true
-		return true
 	}
+	// Codex can persist one logical assistant message as both event_msg and
+	// response_item records with different (or missing) source IDs. Populate the
+	// short-window content key even when an ID exists so those mirrors collapse;
+	// sourceKeys still preserve legitimate same-text messages outside the window.
 	key := fallbackMessageDedupKey(msg)
 	if key == "" {
 		return true
 	}
-	if previous, ok := seen.fallbackTimes[key]; ok && withinMessageDedupWindow(previous, msg.Timestamp) {
+	sourceKind := messageSourceKind(msg.sourceID)
+	if previous, ok := seen.fallbackTimes[key]; ok &&
+		withinMessageDedupWindow(previous, msg.Timestamp) &&
+		fallbackSourcesCanMirror(seen.fallbackSourceKind[key], sourceKind) {
 		return false
 	}
 	seen.fallbackTimes[key] = msg.Timestamp
+	seen.fallbackSourceKind[key] = sourceKind
 	return true
 }
 
@@ -220,15 +229,32 @@ func rememberMessageSeen(msg Message, seen *messageSeenState) {
 	}
 	if key := sourceMessageDedupKey(msg.sourceID); key != "" {
 		seen.sourceKeys[key] = true
-		return
 	}
+	// Keep both identity layers when rebuilding persistent preview state. A
+	// future append may carry only the other half of an event/response mirror.
 	key := fallbackMessageDedupKey(msg)
 	if key == "" {
 		return
 	}
 	if previous, ok := seen.fallbackTimes[key]; !ok || msg.Timestamp.After(previous) {
 		seen.fallbackTimes[key] = msg.Timestamp
+		seen.fallbackSourceKind[key] = messageSourceKind(msg.sourceID)
 	}
+}
+
+func messageSourceKind(sourceID string) string {
+	sourceID = strings.TrimSpace(sourceID)
+	if idx := strings.IndexByte(sourceID, ':'); idx > 0 {
+		return sourceID[:idx]
+	}
+	return ""
+}
+
+func fallbackSourcesCanMirror(previous string, current string) bool {
+	// Missing IDs are common on legacy event_msg records, so an unknown kind
+	// must remain eligible for the time/content fallback. Distinct IDs from the
+	// same concrete source kind are separate messages and must not be collapsed.
+	return previous == "" || current == "" || previous != current
 }
 
 func fallbackMessageDedupKey(msg Message) string {

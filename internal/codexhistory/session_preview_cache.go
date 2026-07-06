@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const sessionPreviewFilterVersion = "status-answer-v2"
+const sessionPreviewFilterVersion = "status-answer-v3"
 const sessionPreviewPrefixHashBytes int64 = 64 * 1024
 
 type persistentSessionPreviewCache struct {
@@ -42,8 +42,9 @@ type persistentSessionPreviewMessage struct {
 }
 
 type persistentSessionPreviewFallbackMessage struct {
-	Key       string    `json:"key"`
-	Timestamp time.Time `json:"timestamp,omitempty"`
+	Key        string    `json:"key"`
+	Timestamp  time.Time `json:"timestamp,omitempty"`
+	SourceKind string    `json:"sourceKind,omitempty"`
 }
 
 type sessionPreviewPersistentState struct {
@@ -132,12 +133,16 @@ func readSessionPreviewCacheValue(filePath string, wantMessages bool) ([]Message
 	if completeOffset < info.Size() {
 		return readSessionPreviewUncached(filePath)
 	}
-	messages, err := readSessionMessagesWindow(filePath, 0, completeOffset, 0, isPreviewMessage)
+	// Keep the complete dedupe state from the cold scan, including source IDs
+	// attached to mirrored records that were intentionally not retained in
+	// messages. Reconstructing seen from only the visible messages would let a
+	// later replay of one of those skipped source IDs reappear in the preview.
+	seen := newMessageSeenState()
+	messages, err := readSessionMessagesWindow(filePath, 0, completeOffset, 0, isPreviewMessage, seen)
 	if err != nil {
 		return nil, "", err
 	}
 	text := FormatPreviewMessages(messages, 0)
-	seen := seenStateFromMessages(messages)
 	_ = writePersistentSessionPreviewEntry(cachePath, filePath, info, completeOffset, messages, text, seen)
 	return messages, text, nil
 }
@@ -191,12 +196,15 @@ func loadSessionPreviewPersistentState(cachePath string) (persistentSessionPrevi
 func writePersistentSessionPreviewEntry(cachePath string, filePath string, info os.FileInfo, offset int64, messages []Message, text string, seen *messageSeenState) error {
 	cleanPath := filepath.Clean(filePath)
 	entry := persistentSessionPreviewEntry{
-		FileCacheKey:         newFileCacheKey(filePath, info),
-		FilterVersion:        sessionPreviewFilterVersion,
-		Offset:               offset,
-		Messages:             persistentMessagesFromSessionPreview(messages),
-		FormattedText:        text,
-		SeenSourceIDs:        seenSourceIDsFromMessages(messages),
+		FileCacheKey:  newFileCacheKey(filePath, info),
+		FilterVersion: sessionPreviewFilterVersion,
+		Offset:        offset,
+		Messages:      persistentMessagesFromSessionPreview(messages),
+		FormattedText: text,
+		// Messages already carry their own source IDs. Persist only IDs observed on
+		// records that dedupe removed, which keeps the cache compact while retaining
+		// the identity needed to reject a later replay.
+		SeenSourceIDs:        skippedSourceIDsFromState(seen, messages),
 		SeenFallbackMessages: seenFallbackMessagesFromState(seen),
 	}
 	entry.PrefixTailHash, entry.PrefixTailSize, _ = sessionPreviewPrefixTailHash(filePath, entry.Offset)
@@ -406,22 +414,32 @@ func persistentSessionPreviewSeenState(entry persistentSessionPreviewEntry) *mes
 		if msg.Key != "" && !msg.Timestamp.IsZero() {
 			if previous, ok := seen.fallbackTimes[msg.Key]; !ok || msg.Timestamp.After(previous) {
 				seen.fallbackTimes[msg.Key] = msg.Timestamp
+				seen.fallbackSourceKind[msg.Key] = msg.SourceKind
 			}
 		}
 	}
 	return seen
 }
 
-func seenSourceIDsFromMessages(messages []Message) []string {
-	seen := map[string]bool{}
+func skippedSourceIDsFromState(seen *messageSeenState, messages []Message) []string {
+	if seen == nil {
+		return nil
+	}
+	retained := make(map[string]bool, len(messages))
 	for _, msg := range messages {
-		if msg.sourceID != "" {
-			seen[msg.sourceID] = true
+		if key := sourceMessageDedupKey(msg.sourceID); key != "" {
+			retained[key] = true
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for id := range seen {
-		out = append(out, id)
+	out := make([]string, 0, len(seen.sourceKeys))
+	for key := range seen.sourceKeys {
+		if retained[key] {
+			continue
+		}
+		id := strings.TrimPrefix(key, "source:")
+		if id != "" && id != key {
+			out = append(out, id)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -442,7 +460,11 @@ func seenFallbackMessagesFromState(seen *messageSeenState) []persistentSessionPr
 	out := make([]persistentSessionPreviewFallbackMessage, 0, len(seen.fallbackTimes))
 	for key, ts := range seen.fallbackTimes {
 		if key != "" && !ts.IsZero() {
-			out = append(out, persistentSessionPreviewFallbackMessage{Key: key, Timestamp: ts})
+			out = append(out, persistentSessionPreviewFallbackMessage{
+				Key:        key,
+				Timestamp:  ts,
+				SourceKind: seen.fallbackSourceKind[key],
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

@@ -101,7 +101,7 @@ type previewEvent struct {
 	err      error
 }
 
-const previewFilterVersion = "status-answer-v2"
+const previewFilterVersion = "status-answer-v3"
 
 type previewCacheMeta struct {
 	path          string
@@ -864,7 +864,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		}
 	} else if state.focus == "preview" {
 		statusSegments = []statusSegment{
-			{text: "PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: "Up/Down PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: aaaLabel + "  ", style: aaaStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}
@@ -2078,7 +2078,7 @@ func previewScrollToMatch(matchLine int, viewH int) int {
 
 func isPreviewNavKey(ev *tcell.EventKey) bool {
 	switch ev.Key() {
-	case tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
+	case tcell.KeyUp, tcell.KeyDown, tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
 		return true
 	}
 	return false
@@ -2146,6 +2146,10 @@ func applyPreviewNavigation(state *previewState, nLines int, viewH int, ev *tcel
 		return
 	}
 	switch ev.Key() {
+	case tcell.KeyUp:
+		state.scroll = clamp(state.scroll-1, 0, max(0, nLines-viewH))
+	case tcell.KeyDown:
+		state.scroll = clamp(state.scroll+1, 0, max(0, nLines-viewH))
 	case tcell.KeyPgUp:
 		state.scroll = clamp(state.scroll-max(1, viewH), 0, max(0, nLines-viewH))
 	case tcell.KeyPgDn:
