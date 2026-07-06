@@ -229,7 +229,10 @@ class PatchedBinaryCleaner:
         claude_originals: dict[Path, Path] | None = None,
     ) -> None:
         self.home = normalized_absolute(home)
-        self.tmp_root = normalized_absolute(tmp_root)
+        # macOS exposes system aliases such as /var -> /private/var and
+        # /tmp -> /private/tmp. Keep the user-facing HOME spelling, but perform
+        # all temporary-root operations against a single physical namespace.
+        self.tmp_root = normalized_absolute(os.path.realpath(tmp_root))
         self.uid = os.geteuid() if uid is None else uid
         self.purge = purge
         self.terminate_active = terminate_active
@@ -279,6 +282,13 @@ class PatchedBinaryCleaner:
             raise SafetyError(
                 f"home owner uid {home_info.st_uid} does not match current uid {self.uid}"
             )
+        physical_home = normalized_absolute(os.path.realpath(self.home))
+        physical_home_info = os.lstat(physical_home)
+        if not self._same_object(physical_home_info, FileIdentity.from_stat(home_info)):
+            raise SafetyError(
+                f"home alias does not resolve to the validated directory: {self.home}"
+            )
+
         tmp_info = os.lstat(self.tmp_root)
         if stat.S_ISLNK(tmp_info.st_mode) or not stat.S_ISDIR(tmp_info.st_mode):
             raise SafetyError(f"temporary root is not a physical directory: {self.tmp_root}")
@@ -286,8 +296,8 @@ class PatchedBinaryCleaner:
         self.trusted_home_roots = [
             TrustedHomeRoot(
                 logical=self.home,
-                physical=self.home,
-                physical_identity=FileIdentity.from_stat(home_info),
+                physical=physical_home,
+                physical_identity=FileIdentity.from_stat(physical_home_info),
             )
         ]
         standard_roots = [

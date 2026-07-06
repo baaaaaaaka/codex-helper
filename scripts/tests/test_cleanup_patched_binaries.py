@@ -300,6 +300,33 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         self.assertTrue(report["clean"], report)
         self.assertTrue(snapshot_binary.exists())
 
+    def test_home_path_through_parent_alias_uses_one_physical_namespace(self) -> None:
+        physical_parent = self.root / "physical-parent"
+        physical_home = physical_parent / "home"
+        physical_home.mkdir(parents=True, mode=0o700)
+        alias_parent = self.root / "alias-parent"
+        alias_parent.symlink_to(physical_parent, target_is_directory=True)
+        aliased_home = alias_parent / "home"
+        binary = self.write(
+            aliased_home / ".config" / "codex-proxy" / "codex-patched-alias",
+            b"#!/bin/sh\n",
+            0o755,
+        )
+        cleaner = cleanup.PatchedBinaryCleaner(
+            home=aliased_home,
+            tmp_root=self.tmp,
+            uid=self.uid,
+            purge=True,
+            settle_seconds=0,
+        )
+
+        report = cleaner.run()
+
+        self.assertTrue(report["clean"], report)
+        self.assertFalse(binary.exists())
+        paths = [item["path"] for item in report["findings"]]
+        self.assertEqual(len(paths), len(set(paths)), paths)
+
     def _write_yolo_root(self, base: Path) -> Path:
         mirror_dir = (
             base
