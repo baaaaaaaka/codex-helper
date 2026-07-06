@@ -48,7 +48,11 @@ func TestTeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipalCI(t *testing.
 	if os.Getenv("CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST") != "1" {
 		t.Skip("set CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST=1 to run native Task Scheduler principal verification")
 	}
-	existing, err := teamsServiceRunPowerShell(context.Background(), "$task = Get-ScheduledTask -TaskPath '\\' -TaskName "+powershellSingleQuote(teamsServiceWindowsTaskName)+" -ErrorAction SilentlyContinue; if ($null -ne $task) { 'exists' }")
+	// An exact Get-ScheduledTask lookup returns process exit code 1 for a
+	// missing task on Windows Server 2022 even with -ErrorAction
+	// SilentlyContinue. Enumeration plus filtering has stable empty-result
+	// semantics across the hosted Windows 2022 and 2025 runners.
+	existing, err := teamsServiceRunPowerShell(context.Background(), "$task = Get-ScheduledTask | Where-Object { $_.TaskPath -eq '\\' -and $_.TaskName -eq "+powershellSingleQuote(teamsServiceWindowsTaskName)+" } | Select-Object -First 1; if ($null -ne $task) { 'exists' }")
 	if err != nil {
 		t.Fatal(err)
 	}
