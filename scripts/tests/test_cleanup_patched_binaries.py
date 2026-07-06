@@ -472,8 +472,16 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         canonical = cleaner.canonicalize_path(
             alias_scratch / ".local" / "escape" / target.name
         )
+        trusted_local = next(
+            root
+            for root in cleaner.trusted_home_roots
+            if root.logical == self.home / ".local"
+        )
 
-        self.assertEqual(canonical, scratch_local / "escape" / target.name)
+        # Compare against the registered physical root without resolving the
+        # malicious suffix: resolving the complete expectation would follow
+        # "escape" and stop testing that ensure_safe_chain can still see it.
+        self.assertEqual(canonical, trusted_local.physical / "escape" / target.name)
         with self.assertRaises(cleanup.SafetyError):
             cleaner.ensure_safe_chain(canonical, leaf_kind="file")
         self.assertTrue(target.exists())
