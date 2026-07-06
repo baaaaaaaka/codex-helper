@@ -418,6 +418,32 @@ class PatchedBinaryCleaner:
         if logical_matches:
             root = max(logical_matches, key=lambda item: len(item.logical.parts))
             return root.physical / path.relative_to(root.logical)
+
+        # The usual scan path is already in a registered physical namespace,
+        # so keep it allocation- and syscall-light. The fallback below exists
+        # for persisted history paths that use another spelling of a stable
+        # system alias (for example /var versus /private/var on macOS).
+        if lexical_beneath(path, self.tmp_root) or any(
+            lexical_beneath(path, root.physical) for root in self.trusted_home_roots
+        ):
+            return path
+
+        # Do not call realpath() on the whole candidate: that would follow a
+        # symlink below HOME and could bypass ensure_safe_chain(). Instead,
+        # accept only an existing ancestor that is the exact same directory
+        # (device/inode/owner/type) as an already validated trusted root, then
+        # retain the lexical suffix so later safety checks still see every
+        # symlink, ownership boundary, and nested mount below that root.
+        for ancestor in (path, *path.parents):
+            try:
+                info = os.stat(ancestor)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            for root in self.trusted_home_roots:
+                if self._same_object(info, root.physical_identity):
+                    return root.physical / path.relative_to(ancestor)
         return path
 
     def trusted_home_root_for(self, path: Path) -> TrustedHomeRoot | None:

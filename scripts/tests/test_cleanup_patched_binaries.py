@@ -139,7 +139,7 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         self.assertTrue(
             any(
                 item["status"] in {"ambiguous", "residual"}
-                and item["path"] == str(binary)
+                and os.path.realpath(item["path"]) == os.path.realpath(binary)
                 for item in report["findings"]
             )
         )
@@ -418,7 +418,11 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         self.assertEqual(unrelated.read_bytes(), b"keep")
 
     def test_physical_history_target_under_symlinked_local_is_in_home_scope(self) -> None:
-        scratch_local = self.root / "scratch-user" / ".local"
+        physical_scratch = self.root / "physical-scratch"
+        alias_scratch = self.root / "alias-scratch"
+        physical_scratch.mkdir()
+        alias_scratch.symlink_to(physical_scratch, target_is_directory=True)
+        scratch_local = alias_scratch / ".local"
         scratch_local.mkdir(parents=True)
         (self.home / ".local").symlink_to(scratch_local, target_is_directory=True)
         original = b"official Claude from scratch home"
@@ -450,6 +454,29 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         self.assertFalse(backup.exists())
         self.assertFalse(history.exists())
         self.assertTrue((self.home / ".local").is_symlink())
+
+    def test_alias_fallback_preserves_symlink_below_trusted_root(self) -> None:
+        physical_scratch = self.root / "physical-scratch"
+        alias_scratch = self.root / "alias-scratch"
+        scratch_local = physical_scratch / ".local"
+        scratch_local.mkdir(parents=True)
+        alias_scratch.symlink_to(physical_scratch, target_is_directory=True)
+        (self.home / ".local").symlink_to(scratch_local, target_is_directory=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        target = self.write(outside / "codex-patched", b"#!/bin/sh\n", 0o755)
+        (scratch_local / "escape").symlink_to(outside, target_is_directory=True)
+        cleaner = self.cleaner(purge=True)
+        cleaner.validate_roots()
+
+        canonical = cleaner.canonicalize_path(
+            alias_scratch / ".local" / "escape" / target.name
+        )
+
+        self.assertEqual(canonical, scratch_local / "escape" / target.name)
+        with self.assertRaises(cleanup.SafetyError):
+            cleaner.ensure_safe_chain(canonical, leaf_kind="file")
+        self.assertTrue(target.exists())
 
     def test_changed_home_extension_symlink_aborts_before_deletion(self) -> None:
         first_cache = self.root / "first" / ".cache"
