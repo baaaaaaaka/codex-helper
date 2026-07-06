@@ -1,16 +1,20 @@
 package codexhistory
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	sqlite "modernc.org/sqlite"
 )
 
@@ -248,6 +252,125 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 	}
 }
 
+func TestSessionPreviewSQLiteMultiProcessAppendIsIdempotent(t *testing.T) {
+	const (
+		childEnv = "CXP_SESSION_PREVIEW_MULTIPROCESS_CHILD"
+		pathEnv  = "CXP_SESSION_PREVIEW_MULTIPROCESS_PATH"
+		readyEnv = "CXP_SESSION_PREVIEW_MULTIPROCESS_READY"
+		goEnv    = "CXP_SESSION_PREVIEW_MULTIPROCESS_GO"
+	)
+	if os.Getenv(childEnv) == "1" {
+		readyPath := os.Getenv(readyEnv)
+		if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			if _, err := os.Stat(os.Getenv(goEnv)); err == nil {
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for multi-process start barrier")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		text, err := ReadSessionPreviewText(os.Getenv(pathEnv), 0, 0)
+		if err != nil || strings.Count(text, "multi-process-answer") != 1 {
+			t.Fatalf("child preview count=%d err=%v", strings.Count(text, "multi-process-answer"), err)
+		}
+		return
+	}
+
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+	setTestUserCacheDir(t)
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSessionPreviewText(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"answer-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"multi-process-answer `+strings.Repeat("x", 70*1024)+`"}]}}`)
+	resetSessionPreviewSQLiteForTest()
+
+	executable, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrierDir := t.TempDir()
+	goPath := filepath.Join(barrierDir, "go")
+	type childProcess struct {
+		cmd    *exec.Cmd
+		output bytes.Buffer
+		ready  string
+	}
+	children := make([]*childProcess, 6)
+	for index := range children {
+		child := &childProcess{ready: filepath.Join(barrierDir, fmt.Sprintf("ready-%d", index))}
+		child.cmd = exec.Command(executable, "-test.run=^TestSessionPreviewSQLiteMultiProcessAppendIsIdempotent$", "-test.count=1")
+		child.cmd.Env = append(os.Environ(),
+			childEnv+"=1",
+			pathEnv+"="+path,
+			readyEnv+"="+child.ready,
+			goEnv+"="+goPath,
+		)
+		child.cmd.Stdout = &child.output
+		child.cmd.Stderr = &child.output
+		if err := child.cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		children[index] = child
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for _, child := range children {
+		for {
+			if _, err := os.Stat(child.ready); err == nil {
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for multi-process children")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if err := os.WriteFile(goPath, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index, child := range children {
+		if err := child.cmd.Wait(); err != nil {
+			t.Fatalf("child %d: %v\n%s", index, err, child.output.String())
+		}
+	}
+
+	store, err := currentSessionPreviewSQLiteStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, err := store.load(path, true, true)
+	if err != nil || !ok {
+		t.Fatalf("load multi-process result: ok=%v err=%v", ok, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.offset != info.Size() || len(entry.messages) != 2 || strings.Count(entry.messages[1].Content, "multi-process-answer") != 1 {
+		t.Fatalf("multi-process entry offset=%d size=%d messages=%d", entry.offset, info.Size(), len(entry.messages))
+	}
+	var integrity string
+	if err := store.db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		t.Fatal(err)
+	}
+	if integrity != "ok" {
+		t.Fatalf("integrity_check = %q", integrity)
+	}
+}
+
 func TestSessionPreviewSQLiteBusyWriterFallsBackWithoutLosingPreview(t *testing.T) {
 	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
@@ -396,6 +519,106 @@ func TestSessionPreviewSQLiteCorruptionFallsBackToFreshCache(t *testing.T) {
 	}
 }
 
+func TestSessionPreviewSQLiteInvalidSchemaIsQuarantinedAndRebuilt(t *testing.T) {
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+	setTestUserCacheDir(t)
+	sqlitePath, err := sessionPreviewSQLiteFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken, err := sql.Open("sqlite", sessionPreviewSQLiteFileURI(sqlitePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broken.Exec(`CREATE TABLE preview_session (path TEXT)`); err != nil {
+		_ = broken.Close()
+		t.Fatal(err)
+	}
+	if err := broken.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"schema recovery"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	text, err := ReadSessionPreviewText(path, 0, 0)
+	if err != nil || !strings.Contains(text, "schema recovery") {
+		t.Fatalf("preview after malformed schema: text=%q err=%v", text, err)
+	}
+	invalid, err := filepath.Glob(sqlitePath + ".invalid-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(invalid) != 1 {
+		t.Fatalf("quarantined malformed schemas = %#v, want one", invalid)
+	}
+	store, err := currentSessionPreviewSQLiteStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateSessionPreviewSQLiteSchema(store.db); err != nil {
+		t.Fatalf("rebuilt schema validation: %v", err)
+	}
+}
+
+func TestSessionPreviewSQLiteArtifactsArePrivateAndRejectSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes and unprivileged symlink creation are not portable to Windows")
+	}
+	t.Run("private modes", func(t *testing.T) {
+		t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+		setTestUserCacheDir(t)
+		store, err := currentSessionPreviewSQLiteStore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			info, err := os.Lstat(store.path + suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("artifact %q mode = %o, want 600", store.path+suffix, info.Mode().Perm())
+			}
+		}
+	})
+
+	t.Run("main database symlink", func(t *testing.T) {
+		t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+		setTestUserCacheDir(t)
+		sqlitePath, err := sessionPreviewSQLiteFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(t.TempDir(), "must-not-change")
+		original := []byte("protected")
+		if err := os.WriteFile(target, original, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, sqlitePath); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "session.jsonl")
+		line := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"safe fallback"}]}}` + "\n"
+		if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		text, err := ReadSessionPreviewText(path, 0, 0)
+		if err != nil || !strings.Contains(text, "safe fallback") {
+			t.Fatalf("preview through unsafe cache path: text=%q err=%v", text, err)
+		}
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Fatalf("symlink target changed: got %q want %q", got, original)
+		}
+	})
+}
+
 func TestSessionPreviewSQLitePragmas(t *testing.T) {
 	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
@@ -411,7 +634,7 @@ func TestSessionPreviewSQLitePragmas(t *testing.T) {
 	if !strings.EqualFold(journal, "wal") {
 		t.Fatalf("journal_mode = %q, want wal", journal)
 	}
-	var synchronous, autocheckpoint, busyTimeout int
+	var synchronous, autocheckpoint, busyTimeout, applicationID int
 	if err := store.db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +652,12 @@ func TestSessionPreviewSQLitePragmas(t *testing.T) {
 	}
 	if busyTimeout != sessionPreviewSQLiteBusyMillis {
 		t.Fatalf("busy_timeout = %d, want %d", busyTimeout, sessionPreviewSQLiteBusyMillis)
+	}
+	if err := store.db.QueryRow(`PRAGMA application_id`).Scan(&applicationID); err != nil {
+		t.Fatal(err)
+	}
+	if applicationID != sessionPreviewSQLiteApplicationID {
+		t.Fatalf("application_id = %d, want %d", applicationID, sessionPreviewSQLiteApplicationID)
 	}
 	conn, err := store.db.Conn(context.Background())
 	if err != nil {
@@ -555,6 +784,117 @@ func TestSessionPreviewSQLiteRepeatedExactHitsDoNotGrowCacheFiles(t *testing.T) 
 		if initial.size != current.size || initial.modTime != current.modTime {
 			t.Fatalf("cache file %q changed across exact hits: before=%+v after=%+v", name, initial, current)
 		}
+	}
+}
+
+func TestSessionPreviewSQLiteMemoryHitAvoidsDatabasePageReads(t *testing.T) {
+	path, store := newSessionPreviewCachedFile(t, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"memory hit"}]}}`+"\n")
+	_ = sessionPreviewSQLiteDBStatus(t, store, sqlite.DBStatusCacheHit, true)
+	_ = sessionPreviewSQLiteDBStatus(t, store, sqlite.DBStatusCacheMiss, true)
+	for index := 0; index < 100; index++ {
+		text, err := ReadSessionPreviewText(path, 0, 0)
+		if err != nil || !strings.Contains(text, "memory hit") {
+			t.Fatalf("memory hit %d: text=%q err=%v", index, text, err)
+		}
+	}
+	if hits := sessionPreviewSQLiteDBStatus(t, store, sqlite.DBStatusCacheHit, false); hits != 0 {
+		t.Fatalf("warm memory reads touched %d cached SQLite pages", hits)
+	}
+	if misses := sessionPreviewSQLiteDBStatus(t, store, sqlite.DBStatusCacheMiss, false); misses != 0 {
+		t.Fatalf("warm memory reads missed %d SQLite pages", misses)
+	}
+}
+
+func TestSessionPreviewSQLiteMemoryAndDirtyStateAreBounded(t *testing.T) {
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+	setTestUserCacheDir(t)
+	storePath, err := sessionPreviewSQLiteFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < sessionPreviewSQLiteMemoryMaxEntries+10; index++ {
+		storeSessionPreviewSQLiteMemory(
+			storePath,
+			fmt.Sprintf("/session/%04d.jsonl", index),
+			fileCacheKey{Size: int64(index)},
+			nil,
+			fmt.Sprintf("preview-%04d", index),
+			false,
+		)
+	}
+	sessionPreviewSQLiteState.mu.Lock()
+	memoryEntries := len(sessionPreviewSQLiteState.memory)
+	memoryBytes := sessionPreviewSQLiteState.memoryBytes
+	sessionPreviewSQLiteState.mu.Unlock()
+	if memoryEntries != sessionPreviewSQLiteMemoryMaxEntries {
+		t.Fatalf("memory entries = %d, want %d", memoryEntries, sessionPreviewSQLiteMemoryMaxEntries)
+	}
+	if memoryBytes <= 0 || memoryBytes > sessionPreviewSQLiteMemoryMaxBytes {
+		t.Fatalf("memory bytes = %d, want within 1..%d", memoryBytes, sessionPreviewSQLiteMemoryMaxBytes)
+	}
+	storeSessionPreviewSQLiteMemory(storePath, "/session/too-large.jsonl", fileCacheKey{}, nil, strings.Repeat("x", int(sessionPreviewSQLiteMemoryMaxBytes)+1), false)
+	sessionPreviewSQLiteState.mu.Lock()
+	afterOversize := len(sessionPreviewSQLiteState.memory)
+	sessionPreviewSQLiteState.mu.Unlock()
+	if afterOversize != sessionPreviewSQLiteMemoryMaxEntries {
+		t.Fatalf("oversized entry changed bounded memory count: %d", afterOversize)
+	}
+
+	now := time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC)
+	previousNow := sessionPreviewNow
+	sessionPreviewNow = func() time.Time { return now }
+	t.Cleanup(func() { sessionPreviewNow = previousNow })
+	for index := 0; index < sessionPreviewAppendMaxDirtyPaths+10; index++ {
+		if shouldFlushSessionPreviewAppend(fmt.Sprintf("/dirty/%04d.jsonl", index), 1) {
+			t.Fatalf("dirty path %d flushed before the batching delay", index)
+		}
+		now = now.Add(time.Second)
+	}
+	sessionPreviewAppendState.mu.Lock()
+	dirtyPaths := len(sessionPreviewAppendState.dirtySince)
+	_, oldestPresent := sessionPreviewAppendState.dirtySince[filepath.Clean("/dirty/0000.jsonl")]
+	sessionPreviewAppendState.mu.Unlock()
+	if dirtyPaths != sessionPreviewAppendMaxDirtyPaths {
+		t.Fatalf("dirty paths = %d, want %d", dirtyPaths, sessionPreviewAppendMaxDirtyPaths)
+	}
+	if oldestPresent {
+		t.Fatal("oldest dirty path was not evicted")
+	}
+}
+
+func TestSessionPreviewSQLiteAppendDoesNotRunSessionPruning(t *testing.T) {
+	forceImmediateSessionPreviewFlush(t)
+	path, store := newSessionPreviewCachedFile(t, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"stable"}]}}`+"\n")
+	insertUnrelatedSessionPreviewRows(t, store, sessionPreviewSQLiteMaxSessions+1)
+	var before int
+	if err := store.db.QueryRow(`SELECT count(*) FROM preview_session`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"answer-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"append"}]}}`)
+	if _, err := ReadSessionPreviewText(path, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	var afterAppend int
+	if err := store.db.QueryRow(`SELECT count(*) FROM preview_session`).Scan(&afterAppend); err != nil {
+		t.Fatal(err)
+	}
+	if afterAppend != before {
+		t.Fatalf("append pruned sessions: before=%d after=%d", before, afterAppend)
+	}
+
+	newPath := filepath.Join(t.TempDir(), "new-session.jsonl")
+	if err := os.WriteFile(newPath, []byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-new","type":"message","role":"assistant","content":[{"type":"output_text","text":"new"}]}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSessionPreviewText(newPath, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	var afterReplace int
+	if err := store.db.QueryRow(`SELECT count(*) FROM preview_session`).Scan(&afterReplace); err != nil {
+		t.Fatal(err)
+	}
+	if afterReplace != sessionPreviewSQLiteMaxSessions {
+		t.Fatalf("new session prune count = %d, want %d", afterReplace, sessionPreviewSQLiteMaxSessions)
 	}
 }
 

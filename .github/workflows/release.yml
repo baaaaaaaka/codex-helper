@@ -206,6 +206,19 @@ jobs:
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
 
+      - name: CXP preview SQLite correctness, concurrency, and write budgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexhistory -count=1 -run '^TestSessionPreview(SQLite|CacheOff)' -v
+
+      - name: CXP preview SQLite actual syscall write budget (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/session_preview_sqlite_io_smoke.sh
+
       - name: Patched-binary cleanup real HOME safety (Linux only)
         if: runner.os == 'Linux'
         shell: bash

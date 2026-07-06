@@ -361,6 +361,20 @@ jobs:
           row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
+      - name: CXP preview SQLite correctness, concurrency, and write budgets
+        if: matrix.shard == 'state-perf'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexhistory -count=1 -run '^TestSessionPreview(SQLite|CacheOff)' -v
+
+      - name: CXP preview SQLite actual syscall write budget (Linux only)
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/session_preview_sqlite_io_smoke.sh
+
       - name: Teams control status display regressions
         if: matrix.shard == 'core'
         shell: bash
