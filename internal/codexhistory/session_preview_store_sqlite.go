@@ -1,6 +1,7 @@
 package codexhistory
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ const (
 	sessionPreviewSQLiteSchemaVersion = 1
 	sessionPreviewSQLiteMaxSessions   = 1024
 	sessionPreviewSQLiteBusyMillis    = 100
+	// Keep ordinary preview growth in the WAL so it is written once before a
+	// mature SQLite checkpoint eventually folds it into the main database.
+	sessionPreviewSQLiteAutoCheckpointPages = 8192
 )
 
 var (
@@ -76,10 +80,11 @@ var sessionPreviewAppendState struct {
 func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]Message, string, error) {
 	info, err := os.Stat(filePath)
 	if err != nil {
-		if store, storeErr := currentSessionPreviewSQLiteStore(); storeErr == nil {
-			_ = store.delete(filePath)
-		}
 		return nil, "", err
+	}
+	completeOffset, complete := sessionPreviewCompleteOffset(filePath, info)
+	if !complete || completeOffset < info.Size() {
+		return readSessionPreviewUncached(filePath)
 	}
 
 	store, err := currentSessionPreviewSQLiteStore()
@@ -97,8 +102,7 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 				return sessionPreviewResult(entry.messages, entry.text, wantMessages)
 			}
 			if canAppendSessionPreviewSQLite(filePath, info, entry) {
-				completeOffset, complete := sessionPreviewCompleteOffset(filePath, info)
-				if !complete || completeOffset < info.Size() || completeOffset < entry.offset {
+				if completeOffset < entry.offset {
 					return readSessionPreviewUncached(filePath)
 				}
 
@@ -135,10 +139,6 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 			}
 		}
 
-		completeOffset, complete := sessionPreviewCompleteOffset(filePath, info)
-		if !complete || completeOffset < info.Size() {
-			return readSessionPreviewUncached(filePath)
-		}
 		seen := newMessageSeenState()
 		messages, readErr := readSessionMessagesWindow(filePath, 0, completeOffset, 0, isPreviewMessage, seen)
 		if readErr != nil {
@@ -298,22 +298,61 @@ func openSessionPreviewSQLite(path string) (*sql.DB, error) {
 		fmt.Sprintf(`PRAGMA busy_timeout = %d`, sessionPreviewSQLiteBusyMillis),
 		`PRAGMA temp_store = MEMORY`,
 		`PRAGMA foreign_keys = ON`,
-		`PRAGMA wal_autocheckpoint = 1000`,
+		fmt.Sprintf(`PRAGMA wal_autocheckpoint = %d`, sessionPreviewSQLiteAutoCheckpointPages),
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
 	}
+	if err := enableSessionPreviewPersistentWAL(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := initializeSessionPreviewSQLiteSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	_ = os.Chmod(path, 0o600)
+	ensureSessionPreviewSQLiteMode(path, 0o600)
 	for _, suffix := range []string{"-wal", "-shm"} {
-		_ = os.Chmod(path+suffix, 0o600)
+		ensureSessionPreviewSQLiteMode(path+suffix, 0o600)
 	}
 	return db, nil
+}
+
+func enableSessionPreviewPersistentWAL(db *sql.DB) error {
+	// SQLite otherwise deletes and recreates WAL sidecars when the last
+	// connection closes, producing avoidable metadata and SHM churn on TUI runs.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.Raw(func(driverConn any) error {
+		fileControl, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return errors.New("sqlite driver does not support persistent WAL")
+		}
+		mode, err := fileControl.FileControlPersistWAL("main", 1)
+		if err != nil {
+			return err
+		}
+		if mode != 1 {
+			return fmt.Errorf("enable persistent WAL returned mode %d", mode)
+		}
+		return nil
+	})
+}
+
+func ensureSessionPreviewSQLiteMode(path string, mode os.FileMode) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() == mode.Perm() {
+		return
+	}
+	_ = os.Chmod(path, mode)
 }
 
 func initializeSessionPreviewSQLiteSchema(db *sql.DB) error {
@@ -410,7 +449,7 @@ func sessionPreviewSQLiteFileURI(path string) string {
 		fmt.Sprintf("busy_timeout(%d)", sessionPreviewSQLiteBusyMillis),
 		"temp_store(MEMORY)",
 		"foreign_keys(ON)",
-		"wal_autocheckpoint(1000)",
+		fmt.Sprintf("wal_autocheckpoint(%d)", sessionPreviewSQLiteAutoCheckpointPages),
 	} {
 		query.Add("_pragma", pragma)
 	}
@@ -752,18 +791,6 @@ func (store *sessionPreviewSQLiteStore) append(
 	}
 	notifySessionPreviewSQLiteCommit(store.path)
 	return nil
-}
-
-func (store *sessionPreviewSQLiteStore) delete(path string) error {
-	result, err := store.db.Exec(`DELETE FROM preview_session WHERE path = ?`, filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err == nil && rows > 0 {
-		notifySessionPreviewSQLiteCommit(store.path)
-	}
-	return err
 }
 
 func insertSessionPreviewMessages(tx *sql.Tx, sessionID int64, generation int64, startOrdinal int64, messages []Message) error {
