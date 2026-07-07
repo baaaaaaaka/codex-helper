@@ -108,6 +108,8 @@ func roleLabel(role string) string {
 
 func previewRoleLabel(role string) string {
 	switch role {
+	case "user":
+		return "User"
 	case "assistant":
 		return "Codex answer"
 	case "assistant_commentary":

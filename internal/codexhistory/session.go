@@ -19,6 +19,10 @@ type Message struct {
 	sourceID  string
 }
 
+// messageProjector turns canonical history records into preview records before
+// visible-message limits and mirror deduplication are applied.
+type messageProjector func(Message) (Message, bool)
+
 var sessionPreviewTailInitialBytes int64 = 256 * 1024
 
 const fallbackMessageDedupWindow = 100 * time.Millisecond
@@ -43,7 +47,7 @@ func ReadSessionMessages(filePath string, maxMessages int) ([]Message, error) {
 
 func ReadSessionPreviewMessages(filePath string, maxMessages int) ([]Message, error) {
 	if maxMessages > 0 {
-		return readRecentSessionMessages(filePath, maxMessages, isPreviewMessage)
+		return readRecentSessionMessages(filePath, maxMessages, projectPreviewMessage)
 	}
 	return readSessionPreviewMessagesCached(filePath)
 }
@@ -59,7 +63,7 @@ func ReadSessionPreviewText(filePath string, maxMessages int, maxLen int) (strin
 	return readSessionPreviewTextCached(filePath)
 }
 
-func readSessionMessages(filePath string, maxMessages int, keep func(Message) bool) ([]Message, error) {
+func readSessionMessages(filePath string, maxMessages int, project messageProjector) ([]Message, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -77,10 +81,14 @@ func readSessionMessages(filePath string, maxMessages int, keep func(Message) bo
 		line = bytes.TrimSpace(line)
 		if len(line) > 0 {
 			for _, msg := range parseLineMessages(line) {
-				if keep != nil && !keep(msg) {
-					continue
+				if project != nil {
+					var keep bool
+					msg, keep = project(msg)
+					if !keep {
+						continue
+					}
 				}
-				if !markMessageSeen(msg, seenMessages) {
+				if !markMessageSeen(msg, seenMessages, project != nil) {
 					continue
 				}
 				appendMessage(&ring, msg, maxMessages)
@@ -93,9 +101,9 @@ func readSessionMessages(filePath string, maxMessages int, keep func(Message) bo
 	return ring, nil
 }
 
-func readRecentSessionMessages(filePath string, maxMessages int, keep func(Message) bool) ([]Message, error) {
+func readRecentSessionMessages(filePath string, maxMessages int, project messageProjector) ([]Message, error) {
 	if maxMessages <= 0 {
-		return readSessionMessages(filePath, maxMessages, keep)
+		return readSessionMessages(filePath, maxMessages, project)
 	}
 	info, err := os.Stat(filePath)
 	if err != nil {
@@ -114,7 +122,7 @@ func readRecentSessionMessages(filePath string, maxMessages int, keep func(Messa
 	}
 	for {
 		offset := size - window
-		msgs, err := readSessionMessagesWindow(filePath, offset, window, maxMessages, keep)
+		msgs, err := readSessionMessagesWindow(filePath, offset, window, maxMessages, project)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +140,7 @@ func readRecentSessionMessages(filePath string, maxMessages int, keep func(Messa
 	}
 }
 
-func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, keep func(Message) bool, seenStates ...*messageSeenState) ([]Message, error) {
+func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, project messageProjector, seenStates ...*messageSeenState) ([]Message, error) {
 	if size <= 0 {
 		return nil, nil
 	}
@@ -182,10 +190,14 @@ func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMes
 			continue
 		}
 		for _, msg := range parseLineMessages(line) {
-			if keep != nil && !keep(msg) {
-				continue
+			if project != nil {
+				var keep bool
+				msg, keep = project(msg)
+				if !keep {
+					continue
+				}
 			}
-			if !markMessageSeen(msg, seen) {
+			if !markMessageSeen(msg, seen, project != nil) {
 				continue
 			}
 			appendMessage(&ring, msg, maxMessages)
@@ -194,7 +206,7 @@ func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMes
 	return ring, nil
 }
 
-func markMessageSeen(msg Message, seen *messageSeenState) bool {
+func markMessageSeen(msg Message, seen *messageSeenState, dedupeUserMirrors bool) bool {
 	if seen == nil {
 		return true
 	}
@@ -204,11 +216,11 @@ func markMessageSeen(msg Message, seen *messageSeenState) bool {
 		}
 		seen.sourceKeys[key] = true
 	}
-	// Codex can persist one logical assistant message as both event_msg and
-	// response_item records with different (or missing) source IDs. Populate the
-	// short-window content key even when an ID exists so those mirrors collapse;
-	// sourceKeys still preserve legitimate same-text messages outside the window.
-	key := fallbackMessageDedupKey(msg)
+	// Codex can persist one logical message as both event_msg and response_item
+	// records with different (or missing) source IDs. Preview projection opts user
+	// messages into the same short-window mirror collapse; canonical history keeps
+	// its original repeated-user record semantics.
+	key := fallbackMessageDedupKey(msg, dedupeUserMirrors)
 	if key == "" {
 		return true
 	}
@@ -232,7 +244,7 @@ func rememberMessageSeen(msg Message, seen *messageSeenState) {
 	}
 	// Keep both identity layers when rebuilding persistent preview state. A
 	// future append may carry only the other half of an event/response mirror.
-	key := fallbackMessageDedupKey(msg)
+	key := fallbackMessageDedupKey(msg, true)
 	if key == "" {
 		return
 	}
@@ -257,7 +269,7 @@ func fallbackSourcesCanMirror(previous string, current string) bool {
 	return previous == "" || current == "" || previous != current
 }
 
-func fallbackMessageDedupKey(msg Message) string {
+func fallbackMessageDedupKey(msg Message, includeUser bool) string {
 	if msg.Timestamp.IsZero() {
 		return ""
 	}
@@ -268,6 +280,10 @@ func fallbackMessageDedupKey(msg Message) string {
 	}
 	switch role {
 	case "assistant", "assistant_commentary":
+	case "user":
+		if !includeUser {
+			return ""
+		}
 	default:
 		return ""
 	}
@@ -294,13 +310,19 @@ func sourceMessageDedupKey(sourceID string) string {
 	return "source:" + sourceID
 }
 
-func isPreviewMessage(msg Message) bool {
+func projectPreviewMessage(msg Message) (Message, bool) {
 	switch msg.Role {
+	case "user":
+		if shouldSkipFirstPrompt(msg.Content) {
+			return Message{}, false
+		}
+		msg.Content = firstPromptTitleText(msg.Content)
 	case "assistant", "assistant_commentary":
-		return strings.TrimSpace(msg.Content) != ""
 	default:
-		return false
+		return Message{}, false
 	}
+	msg.Content = strings.TrimSpace(msg.Content)
+	return msg, msg.Content != ""
 }
 
 func appendMessage(ring *[]Message, msg Message, maxMessages int) {
@@ -531,7 +553,8 @@ func parseEventMsg(raw json.RawMessage, ts time.Time) []Message {
 		return nil
 	}
 
-	// Only extract user_message as a fallback for sessions without response_item/user
+	// Preserve event user records for legacy/canonical history. Preview projection
+	// normalizes and collapses them with response_item/user mirrors.
 	if event.Type == "user_message" {
 		text := strings.TrimSpace(firstNonEmptyString(
 			extractContentText(event.Content),

@@ -316,6 +316,48 @@ func TestParseMessagePayload_SystemInjectedSkipped(t *testing.T) {
 	}
 }
 
+func TestParseMessagePayload_PreservesTeamsHelperEnvelope(t *testing.T) {
+	const text = "User message:\nfix the preview\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"
+	p := codexResponsePayload{
+		Type:    "message",
+		Role:    "user",
+		Content: []byte(`[{"type":"input_text","text":"User message:\nfix the preview\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}]`),
+	}
+	msgs := parseMessagePayload(p, fixedTime())
+	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != text {
+		t.Fatalf("messages = %#v, want canonical history to preserve the original user record", msgs)
+	}
+}
+
+func TestParseMessagePayload_PreservesTeamsHelperSafetyOnly(t *testing.T) {
+	const text = "Teams helper safety:\n- do not restart helper"
+	p := codexResponsePayload{
+		Type:    "message",
+		Role:    "user",
+		Content: []byte(`[{"type":"input_text","text":"Teams helper safety:\n- do not restart helper"}]`),
+	}
+	msgs := parseMessagePayload(p, fixedTime())
+	if len(msgs) != 1 || msgs[0].Content != text {
+		t.Fatalf("messages = %#v, want canonical history to preserve the safety-only record", msgs)
+	}
+}
+
+func TestFirstPromptTitleTextStripsLastTeamsHelperSuffix(t *testing.T) {
+	text := "User message:\nreview this quoted block:\n\nTeams helper safety:\n- quoted text\n\nTeams helper safety:\n- actual transport instructions"
+	want := "review this quoted block:\n\nTeams helper safety:\n- quoted text"
+	if got := firstPromptTitleText(text); got != want {
+		t.Fatalf("firstPromptTitleText() = %q, want quoted user content preserved as %q", got, want)
+	}
+}
+
+func TestFirstPromptTitleTextPreservesLeadingQuotedMarkerBeforeOuterSuffix(t *testing.T) {
+	text := "Teams helper safety:\n- quoted user content\n\nTeams helper safety:\n- actual transport instructions"
+	want := "Teams helper safety:\n- quoted user content"
+	if got := firstPromptTitleText(text); got != want {
+		t.Fatalf("firstPromptTitleText() = %q, want leading quoted marker preserved as %q", got, want)
+	}
+}
+
 func TestParseMessagePayload_WhitespaceContent(t *testing.T) {
 	p := codexResponsePayload{
 		Type:    "message",
@@ -755,7 +797,7 @@ func TestReadSessionMessages_MixedTypes(t *testing.T) {
 	}
 }
 
-func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
+func TestReadSessionPreviewMessagesKeepsUserCodexStatusAndAnswer(t *testing.T) {
 	lines := []string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","cwd":"/tmp","source":"cli"}}`,
 		`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"user prompt"}]}}`,
@@ -776,13 +818,14 @@ func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSessionPreviewMessages: %v", err)
 	}
-	if len(msgs) != 4 {
-		t.Fatalf("messages = %#v, want 4 visible messages", msgs)
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %#v, want 5 visible messages", msgs)
 	}
 	want := []struct {
 		role string
 		text string
 	}{
+		{"user", "user prompt"},
 		{"assistant_commentary", "visible status"},
 		{"assistant", "visible answer 1"},
 		{"assistant_commentary", "visible failure"},
@@ -792,6 +835,71 @@ func TestReadSessionPreviewMessagesFiltersToCodexStatusAndAnswer(t *testing.T) {
 		if msgs[i].Role != want[i].role || msgs[i].Content != want[i].text {
 			t.Fatalf("msg[%d] = %#v, want role=%q text=%q", i, msgs[i], want[i].role, want[i].text)
 		}
+	}
+}
+
+func TestReadSessionPreviewMessagesDeduplicatesMirroredUserAndStripsTeamsEnvelope(t *testing.T) {
+	setTestUserCacheDir(t)
+	const prompt = "User message:\nfix the preview\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":` + strconv.Quote(prompt) + `}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.001Z","type":"event_msg","payload":{"type":"user_message","message":` + strconv.Quote(prompt) + `}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-mirrored-user.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != "fix the preview" {
+		t.Fatalf("messages = %#v, want one clean logical user prompt", msgs)
+	}
+	if text, err := ReadSessionPreviewText(f, 0, 0); err != nil {
+		t.Fatalf("ReadSessionPreviewText: %v", err)
+	} else if text != "User:\nfix the preview" {
+		t.Fatalf("preview text = %q, want one clean user prompt", text)
+	}
+}
+
+func TestReadSessionPreviewMessagesCleansEventOnlyUserPrompt(t *testing.T) {
+	setTestUserCacheDir(t)
+	const prompt = "User message:\nfix the preview\n\nTeams helper safety:\n- do not restart helper"
+	line := `{"timestamp":"2026-01-01T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":` + strconv.Quote(prompt) + `}}`
+	f := filepath.Join(t.TempDir(), "preview-event-only-user.jsonl")
+	if err := os.WriteFile(f, []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Role != "user" || msgs[0].Content != "fix the preview" {
+		t.Fatalf("messages = %#v, want clean event-only user prompt", msgs)
+	}
+}
+
+func TestReadSessionPreviewMessagesKeepsDistinctRepeatedUserPrompts(t *testing.T) {
+	setTestUserCacheDir(t)
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00.000Z","type":"response_item","payload":{"id":"user-1","type":"message","role":"user","content":[{"type":"input_text","text":"repeat prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.003Z","type":"response_item","payload":{"id":"user-2","type":"message","role":"user","content":[{"type":"input_text","text":"repeat prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00.200Z","type":"event_msg","payload":{"id":"event-user-1","type":"user_message","message":"repeat prompt"}}`,
+	}
+	f := filepath.Join(t.TempDir(), "preview-repeated-user.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 0)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %#v, want distinct same-source IDs and an outside-window repeat preserved", msgs)
 	}
 }
 
@@ -964,7 +1072,8 @@ func TestReadSessionPreviewMessagesLimitCountsOnlyVisibleMessages(t *testing.T) 
 	}
 	lines = append(lines,
 		`{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"new status"}}`,
-		`{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}`,
 	)
 	f := filepath.Join(t.TempDir(), "preview-limit.jsonl")
 	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
@@ -978,8 +1087,37 @@ func TestReadSessionPreviewMessagesLimitCountsOnlyVisibleMessages(t *testing.T) 
 	if got := len(msgs); got != 2 {
 		t.Fatalf("len = %d, want 2", got)
 	}
-	if msgs[0].Content != "new status" || msgs[1].Content != "new answer" {
-		t.Fatalf("messages = %#v, want last two visible messages", msgs)
+	if msgs[0].Role != "user" || msgs[0].Content != "new prompt" || msgs[1].Content != "new answer" {
+		t.Fatalf("messages = %#v, want user prompt and answer as the last two visible messages", msgs)
+	}
+}
+
+func TestReadSessionPreviewMessagesLimitCountsMirroredUserOnce(t *testing.T) {
+	previousTailBytes := sessionPreviewTailInitialBytes
+	sessionPreviewTailInitialBytes = 128
+	t.Cleanup(func() { sessionPreviewTailInitialBytes = previousTailBytes })
+
+	lines := []string{
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer","type":"message","role":"assistant","content":[{"type":"output_text","text":"previous answer"}]}}`,
+	}
+	for index := 0; index < 20; index++ {
+		lines = append(lines, `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"`+strings.Repeat("hidden", 20)+`"}}`)
+	}
+	lines = append(lines,
+		`{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"latest prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:02.001Z","type":"event_msg","payload":{"type":"user_message","message":"latest prompt"}}`,
+	)
+	f := filepath.Join(t.TempDir(), "preview-limit-mirrored-user.jsonl")
+	if err := os.WriteFile(f, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, err := ReadSessionPreviewMessages(f, 2)
+	if err != nil {
+		t.Fatalf("ReadSessionPreviewMessages: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Content != "previous answer" || msgs[1].Role != "user" || msgs[1].Content != "latest prompt" {
+		t.Fatalf("messages = %#v, want previous answer plus one logical user prompt", msgs)
 	}
 }
 
@@ -1019,9 +1157,10 @@ func TestReadSessionPreviewMessagesDefaultKeepsCompleteCachedHistory(t *testing.
 	setTestUserCacheDir(t)
 	f := filepath.Join(t.TempDir(), "preview-complete-cache.jsonl")
 	initial := strings.Join([]string{
-		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"old","type":"message","role":"assistant","content":[{"type":"output_text","text":"old visible"}]}}`,
-		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"hidden tool output"}}`,
-		`{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"id":"middle","type":"message","role":"assistant","content":[{"type":"output_text","text":"middle visible"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"prompt","type":"message","role":"user","content":[{"type":"input_text","text":"cached prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"old","type":"message","role":"assistant","content":[{"type":"output_text","text":"old visible"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"type":"function_call_output","output":"hidden tool output"}}`,
+		`{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"id":"middle","type":"message","role":"assistant","content":[{"type":"output_text","text":"middle visible"}]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(f, []byte(initial), 0o644); err != nil {
 		t.Fatal(err)
@@ -1031,11 +1170,11 @@ func TestReadSessionPreviewMessagesDefaultKeepsCompleteCachedHistory(t *testing.
 	if err != nil {
 		t.Fatalf("ReadSessionPreviewMessages initial: %v", err)
 	}
-	if len(first) != 2 || first[0].Content != "old visible" || first[1].Content != "middle visible" {
+	if len(first) != 3 || first[0].Role != "user" || first[0].Content != "cached prompt" || first[1].Content != "old visible" || first[2].Content != "middle visible" {
 		t.Fatalf("initial messages = %#v, want complete visible history", first)
 	}
 
-	appendText := `{"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"id":"status","type":"agent_message","phase":"commentary","message":"new status"}}` + "\n"
+	appendText := `{"timestamp":"2026-01-01T00:00:04Z","type":"event_msg","payload":{"id":"status","type":"agent_message","phase":"commentary","message":"new status"}}` + "\n"
 	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("open append: %v", err)
@@ -1052,7 +1191,7 @@ func TestReadSessionPreviewMessagesDefaultKeepsCompleteCachedHistory(t *testing.
 	if err != nil {
 		t.Fatalf("ReadSessionPreviewMessages append: %v", err)
 	}
-	if len(second) != 3 || second[0].Content != "old visible" || second[1].Content != "middle visible" || second[2].Content != "new status" {
+	if len(second) != 4 || second[0].Role != "user" || second[0].Content != "cached prompt" || second[1].Content != "old visible" || second[2].Content != "middle visible" || second[3].Content != "new status" {
 		t.Fatalf("appended messages = %#v, want cached full history plus appended tail", second)
 	}
 }
@@ -1074,9 +1213,11 @@ func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
 	t.Cleanup(func() { persistentCacheWriteHook = prevHook })
 
 	f := filepath.Join(t.TempDir(), "preview-text-cache.jsonl")
+	const teamsPrompt = "User message:\nfirst prompt\n\nTeams helper safety:\n- do not restart helper"
 	initial := strings.Join([]string{
-		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"old","type":"message","role":"assistant","content":[{"type":"output_text","text":"old answer"}]}}`,
-		`{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"id":"status","type":"agent_message","phase":"commentary","message":"middle status"}}`,
+		`{"timestamp":"2026-01-01T00:00:00.000Z","type":"response_item","payload":{"id":"prompt","type":"message","role":"user","content":[{"type":"input_text","text":` + strconv.Quote(teamsPrompt) + `}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"old","type":"message","role":"assistant","content":[{"type":"output_text","text":"old answer"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"id":"status","type":"agent_message","phase":"commentary","message":"middle status"}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(f, []byte(initial), 0o644); err != nil {
 		t.Fatal(err)
@@ -1086,7 +1227,7 @@ func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSessionPreviewText initial: %v", err)
 	}
-	if !strings.Contains(first, "old answer") || !strings.Contains(first, "middle status") {
+	if strings.Count(first, "User:\nfirst prompt") != 1 || strings.Contains(first, "Teams helper safety") || !strings.Contains(first, "old answer") || !strings.Contains(first, "middle status") {
 		t.Fatalf("initial text = %q, want complete formatted preview", first)
 	}
 	if writes != 1 {
@@ -1108,7 +1249,11 @@ func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open append: %v", err)
 	}
-	if _, err := file.WriteString(`{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"id":"new","type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}` + "\n"); err != nil {
+	appendText := strings.Join([]string{
+		`{"timestamp":"2026-01-01T00:00:00.001Z","type":"event_msg","payload":{"type":"user_message","message":` + strconv.Quote(teamsPrompt) + `}}`,
+		`{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"id":"new","type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}`,
+	}, "\n") + "\n"
+	if _, err := file.WriteString(appendText); err != nil {
 		_ = file.Close()
 		t.Fatalf("append: %v", err)
 	}
@@ -1120,7 +1265,7 @@ func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadSessionPreviewText append: %v", err)
 	}
-	if !strings.Contains(third, "old answer") || !strings.Contains(third, "middle status") || !strings.Contains(third, "new answer") {
+	if strings.Count(third, "User:\nfirst prompt") != 1 || strings.Contains(third, "Teams helper safety") || !strings.Contains(third, "old answer") || !strings.Contains(third, "middle status") || !strings.Contains(third, "new answer") {
 		t.Fatalf("appended text = %q, want cached text plus appended tail", third)
 	}
 	if writes != 2 {

@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const sessionPreviewFilterVersion = "status-answer-v3"
+// SessionPreviewFilterVersion is shared with the TUI's in-memory cache metadata
+// so a preview policy change invalidates both cache layers together.
+const SessionPreviewFilterVersion = "user-status-answer-v5"
+const sessionPreviewFilterVersion = SessionPreviewFilterVersion
 const sessionPreviewPrefixHashBytes int64 = 64 * 1024
 
 // envSessionPreviewCacheBackend is a temporary rollback switch. SQLite is the
@@ -150,7 +153,7 @@ func readSessionPreviewCacheValueJSON(filePath string, wantMessages bool) ([]Mes
 			}
 			if completeOffset >= entry.Offset {
 				seen := persistentSessionPreviewSeenState(entry)
-				tail, err := readSessionMessagesWindow(filePath, entry.Offset, completeOffset-entry.Offset, 0, isPreviewMessage, seen)
+				tail, err := readSessionMessagesWindow(filePath, entry.Offset, completeOffset-entry.Offset, 0, projectPreviewMessage, seen)
 				if err != nil {
 					return nil, "", err
 				}
@@ -176,7 +179,7 @@ func readSessionPreviewCacheValueJSON(filePath string, wantMessages bool) ([]Mes
 	// messages. Reconstructing seen from only the visible messages would let a
 	// later replay of one of those skipped source IDs reappear in the preview.
 	seen := newMessageSeenState()
-	messages, err := readSessionMessagesWindow(filePath, 0, completeOffset, 0, isPreviewMessage, seen)
+	messages, err := readSessionMessagesWindow(filePath, 0, completeOffset, 0, projectPreviewMessage, seen)
 	if err != nil {
 		return nil, "", err
 	}
@@ -381,7 +384,7 @@ func sessionPreviewCompleteOffset(path string, info os.FileInfo) (int64, bool) {
 }
 
 func readSessionPreviewUncached(filePath string) ([]Message, string, error) {
-	messages, err := readSessionMessages(filePath, 0, isPreviewMessage)
+	messages, err := readSessionMessages(filePath, 0, projectPreviewMessage)
 	if err != nil {
 		return nil, "", err
 	}

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +50,11 @@ func TestSessionPreviewSQLiteExactHitDoesNotWriteAndAppendIsBatched(t *testing.T
 	t.Cleanup(func() { sessionPreviewSQLiteCommitHook = previousHook })
 
 	path := filepath.Join(t.TempDir(), "session.jsonl")
-	initial := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}` + "\n"
+	const teamsPrompt = "User message:\nfirst prompt\n\nTeams helper safety:\n- do not restart helper"
+	initial := strings.Join([]string{
+		`{"timestamp":"2026-01-01T00:00:00.000Z","type":"response_item","payload":{"id":"prompt-1","type":"message","role":"user","content":[{"type":"input_text","text":` + strconv.Quote(teamsPrompt) + `}]}}`,
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}}`,
+	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +63,7 @@ func TestSessionPreviewSQLiteExactHitDoesNotWriteAndAppendIsBatched(t *testing.T
 	if err != nil {
 		t.Fatalf("initial read: %v", err)
 	}
-	if !strings.Contains(first, "first answer") {
+	if strings.Count(first, "User:\nfirst prompt") != 1 || strings.Contains(first, "Teams helper safety") || !strings.Contains(first, "Codex answer:\nfirst answer") {
 		t.Fatalf("initial preview = %q", first)
 	}
 	if commits != 1 {
@@ -82,12 +87,13 @@ func TestSessionPreviewSQLiteExactHitDoesNotWriteAndAppendIsBatched(t *testing.T
 	}
 	assertSessionPreviewSQLiteWritePages(t, store, 0)
 
-	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"id":"status-1","type":"agent_message","phase":"commentary","message":"new status"}}`)
+	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:00.001Z","type":"event_msg","payload":{"type":"user_message","message":`+strconv.Quote(teamsPrompt)+`}}`)
+	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"id":"status-1","type":"agent_message","phase":"commentary","message":"new status"}}`)
 	third, err := ReadSessionPreviewText(path, 0, 0)
 	if err != nil {
 		t.Fatalf("batched append read: %v", err)
 	}
-	if !strings.Contains(third, "first answer") || !strings.Contains(third, "new status") {
+	if strings.Count(third, "User:\nfirst prompt") != 1 || strings.Contains(third, "Teams helper safety") || !strings.Contains(third, "first answer") || !strings.Contains(third, "new status") {
 		t.Fatalf("batched preview = %q", third)
 	}
 	if commits != 1 {
@@ -224,7 +230,7 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 		t.Fatal("complete offset unavailable")
 	}
 	seenBefore := cloneMessageSeenState(entryOne.seen)
-	tail, err := readSessionMessagesWindow(path, entryOne.offset, completeOffset-entryOne.offset, 0, isPreviewMessage, entryOne.seen)
+	tail, err := readSessionMessagesWindow(path, entryOne.offset, completeOffset-entryOne.offset, 0, projectPreviewMessage, entryOne.seen)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1321,8 +1321,8 @@ func TestEnsurePreview(t *testing.T) {
 		if ev.err != nil {
 			t.Fatalf("unexpected preview error: %v", ev.err)
 		}
-		if strings.Contains(ev.text, "oldest prompt") {
-			t.Fatalf("preview should hide user prompts: %q", ev.text)
+		if !strings.Contains(ev.text, "User:\noldest prompt") {
+			t.Fatalf("preview did not include user prompt: %q", ev.text)
 		}
 		if !strings.Contains(ev.text, "Codex answer:\nmiddle update") {
 			t.Fatalf("preview did not include visible Codex answer: %q", ev.text)
@@ -1554,7 +1554,7 @@ func TestEnsurePreviewCachesEmptyVisiblePreview(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	lines := []string{
-		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hidden prompt"}]}}`,
+		`{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"type":"function_call","name":"read","arguments":"{}"}}`,
 		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"hidden tool output"}}`,
 	}
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {

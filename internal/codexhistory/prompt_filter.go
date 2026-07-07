@@ -43,15 +43,19 @@ func firstPromptTitleText(text string) string {
 	}
 	strippedTeamsHelperSuffix := false
 	for _, marker := range teamsHelperPromptSuffixMarkers {
+		markerIndex := -1
+		for _, prefix := range []string{"\n\n", "\n"} {
+			if idx := strings.LastIndex(text, prefix+marker); idx > markerIndex {
+				markerIndex = idx
+			}
+		}
+		if markerIndex >= 0 {
+			text = strings.TrimSpace(text[:markerIndex])
+			strippedTeamsHelperSuffix = true
+			continue
+		}
 		if strings.HasPrefix(text, marker) {
 			return ""
-		}
-		for _, prefix := range []string{"\n\n", "\n"} {
-			if idx := strings.Index(text, prefix+marker); idx >= 0 {
-				text = strings.TrimSpace(text[:idx])
-				strippedTeamsHelperSuffix = true
-				break
-			}
 		}
 	}
 	if strippedTeamsHelperSuffix {

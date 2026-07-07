@@ -148,9 +148,9 @@ func TestFormatMessages_AllRoles(t *testing.T) {
 	}
 }
 
-func TestFormatPreviewMessagesShowsOnlyCodexStatusAndAnswer(t *testing.T) {
+func TestFormatPreviewMessagesShowsUserCodexStatusAndAnswer(t *testing.T) {
 	msgs := []Message{
-		{Role: "user", Content: "hidden prompt"},
+		{Role: "user", Content: "visible prompt"},
 		{Role: "assistant_commentary", Content: "checking tests"},
 		{Role: "tool", Content: "Tool: exec"},
 		{Role: "tool_result", Content: "stdout"},
@@ -158,12 +158,12 @@ func TestFormatPreviewMessagesShowsOnlyCodexStatusAndAnswer(t *testing.T) {
 		{Role: "assistant", Content: "done"},
 	}
 	got := FormatPreviewMessages(msgs, 0)
-	for _, want := range []string{"Codex status:\nchecking tests", "Codex answer:\ndone"} {
+	for _, want := range []string{"User:\nvisible prompt", "Codex status:\nchecking tests", "Codex answer:\ndone"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in preview: %q", want, got)
 		}
 	}
-	for _, hidden := range []string{"hidden prompt", "Tool:", "stdout", "reasoning"} {
+	for _, hidden := range []string{"Tool:", "stdout", "reasoning"} {
 		if strings.Contains(got, hidden) {
 			t.Fatalf("preview should hide %q: %q", hidden, got)
 		}

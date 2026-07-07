@@ -135,7 +135,7 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 					entry.offset,
 					completeOffset-entry.offset,
 					0,
-					isPreviewMessage,
+					projectPreviewMessage,
 					entry.seen,
 				)
 				if readErr != nil {
@@ -166,7 +166,7 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 		}
 
 		seen := newMessageSeenState()
-		messages, readErr := readSessionMessagesWindow(filePath, 0, completeOffset, 0, isPreviewMessage, seen)
+		messages, readErr := readSessionMessagesWindow(filePath, 0, completeOffset, 0, projectPreviewMessage, seen)
 		if readErr != nil {
 			return nil, "", readErr
 		}

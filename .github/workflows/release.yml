@@ -201,7 +201,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|KeepsDistinctSameSourceIDsWithSameText|KeepsIdenticalCommentaryAndFinal)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID))$'
+          history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix))$'
           tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v

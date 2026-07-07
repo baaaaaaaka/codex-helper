@@ -101,7 +101,7 @@ type previewEvent struct {
 	err      error
 }
 
-const previewFilterVersion = "status-answer-v3"
+const previewFilterVersion = codexhistory.SessionPreviewFilterVersion
 
 type previewCacheMeta struct {
 	path          string
