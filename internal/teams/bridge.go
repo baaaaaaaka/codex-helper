@@ -10516,12 +10516,14 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	if executor == nil {
 		executor = CodexExecutor{}
 	}
-	execCtx, cancelExec := context.WithCancel(ctx)
-	unregisterCancel := b.registerRunningTurnCancel(sessionID, turn.ID, cancelExec)
+	execCtx, cancelExec := context.WithCancelCause(ctx)
+	unregisterCancel := b.registerRunningTurnCancel(sessionID, turn.ID, func() {
+		cancelExec(codexrunner.ErrTurnInterruptRequested)
+	})
 	result, err := b.runExecutorWithHeartbeat(execCtx, executor, session, turn, chatID, input)
 	cancelRequested, cancelReason, cancelSilent := b.runningTurnCancelState(turn.ID)
 	unregisterCancel()
-	cancelExec()
+	cancelExec(nil)
 	if err != nil {
 		if cancelRequested && isCanceledExecutionError(err) {
 			if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {

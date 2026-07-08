@@ -49,6 +49,38 @@ type runtimeMetadataResumeAdapter struct {
 	restoredOnResume bool
 }
 
+type runtimeExplicitCancelAdapter struct {
+	mu            sync.Mutex
+	calls         int
+	firstStarted  chan struct{}
+	releaseFirst  chan struct{}
+	firstFinished chan struct{}
+}
+
+func (a *runtimeExplicitCancelAdapter) Stream(ctx context.Context, _ responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
+	a.mu.Lock()
+	a.calls++
+	call := a.calls
+	a.mu.Unlock()
+	if call == 1 {
+		events := make(chan responsesadapter.ProviderEvent)
+		close(a.firstStarted)
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-a.releaseFirst:
+			}
+			close(a.firstFinished)
+			close(events)
+		}()
+		return events, nil
+	}
+	return runtimeContractEvents(
+		responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventTextDelta, Delta: "AFTER_CANCEL_OK"},
+		responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventDone},
+	), nil
+}
+
 func (a *runtimeMetadataResumeAdapter) Stream(_ context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -520,6 +552,135 @@ func TestInstalledCodexMetadataOnlyResumeRuntime(t *testing.T) {
 	defer adapter.mu.Unlock()
 	if !adapter.firstSeen || !adapter.restoredOnResume {
 		t.Fatalf("provider context state first_seen=%v restored_on_resume=%v", adapter.firstSeen, adapter.restoredOnResume)
+	}
+}
+
+func TestInstalledCodexExplicitCancelInterruptRuntime(t *testing.T) {
+	if os.Getenv("CODEX_RUNTIME_E2E_TEST") != "1" {
+		t.Skip("set CODEX_RUNTIME_E2E_TEST=1 to exercise explicit cancellation against the installed Codex binary")
+	}
+	command := strings.TrimSpace(os.Getenv("CXP_CONTRACT_CODEX"))
+	if command == "" {
+		var err error
+		command, err = exec.LookPath("codex")
+		if err != nil {
+			t.Fatalf("codex not found in PATH: %v", err)
+		}
+	}
+	preflightCtx, preflightCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer preflightCancel()
+	if _, err := codexcontract.Probe(preflightCtx, command); err != nil {
+		t.Fatalf("Codex runtime contract preflight: %v", err)
+	}
+
+	root := t.TempDir()
+	workingDir := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &runtimeExplicitCancelAdapter{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		firstFinished: make(chan struct{}),
+	}
+	provider := httptest.NewServer(&responsesadapter.Facade{
+		Adapter:      adapter,
+		Store:        responsesadapter.NewMemoryStore(),
+		DefaultModel: "gpt-5.4",
+		Models:       []responsesadapter.ModelInfo{{ID: "gpt-5.4", OwnedBy: "cxp-contract"}},
+	})
+	defer provider.Close()
+	codexHome := filepath.Join(root, "codex-home")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeContractChatGPTAuth(t, codexHome)
+
+	runner := &AppServerRunner{
+		Starter: PolicyAppServerStarter{ServerOptions: responsespolicy.ServerOptions{
+			OpenAIUpstream:       provider.URL + "/v1",
+			ChatGPTModelUpstream: provider.URL + "/v1",
+		}},
+		ApprovalMode:         ApprovalModeAutomatic,
+		Command:              command,
+		AppServerArgs:        []string{"-c", `model="gpt-5.4"`, "-c", `model_provider="openai"`, "-c", `chatgpt_base_url="` + provider.URL + `"`, "-c", `features.plugins=false`},
+		ExtraEnv:             []string{"CODEX_HOME=" + codexHome},
+		WorkingDir:           workingDir,
+		Timeout:              60 * time.Second,
+		MetadataOnlyResume:   true,
+		RequireCompleteFinal: true,
+	}
+	defer runner.Close()
+
+	type turnOutcome struct {
+		result TurnResult
+		err    error
+	}
+	turnStarted := make(chan struct{})
+	var turnStartedOnce sync.Once
+	ctx, cancel := context.WithCancelCause(context.Background())
+	firstDone := make(chan turnOutcome, 1)
+	go func() {
+		result, err := runner.StartThread(ctx, TurnInput{
+			Prompt:     "Wait until this turn is explicitly canceled.",
+			WorkingDir: workingDir,
+			EventHandler: func(event StreamEvent) {
+				if event.Kind == StreamEventTurnStarted {
+					turnStartedOnce.Do(func() { close(turnStarted) })
+				}
+			},
+		})
+		firstDone <- turnOutcome{result: result, err: err}
+	}()
+
+	for name, ready := range map[string]<-chan struct{}{
+		"provider request": adapter.firstStarted,
+		"turn/start event": turnStarted,
+	} {
+		select {
+		case <-ready:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("timed out waiting for %s", name)
+		}
+	}
+	cancel(ErrTurnInterruptRequested)
+
+	var first turnOutcome
+	select {
+	case first = <-firstDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("installed Codex did not confirm the explicit turn interrupt")
+	}
+	if !IsKind(first.err, ErrorCanceled) {
+		t.Fatalf("explicitly canceled turn error = %v, want canceled", first.err)
+	}
+	if strings.TrimSpace(first.result.ThreadID) == "" || strings.TrimSpace(first.result.TurnID) == "" {
+		t.Fatalf("explicitly canceled turn lost exact ids: %#v", first.result)
+	}
+	// A Responses WebSocket can outlive an individual turn, so cancellation is
+	// confirmed by the app-server interrupt response and the successful
+	// same-thread resume below, not by closing the shared upstream connection.
+	close(adapter.releaseFirst)
+	<-adapter.firstFinished
+
+	resumeCtx, cancelResume := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelResume()
+	resumed, err := runner.ResumeThread(resumeCtx, first.result.ThreadID, TurnInput{
+		Prompt:     "Reply after the canceled turn.",
+		WorkingDir: workingDir,
+	})
+	if err != nil {
+		t.Fatalf("resume after explicit cancellation: %v", err)
+	}
+	if resumed.Status != TurnStatusCompleted || resumed.FinalAgentMessage != "AFTER_CANCEL_OK" {
+		t.Fatalf("resumed turn after explicit cancellation = %#v", resumed)
+	}
+	state, err := runner.request(resumeCtx, appServerMethodThreadRead, map[string]any{"threadId": first.result.ThreadID})
+	if err != nil {
+		t.Fatalf("read resumed thread state: %v", err)
+	}
+	if idle, ok := decodeThreadIdle(state); !ok || !idle {
+		t.Fatalf("installed Codex idle thread state was not recognized: idle=%v ok=%v raw=%s", idle, ok, state)
 	}
 }
 

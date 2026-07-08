@@ -1522,7 +1522,7 @@ jobs:
             throw "expected local npm codex under $localPrefix, got $upgradedPath"
           }
 
-      - name: Codex approval and thread-name history runtime integration (Linux/macOS)
+      - name: Codex approval, history, and cancellation runtime integration (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         env:
@@ -1536,9 +1536,9 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
-      - name: Codex approval and thread-name history runtime integration (Windows)
+      - name: Codex approval, history, and cancellation runtime integration (Windows)
         if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
         env:
@@ -1553,7 +1553,7 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Managed-node install integration (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
@@ -1632,7 +1632,7 @@ jobs:
             Add-Content -LiteralPath $env:GITHUB_PATH -Value (Split-Path -Parent $bundledWinpty)
           }
 
-      - name: Run original-binary approval and thread-name history contracts
+      - name: Run original-binary approval, history, and cancellation contracts
         shell: bash
         env:
           CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
@@ -1645,9 +1645,9 @@ jobs:
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           printf '%s\n' \
-            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","metadata-only-resume","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
+            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof

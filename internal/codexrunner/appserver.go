@@ -14,17 +14,21 @@ import (
 )
 
 const (
-	appServerMethodInitialize      = "initialize"
-	appServerMethodInitialized     = "initialized"
-	appServerMethodThreadStart     = "thread/start"
-	appServerMethodThreadResume    = "thread/resume"
-	appServerMethodThreadRead      = "thread/read"
-	appServerMethodThreadList      = "thread/list"
-	appServerMethodThreadTurnsList = "thread/turns/list"
-	appServerMethodTurnStart       = "turn/start"
-	appServerMethodTurnInterrupt   = "turn/interrupt"
-	appServerCompletedRequestLimit = 256
+	appServerMethodInitialize                 = "initialize"
+	appServerMethodInitialized                = "initialized"
+	appServerMethodThreadStart                = "thread/start"
+	appServerMethodThreadResume               = "thread/resume"
+	appServerMethodThreadRead                 = "thread/read"
+	appServerMethodThreadList                 = "thread/list"
+	appServerMethodThreadTurnsList            = "thread/turns/list"
+	appServerMethodTurnStart                  = "turn/start"
+	appServerMethodTurnInterrupt              = "turn/interrupt"
+	appServerCompletedRequestLimit            = 256
+	appServerTurnInterruptConfirmationTimeout = 30 * time.Second
+	appServerThreadStateConfirmationTimeout   = 5 * time.Second
 )
+
+var errAppServerTurnStartUnconfirmed = errors.New("turn/start response was not confirmed")
 
 type AppServerLineTransport interface {
 	WriteLine(ctx context.Context, line []byte) error
@@ -121,6 +125,16 @@ type appServerServerRequestState struct {
 type appServerThreadTurnGate struct {
 	mu   sync.Mutex
 	refs int
+	// cancelFence prevents a new same-thread turn until an earlier explicit
+	// cancellation is confirmed. It belongs to this app-server transport only
+	// and is retried lazily by the next same-thread turn.
+	cancelFence *appServerTurnCancelFence
+}
+
+type appServerTurnCancelFence struct {
+	// turnID is empty only when an explicit cancellation raced with turn/start
+	// and Codex did not return the exact id within the confirmation window.
+	turnID string
 }
 
 func NewAppServerRunner(transport AppServerLineTransport) *AppServerRunner {
@@ -217,11 +231,194 @@ func (r *AppServerRunner) InterruptTurn(ctx context.Context, ref TurnRef) error 
 	if err := r.ensureReady(ctx); err != nil {
 		return err
 	}
+	return r.requestTurnInterrupt(ctx, TurnRef{ThreadID: threadID, TurnID: turnID})
+}
+
+func (r *AppServerRunner) requestTurnInterrupt(ctx context.Context, ref TurnRef) error {
+	threadID := strings.TrimSpace(ref.ThreadID)
+	turnID := strings.TrimSpace(ref.TurnID)
+	if threadID == "" {
+		return &Error{Kind: ErrorInvalidRequest, Message: "thread id is required"}
+	}
+	if turnID == "" {
+		return &Error{Kind: ErrorInvalidRequest, Message: "turn id is required"}
+	}
 	_, err := r.request(ctx, appServerMethodTurnInterrupt, map[string]string{
 		"threadId": threadID,
 		"turnId":   turnID,
 	})
 	return err
+}
+
+func explicitTurnInterruptRequested(ctx context.Context) bool {
+	return ctx != nil && errors.Is(context.Cause(ctx), ErrTurnInterruptRequested)
+}
+
+func explicitTurnCanceledError(cause error) error {
+	if cause == nil {
+		cause = ErrTurnInterruptRequested
+	}
+	return &Error{Kind: ErrorCanceled, Message: "Codex turn canceled by explicit interrupt request", Err: cause}
+}
+
+func (r *AppServerRunner) turnInterruptConfirmationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), appServerTurnInterruptConfirmationTimeout)
+}
+
+func (r *AppServerRunner) threadStateConfirmationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), appServerThreadStateConfirmationTimeout)
+}
+
+func (r *AppServerRunner) confirmTurnStopped(threadID string, turnID string, subscription *appServerTurnSubscriber) error {
+	threadID = strings.TrimSpace(threadID)
+	turnID = strings.TrimSpace(turnID)
+	if threadID == "" || turnID == "" {
+		return &Error{Kind: ErrorInvalidRequest, Message: "thread id and turn id are required to confirm cancellation"}
+	}
+
+	confirmationCtx, cancelConfirmation := r.turnInterruptConfirmationContext()
+	interruptErr := r.requestTurnInterrupt(confirmationCtx, TurnRef{ThreadID: threadID, TurnID: turnID})
+	if interruptErr == nil && subscription != nil {
+		interruptErr = r.waitForTurnTerminal(confirmationCtx, subscription, threadID, turnID)
+	}
+	cancelConfirmation()
+	if interruptErr == nil && subscription != nil {
+		return nil
+	}
+	if interruptErr != nil && turnTerminalBuffered(subscription, threadID, turnID) {
+		return nil
+	}
+
+	stateCtx, cancelState := r.threadStateConfirmationContext()
+	idle, stateErr := r.threadIdle(stateCtx, threadID)
+	cancelState()
+	if stateErr == nil && idle {
+		return nil
+	}
+	if stateErr != nil {
+		return &Error{
+			Kind:    ErrorCodex,
+			Message: "Codex turn cancellation could not be confirmed and thread state could not be read",
+			Err:     errors.Join(interruptErr, stateErr),
+		}
+	}
+	return &Error{
+		Kind:    ErrorCodex,
+		Message: "Codex turn cancellation was not confirmed and the thread remains active",
+		Err:     interruptErr,
+	}
+}
+
+func (r *AppServerRunner) waitForTurnTerminal(ctx context.Context, subscription *appServerTurnSubscriber, threadID string, turnID string) error {
+	for {
+		line, err := r.readTurnNotification(ctx, subscription)
+		if err != nil {
+			return err
+		}
+		if appServerTerminalNotificationForTurn(line, threadID, turnID) {
+			return nil
+		}
+	}
+}
+
+func turnTerminalBuffered(subscription *appServerTurnSubscriber, threadID string, turnID string) bool {
+	if subscription == nil {
+		return false
+	}
+	for {
+		select {
+		case line := <-subscription.frames:
+			if appServerTerminalNotificationForTurn(line, threadID, turnID) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
+func appServerTerminalNotificationForTurn(line []byte, threadID string, turnID string) bool {
+	var message appServerMessage
+	if json.Unmarshal(line, &message) != nil {
+		return false
+	}
+	routedThreadID, routedTurnID := appServerNotificationRoute(message.Params)
+	if strings.TrimSpace(routedTurnID) != strings.TrimSpace(turnID) {
+		return false
+	}
+	if routedThreadID != "" && strings.TrimSpace(routedThreadID) != strings.TrimSpace(threadID) {
+		return false
+	}
+	result := TurnResult{}
+	if applyAppServerNotification(&result, line) != nil {
+		return false
+	}
+	return strings.TrimSpace(result.TurnID) == strings.TrimSpace(turnID) && isTerminalTurnStatus(result.Status)
+}
+
+func (r *AppServerRunner) threadIdle(ctx context.Context, threadID string) (bool, error) {
+	raw, err := r.request(ctx, appServerMethodThreadRead, map[string]any{
+		"threadId": threadID,
+	})
+	if err != nil {
+		return false, err
+	}
+	idle, ok := decodeThreadIdle(raw)
+	if !ok {
+		return false, &Error{Kind: ErrorParse, Message: "thread/read response did not include a recognized thread status"}
+	}
+	return idle, nil
+}
+
+func (r *AppServerRunner) interruptStartedTurn(threadID string, turnID string, gate *appServerThreadTurnGate, subscription *appServerTurnSubscriber) error {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		gate.cancelFence = &appServerTurnCancelFence{}
+		return &Error{Kind: ErrorCodex, Message: "Codex turn cancel could not be confirmed because turn/start did not return an exact turn id"}
+	}
+	if err := r.confirmTurnStopped(threadID, turnID, subscription); err != nil {
+		gate.cancelFence = &appServerTurnCancelFence{turnID: turnID}
+		return &Error{
+			Kind:    ErrorCodex,
+			Message: "Codex turn cancel was not confirmed; cleanup will be retried before the next same-thread turn",
+			Err:     err,
+		}
+	}
+	gate.cancelFence = nil
+	return explicitTurnCanceledError(ErrTurnInterruptRequested)
+}
+
+func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appServerThreadTurnGate) error {
+	if gate == nil || gate.cancelFence == nil {
+		return nil
+	}
+	turnID := strings.TrimSpace(gate.cancelFence.turnID)
+	if turnID == "" {
+		stateCtx, cancelState := r.threadStateConfirmationContext()
+		idle, err := r.threadIdle(stateCtx, threadID)
+		cancelState()
+		if err != nil || !idle {
+			if err == nil {
+				err = errors.New("thread remains active")
+			}
+			return &Error{
+				Kind:    ErrorCodex,
+				Message: "Previous Codex turn cancellation is still unconfirmed; no new turn was started. Retry this request later",
+				Err:     err,
+			}
+		}
+		gate.cancelFence = nil
+		return nil
+	}
+	if err := r.confirmTurnStopped(threadID, turnID, nil); err != nil {
+		return &Error{
+			Kind:    ErrorCodex,
+			Message: "Previous Codex turn cancellation is still unconfirmed; no new turn was started. Retry this request later",
+			Err:     err,
+		}
+	}
+	gate.cancelFence = nil
+	return nil
 }
 
 func (r *AppServerRunner) ReadThread(ctx context.Context, threadID string) (Thread, error) {
@@ -403,8 +600,11 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 	if threadID == "" {
 		return TurnResult{}, &Error{Kind: ErrorInvalidRequest, Message: "thread id is required"}
 	}
-	unlockThread := r.lockThreadTurn(threadID)
+	gate, unlockThread := r.lockThreadTurn(threadID)
 	defer unlockThread()
+	if err := r.reconcileTurnCancelFence(threadID, gate); err != nil {
+		return TurnResult{ThreadID: threadID}, err
+	}
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    appServerTurnInput(input.TurnInput),
@@ -422,19 +622,36 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 	defer r.unsubscribeTurn(subscription)
 
 	var result TurnResult
-	raw, err := r.request(ctx, appServerMethodTurnStart, params)
+	raw, err := r.requestTurnStart(ctx, params)
 	if err != nil {
+		if errors.Is(err, errAppServerTurnStartUnconfirmed) {
+			result.Status = TurnStatusStarted
+			gate.cancelFence = &appServerTurnCancelFence{}
+		}
 		return result, err
 	}
 	if err := applyAppServerResult(&result, raw); err != nil {
+		if explicitTurnInterruptRequested(ctx) {
+			result.Status = TurnStatusStarted
+			gate.cancelFence = &appServerTurnCancelFence{turnID: strings.TrimSpace(result.TurnID)}
+		}
 		return result, err
 	}
 	if result.ThreadID == "" {
 		result.ThreadID = threadID
 	}
 	r.setTurnSubscriptionID(subscription, result.TurnID)
+	if explicitTurnInterruptRequested(ctx) {
+		if isTerminalTurnStatus(result.Status) {
+			return result, explicitTurnCanceledError(context.Cause(ctx))
+		}
+		return result, r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+	}
 	if !isTerminalTurnStatus(result.Status) {
 		if err := r.readTurnNotificationsUntilTerminal(ctx, subscription, &result, input.EventHandler); err != nil {
+			if explicitTurnInterruptRequested(ctx) {
+				return result, r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+			}
 			return result, err
 		}
 	}
@@ -558,6 +775,43 @@ func (r *AppServerRunner) readTurnNotificationsUntilTerminal(ctx context.Context
 }
 
 func (r *AppServerRunner) request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id, delivery, err := r.sendRequest(ctx, method, params)
+	if err != nil {
+		return nil, err
+	}
+	return r.awaitRequest(ctx, id, delivery, true)
+}
+
+func (r *AppServerRunner) requestTurnStart(ctx context.Context, params any) (json.RawMessage, error) {
+	id, delivery, err := r.sendRequest(ctx, appServerMethodTurnStart, params)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := r.awaitRequest(ctx, id, delivery, false)
+	if err == nil || !explicitTurnInterruptRequested(ctx) || !IsKind(err, ErrorCanceled) {
+		if err != nil {
+			r.unregisterPendingRequest(id, delivery)
+		}
+		return raw, err
+	}
+
+	confirmationCtx, cancelConfirmation := r.turnInterruptConfirmationContext()
+	defer cancelConfirmation()
+	raw, err = r.awaitRequest(confirmationCtx, id, delivery, true)
+	if err != nil {
+		if IsKind(err, ErrorCodex) {
+			return nil, err
+		}
+		return nil, &Error{
+			Kind:    ErrorCodex,
+			Message: "Codex turn cancel was requested before turn/start returned an exact turn id",
+			Err:     errors.Join(errAppServerTurnStartUnconfirmed, err),
+		}
+	}
+	return raw, nil
+}
+
+func (r *AppServerRunner) sendRequest(ctx context.Context, method string, params any) (int64, chan appServerResponseDelivery, error) {
 	id, delivery := r.registerPendingRequest()
 	request := appServerRequest{
 		JSONRPC: "2.0",
@@ -568,13 +822,17 @@ func (r *AppServerRunner) request(ctx context.Context, method string, params any
 	line, err := json.Marshal(request)
 	if err != nil {
 		r.unregisterPendingRequest(id, delivery)
-		return nil, &Error{Kind: ErrorParse, Message: "failed to encode app-server request", Err: err}
+		return 0, nil, &Error{Kind: ErrorParse, Message: "failed to encode app-server request", Err: err}
 	}
 	if err := r.writeLineLocked(ctx, line); err != nil {
 		r.unregisterPendingRequest(id, delivery)
 		r.setProtocolFailure(err)
-		return nil, err
+		return 0, nil, err
 	}
+	return id, delivery, nil
+}
+
+func (r *AppServerRunner) awaitRequest(ctx context.Context, id int64, delivery chan appServerResponseDelivery, unregisterOnCancel bool) (json.RawMessage, error) {
 	select {
 	case response := <-delivery:
 		if response.err != nil {
@@ -582,7 +840,9 @@ func (r *AppServerRunner) request(ctx context.Context, method string, params any
 		}
 		return response.result, nil
 	case <-ctx.Done():
-		r.unregisterPendingRequest(id, delivery)
+		if unregisterOnCancel {
+			r.unregisterPendingRequest(id, delivery)
+		}
 		return nil, classifyTransportError(ctx.Err())
 	}
 }
@@ -801,7 +1061,7 @@ func (r *AppServerRunner) subscribeTurn(ctx context.Context, threadID string) *a
 	return subscriber
 }
 
-func (r *AppServerRunner) lockThreadTurn(threadID string) func() {
+func (r *AppServerRunner) lockThreadTurn(threadID string) (*appServerThreadTurnGate, func()) {
 	threadID = strings.TrimSpace(threadID)
 	r.protocolMu.Lock()
 	if r.threadTurnGates == nil {
@@ -816,15 +1076,20 @@ func (r *AppServerRunner) lockThreadTurn(threadID string) func() {
 	r.protocolMu.Unlock()
 
 	gate.mu.Lock()
-	return func() {
-		gate.mu.Unlock()
+	release := func() {
+		// Keep the fence observation and reference-count update in one critical
+		// section. Otherwise a queued same-thread caller can clear cancelFence
+		// after this goroutine snapshots it but before refs reaches zero, leaving
+		// an empty gate retained until that thread happens to run again.
 		r.protocolMu.Lock()
 		gate.refs--
-		if gate.refs == 0 && r.threadTurnGates[threadID] == gate {
+		if gate.refs == 0 && gate.cancelFence == nil && r.threadTurnGates[threadID] == gate {
 			delete(r.threadTurnGates, threadID)
 		}
 		r.protocolMu.Unlock()
+		gate.mu.Unlock()
 	}
+	return gate, release
 }
 
 func (r *AppServerRunner) unsubscribeTurn(subscriber *appServerTurnSubscriber) {
@@ -1371,6 +1636,52 @@ func decodeThread(raw json.RawMessage) (Thread, bool) {
 	}
 	name := firstNonEmpty(envelope.Thread.Name, envelope.Thread.ThreadName2, envelope.Thread.ThreadName, envelope.Thread.Title, envelope.Name, envelope.ThreadName2, envelope.ThreadName, envelope.Title)
 	return Thread{ID: id, Name: strings.TrimSpace(name)}, true
+}
+
+func decodeThreadIdle(raw json.RawMessage) (bool, bool) {
+	var envelope struct {
+		Status json.RawMessage `json:"status"`
+		Thread struct {
+			Status json.RawMessage `json:"status"`
+		} `json:"thread"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return false, false
+	}
+	status := bytes.TrimSpace(envelope.Thread.Status)
+	if len(status) == 0 || bytes.Equal(status, []byte("null")) {
+		status = bytes.TrimSpace(envelope.Status)
+	}
+	if len(status) == 0 || bytes.Equal(status, []byte("null")) {
+		return false, false
+	}
+
+	var text string
+	if err := json.Unmarshal(status, &text); err == nil {
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "idle":
+			return true, true
+		case "active", "notloaded", "systemerror":
+			return false, true
+		default:
+			return false, false
+		}
+	}
+
+	var object struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(status, &object); err != nil {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(object.Type)) {
+	case "idle":
+		return true, true
+	case "active", "notloaded", "systemerror":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func decodeThreads(raw json.RawMessage) ([]Thread, error) {

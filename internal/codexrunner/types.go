@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// ErrTurnInterruptRequested distinguishes an explicit request to stop the
+// active Codex turn from a caller lifecycle context that merely went away.
+var ErrTurnInterruptRequested = errors.New("codex turn interrupt requested")
+
 type Runner interface {
 	StartThread(ctx context.Context, input TurnInput) (TurnResult, error)
 	ResumeThread(ctx context.Context, threadID string, input TurnInput) (TurnResult, error)

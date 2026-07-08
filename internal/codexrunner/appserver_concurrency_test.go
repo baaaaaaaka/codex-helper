@@ -3,8 +3,10 @@ package codexrunner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -187,6 +189,583 @@ func TestAppServerRunnerSerializesTurnsOnSameThread(t *testing.T) {
 	transport.complete(ctx, 2)
 	if err := <-results; err != nil {
 		t.Fatalf("second same-thread turn failed: %v", err)
+	}
+}
+
+func TestAppServerRunnerExplicitCancelInterruptsBeforeNextSameThreadTurn(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turnObserved := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "cancel me",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		firstDone <- err
+	}()
+
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("first turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("first turn was not observed as started")
+	}
+	cancel(ErrTurnInterruptRequested)
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "run after cancel"},
+		})
+		secondDone <- err
+	}()
+
+	select {
+	case ref := <-transport.interrupted:
+		if ref.ThreadID != "shared-thread" || ref.TurnID != "turn-1" {
+			t.Fatalf("interrupt ref = %#v, want shared-thread/turn-1", ref)
+		}
+	case sequence := <-transport.started:
+		t.Fatalf("same-thread turn %d started before turn 1 was interrupted", sequence)
+	case <-time.After(time.Second):
+		t.Fatal("explicit cancellation did not send turn/interrupt")
+	}
+
+	transport.finishInterrupt(context.Background())
+	if err := <-firstDone; !IsKind(err, ErrorCanceled) {
+		t.Fatalf("first turn error = %v, want canceled", err)
+	}
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("second turn sequence = %d, want 2", sequence)
+	}
+	transport.complete(context.Background(), 2)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second turn failed: %v", err)
+	}
+}
+
+func TestAppServerRunnerInterruptAckDoesNotReleaseThreadBeforeTerminal(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turnObserved := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "cancel me",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("first turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("first turn was not observed as started")
+	}
+	cancel(ErrTurnInterruptRequested)
+	<-transport.interrupted
+	transport.ackInterrupt(context.Background())
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "run only after terminal"},
+		})
+		secondDone <- err
+	}()
+	select {
+	case err := <-firstDone:
+		t.Fatalf("first turn returned before turn/completed: %v", err)
+	case sequence := <-transport.started:
+		t.Fatalf("same-thread turn %d started before turn/completed", sequence)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	transport.finishInterruptedTurn(context.Background())
+	if err := <-firstDone; !IsKind(err, ErrorCanceled) {
+		t.Fatalf("first turn error = %v, want canceled", err)
+	}
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("second turn sequence = %d, want 2", sequence)
+	}
+	transport.complete(context.Background(), 2)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second turn failed: %v", err)
+	}
+}
+
+func TestAppServerRunnerExplicitCancelDuringTurnStartWaitsForExactInterrupt(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.delayFirstStartResponse = true
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "cancel during start"},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("first turn sequence = %d, want 1", sequence)
+	}
+	cancel(ErrTurnInterruptRequested)
+
+	select {
+	case ref := <-transport.interrupted:
+		t.Fatalf("turn/interrupt was sent without an exact turn id: %#v", ref)
+	case <-time.After(50 * time.Millisecond):
+	}
+	transport.finishStartResponse(context.Background())
+	select {
+	case ref := <-transport.interrupted:
+		if ref.ThreadID != "shared-thread" || ref.TurnID != "turn-1" {
+			t.Fatalf("interrupt ref = %#v, want shared-thread/turn-1", ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("turn/start response did not trigger an exact interrupt")
+	}
+	transport.finishInterrupt(context.Background())
+	select {
+	case err := <-firstDone:
+		if !IsKind(err, ErrorCanceled) {
+			t.Fatalf("turn error = %v, want canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("turn did not return after exact interrupt confirmation")
+	}
+}
+
+func TestAppServerRunnerTurnStartErrorWinningCancelRaceIsPreserved(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.delayFirstStartResponse = true
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "rejected while canceling"},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("first turn sequence = %d, want 1", sequence)
+	}
+	cancel(ErrTurnInterruptRequested)
+	transport.finishStartError(context.Background(), "turn rejected before start")
+	select {
+	case err := <-firstDone:
+		if !IsKind(err, ErrorCodex) || !strings.Contains(err.Error(), "turn rejected before start") {
+			t.Fatalf("turn/start error = %v, want original Codex rejection", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("turn/start rejection was replaced by cancellation handoff wait")
+	}
+	select {
+	case ref := <-transport.interrupted:
+		t.Fatalf("rejected turn unexpectedly sent interrupt: %#v", ref)
+	default:
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "run after rejected start"},
+		})
+		secondDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("second turn sequence = %d, want 2", sequence)
+	}
+	transport.complete(context.Background(), 2)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second turn failed after rejected start: %v", err)
+	}
+}
+
+func TestAppServerRunnerUnconfirmedTurnStartReturnsStartedStatus(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.delayFirstStartResponse = true
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	type outcome struct {
+		result TurnResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "lose start response"},
+		})
+		done <- outcome{result: result, err: err}
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("turn sequence = %d, want 1", sequence)
+	}
+	cancel(ErrTurnInterruptRequested)
+	_ = transport.Close()
+	select {
+	case got := <-done:
+		if !IsKind(got.err, ErrorCodex) || !errors.Is(got.err, errAppServerTurnStartUnconfirmed) {
+			t.Fatalf("unconfirmed turn/start error = %v", got.err)
+		}
+		if got.result.ThreadID != "shared-thread" || got.result.TurnID != "" || got.result.Status != TurnStatusStarted {
+			t.Fatalf("unconfirmed turn/start result = %#v, want started ambiguity", got.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transport failure did not end turn/start confirmation")
+	}
+}
+
+func TestAppServerRunnerLifecycleCancelDoesNotInterruptTurn(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	turnObserved := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "detach without interrupt",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		done <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("turn was not observed as started")
+	}
+	cancel()
+	if err := <-done; !IsKind(err, ErrorCanceled) {
+		t.Fatalf("turn error = %v, want lifecycle cancellation", err)
+	}
+	select {
+	case ref := <-transport.interrupted:
+		t.Fatalf("lifecycle cancellation unexpectedly interrupted turn: %#v", ref)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestAppServerRunnerUnconfirmedExplicitInterruptRetriesBeforeNextTurn(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.exactInterruptError = "expected active turn id turn-1 but found turn-other"
+	transport.exactInterruptErrorsRemaining = 1
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turnObserved := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "cancel with ambiguous interrupt",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("turn was not observed as started")
+	}
+	cancel(ErrTurnInterruptRequested)
+	select {
+	case ref := <-transport.interrupted:
+		if ref.TurnID != "turn-1" {
+			t.Fatalf("interrupt ref = %#v, want turn-1", ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit cancellation did not send exact interrupt")
+	}
+	if err := <-firstDone; !IsKind(err, ErrorCodex) {
+		t.Fatalf("first turn error = %v, want unconfirmed Codex error", err)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "retry cleanup first"},
+		})
+		secondDone <- err
+	}()
+	select {
+	case ref := <-transport.interrupted:
+		if ref.ThreadID != "shared-thread" || ref.TurnID != "turn-1" {
+			t.Fatalf("cleanup interrupt ref = %#v, want shared-thread/turn-1", ref)
+		}
+	case sequence := <-transport.started:
+		t.Fatalf("same-thread turn %d started before cancel fence was cleared", sequence)
+	case <-time.After(time.Second):
+		t.Fatal("next same-thread turn did not retry exact interrupt")
+	}
+	transport.finishInterrupt(context.Background())
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("second turn sequence = %d, want 2", sequence)
+	}
+	transport.complete(context.Background(), 2)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second turn failed after cleanup retry: %v", err)
+	}
+}
+
+func TestAppServerRunnerPersistentCancelFenceDoesNotStartSameThread(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.exactInterruptError = "turn remains active"
+	transport.exactInterruptErrorsRemaining = -1
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turnObserved := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "leave a cancel fence",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("turn was not observed as started")
+	}
+	cancel(ErrTurnInterruptRequested)
+	<-transport.interrupted
+	if err := <-firstDone; !IsKind(err, ErrorCodex) {
+		t.Fatalf("first turn error = %v, want unconfirmed Codex error", err)
+	}
+
+	_, err := runner.StartTurn(context.Background(), StartTurnInput{
+		ThreadID:  "shared-thread",
+		TurnInput: TurnInput{Prompt: "must fail closed"},
+	})
+	if !IsKind(err, ErrorCodex) {
+		t.Fatalf("next same-thread turn error = %v, want recoverable cancel-fence error", err)
+	}
+	select {
+	case sequence := <-transport.started:
+		t.Fatalf("fenced same-thread turn unexpectedly started as sequence %d", sequence)
+	default:
+	}
+
+	otherDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "other-thread",
+			TurnInput: TurnInput{Prompt: "unrelated thread remains usable"},
+		})
+		otherDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("other-thread turn sequence = %d, want 2", sequence)
+	}
+	transport.completeFor(context.Background(), "other-thread", 2)
+	if err := <-otherDone; err != nil {
+		t.Fatalf("cancel fence affected unrelated thread: %v", err)
+	}
+}
+
+func TestAppServerRunnerUnknownTurnCancelFenceWaitsForIdle(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+	if err := runner.ensureReady(context.Background()); err != nil {
+		t.Fatalf("initialize runner: %v", err)
+	}
+
+	gate, unlock := runner.lockThreadTurn("shared-thread")
+	defer unlock()
+	gate.cancelFence = &appServerTurnCancelFence{}
+	if err := runner.reconcileTurnCancelFence("shared-thread", gate); !IsKind(err, ErrorCodex) {
+		t.Fatalf("active unknown-turn fence error = %v, want Codex error", err)
+	}
+	transport.mu.Lock()
+	transport.threadStatus = "idle"
+	transport.mu.Unlock()
+	if err := runner.reconcileTurnCancelFence("shared-thread", gate); err != nil {
+		t.Fatalf("idle unknown-turn fence did not recover: %v", err)
+	}
+	if gate.cancelFence != nil {
+		t.Fatal("idle unknown-turn fence was not cleared")
+	}
+}
+
+func TestAppServerRunnerCompletionWinningCancelRaceDoesNotBlockNextTurn(t *testing.T) {
+	transport := newExplicitCancelTurnTransport()
+	transport.completeBeforeExactInterrupt = true
+	runner := &AppServerRunner{Transport: transport}
+	defer runner.Close()
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	turnObserved := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(ctx, StartTurnInput{
+			ThreadID: "shared-thread",
+			TurnInput: TurnInput{
+				Prompt: "finish while canceling",
+				EventHandler: func(event StreamEvent) {
+					if event.Kind == StreamEventTurnStarted {
+						close(turnObserved)
+					}
+				},
+			},
+		})
+		firstDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 1 {
+		t.Fatalf("turn sequence = %d, want 1", sequence)
+	}
+	select {
+	case <-turnObserved:
+	case <-time.After(time.Second):
+		t.Fatal("turn was not observed as started")
+	}
+	cancel(ErrTurnInterruptRequested)
+	select {
+	case ref := <-transport.interrupted:
+		if ref.TurnID != "turn-1" {
+			t.Fatalf("interrupt ref = %#v, want turn-1", ref)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("explicit cancellation did not send exact interrupt")
+	}
+	if err := <-firstDone; !IsKind(err, ErrorCanceled) {
+		t.Fatalf("first turn error = %v, want canceled race result", err)
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.StartTurn(context.Background(), StartTurnInput{
+			ThreadID:  "shared-thread",
+			TurnInput: TurnInput{Prompt: "run after completed race"},
+		})
+		secondDone <- err
+	}()
+	if sequence := <-transport.started; sequence != 2 {
+		t.Fatalf("second turn sequence = %d, want 2", sequence)
+	}
+	transport.complete(context.Background(), 2)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second turn failed after completion race: %v", err)
+	}
+}
+
+func TestDecodeThreadIdle(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		idle bool
+		ok   bool
+	}{
+		{name: "nested string idle", raw: `{"thread":{"id":"thread","status":"idle"}}`, idle: true, ok: true},
+		{name: "nested object idle", raw: `{"thread":{"id":"thread","status":{"type":"idle"}}}`, idle: true, ok: true},
+		{name: "top-level active", raw: `{"status":"active"}`, idle: false, ok: true},
+		{name: "nested object active", raw: `{"thread":{"status":{"type":"active","activeFlags":[]}}}`, idle: false, ok: true},
+		{name: "not loaded fails closed", raw: `{"thread":{"status":{"type":"notLoaded"}}}`, idle: false, ok: true},
+		{name: "system error fails closed", raw: `{"thread":{"status":{"type":"systemError"}}}`, idle: false, ok: true},
+		{name: "unknown fails closed", raw: `{"thread":{"status":"futureStatus"}}`, idle: false, ok: false},
+		{name: "missing fails closed", raw: `{"thread":{"id":"thread"}}`, idle: false, ok: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			idle, ok := decodeThreadIdle(json.RawMessage(test.raw))
+			if idle != test.idle || ok != test.ok {
+				t.Fatalf("decodeThreadIdle() = (%t, %t), want (%t, %t)", idle, ok, test.idle, test.ok)
+			}
+		})
+	}
+}
+
+func TestAppServerTerminalNotificationForTurnRequiresExactTerminal(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "exact interrupted", line: `{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"interrupted","items":[]}}}`, want: true},
+		{name: "exact completed", line: `{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}`, want: true},
+		{name: "wrong turn", line: `{"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"other","status":"interrupted","items":[]}}}`},
+		{name: "wrong thread", line: `{"method":"turn/completed","params":{"threadId":"other","turn":{"id":"turn","status":"interrupted","items":[]}}}`},
+		{name: "not terminal", line: `{"method":"turn/started","params":{"threadId":"thread","turn":{"id":"turn","status":"inProgress","items":[]}}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := appServerTerminalNotificationForTurn([]byte(test.line), "thread", "turn"); got != test.want {
+				t.Fatalf("appServerTerminalNotificationForTurn() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -550,6 +1129,202 @@ type sameThreadTurnTransport struct {
 	closeOnce sync.Once
 	sequence  int
 	started   chan int
+}
+
+type explicitCancelTurnTransport struct {
+	mu                            sync.Mutex
+	reads                         chan []byte
+	closed                        chan struct{}
+	closeOnce                     sync.Once
+	sequence                      int
+	started                       chan int
+	interrupted                   chan TurnRef
+	interruptID                   int64
+	interruptReady                chan struct{}
+	delayFirstStartResponse       bool
+	firstStartID                  int64
+	exactInterruptError           string
+	exactInterruptErrorsRemaining int
+	completeBeforeExactInterrupt  bool
+	threadStatus                  string
+}
+
+func newExplicitCancelTurnTransport() *explicitCancelTurnTransport {
+	return &explicitCancelTurnTransport{
+		reads:          make(chan []byte, 32),
+		closed:         make(chan struct{}),
+		started:        make(chan int, 2),
+		interrupted:    make(chan TurnRef, 8),
+		interruptReady: make(chan struct{}),
+		threadStatus:   "active",
+	}
+}
+
+func (t *explicitCancelTurnTransport) WriteLine(ctx context.Context, line []byte) error {
+	var message appServerMessage
+	if err := json.Unmarshal(line, &message); err != nil {
+		return err
+	}
+	if message.Method == appServerMethodInitialized {
+		return nil
+	}
+	id, ok := appServerNumericID(message.ID)
+	if !ok {
+		return fmt.Errorf("request %s did not include numeric id", message.Method)
+	}
+	switch message.Method {
+	case appServerMethodInitialize:
+		t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{}}`, id))
+	case appServerMethodThreadList:
+		t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{"data":[]}}`, id))
+	case appServerMethodTurnStart:
+		t.mu.Lock()
+		t.sequence++
+		sequence := t.sequence
+		t.mu.Unlock()
+		if !t.delayFirstStartResponse || sequence != 1 {
+			t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{"turn":{"id":"turn-%d","status":"inProgress","items":[]}}}`, id, sequence))
+			t.send(ctx, fmt.Sprintf(`{"method":"turn/started","params":{"threadId":"shared-thread","turn":{"id":"turn-%d","status":"inProgress","items":[]}}}`, sequence))
+		} else {
+			t.mu.Lock()
+			t.firstStartID = id
+			t.mu.Unlock()
+		}
+		select {
+		case t.started <- sequence:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.closed:
+			return io.EOF
+		}
+	case appServerMethodTurnInterrupt:
+		var params struct {
+			ThreadID string `json:"threadId"`
+			TurnID   string `json:"turnId"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return err
+		}
+		select {
+		case t.interrupted <- TurnRef{ThreadID: params.ThreadID, TurnID: params.TurnID}:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.closed:
+			return io.EOF
+		}
+		if params.TurnID == "" {
+			return fmt.Errorf("turn/interrupt did not include an exact turn id")
+		}
+		t.mu.Lock()
+		interruptError := t.exactInterruptError
+		if t.exactInterruptErrorsRemaining > 0 {
+			t.exactInterruptErrorsRemaining--
+		} else if t.exactInterruptErrorsRemaining == 0 {
+			interruptError = ""
+		}
+		t.mu.Unlock()
+		if interruptError != "" {
+			t.send(ctx, fmt.Sprintf(`{"id":%d,"error":{"code":-32600,"message":%q}}`, id, interruptError))
+			return nil
+		}
+		if t.completeBeforeExactInterrupt {
+			t.mu.Lock()
+			t.threadStatus = "idle"
+			t.mu.Unlock()
+			t.send(ctx, `{"method":"turn/completed","params":{"threadId":"shared-thread","turn":{"id":"turn-1","status":"completed","items":[]}}}`)
+			t.send(ctx, fmt.Sprintf(`{"id":%d,"error":{"code":-32600,"message":"no active turn to interrupt"}}`, id))
+			return nil
+		}
+		t.mu.Lock()
+		t.interruptID = id
+		t.mu.Unlock()
+		close(t.interruptReady)
+	case appServerMethodThreadRead:
+		var params struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(message.Params, &params); err != nil {
+			return err
+		}
+		t.mu.Lock()
+		status := t.threadStatus
+		t.mu.Unlock()
+		t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{"thread":{"id":%q,"status":%q}}}`, id, params.ThreadID, status))
+	default:
+		return fmt.Errorf("unexpected method %q", message.Method)
+	}
+	return nil
+}
+
+func (t *explicitCancelTurnTransport) finishInterrupt(ctx context.Context) {
+	t.finishInterruptedTurn(ctx)
+	t.ackInterrupt(ctx)
+}
+
+func (t *explicitCancelTurnTransport) ackInterrupt(ctx context.Context) {
+	select {
+	case <-t.interruptReady:
+	case <-ctx.Done():
+		return
+	}
+	t.mu.Lock()
+	id := t.interruptID
+	t.mu.Unlock()
+	t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{}}`, id))
+}
+
+func (t *explicitCancelTurnTransport) finishInterruptedTurn(ctx context.Context) {
+	t.mu.Lock()
+	t.threadStatus = "idle"
+	t.mu.Unlock()
+	t.send(ctx, `{"method":"turn/completed","params":{"threadId":"shared-thread","turn":{"id":"turn-1","status":"interrupted","items":[]}}}`)
+}
+
+func (t *explicitCancelTurnTransport) finishStartResponse(ctx context.Context) {
+	t.mu.Lock()
+	id := t.firstStartID
+	t.mu.Unlock()
+	t.send(ctx, fmt.Sprintf(`{"id":%d,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`, id))
+}
+
+func (t *explicitCancelTurnTransport) finishStartError(ctx context.Context, message string) {
+	t.mu.Lock()
+	id := t.firstStartID
+	t.mu.Unlock()
+	t.send(ctx, fmt.Sprintf(`{"id":%d,"error":{"code":-32600,"message":%q}}`, id, message))
+}
+
+func (t *explicitCancelTurnTransport) complete(ctx context.Context, sequence int) {
+	t.completeFor(ctx, "shared-thread", sequence)
+}
+
+func (t *explicitCancelTurnTransport) completeFor(ctx context.Context, threadID string, sequence int) {
+	t.send(ctx, fmt.Sprintf(`{"method":"item/completed","params":{"threadId":%q,"turnId":"turn-%d","item":{"id":"item-%d","type":"agentMessage","text":"done-%d"}}}`, threadID, sequence, sequence, sequence))
+	t.send(ctx, fmt.Sprintf(`{"method":"turn/completed","params":{"threadId":%q,"turn":{"id":"turn-%d","status":"completed","items":[]}}}`, threadID, sequence))
+}
+
+func (t *explicitCancelTurnTransport) send(ctx context.Context, line string) {
+	select {
+	case t.reads <- []byte(line):
+	case <-ctx.Done():
+	case <-t.closed:
+	}
+}
+
+func (t *explicitCancelTurnTransport) ReadLine(ctx context.Context) ([]byte, error) {
+	select {
+	case line := <-t.reads:
+		return line, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-t.closed:
+		return nil, io.EOF
+	}
+}
+
+func (t *explicitCancelTurnTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
 }
 
 func newSameThreadTurnTransport() *sameThreadTurnTransport {

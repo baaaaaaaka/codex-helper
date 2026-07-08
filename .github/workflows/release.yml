@@ -300,6 +300,15 @@ jobs:
           go test ./internal/cli ./internal/teams -count=1 -run 'Test(NewManagedTeamsCodexExecutorUsesStandardAppServerRunner|TeamsCodexExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext)|RunnerExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext))$' -v
           go test ./internal/teams -count=1 -run 'TestBridge(QueuedTurnAmbiguousErrorIncludesDiagnostic|RecoversAmbiguousExecutionFromExactTranscriptFinal|FinalOutbox(RetryRequiresIdenticalChunkPlan|PreflightsAllChunksBeforeQueue)|StreamingErrorDoesNotSuppressPendingFinalLikeProgress)$' -v
 
+      - name: Teams explicit cancellation handoff regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cancel_pattern='Test(AppServerRunner(ExplicitCancelInterruptsBeforeNextSameThreadTurn|InterruptAckDoesNotReleaseThreadBeforeTerminal|ExplicitCancelDuringTurnStartWaitsForExactInterrupt|TurnStartErrorWinningCancelRaceIsPreserved|UnconfirmedTurnStartReturnsStartedStatus|LifecycleCancelDoesNotInterruptTurn|UnconfirmedExplicitInterruptRetriesBeforeNextTurn|PersistentCancelFenceDoesNotStartSameThread|UnknownTurnCancelFenceWaitsForIdle|CompletionWinningCancelRaceDoesNotBlockNextTurn)|DecodeThreadIdle|AppServerTerminalNotificationForTurnRequiresExactTerminal)$'
+          go test ./internal/codexrunner -count=1 -run "$cancel_pattern" -v
+          go test ./internal/cli -count=1 -run '^TestTeamsCodexExecutorTreatsUnidentifiedStartedTurnAsAmbiguous$' -v
+          go test ./internal/teams -count=1 -run '^TestBridgeSessionCancelRunningUsesExplicitTurnInterruptCause$' -v
+
       - name: Teams live progress guard regressions
         shell: bash
         run: |
@@ -445,6 +454,21 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply curated release notes when present
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$notes" ]]; then
+            echo "No curated release notes for ${GITHUB_REF_NAME}; keeping the generated changelog."
+            exit 0
+          fi
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$notes"
 
   publish-update-index:
     name: Publish static update index

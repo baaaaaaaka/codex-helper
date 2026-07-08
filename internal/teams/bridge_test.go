@@ -250,6 +250,18 @@ type blockingExecutor struct {
 	result  ExecutionResult
 }
 
+type cancelCauseRecordingExecutor struct {
+	started chan struct{}
+	cause   chan error
+}
+
+func (e *cancelCauseRecordingExecutor) Run(ctx context.Context, _ *Session, _ string) (ExecutionResult, error) {
+	close(e.started)
+	<-ctx.Done()
+	e.cause <- context.Cause(ctx)
+	return ExecutionResult{}, ctx.Err()
+}
+
 func (e *blockingExecutor) Run(ctx context.Context, _ *Session, _ string) (ExecutionResult, error) {
 	close(e.started)
 	select {
@@ -13381,6 +13393,39 @@ func TestBridgeSessionCancelLastRunningTurnCancelsExecutor(t *testing.T) {
 	if strings.Contains(joined, "error: context canceled") {
 		t.Fatalf("user cancel should not be reported as execution error:\n%s", joined)
 	}
+}
+
+func TestBridgeSessionCancelRunningUsesExplicitTurnInterruptCause(t *testing.T) {
+	graph, _ := newBridgeAsyncQueueGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &cancelCauseRecordingExecutor{
+		started: make(chan struct{}),
+		cause:   make(chan error, 1),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	ctx := context.Background()
+
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("running-cause", "2026-05-03T01:00:00Z", "long task"), "long task"); err != nil {
+		t.Fatalf("handle running message error: %v", err)
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("running Codex turn did not start")
+	}
+	if err := bridge.handleSessionMessage(ctx, "chat-1", bridgePollMessage("cancel-running-cause", "2026-05-03T01:00:05Z", "helper cancel running"), "helper cancel running"); err != nil {
+		t.Fatalf("cancel running turn error: %v", err)
+	}
+	select {
+	case cause := <-executor.cause:
+		if !errors.Is(cause, codexrunner.ErrTurnInterruptRequested) {
+			t.Fatalf("cancel cause = %v, want explicit turn interrupt request", cause)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("executor did not observe cancellation cause")
+	}
+	waitForNoActiveTurnsOrOutbox(t, store, "s001")
 }
 
 func TestBridgeStartingNewTurnStopsSupersededRunningHandleForSameSession(t *testing.T) {

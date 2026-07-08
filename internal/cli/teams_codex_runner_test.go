@@ -316,6 +316,24 @@ func TestTeamsCodexExecutorTreatsStartedTurnErrorAsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorTreatsUnidentifiedStartedTurnAsAmbiguous(t *testing.T) {
+	runner := &fakeTeamsRunner{
+		result: codexrunner.TurnResult{
+			ThreadID: "thread-existing",
+			Status:   codexrunner.TurnStatusStarted,
+		},
+		err: fmt.Errorf("turn/start response was not confirmed"),
+	}
+	executor := teamsCodexExecutor{runner: runner}
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	if !teams.IsAmbiguousExecutionError(err) {
+		t.Fatalf("Run error = %v, want unidentified started turn to be ambiguous", err)
+	}
+	if got.CodexThreadID != "thread-existing" || got.CodexTurnID != "" {
+		t.Fatalf("unexpected execution result: %#v", got)
+	}
+}
+
 func TestTeamsCodexExecutorDoesNotTreatTerminalFailedTurnAsAmbiguous(t *testing.T) {
 	runner := &fakeTeamsRunner{
 		result: codexrunner.TurnResult{
