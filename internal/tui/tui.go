@@ -193,6 +193,28 @@ const (
 	sessionItemSubagent sessionItemKind = "subagent"
 )
 
+type selectionIdentity struct {
+	project projectSelectionIdentity
+	session sessionSelectionIdentity
+}
+
+type projectSelectionIdentity struct {
+	path string
+	key  string
+}
+
+type sessionSelectionIdentity struct {
+	kind   sessionItemKind
+	parent sessionObjectSelectionIdentity
+	item   sessionObjectSelectionIdentity
+}
+
+type sessionObjectSelectionIdentity struct {
+	sessionID string
+	filePath  string
+	agentID   string
+}
+
 type uiState struct {
 	projects         []codexhistory.Project
 	loadError        error
@@ -207,6 +229,10 @@ type uiState struct {
 	projectState     listState
 	sessionState     listState
 	previewState     previewState
+	// currentSelection is captured from the last rendered frame; pendingSelection
+	// reapplies it once after an automatic refresh has replaced the backing lists.
+	currentSelection selectionIdentity
+	pendingSelection selectionIdentity
 	updateStatus     *update.Status
 	updateChecking   bool
 	updateErrorUntil time.Time
@@ -733,9 +759,12 @@ func refreshState(ctx context.Context, state *uiState, opts Options) {
 	state.projectState = listState{}
 	state.sessionState = listState{}
 	state.previewState = previewState{}
+	state.currentSelection = selectionIdentity{}
+	state.pendingSelection = selectionIdentity{}
 }
 
 func refreshStatePreserveSelection(ctx context.Context, state *uiState, opts Options) {
+	selection := state.currentSelection
 	projects, err := opts.LoadProjects(ctx)
 	if err != nil {
 		state.loadError = err
@@ -743,6 +772,7 @@ func refreshStatePreserveSelection(ctx context.Context, state *uiState, opts Opt
 	}
 	state.loadError = nil
 	state.projects = projects
+	state.pendingSelection = selection
 }
 
 func computeLayout(screen tcell.Screen, statusHeight int) layout {
@@ -797,15 +827,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 
 	projects := buildProjectItems(state.projects, opts.DefaultCwd)
 	filteredProjects := filterProjects(projects, state.projectFilter)
-	state.projectState.clamp(len(filteredProjects))
-
-	selectedProject := selectedProject(filteredProjects, state.projectState.selected)
-
-	sessions := buildSessionItems(selectedProject, state.expandedSessions)
-	filteredSessions := filterSessions(sessions, state.sessionFilter)
-	state.sessionState.clamp(len(filteredSessions))
-
-	selectedItem, selectedOk := selectedSessionItem(filteredSessions, state.sessionState.selected)
+	selectedProject, filteredSessions, selectedItem, selectedOk := resolveSelectionForDraw(state, filteredProjects)
 	selectedSession, selectedSubagent, selectedIsNew := sessionSelection(selectedItem)
 	if !selectedOk {
 		selectedSession = nil
@@ -1481,6 +1503,111 @@ func selectedSessionItem(items []sessionItem, idx int) (sessionItem, bool) {
 		return sessionItem{}, false
 	}
 	return items[idx], true
+}
+
+func resolveSelectionForDraw(state *uiState, projects []projectItem) (codexhistory.Project, []sessionItem, sessionItem, bool) {
+	pending := state.pendingSelection
+	state.pendingSelection = selectionIdentity{}
+	projectRestored := false
+	if pending.project != (projectSelectionIdentity{}) {
+		if projectIdx := findProjectSelectionIndex(projects, pending.project); projectIdx >= 0 {
+			state.projectState.selected = projectIdx
+			projectRestored = true
+		}
+	}
+	state.projectState.clamp(len(projects))
+	project := selectedProject(projects, state.projectState.selected)
+
+	sessions := filterSessions(buildSessionItems(project, state.expandedSessions), state.sessionFilter)
+	if projectRestored && pending.session.kind != "" {
+		if sessionIdx := findSessionSelectionIndex(sessions, pending.session); sessionIdx >= 0 {
+			state.sessionState.selected = sessionIdx
+		}
+	}
+	state.sessionState.clamp(len(sessions))
+	item, ok := selectedSessionItem(sessions, state.sessionState.selected)
+
+	state.currentSelection = selectionIdentity{project: projectIdentity(project)}
+	if ok {
+		state.currentSelection.session = sessionItemSelectionIdentity(item)
+	}
+	return project, sessions, item, ok
+}
+
+func projectIdentity(project codexhistory.Project) projectSelectionIdentity {
+	if path := strings.TrimSpace(project.Path); path != "" {
+		return projectSelectionIdentity{path: path}
+	}
+	if key := strings.TrimSpace(project.Key); key != "" {
+		return projectSelectionIdentity{key: key}
+	}
+	return projectSelectionIdentity{}
+}
+
+func sessionItemSelectionIdentity(item sessionItem) sessionSelectionIdentity {
+	switch item.kind {
+	case sessionItemNew:
+		return sessionSelectionIdentity{kind: sessionItemNew}
+	case sessionItemMain:
+		itemIdentity := sessionObjectIdentity(item.session)
+		if itemIdentity == (sessionObjectSelectionIdentity{}) {
+			return sessionSelectionIdentity{}
+		}
+		return sessionSelectionIdentity{kind: sessionItemMain, item: itemIdentity}
+	case sessionItemSubagent:
+		itemIdentity := subagentObjectIdentity(item.subagent)
+		if itemIdentity == (sessionObjectSelectionIdentity{}) {
+			return sessionSelectionIdentity{}
+		}
+		return sessionSelectionIdentity{
+			kind:   sessionItemSubagent,
+			parent: sessionObjectIdentity(item.parentSession),
+			item:   itemIdentity,
+		}
+	default:
+		return sessionSelectionIdentity{}
+	}
+}
+
+func sessionObjectIdentity(session codexhistory.Session) sessionObjectSelectionIdentity {
+	if sessionID := strings.TrimSpace(session.SessionID); sessionID != "" {
+		return sessionObjectSelectionIdentity{sessionID: sessionID}
+	}
+	if path := strings.TrimSpace(session.FilePath); path != "" {
+		return sessionObjectSelectionIdentity{filePath: path}
+	}
+	return sessionObjectSelectionIdentity{}
+}
+
+func subagentObjectIdentity(subagent codexhistory.SubagentSession) sessionObjectSelectionIdentity {
+	if sessionID := strings.TrimSpace(subagent.SessionID); sessionID != "" {
+		return sessionObjectSelectionIdentity{sessionID: sessionID}
+	}
+	if path := strings.TrimSpace(subagent.FilePath); path != "" {
+		return sessionObjectSelectionIdentity{filePath: path}
+	}
+	if agentID := strings.TrimSpace(subagent.AgentID); agentID != "" {
+		return sessionObjectSelectionIdentity{agentID: agentID}
+	}
+	return sessionObjectSelectionIdentity{}
+}
+
+func findProjectSelectionIndex(items []projectItem, identity projectSelectionIdentity) int {
+	for i, item := range items {
+		if projectIdentity(item.project) == identity {
+			return i
+		}
+	}
+	return -1
+}
+
+func findSessionSelectionIndex(items []sessionItem, identity sessionSelectionIdentity) int {
+	for i, item := range items {
+		if sessionItemSelectionIdentity(item) == identity {
+			return i
+		}
+	}
+	return -1
 }
 
 func sessionSelection(item sessionItem) (*codexhistory.Session, *codexhistory.SubagentSession, bool) {

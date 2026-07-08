@@ -178,15 +178,16 @@ jobs:
             exit 1
           fi
 
-      - name: CXP TUI preview mirror and navigation regressions
+      - name: CXP TUI preview, navigation, and refresh selection regressions
         if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix))$'
-          tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused)$'
+          tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused|RefreshState(UpdatesOrPreserves|PreservesSelectionIdentityAcrossListChanges)|SelectionIdentityLookupDoesNotAllocate|SelectSessionAutoRefreshPreservesSelection)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
+          go test ./internal/tui -run '^$' -bench '^BenchmarkResolveSelectionForDrawLargeHistory$' -benchtime=10x -count=1 -benchmem
 
       - name: go mod tidy (verify)
         if: matrix.shard == 'core'

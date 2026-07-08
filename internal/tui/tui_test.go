@@ -154,6 +154,11 @@ func newTestState(projects []codexhistory.Project) *uiState {
 	}
 }
 
+func resolveSelectionForTest(state *uiState, opts Options) {
+	projects := filterProjects(buildProjectItems(state.projects, opts.DefaultCwd), state.projectFilter)
+	resolveSelectionForDraw(state, projects)
+}
+
 func TestHandleKeyQuit(t *testing.T) {
 	screen := newTestScreen(t, 120, 40)
 	state := newTestState([]codexhistory.Project{{Key: "one", Path: "/tmp"}})
@@ -780,6 +785,276 @@ func TestRefreshStateUpdatesOrPreserves(t *testing.T) {
 		}
 		if state.projectState.selected != 1 || state.sessionState.selected != 2 || state.sessionState.scroll != 1 || state.previewState.scroll != 5 {
 			t.Fatalf("expected selection to be preserved, got %#v %#v %#v", state.projectState, state.sessionState, state.previewState)
+		}
+	})
+}
+
+func TestRefreshStatePreservesSelectionIdentityAcrossListChanges(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+
+	t.Run("newer session inserted before selection", func(t *testing.T) {
+		project := codexhistory.Project{
+			Key:  "project",
+			Path: "/project",
+			Sessions: []codexhistory.Session{
+				{SessionID: "session-a", Summary: "A", ModifiedAt: base.Add(2 * time.Minute)},
+				{SessionID: "session-b", Summary: "B", ModifiedAt: base.Add(time.Minute)},
+			},
+		}
+		state := newTestState([]codexhistory.Project{project})
+		state.sessionState = listState{selected: 2, scroll: 1}
+		state.previewState.scroll = 5
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			project.Sessions = append([]codexhistory.Session{{
+				SessionID: "session-new", Summary: "new", ModifiedAt: base.Add(3 * time.Minute),
+			}}, project.Sessions...)
+			return []codexhistory.Project{project}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		if state.sessionState.selected != 3 {
+			t.Fatalf("selected index = %d, want 3", state.sessionState.selected)
+		}
+		items := buildSessionItems(state.projects[0], state.expandedSessions)
+		if items[state.sessionState.selected].session.SessionID != "session-b" {
+			t.Fatalf("selected session = %q, want session-b", items[state.sessionState.selected].session.SessionID)
+		}
+		if state.sessionState.scroll != 1 || state.previewState.scroll != 5 {
+			t.Fatalf("scroll state changed: sessions=%#v preview=%#v", state.sessionState, state.previewState)
+		}
+	})
+
+	t.Run("existing session reordered after activity", func(t *testing.T) {
+		project := codexhistory.Project{
+			Key:  "project",
+			Path: "/project",
+			Sessions: []codexhistory.Session{
+				{SessionID: "session-a", Summary: "A", ModifiedAt: base.Add(2 * time.Minute)},
+				{SessionID: "session-b", Summary: "B", ModifiedAt: base.Add(time.Minute)},
+			},
+		}
+		state := newTestState([]codexhistory.Project{project})
+		state.sessionState.selected = 2
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			project.Sessions = []codexhistory.Session{
+				{SessionID: "session-b", Summary: "B", ModifiedAt: base.Add(3 * time.Minute)},
+				{SessionID: "session-a", Summary: "A", ModifiedAt: base.Add(2 * time.Minute)},
+			}
+			return []codexhistory.Project{project}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		if state.sessionState.selected != 1 {
+			t.Fatalf("selected index = %d, want 1", state.sessionState.selected)
+		}
+		items := buildSessionItems(state.projects[0], state.expandedSessions)
+		if items[state.sessionState.selected].session.SessionID != "session-b" {
+			t.Fatalf("selected session = %q, want session-b", items[state.sessionState.selected].session.SessionID)
+		}
+	})
+
+	t.Run("project reordered after new activity", func(t *testing.T) {
+		projectA := codexhistory.Project{
+			Key: "project-a", Path: "/project-a",
+			Sessions: []codexhistory.Session{{SessionID: "session-a", ModifiedAt: base.Add(3 * time.Minute)}},
+		}
+		projectB := codexhistory.Project{
+			Key: "project-b", Path: "/project-b",
+			Sessions: []codexhistory.Session{{SessionID: "session-b", ModifiedAt: base.Add(2 * time.Minute)}},
+		}
+		state := newTestState([]codexhistory.Project{projectA, projectB})
+		state.projectState.selected = 1
+		state.sessionState.selected = 1
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			projectB.Sessions[0].ModifiedAt = base.Add(4 * time.Minute)
+			return []codexhistory.Project{projectA, projectB}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		projects := buildProjectItems(state.projects, "")
+		if state.projectState.selected != 0 || projects[state.projectState.selected].project.Key != "project-b" {
+			t.Fatalf("selected project = index %d, project %q; want project-b at index 0", state.projectState.selected, projects[state.projectState.selected].project.Key)
+		}
+		items := buildSessionItems(projects[state.projectState.selected].project, state.expandedSessions)
+		if items[state.sessionState.selected].session.SessionID != "session-b" {
+			t.Fatalf("selected session = %q, want session-b", items[state.sessionState.selected].session.SessionID)
+		}
+	})
+
+	t.Run("subagent inserted before selection", func(t *testing.T) {
+		project := codexhistory.Project{
+			Key: "project", Path: "/project",
+			Sessions: []codexhistory.Session{{
+				SessionID: "parent",
+				Subagents: []codexhistory.SubagentSession{
+					{SessionID: "subagent-a", AgentID: "agent-a"},
+					{SessionID: "subagent-b", AgentID: "agent-b"},
+				},
+			}},
+		}
+		state := newTestState([]codexhistory.Project{project})
+		state.expandedSessions["parent"] = true
+		state.sessionState.selected = 3
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			project.Sessions[0].Subagents = append([]codexhistory.SubagentSession{{
+				SessionID: "subagent-new", AgentID: "agent-new",
+			}}, project.Sessions[0].Subagents...)
+			return []codexhistory.Project{project}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		if state.sessionState.selected != 4 {
+			t.Fatalf("selected index = %d, want 4", state.sessionState.selected)
+		}
+		items := buildSessionItems(state.projects[0], state.expandedSessions)
+		if items[state.sessionState.selected].subagent.SessionID != "subagent-b" {
+			t.Fatalf("selected subagent = %q, want subagent-b", items[state.sessionState.selected].subagent.SessionID)
+		}
+	})
+
+	t.Run("filtered session list", func(t *testing.T) {
+		project := codexhistory.Project{
+			Key: "project", Path: "/project",
+			Sessions: []codexhistory.Session{
+				{SessionID: "session-hidden", Summary: "hidden"},
+				{SessionID: "session-kept", Summary: "keep selected"},
+			},
+		}
+		state := newTestState([]codexhistory.Project{project})
+		state.sessionFilter = "keep"
+		state.sessionState.selected = 1
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			project.Sessions = append([]codexhistory.Session{{SessionID: "session-new", Summary: "keep new"}}, project.Sessions...)
+			return []codexhistory.Project{project}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		items := filterSessions(buildSessionItems(state.projects[0], state.expandedSessions), state.sessionFilter)
+		if state.sessionState.selected != 2 || items[state.sessionState.selected].session.SessionID != "session-kept" {
+			t.Fatalf("selected filtered item = index %d, session %q; want session-kept at index 2", state.sessionState.selected, items[state.sessionState.selected].session.SessionID)
+		}
+	})
+
+	t.Run("missing selection keeps positional fallback", func(t *testing.T) {
+		project := codexhistory.Project{
+			Key: "project", Path: "/project",
+			Sessions: []codexhistory.Session{
+				{SessionID: "session-a"},
+				{SessionID: "session-b"},
+			},
+		}
+		state := newTestState([]codexhistory.Project{project})
+		state.sessionState.selected = 2
+		opts := Options{LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			project.Sessions = project.Sessions[:1]
+			return []codexhistory.Project{project}, nil
+		}}
+
+		resolveSelectionForTest(state, opts)
+		refreshStatePreserveSelection(context.Background(), state, opts)
+		resolveSelectionForTest(state, opts)
+
+		if state.sessionState.selected != 1 {
+			t.Fatalf("selected index = %d, want existing positional fallback clamped to 1", state.sessionState.selected)
+		}
+	})
+}
+
+func TestSelectionIdentityLookupDoesNotAllocate(t *testing.T) {
+	const itemCount = 100
+	projects := make([]projectItem, itemCount)
+	sessions := make([]sessionItem, itemCount)
+	for i := range itemCount {
+		id := strconv.Itoa(i)
+		projects[i] = projectItem{project: codexhistory.Project{Key: "project-" + id, Path: "/projects/project-" + id}}
+		sessions[i] = sessionItem{kind: sessionItemMain, session: codexhistory.Session{SessionID: "session-" + id}}
+	}
+	projectTarget := projectIdentity(projects[itemCount-1].project)
+	sessionTarget := sessionItemSelectionIdentity(sessions[itemCount-1])
+	projectIdx := -1
+	sessionIdx := -1
+	allocations := testing.AllocsPerRun(1000, func() {
+		projectIdx = findProjectSelectionIndex(projects, projectTarget)
+		sessionIdx = findSessionSelectionIndex(sessions, sessionTarget)
+	})
+	if projectIdx != itemCount-1 || sessionIdx != itemCount-1 {
+		t.Fatalf("identity lookup returned project=%d session=%d, want %d", projectIdx, sessionIdx, itemCount-1)
+	}
+	if allocations != 0 {
+		t.Fatalf("identity lookup allocations = %.2f, want 0", allocations)
+	}
+}
+
+func BenchmarkResolveSelectionForDrawLargeHistory(b *testing.B) {
+	const projectCount = 100
+	const sessionsPerProject = 100
+	base := time.Unix(1_700_000_000, 0)
+	projects := make([]codexhistory.Project, projectCount)
+	for projectIdx := range projects {
+		projectID := strconv.Itoa(projectIdx)
+		projects[projectIdx] = codexhistory.Project{
+			Key:  "project-" + projectID,
+			Path: "/projects/project-" + projectID,
+		}
+		projects[projectIdx].Sessions = make([]codexhistory.Session, sessionsPerProject)
+		for sessionIdx := range projects[projectIdx].Sessions {
+			projects[projectIdx].Sessions[sessionIdx] = codexhistory.Session{
+				SessionID:  "session-" + projectID + "-" + strconv.Itoa(sessionIdx),
+				ModifiedAt: base.Add(time.Duration(projectIdx*sessionsPerProject+sessionIdx) * time.Second),
+			}
+		}
+	}
+
+	state := newTestState(projects)
+	state.projectState.selected = projectCount / 2
+	state.sessionState.selected = sessionsPerProject / 2
+	projectItems := filterProjects(buildProjectItems(projects, ""), "")
+	resolveSelectionForDraw(state, projectItems)
+	selection := state.currentSelection
+	resolveByPosition := func(state *uiState) {
+		state.projectState.clamp(len(projectItems))
+		project := selectedProject(projectItems, state.projectState.selected)
+		sessions := filterSessions(buildSessionItems(project, state.expandedSessions), state.sessionFilter)
+		state.sessionState.clamp(len(sessions))
+		selectedSessionItem(sessions, state.sessionState.selected)
+	}
+
+	b.Run("position only baseline", func(b *testing.B) {
+		baselineState := newTestState(projects)
+		baselineState.projectState.selected = projectCount / 2
+		baselineState.sessionState.selected = sessionsPerProject / 2
+		b.ReportAllocs()
+		for range b.N {
+			resolveByPosition(baselineState)
+		}
+	})
+	b.Run("without identity remap", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			state.pendingSelection = selectionIdentity{}
+			resolveSelectionForDraw(state, projectItems)
+		}
+	})
+	b.Run("with identity remap", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			state.pendingSelection = selection
+			resolveSelectionForDraw(state, projectItems)
 		}
 	})
 }
@@ -2016,6 +2291,7 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 
 	projectPath1 := t.TempDir()
 	projectPath2 := t.TempDir()
+	base := time.Unix(1_700_000_000, 0)
 	projects := []codexhistory.Project{
 		{
 			Key:  "proj-1",
@@ -2024,6 +2300,7 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 				SessionID:   "sess-1",
 				ProjectPath: projectPath1,
 				FilePath:    filepath.Join(projectPath1, "sess-1.jsonl"),
+				ModifiedAt:  base.Add(2 * time.Minute),
 			}},
 		},
 		{
@@ -2033,12 +2310,28 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 				SessionID:   "sess-2",
 				ProjectPath: projectPath2,
 				FilePath:    filepath.Join(projectPath2, "sess-2.jsonl"),
+				ModifiedAt:  base.Add(time.Minute),
 			}},
 		},
 	}
+	refreshedProjects := []codexhistory.Project{
+		projects[0],
+		{
+			Key:  "proj-2",
+			Path: projectPath2,
+			Sessions: []codexhistory.Session{
+				{
+					SessionID:   "sess-new",
+					ProjectPath: projectPath2,
+					FilePath:    filepath.Join(projectPath2, "sess-new.jsonl"),
+					ModifiedAt:  base.Add(3 * time.Minute),
+				},
+				projects[1].Sessions[0],
+			},
+		},
+	}
 
-	var mu sync.Mutex
-	calls := 0
+	refreshEnabled := make(chan struct{})
 	refreshCh := make(chan struct{})
 	var once sync.Once
 
@@ -2051,6 +2344,8 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'j', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
+		waitForScreenContains(t, screen, "ID: sess-2")
+		close(refreshEnabled)
 
 		<-refreshCh
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
@@ -2058,13 +2353,13 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 
 	selection, err := SelectSession(ctx, Options{
 		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
-			mu.Lock()
-			calls++
-			if calls >= 2 {
+			select {
+			case <-refreshEnabled:
 				once.Do(func() { close(refreshCh) })
+				return refreshedProjects, nil
+			default:
+				return projects, nil
 			}
-			mu.Unlock()
-			return projects, nil
 		},
 		RefreshInterval: 10 * time.Millisecond,
 	})
