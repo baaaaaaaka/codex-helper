@@ -203,6 +203,12 @@ func schedulePostParentRepair(source string, request postParentRepairRequest) er
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if err := os.Remove(readyPath); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		_ = logFile.Close()
+		return fmt.Errorf("remove post-parent repair readiness marker: %w", err)
+	}
 	if err := cmd.Process.Release(); err != nil {
 		_ = logFile.Close()
 		return fmt.Errorf("release post-parent entry repair process: %w", err)
@@ -277,20 +283,8 @@ func repairPostParentEntry(source string, request postParentRepairRequest, out i
 	if !samePath(parentPath, target) {
 		return fmt.Errorf("legacy updater parent is %s, want %s", parentPath, target)
 	}
-	readyFile, err := os.OpenFile(readyPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("publish post-parent repair readiness: %w", err)
-	}
-	if _, err := io.WriteString(readyFile, "ready\n"); err != nil {
-		_ = readyFile.Close()
-		return fmt.Errorf("write post-parent repair readiness: %w", err)
-	}
-	if err := readyFile.Sync(); err != nil {
-		_ = readyFile.Close()
-		return fmt.Errorf("sync post-parent repair readiness: %w", err)
-	}
-	if err := readyFile.Close(); err != nil {
-		return fmt.Errorf("close post-parent repair readiness: %w", err)
+	if err := publishPostParentReady(readyPath, runtimeRoot); err != nil {
+		return err
 	}
 	if status, err := windows.WaitForSingleObject(parentHandle, uint32((2*time.Minute)/time.Millisecond)); err != nil {
 		return fmt.Errorf("wait for legacy updater parent: %w", err)
@@ -354,5 +348,36 @@ func requireManagedTargetCommit(stableEntry string, expectedSHA256 string) error
 	if !strings.EqualFold(managedHash, expectedSHA256) {
 		return fmt.Errorf("managed helper target did not commit the candidate: got %s, want %s", managedHash, expectedSHA256)
 	}
+	return nil
+}
+
+func publishPostParentReady(readyPath string, runtimeRoot string) error {
+	readyFile, err := os.CreateTemp(runtimeRoot, ".post-parent-arming-")
+	if err != nil {
+		return fmt.Errorf("create post-parent repair readiness: %w", err)
+	}
+	tmpPath := readyFile.Name()
+	cleanup := true
+	defer func() {
+		_ = readyFile.Close()
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.WriteString(readyFile, "ready\n"); err != nil {
+		return fmt.Errorf("write post-parent repair readiness: %w", err)
+	}
+	if err := readyFile.Sync(); err != nil {
+		return fmt.Errorf("sync post-parent repair readiness: %w", err)
+	}
+	if err := readyFile.Close(); err != nil {
+		return fmt.Errorf("close post-parent repair readiness: %w", err)
+	}
+	// Rename only after close so observing ReadyPath also proves that Windows
+	// no longer has a writer handle that can block the scheduler's cleanup.
+	if err := os.Rename(tmpPath, readyPath); err != nil {
+		return fmt.Errorf("publish post-parent repair readiness: %w", err)
+	}
+	cleanup = false
 	return nil
 }
