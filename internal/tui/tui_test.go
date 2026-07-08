@@ -220,6 +220,29 @@ func TestHandleKeyEnterSelectsSession(t *testing.T) {
 	}
 }
 
+func TestBuildSessionItemsUsesCodexThreadName(t *testing.T) {
+	project := codexhistory.Project{
+		Key:  "one",
+		Path: "/tmp/one",
+		Sessions: []codexhistory.Session{{
+			SessionID:   "sess-renamed",
+			ThreadName:  "renamed thread",
+			FirstPrompt: "original prompt",
+		}},
+	}
+
+	items := buildSessionItems(project, nil)
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want new-agent row plus one session", len(items))
+	}
+	if !strings.Contains(items[1].label, "renamed thread") {
+		t.Fatalf("session label = %q, want renamed thread", items[1].label)
+	}
+	if strings.Contains(items[1].label, "original prompt") {
+		t.Fatalf("session label = %q, should not use original prompt", items[1].label)
+	}
+}
+
 func TestHandleKeyCtrlJSelectsSession(t *testing.T) {
 	screen := newTestScreen(t, 120, 40)
 	project := codexhistory.Project{
@@ -2368,6 +2391,61 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 	}
 	if selection == nil || selection.Session.SessionID != "sess-2" {
 		t.Fatalf("unexpected selection: %#v", selection)
+	}
+}
+
+func TestSelectSessionAutoRefreshUpdatesThreadNameTitle(t *testing.T) {
+	screen, initDone := newSelectSessionTestScreen(t)
+
+	projectPath := t.TempDir()
+	baseSession := codexhistory.Session{
+		SessionID:   "sess-1",
+		FirstPrompt: "original prompt",
+		ProjectPath: projectPath,
+		FilePath:    filepath.Join(projectPath, "sess-1.jsonl"),
+		ModifiedAt:  time.Unix(1_700_000_000, 0),
+	}
+	initialProjects := []codexhistory.Project{{
+		Key:      "proj-1",
+		Path:     projectPath,
+		Sessions: []codexhistory.Session{baseSession},
+	}}
+	renamedSession := baseSession
+	renamedSession.ThreadName = "renamed thread"
+	renamedProjects := []codexhistory.Project{{
+		Key:      "proj-1",
+		Path:     projectPath,
+		Sessions: []codexhistory.Session{renamedSession},
+	}}
+
+	refreshEnabled := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		<-initDone
+		waitForScreenContains(t, screen, "original prompt")
+		close(refreshEnabled)
+		waitForScreenContains(t, screen, "renamed thread")
+		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
+	}()
+
+	selection, err := SelectSession(ctx, Options{
+		LoadProjects: func(context.Context) ([]codexhistory.Project, error) {
+			select {
+			case <-refreshEnabled:
+				return renamedProjects, nil
+			default:
+				return initialProjects, nil
+			}
+		},
+		RefreshInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("SelectSession error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("selection = %#v, want nil after quitting", selection)
 	}
 }
 

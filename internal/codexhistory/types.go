@@ -14,6 +14,7 @@ type Project struct {
 
 type Session struct {
 	SessionID    string
+	ThreadName   string `json:",omitempty"`
 	Summary      string
 	FirstPrompt  string
 	MessageCount int
@@ -28,6 +29,7 @@ type SubagentSession struct {
 	AgentID         string
 	ParentSessionID string
 	SessionID       string
+	ThreadName      string `json:",omitempty"`
 	Summary         string
 	FirstPrompt     string
 	MessageCount    int
@@ -38,6 +40,9 @@ type SubagentSession struct {
 
 func (s Session) DisplayTitle() string {
 	kind := HelperSessionKind(s)
+	if s.ThreadName != "" {
+		return displayTitleWithHelperMarker(s.ThreadName, kind)
+	}
 	if s.Summary != "" {
 		return displayTitleWithHelperMarker(s.Summary, kind)
 	}
@@ -52,6 +57,9 @@ func (s Session) DisplayTitle() string {
 
 func (s SubagentSession) DisplayTitle() string {
 	kind := HelperSubagentSessionKind(s)
+	if s.ThreadName != "" {
+		return displayTitleWithHelperMarker(s.ThreadName, kind)
+	}
 	if s.Summary != "" {
 		return displayTitleWithHelperMarker(s.Summary, kind)
 	}

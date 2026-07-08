@@ -197,7 +197,7 @@ jobs:
           go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
           go test ./internal/cli -count=1 -run '^TestTeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipalCI$' -v
 
-      - name: CXP TUI preview, navigation, and refresh selection regressions
+      - name: CXP TUI preview, navigation, refresh, and thread-name regressions
         shell: bash
         run: |
           set -euo pipefail
@@ -206,6 +206,11 @@ jobs:
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
           go test ./internal/tui -run '^$' -bench '^BenchmarkResolveSelectionForDrawLargeHistory$' -benchtime=10x -count=1 -benchmem
+          thread_name_history_pattern='^Test(ReadThreadNameIndexUsesLatestValidName|LoadThreadNameIndex(CachesUntilFileChanges|IsOptionalMetadata)|DiscoverProjects(AndFindSessionUseThreadNameIndex|PreservesPromptWithoutValidThreadName|RefreshesThreadNameWhenIndexChanges)|SessionThreadNameJSONIsBackwardCompatibleWhenEmpty)$'
+          go test ./internal/codexhistory -count=1 -run "$thread_name_history_pattern" -v
+          go test ./internal/tui -count=1 -run '^Test(BuildSessionItemsUsesCodexThreadName|SelectSessionAutoRefreshUpdatesThreadNameTitle)$' -v
+          go test ./internal/cli -count=1 -run '^TestHistoryListCmdTracksCodexThreadNameIndex$' -v
+          go test ./internal/codexhistory -run '^$' -bench '^BenchmarkLoadThreadNameIndexCached$' -benchtime=100x -count=1 -benchmem
 
       - name: CXP preview SQLite correctness, concurrency, and write budgets
         shell: bash

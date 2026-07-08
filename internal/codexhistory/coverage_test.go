@@ -287,6 +287,7 @@ func TestSessionDisplayTitle(t *testing.T) {
 		s    Session
 		want string
 	}{
+		{"thread name priority", Session{ThreadName: "renamed", Summary: "sum", FirstPrompt: "fp", SessionID: "id"}, "renamed"},
 		{"summary priority", Session{Summary: "sum", FirstPrompt: "fp", SessionID: "id"}, "sum"},
 		{"first prompt fallback", Session{FirstPrompt: "fp", SessionID: "id"}, "fp"},
 		{"teams helper safety stripped", Session{FirstPrompt: "fix the title\n\nTeams helper safety:\n- do not restart helper"}, "fix the title"},
@@ -301,6 +302,24 @@ func TestSessionDisplayTitle(t *testing.T) {
 				t.Errorf("DisplayTitle() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSessionThreadNameJSONIsBackwardCompatibleWhenEmpty(t *testing.T) {
+	raw, err := json.Marshal(Session{SessionID: "session-1", FirstPrompt: "prompt"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "ThreadName") {
+		t.Fatalf("empty ThreadName should be omitted from history JSON: %s", raw)
+	}
+
+	raw, err = json.Marshal(Session{SessionID: "session-1", ThreadName: "renamed"})
+	if err != nil {
+		t.Fatalf("Marshal renamed session: %v", err)
+	}
+	if !strings.Contains(string(raw), `"ThreadName":"renamed"`) {
+		t.Fatalf("renamed session JSON missing ThreadName: %s", raw)
 	}
 }
 

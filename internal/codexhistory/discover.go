@@ -63,6 +63,10 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 	if len(files) == 0 {
 		return nil, nil
 	}
+	threadNames, err := loadThreadNameIndexContext(ctx, root)
+	if err != nil {
+		return nil, err
+	}
 
 	var firstErr error
 	sessionIndex := map[string]int{}
@@ -123,6 +127,7 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 				AgentID:         meta.SubagentType,
 				ParentSessionID: meta.ParentThreadID,
 				SessionID:       sessionID,
+				ThreadName:      threadNames[sessionID],
 				FirstPrompt:     meta.FirstPrompt,
 				MessageCount:    meta.MessageCount,
 				CreatedAt:       meta.CreatedAt,
@@ -135,6 +140,7 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 
 		sess := Session{
 			SessionID:    sessionID,
+			ThreadName:   threadNames[sessionID],
 			FirstPrompt:  meta.FirstPrompt,
 			MessageCount: meta.MessageCount,
 			CreatedAt:    meta.CreatedAt,
@@ -222,6 +228,7 @@ func attachSubagents(sessions []Session, sessionIndex map[string]int, pending []
 		}
 		sess := Session{
 			SessionID:    orphan.SessionID,
+			ThreadName:   orphan.ThreadName,
 			Summary:      summary,
 			FirstPrompt:  orphan.FirstPrompt,
 			MessageCount: orphan.MessageCount,
@@ -270,6 +277,9 @@ func groupByProject(sessions []Session) []Project {
 }
 
 func mergeSessionMetadata(base Session, other Session) Session {
+	if base.ThreadName == "" && other.ThreadName != "" {
+		base.ThreadName = other.ThreadName
+	}
 	if base.Summary == "" && other.Summary != "" {
 		base.Summary = other.Summary
 	}
@@ -339,8 +349,13 @@ func FindSessionByID(codexDir, sessionID string) (*Session, error) {
 					meta.FirstPrompt = info.FirstPrompt
 				}
 			}
+			threadNames, err := loadThreadNameIndexContext(context.Background(), root)
+			if err != nil {
+				return nil, err
+			}
 			sess := &Session{
 				SessionID:    sessionID,
+				ThreadName:   threadNames[sessionID],
 				FirstPrompt:  meta.FirstPrompt,
 				MessageCount: meta.MessageCount,
 				CreatedAt:    meta.CreatedAt,
@@ -421,4 +436,5 @@ func globRecursive(sessionsDir, sessionID string) []string {
 // ResetCache clears the session file cache. Useful for testing.
 func ResetCache() {
 	resetSessionFileCache()
+	resetThreadNameIndexCache()
 }

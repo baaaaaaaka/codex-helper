@@ -217,7 +217,7 @@ jobs:
           & codex --help 2>&1 | Out-Host
           if ($LASTEXITCODE -ne 0) { throw "codex --help failed with exit code $LASTEXITCODE" }
 
-      - name: Run standard approval runtime contract tests
+      - name: Run approval and thread-name history runtime contracts
         id: smoke
         continue-on-error: true
         shell: bash
@@ -325,7 +325,7 @@ jobs:
         if: steps.smoke.outcome != 'success' || (runner.os == 'Windows' && (steps.wrapper_probe_windows.outcome != 'success' || steps.appserver_probe_windows.outcome != 'success')) || (runner.os != 'Windows' && (steps.wrapper_probe_unix.outcome != 'success' || steps.appserver_probe_unix.outcome != 'success'))
         shell: bash
         run: |
-          echo "Codex wrapper, app-server, schema contract, or standard approval runtime probe failed on ${PLATFORM_NAME}" >&2
+          echo "Codex wrapper, app-server, schema, approval, or thread-name history runtime probe failed on ${PLATFORM_NAME}" >&2
           exit 1
 
   test-linux-distros:
@@ -400,7 +400,7 @@ jobs:
             -v "${GITHUB_WORKSPACE}/scripts/ci:/ci:ro" \
             "${IMAGE}" /bin/sh -lc "$run_cmd"
 
-      - name: Run standard approval runtime contract tests (container)
+      - name: Run approval and thread-name history runtime contracts (container)
         id: smoke
         continue-on-error: true
         shell: bash
@@ -465,7 +465,7 @@ jobs:
         if: steps.wrapper_probe.outcome != 'success' || steps.smoke.outcome != 'success'
         shell: bash
         run: |
-          echo "Codex wrapper, schema contract, or standard approval runtime probe failed on ${{ matrix.platform }}" >&2
+          echo "Codex wrapper, schema, approval, or thread-name history runtime probe failed on ${{ matrix.platform }}" >&2
           exit 1
 
   update:

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexcontract"
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 	"github.com/gorilla/websocket"
@@ -309,6 +310,23 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	}
 	if result.Status != TurnStatusCompleted || !strings.Contains(result.FinalAgentMessage, "contract complete") {
 		t.Fatalf("turn result = %#v", result)
+	}
+	const renamedThread = "CXP live rename contract"
+	if result.ThreadID == "" {
+		t.Fatal("standard approval runtime returned an empty thread ID")
+	}
+	if _, err := runner.request(ctx, "thread/name/set", map[string]string{
+		"threadId": result.ThreadID,
+		"name":     renamedThread,
+	}); err != nil {
+		t.Fatalf("set live Codex thread name: %v", err)
+	}
+	renamedSession, err := codexhistory.FindSessionByID(codexHome, result.ThreadID)
+	if err != nil {
+		t.Fatalf("discover live renamed Codex thread: %v", err)
+	}
+	if renamedSession.ThreadName != renamedThread || renamedSession.DisplayTitle() != renamedThread {
+		t.Fatalf("live renamed session = %#v, want thread name %q", renamedSession, renamedThread)
 	}
 	raw, err := os.ReadFile(sentinel)
 	if err != nil {

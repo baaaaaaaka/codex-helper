@@ -1112,6 +1112,11 @@ func TestSubagentSession_DisplayTitle(t *testing.T) {
 		want string
 	}{
 		{
+			name: "thread name takes priority",
+			sub:  SubagentSession{ThreadName: "renamed", Summary: "sum", FirstPrompt: "fp", AgentID: "review"},
+			want: "renamed",
+		},
+		{
 			name: "summary takes priority",
 			sub:  SubagentSession{Summary: "sum", FirstPrompt: "fp", AgentID: "review"},
 			want: "sum",

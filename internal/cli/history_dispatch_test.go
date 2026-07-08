@@ -470,6 +470,64 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	}
 }
 
+func TestHistoryListCmdTracksCodexThreadNameIndex(t *testing.T) {
+	codexDir := setupCodexHistoryDir(t)
+	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	projectDir := t.TempDir()
+	writeCodexSessionFile(t, codexDir, sessionID, projectDir, "original prompt")
+
+	indexPath := filepath.Join(codexDir, "session_index.jsonl")
+	if err := os.WriteFile(indexPath, []byte(`{"id":"`+sessionID+`","thread_name":"first rename"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write session index: %v", err)
+	}
+
+	listSession := func() codexhistory.Session {
+		t.Helper()
+		cmd := newHistoryListCmd(&rootOptions{}, &codexDir)
+		cmd.SetContext(context.Background())
+		var out strings.Builder
+		cmd.SetOut(&out)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute history list: %v", err)
+		}
+		var payload struct {
+			Projects []codexhistory.Project `json:"projects"`
+		}
+		if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+			t.Fatalf("unmarshal history list output: %v\noutput: %s", err, out.String())
+		}
+		if len(payload.Projects) != 1 || len(payload.Projects[0].Sessions) != 1 {
+			t.Fatalf("unexpected history list payload: %+v", payload)
+		}
+		return payload.Projects[0].Sessions[0]
+	}
+
+	first := listSession()
+	if first.ThreadName != "first rename" || first.DisplayTitle() != "first rename" {
+		t.Fatalf("first history list session = %#v, want first rename", first)
+	}
+	if first.FirstPrompt != "original prompt" {
+		t.Fatalf("first prompt = %q, want original prompt", first.FirstPrompt)
+	}
+
+	f, err := os.OpenFile(indexPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open session index: %v", err)
+	}
+	if _, err := f.WriteString(`{"id":"` + sessionID + `","thread_name":"second rename"}` + "\n"); err != nil {
+		_ = f.Close()
+		t.Fatalf("append session index: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close session index: %v", err)
+	}
+
+	second := listSession()
+	if second.ThreadName != "second rename" || second.DisplayTitle() != "second rename" {
+		t.Fatalf("second history list session = %#v, want second rename", second)
+	}
+}
+
 func TestHistoryShowCmdPrintsFormattedSession(t *testing.T) {
 	codexDir := setupCodexHistoryDir(t)
 	sessionID := "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
