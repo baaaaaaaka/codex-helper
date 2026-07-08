@@ -734,6 +734,9 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           .\scripts\ci\helper_upgrade_compat_smoke.ps1
+          if ($env:OLD_TAG -eq "v0.1.12") {
+            .\scripts\ci\windows_locked_cxp_self_upgrade.ps1 -ExpectedState Converged
+          }
 
   install-container-smoke:
     name: Install smoke (containers)

@@ -14,6 +14,7 @@ import (
 var (
 	runLegacyUpdaterVersionPreflight = cli.LegacyUpdaterVersionPreflight
 	launchHelperRuntime              = helperruntime.Launch
+	scheduleLegacyDirectEntryRepair  = candidateupdate.ScheduleLegacyDirectSelfUpdateRepair
 	executeCLI                       = cli.Execute
 )
 
@@ -33,6 +34,9 @@ func runMain(args []string) int {
 		_, _ = fmt.Fprintf(os.Stdout, "Recovered previous cxp runtime %s. Restart the helper to use it.\n", version)
 		return 0
 	}
+	if exitCode, handled := candidateupdate.HandlePostParentRepairCommand(args, os.Stdout, os.Stderr); handled {
+		return exitCode
+	}
 	if exitCode, handled := candidateupdate.HandleInternalCommand(args, cli.RuntimeVersion(), os.Stdout, os.Stderr); handled {
 		return exitCode
 	}
@@ -51,6 +55,12 @@ func runMain(args []string) int {
 	if exitCode, handled, err := launchHelperRuntime(cli.RuntimeVersion(), args); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Warning: cxp runtime activation failed; continuing with the current executable: %v\n", err)
 	} else if handled {
+		if exitCode == 0 {
+			if err := scheduleLegacyDirectEntryRepair(args, cli.RuntimeVersion()); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "Error: schedule legacy Windows cxp entry repair: %v\n", err)
+				return 1
+			}
+		}
 		return exitCode
 	}
 	if _, ok := helperruntime.Current(); ok {

@@ -36,6 +36,32 @@ func TestRunMainHandlesCandidateUpdateBeforeRuntimeDispatch(t *testing.T) {
 	}
 }
 
+func TestRunMainHandlesPostParentRepairBeforeRuntimeDispatch(t *testing.T) {
+	previousPreflight := runLegacyUpdaterVersionPreflight
+	previousLaunch := launchHelperRuntime
+	previousExecute := executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight = previousPreflight
+		launchHelperRuntime = previousLaunch
+		executeCLI = previousExecute
+	})
+	runLegacyUpdaterVersionPreflight = func() error {
+		t.Fatal("legacy preflight ran for post-parent repair")
+		return nil
+	}
+	launchHelperRuntime = func(string, []string) (int, bool, error) {
+		t.Fatal("runtime dispatch ran for post-parent repair")
+		return 0, false, nil
+	}
+	executeCLI = func() int {
+		t.Fatal("CLI ran for post-parent repair")
+		return 0
+	}
+	if got := runMain([]string{"candidate", candidateupdate.PostParentRepairCommand, "--unsupported"}); got != 2 {
+		t.Fatalf("runMain exit code = %d, want 2", got)
+	}
+}
+
 func TestRunMainRunsLegacyPreflightBeforeRuntimeDispatch(t *testing.T) {
 	previousPreflight := runLegacyUpdaterVersionPreflight
 	previousLaunch := launchHelperRuntime
@@ -66,6 +92,92 @@ func TestRunMainRunsLegacyPreflightBeforeRuntimeDispatch(t *testing.T) {
 	want := []string{"preflight", "runtime:candidate", "cli"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %#v, want %#v", events, want)
+	}
+}
+
+func TestRunMainSchedulesLegacyDirectRepairAfterSuccessfulRuntimeDispatch(t *testing.T) {
+	previousPreflight := runLegacyUpdaterVersionPreflight
+	previousLaunch := launchHelperRuntime
+	previousSchedule := scheduleLegacyDirectEntryRepair
+	previousExecute := executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight = previousPreflight
+		launchHelperRuntime = previousLaunch
+		scheduleLegacyDirectEntryRepair = previousSchedule
+		executeCLI = previousExecute
+	})
+	var events []string
+	runLegacyUpdaterVersionPreflight = func() error {
+		events = append(events, "preflight")
+		return nil
+	}
+	launchHelperRuntime = func(_ string, _ []string) (int, bool, error) {
+		events = append(events, "runtime")
+		return 0, true, nil
+	}
+	scheduleLegacyDirectEntryRepair = func(_ []string, _ string) error {
+		events = append(events, "schedule")
+		return nil
+	}
+	executeCLI = func() int {
+		t.Fatal("CLI ran after handled runtime dispatch")
+		return 1
+	}
+	if got := runMain([]string{"candidate", "--version"}); got != 0 {
+		t.Fatalf("runMain exit code = %d, want 0", got)
+	}
+	want := []string{"preflight", "runtime", "schedule"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %#v, want %#v", events, want)
+	}
+}
+
+func TestRunMainRejectsLegacyCandidateWhenRepairCannotArm(t *testing.T) {
+	previousPreflight := runLegacyUpdaterVersionPreflight
+	previousLaunch := launchHelperRuntime
+	previousSchedule := scheduleLegacyDirectEntryRepair
+	previousExecute := executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight = previousPreflight
+		launchHelperRuntime = previousLaunch
+		scheduleLegacyDirectEntryRepair = previousSchedule
+		executeCLI = previousExecute
+	})
+	runLegacyUpdaterVersionPreflight = func() error { return nil }
+	launchHelperRuntime = func(string, []string) (int, bool, error) { return 0, true, nil }
+	scheduleLegacyDirectEntryRepair = func([]string, string) error { return errors.New("worker not ready") }
+	executeCLI = func() int {
+		t.Fatal("CLI ran after handled runtime dispatch")
+		return 0
+	}
+	if got := runMain([]string{"candidate", "--version"}); got != 1 {
+		t.Fatalf("runMain exit code = %d, want 1", got)
+	}
+}
+
+func TestRunMainDoesNotScheduleRepairAfterFailedRuntimeCommand(t *testing.T) {
+	previousPreflight := runLegacyUpdaterVersionPreflight
+	previousLaunch := launchHelperRuntime
+	previousSchedule := scheduleLegacyDirectEntryRepair
+	previousExecute := executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight = previousPreflight
+		launchHelperRuntime = previousLaunch
+		scheduleLegacyDirectEntryRepair = previousSchedule
+		executeCLI = previousExecute
+	})
+	runLegacyUpdaterVersionPreflight = func() error { return nil }
+	launchHelperRuntime = func(string, []string) (int, bool, error) { return 9, true, nil }
+	scheduleLegacyDirectEntryRepair = func([]string, string) error {
+		t.Fatal("repair scheduled after the runtime command failed")
+		return nil
+	}
+	executeCLI = func() int {
+		t.Fatal("CLI ran after handled runtime dispatch")
+		return 0
+	}
+	if got := runMain([]string{"candidate", "--version"}); got != 9 {
+		t.Fatalf("runMain exit code = %d, want 9", got)
 	}
 }
 

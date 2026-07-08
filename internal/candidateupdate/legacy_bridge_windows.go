@@ -14,6 +14,10 @@ func directParentExecutable() (string, error) {
 		return "", err
 	}
 	defer windows.CloseHandle(handle)
+	return processExecutableFromHandle(handle)
+}
+
+func processExecutableFromHandle(handle windows.Handle) (string, error) {
 	buffer := make([]uint16, 32768)
 	size := uint32(len(buffer))
 	if err := windows.QueryFullProcessImageName(handle, 0, &buffer[0], &size); err != nil {

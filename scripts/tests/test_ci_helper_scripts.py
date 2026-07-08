@@ -10,6 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_DIR = REPO_ROOT / "scripts" / "ci"
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 class CIHelperScriptTests(unittest.TestCase):
@@ -169,6 +170,32 @@ class CIHelperScriptTests(unittest.TestCase):
         self.assertIn(
             'Run-UpgradeScenario "existing-cxp-cmd-missing-exe" "existing-cmd-missing-exe"',
             script,
+        )
+
+    def test_windows_locked_cxp_regression_and_release_gates_are_both_wired(self) -> None:
+        script = (CI_DIR / "windows_locked_cxp_self_upgrade.ps1").read_text(
+            encoding="utf-8"
+        )
+        ci = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+        release = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+
+        self.assertIn('[ValidateSet("Split", "Converged")]', script)
+        self.assertIn("Start-Process -FilePath $cxpExe", script)
+        self.assertIn('if ($ExpectedState -eq "Split")', script)
+        self.assertIn("failed to unify helper entrypoint", script)
+        self.assertIn("post-parent repair did not converge", script)
+        self.assertIn("Assert-Version $cxpExe $TargetTag $true", script)
+        self.assertIn("Assert-Version $cxpCmd $TargetTag", script)
+
+        self.assertIn("OLD_TAG: v0.1.12", ci)
+        self.assertIn("TARGET_TAG: v0.1.13-rc.53", ci)
+        self.assertIn(
+            "windows_locked_cxp_self_upgrade.ps1 -ExpectedState Split", ci
+        )
+        self.assertIn('if ($env:OLD_TAG -eq "v0.1.12")', release)
+        self.assertIn(
+            "windows_locked_cxp_self_upgrade.ps1 -ExpectedState Converged",
+            release,
         )
 
 

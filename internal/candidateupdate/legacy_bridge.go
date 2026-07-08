@@ -288,7 +288,7 @@ func copyExecutableAtomically(source string, target string, expectedHash string)
 	if !strings.EqualFold(currentHash, expectedHash) {
 		return fmt.Errorf("stable entry changed while preparing replacement")
 	}
-	if err := os.Rename(tmp, target); err != nil {
+	if err := replaceStateFile(tmp, target); err != nil {
 		return err
 	}
 	cleanup = false

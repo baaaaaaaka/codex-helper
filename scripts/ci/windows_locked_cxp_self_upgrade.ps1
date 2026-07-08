@@ -195,14 +195,35 @@ try {
     }
     Write-Host "Known locked-cxp regression reproduced: managed target/runtime/record=$TargetTag, user-facing cxp=$OldTag"
   } else {
-    if ($combined.IndexOf("failed to unify helper entrypoint", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-      throw "self-upgrade still emitted the locked-entrypoint warning: $combined"
+    # The v0.1.12 parent necessarily observes its own cxp.exe lock before it
+    # exits, so its historical finalizer may still print the warning. The new
+    # candidate owns the only operation that can happen after that lock is
+    # released. Wait for that post-parent repair rather than treating the old
+    # process's warning as the final installation state.
+    $converged = $false
+    for ($attempt = 0; $attempt -lt 150; $attempt++) {
+      if ((Test-Path -LiteralPath $target -PathType Leaf) -and (Test-Path -LiteralPath $cxpExe -PathType Leaf)) {
+        $targetHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash
+        $cxpHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cxpExe).Hash
+        if ($targetHash -eq $cxpHash) {
+          $converged = $true
+          break
+        }
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (!$converged) {
+      $repairLog = Get-Content -Raw -LiteralPath ($cxpExe + ".update.log") -ErrorAction SilentlyContinue
+      throw "post-parent repair did not converge cxp.exe to $TargetTag. Repair log:`n$repairLog"
     }
     Assert-Version $target $TargetTag $true
     Assert-Version $cxpExe $TargetTag $true
     Assert-Version $cxpCmd $TargetTag
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $cxpExe).Hash) {
       throw "converged entrypoints report the target version but contain different binaries"
+    }
+    if ($combined.IndexOf("failed to unify helper entrypoint", [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+      Write-Host "Historical parent warning observed; post-parent repair still converged the user entrypoint."
     }
     Write-Host "Locked cxp self-upgrade converged without user intervention: all entrypoints=$TargetTag"
   }
