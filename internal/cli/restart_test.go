@@ -347,6 +347,13 @@ func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T)
 	if err := os.WriteFile(installPath, []byte("updated"), 0o755); err != nil {
 		t.Fatalf("write install path: %v", err)
 	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, filepath.Join(tmp, ".cxp-runtime"))
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+	t.Setenv(helperruntime.EnvEntryPath, installPath)
+	t.Setenv(helperruntime.EnvDisable, "1")
+	t.Setenv(helperruntime.EnvForce, "1")
+	t.Setenv("KEEP_RESTART_TEST", "yes")
 
 	prevExecSelf := execSelf
 	prevStartSelf := startSelf
@@ -362,9 +369,11 @@ func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T)
 	wantErr := errors.New("stop before real exec")
 	var gotExe string
 	var gotArgs []string
+	var gotEnv []string
 	execSelf = func(exe string, args []string, env []string) error {
 		gotExe = exe
 		gotArgs = append([]string{}, args...)
+		gotEnv = append([]string{}, env...)
 		return wantErr
 	}
 
@@ -382,6 +391,21 @@ func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T)
 	wantArgs := []string{installPath, "teams", "run", "--auto-service=false"}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	for _, key := range []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvDisable,
+		helperruntime.EnvForce,
+	} {
+		if value := envValue(gotEnv, key); value != "" {
+			t.Fatalf("installed-path restart leaked %s=%q into the fresh helper process", key, value)
+		}
+	}
+	if value := envValue(gotEnv, "KEEP_RESTART_TEST"); value != "yes" {
+		t.Fatalf("installed-path restart lost unrelated environment value %q", value)
 	}
 }
 

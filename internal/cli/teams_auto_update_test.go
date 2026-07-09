@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -582,6 +583,57 @@ func TestTeamsReleaseAutoUpdaterApplyUsesRunningGoBinAndUnifiesManagedDefault(t 
 	}
 	if target, err := os.Readlink(managedCXP); err != nil || target != goBin {
 		t.Fatalf("managed cxp should be symlink to running helper, target=%q err=%v", target, err)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the reported helper activation mismatch occurred on Linux/WSL")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	entry := filepath.Join(tmp, ".local", "bin", "cxp")
+	runtimeRoot := filepath.Join(filepath.Dir(entry), ".cxp-runtime")
+	oldRuntime := helperruntime.VersionPath(runtimeRoot, "v1.2.3", runtime.GOOS)
+	targetRuntime := helperruntime.VersionPath(runtimeRoot, "v1.2.4", runtime.GOOS)
+	writeCLIFile(t, oldRuntime, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	writeCLIFile(t, targetRuntime, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	writeCLIFile(t, entry, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:  "linux",
+		exe:   oldRuntime,
+		argv0: oldRuntime,
+		cwd:   tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return entry, nil }
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{
+			Version:          "1.2.4",
+			InstallPath:      opts.InstallPath,
+			RuntimePath:      targetRuntime,
+			RuntimeActivated: true,
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+		TagName: "v1.2.4",
+		Version: "1.2.4",
+	})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if res.ActivationPending {
+		t.Fatalf("managed runtime update reported ActivationPending: %s; RuntimeActivated updates must use the normal fresh-launch restart", res.ActivationReason)
 	}
 }
 
