@@ -159,6 +159,43 @@ func TestCacheV2DatabasesUseUnifiedVersionAndRollbackJournal(t *testing.T) {
 	}
 }
 
+func TestCacheV2CloseCachesReleasesSQLiteFilesAndAllowsReopen(t *testing.T) {
+	setTestUserCacheDir(t)
+	root := os.Getenv(EnvCodexDir)
+	source := testSessionPath(t, root, "close-reopen")
+	writeSessionMetaFile(t, source, "close-reopen", root, "close and reopen")
+	if _, err := readSessionFileMetaCached(source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadSessionPreviewText(source, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath, err := catalogSQLiteFileForSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previewPath, err := sessionPreviewSQLiteFileForSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CloseCaches(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{catalogPath, previewPath} {
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove closed cache %q: %v", path, err)
+		}
+	}
+	if _, err := readSessionFileMetaCached(source); err != nil {
+		t.Fatalf("metadata after cache reopen: %v", err)
+	}
+	text, err := ReadSessionPreviewText(source, 0, 0)
+	if err != nil || !strings.Contains(text, "close and reopen") {
+		t.Fatalf("preview after cache reopen=%q err=%v", text, err)
+	}
+}
+
 func TestSessionMetaCatalogPersistsAcrossProcessStateResetWithoutWriting(t *testing.T) {
 	lockCodexHistoryTestHooks(t)
 	setTestUserCacheDir(t)

@@ -252,6 +252,7 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	}
 
 	root := t.TempDir()
+	t.Cleanup(func() { _ = codexhistory.CloseCaches() })
 	workingDir := filepath.Join(root, "workspace")
 	if err := os.MkdirAll(workingDir, 0o700); err != nil {
 		t.Fatal(err)

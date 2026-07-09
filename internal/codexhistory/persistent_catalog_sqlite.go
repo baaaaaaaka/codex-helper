@@ -770,10 +770,5 @@ func cacheTimeFromUnixNano(value int64) time.Time {
 }
 
 func resetCatalogSQLiteForTest() {
-	catalogSQLiteState.Lock()
-	for _, store := range catalogSQLiteState.stores {
-		_ = store.db.Close()
-	}
-	catalogSQLiteState.stores = map[string]*catalogSQLiteStore{}
-	catalogSQLiteState.Unlock()
+	_ = closeCatalogSQLiteCaches()
 }

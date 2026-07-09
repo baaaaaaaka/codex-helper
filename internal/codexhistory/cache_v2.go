@@ -39,6 +39,54 @@ var cacheV2CleanupState = struct {
 
 var persistentCacheWriterScopeID = defaultPersistentCacheWriterScopeID
 
+// CloseCaches releases all open codexhistory SQLite handles and clears the
+// associated in-process acceleration. Long-running callers should use it when
+// they are finished with a Codex data root; process exit remains sufficient for
+// short-lived commands. Cache contents stay on disk and can be reopened.
+func CloseCaches() error {
+	var closeErrors []error
+	if err := closeSessionPreviewSQLiteCache(); err != nil {
+		closeErrors = append(closeErrors, err)
+	}
+	if err := closeCatalogSQLiteCaches(); err != nil {
+		closeErrors = append(closeErrors, err)
+	}
+	resetSessionFileCache()
+	return errors.Join(closeErrors...)
+}
+
+func closeSessionPreviewSQLiteCache() error {
+	sessionPreviewSQLiteState.mu.Lock()
+	var closeErr error
+	if sessionPreviewSQLiteState.db != nil {
+		closeErr = sessionPreviewSQLiteState.db.Close()
+	}
+	sessionPreviewSQLiteState.path = ""
+	sessionPreviewSQLiteState.db = nil
+	sessionPreviewSQLiteState.memory = nil
+	sessionPreviewSQLiteState.memoryBytes = 0
+	sessionPreviewSQLiteState.memoryTick = 0
+	sessionPreviewSQLiteState.mu.Unlock()
+
+	sessionPreviewAppendState.mu.Lock()
+	sessionPreviewAppendState.dirtySince = nil
+	sessionPreviewAppendState.mu.Unlock()
+	return closeErr
+}
+
+func closeCatalogSQLiteCaches() error {
+	catalogSQLiteState.Lock()
+	var closeErrors []error
+	for _, store := range catalogSQLiteState.stores {
+		if err := store.db.Close(); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+	}
+	catalogSQLiteState.stores = map[string]*catalogSQLiteStore{}
+	catalogSQLiteState.Unlock()
+	return errors.Join(closeErrors...)
+}
+
 func codexRootForSessionFile(filePath string) string {
 	path := filepath.Clean(filePath)
 	for dir := filepath.Dir(path); dir != "" && dir != filepath.Dir(dir); dir = filepath.Dir(dir) {

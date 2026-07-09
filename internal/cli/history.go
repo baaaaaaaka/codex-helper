@@ -201,6 +201,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, codexDir string, codexPath string, refreshInterval time.Duration) error {
 	ctx, stop := withSignalContext(cmd.Context())
 	defer stop()
+	defer func() { _ = codexhistory.CloseCaches() }()
 
 	store, paths, err := newRootStore(root, codexDir)
 	if err != nil {

@@ -1148,18 +1148,5 @@ func notifySessionPreviewSQLiteCommit(path string) {
 }
 
 func resetSessionPreviewSQLiteForTest() {
-	sessionPreviewSQLiteState.mu.Lock()
-	if sessionPreviewSQLiteState.db != nil {
-		_ = sessionPreviewSQLiteState.db.Close()
-	}
-	sessionPreviewSQLiteState.path = ""
-	sessionPreviewSQLiteState.db = nil
-	sessionPreviewSQLiteState.memory = nil
-	sessionPreviewSQLiteState.memoryBytes = 0
-	sessionPreviewSQLiteState.memoryTick = 0
-	sessionPreviewSQLiteState.mu.Unlock()
-
-	sessionPreviewAppendState.mu.Lock()
-	sessionPreviewAppendState.dirtySince = nil
-	sessionPreviewAppendState.mu.Unlock()
+	_ = closeSessionPreviewSQLiteCache()
 }
