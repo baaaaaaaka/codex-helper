@@ -14,6 +14,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -582,6 +583,125 @@ func TestTeamsReleaseAutoUpdaterApplyUsesRunningGoBinAndUnifiesManagedDefault(t 
 	}
 	if target, err := os.Readlink(managedCXP); err != nil || target != goBin {
 		t.Fatalf("managed cxp should be symlink to running helper, target=%q err=%v", target, err)
+	}
+}
+
+func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("managed-runtime executable fixture uses a POSIX script")
+	}
+	lockCLITestHooks(t)
+	prevPerform := performUpdate
+	prevResolveInstallPath := teamsAutoUpdateResolveInstallPath
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolveInstallPath
+	})
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	entry := filepath.Join(tmp, ".local", "bin", "cxp")
+	runtimeRoot := filepath.Join(filepath.Dir(entry), ".cxp-runtime")
+	oldRuntime := helperruntime.VersionPath(runtimeRoot, "v1.2.3", runtime.GOOS)
+	targetRuntime := helperruntime.VersionPath(runtimeRoot, "v1.2.4", runtime.GOOS)
+	writeCLIFile(t, oldRuntime, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	writeCLIFile(t, targetRuntime, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	writeCLIFile(t, entry, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:  "linux",
+		exe:   oldRuntime,
+		argv0: oldRuntime,
+		cwd:   tmp,
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return entry, nil }
+	performUpdate = func(_ context.Context, opts update.UpdateOptions) (update.ApplyResult, error) {
+		return update.ApplyResult{
+			Version:          "1.2.4",
+			InstallPath:      opts.InstallPath,
+			RuntimePath:      targetRuntime,
+			RuntimeActivated: true,
+		}, nil
+	}
+
+	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
+	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+		TagName: "v1.2.4",
+		Version: "1.2.4",
+	})
+	if err != nil {
+		t.Fatalf("Apply error: %v", err)
+	}
+	if res.ActivationPending {
+		t.Fatalf("managed runtime update reported ActivationPending: %s; RuntimeActivated updates must use the normal fresh-launch restart", res.ActivationReason)
+	}
+}
+
+func TestTeamsAutoUpdateActivationAfterApply(t *testing.T) {
+	tests := []struct {
+		name           string
+		prePending     bool
+		preReason      string
+		result         update.ApplyResult
+		wantPending    bool
+		wantReason     string
+		wantErrContain string
+	}{
+		{
+			name:        "legacy path mismatch remains pending",
+			prePending:  true,
+			preReason:   "running helper executable differs",
+			wantPending: true,
+			wantReason:  "running helper executable differs",
+		},
+		{
+			name:       "legacy stable path remains immediate",
+			preReason:  "",
+			wantReason: "",
+		},
+		{
+			name:       "managed runtime activation overrides physical path mismatch",
+			prePending: true,
+			preReason:  "running helper is the previous immutable runtime",
+			result: update.ApplyResult{
+				RuntimeActivated: true,
+			},
+		},
+		{
+			name:       "managed runtime rejects legacy restart requirement",
+			prePending: true,
+			result: update.ApplyResult{
+				RuntimeActivated: true,
+				RestartRequired:  true,
+			},
+			wantErrContain: "contradictory activation state",
+		},
+		{
+			name: "managed runtime rejects pending replacement",
+			result: update.ApplyResult{
+				RuntimeActivated:   true,
+				PendingReplacePath: "pending-helper",
+			},
+			wantErrContain: "contradictory activation state",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pending, reason, err := teamsAutoUpdateActivationAfterApply(tt.prePending, tt.preReason, tt.result)
+			if tt.wantErrContain != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrContain) {
+					t.Fatalf("error = %v, want containing %q", err, tt.wantErrContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("teamsAutoUpdateActivationAfterApply error: %v", err)
+			}
+			if pending != tt.wantPending || reason != tt.wantReason {
+				t.Fatalf("activation = pending %v reason %q, want pending %v reason %q", pending, reason, tt.wantPending, tt.wantReason)
+			}
+		})
 	}
 }
 

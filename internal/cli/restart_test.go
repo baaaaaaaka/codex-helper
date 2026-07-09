@@ -83,7 +83,7 @@ func TestRestartSelfExecsSameBinaryWithCurrentArgs(t *testing.T) {
 	executablePath = func() (string, error) {
 		return exe, nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("startSelf should not be used on non-Windows restart")
 		return nil
 	}
@@ -289,7 +289,7 @@ func TestHandleUpdateAndRestartUnifiesCXPShimBeforeExec(t *testing.T) {
 		writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 		return update.ApplyResult{Version: "1.2.4", InstallPath: installPath}, nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("startSelf should not be used on non-Windows restart")
 		return nil
 	}
@@ -333,20 +333,24 @@ func TestHandleUpdateAndRestartUnifiesCXPShimBeforeExec(t *testing.T) {
 }
 
 func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("non-Windows restart uses exec; Windows is covered by process start tests")
-	}
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
 	isolateUpgradeTeamsStateForTest(t, tmp)
-	installPath := filepath.Join(tmp, ".local", "bin", "codex-proxy")
+	installPath := filepath.Join(tmp, ".local", "bin", helperpath.BinaryName(runtime.GOOS))
 	if err := os.MkdirAll(filepath.Dir(installPath), 0o755); err != nil {
 		t.Fatalf("mkdir install dir: %v", err)
 	}
 	if err := os.WriteFile(installPath, []byte("updated"), 0o755); err != nil {
 		t.Fatalf("write install path: %v", err)
 	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, filepath.Join(tmp, ".cxp-runtime"))
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+	t.Setenv(helperruntime.EnvEntryPath, installPath)
+	t.Setenv(helperruntime.EnvDisable, "1")
+	t.Setenv(helperruntime.EnvForce, "1")
+	t.Setenv("KEEP_RESTART_TEST", "yes")
 
 	prevExecSelf := execSelf
 	prevStartSelf := startSelf
@@ -354,18 +358,33 @@ func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T)
 		execSelf = prevExecSelf
 		startSelf = prevStartSelf
 	})
-	startSelf = func(string, []string) error {
-		t.Fatal("startSelf should not be used on non-Windows restart")
-		return nil
-	}
 
 	wantErr := errors.New("stop before real exec")
 	var gotExe string
 	var gotArgs []string
-	execSelf = func(exe string, args []string, env []string) error {
-		gotExe = exe
-		gotArgs = append([]string{}, args...)
-		return wantErr
+	var gotEnv []string
+	if runtime.GOOS == "windows" {
+		execSelf = func(string, []string, []string) error {
+			t.Fatal("execSelf should not be used on Windows restart")
+			return nil
+		}
+		startSelf = func(exe string, args []string, env []string) error {
+			gotExe = exe
+			gotArgs = append([]string{}, args...)
+			gotEnv = append([]string{}, env...)
+			return wantErr
+		}
+	} else {
+		startSelf = func(string, []string, []string) error {
+			t.Fatal("startSelf should not be used on non-Windows restart")
+			return nil
+		}
+		execSelf = func(exe string, args []string, env []string) error {
+			gotExe = exe
+			gotArgs = append([]string{}, args...)
+			gotEnv = append([]string{}, env...)
+			return wantErr
+		}
 	}
 
 	prevArgs := os.Args
@@ -380,8 +399,26 @@ func TestRestartTeamsHelperAfterActivationPendingUsesInstalledPath(t *testing.T)
 		t.Fatalf("exec exe = %q, want installed path %q", gotExe, installPath)
 	}
 	wantArgs := []string{installPath, "teams", "run", "--auto-service=false"}
+	if runtime.GOOS == "windows" {
+		wantArgs = wantArgs[1:]
+	}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
-		t.Fatalf("exec args = %#v, want %#v", gotArgs, wantArgs)
+		t.Fatalf("restart args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	for _, key := range []string{
+		helperruntime.EnvRuntime,
+		helperruntime.EnvRuntimeRoot,
+		helperruntime.EnvRuntimeVersion,
+		helperruntime.EnvEntryPath,
+		helperruntime.EnvDisable,
+		helperruntime.EnvForce,
+	} {
+		if value, ok := testEnvValue(gotEnv, key); ok {
+			t.Fatalf("installed-path restart leaked %s=%q into the fresh helper process", key, value)
+		}
+	}
+	if value, ok := testEnvValue(gotEnv, "KEEP_RESTART_TEST"); !ok || value != "yes" {
+		t.Fatalf("installed-path restart lost unrelated environment value %q", value)
 	}
 }
 
@@ -408,7 +445,7 @@ func TestRestartSelfUsesStablePathWhenRunningReloadBackup(t *testing.T) {
 	executablePath = func() (string, error) {
 		return backup, nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("startSelf should not be used on non-Windows restart")
 		return nil
 	}
@@ -462,7 +499,7 @@ func TestRestartSelfUsesStablePathWhenRunningNFSSillyRename(t *testing.T) {
 	executablePath = func() (string, error) {
 		return running, nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("startSelf should not be used on non-Windows restart")
 		return nil
 	}

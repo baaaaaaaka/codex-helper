@@ -361,7 +361,7 @@ func TestRestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart(
 		t.Fatal("local-supervisor service restart must not exec the current helper process")
 		return nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("local-supervisor service restart must not spawn teams run directly")
 		return nil
 	}
@@ -410,7 +410,7 @@ func TestRestartTeamsHelperFromTeamsBlocksOnBeaconJob(t *testing.T) {
 		t.Fatal("helper restart must not exec while beacon work is active")
 		return nil
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("helper restart must not spawn while beacon work is active")
 		return nil
 	}

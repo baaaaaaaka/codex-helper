@@ -3328,7 +3328,7 @@ func TestRestartTeamsHelperFromTeamsUsesPendingActivationForWindowsService(t *te
 	exitFunc = func(code int) {
 		exitCode = &code
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("pending Windows service restart must not start the old helper entry directly")
 		return nil
 	}
@@ -3396,7 +3396,7 @@ func TestRestartTeamsHelperFromTeamsUsesPendingProcessRestartForWindowsManualRun
 	exitFunc = func(code int) {
 		exitCode = &code
 	}
-	startSelf = func(string, []string) error {
+	startSelf = func(string, []string, []string) error {
 		t.Fatal("pending Windows manual restart must not start the old helper entry directly")
 		return nil
 	}
