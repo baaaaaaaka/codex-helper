@@ -987,7 +987,7 @@ func TestLoadHistoryIndex_FileNotExist(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_ValidEntries(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	entries := []string{
 		`{"session_id":"s1","ts":1770777540,"text":"hello world"}`,
 		`{"session_id":"s1","ts":1770777600,"text":"second prompt"}`,
@@ -1018,7 +1018,7 @@ func TestLoadHistoryIndex_ValidEntries(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_SkipsSystemInjected(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	entries := []string{
 		`{"session_id":"s1","ts":1770777540,"text":"# AGENTS.md\nskill instructions"}`,
 		`{"session_id":"s1","ts":1770777600,"text":"real prompt"}`,
@@ -1037,7 +1037,7 @@ func TestLoadHistoryIndex_SkipsSystemInjected(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	entries := []string{
 		`{"session_id":"s1","ts":1770777540,"text":"User message:\nfix current bug\n\nTeams helper safety:\n- do not restart helper\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:"}`,
 	}
@@ -1055,7 +1055,7 @@ func TestLoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_InvalidJSON(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	content := "{broken json\n" + `{"session_id":"s1","ts":1770777540,"text":"valid"}` + "\n"
 	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1071,7 +1071,7 @@ func TestLoadHistoryIndex_InvalidJSON(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_EmptyFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	if err := os.WriteFile(filepath.Join(dir, "history.jsonl"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1082,7 +1082,7 @@ func TestLoadHistoryIndex_EmptyFile(t *testing.T) {
 }
 
 func TestLoadHistoryIndex_SkipsEmptyText(t *testing.T) {
-	dir := t.TempDir()
+	dir := tempCodexRoot(t)
 	entries := []string{
 		`{"session_id":"s1","ts":1770777540,"text":""}`,
 		`{"session_id":"s1","ts":1770777600,"text":"actual prompt"}`,
