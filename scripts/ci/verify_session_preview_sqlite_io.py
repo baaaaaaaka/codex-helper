@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-CACHE_NAME = "session_preview_cache.sqlite3"
+CACHE_NAME = "preview.sqlite3"
 PHASES = ("exact-hit", "close", "reopen", "batched-small", "threshold-append")
 MARKER_RE = re.compile(r"CXP_PREVIEW_IO_PHASE ([a-z-]+)")
 CALL_RE = re.compile(
@@ -57,41 +57,43 @@ def main() -> None:
     missing = set(PHASES) - observed
     if missing:
         fail(f"missing probe phases: {sorted(missing)}")
-    for phase in ("exact-hit", "close", "batched-small"):
+    for phase in ("exact-hit", "close", "reopen", "batched-small"):
         if writes[phase]:
             fail(f"{phase} unexpectedly wrote cache files", [line for _, line in writes[phase]])
 
-    reopen_unexpected = [
-        line
-        for call, line in writes["reopen"]
-        if f"{CACHE_NAME}-shm" not in line or call not in {"ftruncate", "pwrite64", "msync"}
-    ]
-    if reopen_unexpected:
-        fail("reopen wrote outside SQLite's required SHM initialization", reopen_unexpected)
-
     threshold = writes["threshold-append"]
     if not threshold:
-        fail("threshold append did not write its required WAL transaction")
-    unexpected_threshold = [line for _, line in threshold if f"{CACHE_NAME}-wal" not in line]
+        fail("threshold append did not write its required rollback transaction")
+    unexpected_threshold = [
+        line
+        for _, line in threshold
+        if CACHE_NAME not in line
+        or f"{CACHE_NAME}-wal" in line
+        or f"{CACHE_NAME}-shm" in line
+    ]
     if unexpected_threshold:
-        fail("threshold append wrote the main database or SHM", unexpected_threshold)
+        fail("threshold append wrote outside the main database and rollback journal", unexpected_threshold)
+    if not any(f"{CACHE_NAME}-journal" in line for _, line in threshold):
+        fail("threshold append did not use a rollback journal", [line for _, line in threshold])
+    if not any(f"{CACHE_NAME}-journal" not in line and call in {"pwrite64", "write", "writev"} for call, line in threshold):
+        fail("threshold append did not update the main database", [line for _, line in threshold])
     if not any(call in {"fsync", "fdatasync"} for call, _ in threshold):
-        fail("threshold append did not durably start its WAL cycle")
+        fail("threshold append did not durably complete its rollback transaction")
 
-    wal_bytes = 0
+    written_bytes = 0
     for call, line in threshold:
         if call not in {"pwrite64", "write", "writev"}:
             continue
         result = RESULT_RE.search(line)
         if result:
-            wal_bytes += int(result.group(1))
-    if not 64 * 1024 <= wal_bytes <= 128 * 1024:
-        fail(f"64 KiB append wrote an unexpected {wal_bytes} WAL bytes", [line for _, line in threshold])
+            written_bytes += int(result.group(1))
+    if not 64 * 1024 <= written_bytes <= 512 * 1024:
+        fail(f"64 KiB append wrote an unexpected {written_bytes} cache bytes", [line for _, line in threshold])
 
     print(
         "preview-cache I/O validation passed: "
-        f"zero cache writes for exact-hit/close/batched-small; "
-        f"reopen limited to SHM; threshold WAL bytes={wal_bytes}"
+        f"zero cache writes for exact-hit/close/reopen/batched-small; "
+        f"threshold rollback bytes={written_bytes}"
     )
 
 

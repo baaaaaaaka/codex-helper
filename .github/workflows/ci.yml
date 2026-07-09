@@ -388,7 +388,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/codexhistory -count=1 -run '^TestSessionPreview(SQLite|CacheOff)' -v
+          go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
 
       - name: CXP preview SQLite actual syscall write budget (Linux only)
         if: matrix.shard == 'state-perf' && runner.os == 'Linux'
@@ -396,6 +396,13 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/ci/session_preview_sqlite_io_smoke.sh
+
+      - name: CXP cache v2 real NFS concurrency smoke (Linux only)
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/codexhistory_cache_nfs_smoke.sh
 
       - name: Teams control status display regressions
         if: matrix.shard == 'core'

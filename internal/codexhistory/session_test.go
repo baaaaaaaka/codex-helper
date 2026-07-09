@@ -1197,20 +1197,15 @@ func TestReadSessionPreviewMessagesDefaultKeepsCompleteCachedHistory(t *testing.
 }
 
 func TestReadSessionPreviewTextUsesFormattedCacheAndAppendsTail(t *testing.T) {
-	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendJSON)
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
-	cachePath, err := sessionPreviewCacheFile()
-	if err != nil {
-		t.Fatalf("sessionPreviewCacheFile: %v", err)
-	}
+	forceImmediateSessionPreviewFlush(t)
 	var writes int
-	prevHook := persistentCacheWriteHook
-	persistentCacheWriteHook = func(path string) {
-		if filepath.Clean(path) == filepath.Clean(cachePath) {
-			writes++
-		}
+	prevHook := sessionPreviewSQLiteCommitHook
+	sessionPreviewSQLiteCommitHook = func(string) {
+		writes++
 	}
-	t.Cleanup(func() { persistentCacheWriteHook = prevHook })
+	t.Cleanup(func() { sessionPreviewSQLiteCommitHook = prevHook })
 
 	f := filepath.Join(t.TempDir(), "preview-text-cache.jsonl")
 	const teamsPrompt = "User message:\nfirst prompt\n\nTeams helper safety:\n- do not restart helper"
@@ -1353,7 +1348,7 @@ func TestReadSessionPreviewTextAppendDeduplicatesMirroredMessage(t *testing.T) {
 }
 
 func TestReadSessionPreviewTextColdCacheRetainsSkippedMirrorSourceID(t *testing.T) {
-	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendJSON)
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
 	f := filepath.Join(t.TempDir(), "preview-text-cold-cache-mirror.jsonl")
 	initial := strings.Join([]string{
@@ -1371,16 +1366,16 @@ func TestReadSessionPreviewTextColdCacheRetainsSkippedMirrorSourceID(t *testing.
 	if strings.Count(first, "working") != 1 {
 		t.Fatalf("initial text = %q, want one status", first)
 	}
-	cachePath, err := sessionPreviewCacheFile()
+	store, err := currentSessionPreviewSQLiteStore()
 	if err != nil {
-		t.Fatalf("sessionPreviewCacheFile: %v", err)
+		t.Fatalf("currentSessionPreviewSQLiteStore: %v", err)
 	}
-	entry, ok := readPersistentSessionPreviewEntry(cachePath, f)
-	if !ok {
-		t.Fatal("cold preview cache entry was not written")
+	var seenCount int
+	if err := store.db.QueryRow(`SELECT count(*) FROM preview_seen_source WHERE source_key = ?`, "source:message:status-cold-1").Scan(&seenCount); err != nil {
+		t.Fatal(err)
 	}
-	if len(entry.SeenSourceIDs) != 1 || entry.SeenSourceIDs[0] != "message:status-cold-1" {
-		t.Fatalf("seen source IDs = %#v, want only skipped mirror identity", entry.SeenSourceIDs)
+	if seenCount != 1 {
+		t.Fatalf("seen source ID rows = %d, want one skipped mirror identity", seenCount)
 	}
 
 	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY, 0)
@@ -1535,11 +1530,7 @@ func BenchmarkReadSessionPreviewMessagesTailLargeHiddenPrefix(b *testing.B) {
 }
 
 func BenchmarkReadSessionPreviewMessagesCachedCompleteLarge(b *testing.B) {
-	cacheDir := b.TempDir()
-	b.Setenv("XDG_CACHE_HOME", cacheDir)
-	b.Setenv("HOME", cacheDir)
-	b.Setenv("LOCALAPPDATA", cacheDir)
-	resetPersistentCacheStatesForTest()
+	setBenchmarkUserCacheDir(b)
 
 	dir := b.TempDir()
 	f := filepath.Join(dir, "large-complete-preview.jsonl")
@@ -1577,11 +1568,7 @@ func BenchmarkReadSessionPreviewMessagesCachedCompleteLarge(b *testing.B) {
 }
 
 func BenchmarkReadSessionPreviewTextCachedCompleteLarge(b *testing.B) {
-	cacheDir := b.TempDir()
-	b.Setenv("XDG_CACHE_HOME", cacheDir)
-	b.Setenv("HOME", cacheDir)
-	b.Setenv("LOCALAPPDATA", cacheDir)
-	resetPersistentCacheStatesForTest()
+	setBenchmarkUserCacheDir(b)
 
 	dir := b.TempDir()
 	f := filepath.Join(dir, "large-complete-preview-text.jsonl")

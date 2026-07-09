@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -2168,55 +2167,26 @@ func TestPostUIEventWithRetryReturnsOnContextCancelAfterEventQueueFull(t *testin
 	}
 }
 
-func TestSelectSessionCancelsInitialLoadUnderPersistentCacheLockContention(t *testing.T) {
+func TestSelectSessionCancelsInitialLoad(t *testing.T) {
 	screen, initDone := newSelectSessionTestScreen(t)
 
-	cacheHome := t.TempDir()
-	t.Setenv("XDG_CACHE_HOME", cacheHome)
-	t.Setenv("HOME", cacheHome)
-	t.Setenv("LOCALAPPDATA", cacheHome)
-
-	codexDir := t.TempDir()
-	sessionsDir := filepath.Join(codexDir, "sessions")
-	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
-		t.Fatalf("mkdir sessions: %v", err)
-	}
-	sessionID := "11111111-1111-1111-1111-111111111111"
-	sessionPath := filepath.Join(sessionsDir, "rollout-2026-01-01T00-00-00-"+sessionID+".jsonl")
-	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + filepath.ToSlash(codexDir) + `","source":"cli"}}` + "\n" +
-		`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]}}` + "\n"
-	if err := os.WriteFile(sessionPath, []byte(content), 0o644); err != nil {
-		t.Fatalf("write session file: %v", err)
-	}
-
-	userCacheDir, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatalf("resolve user cache dir: %v", err)
-	}
-	cachePath := filepath.Join(userCacheDir, "codex-proxy", "codexhistory", "session_meta_cache.json")
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
-		t.Fatalf("mkdir cache dir: %v", err)
-	}
-	lock := flock.New(cachePath + ".lock")
-	if err := lock.Lock(); err != nil {
-		t.Fatalf("lock session meta cache: %v", err)
-	}
-	defer func() { _ = lock.Unlock() }()
-
 	loadReturned := make(chan error, 1)
+	loadStarted := make(chan struct{})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	go func() {
 		<-initDone
+		<-loadStarted
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'q', 0))
 	}()
 
 	selection, err := SelectSession(ctx, Options{
 		LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
-			projects, err := codexhistory.DiscoverProjectsContext(ctx, codexDir)
-			loadReturned <- err
-			return projects, err
+			close(loadStarted)
+			<-ctx.Done()
+			loadReturned <- ctx.Err()
+			return nil, ctx.Err()
 		},
 	})
 	if err != nil {
@@ -2232,7 +2202,7 @@ func TestSelectSessionCancelsInitialLoadUnderPersistentCacheLockContention(t *te
 			t.Fatalf("LoadProjects error = %v, want context cancellation", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for initial load to return under cache lock contention")
+		t.Fatal("timeout waiting for canceled initial load to return")
 	}
 }
 

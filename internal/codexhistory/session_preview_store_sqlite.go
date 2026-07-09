@@ -1,14 +1,11 @@
 package codexhistory
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,16 +20,13 @@ import (
 // amount of dedupe state that cannot be recovered from those messages.
 
 const (
-	sessionPreviewSQLiteSchemaVersion          = 1
+	sessionPreviewSQLiteSchemaVersion          = cacheVersion
 	sessionPreviewSQLiteApplicationID          = 0x43585050 // "CXPP"
 	sessionPreviewSQLiteMaxSessions            = 1024
 	sessionPreviewSQLiteBusyMillis             = 100
 	sessionPreviewAppendMaxDirtyPaths          = 1024
 	sessionPreviewSQLiteMemoryMaxEntries       = 64
 	sessionPreviewSQLiteMemoryMaxBytes   int64 = 16 * 1024 * 1024
-	// Keep ordinary preview growth in the WAL so it is written once before a
-	// mature SQLite checkpoint eventually folds it into the main database.
-	sessionPreviewSQLiteAutoCheckpointPages = 8192
 )
 
 var (
@@ -71,12 +65,14 @@ type sessionPreviewSeenDelta struct {
 }
 
 type sessionPreviewSQLiteMemoryEntry struct {
-	fileKey     fileCacheKey
-	messages    []Message
-	text        string
-	hasMessages bool
-	bytes       int64
-	lastAccess  uint64
+	fileKey      fileCacheKey
+	messages     []Message
+	text         string
+	hasMessages  bool
+	persisted    sessionPreviewSQLiteEntry
+	hasPersisted bool
+	bytes        int64
+	lastAccess   uint64
 }
 
 var sessionPreviewSQLiteState struct {
@@ -104,7 +100,7 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 		return readSessionPreviewUncached(filePath)
 	}
 
-	store, err := currentSessionPreviewSQLiteStore()
+	store, err := currentSessionPreviewSQLiteStoreForSource(filePath)
 	if err != nil {
 		return nil, "", err
 	}
@@ -113,23 +109,39 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 	}
 
 	for attempt := 0; attempt < 3; attempt++ {
-		entry, ok, err := store.load(filePath, wantMessages, false)
-		if err != nil {
-			return nil, "", err
+		entry, ok := loadSessionPreviewSQLiteAppendBase(store.path, filePath, info, wantMessages)
+		if !ok {
+			entry, ok, err = store.load(filePath, wantMessages, false)
+			if err != nil {
+				return nil, "", err
+			}
 		}
 		if ok && entry.filterVersion == sessionPreviewFilterVersion {
 			if matchesFileInfo(filePath, info, entry.fileKey) {
-				return rememberSessionPreviewSQLiteResult(store.path, filePath, entry.fileKey, entry.messages, entry.text, wantMessages)
+				var persisted *sessionPreviewSQLiteEntry
+				if entry.seen == nil {
+					if seenErr := store.loadSeenState(&entry); seenErr == nil {
+						persisted = &entry
+					}
+				} else {
+					persisted = &entry
+				}
+				return rememberSessionPreviewSQLiteResult(store.path, filePath, entry.fileKey, entry.messages, entry.text, wantMessages, persisted)
 			}
 			if canAppendSessionPreviewSQLite(filePath, info, entry) {
 				if completeOffset < entry.offset {
 					return readSessionPreviewUncached(filePath)
 				}
 
-				if err := store.loadSeenState(&entry); err != nil {
+				if entry.seen == nil {
+					err = store.loadSeenState(&entry)
+				}
+				if err != nil {
 					return nil, "", err
 				}
-				seenBefore := cloneMessageSeenState(entry.seen)
+				seenBefore := entry.seen
+				persistedBase := entry
+				entry.seen = cloneMessageSeenState(seenBefore)
 				tail, readErr := readSessionMessagesWindow(
 					filePath,
 					entry.offset,
@@ -146,22 +158,31 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 				deltaBytes := completeOffset - entry.offset
 				key := newFileCacheKey(filePath, info)
 				persisted := false
+				hash, hashSize := "", int64(0)
 				if shouldFlushSessionPreviewAppend(filePath, deltaBytes) {
-					hash, hashSize, _ := sessionPreviewPrefixTailHash(filePath, completeOffset)
+					hash, hashSize, _ = sessionPreviewPrefixTailHash(filePath, completeOffset)
 					delta := diffMessageSeenState(seenBefore, entry.seen)
 					appendErr := store.append(entry, key, completeOffset, hash, hashSize, tail, delta)
 					switch {
 					case errors.Is(appendErr, errSessionPreviewSQLiteConflict):
+						invalidateSessionPreviewSQLiteMemory(store.path, filePath)
 						continue
 					case appendErr == nil:
 						markSessionPreviewAppendFlushed(filePath)
 						persisted = true
 					}
 				}
-				if persisted || deltaBytes == 0 {
-					return rememberSessionPreviewSQLiteResult(store.path, filePath, key, messages, text, wantMessages)
+				if persisted {
+					persistedBase.fileKey = key
+					persistedBase.offset = completeOffset
+					persistedBase.prefixTailHash = hash
+					persistedBase.prefixTailSize = hashSize
+					persistedBase.nextOrdinal += int64(len(tail))
+					persistedBase.messages = messages
+					persistedBase.text = text
+					persistedBase.seen = entry.seen
 				}
-				return sessionPreviewResult(messages, text, wantMessages)
+				return rememberSessionPreviewSQLiteResult(store.path, filePath, key, messages, text, wantMessages, &persistedBase)
 			}
 		}
 
@@ -172,9 +193,24 @@ func readSessionPreviewCacheValueSQLite(filePath string, wantMessages bool) ([]M
 		}
 		hash, hashSize, _ := sessionPreviewPrefixTailHash(filePath, completeOffset)
 		key := newFileCacheKey(filePath, info)
-		if err := store.replace(filePath, key, completeOffset, hash, hashSize, messages, seen); err == nil {
+		replaceErr := store.replace(entry, ok, filePath, key, completeOffset, hash, hashSize, messages, seen)
+		if errors.Is(replaceErr, errSessionPreviewSQLiteConflict) {
+			invalidateSessionPreviewSQLiteMemory(store.path, filePath)
+			continue
+		}
+		if replaceErr == nil {
 			markSessionPreviewAppendFlushed(filePath)
-			return rememberSessionPreviewSQLiteResult(store.path, filePath, key, messages, "", wantMessages)
+			text := FormatPreviewMessages(messages, 0)
+			base, baseOK, baseErr := store.loadHeader(filePath)
+			if baseErr == nil && baseOK {
+				if wantMessages {
+					base.messages = append([]Message(nil), messages...)
+				}
+				base.text = text
+				base.seen = seen
+				return rememberSessionPreviewSQLiteResult(store.path, filePath, key, messages, text, wantMessages, &base)
+			}
+			return rememberSessionPreviewSQLiteResult(store.path, filePath, key, messages, text, wantMessages, nil)
 		}
 		return sessionPreviewResult(messages, "", wantMessages)
 	}
@@ -189,10 +225,11 @@ func rememberSessionPreviewSQLiteResult(
 	messages []Message,
 	text string,
 	wantMessages bool,
+	persisted *sessionPreviewSQLiteEntry,
 ) ([]Message, string, error) {
 	resultMessages, resultText, err := sessionPreviewResult(messages, text, wantMessages)
 	if err == nil {
-		storeSessionPreviewSQLiteMemory(storePath, filePath, key, resultMessages, resultText, wantMessages)
+		storeSessionPreviewSQLiteMemory(storePath, filePath, key, resultMessages, resultText, wantMessages, persisted)
 	}
 	return resultMessages, resultText, err
 }
@@ -228,6 +265,24 @@ func loadSessionPreviewSQLiteMemory(storePath string, filePath string, info os.F
 	return nil, entry.text, true
 }
 
+func loadSessionPreviewSQLiteAppendBase(storePath string, filePath string, info os.FileInfo, wantMessages bool) (sessionPreviewSQLiteEntry, bool) {
+	key := sessionPreviewSQLiteMemoryKey(storePath, filePath)
+	sessionPreviewSQLiteState.mu.Lock()
+	defer sessionPreviewSQLiteState.mu.Unlock()
+	memory, ok := sessionPreviewSQLiteState.memory[key]
+	if !ok || !memory.hasPersisted || (wantMessages && !memory.hasMessages) {
+		return sessionPreviewSQLiteEntry{}, false
+	}
+	base := memory.persisted
+	if !canAppendSessionPreviewSQLite(filePath, info, base) {
+		return sessionPreviewSQLiteEntry{}, false
+	}
+	sessionPreviewSQLiteState.memoryTick++
+	memory.lastAccess = sessionPreviewSQLiteState.memoryTick
+	sessionPreviewSQLiteState.memory[key] = memory
+	return base, true
+}
+
 func storeSessionPreviewSQLiteMemory(
 	storePath string,
 	filePath string,
@@ -235,6 +290,7 @@ func storeSessionPreviewSQLiteMemory(
 	messages []Message,
 	text string,
 	hasMessages bool,
+	persisted *sessionPreviewSQLiteEntry,
 ) {
 	entry := sessionPreviewSQLiteMemoryEntry{
 		fileKey:     fileKey,
@@ -246,6 +302,18 @@ func storeSessionPreviewSQLiteMemory(
 		entry.messages = append([]Message(nil), messages...)
 		for _, message := range entry.messages {
 			entry.bytes += int64(len(message.Role) + len(message.Content) + len(message.sourceID))
+		}
+	}
+	if persisted != nil {
+		entry.persisted = *persisted
+		entry.hasPersisted = true
+		if entry.persisted.seen != nil {
+			for key := range entry.persisted.seen.sourceKeys {
+				entry.bytes += int64(len(key) + 1)
+			}
+			for key, sourceKind := range entry.persisted.seen.fallbackSourceKind {
+				entry.bytes += int64(len(key) + len(sourceKind) + 24)
+			}
 		}
 	}
 	if entry.bytes > sessionPreviewSQLiteMemoryMaxBytes {
@@ -266,6 +334,16 @@ func storeSessionPreviewSQLiteMemory(
 	sessionPreviewSQLiteState.memory[key] = entry
 	sessionPreviewSQLiteState.memoryBytes += entry.bytes
 	pruneSessionPreviewSQLiteMemoryLocked()
+}
+
+func invalidateSessionPreviewSQLiteMemory(storePath string, filePath string) {
+	key := sessionPreviewSQLiteMemoryKey(storePath, filePath)
+	sessionPreviewSQLiteState.mu.Lock()
+	defer sessionPreviewSQLiteState.mu.Unlock()
+	if entry, ok := sessionPreviewSQLiteState.memory[key]; ok {
+		delete(sessionPreviewSQLiteState.memory, key)
+		sessionPreviewSQLiteState.memoryBytes -= entry.bytes
+	}
 }
 
 func pruneSessionPreviewSQLiteMemoryLocked() {
@@ -289,13 +367,7 @@ func pruneSessionPreviewSQLiteMemoryLocked() {
 }
 
 func canAppendSessionPreviewSQLite(path string, info os.FileInfo, entry sessionPreviewSQLiteEntry) bool {
-	return canAppendPersistentSessionPreview(path, info, persistentSessionPreviewEntry{
-		FileCacheKey:   entry.fileKey,
-		FilterVersion:  entry.filterVersion,
-		Offset:         entry.offset,
-		PrefixTailHash: entry.prefixTailHash,
-		PrefixTailSize: entry.prefixTailSize,
-	})
+	return canAppendCacheFile(path, info, entry.fileKey, entry.offset, entry.prefixTailHash, entry.prefixTailSize)
 }
 
 func shouldFlushSessionPreviewAppend(path string, deltaBytes int64) bool {
@@ -387,7 +459,30 @@ func currentSessionPreviewSQLiteStore() (*sessionPreviewSQLiteStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	store, err := currentSessionPreviewSQLiteStoreAtPath(path)
+	if err == nil {
+		if root, rootErr := cacheV2RootForSource(""); rootErr == nil {
+			cleanupLegacyCaches(root)
+		}
+	}
+	return store, err
+}
 
+func currentSessionPreviewSQLiteStoreForSource(sourcePath string) (*sessionPreviewSQLiteStore, error) {
+	path, err := sessionPreviewSQLiteFileForSource(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	store, err := currentSessionPreviewSQLiteStoreAtPath(path)
+	if err == nil {
+		if root, rootErr := cacheV2RootForSource(sourcePath); rootErr == nil {
+			cleanupLegacyCaches(root)
+		}
+	}
+	return store, err
+}
+
+func currentSessionPreviewSQLiteStoreAtPath(path string) (*sessionPreviewSQLiteStore, error) {
 	sessionPreviewSQLiteState.mu.Lock()
 	defer sessionPreviewSQLiteState.mu.Unlock()
 	if sessionPreviewSQLiteState.db != nil && sessionPreviewSQLiteState.path == path {
@@ -413,15 +508,15 @@ func currentSessionPreviewSQLiteStore() (*sessionPreviewSQLiteStore, error) {
 }
 
 func sessionPreviewSQLiteFile() (string, error) {
-	dir, err := persistentCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "session_preview_cache.sqlite3"), nil
+	return cacheV2DatabasePath("", cacheV2PreviewFile)
+}
+
+func sessionPreviewSQLiteFileForSource(sourcePath string) (string, error) {
+	return cacheV2DatabasePath(sourcePath, cacheV2PreviewFile)
 }
 
 func openSessionPreviewSQLite(path string) (*sql.DB, error) {
-	if err := prepareSessionPreviewSQLiteArtifacts(path); err != nil {
+	if err := secureCacheV2Database(path, true); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", sessionPreviewSQLiteFileURI(path))
@@ -430,100 +525,35 @@ func openSessionPreviewSQLite(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA journal_mode = DELETE`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if journalMode != "delete" {
+		_ = db.Close()
+		return nil, fmt.Errorf("session preview sqlite journal mode = %q, want delete", journalMode)
+	}
 	for _, statement := range []string{
-		`PRAGMA journal_mode = WAL`,
 		`PRAGMA synchronous = NORMAL`,
 		fmt.Sprintf(`PRAGMA busy_timeout = %d`, sessionPreviewSQLiteBusyMillis),
 		`PRAGMA temp_store = MEMORY`,
 		`PRAGMA foreign_keys = ON`,
-		fmt.Sprintf(`PRAGMA wal_autocheckpoint = %d`, sessionPreviewSQLiteAutoCheckpointPages),
 	} {
 		if _, err := db.Exec(statement); err != nil {
 			_ = db.Close()
 			return nil, err
 		}
 	}
-	if err := enableSessionPreviewPersistentWAL(db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	if err := initializeSessionPreviewSQLiteSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := secureSessionPreviewSQLiteArtifact(path+suffix, false); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
+	if err := secureCacheV2Database(path, false); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return db, nil
-}
-
-func prepareSessionPreviewSQLiteArtifacts(path string) error {
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := secureSessionPreviewSQLiteArtifact(path+suffix, suffix == ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func enableSessionPreviewPersistentWAL(db *sql.DB) error {
-	// SQLite otherwise deletes and recreates WAL sidecars when the last
-	// connection closes, producing avoidable metadata and SHM churn on TUI runs.
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	return conn.Raw(func(driverConn any) error {
-		fileControl, ok := driverConn.(sqlite.FileControl)
-		if !ok {
-			return errors.New("sqlite driver does not support persistent WAL")
-		}
-		mode, err := fileControl.FileControlPersistWAL("main", 1)
-		if err != nil {
-			return err
-		}
-		if mode != 1 {
-			return fmt.Errorf("enable persistent WAL returned mode %d", mode)
-		}
-		return nil
-	})
-}
-
-func secureSessionPreviewSQLiteArtifact(path string, create bool) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) && create {
-		file, createErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-		if createErr == nil {
-			if closeErr := file.Close(); closeErr != nil {
-				return closeErr
-			}
-			info, err = os.Lstat(path)
-		} else if errors.Is(createErr, os.ErrExist) {
-			info, err = os.Lstat(path)
-		} else {
-			return createErr
-		}
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("unsafe sqlite cache artifact %q: mode %s", path, info.Mode())
-	}
-	if runtime.GOOS == "windows" || info.Mode().Perm() == 0o600 {
-		return nil
-	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("secure sqlite cache artifact %q: %w", path, err)
-	}
-	return nil
 }
 
 func initializeSessionPreviewSQLiteSchema(db *sql.DB) error {
@@ -541,13 +571,21 @@ func initializeSessionPreviewSQLiteSchema(db *sql.DB) error {
 		}
 		return validateSessionPreviewSQLiteSchema(db)
 	}
+	var existingObjects int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema
+		WHERE name NOT LIKE 'sqlite_%'`).Scan(&existingObjects); err != nil {
+		return err
+	}
+	if existingObjects != 0 {
+		return fmt.Errorf("%w: uninitialized database contains %d schema objects", errSessionPreviewSQLiteSchema, existingObjects)
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for _, statement := range []string{
-		`CREATE TABLE IF NOT EXISTS preview_session (
+		`CREATE TABLE preview_session (
 				id INTEGER PRIMARY KEY,
 				path TEXT NOT NULL UNIQUE,
 				filter_version TEXT NOT NULL,
@@ -566,7 +604,7 @@ func initializeSessionPreviewSQLiteSchema(db *sql.DB) error {
 				next_ordinal INTEGER NOT NULL,
 				last_write_ns INTEGER NOT NULL
 			) STRICT`,
-		`CREATE TABLE IF NOT EXISTS preview_message (
+		`CREATE TABLE preview_message (
 				session_id INTEGER NOT NULL REFERENCES preview_session(id) ON DELETE CASCADE,
 				generation INTEGER NOT NULL,
 				ordinal INTEGER NOT NULL,
@@ -576,13 +614,13 @@ func initializeSessionPreviewSQLiteSchema(db *sql.DB) error {
 				source_id TEXT NOT NULL,
 				PRIMARY KEY (session_id, generation, ordinal)
 			) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS preview_seen_source (
+		`CREATE TABLE preview_seen_source (
 				session_id INTEGER NOT NULL REFERENCES preview_session(id) ON DELETE CASCADE,
 				generation INTEGER NOT NULL,
 				source_key TEXT NOT NULL,
 				PRIMARY KEY (session_id, generation, source_key)
 			) STRICT, WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS preview_seen_fallback (
+		`CREATE TABLE preview_seen_fallback (
 				session_id INTEGER NOT NULL REFERENCES preview_session(id) ON DELETE CASCADE,
 				generation INTEGER NOT NULL,
 				fallback_key TEXT NOT NULL,
@@ -628,33 +666,7 @@ func validateSessionPreviewSQLiteSchema(db *sql.DB) error {
 }
 
 func sessionPreviewSQLiteFileURI(path string) string {
-	slash := filepath.ToSlash(path)
-	u := &url.URL{Scheme: "file", Path: slash}
-	if runtime.GOOS == "windows" {
-		if strings.HasPrefix(slash, "//") {
-			trimmed := strings.TrimLeft(slash, "/")
-			host, rest, ok := strings.Cut(trimmed, "/")
-			if ok {
-				u.Host = host
-				u.Path = "/" + rest
-			}
-		}
-		if len(slash) >= 2 && slash[1] == ':' {
-			u.Path = "/" + slash
-		}
-	}
-	query := u.Query()
-	for _, pragma := range []string{
-		"synchronous(NORMAL)",
-		fmt.Sprintf("busy_timeout(%d)", sessionPreviewSQLiteBusyMillis),
-		"temp_store(MEMORY)",
-		"foreign_keys(ON)",
-		fmt.Sprintf("wal_autocheckpoint(%d)", sessionPreviewSQLiteAutoCheckpointPages),
-	} {
-		query.Add("_pragma", pragma)
-	}
-	u.RawQuery = query.Encode()
-	return u.String()
+	return cacheV2SQLiteFileURI(path, sessionPreviewSQLiteBusyMillis)
 }
 
 func isRebuildableSessionPreviewSQLiteError(err error) bool {
@@ -689,13 +701,29 @@ func quarantineSessionPreviewSQLite(path string) error {
 	if err := os.Rename(path, quarantine); err != nil {
 		return err
 	}
-	for _, suffix := range []string{"-wal", "-shm"} {
+	for _, suffix := range []string{"-journal", "-wal", "-shm"} {
 		_ = os.Remove(path + suffix)
 	}
 	return nil
 }
 
 func (store *sessionPreviewSQLiteStore) load(path string, wantMessages bool, wantSeen bool) (sessionPreviewSQLiteEntry, bool, error) {
+	entry, ok, err := store.loadHeader(path)
+	if err != nil || !ok {
+		return entry, ok, err
+	}
+	if err := store.loadMessages(&entry, wantMessages); err != nil {
+		return sessionPreviewSQLiteEntry{}, false, err
+	}
+	if wantSeen {
+		if err := store.loadSeenState(&entry); err != nil {
+			return sessionPreviewSQLiteEntry{}, false, err
+		}
+	}
+	return entry, true, nil
+}
+
+func (store *sessionPreviewSQLiteStore) loadHeader(path string) (sessionPreviewSQLiteEntry, bool, error) {
 	var entry sessionPreviewSQLiteEntry
 	var hasFileID, hasCtime int
 	var dev, ino string
@@ -731,14 +759,6 @@ func (store *sessionPreviewSQLiteStore) load(path string, wantMessages bool, wan
 	entry.fileKey.Dev, _ = strconv.ParseUint(dev, 10, 64)
 	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
 
-	if err := store.loadMessages(&entry, wantMessages); err != nil {
-		return sessionPreviewSQLiteEntry{}, false, err
-	}
-	if wantSeen {
-		if err := store.loadSeenState(&entry); err != nil {
-			return sessionPreviewSQLiteEntry{}, false, err
-		}
-	}
 	return entry, true, nil
 }
 
@@ -875,6 +895,8 @@ func (store *sessionPreviewSQLiteStore) loadSeenState(entry *sessionPreviewSQLit
 }
 
 func (store *sessionPreviewSQLiteStore) replace(
+	expected sessionPreviewSQLiteEntry,
+	expectedFound bool,
 	path string,
 	key fileCacheKey,
 	offset int64,
@@ -890,32 +912,38 @@ func (store *sessionPreviewSQLiteStore) replace(
 	defer tx.Rollback()
 
 	var sessionID, generation int64
-	err = tx.QueryRow(`INSERT INTO preview_session (
-		path, filter_version, generation, parsed_offset, prefix_tail_hash, prefix_tail_size,
-		source_size, source_mtime_ns, source_mode, has_file_id, source_dev, source_ino,
-		has_ctime, source_ctime_ns, next_ordinal, last_write_ns
-	) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT(path) DO UPDATE SET
-		filter_version = excluded.filter_version,
-		generation = preview_session.generation + 1,
-		parsed_offset = excluded.parsed_offset,
-		prefix_tail_hash = excluded.prefix_tail_hash,
-		prefix_tail_size = excluded.prefix_tail_size,
-		source_size = excluded.source_size,
-		source_mtime_ns = excluded.source_mtime_ns,
-		source_mode = excluded.source_mode,
-		has_file_id = excluded.has_file_id,
-		source_dev = excluded.source_dev,
-		source_ino = excluded.source_ino,
-		has_ctime = excluded.has_ctime,
-		source_ctime_ns = excluded.source_ctime_ns,
-		next_ordinal = excluded.next_ordinal,
-		last_write_ns = excluded.last_write_ns
-	RETURNING id, generation`,
-		filepath.Clean(path), sessionPreviewFilterVersion, offset, prefixHash, prefixSize,
-		key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID), strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
-		boolInt(key.HasCtime), key.CtimeUnixNano, len(messages), sessionPreviewNow().UnixNano(),
-	).Scan(&sessionID, &generation)
+	if expectedFound {
+		err = tx.QueryRow(`UPDATE preview_session SET
+			filter_version = ?, generation = generation + 1, parsed_offset = ?,
+			prefix_tail_hash = ?, prefix_tail_size = ?, source_size = ?,
+			source_mtime_ns = ?, source_mode = ?, has_file_id = ?, source_dev = ?,
+			source_ino = ?, has_ctime = ?, source_ctime_ns = ?, next_ordinal = ?,
+			last_write_ns = ?
+			WHERE id = ? AND generation = ? AND parsed_offset = ?
+			RETURNING id, generation`,
+			sessionPreviewFilterVersion, offset, prefixHash, prefixSize, key.Size,
+			key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
+			strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
+			boolInt(key.HasCtime), key.CtimeUnixNano, len(messages), sessionPreviewNow().UnixNano(),
+			expected.sessionID, expected.generation, expected.offset,
+		).Scan(&sessionID, &generation)
+	} else {
+		err = tx.QueryRow(`INSERT INTO preview_session (
+			path, filter_version, generation, parsed_offset, prefix_tail_hash, prefix_tail_size,
+			source_size, source_mtime_ns, source_mode, has_file_id, source_dev, source_ino,
+			has_ctime, source_ctime_ns, next_ordinal, last_write_ns
+		) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO NOTHING
+		RETURNING id, generation`, filepath.Clean(path), sessionPreviewFilterVersion,
+			offset, prefixHash, prefixSize, key.Size, key.MtimeUnixNano, key.Mode,
+			boolInt(key.HasFileID), strconv.FormatUint(key.Dev, 10),
+			strconv.FormatUint(key.Ino, 10), boolInt(key.HasCtime), key.CtimeUnixNano,
+			len(messages), sessionPreviewNow().UnixNano(),
+		).Scan(&sessionID, &generation)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return errSessionPreviewSQLiteConflict
+	}
 	if err != nil {
 		return err
 	}

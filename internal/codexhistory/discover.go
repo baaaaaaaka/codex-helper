@@ -36,12 +36,12 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 		return nil, fmt.Errorf("%w: %s", ErrSessionsDirNotFound, sessionsDir)
 	}
 
-	ctx, sessionMetaBatch := withSessionMetaPersistentBatch(ctx)
+	ctx, sessionMetaBatch := withCatalogSessionMetaBatch(ctx)
 	defer func() {
 		if errors.Is(retErr, context.Canceled) || errors.Is(retErr, context.DeadlineExceeded) {
 			return
 		}
-		if err := flushPersistentSessionMetaBatchContext(ctx, sessionMetaBatch); err != nil {
+		if err := flushCatalogSessionMetaBatch(ctx, sessionMetaBatch); err != nil {
 			if retErr == nil {
 				retErr = err
 			}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -54,6 +55,7 @@ type codexResponsePayload struct {
 }
 
 var openSessionMetaFile = os.Open
+var sessionMetaWindowReadHook func(offset int64, size int64)
 
 func readSessionFileMeta(filePath string) (sessionFileMeta, error) {
 	return readSessionFileMetaContext(context.Background(), filePath)
@@ -84,6 +86,57 @@ func readSessionFileMetaContext(ctx context.Context, filePath string) (sessionFi
 			processMetaLine(line, &meta)
 		}
 		if err == io.EOF {
+			break
+		}
+	}
+
+	if meta.CreatedAt.IsZero() || meta.ModifiedAt.IsZero() {
+		if st, err := os.Stat(filePath); err == nil {
+			if meta.CreatedAt.IsZero() {
+				meta.CreatedAt = st.ModTime()
+			}
+			if meta.ModifiedAt.IsZero() {
+				meta.ModifiedAt = st.ModTime()
+			}
+		}
+	}
+	return meta, nil
+}
+
+// readSessionFileMetaWindowContext applies a byte-aligned JSONL window to an
+// existing metadata value. Callers only pass complete-line boundaries, which
+// lets the persistent catalog advance without rescanning an older conversation.
+func readSessionFileMetaWindowContext(ctx context.Context, filePath string, offset int64, size int64, base sessionFileMeta) (sessionFileMeta, error) {
+	meta := base
+	if err := ctx.Err(); err != nil {
+		return meta, err
+	}
+	if offset < 0 || size < 0 {
+		return meta, fmt.Errorf("invalid session metadata window offset=%d size=%d", offset, size)
+	}
+	if sessionMetaWindowReadHook != nil {
+		sessionMetaWindowReadHook(offset, size)
+	}
+	f, err := openSessionMetaFile(filePath)
+	if err != nil {
+		return meta, err
+	}
+	defer f.Close()
+
+	reader := bufio.NewReaderSize(io.NewSectionReader(f, offset, size), 64*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return meta, err
+		}
+		line, readErr := reader.ReadBytes('\n')
+		if readErr != nil && readErr != io.EOF {
+			return meta, readErr
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			processMetaLine(line, &meta)
+		}
+		if readErr == io.EOF {
 			break
 		}
 	}

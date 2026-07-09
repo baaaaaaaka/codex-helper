@@ -4,13 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -20,70 +15,19 @@ const SessionPreviewFilterVersion = "user-status-answer-v5"
 const sessionPreviewFilterVersion = SessionPreviewFilterVersion
 const sessionPreviewPrefixHashBytes int64 = 64 * 1024
 
-// envSessionPreviewCacheBackend is a temporary rollback switch. SQLite is the
-// default; "json" retains the previous writer and "off" reads source JSONL only.
+// "off" is retained for diagnostics. Every other value, including the former
+// "json" rollback value, selects SQLite so JSON cache writes cannot reappear.
 const envSessionPreviewCacheBackend = "CODEX_HELPER_PREVIEW_CACHE_BACKEND"
 
 const (
 	sessionPreviewBackendSQLite = "sqlite"
-	sessionPreviewBackendJSON   = "json"
 	sessionPreviewBackendOff    = "off"
 )
 
-type persistentSessionPreviewCache struct {
-	Version int                                      `json:"version"`
-	Entries map[string]persistentSessionPreviewEntry `json:"entries"`
-}
-
-type persistentSessionPreviewEntry struct {
-	FileCacheKey         fileCacheKey                              `json:"fileCacheKey"`
-	FilterVersion        string                                    `json:"filterVersion"`
-	Offset               int64                                     `json:"offset"`
-	PrefixTailHash       string                                    `json:"prefixTailHash,omitempty"`
-	PrefixTailSize       int64                                     `json:"prefixTailSize,omitempty"`
-	Messages             []persistentSessionPreviewMessage         `json:"messages"`
-	FormattedText        string                                    `json:"formattedText,omitempty"`
-	SeenSourceIDs        []string                                  `json:"seenSourceIds,omitempty"`
-	SeenFallbackMessages []persistentSessionPreviewFallbackMessage `json:"seenFallbackMessages,omitempty"`
-}
-
-type persistentSessionPreviewMessage struct {
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	Timestamp time.Time `json:"timestamp,omitempty"`
-	SourceID  string    `json:"sourceId,omitempty"`
-}
-
 type persistentSessionPreviewFallbackMessage struct {
-	Key        string    `json:"key"`
-	Timestamp  time.Time `json:"timestamp,omitempty"`
-	SourceKind string    `json:"sourceKind,omitempty"`
-}
-
-type sessionPreviewPersistentState struct {
-	mu               sync.Mutex
-	path             string
-	cacheFilePresent bool
-	cacheFileMtime   int64
-	loaded           bool
-	cache            persistentSessionPreviewCache
-}
-
-var persistentSessionPreviewState sessionPreviewPersistentState
-
-func newPersistentSessionPreviewCache() persistentSessionPreviewCache {
-	return persistentSessionPreviewCache{
-		Version: persistentCacheVersion,
-		Entries: map[string]persistentSessionPreviewEntry{},
-	}
-}
-
-func sessionPreviewCacheFile() (string, error) {
-	dir, err := persistentCacheDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "session_preview_cache.json"), nil
+	Key        string
+	Timestamp  time.Time
+	SourceKind string
 }
 
 func readSessionPreviewMessagesCached(filePath string) ([]Message, error) {
@@ -97,204 +41,30 @@ func readSessionPreviewTextCached(filePath string) (string, error) {
 }
 
 func readSessionPreviewCacheValue(filePath string, wantMessages bool) ([]Message, string, error) {
-	switch sessionPreviewCacheBackend() {
-	case sessionPreviewBackendJSON:
-		return readSessionPreviewCacheValueJSON(filePath, wantMessages)
-	case sessionPreviewBackendOff:
-		return readSessionPreviewUncached(filePath)
-	default:
-		messages, text, err := readSessionPreviewCacheValueSQLite(filePath, wantMessages)
-		if err == nil {
-			return messages, text, nil
-		}
-		// Preview state is disposable acceleration. A database open, migration,
-		// lock, or corruption failure must never hide the source session.
+	if sessionPreviewCacheBackend() == sessionPreviewBackendOff {
 		return readSessionPreviewUncached(filePath)
 	}
+	messages, text, err := readSessionPreviewCacheValueSQLite(filePath, wantMessages)
+	if err == nil {
+		return messages, text, nil
+	}
+	// Cache state is disposable acceleration. Open, lock, permission, and
+	// corruption failures must never hide the source session.
+	return readSessionPreviewUncached(filePath)
 }
 
 func sessionPreviewCacheBackend() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(envSessionPreviewCacheBackend))) {
-	case sessionPreviewBackendJSON:
-		return sessionPreviewBackendJSON
-	case sessionPreviewBackendOff:
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(envSessionPreviewCacheBackend)), sessionPreviewBackendOff) {
 		return sessionPreviewBackendOff
-	default:
-		return sessionPreviewBackendSQLite
 	}
+	return sessionPreviewBackendSQLite
 }
 
-func readSessionPreviewCacheValueJSON(filePath string, wantMessages bool) ([]Message, string, error) {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		_ = deletePersistentSessionPreview(filePath)
-		return nil, "", err
-	}
-	cachePath, err := sessionPreviewCacheFile()
-	if err != nil {
-		return readSessionPreviewUncached(filePath)
-	}
-	entry, ok := readPersistentSessionPreviewEntry(cachePath, filePath)
-	if ok && entry.FilterVersion == sessionPreviewFilterVersion {
-		if matchesFileInfo(filePath, info, entry.FileCacheKey) {
-			if !wantMessages && entry.FormattedText != "" {
-				return nil, entry.FormattedText, nil
-			}
-			messages := messagesFromPersistentSessionPreview(entry.Messages)
-			return messages, sessionPreviewEntryText(entry, messages), nil
-		}
-		if canAppendPersistentSessionPreview(filePath, info, entry) {
-			completeOffset, ok := sessionPreviewCompleteOffset(filePath, info)
-			if !ok {
-				return readSessionPreviewUncached(filePath)
-			}
-			if completeOffset < info.Size() {
-				return readSessionPreviewUncached(filePath)
-			}
-			if completeOffset >= entry.Offset {
-				seen := persistentSessionPreviewSeenState(entry)
-				tail, err := readSessionMessagesWindow(filePath, entry.Offset, completeOffset-entry.Offset, 0, projectPreviewMessage, seen)
-				if err != nil {
-					return nil, "", err
-				}
-				messages := messagesFromPersistentSessionPreview(entry.Messages)
-				baseText := sessionPreviewEntryText(entry, messages)
-				messages = append(messages, tail...)
-				text := appendPreviewText(baseText, FormatPreviewMessages(tail, 0))
-				_ = writePersistentSessionPreviewEntry(cachePath, filePath, info, completeOffset, messages, text, seen)
-				return messages, text, nil
-			}
-		}
-	}
-
-	completeOffset, ok := sessionPreviewCompleteOffset(filePath, info)
-	if !ok {
-		return readSessionPreviewUncached(filePath)
-	}
-	if completeOffset < info.Size() {
-		return readSessionPreviewUncached(filePath)
-	}
-	// Keep the complete dedupe state from the cold scan, including source IDs
-	// attached to mirrored records that were intentionally not retained in
-	// messages. Reconstructing seen from only the visible messages would let a
-	// later replay of one of those skipped source IDs reappear in the preview.
-	seen := newMessageSeenState()
-	messages, err := readSessionMessagesWindow(filePath, 0, completeOffset, 0, projectPreviewMessage, seen)
-	if err != nil {
-		return nil, "", err
-	}
-	text := FormatPreviewMessages(messages, 0)
-	_ = writePersistentSessionPreviewEntry(cachePath, filePath, info, completeOffset, messages, text, seen)
-	return messages, text, nil
-}
-
-func readPersistentSessionPreviewEntry(cachePath string, filePath string) (persistentSessionPreviewEntry, bool) {
-	cache, err := loadSessionPreviewPersistentState(cachePath)
-	if err != nil {
-		return persistentSessionPreviewEntry{}, false
-	}
-	entry, ok := cache.Entries[filepath.Clean(filePath)]
-	return entry, ok
-}
-
-func loadSessionPreviewPersistentState(cachePath string) (persistentSessionPreviewCache, error) {
-	present, mtime := cacheFileState(cachePath)
-	persistentSessionPreviewState.mu.Lock()
-	defer persistentSessionPreviewState.mu.Unlock()
-	if persistentSessionPreviewState.loaded &&
-		persistentSessionPreviewState.path == cachePath &&
-		persistentSessionPreviewState.cacheFilePresent == present &&
-		(!present || persistentSessionPreviewState.cacheFileMtime == mtime) {
-		return persistentSessionPreviewState.cache, nil
-	}
-	cache := newPersistentSessionPreviewCache()
-	err := withLockedCache(cachePath, func() error {
-		data, err := os.ReadFile(cachePath)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		if err := json.Unmarshal(data, &cache); err != nil {
-			return err
-		}
-		if cache.Version != persistentCacheVersion || cache.Entries == nil {
-			cache = newPersistentSessionPreviewCache()
-		}
-		return nil
-	})
-	if err != nil {
-		return persistentSessionPreviewCache{}, err
-	}
-	persistentSessionPreviewState.path = cachePath
-	persistentSessionPreviewState.cacheFilePresent, persistentSessionPreviewState.cacheFileMtime = cacheFileState(cachePath)
-	persistentSessionPreviewState.loaded = true
-	persistentSessionPreviewState.cache = cache
-	return cache, nil
-}
-
-func writePersistentSessionPreviewEntry(cachePath string, filePath string, info os.FileInfo, offset int64, messages []Message, text string, seen *messageSeenState) error {
-	cleanPath := filepath.Clean(filePath)
-	entry := persistentSessionPreviewEntry{
-		FileCacheKey:  newFileCacheKey(filePath, info),
-		FilterVersion: sessionPreviewFilterVersion,
-		Offset:        offset,
-		Messages:      persistentMessagesFromSessionPreview(messages),
-		FormattedText: text,
-		// Messages already carry their own source IDs. Persist only IDs observed on
-		// records that dedupe removed, which keeps the cache compact while retaining
-		// the identity needed to reject a later replay.
-		SeenSourceIDs:        skippedSourceIDsFromState(seen, messages),
-		SeenFallbackMessages: seenFallbackMessagesFromState(seen),
-	}
-	entry.PrefixTailHash, entry.PrefixTailSize, _ = sessionPreviewPrefixTailHash(filePath, entry.Offset)
-	return updatePersistentSessionPreviewCache(cachePath, func(cache *persistentSessionPreviewCache) {
-		cache.Entries[cleanPath] = entry
-	})
-}
-
-func deletePersistentSessionPreview(filePath string) error {
-	cachePath, err := sessionPreviewCacheFile()
-	if err != nil {
-		return nil
-	}
-	cleanPath := filepath.Clean(filePath)
-	return updatePersistentSessionPreviewCache(cachePath, func(cache *persistentSessionPreviewCache) {
-		delete(cache.Entries, cleanPath)
-	})
-}
-
-func updatePersistentSessionPreviewCache(cachePath string, fn func(*persistentSessionPreviewCache)) error {
-	return withLockedCache(cachePath, func() error {
-		cache := newPersistentSessionPreviewCache()
-		if data, err := os.ReadFile(cachePath); err == nil {
-			if json.Unmarshal(data, &cache) != nil || cache.Version != persistentCacheVersion || cache.Entries == nil {
-				cache = newPersistentSessionPreviewCache()
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		fn(&cache)
-		if err := writeJSONAtomically(cachePath, cache); err != nil {
-			return err
-		}
-		persistentSessionPreviewState.mu.Lock()
-		persistentSessionPreviewState.path = cachePath
-		persistentSessionPreviewState.cacheFilePresent, persistentSessionPreviewState.cacheFileMtime = cacheFileState(cachePath)
-		persistentSessionPreviewState.loaded = true
-		persistentSessionPreviewState.cache = cache
-		persistentSessionPreviewState.mu.Unlock()
-		return nil
-	})
-}
-
-func canAppendPersistentSessionPreview(path string, info os.FileInfo, entry persistentSessionPreviewEntry) bool {
-	if info == nil || entry.Offset < 0 || entry.Offset > info.Size() {
+func canAppendCacheFile(path string, info os.FileInfo, previous fileCacheKey, offset int64, prefixTailHash string, prefixTailSize int64) bool {
+	if info == nil || offset < 0 || offset > info.Size() {
 		return false
 	}
 	current := newFileCacheKey(path, info)
-	previous := entry.FileCacheKey
 	if previous.Mode != current.Mode {
 		return false
 	}
@@ -307,22 +77,18 @@ func canAppendPersistentSessionPreview(path string, info os.FileInfo, entry pers
 	if !sameFile {
 		return false
 	}
-	if entry.PrefixTailSize <= 0 || entry.PrefixTailHash == "" {
+	if offset == 0 && prefixTailSize == 0 && prefixTailHash == "" {
+		return true
+	}
+	if prefixTailSize <= 0 || prefixTailHash == "" {
 		return false
 	}
-	hash, size, ok := sessionPreviewPrefixTailHash(path, entry.Offset)
-	return ok && size == entry.PrefixTailSize && hash == entry.PrefixTailHash
+	hash, size, ok := sessionPreviewPrefixTailHash(path, offset)
+	return ok && size == prefixTailSize && hash == prefixTailHash
 }
 
 func sessionPreviewPrefixTailHash(path string, offset int64) (string, int64, bool) {
 	if offset <= 0 {
-		return "", 0, true
-	}
-	size := sessionPreviewPrefixHashBytes
-	if size > offset {
-		size = offset
-	}
-	if size <= 0 {
 		return "", 0, true
 	}
 	f, err := os.Open(path)
@@ -330,14 +96,30 @@ func sessionPreviewPrefixTailHash(path string, offset int64) (string, int64, boo
 		return "", 0, false
 	}
 	defer f.Close()
-	buf := make([]byte, size)
-	n, err := f.ReadAt(buf, offset-size)
-	if err != nil && n <= 0 {
+	headSize := sessionPreviewPrefixHashBytes / 2
+	if headSize > offset {
+		headSize = offset
+	}
+	tailStart := offset - sessionPreviewPrefixHashBytes/2
+	if tailStart < headSize {
+		tailStart = headSize
+	}
+	tailSize := offset - tailStart
+	buf := make([]byte, headSize+tailSize)
+	headRead, err := f.ReadAt(buf[:headSize], 0)
+	if err != nil && int64(headRead) < headSize {
 		return "", 0, false
 	}
-	buf = buf[:n]
+	tailRead := 0
+	if tailSize > 0 {
+		tailRead, err = f.ReadAt(buf[headSize:], tailStart)
+		if err != nil && int64(tailRead) < tailSize {
+			return "", 0, false
+		}
+	}
+	buf = buf[:headRead+tailRead]
 	sum := sha256.Sum256(buf)
-	return hex.EncodeToString(sum[:]), int64(n), true
+	return hex.EncodeToString(sum[:]), int64(len(buf)), true
 }
 
 func sessionPreviewCompleteOffset(path string, info os.FileInfo) (int64, bool) {
@@ -391,13 +173,6 @@ func readSessionPreviewUncached(filePath string) ([]Message, string, error) {
 	return messages, FormatPreviewMessages(messages, 0), nil
 }
 
-func sessionPreviewEntryText(entry persistentSessionPreviewEntry, messages []Message) string {
-	if entry.FormattedText != "" || len(messages) == 0 {
-		return entry.FormattedText
-	}
-	return FormatPreviewMessages(messages, 0)
-}
-
 func appendPreviewText(base string, tail string) string {
 	base = strings.TrimSpace(base)
 	tail = strings.TrimSpace(tail)
@@ -408,111 +183,4 @@ func appendPreviewText(base string, tail string) string {
 		return base
 	}
 	return base + "\n\n" + tail
-}
-
-func persistentMessagesFromSessionPreview(messages []Message) []persistentSessionPreviewMessage {
-	out := make([]persistentSessionPreviewMessage, 0, len(messages))
-	for _, msg := range messages {
-		out = append(out, persistentSessionPreviewMessage{
-			Role:      msg.Role,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-			SourceID:  msg.sourceID,
-		})
-	}
-	return out
-}
-
-func messagesFromPersistentSessionPreview(messages []persistentSessionPreviewMessage) []Message {
-	out := make([]Message, 0, len(messages))
-	for _, msg := range messages {
-		out = append(out, Message{
-			Role:      msg.Role,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-			sourceID:  msg.SourceID,
-		})
-	}
-	return out
-}
-
-func persistentSessionPreviewSeenState(entry persistentSessionPreviewEntry) *messageSeenState {
-	seen := newMessageSeenState()
-	for _, msg := range entry.Messages {
-		rememberMessageSeen(Message{
-			Role:      msg.Role,
-			Content:   msg.Content,
-			Timestamp: msg.Timestamp,
-			sourceID:  msg.SourceID,
-		}, seen)
-	}
-	for _, id := range entry.SeenSourceIDs {
-		if key := sourceMessageDedupKey(id); key != "" {
-			seen.sourceKeys[key] = true
-		}
-	}
-	for _, msg := range entry.SeenFallbackMessages {
-		if msg.Key != "" && !msg.Timestamp.IsZero() {
-			if previous, ok := seen.fallbackTimes[msg.Key]; !ok || msg.Timestamp.After(previous) {
-				seen.fallbackTimes[msg.Key] = msg.Timestamp
-				seen.fallbackSourceKind[msg.Key] = msg.SourceKind
-			}
-		}
-	}
-	return seen
-}
-
-func skippedSourceIDsFromState(seen *messageSeenState, messages []Message) []string {
-	if seen == nil {
-		return nil
-	}
-	retained := make(map[string]bool, len(messages))
-	for _, msg := range messages {
-		if key := sourceMessageDedupKey(msg.sourceID); key != "" {
-			retained[key] = true
-		}
-	}
-	out := make([]string, 0, len(seen.sourceKeys))
-	for key := range seen.sourceKeys {
-		if retained[key] {
-			continue
-		}
-		id := strings.TrimPrefix(key, "source:")
-		if id != "" && id != key {
-			out = append(out, id)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func seenStateFromMessages(messages []Message) *messageSeenState {
-	seen := newMessageSeenState()
-	for _, msg := range messages {
-		rememberMessageSeen(msg, seen)
-	}
-	return seen
-}
-
-func seenFallbackMessagesFromState(seen *messageSeenState) []persistentSessionPreviewFallbackMessage {
-	if seen == nil || len(seen.fallbackTimes) == 0 {
-		return nil
-	}
-	out := make([]persistentSessionPreviewFallbackMessage, 0, len(seen.fallbackTimes))
-	for key, ts := range seen.fallbackTimes {
-		if key != "" && !ts.IsZero() {
-			out = append(out, persistentSessionPreviewFallbackMessage{
-				Key:        key,
-				Timestamp:  ts,
-				SourceKind: seen.fallbackSourceKind[key],
-			})
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Key == out[j].Key {
-			return out[i].Timestamp.Before(out[j].Timestamp)
-		}
-		return out[i].Key < out[j].Key
-	})
-	return out
 }

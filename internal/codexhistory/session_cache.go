@@ -4,11 +4,10 @@ import (
 	"context"
 	"os"
 	"sync"
-	"time"
 )
 
 type sessionFileCacheEntry struct {
-	mtime   time.Time
+	fileKey fileCacheKey
 	meta    sessionFileMeta
 	hasMeta bool
 }
@@ -34,14 +33,14 @@ func getSessionFileCacheEntry(filePath string) (sessionFileCacheEntry, os.FileIn
 		sessionFileCache.mu.Unlock()
 		return sessionFileCacheEntry{}, nil, false, err
 	}
-	mtime := info.ModTime()
+	fileKey := newFileCacheKey(filePath, info)
 	sessionFileCache.mu.Lock()
 	entry, ok := sessionFileCache.entries[filePath]
 	sessionFileCache.mu.Unlock()
-	if ok && entry.mtime.Equal(mtime) {
+	if ok && entry.fileKey == fileKey {
 		return entry, info, true, nil
 	}
-	return sessionFileCacheEntry{mtime: mtime}, info, false, nil
+	return sessionFileCacheEntry{fileKey: fileKey}, info, false, nil
 }
 
 func setSessionFileCacheEntry(filePath string, entry sessionFileCacheEntry) {
@@ -60,8 +59,8 @@ func readSessionFileMetaCachedContext(ctx context.Context, filePath string) (ses
 	}
 	entry, info, ok, err := getSessionFileCacheEntry(filePath)
 	if err != nil {
-		if !stagePersistentSessionMetaDelete(ctx, filePath) {
-			if delErr := deletePersistentSessionMetaContext(ctx, filePath); delErr != nil {
+		if !stageCatalogSessionMetaDelete(ctx, filePath) {
+			if delErr := deleteCatalogSessionMeta(ctx, filePath); isContextError(delErr) {
 				return sessionFileMeta{}, delErr
 			}
 		}
@@ -70,23 +69,64 @@ func readSessionFileMetaCachedContext(ctx context.Context, filePath string) (ses
 	if ok && entry.hasMeta {
 		return entry.meta, nil
 	}
-	if meta, ok, err := readPersistentSessionMetaContext(ctx, filePath, info); err != nil {
-		return sessionFileMeta{}, err
-	} else if ok {
+	store, storeErr := currentCatalogSQLiteStore(filePath)
+	if isContextError(storeErr) {
+		return sessionFileMeta{}, storeErr
+	}
+	var cached catalogSessionMetaEntry
+	var found bool
+	if storeErr == nil {
+		cached, found, err = store.loadSessionMeta(ctx, filePath)
+		if isContextError(err) {
+			return sessionFileMeta{}, err
+		}
+		if err != nil {
+			found = false
+		}
+	}
+	if found && cached.parsedOffset == info.Size() && matchesFileInfo(filePath, info, cached.fileKey) {
+		entry.meta = cached.meta
+		entry.hasMeta = true
+		setSessionFileCacheEntry(filePath, entry)
+		return cached.meta, nil
+	}
+
+	completeOffset, complete := sessionPreviewCompleteOffset(filePath, info)
+	if !complete || completeOffset < info.Size() {
+		meta, readErr := readSessionFileMetaContext(ctx, filePath)
+		if readErr != nil {
+			return meta, readErr
+		}
 		entry.meta = meta
 		entry.hasMeta = true
 		setSessionFileCacheEntry(filePath, entry)
 		return meta, nil
 	}
-	meta, err := readSessionFileMetaContext(ctx, filePath)
+
+	meta := sessionFileMeta{}
+	startOffset := int64(0)
+	if found && canAppendCacheFile(filePath, info, cached.fileKey, cached.parsedOffset, cached.prefixTailHash, cached.prefixTailSize) {
+		meta = cached.meta
+		startOffset = cached.parsedOffset
+	}
+	meta, err = readSessionFileMetaWindowContext(ctx, filePath, startOffset, completeOffset-startOffset, meta)
 	if err != nil {
 		return meta, err
 	}
 	entry.meta = meta
 	entry.hasMeta = true
 	setSessionFileCacheEntry(filePath, entry)
-	if !stagePersistentSessionMetaWrite(ctx, filePath, info, meta) {
-		if err := writePersistentSessionMetaContext(ctx, filePath, info, meta); err != nil {
+	hash, hashSize, _ := sessionPreviewPrefixTailHash(filePath, completeOffset)
+	catalogEntry := catalogSessionMetaEntry{
+		path:           filePath,
+		fileKey:        newFileCacheKey(filePath, info),
+		parsedOffset:   completeOffset,
+		prefixTailHash: hash,
+		prefixTailSize: hashSize,
+		meta:           meta,
+	}
+	if !stageCatalogSessionMeta(ctx, catalogEntry) {
+		if err := writeCatalogSessionMeta(ctx, catalogEntry); isContextError(err) {
 			return meta, err
 		}
 	}

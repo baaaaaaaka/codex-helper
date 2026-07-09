@@ -105,25 +105,35 @@ func TestSessionPreviewSQLiteExactHitDoesNotWriteAndAppendIsBatched(t *testing.T
 	resetSessionPreviewSQLiteWriteCounters(t, store)
 	fourth, err := ReadSessionPreviewText(path, 0, 0)
 	if err != nil {
-		t.Fatalf("delayed flush read: %v", err)
+		t.Fatalf("delayed exact read: %v", err)
 	}
 	if fourth != third {
-		t.Fatalf("flushed preview changed: got %q want %q", fourth, third)
+		t.Fatalf("delayed preview changed: got %q want %q", fourth, third)
 	}
-	if commits != 2 {
-		t.Fatalf("delayed append commits = %d, want 2", commits)
+	if commits != 1 {
+		t.Fatalf("unchanged delayed read committed cache: got %d want 1", commits)
 	}
-	if writes := sessionPreviewSQLiteWritePages(t, store, false); writes <= 0 || writes > 5 {
-		t.Fatalf("small visible append cache writes = %d pages, want 1..5", writes)
+	assertSessionPreviewSQLiteWritePages(t, store, 0)
+
+	appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:03Z","type":"response_item","payload":{"id":"answer-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"new answer"}]}}`)
+	fifth, err := ReadSessionPreviewText(path, 0, 0)
+	if err != nil {
+		t.Fatalf("next append flush: %v", err)
+	}
+	if !strings.Contains(fifth, "new answer") || commits != 2 {
+		t.Fatalf("next append preview=%q commits=%d", fifth, commits)
+	}
+	if writes := sessionPreviewSQLiteWritePages(t, store, false); writes <= 0 || writes > 6 {
+		t.Fatalf("coalesced visible append cache writes = %d pages, want 1..6", writes)
 	}
 
 	resetSessionPreviewSQLiteForTest()
-	fifth, err := ReadSessionPreviewText(path, 0, 0)
+	sixth, err := ReadSessionPreviewText(path, 0, 0)
 	if err != nil {
 		t.Fatalf("cold sqlite reload: %v", err)
 	}
-	if fifth != fourth {
-		t.Fatalf("cold sqlite preview = %q, want %q", fifth, fourth)
+	if sixth != fifth {
+		t.Fatalf("cold sqlite preview = %q, want %q", sixth, fifth)
 	}
 	if commits != 2 {
 		t.Fatalf("cold exact hit added a commit: got %d want 2", commits)
@@ -136,10 +146,11 @@ func TestSessionPreviewSQLiteExactHitDoesNotWriteAndAppendIsBatched(t *testing.T
 	if _, err := os.Stat(sqlitePath); err != nil {
 		t.Fatalf("sqlite cache missing: %v", err)
 	}
-	jsonPath, err := sessionPreviewCacheFile()
+	legacyDir, err := legacyLocalPersistentCacheDir()
 	if err != nil {
 		t.Fatal(err)
 	}
+	jsonPath := filepath.Join(legacyDir, "session_preview_cache.json")
 	if _, err := os.Stat(jsonPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy JSON cache unexpectedly written: %v", err)
 	}
@@ -190,6 +201,9 @@ func TestSessionPreviewSQLitePersistsHiddenTailOffset(t *testing.T) {
 func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
+	previousDelay := sessionPreviewAppendFlushDelay
+	sessionPreviewAppendFlushDelay = 0
+	t.Cleanup(func() { sessionPreviewAppendFlushDelay = previousDelay })
 
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"first"}]}}` + "\n"
@@ -240,14 +254,23 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 	if err := storeOne.append(entryOne, key, completeOffset, hash, hashSize, tail, delta); err != nil {
 		t.Fatalf("writer one append: %v", err)
 	}
+	text, err := ReadSessionPreviewText(path, 0, 0)
+	if err != nil || !strings.Contains(text, "second") {
+		t.Fatalf("stale in-memory writer refresh: text=%q err=%v", text, err)
+	}
+	memoryKey := sessionPreviewSQLiteMemoryKey(storeOne.path, path)
+	sessionPreviewSQLiteState.mu.Lock()
+	memory, memoryOK := sessionPreviewSQLiteState.memory[memoryKey]
+	sessionPreviewSQLiteState.mu.Unlock()
+	if !memoryOK || !matchesFileInfo(path, info, memory.fileKey) || !strings.Contains(memory.text, "second") {
+		t.Fatalf("stale writer retained obsolete memory: ok=%v entry=%#v", memoryOK, memory)
+	}
 	resetSessionPreviewSQLiteWriteCounters(t, storeTwo)
 	if err := storeTwo.append(entryTwo, key, completeOffset, hash, hashSize, tail, delta); !errors.Is(err, errSessionPreviewSQLiteConflict) {
 		t.Fatalf("writer two error = %v, want conflict", err)
 	}
 	assertSessionPreviewSQLiteWritePages(t, storeTwo, 0)
-	if frames := sessionPreviewSQLiteWALFrames(t, storeTwo); frames != 0 {
-		t.Fatalf("stale writer produced %d WAL frames", frames)
-	}
+	assertSessionPreviewSQLiteNoSidecars(t, storeTwo.path)
 
 	stored, ok, err := storeOne.load(path, true, true)
 	if err != nil || !ok {
@@ -256,6 +279,46 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 	if len(stored.messages) != 2 || stored.messages[1].Content != "second" {
 		t.Fatalf("stored messages = %#v", stored.messages)
 	}
+}
+
+func TestSessionPreviewSQLiteColdReplaceRejectsSecondWriterWithoutWriting(t *testing.T) {
+	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+	setTestUserCacheDir(t)
+	path := filepath.Join(t.TempDir(), "cold-session.jsonl")
+	body := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"cold"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	storeOne, err := currentSessionPreviewSQLiteStoreForSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbTwo, err := openSessionPreviewSQLite(storeOne.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbTwo.Close()
+	storeTwo := &sessionPreviewSQLiteStore{path: storeOne.path, db: dbTwo}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := newMessageSeenState()
+	messages, err := readSessionMessagesWindow(path, 0, info.Size(), 0, projectPreviewMessage, seen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, hashSize, _ := sessionPreviewPrefixTailHash(path, info.Size())
+	key := newFileCacheKey(path, info)
+	if err := storeOne.replace(sessionPreviewSQLiteEntry{}, false, path, key, info.Size(), hash, hashSize, messages, seen); err != nil {
+		t.Fatal(err)
+	}
+	resetSessionPreviewSQLiteWriteCounters(t, storeTwo)
+	if err := storeTwo.replace(sessionPreviewSQLiteEntry{}, false, path, key, info.Size(), hash, hashSize, messages, seen); !errors.Is(err, errSessionPreviewSQLiteConflict) {
+		t.Fatalf("second cold writer error = %v, want conflict", err)
+	}
+	assertSessionPreviewSQLiteWritePages(t, storeTwo, 0)
+	assertSessionPreviewSQLiteNoSidecars(t, storeTwo.path)
 }
 
 func TestSessionPreviewSQLiteMultiProcessAppendIsIdempotent(t *testing.T) {
@@ -425,9 +488,6 @@ func TestSessionPreviewSQLiteBusyWriterFallsBackWithoutLosingPreview(t *testing.
 		t.Fatalf("preview waited %s for disposable cache writer", elapsed)
 	}
 	assertSessionPreviewSQLiteWritePages(t, store, 0)
-	if frames := sessionPreviewSQLiteWALFrames(t, store); frames != 0 {
-		t.Fatalf("busy fallback produced %d WAL frames", frames)
-	}
 	if _, err := lockConn.ExecContext(context.Background(), `ROLLBACK`); err != nil {
 		t.Fatal(err)
 	}
@@ -580,13 +640,16 @@ func TestSessionPreviewSQLiteArtifactsArePrivateAndRejectSymlinks(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, suffix := range []string{"", "-wal", "-shm"} {
-			info, err := os.Lstat(store.path + suffix)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if info.Mode().Perm() != 0o600 {
-				t.Fatalf("artifact %q mode = %o, want 600", store.path+suffix, info.Mode().Perm())
+		info, err := os.Lstat(store.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("artifact %q mode = %o, want 600", store.path, info.Mode().Perm())
+		}
+		for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+			if _, err := os.Lstat(store.path + suffix); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rollback cache left sidecar %q: %v", store.path+suffix, err)
 			}
 		}
 	})
@@ -637,21 +700,15 @@ func TestSessionPreviewSQLitePragmas(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA journal_mode`).Scan(&journal); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.EqualFold(journal, "wal") {
-		t.Fatalf("journal_mode = %q, want wal", journal)
+	if !strings.EqualFold(journal, "delete") {
+		t.Fatalf("journal_mode = %q, want delete", journal)
 	}
-	var synchronous, autocheckpoint, busyTimeout, applicationID int
+	var synchronous, busyTimeout, applicationID, version int
 	if err := store.db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
 		t.Fatal(err)
 	}
 	if synchronous != 1 {
 		t.Fatalf("synchronous = %d, want NORMAL/1", synchronous)
-	}
-	if err := store.db.QueryRow(`PRAGMA wal_autocheckpoint`).Scan(&autocheckpoint); err != nil {
-		t.Fatal(err)
-	}
-	if autocheckpoint != sessionPreviewSQLiteAutoCheckpointPages {
-		t.Fatalf("wal_autocheckpoint = %d, want %d", autocheckpoint, sessionPreviewSQLiteAutoCheckpointPages)
 	}
 	if err := store.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
 		t.Fatal(err)
@@ -665,26 +722,11 @@ func TestSessionPreviewSQLitePragmas(t *testing.T) {
 	if applicationID != sessionPreviewSQLiteApplicationID {
 		t.Fatalf("application_id = %d, want %d", applicationID, sessionPreviewSQLiteApplicationID)
 	}
-	conn, err := store.db.Conn(context.Background())
-	if err != nil {
+	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	if err := conn.Raw(func(driverConn any) error {
-		fileControl, ok := driverConn.(sqlite.FileControl)
-		if !ok {
-			return errors.New("sqlite driver does not support persistent WAL")
-		}
-		mode, err := fileControl.FileControlPersistWAL("main", -1)
-		if err != nil {
-			return err
-		}
-		if mode != 1 {
-			return fmt.Errorf("persistent WAL mode = %d, want 1", mode)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	if version != cacheVersion {
+		t.Fatalf("user_version = %d, want unified cache version %d", version, cacheVersion)
 	}
 }
 
@@ -714,7 +756,7 @@ func TestSessionPreviewSQLiteMissingAndIncompleteSourcesDoNotCreateDatabase(t *t
 	})
 }
 
-func TestSessionPreviewSQLitePersistentSidecarsAvoidCloseReopenChurn(t *testing.T) {
+func TestSessionPreviewSQLiteRollbackCloseReopenHasNoSidecars(t *testing.T) {
 	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
 	path := filepath.Join(t.TempDir(), "session.jsonl")
@@ -731,10 +773,8 @@ func TestSessionPreviewSQLitePersistentSidecarsAvoidCloseReopenChurn(t *testing.
 	}
 	resetSessionPreviewSQLiteWriteCounters(t, store)
 	beforeClose := sessionPreviewCacheFileStates(t, store.path)
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if _, ok := beforeClose[filepath.Base(store.path+suffix)]; !ok {
-			t.Fatalf("persistent cache file %q is missing before close", store.path+suffix)
-		}
+	if len(beforeClose) != 1 {
+		t.Fatalf("rollback cache files before close = %v, want only main database", beforeClose)
 	}
 
 	resetSessionPreviewSQLiteForTest()
@@ -769,9 +809,6 @@ func TestSessionPreviewSQLiteRepeatedExactHitsDoNotGrowCacheFiles(t *testing.T) 
 
 	store, err := currentSessionPreviewSQLiteStore()
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
 		t.Fatal(err)
 	}
 	before := sessionPreviewCacheFileStates(t, store.path)
@@ -826,6 +863,7 @@ func TestSessionPreviewSQLiteMemoryAndDirtyStateAreBounded(t *testing.T) {
 			nil,
 			fmt.Sprintf("preview-%04d", index),
 			false,
+			nil,
 		)
 	}
 	sessionPreviewSQLiteState.mu.Lock()
@@ -838,7 +876,7 @@ func TestSessionPreviewSQLiteMemoryAndDirtyStateAreBounded(t *testing.T) {
 	if memoryBytes <= 0 || memoryBytes > sessionPreviewSQLiteMemoryMaxBytes {
 		t.Fatalf("memory bytes = %d, want within 1..%d", memoryBytes, sessionPreviewSQLiteMemoryMaxBytes)
 	}
-	storeSessionPreviewSQLiteMemory(storePath, "/session/too-large.jsonl", fileCacheKey{}, nil, strings.Repeat("x", int(sessionPreviewSQLiteMemoryMaxBytes)+1), false)
+	storeSessionPreviewSQLiteMemory(storePath, "/session/too-large.jsonl", fileCacheKey{}, nil, strings.Repeat("x", int(sessionPreviewSQLiteMemoryMaxBytes)+1), false, nil)
 	sessionPreviewSQLiteState.mu.Lock()
 	afterOversize := len(sessionPreviewSQLiteState.memory)
 	sessionPreviewSQLiteState.mu.Unlock()
@@ -904,7 +942,7 @@ func TestSessionPreviewSQLiteAppendDoesNotRunSessionPruning(t *testing.T) {
 	}
 }
 
-func TestSessionPreviewSQLiteAppendWritesOnlyBoundedWALDelta(t *testing.T) {
+func TestSessionPreviewSQLiteAppendWritesOnlyBoundedRollbackDelta(t *testing.T) {
 	t.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
 	setTestUserCacheDir(t)
 	path := filepath.Join(t.TempDir(), "session.jsonl")
@@ -919,7 +957,9 @@ func TestSessionPreviewSQLiteAppendWritesOnlyBoundedWALDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	resetSessionPreviewSQLiteWriteCounters(t, store)
+	before, err := os.Stat(store.path)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -929,16 +969,23 @@ func TestSessionPreviewSQLiteAppendWritesOnlyBoundedWALDelta(t *testing.T) {
 	if err != nil || !strings.Contains(text, payload[:128]) {
 		t.Fatalf("append preview: len=%d err=%v", len(text), err)
 	}
-	walInfo, err := os.Stat(store.path + "-wal")
+	after, err := os.Stat(store.path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if walInfo.Size() <= 0 || walInfo.Size() > 1024*1024 {
-		t.Fatalf("64 KiB append WAL size = %d, want a bounded delta under 1 MiB", walInfo.Size())
+	if growth := after.Size() - before.Size(); growth < int64(len(payload)) || growth > 1024*1024 {
+		t.Fatalf("64 KiB append database growth = %d, want payload-sized growth under 1 MiB", growth)
+	}
+	if pages := sessionPreviewSQLiteWritePages(t, store, false); pages <= 0 || pages > 24 {
+		t.Fatalf("64 KiB append wrote %d database pages, want 1..24", pages)
+	}
+	assertSessionPreviewSQLiteNoSidecars(t, store.path)
+	if _, err := os.Stat(store.path + "-journal"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rollback journal survived commit: %v", err)
 	}
 }
 
-func TestSessionPreviewSQLiteLargeAppendDefersCheckpointAndStaysNearPayloadPages(t *testing.T) {
+func TestSessionPreviewSQLiteLargeAppendStaysNearPayloadPages(t *testing.T) {
 	forceImmediateSessionPreviewFlush(t)
 	path, store := newSessionPreviewCachedFile(t, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"stable"}]}}`+"\n")
 	resetSessionPreviewSQLiteWriteCounters(t, store)
@@ -952,37 +999,23 @@ func TestSessionPreviewSQLiteLargeAppendDefersCheckpointAndStaysNearPayloadPages
 	if _, err := ReadSessionPreviewText(path, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	frames := sessionPreviewSQLiteWALFrames(t, store)
 	writes := sessionPreviewSQLiteWritePages(t, store, false)
-	if frames != int64(writes) {
-		t.Fatalf("WAL frames = %d, cache writes = %d", frames, writes)
-	}
 	var pageSize int64
 	if err := store.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
 		t.Fatal(err)
 	}
 	minimumPayloadPages := (int64(len(payload)) + pageSize - 1) / pageSize
-	if frames < minimumPayloadPages || frames > minimumPayloadPages+16 {
-		t.Fatalf("5 MiB append wrote %d frames, payload needs %d pages", frames, minimumPayloadPages)
-	}
-	if frames >= sessionPreviewSQLiteAutoCheckpointPages {
-		t.Fatalf("test append unexpectedly reached auto-checkpoint threshold: frames=%d threshold=%d", frames, sessionPreviewSQLiteAutoCheckpointPages)
+	if int64(writes) < minimumPayloadPages || int64(writes) > minimumPayloadPages+24 {
+		t.Fatalf("5 MiB append wrote %d pages, payload needs %d pages", writes, minimumPayloadPages)
 	}
 	mainAfter, err := os.Stat(store.path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mainAfter.Size() != mainBefore.Size() || mainAfter.ModTime() != mainBefore.ModTime() {
-		t.Fatalf("main database changed before checkpoint: before=%+v after=%+v", mainBefore, mainAfter)
+	if growth := mainAfter.Size() - mainBefore.Size(); growth < int64(len(payload)) || growth > int64(len(payload))+32*pageSize {
+		t.Fatalf("main database growth = %d, payload=%d page_size=%d", growth, len(payload), pageSize)
 	}
-
-	var busy, logged, checkpointed int64
-	if err := store.db.QueryRow(`PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logged, &checkpointed); err != nil {
-		t.Fatal(err)
-	}
-	if busy != 0 || logged != frames || checkpointed != frames {
-		t.Fatalf("checkpoint result busy=%d logged=%d checkpointed=%d frames=%d", busy, logged, checkpointed, frames)
-	}
+	assertSessionPreviewSQLiteNoSidecars(t, store.path)
 }
 
 func TestSessionPreviewSQLiteWriteBudgetByMutation(t *testing.T) {
@@ -1077,6 +1110,29 @@ func TestSessionPreviewSQLiteWriteBudgetByMutation(t *testing.T) {
 		assertSessionPreviewSQLiteMutationBudget(t, metrics, 3, 6)
 	})
 
+	t.Run("early rewrite followed by append", func(t *testing.T) {
+		first := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"old answer"}]}}` + "\n"
+		padding := `{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"function_call_output","output":"` + strings.Repeat("x", 96*1024) + `"}}` + "\n"
+		path, _ := newSessionPreviewCachedFile(t, first+padding)
+
+		replacement := strings.Replace(first, "old answer", "new answer", 1) + padding
+		if len(replacement) != len(first+padding) {
+			t.Fatal("fixed-size rewrite changed source length")
+		}
+		if err := os.WriteFile(path, []byte(replacement), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		appendPreviewLine(t, path, `{"timestamp":"2026-01-01T00:00:02Z","type":"response_item","payload":{"id":"answer-2","type":"message","role":"assistant","content":[{"type":"output_text","text":"appended answer"}]}}`)
+
+		text, err := ReadSessionPreviewText(path, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(text, "new answer") || !strings.Contains(text, "appended answer") || strings.Contains(text, "old answer") {
+			t.Fatalf("rewrite-plus-append preview = %q", text)
+		}
+	})
+
 	t.Run("missing after warm cache", func(t *testing.T) {
 		path, store := newSessionPreviewCachedFile(t, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"stable"}]}}`+"\n")
 		metrics := measureSessionPreviewSQLiteMutation(t, store, func() {
@@ -1102,14 +1158,14 @@ func TestSessionPreviewSQLiteFiveSecondRefreshesCoalesceWrites(t *testing.T) {
 			line: func(index int) string {
 				return fmt.Sprintf(`{"timestamp":"2026-01-01T00:00:%02dZ","type":"response_item","payload":{"id":"answer-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer %d"}]}}`, index+1, index+2, index+2)
 			},
-			wantPages: 3,
+			wantPages: 4,
 		},
 		{
 			name: "hidden messages",
 			line: func(index int) string {
 				return fmt.Sprintf(`{"timestamp":"2026-01-01T00:00:%02dZ","type":"response_item","payload":{"type":"function_call_output","output":"hidden %d"}}`, index+1, index+1)
 			},
-			wantPages: 1,
+			wantPages: 2,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1140,9 +1196,7 @@ func TestSessionPreviewSQLiteFiveSecondRefreshesCoalesceWrites(t *testing.T) {
 			if pages := sessionPreviewSQLiteWritePages(t, store, false); pages != test.wantPages {
 				t.Fatalf("coalesced page writes = %d, want %d", pages, test.wantPages)
 			}
-			if frames := sessionPreviewSQLiteWALFrames(t, store); frames != int64(test.wantPages) {
-				t.Fatalf("coalesced WAL frames = %d, want %d", frames, test.wantPages)
-			}
+			assertSessionPreviewSQLiteNoSidecars(t, store.path)
 		})
 	}
 }
@@ -1162,10 +1216,10 @@ func TestSessionPreviewSQLiteAppendWriteBudgetDoesNotScaleWithOtherSessions(t *t
 	}
 	t.Run("baseline", func(t *testing.T) { baseline = measure(t, 0) })
 	t.Run("500 unrelated sessions", func(t *testing.T) { populated = measure(t, 500) })
-	if baseline.writePages != populated.writePages || baseline.walFrames != populated.walFrames {
+	if baseline.writePages != populated.writePages {
 		t.Fatalf("append write budget scaled with unrelated cache: baseline=%+v populated=%+v", baseline, populated)
 	}
-	if baseline.writePages != 3 || baseline.commits != 1 {
+	if baseline.writePages != 4 || baseline.commits != 1 {
 		t.Fatalf("unexpected baseline append budget: %+v", baseline)
 	}
 }
@@ -1252,12 +1306,7 @@ func TestSessionPreviewSQLiteSyscallProbe(t *testing.T) {
 
 func BenchmarkSessionPreviewSQLiteWarmLoadLargeVisible(b *testing.B) {
 	b.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
-	cacheDir := b.TempDir()
-	b.Setenv("XDG_CACHE_HOME", cacheDir)
-	b.Setenv("HOME", cacheDir)
-	b.Setenv("LOCALAPPDATA", cacheDir)
-	resetPersistentCacheStatesForTest()
-	b.Cleanup(resetPersistentCacheStatesForTest)
+	setBenchmarkUserCacheDir(b)
 
 	path := filepath.Join(b.TempDir(), "large-visible-session.jsonl")
 	var body strings.Builder
@@ -1284,12 +1333,7 @@ func BenchmarkSessionPreviewSQLiteWarmLoadLargeVisible(b *testing.B) {
 
 func BenchmarkSessionPreviewSQLiteColdOpenLargeVisible(b *testing.B) {
 	b.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
-	cacheDir := b.TempDir()
-	b.Setenv("XDG_CACHE_HOME", cacheDir)
-	b.Setenv("HOME", cacheDir)
-	b.Setenv("LOCALAPPDATA", cacheDir)
-	resetPersistentCacheStatesForTest()
-	b.Cleanup(resetPersistentCacheStatesForTest)
+	setBenchmarkUserCacheDir(b)
 
 	path := filepath.Join(b.TempDir(), "large-visible-session.jsonl")
 	var body strings.Builder
@@ -1315,7 +1359,38 @@ func BenchmarkSessionPreviewSQLiteColdOpenLargeVisible(b *testing.B) {
 	}
 }
 
-func appendPreviewLine(t *testing.T, path string, line string) {
+func BenchmarkSessionPreviewSQLiteSmallAppendLargeVisible(b *testing.B) {
+	b.Setenv(envSessionPreviewCacheBackend, sessionPreviewBackendSQLite)
+	setBenchmarkUserCacheDir(b)
+	previousDelay := sessionPreviewAppendFlushDelay
+	sessionPreviewAppendFlushDelay = 0
+	b.Cleanup(func() { sessionPreviewAppendFlushDelay = previousDelay })
+
+	path := filepath.Join(b.TempDir(), "large-visible-append.jsonl")
+	var body strings.Builder
+	content := strings.Repeat("preview payload ", 16)
+	for index := 0; index < 8800; index++ {
+		fmt.Fprintf(&body, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"%s %d"}]}}`+"\n", index, content, index)
+	}
+	if err := os.WriteFile(path, []byte(body.String()), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	if text, err := ReadSessionPreviewText(path, 0, 0); err != nil || text == "" {
+		b.Fatalf("warm cache: text=%d err=%v", len(text), err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		appendPreviewLine(b, path, fmt.Sprintf(`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"id":"tail-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"small tail %d"}]}}`, index, index))
+		text, err := ReadSessionPreviewText(path, 0, 0)
+		if err != nil || !strings.Contains(text, "small tail") {
+			b.Fatalf("append cache: text=%d err=%v", len(text), err)
+		}
+	}
+}
+
+func appendPreviewLine(t testing.TB, path string, line string) {
 	t.Helper()
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
@@ -1338,13 +1413,12 @@ type sessionPreviewCacheFileState struct {
 type sessionPreviewSQLiteMutationMetrics struct {
 	commits    int
 	writePages int
-	walFrames  int64
 }
 
 func sessionPreviewCacheFileStates(t *testing.T, path string) map[string]sessionPreviewCacheFileState {
 	t.Helper()
 	states := make(map[string]sessionPreviewCacheFileState)
-	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 		info, err := os.Stat(candidate)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -1363,7 +1437,7 @@ func assertSessionPreviewSQLiteDatabaseAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, candidate := range []string{path, path + "-wal", path + "-shm"} {
+	for _, candidate := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 		if _, err := os.Stat(candidate); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("unexpected SQLite cache file %q: %v", candidate, err)
 		}
@@ -1380,12 +1454,6 @@ func assertNoSessionPreviewSidecarChurn(t *testing.T, before map[string]sessionP
 		if !ok {
 			t.Fatalf("cache file %q disappeared: before=%v after=%v", name, before, after)
 		}
-		if strings.HasSuffix(name, "-shm") {
-			if initial.size != current.size {
-				t.Fatalf("shared-memory sidecar %q changed size: before=%+v after=%+v", name, initial, current)
-			}
-			continue
-		}
 		if initial != current {
 			t.Fatalf("cache file %q changed: before=%+v after=%+v", name, initial, current)
 		}
@@ -1394,9 +1462,6 @@ func assertNoSessionPreviewSidecarChurn(t *testing.T, before map[string]sessionP
 
 func resetSessionPreviewSQLiteWriteCounters(t *testing.T, store *sessionPreviewSQLiteStore) {
 	t.Helper()
-	if _, err := store.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		t.Fatal(err)
-	}
 	resetSessionPreviewSQLiteDBStatus(t, store)
 }
 
@@ -1443,25 +1508,13 @@ func sessionPreviewSQLiteDBStatus(t *testing.T, store *sessionPreviewSQLiteStore
 	return current
 }
 
-func sessionPreviewSQLiteWALFrames(t *testing.T, store *sessionPreviewSQLiteStore) int64 {
+func assertSessionPreviewSQLiteNoSidecars(t *testing.T, path string) {
 	t.Helper()
-	info, err := os.Stat(store.path + "-wal")
-	if err != nil {
-		t.Fatal(err)
+	for _, suffix := range []string{"-journal", "-wal", "-shm"} {
+		if _, err := os.Stat(path + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unexpected SQLite sidecar %q: %v", path+suffix, err)
+		}
 	}
-	if info.Size() == 0 {
-		return 0
-	}
-	var pageSize int64
-	if err := store.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
-		t.Fatal(err)
-	}
-	const walHeaderBytes int64 = 32
-	const walFrameHeaderBytes int64 = 24
-	if info.Size() < walHeaderBytes || (info.Size()-walHeaderBytes)%(pageSize+walFrameHeaderBytes) != 0 {
-		t.Fatalf("unexpected WAL size %d for page size %d", info.Size(), pageSize)
-	}
-	return (info.Size() - walHeaderBytes) / (pageSize + walFrameHeaderBytes)
 }
 
 func newSessionPreviewCachedFile(t *testing.T, body string) (string, *sessionPreviewSQLiteStore) {
@@ -1529,13 +1582,12 @@ func measureSessionPreviewSQLiteMutation(t *testing.T, store *sessionPreviewSQLi
 	return sessionPreviewSQLiteMutationMetrics{
 		commits:    commits,
 		writePages: sessionPreviewSQLiteWritePages(t, store, false),
-		walFrames:  sessionPreviewSQLiteWALFrames(t, store),
 	}
 }
 
 func assertSessionPreviewSQLiteMutationBudget(t *testing.T, metrics sessionPreviewSQLiteMutationMetrics, minPages int, maxPages int) {
 	t.Helper()
-	t.Logf("SQLite preview mutation metrics: commits=%d page-writes=%d WAL-frames=%d", metrics.commits, metrics.writePages, metrics.walFrames)
+	t.Logf("SQLite preview mutation metrics: commits=%d page-writes=%d", metrics.commits, metrics.writePages)
 	wantCommits := 0
 	if maxPages > 0 {
 		wantCommits = 1
@@ -1545,8 +1597,5 @@ func assertSessionPreviewSQLiteMutationBudget(t *testing.T, metrics sessionPrevi
 	}
 	if metrics.writePages < minPages || metrics.writePages > maxPages {
 		t.Fatalf("page writes = %d, want %d..%d; metrics=%+v", metrics.writePages, minPages, maxPages, metrics)
-	}
-	if metrics.walFrames != int64(metrics.writePages) {
-		t.Fatalf("WAL frames = %d, page writes = %d; metrics=%+v", metrics.walFrames, metrics.writePages, metrics)
 	}
 }

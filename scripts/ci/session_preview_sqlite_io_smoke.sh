@@ -19,3 +19,11 @@ env CXP_SESSION_PREVIEW_IO_PROBE=1 \
       -test.run '^TestSessionPreviewSQLiteSyscallProbe$' -test.count=1 -test.v
 
 python3 "$repo_root/scripts/ci/verify_session_preview_sqlite_io.py" "$tmp_dir/trace.log"
+
+env CXP_CATALOG_IO_PROBE=1 \
+  strace -f -yy -s 256 -o "$tmp_dir/catalog-trace.log" \
+    -e trace=pwrite64,write,writev,fdatasync,fsync,ftruncate,unlink,unlinkat,rename,renameat,mkdir,mkdirat,chmod,fchmodat,msync \
+    "$tmp_dir/codexhistory-preview-io.test" \
+      -test.run '^TestCatalogSQLiteSyscallProbe$' -test.count=1 -test.v
+
+python3 "$repo_root/scripts/ci/verify_codexhistory_catalog_sqlite_io.py" "$tmp_dir/catalog-trace.log"
