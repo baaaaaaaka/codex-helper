@@ -14,6 +14,58 @@ foreach ($name in @("CXP_RUNTIME", "CXP_RUNTIME_ROOT", "CXP_RUNTIME_VERSION", "C
   Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
 }
 
+function Assert-FreshLauncherDispatchesActiveRuntime {
+  $fixture = Join-Path $root "fresh-launch-restart"
+  $entry = Join-Path $fixture "cxp.exe"
+  $runtimeRoot = Join-Path $fixture ".cxp-runtime"
+  $oldVersion = "0.1.13-rc.9001"
+  $targetVersion = "0.1.13-rc.9002"
+  $oldRuntime = Join-Path $runtimeRoot "versions\v$oldVersion\cxp.exe"
+  $targetRuntime = Join-Path $runtimeRoot "versions\v$targetVersion\cxp.exe"
+
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $oldRuntime),(Split-Path -Parent $targetRuntime) | Out-Null
+  Push-Location $repoRoot
+  try {
+    & go build -trimpath `
+      -ldflags "-X github.com/baaaaaaaka/codex-helper/internal/cli.version=$oldVersion" `
+      -o $entry `
+      .\cmd\codex-proxy
+    Copy-Item -Force -LiteralPath $entry -Destination $oldRuntime
+    & go build -trimpath `
+      -ldflags "-X github.com/baaaaaaaka/codex-helper/internal/cli.version=$targetVersion" `
+      -o $targetRuntime `
+      .\cmd\codex-proxy
+  } finally {
+    Pop-Location
+  }
+  Set-Content -LiteralPath (Join-Path $runtimeRoot "active") -NoNewline -Value "v$targetVersion"
+
+  try {
+    $env:CXP_RUNTIME = "1"
+    $env:CXP_RUNTIME_ROOT = $runtimeRoot
+    $env:CXP_RUNTIME_VERSION = "v$oldVersion"
+    $env:CXP_ENTRY_PATH = $entry
+    $staleOutput = (& $entry --version | Out-String)
+    $staleOutput | Write-Host
+    if ($staleOutput -notmatch [regex]::Escape($oldVersion)) {
+      throw "runtime-marked launcher did not stay pinned to $oldVersion`: $staleOutput"
+    }
+  } finally {
+    foreach ($name in @("CXP_RUNTIME", "CXP_RUNTIME_ROOT", "CXP_RUNTIME_VERSION", "CXP_ENTRY_PATH", "CXP_RUNTIME_DISABLE", "CXP_RUNTIME_FORCE")) {
+      Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+    }
+  }
+
+  $freshOutput = (& $entry --version | Out-String)
+  $freshOutput | Write-Host
+  if ($freshOutput -notmatch [regex]::Escape($targetVersion)) {
+    throw "fresh stable launcher did not dispatch active runtime $targetVersion`: $freshOutput"
+  }
+  if ((Get-Content -Raw (Join-Path $runtimeRoot "active")).Trim() -ne "v$targetVersion") {
+    throw "fresh stable launcher changed the active runtime pointer"
+  }
+}
+
 try {
   New-Item -ItemType Directory -Force -Path $root | Out-Null
   Push-Location $repoRoot
@@ -22,6 +74,8 @@ try {
   } finally {
     Pop-Location
   }
+
+  Assert-FreshLauncherDispatchesActiveRuntime
 
   $stdout = Join-Path $root "stdout.log"
   $stderr = Join-Path $root "stderr.log"

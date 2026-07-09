@@ -265,7 +265,7 @@ jobs:
           go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*)$' -v
           go test ./internal/candidateupdate -count=1 -v
           go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
-          go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
+          go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile|TeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart|TeamsAutoUpdateActivationAfterApply|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$' -v
 
       - name: Actual candidate-owned update and recovery (Linux/macOS)
         if: runner.os != 'Windows'

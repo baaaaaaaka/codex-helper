@@ -45,6 +45,63 @@ assert_process_clean() {
   fi
 }
 
+assert_fresh_launcher_dispatches_active_runtime() {
+  local fixture="$root/fresh-launch-restart"
+  local entry="$fixture/cxp"
+  local runtime_root="$fixture/.cxp-runtime"
+  local old_version="0.1.13-rc.9001"
+  local target_version="0.1.13-rc.9002"
+  local old_runtime="$runtime_root/versions/v$old_version/cxp"
+  local target_runtime="$runtime_root/versions/v$target_version/cxp"
+
+  mkdir -p "$(dirname "$old_runtime")" "$(dirname "$target_runtime")"
+  (
+    cd "$repo_root"
+    go build -trimpath \
+      -ldflags "-X github.com/baaaaaaaka/codex-helper/internal/cli.version=$old_version" \
+      -o "$entry" \
+      ./cmd/codex-proxy
+    install -m 0755 "$entry" "$old_runtime"
+    go build -trimpath \
+      -ldflags "-X github.com/baaaaaaaka/codex-helper/internal/cli.version=$target_version" \
+      -o "$target_runtime" \
+      ./cmd/codex-proxy
+  )
+  printf 'v%s\n' "$target_version" >"$runtime_root/active"
+
+  local stale_output
+  stale_output="$(
+    CXP_RUNTIME=1 \
+      CXP_RUNTIME_ROOT="$runtime_root" \
+      CXP_RUNTIME_VERSION="v$old_version" \
+      CXP_ENTRY_PATH="$entry" \
+      "$entry" --version
+  )"
+  printf '%s\n' "$stale_output"
+  if [[ "$stale_output" != *"$old_version"* ]]; then
+    echo "runtime-marked launcher did not stay pinned to $old_version" >&2
+    exit 1
+  fi
+
+  local fresh_output
+  fresh_output="$(
+    env \
+      -u CXP_RUNTIME \
+      -u CXP_RUNTIME_ROOT \
+      -u CXP_RUNTIME_VERSION \
+      -u CXP_ENTRY_PATH \
+      -u CXP_RUNTIME_DISABLE \
+      -u CXP_RUNTIME_FORCE \
+      "$entry" --version
+  )"
+  printf '%s\n' "$fresh_output"
+  if [[ "$fresh_output" != *"$target_version"* ]]; then
+    echo "fresh stable launcher did not dispatch active runtime $target_version" >&2
+    exit 1
+  fi
+  test "$(tr -d '\r\n' <"$runtime_root/active")" = "v$target_version"
+}
+
 wait_for_runtime() {
   local current_pid="$1"
   local active="$root/.cxp-runtime/active"
@@ -79,6 +136,8 @@ cd "$repo_root"
 go build -o "$root/cxp" ./cmd/codex-proxy
 cp "$root/cxp" "$root/codex-proxy"
 chmod 0755 "$root/cxp" "$root/codex-proxy"
+
+assert_fresh_launcher_dispatches_active_runtime
 
 for entry in cxp codex-proxy; do
   : >"$root/stdout.log"
