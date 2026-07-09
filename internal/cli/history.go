@@ -76,6 +76,7 @@ func newHistoryListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 		Short: "List discovered projects and sessions as JSON",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			defer func() { _ = codexhistory.CloseCaches() }()
 			paths, err := resolveEffectivePaths(root.configPath, *codexDir, "")
 			if err != nil {
 				return err
@@ -113,6 +114,7 @@ func newHistoryShowCmd(root *rootOptions, codexDir *string) *cobra.Command {
 		Short: "Print full history for a session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			defer func() { _ = codexhistory.CloseCaches() }()
 			sessionID := args[0]
 			paths, err := resolveEffectivePaths(root.configPath, *codexDir, "")
 			if err != nil {
@@ -139,6 +141,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 		Short: "Open a session in Codex",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			defer func() { _ = codexhistory.CloseCaches() }()
 			ctx, stop := withSignalContext(cmd.Context())
 			defer stop()
 

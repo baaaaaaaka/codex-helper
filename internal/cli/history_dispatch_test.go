@@ -567,6 +567,10 @@ func setupCodexHistoryDir(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0o755); err != nil {
 		t.Fatalf("create sessions dir: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = codexhistory.CloseCaches()
+		codexhistory.ResetCache()
+	})
 	return root
 }
 
