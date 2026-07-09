@@ -49,8 +49,8 @@ assert_fresh_launcher_dispatches_active_runtime() {
   local fixture="$root/fresh-launch-restart"
   local entry="$fixture/cxp"
   local runtime_root="$fixture/.cxp-runtime"
-  local old_version="0.1.13-rc.9001"
-  local target_version="0.1.13-rc.9002"
+  local old_version="0.1.13-rc.56"
+  local target_version="0.1.13-rc.57"
   local old_runtime="$runtime_root/versions/v$old_version/cxp"
   local target_runtime="$runtime_root/versions/v$target_version/cxp"
 

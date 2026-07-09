@@ -18,8 +18,8 @@ function Assert-FreshLauncherDispatchesActiveRuntime {
   $fixture = Join-Path $root "fresh-launch-restart"
   $entry = Join-Path $fixture "cxp.exe"
   $runtimeRoot = Join-Path $fixture ".cxp-runtime"
-  $oldVersion = "0.1.13-rc.9001"
-  $targetVersion = "0.1.13-rc.9002"
+  $oldVersion = "0.1.13-rc.56"
+  $targetVersion = "0.1.13-rc.57"
   $oldRuntime = Join-Path $runtimeRoot "versions\v$oldVersion\cxp.exe"
   $targetRuntime = Join-Path $runtimeRoot "versions\v$targetVersion\cxp.exe"
 
