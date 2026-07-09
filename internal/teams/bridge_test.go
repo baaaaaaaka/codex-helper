@@ -33931,6 +33931,13 @@ func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath stri
 		}}, nil
 	}
 	return func() {
+		// Direct history-watch tests do not enter Bridge.Listen, whose lifecycle
+		// normally owns this cleanup. Release the process-global cache before the
+		// test's temporary CODEX_DIR is removed; Windows correctly refuses to
+		// unlink an open SQLite database.
+		if err := codexhistory.CloseCaches(); err != nil {
+			t.Fatalf("Close codexhistory caches: %v", err)
+		}
 		discoverCodexProjectsForTeams = prevDiscover
 		discoverCodexSessionTestMu.Unlock()
 	}

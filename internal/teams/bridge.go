@@ -839,6 +839,16 @@ func (b *Bridge) markRegistrySent(chatID string, messageID string) {
 }
 
 func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
+	// codexhistory keeps SQLite handles open so repeated history discovery and
+	// preview reads stay cheap. A Teams listener is the lifetime owner of those
+	// process-global handles in service mode, so release them only when the
+	// listener exits. This is especially important on Windows, where an open
+	// database handle prevents cleanup or replacement of its CODEX_DIR.
+	defer func() {
+		if err := codexhistory.CloseCaches(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams history cache close skipped: %v\n", err)
+		}
+	}()
 	if opts.Interval <= 0 {
 		opts.Interval = 5 * time.Second
 	}
