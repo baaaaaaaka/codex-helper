@@ -372,7 +372,7 @@ func TestCatalogIdenticalConcurrentWritersCommitOnlyOnce(t *testing.T) {
 }
 
 func TestCacheV2DoesNotCreateJSONWALOrSHM(t *testing.T) {
-	base := setTestUserCacheDir(t)
+	setTestUserCacheDir(t)
 	root := os.Getenv(EnvCodexDir)
 	source := testSessionPath(t, root, "no-sidecars")
 	writeSessionMetaFile(t, source, "no-sidecars", root, "prompt")
@@ -382,7 +382,11 @@ func TestCacheV2DoesNotCreateJSONWALOrSHM(t *testing.T) {
 	if _, err := ReadSessionPreviewText(source, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	for _, tree := range []string{sharedPersistentCacheBase(root), filepath.Join(base, "codex-proxy", "codexhistory")} {
+	legacy, err := legacyLocalPersistentCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tree := range []string{sharedPersistentCacheBase(root), legacy} {
 		_ = filepath.WalkDir(tree, func(path string, entry os.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil
@@ -481,9 +485,12 @@ func TestCatalogBusyWriterFallsBackToSourcePromptly(t *testing.T) {
 }
 
 func TestCacheV2CleansKnownLegacyArtifactsButKeepsForeignShard(t *testing.T) {
-	base := setTestUserCacheDir(t)
+	setTestUserCacheDir(t)
 	root := os.Getenv(EnvCodexDir)
-	legacy := filepath.Join(base, "codex-proxy", "codexhistory")
+	legacy, err := legacyLocalPersistentCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.MkdirAll(legacy, 0o700); err != nil {
 		t.Fatal(err)
 	}
