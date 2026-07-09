@@ -129,7 +129,7 @@ func restartSelfWithExecutable(path string) error {
 	if err != nil {
 		return err
 	}
-	return restartSelfWithResolvedExecutable(exe)
+	return restartSelfWithResolvedExecutableAndEnv(exe, helperruntime.LauncherEnvironment(os.Environ()))
 }
 
 func restartSelfWithResolvedExecutable(exe string) error {
@@ -139,7 +139,7 @@ func restartSelfWithResolvedExecutable(exe string) error {
 func restartSelfWithResolvedExecutableAndEnv(exe string, env []string) error {
 	args := append([]string{exe}, os.Args[1:]...)
 	if runtime.GOOS == "windows" {
-		if err := startSelf(exe, args[1:]); err != nil {
+		if err := startSelf(exe, args[1:], env); err != nil {
 			return err
 		}
 		exitFunc(0)
@@ -180,8 +180,9 @@ func stripReloadBackupSuffix(path string) string {
 	return path
 }
 
-func startRestartProcess(exe string, args []string) error {
+func startRestartProcess(exe string, args []string, env []string) error {
 	c := exec.Command(exe, args...)
+	c.Env = env
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr

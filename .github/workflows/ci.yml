@@ -227,12 +227,12 @@ jobs:
           go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
           go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
 
-      - name: Reproduce Teams managed-runtime activation mismatch (Linux)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
+      - name: Teams managed-runtime activation and fresh restart
+        if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(TeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart|TeamsAutoUpdateActivationAfterApply|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$' -v
 
       - name: Actual candidate-owned update and recovery (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'

@@ -179,6 +179,10 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
 	}
+	activationPending, activationReason, err = teamsAutoUpdateActivationAfterApply(activationPending, activationReason, res)
+	if err != nil {
+		return teams.HelperAutoUpdateApplyResult{}, err
+	}
 	if res.RestartRequired {
 		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
 			return teams.HelperAutoUpdateApplyResult{}, err
@@ -203,6 +207,26 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 		ActivationPending:  activationPending,
 		ActivationReason:   activationReason,
 	}, nil
+}
+
+func teamsAutoUpdateActivationAfterApply(preUpdatePending bool, preUpdateReason string, res update.ApplyResult) (bool, string, error) {
+	if !res.RuntimeActivated {
+		return preUpdatePending, preUpdateReason, nil
+	}
+	if res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != "" {
+		return false, "", fmt.Errorf(
+			"managed runtime update returned contradictory activation state: runtime_activated=%t restart_required=%t pending_replace_path=%q",
+			res.RuntimeActivated,
+			res.RestartRequired,
+			res.PendingReplacePath,
+		)
+	}
+	// RuntimeActivated is the authoritative postcondition for an immutable
+	// runtime update. finalizeHelperUpdateResult still verifies both the
+	// published runtime and the stable entry before Apply returns this state.
+	// The pre-update executable can legitimately remain the old immutable
+	// runtime until the normal fresh-launch restart crosses the stable entry.
+	return false, "", nil
 }
 
 func teamsPendingReplacementMode(applyOpts teams.HelperAutoUpdateApplyOptions) update.PendingReplacementMode {

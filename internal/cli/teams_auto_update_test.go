@@ -587,8 +587,8 @@ func TestTeamsReleaseAutoUpdaterApplyUsesRunningGoBinAndUnifiesManagedDefault(t 
 }
 
 func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the reported helper activation mismatch occurred on Linux/WSL")
+	if runtime.GOOS == "windows" {
+		t.Skip("managed-runtime executable fixture uses a POSIX script")
 	}
 	lockCLITestHooks(t)
 	prevPerform := performUpdate
@@ -634,6 +634,74 @@ func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *tes
 	}
 	if res.ActivationPending {
 		t.Fatalf("managed runtime update reported ActivationPending: %s; RuntimeActivated updates must use the normal fresh-launch restart", res.ActivationReason)
+	}
+}
+
+func TestTeamsAutoUpdateActivationAfterApply(t *testing.T) {
+	tests := []struct {
+		name           string
+		prePending     bool
+		preReason      string
+		result         update.ApplyResult
+		wantPending    bool
+		wantReason     string
+		wantErrContain string
+	}{
+		{
+			name:        "legacy path mismatch remains pending",
+			prePending:  true,
+			preReason:   "running helper executable differs",
+			wantPending: true,
+			wantReason:  "running helper executable differs",
+		},
+		{
+			name:       "legacy stable path remains immediate",
+			preReason:  "",
+			wantReason: "",
+		},
+		{
+			name:       "managed runtime activation overrides physical path mismatch",
+			prePending: true,
+			preReason:  "running helper is the previous immutable runtime",
+			result: update.ApplyResult{
+				RuntimeActivated: true,
+			},
+		},
+		{
+			name:       "managed runtime rejects legacy restart requirement",
+			prePending: true,
+			result: update.ApplyResult{
+				RuntimeActivated: true,
+				RestartRequired:  true,
+			},
+			wantErrContain: "contradictory activation state",
+		},
+		{
+			name: "managed runtime rejects pending replacement",
+			result: update.ApplyResult{
+				RuntimeActivated:   true,
+				PendingReplacePath: "pending-helper",
+			},
+			wantErrContain: "contradictory activation state",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pending, reason, err := teamsAutoUpdateActivationAfterApply(tt.prePending, tt.preReason, tt.result)
+			if tt.wantErrContain != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrContain) {
+					t.Fatalf("error = %v, want containing %q", err, tt.wantErrContain)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("teamsAutoUpdateActivationAfterApply error: %v", err)
+			}
+			if pending != tt.wantPending || reason != tt.wantReason {
+				t.Fatalf("activation = pending %v reason %q, want pending %v reason %q", pending, reason, tt.wantPending, tt.wantReason)
+			}
+		})
 	}
 }
 
