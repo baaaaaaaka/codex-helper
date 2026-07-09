@@ -22,6 +22,7 @@ func TestMain(m *testing.M) {
 	_ = os.Setenv("LOCALAPPDATA", filepath.Join(tmp, "localappdata"))
 
 	code := m.Run()
+	_ = codexhistory.CloseCaches()
 	_ = os.RemoveAll(tmp)
 	os.Exit(code)
 }

@@ -629,6 +629,10 @@ func setupCodexDir(t *testing.T) (tmpDir, sessionsDir, projDir string) {
 		t.Fatal(err)
 	}
 	projDir = t.TempDir()
+	t.Cleanup(func() {
+		_ = CloseCaches()
+		ResetCache()
+	})
 	return
 }
 
