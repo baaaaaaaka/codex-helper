@@ -665,6 +665,13 @@ func TestBridgeMachineDelegationWorkerPagedDrainFindsRequestBehindFirstPage(t *t
 	if state.Status != delegation.StateComplete || state.Terminal == nil || state.Terminal.Body != "paged result" {
 		t.Fatalf("state = %#v records=%#v, want complete paged result", state, records)
 	}
+	// The terminal Graph record becomes observable immediately before the worker
+	// persists its final local fence. Wait for that goroutine-owned lifecycle
+	// boundary before reading the legacy JSON store; otherwise Windows can
+	// correctly reject a read racing the atomic file replacement.
+	if !waitPublishersIdle(time.Second, publisher) {
+		t.Fatal("publisher did not finish paged delegation goroutine")
+	}
 	store, err = delegation.LoadStore(statePath)
 	if err != nil {
 		t.Fatalf("LoadStore after poll: %v", err)

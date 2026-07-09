@@ -24203,7 +24203,7 @@ func TestBridgeSyncLinkedTranscriptSkipsStoreWhenNoLinkedThreads(t *testing.T) {
 }
 
 func TestBridgeSyncLinkedTranscriptDiscoveryUsesScopedCodexHome(t *testing.T) {
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	prevDiscover := discoverCodexProjectsForTeams
 	var gotRoot string
 	var discoverCalls int
@@ -28394,7 +28394,7 @@ func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointThenImportsTail(t *
 
 func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-watch.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28490,7 +28490,7 @@ func TestBridgeHistoryWatchBaselinesExistingThenPublishesNewFinal(t *testing.T) 
 
 func TestBridgeHistoryWatchPublishesLocalSessionBeforeFinalAnswer(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 30, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-30-00-thread-local-start.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28552,7 +28552,7 @@ func TestBridgeHistoryWatchPublishesLocalSessionBeforeFinalAnswer(t *testing.T) 
 
 func TestBridgeHistoryWatchSendsWorkflowCardForDetectedFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-watch-card.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28629,7 +28629,7 @@ func TestBridgeHistoryWatchSendsWorkflowCardForDetectedFinal(t *testing.T) {
 
 func TestBridgeHistoryWatchDiscoversNewRecentFileWithoutFullReconcile(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-01-thread-new.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28664,7 +28664,7 @@ func TestBridgeHistoryWatchDiscoversNewRecentFileWithoutFullReconcile(t *testing
 
 func TestBridgeHistoryWatchPersistsPendingAssistantAcrossPolls(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-02-thread-pending.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28727,7 +28727,7 @@ func TestBridgeHistoryWatchPersistsPendingAssistantAcrossPolls(t *testing.T) {
 
 func TestBridgeHistoryWatchPublishLookupUsesScopedCodexHome(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-03-thread-scoped.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28784,7 +28784,7 @@ func TestBridgeHistoryWatchPublishLookupUsesScopedCodexHome(t *testing.T) {
 func TestBridgeHistoryWatchFallsBackForLargeTail(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-04-thread-large-tail.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -28828,7 +28828,7 @@ func TestBridgeHistoryWatchFallsBackForLargeTail(t *testing.T) {
 
 func TestBridgeHistoryWatchDoesNotMarkReadyWhenInitialReconcileFails(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	oldPath := filepath.Join(codexRoot, "sessions", "2026", "04", "01", "rollout-2026-04-01T09-00-00-thread-old.jsonl")
 	if err := os.MkdirAll(filepath.Dir(oldPath), 0o700); err != nil {
 		t.Fatalf("mkdir old transcript dir: %v", err)
@@ -28891,7 +28891,7 @@ func TestBridgeHistoryWatchDoesNotMarkReadyWhenInitialReconcileFails(t *testing.
 
 func TestBridgeHistoryWatchMissingSessionsRootWaitsForInitialBaseline(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	graph, sent := newBridgeCreateChatGraph(t, nil)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
@@ -28944,7 +28944,7 @@ func TestBridgeHistoryWatchMissingSessionsRootWaitsForInitialBaseline(t *testing
 
 func TestBridgeHistoryWatchReconcileBaselinesMissingOldSessions(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	oldPath := filepath.Join(codexRoot, "sessions", "2026", "04", "01", "rollout-2026-04-01T09-00-00-thread-old-reconcile.jsonl")
 	if err := os.MkdirAll(filepath.Dir(oldPath), 0o700); err != nil {
 		t.Fatalf("mkdir old transcript dir: %v", err)
@@ -28998,7 +28998,7 @@ func TestBridgeHistoryWatchReconcileBaselinesMissingOldSessions(t *testing.T) {
 
 func TestBridgeHistoryWatchDoesNotAdvanceWhenPublishTargetIsTemporarilyMissing(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-01-thread-late.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29061,7 +29061,7 @@ func TestBridgeHistoryWatchDoesNotAdvanceWhenPublishTargetIsTemporarilyMissing(t
 
 func TestBridgeHistoryWatchSkipsAlreadyLinkedSession(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-linked.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29107,7 +29107,7 @@ func TestBridgeHistoryWatchSkipsAlreadyLinkedSession(t *testing.T) {
 
 func TestBridgeHistoryWatchSkipsSubagentFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	childPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-child.jsonl")
 	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29194,7 +29194,7 @@ func TestBridgeHistoryWatchSkipsSubagentFinal(t *testing.T) {
 
 func TestBridgeHistoryWatchSkipsSubagentPromptBeforeFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	childPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-child-prompt.jsonl")
 	if err := os.MkdirAll(filepath.Dir(childPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29230,7 +29230,7 @@ func TestBridgeHistoryWatchSkipsSubagentPromptBeforeFinal(t *testing.T) {
 
 func TestBridgeHistoryWatchSkipsTeamsOriginPromptBeforeFinal(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-teams-origin.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29267,7 +29267,7 @@ func TestBridgeHistoryWatchSkipsTeamsOriginPromptBeforeFinal(t *testing.T) {
 
 func TestBridgeHistoryWatchSkipsTeamsOriginPromptAfterInjectedContext(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-teams-origin-context.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29306,7 +29306,7 @@ func TestBridgeHistoryWatchSkipsTeamsOriginPromptAfterInjectedContext(t *testing
 
 func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAfterInjectedContextBurst(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	threadID := "thread-teams-origin-context-burst"
 	turnID := "turn-context-burst"
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
@@ -29362,7 +29362,7 @@ func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAfterInjectedContextBurst(
 
 func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAcrossCheckpoint(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	threadID := "thread-teams-origin-two-phase"
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
@@ -29441,7 +29441,7 @@ func TestBridgeHistoryWatchStressSkipsTeamsOriginFinalAcrossCheckpoint(t *testin
 
 func TestBridgeHistoryWatchClearsTeamsOriginMarkerForLocalPrompt(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	threadID := "thread-local-after-teams-origin"
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-"+threadID+".jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
@@ -29547,7 +29547,7 @@ func teamsOriginHistoryWatchStressTranscriptNoTurnIDs(threadID string, injectedC
 
 func TestBridgeHistoryWatchSkipsTeamsOriginPromptByInboundHash(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-teams-origin-image.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -29606,7 +29606,7 @@ func TestBridgeHistoryWatchSkipsTeamsOriginPromptByInboundHash(t *testing.T) {
 
 func TestBridgeHistoryWatchDoesNotSkipLocalPromptWithSameTextAsTeamsInboundDifferentThread(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
-	codexRoot := t.TempDir()
+	codexRoot := newBridgeTestCodexRoot(t)
 	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-local-same-prompt.jsonl")
 	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
 		t.Fatalf("mkdir transcript dir: %v", err)
@@ -33912,6 +33912,24 @@ func bridgePollMessage(id string, timestamp string, text string) ChatMessage {
 	msg.Body.ContentType = "html"
 	msg.Body.Content = "<p>" + text + "</p>"
 	return msg
+}
+
+// newBridgeTestCodexRoot returns a Codex data root whose process-global
+// codexhistory handles are released before testing.TempDir removes it. Every
+// Teams test that models a real Codex root should use this helper, including
+// tests with custom discovery stubs that do not call stubDiscoverCodexSession.
+func newBridgeTestCodexRoot(t *testing.T) string {
+	t.Helper()
+	if err := codexhistory.CloseCaches(); err != nil {
+		t.Fatalf("close caches before temporary Teams Codex root: %v", err)
+	}
+	root := t.TempDir()
+	t.Cleanup(func() {
+		if err := codexhistory.CloseCaches(); err != nil {
+			t.Errorf("close caches for temporary Teams Codex root: %v", err)
+		}
+	})
+	return root
 }
 
 func stubDiscoverCodexSession(t *testing.T, threadID string, transcriptPath string) func() {
