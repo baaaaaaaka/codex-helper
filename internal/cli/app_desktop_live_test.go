@@ -248,7 +248,15 @@ func liveDesktopCodexAppPath(t *testing.T, powershell string) string {
 	if err != nil {
 		t.Fatalf("convert Codex app path failed: %v\n%s", err, strings.TrimSpace(string(converted)))
 	}
-	return filepath.Join(strings.TrimSpace(string(converted)), "app", "Codex.exe")
+	installLocation := strings.TrimSpace(string(converted))
+	for _, executableName := range []string{codexDesktopWindowsCurrentExecutable, codexDesktopWindowsLegacyExecutable} {
+		candidate := filepath.Join(installLocation, "app", executableName)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	t.Fatalf("OpenAI.Codex package does not contain ChatGPT.exe or Codex.exe under %s", filepath.Join(installLocation, "app"))
+	return ""
 }
 
 func appendWindowsToolPath(env []string, powershell string) []string {
@@ -431,8 +439,8 @@ func liveDesktopSendPromptWindows(t *testing.T, powershell string, prompt string
 		`Add-Type -AssemblyName System.Windows.Forms`,
 		`$shell = New-Object -ComObject WScript.Shell`,
 		`$activated = $false`,
-		`for ($i = 0; $i -lt 60; $i++) { if ($shell.AppActivate('Codex')) { $activated = $true; break }; Start-Sleep -Milliseconds 500 }`,
-		`if (-not $activated) { throw 'Could not activate Codex window' }`,
+		`for ($i = 0; $i -lt 60; $i++) { if ($shell.AppActivate('ChatGPT') -or $shell.AppActivate('Codex')) { $activated = $true; break }; Start-Sleep -Milliseconds 500 }`,
+		`if (-not $activated) { throw 'Could not activate ChatGPT or Codex window' }`,
 		`Set-Clipboard -Value '` + powershellSingleQuoteContent(prompt) + `'`,
 		`Start-Sleep -Milliseconds 250`,
 		`[System.Windows.Forms.SendKeys]::SendWait('^v')`,
@@ -452,9 +460,15 @@ func liveDesktopSendPromptMac(t *testing.T, prompt string) {
 	t.Helper()
 	args := []string{
 		"-e", `set the clipboard to ` + appleScriptString(prompt),
-		"-e", `tell application "Codex" to activate`,
-		"-e", `delay 1`,
 		"-e", `tell application "System Events"`,
+		"-e", `if exists process "ChatGPT" then`,
+		"-e", `set frontmost of process "ChatGPT" to true`,
+		"-e", `else if exists process "Codex" then`,
+		"-e", `set frontmost of process "Codex" to true`,
+		"-e", `else`,
+		"-e", `error "Could not activate ChatGPT or Codex window"`,
+		"-e", `end if`,
+		"-e", `delay 1`,
 		"-e", `keystroke "v" using command down`,
 		"-e", `key code 36`,
 		"-e", `end tell`,

@@ -950,7 +950,13 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"--source msstore",
 		"Microsoft Store/winget may be blocked by enterprise policy",
 		"OpenAI.Codex",
+		"$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName",
+		"$currentApplication = @($applications",
+		"Join-Path $pkg.InstallLocation ([string]$currentApplication[0].Executable)",
+		"Join-Path $pkg.InstallLocation ([string]$legacyApplication[0].Executable)",
+		"app\\ChatGPT.exe",
 		"app\\Codex.exe",
+		"$exeCandidates",
 		"Start-CodexDesktopProcess $exe",
 		"$codexArgs = @('--proxy-server=http://127.0.0.1:23123')",
 		"$codexWaitForExit = $false",
@@ -962,7 +968,12 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		"proxy mode cannot use AppX activation because Chromium --proxy-server would be lost",
 		"falling back to AppX activation",
 		"CODEX_HOME/proxy environment may not be inherited",
-		"Pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.",
+		"Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.",
+		"$applications = @($manifest.Package.Applications.Application)",
+		"[IO.Path]::GetFileName([string]$_.Executable) -ieq 'ChatGPT.exe'",
+		"[IO.Path]::GetFileName([string]$_.Executable) -ieq 'Codex.exe'",
+		"$applications.Count -eq 1",
+		"does not define a ChatGPT or Codex application entry",
 		"protected WindowsApps package directory",
 		"Current Windows session is non-interactive",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd",
@@ -974,6 +985,16 @@ func TestCodexDesktopWindowsScriptInstallsStorePackageAndLaunchesExe(t *testing.
 		if !strings.Contains(script, want) {
 			t.Fatalf("Windows desktop app script missing %q:\n%s", want, script)
 		}
+	}
+	currentEntry := strings.Index(script, "-ieq 'ChatGPT.exe'")
+	legacyEntry := strings.Index(script, "-ieq 'Codex.exe'")
+	if currentEntry < 0 || legacyEntry < 0 || currentEntry >= legacyEntry {
+		t.Fatalf("Windows AppX entry selection must prefer ChatGPT before Codex:\n%s", script)
+	}
+	manifest := strings.Index(script, "$manifest = Get-AppxPackageManifest")
+	executableCandidates := strings.Index(script, "$exeCandidates = @()")
+	if manifest < 0 || executableCandidates < 0 || manifest >= executableCandidates {
+		t.Fatalf("Windows direct launch must derive executable candidates from the AppX manifest:\n%s", script)
 	}
 	if strings.Contains(script, "codex app") {
 		t.Fatalf("Windows desktop app script must not launch Codex CLI app subcommand:\n%s", script)
@@ -997,7 +1018,7 @@ func TestCodexDesktopWindowsScriptExplainsWindowsAppsAppPathFailure(t *testing.T
 		"protected WindowsApps package directory",
 		"AppX activation",
 		"cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments",
-		"unpackaged Codex.exe",
+		"unpackaged ChatGPT.exe or Codex.exe",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("Windows desktop app script missing %q:\n%s", want, script)
@@ -1229,15 +1250,115 @@ func TestCodexDesktopWindowsScriptWindowsAppsAppPathFailureIntegration(t *testin
 	}
 	text := string(out)
 	for _, want := range []string{
-		"direct Codex.exe launch failed:",
+		"direct ChatGPT/Codex desktop executable launch failed:",
 		"protected WindowsApps package directory",
 		"AppX activation",
 		"cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments",
-		"unpackaged Codex.exe",
+		"unpackaged ChatGPT.exe or Codex.exe",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("PowerShell failure output missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestCodexDesktopWindowsAppXEntrySelectionIntegration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell AppX entry selection integration is Windows-only")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skipf("powershell.exe not found: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		entries string
+		want    string
+		wantErr string
+	}{
+		{
+			name:    "current wins even when legacy is first",
+			entries: "[pscustomobject]@{ Id = 'Legacy'; Executable = 'app/Codex.exe' }, [pscustomobject]@{ Id = 'Current'; Executable = 'app/ChatGPT.exe' }",
+			want:    "Current",
+		},
+		{
+			name:    "legacy remains supported",
+			entries: "[pscustomobject]@{ Id = 'Legacy'; Executable = 'app/Codex.exe' }",
+			want:    "Legacy",
+		},
+		{
+			name:    "single unknown entry preserves AppX compatibility",
+			entries: "[pscustomobject]@{ Id = 'Only'; Executable = 'app/Launcher.exe' }",
+			want:    "Only",
+		},
+		{
+			name:    "ambiguous unknown entries fail closed",
+			entries: "[pscustomobject]@{ Id = 'One'; Executable = 'app/One.exe' }, [pscustomobject]@{ Id = 'Two'; Executable = 'app/Two.exe' }",
+			wantErr: "does not define a ChatGPT or Codex application entry",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := strings.Join([]string{
+				"$ErrorActionPreference = 'Stop'",
+				"$applications = @(" + tc.entries + ")",
+				codexDesktopWindowsAppXSelectionPowerShell(),
+				"Write-Output $app[0].Id",
+			}, "; ")
+			out, err := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script).CombinedOutput()
+			text := strings.TrimSpace(string(out))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(text, tc.wantErr) {
+					t.Fatalf("PowerShell selection error = %v, output = %q, want %q", err, text, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("PowerShell selection failed: %v\n%s", err, text)
+			}
+			if text != tc.want {
+				t.Fatalf("selected application = %q, want %q", text, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexDesktopWindowsManifestExecutableCandidateIntegration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell manifest executable candidate integration is Windows-only")
+	}
+	powershell, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Skipf("powershell.exe not found: %v", err)
+	}
+
+	installLocation := t.TempDir()
+	currentExecutable := filepath.Join(installLocation, "current", codexDesktopWindowsCurrentExecutable)
+	legacyExecutable := filepath.Join(installLocation, "legacy", codexDesktopWindowsLegacyExecutable)
+	for _, path := range []string{currentExecutable, legacyExecutable} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir fake package executable dir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("fake"), 0o600); err != nil {
+			t.Fatalf("write fake package executable: %v", err)
+		}
+	}
+
+	script := strings.Join([]string{
+		"$ErrorActionPreference = 'Stop'",
+		"$pkg = [pscustomobject]@{ InstallLocation = " + powershellSingleQuote(installLocation) + " }",
+		"$applications = @([pscustomobject]@{ Id = 'Legacy'; Executable = 'legacy/Codex.exe' }, [pscustomobject]@{ Id = 'Current'; Executable = 'current/ChatGPT.exe' })",
+		codexDesktopWindowsExecutableCandidatesPowerShell(),
+		"$exe = $exeCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1",
+		"Write-Output $exe",
+	}, "; ")
+	out, err := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell manifest executable selection failed: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	got := filepath.Clean(strings.TrimSpace(string(out)))
+	if !strings.EqualFold(got, filepath.Clean(currentExecutable)) {
+		t.Fatalf("selected executable = %q, want current manifest path %q", got, currentExecutable)
 	}
 }
 
@@ -1266,9 +1387,54 @@ func TestLaunchCodexDesktopAppWindowsRequiresPowerShell(t *testing.T) {
 	}
 }
 
+func TestCodexDesktopMacCandidatePathsPreferCurrentAndKeepLegacy(t *testing.T) {
+	home := filepath.Join("Users", "alice")
+	got := codexDesktopMacCandidatePaths(home)
+	want := []string{
+		filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacCurrentAppName),
+		filepath.Join(home, "Applications", codexDesktopMacCurrentAppName),
+		filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacLegacyAppName),
+		filepath.Join(home, "Applications", codexDesktopMacLegacyAppName),
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("candidate paths = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexDesktopMacExecutablePathSupportsCurrentAndLegacy(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		appName         string
+		executableNames []string
+		wantExecutable  string
+	}{
+		{name: "current ChatGPT entry", appName: codexDesktopMacCurrentAppName, executableNames: []string{codexDesktopMacCurrentExecutableName}, wantExecutable: codexDesktopMacCurrentExecutableName},
+		{name: "current bundle legacy executable fallback", appName: codexDesktopMacCurrentAppName, executableNames: []string{codexDesktopMacLegacyExecutableName}, wantExecutable: codexDesktopMacLegacyExecutableName},
+		{name: "current bundle prefers current executable", appName: codexDesktopMacCurrentAppName, executableNames: []string{codexDesktopMacLegacyExecutableName, codexDesktopMacCurrentExecutableName}, wantExecutable: codexDesktopMacCurrentExecutableName},
+		{name: "legacy Codex entry", appName: codexDesktopMacLegacyAppName, executableNames: []string{codexDesktopMacLegacyExecutableName}, wantExecutable: codexDesktopMacLegacyExecutableName},
+		{name: "legacy bundle current executable fallback", appName: codexDesktopMacLegacyAppName, executableNames: []string{codexDesktopMacCurrentExecutableName}, wantExecutable: codexDesktopMacCurrentExecutableName},
+		{name: "legacy bundle prefers legacy executable", appName: codexDesktopMacLegacyAppName, executableNames: []string{codexDesktopMacCurrentExecutableName, codexDesktopMacLegacyExecutableName}, wantExecutable: codexDesktopMacLegacyExecutableName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := filepath.Join(t.TempDir(), tc.appName)
+			for _, executableName := range tc.executableNames {
+				writeFakeMacDesktopApp(t, app, executableName, tc.name)
+			}
+			got, err := codexDesktopMacExecutablePath(app)
+			if err != nil {
+				t.Fatalf("codexDesktopMacExecutablePath error: %v", err)
+			}
+			want := filepath.Join(app, "Contents", "MacOS", tc.wantExecutable)
+			if got != want {
+				t.Fatalf("executable = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestFindCodexAppBundle(t *testing.T) {
 	root := t.TempDir()
-	app := filepath.Join(root, "nested", codexDesktopMacAppName)
+	app := filepath.Join(root, "nested", codexDesktopMacLegacyAppName)
 	if err := os.MkdirAll(app, 0o755); err != nil {
 		t.Fatalf("mkdir app bundle: %v", err)
 	}
@@ -1278,6 +1444,105 @@ func TestFindCodexAppBundle(t *testing.T) {
 	}
 	if got != app {
 		t.Fatalf("bundle = %q, want %q", got, app)
+	}
+}
+
+func TestFindCodexAppBundlePrefersCurrentEntry(t *testing.T) {
+	root := t.TempDir()
+	legacyApp := filepath.Join(root, "a", codexDesktopMacLegacyAppName)
+	currentApp := filepath.Join(root, "z", codexDesktopMacCurrentAppName)
+	for _, app := range []string{legacyApp, currentApp} {
+		if err := os.MkdirAll(app, 0o755); err != nil {
+			t.Fatalf("mkdir app bundle: %v", err)
+		}
+	}
+	got, err := findCodexAppBundle(root)
+	if err != nil {
+		t.Fatalf("findCodexAppBundle error: %v", err)
+	}
+	if got != currentApp {
+		t.Fatalf("bundle = %q, want current entry %q", got, currentApp)
+	}
+}
+
+func TestEnsureCodexDesktopAppMacPrefersCurrentAndFallsBackToLegacy(t *testing.T) {
+	lockCLITestHooks(t)
+	stubCodexAppMacOpenAIIdentity(t)
+
+	prevSystemApps := codexAppMacSystemAppsDir
+	prevRunCommand := codexAppRunCommand
+	t.Cleanup(func() {
+		codexAppMacSystemAppsDir = prevSystemApps
+		codexAppRunCommand = prevRunCommand
+	})
+	codexAppRunCommand = func(context.Context, io.Writer, string, ...string) error { return nil }
+
+	for _, tc := range []struct {
+		name          string
+		currentBroken bool
+		wantAppName   string
+	}{
+		{name: "prefers current when both are valid", wantAppName: codexDesktopMacCurrentAppName},
+		{name: "falls back when current is broken", currentBroken: true, wantAppName: codexDesktopMacLegacyAppName},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			codexAppMacSystemAppsDir = filepath.Join(root, "Applications")
+			currentApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacCurrentAppName)
+			if tc.currentBroken {
+				if err := os.MkdirAll(currentApp, 0o755); err != nil {
+					t.Fatalf("mkdir broken current app: %v", err)
+				}
+			} else {
+				writeFakeChatGPTMacApp(t, currentApp, "current")
+			}
+			legacyApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacLegacyAppName)
+			writeFakeCodexMacApp(t, legacyApp, "legacy")
+
+			got, err := ensureCodexDesktopAppMac(context.Background(), codexDesktopAppOptions{InstallHome: filepath.Join(root, "home"), Log: io.Discard})
+			if err != nil {
+				t.Fatalf("ensureCodexDesktopAppMac error: %v", err)
+			}
+			want := filepath.Join(codexAppMacSystemAppsDir, tc.wantAppName)
+			if got != want {
+				t.Fatalf("selected app = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestEnsureCodexDesktopAppMacRejectsClassicChatGPTAndUsesLegacyCodex(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevSystemApps := codexAppMacSystemAppsDir
+	prevRunCommand := codexAppRunCommand
+	prevCommandOutput := codexAppCommandOutput
+	t.Cleanup(func() {
+		codexAppMacSystemAppsDir = prevSystemApps
+		codexAppRunCommand = prevRunCommand
+		codexAppCommandOutput = prevCommandOutput
+	})
+
+	root := t.TempDir()
+	codexAppMacSystemAppsDir = filepath.Join(root, "Applications")
+	classicApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacCurrentAppName)
+	writeFakeChatGPTMacApp(t, classicApp, "classic")
+	legacyApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacLegacyAppName)
+	writeFakeCodexMacApp(t, legacyApp, "legacy")
+	codexAppRunCommand = func(context.Context, io.Writer, string, ...string) error { return nil }
+	codexAppCommandOutput = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[len(args)-1] == classicApp {
+			return []byte("Identifier=com.openai.chat\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+		}
+		return []byte("Identifier=" + codexDesktopMacBundleIdentifier + "\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+	}
+
+	got, err := ensureCodexDesktopAppMac(context.Background(), codexDesktopAppOptions{InstallHome: filepath.Join(root, "home"), Log: io.Discard})
+	if err != nil {
+		t.Fatalf("ensureCodexDesktopAppMac error: %v", err)
+	}
+	if got != legacyApp {
+		t.Fatalf("selected app = %q, want legacy Codex app %q", got, legacyApp)
 	}
 }
 
@@ -1294,12 +1559,12 @@ func TestEnsureCodexDesktopAppMacSkipsBrokenCandidate(t *testing.T) {
 
 	root := t.TempDir()
 	codexAppMacSystemAppsDir = filepath.Join(root, "Applications")
-	brokenSystemApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacAppName)
+	brokenSystemApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacLegacyAppName)
 	if err := os.MkdirAll(brokenSystemApp, 0o755); err != nil {
 		t.Fatalf("mkdir broken app: %v", err)
 	}
 	home := filepath.Join(root, "home")
-	userApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
+	userApp := filepath.Join(home, "Applications", codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, userApp, "user")
 
 	var verified []string
@@ -1333,10 +1598,10 @@ func TestEnsureCodexDesktopAppMacSkipsUntrustedCandidate(t *testing.T) {
 
 	root := t.TempDir()
 	codexAppMacSystemAppsDir = filepath.Join(root, "Applications")
-	systemApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacAppName)
+	systemApp := filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, systemApp, "system")
 	home := filepath.Join(root, "home")
-	userApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
+	userApp := filepath.Join(home, "Applications", codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, userApp, "user")
 
 	codexAppRunCommand = func(_ context.Context, _ io.Writer, _ string, args ...string) error {
@@ -1367,7 +1632,7 @@ func TestEnsureCodexDesktopAppMacExplicitUntrustedAppFails(t *testing.T) {
 	prevRunCommand := codexAppRunCommand
 	t.Cleanup(func() { codexAppRunCommand = prevRunCommand })
 
-	app := filepath.Join(t.TempDir(), codexDesktopMacAppName)
+	app := filepath.Join(t.TempDir(), codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, app, "explicit")
 	codexAppRunCommand = func(context.Context, io.Writer, string, ...string) error {
 		return errors.New("signature rejected")
@@ -1389,18 +1654,41 @@ func TestVerifyCodexDesktopAppMacRejectsWrongTeamID(t *testing.T) {
 		codexAppCommandOutput = prevCommandOutput
 	})
 
-	app := filepath.Join(t.TempDir(), codexDesktopMacAppName)
+	app := filepath.Join(t.TempDir(), codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, app, "wrong-team")
 	codexAppRunCommand = func(context.Context, io.Writer, string, ...string) error {
 		return nil
 	}
 	codexAppCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
-		return []byte("TeamIdentifier=NOTOPENAI\n"), nil
+		return []byte("Identifier=" + codexDesktopMacBundleIdentifier + "\nTeamIdentifier=NOTOPENAI\n"), nil
 	}
 
 	err := verifyCodexDesktopAppMac(context.Background(), app, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "expected OpenAI Team ID") || !strings.Contains(err.Error(), codexDesktopMacOpenAITeamID) {
+	if err == nil || !strings.Contains(err.Error(), "OpenAI Team ID") || !strings.Contains(err.Error(), codexDesktopMacOpenAITeamID) {
 		t.Fatalf("verify error = %v, want OpenAI Team ID failure", err)
+	}
+}
+
+func TestVerifyCodexDesktopAppMacRejectsClassicChatGPTBundle(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevRunCommand := codexAppRunCommand
+	prevCommandOutput := codexAppCommandOutput
+	t.Cleanup(func() {
+		codexAppRunCommand = prevRunCommand
+		codexAppCommandOutput = prevCommandOutput
+	})
+
+	app := filepath.Join(t.TempDir(), codexDesktopMacCurrentAppName)
+	writeFakeChatGPTMacApp(t, app, "classic-chatgpt")
+	codexAppRunCommand = func(context.Context, io.Writer, string, ...string) error { return nil }
+	codexAppCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("Identifier=com.openai.codex.classic\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+	}
+
+	err := verifyCodexDesktopAppMac(context.Background(), app, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "bundle identifier") || !strings.Contains(err.Error(), codexDesktopMacBundleIdentifier) {
+		t.Fatalf("verify error = %v, want classic ChatGPT bundle rejection", err)
 	}
 }
 
@@ -1444,7 +1732,7 @@ func TestInstallCodexDesktopAppMacVerifiesBeforeReplacing(t *testing.T) {
 	})
 
 	home := t.TempDir()
-	oldApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
+	oldApp := filepath.Join(home, "Applications", codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, oldApp, "old")
 
 	var calls []string
@@ -1462,7 +1750,7 @@ func TestInstallCodexDesktopAppMacVerifiesBeforeReplacing(t *testing.T) {
 				if mount == "" {
 					t.Fatalf("hdiutil attach missing mountpoint: %v", args)
 				}
-				writeFakeCodexMacApp(t, filepath.Join(mount, codexDesktopMacAppName), "mounted")
+				writeFakeCodexMacApp(t, filepath.Join(mount, codexDesktopMacLegacyAppName), "mounted")
 			}
 			return nil
 		case "ditto":
@@ -1509,6 +1797,147 @@ func TestInstallCodexDesktopAppMacVerifiesBeforeReplacing(t *testing.T) {
 	}
 }
 
+func TestInstallCodexDesktopAppMacUsesCurrentEntry(t *testing.T) {
+	lockCLITestHooks(t)
+	stubCodexAppMacOpenAIIdentity(t)
+
+	prevRunCommand := codexAppRunCommand
+	prevDownload := codexAppDownloadPackageFn
+	t.Cleanup(func() {
+		codexAppRunCommand = prevRunCommand
+		codexAppDownloadPackageFn = prevDownload
+	})
+
+	home := t.TempDir()
+	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
+		return os.WriteFile(opts.Path, []byte("dmg"), 0o600)
+	}
+	codexAppRunCommand = func(_ context.Context, _ io.Writer, name string, args ...string) error {
+		switch name {
+		case "hdiutil":
+			if len(args) > 0 && args[0] == "attach" {
+				writeFakeChatGPTMacApp(t, filepath.Join(commandArgAfter(args, "-mountpoint"), codexDesktopMacCurrentAppName), "mounted")
+			}
+			return nil
+		case "ditto":
+			writeFakeChatGPTMacApp(t, args[1], "current")
+			return nil
+		case "codesign", "spctl", "xattr":
+			return nil
+		default:
+			t.Fatalf("unexpected command %s %v", name, args)
+			return nil
+		}
+	}
+
+	got, err := installCodexDesktopAppMac(context.Background(), codexDesktopAppOptions{InstallHome: home, Log: io.Discard}, home, codexDesktopMacAppleSiliconDownloadURL)
+	if err != nil {
+		t.Fatalf("installCodexDesktopAppMac error: %v", err)
+	}
+	want := filepath.Join(home, "Applications", codexDesktopMacCurrentAppName)
+	if got != want {
+		t.Fatalf("installed app = %q, want current entry %q", got, want)
+	}
+	data, err := os.ReadFile(filepath.Join(want, "Contents", "MacOS", codexDesktopMacCurrentExecutableName))
+	if err != nil {
+		t.Fatalf("read installed executable: %v", err)
+	}
+	if string(data) != "current" {
+		t.Fatalf("installed executable = %q, want current", data)
+	}
+}
+
+func TestInstallCodexDesktopAppMacPreservesClassicChatGPTNameConflict(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevRunCommand := codexAppRunCommand
+	prevCommandOutput := codexAppCommandOutput
+	prevDownload := codexAppDownloadPackageFn
+	t.Cleanup(func() {
+		codexAppRunCommand = prevRunCommand
+		codexAppCommandOutput = prevCommandOutput
+		codexAppDownloadPackageFn = prevDownload
+	})
+
+	home := t.TempDir()
+	classicApp := filepath.Join(home, "Applications", codexDesktopMacCurrentAppName)
+	writeFakeChatGPTMacApp(t, classicApp, "classic")
+	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
+		return os.WriteFile(opts.Path, []byte("dmg"), 0o600)
+	}
+	codexAppRunCommand = func(_ context.Context, _ io.Writer, name string, args ...string) error {
+		switch name {
+		case "hdiutil":
+			if len(args) > 0 && args[0] == "attach" {
+				writeFakeChatGPTMacApp(t, filepath.Join(commandArgAfter(args, "-mountpoint"), codexDesktopMacCurrentAppName), "mounted")
+			}
+			return nil
+		case "ditto":
+			writeFakeChatGPTMacApp(t, args[1], "unified")
+			return nil
+		case "codesign", "spctl", "xattr":
+			return nil
+		default:
+			t.Fatalf("unexpected command %s %v", name, args)
+			return nil
+		}
+	}
+	codexAppCommandOutput = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[len(args)-1] == classicApp {
+			return []byte("Identifier=com.openai.chat\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+		}
+		return []byte("Identifier=" + codexDesktopMacBundleIdentifier + "\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+	}
+
+	got, err := installCodexDesktopAppMac(context.Background(), codexDesktopAppOptions{InstallHome: home, Log: io.Discard}, home, codexDesktopMacAppleSiliconDownloadURL)
+	if err != nil {
+		t.Fatalf("installCodexDesktopAppMac error: %v", err)
+	}
+	want := filepath.Join(home, "Applications", codexDesktopMacLegacyAppName)
+	if got != want {
+		t.Fatalf("installed app = %q, want safe alternate path %q", got, want)
+	}
+	classicData, err := os.ReadFile(filepath.Join(classicApp, "Contents", "MacOS", codexDesktopMacCurrentExecutableName))
+	if err != nil {
+		t.Fatalf("read preserved classic ChatGPT executable: %v", err)
+	}
+	if string(classicData) != "classic" {
+		t.Fatalf("classic ChatGPT app was overwritten: %q", classicData)
+	}
+	unifiedData, err := os.ReadFile(filepath.Join(want, "Contents", "MacOS", codexDesktopMacCurrentExecutableName))
+	if err != nil {
+		t.Fatalf("read unified desktop executable: %v", err)
+	}
+	if string(unifiedData) != "unified" {
+		t.Fatalf("unified executable = %q, want unified", unifiedData)
+	}
+}
+
+func TestCodexDesktopMacInstallDestinationRefusesTwoNonCodexConflicts(t *testing.T) {
+	lockCLITestHooks(t)
+
+	prevCommandOutput := codexAppCommandOutput
+	t.Cleanup(func() { codexAppCommandOutput = prevCommandOutput })
+
+	installDir := t.TempDir()
+	for _, appName := range codexDesktopMacAppNames() {
+		writeFakeMacDesktopApp(t, filepath.Join(installDir, appName), codexDesktopMacCurrentExecutableName, "non-codex")
+	}
+	codexAppCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte("Identifier=com.openai.chat\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+	}
+
+	_, err := codexDesktopMacInstallDestination(context.Background(), installDir, codexDesktopMacCurrentAppName)
+	if err == nil || !strings.Contains(err.Error(), "refusing to replace existing non-Codex desktop app paths") {
+		t.Fatalf("install destination error = %v, want fail-closed name conflict", err)
+	}
+	for _, appName := range codexDesktopMacAppNames() {
+		if !strings.Contains(err.Error(), filepath.Join(installDir, appName)) {
+			t.Fatalf("install destination error missing conflict %s: %v", appName, err)
+		}
+	}
+}
+
 func TestInstallCodexDesktopAppMacKeepsExistingBundleWhenCopyFails(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1520,7 +1949,7 @@ func TestInstallCodexDesktopAppMacKeepsExistingBundleWhenCopyFails(t *testing.T)
 	})
 
 	home := t.TempDir()
-	oldApp := filepath.Join(home, "Applications", codexDesktopMacAppName)
+	oldApp := filepath.Join(home, "Applications", codexDesktopMacLegacyAppName)
 	writeFakeCodexMacApp(t, oldApp, "old")
 	copyErr := errors.New("copy failed")
 
@@ -1531,7 +1960,7 @@ func TestInstallCodexDesktopAppMacKeepsExistingBundleWhenCopyFails(t *testing.T)
 		switch name {
 		case "hdiutil":
 			if len(args) > 0 && args[0] == "attach" {
-				writeFakeCodexMacApp(t, filepath.Join(commandArgAfter(args, "-mountpoint"), codexDesktopMacAppName), "mounted")
+				writeFakeCodexMacApp(t, filepath.Join(commandArgAfter(args, "-mountpoint"), codexDesktopMacLegacyAppName), "mounted")
 			}
 			return nil
 		case "ditto":
@@ -1962,7 +2391,17 @@ func TestCodexAppProxyDaemonHelperProcess(t *testing.T) {
 
 func writeFakeCodexMacApp(t *testing.T, appPath string, contents string) {
 	t.Helper()
-	exe := filepath.Join(appPath, "Contents", "MacOS", "Codex")
+	writeFakeMacDesktopApp(t, appPath, codexDesktopMacLegacyExecutableName, contents)
+}
+
+func writeFakeChatGPTMacApp(t *testing.T, appPath string, contents string) {
+	t.Helper()
+	writeFakeMacDesktopApp(t, appPath, codexDesktopMacCurrentExecutableName, contents)
+}
+
+func writeFakeMacDesktopApp(t *testing.T, appPath string, executableName string, contents string) {
+	t.Helper()
+	exe := filepath.Join(appPath, "Contents", "MacOS", executableName)
 	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
 		t.Fatalf("mkdir fake app: %v", err)
 	}
@@ -1975,7 +2414,7 @@ func stubCodexAppMacOpenAIIdentity(t *testing.T) {
 	t.Helper()
 	prevCommandOutput := codexAppCommandOutput
 	codexAppCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
-		return []byte("TeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
+		return []byte("Identifier=" + codexDesktopMacBundleIdentifier + "\nTeamIdentifier=" + codexDesktopMacOpenAITeamID + "\n"), nil
 	}
 	t.Cleanup(func() { codexAppCommandOutput = prevCommandOutput })
 }

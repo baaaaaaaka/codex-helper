@@ -3,8 +3,9 @@ set -euo pipefail
 
 helper="${1:-}"
 mode="${2:-direct}"
+expected_entry="${3:-either}"
 if [ -z "$helper" ]; then
-  echo "usage: $0 /path/to/codex-proxy-or-cxp [direct|proxy]" >&2
+  echo "usage: $0 /path/to/codex-proxy-or-cxp [direct|proxy] [chatgpt|codex|either]" >&2
   exit 2
 fi
 if [ ! -x "$helper" ]; then
@@ -19,6 +20,10 @@ if [ "$mode" != "direct" ] && [ "$mode" != "proxy" ]; then
   echo "unsupported smoke mode: $mode" >&2
   exit 2
 fi
+if [ "$expected_entry" != "chatgpt" ] && [ "$expected_entry" != "codex" ] && [ "$expected_entry" != "either" ]; then
+  echo "unsupported expected desktop entry: $expected_entry" >&2
+  exit 2
+fi
 
 base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-desktop-network-install-smoke"
 rm -rf "$base"
@@ -27,11 +32,15 @@ mkdir -p "$base/work" "$base/home" "$base/cache"
 out="$base/app-launch.out"
 config="$base/config.json"
 home="$base/home"
-app="$home/Applications/Codex.app"
-exe="$app/Contents/MacOS/Codex"
+current_app="$home/Applications/ChatGPT.app"
+legacy_app="$home/Applications/Codex.app"
+current_exe="$current_app/Contents/MacOS/ChatGPT"
+legacy_exe="$legacy_app/Contents/MacOS/Codex"
 existing_pids="$base/existing-codex-pids"
 proxy_log="$base/proxy.log"
-pgrep -f "$exe" >"$existing_pids" 2>/dev/null || true
+for candidate in "$current_exe" "$current_app/Contents/MacOS/Codex" "$legacy_exe" "$legacy_app/Contents/MacOS/ChatGPT"; do
+  pgrep -f "$candidate" 2>/dev/null || true
+done | sort -u >"$existing_pids"
 proxy_pid=""
 
 cleanup() {
@@ -143,13 +152,50 @@ elif ! run_app >"$out" 2>&1; then
   exit 1
 fi
 
-if [ ! -d "$app" ]; then
-  echo "cxp app did not install Codex.app at $app" >&2
+app=""
+exe=""
+entry=""
+if [ -x "$current_exe" ]; then
+  app="$current_app"
+  exe="$current_exe"
+  entry="chatgpt"
+elif [ -x "$current_app/Contents/MacOS/Codex" ]; then
+  app="$current_app"
+  exe="$current_app/Contents/MacOS/Codex"
+  entry="chatgpt"
+elif [ -x "$legacy_exe" ]; then
+  app="$legacy_app"
+  exe="$legacy_exe"
+  entry="codex"
+elif [ -x "$legacy_app/Contents/MacOS/ChatGPT" ]; then
+  app="$legacy_app"
+  exe="$legacy_app/Contents/MacOS/ChatGPT"
+  entry="codex"
+fi
+
+if [ -z "$app" ]; then
+  echo "cxp app did not install a supported ChatGPT.app or Codex.app bundle under $home/Applications" >&2
   sed -n '1,160p' "$out" >&2 || true
   exit 1
 fi
 if [ ! -x "$exe" ]; then
-  echo "Codex.app executable is missing or not executable: $exe" >&2
+  echo "ChatGPT/Codex desktop executable is missing or not executable: $exe" >&2
+  exit 1
+fi
+codesign_info="$(codesign --display --verbose=4 "$app" 2>&1)"
+if ! grep -q '^Identifier=com.openai.codex$' <<<"$codesign_info"; then
+  echo "desktop app bundle identifier is not com.openai.codex: $app" >&2
+  printf '%s\n' "$codesign_info" >&2
+  exit 1
+fi
+if ! grep -q '^TeamIdentifier=2DC432GLL2$' <<<"$codesign_info"; then
+  echo "desktop app is not signed by the expected OpenAI team: $app" >&2
+  printf '%s\n' "$codesign_info" >&2
+  exit 1
+fi
+if [ "$expected_entry" != "either" ] && [ "$entry" != "$expected_entry" ]; then
+  echo "desktop entry = $entry ($app), want $expected_entry" >&2
+  sed -n '1,160p' "$out" >&2 || true
   exit 1
 fi
 if [ "$mode" = "proxy" ] && ! grep -q 'persistent.oaistatic.com:443' "$proxy_log"; then
@@ -185,7 +231,7 @@ for _ in $(seq 1 90); do
         exit 1
       fi
     fi
-    echo "Codex desktop app network install smoke passed: $app"
+    echo "Codex desktop app network install smoke passed: entry=$entry app=$app"
     kill "${launched_pids[@]}" >/dev/null 2>&1 || true
     exit 0
   fi

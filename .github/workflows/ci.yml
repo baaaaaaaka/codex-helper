@@ -1310,7 +1310,8 @@ jobs:
           set -euo pipefail
           helper="$RUNNER_TEMP/codex-proxy-desktop-network-smoke"
           go build -o "$helper" ./cmd/codex-proxy
-          bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy
+          go test ./internal/cli -run 'Test(CodexDesktopMacCandidatePaths|CodexDesktopMacExecutablePath|FindCodexAppBundle|EnsureCodexDesktopAppMac|InstallCodexDesktopAppMac)' -count=1 -v
+          bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy chatgpt
 
       - name: Codex desktop app network install smoke (Windows)
         if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
@@ -1320,6 +1321,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-network-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
+          go test ./internal/cli -run 'TestCodexDesktopWindows(AppXEntrySelectionIntegration|ManifestExecutableCandidateIntegration|Script)' -count=1 -v
           for ($attempt = 1; $attempt -le 2; $attempt++) {
             try {
               .\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper

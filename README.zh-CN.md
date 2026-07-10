@@ -437,7 +437,15 @@ codex-proxy app
 在 macOS 和 Windows 上，这会在需要时安装桌面 App，使用保存的直接/代理偏好，
 首次设置时询问，并启动桌面 App。WSL 会启动 Windows 桌面 App。WSL 之外的
 Linux 没有官方 Codex 桌面 App，所以该命令会显示 unsupported-platform message
-后退出。用 `codex-proxy app <profile>` 强制使用某个代理 profile。如果代理模式
+后退出。OpenAI 现在把 Codex 放在统一的 ChatGPT 桌面 App 中。当前 macOS 包使用
+`ChatGPT.app` 和 `ChatGPT` executable，旧包使用 `Codex.app` 和 `Codex`
+executable；`codex-proxy app` 同时支持两者，并在两者都存在时优先使用新的
+ChatGPT 入口。Windows 为了兼容更新仍保留 Codex Store product/package identity，
+direct launch 则同时接受 `ChatGPT.exe` 和旧的 `Codex.exe`。macOS 启动时还会
+强制校验 bundle identifier 为 `com.openai.codex`，因此不会把单独安装的经典
+`ChatGPT.app` 误当成 Codex，也不会覆盖它；遇到同名冲突时会安全安装为
+`Codex.app`。用
+`codex-proxy app <profile>` 强制使用某个代理 profile。如果代理模式
 已启用，该命令会把代理环境变量传给桌面 App，并对 WSL/AppX 这种桌面 App 可能
 无法继承或访问该环境的情况打印 warning。
 

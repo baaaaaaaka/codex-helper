@@ -494,6 +494,15 @@ On macOS and Windows this installs the desktop app if needed, uses the saved
 direct/proxy preference, asks on first setup, and launches the desktop app. WSL
 launches the Windows desktop app. Linux outside WSL has no official Codex
 desktop app, so the command exits with an unsupported-platform message there.
+OpenAI now exposes Codex from the unified ChatGPT desktop app. Current macOS
+packages use `ChatGPT.app` with a `ChatGPT` executable, while older packages use
+`Codex.app` with a `Codex` executable; `codex-proxy app` supports both and
+prefers the current ChatGPT entry when both are installed. Windows keeps the
+Codex Store product/package identity for update compatibility, while direct
+launch accepts either `ChatGPT.exe` or the legacy `Codex.exe`. On macOS the
+launcher also requires bundle identifier `com.openai.codex`, so a separately
+installed classic `ChatGPT.app` is never mistaken for Codex or overwritten; a
+name conflict is installed safely as `Codex.app` instead.
 Use `codex-proxy app <profile>` to force a proxy profile. If proxy mode is
 enabled, the command passes proxy environment variables to the desktop app and
 prints a warning for WSL/AppX cases where the desktop app may not inherit or

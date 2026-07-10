@@ -25,10 +25,16 @@ import (
 const (
 	codexDesktopMacAppleSiliconDownloadURL = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg"
 	codexDesktopMacIntelDownloadURL        = "https://persistent.oaistatic.com/codex-app-prod/Codex-latest-x64.dmg"
-	codexDesktopMacAppName                 = "Codex.app"
+	codexDesktopMacCurrentAppName          = "ChatGPT.app"
+	codexDesktopMacLegacyAppName           = "Codex.app"
+	codexDesktopMacCurrentExecutableName   = "ChatGPT"
+	codexDesktopMacLegacyExecutableName    = "Codex"
+	codexDesktopMacBundleIdentifier        = "com.openai.codex"
 	codexDesktopMacOpenAITeamID            = "2DC432GLL2"
 	codexDesktopWindowsStoreID             = "9PLM9XGG6VKS"
 	codexDesktopWindowsPackageName         = "OpenAI.Codex"
+	codexDesktopWindowsCurrentExecutable   = "ChatGPT.exe"
+	codexDesktopWindowsLegacyExecutable    = "Codex.exe"
 )
 
 var (
@@ -540,26 +546,41 @@ func codexDesktopMacInstallHome(opts codexDesktopAppOptions) (string, error) {
 }
 
 func codexDesktopMacCandidatePaths(home string) []string {
-	candidates := []string{filepath.Join(codexAppMacSystemAppsDir, codexDesktopMacAppName)}
-	if strings.TrimSpace(home) != "" {
-		candidates = append(candidates, filepath.Join(home, "Applications", codexDesktopMacAppName))
+	var candidates []string
+	for _, appName := range codexDesktopMacAppNames() {
+		candidates = append(candidates, filepath.Join(codexAppMacSystemAppsDir, appName))
+		if strings.TrimSpace(home) != "" {
+			candidates = append(candidates, filepath.Join(home, "Applications", appName))
+		}
 	}
 	return candidates
 }
 
 func codexDesktopMacExecutablePath(appPath string) (string, error) {
 	appPath = filepath.Clean(strings.TrimSpace(appPath))
-	executable := appPath
-	if strings.HasSuffix(appPath, ".app") {
-		executable = filepath.Join(appPath, "Contents", "MacOS", "Codex")
+	if !strings.HasSuffix(strings.ToLower(appPath), ".app") {
+		if info, err := os.Stat(appPath); err != nil || info.IsDir() {
+			if err == nil {
+				err = fmt.Errorf("%s is a directory", appPath)
+			}
+			return "", fmt.Errorf("Codex desktop app executable not found: %w", err)
+		}
+		return appPath, nil
 	}
-	if info, err := os.Stat(executable); err != nil || info.IsDir() {
+
+	var lastErr error
+	for _, executableName := range codexDesktopMacExecutableNames(appPath) {
+		executable := filepath.Join(appPath, "Contents", "MacOS", executableName)
+		info, err := os.Stat(executable)
+		if err == nil && !info.IsDir() {
+			return executable, nil
+		}
 		if err == nil {
 			err = fmt.Errorf("%s is a directory", executable)
 		}
-		return "", fmt.Errorf("Codex desktop app executable not found: %w", err)
+		lastErr = err
 	}
-	return executable, nil
+	return "", fmt.Errorf("Codex desktop app executable not found in %s: %w", appPath, lastErr)
 }
 
 func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions, home string, installURL string) (string, error) {
@@ -604,13 +625,14 @@ func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions,
 	if err != nil {
 		return "", err
 	}
+	appName := filepath.Base(sourceApp)
 
 	stagingRoot, err := os.MkdirTemp(installDir, ".codex-desktop-install-*")
 	if err != nil {
 		return "", err
 	}
 	defer os.RemoveAll(stagingRoot)
-	stagedApp := filepath.Join(stagingRoot, codexDesktopMacAppName)
+	stagedApp := filepath.Join(stagingRoot, appName)
 	if err := codexAppRunCommand(ctx, opts.Log, "ditto", sourceApp, stagedApp); err != nil {
 		return "", fmt.Errorf("copy Codex desktop app bundle: %w", err)
 	}
@@ -622,8 +644,11 @@ func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions,
 		return "", fmt.Errorf("set Codex desktop app ownership: %w", err)
 	}
 
-	destApp := filepath.Join(installDir, codexDesktopMacAppName)
-	backupApp := filepath.Join(installDir, fmt.Sprintf(".%s.backup-%d", codexDesktopMacAppName, time.Now().UnixNano()))
+	destApp, err := codexDesktopMacInstallDestination(ctx, installDir, appName)
+	if err != nil {
+		return "", err
+	}
+	backupApp := filepath.Join(installDir, fmt.Sprintf(".%s.backup-%d", filepath.Base(destApp), time.Now().UnixNano()))
 	hadExisting := false
 	if _, err := os.Stat(destApp); err == nil {
 		hadExisting = true
@@ -666,10 +691,55 @@ func verifyCodexDesktopAppMacOpenAIIdentity(ctx context.Context, appPath string)
 	if err != nil {
 		return fmt.Errorf("inspect Codex desktop app signing identity: %w", err)
 	}
-	if !strings.Contains(string(data), "TeamIdentifier="+codexDesktopMacOpenAITeamID) {
-		return fmt.Errorf("Codex desktop app is not signed by the expected OpenAI Team ID %s", codexDesktopMacOpenAITeamID)
+	if bundleIdentifier := codexDesktopMacCodesignField(data, "Identifier"); bundleIdentifier != codexDesktopMacBundleIdentifier {
+		return fmt.Errorf("Codex desktop app bundle identifier is %q, want %s", bundleIdentifier, codexDesktopMacBundleIdentifier)
+	}
+	if teamIdentifier := codexDesktopMacCodesignField(data, "TeamIdentifier"); teamIdentifier != codexDesktopMacOpenAITeamID {
+		return fmt.Errorf("Codex desktop app Team ID is %q, want OpenAI Team ID %s", teamIdentifier, codexDesktopMacOpenAITeamID)
 	}
 	return nil
+}
+
+func codexDesktopMacCodesignField(data []byte, name string) string {
+	prefix := name + "="
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func codexDesktopMacInstallDestination(ctx context.Context, installDir string, sourceAppName string) (string, error) {
+	appNames := []string{sourceAppName}
+	for _, appName := range codexDesktopMacAppNames() {
+		if appName != sourceAppName {
+			appNames = append(appNames, appName)
+		}
+	}
+
+	var conflicts []string
+	for _, appName := range appNames {
+		destination := filepath.Join(installDir, appName)
+		info, err := os.Stat(destination)
+		if os.IsNotExist(err) {
+			return destination, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect existing desktop app at %s: %w", destination, err)
+		}
+		if !info.IsDir() {
+			conflicts = append(conflicts, destination)
+			continue
+		}
+		if err := verifyCodexDesktopAppMacOpenAIIdentity(ctx, destination); err == nil {
+			return destination, nil
+		}
+		conflicts = append(conflicts, destination)
+	}
+
+	return "", fmt.Errorf("refusing to replace existing non-Codex desktop app paths: %s", strings.Join(conflicts, ", "))
 }
 
 func ensureTreeOwnedByIdentity(root string, identity *execIdentity) error {
@@ -688,19 +758,15 @@ func ensureTreeOwnedByIdentity(root string, identity *execIdentity) error {
 }
 
 func findCodexAppBundle(root string) (string, error) {
-	var found string
+	found := make(map[string]string)
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if found != "" {
-			if d.IsDir() {
-				return filepath.SkipDir
+		if d.IsDir() && isCodexDesktopMacAppName(d.Name()) {
+			if found[d.Name()] == "" {
+				found[d.Name()] = path
 			}
-			return nil
-		}
-		if d.IsDir() && d.Name() == codexDesktopMacAppName {
-			found = path
 			return filepath.SkipDir
 		}
 		return nil
@@ -708,10 +774,32 @@ func findCodexAppBundle(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if found == "" {
-		return "", fmt.Errorf("Codex.app not found in mounted DMG")
+	for _, appName := range codexDesktopMacAppNames() {
+		if path := found[appName]; path != "" {
+			return path, nil
+		}
 	}
-	return found, nil
+	return "", fmt.Errorf("ChatGPT.app or Codex.app not found in mounted DMG")
+}
+
+func codexDesktopMacAppNames() []string {
+	return []string{codexDesktopMacCurrentAppName, codexDesktopMacLegacyAppName}
+}
+
+func isCodexDesktopMacAppName(name string) bool {
+	for _, appName := range codexDesktopMacAppNames() {
+		if name == appName {
+			return true
+		}
+	}
+	return false
+}
+
+func codexDesktopMacExecutableNames(appPath string) []string {
+	if filepath.Base(appPath) == codexDesktopMacLegacyAppName {
+		return []string{codexDesktopMacLegacyExecutableName, codexDesktopMacCurrentExecutableName}
+	}
+	return []string{codexDesktopMacCurrentExecutableName, codexDesktopMacLegacyExecutableName}
 }
 
 func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptions) error {
@@ -745,24 +833,47 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"$packageName = " + packageName,
 		"$storeId = " + storeID,
 		"function Get-CodexPackage { Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1 }",
-		"function Get-CodexWinget { $cmd = Get-Command winget -ErrorAction SilentlyContinue; if ($null -eq $cmd) { throw 'winget was not found. Install or update App Installer, enable Microsoft Store/winget, or pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.' }; return $cmd }",
+		"function Get-CodexWinget { $cmd = Get-Command winget -ErrorAction SilentlyContinue; if ($null -eq $cmd) { throw 'winget was not found. Install or update App Installer, enable Microsoft Store/winget, or pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; return $cmd }",
 		"function Warn-NonInteractiveDesktop { if (-not ([Environment]::UserInteractive)) { Write-Warning 'Current Windows session is non-interactive. The Codex desktop app may install successfully but no visible window may appear; run from an interactive Windows desktop session if launch is not visible.' } }",
 		"function Start-CodexDesktopProcess([string]$FilePath) { $start = @{ FilePath = $FilePath; WorkingDirectory = $cwd }; if ($codexArgs.Count -gt 0) { $start.ArgumentList = $codexArgs }; if ($codexWaitForExit) { $start.Wait = $true }; Start-Process @start | Out-Null }",
-		"function Get-CodexDirectLaunchFailureMessage([string]$FilePath, [System.Exception]$Exception) { $message = 'direct Codex.exe launch failed: ' + $Exception.Message; if ($FilePath.IndexOf('\\WindowsApps\\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $message += ' The selected path is inside the protected WindowsApps package directory. Microsoft Store apps usually cannot be launched directly from that path; they must be started through AppX activation, which cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments. Pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.' }; return $message }",
+		"function Get-CodexDirectLaunchFailureMessage([string]$FilePath, [System.Exception]$Exception) { $message = 'direct ChatGPT/Codex desktop executable launch failed: ' + $Exception.Message; if ($FilePath.IndexOf('\\WindowsApps\\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $message += ' The selected path is inside the protected WindowsApps package directory. Microsoft Store apps usually cannot be launched directly from that path; they must be started through AppX activation, which cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; return $message }",
 		"Warn-NonInteractiveDesktop",
 		"$pkg = Get-CodexPackage",
 		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
 		"if (-not [string]::IsNullOrWhiteSpace($appPath)) { if (-not (Test-Path -LiteralPath $appPath)) { throw ('Codex desktop app path not found: ' + $appPath) }; try { Start-CodexDesktopProcess $appPath; return } catch { throw (Get-CodexDirectLaunchFailureMessage $appPath $_.Exception) } }",
 		"if ($null -eq $pkg) { throw 'OpenAI.Codex package was not found after installation. Microsoft Store/winget may be blocked by policy or source availability.' }",
-		"$exe = Join-Path $pkg.InstallLocation 'app\\Codex.exe'",
-		"if (Test-Path -LiteralPath $exe) { try { Start-CodexDesktopProcess $exe; return } catch { $directLaunchError = Get-CodexDirectLaunchFailureMessage $exe $_.Exception; if ($codexArgs.Count -gt 0) { throw ($directLaunchError + ' proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost.') }; Write-Warning ($directLaunchError + '; falling back to AppX activation') } }",
-		"if ($codexArgs.Count -gt 0) { throw 'Codex.exe was not found in the Microsoft Store package and proxy mode cannot use AppX activation because Chromium --proxy-server would be lost. Pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.' }",
 		"$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName",
-		"$app = @($manifest.Package.Applications.Application | Select-Object -First 1)",
-		"if ($app.Count -eq 0) { throw 'Codex desktop app manifest does not define an application entry' }",
+		"$applications = @($manifest.Package.Applications.Application)",
+		codexDesktopWindowsExecutableCandidatesPowerShell(),
+		"$exe = $exeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1",
+		"if (-not [string]::IsNullOrWhiteSpace($exe)) { try { Start-CodexDesktopProcess $exe; return } catch { $directLaunchError = Get-CodexDirectLaunchFailureMessage $exe $_.Exception; if ($codexArgs.Count -gt 0) { throw ($directLaunchError + ' proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost.') }; Write-Warning ($directLaunchError + '; falling back to AppX activation') } }",
+		"if ($codexArgs.Count -gt 0) { throw 'ChatGPT.exe and Codex.exe were not found in the Microsoft Store package and proxy mode cannot use AppX activation because Chromium --proxy-server would be lost. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }",
+		codexDesktopWindowsAppXSelectionPowerShell(),
 		"$aumid = $pkg.PackageFamilyName + '!' + $app[0].Id",
-		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app. If ChatGPT auth or proxy support is required, pass --app-path only for an unpackaged Codex.exe that Windows can execute directly.'",
+		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app. If ChatGPT auth or proxy support is required, pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.'",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd | Out-Null",
+	}, "; ")
+}
+
+func codexDesktopWindowsExecutableCandidatesPowerShell() string {
+	return strings.Join([]string{
+		"$currentApplication = @($applications | Where-Object { [IO.Path]::GetFileName([string]$_.Executable) -ieq '" + codexDesktopWindowsCurrentExecutable + "' } | Select-Object -First 1)",
+		"$legacyApplication = @($applications | Where-Object { [IO.Path]::GetFileName([string]$_.Executable) -ieq '" + codexDesktopWindowsLegacyExecutable + "' } | Select-Object -First 1)",
+		"$exeCandidates = @()",
+		"if ($currentApplication.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$currentApplication[0].Executable)) { $exeCandidates += Join-Path $pkg.InstallLocation ([string]$currentApplication[0].Executable) }",
+		"$exeCandidates += Join-Path $pkg.InstallLocation 'app\\" + codexDesktopWindowsCurrentExecutable + "'",
+		"if ($legacyApplication.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$legacyApplication[0].Executable)) { $exeCandidates += Join-Path $pkg.InstallLocation ([string]$legacyApplication[0].Executable) }",
+		"$exeCandidates += Join-Path $pkg.InstallLocation 'app\\" + codexDesktopWindowsLegacyExecutable + "'",
+		"$exeCandidates = @($exeCandidates | Select-Object -Unique)",
+	}, "; ")
+}
+
+func codexDesktopWindowsAppXSelectionPowerShell() string {
+	return strings.Join([]string{
+		"$app = @($applications | Where-Object { [IO.Path]::GetFileName([string]$_.Executable) -ieq '" + codexDesktopWindowsCurrentExecutable + "' } | Select-Object -First 1)",
+		"if ($app.Count -eq 0) { $app = @($applications | Where-Object { [IO.Path]::GetFileName([string]$_.Executable) -ieq '" + codexDesktopWindowsLegacyExecutable + "' } | Select-Object -First 1) }",
+		"if ($app.Count -eq 0 -and $applications.Count -eq 1) { $app = @($applications[0]) }",
+		"if ($app.Count -eq 0) { throw 'Codex desktop app manifest does not define a ChatGPT or Codex application entry' }",
 	}, "; ")
 }
 
