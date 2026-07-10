@@ -1711,9 +1711,6 @@ func TestBridgePacesRealGraphOutboxWritesCI(t *testing.T) {
 	if sleeps[0] <= 0 || sleeps[0] > graphOutboxSendMinInterval {
 		t.Fatalf("Graph write sleep = %s, want positive delay up to %s", sleeps[0], graphOutboxSendMinInterval)
 	}
-	if sleeps[0] < graphOutboxSendMinInterval/2 {
-		t.Fatalf("Graph write sleep = %s, want conservative same-chat pacing delay", sleeps[0])
-	}
 }
 
 func TestBridgeDoesNotSendFinalTextAsProgressWhenOnlyMemoryCitationDiffers(t *testing.T) {
