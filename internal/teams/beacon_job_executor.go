@@ -123,6 +123,7 @@ func enqueueBeaconJobForTurn(ctx context.Context, store *beacon.Store, plan beac
 		if session != nil {
 			payload.WorkingDir = session.Cwd
 			payload.CodexThreadID = session.CodexThreadID
+			payload.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
 		}
 		var err error
 		job, _, err = beacon.EnqueueJobAttempt(st, plan.AllocationRequestID, machine, payload, time.Now())

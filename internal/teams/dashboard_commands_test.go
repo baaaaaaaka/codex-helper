@@ -83,6 +83,10 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "models", name: DashboardCommandModel},
 		{text: "helper model default mimo25", name: DashboardCommandModel, raw: "default mimo25"},
 		{text: "/model doctor deepseek", name: DashboardCommandModel, raw: "doctor deepseek"},
+		{text: "effort status", name: DashboardCommandEffort, raw: "status"},
+		{text: "efforts", name: DashboardCommandEffort, raw: "list"},
+		{text: "helper effort set high", name: DashboardCommandEffort, raw: "set high"},
+		{text: "/thinking-effort reset", name: DashboardCommandEffort, raw: "reset"},
 		{text: "beacon list", name: DashboardCommandBeacon, raw: "list"},
 		{text: "/beacon machine list", name: DashboardCommandBeacon, raw: "machine list"},
 		{text: "helper beacon profile list", name: DashboardCommandBeacon, raw: "profile list"},
@@ -246,7 +250,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/park s001", "/resume s001", "/unpark s001", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper park s001", "helper resume s001", "helper unpark s001", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "codex status", "codex stats", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/park s001", "/resume s001", "/unpark s001", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper park s001", "helper resume s001", "helper unpark s001", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "effort list", "effort set xhigh", "helper effort reset", "codex status", "codex stats", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {

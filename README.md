@@ -694,6 +694,9 @@ continue 1
 status
 model list
 model use deepseek
+effort status
+effort list
+effort set high
 ```
 
 Daily Work chat commands:
@@ -708,7 +711,14 @@ helper publish-history full
 model status
 model switch deepseek
 model fork deepseek
+effort status
+effort list
+effort set xhigh
 ```
+
+Control and Work chats keep their effort independently. `effort list` uses the
+current model's advertised choices and order; a switch applies to turns queued
+after the command, while `effort reset` selects the model-advertised default.
 
 Advanced local checks and maintenance:
 

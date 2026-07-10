@@ -514,9 +514,12 @@ func TestBeaconJobExecutorStreamsPerJobSidecarBeforeTerminal(t *testing.T) {
 		LeaseID:             "lease-1",
 		ProviderJobID:       "slurm-1",
 		Snapshot:            beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", MachineID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1"},
-	}, &Session{ID: "s001", Cwd: t.TempDir()}, ExecutionInput{Prompt: "stream remotely"})
+	}, &Session{ID: "s001", Cwd: t.TempDir(), ReasoningEffort: "xhigh"}, ExecutionInput{Prompt: "stream remotely"})
 	if err != nil {
 		t.Fatalf("enqueue job: %v", err)
+	}
+	if job.Payload.ReasoningEffort != "xhigh" {
+		t.Fatalf("beacon job reasoning effort = %q, want xhigh", job.Payload.ReasoningEffort)
 	}
 	emptyStream, err := beacon.NewJobStreamWriter(store.Path(), job)
 	if err != nil {

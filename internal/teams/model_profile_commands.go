@@ -61,6 +61,8 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 			return "", fmt.Errorf("usage: `model delete <profile> --confirm`")
 		}
 		return b.modelManagerDelete(ctx, name, confirm)
+	case "effort", "reasoning-effort", "thinking-effort":
+		return b.handleReasoningEffortControlCommand(ctx, rest)
 	default:
 		return modelControlUsage(), nil
 	}
@@ -92,6 +94,8 @@ func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, a
 			return "", fmt.Errorf("usage: `model fork <profile>`")
 		}
 		return b.forkWorkChatWithModelProfile(ctx, session, rest)
+	case "effort", "reasoning-effort", "thinking-effort":
+		return b.handleReasoningEffortWorkCommand(ctx, session, rest)
 	default:
 		return modelWorkUsage(), nil
 	}
@@ -180,6 +184,7 @@ func modelControlUsage() string {
 		"- `model doctor <model>` - validate the model backing profile",
 		"- `model use <model>` - set the default for future chats",
 		"- `new <directory> --model <model>` - create a chat pinned to a model",
+		"- `effort list|status|set|reset` - inspect or change Control chat effort",
 	}, "\n")
 }
 
@@ -190,6 +195,7 @@ func modelWorkUsage() string {
 		"- `model switch <name>` - switch before any Codex turn starts",
 		"- `model fork <name>` - create a new Work chat with another profile",
 		"- `model list` - list profiles",
+		"- `effort list|status|set|reset` - inspect or change this chat's effort",
 	}, "\n")
 }
 

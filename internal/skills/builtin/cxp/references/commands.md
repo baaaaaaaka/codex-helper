@@ -111,6 +111,7 @@ Control chat commands:
 - `open <number>`: show an existing linked Work chat.
 - `status` or `st`: list active Work chats.
 - `model list`, `model setup <model>`, `model use <model>`, and `model doctor <model>`: list, configure, select, or validate model profiles from Teams.
+- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change the Control chat reasoning effort.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
@@ -126,6 +127,7 @@ Work chat commands:
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
 - `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
 - `model status`, `model switch <profile>`, and `model fork <profile>`: inspect, switch when compatible, or fork the Work chat with another model profile.
+- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change this Work chat's reasoning effort.
 - `helper close`: close the Work chat binding.
 
 ## Beacon Execution Profiles

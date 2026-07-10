@@ -21,6 +21,7 @@ const (
 	appServerMethodThreadRead                 = "thread/read"
 	appServerMethodThreadList                 = "thread/list"
 	appServerMethodThreadTurnsList            = "thread/turns/list"
+	appServerMethodModelList                  = "model/list"
 	appServerMethodTurnStart                  = "turn/start"
 	appServerMethodTurnInterrupt              = "turn/interrupt"
 	appServerCompletedRequestLimit            = 256
@@ -618,6 +619,9 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 	if len(input.OutputSchema) > 0 {
 		params["outputSchema"] = input.OutputSchema
 	}
+	if effort := strings.TrimSpace(input.ReasoningEffort); effort != "" {
+		params["effort"] = effort
+	}
 	subscription := r.subscribeTurn(ctx, threadID)
 	defer r.unsubscribeTurn(subscription)
 
@@ -677,6 +681,69 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 		return result, turnResultError(result)
 	}
 	return result, nil
+}
+
+func (r *AppServerRunner) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	ctx, cancel := withOptionalTimeout(ctx, r.Timeout)
+	defer cancel()
+	if err := r.ensureReady(ctx); err != nil {
+		return nil, err
+	}
+
+	var out []ModelInfo
+	cursor := ""
+	seen := map[string]bool{}
+	for {
+		params := map[string]any{"includeHidden": false}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		raw, err := r.request(ctx, appServerMethodModelList, params)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Data []struct {
+				ID                     string `json:"id"`
+				Model                  string `json:"model"`
+				DisplayName            string `json:"displayName"`
+				IsDefault              bool   `json:"isDefault"`
+				DefaultReasoningEffort string `json:"defaultReasoningEffort"`
+				Supported              []struct {
+					Effort      string `json:"reasoningEffort"`
+					Description string `json:"description"`
+				} `json:"supportedReasoningEfforts"`
+			} `json:"data"`
+			NextCursor string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return nil, &Error{Kind: ErrorParse, Message: "invalid model/list result", Err: err}
+		}
+		for _, model := range page.Data {
+			info := ModelInfo{
+				ID:                     strings.TrimSpace(model.ID),
+				Model:                  strings.TrimSpace(model.Model),
+				DisplayName:            strings.TrimSpace(model.DisplayName),
+				IsDefault:              model.IsDefault,
+				DefaultReasoningEffort: strings.TrimSpace(model.DefaultReasoningEffort),
+			}
+			for _, option := range model.Supported {
+				if effort := strings.TrimSpace(option.Effort); effort != "" {
+					info.ReasoningEfforts = append(info.ReasoningEfforts, ReasoningEffortOption{Effort: effort, Description: strings.TrimSpace(option.Description)})
+				}
+			}
+			out = append(out, info)
+		}
+		next := strings.TrimSpace(page.NextCursor)
+		if next == "" {
+			return out, nil
+		}
+		if seen[next] {
+			return nil, &Error{Kind: ErrorParse, Message: "model/list returned a repeated cursor"}
+		}
+		seen[next] = true
+		cursor = next
+	}
 }
 
 func appServerTurnInput(input TurnInput) []map[string]string {

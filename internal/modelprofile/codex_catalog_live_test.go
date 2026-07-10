@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,8 +26,12 @@ func TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn(t *testing.T) {
 	if codexPath == "" {
 		codexPath = "codex"
 	}
-	if _, err := exec.LookPath(codexPath); err != nil && !filepath.IsAbs(codexPath) {
-		t.Fatalf("find codex executable %q: %v", codexPath, err)
+	if !filepath.IsAbs(codexPath) {
+		resolved, err := exec.LookPath(codexPath)
+		if err != nil {
+			t.Fatalf("find codex executable %q: %v", codexPath, err)
+		}
+		codexPath = resolved
 	}
 
 	spec, err := MustLookupProvider("mimo")
@@ -49,7 +55,7 @@ func TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, codexPath,
+	cmd := liveCodexAppServerCommand(ctx, codexPath,
 		"-c", `model_catalog_json="`+tomlEscape(catalogPath)+`"`,
 		"-c", `model="`+tomlEscape(spec.DefaultPublicModel())+`"`,
 		"app-server", "--listen", "stdio://",
@@ -96,8 +102,12 @@ func TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn(t *testing.T) {
 
 	var result struct {
 		Data []struct {
-			Model     string `json:"model"`
-			IsDefault bool   `json:"isDefault"`
+			Model                  string `json:"model"`
+			IsDefault              bool   `json:"isDefault"`
+			DefaultReasoningEffort string `json:"defaultReasoningEffort"`
+			Supported              []struct {
+				Effort string `json:"reasoningEffort"`
+			} `json:"supportedReasoningEfforts"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(msg.Result, &result); err != nil {
@@ -111,6 +121,30 @@ func TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn(t *testing.T) {
 	}
 	if result.Data[1].Model != "mimo/mimo-v2.5-pro" || result.Data[1].IsDefault {
 		t.Fatalf("second model = %#v, want mimo/mimo-v2.5-pro non-default", result.Data[1])
+	}
+	if result.Data[0].DefaultReasoningEffort != "medium" {
+		t.Fatalf("default reasoning effort = %q, want medium", result.Data[0].DefaultReasoningEffort)
+	}
+	efforts := make([]string, 0, len(result.Data[0].Supported))
+	for _, option := range result.Data[0].Supported {
+		efforts = append(efforts, option.Effort)
+	}
+	if want := []string{"low", "medium", "high", "xhigh"}; !reflect.DeepEqual(efforts, want) {
+		t.Fatalf("supported reasoning efforts = %#v, want %#v", efforts, want)
+	}
+}
+
+func liveCodexAppServerCommand(ctx context.Context, codexPath string, args ...string) *exec.Cmd {
+	if runtime.GOOS != "windows" {
+		return exec.CommandContext(ctx, codexPath, args...)
+	}
+	switch strings.ToLower(filepath.Ext(codexPath)) {
+	case ".cmd", ".bat":
+		return exec.CommandContext(ctx, "cmd.exe", append([]string{"/d", "/s", "/c", codexPath}, args...)...)
+	case ".ps1":
+		return exec.CommandContext(ctx, "pwsh", append([]string{"-NoProfile", "-File", codexPath}, args...)...)
+	default:
+		return exec.CommandContext(ctx, codexPath, args...)
 	}
 }
 

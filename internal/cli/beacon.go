@@ -1307,10 +1307,11 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
 		ThreadID: strings.TrimSpace(job.Payload.CodexThreadID),
 		TurnInput: codexrunner.TurnInput{
-			Prompt:       job.Payload.Prompt,
-			ImagePaths:   append([]string(nil), job.Payload.ImagePaths...),
-			WorkingDir:   job.Payload.WorkingDir,
-			EventHandler: handler,
+			Prompt:          job.Payload.Prompt,
+			ImagePaths:      append([]string(nil), job.Payload.ImagePaths...),
+			WorkingDir:      job.Payload.WorkingDir,
+			EventHandler:    handler,
+			ReasoningEffort: strings.TrimSpace(job.Payload.ReasoningEffort),
 		},
 	})
 	payload := beacon.JobTerminalPayload{

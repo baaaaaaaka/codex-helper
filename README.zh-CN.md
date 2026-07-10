@@ -585,6 +585,9 @@ continue 1
 status
 model list
 model use deepseek
+effort status
+effort list
+effort set high
 ```
 
 日常 Work chat 命令：
@@ -599,7 +602,13 @@ helper publish-history full
 model status
 model switch deepseek
 model fork deepseek
+effort status
+effort list
+effort set xhigh
 ```
+
+Control 和 Work chat 各自独立保存 effort。`effort list` 按当前模型声明的选项和顺序
+展示；切换只作用于命令之后排队的 turn，`effort reset` 会恢复为模型声明的默认值。
 
 高级本地检查和维护：
 

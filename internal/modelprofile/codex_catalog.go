@@ -129,6 +129,7 @@ func supportedReasoningLevels(model ModelSpec) []codexReasoningPreset {
 		{Effort: "low", Description: "Fast responses with lighter reasoning"},
 		{Effort: "medium", Description: "Balances speed and reasoning depth"},
 		{Effort: "high", Description: "Greater reasoning depth for complex tasks"},
+		{Effort: "xhigh", Description: "Maximum reasoning exposed by the CXP provider adapter"},
 	}
 }
 

@@ -48,6 +48,7 @@ const (
 	DashboardCommandSkills         DashboardCommandName = "skills"
 	DashboardCommandBeacon         DashboardCommandName = "beacon"
 	DashboardCommandModel          DashboardCommandName = "model"
+	DashboardCommandEffort         DashboardCommandName = "effort"
 )
 
 type ParsedDashboardCommand struct {
@@ -84,6 +85,9 @@ func ParseDashboardCommand(scope ChatScope, text string) ParsedDashboardCommand 
 	}
 	if name, arg, ok := splitNaturalControlCommand(trimmed); ok {
 		commandName, _ := controlNaturalCommandName(name, arg)
+		if commandName == DashboardCommandEffort {
+			arg = dashboardCommandArgumentAlias(commandName, name, arg)
+		}
 		return ParsedDashboardCommand{
 			Scope:         ChatScopeControl,
 			Name:          commandName,
@@ -207,6 +211,9 @@ func dashboardCommandArgumentAlias(commandName DashboardCommandName, name string
 	if commandName == DashboardCommandModel && strings.EqualFold(strings.TrimSpace(name), "models") && strings.TrimSpace(arg) == "" {
 		return "list"
 	}
+	if commandName == DashboardCommandEffort && strings.EqualFold(strings.TrimSpace(name), "efforts") && strings.TrimSpace(arg) == "" {
+		return "list"
+	}
 	return arg
 }
 
@@ -230,6 +237,13 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 			arg = "list"
 		}
 		return DashboardCommandModel, arg, true
+	case "effort", "reasoning-effort", "thinking-effort":
+		return DashboardCommandEffort, arg, true
+	case "efforts":
+		if strings.TrimSpace(arg) == "" {
+			arg = "list"
+		}
+		return DashboardCommandEffort, arg, true
 	default:
 	}
 	return DashboardCommandNone, "", false
@@ -392,7 +406,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel:
+	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandEffort:
 		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandPark, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
@@ -440,6 +454,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandBeacon, true
 	case "model", "models", "model-profile", "model-profiles", "profiles":
 		return DashboardCommandModel, true
+	case "effort", "efforts", "reasoning-effort", "thinking-effort":
+		return DashboardCommandEffort, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -538,6 +554,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandBeacon, true
 	case "model", "models", "model-profile", "model-profiles", "profiles":
 		return DashboardCommandModel, true
+	case "effort", "efforts", "reasoning-effort", "thinking-effort":
+		return DashboardCommandEffort, true
 	default:
 		return DashboardCommandNone, false
 	}

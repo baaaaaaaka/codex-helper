@@ -37,6 +37,7 @@ type runtimeContractAdapter struct {
 	originalArguments string
 	toolName          string
 	restoredHistory   bool
+	expectedEffort    string
 }
 
 type runtimeMetadataResumeAdapter struct {
@@ -125,6 +126,9 @@ func runtimeProviderRequestText(request responsesadapter.ProviderRequest) string
 func (a *runtimeContractAdapter) Stream(_ context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.expectedEffort != "" && request.ReasoningEffort != a.expectedEffort {
+		return nil, fmt.Errorf("provider reasoning effort = %q, want %q", request.ReasoningEffort, a.expectedEffort)
+	}
 	a.calls++
 	if a.calls == 1 {
 		command := strings.TrimSpace(a.command)
@@ -258,7 +262,7 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	sentinel := filepath.Join(root, "outside-workspace.txt")
-	adapter := &runtimeContractAdapter{sentinel: sentinel, workingDir: workingDir}
+	adapter := &runtimeContractAdapter{sentinel: sentinel, workingDir: workingDir, expectedEffort: "xhigh"}
 	var providerMu sync.Mutex
 	var providerRequests, providerWebSockets, providerWebSocketMessages int
 	var analyticsRequests [][]byte
@@ -326,8 +330,9 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	defer cancel()
 	started := time.Now()
 	result, err := runner.StartThread(ctx, TurnInput{
-		Prompt:     "Use the available shell tool exactly once, then report completion.",
-		WorkingDir: workingDir,
+		Prompt:          "Use the available shell tool exactly once, then report completion.",
+		WorkingDir:      workingDir,
+		ReasoningEffort: "xhigh",
 	})
 	if err != nil {
 		adapter.mu.Lock()

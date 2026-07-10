@@ -18,7 +18,7 @@ const DefaultSessionReasoningEffort = "xhigh"
 const DefaultControlFallbackReasoningEffort = "low"
 const DefaultControlFallbackModel = ""
 const controlFallbackHistoryKeyword = codexhistory.HelperControlSessionTitleKeyword
-const maxControlFallbackHelpContextChars = 7000
+const maxControlFallbackHelpContextChars = 7200
 const maxControlFallbackStateContextChars = 2500
 
 func CodexReasoningEffortConfigArg(effort string) string {
@@ -102,6 +102,7 @@ Control chat commands the helper understands:
 - open <number>: show the linked Teams work chat for a session
 - status: show current helper sessions
 - model list, model setup <model>, model use <model>, model doctor <model>: manage model profiles from the control chat
+- effort status, effort list, effort set <value>, or effort reset: inspect or change this Control chat's reasoning effort
 - skills or helper skills list: list installed skill subscriptions
 - helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated in the user agents skills directory
 - helper skills sync [name]: sync one skill source, or all sources when no name is given
@@ -115,6 +116,7 @@ Work chat helper commands:
 - helper file <relative-path>: upload a generated file from the Teams outbound folder
 - helper skills list, helper skills add <url>, helper skills sync [name], or helper skills push [name]: inspect or sync skill subscriptions
 - model status, model switch <profile>, or model fork <profile>: inspect, switch when compatible, or fork the Work chat with another model profile
+- effort status, effort list, effort set <value>, or effort reset: inspect or change this Work chat's reasoning effort
 - helper close: close the Work chat binding
 
 Local cxp skills commands:

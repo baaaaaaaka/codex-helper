@@ -35289,15 +35289,18 @@ func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
 	}
 }
 
-func TestBridgeTurnModelProfileOverridesSessionForExecution(t *testing.T) {
-	session := &Session{ID: "s001", ModelProfile: modelprofile.Snapshot{Name: "deepseek", Provider: "deepseek", Revision: 1}}
-	turn := teamstore.Turn{ID: "turn-1", SessionID: "s001", ModelProfile: modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", Revision: 2}}
-	got := sessionWithTurnModelProfile(session, turn)
+func TestBridgeTurnExecutionConfigOverridesSessionSnapshot(t *testing.T) {
+	session := &Session{ID: "s001", ModelProfile: modelprofile.Snapshot{Name: "deepseek", Provider: "deepseek", Revision: 1}, ReasoningEffort: "low"}
+	turn := teamstore.Turn{ID: "turn-1", SessionID: "s001", ModelProfile: modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", Revision: 2}, ReasoningEffort: "xhigh"}
+	got := sessionWithTurnExecutionConfig(session, turn)
 	if got == session {
-		t.Fatal("sessionWithTurnModelProfile should clone when turn has a pinned model profile")
+		t.Fatal("sessionWithTurnExecutionConfig should clone the queued turn snapshot")
 	}
 	if got.ModelProfile.Name != "mimo25" || session.ModelProfile.Name != "deepseek" {
 		t.Fatalf("model profile override got=%#v original=%#v", got.ModelProfile, session.ModelProfile)
+	}
+	if got.ReasoningEffort != "xhigh" || session.ReasoningEffort != "low" {
+		t.Fatalf("reasoning effort override got=%q original=%q", got.ReasoningEffort, session.ReasoningEffort)
 	}
 }
 

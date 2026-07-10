@@ -86,10 +86,11 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	}
 
 	got, err := runner.StartThread(context.Background(), TurnInput{
-		Prompt:         "hello",
-		AdditionalDirs: []string{"/extra-a", "/extra-b"},
-		OutputSchema:   json.RawMessage(`{"type":"object"}`),
-		Ephemeral:      true,
+		Prompt:          "hello",
+		AdditionalDirs:  []string{"/extra-a", "/extra-b"},
+		OutputSchema:    json.RawMessage(`{"type":"object"}`),
+		Ephemeral:       true,
+		ReasoningEffort: "xhigh",
 	})
 	if err != nil {
 		t.Fatalf("StartThread error: %v", err)
@@ -124,7 +125,52 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	if schema, ok := turnParams["outputSchema"].(map[string]any); !ok || schema["type"] != "object" {
 		t.Fatalf("outputSchema = %#v", turnParams["outputSchema"])
 	}
+	if turnParams["effort"] != "xhigh" {
+		t.Fatalf("effort = %#v, want xhigh", turnParams["effort"])
+	}
 	assertJSONRPC(t, writes[4])
+}
+
+func TestAppServerRunnerListModelsPreservesEffortOrderAndPaginates(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"data":[{"id":"gpt-main","model":"gpt-main","displayName":"GPT Main","isDefault":true,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"fast"},{"reasoningEffort":"ultra","description":"deep"}]}],"nextCursor":"page-2"}}`,
+		`{"id":4,"result":{"data":[{"id":"gpt-alt","model":"gpt-alt","displayName":"GPT Alt","isDefault":false,"defaultReasoningEffort":"high","supportedReasoningEfforts":[{"reasoningEffort":"custom-future","description":"future"}]}],"nextCursor":null}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	models, err := runner.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels error: %v", err)
+	}
+	if len(models) != 2 || models[0].Model != "gpt-main" || models[1].Model != "gpt-alt" {
+		t.Fatalf("models = %#v", models)
+	}
+	if got := []string{models[0].ReasoningEfforts[0].Effort, models[0].ReasoningEfforts[1].Effort}; !reflect.DeepEqual(got, []string{"low", "ultra"}) {
+		t.Fatalf("effort order = %#v", got)
+	}
+	if models[1].ReasoningEfforts[0].Effort != "custom-future" {
+		t.Fatalf("custom effort was not preserved: %#v", models[1])
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[3], "model/list")
+	assertMethod(t, writes[4], "model/list")
+	assertParamString(t, writes[4], "cursor", "page-2")
+}
+
+func TestAppServerRunnerListModelsRejectsRepeatedCursor(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"data":[],"nextCursor":"same"}}`,
+		`{"id":4,"result":{"data":[],"nextCursor":"same"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	if _, err := runner.ListModels(context.Background()); err == nil || !strings.Contains(err.Error(), "repeated cursor") {
+		t.Fatalf("ListModels repeated cursor error = %v", err)
+	}
 }
 
 func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {

@@ -125,6 +125,16 @@ jobs:
           set -euo pipefail
           go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*)|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
 
+      - name: Teams per-chat reasoning effort release contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexrunner -count=1 -run '^TestAppServerRunner(StartThreadEncodesThreadStartAndTurnStart|ListModels.*)$' -v
+          go test ./internal/modelprofile -count=1 -run '^TestCodexModelCatalogJSONUsesPublicModelIDs$' -v
+          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|ReasoningEffortCatalog.*)|CodexReasoningEffortFromArgsPreservesExplicitLastOverride|RunBeaconWorkerJobUsesStandardAppServer)$' -v
+          go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
+          go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
+
   teams-runtime-preflight:
     name: Teams runtime preflight (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -2,6 +2,7 @@ package modelprofile
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,8 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 				Mode  string `json:"mode"`
 				Limit int    `json:"limit"`
 			} `json:"truncation_policy"`
+			DefaultReasoningLevel    string                 `json:"default_reasoning_level"`
+			SupportedReasoningLevels []codexReasoningPreset `json:"supported_reasoning_levels"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -50,6 +53,16 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 	}
 	if decoded.Models[0].TruncationPolicy.Mode != "tokens" || decoded.Models[0].TruncationPolicy.Limit <= 0 {
 		t.Fatalf("truncation policy = %#v", decoded.Models[0].TruncationPolicy)
+	}
+	if decoded.Models[0].DefaultReasoningLevel != "medium" {
+		t.Fatalf("default reasoning level = %q, want medium", decoded.Models[0].DefaultReasoningLevel)
+	}
+	var efforts []string
+	for _, option := range decoded.Models[0].SupportedReasoningLevels {
+		efforts = append(efforts, option.Effort)
+	}
+	if got := strings.Join(efforts, ","); got != "low,medium,high,xhigh" {
+		t.Fatalf("supported reasoning levels = %q", got)
 	}
 }
 

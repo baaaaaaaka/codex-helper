@@ -258,10 +258,11 @@ type JobAttempt struct {
 }
 
 type JobPayload struct {
-	Prompt        string   `json:"prompt,omitempty"`
-	ImagePaths    []string `json:"image_paths,omitempty"`
-	WorkingDir    string   `json:"working_dir,omitempty"`
-	CodexThreadID string   `json:"codex_thread_id,omitempty"`
+	Prompt          string   `json:"prompt,omitempty"`
+	ImagePaths      []string `json:"image_paths,omitempty"`
+	WorkingDir      string   `json:"working_dir,omitempty"`
+	CodexThreadID   string   `json:"codex_thread_id,omitempty"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
 }
 
 type JobTerminalPayload struct {

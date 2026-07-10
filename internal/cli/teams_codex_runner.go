@@ -24,22 +24,23 @@ import (
 var prepareTeamsAppServerModelProfileForRunner = prepareTeamsAppServerModelProfileWithContext
 
 type teamsCodexExecutor struct {
-	runner               codexrunner.Runner
-	workDir              string
-	timeout              time.Duration
-	root                 *rootOptions
-	runnerName           string
-	codexPath            string
-	codexArgs            []string
-	modelProfileRef      string
-	modelProfileSnapshot modelprofile.Snapshot
-	log                  io.Writer
-	runnerCacheMu        *sync.Mutex
-	runnersByProfile     map[string]codexrunner.Runner
-	staticImages         []string
-	additionalDirs       []string
-	outputSchema         json.RawMessage
-	ephemeral            bool
+	runner                 codexrunner.Runner
+	workDir                string
+	timeout                time.Duration
+	root                   *rootOptions
+	runnerName             string
+	codexPath              string
+	codexArgs              []string
+	modelProfileRef        string
+	modelProfileSnapshot   modelprofile.Snapshot
+	log                    io.Writer
+	runnerCacheMu          *sync.Mutex
+	runnersByProfile       map[string]codexrunner.Runner
+	staticImages           []string
+	additionalDirs         []string
+	outputSchema           json.RawMessage
+	ephemeral              bool
+	defaultReasoningEffort string
 }
 
 func (e teamsCodexExecutor) Close() error {
@@ -158,22 +159,23 @@ func newManagedTeamsCodexExecutorWithContext(
 		return nil, fmt.Errorf("unknown Teams codex runner %q", runnerName)
 	}
 	return teamsCodexExecutor{
-		runner:               runner,
-		workDir:              strings.TrimSpace(workDir),
-		timeout:              timeout,
-		root:                 root,
-		runnerName:           runnerName,
-		codexPath:            codexPath,
-		codexArgs:            append([]string{}, codexArgs...),
-		modelProfileRef:      strings.TrimSpace(modelProfile),
-		modelProfileSnapshot: snapshot,
-		log:                  log,
-		runnerCacheMu:        &sync.Mutex{},
-		runnersByProfile:     map[string]codexrunner.Runner{},
-		staticImages:         turnOptions.ImagePaths,
-		additionalDirs:       turnOptions.AdditionalDirs,
-		outputSchema:         turnOptions.OutputSchema,
-		ephemeral:            turnOptions.Ephemeral,
+		runner:                 runner,
+		workDir:                strings.TrimSpace(workDir),
+		timeout:                timeout,
+		root:                   root,
+		runnerName:             runnerName,
+		codexPath:              codexPath,
+		codexArgs:              append([]string{}, codexArgs...),
+		modelProfileRef:        strings.TrimSpace(modelProfile),
+		modelProfileSnapshot:   snapshot,
+		log:                    log,
+		runnerCacheMu:          &sync.Mutex{},
+		runnersByProfile:       map[string]codexrunner.Runner{},
+		staticImages:           turnOptions.ImagePaths,
+		additionalDirs:         turnOptions.AdditionalDirs,
+		outputSchema:           turnOptions.OutputSchema,
+		ephemeral:              turnOptions.Ephemeral,
+		defaultReasoningEffort: codexReasoningEffortFromArgs(codexArgs),
 	}, nil
 }
 
@@ -254,6 +256,61 @@ func (e teamsCodexExecutor) RunInput(ctx context.Context, session *teams.Session
 	return e.RunInputWithEventHandler(ctx, session, input, nil)
 }
 
+func (e teamsCodexExecutor) DefaultReasoningEffort() string {
+	return strings.TrimSpace(firstNonEmptyCLI(e.defaultReasoningEffort, codexReasoningEffortFromArgs(e.codexArgs)))
+}
+
+func (e teamsCodexExecutor) ReasoningEffortCatalog(ctx context.Context, session *teams.Session) (teams.ReasoningEffortCatalog, error) {
+	runner, err := e.runnerForSessionProfile(ctx, session)
+	if err != nil {
+		return teams.ReasoningEffortCatalog{}, err
+	}
+	reader, ok := runner.(codexrunner.ModelCatalogReader)
+	if !ok {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("Codex runner does not expose model/list")
+	}
+	models, err := reader.ListModels(ctx)
+	if err != nil {
+		return teams.ReasoningEffortCatalog{}, err
+	}
+	target := ""
+	if session != nil {
+		target = strings.TrimSpace(session.ModelProfile.Model)
+		if target == "" {
+			target = strings.TrimSpace(session.ModelProfile.DefaultModel)
+		}
+	}
+	var selected *codexrunner.ModelInfo
+	for i := range models {
+		model := &models[i]
+		if target != "" && (strings.EqualFold(model.Model, target) || strings.EqualFold(model.ID, target)) {
+			selected = model
+			break
+		}
+		if target == "" && model.IsDefault && selected == nil {
+			selected = model
+		}
+	}
+	if selected == nil && len(models) > 0 {
+		if target != "" {
+			return teams.ReasoningEffortCatalog{}, fmt.Errorf("Codex model/list did not include configured model %q", target)
+		}
+		selected = &models[0]
+	}
+	if selected == nil {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("Codex model/list returned no models")
+	}
+	catalog := teams.ReasoningEffortCatalog{
+		Model:         firstNonEmptyCLI(selected.Model, selected.ID),
+		DisplayName:   strings.TrimSpace(selected.DisplayName),
+		DefaultEffort: strings.TrimSpace(selected.DefaultReasoningEffort),
+	}
+	for _, option := range selected.ReasoningEfforts {
+		catalog.Options = append(catalog.Options, teams.ReasoningEffortOption{Effort: option.Effort, Description: option.Description})
+	}
+	return catalog, nil
+}
+
 func teamsCodexEffectiveWorkDir(session *teams.Session, fallback string) string {
 	if session != nil {
 		if cwd := strings.TrimSpace(session.Cwd); cwd != "" {
@@ -278,6 +335,9 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		Timeout:        e.timeout,
 		EventHandler:   handler,
 		Ephemeral:      e.ephemeral,
+	}
+	if session != nil {
+		turnInput.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
 	}
 	if session != nil && teams.SessionAllowsAutoTitleUpdate(*session) {
 		turnInput.BackfillThreadName = true

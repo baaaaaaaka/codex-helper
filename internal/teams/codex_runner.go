@@ -14,6 +14,31 @@ type Executor interface {
 	Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error)
 }
 
+// ReasoningEffortCatalogProvider is implemented by executors that can ask
+// their actual Codex runtime for the current model's effort choices.
+type ReasoningEffortCatalogProvider interface {
+	ReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error)
+}
+
+// ReasoningEffortDefaultProvider exposes the launch-level default already
+// configured on an executor. Per-chat state overrides this value once the user
+// explicitly switches or resets the chat.
+type ReasoningEffortDefaultProvider interface {
+	DefaultReasoningEffort() string
+}
+
+type ReasoningEffortCatalog struct {
+	Model         string
+	DisplayName   string
+	DefaultEffort string
+	Options       []ReasoningEffortOption
+}
+
+type ReasoningEffortOption struct {
+	Effort      string
+	Description string
+}
+
 type StreamingExecutor interface {
 	RunWithEventHandler(ctx context.Context, session *Session, prompt string, handler codexrunner.EventHandler) (ExecutionResult, error)
 }
@@ -121,6 +146,12 @@ func (e RunnerExecutor) RunInputWithEventHandler(ctx context.Context, session *S
 			ExtraArgs:    e.ExtraArgs,
 			Timeout:      e.Timeout,
 			EventHandler: handler,
+			ReasoningEffort: func() string {
+				if session == nil {
+					return ""
+				}
+				return strings.TrimSpace(session.ReasoningEffort)
+			}(),
 		},
 	})
 	if err != nil {

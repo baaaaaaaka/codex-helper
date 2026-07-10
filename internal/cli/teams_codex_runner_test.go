@@ -159,7 +159,7 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 		FinalAgentMessage: "final",
 	}}
 	executor := teamsCodexExecutor{runner: runner}
-	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing"}, "continue")
+	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing", ReasoningEffort: "high"}, "continue")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -168,6 +168,9 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 	if !runner.input.BackfillThreadName {
 		t.Fatal("auto-title session should request thread name backfill")
+	}
+	if runner.input.ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want high", runner.input.ReasoningEffort)
 	}
 	if got.Text != "final" || got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-existing" {
 		t.Fatalf("unexpected result: %#v", got)
@@ -193,6 +196,39 @@ func TestTeamsCodexExecutorUsesSessionCwdForNewThread(t *testing.T) {
 	}
 	if runner.input.WorkingDir != "/workspace/project" {
 		t.Fatalf("working dir = %q, want session cwd", runner.input.WorkingDir)
+	}
+}
+
+func TestTeamsCodexExecutorReasoningEffortCatalogUsesPinnedModelAndPreservesOptions(t *testing.T) {
+	runner := &fakeTeamsRunner{models: []codexrunner.ModelInfo{
+		{ID: "default", Model: "gpt-default", IsDefault: true, DefaultReasoningEffort: "medium"},
+		{ID: "pinned", Model: "provider/pinned", DisplayName: "Pinned", DefaultReasoningEffort: "high", ReasoningEfforts: []codexrunner.ReasoningEffortOption{
+			{Effort: "low", Description: "fast"},
+			{Effort: "xhigh", Description: "deep"},
+		}},
+	}}
+	executor := teamsCodexExecutor{runner: runner}
+	catalog, err := executor.ReasoningEffortCatalog(context.Background(), &teams.Session{ModelProfile: modelprofile.Snapshot{Model: "provider/pinned"}})
+	if err != nil {
+		t.Fatalf("ReasoningEffortCatalog: %v", err)
+	}
+	if catalog.Model != "provider/pinned" || catalog.DefaultEffort != "high" || len(catalog.Options) != 2 {
+		t.Fatalf("catalog = %#v", catalog)
+	}
+	if catalog.Options[0].Effort != "low" || catalog.Options[1].Effort != "xhigh" {
+		t.Fatalf("option order = %#v", catalog.Options)
+	}
+}
+
+func TestTeamsCodexExecutorReasoningEffortCatalogRejectsMissingPinnedModel(t *testing.T) {
+	runner := &fakeTeamsRunner{models: []codexrunner.ModelInfo{{
+		ID: "default", Model: "gpt-default", IsDefault: true,
+		ReasoningEfforts: []codexrunner.ReasoningEffortOption{{Effort: "low"}},
+	}}}
+	executor := teamsCodexExecutor{runner: runner}
+	_, err := executor.ReasoningEffortCatalog(context.Background(), &teams.Session{ModelProfile: modelprofile.Snapshot{Model: "provider/missing"}})
+	if err == nil || !strings.Contains(err.Error(), `configured model "provider/missing"`) {
+		t.Fatalf("missing pinned model error = %v", err)
 	}
 }
 
@@ -1247,6 +1283,29 @@ func TestCodexArgsWithReasoningEffortReplacesExistingConfigForms(t *testing.T) {
 	}
 }
 
+func TestCodexReasoningEffortFromArgsPreservesExplicitLastOverride(t *testing.T) {
+	args := []string{
+		"-c", `model_reasoning_effort="low"`,
+		"--config=unrelated=true",
+		`-c=model_reasoning_effort='medium'`,
+		"--config", `model_reasoning_effort="xhigh"`,
+	}
+	if got := codexReasoningEffortFromArgs(args); got != "xhigh" {
+		t.Fatalf("codexReasoningEffortFromArgs = %q, want xhigh", got)
+	}
+	executor, err := newTeamsExecutor(&rootOptions{}, "codex", "appserver", "/tmp/codex", "/work", []string{"-c", `model_reasoning_effort="medium"`}, "", time.Minute, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, ok := executor.(teams.ReasoningEffortDefaultProvider)
+	if !ok {
+		t.Fatalf("executor %T does not expose its launch effort default", executor)
+	}
+	if got := provider.DefaultReasoningEffort(); got != "medium" {
+		t.Fatalf("executor default effort = %q, want medium", got)
+	}
+}
+
 func TestNewManagedTeamsCodexExecutorRejectsUnknownRunner(t *testing.T) {
 	_, err := newManagedTeamsCodexExecutor(&rootOptions{}, "unknown", "", "", nil, "", 0, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "unknown Teams codex runner") {
@@ -1563,6 +1622,7 @@ type fakeTeamsRunner struct {
 	resumed  bool
 	threadID string
 	input    codexrunner.TurnInput
+	models   []codexrunner.ModelInfo
 }
 
 func (r *fakeTeamsRunner) StartThread(_ context.Context, input codexrunner.TurnInput) (codexrunner.TurnResult, error) {
@@ -1591,4 +1651,8 @@ func (r *fakeTeamsRunner) ReadThread(context.Context, string) (codexrunner.Threa
 
 func (r *fakeTeamsRunner) ListThreads(context.Context, codexrunner.ListThreadsOptions) ([]codexrunner.Thread, error) {
 	return nil, nil
+}
+
+func (r *fakeTeamsRunner) ListModels(context.Context) ([]codexrunner.ModelInfo, error) {
+	return append([]codexrunner.ModelInfo(nil), r.models...), nil
 }

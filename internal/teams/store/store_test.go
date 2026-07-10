@@ -371,7 +371,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
-func TestQueueTurnPinsSessionModelProfileSnapshot(t *testing.T) {
+func TestQueueTurnPinsSessionExecutionConfigSnapshot(t *testing.T) {
 	for _, sqlite := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
 			store := newTestStore(t)
@@ -387,6 +387,7 @@ func TestQueueTurnPinsSessionModelProfileSnapshot(t *testing.T) {
 			}
 			session := testSession()
 			session.ModelProfile = snapshot
+			session.ReasoningEffort = "xhigh"
 			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
 				t.Fatalf("CreateSession created=%v err=%v", created, err)
 			}
@@ -404,12 +405,18 @@ func TestQueueTurnPinsSessionModelProfileSnapshot(t *testing.T) {
 			if turn.ModelProfile != snapshot {
 				t.Fatalf("queued turn model profile = %#v, want %#v", turn.ModelProfile, snapshot)
 			}
+			if turn.ReasoningEffort != "xhigh" {
+				t.Fatalf("queued turn reasoning effort = %q, want xhigh", turn.ReasoningEffort)
+			}
 			state, err := store.Load(ctx)
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}
 			if got := state.Turns[turn.ID].ModelProfile; got != snapshot {
 				t.Fatalf("stored turn model profile = %#v, want %#v", got, snapshot)
+			}
+			if got := state.Turns[turn.ID].ReasoningEffort; got != "xhigh" {
+				t.Fatalf("stored turn reasoning effort = %q, want xhigh", got)
 			}
 		})
 	}

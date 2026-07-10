@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -2081,6 +2082,45 @@ func codexArgsHasConfigOverride(args []string, key string) bool {
 		}
 	}
 	return false
+}
+
+func codexReasoningEffortFromArgs(args []string) string {
+	key := teams.CodexReasoningEffortConfigKey
+	value := ""
+	for i := 0; i < len(args); i++ {
+		trimmed := strings.TrimSpace(args[i])
+		raw := ""
+		switch {
+		case trimmed == "-c" || trimmed == "--config":
+			if i+1 < len(args) {
+				i++
+				raw = args[i]
+			}
+		case strings.HasPrefix(trimmed, "-c="):
+			raw = strings.TrimPrefix(trimmed, "-c=")
+		case strings.HasPrefix(trimmed, "--config="):
+			raw = strings.TrimPrefix(trimmed, "--config=")
+		}
+		if parsed, ok := codexConfigStringOverrideValue(raw, key); ok {
+			value = parsed
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+func codexConfigStringOverrideValue(raw string, key string) (string, bool) {
+	rawKey, rawValue, ok := strings.Cut(strings.TrimSpace(raw), "=")
+	if !ok || strings.TrimSpace(rawKey) != strings.TrimSpace(key) {
+		return "", false
+	}
+	value := strings.TrimSpace(rawValue)
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return value[1 : len(value)-1], true
+	}
+	if unquoted, err := strconv.Unquote(value); err == nil {
+		return unquoted, true
+	}
+	return value, true
 }
 
 func codexArgsWithoutConfigOverride(args []string, key string) []string {

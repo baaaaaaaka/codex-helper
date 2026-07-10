@@ -21,6 +21,28 @@ type Runner interface {
 	ListThreads(ctx context.Context, opts ListThreadsOptions) ([]Thread, error)
 }
 
+// ModelCatalogReader is an optional runner capability. Keeping it separate
+// from Runner lets lightweight and test runners continue to implement only
+// turn execution while rich app-server clients can discover model-specific
+// reasoning effort choices.
+type ModelCatalogReader interface {
+	ListModels(context.Context) ([]ModelInfo, error)
+}
+
+type ModelInfo struct {
+	ID                     string
+	Model                  string
+	DisplayName            string
+	IsDefault              bool
+	DefaultReasoningEffort string
+	ReasoningEfforts       []ReasoningEffortOption
+}
+
+type ReasoningEffortOption struct {
+	Effort      string
+	Description string
+}
+
 type TurnInput struct {
 	Prompt             string
 	ImagePaths         []string
@@ -31,6 +53,8 @@ type TurnInput struct {
 	Timeout            time.Duration
 	EventHandler       EventHandler
 	BackfillThreadName bool
+	// ReasoningEffort is the exact model-advertised wire value to apply to this turn.
+	ReasoningEffort string
 	// Ephemeral creates a pathless thread that is not persisted by Codex.
 	Ephemeral bool
 }

@@ -3590,6 +3590,9 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 			if turn.ModelProfile.IsZero() {
 				turn.ModelProfile = session.ModelProfile
 			}
+			if strings.TrimSpace(turn.ReasoningEffort) == "" {
+				turn.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
+			}
 			if turn.QueuedAt.IsZero() {
 				turn.QueuedAt = now
 			}

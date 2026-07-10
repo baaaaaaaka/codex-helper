@@ -367,6 +367,7 @@ type Bridge struct {
 	registryPath                      string
 	reg                               Registry
 	regMu                             sync.Mutex
+	reasoningEffortMu                 sync.Mutex
 	registryProjectionLastFingerprint string
 	registryProjectionLastSavedAt     time.Time
 	registryProjectionDirty           bool
@@ -1676,18 +1677,20 @@ func registrySessionFromDurable(durable teamstore.SessionContext) Session {
 		status = string(teamstore.SessionStatusActive)
 	}
 	return Session{
-		ID:            durable.ID,
-		ChatID:        durable.TeamsChatID,
-		ChatURL:       durable.TeamsChatURL,
-		Topic:         durable.TeamsTopic,
-		UserTitle:     durable.UserTitle,
-		TitleSource:   durable.TitleSource,
-		Status:        status,
-		CodexThreadID: durable.CodexThreadID,
-		Cwd:           durable.Cwd,
-		ModelProfile:  durable.ModelProfile,
-		CreatedAt:     durable.CreatedAt,
-		UpdatedAt:     durable.UpdatedAt,
+		ID:                    durable.ID,
+		ChatID:                durable.TeamsChatID,
+		ChatURL:               durable.TeamsChatURL,
+		Topic:                 durable.TeamsTopic,
+		UserTitle:             durable.UserTitle,
+		TitleSource:           durable.TitleSource,
+		Status:                status,
+		CodexThreadID:         durable.CodexThreadID,
+		Cwd:                   durable.Cwd,
+		ModelProfile:          durable.ModelProfile,
+		ReasoningEffort:       durable.ReasoningEffort,
+		ReasoningEffortSource: durable.ReasoningEffortSource,
+		CreatedAt:             durable.CreatedAt,
+		UpdatedAt:             durable.UpdatedAt,
 	}
 }
 
@@ -4436,6 +4439,12 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
+		case DashboardCommandEffort:
+			message, err := b.handleReasoningEffortControlCommand(ctx, parsed.Argument)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return b.sendControl(ctx, message)
 		case DashboardCommandRestart:
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
@@ -4814,18 +4823,20 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 		status = "active"
 	}
 	return &Session{
-		ID:            controlFallbackSessionID,
-		ChatID:        b.reg.ControlChatID,
-		ChatURL:       b.reg.ControlChatURL,
-		Topic:         firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
-		UserTitle:     durable.UserTitle,
-		TitleSource:   durable.TitleSource,
-		Status:        status,
-		CodexThreadID: durable.CodexThreadID,
-		Cwd:           durable.Cwd,
-		ModelProfile:  durable.ModelProfile,
-		CreatedAt:     durable.CreatedAt,
-		UpdatedAt:     durable.UpdatedAt,
+		ID:                    controlFallbackSessionID,
+		ChatID:                b.reg.ControlChatID,
+		ChatURL:               b.reg.ControlChatURL,
+		Topic:                 firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
+		UserTitle:             durable.UserTitle,
+		TitleSource:           durable.TitleSource,
+		Status:                status,
+		CodexThreadID:         durable.CodexThreadID,
+		Cwd:                   durable.Cwd,
+		ModelProfile:          durable.ModelProfile,
+		ReasoningEffort:       durable.ReasoningEffort,
+		ReasoningEffortSource: durable.ReasoningEffortSource,
+		CreatedAt:             durable.CreatedAt,
+		UpdatedAt:             durable.UpdatedAt,
 	}
 }
 
@@ -4839,6 +4850,7 @@ func controlHelpText() string {
 		"- `n <directory>` / `new <directory>` - create a new Work chat for a directory",
 		"- `new <directory> --model <model>` - create a Work chat pinned to a model",
 		"- `model list` / `model use <model>` - list models or set the default for future chats",
+		"- `effort status|list|set|reset` - inspect or change this Control chat's reasoning effort",
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
@@ -4876,6 +4888,7 @@ func controlAdvancedHelpText() string {
 		"- `ask <question>` - ask a quick helper question in this control chat",
 		"- `helper cancel last` / `helper cancel queued` / `helper cancel running` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
 		"- `model list`, `model setup <model>`, `model doctor <model>`, `model use <model>` - manage models",
+		"- `effort status|list|set|reset` - inspect or change this Control chat's reasoning effort",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
 		"- `h` / `help` / `menu` - show short help",
@@ -4934,6 +4947,7 @@ func sessionHelpText() string {
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
 		"`model status`, `model switch <model>`, or `model fork <model>` - inspect or change this Work chat model",
+		"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
 		"`helper publish-history` - import a paused local Codex history backlog",
 		"`helper publish-history full` - publish the complete local Codex history once to this chat",
 		"`helper skills list` / `helper skills add <url>` / `helper skills push` / `helper skills push confirm` - inspect and push skill subscriptions",
@@ -7763,6 +7777,12 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
 			}
 			return b.sendToChat(ctx, chatID, message)
+		case DashboardCommandEffort:
+			message, err := b.handleReasoningEffortWorkCommand(ctx, session, parsed.Argument)
+			if err != nil {
+				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
+			}
+			return b.sendToChat(ctx, chatID, message)
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())
@@ -7949,11 +7969,12 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		return b.sendToChat(ctx, session.ChatID, "retry failed while reading the original Teams message: "+err.Error())
 	}
 	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
-		ID:             retryTurnID(turn.ID),
-		SessionID:      session.ID,
-		CodexThreadID:  session.CodexThreadID,
-		ModelProfile:   retryTurnModelProfile(turn, session.ModelProfile),
-		RecoveryReason: "retry of " + turn.ID,
+		ID:              retryTurnID(turn.ID),
+		SessionID:       session.ID,
+		CodexThreadID:   session.CodexThreadID,
+		ModelProfile:    retryTurnModelProfile(turn, session.ModelProfile),
+		ReasoningEffort: retryTurnReasoningEffort(turn, session, b.executor),
+		RecoveryReason:  "retry of " + turn.ID,
 	})
 	if err != nil {
 		return err
@@ -10521,7 +10542,7 @@ func (b *Bridge) runQueuedTurnInput(ctx context.Context, session *Session, turn 
 }
 
 func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) error {
-	session = sessionWithTurnModelProfile(session, turn)
+	session = sessionWithTurnExecutionConfig(session, turn)
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
 			return err
@@ -12373,6 +12394,8 @@ func registrySessionsEqual(left Session, right Session) bool {
 		left.Status == right.Status &&
 		left.CodexThreadID == right.CodexThreadID &&
 		left.Cwd == right.Cwd &&
+		left.ReasoningEffort == right.ReasoningEffort &&
+		left.ReasoningEffortSource == right.ReasoningEffortSource &&
 		modelProfileSnapshotsEqual(left.ModelProfile, right.ModelProfile) &&
 		left.CreatedAt.Equal(right.CreatedAt) &&
 		left.UpdatedAt.Equal(right.UpdatedAt)
@@ -12504,18 +12527,20 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				updated = created
 			}
 			state.Sessions[session.ID] = teamstore.SessionContext{
-				ID:            session.ID,
-				Status:        status,
-				TeamsChatID:   session.ChatID,
-				TeamsChatURL:  session.ChatURL,
-				TeamsTopic:    session.Topic,
-				UserTitle:     session.UserTitle,
-				TitleSource:   session.TitleSource,
-				CodexThreadID: session.CodexThreadID,
-				Cwd:           session.Cwd,
-				ModelProfile:  session.ModelProfile,
-				CreatedAt:     created,
-				UpdatedAt:     updated,
+				ID:                    session.ID,
+				Status:                status,
+				TeamsChatID:           session.ChatID,
+				TeamsChatURL:          session.ChatURL,
+				TeamsTopic:            session.Topic,
+				UserTitle:             session.UserTitle,
+				TitleSource:           session.TitleSource,
+				CodexThreadID:         session.CodexThreadID,
+				Cwd:                   session.Cwd,
+				ModelProfile:          session.ModelProfile,
+				ReasoningEffort:       session.ReasoningEffort,
+				ReasoningEffortSource: session.ReasoningEffortSource,
+				CreatedAt:             created,
+				UpdatedAt:             updated,
 			}
 			changed = true
 		}
@@ -12616,19 +12641,21 @@ func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) err
 		status = teamstore.SessionStatusArchived
 	}
 	_, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:            session.ID,
-		Status:        status,
-		TeamsChatID:   session.ChatID,
-		TeamsChatURL:  session.ChatURL,
-		TeamsTopic:    session.Topic,
-		UserTitle:     session.UserTitle,
-		TitleSource:   session.TitleSource,
-		CodexThreadID: session.CodexThreadID,
-		RunnerKind:    "executor",
-		Cwd:           session.Cwd,
-		ModelProfile:  session.ModelProfile,
-		CreatedAt:     session.CreatedAt,
-		UpdatedAt:     session.UpdatedAt,
+		ID:                    session.ID,
+		Status:                status,
+		TeamsChatID:           session.ChatID,
+		TeamsChatURL:          session.ChatURL,
+		TeamsTopic:            session.Topic,
+		UserTitle:             session.UserTitle,
+		TitleSource:           session.TitleSource,
+		CodexThreadID:         session.CodexThreadID,
+		RunnerKind:            "executor",
+		Cwd:                   session.Cwd,
+		ModelProfile:          session.ModelProfile,
+		ReasoningEffort:       session.ReasoningEffort,
+		ReasoningEffortSource: session.ReasoningEffortSource,
+		CreatedAt:             session.CreatedAt,
+		UpdatedAt:             session.UpdatedAt,
 	})
 	return err
 }
@@ -12801,6 +12828,10 @@ func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, 
 
 func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamstore.InboundEvent) (teamstore.Turn, bool, error) {
 	leaseGeneration := b.currentLeaseGeneration()
+	executor := b.executor
+	if session != nil && isControlFallbackSessionID(session.ID) {
+		executor = b.effectiveControlFallbackExecutor()
+	}
 	return b.store.QueueTurn(ctx, teamstore.Turn{
 		SessionID:       session.ID,
 		InboundEventID:  inbound.ID,
@@ -12809,16 +12840,43 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 		LeaseGeneration: leaseGeneration,
 		CodexThreadID:   session.CodexThreadID,
 		ModelProfile:    session.ModelProfile,
+		ReasoningEffort: effectiveSessionReasoningEffortWithExecutor(session, executor),
 	})
 }
 
-func sessionWithTurnModelProfile(session *Session, turn teamstore.Turn) *Session {
-	if session == nil || turn.ModelProfile.IsZero() {
+func sessionWithTurnExecutionConfig(session *Session, turn teamstore.Turn) *Session {
+	if session == nil {
 		return session
 	}
 	clone := *session
-	clone.ModelProfile = turn.ModelProfile
+	if !turn.ModelProfile.IsZero() {
+		clone.ModelProfile = turn.ModelProfile
+	}
+	if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
+		clone.ReasoningEffort = effort
+	}
 	return &clone
+}
+
+func effectiveSessionReasoningEffort(session *Session) string {
+	return effectiveSessionReasoningEffortWithExecutor(session, nil)
+}
+
+func effectiveSessionReasoningEffortWithExecutor(session *Session, executor Executor) string {
+	if session != nil {
+		if effort := strings.TrimSpace(session.ReasoningEffort); effort != "" {
+			return effort
+		}
+		if provider, ok := executor.(ReasoningEffortDefaultProvider); ok {
+			if effort := strings.TrimSpace(provider.DefaultReasoningEffort()); effort != "" {
+				return effort
+			}
+		}
+		if isControlFallbackSessionID(session.ID) {
+			return DefaultControlFallbackReasoningEffort
+		}
+	}
+	return DefaultSessionReasoningEffort
 }
 
 func retryTurnModelProfile(turn teamstore.Turn, fallback modelprofile.Snapshot) modelprofile.Snapshot {
@@ -12826,6 +12884,13 @@ func retryTurnModelProfile(turn teamstore.Turn, fallback modelprofile.Snapshot) 
 		return turn.ModelProfile
 	}
 	return fallback
+}
+
+func retryTurnReasoningEffort(turn teamstore.Turn, session *Session, executor Executor) string {
+	if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
+		return effort
+	}
+	return effectiveSessionReasoningEffortWithExecutor(session, executor)
 }
 
 func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string) error {

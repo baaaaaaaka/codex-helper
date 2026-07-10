@@ -705,31 +705,33 @@ type OwnerMetadata struct {
 }
 
 type SessionContext struct {
-	ID                   string                `json:"id"`
-	Status               SessionStatus         `json:"status"`
-	TeamsChatID          string                `json:"teams_chat_id"`
-	TeamsChatURL         string                `json:"teams_chat_url,omitempty"`
-	TeamsTopic           string                `json:"teams_topic,omitempty"`
-	UserTitle            string                `json:"user_title,omitempty"`
-	TitleSource          string                `json:"title_source,omitempty"`
-	CodexThreadID        string                `json:"codex_thread_id,omitempty"`
-	LatestCodexTurnID    string                `json:"latest_codex_turn_id,omitempty"`
-	LatestTurnID         string                `json:"latest_turn_id,omitempty"`
-	RunnerKind           string                `json:"runner_kind,omitempty"`
-	CodexVersion         string                `json:"codex_version,omitempty"`
-	Cwd                  string                `json:"cwd,omitempty"`
-	CodexHome            string                `json:"codex_home,omitempty"`
-	Profile              string                `json:"profile,omitempty"`
-	Model                string                `json:"model,omitempty"`
-	ModelProfile         modelprofile.Snapshot `json:"model_profile,omitempty"`
-	Sandbox              string                `json:"sandbox,omitempty"`
-	ProxyMode            string                `json:"proxy_mode,omitempty"`
-	QuarantinedAt        time.Time             `json:"quarantined_at,omitempty"`
-	QuarantineReason     string                `json:"quarantine_reason,omitempty"`
-	QuarantineSource     string                `json:"quarantine_source,omitempty"`
-	QuarantineMessageIDs []string              `json:"quarantine_message_ids,omitempty"`
-	CreatedAt            time.Time             `json:"created_at,omitempty"`
-	UpdatedAt            time.Time             `json:"updated_at,omitempty"`
+	ID                    string                `json:"id"`
+	Status                SessionStatus         `json:"status"`
+	TeamsChatID           string                `json:"teams_chat_id"`
+	TeamsChatURL          string                `json:"teams_chat_url,omitempty"`
+	TeamsTopic            string                `json:"teams_topic,omitempty"`
+	UserTitle             string                `json:"user_title,omitempty"`
+	TitleSource           string                `json:"title_source,omitempty"`
+	CodexThreadID         string                `json:"codex_thread_id,omitempty"`
+	LatestCodexTurnID     string                `json:"latest_codex_turn_id,omitempty"`
+	LatestTurnID          string                `json:"latest_turn_id,omitempty"`
+	RunnerKind            string                `json:"runner_kind,omitempty"`
+	CodexVersion          string                `json:"codex_version,omitempty"`
+	Cwd                   string                `json:"cwd,omitempty"`
+	CodexHome             string                `json:"codex_home,omitempty"`
+	Profile               string                `json:"profile,omitempty"`
+	Model                 string                `json:"model,omitempty"`
+	ModelProfile          modelprofile.Snapshot `json:"model_profile,omitempty"`
+	ReasoningEffort       string                `json:"reasoning_effort,omitempty"`
+	ReasoningEffortSource string                `json:"reasoning_effort_source,omitempty"`
+	Sandbox               string                `json:"sandbox,omitempty"`
+	ProxyMode             string                `json:"proxy_mode,omitempty"`
+	QuarantinedAt         time.Time             `json:"quarantined_at,omitempty"`
+	QuarantineReason      string                `json:"quarantine_reason,omitempty"`
+	QuarantineSource      string                `json:"quarantine_source,omitempty"`
+	QuarantineMessageIDs  []string              `json:"quarantine_message_ids,omitempty"`
+	CreatedAt             time.Time             `json:"created_at,omitempty"`
+	UpdatedAt             time.Time             `json:"updated_at,omitempty"`
 }
 
 type InboundEvent struct {
@@ -774,6 +776,7 @@ type Turn struct {
 	CodexThreadID   string                `json:"codex_thread_id,omitempty"`
 	CodexTurnID     string                `json:"codex_turn_id,omitempty"`
 	ModelProfile    modelprofile.Snapshot `json:"model_profile,omitempty"`
+	ReasoningEffort string                `json:"reasoning_effort,omitempty"`
 	FailureMessage  string                `json:"failure_message,omitempty"`
 	RecoveryReason  string                `json:"recovery_reason,omitempty"`
 	QueuedAt        time.Time             `json:"queued_at,omitempty"`
@@ -4411,6 +4414,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		}
 		if turn.ModelProfile.IsZero() {
 			turn.ModelProfile = session.ModelProfile
+		}
+		if strings.TrimSpace(turn.ReasoningEffort) == "" {
+			turn.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
 		}
 		if turn.QueuedAt.IsZero() {
 			turn.QueuedAt = now

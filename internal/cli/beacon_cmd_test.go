@@ -53,15 +53,23 @@ func TestBeaconHelpShowsRequiredOperationalFlags(t *testing.T) {
 
 func TestRunBeaconWorkerJobUsesStandardAppServer(t *testing.T) {
 	workDir := t.TempDir()
-	codexPath := writeBeaconCLICodexFixture(t, "beacon standard approval runtime")
+	requestLog := filepath.Join(t.TempDir(), "requests.jsonl")
+	codexPath := writeBeaconCLIAppServerFixtureWithRequestLog(t, []string{"beacon standard approval runtime"}, requestLog)
 	payload, err := runBeaconWorkerJob(context.Background(), beacon.JobAttempt{Payload: beacon.JobPayload{
-		Prompt: "run remotely", WorkingDir: workDir,
+		Prompt: "run remotely", WorkingDir: workDir, ReasoningEffort: "xhigh",
 	}}, codexPath, nil)
 	if err != nil {
 		t.Fatalf("runBeaconWorkerJob: %v", err)
 	}
 	if payload.Text != "beacon standard approval runtime" || payload.CodexThreadID != "thread-worker" || payload.Error != "" {
 		t.Fatalf("payload = %#v", payload)
+	}
+	requests, err := os.ReadFile(requestLog)
+	if err != nil {
+		t.Fatalf("read app-server request log: %v", err)
+	}
+	if !strings.Contains(string(requests), `"method":"turn/start"`) || !strings.Contains(string(requests), `"effort":"xhigh"`) {
+		t.Fatalf("turn/start did not preserve Beacon effort:\n%s", requests)
 	}
 }
 
@@ -1345,6 +1353,10 @@ func writeBeaconCLIStressCodexFixture(t *testing.T, total int) string {
 }
 
 func writeBeaconCLIAppServerFixture(t *testing.T, messages []string) string {
+	return writeBeaconCLIAppServerFixtureWithRequestLog(t, messages, "")
+}
+
+func writeBeaconCLIAppServerFixtureWithRequestLog(t *testing.T, messages []string, requestLog string) string {
 	t.Helper()
 	if os.PathSeparator != '/' {
 		t.Skip("POSIX app-server fixture script")
@@ -1361,6 +1373,9 @@ func writeBeaconCLIAppServerFixture(t *testing.T, messages []string) string {
 	body.WriteString("  *) exit 64 ;;\n")
 	body.WriteString("esac\n")
 	body.WriteString("while IFS= read -r line; do\n")
+	if strings.TrimSpace(requestLog) != "" {
+		body.WriteString("  printf '%s\\n' \"$line\" >> " + shellSingleQuoteForBeaconCLITest(requestLog) + "\n")
+	}
 	body.WriteString("  id=$(printf %s \"$line\" | sed -n 's/.*\"id\":\\([0-9][0-9]*\\).*/\\1/p')\n")
 	body.WriteString("  case \"$line\" in\n")
 	body.WriteString("    *'\"method\":\"initialize\"'*) printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\n' \"$id\" ;;\n")

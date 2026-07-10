@@ -466,6 +466,7 @@ var providerCatalog = map[string]ProviderSpec{
 		UsesAdapter:     true,
 		SupportsTools:   true,
 		SupportsVision:  true,
+		SupportsReason:  true,
 		Models: []ModelSpec{{
 			ID:               "mimo/mimo-v2.5",
 			UpstreamID:       "mimo-v2.5",
@@ -476,6 +477,7 @@ var providerCatalog = map[string]ProviderSpec{
 			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsVision:   true,
+			SupportsReason:   true,
 			Priority:         0,
 		}, {
 			ID:               "mimo/mimo-v2.5-pro",
@@ -487,6 +489,7 @@ var providerCatalog = map[string]ProviderSpec{
 			MaxContextWindow: millionTokenContextWindow,
 			SupportsTools:    true,
 			SupportsVision:   true,
+			SupportsReason:   true,
 			Priority:         1,
 		}},
 	},
