@@ -1548,6 +1548,37 @@ func TestTeamsChatQuarantineDryRunAndUnquarantine(t *testing.T) {
 	}
 }
 
+func TestTeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags(t *testing.T) {
+	registryPath := ""
+	root := &rootOptions{}
+	recreate := newTeamsChatRecreateCmd(root, &registryPath)
+	for name, wantDefault := range map[string]string{
+		"store":    "",
+		"history":  "none",
+		"activate": "false",
+		"yes":      "false",
+	} {
+		flag := recreate.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != wantDefault {
+			t.Fatalf("recreate --%s flag = %#v, want default %q", name, flag, wantDefault)
+		}
+	}
+	publish := newTeamsChatPublishHistoryCmd(root, &registryPath)
+	for _, name := range []string{"full", "force", "yes", "store", "drain-timeout"} {
+		if flag := publish.Flags().Lookup(name); flag == nil {
+			t.Fatalf("publish-history missing --%s", name)
+		}
+	}
+	recreate.SetArgs([]string{"s178", "--yes", "--history", "delta"})
+	if err := recreate.Execute(); err == nil || !strings.Contains(err.Error(), "expected none or full") {
+		t.Fatalf("invalid recreate history mode error = %v", err)
+	}
+	publish.SetArgs([]string{"s178", "--force", "--yes"})
+	if err := publish.Execute(); err == nil || !strings.Contains(err.Error(), "requires --full") {
+		t.Fatalf("force publish without --full error = %v", err)
+	}
+}
+
 func TestTeamsChatQuarantineRejectsAmbiguousScopes(t *testing.T) {
 	lockCLITestHooks(t)
 	tmp := t.TempDir()
@@ -1881,6 +1912,57 @@ func TestBeginTeamsBridgeDrainForChatRecreateKeepsFencedUntilRelease(t *testing.
 	}
 	if control.Draining || control.DrainOperationID != "" {
 		t.Fatalf("maintenance fence remains after release: %#v", control)
+	}
+}
+
+func TestBeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	st, err := openTeamsStore()
+	if err != nil {
+		t.Fatalf("openTeamsStore error: %v", err)
+	}
+	storePath := st.Path()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+	var out bytes.Buffer
+	drain, err := beginTeamsBridgeDrainForHistoryPublish(context.Background(), &out, time.Second, storePath)
+	if err != nil {
+		t.Fatalf("begin history publish drain: %v", err)
+	}
+	check, err := teamsstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("open fenced store: %v", err)
+	}
+	control, err := check.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("read history publish fence: %v", err)
+	}
+	if !control.Draining || control.Reason != "history publish" || control.DrainOperationID != drain.operationID {
+		t.Fatalf("history publish fence = %#v", control)
+	}
+	if !strings.Contains(out.String(), "before publishing history") {
+		t.Fatalf("history publish drain output = %q", out.String())
+	}
+	if err := check.Close(); err != nil {
+		t.Fatalf("close fenced store: %v", err)
+	}
+	if err := drain.Release(context.Background()); err != nil {
+		t.Fatalf("release history publish drain: %v", err)
+	}
+	check, err = teamsstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("reopen released store: %v", err)
+	}
+	defer check.Close()
+	control, err = check.ReadControl(context.Background())
+	if err != nil {
+		t.Fatalf("read released history publish fence: %v", err)
+	}
+	if control.Draining || control.DrainOperationID != "" {
+		t.Fatalf("history publish fence remained after release: %#v", control)
 	}
 }
 

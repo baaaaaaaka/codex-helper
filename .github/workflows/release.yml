@@ -342,10 +342,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          durable_routing_pattern='TestBridge(DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|ActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry|PollOnce(UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChatRebindsSessionAndRetiresOldRouting|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
-          scope_authority_pattern='TestResolveStorePathFor(Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
+          durable_routing_pattern='TestBridge(DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|ActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry|PollOnce(UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChat(RebindsSessionAndRetiresOldRouting|PublishesFullHistoryAfterPrimaryEOF|RetiresOldRoutingWhenMoveNoticeFails|CASPreservesConcurrentBinding|RejectsInactiveStatusBeforeGraphCreate|ActivatesQuarantinedSession)|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
+          scope_authority_pattern='TestResolveStorePathFor(SessionMaintenance(SelectsOnlyLiveMatchingStore|IgnoresUnrelatedLiveStore|UsesOnlyExistingLegacyStore|RejectsConflictingRetainedCopies|UsesCurrentForIdenticalRetainedCopies|FailsClosedWhenCurrentStoreIsUnreadable|RejectsAmbiguousSelectorInsideStore|RejectsForeignOverride|RejectsOverrideWithoutSelector)|Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
+          history_publish_pattern='Test(ResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate|BridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace|BridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat|PublishSessionFullHistoryIsIdempotentAndForceable|TranscriptDeliveryNamespacePreservesLegacyIDsAndSeparatesTargetChats|TranscriptCheckpointAtSourceEOFAllowsNoVisibleRecords|TranscriptImportBatchKindsRenderPreRenderedHTMLDirectly|OutboxMathTrustIsRestrictedToCodexOutputKinds)$'
           go test ./internal/teams -count=1 -run "$durable_routing_pattern" -v
           go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
+          go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
 
       - name: Teams read-only diagnostics regressions
         shell: bash
@@ -375,7 +377,7 @@ jobs:
         run: |
           set -euo pipefail
           go test ./internal/teams/store -count=1 -run 'TestServiceControlDrainOperationFence$' -v
-          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|TeamsChatRecreateDrainReleaseDoesNotClearNewerFence|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
+          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainFor(ChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|HistoryPublishUsesDistinctFenceAndReleases)|TeamsChat(RecreateDrainReleaseDoesNotClearNewerFence|RecreateAndPublishHistoryExposeSafeRepairFlags)|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
 
       - name: Teams SQLite row-level migration regressions
         shell: bash

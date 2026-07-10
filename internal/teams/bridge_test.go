@@ -23909,6 +23909,354 @@ func TestBridgeRecreateSessionChatRebindsSessionAndRetiresOldRouting(t *testing.
 	}
 }
 
+func TestBridgeRecreateSessionChatPublishesFullHistoryAfterPrimaryEOF(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-recreate-full"}}`,
+		`{"id":"u1","role":"user","text":"recreated full-history prompt"}`,
+		`{"id":"a1","role":"assistant","text":"recreated full-history answer"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-recreate-full", transcriptPath)
+	defer restoreDiscover()
+	var sent []bridgeSentMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "new-work-full", decodeTestOnlineMeetingSubject(t, r))
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
+			var request struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+				Mentions []json.RawMessage `json:"mentions"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode recreated full-history message: %v", err)
+			}
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: request.Body.Content, Mentions: len(request.Mentions)})
+			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-recreate-full"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := bridge.markTranscriptImportCompleteAtEOF(context.Background(), *session, transcriptPath, "a1", 3); err != nil {
+		t.Fatalf("seed primary EOF checkpoint: %v", err)
+	}
+
+	recreated, err := bridge.RecreateSessionChat(context.Background(), session.ID, RecreateSessionChatOptions{ImportHistory: true})
+	if err != nil {
+		t.Fatalf("RecreateSessionChat with full history: %v", err)
+	}
+	if recreated.NewChat.ID != "new-work-full" {
+		t.Fatalf("recreated chat = %#v", recreated.NewChat)
+	}
+	var newChatMessages []string
+	for _, message := range sent {
+		if message.ChatID == recreated.NewChat.ID {
+			plain := PlainTextFromTeamsHTML(message.Content)
+			if strings.Contains(plain, "<p>") || strings.Contains(plain, "</p>") {
+				t.Fatalf("recreated full-history message contains escaped HTML instead of rendered transcript content:\n%s", plain)
+			}
+			newChatMessages = append(newChatMessages, plain)
+		}
+	}
+	joined := strings.Join(newChatMessages, "\n")
+	for _, want := range []string{"Imported Codex session history", "recreated full-history prompt", "recreated full-history answer", "Import complete", "Work chat recreated", "Work chat is ready"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("recreated chat history missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "recreated full-history answer") > strings.Index(joined, "Work chat recreated") || strings.Index(joined, "Work chat recreated") > strings.Index(joined, "Work chat is ready") {
+		t.Fatalf("recreated chat history/lifecycle order is wrong:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load recreated state: %v", err)
+	}
+	targetID := transcriptChatPublishCheckpointID(session.ID, transcriptChatPublishTargetKey(recreated.NewChat.ID))
+	if checkpoint := state.ImportCheckpoints[targetID]; checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a1" {
+		t.Fatalf("recreated target checkpoint = %#v", checkpoint)
+	}
+}
+
+func TestTranscriptImportBatchKindsRenderPreRenderedHTMLDirectly(t *testing.T) {
+	body := `<p><strong>🧑‍💻 User:</strong></p><p>historical prompt</p>`
+	for _, kind := range []string{
+		"import-batch-0001-first-last",
+		"import-bg-batch-0001-first-last",
+		"sync-batch-0001-first-last",
+		"publish-full-batch-0001-first-last",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			outbox := teamstore.OutboxMessage{Kind: kind, Body: body, PartIndex: 1, PartCount: 1}
+			if got := renderOutboxHTML(outbox); got != body {
+				t.Fatalf("renderOutboxHTML() = %q, want pre-rendered batch HTML %q", got, body)
+			}
+		})
+	}
+
+	ordinary := teamstore.OutboxMessage{Kind: "publish-full-complete", Body: body, PartIndex: 1, PartCount: 1}
+	if got := renderOutboxHTML(ordinary); got == body {
+		t.Fatal("non-batch full-history message bypassed normal safe rendering")
+	}
+}
+
+func TestBridgeRecreateSessionChatRetiresOldRoutingWhenMoveNoticeFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
+			writeTestOnlineMeeting(w, "new-work-notice-failed", decodeTestOnlineMeetingSubject(t, r))
+		case r.Method == http.MethodPost && r.URL.Path == "/chats/chat-1/messages":
+			http.Error(w, `{"error":{"message":"synthetic move notice failure"}}`, http.StatusInternalServerError)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	session := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		state.ChatPolls[session.ChatID] = teamstore.ChatPollState{ChatID: session.ChatID, Seeded: true}
+		state.ChatSequences[session.ChatID] = teamstore.ChatSequenceState{ChatID: session.ChatID, Next: 9}
+		state.ChatRateLimits[session.ChatID] = teamstore.ChatRateLimitState{ChatID: session.ChatID, Reason: "old block"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old routing: %v", err)
+	}
+
+	_, err := bridge.RecreateSessionChat(context.Background(), session.ID, RecreateSessionChatOptions{})
+	if err == nil || !strings.Contains(err.Error(), "https://teams.microsoft.com/l/chat/new-work-notice-failed/0") || !strings.Contains(err.Error(), "durably bound") {
+		t.Fatalf("post-bind move-notice error = %v", err)
+	}
+	state, loadErr := store.Load(context.Background())
+	if loadErr != nil {
+		t.Fatalf("load post-failure state: %v", loadErr)
+	}
+	durable := state.Sessions[session.ID]
+	if durable.TeamsChatID != "new-work-notice-failed" {
+		t.Fatalf("durable binding rolled back after notice failure: %#v", durable)
+	}
+	if _, ok := state.ChatPolls["chat-1"]; ok {
+		t.Fatalf("old poll routing survived notice failure: %#v", state.ChatPolls["chat-1"])
+	}
+	if _, ok := state.ChatSequences["chat-1"]; ok {
+		t.Fatalf("old sequence routing survived notice failure: %#v", state.ChatSequences["chat-1"])
+	}
+	if _, ok := state.ChatRateLimits["chat-1"]; ok {
+		t.Fatalf("old rate limit survived notice failure: %#v", state.ChatRateLimits["chat-1"])
+	}
+}
+
+func TestBridgeRecreateSessionChatCASPreservesConcurrentBinding(t *testing.T) {
+	store := newBridgeTestStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost || r.URL.Path != "/me/onlineMeetings" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		if err := store.UpdateSession(context.Background(), "s001", func(state *teamstore.State) error {
+			current := state.Sessions["s001"]
+			current.TeamsChatID = "chat-concurrent"
+			current.TeamsChatURL = "https://teams.example/chat-concurrent"
+			state.Sessions[current.ID] = current
+			return nil
+		}); err != nil {
+			t.Fatalf("move durable binding concurrently: %v", err)
+		}
+		writeTestOnlineMeeting(w, "new-work-orphaned", decodeTestOnlineMeetingSubject(t, r))
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	session := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+
+	_, err := bridge.RecreateSessionChat(context.Background(), session.ID, RecreateSessionChatOptions{})
+	if err == nil || !strings.Contains(err.Error(), "new-work-orphaned") || !strings.Contains(err.Error(), "moved concurrently") {
+		t.Fatalf("concurrent rebind error = %v", err)
+	}
+	state, loadErr := store.Load(context.Background())
+	if loadErr != nil {
+		t.Fatalf("load concurrent binding: %v", loadErr)
+	}
+	if durable := state.Sessions[session.ID]; durable.TeamsChatID != "chat-concurrent" {
+		t.Fatalf("CAS overwrote concurrent binding: %#v", durable)
+	}
+}
+
+func TestBridgeRecreateSessionChatRejectsInactiveStatusBeforeGraphCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  teamstore.SessionStatus
+		wantErr string
+	}{
+		{name: "quarantined", status: teamstore.SessionStatusQuarantined, wantErr: "rerun with --activate"},
+		{name: "closed", status: teamstore.SessionStatusClosed, wantErr: "cannot be recreated"},
+		{name: "archived", status: teamstore.SessionStatusArchived, wantErr: "cannot be recreated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			graph := &GraphClient{
+				auth: &fakeGraphAuth{token: "access"},
+				client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					t.Fatalf("inactive session unexpectedly called Graph: %s %s", r.Method, r.URL.String())
+					return nil, nil
+				})},
+				baseURL:    "https://graph.example.test",
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+			session := bridge.reg.SessionByID("s001")
+			if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+				t.Fatalf("ensure durable session: %v", err)
+			}
+			if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+				current := state.Sessions[session.ID]
+				current.Status = tc.status
+				state.Sessions[current.ID] = current
+				return nil
+			}); err != nil {
+				t.Fatalf("set inactive status: %v", err)
+			}
+
+			_, err := bridge.RecreateSessionChat(context.Background(), session.ID, RecreateSessionChatOptions{})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("inactive recreate error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestBridgeRecreateSessionChatActivatesQuarantinedSession(t *testing.T) {
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	session := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		current := state.Sessions[session.ID]
+		current.Status = teamstore.SessionStatusQuarantined
+		current.QuarantinedAt = time.Now()
+		current.QuarantineReason = "synthetic unsafe echo"
+		current.QuarantineSource = "test"
+		current.QuarantineMessageIDs = []string{"message-1"}
+		state.Sessions[session.ID] = current
+		return nil
+	}); err != nil {
+		t.Fatalf("quarantine durable session: %v", err)
+	}
+
+	recreated, err := bridge.RecreateSessionChat(context.Background(), session.ID, RecreateSessionChatOptions{Activate: true})
+	if err != nil {
+		t.Fatalf("activate quarantined recreate: %v", err)
+	}
+	if recreated.NewChat.ID != "work-chat" {
+		t.Fatalf("recreated chat = %#v", recreated.NewChat)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load activated session: %v", err)
+	}
+	durable := state.Sessions[session.ID]
+	if durable.Status != teamstore.SessionStatusActive || durable.TeamsChatID != recreated.NewChat.ID || !durable.QuarantinedAt.IsZero() || durable.QuarantineReason != "" || durable.QuarantineSource != "" || len(durable.QuarantineMessageIDs) != 0 {
+		t.Fatalf("activated durable session = %#v", durable)
+	}
+	if !sentPlainContains(*sent, "This chat moved") || !sentPlainContains(*sent, "Work chat recreated") || !sentPlainContains(*sent, "Work chat is ready") {
+		t.Fatalf("activated recreate messages = %#v", *sent)
+	}
+}
+
+func TestResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate(t *testing.T) {
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["s178"] = teamstore.SessionContext{
+			ID:                   "s178",
+			Status:               teamstore.SessionStatusQuarantined,
+			TeamsChatID:          "chat-old",
+			TeamsChatURL:         "https://teams.example/chat-old",
+			CodexThreadID:        "thread-178",
+			QuarantinedAt:        now,
+			QuarantineReason:     "test quarantine",
+			QuarantineSource:     "test",
+			QuarantineMessageIDs: []string{"m1"},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed quarantined session: %v", err)
+	}
+	next := Session{ID: "s178", Status: "active", ChatID: "chat-new", ChatURL: "https://teams.example/chat-new", CodexThreadID: "thread-178"}
+	if err := bridge.resetRecreatedSessionChatState(context.Background(), "wrong-old-chat", next, true); err == nil || !strings.Contains(err.Error(), "moved concurrently") {
+		t.Fatalf("CAS mismatch error = %v", err)
+	}
+	if err := bridge.resetRecreatedSessionChatState(context.Background(), "chat-old", next, false); err == nil || !strings.Contains(err.Error(), "quarantined") {
+		t.Fatalf("quarantine activation guard error = %v", err)
+	}
+	if err := bridge.resetRecreatedSessionChatState(context.Background(), "chat-old", next, true); err != nil {
+		t.Fatalf("activated rebind: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load rebound state: %v", err)
+	}
+	durable := state.Sessions["s178"]
+	if durable.Status != teamstore.SessionStatusActive || durable.TeamsChatID != "chat-new" || !durable.QuarantinedAt.IsZero() || durable.QuarantineReason != "" || durable.QuarantineSource != "" || len(durable.QuarantineMessageIDs) != 0 {
+		t.Fatalf("activated durable session = %#v", durable)
+	}
+}
+
 func TestBridgeRestoresRoutingFromDurableStateWhenRegistryIsMissing(t *testing.T) {
 	store := newBridgeTestStore(t)
 	now := time.Now()
@@ -25867,6 +26215,207 @@ func TestBridgeTranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPrune
 	}
 }
 
+func TestBridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-full-target"}}`,
+		`{"id":"u1","thread_id":"thread-full-target","role":"user","text":"history prompt for recreated chat"}`,
+		`{"id":"a1","thread_id":"thread-full-target","role":"assistant","text":"history answer for recreated chat"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-full-target"
+	local := codexhistory.Session{
+		SessionID:   session.CodexThreadID,
+		ProjectPath: session.Cwd,
+		FilePath:    transcriptPath,
+		Subagents: []codexhistory.SubagentSession{{
+			SessionID: "thread-full-target-child",
+			AgentID:   "reviewer",
+		}},
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := bridge.importCodexTranscriptToTeams(context.Background(), *session, local); err != nil {
+		t.Fatalf("seed primary import: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "history answer for recreated chat") {
+		t.Fatalf("primary import output missing history: %s", sentPlainJoined(*sent))
+	}
+	oldTargetKey := transcriptChatPublishTargetKey(session.ChatID)
+	session.ChatID = "chat-recreated"
+	session.ChatURL = "https://teams.example/chat-recreated"
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		current := state.Sessions[session.ID]
+		current.TeamsChatID = session.ChatID
+		current.TeamsChatURL = session.ChatURL
+		state.Sessions[session.ID] = current
+		return nil
+	}); err != nil {
+		t.Fatalf("rebind durable session: %v", err)
+	}
+
+	*sent = nil
+	if err := bridge.importFullCodexTranscriptToTeams(context.Background(), *session, local, ""); err != nil {
+		t.Fatalf("full import into recreated chat: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "history prompt for recreated chat") || !strings.Contains(joined, "history answer for recreated chat") {
+		t.Fatalf("target-scoped full import was suppressed by primary delivery state:\n%s", joined)
+	}
+	for _, message := range *sent {
+		if message.ChatID != "chat-recreated" {
+			t.Fatalf("full import sent to %q, want recreated chat", message.ChatID)
+		}
+	}
+	newTargetKey := transcriptChatPublishTargetKey(session.ChatID)
+	if oldTargetKey == newTargetKey {
+		t.Fatal("different chat IDs produced the same publish target key")
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load target checkpoint: %v", err)
+	}
+	primary := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	target := state.ImportCheckpoints[transcriptChatPublishCheckpointID(session.ID, newTargetKey)]
+	if primary.LastRecordID != "a1" || target.LastRecordID != "a1" || target.Status != importCheckpointStatusComplete {
+		t.Fatalf("primary/target checkpoints = %#v / %#v", primary, target)
+	}
+	subagentKey := subagentImportKey(local.Subagents[0], 1)
+	primarySubagentID := transcriptSubagentCheckpointID(session.ID, local.Subagents[0].SessionID, subagentKey)
+	targetSubagentID := transcriptSubagentCheckpointIDForParent(target.ID, local.Subagents[0].SessionID, subagentKey)
+	if state.ImportCheckpoints[primarySubagentID].LastRecordID == "" || state.ImportCheckpoints[targetSubagentID].LastRecordID == "" || primarySubagentID == targetSubagentID {
+		t.Fatalf("primary/target subagent checkpoints = %q %#v / %q %#v", primarySubagentID, state.ImportCheckpoints[primarySubagentID], targetSubagentID, state.ImportCheckpoints[targetSubagentID])
+	}
+
+	*sent = nil
+	if err := bridge.importFullCodexTranscriptToTeams(context.Background(), *session, local, ""); err != nil {
+		t.Fatalf("repeat full import: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("same-chat full import replayed deliveries: %#v", *sent)
+	}
+
+	if err := bridge.importFullCodexTranscriptToTeams(context.Background(), *session, local, "operator-run-1"); err != nil {
+		t.Fatalf("forced full import: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "history answer for recreated chat") || !strings.Contains(sentPlainJoined(*sent), "Subagent spawned") {
+		t.Fatalf("forced full import did not replay complete visible history: %s", sentPlainJoined(*sent))
+	}
+	*sent = nil
+	if err := bridge.importFullCodexTranscriptToTeams(context.Background(), *session, local, "operator-run-1"); err != nil {
+		t.Fatalf("repeat same forced full import: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("same force run id replayed deliveries: %#v", *sent)
+	}
+	if err := bridge.importFullCodexTranscriptToTeams(context.Background(), *session, local, "operator-run-2"); err != nil {
+		t.Fatalf("second forced full import: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "history answer for recreated chat") {
+		t.Fatalf("new force run id did not create an explicit replay: %s", sentPlainJoined(*sent))
+	}
+}
+
+func TestTranscriptDeliveryNamespacePreservesLegacyIDsAndSeparatesTargetChats(t *testing.T) {
+	session := Session{ID: "s178", ChatID: "chat-new", CodexThreadID: "thread-178"}
+	local := codexhistory.Session{SessionID: "thread-178", FilePath: "/tmp/thread-178.jsonl"}
+	record := TranscriptRecord{ItemID: "a1", Kind: TranscriptKindAssistant, SourceLine: 5, SourceOffset: 123}
+	legacy := transcriptDeliveryRecord(session, local, record, "import-assistant", "answer")
+	legacyViaEmptyNamespace := transcriptDeliveryRecordWithNamespace(session, local, record, "import-assistant", "answer", "")
+	chatA := transcriptDeliveryRecordWithNamespace(session, local, record, "import-assistant", "answer", "chat:a")
+	chatB := transcriptDeliveryRecordWithNamespace(session, local, record, "import-assistant", "answer", "chat:b")
+	if legacy.ID != legacyViaEmptyNamespace.ID {
+		t.Fatalf("empty namespace changed legacy delivery ID: %q != %q", legacy.ID, legacyViaEmptyNamespace.ID)
+	}
+	if legacy.ID == chatA.ID || chatA.ID == chatB.ID {
+		t.Fatalf("delivery namespaces were not isolated: legacy=%q chatA=%q chatB=%q", legacy.ID, chatA.ID, chatB.ID)
+	}
+}
+
+func TestTranscriptCheckpointAtSourceEOFAllowsNoVisibleRecords(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, nil, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	checkpointID := transcriptChatPublishCheckpointID(session.ID, transcriptChatPublishTargetKey(session.ChatID))
+	if err := bridge.markTranscriptImportCompleteAtEOFWithID(context.Background(), *session, transcriptPath, "", 0, checkpointID); err != nil {
+		t.Fatalf("mark empty-visible transcript complete: %v", err)
+	}
+	complete, err := bridge.transcriptCheckpointAtSourceEOF(context.Background(), checkpointID, transcriptPath)
+	if err != nil {
+		t.Fatalf("transcriptCheckpointAtSourceEOF: %v", err)
+	}
+	if !complete {
+		t.Fatal("EOF checkpoint without visible records was not recognized as complete")
+	}
+}
+
+func TestPublishSessionFullHistoryIsIdempotentAndForceable(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(transcriptPath, []byte(`{"id":"a1","role":"assistant","text":"operator full-history answer"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-operator-full", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	session.CodexThreadID = "thread-operator-full"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		legacy := state.Sessions[session.ID]
+		legacy.Status = ""
+		state.Sessions[session.ID] = legacy
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy blank session status: %v", err)
+	}
+	bridge.reg.Sessions = append(bridge.reg.Sessions, Session{ID: "s-registry-only", ChatID: "registry-only-chat", Status: "active"})
+	bridge.maintenanceStorePinned = true
+
+	published, err := bridge.PublishSessionFullHistory(context.Background(), session.ID, "")
+	if err != nil || !published {
+		t.Fatalf("first operator full publish = %t, %v", published, err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "operator full-history answer") {
+		t.Fatalf("first operator full publish output: %s", sentPlainJoined(*sent))
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load pinned maintenance store: %v", err)
+	}
+	if _, exists := state.Sessions["s-registry-only"]; exists {
+		t.Fatalf("selector-pinned maintenance imported an unrelated registry projection: %#v", state.Sessions["s-registry-only"])
+	}
+	*sent = nil
+	published, err = bridge.PublishSessionFullHistory(context.Background(), session.ID, "")
+	if err != nil || published || len(*sent) != 0 {
+		t.Fatalf("idempotent operator full publish = %t, %v, sent=%#v", published, err, *sent)
+	}
+	published, err = bridge.PublishSessionFullHistory(context.Background(), session.ID, "operator-force")
+	if err != nil || !published {
+		t.Fatalf("forced operator full publish = %t, %v", published, err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "operator full-history answer") {
+		t.Fatalf("forced operator full publish output: %s", sentPlainJoined(*sent))
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptMirrorsLocalCodexConversation(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -27708,6 +28257,107 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 	}
 	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID == "" || !strings.Contains(checkpoint.LastRecordID, fmt.Sprintf("a%03d", transcriptSyncMaxAutoBacklogRecords)) {
 		t.Fatalf("checkpoint after publish-history = %#v, want complete at final backlog record", checkpoint)
+	}
+}
+
+func TestBridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-full-command"}}`,
+		`{"id":"u1","role":"user","text":"full command historical prompt"}`,
+		`{"id":"a1","role":"assistant","text":"full command historical answer"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-full-command", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-full-command"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	if err := bridge.markTranscriptImportCompleteAtEOF(context.Background(), *session, transcriptPath, "a1", 3); err != nil {
+		t.Fatalf("seed primary EOF checkpoint: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-full-1", "2026-07-10T08:00:00Z", "helper publish-history full"), "helper publish-history full"); err != nil {
+		t.Fatalf("helper publish-history full: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "full command historical prompt") || !strings.Contains(joined, "full command historical answer") {
+		t.Fatalf("full command was suppressed by primary EOF checkpoint:\n%s", joined)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load full command state: %v", err)
+	}
+	targetID := transcriptChatPublishCheckpointID(session.ID, transcriptChatPublishTargetKey(session.ChatID))
+	if checkpoint := state.ImportCheckpoints[targetID]; checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a1" {
+		t.Fatalf("full command target checkpoint = %#v", checkpoint)
+	}
+
+	file, err := os.OpenFile(transcriptPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open transcript append: %v", err)
+	}
+	if _, err := file.WriteString(`{"id":"a2","role":"assistant","text":"new answer after first full publish"}` + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append transcript: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close appended transcript: %v", err)
+	}
+	*sent = nil
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-full-2", "2026-07-10T08:01:00Z", "helper publish-history full"), "helper publish-history full"); err != nil {
+		t.Fatalf("updated helper publish-history full: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "new answer after first full publish") {
+		t.Fatalf("updated full command did not import appended history: %#v", *sent)
+	}
+
+	*sent = nil
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-full-3", "2026-07-10T08:02:00Z", "helper publish-history full"), "helper publish-history full"); err != nil {
+		t.Fatalf("repeat helper publish-history full: %v", err)
+	}
+	if len(*sent) != 1 || !strings.Contains(sentPlainJoined(*sent), "already published to this chat") {
+		t.Fatalf("repeat full command output = %#v", *sent)
+	}
+
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript before mtime-only change: %v", err)
+	}
+	changedModTime := info.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(transcriptPath, changedModTime, changedModTime); err != nil {
+		t.Fatalf("change transcript mtime: %v", err)
+	}
+	*sent = nil
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-full-4", "2026-07-10T08:03:00Z", "helper publish-history full"), "helper publish-history full"); err != nil {
+		t.Fatalf("mtime-only helper publish-history full: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "now up to date in this chat") {
+		t.Fatalf("mtime-only full command did not acknowledge completion: %#v", *sent)
+	}
+	if err := store.UpdateSession(context.Background(), session.ID, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[targetID]
+		checkpoint.Status = importCheckpointStatusImporting
+		checkpoint.UpdatedAt = time.Now()
+		state.ImportCheckpoints[targetID] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("seed active target import: %v", err)
+	}
+	*sent = nil
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-full-5", "2026-07-10T08:04:00Z", "helper publish-history full"), "helper publish-history full"); err != nil {
+		t.Fatalf("concurrent helper publish-history full: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "already running for this chat") {
+		t.Fatalf("concurrent full command output = %#v", *sent)
 	}
 }
 

@@ -214,7 +214,8 @@ codex-proxy proxy doctor
 | `codex-proxy teams send-file <path> --session <id>` | 上传本地 outbound 文件并作为 Teams attachment 发送 |
 | `codex-proxy teams probe-chat --chat <chat-id-or-link>` | 对外部 Teams chat 做只读探测，不绑定 helper state |
 | `codex-proxy teams pause` / `resume` / `drain` / `recover` | 从终端 pause、resume、drain 或 recover Teams helper state |
-| `codex-proxy teams chat recreate <session-id> --yes` | 为现有 helper session 创建并绑定新的 Teams Work chat |
+| `codex-proxy teams chat recreate <session-id> --history full --yes` | 按 session 选择权威 store，原子创建并绑定新的 Work chat，并可选择发布完整本地历史 |
+| `codex-proxy teams chat publish-history <session-id> --full --yes` | 幂等地把完整本地 Codex 历史发布到当前 Work chat；仅在明确需要重放时添加 `--force` |
 | `codex-proxy teams chat quarantine <session-or-chat> --dry-run\|--yes` | 精确隔离一个异常 Work chat，停止轮询并原子中断待处理工作；运行中的 service owner 存在时拒绝终端修改 |
 | `codex-proxy teams chat unquarantine <session-or-chat> --dry-run\|--yes` | 仅恢复明确处于 `quarantined` 状态的会话，不重放旧 turn、inbound 或 outbox |
 | `codex-proxy teams service bootstrap` | 安装或修复后台 Teams helper service |
@@ -593,6 +594,8 @@ helper status
 helper retry last
 helper cancel running
 helper file relative/path.ext
+helper publish-history
+helper publish-history full
 model status
 model switch deepseek
 model fork deepseek
@@ -614,10 +617,15 @@ codex-proxy teams pause
 codex-proxy teams resume
 codex-proxy teams drain
 codex-proxy teams recover
-codex-proxy teams chat recreate <session-id> --yes
+codex-proxy teams chat recreate <session-id> --history full --yes
+codex-proxy teams chat publish-history <session-id> --full --yes
 codex-proxy teams chat quarantine <session-or-chat> --dry-run
 codex-proxy teams chat unquarantine <session-or-chat> --dry-run
 ```
+
+如果多个保留的 state store 对同一个 session 的绑定不一致，这两个维护命令会安全失败并
+列出候选项。只有确认权威副本后才应使用 `--store <state.json>`。重新创建 quarantined
+session 还必须显式添加 `--activate`；closed 或 archived session 不能 recreate。
 
 Teams 启动的 Codex app-server 默认使用目标账号的默认 PATH，而不是直接复制后台
 service PATH。由旧版 helper 写入的现有配置会迁移到显式 `service` 模式，避免升级时

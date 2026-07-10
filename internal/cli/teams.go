@@ -526,9 +526,89 @@ func newTeamsChatCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	}
 	cmd.AddCommand(
 		newTeamsChatRecreateCmd(root, registryPath),
+		newTeamsChatPublishHistoryCmd(root, registryPath),
 		newTeamsChatQuarantineCmd(),
 		newTeamsChatUnquarantineCmd(),
 	)
+	return cmd
+}
+
+func newTeamsChatPublishHistoryCmd(root *rootOptions, registryPath *string) *cobra.Command {
+	var (
+		yes                  bool
+		full                 bool
+		force                bool
+		storeOverride        string
+		recreateDrainTimeout time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "publish-history <session-id|codex-thread-id|teams-chat-id>",
+		Short: "Publish complete local Codex history to a Teams work chat",
+		Long:  "Publish the complete linked local Codex transcript to the selected session's current Teams chat. Normal runs are idempotent per target chat; --force deliberately creates a fresh replay namespace.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			var recreateDrain *teamsChatRecreateDrain
+			defer func() {
+				if recreateDrain == nil {
+					return
+				}
+				if cleanupErr := recreateDrain.Release(context.Background()); cleanupErr != nil {
+					runErr = errors.Join(runErr, cleanupErr)
+				}
+			}()
+			if !full {
+				return fmt.Errorf("publishing complete local history requires --full")
+			}
+			if !yes {
+				return fmt.Errorf("publishing local history sends messages to Teams; rerun with --yes")
+			}
+			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			defer func() { _ = httpClient.Close(context.Background()) }()
+			auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
+			if err != nil {
+				return err
+			}
+			bridge, err := teams.NewBridgeForSessionChatRecreateWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client, args[0], storeOverride)
+			if err != nil {
+				return err
+			}
+			maintenanceStorePath, err := bridge.PinStoreForMaintenance()
+			if err != nil {
+				return err
+			}
+			recreateDrain, err = beginTeamsBridgeDrainForHistoryPublish(cmd.Context(), cmd.OutOrStdout(), recreateDrainTimeout, maintenanceStorePath)
+			if err != nil {
+				return err
+			}
+			forceRunID := ""
+			if force {
+				forceRunID = fmt.Sprintf("cli:%d:%d", os.Getpid(), time.Now().UnixNano())
+			}
+			published, err := bridge.PublishSessionFullHistory(cmd.Context(), args[0], forceRunID)
+			if err != nil {
+				return err
+			}
+			if err := recreateDrain.Release(cmd.Context()); err != nil {
+				return err
+			}
+			recreateDrain = nil
+			if !published {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Full local Codex history is already published to this Teams chat.")
+			} else {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Full local Codex history published to the selected Teams chat.")
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "History-publish maintenance fence released. Supervised Teams services can resume; restart a foreground listener manually.")
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&full, "full", false, "Publish the complete linked local Codex transcript")
+	cmd.Flags().BoolVar(&force, "force", false, "Deliberately replay the full transcript even if this target chat was already published")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that this sends local Codex history to Teams")
+	cmd.Flags().StringVar(&storeOverride, "store", "", "Use this exact Teams state store after validating that it contains the selected session")
+	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", defaultTeamsChatRecreateDrainTime, "How long to wait for the running Teams listener to drain before publishing")
 	return cmd
 }
 
@@ -727,12 +807,17 @@ func printTeamsChatMaintenanceTarget(out io.Writer, action string, target teamsC
 }
 
 func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Command {
-	var yes bool
-	var recreateDrainTimeout time.Duration
+	var (
+		yes                  bool
+		storeOverride        string
+		historyMode          string
+		activate             bool
+		recreateDrainTimeout time.Duration
+	)
 	cmd := &cobra.Command{
 		Use:   "recreate <session-id|codex-thread-id|teams-chat-id>",
 		Short: "Create a fresh Teams work chat for an existing session",
-		Long:  "Create a fresh meeting-based Teams work chat for an existing helper session and rebind local state. The old Teams chat is left untouched.",
+		Long:  "Create a fresh meeting-based Teams work chat for an existing helper session and atomically rebind durable state. The old Teams chat is retained and receives a migration link; it is never deleted.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			var recreateDrain *teamsChatRecreateDrain
@@ -747,6 +832,10 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 			if !yes {
 				return fmt.Errorf("recreating a work chat creates a new Teams chat and sends messages; rerun with --yes")
 			}
+			historyMode = strings.ToLower(strings.TrimSpace(historyMode))
+			if historyMode != "none" && historyMode != "full" {
+				return fmt.Errorf("invalid --history %q: expected none or full", historyMode)
+			}
 			httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -756,7 +845,7 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 			if err != nil {
 				return err
 			}
-			bridge, err := teams.NewBridgeForChatRecreateWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+			bridge, err := teams.NewBridgeForSessionChatRecreateWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client, args[0], storeOverride)
 			if err != nil {
 				return err
 			}
@@ -769,7 +858,10 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 				return err
 			}
 			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
-			recreated, err := bridge.RecreateSessionChat(cmd.Context(), args[0], teams.RecreateSessionChatOptions{})
+			recreated, err := bridge.RecreateSessionChat(cmd.Context(), args[0], teams.RecreateSessionChatOptions{
+				ImportHistory: historyMode == "full",
+				Activate:      activate,
+			})
 			if err != nil {
 				return err
 			}
@@ -785,7 +877,10 @@ func newTeamsChatRecreateCmd(root *rootOptions, registryPath *string) *cobra.Com
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that this may create a Teams chat and send an @mention plus a ready message")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that this may create a Teams chat, send messages, and publish history when requested")
+	cmd.Flags().StringVar(&storeOverride, "store", "", "Use this exact Teams state store after validating that it contains the selected session")
+	cmd.Flags().StringVar(&historyMode, "history", "none", "History to publish into the new chat: none or full")
+	cmd.Flags().BoolVar(&activate, "activate", false, "Reactivate a quarantined session while recreating its chat")
 	cmd.Flags().DurationVar(&recreateDrainTimeout, "drain-timeout", defaultTeamsChatRecreateDrainTime, "How long to wait for the running Teams listener to drain before recreating")
 	return cmd
 }
@@ -822,6 +917,14 @@ func (d *teamsChatRecreateDrain) Release(ctx context.Context) error {
 }
 
 func beginTeamsBridgeDrainForChatRecreate(ctx context.Context, out io.Writer, timeout time.Duration, maintenanceStorePath string) (_ *teamsChatRecreateDrain, err error) {
+	return beginTeamsBridgeDrainForMaintenance(ctx, out, timeout, maintenanceStorePath, "chat recreate", "recreating chat")
+}
+
+func beginTeamsBridgeDrainForHistoryPublish(ctx context.Context, out io.Writer, timeout time.Duration, maintenanceStorePath string) (_ *teamsChatRecreateDrain, err error) {
+	return beginTeamsBridgeDrainForMaintenance(ctx, out, timeout, maintenanceStorePath, "history publish", "publishing history")
+}
+
+func beginTeamsBridgeDrainForMaintenance(ctx context.Context, out io.Writer, timeout time.Duration, maintenanceStorePath string, operationReason string, action string) (_ *teamsChatRecreateDrain, err error) {
 	maintenanceStorePath = strings.TrimSpace(maintenanceStorePath)
 	if maintenanceStorePath == "" {
 		maintenanceStorePath, err = teamsStorePathReadOnly()
@@ -851,7 +954,7 @@ func beginTeamsBridgeDrainForChatRecreate(ctx context.Context, out io.Writer, ti
 	if hasOwner && teamsstore.IsStale(owner, defaultTeamsOwnerStaleAfter, time.Now()) {
 		return nil, closeTeamsStoreWithPriorError(st, fmt.Errorf("Teams bridge owner appears stale in %s; run `codex-proxy teams recover` before recreating chats", maintenanceStorePath))
 	}
-	if _, err := st.SetDrainingOperation(ctx, "chat recreate", drain.operationID); err != nil {
+	if _, err := st.SetDrainingOperation(ctx, operationReason, drain.operationID); err != nil {
 		return nil, closeTeamsStoreWithPriorError(st, err)
 	}
 	drain.stores = append(drain.stores, teamsChatRecreateStore{Path: maintenanceStorePath, St: st})
@@ -862,7 +965,7 @@ func beginTeamsBridgeDrainForChatRecreate(ctx context.Context, out io.Writer, ti
 		timeout = defaultTeamsChatRecreateDrainTime
 	}
 	if out != nil {
-		_, _ = fmt.Fprintln(out, "Waiting for active Teams listener to drain before recreating chat...")
+		_, _ = fmt.Fprintf(out, "Waiting for active Teams listener to drain before %s...\n", action)
 	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -891,7 +994,7 @@ func beginTeamsBridgeDrainForChatRecreate(ctx context.Context, out io.Writer, ti
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-deadline.C:
-			return nil, fmt.Errorf("timed out waiting for Teams listener to drain before recreating chat; run `codex-proxy teams status` or `codex-proxy teams recover --force` if the owner is gone")
+			return nil, fmt.Errorf("timed out waiting for Teams listener to drain before %s; store=%s; run `codex-proxy teams status` or `codex-proxy teams recover --force` if the owner is gone", action, maintenanceStorePath)
 		case <-tick.C:
 		}
 	}

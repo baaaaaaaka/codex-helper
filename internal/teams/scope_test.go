@@ -501,6 +501,341 @@ func TestResolveStorePathForMaintenanceRejectsMultipleFreshAuthorities(t *testin
 	}
 }
 
+func TestResolveStorePathForSessionMaintenanceSelectsOnlyLiveMatchingStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "legacy-chat", CodexThreadID: "thread-178"}); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "current-chat", CodexThreadID: "thread-178"}); err != nil {
+		t.Fatalf("seed current session: %v", err)
+	}
+	owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	if _, err := currentStore.RecordOwnerHeartbeat(context.Background(), owner, scopeStoreOwnerFreshAfter, time.Now()); err != nil {
+		t.Fatalf("record current owner: %v", err)
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	resolved, path, err := ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err != nil {
+		t.Fatalf("ResolveStorePathForSessionMaintenance: %v", err)
+	}
+	if resolved.ID != scope.ID || !samePath(path, currentPath) {
+		t.Fatalf("resolved scope/path = %#v %q, want current %q", resolved, path, currentPath)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceIgnoresUnrelatedLiveStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, _ := legacyDefaultStorePathForScope(scope.ID)
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "target-chat", CodexThreadID: "thread-178"}); err != nil {
+		t.Fatalf("seed target session: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	currentStore, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := currentStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record current scope: %v", err)
+	}
+	if _, _, err := currentStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s999", Status: teamstore.SessionStatusActive, TeamsChatID: "unrelated-chat", CodexThreadID: "thread-999"}); err != nil {
+		t.Fatalf("seed unrelated session: %v", err)
+	}
+	owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	if _, err := currentStore.RecordOwnerHeartbeat(context.Background(), owner, scopeStoreOwnerFreshAfter, time.Now()); err != nil {
+		t.Fatalf("record unrelated live owner: %v", err)
+	}
+	if err := currentStore.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	_, path, err := ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err != nil {
+		t.Fatalf("ResolveStorePathForSessionMaintenance: %v", err)
+	}
+	if !samePath(path, legacyPath) {
+		t.Fatalf("resolved path = %q, want target-bearing store %q", path, legacyPath)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceUsesOnlyExistingLegacyStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, _ := legacyDefaultStorePathForScope(scope.ID)
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "legacy-chat"}); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	if ok, err := pathExists(currentPath); err != nil || ok {
+		t.Fatalf("current store unexpectedly exists before resolution: exists=%t err=%v", ok, err)
+	}
+
+	_, path, err := ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err != nil {
+		t.Fatalf("ResolveStorePathForSessionMaintenance: %v", err)
+	}
+	if !samePath(path, legacyPath) {
+		t.Fatalf("resolved path = %q, want only existing legacy store %q", path, legacyPath)
+	}
+	if ok, err := pathExists(currentPath); err != nil || ok {
+		t.Fatalf("read-only resolution created current store: exists=%t err=%v", ok, err)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceRejectsConflictingRetainedCopies(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, _ := legacyDefaultStorePathForScope(scope.ID)
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	for path, chatID := range map[string]string{legacyPath: "legacy-chat", currentPath: "current-chat"} {
+		st, err := teamstore.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		if _, err := st.RecordScope(context.Background(), scope); err != nil {
+			t.Fatalf("record scope %s: %v", path, err)
+		}
+		if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: chatID, CodexThreadID: "thread-178"}); err != nil {
+			t.Fatalf("seed session %s: %v", path, err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close %s: %v", path, err)
+		}
+	}
+
+	_, _, err := ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err == nil || !strings.Contains(err.Error(), "conflicting retained Teams stores") || !strings.Contains(err.Error(), legacyPath) || !strings.Contains(err.Error(), currentPath) {
+		t.Fatalf("conflict error = %v", err)
+	}
+	resolved, path, err := ResolveStorePathForSessionMaintenance(scope, "s178", currentPath)
+	if err != nil {
+		t.Fatalf("override current store: %v", err)
+	}
+	if resolved.ID != scope.ID || !samePath(path, currentPath) {
+		t.Fatalf("override resolved %#v %q, want %q", resolved, path, currentPath)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceUsesCurrentForIdenticalRetainedCopies(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, _ := legacyDefaultStorePathForScope(scope.ID)
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	for _, path := range []string{legacyPath, currentPath} {
+		st, err := teamstore.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		if _, err := st.RecordScope(context.Background(), scope); err != nil {
+			t.Fatalf("record scope %s: %v", path, err)
+		}
+		if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "same-chat", CodexThreadID: "thread-178"}); err != nil {
+			t.Fatalf("seed session %s: %v", path, err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close %s: %v", path, err)
+		}
+	}
+
+	_, path, err := ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err != nil {
+		t.Fatalf("ResolveStorePathForSessionMaintenance: %v", err)
+	}
+	if !samePath(path, currentPath) {
+		t.Fatalf("resolved path = %q, want current %q", path, currentPath)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceFailsClosedWhenCurrentStoreIsUnreadable(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, _ := legacyDefaultStorePathForScope(scope.ID)
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	legacyStore, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, err := legacyStore.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if _, _, err := legacyStore.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "legacy-chat"}); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+	if err := legacyStore.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(currentPath), 0o700); err != nil {
+		t.Fatalf("mkdir current store dir: %v", err)
+	}
+	if err := os.WriteFile(currentPath, []byte("not valid Teams state"), 0o600); err != nil {
+		t.Fatalf("write unreadable current store: %v", err)
+	}
+
+	_, _, err = ResolveStorePathForSessionMaintenance(scope, "s178", "")
+	if err == nil || !strings.Contains(err.Error(), "read candidate Teams maintenance store") || !strings.Contains(err.Error(), currentPath) {
+		t.Fatalf("unreadable current-store error = %v", err)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceRejectsAmbiguousSelectorInsideStore(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	st, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := st.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record scope: %v", err)
+	}
+	if err := st.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["s178"] = teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-a", CodexThreadID: "shared-thread"}
+		state.Sessions["s179"] = teamstore.SessionContext{ID: "s179", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-b", CodexThreadID: "shared-thread"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed ambiguous sessions: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	_, _, err = ResolveStorePathForSessionMaintenance(scope, "shared-thread", "")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous inside") || !strings.Contains(err.Error(), "s178,s179") {
+		t.Fatalf("ambiguous selector error = %v", err)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceRejectsForeignOverride(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	foreignScope := ScopeIdentityForUser(User{ID: "teams-user-2", UserPrincipalName: "other@example.test"})
+	foreignPath, _ := DefaultStorePathForScope(foreignScope.ID)
+	st, err := teamstore.Open(foreignPath)
+	if err != nil {
+		t.Fatalf("open foreign store: %v", err)
+	}
+	if _, err := st.RecordScope(context.Background(), foreignScope); err != nil {
+		t.Fatalf("record foreign scope: %v", err)
+	}
+	if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s178", Status: teamstore.SessionStatusActive, TeamsChatID: "foreign-chat"}); err != nil {
+		t.Fatalf("seed foreign session: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close foreign store: %v", err)
+	}
+
+	_, _, err = ResolveStorePathForSessionMaintenance(scope, "s178", foreignPath)
+	if err == nil || !strings.Contains(err.Error(), "scope mismatch") {
+		t.Fatalf("foreign override error = %v", err)
+	}
+}
+
+func TestResolveStorePathForSessionMaintenanceRejectsOverrideWithoutSelector(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	currentPath, _ := DefaultStorePathForScope(scope.ID)
+	st, err := teamstore.Open(currentPath)
+	if err != nil {
+		t.Fatalf("open current store: %v", err)
+	}
+	if _, err := st.RecordScope(context.Background(), scope); err != nil {
+		t.Fatalf("record scope: %v", err)
+	}
+	if _, _, err := st.CreateSession(context.Background(), teamstore.SessionContext{ID: "s999", Status: teamstore.SessionStatusActive, TeamsChatID: "other-chat"}); err != nil {
+		t.Fatalf("seed unrelated session: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close current store: %v", err)
+	}
+
+	_, _, err = ResolveStorePathForSessionMaintenance(scope, "s178", currentPath)
+	if err == nil || !strings.Contains(err.Error(), "maintenance selector not found") {
+		t.Fatalf("missing-selector override error = %v", err)
+	}
+}
+
 func TestTeamsBackgroundKeepaliveResolveStorePathUsesControlBindingWhenScopeMissingCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)

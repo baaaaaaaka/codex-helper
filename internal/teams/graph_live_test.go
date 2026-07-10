@@ -1868,7 +1868,7 @@ func TestLiveBridgeHelperE2EOptIn(t *testing.T) {
 
 func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_PUBLISH_HISTORY_E2E")) != "1" {
-		t.Skip("set CODEX_HELPER_TEAMS_LIVE_PUBLISH_HISTORY_E2E=1 to create one Jason Wei-only live work chat and verify imported history order")
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_PUBLISH_HISTORY_E2E=1 to create and recreate Jason Wei-only live work chats and verify full-history order")
 	}
 	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
 		t.Fatalf("%s=%s is required before any live Teams chat read or send", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
@@ -1939,11 +1939,15 @@ func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open live publish history store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	bridge, err := NewBridge(ctx, auth, registryPath, io.Discard)
 	if err != nil {
 		t.Fatalf("NewBridge error: %v", err)
 	}
 	bridge.readGraph = readGraph
+	if bridge.store != nil {
+		_ = bridge.store.Close()
+	}
 	bridge.store = store
 	bridge.machine.Label = "live-test-synthetic-history-" + nonce
 	if _, err := bridge.publishCodexSession(ctx, DashboardCommandTarget{Raw: sessionID}); err != nil {
@@ -1979,6 +1983,7 @@ func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 	deadline := time.Now().Add(6 * time.Minute)
 	var got []string
 	var lastErr error
+	foundInitialHistory := false
 	for attempts := 0; attempts < 12 && time.Now().Before(deadline); attempts++ {
 		got, lastErr = liveRecentPlainMessagesAscending(ctx, readGraph, workSession.ChatID, 20)
 		if lastErr == nil && containsOrderedLiveHistoryMessages(got, want) {
@@ -1987,14 +1992,55 @@ func TestLiveBridgePublishExistingTranscriptOrderOptIn(t *testing.T) {
 					t.Fatalf("historical tool record should not be imported, got recent messages: %#v", got)
 				}
 			}
-			return
+			foundInitialHistory = true
+			break
 		}
 		time.Sleep(15 * time.Second)
 	}
 	if lastErr != nil {
 		t.Fatalf("read live imported history messages failed: %v", lastErr)
 	}
-	t.Fatalf("live imported history messages were not in expected order.\nwant subsequence: %#v\ngot: %#v", want, got)
+	if !foundInitialHistory {
+		t.Fatalf("live imported history messages were not in expected order.\nwant subsequence: %#v\ngot: %#v", want, got)
+	}
+
+	recreated, err := bridge.RecreateSessionChat(ctx, workSession.ID, RecreateSessionChatOptions{ImportHistory: true})
+	if err != nil {
+		t.Fatalf("live recreate with full history failed: %v", err)
+	}
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, recreated.NewChat.ID)
+	recreatedWant := append(append([]string(nil), want...), "Work chat recreated", "Work chat is ready")
+	deadline = time.Now().Add(6 * time.Minute)
+	var recreatedMessages []string
+	lastErr = nil
+	for attempts := 0; attempts < 12 && time.Now().Before(deadline); attempts++ {
+		recreatedMessages, lastErr = liveRecentPlainMessagesAscending(ctx, readGraph, recreated.NewChat.ID, 24)
+		if lastErr == nil && containsOrderedLiveHistoryMessages(recreatedMessages, recreatedWant) {
+			break
+		}
+		time.Sleep(15 * time.Second)
+	}
+	if lastErr != nil {
+		t.Fatalf("read recreated live history messages failed: %v", lastErr)
+	}
+	if !containsOrderedLiveHistoryMessages(recreatedMessages, recreatedWant) {
+		t.Fatalf("recreated live chat did not receive complete history before ready.\nwant subsequence: %#v\ngot: %#v", recreatedWant, recreatedMessages)
+	}
+	oldMessages, err := liveRecentPlainMessagesAscending(ctx, readGraph, workSession.ChatID, 24)
+	if err != nil {
+		t.Fatalf("read old live chat migration notice failed: %v", err)
+	}
+	if !containsAllLivePlainText(oldMessages, []string{"This chat moved"}) {
+		t.Fatalf("old live chat did not receive a migration notice: %#v", oldMessages)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load recreated live history store: %v", err)
+	}
+	targetID := transcriptChatPublishCheckpointID(workSession.ID, transcriptChatPublishTargetKey(recreated.NewChat.ID))
+	if checkpoint := state.ImportCheckpoints[targetID]; checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a2" {
+		t.Fatalf("recreated live target checkpoint = %#v", checkpoint)
+	}
 }
 
 func TestLiveBridgePublishLongLocalTranscriptOptIn(t *testing.T) {
@@ -2740,14 +2786,35 @@ func liveHTMLCodeBlockPlainTexts(raw string) []string {
 func containsOrderedLiveHistoryMessages(got []string, want []string) bool {
 	next := 0
 	for _, text := range got {
-		if next >= len(want) {
-			return true
-		}
-		if strings.Contains(compactLivePlainTextBlankLines(text), compactLivePlainTextBlankLines(want[next])) {
+		text = compactLivePlainTextBlankLines(text)
+		searchFrom := 0
+		for next < len(want) {
+			needle := compactLivePlainTextBlankLines(want[next])
+			index := strings.Index(text[searchFrom:], needle)
+			if index < 0 {
+				break
+			}
+			searchFrom += index + len(needle)
 			next++
 		}
 	}
 	return next == len(want)
+}
+
+func TestContainsOrderedLiveHistoryMessagesAllowsBatchedFragments(t *testing.T) {
+	got := []string{
+		"Imported Codex session history",
+		"User:\nfirst\n\nCodex answer:\nsecond\n\nCodex status:\nthird",
+		"Import complete",
+	}
+	want := []string{"Imported Codex session history", "User:\nfirst", "Codex answer:\nsecond", "Codex status:\nthird", "Import complete"}
+	if !containsOrderedLiveHistoryMessages(got, want) {
+		t.Fatalf("batched ordered fragments were not recognized: got=%#v want=%#v", got, want)
+	}
+	wrongOrder := []string{"Imported Codex session history", "Codex answer:\nsecond\n\nUser:\nfirst\n\nCodex status:\nthird", "Import complete"}
+	if containsOrderedLiveHistoryMessages(wrongOrder, want) {
+		t.Fatalf("out-of-order fragments were accepted: got=%#v want=%#v", wrongOrder, want)
+	}
 }
 
 func containsAllLivePlainText(got []string, want []string) bool {

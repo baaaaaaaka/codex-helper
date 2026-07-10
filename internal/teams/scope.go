@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -108,6 +109,196 @@ func ResolveStorePathForMaintenance(scope teamstore.ScopeIdentity) (teamstore.Sc
 		scope.CreatedAt = resolved.CreatedAt
 	}
 	return scope, path, nil
+}
+
+type sessionMaintenanceStoreCandidate struct {
+	scope     teamstore.ScopeIdentity
+	path      string
+	session   teamstore.SessionContext
+	fresh     bool
+	isCurrent bool
+}
+
+// ResolveStorePathForSessionMaintenance selects the store that actually owns
+// selector. Unlike the scope-wide resolver, it never lets unrelated row counts
+// or retained maintenance markers decide between conflicting copies of the
+// same session. A conflict without one unambiguous live authority fails before
+// a maintenance command can create or mutate a Teams chat.
+func ResolveStorePathForSessionMaintenance(scope teamstore.ScopeIdentity, selector string, storeOverride string) (teamstore.ScopeIdentity, string, error) {
+	scope = normalizeScopeForResolution(scope)
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return scope, "", fmt.Errorf("session id, Codex thread id, or Teams chat id is required")
+	}
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		return scope, "", err
+	}
+	now := time.Now()
+	if override := strings.TrimSpace(storeOverride); override != "" {
+		state, err := teamstore.LoadPathReadOnly(context.Background(), override)
+		if err != nil {
+			return scope, "", fmt.Errorf("invalid Teams maintenance store override %s: %w", override, err)
+		}
+		candidate, err := sessionMaintenanceStoreCandidateFromState(scope, currentPath, override, selector, state, now)
+		if err != nil {
+			return scope, "", fmt.Errorf("invalid Teams maintenance store override %s: %w", override, err)
+		}
+		if strings.TrimSpace(candidate.scope.ID) != "" {
+			scope.ID = candidate.scope.ID
+		}
+		return scope, candidate.path, nil
+	}
+
+	paths, err := candidateScopeStorePaths(currentPath)
+	if err != nil {
+		return scope, "", err
+	}
+	var candidates []sessionMaintenanceStoreCandidate
+	for _, path := range paths {
+		state, err := teamstore.LoadPathReadOnly(context.Background(), path)
+		if err != nil {
+			if sessionMaintenanceStoreMustBeReadable(scope, currentPath, path) {
+				return scope, "", fmt.Errorf("read candidate Teams maintenance store %s: %w", path, err)
+			}
+			continue
+		}
+		candidate, err := sessionMaintenanceStoreCandidateFromState(scope, currentPath, path, selector, state, now)
+		if err != nil {
+			if errors.Is(err, errSessionMaintenanceSelectorNotFound) || errors.Is(err, errSessionMaintenanceScopeMismatch) {
+				continue
+			}
+			return scope, "", err
+		}
+		candidates = append(candidates, candidate)
+	}
+	if len(candidates) == 0 {
+		return scope, "", fmt.Errorf("Teams session or chat %q was not found in the authenticated scope", selector)
+	}
+	var fresh []sessionMaintenanceStoreCandidate
+	for _, candidate := range candidates {
+		if candidate.fresh {
+			fresh = append(fresh, candidate)
+		}
+	}
+	if len(fresh) == 1 {
+		return resolvedSessionMaintenanceCandidate(scope, fresh[0])
+	}
+	if len(fresh) > 1 {
+		return scope, "", sessionMaintenanceStoreConflictError(selector, candidates, "multiple live Teams stores claim this session")
+	}
+	if len(candidates) == 1 {
+		return resolvedSessionMaintenanceCandidate(scope, candidates[0])
+	}
+	if sessionMaintenanceBindingsAgree(candidates) {
+		for _, candidate := range candidates {
+			if candidate.isCurrent {
+				return resolvedSessionMaintenanceCandidate(scope, candidate)
+			}
+		}
+	}
+	return scope, "", sessionMaintenanceStoreConflictError(selector, candidates, "conflicting retained Teams stores contain this session")
+}
+
+var (
+	errSessionMaintenanceSelectorNotFound = errors.New("maintenance selector not found")
+	errSessionMaintenanceScopeMismatch    = errors.New("maintenance store scope mismatch")
+)
+
+func sessionMaintenanceStoreCandidateFromState(scope teamstore.ScopeIdentity, currentPath string, path string, selector string, state teamstore.State, now time.Time) (sessionMaintenanceStoreCandidate, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return sessionMaintenanceStoreCandidate{}, fmt.Errorf("store path is required")
+	}
+	if !scopeStateMatches(scope, state) && !defaultGlobalStoreCanSeedScope(scope, path, state) {
+		return sessionMaintenanceStoreCandidate{}, errSessionMaintenanceScopeMismatch
+	}
+	matches := sessionMaintenanceSelectorMatches(state, selector)
+	if len(matches) == 0 {
+		return sessionMaintenanceStoreCandidate{}, errSessionMaintenanceSelectorNotFound
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, match := range matches {
+			ids = append(ids, match.ID)
+		}
+		sort.Strings(ids)
+		return sessionMaintenanceStoreCandidate{}, fmt.Errorf("selector %q is ambiguous inside %s: sessions=%s", selector, path, strings.Join(ids, ","))
+	}
+	candidateScope := state.Scope
+	if strings.TrimSpace(candidateScope.ID) == "" {
+		candidateScope = scope
+	}
+	return sessionMaintenanceStoreCandidate{
+		scope:     candidateScope,
+		path:      path,
+		session:   matches[0],
+		fresh:     scopeStoreHasFreshOwner(state, now) || scopeStoreHasFreshControlLease(state, now),
+		isCurrent: samePath(path, currentPath),
+	}, nil
+}
+
+func sessionMaintenanceStoreMustBeReadable(scope teamstore.ScopeIdentity, currentPath string, path string) bool {
+	if samePath(path, currentPath) || isDefaultGlobalStorePath(path) {
+		return true
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	return err == nil && samePath(path, legacyPath)
+}
+
+func sessionMaintenanceSelectorMatches(state teamstore.State, selector string) []teamstore.SessionContext {
+	selector = strings.TrimSpace(selector)
+	var matches []teamstore.SessionContext
+	for _, session := range state.Sessions {
+		if selector == strings.TrimSpace(session.ID) ||
+			selector == strings.TrimSpace(session.CodexThreadID) ||
+			selector == strings.TrimSpace(session.TeamsChatID) ||
+			strings.EqualFold(recreateShortGraphID(session.TeamsChatID), selector) {
+			matches = append(matches, session)
+		}
+	}
+	return matches
+}
+
+func resolvedSessionMaintenanceCandidate(scope teamstore.ScopeIdentity, candidate sessionMaintenanceStoreCandidate) (teamstore.ScopeIdentity, string, error) {
+	if strings.TrimSpace(candidate.scope.ID) != "" {
+		scope.ID = candidate.scope.ID
+	}
+	if !candidate.scope.CreatedAt.IsZero() {
+		scope.CreatedAt = candidate.scope.CreatedAt
+	}
+	return scope, candidate.path, nil
+}
+
+func sessionMaintenanceBindingsAgree(candidates []sessionMaintenanceStoreCandidate) bool {
+	if len(candidates) < 2 {
+		return true
+	}
+	first := candidates[0].session
+	for _, candidate := range candidates[1:] {
+		if candidate.session.ID != first.ID ||
+			strings.TrimSpace(candidate.session.TeamsChatID) != strings.TrimSpace(first.TeamsChatID) ||
+			strings.TrimSpace(candidate.session.CodexThreadID) != strings.TrimSpace(first.CodexThreadID) {
+			return false
+		}
+	}
+	return true
+}
+
+func sessionMaintenanceStoreConflictError(selector string, candidates []sessionMaintenanceStoreCandidate, reason string) error {
+	details := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		details = append(details, fmt.Sprintf(
+			"store=%s session=%s chat=%s thread=%s live=%t",
+			candidate.path,
+			candidate.session.ID,
+			firstNonEmptyString(candidate.session.TeamsChatID, "none"),
+			firstNonEmptyString(candidate.session.CodexThreadID, "none"),
+			candidate.fresh,
+		))
+	}
+	sort.Strings(details)
+	return fmt.Errorf("%s for %q; choose the authoritative copy with --store:\n  %s", reason, selector, strings.Join(details, "\n  "))
 }
 
 func ResolveRegistryPathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {

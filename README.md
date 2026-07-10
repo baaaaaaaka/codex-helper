@@ -225,7 +225,8 @@ walk through the normal flows in order.
 | `codex-proxy teams send-file <path> --session <id>` | Upload a local outbound file and send it as a Teams attachment |
 | `codex-proxy teams probe-chat --chat <chat-id-or-link>` | Read-only probe of an external Teams chat without binding helper state |
 | `codex-proxy teams pause` / `resume` / `drain` / `recover` | Pause, resume, drain, or recover Teams helper state from a terminal |
-| `codex-proxy teams chat recreate <session-id> --yes` | Create and bind a fresh Teams Work chat for an existing helper session |
+| `codex-proxy teams chat recreate <session-id> --history full --yes` | Create and atomically bind a fresh Work chat, selecting the store that owns the session and optionally publishing full local history |
+| `codex-proxy teams chat publish-history <session-id> --full --yes` | Idempotently publish full local Codex history to the current Work chat; add `--force` only for an intentional replay |
 | `codex-proxy teams chat quarantine <session-or-chat> --dry-run\|--yes` | Atomically contain exactly one unsafe Work chat; terminal mutation refuses a live helper owner |
 | `codex-proxy teams chat unquarantine <session-or-chat> --dry-run\|--yes` | Resume only an explicitly quarantined session without replaying old work |
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
@@ -702,6 +703,8 @@ helper status
 helper retry last
 helper cancel running
 helper file relative/path.ext
+helper publish-history
+helper publish-history full
 model status
 model switch deepseek
 model fork deepseek
@@ -720,10 +723,16 @@ codex-proxy teams pause
 codex-proxy teams resume
 codex-proxy teams drain
 codex-proxy teams recover
-codex-proxy teams chat recreate <session-id> --yes
+codex-proxy teams chat recreate <session-id> --history full --yes
+codex-proxy teams chat publish-history <session-id> --full --yes
 codex-proxy teams chat quarantine <session-or-chat> --dry-run
 codex-proxy teams chat unquarantine <session-or-chat> --dry-run
 ```
+
+If retained state stores disagree about a session, both maintenance commands
+fail closed and print the candidates. Use `--store <state.json>` only after
+checking which copy is authoritative. Recreating a quarantined session also
+requires `--activate`; closed and archived sessions cannot be recreated.
 
 In the Teams control chat, `helper reload now` is for source-checkout
 development reloads only. Normal installed helpers should use `helper restart

@@ -75,7 +75,8 @@ Use `cxp proxy` only when the user is asking about SSH/network routing. If the u
 - `cxp teams send-file <path> --session <session-id>`: upload a local outbound file and send it as a Teams attachment.
 - `cxp teams probe-chat --chat <teams-chat-id-or-link>`: read-only probe of an external Teams chat without binding helper state unless `--send-test` is used.
 - `cxp teams pause`, `cxp teams resume`, `cxp teams drain`, and `cxp teams recover`: local helper lifecycle controls for diagnosis and recovery.
-- `cxp teams chat recreate <session-id> --yes`: create and bind a fresh Work chat for an existing helper session.
+- `cxp teams chat recreate <session-id> --history full --yes`: create and atomically bind a fresh Work chat for an existing helper session, pinning the store that owns the session and publishing full history when requested. Add `--activate` only to reactivate a quarantined session, or `--store <state.json>` to resolve an inspected retained-store conflict.
+- `cxp teams chat publish-history <session-id> --full --yes`: idempotently publish complete local Codex history to the session's current Work chat. Add `--force` only for an intentional replay; the command briefly drains the listener and releases its maintenance fence before returning.
 - `cxp teams chat quarantine <session-or-chat> --dry-run|--yes`: resolve exactly one durable Work-chat session and atomically stop its polling, turns, pending inbound, and unsent outbox after unsafe helper behavior. Mutation refuses a live helper owner.
 - `cxp teams chat unquarantine <session-or-chat> --dry-run|--yes`: resume polling only for a session whose durable status is `quarantined`; interrupted turns and skipped messages are not replayed.
 

@@ -400,7 +400,7 @@ func TestUntrustedTeamsSurfacesNeverInterpretMathMarkers(t *testing.T) {
 
 func TestOutboxMathTrustIsRestrictedToCodexOutputKinds(t *testing.T) {
 	t.Parallel()
-	for _, kind := range []string{"final", "final-002", "codex-progress", "codex-progress-003", "import-assistant-abc", "sync-assistant-abc", "codex-assistant-abc"} {
+	for _, kind := range []string{"final", "final-002", "codex-progress", "codex-progress-003", "import-assistant-abc", "import-bg-assistant-abc", "sync-assistant-abc", "publish-full-assistant-abc", "codex-assistant-abc"} {
 		if !outboxKindTrustsMath(kind) {
 			t.Fatalf("kind %q should trust math", kind)
 		}

@@ -334,10 +334,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          durable_routing_pattern='TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|ActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding|UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChatRebindsSessionAndRetiresOldRouting|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
-          scope_authority_pattern='TestResolveStorePathFor(Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
+          durable_routing_pattern='TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|ActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding|UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChat(RebindsSessionAndRetiresOldRouting|PublishesFullHistoryAfterPrimaryEOF|RetiresOldRoutingWhenMoveNoticeFails|CASPreservesConcurrentBinding|RejectsInactiveStatusBeforeGraphCreate|ActivatesQuarantinedSession)|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
+          scope_authority_pattern='TestResolveStorePathFor(SessionMaintenance(SelectsOnlyLiveMatchingStore|IgnoresUnrelatedLiveStore|UsesOnlyExistingLegacyStore|RejectsConflictingRetainedCopies|UsesCurrentForIdenticalRetainedCopies|FailsClosedWhenCurrentStoreIsUnreadable|RejectsAmbiguousSelectorInsideStore|RejectsForeignOverride|RejectsOverrideWithoutSelector)|Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
+          history_publish_pattern='Test(ResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate|BridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace|BridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat|PublishSessionFullHistoryIsIdempotentAndForceable|TranscriptDeliveryNamespacePreservesLegacyIDsAndSeparatesTargetChats|TranscriptCheckpointAtSourceEOFAllowsNoVisibleRecords|TranscriptImportBatchKindsRenderPreRenderedHTMLDirectly|OutboxMathTrustIsRestrictedToCodexOutputKinds)$'
           go test ./internal/teams -count=1 -run "$durable_routing_pattern" -v
           go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
+          go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
       - name: Teams read-only diagnostics regressions
@@ -373,7 +375,16 @@ jobs:
         run: |
           set -euo pipefail
           go test ./internal/teams/store -count=1 -run 'TestServiceControlDrainOperationFence$' -v
-          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|TeamsChatRecreateDrainReleaseDoesNotClearNewerFence|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
+          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainFor(ChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|HistoryPublishUsesDistinctFenceAndReleases)|TeamsChat(RecreateDrainReleaseDoesNotClearNewerFence|RecreateAndPublishHistoryExposeSafeRepairFlags)|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
+
+      - name: Teams recreate and full-history race regressions (Linux only)
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          teams_pattern='Test(BridgeRecreateSessionChat(PublishesFullHistoryAfterPrimaryEOF|RetiresOldRoutingWhenMoveNoticeFails|CASPreservesConcurrentBinding|RejectsInactiveStatusBeforeGraphCreate|ActivatesQuarantinedSession)|ResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate|BridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace|BridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat|PublishSessionFullHistoryIsIdempotentAndForceable|TranscriptImportBatchKindsRenderPreRenderedHTMLDirectly|ResolveStorePathForSessionMaintenance.*)$'
+          go test -race ./internal/teams -count=1 -run "$teams_pattern" -v
+          go test -race ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases|TeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags)$' -v
 
       - name: Teams SQLite row-level migration regressions
         if: matrix.shard == 'state-perf'
