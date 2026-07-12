@@ -537,6 +537,33 @@ func TestFindVendorBinaryPrefersNewLayout(t *testing.T) {
 	}
 }
 
+func TestFindNativeBinaryAcceptsAlreadyResolvedNativeExecutable(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	vendorRoot := filepath.Join(t.TempDir(), "vendor", triple)
+	nativeDir := filepath.Join(vendorRoot, "bin")
+	pathDir := filepath.Join(vendorRoot, "codex-path")
+	for _, dir := range []string{nativeDir, pathDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+	if err := os.WriteFile(nativePath, []byte("native"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	gotNative, gotPath, err := FindNativeBinary(nativePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNative != nativePath || gotPath != pathDir {
+		t.Fatalf("native=%q path=%q, want %q and %q", gotNative, gotPath, nativePath, pathDir)
+	}
+}
+
 // TestFindNativeBinaryPlatformSiblingPackage covers npm layouts where the
 // scoped platform package is installed next to @openai/codex under the same
 // node_modules root.

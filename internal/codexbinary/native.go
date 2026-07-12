@@ -297,6 +297,29 @@ func FindNativeBinary(codexWrapperPath string) (nativeBin string, pathDir string
 		return "", "", fmt.Errorf("unsupported platform: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
+	// Upgrade/install resolution can already return the native executable
+	// instead of the npm wrapper, especially on Windows where npm exposes
+	// multiple shim variants. Preserve the adjacent bundled-tool directory in
+	// that case instead of trying to interpret the PE binary as codex.js.
+	direct := filepath.Clean(codexWrapperPath)
+	if strings.EqualFold(filepath.Base(direct), nativeBinaryName()) {
+		parent := filepath.Dir(direct)
+		var directPathDir string
+		switch strings.ToLower(filepath.Base(parent)) {
+		case "bin":
+			directPathDir = filepath.Join(filepath.Dir(parent), "codex-path")
+		case "codex":
+			directPathDir = filepath.Join(filepath.Dir(parent), "path")
+		}
+		if directPathDir != "" {
+			if _, statErr := os.Stat(direct); statErr == nil {
+				if _, pathErr := os.Stat(directPathDir); pathErr == nil {
+					return direct, directPathDir, nil
+				}
+			}
+		}
+	}
+
 	resolved, err := resolveWrapper(codexWrapperPath)
 	if err != nil {
 		return "", "", err

@@ -231,7 +231,7 @@ func TestTeamsCodexUpgradeLiveTargetPATH(t *testing.T) {
 	}, userpath.Result{Path: servicePath, Mode: userpath.ModeService}, io.Discard)
 	rgPath, err := lookPathInEnvironment("rg", runtimeContract.Environment)
 	if err != nil {
-		t.Fatalf("service-mode Codex runtime did not expose bundled rg: %v; PATH=%s", err, envValue(runtimeContract.Environment, "PATH"))
+		t.Fatalf("service-mode Codex runtime did not expose bundled rg: %v; command=%s wrapper=%s vendor=%s PATH=%s", err, runtimeContract.Command, runtimeContract.WrapperCommand, runtimeContract.VendorPathDir, envValue(runtimeContract.Environment, "PATH"))
 	}
 	rgProbe := exec.Command(rgPath, "--version")
 	rgProbe.Env = runtimeContract.Environment
