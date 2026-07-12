@@ -1727,13 +1727,25 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./...
+          set -euo pipefail
+          log="$RUNNER_TEMP/full-go-test.log"
+          if ! go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
+            summary="$(grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -50 | tr '\n' ' ' || true)"
+            echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
+            exit 1
+          fi
 
       - name: go test (without coverage, non-Linux)
         if: runner.os != 'Linux'
         shell: bash
         run: |
-          go test -timeout=20m -parallel=16 ./...
+          set -euo pipefail
+          log="$RUNNER_TEMP/full-go-test.log"
+          if ! go test -timeout=20m -parallel=16 ./... 2>&1 | tee "$log"; then
+            summary="$(grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -50 | tr '\n' ' ' || true)"
+            echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
+            exit 1
+          fi
 
       - name: Coverage gate (Linux only)
         if: runner.os == 'Linux'
