@@ -265,7 +265,7 @@ func codexInvocationUsesNativeCLI(invocation codexCLIInvocation, rawArgs []strin
 }
 
 func runCodexNativeInvocation(ctx context.Context, store *config.Store, profile *config.Profile, instances []config.Instance, cmdArgs []string, useProxy bool, opts runTargetOptions) error {
-	installOptions := codexInstallOptions{}
+	installOptions := codexInstallOptions{requireManaged: true}
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")
@@ -532,7 +532,7 @@ func runCodexExecFacade(
 		return fmt.Errorf("codex exec prompt is required")
 	}
 
-	installOptions := codexInstallOptions{}
+	installOptions := codexInstallOptions{requireManaged: true}
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")

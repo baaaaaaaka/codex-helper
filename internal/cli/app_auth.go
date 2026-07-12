@@ -171,7 +171,7 @@ func runCodexAppAuth(cmd *cobra.Command, root *rootOptions, opts codexAppAuthOpt
 		return fmt.Errorf("set Codex auth home ownership: %w", err)
 	}
 
-	installOpts := codexInstallOptions{}
+	installOpts := codexInstallOptions{requireManaged: true}
 	if useProxy {
 		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
 			return withProfileInstallEnv(ctx, store, *profile, cfg.Instances, runInstall)
@@ -268,7 +268,7 @@ func ensureCodexAppAuthCodexInstalled(ctx context.Context, codexPath string, out
 
 func ensureCodexAppAuthCodexInstalledForIdentity(ctx context.Context, out io.Writer, opts codexInstallOptions, identity *execIdentity) (string, error) {
 	if !opts.upgradeCodex {
-		if path, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
+		if path, err := findCodexAppAuthCodexForIdentityWithPolicy(ctx, identity, opts.requireManaged); err == nil {
 			return path, nil
 		}
 	}
@@ -281,7 +281,7 @@ func ensureCodexAppAuthCodexInstalledForIdentity(ctx context.Context, out io.Wri
 	}
 	if err := withCodexInstallLock(ctx, out, func() error {
 		if !opts.upgradeCodex {
-			if _, err := findCodexAppAuthCodexForIdentity(ctx, identity); err == nil {
+			if _, err := findCodexAppAuthCodexForIdentityWithPolicy(ctx, identity, opts.requireManaged); err == nil {
 				return nil
 			}
 		}
@@ -308,7 +308,7 @@ func ensureCodexAppAuthCodexInstalledForIdentity(ctx context.Context, out io.Wri
 	}); err != nil {
 		return "", err
 	}
-	path, err := findCodexAppAuthCodexForIdentity(ctx, identity)
+	path, err := findCodexAppAuthCodexForIdentityWithPolicy(ctx, identity, opts.requireManaged)
 	if err != nil {
 		return "", codexPostInstallError("installation for target user "+codexAppAuthIdentityLabel(identity), err)
 	}
@@ -382,6 +382,10 @@ func codexAppAuthRuntimeEnvForIdentity(base []string, identity *execIdentity) []
 }
 
 func findCodexAppAuthCodexForIdentity(ctx context.Context, identity *execIdentity) (string, error) {
+	return findCodexAppAuthCodexForIdentityWithPolicy(ctx, identity, false)
+}
+
+func findCodexAppAuthCodexForIdentityWithPolicy(ctx context.Context, identity *execIdentity, requireManaged bool) (string, error) {
 	candidates := make([]string, 0, 8)
 	seen := map[string]struct{}{}
 	add := func(path string) {
@@ -400,22 +404,32 @@ func findCodexAppAuthCodexForIdentity(ctx context.Context, identity *execIdentit
 		candidates = append(candidates, path)
 	}
 
-	if path, err := exec.LookPath("codex"); err == nil {
-		add(path)
-	}
-	if cached := strings.TrimSpace(readCachedCodexPath()); cached != "" {
-		add(cached)
+	if !requireManaged {
+		if path, err := exec.LookPath("codex"); err == nil {
+			add(path)
+		}
+		if cached := strings.TrimSpace(readCachedCodexPath()); cached != "" {
+			add(cached)
+		}
 	}
 	identityEnv := codexAppAuthInstallerEnvForIdentity(os.Environ(), identity)
-	for _, candidate := range codexBinaryCandidatesForEnv(
-		runtime.GOOS,
-		envValue(identityEnv, "HOME"),
-		envValue(identityEnv, "CODEX_NPM_PREFIX"),
-		envValue(identityEnv, "LOCALAPPDATA"),
-		envValue(identityEnv, "APPDATA"),
-		envTempDir(identityEnv),
-	) {
-		add(candidate)
+	if requireManaged {
+		for _, prefix := range managedCodexPrefixCandidates(identityEnv) {
+			for _, candidate := range codexBinCandidatesForPrefixForOS(runtime.GOOS, prefix) {
+				add(candidate)
+			}
+		}
+	} else {
+		for _, candidate := range codexBinaryCandidatesForEnv(
+			runtime.GOOS,
+			envValue(identityEnv, "HOME"),
+			envValue(identityEnv, "CODEX_NPM_PREFIX"),
+			envValue(identityEnv, "LOCALAPPDATA"),
+			envValue(identityEnv, "APPDATA"),
+			envTempDir(identityEnv),
+		) {
+			add(candidate)
+		}
 	}
 
 	var failures []string

@@ -223,8 +223,10 @@ jobs:
           prefix="$RUNNER_TEMP/teams-target-codex"
           bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$prefix" --include=optional @openai/codex
           NPM_CONFIG_PREFIX="$prefix" \
+            CODEX_NPM_PREFIX="$prefix" \
             CODEX_HELPER_TEAMS_UPGRADE_LIVE=1 \
             CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR="$prefix/bin" \
+            CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE=service \
             go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: Teams target-account PATH Codex upgrade (Windows)
@@ -236,8 +238,10 @@ jobs:
           $prefix = Join-Path $env:RUNNER_TEMP "teams-target-codex"
           & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $prefix --include=optional @openai/codex
           $env:NPM_CONFIG_PREFIX = $prefix
+          $env:CODEX_NPM_PREFIX = $prefix
           $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
           $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
+          $env:CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE = "service"
           go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: CXP TUI preview, navigation, refresh, and thread-name regressions

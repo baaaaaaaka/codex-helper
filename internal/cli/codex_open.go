@@ -146,7 +146,7 @@ func runCodexTUIInvocationViaBroker(
 	if err != nil {
 		return err
 	}
-	installOptions := codexInstallOptions{}
+	installOptions := codexInstallOptions{requireManaged: true}
 	if useProxy {
 		if profile == nil {
 			return fmt.Errorf("proxy mode enabled but no profile configured")

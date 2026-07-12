@@ -182,7 +182,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	if isCodexCommand(after[0]) {
 		return runCodexCLIInvocationFn(ctx, root, store, nil, nil, after, false, opts)
 	}
-	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{})
+	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, after, log, codexInstallOptions{requireManaged: true})
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,8 @@ func runWithExistingInstanceOptions(
 		log = os.Stderr
 	}
 	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, cmdArgs, log, codexInstallOptions{
-		installerEnv: env.WithProxy(os.Environ(), proxyURL),
+		installerEnv:   env.WithProxy(os.Environ(), proxyURL),
+		requireManaged: true,
 	})
 	if err != nil {
 		return codexResolveError{err: err}
@@ -296,7 +297,8 @@ func runWithNewStackOptions(
 		log = os.Stderr
 	}
 	resolvedCmd, err := resolveRunCommandWithInstallOptions(ctx, cmdArgs, log, codexInstallOptions{
-		installerEnv: env.WithProxy(os.Environ(), proxyURL),
+		installerEnv:   env.WithProxy(os.Environ(), proxyURL),
+		requireManaged: true,
 	})
 	if err != nil {
 		return err

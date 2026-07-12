@@ -1272,7 +1272,7 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 		ctx,
 		command,
 		nil,
-		codexInstallOptions{},
+		codexInstallOptions{requireManaged: true},
 		codexPathAllowsAutomaticUpgrade(codexPath),
 		paths.ExecIdentity,
 		codexHomeEnv(paths.CodexDir),

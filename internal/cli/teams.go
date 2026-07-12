@@ -1142,7 +1142,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					MachineRegistryEnabled:             machineRegistryEnabled,
 					MachineRegistryGraph:               machineRegistryGraph,
 					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
-					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath),
+					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
 				})
 			}
 			if teamsRunShouldRetryInProcess(once) {

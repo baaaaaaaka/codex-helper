@@ -29,16 +29,47 @@ func TestEnsureCodexBrokerRuntimeUpgradesOldManagedCapability(t *testing.T) {
 	previousUpgrade := upgradeCodexForBrokerRuntime
 	t.Cleanup(func() { upgradeCodexForBrokerRuntime = previousUpgrade })
 	var upgraded bool
+	var upgradedPath string
 	upgradeCodexForBrokerRuntime = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
 		upgraded = opts.upgradeCodex
+		upgradedPath = opts.upgradeCodexPath
 		return newPath, nil
 	}
 	resolved, err := ensureCodexBrokerRuntime(context.Background(), oldPath, io.Discard, codexInstallOptions{}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !upgraded || resolved != newPath {
-		t.Fatalf("upgraded=%v resolved=%q, want %q", upgraded, resolved, newPath)
+	if !upgraded || upgradedPath != oldPath || resolved != newPath {
+		t.Fatalf("upgraded=%v upgradePath=%q resolved=%q, want path %q and result %q", upgraded, upgradedPath, resolved, oldPath, newPath)
+	}
+}
+
+func TestEnsureCodexInstalledManagedPolicyIgnoresPATHAndCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	lockCLITestHooks(t)
+	managedPrefix := t.TempDir()
+	managedBin := filepath.Join(managedPrefix, "bin")
+	if err := os.MkdirAll(managedBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	managed := writeProbeScript(t, managedBin, "codex", "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 1.0.0'; exit 0; fi\n")
+	foreignBin := t.TempDir()
+	foreign := writeProbeScript(t, foreignBin, "codex", "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 9.9.9'; exit 0; fi\n")
+	t.Setenv("PATH", foreignBin)
+	t.Setenv("CODEX_NPM_PREFIX", managedPrefix)
+	writeCachedCodexPath(foreign)
+
+	got, err := ensureCodexInstalledWithOptions(context.Background(), "", io.Discard, codexInstallOptions{
+		installerEnv:   []string{"PATH=" + foreignBin, "CODEX_NPM_PREFIX=" + managedPrefix},
+		requireManaged: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != managed {
+		t.Fatalf("resolved Codex = %q, want managed %q instead of PATH/cache %q", got, managed, foreign)
 	}
 }
 
@@ -1501,6 +1532,29 @@ func TestRunSystemNpmCodexUpgradeAppliesInstallerCommandConfiguration(t *testing
 	}
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestNPMGlobalPrefixUsesInstallerEnvironmentPATH(t *testing.T) {
+	binDir := t.TempDir()
+	wantPrefix := filepath.Join(t.TempDir(), "npm-prefix")
+	npmName := "npm"
+	npmBody := "#!/bin/sh\nif [ \"$1\" = prefix ] && [ \"$2\" = -g ]; then echo \"$TEST_NPM_PREFIX\"; exit 0; fi\nexit 99\n"
+	installerEnv := []string{"PATH=" + binDir, "TEST_NPM_PREFIX=" + wantPrefix}
+	if runtime.GOOS == "windows" {
+		npmName = "npm.cmd"
+		npmBody = "@echo off\r\nif \"%1\"==\"prefix\" if \"%2\"==\"-g\" echo %TEST_NPM_PREFIX%& exit /b 0\r\nexit /b 99\r\n"
+		installerEnv = append(installerEnv, "PATHEXT=.COM;.EXE;.BAT;.CMD")
+	}
+	writeExecutable(t, filepath.Join(binDir, npmName), npmBody)
+	t.Setenv("PATH", t.TempDir())
+
+	got, err := npmGlobalPrefix(context.Background(), installerEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != wantPrefix {
+		t.Fatalf("npm prefix = %q, want %q", got, wantPrefix)
 	}
 }
 

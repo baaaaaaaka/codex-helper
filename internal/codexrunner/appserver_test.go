@@ -1103,6 +1103,29 @@ func TestAppServerRunnerCloseClosesTransport(t *testing.T) {
 	}
 }
 
+func TestAppServerRunnerRestartClosesTransportWithoutRunningCloseHook(t *testing.T) {
+	transport := newFakeAppServerTransport()
+	hookCalls := 0
+	runner := NewAppServerRunner(transport)
+	runner.CloseHook = func() { hookCalls++ }
+	runner.ready = true
+	if err := runner.Restart(); err != nil {
+		t.Fatalf("Restart error: %v", err)
+	}
+	if !transport.closed || runner.Transport != nil || runner.ready {
+		t.Fatalf("runner transport was not reset: transport=%#v ready=%v closed=%v", runner.Transport, runner.ready, transport.closed)
+	}
+	if hookCalls != 0 {
+		t.Fatalf("Restart ran runner CloseHook %d times", hookCalls)
+	}
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if hookCalls != 1 {
+		t.Fatalf("CloseHook calls = %d, want 1", hookCalls)
+	}
+}
+
 func TestProbeAppServerCompatibilityRunsColdProbeRepeatedly(t *testing.T) {
 	starts := 0
 	starter := AppServerTransportStarterFunc(func(_ context.Context, req AppServerStartRequest) (AppServerLineTransport, error) {

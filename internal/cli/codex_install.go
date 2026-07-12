@@ -49,6 +49,7 @@ type codexInstallOptions struct {
 	configureInstallerCommand func(*exec.Cmd) error
 	upgradeCodex              bool
 	upgradeCodexPath          string
+	requireManaged            bool
 }
 
 type codexInstallCmd struct {
@@ -1436,6 +1437,7 @@ func ensureCodexBrokerRuntime(ctx context.Context, codexPath string, out io.Writ
 	}
 	upgradeOptions := opts
 	upgradeOptions.upgradeCodex = true
+	upgradeOptions.upgradeCodexPath = resolved
 	upgraded, err := upgradeCodexForBrokerRuntime(ctx, out, upgradeOptions)
 	if err != nil {
 		return "", fmt.Errorf("installed Codex lacks remote app-server support and automatic upgrade failed: %w", err)
@@ -1471,6 +1473,14 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 			}
 		}
 		return "", fmt.Errorf("codex not found at %s", codexPath)
+	}
+
+	if opts.requireManaged {
+		if path, err := findManagedCodexForEnvironment(ctx, opts.installerEnv); err == nil {
+			writeCachedCodexPath(path)
+			return path, nil
+		}
+		return installManagedCodexWithOptions(ctx, out, opts)
 	}
 
 	if path, err := exec.LookPath("codex"); err == nil {
@@ -1541,6 +1551,63 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 		return installedPath, nil
 	}
 	return "", codexPostInstallError("installation", nil)
+}
+
+func findManagedCodexForEnvironment(ctx context.Context, environment []string) (string, error) {
+	for _, prefix := range managedCodexPrefixCandidates(environment) {
+		for _, candidate := range codexBinCandidatesForPrefixForOS(runtime.GOOS, prefix) {
+			if !executableExists(candidate) {
+				continue
+			}
+			candidate = normalizeExecutablePath(candidate)
+			probeCtx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
+			command := exec.CommandContext(probeCtx, candidate, "--version")
+			if len(environment) > 0 {
+				command.Env = environment
+			}
+			_, err := command.CombinedOutput()
+			cancel()
+			if err == nil {
+				return candidate, nil
+			}
+		}
+	}
+	return "", errCodexBinaryNotFound
+}
+
+func installManagedCodexWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "CXP-managed Codex not found; installing...")
+	}
+	var installedPath string
+	if err := withCodexInstallLock(ctx, out, func() error {
+		if path, err := findManagedCodexForEnvironment(ctx, opts.installerEnv); err == nil {
+			installedPath = path
+			return nil
+		}
+		runInstall := func(installerEnv []string) error {
+			if err := runCodexInstallerWithOptions(ctx, out, installerEnv, opts.configureInstallerCommand); err != nil {
+				return err
+			}
+			path, err := findManagedCodexForEnvironment(ctx, installerEnv)
+			if err != nil {
+				return codexPostInstallError("installation", err)
+			}
+			installedPath = path
+			return nil
+		}
+		if opts.withInstallerEnv != nil {
+			return opts.withInstallerEnv(ctx, runInstall)
+		}
+		return runInstall(opts.installerEnv)
+	}); err != nil {
+		return "", err
+	}
+	if installedPath == "" {
+		return "", codexPostInstallError("installation", nil)
+	}
+	writeCachedCodexPath(installedPath)
+	return installedPath, nil
 }
 
 func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
@@ -1779,7 +1846,7 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 }
 
 func runSystemNpmCodexUpgradeWithOptions(ctx context.Context, out io.Writer, installerEnv []string, configureCommand func(*exec.Cmd) error) error {
-	npmPath, err := exec.LookPath("npm")
+	npmPath, err := lookPathInEnvironment("npm", installerEnv)
 	if err != nil {
 		return fmt.Errorf("npm not found in PATH: %w", err)
 	}
@@ -1990,7 +2057,7 @@ func inferManagedPrefixFromPath(path string) (string, bool) {
 }
 
 func npmGlobalPrefix(ctx context.Context, installerEnv []string) (string, error) {
-	npmPath, err := exec.LookPath("npm")
+	npmPath, err := lookPathInEnvironment("npm", installerEnv)
 	if err != nil {
 		return "", err
 	}
@@ -2007,6 +2074,56 @@ func npmGlobalPrefix(ctx context.Context, installerEnv []string) (string, error)
 		return "", fmt.Errorf("resolve npm global prefix: empty output")
 	}
 	return prefix, nil
+}
+
+func lookPathInEnvironment(name string, environment []string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("executable name is empty")
+	}
+	if strings.ContainsAny(name, `/\\`) {
+		if executableExists(name) {
+			return normalizeExecutablePath(name), nil
+		}
+		return "", exec.ErrNotFound
+	}
+	pathValue := os.Getenv("PATH")
+	if len(environment) > 0 {
+		if value, ok := explicitEnvironmentValue(environment, "PATH"); ok {
+			pathValue = value
+		}
+	}
+	names := []string{name}
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		names = nil
+		pathExt := ".COM;.EXE;.BAT;.CMD"
+		if len(environment) > 0 {
+			if value, ok := explicitEnvironmentValue(environment, "PATHEXT"); ok && strings.TrimSpace(value) != "" {
+				pathExt = value
+			}
+		} else if value := strings.TrimSpace(os.Getenv("PATHEXT")); value != "" {
+			pathExt = value
+		}
+		for _, ext := range strings.Split(pathExt, ";") {
+			ext = strings.TrimSpace(ext)
+			if ext != "" {
+				names = append(names, name+ext)
+			}
+		}
+		names = append(names, name)
+	}
+	for _, dir := range filepath.SplitList(pathValue) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		for _, candidateName := range names {
+			candidate := filepath.Join(dir, candidateName)
+			if executableExists(candidate) {
+				return normalizeExecutablePath(candidate), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("executable file not found in PATH: %w", exec.ErrNotFound)
 }
 
 func pathWithinDir(path string, dir string) bool {

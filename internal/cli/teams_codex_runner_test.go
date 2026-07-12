@@ -1745,6 +1745,76 @@ func TestTeamsCodexUpgraderForRunRejectsCustomCodexPathBeforeDrain(t *testing.T)
 	}
 }
 
+func TestUpgradeOrInstallManagedTeamsCodexMigratesWhenManagedInstallIsMissing(t *testing.T) {
+	previousEnsure := ensureCodexInstalledForTeamsRun
+	previousUpgrade := upgradeCodexInstalledForTeamsRun
+	t.Cleanup(func() {
+		ensureCodexInstalledForTeamsRun = previousEnsure
+		upgradeCodexInstalledForTeamsRun = previousUpgrade
+	})
+	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+		t.Fatal("missing managed install must not upgrade a PATH or cached Codex")
+		return "", nil
+	}
+	ensureCodexInstalledForTeamsRun = func(_ context.Context, path string, _ io.Writer, opts codexInstallOptions) (string, error) {
+		if path != "" || opts.upgradeCodex || !opts.requireManaged || envValue(opts.installerEnv, "PATH") != "/service/bin" {
+			t.Fatalf("managed migration path=%q opts=%#v", path, opts)
+		}
+		return "/managed/bin/codex", nil
+	}
+
+	got, err := upgradeOrInstallManagedTeamsCodex(context.Background(), io.Discard, teamsCodexUpgradeTarget{
+		environment: []string{"PATH=/service/bin"},
+	}, codexInstallOptions{upgradeCodex: true, installerEnv: []string{"PATH=/service/bin"}, requireManaged: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/managed/bin/codex" {
+		t.Fatalf("managed migration result = %q", got)
+	}
+}
+
+type restartTrackingTeamsExecutor struct {
+	restarts int
+}
+
+func (e *restartTrackingTeamsExecutor) Run(context.Context, *teams.Session, string) (teams.ExecutionResult, error) {
+	return teams.ExecutionResult{}, nil
+}
+
+func (e *restartTrackingTeamsExecutor) RestartCodexRunners() error {
+	e.restarts++
+	return nil
+}
+
+func TestTeamsCodexUpgraderForRunRestartsCachedRunnersAfterSuccess(t *testing.T) {
+	lockCLITestHooks(t)
+	stubTeamsCodexUpgradePath(t, "/target-account/bin/codex")
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	previousUpgrade := upgradeCodexInstalledForTeamsRun
+	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+		return "/target-account/bin/codex", nil
+	}
+	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = previousUpgrade })
+
+	executor := &restartTrackingTeamsExecutor{}
+	upgrader := teamsCodexUpgraderForRun(&rootOptions{configPath: cfgPath}, io.Discard, "", executor)
+	result, err := upgrader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Path != "/target-account/bin/codex" || executor.restarts != 1 {
+		t.Fatalf("result=%#v runner restarts=%d", result, executor.restarts)
+	}
+}
+
 type fakeTeamsRunner struct {
 	result   codexrunner.TurnResult
 	err      error

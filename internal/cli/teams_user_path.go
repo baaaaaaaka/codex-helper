@@ -82,6 +82,10 @@ func applyTeamsUserPathRuntime(runtimeContract resolvedCodexRuntime, pathResult 
 	// the service PATH; otherwise migration would still change runtime behavior
 	// even though the configured PATH source was kept compatible.
 	if pathResult.Mode == userpath.ModeService {
+		if _, vendorPath, err := teamsFindNativeCodex(runtimeContract.Command); err == nil && strings.TrimSpace(vendorPath) != "" {
+			runtimeContract.VendorPathDir = vendorPath
+			runtimeContract.Environment = setEnvValue(runtimeContract.Environment, "PATH", prependPathDir(vendorPath, envValue(runtimeContract.Environment, "PATH")))
+		}
 		return runtimeContract
 	}
 	userPath := pathResult.Path

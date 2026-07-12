@@ -477,6 +477,15 @@ func (r *AppServerRunner) Close() error {
 	return err
 }
 
+// Restart closes only the current transport so the next operation performs a
+// cold start. Unlike Close it preserves the runner-scoped CloseHook because
+// the runner remains usable after a runtime upgrade.
+func (r *AppServerRunner) Restart() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closeTransportLocked()
+}
+
 func (r *AppServerRunner) ensureReady(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -69,6 +69,30 @@ func (e teamsCodexExecutor) Close() error {
 	return errors.Join(errs...)
 }
 
+func (e teamsCodexExecutor) RestartCodexRunners() error {
+	if e.runnerCacheMu != nil {
+		e.runnerCacheMu.Lock()
+		defer e.runnerCacheMu.Unlock()
+	}
+	seen := make(map[*codexrunner.AppServerRunner]bool)
+	var errs []error
+	restart := func(runner codexrunner.Runner) {
+		managed, ok := runner.(*codexrunner.AppServerRunner)
+		if !ok || managed == nil || seen[managed] {
+			return
+		}
+		seen[managed] = true
+		if err := managed.Restart(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	restart(e.runner)
+	for _, runner := range e.runnersByProfile {
+		restart(runner)
+	}
+	return errors.Join(errs...)
+}
+
 func newManagedTeamsCodexExecutor(
 	root *rootOptions,
 	runnerName string,
@@ -195,7 +219,7 @@ func (s teamsPolicyAppServerStarter) StartAppServer(ctx context.Context, request
 		return nil, err
 	}
 	proxyURL := ""
-	installOptions := codexInstallOptions{}
+	installOptions := codexInstallOptions{requireManaged: strings.TrimSpace(s.rawCommand) == ""}
 	if upgradeUsesProxy(cfg) {
 		profile, selectErr := selectProfile(cfg, "")
 		if selectErr != nil {
@@ -597,7 +621,9 @@ func teamsStoreConfigForStatus(root *rootOptions) (*config.Store, error) {
 }
 
 var upgradeCodexInstalledForTeamsRun = upgradeCodexInstalledWithOptions
+var ensureCodexInstalledForTeamsRun = ensureCodexInstalledWithOptions
 var resolveTeamsCodexUpgradeTargetForRun = resolveTeamsCodexUpgradeTarget
+var probeTeamsCodexUpgradeCandidateForRun = probeTeamsCodexUpgradeCandidate
 
 type teamsCodexUpgradeTarget struct {
 	path        string
@@ -640,7 +666,7 @@ func runTeamsUpgradeCodexOnce(cmd interface {
 			})
 		}
 	}
-	path, err := upgradeCodexInstalledForTeamsRun(cmd.Context(), cmd.ErrOrStderr(), installOpts)
+	path, err := upgradeOrInstallManagedTeamsCodex(cmd.Context(), cmd.ErrOrStderr(), upgradeTarget, installOpts)
 	if err != nil {
 		return err
 	}
@@ -676,7 +702,7 @@ func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out 
 			})
 		}
 	}
-	path, err := upgradeCodexInstalledForTeamsRun(ctx, out, installOpts)
+	path, err := upgradeOrInstallManagedTeamsCodex(ctx, out, upgradeTarget, installOpts)
 	if err != nil {
 		return teams.CodexUpgradeResult{}, err
 	}
@@ -692,15 +718,69 @@ func resolveTeamsCodexUpgradeTarget(ctx context.Context, cfg config.Config, path
 	if err != nil {
 		return teamsCodexUpgradeTarget{}, err
 	}
-	if path, ok := teamsCodexExecutableOnPath(pathResult.Path); ok {
-		environment := codexRuntimeEnvironment(os.Environ(), []string{"PATH=" + pathResult.Path}, paths.ExecIdentity)
+	environment := codexRuntimeEnvironment(os.Environ(), []string{"PATH=" + pathResult.Path}, paths.ExecIdentity)
+	if path, ok := findManagedTeamsCodexUpgradeCandidate(ctx, environment, paths.ExecIdentity); ok {
 		return teamsCodexUpgradeTarget{path: path, environment: environment, identity: paths.ExecIdentity}, nil
 	}
-	return teamsCodexUpgradeTarget{}, fmt.Errorf("codex not found in Teams target account PATH (%s mode)", pathResult.Mode)
+	return teamsCodexUpgradeTarget{environment: environment, identity: paths.ExecIdentity}, nil
+}
+
+func upgradeOrInstallManagedTeamsCodex(ctx context.Context, out io.Writer, target teamsCodexUpgradeTarget, opts codexInstallOptions) (string, error) {
+	if strings.TrimSpace(target.path) != "" {
+		return upgradeCodexInstalledForTeamsRun(ctx, out, opts)
+	}
+	opts.upgradeCodex = false
+	opts.upgradeCodexPath = ""
+	return ensureCodexInstalledForTeamsRun(ctx, "", out, opts)
+}
+
+func findManagedTeamsCodexUpgradeCandidate(ctx context.Context, environment []string, identity *execIdentity) (string, bool) {
+	var candidates []string
+	seen := map[string]bool{}
+	add := func(path string) {
+		path = normalizeExecutablePath(path)
+		key := path
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if path != "" && !seen[key] {
+			seen[key] = true
+			candidates = append(candidates, path)
+		}
+	}
+	for _, prefix := range managedCodexPrefixCandidates(environment) {
+		for _, candidate := range codexBinCandidatesForPrefixForOS(runtime.GOOS, prefix) {
+			add(candidate)
+		}
+	}
+	for _, candidate := range candidates {
+		if !executableExists(candidate) || probeTeamsCodexUpgradeCandidateForRun(ctx, candidate, environment, identity) != nil {
+			continue
+		}
+		source, err := detectCodexUpgradeSourceForPath(ctx, candidate, environment)
+		if err == nil && source.origin == codexInstallOriginManaged {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func probeTeamsCodexUpgradeCandidate(ctx context.Context, path string, environment []string, identity *execIdentity) error {
+	probeCtx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
+	defer cancel()
+	if identity != nil && identity.UID != 0 {
+		return probeCodexForAppAuthIdentity(probeCtx, path, identity)
+	}
+	cmd := exec.CommandContext(probeCtx, path, "--version")
+	cmd.Env = environment
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("codex at %s is not functional: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func teamsCodexUpgradeInstallOptions(target teamsCodexUpgradeTarget) codexInstallOptions {
-	opts := codexInstallOptions{upgradeCodex: true, upgradeCodexPath: target.path, installerEnv: target.environment}
+	opts := codexInstallOptions{upgradeCodex: true, upgradeCodexPath: target.path, installerEnv: target.environment, requireManaged: true}
 	if target.identity != nil {
 		opts.configureInstallerCommand = func(cmd *exec.Cmd) error {
 			updated, err := applyExecIdentity(cmd, cmd.Env, target.identity)
@@ -741,12 +821,23 @@ func teamsCodexExecutableOnPath(pathValue string) (string, bool) {
 	return "", false
 }
 
-func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string) teams.CodexUpgrader {
+func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string, executors ...teams.Executor) teams.CodexUpgrader {
 	if strings.TrimSpace(codexPath) != "" {
 		return nil
 	}
 	return func(ctx context.Context) (teams.CodexUpgradeResult, error) {
-		return runTeamsCodexUpgradeFromBridge(ctx, root, out, "")
+		result, err := runTeamsCodexUpgradeFromBridge(ctx, root, out, "")
+		if err != nil {
+			return result, err
+		}
+		for _, executor := range executors {
+			if resetter, ok := executor.(interface{ RestartCodexRunners() error }); ok {
+				if err := resetter.RestartCodexRunners(); err != nil {
+					return teams.CodexUpgradeResult{}, fmt.Errorf("restart Teams Codex runners after upgrade: %w", err)
+				}
+			}
+		}
+		return result, nil
 	}
 }
 
