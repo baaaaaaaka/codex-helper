@@ -1478,6 +1478,15 @@ func TestRunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService(t *testing.T) {
 
 func TestRunSystemNpmCodexUpgradeAppliesInstallerCommandConfiguration(t *testing.T) {
 	lockCLITestHooks(t)
+	binDir := t.TempDir()
+	npmName := "npm"
+	npmBody := "#!/bin/sh\nif [ \"$1\" = prefix ]; then echo \"$TMPDIR/npm-prefix\"; exit 0; fi\nexit 99\n"
+	if runtime.GOOS == "windows" {
+		npmName = "npm.cmd"
+		npmBody = "@echo off\r\nif \"%1\"==\"prefix\" echo %TEMP%\\npm-prefix& exit /b 0\r\nexit /b 99\r\n"
+	}
+	writeExecutable(t, filepath.Join(binDir, npmName), npmBody)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	configured := false
 	wantErr := errors.New("configured target identity")
 	err := runSystemNpmCodexUpgradeWithOptions(context.Background(), io.Discard, os.Environ(), func(cmd *exec.Cmd) error {
