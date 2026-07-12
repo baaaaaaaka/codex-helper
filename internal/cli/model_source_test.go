@@ -104,6 +104,9 @@ func TestRecordModelSourceBackupFailureRequiresLastKnownGoodRevision(t *testing.
 }
 
 func TestModelSourceSyncClonesLocalRepoWithoutKey(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed in this minimal runtime compatibility environment")
+	}
 	repo := filepath.Join(t.TempDir(), "models")
 	if err := os.MkdirAll(repo, 0o755); err != nil {
 		t.Fatal(err)
