@@ -113,6 +113,18 @@ func resolveWrapper(wrapperPath string) (string, error) {
 		return jsPath, nil
 	}
 
+	// npm also creates an extensionless POSIX shim beside codex.cmd on
+	// Windows. Go can resolve that shim as the selected command, but it is not a
+	// symlink and therefore must be mapped back to the package entrypoint before
+	// platform-vendor discovery. Prefer the deterministic npm prefix layout to
+	// parsing shell syntax that varies across cmd-shim releases.
+	if !strings.HasSuffix(strings.ToLower(resolved), ".js") {
+		jsPath := filepath.Join(filepath.Dir(resolved), "node_modules", "@openai", "codex", "bin", "codex.js")
+		if _, statErr := os.Stat(jsPath); statErr == nil {
+			return jsPath, nil
+		}
+	}
+
 	return resolved, nil
 }
 

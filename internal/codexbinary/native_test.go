@@ -498,6 +498,50 @@ func TestFindNativeBinaryPlatformSubPackageNewLayout(t *testing.T) {
 	}
 }
 
+func TestFindNativeBinaryExtensionlessNPMShimLayout(t *testing.T) {
+	triple := targetTriple()
+	if triple == "" {
+		t.Skip("unsupported platform for this test")
+	}
+	platPkg := platformPackageName()
+	if platPkg == "" {
+		t.Skip("no platform package for this platform")
+	}
+	prefix := t.TempDir()
+	shim := filepath.Join(prefix, "codex")
+	moduleDir := filepath.Join(prefix, "node_modules", "@openai", "codex")
+	jsPath := filepath.Join(moduleDir, "bin", "codex.js")
+	platformRoot := filepath.Join(moduleDir, "node_modules", platPkg)
+	nativeDir := filepath.Join(platformRoot, "vendor", triple, "bin")
+	pathDir := filepath.Join(platformRoot, "vendor", triple, "codex-path")
+	for _, dir := range []string{filepath.Dir(jsPath), platformRoot, nativeDir, pathDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, content := range map[string]string{
+		shim:   "#!/bin/sh\n",
+		jsPath: "#!/usr/bin/env node\n",
+		filepath.Join(platformRoot, "package.json"): "{}",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nativePath := filepath.Join(nativeDir, nativeBinaryName())
+	if err := os.WriteFile(nativePath, []byte("native"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	gotNative, gotPath, err := FindNativeBinary(shim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotNative != nativePath || gotPath != pathDir {
+		t.Fatalf("native=%q path=%q, want %q and %q", gotNative, gotPath, nativePath, pathDir)
+	}
+}
+
 func TestFindVendorBinaryPrefersNewLayout(t *testing.T) {
 	triple := targetTriple()
 	if triple == "" {
