@@ -1730,7 +1730,7 @@ jobs:
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
           if ! go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
-            summary="$(grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -50 | tr '\n' ' ' || true)"
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
@@ -1745,11 +1745,23 @@ jobs:
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
           if ! go test -timeout=20m -parallel=16 ./... 2>&1 | tee "$log"; then
-            summary="$(grep -E '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -50 | tr '\n' ' ' || true)"
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
             echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
+            retry_log="$RUNNER_TEMP/full-go-test-cli-retry.log"
+            set +e
+            go test -v -count=1 ./internal/cli 2>&1 | tee "$retry_log"
+            retry_status="${PIPESTATUS[0]}"
+            set -e
+            retry_summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$retry_log" | tail -80 | tr '\n' ' ' || true)"
+            if [ "$retry_status" = 0 ]; then
+              retry_summary="isolated internal/cli retry passed; the original failure depends on full-suite concurrency or ambient runner state"
+            elif [ -z "$retry_summary" ]; then
+              retry_summary="$(tail -40 "$retry_log" | tr '\n' ' ')"
+            fi
+            echo "::error title=Isolated CLI retry after full-suite failure::$retry_summary"
             exit 1
           fi
 
@@ -2163,6 +2175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          trap 'status=$?; echo "::error title=Linux distro smoke command failed::${BASH_COMMAND} (exit ${status})"' ERR
           teams_resource_pattern='Test(BridgePollDrops(HelperAttachmentEchoWithoutDurableMatch|RenderedHelperLabelOutputInWorkChat)|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
           teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|CompletesTurnWithTranscriptFinalForCanonicalDedupe|StreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder|StreamingErrorDoesNotSuppressPendingFinalLikeProgress|TranscriptCanonicalFinal(PreservesObservedArtifactManifest|RequiresSameCodexTurn)|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|KnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
           img="$DISTRO_IMAGE"
