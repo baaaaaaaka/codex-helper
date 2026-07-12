@@ -202,3 +202,27 @@ func TestParseInputKeepsImageOnlyMessageVisibleAsTextPlaceholder(t *testing.T) {
 		t.Fatalf("parsed = %#v", parsed)
 	}
 }
+
+func TestParseInputReplaysCustomToolCallAsChatFunction(t *testing.T) {
+	parsed, err := parseInput(json.RawMessage(`[
+		{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},
+		{"type":"custom_tool_call_output","call_id":"call_patch","output":"Done!"}
+	]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Messages) != 2 || len(parsed.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("messages = %#v", parsed.Messages)
+	}
+	call := parsed.Messages[0].ToolCalls[0]
+	if call.Name != "apply_patch" || call.Type != "custom" || !json.Valid([]byte(call.Arguments)) {
+		t.Fatalf("call = %#v", call)
+	}
+	var arguments map[string]string
+	if err := json.Unmarshal([]byte(call.Arguments), &arguments); err != nil || arguments["input"] != "*** Begin Patch\n*** End Patch" {
+		t.Fatalf("arguments = %#v err=%v", arguments, err)
+	}
+	if parsed.Messages[1].Role != "tool" || parsed.Messages[1].ToolCallID != "call_patch" {
+		t.Fatalf("output = %#v", parsed.Messages[1])
+	}
+}

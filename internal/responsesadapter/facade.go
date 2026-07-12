@@ -335,7 +335,7 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, errorBody(err.Error()))
 		return
 	}
-	tools, toolWarnings, err := NormalizeTools(req.Tools)
+	tools, toolWarnings, err := NormalizeToolsWithMode(req.Tools, runtime.CustomToolMode)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 		return
@@ -407,6 +407,30 @@ func (f *Facade) prepareProviderToolCalls(records []ToolCallRecord) []ToolCallRe
 		call.Arguments = f.ShellPolicy.Prepare(call.ID, call.Name, call.Arguments)
 	}
 	return prepared
+}
+
+func markProviderToolCallTypes(records []ToolCallRecord, tools []ChatTool) []ToolCallRecord {
+	if len(records) == 0 || len(tools) == 0 {
+		return records
+	}
+	types := make(map[string]string, len(tools))
+	for _, tool := range tools {
+		types[strings.ToLower(strings.TrimSpace(tool.Function.Name))] = tool.SourceType
+	}
+	out := append([]ToolCallRecord(nil), records...)
+	for index := range out {
+		out[index].Type = types[strings.ToLower(strings.TrimSpace(out[index].Name))]
+	}
+	return out
+}
+
+func providerToolSourceType(name string, tools []ChatTool) string {
+	for _, tool := range tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Function.Name), strings.TrimSpace(name)) {
+			return tool.SourceType
+		}
+	}
+	return ""
 }
 
 func beginTurnWithWait(ctx context.Context, store ResponseStore, scope Scope, responseID string) (func(), error) {

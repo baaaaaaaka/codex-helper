@@ -188,7 +188,11 @@ func runCodexTUIInvocationViaBroker(
 		extraEnv = env.WithProxy(extraEnv, proxyURL)
 	}
 
-	modelLaunch, modelCleanup, err := startModelProfileAdapterForCodex(ctx, store, modelProfileRef, modelprofile.Snapshot{}, proxyURL, log)
+	officialAuth := false
+	if shouldProbeCodexLogin(store) {
+		officialAuth = codexLoginStatusProbeFn(ctx, codexPath, extraEnv, log)
+	}
+	modelLaunch, modelCleanup, err := startModelProfileAdapterForCodex(withCodexLoginProbePath(ctx, codexPath), store, modelProfileRef, modelprofile.Snapshot{}, proxyURL, officialAuth, log)
 	if err != nil {
 		return err
 	}
@@ -199,7 +203,7 @@ func runCodexTUIInvocationViaBroker(
 	if modelLaunch.Enabled {
 		modelArgs := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
 		appServerArgs = append(appServerArgs, modelArgs[1:]...)
-		extraEnv = append(extraEnv, envCXPResponsesProxyKey+"="+modelLaunch.ProxyKey)
+		extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
 	}
 
 	guardCleanup := func() {}

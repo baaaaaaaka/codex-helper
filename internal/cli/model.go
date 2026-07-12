@@ -169,12 +169,28 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 		CreatedAt: createdAt,
 		UpdatedAt: now,
 	}
+	currentVerification := existed && !modelProfileSetupChanges(existing, choice.ProviderID, choice.PublicModel, apiKeyRef, sshProxy) && modelProfileVerificationCurrent(cfg, profileName, existing, secretStore)
+	if currentVerification {
+		profile.VerifiedAt = existing.VerifiedAt
+		profile.VerificationFingerprint = existing.VerificationFingerprint
+	}
 	cfg.UpsertModelProfile(profileName, profile)
 	if !opts.noDefault {
 		cfg.DefaultModelProfile = profileName
 	}
+	var verifyErr error
+	if !currentVerification {
+		apiKey, resolveErr := modelprofile.ResolveAPIKey(apiKeyRef, secretStore, os.Getenv)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		verifyErr = verifyAndStampTeamsModelProfile(cmd.Context(), &cfg, profileName, apiKey)
+	}
 	if err := store.Save(cfg); err != nil {
 		return err
+	}
+	if verifyErr != nil {
+		return fmt.Errorf("model %s authentication verification failed and remains hidden: %w", choice.ID, verifyErr)
 	}
 	action := "Saved"
 	if existed {
@@ -214,39 +230,9 @@ func runModelUse(cmd *cobra.Command, root *rootOptions, modelRef string) error {
 		return nil
 	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
-	profileName := choice.RecommendedProfile
-	existing, existed := cfg.FindModelProfile(profileName)
-	apiKeyRef := strings.TrimSpace(existing.APIKeyRef)
-	if apiKeyRef == "" {
-		apiKeyRef = reusableAPIKeyRef(cfg, secretStore, choice)
-	}
-	if apiKeyRef == "" {
-		return fmt.Errorf("%s is not configured yet; run `cxp model setup %s --api-key-stdin`", choice.ID, choice.ID)
-	}
-	if !existed ||
-		strings.TrimSpace(existing.APIKeyRef) == "" ||
-		!strings.EqualFold(strings.TrimSpace(existing.Provider), choice.ProviderID) ||
-		!strings.EqualFold(strings.TrimSpace(existing.Model), choice.PublicModel) {
-		now := time.Now().UTC()
-		revision := existing.Revision
-		if revision <= 0 {
-			revision = 1
-		} else if modelProfileSetupChanges(existing, choice.ProviderID, choice.PublicModel, apiKeyRef, existing.SSHProxy) {
-			revision++
-		}
-		createdAt := existing.CreatedAt
-		if createdAt.IsZero() {
-			createdAt = now
-		}
-		cfg.UpsertModelProfile(profileName, config.ModelProfile{
-			Provider:  choice.ProviderID,
-			Model:     choice.PublicModel,
-			APIKeyRef: apiKeyRef,
-			SSHProxy:  existing.SSHProxy,
-			Revision:  revision,
-			CreatedAt: createdAt,
-			UpdatedAt: now,
-		})
+	profileName := verifiedModelChoiceProfileName(cfg, secretStore, choice)
+	if profileName == "" {
+		return fmt.Errorf("%s is not authentication-verified; run `cxp model setup %s --api-key-stdin`", choice.ID, choice.ID)
 	}
 	cfg.DefaultModelProfile = profileName
 	if err := store.Save(cfg); err != nil {
@@ -254,6 +240,25 @@ func runModelUse(cmd *cobra.Command, root *rootOptions, modelRef string) error {
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Default model: %s\n", choice.DisplayName)
 	return nil
+}
+
+func verifiedModelChoiceProfileName(cfg config.Config, secrets *modelprofile.SecretStore, choice modelprofile.ModelChoice) string {
+	names := make([]string, 0, len(cfg.ModelProfiles))
+	for name := range cfg.ModelProfiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		profile := cfg.ModelProfiles[name]
+		if !modelProfileVerificationCurrent(cfg, name, profile, secrets) {
+			continue
+		}
+		resolved, err := modelprofile.Resolve(cfg, name)
+		if err == nil && resolvedModelChoiceMatches(resolved, choice) {
+			return name
+		}
+	}
+	return ""
 }
 
 func modelChoiceForCLI(cmd *cobra.Command, modelRef string, cfg config.Config, secretStore *modelprofile.SecretStore) (modelprofile.ModelChoice, error) {
@@ -445,6 +450,27 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 			marker = "*"
 		}
 		_, _ = fmt.Fprintf(out, "%s %d. %-20s %-22s %s\n", marker, i+1, choice.ID, choice.DisplayName, status)
+	}
+	verified := make([]string, 0)
+	for name, profile := range cfg.ModelProfiles {
+		if strings.TrimSpace(profile.Source) != "" && strings.TrimSpace(profile.VerificationFingerprint) != "" {
+			verified = append(verified, name)
+		}
+	}
+	sort.Strings(verified)
+	if len(verified) > 0 {
+		_, _ = fmt.Fprintln(out, "Verified repository models")
+		for _, name := range verified {
+			resolved, err := modelprofile.Resolve(cfg, name)
+			if err != nil {
+				continue
+			}
+			marker := " "
+			if strings.EqualFold(name, defaultName) {
+				marker = "*"
+			}
+			_, _ = fmt.Fprintf(out, "%s %-20s %-22s verified (source %s)\n", marker, name, resolved.Model.Label(), cfg.ModelProfiles[name].Source)
+		}
 	}
 }
 

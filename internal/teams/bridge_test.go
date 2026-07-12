@@ -35209,7 +35209,7 @@ func TestBridgeRecordControlChatBindingSkipsSaveWhenUnchanged(t *testing.T) {
 	}
 }
 
-func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
+func TestBridgeModelProfileSwitchStartsNewGenerationAndRejectsActiveTurn(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	now := time.Now()
@@ -35238,12 +35238,16 @@ func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
 		t.Fatalf("CreateSession created=%v err=%v", created, err)
 	}
 	want := modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "secret:model-profile/mimo25/api-key", Revision: 4, KeyFingerprint: "key:mimo"}
+	second := modelprofile.Snapshot{Name: "deepseek", Provider: "deepseek", APIKeyRef: "secret:model-profile/deepseek/api-key", Revision: 1, KeyFingerprint: "key:deepseek"}
 	bridge := &Bridge{
 		store: store,
 		reg:   Registry{Version: 1, Sessions: []Session{session}, Chats: map[string]ChatState{}},
 		modelProfileResolver: func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+			if ref == "deepseek" {
+				return second, nil
+			}
 			if ref != "mimo25" {
-				t.Fatalf("model profile ref = %q, want mimo25", ref)
+				t.Fatalf("model profile ref = %q, want mimo25 or deepseek", ref)
 			}
 			return want, nil
 		},
@@ -35268,6 +35272,15 @@ func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
 	if got := state.Sessions[session.ID].ModelProfile; !modelProfileSnapshotsEqual(got, want) {
 		t.Fatalf("durable model profile = %#v, want %#v", got, want)
 	}
+	if session.ModelGeneration != 1 || state.Sessions[session.ID].ModelGeneration != 1 {
+		t.Fatalf("model generation registry=%d durable=%d, want 1", session.ModelGeneration, state.Sessions[session.ID].ModelGeneration)
+	}
+	if message, err := bridge.switchWorkModelProfile(ctx, &session, "mimo25"); err != nil || !strings.Contains(message, "already selected") {
+		t.Fatalf("same-profile switch message=%q err=%v", message, err)
+	}
+	if session.ModelGeneration != 1 {
+		t.Fatalf("same-profile switch advanced generation to %d", session.ModelGeneration)
+	}
 
 	inbound, created, err := store.PersistInbound(ctx, teamstore.InboundEvent{
 		ID:             "inbound-1",
@@ -35281,11 +35294,204 @@ func TestBridgeModelProfileSwitchOnlyBeforeFirstTurn(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("PersistInbound created=%v err=%v", created, err)
 	}
-	if _, created, err := store.QueueTurn(ctx, teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil || !created {
+	queuedTurn, created, err := store.QueueTurn(ctx, teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil || !created {
 		t.Fatalf("QueueTurn created=%v err=%v", created, err)
 	}
-	if _, err := bridge.switchWorkModelProfile(ctx, &session, "mimo25"); err == nil || !strings.Contains(err.Error(), "queued or running") {
-		t.Fatalf("switch with queued turn err = %v, want queued/running rejection", err)
+	if message, err := bridge.switchWorkModelProfile(ctx, &session, "deepseek"); err != nil || !strings.Contains(message, "scheduled") {
+		t.Fatalf("switch with queued turn message=%q err=%v, want scheduled switch", message, err)
+	}
+	turnID := queuedTurn.ID
+	if _, err := store.MarkTurnInterrupted(ctx, turnID, "test completed history"); err != nil {
+		t.Fatalf("MarkTurnInterrupted: %v", err)
+	}
+	session.CodexThreadID = "thread-old"
+	if _, _, err := store.BindSessionCodexThread(ctx, session.ID, turnID, session.CodexThreadID); err != nil {
+		t.Fatalf("BindSessionCodexThread: %v", err)
+	}
+	if err := bridge.applyPendingSessionModelProfileIfIdle(ctx, &session); err != nil {
+		t.Fatalf("apply pending switch after historical turn: %v", err)
+	}
+	if session.ModelGeneration != 2 || session.CodexThreadID != "" {
+		t.Fatalf("switched session generation=%d thread=%q, want generation 2 and empty thread", session.ModelGeneration, session.CodexThreadID)
+	}
+}
+
+func TestReasoningEffortForModelSwitchResetsUnsupportedExplicitEffort(t *testing.T) {
+	bridge := &Bridge{}
+	session := &Session{ReasoningEffort: "xhigh", ReasoningEffortSource: reasoningEffortSourceExplicit}
+	snapshot := modelprofile.Snapshot{DefaultReasoningEffort: "high", SupportedReasoningEffortsJSON: `["high"]`}
+	effort, source, notice := bridge.reasoningEffortForModelSwitch(context.Background(), session, snapshot)
+	if effort != "high" || source != reasoningEffortSourceModelDefault || !strings.Contains(notice, "high") {
+		t.Fatalf("switch effort=%q source=%q notice=%q", effort, source, notice)
+	}
+}
+
+func TestBridgeModelSwitchSerializesWithQueueTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now()
+	oldProfile := modelprofile.Snapshot{Name: "old", Provider: "default", Model: "gpt-old", Revision: 1}
+	newProfile := modelprofile.Snapshot{Name: "new", Provider: "default", Model: "gpt-new", Revision: 1}
+	session := Session{ID: "switch-race", ChatID: "chat-switch-race", Status: "active", ModelProfile: oldProfile, CreatedAt: now, UpdatedAt: now}
+	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, ModelProfile: oldProfile}); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	bridge := &Bridge{store: store, reg: Registry{Version: 1, Sessions: []Session{session}}, modelProfileResolver: func(context.Context, string) (modelprofile.Snapshot, error) {
+		close(entered)
+		<-release
+		return newProfile, nil
+	}}
+	switchDone := make(chan error, 1)
+	go func() { _, err := bridge.switchWorkModelProfile(ctx, &session, "new"); switchDone <- err }()
+	<-entered
+	inbound, _, err := store.PersistInbound(ctx, teamstore.InboundEvent{ID: "switch-race-inbound", SessionID: session.ID, TeamsChatID: session.ChatID, TeamsMessageID: "switch-race-message", Status: teamstore.InboundStatusPersisted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := make(chan teamstore.Turn, 1)
+	go func() {
+		turn, _, _ := bridge.queueTurn(ctx, &session, inbound)
+		queued <- turn
+	}()
+	close(release)
+	if err := <-switchDone; err != nil {
+		t.Fatalf("switch: %v", err)
+	}
+	turn := <-queued
+	if turn.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(turn.ModelProfile, newProfile) {
+		t.Fatalf("queued turn crossed switch boundary: %#v", turn)
+	}
+}
+
+func TestBridgePendingModelSwitchSnapshotsNewTurnsAndActivatesAtBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	oldProfile := modelprofile.Snapshot{Name: "old", Provider: "default", Model: "gpt-old", Revision: 1}
+	newProfile := modelprofile.Snapshot{Name: "new", Provider: "default", Model: "gpt-new", Revision: 1}
+	session := Session{ID: "pending-boundary", ChatID: "chat-pending-boundary", Status: "active", ModelProfile: oldProfile}
+	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, ModelProfile: oldProfile}); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	bridge := &Bridge{store: store, reg: Registry{Version: 1, Sessions: []Session{session}}, modelProfileResolver: func(context.Context, string) (modelprofile.Snapshot, error) { return newProfile, nil }}
+	oldInbound, _, _ := store.PersistInbound(ctx, teamstore.InboundEvent{ID: "pending-old", SessionID: session.ID, TeamsChatID: session.ChatID, TeamsMessageID: "old", Status: teamstore.InboundStatusPersisted})
+	oldTurn, _, err := bridge.queueTurn(ctx, &session, oldInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message, err := bridge.switchWorkModelProfile(ctx, &session, "new"); err != nil || !strings.Contains(message, "scheduled") {
+		t.Fatalf("schedule message=%q err=%v", message, err)
+	}
+	newInbound, _, _ := store.PersistInbound(ctx, teamstore.InboundEvent{ID: "pending-new", SessionID: session.ID, TeamsChatID: session.ChatID, TeamsMessageID: "new", Status: teamstore.InboundStatusPersisted})
+	newTurn, _, err := bridge.queueTurn(ctx, &session, newInbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldTurn.ModelGeneration != 0 || newTurn.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(newTurn.ModelProfile, newProfile) || newTurn.CodexThreadID != "" {
+		t.Fatalf("turn boundary old=%#v new=%#v", oldTurn, newTurn)
+	}
+	if _, err := store.MarkTurnInterrupted(ctx, oldTurn.ID, "old work finished"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := registrySessionFromDurable(state.Sessions[session.ID])
+	if recovered.PendingModelProfile.IsZero() || recovered.PendingReasoningSource == "" {
+		t.Fatalf("pending switch did not survive durable reload: %#v", recovered)
+	}
+	session = recovered
+	if err := bridge.activatePendingSessionModelProfileForQueuedTurn(ctx, &session, newTurn); err != nil {
+		t.Fatal(err)
+	}
+	if session.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(session.ModelProfile, newProfile) || !session.PendingModelProfile.IsZero() {
+		t.Fatalf("pending switch did not activate at boundary: %#v", session)
+	}
+}
+
+func TestBridgeModelProfileSwitchMatrixKeepsThreadsGenerationIsolated(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now()
+	official := modelprofile.Snapshot{Name: "gpt-5.6-luna", Provider: modelprofile.DefaultProvider, Revision: 1}
+	profiles := map[string]modelprofile.Snapshot{
+		"deepseek": {Name: "deepseek-v4-pro-quality", Provider: "nvidia-inference-hub", Revision: 2},
+		"glm":      {Name: "glm-5.2-quality", Provider: "nvidia-inference-hub", Revision: 3},
+		"minimax":  {Name: "minimax-m3-quality", Provider: "nvidia-inference-hub", Revision: 4},
+		"nemotron": {Name: "nemotron-3-ultra-quality", Provider: "nvidia-inference-hub", Revision: 5},
+		"luna":     official,
+	}
+	session := Session{ID: "switch-matrix", ChatID: "chat-switch-matrix", Status: "active", Cwd: t.TempDir(), ModelProfile: official, CreatedAt: now, UpdatedAt: now}
+	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, Cwd: session.Cwd, ModelProfile: official, CreatedAt: now, UpdatedAt: now}); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	bridge := &Bridge{
+		store: store,
+		reg:   Registry{Version: 1, Sessions: []Session{session}, Chats: map[string]ChatState{}},
+		modelProfileResolver: func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+			profile, ok := profiles[ref]
+			if !ok {
+				return modelprofile.Snapshot{}, fmt.Errorf("unknown test profile %q", ref)
+			}
+			return profile, nil
+		},
+	}
+
+	runGeneration := func(step int, wantProfile modelprofile.Snapshot) {
+		t.Helper()
+		inbound, created, err := store.PersistInbound(ctx, teamstore.InboundEvent{ID: fmt.Sprintf("switch-inbound-%d", step), SessionID: session.ID, TeamsChatID: session.ChatID, TeamsMessageID: fmt.Sprintf("switch-message-%d", step), Status: teamstore.InboundStatusPersisted})
+		if err != nil || !created {
+			t.Fatalf("step %d PersistInbound created=%v err=%v", step, created, err)
+		}
+		turn, created, err := bridge.queueTurn(ctx, &session, inbound)
+		if err != nil || !created {
+			t.Fatalf("step %d queueTurn created=%v err=%v", step, created, err)
+		}
+		if turn.ModelGeneration != session.ModelGeneration || !modelProfileSnapshotsEqual(turn.ModelProfile, wantProfile) {
+			t.Fatalf("step %d queued turn generation/profile = %d/%#v, want %d/%#v", step, turn.ModelGeneration, turn.ModelProfile, session.ModelGeneration, wantProfile)
+		}
+		decision, err := bridge.resolveCodexThreadDecision(ctx, &session, turn)
+		if err != nil || decision.Action != threadResolveStartNew {
+			t.Fatalf("step %d resolve decision=%#v err=%v, want startNew", step, decision, err)
+		}
+		threadID := fmt.Sprintf("thread-generation-%d", session.ModelGeneration)
+		if err := bridge.bindSessionCodexThreadIfSafe(ctx, &session, turn.ID, threadID, "switch_matrix"); err != nil {
+			t.Fatalf("step %d bind thread: %v", step, err)
+		}
+		if _, err := store.MarkTurnCompleted(ctx, turn.ID, threadID, fmt.Sprintf("codex-turn-%d", step)); err != nil {
+			t.Fatalf("step %d complete turn: %v", step, err)
+		}
+	}
+
+	runGeneration(0, official)
+	for step, ref := range []string{"deepseek", "glm", "minimax", "nemotron", "luna"} {
+		if _, err := bridge.switchWorkModelProfile(ctx, &session, ref); err != nil {
+			t.Fatalf("switch to %s: %v", ref, err)
+		}
+		if session.CodexThreadID != "" || session.ModelGeneration != step+1 {
+			t.Fatalf("after switch to %s generation=%d thread=%q", ref, session.ModelGeneration, session.CodexThreadID)
+		}
+		runGeneration(step+1, profiles[ref])
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	seen := map[int]string{}
+	for _, turn := range state.Turns {
+		if turn.SessionID == session.ID && turn.CodexThreadID != "" {
+			seen[turn.ModelGeneration] = turn.CodexThreadID
+		}
+	}
+	for generation := 0; generation <= 5; generation++ {
+		want := fmt.Sprintf("thread-generation-%d", generation)
+		if seen[generation] != want {
+			t.Fatalf("generation %d thread=%q, want %q; all=%#v", generation, seen[generation], want, seen)
+		}
 	}
 }
 

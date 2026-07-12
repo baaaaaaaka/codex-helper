@@ -15,12 +15,28 @@ import (
 )
 
 type OpenAIChatAdapter struct {
-	BaseURL    string
-	APIKey     string
-	Profile    ProviderProfile
-	HTTPClient *http.Client
-	MaxRetries int
-	RetryBase  time.Duration
+	BaseURL               string
+	APIKey                string
+	Profile               ProviderProfile
+	HTTPClient            *http.Client
+	MaxRetries            int
+	MaxRetriesSet         bool
+	RetryBase             time.Duration
+	RetryStatuses         []int
+	HonorRetryAfter       *bool
+	RetryTransportErrors  *bool
+	ResponseHeaderTimeout time.Duration
+	StreamIdleTimeout     time.Duration
+	Status                func(string)
+	MaxOutputTokens       int
+	Headers               map[string]string
+	AuthType              string
+	AuthHeader            string
+	StreamMode            string
+	ReasoningDeltaPath    string
+	CachedTokensPath      string
+	UsageField            string
+	RequestGate           chan struct{}
 }
 
 type chatCompletionRequest struct {
@@ -80,6 +96,7 @@ type chatToolFunction struct {
 
 func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-chan ProviderEvent, error) {
 	profile := a.Profile.withDefaults()
+	buffered := strings.EqualFold(strings.TrimSpace(a.StreamMode), "nonstream-buffered")
 	body := chatCompletionRequest{
 		Model:               req.Model,
 		Messages:            chatMessagesFromProviderRequestWithProfile(req, profile),
@@ -90,22 +107,28 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 		ReasoningEffort:     profile.reasoningEffort(req.ReasoningEffort),
 		Temperature:         req.Temperature,
 		TopP:                req.TopP,
-		Stream:              true,
+		Stream:              !buffered,
+	}
+	if a.MaxOutputTokens > 0 && (body.MaxCompletionTokens == nil || *body.MaxCompletionTokens > a.MaxOutputTokens) {
+		value := a.MaxOutputTokens
+		body.MaxCompletionTokens = &value
 	}
 	if profile.ForceParallelToolCalls != nil {
 		body.ParallelToolCalls = profile.ForceParallelToolCalls
 	}
-	if profile.shouldEnableThinking(req.Model) {
-		body.Thinking = &thinkingConfig{Type: "enabled"}
+	if thinkingType := profile.thinkingType(req.Model, req.ReasoningEffort); thinkingType != "" {
+		body.Thinking = &thinkingConfig{Type: thinkingType}
 	}
-	if profile.shouldStripSampling(req.Model) {
+	if profile.shouldStripSampling(req.Model) || profile.TemperaturePolicy == "strip" || (profile.TemperaturePolicy == "strip-when-reasoning" && body.Thinking != nil && body.Thinking.Type == "enabled") {
 		body.Temperature = nil
+	}
+	if profile.shouldStripSampling(req.Model) || profile.TopPPolicy == "strip" || (profile.TopPPolicy == "strip-when-reasoning" && body.Thinking != nil && body.Thinking.Type == "enabled") {
 		body.TopP = nil
 	}
-	if profile.IncludeUsageStreamOptions {
+	if profile.IncludeUsageStreamOptions && !buffered {
 		body.StreamOptions = &chatStreamOptions{IncludeUsage: true}
 	}
-	payload, err := json.Marshal(body)
+	payload, err := marshalChatCompletionRequest(body, profile, req.Model, req.ReasoningEffort)
 	if err != nil {
 		return nil, err
 	}
@@ -113,15 +136,32 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 	if err != nil {
 		return nil, err
 	}
+	if a.RequestGate != nil {
+		if a.Status != nil {
+			a.Status("waiting for upstream concurrency slot")
+		}
+		select {
+		case a.RequestGate <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	releaseGate := func() {
+		if a.RequestGate != nil {
+			<-a.RequestGate
+		}
+	}
 	client := a.HTTPClient
 	if client == nil {
-		client = defaultUpstreamHTTPClient()
+		client = NewUpstreamHTTPClientWithResponseHeaderTimeout(http.ProxyFromEnvironment, a.ResponseHeaderTimeout)
 	}
 	resp, err := a.doChatCompletionsRequest(ctx, client, endpoint, payload)
 	if err != nil {
+		releaseGate()
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		releaseGate()
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, upstreamHTTPError(resp.StatusCode, resp.Status, strings.TrimSpace(string(raw)), req.Model)
@@ -130,30 +170,167 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
-		parseChatCompletionSSE(ctx, resp.Body, ch)
+		defer releaseGate()
+		if buffered {
+			parseBufferedChatCompletion(ctx, resp.Body, ch, profile.ValidateToolArguments, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
+			return
+		}
+		parseChatCompletionSSEWithPolicy(ctx, resp.Body, ch, profile.ValidateToolArguments, a.StreamIdleTimeout, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
 	}()
 	return ch, nil
 }
 
+type bufferedChatCompletion struct {
+	Choices []struct {
+		FinishReason string              `json:"finish_reason"`
+		Message      chatBufferedMessage `json:"message"`
+	} `json:"choices"`
+	Usage *chatUsage `json:"usage"`
+}
+
+type chatBufferedMessage struct {
+	Content          string                `json:"content"`
+	ReasoningContent string                `json:"reasoning_content"`
+	Reasoning        string                `json:"reasoning"`
+	ToolCalls        []chatMessageToolCall `json:"tool_calls"`
+	Raw              map[string]any        `json:"-"`
+}
+
+func (m *chatBufferedMessage) UnmarshalJSON(data []byte) error {
+	type alias chatBufferedMessage
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = chatBufferedMessage(decoded)
+	return json.Unmarshal(data, &m.Raw)
+}
+
+func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string)) {
+	var completion bufferedChatCompletion
+	if err := json.NewDecoder(body).Decode(&completion); err != nil {
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("invalid buffered chat completion: %w", err)}
+		return
+	}
+	if len(completion.Choices) == 0 {
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("buffered chat completion has no choices")}
+		return
+	}
+	choice := completion.Choices[0]
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+	reasoning := firstNonEmptyJSONPath(choice.Message.Raw, reasoningPath, choice.Message.ReasoningContent, choice.Message.Reasoning)
+	if reasoning != "" {
+		out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: reasoning}
+	}
+	if choice.Message.Content != "" {
+		parser := newInlineThinkParser()
+		emitSplitText(out, parser.feed(choice.Message.Content))
+		emitSplitText(out, parser.flush())
+	}
+	for index, call := range choice.Message.ToolCalls {
+		if validateArguments && !json.Valid([]byte(strings.TrimSpace(call.Function.Arguments))) {
+			out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("tool call %d returned invalid JSON arguments", index)}
+			return
+		}
+		out <- ProviderEvent{Kind: ProviderEventToolCallDelta, ToolCall: &ProviderToolCallDelta{
+			Index: index, ID: call.ID, Name: call.Function.Name, ArgumentsDelta: call.Function.Arguments,
+		}}
+	}
+	if completion.Usage != nil {
+		out <- ProviderEvent{Kind: ProviderEventUsage, Usage: completion.Usage.toUsage(cachedTokensPath, status)}
+	}
+	out <- ProviderEvent{Kind: ProviderEventDone, FinishReason: choice.FinishReason}
+}
+
+func (a OpenAIChatAdapter) reasoningPath(profile ProviderProfile) string {
+	if value := strings.TrimSpace(a.ReasoningDeltaPath); value != "" {
+		return value
+	}
+	return strings.TrimSpace(profile.ReasoningResponseField)
+}
+
+func (a OpenAIChatAdapter) cachedUsagePath() string {
+	if value := strings.TrimSpace(a.CachedTokensPath); value != "" {
+		return value
+	}
+	return strings.TrimSpace(a.UsageField)
+}
+
+// marshalChatCompletionRequest applies model-specific request fragments only
+// after the stable Chat Completions shape has been built. Core routing and
+// conversation fields cannot be overridden by repository-supplied config.
+func marshalChatCompletionRequest(body chatCompletionRequest, profile ProviderProfile, model, effort string) ([]byte, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	var merged map[string]any
+	if err := json.Unmarshal(raw, &merged); err != nil {
+		return nil, err
+	}
+	var fragment map[string]any
+	switch profile.thinkingType(model, effort) {
+	case "enabled":
+		fragment = profile.ThinkingEnabledRequest
+	case "disabled":
+		fragment = profile.ThinkingDisabledRequest
+	}
+	for key, value := range fragment {
+		switch key {
+		case "model", "messages", "tools", "tool_choice", "parallel_tool_calls", "stream", "stream_options":
+			continue
+		default:
+			merged[key] = value
+		}
+	}
+	return json.Marshal(merged)
+}
+
 func (a OpenAIChatAdapter) doChatCompletionsRequest(ctx context.Context, client *http.Client, endpoint string, payload []byte) (*http.Response, error) {
 	maxRetries := a.MaxRetries
-	if maxRetries == 0 {
+	if !a.MaxRetriesSet && maxRetries == 0 {
 		maxRetries = 2
 	}
 	if maxRetries < 0 {
 		maxRetries = 0
 	}
 	for attempt := 0; ; attempt++ {
+		if a.Status != nil {
+			a.Status(fmt.Sprintf("waiting for upstream response headers (attempt %d/%d)", attempt+1, maxRetries+1))
+		}
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 		if err != nil {
 			return nil, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		for key, value := range a.Headers {
+			if strings.TrimSpace(key) != "" {
+				httpReq.Header.Set(key, value)
+			}
+		}
 		if strings.TrimSpace(a.APIKey) != "" {
-			httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(a.APIKey))
+			if strings.EqualFold(strings.TrimSpace(a.AuthType), "header") {
+				header := strings.TrimSpace(a.AuthHeader)
+				if header == "" {
+					header = "X-API-Key"
+				}
+				httpReq.Header.Set(header, strings.TrimSpace(a.APIKey))
+			} else {
+				httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(a.APIKey))
+			}
 		}
 		resp, err := client.Do(httpReq)
-		if err == nil && !shouldRetryStatus(resp.StatusCode) {
+		if err != nil && a.RetryTransportErrors != nil && !*a.RetryTransportErrors {
+			return nil, err
+		}
+		if err == nil && !a.shouldRetryStatus(resp.StatusCode) {
+			if a.Status != nil {
+				a.Status(fmt.Sprintf("upstream response started with HTTP %d", resp.StatusCode))
+			}
 			return resp, nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -170,6 +347,13 @@ func (a OpenAIChatAdapter) doChatCompletionsRequest(ctx context.Context, client 
 			return resp, nil
 		}
 		delay := a.retryDelay(attempt, resp)
+		if a.Status != nil {
+			reason := "transport error"
+			if resp != nil {
+				reason = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+			a.Status(fmt.Sprintf("retrying upstream after %s (next attempt %d/%d)", reason, attempt+2, maxRetries+1))
+		}
 		if resp != nil && resp.Body != nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
@@ -182,12 +366,24 @@ func (a OpenAIChatAdapter) doChatCompletionsRequest(ctx context.Context, client 
 	}
 }
 
+func (a OpenAIChatAdapter) shouldRetryStatus(status int) bool {
+	if len(a.RetryStatuses) == 0 {
+		return shouldRetryStatus(status) || status == 529
+	}
+	for _, candidate := range a.RetryStatuses {
+		if status == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldRetryStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout || status >= 500
 }
 
 func (a OpenAIChatAdapter) retryDelay(attempt int, resp *http.Response) time.Duration {
-	if resp != nil {
+	if resp != nil && (a.HonorRetryAfter == nil || *a.HonorRetryAfter) {
 		if retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")); retryAfter != "" {
 			if seconds, err := strconv.ParseFloat(retryAfter, 64); err == nil && seconds >= 0 {
 				return time.Duration(seconds * float64(time.Second))
@@ -404,12 +600,22 @@ func chatCompletionsURL(base string) (string, error) {
 	return u.String(), nil
 }
 
-func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent) {
+func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool) {
+	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, 0, "", "", nil)
+}
+
+func parseChatCompletionSSEWithIdleTimeout(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration) {
+	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, idleTimeout, "", "", nil)
+}
+
+func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string)) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
+	finishReason := ""
 	inlineThink := newInlineThinkParser()
-	idleExpired, touchIdleWatch, stopIdleWatch := watchUpstreamStreamIdle(ctx, body)
+	toolArguments := map[int]*strings.Builder{}
+	idleExpired, touchIdleWatch, stopIdleWatch := watchUpstreamStreamIdle(ctx, body, idleTimeout)
 	defer stopIdleWatch()
 	for scanner.Scan() {
 		touchIdleWatch()
@@ -427,9 +633,17 @@ func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- 
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			if validateArguments {
+				for index, arguments := range toolArguments {
+					if !json.Valid([]byte(strings.TrimSpace(arguments.String()))) {
+						out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("tool call %d returned invalid JSON arguments", index)}
+						return
+					}
+				}
+			}
 			sawDone = true
 			emitSplitText(out, inlineThink.flush())
-			out <- ProviderEvent{Kind: ProviderEventDone}
+			out <- ProviderEvent{Kind: ProviderEventDone, FinishReason: finishReason}
 			return
 		}
 		var chunk chatCompletionChunk
@@ -438,16 +652,23 @@ func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- 
 			return
 		}
 		for _, choice := range chunk.Choices {
-			if choice.Delta.ReasoningContent != "" {
-				out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: choice.Delta.ReasoningContent}
+			if strings.TrimSpace(choice.FinishReason) != "" {
+				finishReason = strings.TrimSpace(choice.FinishReason)
 			}
-			if choice.Delta.Reasoning != "" {
-				out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: choice.Delta.Reasoning}
+			reasoning := firstNonEmptyJSONPath(choice.Delta.Raw, reasoningPath, choice.Delta.ReasoningContent, choice.Delta.Reasoning)
+			if reasoning != "" {
+				out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: reasoning}
 			}
 			if choice.Delta.Content != "" {
 				emitSplitText(out, inlineThink.feed(choice.Delta.Content))
 			}
 			for _, toolCall := range choice.Delta.ToolCalls {
+				arguments := toolArguments[toolCall.Index]
+				if arguments == nil {
+					arguments = &strings.Builder{}
+					toolArguments[toolCall.Index] = arguments
+				}
+				arguments.WriteString(toolCall.Function.Arguments)
 				out <- ProviderEvent{
 					Kind: ProviderEventToolCallDelta,
 					ToolCall: &ProviderToolCallDelta{
@@ -460,12 +681,12 @@ func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- 
 			}
 		}
 		if chunk.Usage != nil {
-			out <- ProviderEvent{Kind: ProviderEventUsage, Usage: chunk.Usage.toUsage()}
+			out <- ProviderEvent{Kind: ProviderEventUsage, Usage: chunk.Usage.toUsage(cachedTokensPath, status)}
 		}
 	}
 	select {
 	case <-idleExpired:
-		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream idle timeout after %s", upstreamHTTPStreamIdleTimeout)}
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream idle timeout after %s", effectiveUpstreamStreamIdleTimeout(idleTimeout))}
 		return
 	default:
 	}
@@ -481,8 +702,8 @@ func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- 
 	}
 }
 
-func watchUpstreamStreamIdle(ctx context.Context, body io.Closer) (<-chan struct{}, func(), func()) {
-	timeout := upstreamHTTPStreamIdleTimeout
+func watchUpstreamStreamIdle(ctx context.Context, body io.Closer, configured time.Duration) (<-chan struct{}, func(), func()) {
+	timeout := effectiveUpstreamStreamIdleTimeout(configured)
 	expired := make(chan struct{}, 1)
 	if timeout <= 0 {
 		return expired, func() {}, func() {}
@@ -533,16 +754,27 @@ func watchUpstreamStreamIdle(ctx context.Context, body io.Closer) (<-chan struct
 	return expired, touch, stop
 }
 
+func effectiveUpstreamStreamIdleTimeout(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return upstreamHTTPStreamIdleTimeout
+}
+
 type chatCompletionChunk struct {
 	Choices []struct {
-		Delta struct {
-			Content          string              `json:"content"`
-			ReasoningContent string              `json:"reasoning_content"`
-			Reasoning        string              `json:"reasoning"`
-			ToolCalls        []chatToolCallDelta `json:"tool_calls"`
-		} `json:"delta"`
+		FinishReason string              `json:"finish_reason"`
+		Delta        chatCompletionDelta `json:"delta"`
 	} `json:"choices"`
 	Usage *chatUsage `json:"usage"`
+}
+
+type chatCompletionDelta struct {
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content"`
+	Reasoning        string              `json:"reasoning"`
+	ToolCalls        []chatToolCallDelta `json:"tool_calls"`
+	Raw              map[string]any      `json:"-"`
 }
 
 type chatToolCallDelta struct {
@@ -565,16 +797,151 @@ type chatUsage struct {
 	CompletionTokensDetails struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
+	Raw map[string]any `json:"-"`
 }
 
-func (u chatUsage) toUsage() *Usage {
-	return &Usage{
+func (u *chatUsage) UnmarshalJSON(data []byte) error {
+	type alias chatUsage
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*u = chatUsage(decoded)
+	return json.Unmarshal(data, &u.Raw)
+}
+
+func (d *chatCompletionDelta) UnmarshalJSON(data []byte) error {
+	type alias chatCompletionDelta
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*d = chatCompletionDelta(decoded)
+	return json.Unmarshal(data, &d.Raw)
+}
+
+func (u chatUsage) toUsage(cachedTokensPath string, status func(string)) *Usage {
+	result := &Usage{
 		InputTokens:     u.PromptTokens,
 		OutputTokens:    u.CompletionTokens,
 		TotalTokens:     u.TotalTokens,
 		CachedTokens:    u.PromptTokensDetails.CachedTokens,
 		ReasoningTokens: u.CompletionTokensDetails.ReasoningTokens,
 	}
+	if value, ok := intAtJSONPath(u.Raw, cachedTokensPath, "usage"); ok {
+		result.CachedTokens = value
+	}
+	if result.CachedTokens < 0 {
+		warnUsage(status, "upstream reported negative cached token count; clamped to zero")
+		result.CachedTokens = 0
+	}
+	if result.InputTokens > 0 && result.CachedTokens > result.InputTokens {
+		warnUsage(status, fmt.Sprintf("upstream reported cached tokens %d greater than input tokens %d; clamped", result.CachedTokens, result.InputTokens))
+		result.CachedTokens = result.InputTokens
+	}
+	if result.ReasoningTokens < 0 {
+		warnUsage(status, "upstream reported negative reasoning token count; clamped to zero")
+		result.ReasoningTokens = 0
+	}
+	if result.OutputTokens > 0 && result.ReasoningTokens > result.OutputTokens {
+		warnUsage(status, fmt.Sprintf("upstream reported reasoning tokens %d greater than output tokens %d; clamped", result.ReasoningTokens, result.OutputTokens))
+		result.ReasoningTokens = result.OutputTokens
+	}
+	return result
+}
+
+func warnUsage(status func(string), message string) {
+	if status != nil {
+		status("usage warning: " + message)
+	}
+}
+
+func firstNonEmptyJSONPath(raw map[string]any, path string, fallbacks ...string) string {
+	if value, ok := valueAtJSONPath(raw, path, "choices.0.delta", "choices.0.message", "delta", "message"); ok {
+		if text, ok := value.(string); ok && text != "" {
+			return text
+		}
+	}
+	for _, value := range fallbacks {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func intAtJSONPath(raw map[string]any, path string, prefixes ...string) (int, bool) {
+	value, ok := valueAtJSONPath(raw, path, prefixes...)
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), typed == float64(int(typed))
+	case json.Number:
+		integer, err := typed.Int64()
+		return int(integer), err == nil
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
+}
+
+func valueAtJSONPath(raw map[string]any, path string, prefixes ...string) (any, bool) {
+	path = strings.TrimSpace(path)
+	if path == "" || len(raw) == 0 {
+		return nil, false
+	}
+	path = strings.TrimPrefix(path, "$")
+	path = strings.TrimPrefix(path, ".")
+	path = strings.ReplaceAll(path, "[", ".")
+	path = strings.ReplaceAll(path, "]", "")
+	path = strings.ReplaceAll(path, "/", ".")
+	for _, prefix := range prefixes {
+		prefix = strings.Trim(strings.TrimSpace(prefix), ".")
+		if strings.EqualFold(path, prefix) {
+			path = ""
+			break
+		}
+		if len(path) > len(prefix) && strings.EqualFold(path[:len(prefix)], prefix) && path[len(prefix)] == '.' {
+			path = path[len(prefix)+1:]
+			break
+		}
+	}
+	if path == "" {
+		return raw, true
+	}
+	var current any = raw
+	for _, segment := range strings.Split(path, ".") {
+		if segment == "" {
+			continue
+		}
+		switch typed := current.(type) {
+		case map[string]any:
+			var found bool
+			for key, value := range typed {
+				if strings.EqualFold(key, segment) {
+					current, found = value, true
+					break
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		case []any:
+			index, err := strconv.Atoi(segment)
+			if err != nil || index < 0 || index >= len(typed) {
+				return nil, false
+			}
+			current = typed[index]
+		default:
+			return nil, false
+		}
+	}
+	return current, true
 }
 
 type splitText struct {

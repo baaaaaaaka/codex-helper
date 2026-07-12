@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -61,10 +62,22 @@ func ModelFingerprint(provider ProviderSpec, modelRef string) string {
 	if !ok {
 		return ""
 	}
+	policy, _ := json.Marshal(struct {
+		Reasoning any `json:"reasoning"`
+		Tools     any `json:"tools"`
+		Messages  any `json:"messages"`
+		Sampling  any `json:"sampling"`
+		Stream    any `json:"stream"`
+		HTTP      any `json:"http"`
+		Cache     any `json:"cache"`
+	}{model.ReasoningPolicy, model.ToolPolicy, model.MessagePolicy, model.SamplingPolicy, model.StreamPolicy, model.HTTPPolicy, model.CachePolicy})
 	material := strings.Join([]string{
 		strings.TrimSpace(provider.ID),
 		strings.TrimSpace(model.PublicID()),
 		strings.TrimSpace(model.UpstreamModel()),
+		fmt.Sprint(model.ContextWindow), fmt.Sprint(model.MaxContextWindow), fmt.Sprint(model.MaxOutputTokens),
+		fmt.Sprint(model.SupportsTools), fmt.Sprint(model.SupportsVision), fmt.Sprint(model.SupportsReason), fmt.Sprint(model.SupportsSearch),
+		string(policy),
 	}, "\n")
 	sum := sha256.Sum256([]byte(material))
 	return "model:" + hex.EncodeToString(sum[:])[:24]

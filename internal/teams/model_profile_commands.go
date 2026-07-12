@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,9 @@ import (
 )
 
 func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage, arg string) (string, error) {
+	if modelNaturalLanguageListRequest(arg) {
+		return b.modelManagerList(ctx)
+	}
 	sub, rest := modelCommandParts(arg)
 	if sub == "" {
 		sub = "list"
@@ -69,6 +73,9 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 }
 
 func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, arg string) (string, error) {
+	if modelNaturalLanguageListRequest(arg) {
+		return b.modelManagerList(ctx)
+	}
 	sub, rest := modelCommandParts(arg)
 	if sub == "" {
 		sub = "status"
@@ -99,6 +106,31 @@ func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, a
 	default:
 		return modelWorkUsage(), nil
 	}
+}
+
+func modelNaturalLanguageListRequest(arg string) bool {
+	value := strings.ToLower(strings.TrimSpace(arg))
+	if value == "" {
+		return false
+	}
+	// Exact command forms are handled by the normal parser below. This helper
+	// only recognizes read-only natural-language questions; mutations continue
+	// to require explicit switch/use/fork commands.
+	for _, exact := range []string{"list", "ls", "profiles", "status", "current", "providers", "provider", "setup", "doctor"} {
+		if value == exact || strings.HasPrefix(value, exact+" ") {
+			return false
+		}
+	}
+	listSignals := []string{
+		"列出", "列出来", "列表", "有哪些", "有什么模型", "哪些模型", "可用模型", "所有模型", "全部模型",
+		"what model", "which model", "models are available", "available model", "list model", "show model", "all model",
+	}
+	for _, signal := range listSignals {
+		if strings.Contains(value, signal) {
+			return true
+		}
+	}
+	return false
 }
 
 func modelCommandParts(arg string) (string, string) {
@@ -231,7 +263,7 @@ func (b *Bridge) formatWorkModelStatus(ctx context.Context, session *Session) (s
 		"Model profile: " + modelProfileDisplayName(session.ModelProfile),
 	}
 	if switchable, reason := b.workModelProfileSwitchability(ctx, session); switchable {
-		lines = append(lines, "Switchable: yes, before the first Codex turn starts.")
+		lines = append(lines, "Switchable: yes. Switching after a turn starts a new Codex thread.")
 	} else if strings.TrimSpace(reason) != "" {
 		lines = append(lines, "Switchable: no - "+reason)
 	}
@@ -245,25 +277,110 @@ func (b *Bridge) switchWorkModelProfile(ctx context.Context, session *Session, r
 	if session == nil {
 		return "", fmt.Errorf("session not found")
 	}
-	if switchable, reason := b.workModelProfileSwitchability(ctx, session); !switchable {
-		return "", fmt.Errorf("cannot switch this Work chat's model profile: %s. Use `model fork <profile>` to start a new Work chat instead", reason)
-	}
+	b.modelProfileMu.Lock()
+	defer b.modelProfileMu.Unlock()
 	snapshot, err := b.resolveNewSessionModelProfile(ctx, ref)
 	if err != nil {
 		return "", err
 	}
-	if err := b.setSessionModelProfile(ctx, session, snapshot); err != nil {
+	if modelProfileSnapshotsSameRuntime(session.ModelProfile, snapshot) {
+		return "Model profile already selected for this Work chat: " + modelProfileDisplayName(snapshot), nil
+	}
+	if switchable, reason := b.workModelProfileSwitchability(ctx, session); !switchable {
+		if strings.Contains(reason, "queued or running") {
+			effort, source, _ := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+			if err := b.setPendingSessionModelProfile(ctx, session, snapshot, effort, source); err != nil {
+				return "", err
+			}
+			return "Model profile switch scheduled: " + modelProfileDisplayName(snapshot) + "\n\nCurrent queued or running work keeps its captured model. The switch will apply automatically when this chat becomes idle.", nil
+		}
+		return "", fmt.Errorf("cannot switch this Work chat's model profile: %s", reason)
+	}
+	effort, effortSource, effortNotice := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+	if err := b.setSessionModelProfile(ctx, session, snapshot, effort, effortSource); err != nil {
 		return "", err
 	}
-	return "Model profile switched for this Work chat: " + modelProfileDisplayName(snapshot), nil
+	message := "Model profile switched for this Work chat: " + modelProfileDisplayName(snapshot) + "\n\nA new Codex thread will start with the next message; the previous thread remains preserved."
+	if effortNotice != "" {
+		message += "\n\n" + effortNotice
+	}
+	return message, nil
+}
+
+func (b *Bridge) setPendingSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, effort string, source string) error {
+	now := time.Now()
+	if b.store != nil {
+		if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, found bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+			if !found || current.ID == "" {
+				return current, false, fmt.Errorf("session %q not found", session.ID)
+			}
+			current.PendingModelProfile = snapshot
+			current.PendingModelRequestedAt = now
+			current.PendingReasoningEffort = effort
+			current.PendingReasoningSource = source
+			current.UpdatedAt = now
+			return current, true, nil
+		}); err != nil {
+			return err
+		}
+	}
+	session.PendingModelProfile = snapshot
+	session.PendingModelRequestedAt = now
+	session.PendingReasoningEffort = effort
+	session.PendingReasoningSource = source
+	if current := b.reg.SessionByID(session.ID); current != nil {
+		current.PendingModelProfile = snapshot
+		current.PendingModelRequestedAt = now
+		current.PendingReasoningEffort = effort
+		current.PendingReasoningSource = source
+		current.UpdatedAt = now
+		b.markRegistryProjectionDirty()
+	}
+	if strings.TrimSpace(b.registryPath) != "" {
+		if err := b.Save(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams registry pending model projection save skipped for %s: %v\n", session.ID, err)
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) applyPendingSessionModelProfileIfIdle(ctx context.Context, session *Session) error {
+	if session == nil || session.PendingModelProfile.IsZero() {
+		return nil
+	}
+	b.modelProfileMu.Lock()
+	defer b.modelProfileMu.Unlock()
+	if switchable, _ := b.workModelProfileSwitchability(ctx, session); !switchable {
+		return nil
+	}
+	return b.activatePendingSessionModelProfileLocked(ctx, session)
+}
+
+func (b *Bridge) activatePendingSessionModelProfileForQueuedTurn(ctx context.Context, session *Session, turn teamstore.Turn) error {
+	if session == nil || session.PendingModelProfile.IsZero() || turn.ModelGeneration != session.ModelGeneration+1 || !modelProfileSnapshotsSameRuntime(turn.ModelProfile, session.PendingModelProfile) {
+		return nil
+	}
+	b.modelProfileMu.Lock()
+	defer b.modelProfileMu.Unlock()
+	return b.activatePendingSessionModelProfileLocked(ctx, session)
+}
+
+func (b *Bridge) activatePendingSessionModelProfileLocked(ctx context.Context, session *Session) error {
+	snapshot := session.PendingModelProfile
+	effort := session.PendingReasoningEffort
+	source := session.PendingReasoningSource
+	if strings.TrimSpace(effort) == "" {
+		effort, source, _ = b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+	}
+	if err := b.setSessionModelProfile(ctx, session, snapshot, effort, source); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (b *Bridge) workModelProfileSwitchability(ctx context.Context, session *Session) (bool, string) {
 	if b == nil || b.store == nil || session == nil {
 		return false, "durable state is not available"
-	}
-	if strings.TrimSpace(session.CodexThreadID) != "" {
-		return false, "this chat is already bound to a Codex thread"
 	}
 	state, err := b.store.SessionWorkflowEventSnapshot(ctx, session.ID)
 	if err != nil {
@@ -277,37 +394,116 @@ func (b *Bridge) workModelProfileSwitchability(ctx context.Context, session *Ses
 		case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning:
 			return false, "a turn is queued or running"
 		default:
-			return false, "this chat already has Codex turn history"
+			continue
 		}
 	}
 	return true, ""
 }
 
-func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot) error {
+func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, effort string, effortSource string) error {
 	now := time.Now()
+	nextGeneration := session.ModelGeneration + 1
 	if b.store != nil {
-		if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		updated, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 			if current.ID == "" {
 				return current, false, fmt.Errorf("session %q not found", session.ID)
 			}
 			current.ModelProfile = snapshot
+			current.ModelGeneration++
+			current.CodexThreadID = ""
+			current.LatestCodexTurnID = ""
+			current.ReasoningEffort = effort
+			current.ReasoningEffortSource = effortSource
+			current.PendingModelProfile = modelprofile.Snapshot{}
+			current.PendingModelRequestedAt = time.Time{}
+			current.PendingReasoningEffort = ""
+			current.PendingReasoningSource = ""
 			current.UpdatedAt = now
 			return current, true, nil
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		nextGeneration = updated.ModelGeneration
 	}
 	session.ModelProfile = snapshot
+	session.ModelGeneration = nextGeneration
+	session.CodexThreadID = ""
+	session.ReasoningEffort = effort
+	session.ReasoningEffortSource = effortSource
+	session.PendingModelProfile = modelprofile.Snapshot{}
+	session.PendingModelRequestedAt = time.Time{}
+	session.PendingReasoningEffort = ""
+	session.PendingReasoningSource = ""
 	session.UpdatedAt = now
 	if current := b.reg.SessionByID(session.ID); current != nil {
 		current.ModelProfile = snapshot
+		current.ModelGeneration = session.ModelGeneration
+		current.CodexThreadID = ""
+		current.ReasoningEffort = effort
+		current.ReasoningEffortSource = effortSource
+		current.PendingModelProfile = modelprofile.Snapshot{}
+		current.PendingModelRequestedAt = time.Time{}
+		current.PendingReasoningEffort = ""
+		current.PendingReasoningSource = ""
 		current.UpdatedAt = now
 		b.markRegistryProjectionDirty()
 	}
 	if strings.TrimSpace(b.registryPath) != "" {
-		return b.Save()
+		if err := b.Save(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams registry model projection save skipped for %s: %v\n", session.ID, err)
+		}
 	}
 	return nil
+}
+
+func modelProfileSnapshotsSameRuntime(left, right modelprofile.Snapshot) bool {
+	left.CapturedAt = time.Time{}
+	right.CapturedAt = time.Time{}
+	return modelProfileSnapshotsEqual(left, right)
+}
+
+func (b *Bridge) reasoningEffortForModelSwitch(ctx context.Context, session *Session, snapshot modelprofile.Snapshot) (string, string, string) {
+	current := strings.TrimSpace(session.ReasoningEffort)
+	source := strings.TrimSpace(session.ReasoningEffortSource)
+	wasExplicit := source == reasoningEffortSourceExplicit && current != ""
+	target := *session
+	target.ModelProfile = snapshot
+	target.CodexThreadID = ""
+	catalog, err := reasoningEffortCatalog(ctx, b.executor, &target)
+	options := make([]string, 0, len(catalog.Options))
+	for _, option := range catalog.Options {
+		if value := strings.TrimSpace(option.Effort); value != "" {
+			options = append(options, value)
+		}
+	}
+	defaultEffort := strings.TrimSpace(catalog.DefaultEffort)
+	if err != nil {
+		_ = json.Unmarshal([]byte(snapshot.SupportedReasoningEffortsJSON), &options)
+		defaultEffort = strings.TrimSpace(snapshot.DefaultReasoningEffort)
+	}
+	supported := func(value string) bool {
+		for _, option := range options {
+			if strings.EqualFold(strings.TrimSpace(option), strings.TrimSpace(value)) {
+				return true
+			}
+		}
+		return false
+	}
+	if wasExplicit && (len(options) == 0 || supported(current)) {
+		return current, source, ""
+	}
+	if defaultEffort == "" {
+		if current != "" && (len(options) == 0 || supported(current)) {
+			return current, source, ""
+		}
+		return "", reasoningEffortSourceModelDefault, "Reasoning effort will use the target model default."
+	}
+	notice := ""
+	if wasExplicit && !strings.EqualFold(current, defaultEffort) {
+		notice = "Your explicit reasoning effort `" + current + "` is not supported by the target model; it was reset to `" + defaultEffort + "`."
+	}
+	return defaultEffort, reasoningEffortSourceModelDefault, notice
 }
 
 func (b *Bridge) forkWorkChatWithModelProfile(ctx context.Context, source *Session, ref string) (string, error) {

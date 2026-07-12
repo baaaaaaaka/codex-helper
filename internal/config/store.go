@@ -147,6 +147,9 @@ func (s *Store) loadUnlocked() (Config, error) {
 	}
 
 	var cfg Config
+	if err := validateRawModelConfig(b); err != nil {
+		return Config{}, fmt.Errorf("parse model config: %w", err)
+	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
@@ -170,6 +173,9 @@ func (s *Store) loadUnlocked() (Config, error) {
 			WriterVersion: cfg.Version,
 		}
 	}
+	if err := ValidateModelConfig(cfg); err != nil {
+		return Config{}, fmt.Errorf("validate model config: %w", err)
+	}
 
 	// Migrate legacy write-generation stamps in memory. Newer additive
 	// generations (Version > CurrentVersion) are left as-is and read tolerantly.
@@ -188,6 +194,9 @@ func (s *Store) loadUnlocked() (Config, error) {
 }
 
 func (s *Store) saveUnlocked(cfg Config) error {
+	if err := ValidateModelConfig(cfg); err != nil {
+		return fmt.Errorf("validate model config: %w", err)
+	}
 	// Never let an older binary clobber a newer-generation file: that would
 	// silently drop fields this build does not know about. Fail loudly instead;
 	// the operator/service should upgrade rather than corrupt the config.

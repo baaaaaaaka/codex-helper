@@ -1,6 +1,10 @@
 package responsesadapter
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
+)
 
 type ProviderProfile struct {
 	ID                                     string
@@ -12,6 +16,15 @@ type ProviderProfile struct {
 	ForceParallelToolCalls                 *bool
 	StripSamplingWhenThinking              bool
 	DropNonAutoToolChoice                  bool
+	ReasoningEffortMap                     map[string]string
+	ThinkingMode                           string
+	HistoryPolicy                          string
+	TemperaturePolicy                      string
+	TopPPolicy                             string
+	ValidateToolArguments                  bool
+	ThinkingEnabledRequest                 map[string]any
+	ThinkingDisabledRequest                map[string]any
+	ReasoningResponseField                 string
 }
 
 func ProfileForProvider(provider string) ProviderProfile {
@@ -37,6 +50,9 @@ func ProfileForProvider(provider string) ProviderProfile {
 		profile.ForceParallelToolCalls = &forceParallel
 		profile.StripSamplingWhenThinking = true
 		profile.DropNonAutoToolChoice = true
+	case strings.Contains(id, "glm"):
+		profile.DefaultReasoningEffort = "high"
+		profile.ReasoningEffortMap = map[string]string{"xhigh": "max"}
 	}
 	return profile
 }
@@ -50,21 +66,120 @@ func (p ProviderProfile) withDefaults() ProviderProfile {
 
 func (p ProviderProfile) reasoningEffort(requested string) string {
 	requested = strings.ToLower(strings.TrimSpace(requested))
+	if mapped := strings.ToLower(strings.TrimSpace(p.ReasoningEffortMap[requested])); mapped != "" {
+		return mapped
+	}
 	switch requested {
 	case "xhigh":
 		if strings.Contains(p.ID, "deepseek") {
 			return "max"
 		}
 		return "high"
-	case "none", "minimal":
-		return "low"
-	case "low", "medium", "high":
+	case "none", "minimal", "low", "medium", "high":
 		return requested
 	case "":
 		return p.DefaultReasoningEffort
 	default:
 		return requested
 	}
+}
+
+// WithReasoningOverrides applies model-profile configuration after built-in
+// compatibility defaults. This keeps provider changes out of the binary while
+// retaining safe defaults for well-known adapters.
+func (p ProviderProfile) WithReasoningOverrides(defaultEffort string, effortMap map[string]string) ProviderProfile {
+	if value := strings.ToLower(strings.TrimSpace(defaultEffort)); value != "" {
+		p.DefaultReasoningEffort = value
+	}
+	if len(effortMap) > 0 {
+		p.ReasoningEffortMap = make(map[string]string, len(effortMap))
+		for key, value := range effortMap {
+			key = strings.ToLower(strings.TrimSpace(key))
+			value = strings.ToLower(strings.TrimSpace(value))
+			if key != "" && value != "" {
+				p.ReasoningEffortMap[key] = value
+			}
+		}
+	}
+	return p
+}
+
+func (p ProviderProfile) WithModelPolicies(reasoning config.ModelReasoningPolicy, tools config.ModelToolPolicy, messages config.ModelMessagePolicy, sampling config.ModelSamplingPolicy) ProviderProfile {
+	p.ThinkingEnabledRequest = cloneAnyMap(reasoning.EnabledRequest)
+	p.ThinkingDisabledRequest = cloneAnyMap(reasoning.DisabledRequest)
+	p.ReasoningResponseField = strings.TrimSpace(reasoning.ResponseField)
+	if value := strings.ToLower(strings.TrimSpace(reasoning.ThinkingMode)); value != "" {
+		p.ThinkingMode = value
+		p.EnableThinking = value != "disabled" && value != "provider-default"
+	}
+	if value := strings.ToLower(strings.TrimSpace(reasoning.HistoryPolicy)); value != "" {
+		p.HistoryPolicy = value
+	}
+	if reasoning.StripSamplingWhenEnabled != nil {
+		p.StripSamplingWhenThinking = *reasoning.StripSamplingWhenEnabled
+	}
+	if messages.MergeSystemMessages != nil {
+		p.MergeSystemMessages = *messages.MergeSystemMessages
+	}
+	switch strings.ToLower(strings.TrimSpace(tools.EmptyAssistantContent)) {
+	case "omit":
+		p.OmitEmptyAssistantContentWithToolCalls = true
+	case "empty-string", "preserve":
+		p.OmitEmptyAssistantContentWithToolCalls = false
+	}
+	switch strings.ToLower(strings.TrimSpace(tools.ToolChoice)) {
+	case "auto-only":
+		p.DropNonAutoToolChoice = true
+	case "full":
+		p.DropNonAutoToolChoice = false
+	}
+	switch strings.ToLower(strings.TrimSpace(tools.Parallel)) {
+	case "enabled":
+		value := true
+		p.ForceParallelToolCalls = &value
+	case "disabled":
+		value := false
+		p.ForceParallelToolCalls = &value
+	}
+	if tools.ValidateArguments != nil {
+		p.ValidateToolArguments = *tools.ValidateArguments
+	}
+	p.TemperaturePolicy = strings.ToLower(strings.TrimSpace(sampling.Temperature))
+	p.TopPPolicy = strings.ToLower(strings.TrimSpace(sampling.TopP))
+	return p.WithReasoningOverrides(reasoning.DefaultEffort, reasoning.EffortMap)
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for key, value := range src {
+		out[key] = value
+	}
+	return out
+}
+
+func (p ProviderProfile) thinkingType(model, effort string) string {
+	switch strings.ToLower(strings.TrimSpace(p.ThinkingMode)) {
+	case "disabled":
+		return "disabled"
+	case "always":
+		return "enabled"
+	case "effort-dependent":
+		switch strings.ToLower(strings.TrimSpace(effort)) {
+		case "none", "minimal":
+			return "disabled"
+		default:
+			return "enabled"
+		}
+	case "provider-default":
+		return ""
+	}
+	if p.shouldEnableThinking(model) {
+		return "enabled"
+	}
+	return ""
 }
 
 func (p ProviderProfile) shouldEnableThinking(model string) bool {

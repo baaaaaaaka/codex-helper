@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -47,6 +46,16 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	if err != nil {
 		return codexModelProfileLaunch{}, err
 	}
+	if modelprofile.HasConfiguredThirdPartyModels(cfg) {
+		launch, gatewayErr := ensureLongLivedUnifiedModelGatewayForApp(ctx, store, cfg, resolved, proxyRef, log)
+		if gatewayErr != nil && resolved.IsDefault() {
+			if log != nil {
+				_, _ = fmt.Fprintf(log, "warning: unified App model gateway unavailable; using native Codex provider: %v\n", gatewayErr)
+			}
+			return codexModelProfileLaunch{}, nil
+		}
+		return launch, gatewayErr
+	}
 	if resolved.IsDefault() {
 		return codexModelProfileLaunch{}, nil
 	}
@@ -75,7 +84,7 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "starting a long-lived model adapter for profile %q...\n", resolved.Name)
 	}
-	instanceID, err := startModelProfileAdapterDaemon(ctx, store, resolved, instanceProfileID, listenHost, upstreamProfile)
+	instanceID, err := startModelProfileAdapterDaemon(ctx, store, resolved, instanceProfileID, listenHost, upstreamProfile, false)
 	if err != nil {
 		return codexModelProfileLaunch{}, err
 	}
@@ -85,6 +94,50 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 		return codexModelProfileLaunch{}, err
 	}
 	return modelProfileAdapterLaunchFromInstance(resolved, inst), nil
+}
+
+func ensureLongLivedUnifiedModelGatewayForApp(
+	ctx context.Context,
+	store *config.Store,
+	cfg config.Config,
+	selected modelprofile.Resolved,
+	proxyRef string,
+	log io.Writer,
+) (codexModelProfileLaunch, error) {
+	configured, apiKeys := resolveRoutableConfiguredModels(cfg, store, log)
+	if len(configured) == 0 {
+		if selected.IsDefault() {
+			return codexModelProfileLaunch{}, nil
+		}
+		return codexModelProfileLaunch{}, fmt.Errorf("selected third-party model profile %q is not currently verified and routable", selected.Name)
+	}
+	upstreamProfile, err := unifiedModelUpstreamProxyProfile(cfg, configured, proxyRef)
+	if err != nil {
+		return codexModelProfileLaunch{}, err
+	}
+	listenHost := modelProfileAdapterListenHostForApp()
+	instanceProfileID := unifiedModelProfileAdapterInstanceProfileID(configured, apiKeys, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile))
+	if inst := reusableModelProfileAdapterInstance(cfg.Instances, instanceProfileID); inst != nil {
+		return modelProfileAdapterLaunchFromInstance(selected, *inst), nil
+	}
+	if freshCfg, err := store.Load(); err == nil {
+		if inst := reusableModelProfileAdapterInstance(freshCfg.Instances, instanceProfileID); inst != nil {
+			return modelProfileAdapterLaunchFromInstance(selected, *inst), nil
+		}
+	}
+	if log != nil {
+		_, _ = fmt.Fprintf(log, "starting a long-lived unified model gateway for %d third-party profile(s)...\n", len(configured))
+	}
+	instanceID, err := startModelProfileAdapterDaemon(ctx, store, selected, instanceProfileID, listenHost, upstreamProfile, true)
+	if err != nil {
+		return codexModelProfileLaunch{}, err
+	}
+	inst, err := waitForModelProfileAdapterInstance(ctx, store, instanceProfileID, instanceID, manager.HealthClient{Timeout: time.Second})
+	if err != nil {
+		cleanupModelProfileAdapterStartup(store, instanceID)
+		return codexModelProfileLaunch{}, err
+	}
+	return modelProfileAdapterLaunchFromInstance(selected, inst), nil
 }
 
 func reusableModelProfileAdapterInstance(instances []config.Instance, instanceProfileID string) *config.Instance {
@@ -116,21 +169,50 @@ func findReusableModelProfileAdapterInstance(instances []config.Instance, instan
 }
 
 func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst config.Instance) codexModelProfileLaunch {
+	if inst.ModelUnified {
+		launch := codexModelProfileLaunch{
+			Enabled:      true,
+			Unified:      true,
+			Name:         "unified",
+			ProviderID:   cxpUnifiedCodexModelProviderID,
+			BaseURL:      fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
+			ProxyKey:     inst.ModelProxyKey,
+			Revision:     1,
+			ProviderName: "Unified official and third-party models",
+			EnvKey:       envCXPUnifiedGatewayKey,
+		}
+		if !resolved.IsDefault() {
+			launch.Name = resolved.Name
+			launch.Model = resolved.SelectedPublicModel()
+			launch.DisableHostedWebSearch = resolved.Provider.DisableHostedWebSearch
+			if launch.DisableHostedWebSearch {
+				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+			}
+		}
+		return launch
+	}
 	catalogJSON, _ := modelprofile.CodexModelCatalogJSON(resolved.Provider)
+	webSearchFallbackTOML := []byte(nil)
+	if resolved.Provider.DisableHostedWebSearch {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+	}
 	return codexModelProfileLaunch{
-		Enabled:      true,
-		Name:         resolved.Name,
-		ProviderID:   resolved.Provider.ID,
-		Model:        resolved.SelectedPublicModel(),
-		BaseURL:      fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
-		ProxyKey:     inst.ModelProxyKey,
-		Revision:     resolved.Revision(),
-		ProviderName: resolved.Provider.DisplayName,
-		CatalogJSON:  catalogJSON,
+		Enabled:                true,
+		Name:                   resolved.Name,
+		ProviderID:             resolved.Provider.ID,
+		Model:                  resolved.SelectedPublicModel(),
+		BaseURL:                fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
+		ProxyKey:               inst.ModelProxyKey,
+		Revision:               resolved.Revision(),
+		ProviderName:           resolved.Provider.DisplayName,
+		CatalogJSON:            catalogJSON,
+		WebSearchFallbackTOML:  webSearchFallbackTOML,
+		Direct:                 resolved.Provider.DirectResponses,
+		DisableHostedWebSearch: resolved.Provider.DisableHostedWebSearch,
 	}
 }
 
-func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, resolved modelprofile.Resolved, instanceProfileID string, listenHost string, upstreamProfile *config.Profile) (string, error) {
+func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, resolved modelprofile.Resolved, instanceProfileID string, listenHost string, upstreamProfile *config.Profile, unified bool) (string, error) {
 	instanceID, err := ids.New()
 	if err != nil {
 		return "", err
@@ -151,8 +233,10 @@ func startModelProfileAdapterDaemon(_ context.Context, store *config.Store, reso
 		StartedAt:            now,
 		LastSeenAt:           now,
 		ModelProfileName:     snapshot.Name,
+		ModelUnified:         unified,
 		ModelProvider:        snapshot.Provider,
 		ModelPublicModel:     snapshot.Model,
+		ModelBaseURL:         snapshot.BaseURL,
 		ModelAPIKeyRef:       snapshot.APIKeyRef,
 		ModelSSHProxy:        snapshot.SSHProxy,
 		ModelRevision:        snapshot.Revision,
@@ -271,29 +355,46 @@ func runModelProfileAdapterDaemon(parentCtx context.Context, store *config.Store
 	if inst.Kind != config.InstanceKindModelAdapter {
 		return fmt.Errorf("instance %q is %q, not %q", instanceID, inst.Kind, config.InstanceKindModelAdapter)
 	}
-	snapshot := modelProfileSnapshotFromInstance(inst)
-	resolved, err := modelprofile.ResolveSnapshot(cfg, snapshot)
-	if err != nil {
-		return err
-	}
-	apiKey, err := modelprofile.ResolveAPIKey(
-		resolved.Profile.APIKeyRef,
-		modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path())),
-		os.Getenv,
-	)
-	if err != nil {
-		return err
-	}
 	listenHost := strings.TrimSpace(os.Getenv(envCXPModelProfileAdapterListenHost))
 	if listenHost == "" {
 		listenHost = "127.0.0.1"
 	}
-	upstreamProfile, err := modelProfileUpstreamProxyProfile(cfg, resolved, inst.ModelUpstreamProxyID)
-	if err != nil {
-		return err
-	}
-	if expectedProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile)); inst.ProfileID != expectedProfileID {
-		return fmt.Errorf("model adapter instance profile changed since it was recorded")
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+	var resolved modelprofile.Resolved
+	var apiKey string
+	var configured []modelprofile.Resolved
+	apiKeys := map[string]string{}
+	var upstreamProfile *config.Profile
+	if inst.ModelUnified {
+		configured, apiKeys = resolveRoutableConfiguredModels(cfg, store, os.Stderr)
+		if len(configured) == 0 {
+			return fmt.Errorf("unified model gateway has no currently verified and routable third-party profiles")
+		}
+		upstreamProfile, err = unifiedModelUpstreamProxyProfile(cfg, configured, inst.ModelUpstreamProxyID)
+		if err != nil {
+			return err
+		}
+		expected := unifiedModelProfileAdapterInstanceProfileID(configured, apiKeys, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile))
+		if inst.ProfileID != expected {
+			return fmt.Errorf("unified model gateway instance profile changed since it was recorded")
+		}
+	} else {
+		snapshot := modelProfileSnapshotFromInstance(inst)
+		resolved, err = modelprofile.ResolveSnapshot(cfg, snapshot)
+		if err != nil {
+			return err
+		}
+		apiKey, err = modelprofile.ResolveAPIKey(resolved.Profile.APIKeyRef, secretStore, os.Getenv)
+		if err != nil {
+			return err
+		}
+		upstreamProfile, err = modelProfileUpstreamProxyProfile(cfg, resolved, inst.ModelUpstreamProxyID)
+		if err != nil {
+			return err
+		}
+		if expectedProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile)); inst.ProfileID != expectedProfileID {
+			return fmt.Errorf("model adapter instance profile changed since it was recorded")
+		}
 	}
 	upstreamProxyURL := ""
 	if upstreamProfile != nil {
@@ -312,13 +413,29 @@ func runModelProfileAdapterDaemon(parentCtx context.Context, store *config.Store
 	}
 	defer ln.Close()
 
-	facade, cleanup, err := modelProfileAdapterFacade(resolved, apiKey, inst.ModelProxyKey, upstreamProxyURL, instanceID)
+	var handler http.Handler
+	var cleanup func()
+	if inst.ModelUnified {
+		handler, cleanup, err = newUnifiedModelGateway(unifiedModelGatewayOptions{
+			LocalKey:      inst.ModelProxyKey,
+			CatalogPath:   unifiedModelCatalogPath(store, configured),
+			Providers:     configured,
+			APIKeys:       apiKeys,
+			UpstreamProxy: upstreamProxyURL,
+			Log:           os.Stderr,
+			InstanceID:    instanceID,
+		})
+	} else if resolved.Provider.DirectResponses {
+		handler, cleanup, err = newNativeResponsesCompatibilityProxy(resolved.Provider.BaseURL, apiKey, inst.ModelProxyKey, upstreamProxyURL, os.Stderr)
+	} else {
+		handler, cleanup, err = modelProfileAdapterFacade(resolved, apiKey, inst.ModelProxyKey, upstreamProxyURL, instanceID)
+	}
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	server := &http.Server{Handler: facade}
+	server := &http.Server{Handler: handler}
 	errCh := make(chan error, 1)
 	go func() {
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -373,26 +490,35 @@ func modelProfileAdapterFacade(
 	adapter := responsesadapter.OpenAIChatAdapter{
 		BaseURL: resolved.Provider.BaseURL,
 		APIKey:  apiKey,
-		Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile),
+		Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithReasoningOverrides(
+			resolved.Provider.DefaultReasoningEffort,
+			resolved.Provider.ReasoningEffortMap,
+		).WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy),
+		RetryStatuses:      append([]int(nil), resolved.Model.HTTPPolicy.RetryStatuses...),
+		MaxOutputTokens:    resolved.Model.MaxOutputTokens,
+		Headers:            resolved.Provider.Headers,
+		AuthType:           resolved.Provider.AuthType,
+		AuthHeader:         resolved.Provider.AuthHeader,
+		StreamMode:         resolved.Model.StreamPolicy.UpstreamMode,
+		ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath,
+		CachedTokensPath:   resolved.Model.StreamPolicy.CachedTokensPath,
+		UsageField:         resolved.Model.CachePolicy.UsageField,
 	}
-	if strings.TrimSpace(upstreamProxyURL) != "" {
-		proxyURL, err := url.Parse(upstreamProxyURL)
-		if err != nil {
-			storeCleanup()
-			return nil, nil, fmt.Errorf("parse upstream proxy url: %w", err)
-		}
-		adapter.HTTPClient = responsesadapter.NewUpstreamHTTPClient(http.ProxyURL(proxyURL))
+	if err := configureOpenAIChatAdapterHTTP(&adapter, resolved.Model.HTTPPolicy, resolved.Model.StreamPolicy, upstreamProxyURL, nil); err != nil {
+		storeCleanup()
+		return nil, nil, err
 	}
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,
 		Providers: []responsesadapter.ProviderConfig{{
-			ID:           resolved.Provider.ID,
-			ProfileID:    resolved.Provider.AdapterProfile,
-			BaseURL:      resolved.Provider.BaseURL,
-			APIKey:       apiKey,
-			DefaultModel: resolved.SelectedPublicModel(),
-			Models:       responsesAdapterModelsForProvider(resolved.Provider),
-			Adapter:      adapter,
+			ID:             resolved.Provider.ID,
+			ProfileID:      resolved.Provider.AdapterProfile,
+			BaseURL:        resolved.Provider.BaseURL,
+			APIKey:         apiKey,
+			DefaultModel:   resolved.SelectedPublicModel(),
+			Models:         responsesAdapterModelsForProvider(resolved.Provider),
+			Adapter:        adapter,
+			CustomToolMode: resolved.Model.ToolPolicy.CustomToolMode,
 		}},
 		ProxyKeys: map[string]string{proxyKey: resolved.Provider.ID},
 		KeySalt:   resolved.Name + ":" + strconv.Itoa(resolved.Revision()),
@@ -435,6 +561,45 @@ func modelProfileAdapterInstanceProfileID(resolved modelprofile.Resolved, apiKey
 	return modelProfileAdapterInstancePrefix + hex.EncodeToString(sum[:])[:32]
 }
 
+func unifiedModelProfileAdapterInstanceProfileID(profiles []modelprofile.Resolved, apiKeys map[string]string, listenHost string, upstreamProxyFingerprint string) string {
+	parts := []string{"unified-v1", strings.TrimSpace(listenHost)}
+	for _, profile := range profiles {
+		parts = append(parts,
+			profile.Name,
+			profile.Provider.ID,
+			profile.Provider.BaseURL,
+			profile.SelectedPublicModel(),
+			modelProfileCatalogFingerprint(profile.Provider),
+			strconv.Itoa(profile.Revision()),
+			responsesadapter.KeyFingerprint(apiKeys[profile.Name], "cxp-unified-model-gateway-instance-v1"),
+		)
+	}
+	if upstreamProxyFingerprint = strings.TrimSpace(upstreamProxyFingerprint); upstreamProxyFingerprint != "" {
+		parts = append(parts, "upstream-proxy:"+upstreamProxyFingerprint)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return modelProfileAdapterInstancePrefix + hex.EncodeToString(sum[:])[:32]
+}
+
+func unifiedModelUpstreamProxyProfile(cfg config.Config, profiles []modelprofile.Resolved, fallbackProxyRef string) (*config.Profile, error) {
+	var selected *config.Profile
+	for _, resolved := range profiles {
+		profile, err := modelProfileUpstreamProxyProfile(cfg, resolved, fallbackProxyRef)
+		if err != nil {
+			return nil, err
+		}
+		if profile == nil {
+			continue
+		}
+		if selected != nil && selected.ID != profile.ID {
+			return nil, fmt.Errorf("configured third-party model profiles require different SSH proxies (%q and %q); a unified gateway currently requires one upstream proxy", selected.ID, profile.ID)
+		}
+		copy := *profile
+		selected = &copy
+	}
+	return selected, nil
+}
+
 func modelProfileUpstreamProxyProfile(cfg config.Config, resolved modelprofile.Resolved, fallbackProxyRef string) (*config.Profile, error) {
 	if resolved.SSHProfile != nil {
 		profile := *resolved.SSHProfile
@@ -462,6 +627,7 @@ func modelProfileSnapshotFromInstance(inst config.Instance) modelprofile.Snapsho
 		Name:       inst.ModelProfileName,
 		Provider:   inst.ModelProvider,
 		Model:      inst.ModelPublicModel,
+		BaseURL:    inst.ModelBaseURL,
 		APIKeyRef:  inst.ModelAPIKeyRef,
 		SSHProxy:   inst.ModelSSHProxy,
 		Revision:   inst.ModelRevision,

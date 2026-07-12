@@ -13,6 +13,7 @@ type ProviderRuntime struct {
 	KeyFingerprint string
 	BaseURLHash    string
 	ProfileVersion string
+	CustomToolMode string
 }
 
 type ProviderRouter interface {

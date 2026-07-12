@@ -567,7 +567,11 @@ func runCodexExecFacade(
 		}
 		extraEnv = env.WithProxy(extraEnv, proxyURL)
 	}
-	modelLaunch, cleanup, err := startModelProfileAdapterForCodex(ctx, store, runOptions.ModelProfileRef, runOptions.ModelProfileSnapshot, proxyURL, runOptions.Log)
+	officialAuth := false
+	if shouldProbeCodexLogin(store) {
+		officialAuth = codexLoginStatusProbeFn(ctx, codexPath, extraEnv, runOptions.Log)
+	}
+	modelLaunch, cleanup, err := startModelProfileAdapterForCodex(withCodexLoginProbePath(ctx, codexPath), store, runOptions.ModelProfileRef, runOptions.ModelProfileSnapshot, proxyURL, officialAuth, runOptions.Log)
 	if err != nil {
 		return err
 	}
@@ -577,7 +581,7 @@ func runCodexExecFacade(
 	if modelLaunch.Enabled {
 		args := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
 		options.AppServerArgs = append(options.AppServerArgs, args[1:]...)
-		extraEnv = append(extraEnv, envCXPResponsesProxyKey+"="+modelLaunch.ProxyKey)
+		extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
 	}
 	configureIdentity := func(command *exec.Cmd) error {
 		updated, err := applyExecIdentity(command, command.Env, paths.ExecIdentity)

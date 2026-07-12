@@ -6,19 +6,61 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
 type teamsModelProfileManager struct {
-	root *rootOptions
+	root      *rootOptions
+	codexPath string
 }
 
-func newTeamsModelProfileManager(root *rootOptions) teamsModelProfileManager {
-	return teamsModelProfileManager{root: root}
+var listTeamsOfficialModelsFn = listTeamsOfficialModels
+
+var teamsOfficialModelCache = struct {
+	sync.Mutex
+	byPath map[string]teamsOfficialModelCacheEntry
+}{byPath: map[string]teamsOfficialModelCacheEntry{}}
+
+type teamsOfficialModelCacheEntry struct {
+	models []teamsOfficialModel
+	at     time.Time
+}
+
+const teamsOfficialModelCacheTTL = 30 * time.Minute
+
+func verifyAndStampTeamsModelProfile(ctx context.Context, cfg *config.Config, name string, apiKey string) error {
+	resolved, err := modelprofile.Resolve(*cfg, name)
+	if err != nil {
+		return err
+	}
+	if err := verifyConfiguredModelAuthenticationFn(ctx, resolved, apiKey); err != nil {
+		profile := cfg.ModelProfiles[name]
+		profile.VerificationFingerprint = ""
+		profile.VerifiedAt = time.Time{}
+		profile.VerificationError = compactVerificationError(err, apiKey)
+		cfg.ModelProfiles[name] = profile
+		return err
+	}
+	profile := cfg.ModelProfiles[name]
+	profile.VerifiedAt = time.Now().UTC()
+	profile.VerificationError = ""
+	profile.VerificationFingerprint = modelVerificationFingerprint("", resolved, apiKey)
+	cfg.ModelProfiles[name] = profile
+	return nil
+}
+
+func newTeamsModelProfileManager(root *rootOptions, codexPath ...string) teamsModelProfileManager {
+	path := "codex"
+	if len(codexPath) > 0 && strings.TrimSpace(codexPath[0]) != "" {
+		path = strings.TrimSpace(codexPath[0])
+	}
+	return teamsModelProfileManager{root: root, codexPath: path}
 }
 
 func (m teamsModelProfileManager) store() (*config.Store, error) {
@@ -35,11 +77,191 @@ func (m teamsModelProfileManager) ListModelProfiles(ctx context.Context) (string
 	if err != nil {
 		return "", err
 	}
-	var out bytes.Buffer
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
-	printModelChoices(&out, cfg, secretStore)
-	_ = ctx
-	return strings.TrimSpace(out.String()) + "\n\nUse `model setup <model>` to configure a model, or `model use <model>` for future Work chats.", nil
+	officialReady := codexLoginStatusProbeFn(ctx, m.codexPath, nil, nil)
+	var officialModels []teamsOfficialModel
+	var officialCatalogErr error
+	if officialReady {
+		officialModels, officialCatalogErr = listTeamsOfficialModelsFn(ctx, m.codexPath)
+	}
+	return printTeamsVerifiedModels(cfg, secretStore, officialReady, officialModels, officialCatalogErr) + "\n\nUse `model setup` to discover or verify additional models; only authentication-verified models appear above.", nil
+}
+
+func (m teamsModelProfileManager) ModelProfileRuntimeWarning(_ context.Context, snapshot modelprofile.Snapshot) (string, bool, error) {
+	name := strings.TrimSpace(snapshot.Name)
+	if name == "" || snapshot.IsDefault() {
+		return "", false, nil
+	}
+	store, err := m.store()
+	if err != nil {
+		return "", false, err
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return "", false, err
+	}
+	profile, ok := cfg.FindModelProfile(name)
+	if !ok || strings.TrimSpace(profile.Source) == "" {
+		return "", false, nil
+	}
+	source, ok := findSource(cfg, profile.Source)
+	if !ok || !source.BackupActive || strings.TrimSpace(source.Revision) == "" {
+		return "", false, nil
+	}
+	lines := []string{
+		"⚠️ **Backup JSON configuration is active.**",
+		fmt.Sprintf("Profile `%s` is using last-known-good source `%s` revision `%s` because the latest JSON sync failed.", name, profile.Source, shortModelSourceRevision(source.Revision)),
+	}
+	if attempted := shortModelSourceRevision(source.BackupAttemptedRevision); attempted != "" {
+		lines = append(lines, "Failed revision: `"+attempted+"`.")
+	}
+	if reason := strings.TrimSpace(source.BackupReason); reason != "" {
+		lines = append(lines, "Reason: "+shortenModelProfileWarning(reason, 240))
+	}
+	lines = append(lines, "This warning is shown on every turn until a newer JSON revision syncs and verifies successfully.")
+	return strings.Join(lines, "\n"), true, nil
+}
+
+func shortModelSourceRevision(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
+}
+
+func shortenModelProfileWarning(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if limit > 0 && len(value) > limit {
+		return value[:limit-1] + "…"
+	}
+	return value
+}
+
+type teamsOfficialModel struct {
+	Slug                  string
+	DisplayName           string
+	IsDefault             bool
+	DefaultReasoningLevel string
+}
+
+func listTeamsOfficialModels(ctx context.Context, codexPath string) ([]teamsOfficialModel, error) {
+	cacheKey := strings.TrimSpace(codexPath)
+	teamsOfficialModelCache.Lock()
+	if cached, ok := teamsOfficialModelCache.byPath[cacheKey]; ok && time.Since(cached.at) < teamsOfficialModelCacheTTL {
+		models := append([]teamsOfficialModel(nil), cached.models...)
+		teamsOfficialModelCache.Unlock()
+		return models, nil
+	}
+	teamsOfficialModelCache.Unlock()
+	runner := &codexrunner.AppServerRunner{
+		Starter:       codexrunner.AppServerProcessStarter{},
+		Command:       strings.TrimSpace(codexPath),
+		AppServerArgs: []string{"--analytics-default-enabled"},
+		Timeout:       10 * time.Second,
+	}
+	defer func() { _ = runner.Close() }()
+	listed, err := runner.ListModels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read current-account Codex model/list: %w", err)
+	}
+	models := make([]teamsOfficialModel, 0, len(listed))
+	for _, listedModel := range listed {
+		model := teamsOfficialModel{
+			Slug:                  strings.TrimSpace(firstNonEmptyCLI(listedModel.Model, listedModel.ID)),
+			DisplayName:           strings.TrimSpace(listedModel.DisplayName),
+			IsDefault:             listedModel.IsDefault,
+			DefaultReasoningLevel: strings.TrimSpace(listedModel.DefaultReasoningEffort),
+		}
+		if model.Slug == "" {
+			continue
+		}
+		if model.DisplayName == "" {
+			model.DisplayName = model.Slug
+		}
+		models = append(models, model)
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("current-account Codex model/list contains no selectable models")
+	}
+	teamsOfficialModelCache.Lock()
+	teamsOfficialModelCache.byPath[cacheKey] = teamsOfficialModelCacheEntry{models: append([]teamsOfficialModel(nil), models...), at: time.Now()}
+	teamsOfficialModelCache.Unlock()
+	return models, nil
+}
+
+func teamsOfficialDefaultModel(models []teamsOfficialModel) (teamsOfficialModel, int) {
+	for index, model := range models {
+		if model.IsDefault {
+			return model, index
+		}
+	}
+	if len(models) > 0 {
+		return models[0], 0
+	}
+	return teamsOfficialModel{}, -1
+}
+
+func printTeamsVerifiedModels(cfg config.Config, secrets *modelprofile.SecretStore, officialReady bool, officialModels []teamsOfficialModel, officialCatalogErr error) string {
+	lines := []string{"Verified models"}
+	defaultName := cfg.EffectiveDefaultModelProfile()
+	officialDefault, officialDefaultIndex := teamsOfficialDefaultModel(officialModels)
+	if strings.EqualFold(defaultName, config.DefaultModelProfileName) && officialReady && officialDefaultIndex >= 0 {
+		lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
+	} else if !strings.EqualFold(defaultName, config.DefaultModelProfileName) {
+		if profile, ok := cfg.FindModelProfile(defaultName); ok && modelProfileVerificationCurrent(cfg, defaultName, profile, secrets) {
+			if resolved, err := modelprofile.Resolve(cfg, defaultName); err == nil {
+				lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", resolved.Model.Label(), defaultName))
+			}
+		}
+	}
+	if officialReady {
+		if len(officialModels) > 0 {
+			lines = append(lines, fmt.Sprintf("  official default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
+			lines = append(lines, "", "Official Codex models")
+			for index, model := range officialModels {
+				suffix := ""
+				if index == officialDefaultIndex {
+					suffix = " [official default]"
+				}
+				if model.DefaultReasoningLevel != "" {
+					suffix += " effort=" + model.DefaultReasoningLevel
+				}
+				lines = append(lines, fmt.Sprintf("  - %s (`%s`)%s", model.DisplayName, model.Slug, suffix))
+			}
+		} else {
+			lines = append(lines, fmt.Sprintf("  official default unavailable: %v", officialCatalogErr))
+		}
+	}
+	thirdPartyHeaderAdded := false
+	names := make([]string, 0, len(cfg.ModelProfiles))
+	for name := range cfg.ModelProfiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		profile := cfg.ModelProfiles[name]
+		if !modelProfileVerificationCurrent(cfg, name, profile, secrets) {
+			continue
+		}
+		resolved, err := modelprofile.Resolve(cfg, name)
+		if err != nil || resolved.IsDefault() {
+			continue
+		}
+		marker := " "
+		if strings.EqualFold(defaultName, name) {
+			marker = "*"
+		}
+		if !thirdPartyHeaderAdded {
+			lines = append(lines, "", "Verified third-party profiles")
+			thirdPartyHeaderAdded = true
+		}
+		lines = append(lines, fmt.Sprintf("%s %s: %s (%s)", marker, name, resolved.Model.Label(), resolved.Provider.DisplayName))
+	}
+	if len(lines) == 1 {
+		lines = append(lines, "  none")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m teamsModelProfileManager) ModelProfileProviders(ctx context.Context) (string, error) {
@@ -231,16 +453,30 @@ func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req tea
 		CreatedAt: createdAt,
 		UpdatedAt: now,
 	}
-	if err := store.Update(func(cfg *config.Config) error {
-		cfg.UpsertModelProfile(profileName, profile)
-		if req.SetDefault {
-			cfg.DefaultModelProfile = profileName
+	currentVerification := existed && !modelProfileSetupChanges(existing, choice.ProviderID, choice.PublicModel, apiKeyRef, sshProxy) && modelProfileVerificationCurrent(cfg, profileName, existing, secretStore)
+	if currentVerification {
+		profile.VerifiedAt = existing.VerifiedAt
+		profile.VerificationFingerprint = existing.VerificationFingerprint
+	}
+	cfg.UpsertModelProfile(profileName, profile)
+	if req.SetDefault {
+		cfg.DefaultModelProfile = profileName
+	}
+	if !currentVerification {
+		apiKey, resolveErr := modelprofile.ResolveAPIKey(apiKeyRef, secretStore, nil)
+		if resolveErr != nil {
+			return teams.ModelProfileSetupResult{}, resolveErr
 		}
-		return nil
-	}); err != nil {
+		verifyErr := verifyAndStampTeamsModelProfile(ctx, &cfg, profileName, apiKey)
+		if saveErr := store.Save(cfg); saveErr != nil {
+			return teams.ModelProfileSetupResult{}, saveErr
+		}
+		if verifyErr != nil {
+			return teams.ModelProfileSetupResult{}, fmt.Errorf("model %s authentication verification failed and remains hidden: %w", choice.ID, verifyErr)
+		}
+	} else if err := store.Save(cfg); err != nil {
 		return teams.ModelProfileSetupResult{}, err
 	}
-	_ = ctx
 	return teams.ModelProfileSetupResult{
 		ProfileName:     profileName,
 		Provider:        choice.ProviderID,
@@ -424,16 +660,25 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 		CreatedAt: createdAt,
 		UpdatedAt: now,
 	}
-	if err := store.Update(func(cfg *config.Config) error {
-		cfg.UpsertModelProfile(name, profile)
-		if req.SetDefault {
-			cfg.DefaultModelProfile = name
-		}
-		return nil
-	}); err != nil {
+	currentVerification := existed && !changed && modelProfileVerificationCurrent(cfg, name, existing, secretStore)
+	if currentVerification {
+		profile.VerifiedAt = existing.VerifiedAt
+		profile.VerificationFingerprint = existing.VerificationFingerprint
+	}
+	cfg.UpsertModelProfile(name, profile)
+	if req.SetDefault {
+		cfg.DefaultModelProfile = name
+	}
+	var verifyErr error
+	if !currentVerification {
+		verifyErr = verifyAndStampTeamsModelProfile(ctx, &cfg, name, apiKey)
+	}
+	if err := store.Save(cfg); err != nil {
 		return teams.ModelProfileAPIKeySaveResult{}, err
 	}
-	_ = ctx
+	if verifyErr != nil {
+		return teams.ModelProfileAPIKeySaveResult{}, fmt.Errorf("model profile %q authentication verification failed and remains hidden: %w", name, verifyErr)
+	}
 	return teams.ModelProfileAPIKeySaveResult{
 		ProfileName: name,
 		Provider:    spec.ID,

@@ -1048,6 +1048,11 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				return err
 			}
 			runOnce := func() error {
+				autoSyncCtx, stopModelSourceAutoSync := context.WithCancel(cmd.Context())
+				defer stopModelSourceAutoSync()
+				if !once {
+					go runModelSourceAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
+				}
 				if autoService && !once {
 					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
@@ -1126,8 +1131,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					ControlFallbackExecutor:            controlFallbackExecutor,
 					ControlFallbackModel:               controlFallbackModel,
 					ControlFallbackHelpContext:         teamsControlFallbackHelpContext(),
-					ModelProfileResolver:               newTeamsModelProfileResolver(root),
-					ModelProfileManager:                newTeamsModelProfileManager(root),
+					ModelProfileResolver:               newTeamsModelProfileResolver(root, codexPath),
+					ModelProfileManager:                newTeamsModelProfileManager(root, codexPath),
 					ASRTranscriber:                     asrTranscriber,
 					HelperRestarter:                    restartTeamsHelperFromTeams,
 					HelperPendingRestarter:             restartTeamsHelperFromTeamsAfterPendingReplacement,

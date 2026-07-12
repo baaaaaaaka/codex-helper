@@ -361,7 +361,8 @@ codex-proxy model doctor deepseek
 
 The built-in choices include `default` plus third-party choices such as
 `deepseek`, `mimo`, `kimi`, `glm`, `minimax`, and `qwen`. Third-party choices
-store a model profile locally and run Codex through the local Responses adapter.
+store a model profile locally. OpenAI-compatible chat providers run through
+CXP's local Responses adapter.
 
 Use a saved model profile for one launch without changing the default:
 
@@ -389,6 +390,194 @@ codex-proxy model-profile list
 codex-proxy model-profile doctor work-deepseek
 codex-proxy model-profile set-default work-deepseek
 ```
+
+For a provider that already exposes a Responses-compatible API, use the generic
+`responses-compatible` provider. Keep provider-specific URLs, model ids, and
+credentials in local configuration or environment variables rather than in
+source control:
+
+```bash
+export RESPONSES_BASE_URL=https://api.example.com/v1
+
+codex-proxy model-profile setup private-responses \
+  --provider responses-compatible \
+  --model provider/model-id \
+  --base-url-env RESPONSES_BASE_URL \
+  --api-key-env RESPONSES_API_KEY \
+  --set-default
+
+codex-proxy model-profile doctor private-responses
+codex-proxy run --model-profile private-responses -- codex
+```
+
+For an OpenAI-compatible Chat Completions endpoint, use `chat-compatible`.
+The model id is not compiled into CXP, and reasoning compatibility can be kept
+in the local profile instead of source code:
+
+```bash
+codex-proxy model-profile setup private-chat \
+  --provider chat-compatible \
+  --model provider/future-model \
+  --base-url-env CHAT_BASE_URL \
+  --api-key-env CHAT_API_KEY \
+  --default-reasoning-effort high \
+  --supported-reasoning-efforts low,medium,high,xhigh \
+  --reasoning-effort-map xhigh=max
+```
+
+The same settings are stored as `defaultReasoningEffort`,
+`supportedReasoningEfforts`, and `reasoningEffortMap` in the local CXP JSON
+configuration and can be changed without adding provider-specific details to
+the repository.
+
+For per-model tuning, the local CXP config also supports a versioned four-layer
+schema. A `modelCredentials` entry can be shared by multiple models under one
+provider. `modelProviders` stores protocol, endpoint, credential reference,
+fixed headers, retry, and stream policy. `models` stores limits, capabilities,
+reasoning, tools, messages, sampling, cache, and search policy.
+`modelProfiles` contains only user choices and overrides. Unknown fields,
+dangling references, and contradictory capabilities fail during config load.
+
+HTTP behavior is independently tunable per provider and per model. The
+phase-specific fields avoid treating a slow first token and a stalled SSE body
+as the same failure. An explicit `maxRetries: 0` disables adapter retries;
+omitting it retains the default. `honorRetryAfter` controls whether an upstream
+`Retry-After` header can extend the backoff:
+
+```json
+{
+  "http": {
+    "responseHeaderTimeoutSeconds": 120,
+    "timeoutSeconds": 0,
+    "maxRetries": 1,
+    "retryStatuses": [429, 502, 503, 504, 529],
+    "honorRetryAfter": true,
+    "retryTransportErrors": false,
+    "maxConcurrentRequests": 1
+  },
+  "stream": {
+    "idleTimeoutSeconds": 300,
+    "reasoningDeltaPath": "choices[0].delta.reasoning_content",
+    "cachedTokensPath": "usage.prompt_tokens_details.cached_tokens"
+  },
+  "cache": {"usageField": "prompt_cache_hit_tokens"}
+}
+```
+
+`timeoutSeconds` is the legacy optional whole-request bound; zero or omission
+leaves the total request unbounded while the two phase-specific guards remain
+active. CXP logs when it is waiting for response headers and when it retries an
+upstream request so a slow model is distinguishable from a stalled stream.
+`maxConcurrentRequests` is zero/unlimited by default and can serialize a model
+whose serving deployment stalls under concurrency. The two stream paths accept
+dot, slash, or array-index JSON paths. `cache.usageField` is the fallback cached
+token path when `stream.cachedTokensPath` is omitted. Standard OpenAI fields
+continue to work without any path configuration. Impossible upstream counts
+(for example reasoning tokens greater than all completion tokens) are clamped
+and written to the CXP upstream diagnostic log.
+Set `retryTransportErrors` to false for deployments where a client-side header
+timeout may leave inference running server-side; this prevents one timed-out
+generation from being duplicated by adapter retries. HTTP status retries remain
+controlled independently by `maxRetries` and `retryStatuses`.
+
+`codex-proxy model-profile explain <name>` prints the redacted effective
+configuration and provider/model/catalog fingerprints, so inheritance and
+overrides can be checked before launching Teams, CLI, or App.
+
+Model configuration can also be distributed in Git. Put `cxp-models.json` at
+the repository root by default. It uses the same strict model schema, but
+credentials declare only their names and authentication shape, never an
+`apiKeyRef` or raw key:
+
+```bash
+cxp model-source sync https://github.example/team/models.git
+cxp model-source list
+cxp model-source bind models work-glm --api-key-stdin
+```
+
+The first sync uses a shallow filtered clone and asks for no key. Candidates
+appear only in `model-source list`, not in Codex. `bind` asks only for the
+source, profile, and missing key, then sends one timeout-bounded minimal real
+inference request. A model enters the CXP/Teams model list and the shared Codex
+CLI/App/Teams catalog only after that request succeeds. Failed verification
+keeps the candidate and a short diagnostic while the model remains hidden.
+Git revisions alone do not invalidate verification. If the effective provider,
+model, compatibility policy, or credential binding changes, CXP automatically
+reuses the stored key for a minimal re-verification; unchanged models remain
+available without user action. Only a failed re-verification stays hidden and
+is retried by later syncs. Private repositories use the existing Git credential helper or SSH agent;
+repository URLs with embedded credentials are rejected.
+
+While the long-lived Teams service is running, configured model-source
+repositories are shallow-synced automatically every 30 minutes. The schedule
+is based on each source's persisted `syncedAt`, so restarting the helper does
+not postpone an overdue pull. Git, checkout, schema-validation, or merge
+failures emit a warning and keep the last successfully synced repository and
+configuration active; failures are retried on the next normal interval rather
+than in a tight loop. `teams run --once` never starts the background sync.
+When a previously activated source cannot accept its latest JSON, CXP records
+the last-known-good revision as an active backup. `model-source list` shows the
+state, and every accepted Teams Work-chat turn using one of its profiles carries
+a visible backup-JSON warning until a later sync succeeds. Initial sync failures
+do not claim that a backup exists.
+
+When at least one valid third-party model profile is configured, CXP starts a
+loopback-only unified model gateway. It asks the same Codex binary that will run
+the session for its complete bundled official catalog, appends only currently
+verified and routable third-party models, and atomically writes a reusable
+last-known-good catalog. This local operation does not perform the old
+`model/list` network prewarm or wait for gateway readiness. Codex CLI, App, and
+Teams model pickers can then show and switch
+between official and third-party models in the same launch. Requests are
+routed by an explicit model allowlist. Official authentication is forwarded
+only to the official backend; third-party credentials are forwarded only to
+their configured provider. If no third-party model profile is configured, CXP
+does not start the gateway or inject any provider, catalog, header, or
+environment override, so official-only Codex behavior is unchanged.
+If the unified gateway cannot be prepared while the official default is
+selected—including catalog, proxy, routing, or listener failures—CXP bypasses
+it and keeps Codex on its native official provider instead of letting a
+third-party failure block GPT. The App
+profile inherits user config and credential-store selection while overriding
+only CXP-owned model fields.
+
+CXP probes the effective `CODEX_HOME` and credential store through the official
+`codex login status` command instead of reading `auth.json` directly. When
+logged in, the official GPT catalog keeps its native order and always precedes
+third-party models, including explicit third-party profiles and resumed
+snapshots. When logged out, CXP uses a third-party-only provider with
+`requires_openai_auth=false`, so users who only want third-party models are not
+forced to log in. Official catalog refresh is never a prerequisite for
+third-party inference; an unavailable bundled catalog degrades immediately to
+the verified third-party-only catalog.
+
+Teams `model list` contains only models whose authentication verification is
+still current. After a successful Codex login probe, it reads the account-filtered
+Codex app-server `model/list`, shows every selectable official model in server
+order, and resolves `default` to the concrete model marked `isDefault`. A
+third-party profile requires a successful minimal real inference for that
+specific model, and its verification fingerprint must still match the current
+key and effective model configuration. `model setup` remains the
+separate discovery and key-intake surface. CLI setup, Teams one-time key intake,
+and Git `model-source bind` share the same verification semantics; failed
+profiles remain saved for retry but stay out of the Teams picker.
+
+CXP keeps each upstream key inside the helper and authenticates local gateway
+requests with a separate one-time header.
+The compatibility proxy preserves `prompt_cache_key`, native usage, streaming,
+and response ids while normalizing namespace/custom tools and replay items for
+function-tool-only Responses implementations. It configures Codex with
+`wire_api="responses"`, does not write the upstream key into generated Codex
+config, and does not translate requests through Chat Completions. Hosted web
+search is disabled on the third-party parent model. When that profile needs
+live web information, CXP exposes a local `gpt_search` role backed by
+`gpt-5.6-luna` with high reasoning and live search; Codex delegates only the
+standalone search task and returns the cited result. Profiles that support
+native hosted search are unchanged and do not receive this fallback. The role
+configuration stays in the local model-profile asset directory and contains no
+third-party URL or credential. Local MCP servers and skills remain available.
+Cache usage is reported as input, cached-token count, and hit rate in the
+launch log.
 
 For lower-level experiments or integrations, `responses serve` exposes a local
 `/v1/responses` facade backed by an OpenAI-compatible chat upstream:

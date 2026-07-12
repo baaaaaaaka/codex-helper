@@ -2,6 +2,7 @@ package modelprofile
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,43 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 	}
 }
 
+func TestCodexModelCatalogJSONUsesConfiguredReasoningEfforts(t *testing.T) {
+	provider := ProviderSpec{
+		ID:                        "configured",
+		DisplayName:               "Configured",
+		DefaultModel:              "configured/model",
+		SupportsReason:            true,
+		DefaultReasoningEffort:    "max",
+		SupportedReasoningEfforts: []string{"low", "high", "max"},
+		Models: []ModelSpec{{
+			ID:             "configured/model",
+			SupportsReason: true,
+		}},
+	}
+	raw, err := CodexModelCatalogJSON(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 {
+		t.Fatalf("models = %#v", catalog.Models)
+	}
+	model := catalog.Models[0]
+	if model.DefaultReasoningLevel != "max" {
+		t.Fatalf("default effort = %q, want max", model.DefaultReasoningLevel)
+	}
+	efforts := make([]string, 0, len(model.SupportedReasoningLevels))
+	for _, effort := range model.SupportedReasoningLevels {
+		efforts = append(efforts, effort.Effort)
+	}
+	if want := []string{"low", "high", "max"}; !reflect.DeepEqual(efforts, want) {
+		t.Fatalf("efforts = %#v, want %#v", efforts, want)
+	}
+}
+
 func TestThirdPartyMillionTokenProviderCatalogWindows(t *testing.T) {
 	for _, tc := range []struct {
 		provider string
@@ -121,6 +159,28 @@ func TestProviderSpecDefaultPublicModel(t *testing.T) {
 	}
 	if got, ok := spec.ResolveModel("flash"); !ok || got.PublicID() != "deepseek/deepseek-v4-flash" {
 		t.Fatalf("ResolveModel(flash) = %#v ok=%v", got, ok)
+	}
+}
+
+func TestResponsesCompatibleProviderAcceptsConfiguredModel(t *testing.T) {
+	spec, err := MustLookupProvider("responses-compatible")
+	if err != nil {
+		t.Fatalf("lookup responses-compatible: %v", err)
+	}
+	if !spec.DirectResponses || !spec.AllowsAnyModel || !spec.DisableHostedWebSearch || spec.BaseURL != "" || spec.RecommendedEnv != "RESPONSES_API_KEY" {
+		t.Fatalf("unexpected Responses-compatible provider: %#v", spec)
+	}
+	const modelID = "Example/Reasoning-Model"
+	model, ok := spec.ResolveModel(modelID)
+	if !ok || model.PublicID() != modelID || model.UpstreamModel() != modelID {
+		t.Fatalf("ResolveModel(%q) = %#v, %v", modelID, model, ok)
+	}
+	raw, err := CodexModelCatalogJSON(spec.WithSelectedModel(model))
+	if err != nil {
+		t.Fatalf("CodexModelCatalogJSON: %v", err)
+	}
+	if !strings.Contains(string(raw), `"slug": "`+modelID+`"`) {
+		t.Fatalf("dynamic model missing from catalog:\n%s", raw)
 	}
 }
 

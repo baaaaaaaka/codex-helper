@@ -2,8 +2,10 @@ package cli
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -17,13 +19,18 @@ import (
 )
 
 type modelProfileSetupOptions struct {
-	provider    string
-	model       string
-	apiKeyEnv   string
-	apiKeyStdin bool
-	sshProxy    string
-	setDefault  bool
-	noDoctor    bool
+	provider                  string
+	model                     string
+	baseURL                   string
+	baseURLEnv                string
+	apiKeyEnv                 string
+	apiKeyStdin               bool
+	sshProxy                  string
+	defaultReasoningEffort    string
+	supportedReasoningEfforts []string
+	reasoningEffortMap        map[string]string
+	setDefault                bool
+	noDoctor                  bool
 }
 
 func newModelProfileCmd(root *rootOptions) *cobra.Command {
@@ -35,9 +42,71 @@ func newModelProfileCmd(root *rootOptions) *cobra.Command {
 		newModelProfileSetupCmd(root),
 		newModelProfileListCmd(root),
 		newModelProfileDoctorCmd(root),
+		newModelProfileExplainCmd(root),
 		newModelProfileDeleteCmd(root),
 		newModelProfileSetDefaultCmd(root),
 	)
+	return cmd
+}
+
+func newModelProfileExplainCmd(root *rootOptions) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "explain [name]",
+		Aliases: []string{"config-effective", "effective"},
+		Short:   "Show the resolved, credential-redacted model configuration",
+		Args:    cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ref := ""
+			if len(args) > 0 {
+				ref = args[0]
+			}
+			store, _, err := newRootStore(root, "")
+			if err != nil {
+				return err
+			}
+			cfg, err := store.Load()
+			if err != nil {
+				return err
+			}
+			resolved, err := modelprofile.Resolve(cfg, ref)
+			if err != nil {
+				return err
+			}
+			model := resolved.Model
+			effective := struct {
+				Name               string                      `json:"name"`
+				Provider           string                      `json:"provider"`
+				PublicModel        string                      `json:"publicModel"`
+				UpstreamModel      string                      `json:"upstreamModel"`
+				BaseURLFingerprint string                      `json:"baseUrlFingerprint"`
+				Credential         string                      `json:"credential"`
+				SSHProxy           string                      `json:"sshProxy,omitempty"`
+				Capabilities       map[string]bool             `json:"capabilities"`
+				Limits             config.ModelLimits          `json:"limits"`
+				Reasoning          config.ModelReasoningPolicy `json:"reasoning"`
+				Tools              config.ModelToolPolicy      `json:"tools"`
+				Messages           config.ModelMessagePolicy   `json:"messages"`
+				Sampling           config.ModelSamplingPolicy  `json:"sampling"`
+				Stream             config.ModelStreamPolicy    `json:"stream"`
+				HTTP               config.ModelHTTPPolicy      `json:"http"`
+				Cache              config.ModelCachePolicy     `json:"cache"`
+				Fingerprints       map[string]string           `json:"fingerprints"`
+			}{
+				Name: resolved.Name, Provider: resolved.Provider.ID, PublicModel: model.PublicID(), UpstreamModel: model.UpstreamModel(),
+				BaseURLFingerprint: modelprofile.BaseURLHash(resolved.Provider.BaseURL), Credential: modelprofile.MaskRef(resolved.Profile.APIKeyRef), SSHProxy: resolved.Profile.SSHProxy,
+				Capabilities: map[string]bool{"tools": model.SupportsTools, "vision": model.SupportsVision, "reasoning": model.SupportsReason, "nativeWebSearch": model.SupportsSearch},
+				Limits:       config.ModelLimits{ContextWindow: model.ContextWindow, MaxContextWindow: model.MaxContextWindow, MaxOutputTokens: model.MaxOutputTokens, EffectiveContextPercent: model.EffectiveContextPercent},
+				Reasoning:    model.ReasoningPolicy, Tools: model.ToolPolicy, Messages: model.MessagePolicy, Sampling: model.SamplingPolicy, Stream: model.StreamPolicy, HTTP: model.HTTPPolicy, Cache: model.CachePolicy,
+				Fingerprints: map[string]string{"model": modelprofile.ModelFingerprint(resolved.Provider, model.PublicID()), "catalog": modelprofile.CatalogFingerprint(resolved.Provider)},
+			}
+			raw, err := json.MarshalIndent(effective, "", "  ")
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(raw))
+			return err
+		},
+	}
 	return cmd
 }
 
@@ -55,11 +124,16 @@ func newModelProfileSetupCmd(root *rootOptions) *cobra.Command {
 			return runModelProfileSetup(cmd, root, name, opts)
 		},
 	}
-	cmd.Flags().StringVar(&opts.provider, "provider", "", "Model provider: default, deepseek, mimo, kimi, glm, minimax, qwen")
+	cmd.Flags().StringVar(&opts.provider, "provider", "", "Model provider: default, deepseek, mimo, kimi, glm, minimax, qwen, responses-compatible, chat-compatible")
 	cmd.Flags().StringVar(&opts.model, "model", "", "Provider model to use by default, for example pro or deepseek/deepseek-v4-pro")
+	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "Base URL for a configurable provider")
+	cmd.Flags().StringVar(&opts.baseURLEnv, "base-url-env", "", "Environment variable containing the configurable provider base URL")
 	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the provider API key")
 	cmd.Flags().BoolVar(&opts.apiKeyStdin, "api-key-stdin", false, "Read the provider API key from stdin and save it to the local secret store")
 	cmd.Flags().StringVar(&opts.sshProxy, "ssh-proxy", "", "SSH proxy profile id or name to use for this model profile")
+	cmd.Flags().StringVar(&opts.defaultReasoningEffort, "default-reasoning-effort", "", "Default upstream reasoning effort for this profile")
+	cmd.Flags().StringSliceVar(&opts.supportedReasoningEfforts, "supported-reasoning-efforts", nil, "Codex-visible reasoning efforts for this profile, for example low,medium,high,xhigh")
+	cmd.Flags().StringToStringVar(&opts.reasoningEffortMap, "reasoning-effort-map", nil, "Map Codex efforts to upstream values, for example xhigh=max")
 	cmd.Flags().BoolVar(&opts.setDefault, "set-default", false, "Make this the default model profile")
 	cmd.Flags().BoolVar(&opts.noDoctor, "no-doctor", false, "Skip static profile validation after saving")
 	return cmd
@@ -201,6 +275,13 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 		return fmt.Errorf("the built-in default model profile must use provider %q", modelprofile.DefaultProvider)
 	}
 	existing, existed := cfg.FindModelProfile(name)
+	baseURL, err := modelProfileBaseURL(spec, existing, opts)
+	if err != nil {
+		return err
+	}
+	if baseURL != "" {
+		spec.BaseURL = baseURL
+	}
 	modelRef := strings.TrimSpace(opts.model)
 	if modelRef == "" && strings.TrimSpace(existing.Model) != "" && strings.EqualFold(existing.Provider, spec.ID) {
 		modelRef = existing.Model
@@ -211,6 +292,9 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 			_, _ = fmt.Fprintf(os.Stderr, "- %s (%s)%s\n", model.PublicID(), model.Label(), modelAliasSummary(model))
 		}
 		modelRef = prompt(reader, "Model", spec.DefaultPublicModel())
+	}
+	if spec.AllowsAnyModel && modelRef == "" {
+		return fmt.Errorf("provider %q requires --model", spec.ID)
 	}
 	selectedModel, err := spec.MustResolveModel(modelRef)
 	if spec.UsesAdapter && err != nil {
@@ -265,7 +349,8 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 	revision := existing.Revision
 	if revision <= 0 {
 		revision = 1
-	} else if modelProfileSetupChanges(existing, spec.ID, modelID, apiKeyRef, sshProxy) {
+	} else if modelProfileSetupChanges(existing, spec.ID, modelID, apiKeyRef, sshProxy, baseURL) ||
+		reasoningEffortConfigChanges(existing, opts.defaultReasoningEffort, opts.supportedReasoningEfforts, opts.reasoningEffortMap) {
 		revision++
 	}
 	createdAt := existing.CreatedAt
@@ -276,13 +361,17 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 		apiKeyRef = existing.APIKeyRef
 	}
 	profile := config.ModelProfile{
-		Provider:  spec.ID,
-		Model:     modelID,
-		APIKeyRef: apiKeyRef,
-		SSHProxy:  sshProxy,
-		Revision:  revision,
-		CreatedAt: createdAt,
-		UpdatedAt: now,
+		Provider:                  spec.ID,
+		Model:                     modelID,
+		BaseURL:                   baseURL,
+		APIKeyRef:                 apiKeyRef,
+		SSHProxy:                  sshProxy,
+		DefaultReasoningEffort:    firstNonEmptyCLI(strings.TrimSpace(opts.defaultReasoningEffort), existing.DefaultReasoningEffort),
+		SupportedReasoningEfforts: mergeReasoningEffortList(existing.SupportedReasoningEfforts, opts.supportedReasoningEfforts),
+		ReasoningEffortMap:        mergeReasoningEffortMap(existing.ReasoningEffortMap, opts.reasoningEffortMap),
+		Revision:                  revision,
+		CreatedAt:                 createdAt,
+		UpdatedAt:                 now,
 	}
 
 	if strings.EqualFold(name, config.DefaultModelProfileName) {
@@ -302,8 +391,8 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 	if existed {
 		action = "Updated"
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s model profile %q (provider=%s, model=%s, api_key=%s, ssh_proxy=%s, revision=%d)\n",
-		action, name, spec.ID, emptyAsNone(profile.Model), modelprofile.MaskRef(profile.APIKeyRef), emptyAsNone(profile.SSHProxy), profile.Revision)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s model profile %q (provider=%s, model=%s, base_url=%s, api_key=%s, ssh_proxy=%s, revision=%d)\n",
+		action, name, spec.ID, emptyAsNone(profile.Model), configuredAsStatus(profile.BaseURL), modelprofile.MaskRef(profile.APIKeyRef), emptyAsNone(profile.SSHProxy), profile.Revision)
 	if !opts.noDoctor {
 		return runModelProfileDoctor(cmd.OutOrStdout(), store, name)
 	}
@@ -324,6 +413,10 @@ func runModelProfileDoctor(out io.Writer, store *config.Store, name string) erro
 		_, _ = fmt.Fprintf(out, "OK  provider %s\n", resolved.Provider.ID)
 		if resolved.Provider.UsesAdapter {
 			_, _ = fmt.Fprintf(out, "OK  model %s\n", resolved.SelectedPublicModel())
+			_, _ = fmt.Fprintf(out, "OK  base URL configured fingerprint=%s\n", modelprofile.BaseURLHash(resolved.Provider.BaseURL))
+			if resolved.Provider.DisableHostedWebSearch {
+				_, _ = fmt.Fprintf(out, "OK  web search fallback %s reasoning=high mode=live\n", codexWebSearchFallbackModel)
+			}
 		}
 	}
 	if resolved.Provider.UsesAdapter {
@@ -369,8 +462,8 @@ func printModelProfiles(out io.Writer, cfg config.Config) {
 				model = spec.DefaultPublicModel()
 			}
 		}
-		_, _ = fmt.Fprintf(out, "%s %s: provider=%s model=%s api_key=%s ssh_proxy=%s revision=%d\n",
-			marker, name, provider, emptyAsNone(model), modelprofile.MaskRef(p.APIKeyRef), emptyAsNone(p.SSHProxy), maxInt(p.Revision, 1))
+		_, _ = fmt.Fprintf(out, "%s %s: provider=%s model=%s base_url=%s api_key=%s ssh_proxy=%s revision=%d\n",
+			marker, name, provider, emptyAsNone(model), configuredAsStatus(p.BaseURL), modelprofile.MaskRef(p.APIKeyRef), emptyAsNone(p.SSHProxy), maxInt(p.Revision, 1))
 	}
 	printOne(config.DefaultModelProfileName, config.ModelProfile{Provider: modelprofile.DefaultProvider, Revision: 1})
 	names := make([]string, 0, len(cfg.ModelProfiles))
@@ -396,14 +489,119 @@ func findModelProfileForCLI(cfg config.Config, ref string) (string, config.Model
 	return "", config.ModelProfile{}, false
 }
 
-func modelProfileSetupChanges(existing config.ModelProfile, provider string, model string, apiKeyRef string, sshProxy string) bool {
+func modelProfileSetupChanges(existing config.ModelProfile, provider string, model string, apiKeyRef string, sshProxy string, baseURLs ...string) bool {
 	if strings.TrimSpace(apiKeyRef) == "" {
 		apiKeyRef = existing.APIKeyRef
 	}
-	return strings.TrimSpace(existing.Provider) != strings.TrimSpace(provider) ||
+	changed := strings.TrimSpace(existing.Provider) != strings.TrimSpace(provider) ||
 		strings.TrimSpace(existing.Model) != strings.TrimSpace(model) ||
 		strings.TrimSpace(existing.APIKeyRef) != strings.TrimSpace(apiKeyRef) ||
 		strings.TrimSpace(existing.SSHProxy) != strings.TrimSpace(sshProxy)
+	if len(baseURLs) > 0 {
+		changed = changed || strings.TrimSpace(existing.BaseURL) != strings.TrimSpace(baseURLs[0])
+	}
+	return changed
+}
+
+func modelProfileBaseURL(spec modelprofile.ProviderSpec, existing config.ModelProfile, opts modelProfileSetupOptions) (string, error) {
+	literal := strings.TrimSpace(opts.baseURL)
+	envName := strings.TrimSpace(opts.baseURLEnv)
+	if literal != "" && envName != "" {
+		return "", fmt.Errorf("pass only one of --base-url or --base-url-env")
+	}
+	if (literal != "" || envName != "") && !spec.AllowsAnyModel {
+		return "", fmt.Errorf("provider %q does not accept a configurable base URL", spec.ID)
+	}
+	baseURL := literal
+	if envName != "" {
+		baseURL = strings.TrimSpace(os.Getenv(envName))
+		if baseURL == "" {
+			return "", fmt.Errorf("base URL environment variable %q is empty", envName)
+		}
+	}
+	if baseURL == "" && strings.EqualFold(existing.Provider, spec.ID) {
+		baseURL = strings.TrimSpace(existing.BaseURL)
+	}
+	if !spec.AllowsAnyModel {
+		return "", nil
+	}
+	if baseURL == "" {
+		return "", fmt.Errorf("provider %q requires --base-url or --base-url-env", spec.ID)
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "", fmt.Errorf("provider %q requires an absolute http(s) base URL", spec.ID)
+	}
+	return strings.TrimRight(baseURL, "/"), nil
+}
+
+func mergeReasoningEffortMap(existing, override map[string]string) map[string]string {
+	if len(override) == 0 {
+		return existing
+	}
+	out := make(map[string]string, len(override))
+	for key, value := range override {
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.ToLower(strings.TrimSpace(value))
+		if key != "" && value != "" {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func reasoningEffortConfigChanges(existing config.ModelProfile, defaultEffort string, supportedEfforts []string, effortMap map[string]string) bool {
+	if value := strings.TrimSpace(defaultEffort); value != "" && !strings.EqualFold(value, existing.DefaultReasoningEffort) {
+		return true
+	}
+	if len(supportedEfforts) > 0 {
+		merged := mergeReasoningEffortList(nil, supportedEfforts)
+		if len(merged) != len(existing.SupportedReasoningEfforts) {
+			return true
+		}
+		for i := range merged {
+			if !strings.EqualFold(merged[i], existing.SupportedReasoningEfforts[i]) {
+				return true
+			}
+		}
+	}
+	if len(effortMap) == 0 {
+		return false
+	}
+	merged := mergeReasoningEffortMap(nil, effortMap)
+	if len(merged) != len(existing.ReasoningEffortMap) {
+		return true
+	}
+	for key, value := range merged {
+		if !strings.EqualFold(value, existing.ReasoningEffortMap[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeReasoningEffortList(existing, override []string) []string {
+	if len(override) == 0 {
+		return existing
+	}
+	out := make([]string, 0, len(override))
+	seen := map[string]bool{}
+	for _, value := range override {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func configuredAsStatus(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "none"
+	}
+	return "configured"
 }
 
 func modelAliasSummary(model modelprofile.ModelSpec) string {

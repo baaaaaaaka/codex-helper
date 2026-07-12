@@ -825,6 +825,7 @@ func (r *AppServerRunner) backfillTurnResult(ctx context.Context, result *TurnRe
 }
 
 func (r *AppServerRunner) readTurnNotificationsUntilTerminal(ctx context.Context, subscription *appServerTurnSubscriber, result *TurnResult, handler EventHandler) error {
+	seenCompletedItems := map[string]struct{}{}
 	for !isTerminalTurnStatus(result.Status) {
 		line, err := r.readTurnNotification(ctx, subscription)
 		if err != nil {
@@ -836,9 +837,27 @@ func (r *AppServerRunner) readTurnNotificationsUntilTerminal(ctx context.Context
 		if subscription.turnID == "" && result.TurnID != "" {
 			r.setTurnSubscriptionID(subscription, result.TurnID)
 		}
-		emitAppServerStreamEvent(handler, line)
+		emitAppServerStreamEventDeduplicated(handler, line, seenCompletedItems)
 	}
 	return nil
+}
+
+func emitAppServerStreamEventDeduplicated(handler EventHandler, line []byte, seen map[string]struct{}) {
+	if handler == nil {
+		return
+	}
+	event, ok := appServerNotificationStreamEvent(line)
+	if !ok {
+		return
+	}
+	if event.Kind == StreamEventAgentMessage && strings.TrimSpace(event.ItemID) != "" {
+		key := event.TurnID + "\x00" + event.ItemID
+		if _, duplicate := seen[key]; duplicate {
+			return
+		}
+		seen[key] = struct{}{}
+	}
+	handler(event)
 }
 
 func (r *AppServerRunner) request(ctx context.Context, method string, params any) (json.RawMessage, error) {

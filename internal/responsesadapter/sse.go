@@ -10,14 +10,19 @@ import (
 )
 
 type responseObject struct {
-	ID                 string       `json:"id"`
-	Object             string       `json:"object"`
-	Status             string       `json:"status"`
-	Model              string       `json:"model"`
-	PreviousResponseID string       `json:"previous_response_id,omitempty"`
-	Output             []outputItem `json:"output"`
-	OutputText         string       `json:"output_text,omitempty"`
-	Usage              *Usage       `json:"usage,omitempty"`
+	ID                 string             `json:"id"`
+	Object             string             `json:"object"`
+	Status             string             `json:"status"`
+	Model              string             `json:"model"`
+	PreviousResponseID string             `json:"previous_response_id,omitempty"`
+	Output             []outputItem       `json:"output"`
+	OutputText         string             `json:"output_text,omitempty"`
+	Usage              *Usage             `json:"usage,omitempty"`
+	IncompleteDetails  *incompleteDetails `json:"incomplete_details,omitempty"`
+}
+
+type incompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 type outputItem struct {
@@ -28,6 +33,7 @@ type outputItem struct {
 	CallID           string             `json:"call_id,omitempty"`
 	Name             string             `json:"name,omitempty"`
 	Arguments        string             `json:"arguments,omitempty"`
+	Input            string             `json:"input,omitempty"`
 	Summary          []reasoningSummary `json:"summary,omitempty"`
 	EncryptedContent string             `json:"encrypted_content,omitempty"`
 	Content          []contentPart      `json:"content,omitempty"`
@@ -77,6 +83,13 @@ func (i outputItem) MarshalJSON() ([]byte, error) {
 		item["call_id"] = i.CallID
 		item["name"] = i.Name
 		item["arguments"] = i.Arguments
+	case "custom_tool_call":
+		if i.Status != "" {
+			item["status"] = i.Status
+		}
+		item["call_id"] = i.CallID
+		item["name"] = i.Name
+		item["input"] = i.Input
 	default:
 		if i.Role != "" {
 			item["role"] = i.Role
@@ -112,8 +125,14 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 		writeJSON(w, http.StatusBadGateway, errorBody("provider stream ended before completion"))
 		return
 	}
+	result.toolCalls = markProviderToolCallTypes(result.toolCalls, providerReq.Tools)
 	visibleToolCalls := f.prepareProviderToolCalls(result.toolCalls)
 	response := buildResponseObject(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, visibleToolCalls)
+	status := ResponseStatusCompleted
+	if isLengthFinishReason(result.finishReason) {
+		status = ResponseStatusIncomplete
+		markResponseIncomplete(&response)
+	}
 	if f.Store != nil {
 		if err := f.Store.Store(ResponseRecord{
 			ID:                 responseID,
@@ -124,7 +143,7 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 			OutputText:         result.text,
 			ReasoningText:      result.reasoningText,
 			ToolCalls:          result.toolCalls,
-			Status:             ResponseStatusCompleted,
+			Status:             status,
 			Model:              req.Model,
 			Usage:              result.usage,
 		}); err != nil {
@@ -163,6 +182,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	startedReasoningItem := false
 	reasoningOutputIndex := -1
 	var usage *Usage
+	finishReason := ""
 	toolCalls := newToolCallAccumulator(responseID)
 	created := buildResponseObject(responseID, req, req.Model, "", 0, "", -1, nil, nil)
 	created.Status = string(ResponseStatusInProgress)
@@ -195,14 +215,22 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	}
 
 	emitToolCallAdded := func(call *toolCallState) {
+		record := call.record("in_progress")
+		record.Type = providerToolSourceType(record.Name, providerReq.Tools)
 		writeEvent("response.output_item.added", map[string]any{
 			"output_index": call.OutputIndex,
-			"item":         buildToolCallItem(call.record("in_progress")),
+			"item":         buildToolCallItem(record),
 		})
 	}
 
 	emitToolCallDelta := func(call *toolCallState, delta string) {
 		if delta == "" {
+			return
+		}
+		if providerToolSourceType(call.Name, providerReq.Tools) == "custom" {
+			// Chat providers stream a JSON wrapper ({"input":"..."}) while the
+			// Responses custom-tool delta contract expects raw freeform input.
+			// Emit the decoded input on item.done instead of leaking JSON fragments.
 			return
 		}
 		writeEvent("response.function_call_arguments.delta", map[string]any{
@@ -266,6 +294,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				emitFailure(msg)
 				return
 			case ProviderEventDone:
+				finishReason = event.FinishReason
 				if err := toolCalls.validateComplete(); err != nil {
 					emitFailure(err.Error())
 					return
@@ -273,7 +302,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				if !startedMessageItem && toolCalls.len() == 0 && !startedReasoningItem {
 					ensureMessageItem()
 				}
-				records := toolCalls.records()
+				records := markProviderToolCallTypes(toolCalls.records(), providerReq.Tools)
 				visibleRecords := f.prepareProviderToolCalls(records)
 				for _, doneItem := range buildDoneItems(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, visibleRecords, startedMessageItem, startedReasoningItem) {
 					writeEvent("response.output_item.done", map[string]any{
@@ -282,6 +311,13 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 					})
 				}
 				response := buildResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, visibleRecords)
+				status := ResponseStatusCompleted
+				terminalEvent := "response.completed"
+				if isLengthFinishReason(finishReason) {
+					status = ResponseStatusIncomplete
+					terminalEvent = "response.incomplete"
+					markResponseIncomplete(&response)
+				}
 				if f.Store != nil {
 					if err := f.Store.Store(ResponseRecord{
 						ID:                 responseID,
@@ -292,7 +328,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 						OutputText:         text,
 						ReasoningText:      reasoning,
 						ToolCalls:          records,
-						Status:             ResponseStatusCompleted,
+						Status:             status,
 						Model:              req.Model,
 						Usage:              usage,
 					}); err != nil {
@@ -300,7 +336,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 						return
 					}
 				}
-				writeEvent("response.completed", map[string]any{"response": response})
+				writeEvent(terminalEvent, map[string]any{"response": response})
 				return
 			}
 		}
@@ -314,6 +350,7 @@ type providerResult struct {
 	reasoningOutputIndex int
 	usage                *Usage
 	toolCalls            []ToolCallRecord
+	finishReason         string
 }
 
 func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan ProviderEvent) (providerResult, bool) {
@@ -358,10 +395,23 @@ func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan Provid
 					return providerResult{}, false
 				}
 				result.toolCalls = toolCalls.records()
+				result.finishReason = event.FinishReason
 				return result, true
 			}
 		}
 	}
+}
+
+func isLengthFinishReason(reason string) bool {
+	return strings.EqualFold(strings.TrimSpace(reason), "length")
+}
+
+func markResponseIncomplete(response *responseObject) {
+	if response == nil {
+		return
+	}
+	response.Status = string(ResponseStatusIncomplete)
+	response.IncompleteDetails = &incompleteDetails{Reason: "max_output_tokens"}
 }
 
 func buildResponseObject(responseID string, req ResponsesRequest, model string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, usage *Usage, toolCalls []ToolCallRecord) responseObject {
@@ -450,6 +500,12 @@ func reasoningItemID(responseID string) string {
 }
 
 func buildToolCallItem(call ToolCallRecord) outputItem {
+	if call.Type == "custom" {
+		return outputItem{
+			ID: call.ItemID, Type: "custom_tool_call", Status: firstNonEmpty(call.Status, "completed"),
+			CallID: call.ID, Name: call.Name, Input: customToolInput(call.Arguments),
+		}
+	}
 	return outputItem{
 		ID:        call.ItemID,
 		Type:      "function_call",
@@ -458,6 +514,16 @@ func buildToolCallItem(call ToolCallRecord) outputItem {
 		Name:      call.Name,
 		Arguments: call.Arguments,
 	}
+}
+
+func customToolInput(arguments string) string {
+	var payload struct {
+		Input string `json:"input"`
+	}
+	if json.Unmarshal([]byte(arguments), &payload) == nil && payload.Input != "" {
+		return payload.Input
+	}
+	return arguments
 }
 
 type doneItem struct {

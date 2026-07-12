@@ -17,11 +17,18 @@ var (
 )
 
 func NewUpstreamHTTPClient(proxy func(*http.Request) (*url.URL, error)) *http.Client {
+	return NewUpstreamHTTPClientWithResponseHeaderTimeout(proxy, 0)
+}
+
+func NewUpstreamHTTPClientWithResponseHeaderTimeout(proxy func(*http.Request) (*url.URL, error), responseHeaderTimeout time.Duration) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = proxy
 	tr.DialContext = (&net.Dialer{Timeout: upstreamHTTPDialTimeout, KeepAlive: 30 * time.Second}).DialContext
 	tr.TLSHandshakeTimeout = upstreamHTTPTLSHandshakeTimeout
-	tr.ResponseHeaderTimeout = upstreamHTTPResponseHeaderTimeout
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = upstreamHTTPResponseHeaderTimeout
+	}
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
 	tr.ExpectContinueTimeout = upstreamHTTPExpectContinueTimeout
 	tr.IdleConnTimeout = upstreamHTTPIdleConnTimeout
 	return &http.Client{Transport: tr}

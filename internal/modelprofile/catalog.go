@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 const DefaultProvider = "default"
@@ -11,33 +13,53 @@ const DefaultProvider = "default"
 const millionTokenContextWindow = 1000000
 
 type ProviderSpec struct {
-	ID              string
-	DisplayName     string
-	DefaultModel    string
-	CredentialScope string
-	Models          []ModelSpec
-	BaseURL         string
-	AdapterProfile  string
-	RecommendedEnv  string
-	UsesAdapter     bool
-	SupportsTools   bool
-	SupportsVision  bool
-	SupportsReason  bool
+	ID                        string
+	DisplayName               string
+	DefaultModel              string
+	CredentialScope           string
+	Models                    []ModelSpec
+	BaseURL                   string
+	AdapterProfile            string
+	RecommendedEnv            string
+	UsesAdapter               bool
+	DirectResponses           bool
+	AllowsAnyModel            bool
+	DisableHostedWebSearch    bool
+	SupportsTools             bool
+	SupportsVision            bool
+	SupportsReason            bool
+	DefaultReasoningEffort    string
+	SupportedReasoningEfforts []string
+	ReasoningEffortMap        map[string]string
+	HTTP                      config.ModelHTTPPolicy
+	Stream                    config.ModelStreamPolicy
+	Headers                   map[string]string
+	AuthType                  string
+	AuthHeader                string
 }
 
 type ModelSpec struct {
-	ID               string
-	UpstreamID       string
-	DisplayName      string
-	Description      string
-	Aliases          []string
-	ContextWindow    int
-	MaxContextWindow int
-	SupportsTools    bool
-	SupportsVision   bool
-	SupportsReason   bool
-	SupportsSearch   bool
-	Priority         int
+	ID                      string
+	UpstreamID              string
+	DisplayName             string
+	Description             string
+	Aliases                 []string
+	ContextWindow           int
+	MaxContextWindow        int
+	SupportsTools           bool
+	SupportsVision          bool
+	SupportsReason          bool
+	SupportsSearch          bool
+	Priority                int
+	MaxOutputTokens         int
+	EffectiveContextPercent int
+	ReasoningPolicy         config.ModelReasoningPolicy
+	ToolPolicy              config.ModelToolPolicy
+	MessagePolicy           config.ModelMessagePolicy
+	SamplingPolicy          config.ModelSamplingPolicy
+	StreamPolicy            config.ModelStreamPolicy
+	HTTPPolicy              config.ModelHTTPPolicy
+	CachePolicy             config.ModelCachePolicy
 }
 
 type ModelChoice struct {
@@ -133,10 +155,14 @@ func (p ProviderSpec) DefaultPublicModel() string {
 
 func (p ProviderSpec) ResolveModel(ref string) (ModelSpec, bool) {
 	models := p.ModelCatalog()
+	rawRef := strings.TrimSpace(ref)
+	ref = strings.ToLower(rawRef)
 	if len(models) == 0 {
+		if p.AllowsAnyModel && ref != "" {
+			return p.dynamicModel(rawRef), true
+		}
 		return ModelSpec{}, false
 	}
-	ref = strings.ToLower(strings.TrimSpace(ref))
 	if ref == "" {
 		ref = strings.ToLower(strings.TrimSpace(p.DefaultModel))
 	}
@@ -160,7 +186,39 @@ func (p ProviderSpec) ResolveModel(ref string) (ModelSpec, bool) {
 	if matched != nil {
 		return *matched, true
 	}
+	if p.AllowsAnyModel && ref != "" {
+		return p.dynamicModel(rawRef), true
+	}
 	return ModelSpec{}, false
+}
+
+func (p ProviderSpec) dynamicModel(ref string) ModelSpec {
+	return ModelSpec{
+		ID:               ref,
+		UpstreamID:       ref,
+		DisplayName:      ref,
+		Description:      p.DisplayName + " model selected from the configured provider",
+		ContextWindow:    128000,
+		MaxContextWindow: 128000,
+		SupportsTools:    p.SupportsTools,
+		SupportsVision:   p.SupportsVision,
+		SupportsReason:   p.SupportsReason,
+	}
+}
+
+// WithSelectedModel ensures a dynamically selected provider model is present in
+// the generated Codex catalog while leaving the reviewed static entries intact.
+func (p ProviderSpec) WithSelectedModel(model ModelSpec) ProviderSpec {
+	if model.PublicID() == "" {
+		return p
+	}
+	for _, existing := range p.ModelCatalog() {
+		if strings.EqualFold(existing.PublicID(), model.PublicID()) {
+			return p
+		}
+	}
+	p.Models = append(append([]ModelSpec(nil), p.Models...), model)
+	return p
 }
 
 func (p ProviderSpec) FamilyCredentialScope() string {
@@ -417,8 +475,9 @@ func modelAliases(providerID string, model ModelSpec) []string {
 
 var providerCatalog = map[string]ProviderSpec{
 	DefaultProvider: {
-		ID:          DefaultProvider,
-		DisplayName: "Codex official API",
+		ID:             DefaultProvider,
+		DisplayName:    "Codex official API",
+		AllowsAnyModel: true,
 	},
 	"deepseek": {
 		ID:              "deepseek",
@@ -534,6 +593,31 @@ var providerCatalog = map[string]ProviderSpec{
 		SupportsTools:  true,
 		SupportsVision: true,
 	},
+	"responses-compatible": {
+		ID:                     "responses-compatible",
+		DisplayName:            "Responses-compatible provider",
+		CredentialScope:        "responses-compatible",
+		AdapterProfile:         "openai-responses",
+		RecommendedEnv:         "RESPONSES_API_KEY",
+		UsesAdapter:            true,
+		DirectResponses:        true,
+		AllowsAnyModel:         true,
+		DisableHostedWebSearch: true,
+		SupportsTools:          true,
+		SupportsReason:         true,
+	},
+	"chat-compatible": {
+		ID:                     "chat-compatible",
+		DisplayName:            "Chat Completions-compatible provider",
+		CredentialScope:        "chat-compatible",
+		AdapterProfile:         "openai-chat",
+		RecommendedEnv:         "CHAT_API_KEY",
+		UsesAdapter:            true,
+		AllowsAnyModel:         true,
+		DisableHostedWebSearch: true,
+		SupportsTools:          true,
+		SupportsReason:         true,
+	},
 }
 
 func NormalizeProvider(id string) string {
@@ -561,7 +645,7 @@ func LookupProvider(id string) (ProviderSpec, bool) {
 func MustLookupProvider(id string) (ProviderSpec, error) {
 	spec, ok := LookupProvider(id)
 	if !ok {
-		return ProviderSpec{}, fmt.Errorf("unknown model provider %q", strings.TrimSpace(id))
+		return ProviderSpec{}, fmt.Errorf("unknown model provider %q; available providers: %s", strings.TrimSpace(id), strings.Join(ProviderIDs(), ", "))
 	}
 	return spec, nil
 }

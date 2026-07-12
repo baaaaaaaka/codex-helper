@@ -116,6 +116,22 @@ func TestOpenAIChatAdapterRetriesNetworkFailure(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatAdapterCanDisableTransportRetries(t *testing.T) {
+	var calls int
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("response header timeout")
+	})}
+	retryTransport := false
+	adapter := OpenAIChatAdapter{BaseURL: "http://upstream.test/v1", HTTPClient: client, MaxRetries: 2, RetryTransportErrors: &retryTransport}
+	if _, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"}); err == nil {
+		t.Fatal("expected transport error")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want one attempt", calls)
+	}
+}
+
 func TestOpenAIChatAdapterAbortDuringRetryBackoff(t *testing.T) {
 	var calls int
 	ctx, cancel := context.WithCancel(context.Background())

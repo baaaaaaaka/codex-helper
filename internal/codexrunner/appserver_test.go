@@ -13,6 +13,23 @@ import (
 	"time"
 )
 
+func TestEmitAppServerStreamEventDeduplicatesAgentMessageItemID(t *testing.T) {
+	line := []byte(`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"msg-1","type":"agentMessage","text":"done"}}}`)
+	seen := map[string]struct{}{}
+	var events []StreamEvent
+	handler := func(event StreamEvent) { events = append(events, event) }
+	emitAppServerStreamEventDeduplicated(handler, line, seen)
+	emitAppServerStreamEventDeduplicated(handler, line, seen)
+	if len(events) != 1 || events[0].Text != "done" {
+		t.Fatalf("events = %#v", events)
+	}
+	otherTurn := bytes.ReplaceAll(line, []byte(`"turn-1"`), []byte(`"turn-2"`))
+	emitAppServerStreamEventDeduplicated(handler, otherTurn, seen)
+	if len(events) != 2 {
+		t.Fatalf("same item id in another turn was dropped: %#v", events)
+	}
+}
+
 func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{"userAgent":"codex-helper-test/0","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}`,

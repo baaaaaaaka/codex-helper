@@ -20,6 +20,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
 const (
@@ -70,6 +71,7 @@ type codexDesktopAppOptions struct {
 	Cwd              string
 	AppPath          string
 	InstallHome      string
+	CodexHomeSource  string
 	ExtraEnv         []string
 	ProxyURL         string
 	ModelProfileName string
@@ -212,7 +214,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 		launchOpts.ProxyURL = proxyURL
 	}
 
-	if strings.TrimSpace(opts.modelProfileRef) != "" {
+	if strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) {
 		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
@@ -269,6 +271,7 @@ func codexDesktopAppLaunchOptions(
 	if err != nil {
 		return codexDesktopAppOptions{}, err
 	}
+	sourceCodexHome := codexHome
 	launchCwd := cwd
 	launchAppPath := strings.TrimSpace(appPath)
 	if platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
@@ -292,13 +295,14 @@ func codexDesktopAppLaunchOptions(
 	}
 
 	return codexDesktopAppOptions{
-		Platform:     platform,
-		Cwd:          launchCwd,
-		AppPath:      launchAppPath,
-		InstallHome:  paths.Home,
-		ExtraEnv:     codexHomeEnv(codexHome),
-		ExecIdentity: paths.ExecIdentity,
-		Log:          log,
+		Platform:        platform,
+		Cwd:             launchCwd,
+		AppPath:         launchAppPath,
+		InstallHome:     paths.Home,
+		CodexHomeSource: sourceCodexHome,
+		ExtraEnv:        codexHomeEnv(codexHome),
+		ExecIdentity:    paths.ExecIdentity,
+		Log:             log,
 	}, nil
 }
 

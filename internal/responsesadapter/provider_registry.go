@@ -14,13 +14,14 @@ type ProviderRegistryOptions struct {
 }
 
 type ProviderConfig struct {
-	ID           string
-	ProfileID    string
-	BaseURL      string
-	APIKey       string
-	DefaultModel string
-	Models       []ModelInfo
-	Adapter      ProviderAdapter
+	ID             string
+	ProfileID      string
+	BaseURL        string
+	APIKey         string
+	DefaultModel   string
+	Models         []ModelInfo
+	Adapter        ProviderAdapter
+	CustomToolMode string
 }
 
 type ProviderRegistry struct {
@@ -247,6 +248,7 @@ func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProv
 			KeyFingerprint: KeyFingerprint(cfg.APIKey, keySalt),
 			BaseURLHash:    BaseURLHash(baseURL),
 			ProfileVersion: firstNonEmpty(profileID, id) + ":v1",
+			CustomToolMode: strings.TrimSpace(cfg.CustomToolMode),
 		},
 	}, nil
 }

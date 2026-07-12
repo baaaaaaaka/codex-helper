@@ -76,8 +76,15 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 			candidates = appendUniqueString(candidates, threadID)
 		}
 	}
+	generation := session.ModelGeneration
+	if durable, ok := state.Sessions[sessionID]; ok && durable.ModelGeneration > generation {
+		generation = durable.ModelGeneration
+	}
 	for _, prior := range state.Turns {
 		if strings.TrimSpace(prior.SessionID) != sessionID || strings.TrimSpace(prior.ID) == strings.TrimSpace(turn.ID) {
+			continue
+		}
+		if prior.ModelGeneration != generation {
 			continue
 		}
 		if threadID := strings.TrimSpace(prior.CodexThreadID); threadID != "" {
@@ -90,6 +97,14 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 	}
 	for _, rec := range journal {
 		if !threadLinkJournalRecordMatchesSession(b, session, rec) {
+			continue
+		}
+		if generation == 0 {
+			// Generation-zero sessions may consume legacy journal records.
+			if rec.ModelGeneration != 0 {
+				continue
+			}
+		} else if rec.ModelGeneration != generation || rec.ModelProfile.IsZero() || !modelProfileSnapshotsSameRuntime(rec.ModelProfile, session.ModelProfile) {
 			continue
 		}
 		candidates = appendUniqueString(candidates, strings.TrimSpace(rec.CodexThreadID))
@@ -111,7 +126,7 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 			Message: "Codex thread is only present in the legacy registry projection, not durable state. I did not resume it automatically because that could attach this Teams session to the wrong context. Use `helper restore-thread " + weakThreadID + "` in this Work chat if this is the correct thread, then retry the interrupted turn.",
 		}, nil
 	}
-	if sessionHasPriorCodexAcceptedEvidence(state, sessionID, turn.ID) {
+	if sessionHasPriorCodexAcceptedEvidence(state, sessionID, turn.ID, generation) {
 		return threadResolveDecision{
 			Action:  threadResolveBlock,
 			Kind:    codexThreadMissingKind,
@@ -121,7 +136,7 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 	return threadResolveDecision{Action: threadResolveStartNew}, nil
 }
 
-func sessionHasPriorCodexAcceptedEvidence(state teamstore.State, sessionID string, currentTurnID string) bool {
+func sessionHasPriorCodexAcceptedEvidence(state teamstore.State, sessionID string, currentTurnID string, generation int) bool {
 	sessionID = strings.TrimSpace(sessionID)
 	currentTurnID = strings.TrimSpace(currentTurnID)
 	if session, ok := state.Sessions[sessionID]; ok {
@@ -131,6 +146,9 @@ func sessionHasPriorCodexAcceptedEvidence(state teamstore.State, sessionID strin
 	}
 	for _, turn := range state.Turns {
 		if strings.TrimSpace(turn.SessionID) != sessionID || strings.TrimSpace(turn.ID) == currentTurnID {
+			continue
+		}
+		if turn.ModelGeneration != generation {
 			continue
 		}
 		if strings.TrimSpace(turn.CodexThreadID) != "" || strings.TrimSpace(turn.CodexTurnID) != "" {
@@ -181,14 +199,16 @@ func (b *Bridge) bindSessionCodexThreadIfSafe(ctx context.Context, session *Sess
 		}
 	}
 	_ = b.appendThreadLinkJournal(ctx, threadLinkJournalRecord{
-		Source:        source,
-		ScopeID:       b.scope.ID,
-		MachineID:     b.machine.ID,
-		SessionID:     sessionID,
-		ChatID:        session.ChatID,
-		TeamsTurnID:   turnID,
-		CodexThreadID: threadID,
-		Cwd:           session.Cwd,
+		Source:          source,
+		ScopeID:         b.scope.ID,
+		MachineID:       b.machine.ID,
+		SessionID:       sessionID,
+		ChatID:          session.ChatID,
+		TeamsTurnID:     turnID,
+		CodexThreadID:   threadID,
+		ModelGeneration: session.ModelGeneration,
+		ModelProfile:    session.ModelProfile,
+		Cwd:             session.Cwd,
 	})
 	return nil
 }
@@ -221,6 +241,11 @@ func (b *Bridge) codexThreadBindingAlreadyCurrent(ctx context.Context, sessionID
 	durable, ok := state.Sessions[sessionID]
 	if !ok || durable.ID == "" {
 		return false, nil
+	}
+	if turnID != "" {
+		if turn, ok := state.Turns[turnID]; ok && strings.TrimSpace(turn.SessionID) == sessionID && turn.ModelGeneration != durable.ModelGeneration {
+			return false, fmt.Errorf("model generation conflict for session %s: session=%d turn=%d source=%s", sessionID, durable.ModelGeneration, turn.ModelGeneration, source)
+		}
 	}
 	existing := strings.TrimSpace(durable.CodexThreadID)
 	if existing != "" && existing != threadID {

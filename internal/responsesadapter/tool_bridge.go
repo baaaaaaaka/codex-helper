@@ -8,6 +8,10 @@ import (
 )
 
 func NormalizeTools(raw json.RawMessage) ([]ChatTool, []ToolWarning, error) {
+	return NormalizeToolsWithMode(raw, "function")
+}
+
+func NormalizeToolsWithMode(raw json.RawMessage, customToolMode string) ([]ChatTool, []ToolWarning, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, nil, nil
 	}
@@ -29,6 +33,30 @@ func NormalizeTools(raw json.RawMessage) ([]ChatTool, []ToolWarning, error) {
 			}
 			seen[nameKey] = true
 			tools = append(tools, tool)
+		}
+	}
+	mode := strings.ToLower(strings.TrimSpace(customToolMode))
+	if mode == "shell-fallback" || mode == "omit" {
+		hasPatch := false
+		filtered := tools[:0]
+		for _, tool := range tools {
+			if tool.SourceType == "custom" {
+				if strings.EqualFold(tool.Function.Name, "apply_patch") {
+					hasPatch = true
+				}
+				warnings = append(warnings, ToolWarning{Type: "custom", Name: tool.Function.Name, Reason: "custom tool omitted by compatibility mode"})
+				continue
+			}
+			filtered = append(filtered, tool)
+		}
+		tools = filtered
+		if mode == "shell-fallback" && hasPatch {
+			for index := range tools {
+				if tools[index].SourceType == "local_shell" || strings.EqualFold(tools[index].Function.Name, "shell") {
+					tools[index].Function.Description += " To edit files, invoke the apply_patch command through this shell tool instead of only describing the patch."
+					break
+				}
+			}
 		}
 	}
 	return tools, warnings, nil
@@ -71,10 +99,10 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 		if fn.Name == "" {
 			return nil, []ToolWarning{{Type: toolType, Reason: "function tool missing name dropped"}}
 		}
-		return []ChatTool{{Type: "function", Function: fn}}, nil
+		return []ChatTool{{Type: "function", Function: fn, SourceType: "function"}}, nil
 	case "local_shell":
 		return []ChatTool{{
-			Type: "function",
+			Type: "function", SourceType: "local_shell",
 			Function: ChatFunction{
 				Name:        "shell",
 				Description: "Run a shell command.",
@@ -87,7 +115,7 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 			name = "custom_tool"
 		}
 		return []ChatTool{{
-			Type: "function",
+			Type: "function", SourceType: "custom",
 			Function: ChatFunction{
 				Name:        name,
 				Description: firstNonEmpty(input.Description, "Accepts freeform custom tool input."),
@@ -101,7 +129,7 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 			parameters = json.RawMessage(`{"type":"object","additionalProperties":true}`)
 		}
 		return []ChatTool{{
-			Type: "function",
+			Type: "function", SourceType: "tool_search",
 			Function: ChatFunction{
 				Name:        name,
 				Description: firstNonEmpty(input.Description, "Search available tools."),

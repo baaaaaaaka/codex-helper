@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +14,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
+
+func stubTeamsModelVerification(t *testing.T) {
+	t.Helper()
+	previous := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previous })
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error { return nil }
+}
 
 func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -70,13 +79,49 @@ func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 	}
 
 	out = runRootCommandForModelProfileTest(t, "--config", configPath, "model-profile", "list")
-	if !strings.Contains(out, "* deepseek-work: provider=deepseek model=deepseek/deepseek-v4-pro api_key=env:DEEPSEEK_API_KEY ssh_proxy=work revision=1") {
+	if !strings.Contains(out, "* deepseek-work: provider=deepseek model=deepseek/deepseek-v4-pro base_url=none api_key=env:DEEPSEEK_API_KEY ssh_proxy=work revision=1") {
 		t.Fatalf("list output did not mark default profile:\n%s", out)
 	}
 
 	out = runRootCommandForModelProfileTest(t, "--config", configPath, "model-profile", "set-default", "default")
 	if !strings.Contains(out, "Default model profile: default") {
 		t.Fatalf("set-default output:\n%s", out)
+	}
+}
+
+func TestModelProfileSetupConfiguresResponsesCompatibleProviderFromEnvironment(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("TEST_RESPONSES_BASE_URL", "https://responses.example.invalid/v1/")
+	t.Setenv("TEST_RESPONSES_API_KEY", "sk-responses-test")
+
+	out := runRootCommandForModelProfileTest(t,
+		"--config", configPath,
+		"model-profile", "setup", "custom-responses",
+		"--provider", "responses-compatible",
+		"--model", "example/reasoning-model",
+		"--base-url-env", "TEST_RESPONSES_BASE_URL",
+		"--api-key-env", "TEST_RESPONSES_API_KEY",
+		"--no-doctor",
+	)
+	if !strings.Contains(out, `Saved model profile "custom-responses"`) || !strings.Contains(out, "base_url=configured") {
+		t.Fatalf("setup output:\n%s", out)
+	}
+
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	profile := cfg.ModelProfiles["custom-responses"]
+	if profile.Provider != "responses-compatible" || profile.Model != "example/reasoning-model" || profile.BaseURL != "https://responses.example.invalid/v1" || profile.APIKeyRef != "env:TEST_RESPONSES_API_KEY" {
+		t.Fatalf("stored profile=%#v", profile)
+	}
+	out = runRootCommandForModelProfileTest(t, "--config", configPath, "model-profile", "doctor", "custom-responses")
+	if !strings.Contains(out, "OK  web search fallback gpt-5.6-luna reasoning=high mode=live") {
+		t.Fatalf("doctor output omitted web-search fallback:\n%s", out)
 	}
 }
 
@@ -197,7 +242,181 @@ func TestTeamsModelProfileProvidersMentionsMiMoTierAliases(t *testing.T) {
 	}
 }
 
+func TestTeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	if err := secrets.Put("secret:verified", "key-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := secrets.Put("secret:stale", "key-b"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"verified":   {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "secret:verified", Revision: 1},
+		"unverified": {Provider: "deepseek", Model: "deepseek/deepseek-v4-flash", APIKeyRef: "env:MISSING_KEY", Revision: 1},
+		"stale":      {Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "secret:stale", Revision: 1, VerificationFingerprint: "stale"},
+	}}
+	resolved, err := modelprofile.Resolve(cfg, "verified")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.ModelProfiles["verified"]
+	p.VerificationFingerprint = modelVerificationFingerprint("", resolved, "key-a")
+	p.VerifiedAt = time.Now()
+	cfg.ModelProfiles["verified"] = p
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	previousProbe := codexLoginStatusProbeFn
+	previousCatalog := listTeamsOfficialModelsFn
+	t.Cleanup(func() {
+		codexLoginStatusProbeFn = previousProbe
+		listTeamsOfficialModelsFn = previousCatalog
+	})
+	codexLoginStatusProbeFn = func(_ context.Context, path string, _ []string, _ io.Writer) bool {
+		if path != "/actual/codex" {
+			t.Fatalf("probe path = %q", path)
+		}
+		return true
+	}
+	listTeamsOfficialModelsFn = func(_ context.Context, path string) ([]teamsOfficialModel, error) {
+		if path != "/actual/codex" {
+			t.Fatalf("catalog path = %q", path)
+		}
+		return []teamsOfficialModel{
+			{Slug: "gpt-5.6-luna", DisplayName: "GPT-5.6-Luna", DefaultReasoningLevel: "medium"},
+			{Slug: "gpt-5.6-sol", DisplayName: "GPT-5.6-Sol", IsDefault: true, DefaultReasoningLevel: "low"},
+		}, nil
+	}
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath}, "/actual/codex")
+	out, err := manager.ListModelProfiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Verified models",
+		"current default: GPT-5.6-Sol (`gpt-5.6-sol`)",
+		"official default: GPT-5.6-Sol (`gpt-5.6-sol`)",
+		"Official Codex models",
+		"GPT-5.6-Sol (`gpt-5.6-sol`) [official default] effort=low",
+		"GPT-5.6-Luna (`gpt-5.6-luna`) effort=medium",
+		"Verified third-party profiles",
+		"verified: MiMo 2.5",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list missing %q:\n%s", want, out)
+		}
+	}
+	for _, hidden := range []string{"unverified", "stale:", "needs key", "DeepSeek V4 Pro", "Codex Auto Review"} {
+		if strings.Contains(out, hidden) {
+			t.Fatalf("list exposed %q:\n%s", hidden, out)
+		}
+	}
+	if err := store.Update(func(current *config.Config) error {
+		current.DefaultModelProfile = "verified"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = manager.ListModelProfiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "current default: MiMo 2.5 (`verified`)") || !strings.Contains(out, "official default: GPT-5.6-Sol (`gpt-5.6-sol`)") {
+		t.Fatalf("third-party default is ambiguous:\n%s", out)
+	}
+}
+
+func TestTeamsModelListDoesNotReadOrShowOfficialCatalogWhenLoggedOut(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	previousProbe := codexLoginStatusProbeFn
+	previousCatalog := listTeamsOfficialModelsFn
+	t.Cleanup(func() {
+		codexLoginStatusProbeFn = previousProbe
+		listTeamsOfficialModelsFn = previousCatalog
+	})
+	codexLoginStatusProbeFn = func(context.Context, string, []string, io.Writer) bool { return false }
+	listTeamsOfficialModelsFn = func(context.Context, string) ([]teamsOfficialModel, error) {
+		t.Fatal("logged-out model list must not load the official catalog")
+		return nil, nil
+	}
+	out, err := newTeamsModelProfileManager(&rootOptions{configPath: configPath}, "/actual/codex").ListModelProfiles(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "Codex Official") || strings.Contains(out, "Official Codex models") {
+		t.Fatalf("logged-out list exposed official models:\n%s", out)
+	}
+}
+
+func TestTeamsModelProfileRuntimeWarningShowsActiveBackupJSON(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"work-glm": {Provider: "glm", Source: "models", Revision: 1},
+		},
+		ModelSources: map[string]config.ModelSource{
+			"models": {
+				URL:                     "https://example.invalid/models.git",
+				Revision:                "4d19b77a12345678",
+				BackupActive:            true,
+				BackupAttemptedRevision: "8f3a1c2b87654321",
+				BackupReason:            "validate cxp-models.json: unknown field badSetting",
+				Profiles:                []string{"work-glm"},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	warning, active, err := newTeamsModelProfileManager(&rootOptions{configPath: configPath}).ModelProfileRuntimeWarning(context.Background(), modelprofile.Snapshot{Name: "work-glm", Provider: "glm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Backup JSON configuration is active", "work-glm", "4d19b77a1234", "8f3a1c2b8765", "badSetting", "every turn"} {
+		if !active || !strings.Contains(warning, want) {
+			t.Fatalf("warning active=%v missing %q:\n%s", active, want, warning)
+		}
+	}
+}
+
+func TestTeamsKeyIntakeVerificationFailureStaysHidden(t *testing.T) {
+	previous := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previous })
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error { return fmt.Errorf("unauthorized") }
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+	_, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName: "mimo25", Provider: "mimo", Model: "mimo/mimo-v2.5", APIKey: "secret-value",
+	})
+	if err == nil || !strings.Contains(err.Error(), "remains hidden") {
+		t.Fatalf("Save error = %v", err)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := cfg.ModelProfiles["mimo25"]
+	if profile.VerificationFingerprint != "" || !strings.Contains(profile.VerificationError, "unauthorized") {
+		t.Fatalf("failed profile = %#v", profile)
+	}
+}
+
 func TestTeamsModelProfileManagerSaveModelProfileAPIKeyDefaultsModelForNewProfile(t *testing.T) {
+	stubTeamsModelVerification(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
 	result, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
@@ -225,6 +444,7 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKeyDefaultsModelForNewProfil
 }
 
 func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
+	stubTeamsModelVerification(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(configPath)
 	if err != nil {
@@ -336,6 +556,7 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 }
 
 func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T) {
+	stubTeamsModelVerification(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
 	result, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
@@ -381,6 +602,7 @@ func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T)
 }
 
 func TestModelSetupStoresFamilyCredentialAndSiblingReusesIt(t *testing.T) {
+	stubTeamsModelVerification(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	cmd := newRootCmd()
 	var out bytes.Buffer
@@ -442,16 +664,16 @@ func TestModelSetupStoresFamilyCredentialAndSiblingReusesIt(t *testing.T) {
 	}
 }
 
-func TestModelUseCreatesSiblingProfileFromFamilyCredential(t *testing.T) {
+func TestModelUseRejectsUnverifiedFamilyCredential(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
 	familyRef := modelprofile.SecretRefForCredentialScope("deepseek")
 	if err := secretStore.Put(familyRef, "sk-deepseek-family"); err != nil {
 		t.Fatalf("Put secret: %v", err)
 	}
-	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "use", "deepseek-v4-pro")
-	if !strings.Contains(out, "Default model: DeepSeek V4 Pro") {
-		t.Fatalf("model use output:\n%s", out)
+	err, out := runRootCommandForModelProfileTestError("--config", configPath, "model", "use", "deepseek-v4-pro")
+	if err == nil || !strings.Contains(err.Error(), "not authentication-verified") {
+		t.Fatalf("model use err=%v out=%s", err, out)
 	}
 	store, err := config.NewStore(configPath)
 	if err != nil {
@@ -461,11 +683,11 @@ func TestModelUseCreatesSiblingProfileFromFamilyCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.DefaultModelProfile != "deepseek-pro" {
+	if cfg.DefaultModelProfile != "" {
 		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
 	}
-	if got := cfg.ModelProfiles["deepseek-pro"]; got.Provider != "deepseek" || got.Model != "deepseek/deepseek-v4-pro" || got.APIKeyRef != familyRef {
-		t.Fatalf("deepseek-pro profile=%#v, want family ref %q", got, familyRef)
+	if _, ok := cfg.ModelProfiles["deepseek-pro"]; ok {
+		t.Fatal("model use synthesized an unverified profile")
 	}
 }
 

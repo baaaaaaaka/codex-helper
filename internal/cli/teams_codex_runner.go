@@ -137,7 +137,8 @@ func newManagedTeamsCodexExecutorWithContext(
 		if err != nil {
 			return nil, err
 		}
-		appServerModelArgs, appServerModelEnv, modelCleanup, err := prepareTeamsAppServerModelProfileForRunner(ctx, root, modelProfile, snapshot, log)
+		modelPrepareCtx := withCodexLoginProbePath(ctx, codexPath)
+		appServerModelArgs, appServerModelEnv, modelCleanup, err := prepareTeamsAppServerModelProfileForRunner(modelPrepareCtx, root, modelProfile, snapshot, log)
 		if err != nil {
 			return nil, err
 		}
@@ -670,8 +671,19 @@ func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string
 	}
 }
 
-func newTeamsModelProfileResolver(root *rootOptions) teams.ModelProfileResolver {
+func newTeamsModelProfileResolver(root *rootOptions, codexPaths ...string) teams.ModelProfileResolver {
+	codexPath := "codex"
+	if len(codexPaths) > 0 && strings.TrimSpace(codexPaths[0]) != "" {
+		codexPath = strings.TrimSpace(codexPaths[0])
+	}
 	return func(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
+		ref = strings.TrimSpace(ref)
+		forceProfile := strings.HasPrefix(strings.ToLower(ref), "profile:")
+		forceOfficial := strings.HasPrefix(strings.ToLower(ref), "official:")
+		if forceProfile || forceOfficial {
+			_, ref, _ = strings.Cut(ref, ":")
+			ref = strings.TrimSpace(ref)
+		}
 		store, _, err := newRootStore(root, "")
 		if err != nil {
 			return modelprofile.Snapshot{}, err
@@ -680,12 +692,70 @@ func newTeamsModelProfileResolver(root *rootOptions) teams.ModelProfileResolver 
 		if err != nil {
 			return modelprofile.Snapshot{}, err
 		}
+		resolveOfficial := func() (modelprofile.Snapshot, bool) {
+			models, catalogErr := listTeamsOfficialModelsFn(ctx, codexPath)
+			if catalogErr == nil {
+				for _, model := range models {
+					if strings.EqualFold(strings.TrimSpace(model.Slug), strings.TrimSpace(ref)) {
+						return modelprofile.Snapshot{
+							Name:                   model.Slug,
+							Provider:               modelprofile.DefaultProvider,
+							Model:                  model.Slug,
+							DefaultModel:           model.Slug,
+							DefaultReasoningEffort: model.DefaultReasoningLevel,
+							Revision:               1,
+							CapturedAt:             time.Now().UTC(),
+						}, true
+					}
+				}
+			}
+			return modelprofile.Snapshot{}, false
+		}
+		if !forceProfile && (forceOfficial || strings.HasPrefix(strings.ToLower(ref), "gpt-")) {
+			if snapshot, ok := resolveOfficial(); ok {
+				return snapshot, nil
+			}
+			if forceOfficial {
+				return modelprofile.Snapshot{}, fmt.Errorf("official Codex model %q is not available for the current account", ref)
+			}
+		}
 		resolved, err := modelprofile.Resolve(cfg, ref)
+		if err != nil && ref != "" && !forceProfile {
+			if snapshot, ok := resolveOfficial(); ok {
+				return snapshot, nil
+			}
+			return modelprofile.Snapshot{}, err
+		}
 		if err != nil {
 			return modelprofile.Snapshot{}, err
 		}
-		_ = ctx
 		secrets := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+		if !resolved.IsDefault() {
+			profile, ok := cfg.FindModelProfile(resolved.Name)
+			if !ok {
+				return modelprofile.Snapshot{}, fmt.Errorf("model profile %q not found", resolved.Name)
+			}
+			// Git-sourced profiles are not trusted until their effective config and
+			// current credential have passed the source binding probe. Legacy/local
+			// model-profile setup predates that stamp and remains compatible.
+			if strings.TrimSpace(profile.Source) != "" && !modelProfileVerificationCurrent(cfg, resolved.Name, profile, secrets) {
+				apiKey, keyErr := modelprofile.ResolveAPIKey(resolved.Profile.APIKeyRef, secrets, os.Getenv)
+				if keyErr != nil {
+					return modelprofile.Snapshot{}, fmt.Errorf("model profile %q needs a credential before it can be verified: %w", resolved.Name, keyErr)
+				}
+				verifyErr := verifyAndStampTeamsModelProfile(ctx, &cfg, resolved.Name, apiKey)
+				if saveErr := store.Save(cfg); saveErr != nil {
+					return modelprofile.Snapshot{}, fmt.Errorf("save automatic verification for model profile %q: %w", resolved.Name, saveErr)
+				}
+				if verifyErr != nil {
+					return modelprofile.Snapshot{}, fmt.Errorf("automatic authentication verification failed for model profile %q: %w", resolved.Name, verifyErr)
+				}
+				resolved, err = modelprofile.Resolve(cfg, resolved.Name)
+				if err != nil {
+					return modelprofile.Snapshot{}, err
+				}
+			}
+		}
 		return resolved.RuntimeSnapshot(time.Now(), secrets, os.Getenv)
 	}
 }

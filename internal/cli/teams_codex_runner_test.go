@@ -903,6 +903,15 @@ func TestTeamsParallelAppServerHelperProcess(t *testing.T) {
 }
 
 func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServer(t *testing.T) {
+	lockCLITestHooks(t)
+	previousProbe := codexLoginStatusProbeFn
+	t.Cleanup(func() { codexLoginStatusProbeFn = previousProbe })
+	codexLoginStatusProbeFn = func(_ context.Context, path string, _ []string, _ io.Writer) bool {
+		if path != "/tmp/codex" {
+			t.Fatalf("login probe path = %q, want runner Codex path", path)
+		}
+		return true
+	}
 	store := newTempStore(t)
 	if err := store.Save(config.Config{
 		Version: config.CurrentVersion,
@@ -927,17 +936,17 @@ func TestNewManagedTeamsCodexExecutorConfiguresThirdPartyModelProfileForAppServe
 	}
 	joinedArgs := strings.Join(runner.AppServerArgs, "\n")
 	for _, want := range []string{
-		`model_provider="cxp-thirdparty"`,
+		`model_provider="cxp-unified"`,
 		`model="mimo/mimo-v2.5"`,
-		`model_catalog_json="`,
-		`model_providers.cxp-thirdparty.wire_api="responses"`,
+		`model_providers.cxp-unified.wire_api="responses"`,
+		`model_providers.cxp-unified.requires_openai_auth=true`,
 	} {
 		if !strings.Contains(joinedArgs, want) {
 			t.Fatalf("appserver args missing %q:\n%v", want, runner.AppServerArgs)
 		}
 	}
 	if !slices.ContainsFunc(runner.ExtraEnv, func(entry string) bool {
-		return strings.HasPrefix(entry, envCXPResponsesProxyKey+"=")
+		return strings.HasPrefix(entry, envCXPUnifiedGatewayKey+"=")
 	}) {
 		t.Fatalf("appserver extra env missing proxy key: %v", runner.ExtraEnv)
 	}
@@ -1010,6 +1019,99 @@ func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
 	}
 }
 
+func TestTeamsModelProfileResolverAcceptsListedOfficialModelSlug(t *testing.T) {
+	lockCLITestHooks(t)
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	previous := listTeamsOfficialModelsFn
+	t.Cleanup(func() { listTeamsOfficialModelsFn = previous })
+	listTeamsOfficialModelsFn = func(context.Context, string) ([]teamsOfficialModel, error) {
+		return []teamsOfficialModel{{Slug: "gpt-5.6-luna", DisplayName: "GPT 5.6 Luna", DefaultReasoningLevel: "high"}}, nil
+	}
+	snapshot, err := newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()}, "/test/codex")(context.Background(), "gpt-5.6-luna")
+	if err != nil {
+		t.Fatalf("resolve official model: %v", err)
+	}
+	if snapshot.Provider != modelprofile.DefaultProvider || snapshot.Model != "gpt-5.6-luna" || snapshot.DefaultReasoningEffort != "high" {
+		t.Fatalf("official snapshot = %#v", snapshot)
+	}
+	if _, err := modelprofile.ResolveSnapshot(config.Config{Version: config.CurrentVersion}, snapshot); err != nil {
+		t.Fatalf("official snapshot is not launch-resolvable: %v", err)
+	}
+}
+
+func TestTeamsModelProfileResolverRejectsUnverifiedThirdPartyProfile(t *testing.T) {
+	previousVerify := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previousVerify })
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error { return fmt.Errorf("unauthorized") }
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion,
+		ModelSources: map[string]config.ModelSource{"repo": {URL: "https://example.invalid/repo.git", Revision: "abc123"}},
+		ModelProfiles: map[string]config.ModelProfile{
+			"unverified": {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:TEST_UNVERIFIED_KEY", Revision: 1, Source: "repo"},
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_UNVERIFIED_KEY", "not-a-real-key")
+	_, err = newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()})(context.Background(), "unverified")
+	if err == nil || !strings.Contains(err.Error(), "automatic authentication verification failed") {
+		t.Fatalf("unverified resolver error = %v", err)
+	}
+}
+
+func TestTeamsModelProfileResolverSilentlyReverifiesSourcedProfile(t *testing.T) {
+	previousVerify := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previousVerify })
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error { return nil }
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion,
+		ModelSources:  map[string]config.ModelSource{"repo": {URL: "https://example.invalid/repo.git", Revision: "abc123"}},
+		ModelProfiles: map[string]config.ModelProfile{"sourced": {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:TEST_SOURCE_KEY", Revision: 1, Source: "repo"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_SOURCE_KEY", "valid-test-key")
+	snapshot, err := newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()})(context.Background(), "sourced")
+	if err != nil || snapshot.Name != "sourced" {
+		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelProfiles["sourced"].VerificationFingerprint == "" || cfg.ModelProfiles["sourced"].VerifiedAt.IsZero() {
+		t.Fatalf("automatic verification was not persisted: %#v", cfg.ModelProfiles["sourced"])
+	}
+}
+
+func TestTeamsModelProfileResolverKeepsLegacyLocalProfileCompatible(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"legacy": {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:TEST_LEGACY_KEY", Revision: 1},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_LEGACY_KEY", "legacy-key")
+	snapshot, err := newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()})(context.Background(), "profile:legacy")
+	if err != nil || snapshot.Name != "legacy" {
+		t.Fatalf("legacy snapshot=%#v err=%v", snapshot, err)
+	}
+}
+
 func TestTeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1022,14 +1124,6 @@ func TestTeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI(t *testing.T) 
 		Version:      config.CurrentVersion,
 		ProxyEnabled: &enabled,
 		Profiles:     []config.Profile{{ID: "p1", Name: "dev", Host: "host", Port: 22, User: "me"}},
-		ModelProfiles: map[string]config.ModelProfile{
-			"deepseek-pro": {
-				Provider:  "deepseek",
-				Model:     "deepseek/deepseek-v4-pro",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				Revision:  1,
-			},
-		},
 	}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

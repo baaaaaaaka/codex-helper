@@ -317,8 +317,8 @@ codex-proxy model doctor deepseek
 ```
 
 内置选择包括 `default`，以及 `deepseek`、`mimo`、`kimi`、`glm`、`minimax` 和
-`qwen` 等第三方 choices。第三方 choices 会在本地保存 model profile，并通过本地
-Responses adapter 运行 Codex。
+`qwen` 等第三方 choices。第三方 choices 会在本地保存 model profile。
+OpenAI-compatible chat providers 通过 CXP 本地 Responses adapter 运行。
 
 用保存的 model profile 启动一次，而不改变默认值：
 
@@ -346,6 +346,156 @@ codex-proxy model-profile list
 codex-proxy model-profile doctor work-deepseek
 codex-proxy model-profile set-default work-deepseek
 ```
+
+对于已经提供 Responses-compatible API 的服务，使用通用的
+`responses-compatible` provider。provider 专用 URL、model id 和 credential 应放在
+本地配置或环境变量中，而不是提交到源码仓库：
+
+```bash
+export RESPONSES_BASE_URL=https://api.example.com/v1
+
+codex-proxy model-profile setup private-responses \
+  --provider responses-compatible \
+  --model provider/model-id \
+  --base-url-env RESPONSES_BASE_URL \
+  --api-key-env RESPONSES_API_KEY \
+  --set-default
+
+codex-proxy model-profile doctor private-responses
+codex-proxy run --model-profile private-responses -- codex
+```
+
+对于 OpenAI-compatible Chat Completions endpoint，使用 `chat-compatible`。
+模型 id 不需要编译进 CXP，reasoning 兼容映射也可以保存在本地 profile，而不是写进
+源码：
+
+```bash
+codex-proxy model-profile setup private-chat \
+  --provider chat-compatible \
+  --model provider/future-model \
+  --base-url-env CHAT_BASE_URL \
+  --api-key-env CHAT_API_KEY \
+  --default-reasoning-effort high \
+  --supported-reasoning-efforts low,medium,high,xhigh \
+  --reasoning-effort-map xhigh=max
+```
+
+这些设置会以 `defaultReasoningEffort`、`supportedReasoningEfforts` 和
+`reasoningEffortMap` 保存在本地 CXP JSON 配置中；以后可以直接更新本地配置，不需要把
+provider 专用细节提交到仓库。
+
+需要逐模型调优时，可以直接在本地 CXP config 中使用版本化的四层配置。一个
+`modelCredentials` 条目可以被同一 provider 下的多个模型复用；
+`modelProviders` 保存协议、endpoint、认证引用、固定 headers、重试和 stream 策略；
+`models` 保存 limits、capabilities、reasoning、tools、messages、sampling、cache 和
+search 策略；`modelProfiles` 只保存用户选择和 override。未知字段、悬空引用和互相
+矛盾的能力会在加载时直接报错。
+
+HTTP 行为可以分别在 provider 和 model 层调优。下面两个分阶段字段会区分“首 token
+很慢”和“SSE body 已经停滞”。显式的 `maxRetries: 0` 会关闭 adapter 重试；省略该字段
+则保留默认值。`honorRetryAfter` 控制上游 `Retry-After` 是否可以延长退避时间：
+
+```json
+{
+  "http": {
+    "responseHeaderTimeoutSeconds": 120,
+    "timeoutSeconds": 0,
+    "maxRetries": 1,
+    "retryStatuses": [429, 502, 503, 504, 529],
+    "honorRetryAfter": true,
+    "retryTransportErrors": false,
+    "maxConcurrentRequests": 1
+  },
+  "stream": {
+    "idleTimeoutSeconds": 300,
+    "reasoningDeltaPath": "choices[0].delta.reasoning_content",
+    "cachedTokensPath": "usage.prompt_tokens_details.cached_tokens"
+  },
+  "cache": {"usageField": "prompt_cache_hit_tokens"}
+}
+```
+
+`timeoutSeconds` 是兼容旧配置的可选全请求上限；设为零或省略时不限制总时长，但两个
+分阶段保护仍然生效。CXP 会记录正在等待响应头以及上游重试状态，从而区分慢模型和
+真正停滞的 stream。
+`maxConcurrentRequests` 默认是零（不限制），可用于把在并发下会停滞的模型串行化。
+两个 stream path 支持点号、斜线和数组下标形式；省略
+`stream.cachedTokensPath` 时，`cache.usageField` 是 cached token 路径的 fallback。
+标准 OpenAI 字段不需要配置 path。若上游返回不可能成立的计数（例如 reasoning tokens
+大于全部 completion tokens），CXP 会钳制计数并写入 upstream 诊断日志。
+对于客户端等待响应头超时后、服务端可能仍继续推理的部署，应设置
+`retryTransportErrors: false`，避免 adapter 把一次超时复制成多个生成任务。HTTP status
+重试仍由 `maxRetries` 和 `retryStatuses` 独立控制。
+
+`codex-proxy model-profile explain <name>` 会输出去除 secret 后的最终生效配置及
+provider/model/catalog fingerprint，适合在启动 Teams、CLI 或 App 前核对继承和 override。
+
+模型配置也可以由 Git 仓库分发。仓库根目录默认放置 `cxp-models.json`，使用与上述
+模型配置相同的严格 schema，但 credential 只声明名称和认证方式，不包含 `apiKeyRef`
+或实际密钥：
+
+```bash
+cxp model-source sync https://github.example/team/models.git
+cxp model-source list
+cxp model-source bind models work-glm --api-key-stdin
+```
+
+首次 `sync` 使用 shallow/filter clone，并且不索取密钥。候选 profile 此时只会出现在
+`model-source list`，不会进入 Codex。`bind` 只询问 source、profile 和缺少的 key，随后
+发送一次有超时的最小真实推理请求；只有成功后才会出现在 CXP/Teams model list 以及
+Codex CLI/App/Teams 的统一模型目录。验证失败会保留候选和简短错误但继续隐藏模型。
+Git revision 本身不再使验证失效。如果有效 provider、模型、兼容策略或 credential
+绑定发生变化，CXP 会直接复用已保存的 key 执行最小自动复验；未变模型无需用户操作就会
+继续可用。只有复验失败的模型会保持隐藏，后续 sync 会再次尝试。私有仓库使用现有 Git credential
+helper 或 SSH agent；带内嵌 credential 的仓库 URL 会被拒绝。
+
+长驻 Teams service 运行时，会每 30 分钟自动 shallow-sync 已配置的 model-source Git
+仓库。调度以每个 source 持久化的 `syncedAt` 为准，因此 helper 重启不会延后已经到期的
+pull。Git、checkout、schema 校验或 merge 失败只输出 warning，并继续使用最后一次成功
+同步的仓库和配置；失败会等到下一个正常周期再重试，不会形成紧密重试循环。
+`teams run --once` 不会启动后台同步。
+已经成功激活过的 source 如果无法接受最新 JSON，CXP 会把 last-known-good revision
+记录为正在使用的 backup。`model-source list` 会显示该状态，使用其 profile 的 Teams Work
+chat 每一轮被接受时都会显示 backup JSON 警告，直到后续 sync 成功。首次 sync 失败不会误报存在 backup。
+
+只要配置中至少存在一个有效第三方 model profile，CXP 就会启动仅监听 loopback 的
+统一模型 Gateway。Gateway 从即将运行会话的同一个 Codex 二进制读取完整的内置官方
+模型目录，只追加当前验证有效且可路由的第三方模型，并原子写出可复用的
+last-known-good catalog。这个本地操作不再执行旧的 `model/list` 网络 prewarm，也不等待
+Gateway catalog readiness。Codex CLI、
+App 和 Teams 的模型选择器因此可以在同一次启动中显示并切换官方与第三方模型。请求
+通过明确的 model allowlist 路由：官方认证只会发给官方 backend，第三方 credential
+只会发给对应 provider。没有配置第三方 model profile 时，CXP 不会启动 Gateway，也
+不会注入 provider、catalog、header 或环境变量 override，纯官方 Codex 行为保持不变。
+如果选择官方 default 时统一 Gateway 无法准备（包括 catalog、proxy、路由或监听失败），
+CXP 会绕过 Gateway，继续使用 Codex 原生官方 provider，不会让第三方故障阻断 GPT。App 的隔离
+profile 会继承用户配置和 credential-store 选择，只覆盖 CXP 管理的模型字段。
+
+CXP 使用官方的 `codex login status` 命令探测当前 `CODEX_HOME`/credential store，而不
+直接读取 `auth.json`。已登录时，官方 GPT catalog 保持原顺序并永远位于第三方模型之前，
+包括显式第三方 profile 和 resume/snapshot 启动。未登录时则使用
+`requires_openai_auth=false` 的第三方-only provider，不要求只使用第三方模型的用户登录。
+官方 catalog 刷新不再是第三方推理的启动前置条件；无法读取内置目录时会立即降级为
+当前验证通过的第三方-only catalog。
+
+Teams 的 `model list` 只显示当前仍通过认证验证的可选择模型：Codex login
+probe 成功后，会读取按当前账号过滤的 app-server `model/list`，按服务端顺序显示全部
+可选官方模型，并把 `default` 解析为标记了 `isDefault` 的具体模型；第三方 profile 要求针对该具体模型的最小真实推理成功，而且 verification
+fingerprint 仍匹配当前 key 和有效模型配置。`model setup` 单独用于发现全部
+候选和录入 key。CLI setup、Teams 一次性 key intake 与 Git `model-source bind` 使用相同
+验证语义；失败配置会保留以便重试，但不会出现在 Teams 可选列表中。
+
+CXP 把各个上游 key 保留在 helper 内，并使用独立的一次性 header 验证本地 Gateway
+请求。
+兼容代理会保留 `prompt_cache_key`、原生 usage、streaming 和 response id，同时规范化
+function-tool-only Responses 实现不接受的 namespace/custom tools 与 replay items。
+它为 Codex 配置 `wire_api="responses"`，不会把上游 key 写入生成的 Codex config，
+也不会把请求转换成 Chat Completions。第三方父模型的 hosted web search 会被关闭；当
+该 profile 的任务确实需要实时联网信息时，CXP 会提供一个本地 `gpt_search` role，使用
+`gpt-5.6-luna`、high reasoning 和 live search，只委派独立的搜索任务并返回带引用的
+结果。支持原生 hosted search 的 profile 不会注入这个 fallback，也不会改变现有行为。
+role 配置只保存在本地 model-profile 资产目录，不包含第三方 URL 或 credential。本地
+MCP servers 和 skills 仍可用。启动日志会输出 input、cached tokens 和 cache hit rate。
 
 对于更底层的实验或集成，`responses serve` 会暴露一个本地 `/v1/responses`
 facade，后端是 OpenAI-compatible chat upstream:

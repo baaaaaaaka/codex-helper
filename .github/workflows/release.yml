@@ -135,6 +135,14 @@ jobs:
           go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
           go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
 
+      - name: Unified official and third-party model routing contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(TeamsModelProfileResolver|SelectedOfficialModel|OfficialDefault|TeamsCodexExecutorRoutesSessionModelProfileSnapshot)' -v
+          go test ./internal/teams -count=1 -run 'Test(BridgeModelProfileSwitch|BridgeModelSwitchSerializesWithQueueTurn|BridgePendingModelSwitchSnapshotsNewTurnsAndActivatesAtBoundary|ReasoningEffortForModelSwitch|RunQueuedTurnBindsGenerationAwareJournalAfterModelSwitch)' -v
+          go test ./internal/modelprofile -count=1 -run 'Test(ResolveSnapshot|CodexModelCatalog|MergeCodex)' -v
+
   teams-runtime-preflight:
     name: Teams runtime preflight (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

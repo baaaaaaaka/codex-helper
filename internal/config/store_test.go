@@ -52,6 +52,7 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 		ModelProfiles: map[string]ModelProfile{
 			"deepseek-work": {
 				Provider:  "deepseek",
+				BaseURL:   "https://responses.example.invalid/v1",
 				APIKeyRef: "env:DEEPSEEK_API_KEY",
 				SSHProxy:  "n1",
 				Revision:  2,
@@ -78,7 +79,7 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	if out.DefaultModelProfile != "deepseek-work" {
 		t.Fatalf("DefaultModelProfile=%q", out.DefaultModelProfile)
 	}
-	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
+	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.BaseURL != "https://responses.example.invalid/v1" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
 		t.Fatalf("ModelProfiles round trip failed: %#v", out.ModelProfiles)
 	}
 	if out.TeamsCodexPath != in.TeamsCodexPath {

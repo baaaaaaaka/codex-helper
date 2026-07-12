@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -156,6 +157,36 @@ func TestRunQueuedTurnBindsThreadFromJournalFallback(t *testing.T) {
 	}
 	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "thread-journal" {
 		t.Fatalf("executor session thread = %#v, want journal thread", executor.sessions)
+	}
+}
+
+func TestRunQueuedTurnBindsGenerationAwareJournalAfterModelSwitch(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "done", CodexThreadID: "thread-generation-2", CodexTurnID: "codex-turn-2"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := bridge.reg.SessionByID("s001")
+	seedThreadRecoverySession(t, store, session, "", "")
+	session.ModelGeneration = 2
+	session.ModelProfile = modelprofile.Snapshot{Name: "glm", Provider: "nvidia", Model: "glm-5.2", Revision: 3}
+	if _, _, err := store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
+		current.ModelGeneration = session.ModelGeneration
+		current.ModelProfile = session.ModelProfile
+		current.CodexThreadID = ""
+		return current, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.appendThreadLinkJournal(ctx, threadLinkJournalRecord{Source: "test", SessionID: session.ID, ChatID: session.ChatID, CodexThreadID: "thread-generation-2", ModelGeneration: 2, ModelProfile: session.ModelProfile}); err != nil {
+		t.Fatal(err)
+	}
+	turn := seedQueuedThreadRecoveryTurn(t, store, session.ID, "turn-generation-journal")
+	if err := bridge.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, session.ChatID, ExecutionInput{Prompt: "continue"}); err != nil {
+		t.Fatalf("runQueuedTurnInputWithExecutor: %v", err)
+	}
+	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "thread-generation-2" {
+		t.Fatalf("executor sessions = %#v", executor.sessions)
 	}
 }
 

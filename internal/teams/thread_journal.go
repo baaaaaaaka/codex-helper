@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
+
 	"github.com/gofrs/flock"
 )
 
@@ -24,19 +26,21 @@ const (
 )
 
 type threadLinkJournalRecord struct {
-	Version       int       `json:"version"`
-	EventType     string    `json:"event_type,omitempty"`
-	Source        string    `json:"source,omitempty"`
-	ScopeID       string    `json:"scope_id,omitempty"`
-	MachineID     string    `json:"machine_id,omitempty"`
-	SessionID     string    `json:"session_id,omitempty"`
-	ChatID        string    `json:"chat_id,omitempty"`
-	TeamsTurnID   string    `json:"teams_turn_id,omitempty"`
-	CodexThreadID string    `json:"codex_thread_id,omitempty"`
-	CodexTurnID   string    `json:"codex_turn_id,omitempty"`
-	Cwd           string    `json:"cwd,omitempty"`
-	Diagnostic    string    `json:"diagnostic,omitempty"`
-	ObservedAt    time.Time `json:"observed_at,omitempty"`
+	Version         int                   `json:"version"`
+	EventType       string                `json:"event_type,omitempty"`
+	Source          string                `json:"source,omitempty"`
+	ScopeID         string                `json:"scope_id,omitempty"`
+	MachineID       string                `json:"machine_id,omitempty"`
+	SessionID       string                `json:"session_id,omitempty"`
+	ChatID          string                `json:"chat_id,omitempty"`
+	TeamsTurnID     string                `json:"teams_turn_id,omitempty"`
+	CodexThreadID   string                `json:"codex_thread_id,omitempty"`
+	CodexTurnID     string                `json:"codex_turn_id,omitempty"`
+	ModelGeneration int                   `json:"model_generation,omitempty"`
+	ModelProfile    modelprofile.Snapshot `json:"model_profile,omitempty"`
+	Cwd             string                `json:"cwd,omitempty"`
+	Diagnostic      string                `json:"diagnostic,omitempty"`
+	ObservedAt      time.Time             `json:"observed_at,omitempty"`
 }
 
 func (b *Bridge) appendThreadLinkJournal(ctx context.Context, rec threadLinkJournalRecord) error {

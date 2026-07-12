@@ -19,6 +19,33 @@ func TestResolveDefaultModelProfile(t *testing.T) {
 	}
 }
 
+func TestResolveStructuredModelInheritsProviderCredentialAndPolicies(t *testing.T) {
+	yes, no := true, false
+	retries := 4
+	cfg := config.Config{ModelConfigVersion: 1,
+		ModelCredentials: map[string]config.ModelCredential{"ih": {APIKeyRef: "env:IH_KEY"}},
+		ModelProviders:   map[string]config.ModelProvider{"ih": {Protocol: "chat-completions", BaseURL: "https://ih.example/v1", Credential: "ih", HTTP: config.ModelHTTPPolicy{RetryStatuses: []int{429, 529}}}},
+		Models:           map[string]config.ModelDefinition{"glm": {Provider: "ih", UpstreamModel: "nvidia/glm", DisplayName: "GLM", Capabilities: config.ModelCapabilities{Tools: &yes, ParallelTools: &no, Reasoning: &yes}, Limits: config.ModelLimits{ContextWindow: 200000, MaxOutputTokens: 16384}, Reasoning: config.ModelReasoningPolicy{SupportedEfforts: []string{"high"}, DefaultEffort: "high"}, Tools: config.ModelToolPolicy{Parallel: "disabled"}, HTTP: config.ModelHTTPPolicy{MaxRetries: &retries}}},
+		ModelProfiles:    map[string]config.ModelProfile{"work": {Model: "glm", Revision: 1}},
+	}
+	got, err := Resolve(cfg, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Profile.APIKeyRef != "env:IH_KEY" || got.Provider.BaseURL != "https://ih.example/v1" || got.Model.UpstreamModel() != "nvidia/glm" {
+		t.Fatalf("resolved = %#v", got)
+	}
+	if got.Model.ContextWindow != 200000 || got.Model.MaxOutputTokens != 16384 || got.Model.ToolPolicy.Parallel != "disabled" {
+		t.Fatalf("model = %#v", got.Model)
+	}
+	if got.Model.HTTPPolicy.MaxRetries == nil || *got.Model.HTTPPolicy.MaxRetries != 4 || len(got.Model.HTTPPolicy.RetryStatuses) != 2 {
+		t.Fatalf("http = %#v", got.Model.HTTPPolicy)
+	}
+	if fp := ModelFingerprint(got.Provider, got.Model.PublicID()); fp == "" {
+		t.Fatal("empty model fingerprint")
+	}
+}
+
 func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 	now := time.Now()
 	cfg := config.Config{
@@ -51,6 +78,56 @@ func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 	}
 	if got.SSHProfile == nil || got.SSHProfile.ID != "ssh-1" {
 		t.Fatalf("SSHProfile=%#v", got.SSHProfile)
+	}
+}
+
+func TestResolveResponsesCompatibleProfileUsesLocalConfiguration(t *testing.T) {
+	cfg := config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"custom": {
+				Provider:  "responses-compatible",
+				Model:     "example/reasoning-model",
+				BaseURL:   "https://responses.example.invalid/v1",
+				APIKeyRef: "env:RESPONSES_API_KEY",
+				Revision:  2,
+			},
+		},
+	}
+	resolved, err := Resolve(cfg, "custom")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Provider.BaseURL != "https://responses.example.invalid/v1" || resolved.SelectedPublicModel() != "example/reasoning-model" || !resolved.Provider.DirectResponses || !resolved.Provider.DisableHostedWebSearch {
+		t.Fatalf("resolved=%#v", resolved)
+	}
+	snapshot := resolved.Snapshot(time.Now())
+	if snapshot.BaseURL != resolved.Provider.BaseURL || snapshot.BaseURLHash == "" {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+	resumed, err := ResolveSnapshot(cfg, snapshot)
+	if err != nil {
+		t.Fatalf("ResolveSnapshot: %v", err)
+	}
+	if resumed.Provider.BaseURL != resolved.Provider.BaseURL {
+		t.Fatalf("resumed=%#v", resumed)
+	}
+}
+
+func TestResolveChatCompatibleProfileAppliesExternalReasoningOverrides(t *testing.T) {
+	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"external": {
+			Provider: "chat-compatible", Model: "vendor/future-model",
+			BaseURL: "https://chat.example.invalid/v1", APIKeyRef: "env:CHAT_API_KEY",
+			DefaultReasoningEffort: "high", ReasoningEffortMap: map[string]string{"xhigh": "max"}, Revision: 1,
+		},
+	}}
+	resolved, err := Resolve(cfg, "external")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if resolved.Provider.DirectResponses || resolved.SelectedPublicModel() != "vendor/future-model" || resolved.Provider.DefaultReasoningEffort != "high" || resolved.Provider.ReasoningEffortMap["xhigh"] != "max" {
+		t.Fatalf("resolved=%#v", resolved)
 	}
 }
 
@@ -320,5 +397,67 @@ func TestSecretStoreAndAPIKeyRefs(t *testing.T) {
 	}
 	if Fingerprint("sk-test") == "" || Fingerprint("sk-test") == Fingerprint("different") {
 		t.Fatalf("Fingerprint not stable enough")
+	}
+}
+
+func TestMergeHTTPPolicyIncludesPhaseTimeoutsAndExplicitZeroRetries(t *testing.T) {
+	zero := 0
+	base := config.ModelHTTPPolicy{TimeoutSeconds: 90, ResponseHeaderTimeoutSeconds: 120}
+	override := config.ModelHTTPPolicy{ResponseHeaderTimeoutSeconds: 45, MaxRetries: &zero}
+	got := mergeHTTPPolicy(base, override)
+	if got.TimeoutSeconds != 90 || got.ResponseHeaderTimeoutSeconds != 45 {
+		t.Fatalf("merged timeouts = %#v", got)
+	}
+	if got.MaxRetries == nil || *got.MaxRetries != 0 {
+		t.Fatalf("MaxRetries = %#v, want explicit zero", got.MaxRetries)
+	}
+}
+
+func TestMergeHTTPPolicyOverridesModelConcurrency(t *testing.T) {
+	got := mergeHTTPPolicy(config.ModelHTTPPolicy{MaxConcurrentRequests: 4}, config.ModelHTTPPolicy{MaxConcurrentRequests: 1})
+	if got.MaxConcurrentRequests != 1 {
+		t.Fatalf("maxConcurrentRequests = %d", got.MaxConcurrentRequests)
+	}
+}
+
+func TestMergeStreamPolicyIncludesIdleTimeout(t *testing.T) {
+	got := mergeStreamPolicy(config.ModelStreamPolicy{IdleTimeoutSeconds: 300}, config.ModelStreamPolicy{IdleTimeoutSeconds: 60})
+	if got.IdleTimeoutSeconds != 60 {
+		t.Fatalf("IdleTimeoutSeconds = %d", got.IdleTimeoutSeconds)
+	}
+}
+
+func TestResolveStructuredModelAfterConfigStoreLoad(t *testing.T) {
+	zero := 0
+	path := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Version:            config.CurrentVersion,
+		ModelConfigVersion: config.CurrentModelConfigVersion,
+		ModelCredentials:   map[string]config.ModelCredential{"ih": {APIKeyRef: "env:KEY"}},
+		ModelProviders: map[string]config.ModelProvider{"ih": {
+			Protocol: "chat-completions", BaseURL: "https://example.invalid/v1", Credential: "ih",
+			HTTP:   config.ModelHTTPPolicy{ResponseHeaderTimeoutSeconds: 45, MaxRetries: &zero},
+			Stream: config.ModelStreamPolicy{IdleTimeoutSeconds: 90},
+		}},
+		Models:        map[string]config.ModelDefinition{"glm": {Provider: "ih", UpstreamModel: "vendor/glm"}},
+		ModelProfiles: map[string]config.ModelProfile{"work-glm": {Provider: "ih", Model: "glm", Credential: "ih", Revision: 1}},
+	}
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := Resolve(loaded, "work-glm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Model.HTTPPolicy.MaxRetries == nil || *resolved.Model.HTTPPolicy.MaxRetries != 0 || resolved.Model.HTTPPolicy.ResponseHeaderTimeoutSeconds != 45 || resolved.Model.StreamPolicy.IdleTimeoutSeconds != 90 {
+		t.Fatalf("resolved policies = HTTP:%#v stream:%#v", resolved.Model.HTTPPolicy, resolved.Model.StreamPolicy)
 	}
 }

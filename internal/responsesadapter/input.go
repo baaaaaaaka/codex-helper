@@ -83,6 +83,16 @@ func parseInputItem(raw json.RawMessage) (ProviderMessage, string, bool, error) 
 				Status:    "completed",
 			}},
 		}, "", true, nil
+	case "custom_tool_call":
+		callID := rawString(obj["call_id"])
+		name := rawString(obj["name"])
+		if callID == "" || name == "" {
+			return ProviderMessage{}, "", false, fmt.Errorf("custom_tool_call input requires call_id and name")
+		}
+		arguments, _ := json.Marshal(map[string]string{"input": rawString(obj["input"])})
+		return ProviderMessage{Role: "assistant", ToolCalls: []ToolCallRecord{{
+			ID: callID, Name: name, Arguments: string(arguments), Status: "completed", Type: "custom",
+		}}}, "", true, nil
 	case "reasoning":
 		reasoning := extractReasoningInputText(obj)
 		if strings.TrimSpace(reasoning) == "" {

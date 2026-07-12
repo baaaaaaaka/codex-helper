@@ -75,6 +75,43 @@ func TestNormalizeToolsMapsLocalShellAndCustomTools(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolsShellFallbackOmitsApplyPatchAndStrengthensShell(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"local_shell"},
+		{"type":"custom","name":"apply_patch","description":"Apply a patch"}
+	]`)
+	tools, warnings, err := NormalizeToolsWithMode(raw, "shell-fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Function.Name != "shell" || !strings.Contains(tools[0].Function.Description, "apply_patch") {
+		t.Fatalf("tools = %#v", tools)
+	}
+	if len(warnings) != 1 || warnings[0].Name != "apply_patch" {
+		t.Fatalf("warnings = %#v", warnings)
+	}
+}
+
+func TestCustomToolCallRestoresResponsesShape(t *testing.T) {
+	item := buildToolCallItem(ToolCallRecord{
+		ItemID: "fc-1", ID: "call-1", Name: "apply_patch", Type: "custom", Status: "completed",
+		Arguments: `{"input":"*** Begin Patch\n*** End Patch"}`,
+	})
+	raw, err := json.Marshal(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{`"type":"custom_tool_call"`, `"name":"apply_patch"`, `"input":"*** Begin Patch\n*** End Patch"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("custom tool item = %s, missing %s", text, want)
+		}
+	}
+	if strings.Contains(text, `"arguments"`) {
+		t.Fatalf("custom tool leaked function arguments: %s", text)
+	}
+}
+
 func TestNormalizeToolsFlattensNamespaceTools(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"type":"function","name":"exec_command","parameters":{"type":"object"}},

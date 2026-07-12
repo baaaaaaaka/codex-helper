@@ -442,6 +442,15 @@ func TestSaveRegistryDoesNotResurrectRemovedProjectionChats(t *testing.T) {
 	}
 }
 
+func TestMergeRegistrySessionsDoesNotResurrectThreadAcrossModelGeneration(t *testing.T) {
+	existing := []Session{{ID: "s1", CodexThreadID: "thread-old", ModelGeneration: 1}}
+	next := []Session{{ID: "s1", ModelGeneration: 2}}
+	merged := mergeRegistrySessions(existing, next)
+	if len(merged) != 1 || merged[0].CodexThreadID != "" || merged[0].ModelGeneration != 2 {
+		t.Fatalf("merged session = %#v, want generation 2 with an intentionally empty thread", merged)
+	}
+}
+
 func assertTeamsFileContent(t *testing.T, path string, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)

@@ -133,6 +133,10 @@ type ProviderEvent struct {
 	ToolCall *ProviderToolCallDelta
 	Usage    *Usage
 	Err      error
+	// FinishReason preserves the terminal reason reported by an upstream
+	// Chat Completions provider. In particular, "length" must not be exposed
+	// as a completed Responses API response.
+	FinishReason string
 }
 
 type ProviderToolCallDelta struct {
@@ -150,6 +154,7 @@ type ToolCallRecord struct {
 	Name        string
 	Arguments   string
 	Status      string
+	Type        string
 }
 
 type Usage struct {
@@ -211,8 +216,9 @@ type ModelInfo struct {
 }
 
 type ChatTool struct {
-	Type     string       `json:"type"`
-	Function ChatFunction `json:"function"`
+	Type       string       `json:"type"`
+	Function   ChatFunction `json:"function"`
+	SourceType string       `json:"-"`
 }
 
 type ChatFunction struct {
@@ -233,6 +239,7 @@ type ResponseStatus string
 const (
 	ResponseStatusInProgress ResponseStatus = "in_progress"
 	ResponseStatusCompleted  ResponseStatus = "completed"
+	ResponseStatusIncomplete ResponseStatus = "incomplete"
 	ResponseStatusFailed     ResponseStatus = "failed"
 	ResponseStatusCancelled  ResponseStatus = "cancelled"
 )

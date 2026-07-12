@@ -31,7 +31,7 @@ func applyCodexDesktopModelProfileLaunch(store *config.Store, opts codexDesktopA
 			}
 		}
 	}
-	codexHome, err := writeCodexDesktopModelProfileConfig(store, desktopLaunch, opts.Platform)
+	codexHome, err := writeCodexDesktopModelProfileConfig(store, desktopLaunch, opts.Platform, opts.CodexHomeSource)
 	if err != nil {
 		return opts, err
 	}
@@ -46,7 +46,7 @@ func applyCodexDesktopModelProfileLaunch(store *config.Store, opts codexDesktopA
 		}
 	}
 	opts.ExtraEnv = replaceCodexHomeEnv(opts.ExtraEnv, launchCodexHome)
-	opts.ExtraEnv = append(opts.ExtraEnv, envCXPResponsesProxyKey+"="+launch.ProxyKey)
+	opts.ExtraEnv = withLoopbackNoProxyEnv(append(opts.ExtraEnv, launch.effectiveEnvKey()+"="+launch.ProxyKey))
 	opts.ModelProfileName = launch.Name
 	if opts.Log != nil {
 		_, _ = fmt.Fprintf(opts.Log, "using model profile %q for Codex desktop app via %s\n", launch.Name, desktopLaunch.BaseURL)
@@ -54,7 +54,7 @@ func applyCodexDesktopModelProfileLaunch(store *config.Store, opts codexDesktopA
 	return opts, nil
 }
 
-func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelProfileLaunch, platform codexDesktopPlatform) (string, error) {
+func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelProfileLaunch, platform codexDesktopPlatform, sourceCodexHome ...string) (string, error) {
 	name := safeModelProfilePathPart(launch.Name)
 	if name == "" {
 		name = "profile"
@@ -66,6 +66,15 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 	codexHome := filepath.Join(filepath.Dir(store.Path()), "model-profiles", dirName, "codex")
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		return "", err
+	}
+	source := ""
+	if launch.Unified {
+		if len(sourceCodexHome) > 0 {
+			source = strings.TrimSpace(sourceCodexHome[0])
+		}
+		if err := copyCodexOfficialAuthToProfileHome(source, codexHome); err != nil {
+			return "", err
+		}
 	}
 	catalogConfigPath := strings.TrimSpace(launch.CatalogPath)
 	if len(launch.CatalogJSON) > 0 {
@@ -84,36 +93,181 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 			}
 		}
 	}
+	webSearchFallbackConfigPath := strings.TrimSpace(launch.WebSearchFallbackPath)
+	webSearchFallbackTOML := launch.WebSearchFallbackTOML
+	if launch.DisableHostedWebSearch && len(webSearchFallbackTOML) == 0 {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+	}
+	if len(webSearchFallbackTOML) > 0 {
+		webSearchFallbackPath := filepath.Join(codexHome, codexWebSearchFallbackConfigName)
+		if err := os.WriteFile(webSearchFallbackPath, webSearchFallbackTOML, 0o600); err != nil {
+			return "", err
+		}
+		webSearchFallbackConfigPath = webSearchFallbackPath
+		if platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
+			converted, err := codexAppWSLPathFn(webSearchFallbackPath)
+			if err != nil {
+				return "", fmt.Errorf("convert web search fallback config path for Windows launch: %w", err)
+			}
+			if strings.TrimSpace(converted) != "" {
+				webSearchFallbackConfigPath = converted
+			}
+		}
+	}
+	generatedConfig := codexDesktopModelProfileConfigTOML(launch, catalogConfigPath, webSearchFallbackConfigPath)
+	if launch.Unified {
+		inheritedConfig, err := inheritedCodexDesktopModelProfileConfig(source, generatedConfig)
+		if err != nil {
+			return "", err
+		}
+		generatedConfig = inheritedConfig
+	}
 	configPath := filepath.Join(codexHome, "config.toml")
-	if err := os.WriteFile(configPath, []byte(codexDesktopModelProfileConfigTOML(launch, catalogConfigPath)), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(generatedConfig), 0o600); err != nil {
 		return "", err
 	}
 	return codexHome, nil
 }
 
-func codexDesktopModelProfileConfigTOML(launch codexModelProfileLaunch, catalogPath string) string {
+func copyCodexOfficialAuthToProfileHome(sourceCodexHome string, profileCodexHome string) error {
+	sourceCodexHome = strings.TrimSpace(sourceCodexHome)
+	if sourceCodexHome == "" {
+		return fmt.Errorf("official Codex home is unavailable; run `cxp app auth` before launching unified models")
+	}
+	source := filepath.Join(sourceCodexHome, "auth.json")
+	raw, err := os.ReadFile(source)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Codex may keep credentials in the OS credential store instead of
+			// auth.json. The inherited config retains that store selection.
+			return nil
+		}
+		return fmt.Errorf("read official Codex authentication: %w", err)
+	}
+	destination := filepath.Join(profileCodexHome, "auth.json")
+	if err := writeAtomicPrivateFile(destination, raw); err != nil {
+		return fmt.Errorf("copy official Codex authentication into unified App profile: %w", err)
+	}
+	return nil
+}
+
+func inheritedCodexDesktopModelProfileConfig(sourceCodexHome, generated string) (string, error) {
+	sourceCodexHome = strings.TrimSpace(sourceCodexHome)
+	if sourceCodexHome == "" {
+		return "", fmt.Errorf("official Codex home is unavailable; run `cxp app auth` before launching unified models")
+	}
+	raw, err := os.ReadFile(filepath.Join(sourceCodexHome, "config.toml"))
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("read official Codex config: %w", err)
+	}
+	if len(raw) == 0 {
+		return generated, nil
+	}
+	// Preserve user settings and credential-store selection while removing only
+	// fields owned by the generated unified profile. This intentionally avoids
+	// copying history/state databases into the isolated App home.
+	ownedSections := map[string]bool{
+		"model_providers." + cxpUnifiedCodexModelProviderID: true,
+		"features.multi_agent_v2":                           true,
+		"agents." + codexWebSearchFallbackAgentName:         true,
+	}
+	ownedTopLevel := map[string]bool{
+		"model": true, "model_provider": true, "model_catalog_json": true, "web_search": true,
+	}
+	lines := strings.Split(string(raw), "\n")
+	topLevel := make([]string, 0, len(lines))
+	sections := make([]string, 0, len(lines))
+	inSection := false
+	skipSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			section := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "["), "]"))
+			inSection = true
+			skipSection = ownedSections[section]
+			if skipSection {
+				continue
+			}
+		}
+		if skipSection {
+			continue
+		}
+		if !inSection {
+			if key, _, ok := strings.Cut(trimmed, "="); ok && ownedTopLevel[strings.TrimSpace(key)] {
+				continue
+			}
+		}
+		if inSection {
+			sections = append(sections, line)
+		} else {
+			topLevel = append(topLevel, line)
+		}
+	}
+	parts := make([]string, 0, 3)
+	if value := strings.TrimSpace(strings.Join(topLevel, "\n")); value != "" {
+		parts = append(parts, value)
+	}
+	parts = append(parts, strings.TrimSpace(generated))
+	if value := strings.TrimSpace(strings.Join(sections, "\n")); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, "\n\n") + "\n", nil
+}
+
+func codexDesktopModelProfileConfigTOML(launch codexModelProfileLaunch, catalogPath string, webSearchFallbackPath ...string) string {
 	providerName := "CXP " + launch.ProviderName
 	if strings.TrimSpace(launch.ProviderName) == "" {
 		providerName = "CXP third-party"
 	}
-	lines := []string{
-		`model_provider = "` + cxpCodexModelProviderID + `"`,
-		`model = "` + tomlEscapeString(launch.Model) + `"`,
+	providerID := cxpCodexModelProviderID
+	if launch.Unified {
+		providerID = cxpUnifiedCodexModelProviderID
+		providerName = "CXP Unified models"
+	}
+	lines := []string{`model_provider = "` + providerID + `"`}
+	if strings.TrimSpace(launch.Model) != "" {
+		lines = append(lines, `model = "`+tomlEscapeString(launch.Model)+`"`)
+	}
+	if launch.DisableHostedWebSearch {
+		lines = append(lines, `web_search = "disabled"`)
 	}
 	if strings.TrimSpace(catalogPath) != "" {
 		lines = append(lines, `model_catalog_json = "`+tomlEscapeString(catalogPath)+`"`)
 	}
-	lines = append(lines,
-		"",
-		`[model_providers.`+cxpCodexModelProviderID+`]`,
-		`name = "`+tomlEscapeString(providerName)+`"`,
-		`base_url = "`+tomlEscapeString(launch.BaseURL)+`"`,
-		`env_key = "`+envCXPResponsesProxyKey+`"`,
-		`wire_api = "responses"`,
-		`requires_openai_auth = false`,
-		`supports_websockets = false`,
-		"",
-	)
+	configuredWebSearchFallbackPath := ""
+	if len(webSearchFallbackPath) > 0 {
+		configuredWebSearchFallbackPath = strings.TrimSpace(webSearchFallbackPath[0])
+	}
+	if launch.DisableHostedWebSearch && configuredWebSearchFallbackPath != "" {
+		lines = append(lines,
+			"",
+			`[features.multi_agent_v2]`,
+			`enabled = true`,
+			`hide_spawn_agent_metadata = false`,
+			`root_agent_usage_hint_text = "`+tomlEscapeString(codexWebSearchFallbackRootHint)+`"`,
+			"",
+			`[agents.`+codexWebSearchFallbackAgentName+`]`,
+			`description = "`+tomlEscapeString(codexWebSearchFallbackAgentDescription)+`"`,
+			`config_file = "`+tomlEscapeString(configuredWebSearchFallbackPath)+`"`,
+		)
+	}
+	lines = append(lines, "", `[model_providers.`+providerID+`]`, `name = "`+tomlEscapeString(providerName)+`"`, `base_url = "`+tomlEscapeString(launch.BaseURL)+`"`)
+	if launch.Unified {
+		lines = append(lines,
+			`wire_api = "responses"`,
+			`requires_openai_auth = true`,
+			`supports_websockets = false`,
+			`env_http_headers = { "`+cxpUnifiedGatewayHeader+`" = "`+launch.effectiveEnvKey()+`" }`,
+		)
+	} else {
+		lines = append(lines,
+			`env_key = "`+launch.effectiveEnvKey()+`"`,
+			`wire_api = "responses"`,
+			`requires_openai_auth = false`,
+			`supports_websockets = false`,
+		)
+	}
+	lines = append(lines, "")
 	return strings.Join(lines, "\n")
 }
 

@@ -232,6 +232,13 @@ type ModelProfileManager interface {
 	SaveModelProfileAPIKey(context.Context, ModelProfileAPIKeySaveRequest) (ModelProfileAPIKeySaveResult, error)
 }
 
+// ModelProfileRuntimeWarningProvider is optional so older/custom manager
+// implementations keep working. The warning is appended to every accepted
+// Work-chat turn while a last-known-good JSON source is active.
+type ModelProfileRuntimeWarningProvider interface {
+	ModelProfileRuntimeWarning(context.Context, modelprofile.Snapshot) (string, bool, error)
+}
+
 type ModelProfileSetupRequest struct {
 	Model      string
 	SSHProxy   string
@@ -368,6 +375,7 @@ type Bridge struct {
 	reg                               Registry
 	regMu                             sync.Mutex
 	reasoningEffortMu                 sync.Mutex
+	modelProfileMu                    sync.Mutex
 	registryProjectionLastFingerprint string
 	registryProjectionLastSavedAt     time.Time
 	registryProjectionDirty           bool
@@ -1677,20 +1685,25 @@ func registrySessionFromDurable(durable teamstore.SessionContext) Session {
 		status = string(teamstore.SessionStatusActive)
 	}
 	return Session{
-		ID:                    durable.ID,
-		ChatID:                durable.TeamsChatID,
-		ChatURL:               durable.TeamsChatURL,
-		Topic:                 durable.TeamsTopic,
-		UserTitle:             durable.UserTitle,
-		TitleSource:           durable.TitleSource,
-		Status:                status,
-		CodexThreadID:         durable.CodexThreadID,
-		Cwd:                   durable.Cwd,
-		ModelProfile:          durable.ModelProfile,
-		ReasoningEffort:       durable.ReasoningEffort,
-		ReasoningEffortSource: durable.ReasoningEffortSource,
-		CreatedAt:             durable.CreatedAt,
-		UpdatedAt:             durable.UpdatedAt,
+		ID:                      durable.ID,
+		ChatID:                  durable.TeamsChatID,
+		ChatURL:                 durable.TeamsChatURL,
+		Topic:                   durable.TeamsTopic,
+		UserTitle:               durable.UserTitle,
+		TitleSource:             durable.TitleSource,
+		Status:                  status,
+		CodexThreadID:           durable.CodexThreadID,
+		ModelGeneration:         durable.ModelGeneration,
+		Cwd:                     durable.Cwd,
+		ModelProfile:            durable.ModelProfile,
+		PendingModelProfile:     durable.PendingModelProfile,
+		PendingModelRequestedAt: durable.PendingModelRequestedAt,
+		PendingReasoningEffort:  durable.PendingReasoningEffort,
+		PendingReasoningSource:  durable.PendingReasoningSource,
+		ReasoningEffort:         durable.ReasoningEffort,
+		ReasoningEffortSource:   durable.ReasoningEffortSource,
+		CreatedAt:               durable.CreatedAt,
+		UpdatedAt:               durable.UpdatedAt,
 	}
 }
 
@@ -4823,20 +4836,25 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 		status = "active"
 	}
 	return &Session{
-		ID:                    controlFallbackSessionID,
-		ChatID:                b.reg.ControlChatID,
-		ChatURL:               b.reg.ControlChatURL,
-		Topic:                 firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
-		UserTitle:             durable.UserTitle,
-		TitleSource:           durable.TitleSource,
-		Status:                status,
-		CodexThreadID:         durable.CodexThreadID,
-		Cwd:                   durable.Cwd,
-		ModelProfile:          durable.ModelProfile,
-		ReasoningEffort:       durable.ReasoningEffort,
-		ReasoningEffortSource: durable.ReasoningEffortSource,
-		CreatedAt:             durable.CreatedAt,
-		UpdatedAt:             durable.UpdatedAt,
+		ID:                      controlFallbackSessionID,
+		ChatID:                  b.reg.ControlChatID,
+		ChatURL:                 b.reg.ControlChatURL,
+		Topic:                   firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
+		UserTitle:               durable.UserTitle,
+		TitleSource:             durable.TitleSource,
+		Status:                  status,
+		CodexThreadID:           durable.CodexThreadID,
+		ModelGeneration:         durable.ModelGeneration,
+		Cwd:                     durable.Cwd,
+		ModelProfile:            durable.ModelProfile,
+		PendingModelProfile:     durable.PendingModelProfile,
+		PendingModelRequestedAt: durable.PendingModelRequestedAt,
+		PendingReasoningEffort:  durable.PendingReasoningEffort,
+		PendingReasoningSource:  durable.PendingReasoningSource,
+		ReasoningEffort:         durable.ReasoningEffort,
+		ReasoningEffortSource:   durable.ReasoningEffortSource,
+		CreatedAt:               durable.CreatedAt,
+		UpdatedAt:               durable.UpdatedAt,
 	}
 }
 
@@ -7972,6 +7990,7 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		ID:              retryTurnID(turn.ID),
 		SessionID:       session.ID,
 		CodexThreadID:   session.CodexThreadID,
+		ModelGeneration: session.ModelGeneration,
 		ModelProfile:    retryTurnModelProfile(turn, session.ModelProfile),
 		ReasoningEffort: retryTurnReasoningEffort(turn, session, b.executor),
 		RecoveryReason:  "retry of " + turn.ID,
@@ -8282,6 +8301,11 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 	if body == "" {
 		body = "⏳ Codex is working. Request accepted."
 	}
+	snapshot := turn.ModelProfile
+	if snapshot.IsZero() && session != nil {
+		snapshot = session.ModelProfile
+	}
+	body = b.appendModelProfileRuntimeWarning(ctx, body, snapshot)
 	outbox := teamstore.OutboxMessage{
 		ID:          "outbox:" + turn.ID + ":ack",
 		SessionID:   session.ID,
@@ -8308,6 +8332,24 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 		_, _ = fmt.Fprintf(b.out, "Teams ACK send error: %v\n", err)
 	}
 	return nil
+}
+
+func (b *Bridge) appendModelProfileRuntimeWarning(ctx context.Context, body string, snapshot modelprofile.Snapshot) string {
+	provider, ok := b.modelProfileManager.(ModelProfileRuntimeWarningProvider)
+	if !ok {
+		return body
+	}
+	warning, active, err := provider.ModelProfileRuntimeWarning(ctx, snapshot)
+	if err != nil {
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams model profile backup warning lookup error: %v\n", err)
+		}
+		return body
+	}
+	if !active || strings.TrimSpace(warning) == "" {
+		return body
+	}
+	return strings.TrimSpace(body) + "\n\n" + strings.TrimSpace(warning)
 }
 
 func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
@@ -8690,7 +8732,10 @@ func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Sess
 	}
 	queued, ok := oldestQueuedTurnForSessionState(state, session.ID)
 	if !ok {
-		return nil
+		return b.applyPendingSessionModelProfileIfIdle(ctx, session)
+	}
+	if err := b.activatePendingSessionModelProfileForQueuedTurn(ctx, session, queued); err != nil {
+		return err
 	}
 	gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
 	if err != nil {
@@ -12393,9 +12438,14 @@ func registrySessionsEqual(left Session, right Session) bool {
 		left.TitleSource == right.TitleSource &&
 		left.Status == right.Status &&
 		left.CodexThreadID == right.CodexThreadID &&
+		left.ModelGeneration == right.ModelGeneration &&
 		left.Cwd == right.Cwd &&
 		left.ReasoningEffort == right.ReasoningEffort &&
 		left.ReasoningEffortSource == right.ReasoningEffortSource &&
+		modelProfileSnapshotsEqual(left.PendingModelProfile, right.PendingModelProfile) &&
+		left.PendingModelRequestedAt.Equal(right.PendingModelRequestedAt) &&
+		left.PendingReasoningEffort == right.PendingReasoningEffort &&
+		left.PendingReasoningSource == right.PendingReasoningSource &&
 		modelProfileSnapshotsEqual(left.ModelProfile, right.ModelProfile) &&
 		left.CreatedAt.Equal(right.CreatedAt) &&
 		left.UpdatedAt.Equal(right.UpdatedAt)
@@ -12527,20 +12577,25 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				updated = created
 			}
 			state.Sessions[session.ID] = teamstore.SessionContext{
-				ID:                    session.ID,
-				Status:                status,
-				TeamsChatID:           session.ChatID,
-				TeamsChatURL:          session.ChatURL,
-				TeamsTopic:            session.Topic,
-				UserTitle:             session.UserTitle,
-				TitleSource:           session.TitleSource,
-				CodexThreadID:         session.CodexThreadID,
-				Cwd:                   session.Cwd,
-				ModelProfile:          session.ModelProfile,
-				ReasoningEffort:       session.ReasoningEffort,
-				ReasoningEffortSource: session.ReasoningEffortSource,
-				CreatedAt:             created,
-				UpdatedAt:             updated,
+				ID:                      session.ID,
+				Status:                  status,
+				TeamsChatID:             session.ChatID,
+				TeamsChatURL:            session.ChatURL,
+				TeamsTopic:              session.Topic,
+				UserTitle:               session.UserTitle,
+				TitleSource:             session.TitleSource,
+				CodexThreadID:           session.CodexThreadID,
+				ModelGeneration:         session.ModelGeneration,
+				Cwd:                     session.Cwd,
+				ModelProfile:            session.ModelProfile,
+				PendingModelProfile:     session.PendingModelProfile,
+				PendingModelRequestedAt: session.PendingModelRequestedAt,
+				PendingReasoningEffort:  session.PendingReasoningEffort,
+				PendingReasoningSource:  session.PendingReasoningSource,
+				ReasoningEffort:         session.ReasoningEffort,
+				ReasoningEffortSource:   session.ReasoningEffortSource,
+				CreatedAt:               created,
+				UpdatedAt:               updated,
 			}
 			changed = true
 		}
@@ -12641,21 +12696,26 @@ func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) err
 		status = teamstore.SessionStatusArchived
 	}
 	_, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:                    session.ID,
-		Status:                status,
-		TeamsChatID:           session.ChatID,
-		TeamsChatURL:          session.ChatURL,
-		TeamsTopic:            session.Topic,
-		UserTitle:             session.UserTitle,
-		TitleSource:           session.TitleSource,
-		CodexThreadID:         session.CodexThreadID,
-		RunnerKind:            "executor",
-		Cwd:                   session.Cwd,
-		ModelProfile:          session.ModelProfile,
-		ReasoningEffort:       session.ReasoningEffort,
-		ReasoningEffortSource: session.ReasoningEffortSource,
-		CreatedAt:             session.CreatedAt,
-		UpdatedAt:             session.UpdatedAt,
+		ID:                      session.ID,
+		Status:                  status,
+		TeamsChatID:             session.ChatID,
+		TeamsChatURL:            session.ChatURL,
+		TeamsTopic:              session.Topic,
+		UserTitle:               session.UserTitle,
+		TitleSource:             session.TitleSource,
+		CodexThreadID:           session.CodexThreadID,
+		ModelGeneration:         session.ModelGeneration,
+		RunnerKind:              "executor",
+		Cwd:                     session.Cwd,
+		ModelProfile:            session.ModelProfile,
+		PendingModelProfile:     session.PendingModelProfile,
+		PendingModelRequestedAt: session.PendingModelRequestedAt,
+		PendingReasoningEffort:  session.PendingReasoningEffort,
+		PendingReasoningSource:  session.PendingReasoningSource,
+		ReasoningEffort:         session.ReasoningEffort,
+		ReasoningEffortSource:   session.ReasoningEffortSource,
+		CreatedAt:               session.CreatedAt,
+		UpdatedAt:               session.UpdatedAt,
 	})
 	return err
 }
@@ -12827,10 +12887,24 @@ func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, 
 }
 
 func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamstore.InboundEvent) (teamstore.Turn, bool, error) {
+	b.modelProfileMu.Lock()
+	defer b.modelProfileMu.Unlock()
 	leaseGeneration := b.currentLeaseGeneration()
 	executor := b.executor
 	if session != nil && isControlFallbackSessionID(session.ID) {
 		executor = b.effectiveControlFallbackExecutor()
+	}
+	modelSnapshot := session.ModelProfile
+	modelGeneration := session.ModelGeneration
+	threadID := session.CodexThreadID
+	reasoningEffort := effectiveSessionReasoningEffortWithExecutor(session, executor)
+	if !session.PendingModelProfile.IsZero() {
+		modelSnapshot = session.PendingModelProfile
+		modelGeneration++
+		threadID = ""
+		if effort := strings.TrimSpace(session.PendingReasoningEffort); effort != "" {
+			reasoningEffort = effort
+		}
 	}
 	return b.store.QueueTurn(ctx, teamstore.Turn{
 		SessionID:       session.ID,
@@ -12838,9 +12912,10 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 		ScopeID:         b.scope.ID,
 		MachineID:       b.machine.ID,
 		LeaseGeneration: leaseGeneration,
-		CodexThreadID:   session.CodexThreadID,
-		ModelProfile:    session.ModelProfile,
-		ReasoningEffort: effectiveSessionReasoningEffortWithExecutor(session, executor),
+		CodexThreadID:   threadID,
+		ModelGeneration: modelGeneration,
+		ModelProfile:    modelSnapshot,
+		ReasoningEffort: reasoningEffort,
 	})
 }
 

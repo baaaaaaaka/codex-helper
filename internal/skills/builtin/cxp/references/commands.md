@@ -30,12 +30,19 @@
 - `cxp model setup <model> --api-key-env <ENV>`: configure a built-in model choice using an API key environment variable.
 - `cxp model use <model>`: make a configured model the default for future Codex launches.
 - `cxp model doctor [model]`: validate the profile backing a built-in model choice.
-- `cxp model-profile setup [name] --provider deepseek|mimo|kimi|glm|minimax|qwen --model <provider-model> --api-key-stdin --set-default`: create or update a named profile.
+- `cxp model-profile setup [name] --provider deepseek|mimo|kimi|glm|minimax|qwen|responses-compatible|chat-compatible --model <provider-model> --api-key-stdin --set-default`: create or update a named profile. Generic providers also require `--base-url <url>` or `--base-url-env <ENV>` and can use `--supported-reasoning-efforts low,medium,high,xhigh` plus `--reasoning-effort-map xhigh=max`. When any third-party profile is configured, CXP exposes official and third-party models through one credential-isolating gateway; official-only configurations remain on Codex's native path.
 - `cxp model-profile setup [name] ... --ssh-proxy <proxy-profile>`: route a model profile through an existing SSH proxy profile.
 - `cxp model-profile list`: list saved model profiles.
 - `cxp model-profile doctor [name]`: validate a saved model profile.
 - `cxp model-profile set-default <name>`: set the default model profile.
 - `cxp model-profile delete <name>`: delete a non-default model profile.
+- `cxp model-source sync <git-url-or-source> [--name <name>] [--ref <ref>] [--file <path>]`: shallow-sync repository model candidates without asking for a key; candidates remain hidden from Codex until verified.
+- `cxp model-source list`: list synced sources, candidates, and verification state.
+- `cxp model-source bind <source> <profile> --api-key-stdin|--api-key-env <ENV>`: bind one credential and run a minimal real inference probe; only a successful profile enters CLI, App, and Teams model catalogs.
+- Model-source refreshes preserve verification across Git-only changes. Effective model/config changes reuse the stored key for automatic verification, and a removed or failed default safely falls back to Codex Official.
+- A failed refresh of a previously activated source records its last-known-good JSON as an active backup. `model-source list` and every accepted Teams turn using that source show a warning until sync recovers.
+- CXP checks official login with `codex login status`. Logged-in launches merge the current Codex binary's complete bundled GPT catalog first; logged-out launches remain third-party-only and do not require OpenAI auth. Catalog preparation is local and cached: it never runs the old synchronous `model/list` prewarm or blocks third-party inference on official catalog readiness.
+- Teams `model list` is verified-only. When Codex login succeeds, it reads the current account's app-server `model/list`, preserves official order, and prints the concrete `isDefault` model. Use `model setup` to discover candidates; a third-party model appears in the selectable list only after its model-specific authentication probe succeeds and remains fingerprint-current.
 - `cxp responses serve --base-url <openai-compatible-url> --api-key-env <ENV> --model <model>`: run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream.
 
 ## Proxy Profiles
@@ -126,7 +133,7 @@ Work chat commands:
 - `helper retry last`: retry the last failed or interrupted request.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
 - `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
-- `model status`, `model switch <profile>`, and `model fork <profile>`: inspect, switch when compatible, or fork the Work chat with another model profile.
+- `model status`, `model switch <profile>`, and `model fork <profile>`: inspect, switch when compatible, or fork the Work chat with another model profile. Official `gpt-*` slugs take precedence on name collisions; use `official:<slug>` or `profile:<name>` to select explicitly.
 - `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change this Work chat's reasoning effort.
 - `helper close`: close the Work chat binding.
 

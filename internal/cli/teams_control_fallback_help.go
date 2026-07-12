@@ -29,6 +29,7 @@ func teamsControlFallbackHelpContext() string {
 		"cxp model/profile digest:",
 		"- `cxp model list`: list built-in model choices and setup status.",
 		"- `cxp model setup <model> --api-key-stdin` or `--api-key-env <ENV>`: configure a built-in third-party model choice.",
+		"- `cxp model-source sync <repo>` then `cxp model-source bind <source> <profile> --api-key-stdin`: sync Git-distributed model candidates and expose only verified profiles.",
 		"- `cxp model use <model>` and `cxp model doctor [model]`: select or validate a built-in model choice.",
 		"- `cxp model-profile setup [name] --provider <provider> --model <model> --api-key-stdin --set-default`: create or update a named model profile.",
 		"- Add `--ssh-proxy <proxy-profile>` to a model profile only when upstream model traffic should use an existing SSH proxy profile.",

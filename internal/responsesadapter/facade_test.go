@@ -817,6 +817,36 @@ func TestFacadeEmitsFailedWhenProviderStreamEndsBeforeDone(t *testing.T) {
 	}
 }
 
+func TestFacadeMapsLengthFinishReasonToIncomplete(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "stream"}[stream], func(t *testing.T) {
+			facade := newTestFacade(NewMemoryStore(), fakeAdapter{events: []ProviderEvent{
+				{Kind: ProviderEventReasoningDelta, Delta: "partial reasoning"},
+				{Kind: ProviderEventUsage, Usage: &Usage{OutputTokens: 32, TotalTokens: 40}},
+				{Kind: ProviderEventDone, FinishReason: "length"},
+			}})
+			body := `{"model":"model-a","input":"x"}`
+			if stream {
+				body = `{"model":"model-a","input":"x","stream":true}`
+			}
+			rec := httptest.NewRecorder()
+			facade.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			got := rec.Body.String()
+			for _, want := range []string{`"status":"incomplete"`, `"reason":"max_output_tokens"`} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("body missing %s: %s", want, got)
+				}
+			}
+			if stream && (!strings.Contains(got, "event: response.incomplete") || strings.Contains(got, "event: response.completed")) {
+				t.Fatalf("unexpected terminal event: %s", got)
+			}
+		})
+	}
+}
+
 func TestFacadeEmitsFailedWhenProviderErrorsAfterPartialOutput(t *testing.T) {
 	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
 		events: []ProviderEvent{

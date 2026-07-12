@@ -3,6 +3,7 @@ package modelprofile
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 type codexCatalog struct {
@@ -76,12 +77,23 @@ func CodexModelCatalogJSON(provider ProviderSpec) ([]byte, error) {
 		if maxContextWindow <= 0 {
 			maxContextWindow = contextWindow
 		}
+		effectiveContextPercent := model.EffectiveContextPercent
+		if effectiveContextPercent <= 0 || effectiveContextPercent > 100 {
+			effectiveContextPercent = 90
+		}
+		parallelTools := model.SupportsTools
+		switch strings.ToLower(strings.TrimSpace(model.ToolPolicy.Parallel)) {
+		case "disabled":
+			parallelTools = false
+		case "enabled":
+			parallelTools = true
+		}
 		catalog.Models = append(catalog.Models, codexModelInfo{
 			Slug:                          publicID,
 			DisplayName:                   model.Label(),
 			Description:                   firstNonEmpty(model.Description, provider.DisplayName+" model"),
-			DefaultReasoningLevel:         defaultReasoningLevel(model),
-			SupportedReasoningLevels:      supportedReasoningLevels(model),
+			DefaultReasoningLevel:         defaultReasoningLevel(provider, model),
+			SupportedReasoningLevels:      supportedReasoningLevels(provider, model),
 			ShellType:                     "shell_command",
 			Visibility:                    "list",
 			SupportedInAPI:                true,
@@ -98,11 +110,11 @@ func CodexModelCatalogJSON(provider ProviderSpec) ([]byte, error) {
 			ApplyPatchToolType:            "freeform",
 			WebSearchToolType:             "text_and_image",
 			TruncationPolicy:              codexTruncationPolicy{Mode: "tokens", Limit: 10000},
-			SupportsParallelToolCalls:     true,
+			SupportsParallelToolCalls:     parallelTools,
 			SupportsImageDetailOriginal:   model.SupportsVision,
 			ContextWindow:                 contextWindow,
 			MaxContextWindow:              maxContextWindow,
-			EffectiveContextWindowPercent: 90,
+			EffectiveContextWindowPercent: effectiveContextPercent,
 			ExperimentalSupportedTools:    []string{},
 			InputModalities:               inputModalities(model),
 			SupportsSearchTool:            model.SupportsSearch,
@@ -114,23 +126,46 @@ func CodexModelCatalogJSON(provider ProviderSpec) ([]byte, error) {
 	return json.MarshalIndent(catalog, "", "  ")
 }
 
-func defaultReasoningLevel(model ModelSpec) string {
+func defaultReasoningLevel(provider ProviderSpec, model ModelSpec) string {
 	if model.SupportsReason {
+		configured := strings.ToLower(strings.TrimSpace(provider.DefaultReasoningEffort))
+		for _, effort := range supportedReasoningLevels(provider, model) {
+			if effort.Effort == configured {
+				return configured
+			}
+		}
 		return "medium"
 	}
 	return "none"
 }
 
-func supportedReasoningLevels(model ModelSpec) []codexReasoningPreset {
+func supportedReasoningLevels(provider ProviderSpec, model ModelSpec) []codexReasoningPreset {
 	if !model.SupportsReason {
 		return []codexReasoningPreset{}
 	}
-	return []codexReasoningPreset{
-		{Effort: "low", Description: "Fast responses with lighter reasoning"},
-		{Effort: "medium", Description: "Balances speed and reasoning depth"},
-		{Effort: "high", Description: "Greater reasoning depth for complex tasks"},
-		{Effort: "xhigh", Description: "Maximum reasoning exposed by the CXP provider adapter"},
+	efforts := normalizeStringList(provider.SupportedReasoningEfforts)
+	if len(efforts) == 0 {
+		efforts = []string{"low", "medium", "high", "xhigh"}
 	}
+	descriptions := map[string]string{
+		"none":    "No additional reasoning",
+		"minimal": "Minimal reasoning for the fastest response",
+		"low":     "Fast responses with lighter reasoning",
+		"medium":  "Balances speed and reasoning depth",
+		"high":    "Greater reasoning depth for complex tasks",
+		"xhigh":   "Extra high reasoning depth for complex tasks",
+		"max":     "Maximum reasoning depth for the hardest problems",
+		"ultra":   "Maximum reasoning with automatic task delegation",
+	}
+	levels := make([]codexReasoningPreset, 0, len(efforts))
+	for _, effort := range efforts {
+		description := descriptions[effort]
+		if description == "" {
+			description = "Provider-defined reasoning effort"
+		}
+		levels = append(levels, codexReasoningPreset{Effort: effort, Description: description})
+	}
+	return levels
 }
 
 func inputModalities(model ModelSpec) []string {

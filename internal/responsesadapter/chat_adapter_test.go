@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestOpenAIChatAdapterStreamsTextAndUsage(t *testing.T) {
@@ -108,6 +111,121 @@ func TestOpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatAdapterUsesConfiguredTelemetryPathsAndSanitizesCounts(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"choices":[{"delta":{"vendor_thought":"plan"}}]}`,
+			"",
+			`data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"vendor":{"cache_hit_tokens":12},"completion_tokens_details":{"reasoning_tokens":11}}}`,
+			"",
+			`data: [DONE]`,
+			"",
+		}, "\n")))
+	}))
+	defer server.Close()
+
+	var statuses []string
+	adapter := OpenAIChatAdapter{
+		BaseURL: server.URL + "/v1", HTTPClient: server.Client(),
+		ReasoningDeltaPath: "choices[0].delta.vendor_thought",
+		CachedTokensPath:   "usage.vendor.cache_hit_tokens",
+		Status:             func(value string) { statuses = append(statuses, value) },
+	}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(stream)
+	var reasoning string
+	var usage *Usage
+	for _, event := range events {
+		if event.Kind == ProviderEventReasoningDelta {
+			reasoning += event.Delta
+		}
+		if event.Kind == ProviderEventUsage {
+			usage = event.Usage
+		}
+	}
+	if reasoning != "plan" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+	if usage == nil || usage.CachedTokens != 12 || usage.ReasoningTokens != 8 {
+		t.Fatalf("usage = %#v", usage)
+	}
+	if got := strings.Join(statuses, "\n"); !strings.Contains(got, "reasoning tokens 11 greater than output tokens 8") {
+		t.Fatalf("statuses = %q", got)
+	}
+}
+
+func TestOpenAIChatAdapterUsesCacheUsageFieldFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1,\"total_tokens\":10,\"prompt_cache_hit_tokens\":7}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), UsageField: "prompt_cache_hit_tokens"}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(stream)
+	for _, event := range events {
+		if event.Kind == ProviderEventUsage && event.Usage != nil {
+			if event.Usage.CachedTokens != 7 {
+				t.Fatalf("usage = %#v", event.Usage)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing usage event: %#v", events)
+}
+
+func TestOpenAIChatAdapterLimitsUpstreamConcurrency(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := maximum.Load()
+			if current <= previous || maximum.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(40 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), RequestGate: make(chan struct{}, 1)}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+			if err == nil {
+				_ = collectEvents(stream)
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maximum.Load() != 1 {
+		t.Fatalf("maximum concurrent requests = %d", maximum.Load())
+	}
+}
+
 func TestOpenAIChatAdapterKeepsTailUsageAfterFinishChunk(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -140,7 +258,7 @@ func TestOpenAIChatAdapterKeepsTailUsageAfterFinishChunk(t *testing.T) {
 	if usage == nil || usage.InputTokens != 7 || usage.OutputTokens != 3 || usage.TotalTokens != 10 || usage.CachedTokens != 4 || usage.ReasoningTokens != 2 {
 		t.Fatalf("usage = %#v, events = %#v", usage, events)
 	}
-	if len(events) == 0 || events[len(events)-1].Kind != ProviderEventDone {
+	if len(events) == 0 || events[len(events)-1].Kind != ProviderEventDone || events[len(events)-1].FinishReason != "stop" {
 		t.Fatalf("events = %#v", events)
 	}
 }
@@ -989,6 +1107,121 @@ func TestOpenAIChatAdapterReportsUpstreamErrorsAndTruncatedStreams(t *testing.T)
 			t.Fatalf("events = %#v", events)
 		}
 	})
+}
+
+func TestOpenAIChatAdapterRetriesConfigured529AndClampsOutput(t *testing.T) {
+	requests := 0
+	var got chatCompletionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Header.Get("X-API-Key") != "secret" || r.Header.Get("X-Tenant") != "regulated" {
+			t.Fatalf("headers = %#v", r.Header)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if requests == 1 {
+			w.WriteHeader(529)
+			_, _ = w.Write([]byte("overloaded"))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	wanted := 4096
+	adapter := OpenAIChatAdapter{
+		BaseURL: server.URL, APIKey: "secret", HTTPClient: server.Client(),
+		MaxRetries: 1, RetryBase: time.Millisecond,
+		RetryStatuses: []int{529}, MaxOutputTokens: 64,
+		AuthType: "header", AuthHeader: "X-API-Key", Headers: map[string]string{"X-Tenant": "regulated"},
+	}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{
+		Model: "model-a", InputText: "x", MaxOutputTokens: &wanted,
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	_ = collectEvents(stream)
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+	if got.MaxCompletionTokens == nil || *got.MaxCompletionTokens != 64 {
+		t.Fatalf("max_completion_tokens = %v, want 64", got.MaxCompletionTokens)
+	}
+}
+
+func TestMarshalChatCompletionRequestAppliesConfiguredThinkingFragmentSafely(t *testing.T) {
+	profile := ProviderProfile{
+		ID:           "custom",
+		ThinkingMode: "effort-dependent",
+		ThinkingEnabledRequest: map[string]any{
+			"thinking":         map[string]any{"type": "enabled", "budget_tokens": 8192},
+			"vendor_reasoning": "max",
+			"model":            "must-not-win",
+		},
+		ThinkingDisabledRequest: map[string]any{
+			"thinking": map[string]any{"type": "disabled"},
+		},
+	}
+	body := chatCompletionRequest{Model: "expected-model", Messages: []chatMessage{{Role: "user", Content: "x"}}, Stream: true}
+
+	raw, err := marshalChatCompletionRequest(body, profile, "expected-model", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["model"] != "expected-model" || got["vendor_reasoning"] != "max" {
+		t.Fatalf("request = %#v", got)
+	}
+	thinking, ok := got["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) {
+		t.Fatalf("thinking = %#v", got["thinking"])
+	}
+
+	raw, err = marshalChatCompletionRequest(body, profile, "expected-model", "none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	thinking = got["thinking"].(map[string]any)
+	if thinking["type"] != "disabled" {
+		t.Fatalf("disabled thinking = %#v", thinking)
+	}
+}
+
+func TestOpenAIChatAdapterBuffersNonStreamingCompletion(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["stream"] != false {
+			t.Fatalf("stream = %#v", request["stream"])
+		}
+		if _, exists := request["stream_options"]; exists {
+			t.Fatalf("unexpected stream_options: %#v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"tool_calls","message":{"content":null,"reasoning_content":"think","tool_calls":[{"id":"call-1","type":"function","function":{"name":"add","arguments":"{\"a\":2,\"b\":3}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8}}}`))
+	}))
+	defer server.Close()
+
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), StreamMode: "nonstream-buffered"}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "minimax-m3", InputText: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(stream)
+	if len(events) != 4 || events[0].Kind != ProviderEventReasoningDelta || events[1].Kind != ProviderEventToolCallDelta || events[2].Usage == nil || events[2].Usage.CachedTokens != 8 || events[3].Kind != ProviderEventDone {
+		t.Fatalf("events = %#v", events)
+	}
 }
 
 func collectEvents(stream <-chan ProviderEvent) []ProviderEvent {
