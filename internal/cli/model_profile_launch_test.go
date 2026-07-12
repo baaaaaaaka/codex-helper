@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -599,7 +600,7 @@ func TestPrepareCodexResponsesCompatibleProfileUsesNativeResponsesAPI(t *testing
 	if err != nil {
 		t.Fatalf("stat generated web-search fallback config: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("fallback config permissions = %o, want 600", got)
 	}
 }
@@ -669,7 +670,7 @@ func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testi
 	if err != nil {
 		t.Fatalf("stat generated desktop fallback config: %v", err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("desktop fallback permissions = %o, want 600", got)
 	}
 }
@@ -1327,6 +1328,20 @@ func TestWithLoopbackNoProxyEnvPreservesExistingHosts(t *testing.T) {
 		if ok {
 			values[key] = value
 		}
+	}
+	if runtime.GOOS == "windows" {
+		combined := ""
+		for key, value := range values {
+			if strings.EqualFold(key, "NO_PROXY") {
+				combined = value
+			}
+		}
+		for _, want := range []string{"corp.example", "internal.example", "127.0.0.1", "localhost", "::1"} {
+			if !slices.Contains(strings.Split(combined, ","), want) {
+				t.Fatalf("NO_PROXY = %q, missing %q", combined, want)
+			}
+		}
+		return
 	}
 	for key, existing := range map[string]string{"NO_PROXY": "corp.example", "no_proxy": "internal.example"} {
 		for _, want := range []string{existing, "127.0.0.1", "localhost", "::1"} {

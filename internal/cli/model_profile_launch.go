@@ -877,6 +877,23 @@ func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *roo
 }
 
 func withLoopbackNoProxyEnv(values []string) []string {
+	if runtime.GOOS == "windows" {
+		current := make([]string, 0, 8)
+		out := make([]string, 0, len(values)+1)
+		for _, item := range append(os.Environ(), values...) {
+			name, value, ok := strings.Cut(item, "=")
+			if ok && strings.EqualFold(name, "NO_PROXY") {
+				current = append(current, strings.Split(value, ",")...)
+			}
+		}
+		for _, item := range values {
+			name, _, ok := strings.Cut(item, "=")
+			if !ok || !strings.EqualFold(name, "NO_PROXY") {
+				out = append(out, item)
+			}
+		}
+		return append(out, "NO_PROXY="+loopbackNoProxyValues(current))
+	}
 	out := append([]string(nil), values...)
 	for _, key := range []string{"NO_PROXY", "no_proxy"} {
 		current := ""
@@ -886,24 +903,23 @@ func withLoopbackNoProxyEnv(values []string) []string {
 				current = value
 			}
 		}
-		seen := map[string]bool{}
-		parts := make([]string, 0, 6)
-		for _, value := range strings.Split(current, ",") {
-			value = strings.TrimSpace(value)
-			if value != "" && !seen[strings.ToLower(value)] {
-				seen[strings.ToLower(value)] = true
-				parts = append(parts, value)
-			}
-		}
-		for _, value := range []string{"127.0.0.1", "localhost", "::1"} {
-			if !seen[strings.ToLower(value)] {
-				seen[strings.ToLower(value)] = true
-				parts = append(parts, value)
-			}
-		}
-		out = setEnvValue(out, key, strings.Join(parts, ","))
+		out = setEnvValue(out, key, loopbackNoProxyValues(strings.Split(current, ",")))
 	}
 	return out
+}
+
+func loopbackNoProxyValues(current []string) string {
+	seen := map[string]bool{}
+	parts := make([]string, 0, len(current)+3)
+	for _, value := range append(current, "127.0.0.1", "localhost", "::1") {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value != "" && !seen[key] {
+			seen[key] = true
+			parts = append(parts, value)
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 func withTeamsAppServerModelProfilePrepareTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
