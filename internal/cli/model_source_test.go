@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -158,6 +159,46 @@ func TestModelSourceSyncClonesLocalRepoWithoutKey(t *testing.T) {
 	}
 	if source := cfg.ModelSources["local"]; source.BackupActive || source.BackupReason != "" || !source.BackupSince.IsZero() {
 		t.Fatalf("successful sync did not clear backup state: %#v", source)
+	}
+}
+
+func TestSafeRepoFileCanonicalizesRepositoryRootAndRejectsEscapes(t *testing.T) {
+	realParent := t.TempDir()
+	repo := filepath.Join(realParent, "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(repo, defaultModelSourceFile)
+	if err := os.WriteFile(want, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a Windows symlink requires additional privileges: %v", err)
+		}
+		t.Fatal(err)
+	}
+	got, err := safeRepoFile(filepath.Join(aliasParent, "repo"), defaultModelSourceFile)
+	if err != nil {
+		t.Fatalf("safe file through canonical root: %v", err)
+	}
+	if got != want {
+		t.Fatalf("safe file = %q, want %q", got, want)
+	}
+	escape := filepath.Join(repo, "escape.json")
+	outside := filepath.Join(realParent, "outside.json")
+	if err := os.WriteFile(outside, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, escape); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("creating a Windows symlink requires additional privileges: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if _, err := safeRepoFile(repo, "escape.json"); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("escape error = %v", err)
 	}
 }
 

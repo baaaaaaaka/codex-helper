@@ -503,11 +503,15 @@ func safeRepoFile(repoDir, name string) (string, error) {
 		return "", fmt.Errorf("model config file must be a safe repository-relative path")
 	}
 	path := filepath.Join(repoDir, name)
+	realRepo, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		return "", err
+	}
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
 	}
-	rel, err := filepath.Rel(repoDir, real)
+	rel, err := filepath.Rel(realRepo, real)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("model config file escapes the repository")
 	}

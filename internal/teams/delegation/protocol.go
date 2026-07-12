@@ -1075,7 +1075,20 @@ func LoadStore(path string) (Store, error) {
 	if storePathUsesSQLite(path) {
 		return loadSQLiteStore(path)
 	}
-	raw, err := os.ReadFile(path)
+	var raw []byte
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		raw, err = os.ReadFile(path)
+		if err == nil || os.IsNotExist(err) {
+			break
+		}
+		// Windows can briefly reject a reader while an atomic replacement is
+		// publishing the next store snapshot. Retrying here also protects
+		// antivirus/indexer sharing violations without weakening JSON checks.
+		if attempt < 4 {
+			time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return newStore(), nil
