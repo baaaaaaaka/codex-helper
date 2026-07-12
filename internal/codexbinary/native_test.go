@@ -508,6 +508,9 @@ func TestFindNativeBinaryExtensionlessNPMShimLayout(t *testing.T) {
 		t.Skip("no platform package for this platform")
 	}
 	prefix := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(prefix); err == nil {
+		prefix = resolved
+	}
 	shim := filepath.Join(prefix, "codex")
 	moduleDir := filepath.Join(prefix, "node_modules", "@openai", "codex")
 	jsPath := filepath.Join(moduleDir, "bin", "codex.js")
