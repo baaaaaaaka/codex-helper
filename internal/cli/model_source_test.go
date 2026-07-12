@@ -183,8 +183,12 @@ func TestSafeRepoFileCanonicalizesRepositoryRootAndRejectsEscapes(t *testing.T) 
 	if err != nil {
 		t.Fatalf("safe file through canonical root: %v", err)
 	}
-	if got != want {
-		t.Fatalf("safe file = %q, want %q", got, want)
+	realWant, err := filepath.EvalSymlinks(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != realWant {
+		t.Fatalf("safe file = %q, want canonical path %q", got, realWant)
 	}
 	escape := filepath.Join(repo, "escape.json")
 	outside := filepath.Join(realParent, "outside.json")
