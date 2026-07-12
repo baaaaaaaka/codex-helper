@@ -6,6 +6,10 @@ on:
     paths:
       - ".github/workflows/model-routing-live.yml"
       - "internal/cli/model_profile_launch.go"
+      - "internal/cli/teams_codex_runtime_contract.go"
+      - "internal/cli/teams_model_profile.go"
+      - "internal/cli/teams_codex_runner.go"
+      - "internal/cli/teams.go"
       - "internal/cli/unified_model_gateway.go"
       - "internal/cli/unified_model_gateway_live_test.go"
       - "internal/modelprofile/**"
@@ -38,9 +42,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install -g --include=optional @openai/codex@latest
+          export CODEX_NPM_PREFIX="$RUNNER_TEMP/cxp-managed-codex"
+          npm install -g --prefix "$CODEX_NPM_PREFIX" --include=optional @openai/codex@latest
           go build -o "$RUNNER_TEMP/cxp" .
-          codex --version
+          "$CODEX_NPM_PREFIX/bin/codex" --version
+          echo "CODEX_NPM_PREFIX=$CODEX_NPM_PREFIX" >> "$GITHUB_ENV"
 
       - name: Prepare isolated regulated-account and NVIDIA profile
         shell: bash
@@ -64,12 +70,13 @@ jobs:
             --no-doctor
           {
             echo "CODEX_HELPER_LIVE_UNIFIED_GATEWAY=1"
-            echo "CODEX_HELPER_LIVE_CODEX_PATH=$(command -v codex)"
+            echo "CODEX_HELPER_LIVE_CODEX_PATH=$CODEX_NPM_PREFIX/bin/codex"
             echo "CODEX_HELPER_LIVE_CONFIG_PATH=$config_path"
             echo "CODEX_HELPER_LIVE_MODEL_PROFILE=nvidia-nemotron"
             echo "CODEX_HELPER_LIVE_THIRD_MODEL=nvidia/nvidia/eccn-nemotron-3-ultra"
             echo "CODEX_HELPER_LIVE_OFFICIAL_MODEL=gpt-5.6-luna"
             echo "CODEX_HELPER_LIVE_CODEX_HOME=$live_home"
+            echo "CODEX_HOME=$live_home"
           } >> "$GITHUB_ENV"
 
       - name: Verify official to NVIDIA to official routing
@@ -80,4 +87,4 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${HTTP_PROXY:-}"
-          go test ./internal/cli -run '^TestLiveUnifiedModelGatewayWithRealCodexOptIn$' -count=1 -v -timeout=12m
+          go test ./internal/cli -run '^TestLive(UnifiedModelGatewayWithRealCodex|TeamsOfficialCatalogWithResolvedRuntime)OptIn$' -count=1 -v -timeout=12m

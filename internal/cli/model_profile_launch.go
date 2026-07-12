@@ -50,6 +50,38 @@ var codexLoginStatusProbeFn = probeCodexLoginStatus
 var loadBundledCodexModelCatalogFn = loadBundledCodexModelCatalog
 
 type codexLoginProbePathContextKey struct{}
+type codexInvocationContextKey struct{}
+
+type codexInvocation struct {
+	Command     string
+	Environment []string
+	Identity    *execIdentity
+	Fingerprint string
+}
+
+func withCodexInvocation(ctx context.Context, invocation codexInvocation) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, codexInvocationContextKey{}, invocation)
+}
+
+func codexInvocationFromContext(ctx context.Context) (codexInvocation, bool) {
+	if ctx == nil {
+		return codexInvocation{}, false
+	}
+	invocation, ok := ctx.Value(codexInvocationContextKey{}).(codexInvocation)
+	return invocation, ok && strings.TrimSpace(invocation.Command) != ""
+}
+
+func codexInvocationForRuntime(contract teamsCodexRuntimeContract) codexInvocation {
+	return codexInvocation{
+		Command:     contract.Runtime.Command,
+		Environment: append([]string(nil), contract.Runtime.Environment...),
+		Identity:    contract.Identity,
+		Fingerprint: contract.Fingerprint,
+	}
+}
 
 func withCodexLoginProbePath(ctx context.Context, path string) context.Context {
 	if ctx == nil {
@@ -59,12 +91,38 @@ func withCodexLoginProbePath(ctx context.Context, path string) context.Context {
 }
 
 func codexLoginProbePath(ctx context.Context) string {
+	if invocation, ok := codexInvocationFromContext(ctx); ok {
+		return strings.TrimSpace(invocation.Command)
+	}
 	if ctx != nil {
 		if path, ok := ctx.Value(codexLoginProbePathContextKey{}).(string); ok && strings.TrimSpace(path) != "" {
 			return strings.TrimSpace(path)
 		}
 	}
 	return "codex"
+}
+
+func codexLoginProbeEnvironment(ctx context.Context) []string {
+	if invocation, ok := codexInvocationFromContext(ctx); ok {
+		return append([]string(nil), invocation.Environment...)
+	}
+	return nil
+}
+
+func configureCodexInvocationCommand(ctx context.Context, command *exec.Cmd) error {
+	invocation, ok := codexInvocationFromContext(ctx)
+	if !ok || command == nil {
+		return nil
+	}
+	command.Env = mergeCLIEnvironment(os.Environ(), invocation.Environment)
+	if invocation.Identity != nil {
+		updated, err := applyExecIdentity(command, command.Env, invocation.Identity)
+		if err != nil {
+			return err
+		}
+		command.Env = updated
+	}
+	return nil
 }
 
 func shouldProbeCodexLogin(store *config.Store) bool {
@@ -662,6 +720,9 @@ func loadBundledCodexModelCatalog(ctx context.Context, codexPath string) ([]byte
 	commandCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cmd := unifiedCatalogCommand(commandCtx, codexPath, "debug", "models", "--bundled")
+	if err := configureCodexInvocationCommand(ctx, cmd); err != nil {
+		return nil, fmt.Errorf("configure bundled Codex model catalog command: %w", err)
+	}
 	raw, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("load bundled Codex model catalog: %w", err)
@@ -856,7 +917,7 @@ func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *roo
 	}
 	officialAuth := false
 	if shouldProbeCodexLogin(store) {
-		officialAuth = codexLoginStatusProbeFn(ctx, codexLoginProbePath(ctx), nil, log)
+		officialAuth = codexLoginStatusProbeFn(ctx, codexLoginProbePath(ctx), codexLoginProbeEnvironment(ctx), log)
 	}
 	launch, cleanup, err := startModelProfileAdapterForCodex(ctx, store, ref, snapshot, upstreamProxyURL, officialAuth, log)
 	if err != nil {

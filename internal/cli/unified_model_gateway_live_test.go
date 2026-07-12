@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +95,67 @@ func TestLiveUnifiedModelGatewayWithRealCodexOptIn(t *testing.T) {
 			}
 			t.Logf("cached_input_tokens=%d", cachedInputTokens)
 		})
+	}
+}
+
+func TestLiveTeamsOfficialCatalogWithResolvedRuntimeOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_UNIFIED_GATEWAY")) != "1" {
+		t.Skip("set CODEX_HELPER_LIVE_UNIFIED_GATEWAY=1 to run real Teams official catalog coverage")
+	}
+	codexPath := strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_CODEX_PATH"))
+	configPath := strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_CONFIG_PATH"))
+	officialModel := strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_OFFICIAL_MODEL"))
+	codexHome := strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_CODEX_HOME"))
+	if codexPath == "" || configPath == "" || officialModel == "" || codexHome == "" {
+		t.Fatal("live Teams catalog test requires Codex path, config path, official model, and Codex home")
+	}
+	// Package tests intentionally isolate HOME. Bind managed discovery to the
+	// supplied live launcher instead of accidentally installing or selecting a
+	// second Codex under the test HOME.
+	managedPrefix := filepath.Dir(filepath.Dir(codexPath))
+	t.Setenv("CODEX_NPM_PREFIX", managedPrefix)
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(cfg *config.Config) error {
+		cfg.TeamsCodexPath.Mode = "service"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root := &rootOptions{configPath: configPath}
+	resolver := newTeamsCodexRuntimeResolver(root, "", t.TempDir(), io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	contract, err := resolver(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedCommand, err := filepath.EvalSymlinks(contract.Runtime.Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCommand, err := filepath.EvalSymlinks(codexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedCommand != wantCommand || envValue(contract.Runtime.Environment, "CODEX_HOME") != codexHome {
+		t.Fatalf("resolved Teams runtime = command %q CODEX_HOME %q, want %q and %q", resolvedCommand, envValue(contract.Runtime.Environment, "CODEX_HOME"), wantCommand, codexHome)
+	}
+	manager := newTeamsModelProfileManagerWithRuntime(root, resolver)
+	listed, err := manager.ListModelProfiles(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(listed, "Official Codex models") || !strings.Contains(listed, "(`"+officialModel+"`)") {
+		t.Fatalf("Teams model list did not expose the authenticated official catalog:\n%s", listed)
+	}
+	snapshot, err := newTeamsModelProfileResolverWithRuntime(root, resolver)(ctx, "official:"+officialModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Provider != modelprofile.DefaultProvider || snapshot.Model != officialModel {
+		t.Fatalf("official resolver snapshot = %#v", snapshot)
 	}
 }

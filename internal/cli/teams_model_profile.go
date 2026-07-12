@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -16,8 +17,9 @@ import (
 )
 
 type teamsModelProfileManager struct {
-	root      *rootOptions
-	codexPath string
+	root            *rootOptions
+	codexPath       string
+	runtimeResolver teamsCodexRuntimeResolver
 }
 
 var listTeamsOfficialModelsFn = listTeamsOfficialModels
@@ -33,6 +35,12 @@ type teamsOfficialModelCacheEntry struct {
 }
 
 const teamsOfficialModelCacheTTL = 30 * time.Minute
+
+func invalidateTeamsOfficialModelCache() {
+	teamsOfficialModelCache.Lock()
+	teamsOfficialModelCache.byPath = map[string]teamsOfficialModelCacheEntry{}
+	teamsOfficialModelCache.Unlock()
+}
 
 func verifyAndStampTeamsModelProfile(ctx context.Context, cfg *config.Config, name string, apiKey string) error {
 	resolved, err := modelprofile.Resolve(*cfg, name)
@@ -63,6 +71,10 @@ func newTeamsModelProfileManager(root *rootOptions, codexPath ...string) teamsMo
 	return teamsModelProfileManager{root: root, codexPath: path}
 }
 
+func newTeamsModelProfileManagerWithRuntime(root *rootOptions, resolver teamsCodexRuntimeResolver) teamsModelProfileManager {
+	return teamsModelProfileManager{root: root, runtimeResolver: resolver}
+}
+
 func (m teamsModelProfileManager) store() (*config.Store, error) {
 	store, _, err := newRootStore(m.root, "")
 	return store, err
@@ -78,11 +90,24 @@ func (m teamsModelProfileManager) ListModelProfiles(ctx context.Context) (string
 		return "", err
 	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
-	officialReady := codexLoginStatusProbeFn(ctx, m.codexPath, nil, nil)
+	probePath := m.codexPath
+	var probeEnv []string
+	if m.runtimeResolver != nil {
+		contract, runtimeErr := m.runtimeResolver(ctx)
+		if runtimeErr != nil {
+			return printTeamsVerifiedModels(cfg, secretStore, false, nil, fmt.Errorf("official Codex runtime unavailable: %w", runtimeErr)) + "\n\nUse `model setup` to discover or verify additional models; only authentication-verified models appear above.", nil
+		}
+		ctx = withCodexInvocation(ctx, codexInvocationForRuntime(contract))
+		probePath = contract.Runtime.Command
+		probeEnv = contract.Runtime.Environment
+	}
+	officialReady := codexLoginStatusProbeFn(ctx, probePath, probeEnv, nil)
 	var officialModels []teamsOfficialModel
 	var officialCatalogErr error
 	if officialReady {
-		officialModels, officialCatalogErr = listTeamsOfficialModelsFn(ctx, m.codexPath)
+		officialModels, officialCatalogErr = listTeamsOfficialModelsFn(ctx, probePath)
+	} else {
+		officialCatalogErr = fmt.Errorf("Codex login probe did not succeed for the Teams target account; verify login, executable access, and CODEX_HOME")
 	}
 	return printTeamsVerifiedModels(cfg, secretStore, officialReady, officialModels, officialCatalogErr) + "\n\nUse `model setup` to discover or verify additional models; only authentication-verified models appear above.", nil
 }
@@ -147,6 +172,9 @@ type teamsOfficialModel struct {
 
 func listTeamsOfficialModels(ctx context.Context, codexPath string) ([]teamsOfficialModel, error) {
 	cacheKey := strings.TrimSpace(codexPath)
+	if invocation, ok := codexInvocationFromContext(ctx); ok && strings.TrimSpace(invocation.Fingerprint) != "" {
+		cacheKey = invocation.Fingerprint
+	}
 	teamsOfficialModelCache.Lock()
 	if cached, ok := teamsOfficialModelCache.byPath[cacheKey]; ok && time.Since(cached.at) < teamsOfficialModelCacheTTL {
 		models := append([]teamsOfficialModel(nil), cached.models...)
@@ -154,10 +182,19 @@ func listTeamsOfficialModels(ctx context.Context, codexPath string) ([]teamsOffi
 		return models, nil
 	}
 	teamsOfficialModelCache.Unlock()
+	starter := codexrunner.AppServerTransportStarter(codexrunner.AppServerProcessStarter{})
+	extraEnv := []string(nil)
+	if invocation, ok := codexInvocationFromContext(ctx); ok {
+		extraEnv = append([]string(nil), invocation.Environment...)
+		starter = configureAppServerStarter{base: starter, configure: func(command *exec.Cmd) error {
+			return configureCodexInvocationCommand(ctx, command)
+		}}
+	}
 	runner := &codexrunner.AppServerRunner{
-		Starter:       codexrunner.AppServerProcessStarter{},
+		Starter:       starter,
 		Command:       strings.TrimSpace(codexPath),
 		AppServerArgs: []string{"--analytics-default-enabled"},
+		ExtraEnv:      extraEnv,
 		Timeout:       10 * time.Second,
 	}
 	defer func() { _ = runner.Close() }()
@@ -232,6 +269,8 @@ func printTeamsVerifiedModels(cfg config.Config, secrets *modelprofile.SecretSto
 		} else {
 			lines = append(lines, fmt.Sprintf("  official default unavailable: %v", officialCatalogErr))
 		}
+	} else if officialCatalogErr != nil {
+		lines = append(lines, fmt.Sprintf("  official catalog unavailable: %v", officialCatalogErr))
 	}
 	thirdPartyHeaderAdded := false
 	names := make([]string, 0, len(cfg.ModelProfiles))

@@ -1386,10 +1386,10 @@ func beaconWorkerBootstrapDiagnostics(codexPath string, storePath string) beacon
 	}
 	codex := strings.TrimSpace(codexPath)
 	if codex == "" {
-		if path, err := exec.LookPath("codex"); err == nil {
+		if path, err := findManagedCodexForEnvironment(context.Background(), os.Environ()); err == nil {
 			codex = path
 		} else {
-			codex = "codex"
+			codex = "cxp-managed:auto"
 		}
 	}
 	return beacon.BootstrapDiagnostics{
@@ -1424,7 +1424,14 @@ func runBeaconWorkerDoctor(codexPath string, storePath string) beacon.WorkerDoct
 	}
 	command := strings.TrimSpace(codexPath)
 	if command == "" {
-		command = "codex"
+		if managed, err := findManagedCodexForEnvironment(context.Background(), os.Environ()); err == nil {
+			command = managed
+		} else {
+			// The worker job uses the managed-runtime resolver and can install
+			// Codex lazily. Do not reject registration merely because a naked
+			// `codex` command is absent from the scheduler/container PATH.
+			doctor.CodexAvailable = true
+		}
 	}
 	if strings.ContainsRune(command, rune(os.PathSeparator)) {
 		if st, err := os.Stat(command); err == nil && !st.IsDir() {

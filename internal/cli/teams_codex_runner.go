@@ -164,6 +164,11 @@ func newManagedTeamsCodexExecutorWithContext(
 			return nil, err
 		}
 		modelPrepareCtx := withCodexLoginProbePath(ctx, codexPath)
+		if contract, runtimeErr := resolveTeamsCodexRuntimeContract(ctx, root, codexPath, workDir, log); runtimeErr == nil {
+			modelPrepareCtx = withCodexInvocation(modelPrepareCtx, codexInvocationForRuntime(contract))
+		} else if log != nil {
+			_, _ = fmt.Fprintf(log, "Teams official model runtime unavailable during profile preparation: %v\n", runtimeErr)
+		}
 		appServerModelArgs, appServerModelEnv, modelCleanup, err := prepareTeamsAppServerModelProfileForRunner(modelPrepareCtx, root, modelProfile, snapshot, log)
 		if err != nil {
 			return nil, err
@@ -830,6 +835,7 @@ func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string
 		if err != nil {
 			return result, err
 		}
+		invalidateTeamsOfficialModelCache()
 		for _, executor := range executors {
 			if resetter, ok := executor.(interface{ RestartCodexRunners() error }); ok {
 				if err := resetter.RestartCodexRunners(); err != nil {
@@ -846,6 +852,14 @@ func newTeamsModelProfileResolver(root *rootOptions, codexPaths ...string) teams
 	if len(codexPaths) > 0 && strings.TrimSpace(codexPaths[0]) != "" {
 		codexPath = strings.TrimSpace(codexPaths[0])
 	}
+	return newTeamsModelProfileResolverInternal(root, codexPath, nil)
+}
+
+func newTeamsModelProfileResolverWithRuntime(root *rootOptions, resolver teamsCodexRuntimeResolver) teams.ModelProfileResolver {
+	return newTeamsModelProfileResolverInternal(root, "", resolver)
+}
+
+func newTeamsModelProfileResolverInternal(root *rootOptions, codexPath string, runtimeResolver teamsCodexRuntimeResolver) teams.ModelProfileResolver {
 	return func(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
 		ref = strings.TrimSpace(ref)
 		forceProfile := strings.HasPrefix(strings.ToLower(ref), "profile:")
@@ -862,8 +876,23 @@ func newTeamsModelProfileResolver(root *rootOptions, codexPaths ...string) teams
 		if err != nil {
 			return modelprofile.Snapshot{}, err
 		}
+		catalogCtx := ctx
+		catalogPath := codexPath
+		var runtimeErr error
+		if runtimeResolver != nil {
+			contract, err := runtimeResolver(ctx)
+			if err != nil {
+				runtimeErr = err
+			} else {
+				catalogPath = contract.Runtime.Command
+				catalogCtx = withCodexInvocation(ctx, codexInvocationForRuntime(contract))
+			}
+		}
 		resolveOfficial := func() (modelprofile.Snapshot, bool) {
-			models, catalogErr := listTeamsOfficialModelsFn(ctx, codexPath)
+			if runtimeErr != nil {
+				return modelprofile.Snapshot{}, false
+			}
+			models, catalogErr := listTeamsOfficialModelsFn(catalogCtx, catalogPath)
 			if catalogErr == nil {
 				for _, model := range models {
 					if strings.EqualFold(strings.TrimSpace(model.Slug), strings.TrimSpace(ref)) {
@@ -886,6 +915,9 @@ func newTeamsModelProfileResolver(root *rootOptions, codexPaths ...string) teams
 				return snapshot, nil
 			}
 			if forceOfficial {
+				if runtimeErr != nil {
+					return modelprofile.Snapshot{}, fmt.Errorf("official Codex runtime unavailable: %w", runtimeErr)
+				}
 				return modelprofile.Snapshot{}, fmt.Errorf("official Codex model %q is not available for the current account", ref)
 			}
 		}

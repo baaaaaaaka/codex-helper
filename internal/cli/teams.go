@@ -1102,6 +1102,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if closer, ok := controlFallbackExecutor.(interface{ Close() error }); ok {
 					defer func() { _ = closer.Close() }()
 				}
+				officialRuntimeResolver := newTeamsCodexRuntimeResolver(root, codexPath, workDir, cmd.ErrOrStderr())
 				asrTranscriber := teamsASRTranscriberFromConfig(effectiveASRCommand, effectiveASRArgs)
 				var helperAutoUpdater teams.HelperAutoUpdater
 				if autoUpdate {
@@ -1131,8 +1132,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					ControlFallbackExecutor:            controlFallbackExecutor,
 					ControlFallbackModel:               controlFallbackModel,
 					ControlFallbackHelpContext:         teamsControlFallbackHelpContext(),
-					ModelProfileResolver:               newTeamsModelProfileResolver(root, codexPath),
-					ModelProfileManager:                newTeamsModelProfileManager(root, codexPath),
+					ModelProfileResolver:               newTeamsModelProfileResolverWithRuntime(root, officialRuntimeResolver),
+					ModelProfileManager:                newTeamsModelProfileManagerWithRuntime(root, officialRuntimeResolver),
 					ASRTranscriber:                     asrTranscriber,
 					HelperRestarter:                    restartTeamsHelperFromTeams,
 					HelperPendingRestarter:             restartTeamsHelperFromTeamsAfterPendingReplacement,
