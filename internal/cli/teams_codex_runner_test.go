@@ -1409,6 +1409,7 @@ func TestNewManagedTeamsCodexExecutorRejectsUnknownRunner(t *testing.T) {
 
 func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 	lockCLITestHooks(t)
+	stubTeamsCodexUpgradePath(t, "/target-account/bin/codex")
 
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
@@ -1428,6 +1429,9 @@ func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
+		}
+		if opts.upgradeCodexPath != "/target-account/bin/codex" {
+			t.Fatalf("upgrade Codex path = %q", opts.upgradeCodexPath)
 		}
 		if opts.withInstallerEnv != nil {
 			t.Fatal("did not expect proxy installer env when proxy is disabled")
@@ -1454,6 +1458,7 @@ func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 
 func TestRunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI(t *testing.T) {
 	lockCLITestHooks(t)
+	stubTeamsCodexUpgradePath(t, "/target-account/bin/codex")
 
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
@@ -1630,6 +1635,7 @@ func TestRunTeamsUpgradeCodexOnceRejectsCodexPath(t *testing.T) {
 }
 
 func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
+	stubTeamsCodexUpgradePath(t, "/target-account/bin/codex")
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
 	if err != nil {
@@ -1646,6 +1652,9 @@ func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
 		}
+		if opts.upgradeCodexPath != "/target-account/bin/codex" {
+			t.Fatalf("upgrade Codex path = %q", opts.upgradeCodexPath)
+		}
 		return "/managed/codex", nil
 	}
 
@@ -1660,6 +1669,7 @@ func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
 
 func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testing.T) {
 	lockCLITestHooks(t)
+	stubTeamsCodexUpgradePath(t, "/target-account/bin/codex")
 
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	store, err := config.NewStore(cfgPath)
@@ -1698,6 +1708,31 @@ func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testi
 	}
 	if !called || got.Path != "/managed/codex" {
 		t.Fatalf("upgrade called=%v result=%#v", called, got)
+	}
+}
+
+func stubTeamsCodexUpgradePath(t *testing.T, path string) {
+	t.Helper()
+	previous := resolveTeamsCodexUpgradeTargetForRun
+	resolveTeamsCodexUpgradeTargetForRun = func(context.Context, config.Config, effectivePaths) (teamsCodexUpgradeTarget, error) {
+		return teamsCodexUpgradeTarget{path: path, environment: []string{"PATH=/target-account/bin:/usr/bin"}}, nil
+	}
+	t.Cleanup(func() { resolveTeamsCodexUpgradeTargetForRun = previous })
+}
+
+func TestTeamsCodexUpgradeProxyEnvironmentPreservesTargetPATH(t *testing.T) {
+	got := teamsCodexUpgradeProxyEnvironment(
+		[]string{"PATH=/target/bin:/usr/bin", "HOME=/home/target", "HTTP_PROXY=http://stale"},
+		[]string{"PATH=/service/bin", "HOME=/service", "HTTP_PROXY=http://127.0.0.1:18080"},
+	)
+	if path := envValue(got, "PATH"); path != "/target/bin:/usr/bin" {
+		t.Fatalf("PATH = %q", path)
+	}
+	if home := envValue(got, "HOME"); home != "/home/target" {
+		t.Fatalf("HOME = %q", home)
+	}
+	if proxy := envValue(got, "HTTP_PROXY"); proxy != "http://127.0.0.1:18080" {
+		t.Fatalf("HTTP_PROXY = %q", proxy)
 	}
 }
 

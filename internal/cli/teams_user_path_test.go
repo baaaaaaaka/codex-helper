@@ -73,6 +73,91 @@ func TestResolveTeamsCodexUserPathCarriesPolicyAndTargetIdentity(t *testing.T) {
 	}
 }
 
+func TestResolveTeamsCodexUpgradePathUsesTargetAccountPATH(t *testing.T) {
+	previous := teamsUserPathResolver
+	targetBin := t.TempDir()
+	codexName := "codex"
+	if runtime.GOOS == "windows" {
+		codexName = "codex.exe"
+	}
+	codexPath := filepath.Join(targetBin, codexName)
+	if err := os.WriteFile(codexPath, []byte("test"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	targetPath := targetBin + string(os.PathListSeparator) + t.TempDir()
+	teamsUserPathResolver = &recordingUserPathResolver{result: userpath.Result{
+		Path: targetPath,
+		Mode: userpath.ModeAccountDefault,
+	}}
+	t.Cleanup(func() { teamsUserPathResolver = previous })
+
+	got, err := resolveTeamsCodexUpgradeTarget(context.Background(), config.Config{}, effectivePaths{Home: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.path != codexPath {
+		t.Fatalf("upgrade path = %q, want %q", got.path, codexPath)
+	}
+	if path := envValue(got.environment, "PATH"); path != targetPath {
+		t.Fatalf("upgrade environment PATH = %q, want %q", path, targetPath)
+	}
+}
+
+func TestResolveTeamsCodexUpgradePathDoesNotFallBackToServicePATH(t *testing.T) {
+	previous := teamsUserPathResolver
+	teamsUserPathResolver = &recordingUserPathResolver{result: userpath.Result{
+		Path: t.TempDir(),
+		Mode: userpath.ModeAccountDefault,
+	}}
+	t.Cleanup(func() { teamsUserPathResolver = previous })
+
+	_, err := resolveTeamsCodexUpgradeTarget(context.Background(), config.Config{}, effectivePaths{Home: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "codex not found in Teams target account PATH") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestTeamsCodexUpgradeLiveTargetPATH(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_LIVE") != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_UPGRADE_LIVE=1 to run the real npm upgrade")
+	}
+	codexDir := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR"))
+	if codexDir == "" {
+		t.Fatal("CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR is required")
+	}
+	servicePath := os.Getenv("PATH")
+	if path, ok := teamsCodexExecutableOnPath(servicePath); ok && samePath(filepath.Dir(path), codexDir) {
+		t.Fatalf("test precondition failed: service PATH already exposes target Codex %s", path)
+	}
+	targetPath := codexDir + string(os.PathListSeparator) + servicePath
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		TeamsCodexPath: config.TeamsCodexPathPolicy{
+			Mode:         string(userpath.ModeExplicit),
+			ExplicitPath: targetPath,
+		},
+		ProxyEnabled: boolPtr(false),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runTeamsCodexUpgradeFromBridge(context.Background(), &rootOptions{configPath: cfgPath}, io.Discard, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !samePath(filepath.Dir(result.Path), codexDir) {
+		t.Fatalf("upgraded path = %q, want directory %q", result.Path, codexDir)
+	}
+	if err := probeCodexVersion(context.Background(), result.Path); err != nil {
+		t.Fatalf("upgraded Codex is not functional: %v", err)
+	}
+}
+
 func TestApplyTeamsUserPathRuntimeUsesNativeBinaryWithoutManagedNodePATH(t *testing.T) {
 	previous := teamsFindNativeCodex
 	previousRoot := teamsCodexPackageRoot

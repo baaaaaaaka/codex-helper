@@ -215,6 +215,31 @@ jobs:
           go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
           go test ./internal/cli -count=1 -run '^TestTeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipalCI$' -v
 
+      - name: Teams target-account PATH Codex upgrade (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/teams-target-codex"
+          bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$prefix" --include=optional @openai/codex
+          NPM_CONFIG_PREFIX="$prefix" \
+            CODEX_HELPER_TEAMS_UPGRADE_LIVE=1 \
+            CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR="$prefix/bin" \
+            go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
+
+      - name: Teams target-account PATH Codex upgrade (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $prefix = Join-Path $env:RUNNER_TEMP "teams-target-codex"
+          & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $prefix --include=optional @openai/codex
+          $env:NPM_CONFIG_PREFIX = $prefix
+          $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
+          $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
+          go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
+
       - name: CXP TUI preview, navigation, refresh, and thread-name regressions
         shell: bash
         run: |

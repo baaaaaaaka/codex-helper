@@ -1476,6 +1476,25 @@ func TestRunSystemNpmCodexUpgradeDoesNotPassStdinInTeamsService(t *testing.T) {
 	}
 }
 
+func TestRunSystemNpmCodexUpgradeAppliesInstallerCommandConfiguration(t *testing.T) {
+	lockCLITestHooks(t)
+	configured := false
+	wantErr := errors.New("configured target identity")
+	err := runSystemNpmCodexUpgradeWithOptions(context.Background(), io.Discard, os.Environ(), func(cmd *exec.Cmd) error {
+		configured = true
+		if filepath.Base(cmd.Path) != "npm" && filepath.Base(cmd.Path) != "npm.cmd" {
+			t.Fatalf("installer command = %q", cmd.Path)
+		}
+		return wantErr
+	})
+	if !configured {
+		t.Fatal("system npm upgrade did not apply installer command configuration")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+}
+
 func TestEnsureCodexInstallDiskSpaceWarnsAndContinuesWhenUnknown(t *testing.T) {
 	lockCLITestHooks(t)
 

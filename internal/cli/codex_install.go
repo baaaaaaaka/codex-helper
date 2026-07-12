@@ -48,6 +48,7 @@ type codexInstallOptions struct {
 	withInstallerEnv          func(context.Context, func([]string) error) error
 	configureInstallerCommand func(*exec.Cmd) error
 	upgradeCodex              bool
+	upgradeCodexPath          string
 }
 
 type codexInstallCmd struct {
@@ -1545,7 +1546,7 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts codexInstallOptions) (string, error) {
 	var upgradedPath string
 	if err := withCodexInstallLock(ctx, out, func() error {
-		source, err := detectCodexUpgradeSource(ctx, opts.installerEnv)
+		source, err := detectCodexUpgradeSourceForPath(ctx, opts.upgradeCodexPath, opts.installerEnv)
 		if err != nil {
 			return err
 		}
@@ -1560,7 +1561,7 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 		}
 
 		runUpgrade := func(installerEnv []string) error {
-			return runCodexUpgradeBySource(ctx, out, installerEnv, source)
+			return runCodexUpgradeBySourceWithOptions(ctx, out, installerEnv, source, opts.configureInstallerCommand)
 		}
 		if opts.withInstallerEnv != nil {
 			if err := opts.withInstallerEnv(ctx, runUpgrade); err != nil {
@@ -1750,26 +1751,34 @@ func codexRetirePath(path string) string {
 }
 
 func runCodexUpgradeBySource(ctx context.Context, out io.Writer, installerEnv []string, source codexUpgradeSource) error {
+	return runCodexUpgradeBySourceWithOptions(ctx, out, installerEnv, source, nil)
+}
+
+func runCodexUpgradeBySourceWithOptions(ctx context.Context, out io.Writer, installerEnv []string, source codexUpgradeSource, configureCommand func(*exec.Cmd) error) error {
 	switch source.origin {
 	case codexInstallOriginManaged:
 		if strings.TrimSpace(source.npmPrefix) == "" {
 			return fmt.Errorf("managed codex install path is missing npm prefix")
 		}
 		envWithPrefix := setEnvValue(installerEnv, "CODEX_NPM_PREFIX", source.npmPrefix)
-		return runCodexInstaller(ctx, out, envWithPrefix)
+		return runCodexInstallerWithOptions(ctx, out, envWithPrefix, configureCommand)
 	case codexInstallOriginSystem:
 		if err := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, []codexInstallDiskTarget{
 			{label: "system npm prefix", path: source.npmPrefix},
 		}, false)); err != nil {
 			return err
 		}
-		return runSystemNpmCodexUpgrade(ctx, out, installerEnv)
+		return runSystemNpmCodexUpgradeWithOptions(ctx, out, installerEnv, configureCommand)
 	default:
 		return fmt.Errorf("cannot determine codex installation origin; refusing automatic upgrade")
 	}
 }
 
 func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv []string) error {
+	return runSystemNpmCodexUpgradeWithOptions(ctx, out, installerEnv, nil)
+}
+
+func runSystemNpmCodexUpgradeWithOptions(ctx context.Context, out io.Writer, installerEnv []string, configureCommand func(*exec.Cmd) error) error {
 	npmPath, err := exec.LookPath("npm")
 	if err != nil {
 		return fmt.Errorf("npm not found in PATH: %w", err)
@@ -1787,6 +1796,11 @@ func runSystemNpmCodexUpgrade(ctx context.Context, out io.Writer, installerEnv [
 	cmd.Stdout = out
 	cmd.Stderr = out
 	cmd.Stdin = codexInstallerCommandStdin()
+	if configureCommand != nil {
+		if err := configureCommand(cmd); err != nil {
+			return err
+		}
+	}
 	if err := cmd.Run(); err != nil {
 		if diskErr := ensureCodexInstallDiskSpaceForTargets(out, installerEnv, codexInstallDiskTargets(installerEnv, diskTargets, false)); diskErr != nil {
 			return diskErr

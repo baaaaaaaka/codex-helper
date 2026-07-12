@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -595,6 +597,13 @@ func teamsStoreConfigForStatus(root *rootOptions) (*config.Store, error) {
 }
 
 var upgradeCodexInstalledForTeamsRun = upgradeCodexInstalledWithOptions
+var resolveTeamsCodexUpgradeTargetForRun = resolveTeamsCodexUpgradeTarget
+
+type teamsCodexUpgradeTarget struct {
+	path        string
+	environment []string
+	identity    *execIdentity
+}
 
 func runTeamsUpgradeCodexOnce(cmd interface {
 	Context() context.Context
@@ -607,7 +616,7 @@ func runTeamsUpgradeCodexOnce(cmd interface {
 	if err := ensureTeamsIdleBeforeCodexUpgrade(cmd.Context()); err != nil {
 		return err
 	}
-	store, _, err := newRootStore(root, "")
+	store, paths, err := newRootStore(root, "")
 	if err != nil {
 		return err
 	}
@@ -615,14 +624,20 @@ func runTeamsUpgradeCodexOnce(cmd interface {
 	if err != nil {
 		return err
 	}
-	installOpts := codexInstallOptions{upgradeCodex: true}
+	upgradeTarget, err := resolveTeamsCodexUpgradeTargetForRun(cmd.Context(), cfg, paths)
+	if err != nil {
+		return err
+	}
+	installOpts := teamsCodexUpgradeInstallOptions(upgradeTarget)
 	if upgradeUsesProxy(cfg) {
 		profile, cfgWithProfile, err := ensureProfileRunFn(cmd.Context(), store, "", true, cmd.ErrOrStderr())
 		if err != nil {
 			return err
 		}
 		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
-			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, runInstall)
+			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, func(profileEnv []string) error {
+				return runInstall(teamsCodexUpgradeProxyEnvironment(upgradeTarget.environment, profileEnv))
+			})
 		}
 	}
 	path, err := upgradeCodexInstalledForTeamsRun(cmd.Context(), cmd.ErrOrStderr(), installOpts)
@@ -637,7 +652,7 @@ func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out 
 	if strings.TrimSpace(codexPath) != "" {
 		return teams.CodexUpgradeResult{}, fmt.Errorf("automatic Codex upgrade cannot be used with --codex-path")
 	}
-	store, _, err := newRootStore(root, "")
+	store, paths, err := newRootStore(root, "")
 	if err != nil {
 		return teams.CodexUpgradeResult{}, err
 	}
@@ -645,14 +660,20 @@ func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out 
 	if err != nil {
 		return teams.CodexUpgradeResult{}, err
 	}
-	installOpts := codexInstallOptions{upgradeCodex: true}
+	upgradeTarget, err := resolveTeamsCodexUpgradeTargetForRun(ctx, cfg, paths)
+	if err != nil {
+		return teams.CodexUpgradeResult{}, err
+	}
+	installOpts := teamsCodexUpgradeInstallOptions(upgradeTarget)
 	if upgradeUsesProxy(cfg) {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", true, out)
 		if err != nil {
 			return teams.CodexUpgradeResult{}, err
 		}
 		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
-			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, runInstall)
+			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, func(profileEnv []string) error {
+				return runInstall(teamsCodexUpgradeProxyEnvironment(upgradeTarget.environment, profileEnv))
+			})
 		}
 	}
 	path, err := upgradeCodexInstalledForTeamsRun(ctx, out, installOpts)
@@ -660,6 +681,64 @@ func runTeamsCodexUpgradeFromBridge(ctx context.Context, root *rootOptions, out 
 		return teams.CodexUpgradeResult{}, err
 	}
 	return teams.CodexUpgradeResult{Path: path}, nil
+}
+
+func resolveTeamsCodexUpgradeTarget(ctx context.Context, cfg config.Config, paths effectivePaths) (teamsCodexUpgradeTarget, error) {
+	workDir, err := os.Getwd()
+	if err != nil {
+		return teamsCodexUpgradeTarget{}, fmt.Errorf("resolve Teams Codex upgrade working directory: %w", err)
+	}
+	pathResult, err := resolveTeamsCodexUserPath(ctx, cfg, paths, teamsCodexChildEnv(), workDir)
+	if err != nil {
+		return teamsCodexUpgradeTarget{}, err
+	}
+	if path, ok := teamsCodexExecutableOnPath(pathResult.Path); ok {
+		environment := codexRuntimeEnvironment(os.Environ(), []string{"PATH=" + pathResult.Path}, paths.ExecIdentity)
+		return teamsCodexUpgradeTarget{path: path, environment: environment, identity: paths.ExecIdentity}, nil
+	}
+	return teamsCodexUpgradeTarget{}, fmt.Errorf("codex not found in Teams target account PATH (%s mode)", pathResult.Mode)
+}
+
+func teamsCodexUpgradeInstallOptions(target teamsCodexUpgradeTarget) codexInstallOptions {
+	opts := codexInstallOptions{upgradeCodex: true, upgradeCodexPath: target.path, installerEnv: target.environment}
+	if target.identity != nil {
+		opts.configureInstallerCommand = func(cmd *exec.Cmd) error {
+			updated, err := applyExecIdentity(cmd, cmd.Env, target.identity)
+			if err != nil {
+				return err
+			}
+			cmd.Env = codexRuntimeEnvironment(updated, nil, target.identity)
+			return nil
+		}
+	}
+	return opts
+}
+
+func teamsCodexUpgradeProxyEnvironment(targetEnvironment []string, profileEnvironment []string) []string {
+	proxyURL := envValue(profileEnvironment, "HTTP_PROXY")
+	if strings.TrimSpace(proxyURL) == "" {
+		proxyURL = envValue(profileEnvironment, "http_proxy")
+	}
+	return env.WithProxy(targetEnvironment, proxyURL)
+}
+
+func teamsCodexExecutableOnPath(pathValue string) (string, bool) {
+	names := []string{"codex"}
+	if runtime.GOOS == "windows" {
+		names = []string{"codex.exe", "codex.cmd", "codex.ps1", "codex"}
+	}
+	for _, dir := range filepath.SplitList(pathValue) {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		for _, name := range names {
+			candidate := filepath.Join(dir, name)
+			if executableExists(candidate) {
+				return normalizeExecutablePath(candidate), true
+			}
+		}
+	}
+	return "", false
 }
 
 func teamsCodexUpgraderForRun(root *rootOptions, out io.Writer, codexPath string) teams.CodexUpgrader {
