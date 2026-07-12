@@ -272,6 +272,9 @@ func TestBeaconDoctorDoesNotRequireNakedCodexForManagedRuntime(t *testing.T) {
 
 func TestTeamsRuntimeWiringGuard(t *testing.T) {
 	source, err := os.ReadFile("teams.go")
+	if os.IsNotExist(err) {
+		t.Skip("source-tree wiring audit is unavailable in packaged binary smoke tests")
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,6 +324,9 @@ func TestTeamsBareCodexAuditHasNoUnreviewedConsumers(t *testing.T) {
 	}
 	for name, checks := range expected {
 		source, err := os.ReadFile(name)
+		if os.IsNotExist(err) {
+			t.Skip("source-tree bare-command audit is unavailable in packaged binary smoke tests")
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
