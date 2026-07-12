@@ -1522,7 +1522,7 @@ func TestRunSystemNpmCodexUpgradeAppliesInstallerCommandConfiguration(t *testing
 	wantErr := errors.New("configured target identity")
 	err := runSystemNpmCodexUpgradeWithOptions(context.Background(), io.Discard, os.Environ(), func(cmd *exec.Cmd) error {
 		configured = true
-		if filepath.Base(cmd.Path) != "npm" && filepath.Base(cmd.Path) != "npm.cmd" {
+		if !strings.EqualFold(filepath.Base(cmd.Path), "npm") && !strings.EqualFold(filepath.Base(cmd.Path), "npm.cmd") {
 			t.Fatalf("installer command = %q", cmd.Path)
 		}
 		return wantErr
