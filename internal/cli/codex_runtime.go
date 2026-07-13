@@ -581,7 +581,9 @@ func runCodexExecFacade(
 	if modelLaunch.Enabled {
 		args := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
 		options.AppServerArgs = append(options.AppServerArgs, args[1:]...)
-		extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
+		if !modelLaunch.Native {
+			extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
+		}
 	}
 	configureIdentity := func(command *exec.Cmd) error {
 		updated, err := applyExecIdentity(command, command.Env, paths.ExecIdentity)

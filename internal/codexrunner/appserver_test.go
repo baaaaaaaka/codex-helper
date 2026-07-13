@@ -104,6 +104,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 
 	got, err := runner.StartThread(context.Background(), TurnInput{
 		Prompt:          "hello",
+		Model:           "gpt-switch-target",
 		AdditionalDirs:  []string{"/extra-a", "/extra-b"},
 		OutputSchema:    json.RawMessage(`{"type":"object"}`),
 		Ephemeral:       true,
@@ -137,6 +138,7 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	assertMethod(t, writes[4], "turn/start")
 	assertParamString(t, writes[4], "threadId", "thread-new")
 	assertTextInput(t, writes[4], "hello")
+	assertParamString(t, writes[4], "model", "gpt-switch-target")
 	assertParamString(t, writes[4], "cwd", "/work")
 	turnParams := writes[4]["params"].(map[string]any)
 	if schema, ok := turnParams["outputSchema"].(map[string]any); !ok || schema["type"] != "object" {
@@ -202,7 +204,7 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	)
 	runner := NewAppServerRunner(transport)
 
-	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", AdditionalDirs: []string{"/resume-extra"}})
+	got, err := runner.ResumeThread(context.Background(), "thread-existing", TurnInput{Prompt: "continue", Model: "gpt-resume-target", AdditionalDirs: []string{"/resume-extra"}, ReasoningEffort: "high"})
 	if err != nil {
 		t.Fatalf("ResumeThread error: %v", err)
 	}
@@ -221,6 +223,8 @@ func TestAppServerRunnerResumeThreadEncodesResumeAndTurnStart(t *testing.T) {
 	assertParamAbsent(t, writes[3], "excludeTurns")
 	assertMethod(t, writes[4], "turn/start")
 	assertParamString(t, writes[4], "threadId", "thread-existing")
+	assertParamString(t, writes[4], "model", "gpt-resume-target")
+	assertParamString(t, writes[4], "effort", "high")
 	assertTextInput(t, writes[4], "continue")
 }
 

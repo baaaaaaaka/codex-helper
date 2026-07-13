@@ -117,8 +117,10 @@ Control chat commands:
 - `continue <number-or-session-id>` or `c <...>`: create or open a Work chat for an existing session.
 - `open <number>`: show an existing linked Work chat.
 - `status` or `st`: list active Work chats.
-- `model list`, `model setup <model>`, `model use <model>`, and `model doctor <model>`: list, configure, select, or validate model profiles from Teams.
-- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change the Control chat reasoning effort.
+- `model status`, `model list`, `model switch <model>`, and `model reset`: inspect or change only the Control chat model. `model use <model>` is an alias for `model switch <model>`.
+- `model setup <model>` and `model doctor <model>`: configure or validate model availability without selecting it or changing a default.
+- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change only the Control chat reasoning effort.
+- `default status`, `default model status|list|set|reset`, and `default effort status|list|set|reset`: inspect or change global defaults for future launches and newly created chats. These commands are Control-chat-only and do not rewrite an existing chat.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
 - `helper update now`: update to the latest stable helper release.
 - `helper update prerelease`: update to the newest eligible release or pre-release.
@@ -133,8 +135,9 @@ Work chat commands:
 - `helper retry last`: retry the last failed or interrupted request.
 - `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
 - `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
-- `model status`, `model switch <profile>`, and `model fork <profile>`: inspect, switch when compatible, or fork the Work chat with another model profile. Official `gpt-*` slugs take precedence on name collisions; use `official:<slug>` or `profile:<name>` to select explicitly.
+- `model status`, `model switch <profile>`, `model reset`, and `model fork <profile>`: inspect, switch when compatible, reset to the effective global model, or fork the Work chat with another model profile. Official `gpt-*` slugs take precedence on name collisions; use `official:<slug>` or `profile:<name>` to select explicitly.
 - `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change this Work chat's reasoning effort.
+- `default ...`: rejected in a Work chat because global defaults are Control-chat-only.
 - `helper close`: close the Work chat binding.
 
 ## Beacon Execution Profiles

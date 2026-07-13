@@ -301,6 +301,12 @@ proxy 路由，唯一差别是 reviewer。Contract CI 使用开启 analytics 的
 普通的 `reviewer=user`、`status=approved`、`user_approved` 事件。CXP 不隐藏自己的
 app-server client identity，也不承诺服务端无法根据时序或其他正常 telemetry 推断自动化。
 
+普通 CI 和 Codex release monitor 不使用外部账户凭据。Runtime contract job 会安装并
+启动原版 Codex binary，但只使用全新的合成 `CODEX_HOME`、合成 ChatGPT auth metadata，
+以及 runner 内的 loopback official/third-party Responses services。CI 会验证 per-turn
+model/effort、同一 thread 的跨 provider resume、可见上下文完整性和 reasoning 清洗。
+仓库 CI 禁止存储或注入 OpenAI、NVIDIA、Teams、proxy 等外部 token。
+
 `codex-proxy app` 仍然直接启动官方 Desktop App。Desktop App 目前没有稳定的外部
 app-server attachment contract，因此，在声称“所有 CXP surface 都已接入 broker”之前，
 Desktop 自动审批仍是 final release blocker；CXP 不会为这个入口静默回退到已经退役的执行机制。
@@ -733,11 +739,17 @@ new <directory> --model <profile>
 sessions
 continue 1
 status
+model status
 model list
-model use deepseek
+model switch deepseek
+model reset
 effort status
 effort list
 effort set high
+effort reset
+default status
+default model set official:<slug>
+default effort set high
 ```
 
 日常 Work chat 命令：
@@ -751,14 +763,28 @@ helper publish-history
 helper publish-history full
 model status
 model switch deepseek
+model reset
 model fork deepseek
 effort status
 effort list
 effort set xhigh
+effort reset
 ```
 
+Teams 的 `model` 和 `effort` 命令只影响发送命令的当前 chat，Control chat 也遵循
+相同规则。`model use <model>` 保留为 chat 局部 `model switch <model>` 的别名。
+`model setup` 只配置模型可用性，不会选择模型，也不会修改默认值。
+
+只有 Control chat 可以使用 `default` 命令，它管理同一 config root 下未来的
+CXP/Codex 启动和新建 Teams chat 的全局默认值；不会追溯修改已有 chat，也不会修改
+发送命令的 Control chat。可使用 `default status`、
+`default model status|list|set|reset` 和 `default effort status|list|set|reset`。
+模型名称需要消歧时使用 `official:<slug>` 或 `profile:<name>`。Work chat 会拒绝
+`default` 命令。
+
 Control 和 Work chat 各自独立保存 effort。`effort list` 按当前模型声明的选项和顺序
-展示；切换只作用于命令之后排队的 turn，`effort reset` 会恢复为模型声明的默认值。
+展示；切换只作用于命令之后排队的 turn。存在显式全局 effort 时，`effort reset`
+会恢复该全局值，否则恢复为模型声明的默认值。
 
 高级本地检查和维护：
 

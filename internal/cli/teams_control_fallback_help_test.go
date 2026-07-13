@@ -67,6 +67,10 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`new <directory> --model <profile>`",
 		"`model list`",
 		"`model status`",
+		"`model reset`",
+		"`default status`",
+		"`default model status|list|set|reset`",
+		"`default effort status|list|set|reset`",
 		"`helper update prerelease`",
 		"`codex update now`",
 		"`helper cancel last`",
@@ -113,8 +117,8 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 		},
 		{
 			name:     "teams model commands",
-			fallback: []string{"new <directory> --model <profile>", "model list", "model status", "model switch <profile>", "model fork <profile>"},
-			docs:     []string{"new <directory> --model", "model list", "model status", "model switch", "model fork"},
+			fallback: []string{"new <directory> --model <profile>", "model list", "model status", "model switch <profile>", "model reset", "model fork <profile>", "default model status|list|set|reset", "default effort status|list|set|reset"},
+			docs:     []string{"new <directory> --model", "model list", "model status", "model switch", "model reset", "model fork", "default model status|list|set|reset", "default effort status|list|set|reset"},
 		},
 		{
 			name:     "profile lifecycle",

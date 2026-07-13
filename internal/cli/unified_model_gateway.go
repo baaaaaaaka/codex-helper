@@ -395,6 +395,14 @@ func (g *unifiedModelGateway) serveResponses(w http.ResponseWriter, r *http.Requ
 	}
 	modelKey := strings.ToLower(strings.TrimSpace(request.Model))
 	if route, ok := g.third[modelKey]; ok {
+		body, strippedReasoning, err := sanitizeThirdPartyResponsesHistory(body)
+		if err != nil {
+			http.Error(w, `{"error":{"message":"invalid third-party Responses history"}}`, http.StatusBadRequest)
+			return
+		}
+		if strippedReasoning > 0 && g.log != nil {
+			_, _ = fmt.Fprintf(g.log, "unified third-party route removed encrypted content from %d reasoning item(s) while preserving portable summaries and conversation history\n", strippedReasoning)
+		}
 		if route.rewriteModel && !strings.EqualFold(request.Model, route.upstream) {
 			var value map[string]any
 			if err := json.Unmarshal(body, &value); err != nil {
@@ -427,6 +435,14 @@ func (g *unifiedModelGateway) serveResponses(w http.ResponseWriter, r *http.Requ
 		http.Error(w, `{"error":{"message":"unknown unified gateway model"}}`, http.StatusBadRequest)
 		return
 	}
+	body, droppedReasoning, err := sanitizeOfficialResponsesHistory(body)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"invalid official Responses history"}}`, http.StatusBadRequest)
+		return
+	}
+	if droppedReasoning > 0 && g.log != nil {
+		_, _ = fmt.Fprintf(g.log, "unified official route removed %d third-party reasoning item(s) while preserving portable conversation history\n", droppedReasoning)
+	}
 	resp, err := g.doOfficial(r, body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"official Responses upstream unavailable"}}`, http.StatusBadGateway)
@@ -434,6 +450,134 @@ func (g *unifiedModelGateway) serveResponses(w http.ResponseWriter, r *http.Requ
 	}
 	defer resp.Body.Close()
 	copyUnifiedStreamingResponse(w, resp, g.currentETag())
+}
+
+func sanitizeThirdPartyResponsesHistory(body []byte) ([]byte, int, error) {
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, 0, err
+	}
+	rawInput, ok := request["input"]
+	if !ok || len(bytes.TrimSpace(rawInput)) == 0 {
+		return body, 0, nil
+	}
+	var input []json.RawMessage
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		// String and object input forms cannot contain replayed reasoning items.
+		return body, 0, nil
+	}
+	stripped := 0
+	for index, raw := range input {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &item); err != nil {
+			return nil, 0, err
+		}
+		if !strings.EqualFold(strings.TrimSpace(rawStringCLI(item["type"])), "reasoning") {
+			continue
+		}
+		encrypted, exists := item["encrypted_content"]
+		if !exists || len(bytes.TrimSpace(encrypted)) == 0 || bytes.Equal(bytes.TrimSpace(encrypted), []byte("null")) || bytes.Equal(bytes.TrimSpace(encrypted), []byte(`""`)) {
+			continue
+		}
+		delete(item, "encrypted_content")
+		rewritten, err := json.Marshal(item)
+		if err != nil {
+			return nil, 0, err
+		}
+		input[index] = rewritten
+		stripped++
+	}
+	if stripped == 0 {
+		return body, 0, nil
+	}
+	request["input"], _ = json.Marshal(input)
+	sanitized, err := json.Marshal(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	return sanitized, stripped, nil
+}
+
+func rawStringCLI(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
+func sanitizeOfficialResponsesHistory(body []byte) ([]byte, int, error) {
+	var request map[string]json.RawMessage
+	if err := json.Unmarshal(body, &request); err != nil {
+		return nil, 0, err
+	}
+	rawInput, ok := request["input"]
+	if !ok || len(bytes.TrimSpace(rawInput)) == 0 {
+		return body, 0, nil
+	}
+	var input []json.RawMessage
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		// String and object input forms cannot contain replayed reasoning items.
+		return body, 0, nil
+	}
+	filtered := make([]json.RawMessage, 0, len(input))
+	dropped := 0
+	for _, item := range input {
+		thirdParty, err := isThirdPartyReasoningItem(item)
+		if err != nil {
+			return nil, 0, err
+		}
+		if thirdParty {
+			dropped++
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	if dropped == 0 {
+		return body, 0, nil
+	}
+	request["input"], _ = json.Marshal(filtered)
+	sanitized, err := json.Marshal(request)
+	if err != nil {
+		return nil, 0, err
+	}
+	return sanitized, dropped, nil
+}
+
+func isThirdPartyReasoningItem(raw json.RawMessage) (bool, error) {
+	var item struct {
+		Type             string          `json:"type"`
+		ID               string          `json:"id"`
+		EncryptedContent string          `json:"encrypted_content"`
+		Content          json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(item.Type), "reasoning") {
+		return false, nil
+	}
+	// responsesadapter response IDs are resp_*, so its reasoning item IDs are
+	// rs_resp_*. Keep this provenance check for old rollouts even after the
+	// adapter stops misusing encrypted_content for plaintext reasoning.
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(item.ID)), "rs_resp_") {
+		return true, nil
+	}
+	if strings.TrimSpace(item.EncryptedContent) != "" {
+		// Preserve official opaque reasoning even if a future API revision also
+		// attaches displayable content. Only the CXP adapter-owned rs_resp_ IDs
+		// above are known to have mislabeled plaintext as encrypted historically.
+		return false, nil
+	}
+	content := bytes.TrimSpace(item.Content)
+	if len(content) == 0 || bytes.Equal(content, []byte("null")) || bytes.Equal(content, []byte("[]")) {
+		return false, nil
+	}
+	var parts []json.RawMessage
+	if err := json.Unmarshal(content, &parts); err != nil {
+		return false, err
+	}
+	// Reasoning without an official opaque payload is adapter/vendor output and
+	// must not be forwarded to the official endpoint.
+	return len(parts) > 0, nil
 }
 
 func stripOfficialCredentialHeaders(header http.Header) {

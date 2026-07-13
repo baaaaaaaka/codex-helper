@@ -153,6 +153,9 @@ func ValidateModelConfig(cfg Config) error {
 			}
 		}
 	}
+	if err := validateGlobalDefaults(cfg); err != nil {
+		return err
+	}
 	for name, source := range cfg.ModelSources {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(source.URL) == "" {
 			return fmt.Errorf("model source %q requires url", name)
@@ -178,6 +181,41 @@ func ValidateModelConfig(cfg Config) error {
 				return fmt.Errorf("model source %q owns missing or mismatched profile %q", name, profile)
 			}
 		}
+	}
+	return nil
+}
+
+func validateGlobalDefaults(cfg Config) error {
+	if cfg.Defaults == nil {
+		return nil
+	}
+	rawSelector := cfg.Defaults.Model
+	selector := strings.TrimSpace(rawSelector)
+	if rawSelector != selector {
+		return fmt.Errorf("defaults.model must not contain surrounding whitespace")
+	}
+	if selector != "" && !strings.EqualFold(selector, DefaultModelProfileName) {
+		prefix, value, qualified := strings.Cut(selector, ":")
+		if !qualified || strings.TrimSpace(value) == "" {
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
+		}
+		switch strings.ToLower(strings.TrimSpace(prefix)) {
+		case "official":
+			// Availability is account/runtime-specific and is validated by the
+			// default command before persistence. The config layer only enforces
+			// the canonical typed selector shape.
+		case "profile":
+			if _, ok := cfg.FindModelProfile(strings.TrimSpace(value)); !ok {
+				return fmt.Errorf("defaults.model references missing profile %q", strings.TrimSpace(value))
+			}
+		default:
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
+		}
+	}
+	rawEffort := cfg.Defaults.ReasoningEffort
+	effort := strings.TrimSpace(rawEffort)
+	if rawEffort != effort || len(effort) > 64 || strings.ContainsAny(effort, " \t\r\n") {
+		return fmt.Errorf("defaults.reasoningEffort %q must be a single model-advertised value", effort)
 	}
 	return nil
 }

@@ -121,3 +121,76 @@ func TestConfigModelProfileOps(t *testing.T) {
 		t.Fatalf("removed model profile still found")
 	}
 }
+
+func TestConfigGlobalDefaultsPreferTypedSelectorAndPreserveLegacyFallback(t *testing.T) {
+	cfg := Config{DefaultModelProfile: "legacy-profile"}
+	if got := cfg.EffectiveDefaultModelSelector(); got != "profile:legacy-profile" {
+		t.Fatalf("legacy selector = %q", got)
+	}
+	if got := cfg.ExplicitDefaultReasoningEffort(); got != "" {
+		t.Fatalf("legacy effort = %q", got)
+	}
+
+	cfg.Defaults = &GlobalDefaults{Model: "official:gpt-test", ReasoningEffort: "high"}
+	if got := cfg.EffectiveDefaultModelSelector(); got != "official:gpt-test" {
+		t.Fatalf("typed selector = %q", got)
+	}
+	if got := cfg.ExplicitDefaultReasoningEffort(); got != "high" {
+		t.Fatalf("typed effort = %q", got)
+	}
+	if !cfg.HasExplicitGlobalDefaults() {
+		t.Fatal("HasExplicitGlobalDefaults = false")
+	}
+
+	cfg.Defaults.Model = ""
+	cfg.Defaults.ReasoningEffort = ""
+	cfg.PruneEmptyGlobalDefaults()
+	if cfg.Defaults != nil {
+		t.Fatalf("empty defaults were not pruned: %#v", cfg.Defaults)
+	}
+}
+
+func TestRemoveModelProfileClearsTypedDefaultSelector(t *testing.T) {
+	cfg := Config{
+		DefaultModelProfile: "work",
+		Defaults:            &GlobalDefaults{Model: "PROFILE:work", ReasoningEffort: "high"},
+		ModelProfiles:       map[string]ModelProfile{"work": {Provider: "deepseek", Revision: 1}},
+	}
+	if !cfg.RemoveModelProfile("WORK") {
+		t.Fatal("RemoveModelProfile returned false")
+	}
+	if cfg.DefaultModelProfile != "" || cfg.Defaults != nil {
+		t.Fatalf("defaults after remove = legacy=%q typed=%#v", cfg.DefaultModelProfile, cfg.Defaults)
+	}
+}
+
+func TestRemoveLegacyDefaultDoesNotClobberDifferentTypedDefault(t *testing.T) {
+	cfg := Config{
+		DefaultModelProfile: "work",
+		Defaults:            &GlobalDefaults{Model: "official:gpt-current", ReasoningEffort: "high"},
+		ModelProfiles:       map[string]ModelProfile{"work": {Provider: "deepseek", Revision: 1}},
+	}
+	if !cfg.RemoveModelProfile("work") {
+		t.Fatal("RemoveModelProfile returned false")
+	}
+	if cfg.DefaultModelProfile != "" || cfg.Defaults == nil || cfg.Defaults.Model != "official:gpt-current" || cfg.Defaults.ReasoningEffort != "high" {
+		t.Fatalf("different typed default was clobbered: legacy=%q typed=%#v", cfg.DefaultModelProfile, cfg.Defaults)
+	}
+}
+
+func TestSetDefaultModelProfileClearsEffortOnlyWhenModelChanges(t *testing.T) {
+	cfg := Config{Defaults: &GlobalDefaults{Model: "profile:work", ReasoningEffort: "high"}, DefaultModelProfile: "work"}
+	cfg.SetDefaultModelProfile("work")
+	if cfg.Defaults == nil || cfg.Defaults.ReasoningEffort != "high" {
+		t.Fatalf("same model cleared effort: %#v", cfg.Defaults)
+	}
+	cfg.SetDefaultModelProfile("other")
+	if cfg.Defaults == nil || cfg.Defaults.Model != "profile:other" || cfg.Defaults.ReasoningEffort != "" {
+		t.Fatalf("changed model retained unvalidated effort: %#v", cfg.Defaults)
+	}
+	cfg.Defaults.ReasoningEffort = "medium"
+	cfg.SetDefaultModelProfile("")
+	if cfg.Defaults != nil || cfg.DefaultModelProfile != "" {
+		t.Fatalf("reset model retained stale defaults: legacy=%q typed=%#v", cfg.DefaultModelProfile, cfg.Defaults)
+	}
+}

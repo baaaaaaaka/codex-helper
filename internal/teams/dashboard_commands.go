@@ -49,6 +49,7 @@ const (
 	DashboardCommandBeacon         DashboardCommandName = "beacon"
 	DashboardCommandModel          DashboardCommandName = "model"
 	DashboardCommandEffort         DashboardCommandName = "effort"
+	DashboardCommandDefault        DashboardCommandName = "default"
 )
 
 type ParsedDashboardCommand struct {
@@ -244,6 +245,8 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 			arg = "list"
 		}
 		return DashboardCommandEffort, arg, true
+	case "default", "defaults":
+		return DashboardCommandDefault, arg, true
 	default:
 	}
 	return DashboardCommandNone, "", false
@@ -406,7 +409,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandEffort:
+	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault:
 		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandPark, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
@@ -456,6 +459,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandModel, true
 	case "effort", "efforts", "reasoning-effort", "thinking-effort":
 		return DashboardCommandEffort, true
+	case "default", "defaults":
+		return DashboardCommandDefault, true
 	default:
 		return DashboardCommandNone, false
 	}
@@ -556,6 +561,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandModel, true
 	case "effort", "efforts", "reasoning-effort", "thinking-effort":
 		return DashboardCommandEffort, true
+	case "default", "defaults":
+		return DashboardCommandDefault, true
 	default:
 		return DashboardCommandNone, false
 	}

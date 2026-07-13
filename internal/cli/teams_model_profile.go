@@ -20,6 +20,7 @@ type teamsModelProfileManager struct {
 	root            *rootOptions
 	codexPath       string
 	runtimeResolver teamsCodexRuntimeResolver
+	defaultResolver teams.ModelProfileResolver
 }
 
 var listTeamsOfficialModelsFn = listTeamsOfficialModels
@@ -168,6 +169,7 @@ type teamsOfficialModel struct {
 	DisplayName           string
 	IsDefault             bool
 	DefaultReasoningLevel string
+	ReasoningEfforts      []string
 }
 
 func listTeamsOfficialModels(ctx context.Context, codexPath string) ([]teamsOfficialModel, error) {
@@ -210,6 +212,11 @@ func listTeamsOfficialModels(ctx context.Context, codexPath string) ([]teamsOffi
 			IsDefault:             listedModel.IsDefault,
 			DefaultReasoningLevel: strings.TrimSpace(listedModel.DefaultReasoningEffort),
 		}
+		for _, option := range listedModel.ReasoningEfforts {
+			if effort := strings.TrimSpace(option.Effort); effort != "" {
+				model.ReasoningEfforts = append(model.ReasoningEfforts, effort)
+			}
+		}
 		if model.Slug == "" {
 			continue
 		}
@@ -241,11 +248,20 @@ func teamsOfficialDefaultModel(models []teamsOfficialModel) (teamsOfficialModel,
 
 func printTeamsVerifiedModels(cfg config.Config, secrets *modelprofile.SecretStore, officialReady bool, officialModels []teamsOfficialModel, officialCatalogErr error) string {
 	lines := []string{"Verified models"}
-	defaultName := cfg.EffectiveDefaultModelProfile()
+	defaultSelector := cfg.EffectiveDefaultModelSelector()
+	defaultName := strings.TrimSpace(strings.TrimPrefix(defaultSelector, "profile:"))
 	officialDefault, officialDefaultIndex := teamsOfficialDefaultModel(officialModels)
-	if strings.EqualFold(defaultName, config.DefaultModelProfileName) && officialReady && officialDefaultIndex >= 0 {
+	if strings.HasPrefix(strings.ToLower(defaultSelector), "official:") && officialReady {
+		slug := strings.TrimSpace(strings.TrimPrefix(defaultSelector, "official:"))
+		for _, model := range officialModels {
+			if strings.EqualFold(model.Slug, slug) {
+				lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", model.DisplayName, model.Slug))
+				break
+			}
+		}
+	} else if strings.EqualFold(defaultSelector, config.DefaultModelProfileName) && officialReady && officialDefaultIndex >= 0 {
 		lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
-	} else if !strings.EqualFold(defaultName, config.DefaultModelProfileName) {
+	} else if !strings.EqualFold(defaultSelector, config.DefaultModelProfileName) {
 		if profile, ok := cfg.FindModelProfile(defaultName); ok && modelProfileVerificationCurrent(cfg, defaultName, profile, secrets) {
 			if resolved, err := modelprofile.Resolve(cfg, defaultName); err == nil {
 				lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", resolved.Model.Label(), defaultName))
@@ -361,7 +377,7 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 	}
 	if choice, ok := modelprofile.LookupModelChoice(arg); ok {
 		if !choice.RequiresAPIKey {
-			return "Use `model use default` to switch future Work chats back to the Codex official API.", nil
+			return "The official Codex model is already available. Use `model switch default` for this Control chat or `default model reset` for the global default.", nil
 		}
 		return fmt.Sprintf("Set up %s with `model setup %s`. If no %s API key is configured yet, I will start a one-time Teams key intake.", choice.DisplayName, choice.ID, choice.ProviderDisplayName), nil
 	}
@@ -380,7 +396,7 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 		}
 	}
 	if spec.ID == modelprofile.DefaultProvider {
-		return "Use the built-in official Codex API profile with:\n\n`cxp model-profile set-default default`", nil
+		return "The official Codex model is already available. Use `model switch default` for this Control chat or `default model reset` for the global default.", nil
 	}
 	envName := strings.TrimSpace(spec.RecommendedEnv)
 	if envName == "" {
@@ -389,13 +405,13 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 	lines := []string{
 		"Run one of these commands in a local terminal:",
 		"",
-		fmt.Sprintf("`cxp model-profile setup %s --provider %s --api-key-stdin --set-default`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID)),
-		fmt.Sprintf("`cxp model-profile setup %s --provider %s --api-key-env %s --set-default`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID), shellQuoteForTeams(envName)),
+		fmt.Sprintf("`cxp model-profile setup %s --provider %s --api-key-stdin`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID)),
+		fmt.Sprintf("`cxp model-profile setup %s --provider %s --api-key-env %s`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID), shellQuoteForTeams(envName)),
 		"",
 		"Or, if you cannot access a terminal, use the explicit Teams key intake flow:",
-		fmt.Sprintf("`model setup %s %s --teams-key-intake --set-default`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name)),
+		fmt.Sprintf("`model setup %s %s --teams-key-intake`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name)),
 		"",
-		"After that, use `model list` in Teams, `model default <name>` for future Work chats, or `new <directory> --model <name>`.",
+		"After that, use `model switch <name>` for the current Control chat, `default model set <name>` globally, or `new <directory> --model <name>` for one Work chat.",
 	}
 	if models := spec.ModelCatalog(); len(models) > 1 {
 		lines = append(lines, "", "Optional model choices:")
@@ -404,8 +420,8 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 		}
 		lines = append(lines,
 			"",
-			fmt.Sprintf("To pin a non-default model, add `--model <model>`, for example: `cxp model-profile setup %s --provider %s --model %s --api-key-stdin --set-default`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID), shellQuoteForTeams(models[len(models)-1].PublicID())),
-			fmt.Sprintf("Teams key intake also supports it: `model setup %s %s --model %s --teams-key-intake --set-default`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name), shellQuoteForTeams(models[len(models)-1].PublicID())),
+			fmt.Sprintf("To pin a non-default model, add `--model <model>`, for example: `cxp model-profile setup %s --provider %s --model %s --api-key-stdin`", shellQuoteForTeams(name), shellQuoteForTeams(spec.ID), shellQuoteForTeams(models[len(models)-1].PublicID())),
+			fmt.Sprintf("Teams key intake also supports it: `model setup %s %s --model %s --teams-key-intake`", shellQuoteForTeams(spec.ID), shellQuoteForTeams(name), shellQuoteForTeams(models[len(models)-1].PublicID())),
 		)
 	}
 	_ = ctx
@@ -413,28 +429,21 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 }
 
 func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req teams.ModelProfileSetupRequest) (teams.ModelProfileSetupResult, error) {
+	if req.SetDefault {
+		return teams.ModelProfileSetupResult{}, fmt.Errorf("model setup only configures availability; use `default model set <model>` separately")
+	}
 	choice, err := modelprofile.MustLookupModelChoice(req.Model)
 	if err != nil {
 		return teams.ModelProfileSetupResult{}, err
 	}
 	if !choice.RequiresAPIKey {
-		store, err := m.store()
-		if err != nil {
-			return teams.ModelProfileSetupResult{}, err
-		}
-		if err := store.Update(func(cfg *config.Config) error {
-			cfg.DefaultModelProfile = ""
-			return nil
-		}); err != nil {
-			return teams.ModelProfileSetupResult{}, err
-		}
 		_ = ctx
 		return teams.ModelProfileSetupResult{
 			ProfileName: config.DefaultModelProfileName,
 			Provider:    modelprofile.DefaultProvider,
 			Model:       modelprofile.DefaultProvider,
 			DisplayName: choice.DisplayName,
-			SetDefault:  true,
+			SetDefault:  false,
 		}, nil
 	}
 	store, err := m.store()
@@ -464,7 +473,7 @@ func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req tea
 			DisplayName:     choice.DisplayName,
 			NeedsAPIKey:     true,
 			CredentialScope: choice.CredentialScope,
-			SetDefault:      req.SetDefault,
+			SetDefault:      false,
 		}, nil
 	}
 	profileName := choice.RecommendedProfile
@@ -498,9 +507,6 @@ func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req tea
 		profile.VerificationFingerprint = existing.VerificationFingerprint
 	}
 	cfg.UpsertModelProfile(profileName, profile)
-	if req.SetDefault {
-		cfg.DefaultModelProfile = profileName
-	}
 	if !currentVerification {
 		apiKey, resolveErr := modelprofile.ResolveAPIKey(apiKeyRef, secretStore, nil)
 		if resolveErr != nil {
@@ -524,7 +530,7 @@ func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req tea
 		APIKeyRef:       apiKeyRef,
 		ReusedAPIKey:    true,
 		CredentialScope: choice.CredentialScope,
-		SetDefault:      req.SetDefault,
+		SetDefault:      false,
 	}, nil
 }
 
@@ -539,49 +545,6 @@ func (m teamsModelProfileManager) ModelProfileDoctor(ctx context.Context, name s
 	}
 	_ = ctx
 	return strings.TrimSpace(out.String()), nil
-}
-
-func (m teamsModelProfileManager) SetDefaultModelProfile(ctx context.Context, name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "", fmt.Errorf("model is required")
-	}
-	if choice, ok := modelprofile.LookupModelChoice(name); ok {
-		result, err := m.SetupModelProfile(ctx, teams.ModelProfileSetupRequest{Model: choice.ID, SetDefault: true})
-		if err != nil {
-			return "", err
-		}
-		if result.NeedsAPIKey {
-			return "", fmt.Errorf("%s is not configured yet; run `model setup %s` first", choice.ID, choice.ID)
-		}
-		return fmt.Sprintf("Default model for future Work chats: %s\n\nExisting Work chats keep their pinned model.", result.DisplayName), nil
-	}
-	store, err := m.store()
-	if err != nil {
-		return "", err
-	}
-	var canonical string
-	if err := store.Update(func(cfg *config.Config) error {
-		if _, err := modelprofile.Resolve(*cfg, name); err != nil {
-			return err
-		}
-		if strings.EqualFold(name, config.DefaultModelProfileName) {
-			cfg.DefaultModelProfile = ""
-			canonical = config.DefaultModelProfileName
-			return nil
-		}
-		found, _, ok := findModelProfileForCLI(*cfg, name)
-		if !ok {
-			return fmt.Errorf("model profile %q not found", name)
-		}
-		cfg.DefaultModelProfile = found
-		canonical = found
-		return nil
-	}); err != nil {
-		return "", err
-	}
-	_ = ctx
-	return fmt.Sprintf("Default model profile for future Work chats: %s\n\nExisting Work chats keep their pinned profile.", canonical), nil
 }
 
 func (m teamsModelProfileManager) DeleteModelProfile(ctx context.Context, name string, confirm bool) (string, error) {
@@ -614,6 +577,9 @@ func (m teamsModelProfileManager) DeleteModelProfile(ctx context.Context, name s
 }
 
 func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, req teams.ModelProfileAPIKeySaveRequest) (teams.ModelProfileAPIKeySaveResult, error) {
+	if req.SetDefault {
+		return teams.ModelProfileAPIKeySaveResult{}, fmt.Errorf("model setup only configures availability; use `default model set <model>` separately")
+	}
 	name := strings.TrimSpace(req.ProfileName)
 	if name == "" {
 		return teams.ModelProfileAPIKeySaveResult{}, fmt.Errorf("model profile name is required")
@@ -705,9 +671,6 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 		profile.VerificationFingerprint = existing.VerificationFingerprint
 	}
 	cfg.UpsertModelProfile(name, profile)
-	if req.SetDefault {
-		cfg.DefaultModelProfile = name
-	}
 	var verifyErr error
 	if !currentVerification {
 		verifyErr = verifyAndStampTeamsModelProfile(ctx, &cfg, name, apiKey)
@@ -725,7 +688,7 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 		APIKeyRef:   apiKeyRef,
 		Fingerprint: modelprofile.Fingerprint(apiKey),
 		Revision:    revision,
-		SetDefault:  req.SetDefault,
+		SetDefault:  false,
 	}, nil
 }
 

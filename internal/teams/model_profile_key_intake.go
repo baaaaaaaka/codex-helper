@@ -107,7 +107,7 @@ func parseModelProfileKeyIntakeSetupOptions(arg string) (modelProfileKeyIntakeSe
 				opts.DisplayName = choice.DisplayName
 				opts.SimpleModel = true
 				if !setDefaultExplicit {
-					opts.SetDefault = true
+					opts.SetDefault = false
 				}
 			} else {
 				opts.Provider = strings.TrimSpace(positional[0])
@@ -158,6 +158,9 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 	if err != nil {
 		return "", err
 	}
+	if opts.SetDefault {
+		return "", fmt.Errorf("`model setup` only configures model availability; remove `--set-default`, then use `default model set <model>` explicitly")
+	}
 	if strings.TrimSpace(opts.Provider) == "" {
 		return modelProfileKeyIntakeSetupUsage(), nil
 	}
@@ -166,7 +169,7 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 		return "", err
 	}
 	if spec.ID == modelprofile.DefaultProvider || !spec.UsesAdapter {
-		return "The built-in `default` model uses official Codex auth and does not need an API key. Use `model use default` for future Work chats.", nil
+		return "The built-in `default` model uses official Codex auth and does not need an API key. Use `model switch default` for this Control chat or `default model reset` for the global default.", nil
 	}
 	modelID := ""
 	if strings.TrimSpace(opts.Model) != "" {
@@ -229,9 +232,7 @@ func (b *Bridge) startModelProfileKeyIntake(ctx context.Context, msg ChatMessage
 		fmt.Sprintf("Step 2: then send `model key %s <api-key>`", code),
 		"Cancel: `model key cancel " + code + "`",
 	}
-	if opts.SetDefault {
-		lines = append(lines, "", "After the key is saved, this model will become the default for future Work chats.")
-	}
+	lines = append(lines, "", "After the key is saved, current chats and global defaults remain unchanged.")
 	return strings.Join(lines, "\n"), nil
 }
 
@@ -465,9 +466,7 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 		fmt.Sprintf("Saved model `%s` as `%s` (api_key=%s, fingerprint=%s, revision=%d).", result.Model, result.ProfileName, modelprofile.MaskRef(result.APIKeyRef), result.Fingerprint, result.Revision),
 		"Raw key was not written to local Teams state, control history, or helper outbox.",
 	}
-	if result.SetDefault {
-		lines = append(lines, "Default model for future Work chats: "+result.Model)
-	}
+	lines = append(lines, "Current chats and global defaults are unchanged. Use `model switch "+result.ProfileName+"` for this Control chat or `default model set "+result.ProfileName+"` globally.")
 	lines = append(lines, "Use `model doctor "+result.Model+"` to validate it.")
 	return strings.Join(lines, "\n"), nil
 }

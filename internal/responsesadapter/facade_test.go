@@ -435,7 +435,6 @@ func TestFacadeStreamsReasoningLifecycleAndStoresCompletedResponse(t *testing.T)
 	for _, want := range []string{
 		"event: response.reasoning_text.delta",
 		`"type":"reasoning"`,
-		`"encrypted_content":"think"`,
 		`"content":[{"type":"reasoning_text","text":"think"}]`,
 		`"output_text":"answer"`,
 	} {
@@ -444,6 +443,7 @@ func TestFacadeStreamsReasoningLifecycleAndStoresCompletedResponse(t *testing.T)
 		}
 	}
 	for _, forbidden := range []string{
+		`"encrypted_content":"think"`,
 		"event: response.reasoning_summary_part.added",
 		"event: response.reasoning_summary_text.delta",
 		`"summary":[{"text":"think"`,

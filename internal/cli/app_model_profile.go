@@ -19,7 +19,7 @@ func applyCodexDesktopModelProfileLaunch(store *config.Store, opts codexDesktopA
 		return opts, nil
 	}
 	desktopLaunch := launch
-	if opts.Platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
+	if !launch.Native && opts.Platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
 		host, err := codexAppWSLHostForWindowsFn()
 		if err != nil {
 			return opts, fmt.Errorf("resolve WSL host for Windows Codex desktop app: %w", err)
@@ -46,10 +46,16 @@ func applyCodexDesktopModelProfileLaunch(store *config.Store, opts codexDesktopA
 		}
 	}
 	opts.ExtraEnv = replaceCodexHomeEnv(opts.ExtraEnv, launchCodexHome)
-	opts.ExtraEnv = withLoopbackNoProxyEnv(append(opts.ExtraEnv, launch.effectiveEnvKey()+"="+launch.ProxyKey))
+	if !launch.Native {
+		opts.ExtraEnv = withLoopbackNoProxyEnv(append(opts.ExtraEnv, launch.effectiveEnvKey()+"="+launch.ProxyKey))
+	}
 	opts.ModelProfileName = launch.Name
 	if opts.Log != nil {
-		_, _ = fmt.Fprintf(opts.Log, "using model profile %q for Codex desktop app via %s\n", launch.Name, desktopLaunch.BaseURL)
+		if launch.Native {
+			_, _ = fmt.Fprintf(opts.Log, "using global official defaults for Codex desktop app\n")
+		} else {
+			_, _ = fmt.Fprintf(opts.Log, "using model profile %q for Codex desktop app via %s\n", launch.Name, desktopLaunch.BaseURL)
+		}
 	}
 	return opts, nil
 }
@@ -68,7 +74,7 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 		return "", err
 	}
 	source := ""
-	if launch.Unified {
+	if launch.Unified || launch.Native {
 		if len(sourceCodexHome) > 0 {
 			source = strings.TrimSpace(sourceCodexHome[0])
 		}
@@ -115,8 +121,8 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 		}
 	}
 	generatedConfig := codexDesktopModelProfileConfigTOML(launch, catalogConfigPath, webSearchFallbackConfigPath)
-	if launch.Unified {
-		inheritedConfig, err := inheritedCodexDesktopModelProfileConfig(source, generatedConfig)
+	if launch.Unified || launch.Native {
+		inheritedConfig, err := inheritedCodexDesktopModelProfileConfig(source, generatedConfig, launch)
 		if err != nil {
 			return "", err
 		}
@@ -151,7 +157,7 @@ func copyCodexOfficialAuthToProfileHome(sourceCodexHome string, profileCodexHome
 	return nil
 }
 
-func inheritedCodexDesktopModelProfileConfig(sourceCodexHome, generated string) (string, error) {
+func inheritedCodexDesktopModelProfileConfig(sourceCodexHome, generated string, launches ...codexModelProfileLaunch) (string, error) {
 	sourceCodexHome = strings.TrimSpace(sourceCodexHome)
 	if sourceCodexHome == "" {
 		return "", fmt.Errorf("official Codex home is unavailable; run `cxp app auth` before launching unified models")
@@ -172,7 +178,25 @@ func inheritedCodexDesktopModelProfileConfig(sourceCodexHome, generated string) 
 		"agents." + codexWebSearchFallbackAgentName:         true,
 	}
 	ownedTopLevel := map[string]bool{
-		"model": true, "model_provider": true, "model_catalog_json": true, "web_search": true,
+		"model": true, "model_provider": true, "model_catalog_json": true, "model_reasoning_effort": true, "web_search": true,
+	}
+	if len(launches) > 0 && launches[0].Native {
+		launch := launches[0]
+		ownedSections = map[string]bool{
+			"model_providers." + cxpUnifiedCodexModelProviderID: true,
+		}
+		ownedTopLevel = map[string]bool{}
+		if strings.TrimSpace(launch.Model) != "" {
+			// An explicit official model must not inherit an incompatible custom
+			// provider, catalog, or reasoning override.
+			ownedTopLevel["model"] = true
+			ownedTopLevel["model_provider"] = true
+			ownedTopLevel["model_catalog_json"] = true
+			ownedTopLevel["model_reasoning_effort"] = true
+		}
+		if strings.TrimSpace(launch.ReasoningEffort) != "" {
+			ownedTopLevel["model_reasoning_effort"] = true
+		}
 	}
 	lines := strings.Split(string(raw), "\n")
 	topLevel := make([]string, 0, len(lines))
@@ -215,6 +239,16 @@ func inheritedCodexDesktopModelProfileConfig(sourceCodexHome, generated string) 
 }
 
 func codexDesktopModelProfileConfigTOML(launch codexModelProfileLaunch, catalogPath string, webSearchFallbackPath ...string) string {
+	if launch.Native {
+		lines := []string{}
+		if strings.TrimSpace(launch.Model) != "" {
+			lines = append(lines, `model = "`+tomlEscapeString(launch.Model)+`"`)
+		}
+		if strings.TrimSpace(launch.ReasoningEffort) != "" {
+			lines = append(lines, `model_reasoning_effort = "`+tomlEscapeString(launch.ReasoningEffort)+`"`)
+		}
+		return strings.Join(lines, "\n") + "\n"
+	}
 	providerName := "CXP " + launch.ProviderName
 	if strings.TrimSpace(launch.ProviderName) == "" {
 		providerName = "CXP third-party"
@@ -227,6 +261,9 @@ func codexDesktopModelProfileConfigTOML(launch codexModelProfileLaunch, catalogP
 	lines := []string{`model_provider = "` + providerID + `"`}
 	if strings.TrimSpace(launch.Model) != "" {
 		lines = append(lines, `model = "`+tomlEscapeString(launch.Model)+`"`)
+	}
+	if strings.TrimSpace(launch.ReasoningEffort) != "" {
+		lines = append(lines, `model_reasoning_effort = "`+tomlEscapeString(launch.ReasoningEffort)+`"`)
 	}
 	if launch.DisableHostedWebSearch {
 		lines = append(lines, `web_search = "disabled"`)

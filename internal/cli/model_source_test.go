@@ -311,7 +311,7 @@ func TestMergeModelSourceRepairsRemovedDefaultProfile(t *testing.T) {
 		Models:             map[string]config.ModelDefinition{"m": {Provider: "hub", UpstreamModel: "m"}},
 		ModelProfiles:      map[string]config.ModelProfile{"p": {Model: "m", Revision: 1}},
 	}
-	cfg := config.Config{DefaultModelProfile: "p"}
+	cfg := config.Config{DefaultModelProfile: "p", Defaults: &config.GlobalDefaults{Model: "profile:p", ReasoningEffort: "high"}}
 	if err := mergeModelSource(&cfg, "source", config.ModelSource{URL: "https://example.invalid/repo.git", Revision: "one"}, fragment); err != nil {
 		t.Fatal(err)
 	}
@@ -321,6 +321,17 @@ func TestMergeModelSourceRepairsRemovedDefaultProfile(t *testing.T) {
 	}
 	if cfg.DefaultModelProfile != config.DefaultModelProfileName {
 		t.Fatalf("default after removal = %q", cfg.DefaultModelProfile)
+	}
+	if cfg.Defaults != nil {
+		t.Fatalf("removed default retained typed model/effort: %#v", cfg.Defaults)
+	}
+}
+
+func TestRepairDefaultModelProfileAfterSourceMergeClearsTypedOnlyDanglingProfile(t *testing.T) {
+	cfg := config.Config{Defaults: &config.GlobalDefaults{Model: "profile:removed", ReasoningEffort: "high"}}
+	repairDefaultModelProfileAfterSourceMerge(&cfg)
+	if cfg.Defaults != nil {
+		t.Fatalf("typed-only dangling default was retained: %#v", cfg.Defaults)
 	}
 }
 

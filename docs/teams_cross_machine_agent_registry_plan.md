@@ -593,36 +593,14 @@ Assertions:
 
 The existing live probe command can be reused by allowing a configurable Graph base URL in tests. Production Graph base URL remains the default.
 
-### Live Graph Tests
+### Graph Contract Tests
 
-Live tests must be opt-in only.
-
-Add a workflow similar to `teams-live-lossless-edit.yml`:
-
-```text
-.github/workflows/teams-live-registry.yml
-  workflow_dispatch:
-    inputs:
-      nonce: required
-      heartbeat_seconds: default 15
-      ttl_seconds: default 45
-```
-
-Live job:
-
-- prepares Teams token cache from GitHub secrets
-- builds `teams-registry-probe`
-- runs A, B, watcher in Docker
-- uses a unique registry key containing the nonce
-- mounts CA bundle if needed
-- does not print token JSON
-- fails unless:
-  - all containers converge on same chat hash
-  - B is online before stopping
-  - B is stale by final observation
-  - A remains online
-
-Live workflow should be manually dispatched or protected by an environment. It should not run on pull requests.
+Repository CI must not receive Teams token caches or any other external-account
+credentials. Graph integration coverage uses a loopback synthetic Graph server
+with the same HTTP payload, ETag, PATCH, attachment, throttling, and error
+contracts exercised by production code. If a maintainer wants an additional
+real-tenant probe, it must be run locally from an operator-controlled checkout;
+it is not a GitHub Actions workflow or a release gate.
 
 ## CI Plan
 
@@ -663,19 +641,20 @@ Release workflow:
 - Run fake-Graph Docker smoke in the existing release container matrix if runtime is acceptable.
 - Do not run real Teams live tests during release automatically.
 
-Live workflow:
+External validation:
 
-- New manual workflow for real Graph validation.
-- Requires Teams token secrets.
-- Uses one-shot nonce.
-- Keeps all created registry payloads under a probe-specific key.
+- Optional real Graph validation runs only from an operator-controlled local
+  machine with its existing local token cache.
+- GitHub Actions never stores or injects the token cache.
+- The local probe uses a one-shot nonce and keeps created registry payloads
+  under a probe-specific key.
 
 Required CI gates before merging production integration:
 
 - unit registry tests green
 - fake-Graph integration tests green
 - Docker fake-Graph smoke green
-- manual live Graph registry workflow run green at least once for the release candidate
+- synthetic Graph HTTP/container contracts green for the release candidate
 - no default PR workflow writes to Teams
 
 ## Open Decisions

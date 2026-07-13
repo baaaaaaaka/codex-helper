@@ -203,7 +203,9 @@ func runCodexTUIInvocationViaBroker(
 	if modelLaunch.Enabled {
 		modelArgs := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
 		appServerArgs = append(appServerArgs, modelArgs[1:]...)
-		extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
+		if !modelLaunch.Native {
+			extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
+		}
 	}
 
 	guardCleanup := func() {}

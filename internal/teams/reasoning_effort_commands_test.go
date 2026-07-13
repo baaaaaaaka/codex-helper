@@ -159,6 +159,29 @@ func TestReasoningEffortUsesExecutorDefaultUntilChatOverridesIt(t *testing.T) {
 	}
 }
 
+func TestReasoningEffortResetUsesExplicitGlobalDefaultForCurrentChat(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	executor := testEffortCatalogExecutor()
+	bridge := newBridgeTestBridge(nil, store, executor)
+	bridge.defaultManager = &testGlobalDefaultManager{effort: "xhigh", source: "global_default"}
+	session := bridge.reg.SessionByID("s001")
+	session.ModelProfile = modelprofile.Snapshot{Name: "gpt-test", Provider: modelprofile.DefaultProvider, Model: "gpt-test", Revision: 1}
+	session.ReasoningEffort = "low"
+	session.ReasoningEffortSource = reasoningEffortSourceExplicit
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+
+	message, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ReasoningEffort != "xhigh" || session.ReasoningEffortSource != reasoningEffortSourceGlobalDefault || !strings.Contains(message, "`xhigh`") {
+		t.Fatalf("reset result = session=%#v message=%q", session, message)
+	}
+}
+
 func TestReasoningEffortRejectsUnsupportedSetAndInvalidModelDefault(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

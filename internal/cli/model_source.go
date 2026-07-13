@@ -666,6 +666,14 @@ func repairDefaultModelProfileAfterSourceMerge(cfg *config.Config) {
 	if cfg == nil {
 		return
 	}
+	if name := typedDefaultModelProfileName(cfg); name != "" {
+		if _, ok := cfg.FindModelProfile(name); !ok {
+			clearTypedDefaultModelProfile(cfg, name)
+			if strings.EqualFold(strings.TrimSpace(cfg.DefaultModelProfile), name) {
+				cfg.DefaultModelProfile = config.DefaultModelProfileName
+			}
+		}
+	}
 	name := strings.TrimSpace(cfg.DefaultModelProfile)
 	if name == "" || strings.EqualFold(name, config.DefaultModelProfileName) {
 		return
@@ -673,12 +681,22 @@ func repairDefaultModelProfileAfterSourceMerge(cfg *config.Config) {
 	_, ok := cfg.FindModelProfile(name)
 	if !ok {
 		cfg.DefaultModelProfile = config.DefaultModelProfileName
+		clearTypedDefaultModelProfile(cfg, name)
 	}
 }
 
 func repairUnavailableSourceDefault(cfg *config.Config) {
 	if cfg == nil {
 		return
+	}
+	if name := typedDefaultModelProfileName(cfg); name != "" {
+		profile, ok := cfg.FindModelProfile(name)
+		if !ok || (strings.TrimSpace(profile.Source) != "" && strings.TrimSpace(profile.VerificationFingerprint) == "") {
+			clearTypedDefaultModelProfile(cfg, name)
+			if strings.EqualFold(strings.TrimSpace(cfg.DefaultModelProfile), name) {
+				cfg.DefaultModelProfile = config.DefaultModelProfileName
+			}
+		}
 	}
 	name := strings.TrimSpace(cfg.DefaultModelProfile)
 	if name == "" || strings.EqualFold(name, config.DefaultModelProfileName) {
@@ -687,6 +705,36 @@ func repairUnavailableSourceDefault(cfg *config.Config) {
 	profile, ok := cfg.FindModelProfile(name)
 	if !ok || (strings.TrimSpace(profile.Source) != "" && strings.TrimSpace(profile.VerificationFingerprint) == "") {
 		cfg.DefaultModelProfile = config.DefaultModelProfileName
+		clearTypedDefaultModelProfile(cfg, name)
+	}
+}
+
+func typedDefaultModelProfileName(cfg *config.Config) string {
+	if cfg == nil || cfg.Defaults == nil {
+		return ""
+	}
+	selector := strings.TrimSpace(cfg.Defaults.Model)
+	if !strings.HasPrefix(strings.ToLower(selector), "profile:") {
+		return ""
+	}
+	_, name, _ := strings.Cut(selector, ":")
+	return strings.TrimSpace(name)
+}
+
+func clearTypedDefaultModelProfile(cfg *config.Config, name string) {
+	if cfg == nil || cfg.Defaults == nil {
+		return
+	}
+	selector := strings.TrimSpace(cfg.Defaults.Model)
+	typedProfileMatches := false
+	if strings.HasPrefix(strings.ToLower(selector), "profile:") {
+		_, profileName, _ := strings.Cut(selector, ":")
+		typedProfileMatches = strings.EqualFold(strings.TrimSpace(profileName), strings.TrimSpace(name))
+	}
+	if selector == "" || typedProfileMatches {
+		cfg.Defaults.Model = ""
+		cfg.Defaults.ReasoningEffort = ""
+		cfg.PruneEmptyGlobalDefaults()
 	}
 }
 

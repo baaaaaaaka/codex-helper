@@ -192,6 +192,153 @@ func TestUnifiedModelGatewayRejectsUnknownModel(t *testing.T) {
 	}
 }
 
+func TestSanitizeOfficialResponsesHistoryDropsThirdPartyReasoningOnly(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-official",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]},
+			{"type":"reasoning","id":"rs_official_1","summary":[],"encrypted_content":"opaque-official-token"},
+			{"type":"reasoning","id":"rs_resp_old_adapter","summary":[],"encrypted_content":"plaintext-old","content":[{"type":"reasoning_text","text":"plaintext-old"}]},
+			{"type":"reasoning","id":"rs_vendor_plain","summary":[],"content":[{"type":"reasoning_text","text":"vendor thought"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible answer"}]},
+			{"type":"function_call","call_id":"call_1","name":"read_file","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":"tool result"},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		],
+		"tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]
+	}`)
+
+	sanitized, dropped, err := sanitizeOfficialResponsesHistory(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 2 {
+		t.Fatalf("dropped reasoning items = %d, want 2", dropped)
+	}
+	var request struct {
+		Input []map[string]any `json:"input"`
+		Tools []map[string]any `json:"tools"`
+	}
+	if err := json.Unmarshal(sanitized, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Input) != 6 {
+		t.Fatalf("sanitized input length = %d, want 6: %s", len(request.Input), sanitized)
+	}
+	if request.Input[1]["id"] != "rs_official_1" || request.Input[1]["encrypted_content"] != "opaque-official-token" {
+		t.Fatalf("official reasoning was not preserved: %#v", request.Input[1])
+	}
+	wantTypes := []string{"message", "reasoning", "message", "function_call", "function_call_output", "message"}
+	for index, want := range wantTypes {
+		if got := request.Input[index]["type"]; got != want {
+			t.Fatalf("input %d type = %#v, want %q", index, got, want)
+		}
+	}
+	if len(request.Tools) != 1 || request.Tools[0]["name"] != "read_file" {
+		t.Fatalf("official tools changed during history sanitization: %#v", request.Tools)
+	}
+	if strings.Contains(string(sanitized), "plaintext-old") || strings.Contains(string(sanitized), "vendor thought") {
+		t.Fatalf("third-party reasoning leaked into official request: %s", sanitized)
+	}
+}
+
+func TestSanitizeOfficialResponsesHistoryLeavesOfficialOnlyBodyByteStable(t *testing.T) {
+	raw := []byte(`{"model":"gpt-official","input":[{"type":"reasoning","id":"rs_official","summary":[],"encrypted_content":"opaque"},{"role":"user","content":"continue"}]}`)
+	got, dropped, err := sanitizeOfficialResponsesHistory(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 0 || string(got) != string(raw) {
+		t.Fatalf("official-only request changed: dropped=%d got=%s", dropped, got)
+	}
+}
+
+func TestSanitizeOfficialResponsesHistoryPreservesOpaqueOfficialReasoningWithContent(t *testing.T) {
+	raw := []byte(`{"model":"gpt-official","input":[{"type":"reasoning","id":"rs_official_future","encrypted_content":"opaque","content":[{"type":"reasoning_text","text":"display summary"}]},{"role":"user","content":"continue"}]}`)
+	got, dropped, err := sanitizeOfficialResponsesHistory(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped != 0 || string(got) != string(raw) {
+		t.Fatalf("opaque official reasoning changed: dropped=%d got=%s", dropped, got)
+	}
+}
+
+func TestSanitizeThirdPartyResponsesHistoryRemovesOnlyOpaqueEncryptedContent(t *testing.T) {
+	body := []byte(`{"model":"vendor/model","input":[{"type":"message","role":"user","content":"keep user"},{"type":"reasoning","id":"rs_official","encrypted_content":"opaque-official-ciphertext","summary":[{"type":"summary_text","text":"keep visible summary"}]},{"type":"reasoning","id":"rs_resp_legacy","encrypted_content":"legacy-mislabeled-plaintext","content":[{"type":"reasoning_text","text":"keep portable legacy content"}]},{"type":"message","role":"assistant","content":"keep assistant"}]}`)
+	sanitized, stripped, err := sanitizeThirdPartyResponsesHistory(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stripped != 2 {
+		t.Fatalf("stripped = %d, want 2", stripped)
+	}
+	text := string(sanitized)
+	for _, absent := range []string{"opaque-official-ciphertext", "legacy-mislabeled-plaintext", "encrypted_content"} {
+		if strings.Contains(text, absent) {
+			t.Fatalf("sanitized history retained %q: %s", absent, text)
+		}
+	}
+	for _, present := range []string{"keep user", "keep visible summary", "keep portable legacy content", "keep assistant"} {
+		if !strings.Contains(text, present) {
+			t.Fatalf("sanitized history lost %q: %s", present, text)
+		}
+	}
+}
+
+func TestUnifiedModelGatewaySanitizesHistoryBeforeOfficialUpstream(t *testing.T) {
+	var received string
+	official := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"models":[{"slug":"gpt-official","priority":1}]}`)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		received = string(raw)
+		writeTestResponsesSSE(w, "OFFICIAL_OK")
+	}))
+	defer official.Close()
+	gateway, cleanup, err := newUnifiedModelGateway(unifiedModelGatewayOptions{
+		OfficialBaseURL: official.URL,
+		LocalKey:        "local-secret",
+		CatalogPath:     filepath.Join(t.TempDir(), "catalog.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	server := httptest.NewServer(gateway)
+	defer server.Close()
+	modelsRequest, _ := http.NewRequest(http.MethodGet, server.URL+"/v1/models", nil)
+	setUnifiedTestHeaders(modelsRequest)
+	modelsResponse, err := http.DefaultClient.Do(modelsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = modelsResponse.Body.Close()
+
+	body := `{"model":"gpt-official","stream":true,"input":[{"type":"reasoning","id":"rs_resp_third","content":[{"type":"reasoning_text","text":"private"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}`
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader(body))
+	setUnifiedTestHeaders(request)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("official response status = %d, body=%s", response.StatusCode, responseBody)
+	}
+	if strings.Contains(received, "private") || strings.Contains(received, "rs_resp_third") {
+		t.Fatalf("official upstream received third-party reasoning: %s", received)
+	}
+	for _, want := range []string{"visible", "continue"} {
+		if !strings.Contains(received, want) {
+			t.Fatalf("official upstream lost portable context %q: %s", want, received)
+		}
+	}
+}
+
 func TestUnifiedTerminalResponseWriterFailsIncompleteSSE(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	recorder.Header().Set("Content-Type", "text/event-stream")

@@ -489,7 +489,10 @@ func buildReasoningItem(responseID string, text string) outputItem {
 		Summary: []reasoningSummary{},
 	}
 	if text != "" {
-		item.EncryptedContent = text
+		// Third-party reasoning is plaintext. Keep it in the adapter-owned
+		// reasoning_text field for same-adapter continuation, but never label it
+		// as OpenAI encrypted reasoning: only the official Responses API can
+		// mint replayable reasoning.encrypted_content.
 		item.Content = []contentPart{{Type: "reasoning_text", Text: text}}
 	}
 	return item

@@ -329,18 +329,15 @@ origin and use the selected profile through standard `HTTP_PROXY` / `HTTPS_PROXY
 environment variables. This preserves the official client's secure cookie and
 Cloudflare behavior while keeping the existing SSH/direct proxy choice intact.
 
-The normal CI and Codex release monitor assert this routing boundary without
-credentials. Maintainers can additionally enable the scheduled/dispatchable
-`Codex live cloud-config contract` by setting the repository variable
-`CODEX_LIVE_CLOUD_CONFIG_ENABLED=true` and the secrets
-`CODEX_LIVE_AUTH_JSON` and `CXP_LIVE_HTTP_PROXY`.
-The canary uses a fresh auth-only `CODEX_HOME`, so a cached workspace bundle
-cannot hide a regression. It runs the same account-backed check both directly
-and through the configured real proxy outlet. It also combines the real
-workspace policy with a deterministic local model provider to verify that a
-safe tool does not create an approval request while every approval-required
-shell call is accepted in explicit AAA mode and completes its filesystem side
-effect.
+Normal CI and the Codex release monitor assert this routing boundary without
+external account credentials. Runtime-contract jobs install and launch the
+original Codex binary, but provide a fresh synthetic `CODEX_HOME`, synthetic
+ChatGPT auth metadata, and loopback-only official/third-party Responses
+services. The contract fails if per-turn model or effort is lost, a model switch
+changes the thread, portable context disappears, third-party reasoning reaches
+the synthetic official route, or Codex attempts to rely on a real model account.
+Repository CI must not store or inject OpenAI, NVIDIA, Teams, proxy, or other
+external-account tokens.
 
 `codex-proxy app` still launches the official Desktop App directly. The Desktop
 App does not currently expose a stable external app-server attachment contract,
@@ -881,11 +878,17 @@ new <directory> --model <profile>
 sessions
 continue 1
 status
+model status
 model list
-model use deepseek
+model switch deepseek
+model reset
 effort status
 effort list
 effort set high
+effort reset
+default status
+default model set official:<slug>
+default effort set high
 ```
 
 Daily Work chat commands:
@@ -899,15 +902,31 @@ helper publish-history
 helper publish-history full
 model status
 model switch deepseek
+model reset
 model fork deepseek
 effort status
 effort list
 effort set xhigh
+effort reset
 ```
+
+Teams `model` and `effort` commands affect only the chat where they are sent,
+including the Control chat. `model use <model>` remains an alias for the
+chat-local `model switch <model>`. `model setup` configures availability only;
+it never selects a model or changes a default.
+
+Control-only `default` commands manage global defaults for future CXP/Codex
+launches and newly created Teams chats under the same config root. They do not
+rewrite existing chats, including the Control chat where the command is sent.
+Use `default status`, `default model status|list|set|reset`, and
+`default effort status|list|set|reset`. Use `official:<slug>` or
+`profile:<name>` when a model name needs disambiguation. Work chats reject
+`default` commands.
 
 Control and Work chats keep their effort independently. `effort list` uses the
 current model's advertised choices and order; a switch applies to turns queued
-after the command, while `effort reset` selects the model-advertised default.
+after the command. `effort reset` selects an explicit global effort when one is
+configured, otherwise it uses the model-advertised default.
 
 Advanced local checks and maintenance:
 

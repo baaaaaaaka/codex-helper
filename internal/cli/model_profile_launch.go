@@ -25,6 +25,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
 const (
@@ -204,6 +205,7 @@ type codexModelProfileLaunch struct {
 	Name                   string
 	ProviderID             string
 	Model                  string
+	ReasoningEffort        string
 	BaseURL                string
 	ProxyKey               string
 	Revision               int
@@ -247,6 +249,15 @@ func startModelProfileAdapterForCodex(
 	if err != nil {
 		return codexModelProfileLaunch{}, nil, err
 	}
+	usingGlobalDefault := strings.TrimSpace(ref) == "" && snapshot.IsZero()
+	globalEffort := ""
+	if usingGlobalDefault {
+		globalEffort = cfg.ExplicitDefaultReasoningEffort()
+	}
+	applyGlobalDefaults := func(launch codexModelProfileLaunch) codexModelProfileLaunch {
+		launch.ReasoningEffort = globalEffort
+		return launch
+	}
 	var resolved modelprofile.Resolved
 	if snapshot.IsZero() {
 		resolved, err = modelprofile.Resolve(cfg, ref)
@@ -260,16 +271,28 @@ func startModelProfileAdapterForCodex(
 		launch, cleanup, gatewayErr := startConfiguredUnifiedModelGateway(ctx, store, cfg, resolved, upstreamProxyURL, log)
 		if gatewayErr != nil && resolved.IsDefault() {
 			if model := strings.TrimSpace(resolved.SelectedPublicModel()); model != "" {
-				return codexModelProfileLaunch{Enabled: true, Native: true, Model: model, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider}, nil, nil
+				return applyGlobalDefaults(codexModelProfileLaunch{Enabled: true, Native: true, Model: model, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider}), nil, nil
 			}
 			if log != nil {
 				_, _ = fmt.Fprintf(log, "warning: unified model gateway unavailable; using native Codex provider: %v\n", gatewayErr)
 			}
+			if globalEffort != "" {
+				return applyGlobalDefaults(codexModelProfileLaunch{Enabled: true, Native: true, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider}), nil, nil
+			}
 			return codexModelProfileLaunch{}, nil, nil
 		}
-		return launch, cleanup, gatewayErr
+		if gatewayErr == nil && resolved.IsDefault() && !launch.Enabled {
+			if model := strings.TrimSpace(resolved.SelectedPublicModel()); model != "" || globalEffort != "" {
+				return applyGlobalDefaults(codexModelProfileLaunch{Enabled: true, Native: true, Model: model, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider}), cleanup, nil
+			}
+		}
+		return applyGlobalDefaults(launch), cleanup, gatewayErr
 	}
 	if resolved.IsDefault() {
+		model := strings.TrimSpace(resolved.Profile.Model)
+		if model != "" || globalEffort != "" {
+			return applyGlobalDefaults(codexModelProfileLaunch{Enabled: true, Native: true, Model: model, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider}), nil, nil
+		}
 		return codexModelProfileLaunch{}, nil, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -321,7 +344,7 @@ func startModelProfileAdapterForCodex(
 		if log != nil {
 			_, _ = fmt.Fprintf(log, "using model profile %q through the native Responses compatibility proxy at %s\n", resolved.Name, baseURL)
 		}
-		return codexModelProfileLaunch{
+		return applyGlobalDefaults(codexModelProfileLaunch{
 			Enabled:                true,
 			Direct:                 true,
 			DisableHostedWebSearch: resolved.Provider.DisableHostedWebSearch,
@@ -337,7 +360,7 @@ func startModelProfileAdapterForCodex(
 			WebSearchFallbackPath:  webSearchFallbackPath,
 			WebSearchFallbackTOML:  webSearchFallbackTOML,
 			EnvKey:                 envCXPResponsesProxyKey,
-		}, proxyCleanup, nil
+		}), proxyCleanup, nil
 	}
 	proxyKey, err := ids.New()
 	if err != nil {
@@ -420,7 +443,7 @@ func startModelProfileAdapterForCodex(
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "using model profile %q through local Responses adapter at %s\n", resolved.Name, baseURL)
 	}
-	return codexModelProfileLaunch{
+	return applyGlobalDefaults(codexModelProfileLaunch{
 		Enabled:               true,
 		Name:                  resolved.Name,
 		ProviderID:            resolved.Provider.ID,
@@ -434,7 +457,7 @@ func startModelProfileAdapterForCodex(
 		WebSearchFallbackPath: webSearchFallbackPath,
 		WebSearchFallbackTOML: webSearchFallbackTOML,
 		EnvKey:                envCXPResponsesProxyKey,
-	}, cleanup, nil
+	}), cleanup, nil
 }
 
 func configureOpenAIChatAdapterHTTP(adapter *responsesadapter.OpenAIChatAdapter, policy config.ModelHTTPPolicy, stream config.ModelStreamPolicy, upstreamProxyURL string, log io.Writer) error {
@@ -575,9 +598,11 @@ func startConfiguredUnifiedModelGateway(
 		CatalogPath:  catalogPath,
 		EnvKey:       envCXPUnifiedGatewayKey,
 	}
+	if model := strings.TrimSpace(selected.SelectedPublicModel()); model != "" {
+		launch.Model = model
+	}
 	if !selected.IsDefault() {
 		launch.Name = selected.Name
-		launch.Model = selected.SelectedPublicModel()
 		launch.DisableHostedWebSearch = selected.Provider.DisableHostedWebSearch
 		if launch.DisableHostedWebSearch {
 			launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
@@ -880,7 +905,7 @@ func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *roo
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if ref == "" && snapshot.IsZero() && !modelprofile.HasConfiguredThirdPartyModels(cfg) {
+	if ref == "" && snapshot.IsZero() && !modelprofile.HasConfiguredThirdPartyModels(cfg) && !cfg.HasExplicitGlobalDefaults() {
 		return nil, nil, nil, nil
 	}
 	var resolved modelprofile.Resolved
@@ -892,7 +917,8 @@ func prepareTeamsAppServerModelProfileWithContext(ctx context.Context, root *roo
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if resolved.IsDefault() && !modelprofile.HasConfiguredThirdPartyModels(cfg) {
+	needsNativeOverride := strings.TrimSpace(resolved.Profile.Model) != "" || (ref == "" && snapshot.IsZero() && cfg.ExplicitDefaultReasoningEffort() != "")
+	if resolved.IsDefault() && !modelprofile.HasConfiguredThirdPartyModels(cfg) && !needsNativeOverride {
 		return nil, nil, nil, nil
 	}
 	if resolved.SSHProfile == nil {
@@ -1026,10 +1052,17 @@ func appendCodexModelProfileArgs(cmdArgs []string, launch codexModelProfileLaunc
 		return cmdArgs
 	}
 	if launch.Native {
-		if strings.TrimSpace(launch.Model) == "" {
+		overrides := []string{}
+		if strings.TrimSpace(launch.Model) != "" {
+			overrides = append(overrides, `model="`+tomlEscapeString(launch.Model)+`"`)
+		}
+		if strings.TrimSpace(launch.ReasoningEffort) != "" {
+			overrides = append(overrides, teams.CodexReasoningEffortConfigArg(launch.ReasoningEffort))
+		}
+		if len(overrides) == 0 {
 			return cmdArgs
 		}
-		return append(cmdArgs[:1], append([]string{"-c", `model="` + tomlEscapeString(launch.Model) + `"`}, cmdArgs[1:]...)...)
+		return prependCodexConfigOverrides(cmdArgs, overrides)
 	}
 	providerID := cxpCodexModelProviderID
 	overrides := make([]string, 0, 12)
@@ -1057,6 +1090,9 @@ func appendCodexModelProfileArgs(cmdArgs []string, launch codexModelProfileLaunc
 	}
 	if strings.TrimSpace(launch.Model) != "" {
 		overrides = append(overrides[:1], append([]string{`model="` + tomlEscapeString(launch.Model) + `"`}, overrides[1:]...)...)
+	}
+	if strings.TrimSpace(launch.ReasoningEffort) != "" {
+		overrides = append(overrides, teams.CodexReasoningEffortConfigArg(launch.ReasoningEffort))
 	}
 	if launch.DisableHostedWebSearch {
 		// Some Responses-compatible providers do not expose OpenAI's hosted
@@ -1091,6 +1127,20 @@ func appendCodexModelProfileArgs(cmdArgs []string, launch codexModelProfileLaunc
 	}
 	out = append(out, cmdArgs[insertAt:]...)
 	return out
+}
+
+func prependCodexConfigOverrides(cmdArgs []string, overrides []string) []string {
+	if len(cmdArgs) == 0 || len(overrides) == 0 {
+		return cmdArgs
+	}
+	prefix := make([]string, 0, len(overrides)*2)
+	for _, override := range overrides {
+		if strings.TrimSpace(override) != "" {
+			prefix = append(prefix, "-c", override)
+		}
+	}
+	insertAt := codexModelProfileConfigInsertIndex(cmdArgs)
+	return append(cmdArgs[:insertAt], append(prefix, cmdArgs[insertAt:]...)...)
 }
 
 func codexModelProfileConfigInsertIndex(cmdArgs []string) int {

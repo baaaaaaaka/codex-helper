@@ -38,6 +38,7 @@ type teamsCodexExecutor struct {
 	log                    io.Writer
 	runnerCacheMu          *sync.Mutex
 	runnersByProfile       map[string]codexrunner.Runner
+	runnerKeyBySession     map[string]string
 	staticImages           []string
 	additionalDirs         []string
 	outputSchema           json.RawMessage
@@ -203,6 +204,7 @@ func newManagedTeamsCodexExecutorWithContext(
 		log:                    log,
 		runnerCacheMu:          &sync.Mutex{},
 		runnersByProfile:       map[string]codexrunner.Runner{},
+		runnerKeyBySession:     map[string]string{},
 		staticImages:           turnOptions.ImagePaths,
 		additionalDirs:         turnOptions.AdditionalDirs,
 		outputSchema:           turnOptions.OutputSchema,
@@ -369,6 +371,7 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		Ephemeral:      e.ephemeral,
 	}
 	if session != nil {
+		turnInput.Model = teamsSessionModel(session)
 		turnInput.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
 	}
 	if session != nil && teams.SessionAllowsAutoTitleUpdate(*session) {
@@ -416,6 +419,25 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 	return out, nil
 }
 
+func teamsSessionModel(session *teams.Session) string {
+	if session == nil {
+		return ""
+	}
+	if model := strings.TrimSpace(session.ModelProfile.Model); model != "" {
+		return model
+	}
+	if model := strings.TrimSpace(session.ModelProfile.DefaultModel); model != "" {
+		return model
+	}
+	if strings.EqualFold(strings.TrimSpace(session.ModelProfile.Provider), modelprofile.DefaultProvider) {
+		name := strings.TrimSpace(session.ModelProfile.Name)
+		if name != "" && !strings.EqualFold(name, config.DefaultModelProfileName) {
+			return name
+		}
+	}
+	return ""
+}
+
 func teamsMissingFinalError(result codexrunner.TurnResult, cause error) error {
 	if cause == nil {
 		cause = fmt.Errorf("Codex turn completed without a final agent message")
@@ -432,15 +454,28 @@ func (e teamsCodexExecutor) runnerForSessionProfile(ctx context.Context, session
 	if session == nil || session.ModelProfile.IsZero() {
 		return e.runner, nil
 	}
-	if modelProfileSnapshotKey(session.ModelProfile) == modelProfileSnapshotKey(e.modelProfileSnapshot) {
+	if session.ModelGeneration == 0 && modelProfileSnapshotKey(session.ModelProfile) == modelProfileSnapshotKey(e.modelProfileSnapshot) {
 		return e.runner, nil
 	}
-	key := modelProfileSnapshotKey(session.ModelProfile)
+	key := modelProfileRunnerSessionCacheKey(session)
 	if e.runnerCacheMu == nil || e.runnersByProfile == nil {
 		return e.runner, nil
 	}
 	e.runnerCacheMu.Lock()
 	defer e.runnerCacheMu.Unlock()
+	if sessionID := strings.TrimSpace(session.ID); session.ModelGeneration > 0 && sessionID != "" && e.runnerKeyBySession != nil {
+		if previousKey := e.runnerKeyBySession[sessionID]; previousKey != "" && previousKey != key {
+			if previous := e.runnersByProfile[previousKey]; previous != nil {
+				if managed, ok := previous.(*codexrunner.AppServerRunner); ok {
+					if err := managed.Close(); err != nil && e.log != nil {
+						_, _ = fmt.Fprintf(e.log, "Teams previous model-generation runner close reported an error for %s: %v\n", sessionID, err)
+					}
+				}
+				delete(e.runnersByProfile, previousKey)
+			}
+		}
+		e.runnerKeyBySession[sessionID] = key
+	}
 	if runner, ok := e.runnersByProfile[key]; ok {
 		return runner, nil
 	}
@@ -454,6 +489,25 @@ func (e teamsCodexExecutor) runnerForSessionProfile(ctx context.Context, session
 	}
 	e.runnersByProfile[key] = teamsExecutor.runner
 	return teamsExecutor.runner, nil
+}
+
+func modelProfileRunnerSessionCacheKey(session *teams.Session) string {
+	if session == nil {
+		return ""
+	}
+	key := modelProfileRunnerCacheKey(session.ModelProfile, session.ModelGeneration)
+	if session.ModelGeneration <= 0 || strings.TrimSpace(session.ID) == "" {
+		return key
+	}
+	return "session=" + strings.TrimSpace(session.ID) + "\x00" + key
+}
+
+func modelProfileRunnerCacheKey(snapshot modelprofile.Snapshot, generation int) string {
+	key := modelProfileSnapshotKey(snapshot)
+	if generation <= 0 {
+		return key
+	}
+	return key + "\x00generation=" + fmt.Sprint(generation)
 }
 
 func modelProfileSnapshotKey(snapshot modelprofile.Snapshot) string {
@@ -862,12 +916,6 @@ func newTeamsModelProfileResolverWithRuntime(root *rootOptions, resolver teamsCo
 func newTeamsModelProfileResolverInternal(root *rootOptions, codexPath string, runtimeResolver teamsCodexRuntimeResolver) teams.ModelProfileResolver {
 	return func(ctx context.Context, ref string) (modelprofile.Snapshot, error) {
 		ref = strings.TrimSpace(ref)
-		forceProfile := strings.HasPrefix(strings.ToLower(ref), "profile:")
-		forceOfficial := strings.HasPrefix(strings.ToLower(ref), "official:")
-		if forceProfile || forceOfficial {
-			_, ref, _ = strings.Cut(ref, ":")
-			ref = strings.TrimSpace(ref)
-		}
 		store, _, err := newRootStore(root, "")
 		if err != nil {
 			return modelprofile.Snapshot{}, err
@@ -876,9 +924,19 @@ func newTeamsModelProfileResolverInternal(root *rootOptions, codexPath string, r
 		if err != nil {
 			return modelprofile.Snapshot{}, err
 		}
+		if ref == "" {
+			ref = cfg.EffectiveDefaultModelSelector()
+		}
+		forceProfile := strings.HasPrefix(strings.ToLower(ref), "profile:")
+		forceOfficial := strings.HasPrefix(strings.ToLower(ref), "official:")
+		if forceProfile || forceOfficial {
+			_, ref, _ = strings.Cut(ref, ":")
+			ref = strings.TrimSpace(ref)
+		}
 		catalogCtx := ctx
 		catalogPath := codexPath
 		var runtimeErr error
+		catalogChecked := false
 		if runtimeResolver != nil {
 			contract, err := runtimeResolver(ctx)
 			if err != nil {
@@ -894,35 +952,44 @@ func newTeamsModelProfileResolverInternal(root *rootOptions, codexPath string, r
 			}
 			models, catalogErr := listTeamsOfficialModelsFn(catalogCtx, catalogPath)
 			if catalogErr == nil {
+				catalogChecked = true
 				for _, model := range models {
-					if strings.EqualFold(strings.TrimSpace(model.Slug), strings.TrimSpace(ref)) {
+					matchesDefault := strings.EqualFold(strings.TrimSpace(ref), config.DefaultModelProfileName) && model.IsDefault
+					if matchesDefault || strings.EqualFold(strings.TrimSpace(model.Slug), strings.TrimSpace(ref)) {
+						effortsJSON, _ := json.Marshal(model.ReasoningEfforts)
 						return modelprofile.Snapshot{
-							Name:                   model.Slug,
-							Provider:               modelprofile.DefaultProvider,
-							Model:                  model.Slug,
-							DefaultModel:           model.Slug,
-							DefaultReasoningEffort: model.DefaultReasoningLevel,
-							Revision:               1,
-							CapturedAt:             time.Now().UTC(),
+							Name:                          model.Slug,
+							Provider:                      modelprofile.DefaultProvider,
+							Model:                         model.Slug,
+							DefaultModel:                  model.Slug,
+							DefaultReasoningEffort:        model.DefaultReasoningLevel,
+							SupportedReasoningEffortsJSON: string(effortsJSON),
+							Revision:                      1,
+							CapturedAt:                    time.Now().UTC(),
 						}, true
 					}
 				}
 			}
 			return modelprofile.Snapshot{}, false
 		}
-		if !forceProfile && (forceOfficial || strings.HasPrefix(strings.ToLower(ref), "gpt-")) {
+		officialCandidate := !forceProfile && (forceOfficial || strings.HasPrefix(strings.ToLower(ref), "gpt-") || strings.EqualFold(ref, config.DefaultModelProfileName))
+		if officialCandidate {
 			if snapshot, ok := resolveOfficial(); ok {
 				return snapshot, nil
 			}
-			if forceOfficial {
+			if forceOfficial || catalogChecked {
 				if runtimeErr != nil {
 					return modelprofile.Snapshot{}, fmt.Errorf("official Codex runtime unavailable: %w", runtimeErr)
 				}
 				return modelprofile.Snapshot{}, fmt.Errorf("official Codex model %q is not available for the current account", ref)
 			}
 		}
-		resolved, err := modelprofile.Resolve(cfg, ref)
-		if err != nil && ref != "" && !forceProfile {
+		resolveRef := ref
+		if forceProfile {
+			resolveRef = "profile:" + ref
+		}
+		resolved, err := modelprofile.Resolve(cfg, resolveRef)
+		if err != nil && ref != "" && !forceProfile && !catalogChecked {
 			if snapshot, ok := resolveOfficial(); ok {
 				return snapshot, nil
 			}

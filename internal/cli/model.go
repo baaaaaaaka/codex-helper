@@ -127,7 +127,7 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 	}
 	if !choice.RequiresAPIKey {
 		if err := store.Update(func(cfg *config.Config) error {
-			cfg.DefaultModelProfile = ""
+			cfg.SetDefaultModelProfile("")
 			return nil
 		}); err != nil {
 			return err
@@ -176,7 +176,7 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 	}
 	cfg.UpsertModelProfile(profileName, profile)
 	if !opts.noDefault {
-		cfg.DefaultModelProfile = profileName
+		cfg.SetDefaultModelProfile(profileName)
 	}
 	var verifyErr error
 	if !currentVerification {
@@ -221,7 +221,7 @@ func runModelUse(cmd *cobra.Command, root *rootOptions, modelRef string) error {
 	}
 	if !choice.RequiresAPIKey {
 		if err := store.Update(func(cfg *config.Config) error {
-			cfg.DefaultModelProfile = ""
+			cfg.SetDefaultModelProfile("")
 			return nil
 		}); err != nil {
 			return err
@@ -234,7 +234,7 @@ func runModelUse(cmd *cobra.Command, root *rootOptions, modelRef string) error {
 	if profileName == "" {
 		return fmt.Errorf("%s is not authentication-verified; run `cxp model setup %s --api-key-stdin`", choice.ID, choice.ID)
 	}
-	cfg.DefaultModelProfile = profileName
+	cfg.SetDefaultModelProfile(profileName)
 	if err := store.Save(cfg); err != nil {
 		return err
 	}

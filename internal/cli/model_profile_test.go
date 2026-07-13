@@ -65,7 +65,6 @@ func TestModelProfileSetupListDoctorAndDefault(t *testing.T) {
 			t.Fatalf("setup output missing %q:\n%s", want, out)
 		}
 	}
-
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -201,6 +200,9 @@ func TestTeamsModelProfileSetupGuideMentionsModelChoice(t *testing.T) {
 			t.Fatalf("setup guide missing %q:\n%s", want, out)
 		}
 	}
+	if strings.Contains(out, "--set-default") {
+		t.Fatalf("setup guide still couples availability to defaults:\n%s", out)
+	}
 }
 
 func TestTeamsModelProfileSetupGuideMentionsMiMoTierAliases(t *testing.T) {
@@ -220,6 +222,9 @@ func TestTeamsModelProfileSetupGuideMentionsMiMoTierAliases(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("setup guide missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "--set-default") {
+		t.Fatalf("setup guide still couples availability to defaults:\n%s", out)
 	}
 }
 
@@ -471,20 +476,20 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 		Model:       "mimo/mimo-v2.5-pro",
 		APIKey:      "sk-first-secret",
 		SSHProxy:    "work",
-		SetDefault:  true,
+		SetDefault:  false,
 	})
 	if err != nil {
 		t.Fatalf("SaveModelProfileAPIKey first: %v", err)
 	}
-	if result.ProfileName != "mimo25" || result.Provider != "mimo" || result.Model != "mimo/mimo-v2.5-pro" || result.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || result.Revision != 1 || !result.SetDefault {
+	if result.ProfileName != "mimo25" || result.Provider != "mimo" || result.Model != "mimo/mimo-v2.5-pro" || result.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || result.Revision != 1 || result.SetDefault {
 		t.Fatalf("first save result mismatch: %#v", result)
 	}
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load after first save: %v", err)
 	}
-	if cfg.DefaultModelProfile != "mimo25" {
-		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
+	if cfg.DefaultModelProfile != "" || cfg.Defaults != nil {
+		t.Fatalf("API-key save changed global defaults: legacy=%q typed=%#v", cfg.DefaultModelProfile, cfg.Defaults)
 	}
 	profile := cfg.ModelProfiles["mimo25"]
 	if profile.Provider != "mimo" || profile.Model != "mimo/mimo-v2.5-pro" || profile.APIKeyRef != modelprofile.SecretRefForProfile("mimo25") || profile.SSHProxy != "work" || profile.Revision != 1 {
@@ -564,7 +569,7 @@ func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T)
 		Provider:        "mimo",
 		Model:           "mimo/mimo-v2.5",
 		APIKey:          "sk-family",
-		SetDefault:      true,
+		SetDefault:      false,
 		CredentialScope: "mimo25",
 	})
 	if err != nil {
@@ -576,8 +581,7 @@ func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T)
 	}
 
 	setup, err := manager.SetupModelProfile(context.Background(), teams.ModelProfileSetupRequest{
-		Model:      "mimo-v2.5-pro",
-		SetDefault: true,
+		Model: "mimo-v2.5-pro",
 	})
 	if err != nil {
 		t.Fatalf("SetupModelProfile: %v", err)
@@ -593,11 +597,25 @@ func TestTeamsModelProfileManagerSimpleSetupReusesFamilyCredential(t *testing.T)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.DefaultModelProfile != "mimo25-pro" {
-		t.Fatalf("DefaultModelProfile=%q", cfg.DefaultModelProfile)
+	if cfg.DefaultModelProfile != "" || cfg.Defaults != nil {
+		t.Fatalf("setup changed global defaults: legacy=%q typed=%#v", cfg.DefaultModelProfile, cfg.Defaults)
 	}
 	if got := cfg.ModelProfiles["mimo25-pro"]; got.Model != "mimo/mimo-v2.5-pro" || got.APIKeyRef != familyRef {
 		t.Fatalf("mimo25-pro profile=%#v", got)
+	}
+}
+
+func TestTeamsModelProfileManagerSetupCannotMutateGlobalDefault(t *testing.T) {
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: filepath.Join(t.TempDir(), "config.json")})
+	if _, err := manager.SetupModelProfile(context.Background(), teams.ModelProfileSetupRequest{
+		Model: "default", SetDefault: true,
+	}); err == nil || !strings.Contains(err.Error(), "default model set") {
+		t.Fatalf("SetupModelProfile SetDefault error = %v", err)
+	}
+	if _, err := manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName: "mimo25", Provider: "mimo", APIKey: "sk-test", SetDefault: true,
+	}); err == nil || !strings.Contains(err.Error(), "default model set") {
+		t.Fatalf("SaveModelProfileAPIKey SetDefault error = %v", err)
 	}
 }
 

@@ -214,7 +214,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 		launchOpts.ProxyURL = proxyURL
 	}
 
-	if strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) {
+	if strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults() {
 		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err

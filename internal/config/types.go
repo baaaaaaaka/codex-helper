@@ -3,10 +3,11 @@ package config
 import "time"
 
 // CurrentVersion is the schema generation this binary stamps into configs it
-// writes. Generation 5 adds the Teams Codex user-PATH policy. The field is
-// additive and keeps the reader floor unchanged, while the newer write
-// generation prevents an older helper from silently dropping the policy.
-const CurrentVersion = 5
+// writes. Generation 6 adds the extensible global defaults container. The
+// field is additive and keeps the reader floor unchanged, while the newer
+// write generation prevents an older helper from silently dropping defaults it
+// does not understand.
+const CurrentVersion = 6
 
 const teamsCodexPathIntroducedVersion = 5
 
@@ -39,6 +40,7 @@ type Config struct {
 	AgentAutoApproveEnabled *bool                      `json:"agentAutoApproveEnabled,omitempty"`
 	Profiles                []Profile                  `json:"profiles"`
 	Instances               []Instance                 `json:"instances,omitempty"`
+	Defaults                *GlobalDefaults            `json:"defaults,omitempty"`
 	DefaultModelProfile     string                     `json:"defaultModelProfile,omitempty"`
 	ModelProfiles           map[string]ModelProfile    `json:"modelProfiles,omitempty"`
 	ModelConfigVersion      int                        `json:"modelConfigVersion,omitempty"`
@@ -47,6 +49,16 @@ type Config struct {
 	Models                  map[string]ModelDefinition `json:"models,omitempty"`
 	ModelSources            map[string]ModelSource     `json:"modelSources,omitempty"`
 	TeamsCodexPath          TeamsCodexPathPolicy       `json:"teamsCodexPath,omitempty"`
+}
+
+// GlobalDefaults contains explicit defaults shared by future launches and
+// sessions that use the same CXP config root. Nil/empty fields mean that the
+// existing consumer-specific fallback remains authoritative. Keep this struct
+// typed as new defaults are added; command extensibility must not turn the
+// persisted configuration into an unvalidated string map.
+type GlobalDefaults struct {
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 const CurrentModelConfigVersion = 1

@@ -25,6 +25,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
 const millionTokenContextWindowForLaunchTest = 1000000
@@ -218,6 +219,130 @@ func TestSelectedOfficialModelDoesNotSilentlyFallbackWhenGatewayUnavailable(t *t
 	}
 }
 
+func TestGlobalOfficialModelAndEffortDefaultsUseNativeLaunch(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{
+		Version:  config.CurrentVersion,
+		Defaults: &config.GlobalDefaults{Model: "official:gpt-global", ReasoningEffort: "high"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	launch, cleanup, err := startModelProfileAdapterForCodex(context.Background(), store, "", modelprofile.Snapshot{}, "", false, io.Discard)
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !launch.Enabled || !launch.Native || launch.Model != "gpt-global" || launch.ReasoningEffort != "high" {
+		t.Fatalf("global native launch = %#v", launch)
+	}
+	args := appendCodexModelProfileArgs([]string{"codex", "exec", "resume", "thread-1", "-"}, launch)
+	if index := codexConfigPairIndex(args, `model="gpt-global"`); index != 3 {
+		t.Fatalf("model config index = %d, args=%#v", index, args)
+	}
+	if index := codexConfigPairIndex(args, teams.CodexReasoningEffortConfigArg("high")); index != 5 {
+		t.Fatalf("effort config index = %d, args=%#v", index, args)
+	}
+
+	desktop := codexDesktopModelProfileConfigTOML(launch, "")
+	for _, want := range []string{`model = "gpt-global"`, `model_reasoning_effort = "high"`} {
+		if !strings.Contains(desktop, want) {
+			t.Fatalf("native desktop config missing %q:\n%s", want, desktop)
+		}
+	}
+	if strings.Contains(desktop, "model_provider") {
+		t.Fatalf("native desktop config contains provider override:\n%s", desktop)
+	}
+
+	appLaunch, err := ensureLongLivedModelProfileAdapterForApp(context.Background(), store, "", "", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !appLaunch.Enabled || !appLaunch.Native || appLaunch.Model != "gpt-global" || appLaunch.ReasoningEffort != "high" {
+		t.Fatalf("global desktop launch = %#v", appLaunch)
+	}
+
+	resolved, err := modelprofile.Resolve(config.Config{Version: config.CurrentVersion}, "official:gpt-selected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unifiedLaunch := modelProfileAdapterLaunchFromInstance(resolved, config.Instance{ModelUnified: true, HTTPPort: 1234, ModelProxyKey: "key"})
+	if unifiedLaunch.Model != "gpt-selected" {
+		t.Fatalf("unified official launch omitted explicit model: %#v", unifiedLaunch)
+	}
+
+	if err := store.Update(func(cfg *config.Config) error {
+		cfg.ModelProfiles = map[string]config.ModelProfile{
+			"unroutable": {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:TEST_MISSING_GLOBAL_DEFAULT_KEY", Revision: 1},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fallback, cleanup, err := startModelProfileAdapterForCodex(context.Background(), store, "", modelprofile.Snapshot{}, "", true, io.Discard)
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil || !fallback.Enabled || !fallback.Native || fallback.Model != "gpt-global" || fallback.ReasoningEffort != "high" {
+		t.Fatalf("unroutable unified CLI fallback = %#v err=%v", fallback, err)
+	}
+	fallback, err = ensureLongLivedModelProfileAdapterForApp(context.Background(), store, "", "", io.Discard)
+	if err != nil || !fallback.Enabled || !fallback.Native || fallback.Model != "gpt-global" || fallback.ReasoningEffort != "high" {
+		t.Fatalf("unroutable unified App fallback = %#v err=%v", fallback, err)
+	}
+}
+
+func TestPinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{
+		Version:  config.CurrentVersion,
+		Defaults: &config.GlobalDefaults{Model: "official:gpt-global", ReasoningEffort: "high"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := modelprofile.Snapshot{
+		Name: "gpt-pinned", Provider: modelprofile.DefaultProvider, Model: "gpt-pinned", DefaultModel: "gpt-pinned", Revision: 1,
+	}
+	launch, cleanup, err := startModelProfileAdapterForCodex(context.Background(), store, "", snapshot, "", false, io.Discard)
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !launch.Enabled || !launch.Native || launch.Model != "gpt-pinned" {
+		t.Fatalf("pinned native launch = %#v", launch)
+	}
+	if launch.ReasoningEffort != "" {
+		t.Fatalf("pinned launch inherited later global effort %q", launch.ReasoningEffort)
+	}
+
+	stubCodexLoginProbe(t, false)
+	args, env, cleanup, err := prepareTeamsAppServerModelProfile(&rootOptions{configPath: store.Path()}, "", snapshot, io.Discard)
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, `model="gpt-pinned"`) {
+		t.Fatalf("Teams app-server args omitted pinned official model: %#v", args)
+	}
+	if slices.Contains(args, teams.CodexReasoningEffortConfigArg("high")) {
+		t.Fatalf("Teams app-server args inherited later global effort: %#v", args)
+	}
+	if len(env) != 0 {
+		t.Fatalf("native pinned model env = %#v, want empty", env)
+	}
+}
+
 func TestOfficialDefaultFailsOpenWhenThirdPartyGatewayConfigurationConflicts(t *testing.T) {
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {
@@ -379,6 +504,66 @@ base_url = "http://stale.invalid"
 	for _, stale := range []string{`model = "gpt-old"`, `model_provider = "openai"`, `http://stale.invalid`} {
 		if strings.Contains(got, stale) {
 			t.Fatalf("merged config retained %q:\n%s", stale, got)
+		}
+	}
+}
+
+func TestInheritedCodexDesktopNativeEffortDoesNotEraseUserModel(t *testing.T) {
+	source := t.TempDir()
+	original := `model = "user-model"
+model_provider = "user-provider"
+model_catalog_json = "/user/catalog.json"
+model_reasoning_effort = "low"
+web_search = "live"
+
+[mcp_servers.docs]
+command = "docs-server"
+`
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch := codexModelProfileLaunch{Enabled: true, Native: true, ReasoningEffort: "high"}
+	generated := codexDesktopModelProfileConfigTOML(launch, "")
+	got, err := inheritedCodexDesktopModelProfileConfig(source, generated, launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`model = "user-model"`, `model_provider = "user-provider"`, `model_catalog_json = "/user/catalog.json"`,
+		`model_reasoning_effort = "high"`, `web_search = "live"`, `[mcp_servers.docs]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("native effort config missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `model_reasoning_effort = "low"`) {
+		t.Fatalf("native effort config retained stale effort:\n%s", got)
+	}
+}
+
+func TestInheritedCodexDesktopNativeModelClearsCustomProviderAndEffort(t *testing.T) {
+	source := t.TempDir()
+	original := `model = "user-model"
+model_provider = "user-provider"
+model_catalog_json = "/user/catalog.json"
+model_reasoning_effort = "low"
+sandbox_mode = "workspace-write"
+`
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launch := codexModelProfileLaunch{Enabled: true, Native: true, Model: "gpt-global"}
+	generated := codexDesktopModelProfileConfigTOML(launch, "")
+	got, err := inheritedCodexDesktopModelProfileConfig(source, generated, launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `model = "gpt-global"`) || !strings.Contains(got, `sandbox_mode = "workspace-write"`) {
+		t.Fatalf("native model config lost generated model or user setting:\n%s", got)
+	}
+	for _, stale := range []string{`model = "user-model"`, `model_provider = "user-provider"`, `model_catalog_json = "/user/catalog.json"`, `model_reasoning_effort = "low"`} {
+		if strings.Contains(got, stale) {
+			t.Fatalf("native model config retained %q:\n%s", stale, got)
 		}
 	}
 }

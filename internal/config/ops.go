@@ -66,6 +66,77 @@ func (c Config) EffectiveDefaultModelProfile() string {
 	return name
 }
 
+// EffectiveDefaultModelSelector returns the canonical global model selector.
+// The nested defaults container takes precedence over the legacy named-profile
+// field. Consumers that only understand named profiles should continue using
+// EffectiveDefaultModelProfile until they are migrated to selector-aware
+// resolution.
+func (c Config) EffectiveDefaultModelSelector() string {
+	if c.Defaults != nil {
+		if selector := strings.TrimSpace(c.Defaults.Model); selector != "" {
+			return selector
+		}
+	}
+	name := c.EffectiveDefaultModelProfile()
+	if strings.EqualFold(name, DefaultModelProfileName) {
+		return DefaultModelProfileName
+	}
+	return "profile:" + name
+}
+
+func (c Config) ExplicitDefaultReasoningEffort() string {
+	if c.Defaults == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Defaults.ReasoningEffort)
+}
+
+func (c Config) HasExplicitGlobalDefaults() bool {
+	return c.Defaults != nil && (strings.TrimSpace(c.Defaults.Model) != "" || strings.TrimSpace(c.Defaults.ReasoningEffort) != "")
+}
+
+func (c *Config) EnsureGlobalDefaults() *GlobalDefaults {
+	if c.Defaults == nil {
+		c.Defaults = &GlobalDefaults{}
+	}
+	return c.Defaults
+}
+
+// SetDefaultModelProfile updates the legacy field and the selector-aware typed
+// default together. Use this for named-profile/default mutations so older
+// callers cannot leave the two representations disagreeing.
+func (c *Config) SetDefaultModelProfile(name string) {
+	previous := c.EffectiveDefaultModelSelector()
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, DefaultModelProfileName) {
+		c.DefaultModelProfile = ""
+		if c.Defaults != nil {
+			c.Defaults.Model = ""
+			if !strings.EqualFold(previous, DefaultModelProfileName) {
+				c.Defaults.ReasoningEffort = ""
+			}
+			c.PruneEmptyGlobalDefaults()
+		}
+		return
+	}
+	c.DefaultModelProfile = name
+	next := "profile:" + name
+	defaults := c.EnsureGlobalDefaults()
+	defaults.Model = next
+	if !strings.EqualFold(previous, next) {
+		// Legacy local commands cannot validate an arbitrary typed effort against
+		// the new model. Clearing it is the conservative atomic fallback; the
+		// Control-chat default manager performs richer preserve/reset validation.
+		defaults.ReasoningEffort = ""
+	}
+}
+
+func (c *Config) PruneEmptyGlobalDefaults() {
+	if c.Defaults != nil && strings.TrimSpace(c.Defaults.Model) == "" && strings.TrimSpace(c.Defaults.ReasoningEffort) == "" {
+		c.Defaults = nil
+	}
+}
+
 func (c Config) FindModelProfile(ref string) (ModelProfile, bool) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -107,8 +178,26 @@ func (c *Config) RemoveModelProfile(name string) bool {
 	for existing := range c.ModelProfiles {
 		if strings.EqualFold(existing, name) {
 			delete(c.ModelProfiles, existing)
+			legacyWasEffective := c.Defaults == nil || strings.TrimSpace(c.Defaults.Model) == ""
 			if strings.EqualFold(c.DefaultModelProfile, existing) {
 				c.DefaultModelProfile = ""
+				if legacyWasEffective && c.Defaults != nil {
+					c.Defaults.ReasoningEffort = ""
+				}
+			}
+			if c.Defaults != nil {
+				selector := strings.TrimSpace(c.Defaults.Model)
+				profileSelector := selector
+				isProfileSelector := strings.HasPrefix(strings.ToLower(selector), "profile:")
+				if isProfileSelector {
+					_, profileSelector, _ = strings.Cut(selector, ":")
+					profileSelector = strings.TrimSpace(profileSelector)
+				}
+				if strings.EqualFold(profileSelector, existing) && (isProfileSelector || strings.EqualFold(selector, existing)) {
+					c.Defaults.Model = ""
+					c.Defaults.ReasoningEffort = ""
+					c.PruneEmptyGlobalDefaults()
+				}
 			}
 			return true
 		}

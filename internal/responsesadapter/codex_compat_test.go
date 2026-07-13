@@ -36,6 +36,35 @@ func TestCodexCompatReasoningSSEMaintainsActiveReasoningItem(t *testing.T) {
 	assertCodexCompatibleSSE(t, events)
 }
 
+func TestCodexCompatThirdPartyReasoningIsNotLabeledEncrypted(t *testing.T) {
+	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
+		events: []ProviderEvent{
+			{Kind: ProviderEventReasoningDelta, Delta: "plain provider thought"},
+			{Kind: ProviderEventTextDelta, Delta: "answer"},
+			{Kind: ProviderEventDone},
+		},
+	})
+	events := streamEventsForCodexCompat(t, facade, `{"model":"model-a","stream":true,"input":"reason"}`)
+	for _, event := range events {
+		if event.name != "response.output_item.done" {
+			continue
+		}
+		item := eventItem(t, event)
+		if stringField(t, item, "type") != "reasoning" {
+			continue
+		}
+		if _, exists := item["encrypted_content"]; exists {
+			t.Fatalf("third-party plaintext reasoning was mislabeled encrypted: %#v", item)
+		}
+		content := requireArrayField(t, item, "content")
+		if len(content) != 1 || content[0].(map[string]any)["type"] != "reasoning_text" || content[0].(map[string]any)["text"] != "plain provider thought" {
+			t.Fatalf("third-party reasoning content = %#v", content)
+		}
+		return
+	}
+	t.Fatal("reasoning output item not found")
+}
+
 func TestCodexCompatToolCallSSEMaintainsFunctionCallDeltas(t *testing.T) {
 	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
 		events: []ProviderEvent{

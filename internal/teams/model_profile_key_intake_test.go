@@ -61,7 +61,7 @@ func TestParseModelProfileKeyIntakeSetupOptionsSimpleModel(t *testing.T) {
 		got.ProfileName != "mimo25-pro" ||
 		got.Model != "mimo/mimo-v2.5-pro" ||
 		got.CredentialScope != "mimo25" ||
-		!got.SetDefault ||
+		got.SetDefault ||
 		!got.SimpleModel {
 		t.Fatalf("parsed simple model = %#v", got)
 	}
@@ -99,7 +99,7 @@ func TestBridgeModelProfileTeamsKeyIntakeSimpleModelStoresCredentialScope(t *tes
 		t.Fatalf("pending intakes = %#v", state.ModelProfileKeyIntakes)
 	}
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.Provider != "mimo" || intake.ProfileName != "mimo25-pro" || intake.Model != "mimo/mimo-v2.5-pro" || intake.CredentialScope != "mimo25" || !intake.SetDefault {
+		if intake.Provider != "mimo" || intake.ProfileName != "mimo25-pro" || intake.Model != "mimo/mimo-v2.5-pro" || intake.CredentialScope != "mimo25" || intake.SetDefault {
 			t.Fatalf("stored intake = %#v", intake)
 		}
 	}

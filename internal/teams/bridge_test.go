@@ -35312,8 +35312,29 @@ func TestBridgeModelProfileSwitchStartsNewGenerationAndRejectsActiveTurn(t *test
 	if err := bridge.applyPendingSessionModelProfileIfIdle(ctx, &session); err != nil {
 		t.Fatalf("apply pending switch after historical turn: %v", err)
 	}
-	if session.ModelGeneration != 2 || session.CodexThreadID != "" {
-		t.Fatalf("switched session generation=%d thread=%q, want generation 2 and empty thread", session.ModelGeneration, session.CodexThreadID)
+	if session.ModelGeneration != 2 || session.CodexThreadID != "thread-old" {
+		t.Fatalf("switched session generation=%d thread=%q, want generation 2 and preserved thread-old", session.ModelGeneration, session.CodexThreadID)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if durable := state.Sessions[session.ID]; durable.CodexThreadID != "thread-old" || durable.ModelGeneration != 2 {
+		t.Fatalf("durable switched session = %#v, want generation 2 on thread-old", durable)
+	}
+	journal, err := bridge.readThreadLinkJournal(ctx, session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundGenerationLink := false
+	for _, record := range journal {
+		if record.ModelGeneration == 2 && record.CodexThreadID == "thread-old" && modelProfileSnapshotsSameRuntime(record.ModelProfile, second) {
+			foundGenerationLink = true
+			break
+		}
+	}
+	if !foundGenerationLink {
+		t.Fatalf("model switch did not journal the preserved thread for generation 2: %#v", journal)
 	}
 }
 
@@ -35371,8 +35392,8 @@ func TestBridgePendingModelSwitchSnapshotsNewTurnsAndActivatesAtBoundary(t *test
 	store := newBridgeTestStore(t)
 	oldProfile := modelprofile.Snapshot{Name: "old", Provider: "default", Model: "gpt-old", Revision: 1}
 	newProfile := modelprofile.Snapshot{Name: "new", Provider: "default", Model: "gpt-new", Revision: 1}
-	session := Session{ID: "pending-boundary", ChatID: "chat-pending-boundary", Status: "active", ModelProfile: oldProfile}
-	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, ModelProfile: oldProfile}); err != nil || !created {
+	session := Session{ID: "pending-boundary", ChatID: "chat-pending-boundary", Status: "active", CodexThreadID: "thread-shared", ModelProfile: oldProfile}
+	if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, CodexThreadID: session.CodexThreadID, ModelProfile: oldProfile}); err != nil || !created {
 		t.Fatalf("CreateSession created=%v err=%v", created, err)
 	}
 	bridge := &Bridge{store: store, reg: Registry{Version: 1, Sessions: []Session{session}}, modelProfileResolver: func(context.Context, string) (modelprofile.Snapshot, error) { return newProfile, nil }}
@@ -35389,7 +35410,7 @@ func TestBridgePendingModelSwitchSnapshotsNewTurnsAndActivatesAtBoundary(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if oldTurn.ModelGeneration != 0 || newTurn.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(newTurn.ModelProfile, newProfile) || newTurn.CodexThreadID != "" {
+	if oldTurn.ModelGeneration != 0 || oldTurn.CodexThreadID != "thread-shared" || newTurn.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(newTurn.ModelProfile, newProfile) || newTurn.CodexThreadID != "thread-shared" {
 		t.Fatalf("turn boundary old=%#v new=%#v", oldTurn, newTurn)
 	}
 	if _, err := store.MarkTurnInterrupted(ctx, oldTurn.ID, "old work finished"); err != nil {
@@ -35407,12 +35428,12 @@ func TestBridgePendingModelSwitchSnapshotsNewTurnsAndActivatesAtBoundary(t *test
 	if err := bridge.activatePendingSessionModelProfileForQueuedTurn(ctx, &session, newTurn); err != nil {
 		t.Fatal(err)
 	}
-	if session.ModelGeneration != 1 || !modelProfileSnapshotsSameRuntime(session.ModelProfile, newProfile) || !session.PendingModelProfile.IsZero() {
+	if session.ModelGeneration != 1 || session.CodexThreadID != "thread-shared" || !modelProfileSnapshotsSameRuntime(session.ModelProfile, newProfile) || !session.PendingModelProfile.IsZero() {
 		t.Fatalf("pending switch did not activate at boundary: %#v", session)
 	}
 }
 
-func TestBridgeModelProfileSwitchMatrixKeepsThreadsGenerationIsolated(t *testing.T) {
+func TestBridgeModelProfileSwitchMatrixPreservesThreadAcrossGenerations(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	now := time.Now()
@@ -35454,10 +35475,17 @@ func TestBridgeModelProfileSwitchMatrixKeepsThreadsGenerationIsolated(t *testing
 			t.Fatalf("step %d queued turn generation/profile = %d/%#v, want %d/%#v", step, turn.ModelGeneration, turn.ModelProfile, session.ModelGeneration, wantProfile)
 		}
 		decision, err := bridge.resolveCodexThreadDecision(ctx, &session, turn)
-		if err != nil || decision.Action != threadResolveStartNew {
-			t.Fatalf("step %d resolve decision=%#v err=%v, want startNew", step, decision, err)
+		wantAction := threadResolveBind
+		if step == 0 {
+			wantAction = threadResolveStartNew
 		}
-		threadID := fmt.Sprintf("thread-generation-%d", session.ModelGeneration)
+		if err != nil || decision.Action != wantAction {
+			t.Fatalf("step %d resolve decision=%#v err=%v, want %s", step, decision, err, wantAction)
+		}
+		if step > 0 && decision.ThreadID != "thread-shared" {
+			t.Fatalf("step %d resolved thread = %q, want thread-shared", step, decision.ThreadID)
+		}
+		threadID := "thread-shared"
 		if err := bridge.bindSessionCodexThreadIfSafe(ctx, &session, turn.ID, threadID, "switch_matrix"); err != nil {
 			t.Fatalf("step %d bind thread: %v", step, err)
 		}
@@ -35471,7 +35499,7 @@ func TestBridgeModelProfileSwitchMatrixKeepsThreadsGenerationIsolated(t *testing
 		if _, err := bridge.switchWorkModelProfile(ctx, &session, ref); err != nil {
 			t.Fatalf("switch to %s: %v", ref, err)
 		}
-		if session.CodexThreadID != "" || session.ModelGeneration != step+1 {
+		if session.CodexThreadID != "thread-shared" || session.ModelGeneration != step+1 {
 			t.Fatalf("after switch to %s generation=%d thread=%q", ref, session.ModelGeneration, session.CodexThreadID)
 		}
 		runGeneration(step+1, profiles[ref])
@@ -35488,7 +35516,7 @@ func TestBridgeModelProfileSwitchMatrixKeepsThreadsGenerationIsolated(t *testing
 		}
 	}
 	for generation := 0; generation <= 5; generation++ {
-		want := fmt.Sprintf("thread-generation-%d", generation)
+		want := "thread-shared"
 		if seen[generation] != want {
 			t.Fatalf("generation %d thread=%q, want %q; all=%#v", generation, seen[generation], want, seen)
 		}
@@ -35656,7 +35684,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --model pro --teams-key-intake --set-default"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --model pro --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	stateAfterSetup, err := store.Load(ctx)
@@ -35691,7 +35719,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
 	}
 	req := manager.saveRequestAt(0)
-	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.Model != "mimo/mimo-v2.5-pro" || req.APIKey != rawKey || !req.SetDefault {
+	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.Model != "mimo/mimo-v2.5-pro" || req.APIKey != rawKey || req.SetDefault {
 		t.Fatalf("save request provider/name/model/key/default mismatch: provider=%q name=%q model=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.Model, req.APIKey == rawKey, req.SetDefault)
 	}
 	state, err := store.Load(ctx)

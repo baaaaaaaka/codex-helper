@@ -46,18 +46,39 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	if err != nil {
 		return codexModelProfileLaunch{}, err
 	}
+	usingGlobalDefault := strings.TrimSpace(ref) == ""
+	globalEffort := ""
+	if usingGlobalDefault {
+		globalEffort = cfg.ExplicitDefaultReasoningEffort()
+	}
+	applyGlobalDefaults := func(launch codexModelProfileLaunch) codexModelProfileLaunch {
+		launch.ReasoningEffort = globalEffort
+		return launch
+	}
+	nativeLaunch := func() codexModelProfileLaunch {
+		model := strings.TrimSpace(resolved.Profile.Model)
+		if model == "" && globalEffort == "" {
+			return codexModelProfileLaunch{}
+		}
+		return applyGlobalDefaults(codexModelProfileLaunch{
+			Enabled: true, Native: true, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider, Model: model,
+		})
+	}
 	if modelprofile.HasConfiguredThirdPartyModels(cfg) {
 		launch, gatewayErr := ensureLongLivedUnifiedModelGatewayForApp(ctx, store, cfg, resolved, proxyRef, log)
 		if gatewayErr != nil && resolved.IsDefault() {
 			if log != nil {
 				_, _ = fmt.Fprintf(log, "warning: unified App model gateway unavailable; using native Codex provider: %v\n", gatewayErr)
 			}
-			return codexModelProfileLaunch{}, nil
+			return nativeLaunch(), nil
 		}
-		return launch, gatewayErr
+		if gatewayErr == nil && resolved.IsDefault() && !launch.Enabled {
+			return nativeLaunch(), nil
+		}
+		return applyGlobalDefaults(launch), gatewayErr
 	}
 	if resolved.IsDefault() {
-		return codexModelProfileLaunch{}, nil
+		return nativeLaunch(), nil
 	}
 	apiKey, err := modelprofile.ResolveAPIKey(
 		resolved.Profile.APIKeyRef,
@@ -74,11 +95,11 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 	listenHost := modelProfileAdapterListenHostForApp()
 	instanceProfileID := modelProfileAdapterInstanceProfileID(resolved, apiKey, listenHost, modelprofile.SSHProxyFingerprint(upstreamProfile))
 	if inst := reusableModelProfileAdapterInstance(cfg.Instances, instanceProfileID); inst != nil {
-		return modelProfileAdapterLaunchFromInstance(resolved, *inst), nil
+		return applyGlobalDefaults(modelProfileAdapterLaunchFromInstance(resolved, *inst)), nil
 	}
 	if freshCfg, err := store.Load(); err == nil {
 		if inst := reusableModelProfileAdapterInstance(freshCfg.Instances, instanceProfileID); inst != nil {
-			return modelProfileAdapterLaunchFromInstance(resolved, *inst), nil
+			return applyGlobalDefaults(modelProfileAdapterLaunchFromInstance(resolved, *inst)), nil
 		}
 	}
 	if log != nil {
@@ -93,7 +114,7 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 		cleanupModelProfileAdapterStartup(store, instanceID)
 		return codexModelProfileLaunch{}, err
 	}
-	return modelProfileAdapterLaunchFromInstance(resolved, inst), nil
+	return applyGlobalDefaults(modelProfileAdapterLaunchFromInstance(resolved, inst)), nil
 }
 
 func ensureLongLivedUnifiedModelGatewayForApp(
@@ -181,9 +202,11 @@ func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst 
 			ProviderName: "Unified official and third-party models",
 			EnvKey:       envCXPUnifiedGatewayKey,
 		}
+		if model := strings.TrimSpace(resolved.SelectedPublicModel()); model != "" {
+			launch.Model = model
+		}
 		if !resolved.IsDefault() {
 			launch.Name = resolved.Name
-			launch.Model = resolved.SelectedPublicModel()
 			launch.DisableHostedWebSearch = resolved.Provider.DisableHostedWebSearch
 			if launch.DisableHostedWebSearch {
 				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()

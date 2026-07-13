@@ -108,7 +108,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		if err != nil {
 			return err
 		}
-		modelProfileLaunchRequested = strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != ""
+		modelProfileLaunchRequested = strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != "" || cfgForModelProfile.HasExplicitGlobalDefaults()
 		if resolvedModelProfile.SSHProfile != nil {
 			if profileRef != "" {
 				selected, ok := cfgForModelProfile.FindProfile(profileRef)

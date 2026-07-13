@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,16 @@ import (
 )
 
 type backupWarningModelProfileManager struct{ *fakeModelProfileManager }
+
+type recordingSetupModelProfileManager struct {
+	*fakeModelProfileManager
+	requests []ModelProfileSetupRequest
+}
+
+func (m *recordingSetupModelProfileManager) SetupModelProfile(ctx context.Context, req ModelProfileSetupRequest) (ModelProfileSetupResult, error) {
+	m.requests = append(m.requests, req)
+	return m.fakeModelProfileManager.SetupModelProfile(ctx, req)
+}
 
 func (m *backupWarningModelProfileManager) ModelProfileRuntimeWarning(context.Context, modelprofile.Snapshot) (string, bool, error) {
 	return "⚠️ backup JSON remains active", true, nil
@@ -58,5 +69,85 @@ func TestModelNaturalLanguageListRequestRoutesInControlAndWorkChats(t *testing.T
 	work, err := bridge.handleModelWorkCommand(context.Background(), &Session{ID: "s1"}, request)
 	if err != nil || work != "profiles" {
 		t.Fatalf("work result = %q, err=%v", work, err)
+	}
+}
+
+func TestModelControlCommandsOperateOnControlSessionNotGlobalDefault(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	executor := testEffortCatalogExecutor()
+	bridge := newBridgeTestBridge(nil, store, executor)
+	bridge.controlFallbackExecutor = executor
+	bridge.modelProfileResolver = func(_ context.Context, ref string) (modelprofile.Snapshot, error) {
+		switch strings.TrimSpace(ref) {
+		case "":
+			return modelprofile.Snapshot{Name: "old", Provider: modelprofile.DefaultProvider, Model: "gpt-old", Revision: 1}, nil
+		case "official:gpt-next":
+			return modelprofile.Snapshot{Name: "gpt-next", Provider: modelprofile.DefaultProvider, Model: "gpt-next", Revision: 1}, nil
+		default:
+			return modelprofile.Snapshot{}, fmt.Errorf("unknown model %q", ref)
+		}
+	}
+
+	status, err := bridge.handleModelControlCommand(ctx, ChatMessage{}, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "Chat: Control") || !strings.Contains(status, "gpt-old") {
+		t.Fatalf("control model status = %q", status)
+	}
+	message, err := bridge.handleModelControlCommand(ctx, ChatMessage{}, "use official:gpt-next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(message, "this Control chat") || !strings.Contains(message, "start a Codex thread") {
+		t.Fatalf("control model switch = %q", message)
+	}
+	session, err := bridge.ensureControlFallbackSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ModelProfile.Model != "gpt-next" || session.ModelGeneration != 1 {
+		t.Fatalf("control session after switch = %#v", session)
+	}
+	guidance, err := bridge.handleModelControlCommand(ctx, ChatMessage{}, "default official:gpt-old")
+	if err != nil || !strings.Contains(guidance, "default model set") {
+		t.Fatalf("legacy default guidance = %q err=%v", guidance, err)
+	}
+	session, err = bridge.ensureControlFallbackSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ModelProfile.Model != "gpt-next" {
+		t.Fatalf("legacy default command changed current control model: %#v", session.ModelProfile)
+	}
+	reset, err := bridge.handleModelControlCommand(ctx, ChatMessage{}, "reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reset, "this Control chat") {
+		t.Fatalf("control reset message = %q", reset)
+	}
+	session, err = bridge.ensureControlFallbackSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ModelProfile.Model != "gpt-old" || session.ModelGeneration != 2 {
+		t.Fatalf("control session after reset = %#v", session)
+	}
+}
+
+func TestModelSetupDoesNotSelectCurrentChatOrGlobalDefault(t *testing.T) {
+	manager := &recordingSetupModelProfileManager{fakeModelProfileManager: &fakeModelProfileManager{}}
+	bridge := &Bridge{modelProfileManager: manager}
+	message, err := bridge.handleModelControlCommand(context.Background(), ChatMessage{}, "setup default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.requests) != 1 || manager.requests[0].SetDefault {
+		t.Fatalf("setup requests = %#v", manager.requests)
+	}
+	if !strings.Contains(message, "Current chats and global defaults are unchanged") {
+		t.Fatalf("setup message = %q", message)
 	}
 }

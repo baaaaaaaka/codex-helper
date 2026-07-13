@@ -19,6 +19,40 @@ func TestResolveDefaultModelProfile(t *testing.T) {
 	}
 }
 
+func TestResolveTypedGlobalOfficialModelSelector(t *testing.T) {
+	cfg := config.Config{
+		Version:  config.CurrentVersion,
+		Defaults: &config.GlobalDefaults{Model: "official:gpt-test-model"},
+	}
+	got, err := Resolve(cfg, "")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got.Name != "official:gpt-test-model" || !got.IsDefault() || got.SelectedPublicModel() != "gpt-test-model" {
+		t.Fatalf("official default resolved profile = %#v", got)
+	}
+}
+
+func TestResolveModelSelectorPrefixesDisambiguateProfileAndOfficial(t *testing.T) {
+	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"gpt-collision": {Provider: "responses-compatible", Model: "vendor/model", BaseURL: "https://example.invalid/v1", APIKeyRef: "env:KEY", Revision: 1},
+	}}
+	official, err := Resolve(cfg, "gpt-collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !official.IsDefault() || official.SelectedPublicModel() != "gpt-collision" {
+		t.Fatalf("unqualified gpt selector = %#v", official)
+	}
+	profile, err := Resolve(cfg, "profile:gpt-collision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.IsDefault() || profile.Name != "gpt-collision" || profile.SelectedPublicModel() != "vendor/model" {
+		t.Fatalf("qualified profile selector = %#v", profile)
+	}
+}
+
 func TestResolveStructuredModelInheritsProviderCredentialAndPolicies(t *testing.T) {
 	yes, no := true, false
 	retries := 4
@@ -43,6 +77,10 @@ func TestResolveStructuredModelInheritsProviderCredentialAndPolicies(t *testing.
 	}
 	if fp := ModelFingerprint(got.Provider, got.Model.PublicID()); fp == "" {
 		t.Fatal("empty model fingerprint")
+	}
+	snapshot := got.Snapshot(time.Now())
+	if snapshot.DefaultReasoningEffort != "high" || snapshot.SupportedReasoningEffortsJSON != `["high"]` {
+		t.Fatalf("structured reasoning snapshot = %#v", snapshot)
 	}
 }
 

@@ -341,14 +341,25 @@ helper file relative/path.ext
 Model/profile commands:
 
 ```text
+model status
 model list
 model setup deepseek
-model use deepseek
-new /absolute/path --model deepseek
-model status
 model switch deepseek
+model reset
+new /absolute/path --model deepseek
 model fork deepseek
+effort status
+effort set high
+effort reset
+default status
+default model set profile:deepseek
+default effort set high
 ```
+
+`model` and `effort` always affect only the current Control or Work chat.
+`model setup` changes availability only. Global `default` commands are accepted
+only in the Control chat and affect future launches and newly created chats;
+they never rewrite an existing chat.
 
 Advanced maintenance and recovery:
 

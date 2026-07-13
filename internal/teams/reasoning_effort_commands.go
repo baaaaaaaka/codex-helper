@@ -14,6 +14,7 @@ const (
 	reasoningEffortSourceModelDefault    = "model_default"
 	reasoningEffortSourceExecutorDefault = "executor_default"
 	reasoningEffortSourceHelperDefault   = "helper_default"
+	reasoningEffortSourceGlobalDefault   = "global_default"
 )
 
 func (b *Bridge) handleReasoningEffortControlCommand(ctx context.Context, arg string) (string, error) {
@@ -55,6 +56,15 @@ func (b *Bridge) handleReasoningEffortCommand(ctx context.Context, session *Sess
 		}
 		return b.setReasoningEffortFromCatalog(ctx, session, executor, rest, reasoningEffortSourceExplicit)
 	case "reset", "default":
+		if b != nil && b.defaultManager != nil {
+			effort, source, err := b.defaultManager.ResolveDefaultReasoningEffort(ctx, session.ModelProfile)
+			if err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(effort) != "" {
+				return b.setReasoningEffortFromCatalog(ctx, session, executor, effort, firstNonEmptyString(source, reasoningEffortSourceGlobalDefault))
+			}
+		}
 		catalog, err := reasoningEffortCatalog(ctx, executor, session)
 		if err != nil {
 			return "", err

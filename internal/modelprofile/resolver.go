@@ -75,6 +75,18 @@ func (r Resolved) Snapshot(now time.Time) Snapshot {
 		provider = DefaultProvider
 	}
 	model := strings.TrimSpace(r.SelectedPublicModel())
+	defaultEffort := strings.TrimSpace(r.Profile.DefaultReasoningEffort)
+	if defaultEffort == "" {
+		defaultEffort = strings.TrimSpace(r.Provider.DefaultReasoningEffort)
+	}
+	supportedEfforts := r.Profile.SupportedReasoningEfforts
+	if len(supportedEfforts) == 0 {
+		supportedEfforts = r.Provider.SupportedReasoningEfforts
+	}
+	effortMap := r.Profile.ReasoningEffortMap
+	if len(effortMap) == 0 {
+		effortMap = r.Provider.ReasoningEffortMap
+	}
 	return Snapshot{
 		Name:                          name,
 		Provider:                      provider,
@@ -82,9 +94,9 @@ func (r Resolved) Snapshot(now time.Time) Snapshot {
 		BaseURL:                       strings.TrimSpace(r.Provider.BaseURL),
 		APIKeyRef:                     strings.TrimSpace(r.Profile.APIKeyRef),
 		SSHProxy:                      strings.TrimSpace(r.Profile.SSHProxy),
-		DefaultReasoningEffort:        strings.TrimSpace(r.Profile.DefaultReasoningEffort),
-		SupportedReasoningEffortsJSON: encodeStringList(r.Profile.SupportedReasoningEfforts),
-		ReasoningEffortMapJSON:        encodeStringMap(r.Profile.ReasoningEffortMap),
+		DefaultReasoningEffort:        defaultEffort,
+		SupportedReasoningEffortsJSON: encodeStringList(supportedEfforts),
+		ReasoningEffortMapJSON:        encodeStringMap(effortMap),
 		Revision:                      r.Revision(),
 		BaseURLHash:                   BaseURLHash(r.Provider.BaseURL),
 		AdapterProfile:                strings.TrimSpace(r.Provider.AdapterProfile),
@@ -174,14 +186,26 @@ func (s Snapshot) IsDefault() bool {
 func Resolve(cfg config.Config, ref string) (Resolved, error) {
 	name := strings.TrimSpace(ref)
 	if name == "" {
-		name = cfg.EffectiveDefaultModelProfile()
+		name = cfg.EffectiveDefaultModelSelector()
 	}
 	if name == "" {
 		name = config.DefaultModelProfileName
 	}
+	forceProfile := strings.HasPrefix(strings.ToLower(name), "profile:")
+	forceOfficial := strings.HasPrefix(strings.ToLower(name), "official:")
+	if forceProfile || forceOfficial {
+		_, name, _ = strings.Cut(name, ":")
+		name = strings.TrimSpace(name)
+	}
+	if name == "" {
+		return Resolved{}, fmt.Errorf("model selector is empty")
+	}
 
 	var profile config.ModelProfile
-	if strings.EqualFold(name, config.DefaultModelProfileName) {
+	if forceOfficial || (!forceProfile && strings.HasPrefix(strings.ToLower(name), "gpt-")) {
+		profile = config.ModelProfile{Provider: DefaultProvider, Model: name, Revision: 1}
+		name = "official:" + name
+	} else if strings.EqualFold(name, config.DefaultModelProfileName) {
 		profile = config.ModelProfile{Provider: DefaultProvider, Revision: 1}
 		name = config.DefaultModelProfileName
 	} else {

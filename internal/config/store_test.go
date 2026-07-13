@@ -40,6 +40,10 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	in := Config{
 		Version: CurrentVersion,
+		Defaults: &GlobalDefaults{
+			Model:           "profile:deepseek-work",
+			ReasoningEffort: "high",
+		},
 		TeamsCodexPath: TeamsCodexPathPolicy{
 			Mode:          "explicit",
 			ExplicitPath:  "/home/alice/.local/bin:/usr/bin",
@@ -78,6 +82,9 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	}
 	if out.DefaultModelProfile != "deepseek-work" {
 		t.Fatalf("DefaultModelProfile=%q", out.DefaultModelProfile)
+	}
+	if out.Defaults == nil || out.Defaults.Model != "profile:deepseek-work" || out.Defaults.ReasoningEffort != "high" {
+		t.Fatalf("Defaults round trip failed: %#v", out.Defaults)
 	}
 	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.BaseURL != "https://responses.example.invalid/v1" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
 		t.Fatalf("ModelProfiles round trip failed: %#v", out.ModelProfiles)

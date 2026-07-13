@@ -159,7 +159,11 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 		FinalAgentMessage: "final",
 	}}
 	executor := teamsCodexExecutor{runner: runner}
-	got, err := executor.Run(context.Background(), &teams.Session{CodexThreadID: "thread-existing", ReasoningEffort: "high"}, "continue")
+	got, err := executor.Run(context.Background(), &teams.Session{
+		CodexThreadID:   "thread-existing",
+		ModelProfile:    modelprofile.Snapshot{Provider: modelprofile.DefaultProvider, Model: "gpt-next"},
+		ReasoningEffort: "high",
+	}, "continue")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -171,6 +175,9 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 	if runner.input.ReasoningEffort != "high" {
 		t.Fatalf("reasoning effort = %q, want high", runner.input.ReasoningEffort)
+	}
+	if runner.input.Model != "gpt-next" {
+		t.Fatalf("turn model = %q, want gpt-next", runner.input.Model)
 	}
 	if got.Text != "final" || got.CodexThreadID != "thread-existing" || got.CodexTurnID != "turn-existing" {
 		t.Fatalf("unexpected result: %#v", got)
@@ -187,7 +194,10 @@ func TestTeamsCodexExecutorUsesSessionCwdForNewThread(t *testing.T) {
 		FinalAgentMessage: "final",
 	}}
 	executor := teamsCodexExecutor{runner: runner, workDir: "/helper/default"}
-	_, err := executor.Run(context.Background(), &teams.Session{Cwd: "  /workspace/project  "}, "start")
+	_, err := executor.Run(context.Background(), &teams.Session{
+		Cwd:          "  /workspace/project  ",
+		ModelProfile: modelprofile.Snapshot{Provider: modelprofile.DefaultProvider, Model: "gpt-new-thread"},
+	}, "start")
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -196,6 +206,9 @@ func TestTeamsCodexExecutorUsesSessionCwdForNewThread(t *testing.T) {
 	}
 	if runner.input.WorkingDir != "/workspace/project" {
 		t.Fatalf("working dir = %q, want session cwd", runner.input.WorkingDir)
+	}
+	if runner.input.Model != "gpt-new-thread" {
+		t.Fatalf("new-thread model = %q, want gpt-new-thread", runner.input.Model)
 	}
 }
 
@@ -1019,6 +1032,122 @@ func TestTeamsCodexExecutorRoutesSessionModelProfileSnapshot(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorSwitchesProfileRunnerWithoutChangingThread(t *testing.T) {
+	baseSnapshot := modelprofile.Snapshot{Name: "gpt-origin", Provider: modelprofile.DefaultProvider, Model: "gpt-origin", Revision: 1}
+	targetSnapshot := modelprofile.Snapshot{Name: "ih-target", Provider: "chat-compatible", Model: "nvidia/nvidia/eccn-nemotron-3-ultra", Revision: 2}
+	baseRunner := &fakeTeamsRunner{}
+	targetRunner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:                  "thread-shared",
+		TurnID:                    "turn-target",
+		Status:                    codexrunner.TurnStatusCompleted,
+		FinalAgentMessage:         "target reply",
+		FinalAgentMessageComplete: true,
+	}}
+	executor := teamsCodexExecutor{
+		runner:               baseRunner,
+		modelProfileSnapshot: baseSnapshot,
+		runnerCacheMu:        &sync.Mutex{},
+		runnersByProfile: map[string]codexrunner.Runner{
+			modelProfileRunnerSessionCacheKey(&teams.Session{ID: "session-switch", ModelProfile: targetSnapshot, ModelGeneration: 1}): targetRunner,
+		},
+		runnerKeyBySession: map[string]string{},
+	}
+
+	result, err := executor.Run(context.Background(), &teams.Session{
+		ID:              "session-switch",
+		CodexThreadID:   "thread-shared",
+		ModelProfile:    targetSnapshot,
+		ModelGeneration: 1,
+	}, "continue after switch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseRunner.resumed {
+		t.Fatal("model switch incorrectly resumed through the origin profile runner")
+	}
+	if !targetRunner.resumed || targetRunner.threadID != "thread-shared" {
+		t.Fatalf("target runner resume = resumed:%t thread:%q", targetRunner.resumed, targetRunner.threadID)
+	}
+	if targetRunner.input.Model != targetSnapshot.Model {
+		t.Fatalf("target runner turn model = %q, want %q", targetRunner.input.Model, targetSnapshot.Model)
+	}
+	if result.CodexThreadID != "thread-shared" || result.Text != "target reply" {
+		t.Fatalf("execution result = %#v", result)
+	}
+}
+
+func TestTeamsCodexExecutorReturnToBaseProfileUsesFreshGenerationRunner(t *testing.T) {
+	baseSnapshot := modelprofile.Snapshot{Name: "gpt-origin", Provider: modelprofile.DefaultProvider, Model: "gpt-origin", Revision: 1}
+	baseRunner := &fakeTeamsRunner{}
+	freshRunner := &fakeTeamsRunner{}
+	executor := teamsCodexExecutor{
+		runner:               baseRunner,
+		modelProfileSnapshot: baseSnapshot,
+		runnerCacheMu:        &sync.Mutex{},
+		runnersByProfile: map[string]codexrunner.Runner{
+			modelProfileRunnerSessionCacheKey(&teams.Session{ID: "session-return", ModelProfile: baseSnapshot, ModelGeneration: 2}): freshRunner,
+		},
+		runnerKeyBySession: map[string]string{},
+	}
+
+	initial, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{ModelProfile: baseSnapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial != baseRunner {
+		t.Fatalf("initial profile runner = %p, want base %p", initial, baseRunner)
+	}
+	returned, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{
+		ID:              "session-return",
+		ModelProfile:    baseSnapshot,
+		ModelGeneration: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned != freshRunner {
+		t.Fatalf("return-to-profile runner = %p, want fresh generation runner %p", returned, freshRunner)
+	}
+}
+
+func TestTeamsCodexExecutorReclaimsPreviousSessionGenerationRunner(t *testing.T) {
+	sessionID := "session-reclaim"
+	oldSnapshot := modelprofile.Snapshot{Name: "old", Provider: "chat-compatible", Model: "nvidia/old", Revision: 1}
+	newSnapshot := modelprofile.Snapshot{Name: "new", Provider: modelprofile.DefaultProvider, Model: "gpt-new", Revision: 1}
+	oldKey := modelProfileRunnerSessionCacheKey(&teams.Session{ID: sessionID, ModelProfile: oldSnapshot, ModelGeneration: 1})
+	newKey := modelProfileRunnerSessionCacheKey(&teams.Session{ID: sessionID, ModelProfile: newSnapshot, ModelGeneration: 2})
+	closed := 0
+	oldRunner := &codexrunner.AppServerRunner{CloseHook: func() { closed++ }}
+	newRunner := &fakeTeamsRunner{}
+	executor := teamsCodexExecutor{
+		runner:             &fakeTeamsRunner{},
+		runnerCacheMu:      &sync.Mutex{},
+		runnerKeyBySession: map[string]string{sessionID: oldKey},
+		runnersByProfile: map[string]codexrunner.Runner{
+			oldKey: oldRunner,
+			newKey: newRunner,
+		},
+	}
+
+	got, err := executor.runnerForSessionProfile(context.Background(), &teams.Session{
+		ID:              sessionID,
+		ModelProfile:    newSnapshot,
+		ModelGeneration: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != newRunner || closed != 1 {
+		t.Fatalf("runner=%p want=%p previous closes=%d want=1", got, newRunner, closed)
+	}
+	if _, exists := executor.runnersByProfile[oldKey]; exists {
+		t.Fatal("previous session generation runner remains cached")
+	}
+	if executor.runnerKeyBySession[sessionID] != newKey {
+		t.Fatalf("session runner key = %q, want %q", executor.runnerKeyBySession[sessionID], newKey)
+	}
+}
+
 func TestTeamsModelProfileResolverAcceptsListedOfficialModelSlug(t *testing.T) {
 	lockCLITestHooks(t)
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
@@ -1042,6 +1171,26 @@ func TestTeamsModelProfileResolverAcceptsListedOfficialModelSlug(t *testing.T) {
 	}
 	if _, err := modelprofile.ResolveSnapshot(config.Config{Version: config.CurrentVersion}, snapshot); err != nil {
 		t.Fatalf("official snapshot is not launch-resolvable: %v", err)
+	}
+}
+
+func TestTeamsModelProfileResolverRejectsUnavailableOfficialSlugWhenCatalogIsHealthy(t *testing.T) {
+	lockCLITestHooks(t)
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
+		t.Fatal(err)
+	}
+	previous := listTeamsOfficialModelsFn
+	t.Cleanup(func() { listTeamsOfficialModelsFn = previous })
+	listTeamsOfficialModelsFn = func(context.Context, string) ([]teamsOfficialModel, error) {
+		return []teamsOfficialModel{{Slug: "gpt-available", IsDefault: true}}, nil
+	}
+	_, err = newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()}, "/test/codex")(context.Background(), "gpt-typo")
+	if err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("unavailable official model error = %v", err)
 	}
 }
 

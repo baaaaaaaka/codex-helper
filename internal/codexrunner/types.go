@@ -44,7 +44,10 @@ type ReasoningEffortOption struct {
 }
 
 type TurnInput struct {
-	Prompt             string
+	Prompt string
+	// Model is the exact model slug to apply to this turn. Empty preserves the
+	// app-server/thread default.
+	Model              string
 	ImagePaths         []string
 	AdditionalDirs     []string
 	OutputSchema       json.RawMessage

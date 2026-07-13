@@ -619,6 +619,9 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 		"threadId": threadID,
 		"input":    appServerTurnInput(input.TurnInput),
 	}
+	if model := strings.TrimSpace(input.Model); model != "" {
+		params["model"] = model
+	}
 	if workingDir := firstNonEmpty(input.WorkingDir, r.WorkingDir); workingDir != "" {
 		params["cwd"] = workingDir
 	}

@@ -101,8 +101,10 @@ Control chat commands the helper understands:
 - continue <number-or-session-id>: create a Teams work chat for an existing Codex session and import history
 - open <number>: show the linked Teams work chat for a session
 - status: show current helper sessions
-- model list, model setup <model>, model use <model>, model doctor <model>: manage model profiles from the control chat
+- model status, model list, model switch <model>, or model reset: inspect or change only this Control chat's model; model use is a switch alias
+- model setup <model> or model doctor <model>: configure or validate model availability without selecting it
 - effort status, effort list, effort set <value>, or effort reset: inspect or change this Control chat's reasoning effort
+- default status, default model status/list/set/reset, or default effort status/list/set/reset: manage global defaults for future launches and chats
 - skills or helper skills list: list installed skill subscriptions
 - helper skills add <github/gitlab/git-url>: install skills from a git source and keep them updated in the user agents skills directory
 - helper skills sync [name]: sync one skill source, or all sources when no name is given
@@ -115,8 +117,9 @@ Work chat helper commands:
 - helper cancel last, helper cancel queued, helper cancel running, helper cancel all, or helper cancel <turn-id>: cancel or drop queued/running request(s)
 - helper file <relative-path>: upload a generated file from the Teams outbound folder
 - helper skills list, helper skills add <url>, helper skills sync [name], or helper skills push [name]: inspect or sync skill subscriptions
-- model status, model switch <profile>, or model fork <profile>: inspect, switch when compatible, or fork the Work chat with another model profile
+- model status, model switch <profile>, model reset, or model fork <profile>: inspect, switch when compatible, reset, or fork the Work chat with another model profile
 - effort status, effort list, effort set <value>, or effort reset: inspect or change this Work chat's reasoning effort
+- default ...: rejected because global defaults are Control-chat-only
 - helper close: close the Work chat binding
 
 Local cxp skills commands:
@@ -247,7 +250,7 @@ func defaultControlFallbackHelpDigest() string {
 		"`cxp model list` / `setup <model>` / `use <model>` / `doctor <model>` - manage built-in model choices",
 		"`cxp model-profile setup [name] --provider <provider> --model <model> --api-key-stdin --set-default` - create or update a named model profile",
 		"`cxp responses serve --base-url <url> --api-key-env <ENV> --model <model>` - run a local Responses adapter",
-		"Teams control `model list|setup|use|doctor`, `new <dir> --model <profile>`, and Work chat `model status|switch|fork` manage pinned model profiles.",
+		"Teams current chat: `model` / `effort`. Control future defaults: `default model ...` / `default effort ...`. New/Work: `new <dir> --model <profile>` / `model status|switch|reset|fork`.",
 		"",
 		"Beacon CLI quick help:",
 		"`cxp beacon profile create <name> --provider slurm --partition <partition> --image <image> --nodes <n> --gpu <n> --duration <duration>` - create a Slurm draft profile",

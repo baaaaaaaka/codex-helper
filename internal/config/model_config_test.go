@@ -61,3 +61,34 @@ func TestValidateModelHTTPConcurrency(t *testing.T) {
 		t.Fatal("negative maxConcurrentRequests accepted")
 	}
 }
+
+func TestValidateGlobalDefaultsRejectsMalformedOrDanglingValues(t *testing.T) {
+	cfg := Config{Defaults: &GlobalDefaults{Model: "work"}}
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "defaults.model") {
+		t.Fatalf("unqualified defaults.model error = %v", err)
+	}
+	cfg.Defaults.Model = "profile:missing"
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "missing profile") {
+		t.Fatalf("dangling defaults.model error = %v", err)
+	}
+	cfg.Defaults.Model = "official:gpt-test"
+	cfg.Defaults.ReasoningEffort = "high\ninvalid"
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "reasoningEffort") {
+		t.Fatalf("invalid defaults.reasoningEffort error = %v", err)
+	}
+	cfg.Defaults.Model = " official:gpt-test"
+	cfg.Defaults.ReasoningEffort = ""
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "surrounding whitespace") {
+		t.Fatalf("whitespace defaults.model error = %v", err)
+	}
+	cfg.Defaults.Model = "official:gpt-test"
+	cfg.Defaults.ReasoningEffort = " high"
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "reasoningEffort") {
+		t.Fatalf("whitespace defaults.reasoningEffort error = %v", err)
+	}
+	cfg.Defaults = &GlobalDefaults{Model: "profile:work", ReasoningEffort: "high"}
+	cfg.ModelProfiles = map[string]ModelProfile{"work": {Provider: "synthetic", Revision: 1}}
+	if err := ValidateModelConfig(cfg); err != nil {
+		t.Fatalf("valid global defaults: %v", err)
+	}
+}

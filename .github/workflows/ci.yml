@@ -71,6 +71,29 @@ jobs:
           set -euo pipefail
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.11 -color
 
+      - name: Forbid external account credentials in repository CI (Linux only)
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n '\$\{\{[[:space:]]*secrets\.' .github/workflows; then
+            echo "Repository CI must not read GitHub Actions secrets; use github.token only for repository-scoped release writes." >&2
+            exit 1
+          fi
+          credential_names=(
+            "CODEX_LIVE_AUTH""_JSON"
+            "CXP_LIVE_NVIDIA_API""_KEY"
+            "CXP_LIVE_HTTP""_PROXY"
+            "TEAMS_TOKEN_CACHE""_JSON"
+            "FILE_WRITE_TOKEN_CACHE""_JSON"
+          )
+          for credential_name in "${credential_names[@]}"; do
+            if rg -n --fixed-strings "$credential_name" .github/workflows; then
+              echo "Repository CI must not define external OpenAI, NVIDIA, proxy, or Teams credential input: $credential_name" >&2
+              exit 1
+            fi
+          done
+
       - name: Check CI helper scripts (Linux only)
         if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
@@ -327,6 +350,14 @@ jobs:
           go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|ReasoningEffortCatalog.*)|CodexReasoningEffortFromArgsPreservesExplicitLastOverride|RunBeaconWorkerJobUsesStandardAppServer)$' -v
           go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
           go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
+
+      - name: Teams chat-local model and global default regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(TeamsDefault|PinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults|TeamsCodexExecutor(SwitchesProfileRunnerWithoutChangingThread|ReturnToBaseProfileUsesFreshGenerationRunner|ReclaimsPreviousSessionGenerationRunner)|Sanitize(Official|ThirdParty)ResponsesHistory)' -v
+          go test ./internal/teams -count=1 -run 'Test(ParseDefaultCommand|DefaultCommandWorkChatMessageIsExplicitlyControlOnly|GlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated|BridgeModelProfileSwitch|BridgePendingModelSwitch|BridgeModelSwitchSerializesWithQueueTurn)' -v
 
       - name: Codex streaming transcript visibility regressions
         if: matrix.shard == 'core'
@@ -1716,16 +1747,18 @@ jobs:
           CODEX_RUNTIME_TEST: "1"
           CODEX_RUNTIME_E2E_TEST: "1"
           CODEX_HELPER_LIVE_CODEX_MODEL_CATALOG: "1"
+          CODEX_HELPER_SYNTHETIC_TEAMS_MODEL_SWITCH: "1"
         run: |
           set -euo pipefail
           command -v codex >/dev/null
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
+          go test ./internal/cli -run '^TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext$' -count=1 -v -timeout=4m
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
           go test ./internal/modelprofile -run TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn -count=1 -v
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           printf '%s\n' \
-            '{"schema":2,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","model-list-reasoning-efforts","per-turn-reasoning-effort","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
+            '{"schema":3,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","external_account_credentials":false,"official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","model-list-reasoning-efforts","per-turn-model","per-turn-reasoning-effort","teams-session-model-switch","same-thread-cross-provider-resume","cross-provider-context-sanitization","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof

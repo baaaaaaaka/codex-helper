@@ -223,13 +223,13 @@ func newModelProfileSetDefaultCmd(root *rootOptions) *cobra.Command {
 					return err
 				}
 				if strings.EqualFold(name, config.DefaultModelProfileName) {
-					cfg.DefaultModelProfile = ""
+					cfg.SetDefaultModelProfile("")
 				} else {
 					canonical, _, ok := findModelProfileForCLI(*cfg, name)
 					if !ok {
 						return fmt.Errorf("model profile %q not found", name)
 					}
-					cfg.DefaultModelProfile = canonical
+					cfg.SetDefaultModelProfile(canonical)
 				}
 				return nil
 			}); err != nil {
@@ -376,12 +376,12 @@ func runModelProfileSetup(cmd *cobra.Command, root *rootOptions, name string, op
 
 	if strings.EqualFold(name, config.DefaultModelProfileName) {
 		if opts.setDefault {
-			cfg.DefaultModelProfile = ""
+			cfg.SetDefaultModelProfile("")
 		}
 	} else {
 		cfg.UpsertModelProfile(name, profile)
 		if opts.setDefault {
-			cfg.DefaultModelProfile = name
+			cfg.SetDefaultModelProfile(name)
 		}
 	}
 	if err := store.Save(cfg); err != nil {

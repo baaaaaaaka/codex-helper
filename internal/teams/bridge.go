@@ -201,6 +201,7 @@ type BridgeOptions struct {
 	ControlFallbackHelpContext         string
 	ModelProfileResolver               ModelProfileResolver
 	ModelProfileManager                ModelProfileManager
+	DefaultManager                     GlobalDefaultManager
 	ASRTranscriber                     ASRTranscriber
 	Runner                             codexrunner.Runner
 	HelperRestarter                    HelperRestarter
@@ -227,7 +228,6 @@ type ModelProfileManager interface {
 	ModelProfileSetupGuide(context.Context, string) (string, error)
 	SetupModelProfile(context.Context, ModelProfileSetupRequest) (ModelProfileSetupResult, error)
 	ModelProfileDoctor(context.Context, string) (string, error)
-	SetDefaultModelProfile(context.Context, string) (string, error)
 	DeleteModelProfile(context.Context, string, bool) (string, error)
 	SaveModelProfileAPIKey(context.Context, ModelProfileAPIKeySaveRequest) (ModelProfileAPIKeySaveResult, error)
 }
@@ -395,6 +395,7 @@ type Bridge struct {
 	helperRestarter                   HelperRestarter
 	modelProfileResolver              ModelProfileResolver
 	modelProfileManager               ModelProfileManager
+	defaultManager                    GlobalDefaultManager
 	helperPendingRestarter            HelperPendingRestarter
 	helperReloader                    HelperReloader
 	helperAutoUpdater                 HelperAutoUpdater
@@ -957,6 +958,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	b.controlFallbackHelpContext = strings.TrimSpace(opts.ControlFallbackHelpContext)
 	b.modelProfileResolver = opts.ModelProfileResolver
 	b.modelProfileManager = opts.ModelProfileManager
+	b.defaultManager = opts.DefaultManager
 	b.helperRestarter = opts.HelperRestarter
 	b.helperPendingRestarter = opts.HelperPendingRestarter
 	b.helperReloader = opts.HelperReloader
@@ -4458,6 +4460,12 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
+		case DashboardCommandDefault:
+			message, err := b.handleDefaultControlCommand(ctx, parsed.Argument)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return b.sendControl(ctx, message)
 		case DashboardCommandRestart:
 			return b.restartHelperFromControl(ctx, msg, parsed.Argument)
 		case DashboardCommandReload:
@@ -4803,14 +4811,20 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 	if err != nil {
 		return nil, err
 	}
+	effort, effortSource, err := b.reasoningEffortFromGlobalDefault(ctx, snapshot)
+	if err != nil {
+		return nil, err
+	}
 	created, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:           controlFallbackSessionID,
-		Status:       teamstore.SessionStatusActive,
-		RunnerKind:   "control_fallback",
-		Model:        model,
-		ModelProfile: snapshot,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:                    controlFallbackSessionID,
+		Status:                teamstore.SessionStatusActive,
+		RunnerKind:            "control_fallback",
+		Model:                 model,
+		ModelProfile:          snapshot,
+		ReasoningEffort:       effort,
+		ReasoningEffortSource: effortSource,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	})
 	if err != nil {
 		return nil, err
@@ -4867,8 +4881,9 @@ func controlHelpText() string {
 		"- `p` / `projects` - choose a workspace",
 		"- `n <directory>` / `new <directory>` - create a new Work chat for a directory",
 		"- `new <directory> --model <model>` - create a Work chat pinned to a model",
-		"- `model list` / `model use <model>` - list models or set the default for future chats",
+		"- `model status|list|switch|reset` - inspect or change only this Control chat's model",
 		"- `effort status|list|set|reset` - inspect or change this Control chat's reasoning effort",
+		"- `default status` / `default model ...` / `default effort ...` - manage global defaults for future launches and chats",
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
 		"- `st` / `status` - show active Work chats",
@@ -4905,8 +4920,8 @@ func controlAdvancedHelpText() string {
 		"- `m <directory>` / `mkdir <directory>` - create a directory only",
 		"- `ask <question>` - ask a quick helper question in this control chat",
 		"- `helper cancel last` / `helper cancel queued` / `helper cancel running` / `helper cancel all` - stop queued/running Codex question(s) in this Control chat",
-		"- `model list`, `model setup <model>`, `model doctor <model>`, `model use <model>` - manage models",
-		"- `effort status|list|set|reset` - inspect or change this Control chat's reasoning effort",
+		"- `model status|list|switch|reset` and `effort status|list|set|reset` - inspect or change only this Control chat (`model use` aliases switch)",
+		"- `model setup|doctor` changes availability only; Control-only `default model ...` / `default effort ...` manage future global defaults",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in the Control chat and all linked Work chats",
 		"- `h` / `help` / `menu` - show short help",
@@ -4964,8 +4979,9 @@ func sessionHelpText() string {
 		"`helper details` or `!details` - show debug IDs and links",
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
-		"`model status`, `model switch <model>`, or `model fork <model>` - inspect or change this Work chat model",
+		"`model status`, `model switch <model>`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
 		"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
+		"`default ...` - global defaults are Control-chat-only",
 		"`helper publish-history` - import a paused local Codex history backlog",
 		"`helper publish-history full` - publish the complete local Codex history once to this chat",
 		"`helper skills list` / `helper skills add <url>` / `helper skills push` / `helper skills push confirm` - inspect and push skill subscriptions",
@@ -7274,6 +7290,10 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		}
 	}
 	now := time.Now()
+	effort, effortSource, err := b.reasoningEffortFromGlobalDefault(ctx, parsed.ModelProfileSnapshot)
+	if err != nil {
+		return b.sendControl(ctx, controlCommandErrorMessage(err))
+	}
 	sessionID := b.reg.NextSessionID()
 	topic := WorkChatTitle(ChatTitleOptions{
 		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
@@ -7287,16 +7307,18 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		return err
 	}
 	session := Session{
-		ID:           sessionID,
-		ChatID:       chat.ID,
-		ChatURL:      chat.WebURL,
-		Topic:        chat.Topic,
-		TitleSource:  sessionTitleSourceAuto,
-		Status:       "active",
-		Cwd:          parsed.WorkDir,
-		ModelProfile: parsed.ModelProfileSnapshot,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:                    sessionID,
+		ChatID:                chat.ID,
+		ChatURL:               chat.WebURL,
+		Topic:                 chat.Topic,
+		TitleSource:           sessionTitleSourceAuto,
+		Status:                "active",
+		Cwd:                   parsed.WorkDir,
+		ModelProfile:          parsed.ModelProfileSnapshot,
+		ReasoningEffort:       effort,
+		ReasoningEffortSource: effortSource,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
 	b.markRegistryProjectionDirty()
@@ -7801,6 +7823,8 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
 			}
 			return b.sendToChat(ctx, chatID, message)
+		case DashboardCommandDefault:
+			return b.sendToChat(ctx, chatID, defaultCommandWorkChatMessage())
 		case DashboardCommandHelp:
 			if isAdvancedHelpArg(parsed.Argument) {
 				return b.sendToChat(ctx, chatID, sessionAdvancedHelpText())
@@ -12901,7 +12925,6 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 	if !session.PendingModelProfile.IsZero() {
 		modelSnapshot = session.PendingModelProfile
 		modelGeneration++
-		threadID = ""
 		if effort := strings.TrimSpace(session.PendingReasoningEffort); effort != "" {
 			reasoningEffort = effort
 		}
@@ -15161,23 +15184,29 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 	if err != nil {
 		return "", err
 	}
+	effort, effortSource, err := b.reasoningEffortFromGlobalDefault(ctx, modelSnapshot)
+	if err != nil {
+		return "", err
+	}
 	chat, err := b.createMeetingChat(ctx, title)
 	if err != nil {
 		return "", err
 	}
 	now := time.Now()
 	session := Session{
-		ID:            newSessionID,
-		ChatID:        chat.ID,
-		ChatURL:       chat.WebURL,
-		Topic:         chat.Topic,
-		TitleSource:   sessionTitleSourceAuto,
-		Status:        "active",
-		CodexThreadID: local.SessionID,
-		Cwd:           firstNonEmptyString(local.ProjectPath, project.Path),
-		ModelProfile:  modelSnapshot,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:                    newSessionID,
+		ChatID:                chat.ID,
+		ChatURL:               chat.WebURL,
+		Topic:                 chat.Topic,
+		TitleSource:           sessionTitleSourceAuto,
+		Status:                "active",
+		CodexThreadID:         local.SessionID,
+		Cwd:                   firstNonEmptyString(local.ProjectPath, project.Path),
+		ModelProfile:          modelSnapshot,
+		ReasoningEffort:       effort,
+		ReasoningEffortSource: effortSource,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 	b.reg.Sessions = append(b.reg.Sessions, session)
 	b.markRegistryProjectionDirty()
