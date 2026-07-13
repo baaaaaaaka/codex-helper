@@ -77,7 +77,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 
 	officialProvider := modelprofile.ProviderSpec{
 		ID: "synthetic-official", DisplayName: "Synthetic official", DefaultModel: syntheticOriginModel,
-		SupportsReason: true, DefaultReasoningEffort: "medium", SupportedReasoningEfforts: []string{"low", "medium", "high", "max"},
+		SupportsReason: true, DefaultReasoningEffort: "medium", SupportedReasoningEfforts: []string{"low", "medium", "high", "xhigh"},
 		Models: []modelprofile.ModelSpec{
 			{ID: syntheticOriginModel, DisplayName: "Synthetic Sol", SupportsReason: true, Priority: 20},
 			{ID: syntheticReturnModel, DisplayName: "Synthetic Luna", SupportsReason: true, Priority: 10},
@@ -113,7 +113,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 		ID: "synthetic-nvidia", DisplayName: "Synthetic NVIDIA", DefaultModel: syntheticThirdPartyModel,
 		Models: []modelprofile.ModelSpec{thirdModel}, BaseURL: thirdServer.URL + "/v1",
 		UsesAdapter: true, DirectResponses: true, SupportsReason: true,
-		DefaultReasoningEffort: "high", SupportedReasoningEfforts: []string{"low", "medium", "high", "max"},
+		DefaultReasoningEffort: "high", SupportedReasoningEfforts: []string{"low", "medium", "high", "xhigh"},
 	}
 	mergedCatalog, err := modelprofile.MergeCodexModelCatalogJSON(officialCatalog, []modelprofile.ProviderSpec{thirdProvider})
 	if err != nil {
@@ -188,7 +188,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 	returnRunner := newRunner()
 	originSnapshot := syntheticModelSnapshot(syntheticOriginModel, modelprofile.DefaultProvider, "medium")
 	thirdSnapshot := syntheticModelSnapshot(syntheticThirdPartyModel, thirdProvider.ID, "high")
-	returnSnapshot := syntheticModelSnapshot(syntheticReturnModel, modelprofile.DefaultProvider, "max")
+	returnSnapshot := syntheticModelSnapshot(syntheticReturnModel, modelprofile.DefaultProvider, "xhigh")
 	session := &teams.Session{
 		ID: "synthetic-teams-model-switch", Cwd: workDir,
 		ModelProfile: originSnapshot, ReasoningEffort: "medium",
@@ -231,7 +231,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 	}
 	session.ModelProfile = returnSnapshot
 	session.ModelGeneration = 2
-	session.ReasoningEffort = "max"
+	session.ReasoningEffort = "xhigh"
 	third, err := executor.Run(ctx, session, "Return to the synthetic official route and verify complete portable context.")
 	if err != nil {
 		t.Fatalf("synthetic official return: %v", err)
@@ -253,7 +253,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 	wantContexts := []liveTurnContext{
 		{Model: syntheticOriginModel, Effort: "medium"},
 		{Model: syntheticThirdPartyModel, Effort: "high"},
-		{Model: syntheticReturnModel, Effort: "max"},
+		{Model: syntheticReturnModel, Effort: "xhigh"},
 	}
 	contexts = contexts[len(contexts)-len(wantContexts):]
 	for index := range wantContexts {
@@ -264,7 +264,7 @@ func TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext(t *test
 }
 
 func syntheticModelSnapshot(model string, provider string, defaultEffort string) modelprofile.Snapshot {
-	efforts, _ := json.Marshal([]string{"low", "medium", "high", "max"})
+	efforts, _ := json.Marshal([]string{"low", "medium", "high", "xhigh"})
 	return modelprofile.Snapshot{
 		Name: model, Provider: provider, Model: model, DefaultModel: model,
 		DefaultReasoningEffort: defaultEffort, SupportedReasoningEffortsJSON: string(efforts), Revision: 1,
@@ -289,7 +289,7 @@ func (a *syntheticOfficialSwitchAdapter) Stream(_ context.Context, request respo
 		}
 		return syntheticProviderEvents(syntheticOriginVisible, ""), nil
 	case 2:
-		if request.Model != syntheticReturnModel || request.ReasoningEffort != "max" {
+		if request.Model != syntheticReturnModel || request.ReasoningEffort != "xhigh" {
 			return nil, fmt.Errorf("synthetic official return model=%q effort=%q", request.Model, request.ReasoningEffort)
 		}
 		for _, required := range []string{a.marker, syntheticOriginVisible, syntheticThirdPartyVisible} {
