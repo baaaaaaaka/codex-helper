@@ -13,6 +13,16 @@ STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 SUPPORTED_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
 
 
+def stable_prerelease_base(tag: str) -> str:
+    """Return the stable tag represented by an rc tag, or an empty string."""
+
+    match = SUPPORTED_TAG.fullmatch(tag.strip())
+    if match is None or match.group(4) is None:
+        return ""
+    major, minor, patch, _ = match.groups()
+    return f"v{major}.{minor}.{patch}"
+
+
 def version_key(tag: str) -> tuple[int, int, int]:
     match = STABLE_TAG.fullmatch(tag.strip())
     if not match:
@@ -32,6 +42,7 @@ def select_tags(
     releases: list[dict[str, object]], minimum: str, exclude: str, includes: list[str] | None = None
 ) -> list[str]:
     minimum_key = version_key(minimum)
+    same_version_stable_tag = stable_prerelease_base(exclude)
     selected: set[str] = set()
     for release in releases:
         tag = str(release.get("tagName") or release.get("tag_name") or "").strip()
@@ -41,7 +52,11 @@ def select_tags(
             continue
         if bool(release.get("isPrerelease") or release.get("prerelease")):
             continue
-        if tag == exclude or version_key(tag) < minimum_key:
+        # A formal release is semantically newer than its own prereleases.
+        # Do not manufacture an upgrade fixture from vX.Y.Z to vX.Y.Z-rc.N:
+        # the updater correctly treats that as a downgrade, and Windows
+        # self-replacement cannot produce a meaningful pending upgrade.
+        if tag == exclude or tag == same_version_stable_tag or version_key(tag) < minimum_key:
             continue
         selected.add(tag)
     inventory = {
