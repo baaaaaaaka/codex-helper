@@ -4985,7 +4985,7 @@ func sessionHelpText() string {
 		"",
 		"Common commands:",
 		"`helper status` or `!status` - check progress",
-		"`helper stats` or `!stats` - show Codex token usage from the linked local history",
+		"`helper stats` or `!stats` - show Codex token usage from the linked local history, grouped by model and service tier",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding before retrying an interrupted turn",
 		"`helper close` or `!close` - close this Codex session in Teams",
@@ -5007,7 +5007,7 @@ func sessionAdvancedHelpText() string {
 	return strings.Join([]string{
 		"💬 Work chat advanced help",
 		"`helper status` or `!status` - check progress",
-		"`helper stats` or `!stats` - show Codex token usage, cache/context analysis, and rate-limit metadata when Codex recorded it",
+		"`helper stats` or `!stats` - show Codex token usage by model/service-tier combination, cache/context analysis, and rate-limit metadata when Codex recorded it",
 		"`helper details` or `!details` - show IDs and debug details",
 		"`beacon status`, `beacon list`, `beacon switch <profile>`, or `beacon switch local` - inspect or switch this Work chat execution target",
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",

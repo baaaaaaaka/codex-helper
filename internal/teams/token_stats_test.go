@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -465,6 +466,134 @@ func TestParseCodexTokenStatsFallsBackToUsageFields(t *testing.T) {
 	}
 }
 
+func TestParseCodexTokenStatsAggregatesUsageByModelAndTier(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-sol","service_tier":"default"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":80,"cached_input_tokens":60,"output_tokens":20,"total_tokens":100},"last_token_usage":{"input_tokens":80,"cached_input_tokens":60,"output_tokens":20,"total_tokens":100}}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":90,"output_tokens":30,"total_tokens":160},"last_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":10,"total_tokens":60}}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":90,"output_tokens":30,"total_tokens":160},"last_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":10,"total_tokens":60}}}}`,
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","service_tier":"default"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.6-luna"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":10,"total_tokens":40},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":10,"total_tokens":40}}}}`,
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-luna","service_tier":"priority"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-3","model":"gpt-5.6-luna"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":20,"output_tokens":20,"total_tokens":70},"last_token_usage":{"input_tokens":20,"cached_input_tokens":10,"output_tokens":10,"total_tokens":30}}}}`,
+	}, "\n")
+
+	got, err := ParseCodexTokenStats(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseCodexTokenStats error: %v", err)
+	}
+	if got.Info.Total.TotalTokens != 230 {
+		t.Fatalf("conversation total = %d, want 230", got.Info.Total.TotalTokens)
+	}
+	want := []CodexModelTierUsage{
+		{Model: "gpt-5.6-luna", Tier: "default", Usage: CodexTokenUsage{InputTokens: 30, CachedInputTokens: 10, OutputTokens: 10, TotalTokens: 40}},
+		{Model: "gpt-5.6-luna", Tier: "priority", Usage: CodexTokenUsage{InputTokens: 20, CachedInputTokens: 10, OutputTokens: 10, TotalTokens: 30}},
+		{Model: "gpt-5.6-sol", Tier: "default", Usage: CodexTokenUsage{InputTokens: 130, CachedInputTokens: 90, OutputTokens: 30, TotalTokens: 160}},
+	}
+	if !reflect.DeepEqual(got.ModelTierUsages, want) {
+		t.Fatalf("model/tier usages = %#v, want %#v", got.ModelTierUsages, want)
+	}
+	rendered := strings.Join(formatCodexTokenStatsLines(got), "\n")
+	for _, wantText := range []string{
+		"Model/tier usage:",
+		"Model: gpt-5.6-luna",
+		"Tier: default",
+		"Tier: priority",
+		"Model: gpt-5.6-sol",
+		"input: 130 (cached 90, non-cached 40)",
+		"total: 160",
+		"model/tier attribution: 3 observed combination(s)",
+	} {
+		if !strings.Contains(rendered, wantText) {
+			t.Fatalf("formatted stats missing %q:\n%s", wantText, rendered)
+		}
+	}
+}
+
+func TestParseCodexTokenStatsKeepsMissingModelTierMetadataUnknown(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"turn_context","payload":{"turn_id":"turn-1","model":"model-a"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}`,
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"model-a","service_tier":"default"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-2","model":"model-a"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"output_tokens":4,"total_tokens":24},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}`,
+	}, "\n")
+
+	got, err := ParseCodexTokenStats(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseCodexTokenStats error: %v", err)
+	}
+	want := []CodexModelTierUsage{
+		{Model: "model-a", Tier: "default", Usage: CodexTokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}},
+		{Model: "model-a", Tier: "unknown", Usage: CodexTokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}},
+	}
+	if !reflect.DeepEqual(got.ModelTierUsages, want) {
+		t.Fatalf("model/tier usages = %#v, want %#v", got.ModelTierUsages, want)
+	}
+	rendered := strings.Join(formatCodexTokenStatsLines(got), "\n")
+	for _, wantText := range []string{
+		"Model: model-a",
+		"Tier: unknown",
+		"1 combination(s), 12 total, have missing model or service-tier metadata; they remain `unknown` instead of being guessed or merged",
+	} {
+		if !strings.Contains(rendered, wantText) {
+			t.Fatalf("unknown model/tier diagnostic missing %q:\n%s", wantText, rendered)
+		}
+	}
+}
+
+func TestParseCodexTokenStatsGroupsFallbackUsageByModelAndTier(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"model-a","service_tier":"default"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-1","model":"model-a"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}`,
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"model-b","service_tier":"priority"}}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-2","model":"model-b"}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":3,"total_tokens":23}}`,
+	}, "\n")
+
+	got, err := ParseCodexTokenStats(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("ParseCodexTokenStats error: %v", err)
+	}
+	want := []CodexModelTierUsage{
+		{Model: "model-a", Tier: "default", Usage: CodexTokenUsage{InputTokens: 10, OutputTokens: 2, TotalTokens: 12}},
+		{Model: "model-b", Tier: "priority", Usage: CodexTokenUsage{InputTokens: 20, OutputTokens: 3, TotalTokens: 23}},
+	}
+	if !reflect.DeepEqual(got.ModelTierUsages, want) {
+		t.Fatalf("model/tier fallback usages = %#v, want %#v", got.ModelTierUsages, want)
+	}
+}
+
+func TestRenderCodexTokenStatsHTMLRendersModelTierUsageSafely(t *testing.T) {
+	rendered := renderCodexTokenStatsHTML(strings.Join([]string{
+		"STATS: Codex tokens",
+		"Model/tier usage:",
+		"Model: model<one>",
+		"Tier: tier&one",
+		"input: 100 (cached 80, non-cached 20)",
+		"Cache hit rate: 80.0%",
+		"output: 12 (reasoning 5)",
+		"total: 112",
+	}, "\n"))
+	for _, want := range []string{
+		"<p><strong>Model:</strong> model&lt;one&gt;<br><strong>Tier:</strong> tier&amp;one",
+		"<strong>input:</strong> 100 (cached 80, non-cached 20)",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("model/tier HTML missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, forbidden := range []string{"model<one>", "tier&one"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("model/tier HTML did not escape %q:\n%s", forbidden, rendered)
+		}
+	}
+}
+
 func TestRenderCodexTokenStatsHTMLEscapesMetadataAndTableValues(t *testing.T) {
 	rendered := renderCodexTokenStatsHTML(strings.Join([]string{
 		"STATS: Codex tokens",
@@ -509,6 +638,8 @@ func TestRenderCodexTokenStatsHTMLEscapesMetadataAndTableValues(t *testing.T) {
 func TestBridgeWorkHelperStatsReadsLinkedTranscript(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	transcript := `{"type":"session_meta","payload":{"id":"thread-1"}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-sol","service_tier":"default"}}}` + "\n" +
+		`{"type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}` + "\n" +
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":120,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":330},"last_token_usage":{"input_tokens":200,"cached_input_tokens":100,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":220},"model_context_window":1000},"rate_limits":{"limit_id":"codex","plan_type":"business"}}}` + "\n" +
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":3,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":3,"total_tokens":110},"model_context_window":1000}}}` + "\n" +
 		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":180,"cached_input_tokens":90,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":200},"last_token_usage":{"input_tokens":80,"cached_input_tokens":40,"output_tokens":10,"reasoning_output_tokens":2,"total_tokens":90},"model_context_window":1000}}}` + "\n"
@@ -543,7 +674,7 @@ func TestBridgeWorkHelperStatsReadsLinkedTranscript(t *testing.T) {
 		t.Fatalf("sent = %d, want 1", len(*sent))
 	}
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
-	for _, want := range []string{"STATS: Codex tokens", "Codex thread: thread-1", "Model usage:", "Last recorded model usage", "Conversation total", "input", "Cache hit rate", "total"} {
+	for _, want := range []string{"STATS: Codex tokens", "Codex thread: thread-1", "Model usage:", "Last recorded model usage", "Conversation total", "Model/tier usage:", "Model: gpt-5.6-sol", "Tier: default", "total: 530", "input", "Cache hit rate", "total"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("helper stats response missing %q:\n%s", want, got)
 		}
@@ -559,6 +690,9 @@ func TestBridgeWorkHelperStatsReadsLinkedTranscript(t *testing.T) {
 		"<tr><td><strong>Cache hit rate</strong></td><td>50.0%</td><td>43.8%</td></tr>",
 		"<tr><td><strong>output</strong></td><td>10 (reasoning 2)</td><td>50 (reasoning 15)</td></tr>",
 		"<tr><td><strong>total</strong></td><td>90</td><td>530</td></tr>",
+		"<p><strong>Model/tier usage:</strong></p>",
+		"<strong>Model:</strong> gpt-5.6-sol<br><strong>Tier:</strong> default",
+		"<strong>total:</strong> 530",
 		"<p><strong>Analysis:</strong></p>",
 		"<ul><li><strong>model context window:</strong> 1,000; current context uses 9.0%; approx remaining: 910</li>",
 		"<li><strong>native latest cumulative total:</strong> 200; reconstructed conversation total: 530</li>",

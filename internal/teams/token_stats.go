@@ -26,6 +26,7 @@ type CodexTokenStats struct {
 	SourceLine               int
 	Source                   string
 	Info                     CodexTokenUsageInfo
+	ModelTierUsages          []CodexModelTierUsage
 	NativeLatestTotal        CodexTokenUsage
 	UsageEventCount          int
 	NonAdvancingUsageEvents  int
@@ -36,6 +37,14 @@ type CodexTokenStats struct {
 	RateLimits               CodexRateLimits
 	Diagnostics              []TokenStatsDiagnostic
 	UsedFallbackOnly         bool
+}
+
+// CodexModelTierUsage is the token usage attributed to one model/service-tier
+// combination observed in a Codex transcript.
+type CodexModelTierUsage struct {
+	Model string
+	Tier  string
+	Usage CodexTokenUsage
 }
 
 type CodexTokenUsageInfo struct {
@@ -69,10 +78,10 @@ type codexTokenUsageAccumulator struct {
 	aggregationOverflow     bool
 }
 
-// observe returns whether the snapshot advanced usage and therefore consumed a
-// pending turn boundary. Non-advancing snapshots can be metadata replays before
-// the first real usage of a turn.
-func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnStart bool) bool {
+// observe returns the newly observed usage delta and whether the snapshot
+// advanced usage. Non-advancing snapshots can be metadata replays before the
+// first real usage of a turn.
+func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnStart bool) (CodexTokenUsage, bool) {
 	nativeTotal := info.Total
 	if !nativeTotal.hasTokens() {
 		nativeTotal = info.Last
@@ -92,7 +101,7 @@ func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnSta
 		a.modelContextWindow = info.ModelContextWindow
 		a.usageEventCount = 1
 		a.nativeCounterGlobal = true
-		return true
+		return nativeTotal, true
 	}
 
 	progress := compareCodexTokenUsageTotals(nativeTotal, a.previousTotal)
@@ -112,9 +121,10 @@ func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnSta
 		}
 		a.nativeLatestTotal = nativeTotal
 		a.previousTotal = nativeTotal
-		return false
+		return CodexTokenUsage{}, false
 	}
 
+	previousReconstructedTotal := a.total
 	a.usageEventCount++
 	resetAtTurnStart := componentResetAtTurnStart ||
 		(atTurnStart && progress > 0 && info.Last.hasTokens() && nativeTotal == info.Last)
@@ -167,7 +177,24 @@ func (a *codexTokenUsageAccumulator) observe(info CodexTokenUsageInfo, atTurnSta
 	}
 	a.nativeLatestTotal = nativeTotal
 	a.previousTotal = nativeTotal
-	return true
+	return subtractCodexTokenUsage(a.total, previousReconstructedTotal), true
+}
+
+func subtractCodexTokenUsage(current CodexTokenUsage, previous CodexTokenUsage) CodexTokenUsage {
+	return CodexTokenUsage{
+		InputTokens:           subtractTokenCount(current.InputTokens, previous.InputTokens),
+		CachedInputTokens:     subtractTokenCount(current.CachedInputTokens, previous.CachedInputTokens),
+		OutputTokens:          subtractTokenCount(current.OutputTokens, previous.OutputTokens),
+		ReasoningOutputTokens: subtractTokenCount(current.ReasoningOutputTokens, previous.ReasoningOutputTokens),
+		TotalTokens:           subtractTokenCount(current.TotalTokens, previous.TotalTokens),
+	}
+}
+
+func subtractTokenCount(current int64, previous int64) int64 {
+	if current < 0 || previous < 0 || current < previous {
+		return maxInt64(0, current)
+	}
+	return current - previous
 }
 
 func codexTokenUsageComponentDecreased(current CodexTokenUsage, previous CodexTokenUsage) bool {
@@ -331,6 +358,7 @@ func ReadCodexTokenStats(filePath string) (CodexTokenStats, error) {
 func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 	var fallback CodexTokenStats
 	var usage codexTokenUsageAccumulator
+	modelTierUsage := newCodexModelTierUsageAccumulator()
 	var rateLimits CodexRateLimits
 	var diagnostics []TokenStatsDiagnostic
 	var tokenSourceLine int
@@ -344,7 +372,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 		if readErr != nil && readErr != io.EOF {
-			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine), fmt.Errorf("read Codex token stats: %w", readErr)
+			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot()), fmt.Errorf("read Codex token stats: %w", readErr)
 		}
 		lineNo++
 		line = bytes.TrimSpace(line)
@@ -366,6 +394,13 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			}
 			continue
 		}
+		if context, ok := parseCodexModelTierContext(event); ok {
+			if event.Type == "event_msg" || event.Type == "thread_settings_applied" {
+				modelTierUsage.applySettings(context)
+			} else {
+				modelTierUsage.applyTurnContext(context)
+			}
+		}
 		if event.Type == "turn_context" {
 			// A fixed Codex can restore its conversation-global token counter only
 			// when a new turn starts. Retain this boundary until the first usage
@@ -379,7 +414,9 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			}
 			tokenCountHasUsage := tokenCount.Info.Total.hasTokens() || tokenCount.Info.Last.hasTokens()
 			if tokenCountHasUsage {
-				if usage.observe(tokenCount.Info, atTurnStart) {
+				usageDelta, advanced := usage.observe(tokenCount.Info, atTurnStart)
+				modelTierUsage.observeTokenUsage(usageDelta, advanced)
+				if advanced {
 					atTurnStart = false
 				}
 				tokenSourceLine = lineNo
@@ -391,6 +428,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 		}
 		if usage := normalizeCodexUsage(event.Usage); usage.hasTokens() {
 			atTurnStart = false
+			modelTierUsage.observeFallbackUsage(usage)
 			fallback = CodexTokenStats{
 				SourceLine:       lineNo,
 				Source:           "event usage",
@@ -402,7 +440,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 	}
-	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine), nil
+	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot()), nil
 }
 
 func finishCodexTokenStats(
@@ -412,12 +450,14 @@ func finishCodexTokenStats(
 	diagnostics []TokenStatsDiagnostic,
 	tokenSourceLine int,
 	lastTokenCountLine int,
+	modelTierUsages []CodexModelTierUsage,
 ) CodexTokenStats {
 	if usage.seen {
 		return CodexTokenStats{
 			SourceLine:               tokenSourceLine,
 			Source:                   "token_count",
 			Info:                     usage.info(),
+			ModelTierUsages:          modelTierUsages,
 			NativeLatestTotal:        usage.nativeLatestTotal,
 			UsageEventCount:          usage.usageEventCount,
 			NonAdvancingUsageEvents:  usage.nonAdvancingUsageEvents,
@@ -432,17 +472,20 @@ func finishCodexTokenStats(
 	if fallback.HasUsage() {
 		fallback.RateLimits = rateLimits
 		fallback.Diagnostics = diagnostics
+		fallback.ModelTierUsages = modelTierUsages
 		return fallback
 	}
 	if rateLimits.Present {
 		return CodexTokenStats{
-			SourceLine:  lastTokenCountLine,
-			Source:      "token_count",
-			RateLimits:  rateLimits,
-			Diagnostics: diagnostics,
+			SourceLine:      lastTokenCountLine,
+			Source:          "token_count",
+			ModelTierUsages: modelTierUsages,
+			RateLimits:      rateLimits,
+			Diagnostics:     diagnostics,
 		}
 	}
 	fallback.Diagnostics = append(fallback.Diagnostics, diagnostics...)
+	fallback.ModelTierUsages = modelTierUsages
 	return fallback
 }
 
@@ -487,6 +530,247 @@ type codexTokenUsage struct {
 	PromptTokensDetails struct {
 		CachedTokens int64 `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
+}
+
+type codexModelTierContext struct {
+	Model  string
+	Tier   string
+	TurnID string
+}
+
+type codexModelTierUsageKey struct {
+	Model string
+	Tier  string
+}
+
+type codexModelTierUsageAccumulator struct {
+	current             codexModelTierContext
+	currentTurnID       string
+	hasContext          bool
+	awaitingTurnContext bool
+	turnHasTokenUsage   bool
+	fallbackUsage       CodexTokenUsage
+	groups              map[codexModelTierUsageKey]CodexTokenUsage
+}
+
+func newCodexModelTierUsageAccumulator() codexModelTierUsageAccumulator {
+	return codexModelTierUsageAccumulator{
+		groups: make(map[codexModelTierUsageKey]CodexTokenUsage),
+	}
+}
+
+func (a *codexModelTierUsageAccumulator) applySettings(context codexModelTierContext) {
+	a.finishTurn()
+	a.current = normalizedCodexModelTierContext(context)
+	a.currentTurnID = ""
+	a.hasContext = true
+	a.awaitingTurnContext = true
+	a.resetTurn()
+}
+
+func (a *codexModelTierUsageAccumulator) applyTurnContext(context codexModelTierContext) {
+	context = normalizedCodexModelTierContext(context)
+	if !a.hasContext {
+		a.current = context
+		a.currentTurnID = context.TurnID
+		a.hasContext = true
+		a.awaitingTurnContext = false
+		return
+	}
+	if context.TurnID != "" && a.currentTurnID != "" && context.TurnID != a.currentTurnID {
+		a.finishTurn()
+		a.current = context
+		a.currentTurnID = context.TurnID
+		a.awaitingTurnContext = false
+		a.resetTurn()
+		return
+	}
+	if context.TurnID != "" && a.currentTurnID == "" && !a.awaitingTurnContext && (a.turnHasTokenUsage || a.fallbackUsage.hasTokens()) {
+		a.finishTurn()
+		a.current = context
+		a.currentTurnID = context.TurnID
+		a.resetTurn()
+	} else {
+		if context.Model != "" {
+			a.current.Model = context.Model
+		}
+		if context.Tier != "" {
+			a.current.Tier = context.Tier
+		}
+		if context.TurnID != "" {
+			a.currentTurnID = context.TurnID
+		}
+	}
+	a.awaitingTurnContext = false
+}
+
+func (a *codexModelTierUsageAccumulator) observeTokenUsage(delta CodexTokenUsage, advanced bool) {
+	if !advanced || !delta.hasTokens() {
+		return
+	}
+	a.turnHasTokenUsage = true
+	a.fallbackUsage = CodexTokenUsage{}
+	key := codexModelTierUsageKey{
+		Model: normalizedCodexModelName(a.current.Model),
+		Tier:  normalizedCodexTierName(a.current.Tier),
+	}
+	previous := a.groups[key]
+	a.groups[key], _ = addCodexTokenUsage(previous, delta)
+}
+
+func (a *codexModelTierUsageAccumulator) observeFallbackUsage(usage CodexTokenUsage) {
+	if a.turnHasTokenUsage || !usage.hasTokens() {
+		return
+	}
+	a.fallbackUsage = usage
+}
+
+func (a *codexModelTierUsageAccumulator) finishTurn() {
+	if a.turnHasTokenUsage || !a.fallbackUsage.hasTokens() {
+		a.resetTurn()
+		return
+	}
+	key := codexModelTierUsageKey{
+		Model: normalizedCodexModelName(a.current.Model),
+		Tier:  normalizedCodexTierName(a.current.Tier),
+	}
+	previous := a.groups[key]
+	a.groups[key], _ = addCodexTokenUsage(previous, a.fallbackUsage)
+	a.resetTurn()
+}
+
+func (a *codexModelTierUsageAccumulator) resetTurn() {
+	a.turnHasTokenUsage = false
+	a.fallbackUsage = CodexTokenUsage{}
+}
+
+func (a *codexModelTierUsageAccumulator) snapshot() []CodexModelTierUsage {
+	a.finishTurn()
+	keys := make([]codexModelTierUsageKey, 0, len(a.groups))
+	for key, usage := range a.groups {
+		if usage.hasTokens() {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Model != keys[j].Model {
+			return keys[i].Model < keys[j].Model
+		}
+		return keys[i].Tier < keys[j].Tier
+	})
+	result := make([]CodexModelTierUsage, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, CodexModelTierUsage{
+			Model: key.Model,
+			Tier:  key.Tier,
+			Usage: a.groups[key],
+		})
+	}
+	return result
+}
+
+func normalizedCodexModelTierContext(context codexModelTierContext) codexModelTierContext {
+	context.Model = strings.TrimSpace(context.Model)
+	context.Tier = strings.TrimSpace(context.Tier)
+	context.TurnID = strings.TrimSpace(context.TurnID)
+	return context
+}
+
+func normalizedCodexModelName(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "unknown"
+	}
+	return model
+}
+
+func normalizedCodexTierName(tier string) string {
+	tier = strings.TrimSpace(tier)
+	if tier == "" {
+		return "unknown"
+	}
+	return tier
+}
+
+type codexContextSettings struct {
+	Model        string `json:"model"`
+	ModelSlug    string `json:"model_slug"`
+	ModelSlug2   string `json:"modelSlug"`
+	ServiceTier  string `json:"service_tier"`
+	ServiceTier2 string `json:"serviceTier"`
+}
+
+type codexContextPayload struct {
+	Type              string               `json:"type"`
+	TurnID            string               `json:"turn_id"`
+	TurnID2           string               `json:"turnId"`
+	Model             string               `json:"model"`
+	ModelSlug         string               `json:"model_slug"`
+	ModelSlug2        string               `json:"modelSlug"`
+	ServiceTier       string               `json:"service_tier"`
+	ServiceTier2      string               `json:"serviceTier"`
+	ThreadSettings    codexContextSettings `json:"thread_settings"`
+	ThreadSettings2   codexContextSettings `json:"threadSettings"`
+	CollaborationMode struct {
+		Settings codexContextSettings `json:"settings"`
+	} `json:"collaboration_mode"`
+}
+
+func parseCodexModelTierContext(event codexTokenStatsEvent) (codexModelTierContext, bool) {
+	if event.Type != "turn_context" && event.Type != "thread_settings_applied" && event.Type != "event_msg" {
+		return codexModelTierContext{}, false
+	}
+	if len(bytes.TrimSpace(event.Payload)) == 0 {
+		return codexModelTierContext{}, false
+	}
+	var payload codexContextPayload
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return codexModelTierContext{}, false
+	}
+	if event.Type == "event_msg" && payload.Type != "thread_settings_applied" {
+		return codexModelTierContext{}, false
+	}
+	if event.Type == "thread_settings_applied" && payload.Type != "" && payload.Type != "thread_settings_applied" {
+		return codexModelTierContext{}, false
+	}
+	model := firstNonEmptyCodexString(
+		payload.Model,
+		payload.ModelSlug,
+		payload.ModelSlug2,
+		payload.ThreadSettings.Model,
+		payload.ThreadSettings.ModelSlug,
+		payload.ThreadSettings.ModelSlug2,
+		payload.ThreadSettings2.Model,
+		payload.ThreadSettings2.ModelSlug,
+		payload.ThreadSettings2.ModelSlug2,
+		payload.CollaborationMode.Settings.Model,
+		payload.CollaborationMode.Settings.ModelSlug,
+		payload.CollaborationMode.Settings.ModelSlug2,
+	)
+	tier := firstNonEmptyCodexString(
+		payload.ServiceTier,
+		payload.ServiceTier2,
+		payload.ThreadSettings.ServiceTier,
+		payload.ThreadSettings.ServiceTier2,
+		payload.ThreadSettings2.ServiceTier,
+		payload.ThreadSettings2.ServiceTier2,
+		payload.CollaborationMode.Settings.ServiceTier,
+		payload.CollaborationMode.Settings.ServiceTier2,
+	)
+	turnID := firstNonEmptyCodexString(payload.TurnID, payload.TurnID2)
+	if model == "" && tier == "" && turnID == "" {
+		return codexModelTierContext{}, false
+	}
+	return codexModelTierContext{Model: model, Tier: tier, TurnID: turnID}, true
+}
+
+func firstNonEmptyCodexString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func parseCodexTokenCountEvent(event codexTokenStatsEvent, raw []byte) (CodexTokenStats, bool) {
@@ -853,7 +1137,14 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 		lines = append(lines, "")
 		lines = append(lines, formatTokenUsageLines(stats.Info.Total)...)
 	}
+	if modelTierLines := formatCodexModelTierUsageLines(stats.ModelTierUsages); len(modelTierLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, "Model/tier usage:")
+		lines = append(lines, "")
+		lines = append(lines, modelTierLines...)
+	}
 	analysis := formatTokenUsageAnalysis(stats.Info)
+	analysis = append(analysis, formatCodexModelTierUsageAnalysis(stats.ModelTierUsages)...)
 	analysis = append(analysis, formatTokenAggregationAnalysis(stats)...)
 	if len(analysis) > 0 {
 		lines = append(lines, "")
@@ -869,6 +1160,43 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 	if diagnostics := formatTokenStatsDiagnostics(stats.Diagnostics); len(diagnostics) > 0 {
 		lines = append(lines, "")
 		lines = append(lines, diagnostics...)
+	}
+	return lines
+}
+
+func formatCodexModelTierUsageLines(usages []CodexModelTierUsage) []string {
+	var lines []string
+	for index, usage := range usages {
+		if index > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "Model: "+normalizedCodexModelName(usage.Model))
+		lines = append(lines, "Tier: "+normalizedCodexTierName(usage.Tier))
+		lines = append(lines, formatTokenUsageLines(usage.Usage)...)
+	}
+	return lines
+}
+
+func formatCodexModelTierUsageAnalysis(usages []CodexModelTierUsage) []string {
+	if len(usages) == 0 {
+		return nil
+	}
+	unknownGroups := 0
+	unknownUsage := CodexTokenUsage{}
+	for _, usage := range usages {
+		if normalizedCodexModelName(usage.Model) != "unknown" && normalizedCodexTierName(usage.Tier) != "unknown" {
+			continue
+		}
+		unknownGroups++
+		unknownUsage, _ = addCodexTokenUsage(unknownUsage, usage.Usage)
+	}
+	lines := []string{fmt.Sprintf("model/tier attribution: %d observed combination(s)", len(usages))}
+	if unknownGroups > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"%d combination(s), %s total, have missing model or service-tier metadata; they remain `unknown` instead of being guessed or merged",
+			unknownGroups,
+			formatTokenCount(effectiveCodexTokenUsageTotal(unknownUsage)),
+		))
 	}
 	return lines
 }
@@ -968,6 +1296,8 @@ func renderCodexTokenStatsHTML(text string) string {
 		switch section.Header {
 		case "Analysis:", "Rate limits:":
 			out.WriteString(renderStatsListHTML(section.Lines))
+		case "Model/tier usage:":
+			out.WriteString(renderStatsModelTierUsageHTML(section.Lines))
 		default:
 			out.WriteString(renderStatsParagraphLinesHTML(section.Lines))
 		}
@@ -994,11 +1324,64 @@ func compactStatsRenderLines(lines []string) []string {
 
 func isStatsSectionHeader(line string) bool {
 	switch strings.TrimSpace(line) {
-	case "Last recorded model usage:", "Conversation total:", "Analysis:", "Rate limits:":
+	case "Last recorded model usage:", "Conversation total:", "Model/tier usage:", "Analysis:", "Rate limits:":
 		return true
 	default:
 		return false
 	}
+}
+
+type statsModelTierRenderGroup struct {
+	Model string
+	Tier  string
+	Lines []string
+}
+
+func renderStatsModelTierUsageHTML(lines []string) string {
+	var groups []statsModelTierRenderGroup
+	var current *statsModelTierRenderGroup
+	for _, line := range compactStatsRenderLines(lines) {
+		label, value := splitStatsLineLabelValue(line)
+		switch strings.ToLower(label) {
+		case "model":
+			if current != nil {
+				groups = append(groups, *current)
+			}
+			current = &statsModelTierRenderGroup{Model: value}
+		case "tier":
+			if current == nil {
+				current = &statsModelTierRenderGroup{}
+			}
+			current.Tier = value
+		default:
+			if current == nil {
+				current = &statsModelTierRenderGroup{}
+			}
+			current.Lines = append(current.Lines, line)
+		}
+	}
+	if current != nil {
+		groups = append(groups, *current)
+	}
+	if len(groups) == 0 {
+		return ""
+	}
+	var out strings.Builder
+	for index, group := range groups {
+		if index > 0 {
+			out.WriteString("<p>&nbsp;</p>")
+		}
+		out.WriteString("<p><strong>Model:</strong> ")
+		out.WriteString(html.EscapeString(group.Model))
+		out.WriteString("<br><strong>Tier:</strong> ")
+		out.WriteString(html.EscapeString(group.Tier))
+		for _, line := range compactStatsRenderLines(group.Lines) {
+			out.WriteString("<br>")
+			out.WriteString(renderStatsLineHTML(line))
+		}
+		out.WriteString("</p>")
+	}
+	return out.String()
 }
 
 func renderStatsParagraphLinesHTML(lines []string) string {

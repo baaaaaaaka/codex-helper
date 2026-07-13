@@ -511,7 +511,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Test(ParseCodexTokenStats.*|FormatCodexTokenStats.*|RenderCodexTokenStatsHTMLEscapesMetadataAndTableValues|BridgeWorkHelperStatsReadsLinkedTranscript|ParseWorkChatPlainTextIsCodexInput)$' -v
+          go test ./internal/teams -count=1 -run 'Test(ParseCodexTokenStats.*|FormatCodexTokenStats.*|RenderCodexTokenStatsHTML.*|BridgeWorkHelperStatsReadsLinkedTranscript|ParseWorkChatPlainTextIsCodexInput)$' -v
           go test ./internal/codexrunner -count=1 -run 'Test(ParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens|AppServerRunnerStartThreadEncodesThreadStartAndTurnStart)$' -v
 
       - name: Teams ASR input regressions
