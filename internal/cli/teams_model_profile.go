@@ -255,27 +255,27 @@ func printTeamsVerifiedModels(cfg config.Config, secrets *modelprofile.SecretSto
 		slug := strings.TrimSpace(strings.TrimPrefix(defaultSelector, "official:"))
 		for _, model := range officialModels {
 			if strings.EqualFold(model.Slug, slug) {
-				lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", model.DisplayName, model.Slug))
+				lines = append(lines, fmt.Sprintf("  global default: %s (`%s`)", model.DisplayName, model.Slug))
 				break
 			}
 		}
 	} else if strings.EqualFold(defaultSelector, config.DefaultModelProfileName) && officialReady && officialDefaultIndex >= 0 {
-		lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
+		lines = append(lines, fmt.Sprintf("  global default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
 	} else if !strings.EqualFold(defaultSelector, config.DefaultModelProfileName) {
 		if profile, ok := cfg.FindModelProfile(defaultName); ok && modelProfileVerificationCurrent(cfg, defaultName, profile, secrets) {
 			if resolved, err := modelprofile.Resolve(cfg, defaultName); err == nil {
-				lines = append(lines, fmt.Sprintf("* current default: %s (`%s`)", resolved.Model.Label(), defaultName))
+				lines = append(lines, fmt.Sprintf("  global default: %s (`%s`, selector `profile:%s`)", resolved.Model.Label(), resolved.Model.PublicID(), defaultName))
 			}
 		}
 	}
 	if officialReady {
 		if len(officialModels) > 0 {
-			lines = append(lines, fmt.Sprintf("  official default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
+			lines = append(lines, fmt.Sprintf("  Codex account default: %s (`%s`)", officialDefault.DisplayName, officialDefault.Slug))
 			lines = append(lines, "", "Official Codex models")
 			for index, model := range officialModels {
 				suffix := ""
 				if index == officialDefaultIndex {
-					suffix = " [official default]"
+					suffix = " [account default]"
 				}
 				if model.DefaultReasoningLevel != "" {
 					suffix += " effort=" + model.DefaultReasoningLevel
@@ -303,15 +303,16 @@ func printTeamsVerifiedModels(cfg config.Config, secrets *modelprofile.SecretSto
 		if err != nil || resolved.IsDefault() {
 			continue
 		}
-		marker := " "
+		marker := "-"
 		if strings.EqualFold(defaultName, name) {
-			marker = "*"
+			marker = "[global default]"
 		}
 		if !thirdPartyHeaderAdded {
 			lines = append(lines, "", "Verified third-party profiles")
 			thirdPartyHeaderAdded = true
 		}
-		lines = append(lines, fmt.Sprintf("%s %s: %s (%s)", marker, name, resolved.Model.Label(), resolved.Provider.DisplayName))
+		selector := "profile:" + name
+		lines = append(lines, fmt.Sprintf("  %s %s: %s (%s, model `%s`, selector `%s`) [verified]", marker, name, resolved.Model.Label(), resolved.Provider.DisplayName, resolved.Model.PublicID(), selector))
 	}
 	if len(lines) == 1 {
 		lines = append(lines, "  none")

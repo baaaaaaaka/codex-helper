@@ -443,11 +443,12 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 	}
 	defaultName := cfg.EffectiveDefaultModelProfile()
 	_, _ = fmt.Fprintln(out, "Models")
+	_, _ = fmt.Fprintln(out, "[global default] marks the model used by future launches; it does not describe the current chat")
 	for i, choice := range modelprofile.ModelChoices() {
 		status := modelChoiceStatus(cfg, secretStore, choice)
-		marker := " "
+		marker := "-"
 		if modelChoiceIsDefault(cfg, choice, defaultName) {
-			marker = "*"
+			marker = "[global default]"
 		}
 		_, _ = fmt.Fprintf(out, "%s %d. %-20s %-22s %s\n", marker, i+1, choice.ID, choice.DisplayName, status)
 	}
@@ -465,11 +466,11 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 			if err != nil {
 				continue
 			}
-			marker := " "
+			marker := "-"
 			if strings.EqualFold(name, defaultName) {
-				marker = "*"
+				marker = "[global default]"
 			}
-			_, _ = fmt.Fprintf(out, "%s %-20s %-22s verified (source %s)\n", marker, name, resolved.Model.Label(), cfg.ModelProfiles[name].Source)
+			_, _ = fmt.Fprintf(out, "%s %-20s %-22s verified (model `%s`, selector `profile:%s`, source %s)\n", marker, name, resolved.Model.Label(), resolved.Model.PublicID(), name, cfg.ModelProfiles[name].Source)
 		}
 	}
 }

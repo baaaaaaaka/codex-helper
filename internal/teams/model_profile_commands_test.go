@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 type backupWarningModelProfileManager struct{ *fakeModelProfileManager }
@@ -63,11 +64,11 @@ func TestModelNaturalLanguageListRequestRoutesInControlAndWorkChats(t *testing.T
 	bridge := &Bridge{modelProfileManager: &fakeModelProfileManager{}}
 	request := "里面应该列出来所有可用的 gpt 模型，另外列出来 default 具体是什么模型"
 	control, err := bridge.handleModelControlCommand(context.Background(), ChatMessage{}, request)
-	if err != nil || control != "profiles" {
+	if err != nil || !strings.Contains(control, "Current chat model (Control)") || !strings.HasSuffix(control, "profiles") {
 		t.Fatalf("control result = %q, err=%v", control, err)
 	}
 	work, err := bridge.handleModelWorkCommand(context.Background(), &Session{ID: "s1"}, request)
-	if err != nil || work != "profiles" {
+	if err != nil || !strings.Contains(work, "Current chat model (Work)") || !strings.HasSuffix(work, "profiles") {
 		t.Fatalf("work result = %q, err=%v", work, err)
 	}
 }
@@ -110,6 +111,14 @@ func TestModelControlCommandsOperateOnControlSessionNotGlobalDefault(t *testing.
 	if session.ModelProfile.Model != "gpt-next" || session.ModelGeneration != 1 {
 		t.Fatalf("control session after switch = %#v", session)
 	}
+	if session.ModelSelectionSource != modelSelectionSourceChatOverride {
+		t.Fatalf("control selection source after switch = %q", session.ModelSelectionSource)
+	}
+	state, err := bridge.store.Load(ctx)
+	durable := state.Sessions[session.ID]
+	if err != nil || durable.ModelSelectionSource != modelSelectionSourceChatOverride {
+		t.Fatalf("durable selection source after switch = %q err=%v", durable.ModelSelectionSource, err)
+	}
 	guidance, err := bridge.handleModelControlCommand(ctx, ChatMessage{}, "default official:gpt-old")
 	if err != nil || !strings.Contains(guidance, "default model set") {
 		t.Fatalf("legacy default guidance = %q err=%v", guidance, err)
@@ -134,6 +143,68 @@ func TestModelControlCommandsOperateOnControlSessionNotGlobalDefault(t *testing.
 	}
 	if session.ModelProfile.Model != "gpt-old" || session.ModelGeneration != 2 {
 		t.Fatalf("control session after reset = %#v", session)
+	}
+	if session.ModelSelectionSource != modelSelectionSourceGlobalDefault {
+		t.Fatalf("control selection source after reset = %q", session.ModelSelectionSource)
+	}
+}
+
+func TestModelListPutsCurrentChatBeforeGlobalDefaultAndVerifiedCatalog(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	manager := &fakeModelProfileManager{}
+	bridge := newBridgeTestBridge(nil, store, testEffortCatalogExecutor())
+	bridge.modelProfileManager = manager
+	bridge.modelProfileResolver = func(context.Context, string) (modelprofile.Snapshot, error) {
+		return modelprofile.Snapshot{Name: "sol", Provider: modelprofile.DefaultProvider, Model: "gpt-sol", Revision: 1}, nil
+	}
+	session := bridge.reg.SessionByID("s001")
+	session.ModelProfile = modelprofile.Snapshot{Name: "luna", Provider: modelprofile.DefaultProvider, Model: "gpt-luna", Revision: 1}
+	session.ModelSelectionSource = modelSelectionSourceChatOverride
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	out, err := bridge.modelManagerList(ctx, session, "Work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Effective: Codex Official (`gpt-luna`)") || !strings.Contains(out, "Selection: chat override") {
+		t.Fatalf("current chat summary = %q", out)
+	}
+	if !strings.Contains(out, "Global default for new chats: Codex Official (`gpt-sol`)") {
+		t.Fatalf("global default summary = %q", out)
+	}
+	if strings.Contains(out, "current default:") || strings.Contains(out, "Model profile: default") {
+		t.Fatalf("ambiguous model labels remain: %q", out)
+	}
+}
+
+func TestModelStatusShowsCapturedQueuedModelSeparatelyFromNextChatModel(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, testEffortCatalogExecutor())
+	session := bridge.reg.SessionByID("s001")
+	session.ModelProfile = modelprofile.Snapshot{Name: "luna", Provider: modelprofile.DefaultProvider, Model: "gpt-luna", Revision: 1}
+	session.ModelSelectionSource = modelSelectionSourceChatOverride
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := store.QueueTurn(ctx, teamstore.Turn{
+		ID:              "turn-queued-model",
+		SessionID:       session.ID,
+		Status:          teamstore.TurnStatusQueued,
+		ModelProfile:    modelprofile.Snapshot{Name: "sol", Provider: modelprofile.DefaultProvider, Model: "gpt-sol", Revision: 1},
+		ReasoningEffort: "low",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := bridge.formatChatModelStatus(ctx, session, "Work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "Effective: Codex Official (`gpt-luna`)") || !strings.Contains(status, "Queued turn: Codex Official (`gpt-sol`)") {
+		t.Fatalf("status did not distinguish current and queued models:\n%s", status)
 	}
 }
 

@@ -14,7 +14,11 @@ import (
 
 func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage, arg string) (string, error) {
 	if modelNaturalLanguageListRequest(arg) {
-		return b.modelManagerList(ctx)
+		session, err := b.ensureControlFallbackSession(ctx)
+		if err != nil {
+			return "", err
+		}
+		return b.modelManagerList(ctx, session, "Control")
 	}
 	sub, rest := modelCommandParts(arg)
 	if sub == "" {
@@ -28,7 +32,11 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 		}
 		return b.formatChatModelStatus(ctx, session, "Control")
 	case "list", "ls", "profiles":
-		return b.modelManagerList(ctx)
+		session, err := b.ensureControlFallbackSession(ctx)
+		if err != nil {
+			return "", err
+		}
+		return b.modelManagerList(ctx, session, "Control")
 	case "providers", "provider":
 		return b.modelManagerProviders(ctx)
 	case "setup", "guide", "add", "create":
@@ -82,7 +90,7 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 
 func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, arg string) (string, error) {
 	if modelNaturalLanguageListRequest(arg) {
-		return b.modelManagerList(ctx)
+		return b.modelManagerList(ctx, session, "Work")
 	}
 	sub, rest := modelCommandParts(arg)
 	if sub == "" {
@@ -92,7 +100,7 @@ func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, a
 	case "status", "current":
 		return b.formatChatModelStatus(ctx, session, "Work")
 	case "list", "ls", "profiles":
-		return b.modelManagerList(ctx)
+		return b.modelManagerList(ctx, session, "Work")
 	case "providers", "provider":
 		return b.modelManagerProviders(ctx)
 	case "setup", "guide", "add", "create":
@@ -163,11 +171,18 @@ func parseModelDeleteArgs(arg string) (string, bool) {
 	return strings.Join(keep, " "), confirm
 }
 
-func (b *Bridge) modelManagerList(ctx context.Context) (string, error) {
+func (b *Bridge) modelManagerList(ctx context.Context, session *Session, chatKind string) (string, error) {
 	if b == nil || b.modelProfileManager == nil {
 		return modelProfileManagerUnavailable(), nil
 	}
-	return b.modelProfileManager.ListModelProfiles(ctx)
+	profiles, err := b.modelProfileManager.ListModelProfiles(ctx)
+	if err != nil {
+		return "", err
+	}
+	if session == nil {
+		return profiles, nil
+	}
+	return strings.Join(append(b.currentChatModelSummaryLines(ctx, session, chatKind), "", profiles), "\n"), nil
 }
 
 func (b *Bridge) modelManagerProviders(ctx context.Context) (string, error) {
@@ -212,12 +227,12 @@ func modelProfileManagerUnavailable() string {
 func modelControlUsage() string {
 	return strings.Join([]string{
 		"Model commands:",
-		"- `model list` - list available models and setup status",
+		"- `model list` - show this chat's effective model first, then verified models (global default is labeled separately)",
 		"- `model setup` - list model choices",
 		"- `model setup <model>` - configure a model",
 		"- `model key confirm <code>` then `model key <code> <api-key>` - finish Teams key intake",
 		"- `model doctor <model>` - validate the model backing profile",
-		"- `model status` - show this Control chat's model",
+		"- `model status` - show this Control chat's effective model, selection source, effort, and any active/queued model",
 		"- `model switch <model>` - switch this Control chat",
 		"- `model reset` - switch this Control chat to the global default",
 		"- `default model set <model>` - set the global default",
@@ -233,7 +248,7 @@ func modelWorkUsage() string {
 		"- `model switch <name>` - switch this chat while preserving its Codex thread",
 		"- `model reset` - switch this chat to the global default",
 		"- `model fork <name>` - create a new Work chat with another profile",
-		"- `model list` - list profiles",
+		"- `model list` - show this chat's effective model first, then verified profiles",
 		"- `effort list|status|set|reset` - inspect or change this chat's effort",
 	}, "\n")
 }
@@ -258,13 +273,15 @@ func (b *Bridge) formatChatModelStatus(ctx context.Context, session *Session, ch
 		return "Model profile: session not found.", nil
 	}
 	chatKind = firstNonEmptyString(strings.TrimSpace(chatKind), "Chat")
-	lines := []string{
-		"Chat: " + chatKind,
-		"Model profile: " + modelProfileDisplayName(session.ModelProfile),
+	summary := b.currentChatModelSummaryLines(ctx, session, chatKind)
+	lines := []string{"Chat: " + chatKind}
+	for _, line := range summary {
+		if strings.HasPrefix(line, "Current chat model ") {
+			continue
+		}
+		lines = append(lines, line)
 	}
-	if model := strings.TrimSpace(firstNonEmptyString(session.ModelProfile.Model, session.ModelProfile.DefaultModel)); model != "" {
-		lines = append(lines, "Model: "+model)
-	}
+	lines = append(lines, "Model profile: "+modelSnapshotExactLabel(session.ModelProfile))
 	if switchable, reason := b.workModelProfileSwitchability(ctx, session); switchable {
 		lines = append(lines, "Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.")
 	} else if strings.TrimSpace(reason) != "" {
@@ -277,10 +294,14 @@ func (b *Bridge) formatChatModelStatus(ctx context.Context, session *Session, ch
 }
 
 func (b *Bridge) switchWorkModelProfile(ctx context.Context, session *Session, ref string) (string, error) {
-	return b.switchChatModelProfile(ctx, session, ref, "Work")
+	return b.switchChatModelProfileWithSource(ctx, session, ref, "Work", modelSelectionSourceChatOverride)
 }
 
 func (b *Bridge) switchChatModelProfile(ctx context.Context, session *Session, ref string, chatKind string) (string, error) {
+	return b.switchChatModelProfileWithSource(ctx, session, ref, chatKind, modelSelectionSourceChatOverride)
+}
+
+func (b *Bridge) switchChatModelProfileWithSource(ctx context.Context, session *Session, ref string, chatKind string, selectionSource string) (string, error) {
 	if session == nil {
 		return "", fmt.Errorf("session not found")
 	}
@@ -291,28 +312,40 @@ func (b *Bridge) switchChatModelProfile(ctx context.Context, session *Session, r
 	if err != nil {
 		return "", err
 	}
+	previousSnapshot := session.ModelProfile
 	if modelProfileSnapshotsSameRuntime(session.ModelProfile, snapshot) {
-		return "Model profile already selected for this " + chatKind + " chat: " + modelProfileDisplayName(snapshot), nil
+		if strings.TrimSpace(session.ModelSelectionSource) != strings.TrimSpace(selectionSource) {
+			effort, effortSource, effortNotice := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+			if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, effortSource); err != nil {
+				return "", err
+			}
+			message := "Model selection for this " + chatKind + " chat is now " + modelSelectionSourceLabel(selectionSource) + ": " + modelSnapshotExactLabel(snapshot)
+			if effortNotice != "" {
+				message += "\n\n" + effortNotice
+			}
+			return message, nil
+		}
+		return "Model profile already selected for this " + chatKind + " chat: " + modelSnapshotExactLabel(snapshot) + "\nSelection: " + modelSelectionSourceLabel(selectionSource), nil
 	}
 	if switchable, reason := b.workModelProfileSwitchability(ctx, session); !switchable {
 		if strings.Contains(reason, "queued or running") {
 			effort, source, _ := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
-			if err := b.setPendingSessionModelProfile(ctx, session, snapshot, effort, source); err != nil {
+			if err := b.setPendingSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
 				return "", err
 			}
-			return "Model profile switch scheduled for this " + chatKind + " chat: " + modelProfileDisplayName(snapshot) + "\n\nCurrent queued or running work keeps its captured model. The switch will apply automatically when this chat becomes idle.", nil
+			return "Model profile switch scheduled for this " + chatKind + " chat\nPrevious: " + modelSnapshotExactLabel(previousSnapshot) + "\nNext: " + modelSnapshotExactLabel(snapshot) + "\n\nCurrent queued or running work keeps its captured model. The switch will apply automatically when this chat becomes idle.", nil
 		}
 		return "", fmt.Errorf("cannot switch this %s chat's model profile: %s", chatKind, reason)
 	}
 	effort, effortSource, effortNotice := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
-	if err := b.setSessionModelProfile(ctx, session, snapshot, effort, effortSource); err != nil {
+	if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, effortSource); err != nil {
 		return "", err
 	}
 	threadNotice := "The next message will start a Codex thread with the selected model."
 	if strings.TrimSpace(session.CodexThreadID) != "" {
 		threadNotice = "The next message will continue the current Codex thread with its portable context preserved."
 	}
-	message := "Model profile switched for this " + chatKind + " chat: " + modelProfileDisplayName(snapshot) + "\n\n" + threadNotice
+	message := "Model profile switched for this " + chatKind + " chat\nPrevious: " + modelSnapshotExactLabel(previousSnapshot) + "\nEffective next-turn model: " + modelSnapshotExactLabel(snapshot) + "\nSelection: " + modelSelectionSourceLabel(selectionSource) + "\n\n" + threadNotice
 	if effortNotice != "" {
 		message += "\n\n" + effortNotice
 	}
@@ -320,10 +353,14 @@ func (b *Bridge) switchChatModelProfile(ctx context.Context, session *Session, r
 }
 
 func (b *Bridge) resetChatModelProfile(ctx context.Context, session *Session, chatKind string) (string, error) {
-	return b.switchChatModelProfile(ctx, session, "", chatKind)
+	return b.switchChatModelProfileWithSource(ctx, session, "", chatKind, modelSelectionSourceGlobalDefault)
 }
 
-func (b *Bridge) setPendingSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, effort string, source string) error {
+func (b *Bridge) setPendingSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, selectionSource string, effort string, source string) error {
+	selectionSource = strings.TrimSpace(selectionSource)
+	if selectionSource == "" {
+		selectionSource = modelSelectionSourceChatOverride
+	}
 	now := time.Now()
 	if b.store != nil {
 		if _, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, found bool, _ time.Time) (teamstore.SessionContext, bool, error) {
@@ -331,6 +368,7 @@ func (b *Bridge) setPendingSessionModelProfile(ctx context.Context, session *Ses
 				return current, false, fmt.Errorf("session %q not found", session.ID)
 			}
 			current.PendingModelProfile = snapshot
+			current.PendingModelSelectionSource = selectionSource
 			current.PendingModelRequestedAt = now
 			current.PendingReasoningEffort = effort
 			current.PendingReasoningSource = source
@@ -341,11 +379,13 @@ func (b *Bridge) setPendingSessionModelProfile(ctx context.Context, session *Ses
 		}
 	}
 	session.PendingModelProfile = snapshot
+	session.PendingModelSelectionSource = selectionSource
 	session.PendingModelRequestedAt = now
 	session.PendingReasoningEffort = effort
 	session.PendingReasoningSource = source
 	if current := b.reg.SessionByID(session.ID); current != nil {
 		current.PendingModelProfile = snapshot
+		current.PendingModelSelectionSource = selectionSource
 		current.PendingModelRequestedAt = now
 		current.PendingReasoningEffort = effort
 		current.PendingReasoningSource = source
@@ -383,12 +423,16 @@ func (b *Bridge) activatePendingSessionModelProfileForQueuedTurn(ctx context.Con
 
 func (b *Bridge) activatePendingSessionModelProfileLocked(ctx context.Context, session *Session) error {
 	snapshot := session.PendingModelProfile
+	selectionSource := session.PendingModelSelectionSource
+	if selectionSource == "" {
+		selectionSource = modelSelectionSourceChatOverride
+	}
 	effort := session.PendingReasoningEffort
 	source := session.PendingReasoningSource
 	if strings.TrimSpace(effort) == "" {
 		effort, source, _ = b.reasoningEffortForModelSwitch(ctx, session, snapshot)
 	}
-	if err := b.setSessionModelProfile(ctx, session, snapshot, effort, source); err != nil {
+	if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
 		return err
 	}
 	return nil
@@ -416,7 +460,11 @@ func (b *Bridge) workModelProfileSwitchability(ctx context.Context, session *Ses
 	return true, ""
 }
 
-func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, effort string, effortSource string) error {
+func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, snapshot modelprofile.Snapshot, selectionSource string, effort string, effortSource string) error {
+	selectionSource = strings.TrimSpace(selectionSource)
+	if selectionSource == "" {
+		selectionSource = modelSelectionSourceLegacy
+	}
 	now := time.Now()
 	nextGeneration := session.ModelGeneration + 1
 	preservedThreadID := strings.TrimSpace(session.CodexThreadID)
@@ -427,10 +475,12 @@ func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, s
 				return current, false, fmt.Errorf("session %q not found", session.ID)
 			}
 			current.ModelProfile = snapshot
+			current.ModelSelectionSource = selectionSource
 			current.ModelGeneration++
 			current.ReasoningEffort = effort
 			current.ReasoningEffortSource = effortSource
 			current.PendingModelProfile = modelprofile.Snapshot{}
+			current.PendingModelSelectionSource = ""
 			current.PendingModelRequestedAt = time.Time{}
 			current.PendingReasoningEffort = ""
 			current.PendingReasoningSource = ""
@@ -445,22 +495,26 @@ func (b *Bridge) setSessionModelProfile(ctx context.Context, session *Session, s
 		preservedLatestTurnID = strings.TrimSpace(updated.LatestCodexTurnID)
 	}
 	session.ModelProfile = snapshot
+	session.ModelSelectionSource = selectionSource
 	session.ModelGeneration = nextGeneration
 	session.CodexThreadID = preservedThreadID
 	session.ReasoningEffort = effort
 	session.ReasoningEffortSource = effortSource
 	session.PendingModelProfile = modelprofile.Snapshot{}
+	session.PendingModelSelectionSource = ""
 	session.PendingModelRequestedAt = time.Time{}
 	session.PendingReasoningEffort = ""
 	session.PendingReasoningSource = ""
 	session.UpdatedAt = now
 	if current := b.reg.SessionByID(session.ID); current != nil {
 		current.ModelProfile = snapshot
+		current.ModelSelectionSource = selectionSource
 		current.ModelGeneration = session.ModelGeneration
 		current.CodexThreadID = preservedThreadID
 		current.ReasoningEffort = effort
 		current.ReasoningEffortSource = effortSource
 		current.PendingModelProfile = modelprofile.Snapshot{}
+		current.PendingModelSelectionSource = ""
 		current.PendingModelRequestedAt = time.Time{}
 		current.PendingReasoningEffort = ""
 		current.PendingReasoningSource = ""
@@ -583,6 +637,7 @@ func (b *Bridge) forkWorkChatWithModelProfile(ctx context.Context, source *Sessi
 		Status:                "active",
 		Cwd:                   source.Cwd,
 		ModelProfile:          snapshot,
+		ModelSelectionSource:  modelSelectionSourceChatOverride,
 		ReasoningEffort:       effort,
 		ReasoningEffortSource: effortSource,
 		CreatedAt:             now,

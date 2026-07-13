@@ -1687,25 +1687,27 @@ func registrySessionFromDurable(durable teamstore.SessionContext) Session {
 		status = string(teamstore.SessionStatusActive)
 	}
 	return Session{
-		ID:                      durable.ID,
-		ChatID:                  durable.TeamsChatID,
-		ChatURL:                 durable.TeamsChatURL,
-		Topic:                   durable.TeamsTopic,
-		UserTitle:               durable.UserTitle,
-		TitleSource:             durable.TitleSource,
-		Status:                  status,
-		CodexThreadID:           durable.CodexThreadID,
-		ModelGeneration:         durable.ModelGeneration,
-		Cwd:                     durable.Cwd,
-		ModelProfile:            durable.ModelProfile,
-		PendingModelProfile:     durable.PendingModelProfile,
-		PendingModelRequestedAt: durable.PendingModelRequestedAt,
-		PendingReasoningEffort:  durable.PendingReasoningEffort,
-		PendingReasoningSource:  durable.PendingReasoningSource,
-		ReasoningEffort:         durable.ReasoningEffort,
-		ReasoningEffortSource:   durable.ReasoningEffortSource,
-		CreatedAt:               durable.CreatedAt,
-		UpdatedAt:               durable.UpdatedAt,
+		ID:                          durable.ID,
+		ChatID:                      durable.TeamsChatID,
+		ChatURL:                     durable.TeamsChatURL,
+		Topic:                       durable.TeamsTopic,
+		UserTitle:                   durable.UserTitle,
+		TitleSource:                 durable.TitleSource,
+		Status:                      status,
+		CodexThreadID:               durable.CodexThreadID,
+		ModelGeneration:             durable.ModelGeneration,
+		Cwd:                         durable.Cwd,
+		ModelProfile:                durable.ModelProfile,
+		ModelSelectionSource:        durable.ModelSelectionSource,
+		PendingModelProfile:         durable.PendingModelProfile,
+		PendingModelSelectionSource: durable.PendingModelSelectionSource,
+		PendingModelRequestedAt:     durable.PendingModelRequestedAt,
+		PendingReasoningEffort:      durable.PendingReasoningEffort,
+		PendingReasoningSource:      durable.PendingReasoningSource,
+		ReasoningEffort:             durable.ReasoningEffort,
+		ReasoningEffortSource:       durable.ReasoningEffortSource,
+		CreatedAt:                   durable.CreatedAt,
+		UpdatedAt:                   durable.UpdatedAt,
 	}
 }
 
@@ -1793,6 +1795,14 @@ func sanitizeControlFallbackSession(session *teamstore.SessionContext, model str
 	}
 	if session.ModelProfile.IsZero() && !snapshot.IsZero() {
 		session.ModelProfile = snapshot
+		changed = true
+	}
+	if strings.TrimSpace(session.ModelSelectionSource) == "" {
+		selectionSource := modelSelectionSourceLegacy
+		if !snapshot.IsZero() && modelProfileSnapshotsSameRuntime(session.ModelProfile, snapshot) {
+			selectionSource = modelSelectionSourceGlobalDefault
+		}
+		session.ModelSelectionSource = selectionSource
 		changed = true
 	}
 	setString(&session.TeamsChatID, "")
@@ -4821,6 +4831,7 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 		RunnerKind:            "control_fallback",
 		Model:                 model,
 		ModelProfile:          snapshot,
+		ModelSelectionSource:  modelSelectionSourceGlobalDefault,
 		ReasoningEffort:       effort,
 		ReasoningEffortSource: effortSource,
 		CreatedAt:             now,
@@ -4829,7 +4840,7 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 	if err != nil {
 		return nil, err
 	}
-	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || (created.ModelProfile.IsZero() && !snapshot.IsZero()) || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
+	if !isDurableControlFallbackSession(created) || created.Status != teamstore.SessionStatusActive || created.Model != model || (created.ModelProfile.IsZero() && !snapshot.IsZero()) || strings.TrimSpace(created.ModelSelectionSource) == "" || created.TeamsChatID != "" || created.TeamsChatURL != "" || created.TeamsTopic != "" || created.Cwd != "" {
 		if _, _, err := b.store.UpdateSessionContext(ctx, controlFallbackSessionID, func(current teamstore.SessionContext, _ bool, _ time.Time) (teamstore.SessionContext, bool, error) {
 			sanitizeControlFallbackSession(&current, model, snapshot, now)
 			return current, true, nil
@@ -4850,25 +4861,27 @@ func (b *Bridge) controlFallbackSessionFromState(durable teamstore.SessionContex
 		status = "active"
 	}
 	return &Session{
-		ID:                      controlFallbackSessionID,
-		ChatID:                  b.reg.ControlChatID,
-		ChatURL:                 b.reg.ControlChatURL,
-		Topic:                   firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
-		UserTitle:               durable.UserTitle,
-		TitleSource:             durable.TitleSource,
-		Status:                  status,
-		CodexThreadID:           durable.CodexThreadID,
-		ModelGeneration:         durable.ModelGeneration,
-		Cwd:                     durable.Cwd,
-		ModelProfile:            durable.ModelProfile,
-		PendingModelProfile:     durable.PendingModelProfile,
-		PendingModelRequestedAt: durable.PendingModelRequestedAt,
-		PendingReasoningEffort:  durable.PendingReasoningEffort,
-		PendingReasoningSource:  durable.PendingReasoningSource,
-		ReasoningEffort:         durable.ReasoningEffort,
-		ReasoningEffortSource:   durable.ReasoningEffortSource,
-		CreatedAt:               durable.CreatedAt,
-		UpdatedAt:               durable.UpdatedAt,
+		ID:                          controlFallbackSessionID,
+		ChatID:                      b.reg.ControlChatID,
+		ChatURL:                     b.reg.ControlChatURL,
+		Topic:                       firstNonEmptyString(b.reg.ControlChatTopic, durable.TeamsTopic),
+		UserTitle:                   durable.UserTitle,
+		TitleSource:                 durable.TitleSource,
+		Status:                      status,
+		CodexThreadID:               durable.CodexThreadID,
+		ModelGeneration:             durable.ModelGeneration,
+		Cwd:                         durable.Cwd,
+		ModelProfile:                durable.ModelProfile,
+		PendingModelProfile:         durable.PendingModelProfile,
+		ModelSelectionSource:        durable.ModelSelectionSource,
+		PendingModelSelectionSource: durable.PendingModelSelectionSource,
+		PendingModelRequestedAt:     durable.PendingModelRequestedAt,
+		PendingReasoningEffort:      durable.PendingReasoningEffort,
+		PendingReasoningSource:      durable.PendingReasoningSource,
+		ReasoningEffort:             durable.ReasoningEffort,
+		ReasoningEffortSource:       durable.ReasoningEffortSource,
+		CreatedAt:                   durable.CreatedAt,
+		UpdatedAt:                   durable.UpdatedAt,
 	}
 }
 
@@ -7315,6 +7328,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		Status:                "active",
 		Cwd:                   parsed.WorkDir,
 		ModelProfile:          parsed.ModelProfileSnapshot,
+		ModelSelectionSource:  boolModelSelectionSource(parsed.ModelProfileExplicit),
 		ReasoningEffort:       effort,
 		ReasoningEffortSource: effortSource,
 		CreatedAt:             now,
@@ -7343,6 +7357,13 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	return b.sendControl(ctx, fmt.Sprintf("✅ Work chat created: %s\n\nOpen this Teams link and send your task there:\n%s\n\nIf Teams does not show it right away, search for: %s", session.ID, session.ChatURL, session.ID))
 }
 
+func boolModelSelectionSource(explicit bool) string {
+	if explicit {
+		return modelSelectionSourceChatOverride
+	}
+	return modelSelectionSourceGlobalDefault
+}
+
 func (b *Bridge) controlCommandAlreadyHandled(ctx context.Context, msg ChatMessage, source string) (bool, error) {
 	if b == nil || b.store == nil || strings.TrimSpace(msg.ID) == "" || strings.TrimSpace(b.reg.ControlChatID) == "" {
 		return false, nil
@@ -7366,6 +7387,7 @@ type newSessionRequest struct {
 	BeaconProfile        string
 	BeaconIsolation      string
 	ModelProfile         string
+	ModelProfileExplicit bool
 	ModelProfileSnapshot modelprofile.Snapshot
 }
 
@@ -7405,6 +7427,7 @@ func (b *Bridge) parseNewSessionRequest(ctx context.Context, raw string) (newSes
 		return newSessionRequest{}, err
 	}
 	parsed.ModelProfileSnapshot = snapshot
+	parsed.ModelProfileExplicit = strings.TrimSpace(parsed.ModelProfile) != ""
 	return parsed, nil
 }
 
@@ -12466,7 +12489,9 @@ func registrySessionsEqual(left Session, right Session) bool {
 		left.Cwd == right.Cwd &&
 		left.ReasoningEffort == right.ReasoningEffort &&
 		left.ReasoningEffortSource == right.ReasoningEffortSource &&
+		left.ModelSelectionSource == right.ModelSelectionSource &&
 		modelProfileSnapshotsEqual(left.PendingModelProfile, right.PendingModelProfile) &&
+		left.PendingModelSelectionSource == right.PendingModelSelectionSource &&
 		left.PendingModelRequestedAt.Equal(right.PendingModelRequestedAt) &&
 		left.PendingReasoningEffort == right.PendingReasoningEffort &&
 		left.PendingReasoningSource == right.PendingReasoningSource &&
@@ -12601,25 +12626,27 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 				updated = created
 			}
 			state.Sessions[session.ID] = teamstore.SessionContext{
-				ID:                      session.ID,
-				Status:                  status,
-				TeamsChatID:             session.ChatID,
-				TeamsChatURL:            session.ChatURL,
-				TeamsTopic:              session.Topic,
-				UserTitle:               session.UserTitle,
-				TitleSource:             session.TitleSource,
-				CodexThreadID:           session.CodexThreadID,
-				ModelGeneration:         session.ModelGeneration,
-				Cwd:                     session.Cwd,
-				ModelProfile:            session.ModelProfile,
-				PendingModelProfile:     session.PendingModelProfile,
-				PendingModelRequestedAt: session.PendingModelRequestedAt,
-				PendingReasoningEffort:  session.PendingReasoningEffort,
-				PendingReasoningSource:  session.PendingReasoningSource,
-				ReasoningEffort:         session.ReasoningEffort,
-				ReasoningEffortSource:   session.ReasoningEffortSource,
-				CreatedAt:               created,
-				UpdatedAt:               updated,
+				ID:                          session.ID,
+				Status:                      status,
+				TeamsChatID:                 session.ChatID,
+				TeamsChatURL:                session.ChatURL,
+				TeamsTopic:                  session.Topic,
+				UserTitle:                   session.UserTitle,
+				TitleSource:                 session.TitleSource,
+				CodexThreadID:               session.CodexThreadID,
+				ModelGeneration:             session.ModelGeneration,
+				Cwd:                         session.Cwd,
+				ModelProfile:                session.ModelProfile,
+				ModelSelectionSource:        session.ModelSelectionSource,
+				PendingModelProfile:         session.PendingModelProfile,
+				PendingModelSelectionSource: session.PendingModelSelectionSource,
+				PendingModelRequestedAt:     session.PendingModelRequestedAt,
+				PendingReasoningEffort:      session.PendingReasoningEffort,
+				PendingReasoningSource:      session.PendingReasoningSource,
+				ReasoningEffort:             session.ReasoningEffort,
+				ReasoningEffortSource:       session.ReasoningEffortSource,
+				CreatedAt:                   created,
+				UpdatedAt:                   updated,
 			}
 			changed = true
 		}
@@ -12720,26 +12747,28 @@ func (b *Bridge) ensureDurableSession(ctx context.Context, session *Session) err
 		status = teamstore.SessionStatusArchived
 	}
 	_, _, err := b.store.CreateSession(ctx, teamstore.SessionContext{
-		ID:                      session.ID,
-		Status:                  status,
-		TeamsChatID:             session.ChatID,
-		TeamsChatURL:            session.ChatURL,
-		TeamsTopic:              session.Topic,
-		UserTitle:               session.UserTitle,
-		TitleSource:             session.TitleSource,
-		CodexThreadID:           session.CodexThreadID,
-		ModelGeneration:         session.ModelGeneration,
-		RunnerKind:              "executor",
-		Cwd:                     session.Cwd,
-		ModelProfile:            session.ModelProfile,
-		PendingModelProfile:     session.PendingModelProfile,
-		PendingModelRequestedAt: session.PendingModelRequestedAt,
-		PendingReasoningEffort:  session.PendingReasoningEffort,
-		PendingReasoningSource:  session.PendingReasoningSource,
-		ReasoningEffort:         session.ReasoningEffort,
-		ReasoningEffortSource:   session.ReasoningEffortSource,
-		CreatedAt:               session.CreatedAt,
-		UpdatedAt:               session.UpdatedAt,
+		ID:                          session.ID,
+		Status:                      status,
+		TeamsChatID:                 session.ChatID,
+		TeamsChatURL:                session.ChatURL,
+		TeamsTopic:                  session.Topic,
+		UserTitle:                   session.UserTitle,
+		TitleSource:                 session.TitleSource,
+		CodexThreadID:               session.CodexThreadID,
+		ModelGeneration:             session.ModelGeneration,
+		RunnerKind:                  "executor",
+		Cwd:                         session.Cwd,
+		ModelProfile:                session.ModelProfile,
+		ModelSelectionSource:        session.ModelSelectionSource,
+		PendingModelProfile:         session.PendingModelProfile,
+		PendingModelSelectionSource: session.PendingModelSelectionSource,
+		PendingModelRequestedAt:     session.PendingModelRequestedAt,
+		PendingReasoningEffort:      session.PendingReasoningEffort,
+		PendingReasoningSource:      session.PendingReasoningSource,
+		ReasoningEffort:             session.ReasoningEffort,
+		ReasoningEffortSource:       session.ReasoningEffortSource,
+		CreatedAt:                   session.CreatedAt,
+		UpdatedAt:                   session.UpdatedAt,
 	})
 	return err
 }
@@ -15203,6 +15232,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		CodexThreadID:         local.SessionID,
 		Cwd:                   firstNonEmptyString(local.ProjectPath, project.Path),
 		ModelProfile:          modelSnapshot,
+		ModelSelectionSource:  modelSelectionSourceGlobalDefault,
 		ReasoningEffort:       effort,
 		ReasoningEffortSource: effortSource,
 		CreatedAt:             now,

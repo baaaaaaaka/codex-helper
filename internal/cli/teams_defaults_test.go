@@ -53,7 +53,7 @@ func TestTeamsDefaultManagerUsesRegistryAndAtomicallyReconcilesModelEffort(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(status, "Global defaults") || !strings.Contains(status, "official:gpt-a") || !strings.Contains(status, "high") {
+	if !strings.Contains(status, "Global defaults (Control chat only)") || !strings.Contains(status, "Scope: future Codex launches") || !strings.Contains(status, "official:gpt-a") || !strings.Contains(status, "Effective for future launches") || !strings.Contains(status, "high") {
 		t.Fatalf("status = %q", status)
 	}
 
@@ -61,7 +61,7 @@ func TestTeamsDefaultManagerUsesRegistryAndAtomicallyReconcilesModelEffort(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(message, "reset to `medium`") || !strings.Contains(message, "this Control chat is unchanged") {
+	if !strings.Contains(message, "reset to `medium`") || !strings.Contains(message, "Previous selector: `official:gpt-a`") || !strings.Contains(message, "this Control chat is unchanged") {
 		t.Fatalf("model set message = %q", message)
 	}
 	cfg, err := store.Load()
@@ -132,7 +132,7 @@ func TestTeamsDefaultManagerLegacyConfigKeepsRuntimeEffortFallback(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(status, "runtime fallback") || !strings.Contains(status, "inherited_runtime") {
+	if !strings.Contains(status, "runtime fallback") || !strings.Contains(status, "Source: Codex runtime fallback") {
 		t.Fatalf("legacy effort status = %q", status)
 	}
 }

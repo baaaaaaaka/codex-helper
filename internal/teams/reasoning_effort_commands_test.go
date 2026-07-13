@@ -154,7 +154,7 @@ func TestReasoningEffortUsesExecutorDefaultUntilChatOverridesIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if !strings.Contains(status, "Reasoning effort: `medium`") || !strings.Contains(status, "Source: `executor_default`") {
+	if !strings.Contains(status, "Effective for next turn: `medium`") || !strings.Contains(status, "Source: Codex runtime default") {
 		t.Fatalf("status did not report executor default:\n%s", status)
 	}
 }

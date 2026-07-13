@@ -242,11 +242,12 @@ func TestSaveRegistryMergesProjectionState(t *testing.T) {
 		UserID:        "user-1",
 		ControlChatID: "control-chat",
 		Sessions: []Session{{
-			ID:            "s001",
-			ChatID:        "chat-1",
-			Status:        "active",
-			CodexThreadID: "thread-old",
-			ModelProfile:  modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "secret:model-profile/mimo25/api-key", Revision: 2},
+			ID:                   "s001",
+			ChatID:               "chat-1",
+			Status:               "active",
+			CodexThreadID:        "thread-old",
+			ModelProfile:         modelprofile.Snapshot{Name: "mimo25", Provider: "mimo", APIKeyRef: "secret:model-profile/mimo25/api-key", Revision: 2},
+			ModelSelectionSource: modelSelectionSourceChatOverride,
 		}},
 		Chats: map[string]ChatState{
 			"chat-1": {
@@ -281,7 +282,7 @@ func TestSaveRegistryMergesProjectionState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadRegistry error: %v", err)
 	}
-	if session := merged.SessionByID("s001"); session == nil || session.CodexThreadID != "thread-old" {
+	if session := merged.SessionByID("s001"); session == nil || session.CodexThreadID != "thread-old" || session.ModelSelectionSource != modelSelectionSourceChatOverride {
 		t.Fatalf("merged session = %#v, want existing thread preserved", session)
 	}
 	if session := merged.SessionByID("s001"); session == nil || session.ModelProfile.Name != "mimo25" || session.ModelProfile.Revision != 2 {
@@ -304,6 +305,28 @@ func TestSaveRegistryMergesProjectionState(t *testing.T) {
 	}
 	if session := updated.SessionByID("s001"); session == nil || session.CodexThreadID != "thread-new" {
 		t.Fatalf("updated session = %#v, want durable projection thread-new", session)
+	}
+}
+
+func TestRegistrySessionsEqualIncludesModelSelectionSources(t *testing.T) {
+	base := Session{
+		ID:                          "s001",
+		ChatID:                      "chat-1",
+		Status:                      "active",
+		ModelSelectionSource:        modelSelectionSourceGlobalDefault,
+		PendingModelSelectionSource: modelSelectionSourceChatOverride,
+	}
+
+	changedCurrent := base
+	changedCurrent.ModelSelectionSource = modelSelectionSourceChatOverride
+	if registrySessionsEqual(base, changedCurrent) {
+		t.Fatal("registrySessionsEqual ignored current model selection source")
+	}
+
+	changedPending := base
+	changedPending.PendingModelSelectionSource = modelSelectionSourceGlobalDefault
+	if registrySessionsEqual(base, changedPending) {
+		t.Fatal("registrySessionsEqual ignored pending model selection source")
 	}
 }
 

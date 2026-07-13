@@ -123,6 +123,7 @@ func (b *Bridge) setSessionReasoningEffort(ctx context.Context, session *Session
 	}
 	b.reasoningEffortMu.Lock()
 	defer b.reasoningEffortMu.Unlock()
+	previous := strings.TrimSpace(session.ReasoningEffort)
 	now := time.Now()
 	if b.store != nil {
 		updated, _, err := b.store.UpdateSessionContext(ctx, session.ID, func(current teamstore.SessionContext, found bool, mutationTime time.Time) (teamstore.SessionContext, bool, error) {
@@ -170,7 +171,7 @@ func (b *Bridge) setSessionReasoningEffort(ctx context.Context, session *Session
 	if model == "" {
 		model = "current model"
 	}
-	return fmt.Sprintf("Reasoning effort for this chat: `%s`\nModel: `%s`\nApplies to new turns queued after this command; running or already queued turns keep their captured effort.", effort, model), nil
+	return fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: `%s`\nEffective for next turn: `%s`\nModel: `%s`\nSource: %s\nApplies to new turns in this chat; running or already queued turns keep their captured effort.", reasoningEffortChatKind(session), firstNonEmptyString(previous, "unset"), effort, model, reasoningEffortSourceLabel(source)), nil
 }
 
 func formatReasoningEffortStatus(session *Session, executor Executor, catalog ReasoningEffortCatalog, catalogErr error) string {
@@ -184,14 +185,16 @@ func formatReasoningEffortStatus(session *Session, executor Executor, catalog Re
 		}
 	}
 	lines := []string{
-		"Reasoning effort: `" + effort + "`",
-		"Source: `" + source + "`",
+		"Current chat effort (" + reasoningEffortChatKind(session) + ")",
+		"Effective for next turn: `" + effort + "`",
+		"Source: " + reasoningEffortSourceLabel(source),
+		"Applies to: new turns in this chat; running and already queued turns keep their captured effort.",
 	}
 	if model := strings.TrimSpace(catalog.Model); model != "" {
-		lines = append(lines, "Model: `"+model+"`")
+		lines = append(lines, "Model for this chat: `"+model+"`")
 	}
 	if catalog.DefaultEffort != "" {
-		lines = append(lines, "Model default: `"+catalog.DefaultEffort+"`")
+		lines = append(lines, "Model-advertised default: `"+catalog.DefaultEffort+"`")
 	}
 	if len(catalog.Options) > 0 {
 		lines = append(lines, "Available: "+reasoningEffortOptionNames(catalog.Options))
@@ -204,7 +207,7 @@ func formatReasoningEffortStatus(session *Session, executor Executor, catalog Re
 
 func formatReasoningEffortCatalog(session *Session, executor Executor, catalog ReasoningEffortCatalog) string {
 	model := firstNonEmptyString(catalog.DisplayName, catalog.Model, "current model")
-	lines := []string{"Reasoning efforts for " + model + ":"}
+	lines := []string{"Current chat effort choices for " + model + ":"}
 	current := effectiveSessionReasoningEffortWithExecutor(session, executor)
 	for _, option := range catalog.Options {
 		markers := []string{}
@@ -212,7 +215,7 @@ func formatReasoningEffortCatalog(session *Session, executor Executor, catalog R
 			markers = append(markers, "current")
 		}
 		if strings.EqualFold(option.Effort, catalog.DefaultEffort) {
-			markers = append(markers, "model default")
+			markers = append(markers, "model-advertised default")
 		}
 		line := "- `" + option.Effort + "`"
 		if len(markers) > 0 {
@@ -235,6 +238,13 @@ func reasoningEffortOptionNames(options []ReasoningEffortOption) string {
 		}
 	}
 	return strings.Join(names, ", ")
+}
+
+func reasoningEffortChatKind(session *Session) string {
+	if session != nil && isControlFallbackSessionID(session.ID) {
+		return "Control"
+	}
+	return "Work"
 }
 
 func reasoningEffortUsage() string {

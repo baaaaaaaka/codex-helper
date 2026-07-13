@@ -32,25 +32,27 @@ type Registry struct {
 }
 
 type Session struct {
-	ID                      string                `json:"id"`
-	ChatID                  string                `json:"chat_id"`
-	ChatURL                 string                `json:"chat_url,omitempty"`
-	Topic                   string                `json:"topic"`
-	UserTitle               string                `json:"user_title,omitempty"`
-	TitleSource             string                `json:"title_source,omitempty"`
-	Status                  string                `json:"status"`
-	CodexThreadID           string                `json:"codex_thread_id,omitempty"`
-	ModelGeneration         int                   `json:"model_generation,omitempty"`
-	Cwd                     string                `json:"cwd,omitempty"`
-	ModelProfile            modelprofile.Snapshot `json:"model_profile,omitempty"`
-	PendingModelProfile     modelprofile.Snapshot `json:"pending_model_profile,omitempty"`
-	PendingModelRequestedAt time.Time             `json:"pending_model_requested_at,omitempty"`
-	PendingReasoningEffort  string                `json:"pending_reasoning_effort,omitempty"`
-	PendingReasoningSource  string                `json:"pending_reasoning_source,omitempty"`
-	ReasoningEffort         string                `json:"reasoning_effort,omitempty"`
-	ReasoningEffortSource   string                `json:"reasoning_effort_source,omitempty"`
-	CreatedAt               time.Time             `json:"created_at"`
-	UpdatedAt               time.Time             `json:"updated_at"`
+	ID                          string                `json:"id"`
+	ChatID                      string                `json:"chat_id"`
+	ChatURL                     string                `json:"chat_url,omitempty"`
+	Topic                       string                `json:"topic"`
+	UserTitle                   string                `json:"user_title,omitempty"`
+	TitleSource                 string                `json:"title_source,omitempty"`
+	Status                      string                `json:"status"`
+	CodexThreadID               string                `json:"codex_thread_id,omitempty"`
+	ModelGeneration             int                   `json:"model_generation,omitempty"`
+	Cwd                         string                `json:"cwd,omitempty"`
+	ModelProfile                modelprofile.Snapshot `json:"model_profile,omitempty"`
+	ModelSelectionSource        string                `json:"model_selection_source,omitempty"`
+	PendingModelProfile         modelprofile.Snapshot `json:"pending_model_profile,omitempty"`
+	PendingModelSelectionSource string                `json:"pending_model_selection_source,omitempty"`
+	PendingModelRequestedAt     time.Time             `json:"pending_model_requested_at,omitempty"`
+	PendingReasoningEffort      string                `json:"pending_reasoning_effort,omitempty"`
+	PendingReasoningSource      string                `json:"pending_reasoning_source,omitempty"`
+	ReasoningEffort             string                `json:"reasoning_effort,omitempty"`
+	ReasoningEffortSource       string                `json:"reasoning_effort_source,omitempty"`
+	CreatedAt                   time.Time             `json:"created_at"`
+	UpdatedAt                   time.Time             `json:"updated_at"`
 }
 
 type ChatState struct {
@@ -231,6 +233,12 @@ func mergeRegistrySessions(existing []Session, next []Session) []Session {
 			}
 			if session.ModelProfile.IsZero() {
 				session.ModelProfile = existingSession.ModelProfile
+			}
+			if strings.TrimSpace(session.ModelSelectionSource) == "" {
+				session.ModelSelectionSource = existingSession.ModelSelectionSource
+			}
+			if strings.TrimSpace(session.PendingModelSelectionSource) == "" {
+				session.PendingModelSelectionSource = existingSession.PendingModelSelectionSource
 			}
 		}
 		merged = append(merged, session)

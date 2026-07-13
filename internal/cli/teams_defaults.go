@@ -25,13 +25,21 @@ func (m teamsModelProfileManager) defaultSettingSpecs() []teamsDefaultSettingSpe
 	return []teamsDefaultSettingSpec{
 		{
 			key: "model", aliases: []string{"model-profile"}, description: "model used by future launches and sessions",
-			status: m.globalDefaultModelStatus, list: m.ListModelProfiles, set: m.setGlobalDefaultModel, reset: m.resetGlobalDefaultModel,
+			status: m.globalDefaultModelStatus, list: m.globalDefaultModelList, set: m.setGlobalDefaultModel, reset: m.resetGlobalDefaultModel,
 		},
 		{
 			key: "effort", aliases: []string{"reasoning-effort", "thinking-effort"}, description: "reasoning effort used by future launches and sessions",
 			status: m.globalDefaultEffortStatus, list: m.globalDefaultEffortList, set: m.setGlobalDefaultEffort, reset: m.resetGlobalDefaultEffort,
 		},
 	}
+}
+
+func (m teamsModelProfileManager) globalDefaultModelList(ctx context.Context) (string, error) {
+	profiles, err := m.ListModelProfiles(ctx)
+	if err != nil {
+		return "", err
+	}
+	return "Global default model choices\nScope: future launches and newly created chats; existing chats are unchanged.\n\n" + profiles, nil
 }
 
 func (m teamsModelProfileManager) HandleDefaultCommand(ctx context.Context, command teams.DefaultCommand) (string, error) {
@@ -43,7 +51,11 @@ func (m teamsModelProfileManager) HandleDefaultCommand(ctx context.Context, comm
 		if command.Action != teams.DefaultCommandStatus {
 			return globalDefaultCommandUsage(specs, ""), nil
 		}
-		lines := []string{"Global defaults", "Applies to future launches and newly created chats; existing chats remain unchanged."}
+		lines := []string{
+			"Global defaults (Control chat only)",
+			"Scope: future Codex launches and newly created chats.",
+			"Does not change: this Control chat or existing Work chats.",
+		}
 		for _, spec := range specs {
 			status, err := spec.status(ctx)
 			if err != nil {
@@ -163,15 +175,38 @@ func (m teamsModelProfileManager) globalDefaultModelStatus(ctx context.Context) 
 		return "", err
 	}
 	return strings.Join([]string{
-		"Model",
-		"Configured: `" + selector + "`",
-		"Effective: `" + defaultSnapshotLabel(snapshot) + "`",
-		"Source: `" + source + "`",
+		"Global default model",
+		"Configured selector: `" + selector + "`",
+		"Effective for future launches: `" + defaultSnapshotLabel(snapshot) + "`",
+		"Provider: `" + defaultSnapshotProviderLabel(snapshot) + "`",
+		"Source: " + globalDefaultModelSourceLabel(source),
+		"Applies to: future launches and newly created chats; existing chats are unchanged.",
 	}, "\n"), nil
 }
 
 func defaultSnapshotLabel(snapshot modelprofile.Snapshot) string {
+	if snapshot.IsDefault() && strings.TrimSpace(firstNonEmptyCLI(snapshot.Model, snapshot.DefaultModel)) == "" {
+		return "Codex account default (exact slug unavailable)"
+	}
 	return firstNonEmptyCLI(strings.TrimSpace(snapshot.Model), strings.TrimSpace(snapshot.DefaultModel), strings.TrimSpace(snapshot.Name), config.DefaultModelProfileName)
+}
+
+func defaultSnapshotProviderLabel(snapshot modelprofile.Snapshot) string {
+	if snapshot.IsDefault() {
+		return "Codex Official"
+	}
+	return firstNonEmptyCLI(strings.TrimSpace(snapshot.Provider), "configured provider")
+}
+
+func globalDefaultModelSourceLabel(source string) string {
+	switch strings.TrimSpace(source) {
+	case "explicit":
+		return "global override"
+	case "legacy_default_model_profile":
+		return "legacy global override (compatibility fallback)"
+	default:
+		return "Codex account default"
+	}
 }
 
 func canonicalGlobalModelSelector(snapshot modelprofile.Snapshot) string {
@@ -231,6 +266,7 @@ func (m teamsModelProfileManager) setGlobalDefaultModel(ctx context.Context, val
 	if err != nil {
 		return "", err
 	}
+	previousSelector := validatedConfig.EffectiveDefaultModelSelector()
 	snapshot, err := m.defaultModelResolver()(ctx, requested)
 	if err != nil {
 		return "", err
@@ -271,6 +307,8 @@ func (m teamsModelProfileManager) setGlobalDefaultModel(ctx context.Context, val
 	}
 	lines := []string{
 		"Global default model: `" + selector + "`",
+		"Previous selector: `" + previousSelector + "`",
+		"Effective value for future launches: `" + defaultSnapshotLabel(snapshot) + "`",
 		"Applies to future launches and newly created chats; this Control chat is unchanged.",
 	}
 	if effortNotice != "" {
@@ -287,6 +325,10 @@ func (m teamsModelProfileManager) resetGlobalDefaultModel(ctx context.Context) (
 	store, err := m.store()
 	if err != nil {
 		return "", err
+	}
+	previousSelector := ""
+	if cfg, loadErr := store.Load(); loadErr == nil {
+		previousSelector = cfg.EffectiveDefaultModelSelector()
 	}
 	effortNotice := ""
 	if err := store.Update(func(cfg *config.Config) error {
@@ -305,7 +347,7 @@ func (m teamsModelProfileManager) resetGlobalDefaultModel(ctx context.Context) (
 	}); err != nil {
 		return "", err
 	}
-	message := "Global default model reset to the built-in Codex default. Existing chats are unchanged."
+	message := "Global default model reset to the built-in Codex account default. Previous selector: `" + previousSelector + "`. Scope: future launches and newly created chats; existing chats are unchanged."
 	if effortNotice != "" {
 		message += "\n" + effortNotice
 	}
@@ -374,12 +416,24 @@ func (m teamsModelProfileManager) globalDefaultEffortStatus(ctx context.Context)
 		}
 	}
 	return strings.Join([]string{
-		"Effort",
+		"Global default effort",
 		"Configured: `" + firstNonEmptyCLI(explicit, "unset") + "`",
-		"Effective: `" + effective + "`",
+		"Effective for future launches: `" + effective + "`",
 		"Model: `" + defaultSnapshotLabel(snapshot) + "`",
-		"Source: `" + source + "`",
+		"Source: " + globalDefaultEffortSourceLabel(source),
+		"Applies to: future launches and newly created chats; existing chats are unchanged.",
 	}, "\n"), nil
+}
+
+func globalDefaultEffortSourceLabel(source string) string {
+	switch strings.TrimSpace(source) {
+	case "explicit":
+		return "global override"
+	case "model_default":
+		return "model-advertised default"
+	default:
+		return "Codex runtime fallback"
+	}
 }
 
 func (m teamsModelProfileManager) globalDefaultEffortList(ctx context.Context) (string, error) {
@@ -392,14 +446,17 @@ func (m teamsModelProfileManager) globalDefaultEffortList(ctx context.Context) (
 		return "", fmt.Errorf("model %q did not advertise reasoning effort choices", defaultSnapshotLabel(snapshot))
 	}
 	current := cfg.ExplicitDefaultReasoningEffort()
-	lines := []string{"Global default effort choices for `" + defaultSnapshotLabel(snapshot) + "`:"}
+	lines := []string{
+		"Global default effort choices for `" + defaultSnapshotLabel(snapshot) + "`",
+		"Scope: future launches and newly created chats; existing chats are unchanged.",
+	}
 	for _, option := range options {
 		markers := []string{}
 		if strings.EqualFold(option, current) {
-			markers = append(markers, "configured")
+			markers = append(markers, "global override")
 		}
 		if strings.EqualFold(option, modelDefault) {
-			markers = append(markers, "model default")
+			markers = append(markers, "model-advertised default")
 		}
 		line := "- `" + option + "`"
 		if len(markers) > 0 {
@@ -416,6 +473,7 @@ func (m teamsModelProfileManager) setGlobalDefaultEffort(ctx context.Context, va
 		return "", err
 	}
 	options, _ := snapshotReasoningEfforts(snapshot)
+	previousEffort := validatedConfig.ExplicitDefaultReasoningEffort()
 	requested := strings.TrimSpace(value)
 	var canonical string
 	for _, option := range options {
@@ -444,13 +502,17 @@ func (m teamsModelProfileManager) setGlobalDefaultEffort(ctx context.Context, va
 	}); err != nil {
 		return "", err
 	}
-	return "Global default effort: `" + canonical + "`\nApplies to future launches and newly created chats; existing chats are unchanged.", nil
+	return "Global default effort: `" + canonical + "`\nPrevious configured effort: `" + firstNonEmptyCLI(previousEffort, "unset") + "`\nScope: future launches and newly created chats; existing chats are unchanged.", nil
 }
 
 func (m teamsModelProfileManager) resetGlobalDefaultEffort(ctx context.Context) (string, error) {
 	store, err := m.store()
 	if err != nil {
 		return "", err
+	}
+	previousEffort := ""
+	if cfg, loadErr := store.Load(); loadErr == nil {
+		previousEffort = cfg.ExplicitDefaultReasoningEffort()
 	}
 	if err := store.Update(func(cfg *config.Config) error {
 		if cfg.Defaults != nil {
@@ -462,7 +524,7 @@ func (m teamsModelProfileManager) resetGlobalDefaultEffort(ctx context.Context) 
 		return "", err
 	}
 	_ = ctx
-	return "Global default effort reset to the inherited runtime/model fallback. Existing chats are unchanged.", nil
+	return "Global default effort reset (previous configured effort: `" + firstNonEmptyCLI(previousEffort, "unset") + "`). Future launches will use the selected model's advertised default when available, otherwise the Codex runtime fallback. Existing chats are unchanged.", nil
 }
 
 func (m teamsModelProfileManager) ResolveDefaultReasoningEffort(ctx context.Context, snapshot modelprofile.Snapshot) (string, string, error) {

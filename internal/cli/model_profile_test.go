@@ -305,13 +305,13 @@ func TestTeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels(t *testing
 	}
 	for _, want := range []string{
 		"Verified models",
-		"current default: GPT-5.6-Sol (`gpt-5.6-sol`)",
-		"official default: GPT-5.6-Sol (`gpt-5.6-sol`)",
+		"global default: GPT-5.6-Sol (`gpt-5.6-sol`)",
+		"Codex account default: GPT-5.6-Sol (`gpt-5.6-sol`)",
 		"Official Codex models",
-		"GPT-5.6-Sol (`gpt-5.6-sol`) [official default] effort=low",
+		"GPT-5.6-Sol (`gpt-5.6-sol`) [account default] effort=low",
 		"GPT-5.6-Luna (`gpt-5.6-luna`) effort=medium",
 		"Verified third-party profiles",
-		"verified: MiMo 2.5",
+		"verified: MiMo 2.5 (MiMo, model `mimo/mimo-v2.5`, selector `profile:verified`) [verified]",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("list missing %q:\n%s", want, out)
@@ -332,7 +332,7 @@ func TestTeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "current default: MiMo 2.5 (`verified`)") || !strings.Contains(out, "official default: GPT-5.6-Sol (`gpt-5.6-sol`)") {
+	if !strings.Contains(out, "global default: MiMo 2.5") || !strings.Contains(out, "Codex account default: GPT-5.6-Sol (`gpt-5.6-sol`)") {
 		t.Fatalf("third-party default is ambiguous:\n%s", out)
 	}
 }
@@ -887,7 +887,7 @@ func TestModelListShowsDisplayNamesAndCustomDefaultModel(t *testing.T) {
 	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model", "list")
 	for _, want := range []string{
 		"DeepSeek V4 Pro",
-		"* 3. deepseek-v4-pro",
+		"[global default] 3. deepseek-v4-pro",
 		"ready (profile deepseek-work)",
 		"MiMo 2.5 Pro",
 	} {

@@ -8370,6 +8370,36 @@ func TestBridgeControlFallbackPinsDefaultModelProfileSnapshot(t *testing.T) {
 	}
 }
 
+func TestBridgeControlFallbackLabelsLegacySelectionSourceWithoutGuessing(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	legacy := modelprofile.Snapshot{Name: "legacy", Provider: "mimo", Model: "mimo/legacy", Revision: 3}
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{
+		ID:           controlFallbackSessionID,
+		Status:       teamstore.SessionStatusActive,
+		RunnerKind:   "control_fallback",
+		Model:        "legacy",
+		ModelProfile: legacy,
+	}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	bridge.modelProfileResolver = func(context.Context, string) (modelprofile.Snapshot, error) {
+		return modelprofile.Snapshot{Name: "new-global", Provider: modelprofile.DefaultProvider, Model: "gpt-new", Revision: 1}, nil
+	}
+
+	session, err := bridge.ensureControlFallbackSession(ctx)
+	if err != nil {
+		t.Fatalf("ensureControlFallbackSession: %v", err)
+	}
+	if session.ModelProfile.Model != legacy.Model {
+		t.Fatalf("legacy control model changed: %#v", session.ModelProfile)
+	}
+	if session.ModelSelectionSource != modelSelectionSourceLegacy {
+		t.Fatalf("legacy selection source = %q, want %q", session.ModelSelectionSource, modelSelectionSourceLegacy)
+	}
+}
+
 func TestBridgeControlMixedMessageReferenceAndFileIsRejectedWithoutCodex(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)

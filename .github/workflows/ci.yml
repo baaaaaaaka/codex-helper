@@ -359,6 +359,14 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsDefault|PinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults|TeamsCodexExecutor(SwitchesProfileRunnerWithoutChangingThread|ReturnToBaseProfileUsesFreshGenerationRunner|ReclaimsPreviousSessionGenerationRunner)|Sanitize(Official|ThirdParty)ResponsesHistory)' -v
           go test ./internal/teams -count=1 -run 'Test(ParseDefaultCommand|DefaultCommandWorkChatMessageIsExplicitlyControlOnly|GlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated|BridgeModelProfileSwitch|BridgePendingModelSwitch|BridgeModelSwitchSerializesWithQueueTurn)' -v
 
+      - name: Teams model/default/effort presentation and persistence contracts
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/teams -count=1 -run 'Test(ModelNaturalLanguageListRequestRoutesInControlAndWorkChats|ModelControlCommandsOperateOnControlSessionNotGlobalDefault|ModelListPutsCurrentChatBeforeGlobalDefaultAndVerifiedCatalog|ModelStatusShowsCapturedQueuedModelSeparatelyFromNextChatModel|SaveRegistryMergesProjectionState)$' -v
+          go test ./internal/cli -count=1 -run 'Test(ModelListShowsDisplayNamesAndCustomDefaultModel|TeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels|TeamsDefaultManagerUsesRegistryAndAtomicallyReconcilesModelEffort|TeamsDefaultManagerLegacyConfigKeepsRuntimeEffortFallback)$' -v
+
       - name: Codex streaming transcript visibility regressions
         if: matrix.shard == 'core'
         shell: bash
