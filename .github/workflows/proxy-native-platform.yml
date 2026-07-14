@@ -1,0 +1,131 @@
+name: Proxy native platform validation
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      run_edge:
+        description: "Run the installed Microsoft Edge effective-proxy smoke on the Windows runner"
+        required: false
+        default: false
+        type: boolean
+      run_wsl:
+        description: "Run the WSL2 NAT/forwarding live proxy smoke on the Windows runner"
+        required: false
+        default: false
+        type: boolean
+      wsl_mode:
+        description: "WSL2 boundary mode: nat uses the gateway and wildcard bind; mirrored uses the production loopback bind"
+        required: false
+        default: nat
+        type: choice
+        options: [nat, mirrored]
+      run_native_lint:
+        description: "Run plutil/PowerShell native supervisor definition lint"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxy-native-platform
+  cancel-in-progress: false
+
+jobs:
+  macos-native:
+    name: macOS native proxy validation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise both hosted macOS architectures without requiring a
+        # repository-owned runner. Pin the generation so image migration does
+        # not silently change the native process semantics under test.
+        os: [macos-15, macos-15-intel]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+      - name: Native supervisor and unprivileged resume matrix
+        shell: bash
+        env:
+          CODEX_HELPER_PROXY_NATIVE_LINT: ${{ github.event_name != 'workflow_dispatch' || inputs.run_native_lint }}
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+
+  windows-native:
+    name: Windows native proxy validation
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+      - name: Native supervisor and Windows raw CONNECT validation
+        shell: pwsh
+        env:
+          CODEX_HELPER_PROXY_NATIVE_LINT: ${{ github.event_name != 'workflow_dispatch' || inputs.run_native_lint }}
+          RUN_EDGE: ${{ github.event_name == 'schedule' || inputs.run_edge }}
+          RUN_WSL: ${{ github.event_name == 'schedule' || inputs.run_wsl }}
+          WSL_MODE: ${{ inputs.wsl_mode || 'nat' }}
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          $ErrorActionPreference = "Stop"
+          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+          go test ./internal/cli -count=1 -run '^TestWindowsProxyReachabilityScriptExecutesAgainstLiveProxy$' -v
+          if ($env:RUN_EDGE -eq 'true') {
+            $edgeCandidates = @(
+              "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+              "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+              "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
+            )
+            if (-not ($edgeCandidates | Where-Object { Test-Path -LiteralPath $_ })) {
+              Write-Warning "Microsoft Edge is not available on this GitHub-hosted Windows image; skipping the effective-proxy test"
+              exit 0
+            }
+            $env:CODEX_HELPER_LIVE_EDGE_PROXY_TEST = "1"
+            go test ./internal/cli -count=1 -run '^TestWindowsEdgeActuallyUsesProxyForHTTP$' -v -timeout=60s
+          }
+          if ($env:RUN_WSL -eq 'true') {
+            $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+            if ($null -eq $wsl) {
+              Write-Warning "WSL2 is not available on this GitHub-hosted Windows image; skipping the WSL boundary test"
+              exit 0
+            }
+            $distros = @(& wsl.exe -l -q 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($LASTEXITCODE -ne 0 -or $distros.Count -eq 0) {
+              Write-Warning "No WSL2 distribution is available on this GitHub-hosted runner; skipping the WSL boundary test"
+              exit 0
+            }
+            $curl = @(& wsl.exe -e sh -lc "command -v curl" 2>$null)
+            if ($LASTEXITCODE -ne 0 -or $curl.Count -eq 0) {
+              Write-Warning "WSL2 curl is not available on this GitHub-hosted runner; skipping the WSL boundary test"
+              exit 0
+            }
+            $env:CODEX_HELPER_LIVE_WSL_PROXY_TEST = "1"
+            $env:CODEX_HELPER_LIVE_WSL_MODE = $env:WSL_MODE
+            go test ./internal/cli -count=1 -run '^TestWindowsWSL2CanReachLiveProxy$' -v -timeout=60s
+          }

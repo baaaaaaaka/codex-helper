@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -53,6 +54,78 @@ func TestInstanceRecordHeartbeatRemove(t *testing.T) {
 	cfg, _ = store.Load()
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("expected empty instances, got %#v", cfg.Instances)
+	}
+}
+
+func TestOwnedInstanceOpsFenceStaleDaemon(t *testing.T) {
+	dir := t.TempDir()
+	store, err := config.NewStore(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	inst := config.Instance{
+		ID:          "owned-1",
+		ProfileID:   "p1",
+		OwnerToken:  "owner-a",
+		BrokerEpoch: "epoch-a",
+		LastSeenAt:  time.Unix(1, 0),
+	}
+	if err := RecordInstance(store, inst); err != nil {
+		t.Fatalf("RecordInstance: %v", err)
+	}
+
+	want := time.Unix(2, 0)
+	if err := HeartbeatOwned(store, inst.ID, inst.OwnerToken, inst.BrokerEpoch, want); err != nil {
+		t.Fatalf("HeartbeatOwned: %v", err)
+	}
+
+	if err := UpdateOwnedInstance(store, inst.ID, "owner-stale", inst.BrokerEpoch, func(live *config.Instance) error {
+		live.HTTPPort = 9999
+		return nil
+	}); !errors.Is(err, ErrInstanceOwnershipLost) {
+		t.Fatalf("stale UpdateOwnedInstance error = %v, want %v", err, ErrInstanceOwnershipLost)
+	}
+	if err := RemoveOwnedInstance(store, inst.ID, "owner-stale", inst.BrokerEpoch); !errors.Is(err, ErrInstanceOwnershipLost) {
+		t.Fatalf("stale RemoveOwnedInstance error = %v, want %v", err, ErrInstanceOwnershipLost)
+	}
+
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load after stale operations: %v", err)
+	}
+	if len(cfg.Instances) != 1 || !cfg.Instances[0].LastSeenAt.Equal(want) || cfg.Instances[0].HTTPPort != 0 {
+		t.Fatalf("stale owner changed instance: %+v", cfg.Instances)
+	}
+
+	if err := RemoveOwnedInstance(store, inst.ID, inst.OwnerToken, inst.BrokerEpoch); err != nil {
+		t.Fatalf("RemoveOwnedInstance current owner: %v", err)
+	}
+	cfg, err = store.Load()
+	if err != nil {
+		t.Fatalf("Load after remove: %v", err)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("expected owned instance removed, got %+v", cfg.Instances)
+	}
+}
+
+func TestIsProxyOwnerLeaseStaleRequiresDeadProcessAndExpiredLease(t *testing.T) {
+	now := time.Unix(100, 0)
+	inst := config.Instance{
+		OwnerToken:          "owner",
+		DaemonPID:           123,
+		OwnerLastSeenAt:     now.Add(-time.Minute),
+		OwnerLeaseExpiresAt: now.Add(-time.Second),
+	}
+	if IsProxyOwnerLeaseStale(inst, now, time.Second, func(int) bool { return true }) {
+		t.Fatal("live daemon was considered stale")
+	}
+	if !IsProxyOwnerLeaseStale(inst, now, time.Second, func(int) bool { return false }) {
+		t.Fatal("dead daemon with expired lease was not considered stale")
+	}
+	inst.OwnerLeaseExpiresAt = now.Add(time.Minute)
+	if IsProxyOwnerLeaseStale(inst, now, time.Second, func(int) bool { return false }) {
+		t.Fatal("unexpired lease was considered stale")
 	}
 }
 

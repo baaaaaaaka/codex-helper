@@ -318,7 +318,7 @@ func runWithNewStackOptions(
 		}
 	}
 
-	hc := manager.HealthClient{Timeout: 1 * time.Second}
+	hc := healthClientForProxyProfile(profile, 1*time.Second)
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
 		return hc.CheckHTTPProxy(st.HTTPPort, instanceID)
 	}, st.Fatal(), opts)
@@ -365,7 +365,7 @@ func runWithProfileOptions(
 	cmdArgs []string,
 	opts runTargetOptions,
 ) error {
-	hc := manager.HealthClient{Timeout: 1 * time.Second}
+	hc := healthClientForProxyProfile(profile, 1*time.Second)
 	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
 		return err
 	} else if inst != nil {
@@ -486,7 +486,7 @@ func withProfileInstallEnv(
 	}
 
 	var reuseErr error
-	hc := manager.HealthClient{Timeout: 1 * time.Second}
+	hc := healthClientForProxyProfile(profile, 1*time.Second)
 	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
 		return err
 	} else if inst != nil {

@@ -368,10 +368,11 @@ func buildArgs(c TunnelConfig, hostKeyArgs []string) ([]string, error) {
 type Tunnel struct {
 	cfg TunnelConfig
 
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	waitErr error
-	done    chan struct{}
+	mu            sync.Mutex
+	cmd           *exec.Cmd
+	processHandle tunnelProcessHandle
+	waitErr       error
+	done          chan struct{}
 }
 
 func NewTunnel(cfg TunnelConfig) (*Tunnel, error) {
@@ -392,6 +393,7 @@ func NewTunnel(cfg TunnelConfig) (*Tunnel, error) {
 		cmd:  exec.Command("ssh", args...),
 		done: make(chan struct{}),
 	}
+	configureTunnelCommand(t.cmd)
 	t.cmd.Stdin = cfg.Stdin
 	t.cmd.Stdout = cfg.Stdout
 	t.cmd.Stderr = cfg.Stderr
@@ -419,12 +421,19 @@ func (t *Tunnel) Start() error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	processHandle := attachTunnelProcess(cmd)
+	t.mu.Lock()
+	t.processHandle = processHandle
+	t.mu.Unlock()
 
 	go func() {
 		err := cmd.Wait()
 		t.mu.Lock()
 		t.waitErr = err
+		handle := t.processHandle
+		t.processHandle = tunnelProcessHandle{}
 		t.mu.Unlock()
+		closeTunnelProcess(handle)
 		close(t.done)
 	}()
 
@@ -443,20 +452,14 @@ func (t *Tunnel) Wait() error {
 func (t *Tunnel) Stop(grace time.Duration) error {
 	t.mu.Lock()
 	cmd := t.cmd
+	processHandle := t.processHandle
 	t.mu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 
-	_ = cmd.Process.Signal(os.Interrupt)
-
-	select {
-	case <-t.done:
-		return t.Wait()
-	case <-time.After(grace):
-		_ = cmd.Process.Kill()
-		<-t.done
-		return t.Wait()
-	}
+	_ = terminateTunnelProcess(cmd, processHandle, grace)
+	<-t.done
+	return t.Wait()
 }

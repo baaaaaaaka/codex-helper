@@ -1,0 +1,6 @@
+# The native proxy workflow intentionally targets private runners carrying
+# this label. Keep the label declaration next to the workflow so actionlint
+# can validate the repository without knowing the organization's runner pool.
+self-hosted-runner:
+  labels:
+    - proxy-recovery

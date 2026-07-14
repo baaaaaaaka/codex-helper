@@ -1152,6 +1152,9 @@ func codexAppAuthWindowsProxyReachabilityScript(host string, port string) string
 		"$healthUrl = " + powershellSingleQuote(healthURL),
 		"$response = Invoke-RestMethod -TimeoutSec 2 -Uri $healthUrl",
 		"if ($null -eq $response -or -not $response.ok) { throw ('proxy health check failed at ' + $healthUrl) }",
+		"$connectTarget = '127.0.0.1:1'",
+		"$client = [System.Net.Sockets.TcpClient]::new()",
+		"try { $client.Connect(" + powershellSingleQuote(host) + ", [int]" + powershellSingleQuote(port) + "); $stream = $client.GetStream(); $stream.ReadTimeout = 2000; $stream.WriteTimeout = 2000; $request = ('CONNECT ' + $connectTarget + ' HTTP/1.1`r`nHost: ' + $connectTarget + '`r`nProxy-Connection: close`r`nConnection: close`r`n`r`n'); $bytes = [Text.Encoding]::ASCII.GetBytes($request); $stream.Write($bytes, 0, $bytes.Length); $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 1024, $true); $status = $reader.ReadLine(); if ([string]::IsNullOrWhiteSpace($status) -or $status -notmatch '^HTTP/[0-9][.][0-9] (200|502) ') { throw ('proxy CONNECT probe failed: ' + $status) } } finally { if ($null -ne $reader) { $reader.Dispose() }; if ($null -ne $stream) { $stream.Dispose() }; $client.Dispose() }",
 	}, "; ")
 }
 

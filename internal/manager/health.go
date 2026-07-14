@@ -14,6 +14,10 @@ import (
 
 type HealthClient struct {
 	Timeout time.Duration
+	// RouteTarget optionally requires a real HTTP CONNECT through the proxy
+	// after the local health endpoint succeeds. It is used by desktop-app
+	// reuse so a live listener with a dead route is not accepted.
+	RouteTarget string
 }
 
 type healthResponse struct {
@@ -78,12 +82,27 @@ func (c HealthClient) CheckHTTPProxyContext(ctx context.Context, port int, expec
 	if expectedInstanceID != "" && hr.InstanceID != expectedInstanceID {
 		return fmt.Errorf("unexpected instance id %q", hr.InstanceID)
 	}
+	if c.RouteTarget != "" {
+		if err := c.CheckHTTPProxyCONNECTContext(ctx, port, c.RouteTarget); err != nil {
+			return fmt.Errorf("proxy route probe %s: %w", c.RouteTarget, err)
+		}
+	}
 	return nil
 }
 
 func (c HealthClient) CheckHTTPProxyCONNECT(port int, target string) error {
+	return c.CheckHTTPProxyCONNECTContext(context.Background(), port, target)
+}
+
+func (c HealthClient) CheckHTTPProxyCONNECTContext(ctx context.Context, port int, target string) error {
 	if port <= 0 || port > 65535 {
 		return fmt.Errorf("invalid http port %d", port)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	target, err := cleanConnectTarget(target)
 	if err != nil {
@@ -94,7 +113,9 @@ func (c HealthClient) CheckHTTPProxyCONNECT(port int, target string) error {
 		timeout = 1 * time.Second
 	}
 
-	conn, err := (&net.Dialer{Timeout: timeout}).Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(dialCtx, "tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return err
 	}
