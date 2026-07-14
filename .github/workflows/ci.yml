@@ -73,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           go test -p=1 ./internal/proxysupervisor -count=1 -run 'Test(RenderAllPlatforms|SpecValidation|ChildArgs)' -v
-          go test -p=1 ./internal/localproxy -count=1 -run 'Test(GenerationRouter|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|HTTPProxyGenerationRouter|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|ProxyHop|ProbeSOCKS5|SOCKS5Dialer|HTTPProxyHealthProbe|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
+          go test -p=1 ./internal/localproxy -count=1 -run 'Test(GenerationRouter|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|HTTPProxyGenerationRouter|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|ProxyHop|ProbeSOCKS5|SOCKS5Dialer|HTTPProxyHealthProbe|HTTPProxyNotifiesBackendFailure|HTTPProxyRealSocketFaultRelay|DistinctLoopback)' -v
           go test -p=1 ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyRouteTargetUsesRealConnect|OwnedInstanceOpsFenceStaleDaemon|IsProxyOwnerLeaseStale)' -v
           go test -p=1 ./internal/stack -count=1 -run 'Test(WaitForSOCKS5|NotifyNetworkResume|RequestFailureRecoveryBudgetIsBounded|StackHelpers|StackCloseIsConcurrentSafe|Monitor|SetupHTTPProxy)' -v
           go test -p=1 ./internal/ssh -count=1 -run 'Test(BuildArgs|TunnelStopTerminatesProcessGroupDescendants)' -v
@@ -94,7 +94,7 @@ jobs:
           # failure, candidate failure, resume bursts, and request-failure
           # storms entirely through loopback. They do not require sudo,
           # pfctl, networksetup, or suspending the hosted macOS runner.
-          go test -p=1 ./internal/localproxy -count=5 -run 'Test(HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyGenerationRouterRecoversAfterSOCKSFailure|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|GenerationRouterSwapKeepsListenerAndFencesOldGeneration|GenerationRouterDialContextCancelsBackend|SOCKS5DialerContextCancelsHalfOpenHandshake|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyRepeatedStartCloseResourceBudget|ProbeSOCKS5|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
+          go test -p=1 ./internal/localproxy -count=5 -run 'Test(HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyGenerationRouterRecoversAfterSOCKSFailure|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|GenerationRouterSwapKeepsListenerAndFencesOldGeneration|GenerationRouterDialContextCancelsBackend|SOCKS5DialerContextCancelsHalfOpenHandshake|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|ProbeSOCKS5|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
           go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor(RecoversTunnelAndSwapsProxyGeneration|RetriesCandidateAfterDeadTunnel|NetworkResumeRecoversFailedRemoteProbe|CandidateFailureKeepsLiveActiveTunnel|DetectsProbeGapAsResume)|NotifyNetworkResumeCoalesces|RequestFailureRecoveryBudgetIsBounded|StackCloseIsConcurrentSafe|SetupHTTPProxyBackendFailure(SignalsAreCoalesced|StormCountsRawRequestsAndOneSignal))' -v
 
   proxy-recovery-docker:
