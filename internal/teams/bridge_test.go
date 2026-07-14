@@ -35714,7 +35714,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --model pro --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	stateAfterSetup, err := store.Load(ctx)
@@ -35737,7 +35737,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("Load after confirm: %v", err)
 	}
 	for _, intake := range stateAfterConfirm.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeConfirmed {
+		if intake.ProfileName == "compat-work" && intake.Status != teamstore.ModelProfileKeyIntakeConfirmed {
 			t.Fatalf("intake status after confirm = %q, want confirmed", intake.Status)
 		}
 	}
@@ -35749,7 +35749,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
 	}
 	req := manager.saveRequestAt(0)
-	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.Model != "mimo/mimo-v2.5-pro" || req.APIKey != rawKey || req.SetDefault {
+	if req.Provider != "responses-compatible" || req.ProfileName != "compat-work" || req.Model != "example/reasoning-model" || req.APIKey != rawKey || req.SetDefault {
 		t.Fatalf("save request provider/name/model/key/default mismatch: provider=%q name=%q model=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.Model, req.APIKey == rawKey, req.SetDefault)
 	}
 	state, err := store.Load(ctx)
@@ -35758,7 +35758,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 	}
 	var completed int
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" {
+		if intake.ProfileName == "compat-work" {
 			if intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
 				t.Fatalf("intake status = %q, want completed", intake.Status)
 			}
@@ -35790,7 +35790,7 @@ func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(
 	})
 
 	rawKey := "sk-abcdef1234567890abcdef1234567890"
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-unconfirmed"), "model setup deepseek deepseek-work --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-unconfirmed"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("wrong-code"), "model key BADCODE "+rawKey); err != nil {
@@ -35818,7 +35818,7 @@ func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(
 	}
 	var expired int
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "deepseek-work" && intake.Status == teamstore.ModelProfileKeyIntakeExpired {
+		if intake.ProfileName == "compat-work" && intake.Status == teamstore.ModelProfileKeyIntakeExpired {
 			expired++
 		}
 	}
@@ -35845,7 +35845,7 @@ func TestBridgeModelProfileTeamsKeyIntakeSanitizesSaveErrors(t *testing.T) {
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-error"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-error"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-error"), "model key confirm ERR23456"); err != nil {
@@ -35888,7 +35888,7 @@ func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-claim"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-claim"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-claim"), "model key confirm CLAIM123"); err != nil {
@@ -35934,7 +35934,7 @@ func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
 		t.Fatalf("Load store: %v", err)
 	}
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
+		if intake.ProfileName == "compat-work" && intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
 			t.Fatalf("intake status = %q, want completed", intake.Status)
 		}
 	}

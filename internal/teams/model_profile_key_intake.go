@@ -137,8 +137,6 @@ func defaultTeamsModelProfileNameForProvider(provider string) string {
 	switch provider {
 	case "":
 		return ""
-	case "mimo":
-		return "mimo25"
 	default:
 		return provider
 	}

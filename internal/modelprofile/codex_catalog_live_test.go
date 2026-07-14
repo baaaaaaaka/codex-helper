@@ -34,10 +34,7 @@ func TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn(t *testing.T) {
 		codexPath = resolved
 	}
 
-	spec, err := MustLookupProvider("mimo")
-	if err != nil {
-		t.Fatalf("lookup mimo: %v", err)
-	}
+	spec := testExternalFamilyProvider("mimo")
 	catalog, err := CodexModelCatalogJSON(spec)
 	if err != nil {
 		t.Fatalf("CodexModelCatalogJSON: %v", err)

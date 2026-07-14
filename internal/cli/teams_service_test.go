@@ -4612,20 +4612,38 @@ func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceEnvironmentPreservesModelProfileProviderKeys(t *testing.T) {
+func TestTeamsServiceEnvironmentOmitsRemovedStaticProviderKeys(t *testing.T) {
 	t.Setenv("MIMO_API_KEY", "sk-mimo-test")
 	t.Setenv("DEEPSEEK_API_KEY", "sk-deepseek-test")
 	t.Setenv("UNRELATED_MODEL_KEY", "sk-ignored")
 
 	env := teamsServiceEnvironment()
-	if env["MIMO_API_KEY"] != "sk-mimo-test" {
-		t.Fatalf("MIMO_API_KEY not preserved for Teams service model profiles: %#v", env)
-	}
-	if env["DEEPSEEK_API_KEY"] != "sk-deepseek-test" {
-		t.Fatalf("DEEPSEEK_API_KEY not preserved for Teams service model profiles: %#v", env)
+	for _, name := range []string{"MIMO_API_KEY", "DEEPSEEK_API_KEY"} {
+		if env[name] != "" {
+			t.Fatalf("removed static provider key %s should not be preserved for the Teams service: %#v", name, env)
+		}
 	}
 	if env["UNRELATED_MODEL_KEY"] != "" {
 		t.Fatalf("unexpected non-allowlisted model key preserved: %#v", env)
+	}
+}
+
+func TestTeamsServiceEnvironmentPreservesConfiguredExternalProviderEnvKeys(t *testing.T) {
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "config.json")
+	raw := `{"version":6,"profiles":[],"modelConfigVersion":1,"modelCredentials":{"nvidia":{"apiKeyRef":"env:NVIDIA_API_KEY"}},"modelProfiles":{"nvidia/deepseek-v4":{"provider":"nvidia","model":"nvidia/deepseek-v4","apiKeyRef":"env:NVIDIA_API_KEY","revision":1}}}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HELPER_CONFIG", configPath)
+	t.Setenv("NVIDIA_API_KEY", "sk-nvidia-test")
+	t.Setenv("UNRELATED_MODEL_KEY", "sk-ignored")
+	env := teamsServiceEnvironment()
+	if env["NVIDIA_API_KEY"] != "sk-nvidia-test" {
+		t.Fatalf("configured external provider env key was not preserved: %#v", env)
+	}
+	if env["UNRELATED_MODEL_KEY"] != "" {
+		t.Fatalf("unrelated model key leaked into service environment: %#v", env)
 	}
 }
 
@@ -4664,14 +4682,17 @@ func TestTeamsServiceInstallRendersModelProfileProviderKeysForBackgroundService(
 		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + systemdQuoteArg(registryPath),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_CONFIG="+filepath.Join(tmp, "cxp-config.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=thirdparty-service"),
-		"Environment=" + systemdQuoteArg("DEEPSEEK_API_KEY=sk-deepseek-background-test"),
-		"Environment=" + systemdQuoteArg("MIMO_API_KEY=sk-mimo-background-test"),
 		"Environment=" + systemdQuoteArg("QWEN_API_KEY=sk-qwen-background-test"),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing model-profile service entry %q:\n%s", want, unit)
+		}
+	}
+	for _, removed := range []string{"DEEPSEEK_API_KEY", "MIMO_API_KEY"} {
+		if strings.Contains(unit, removed) {
+			t.Fatalf("unit preserved removed static provider key %s:\n%s", removed, unit)
 		}
 	}
 	if strings.Contains(unit, "UNRELATED_MODEL_KEY") || strings.Contains(unit, "sk-ignored") {

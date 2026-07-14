@@ -7,11 +7,27 @@ import (
 	"testing"
 )
 
-func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
-	spec, err := MustLookupProvider("mimo")
-	if err != nil {
-		t.Fatalf("lookup mimo: %v", err)
+const externalMillionTokenContextWindow = 1000000
+
+func testExternalFamilyProvider(id string) ProviderSpec {
+	if id == "deepseek" {
+		return ProviderSpec{
+			ID: "deepseek", DisplayName: "DeepSeek (external catalog)", DefaultModel: "deepseek/deepseek-v4-flash",
+			BaseURL: "https://catalog.example/deepseek/v1", AdapterProfile: "openai-chat", UsesAdapter: true,
+			SupportsTools: true, SupportsReason: true,
+			Models: []ModelSpec{{ID: "deepseek/deepseek-v4-flash", UpstreamID: "deepseek-v4-flash", DisplayName: "DeepSeek V4 Flash", Aliases: []string{"flash", "default"}, ContextWindow: externalMillionTokenContextWindow, MaxContextWindow: externalMillionTokenContextWindow, SupportsTools: true, SupportsReason: true, Priority: 0}, {ID: "deepseek/deepseek-v4-pro", UpstreamID: "deepseek-v4-pro", DisplayName: "DeepSeek V4 Pro", Aliases: []string{"pro"}, ContextWindow: externalMillionTokenContextWindow, MaxContextWindow: externalMillionTokenContextWindow, SupportsTools: true, SupportsReason: true, Priority: 1}},
+		}
 	}
+	return ProviderSpec{
+		ID: "mimo", DisplayName: "MiMo (external catalog)", DefaultModel: "mimo/mimo-v2.5",
+		BaseURL: "https://catalog.example/mimo/v1", AdapterProfile: "openai-chat", UsesAdapter: true,
+		SupportsTools: true, SupportsVision: true, SupportsReason: true,
+		Models: []ModelSpec{{ID: "mimo/mimo-v2.5", UpstreamID: "mimo-v2.5", DisplayName: "MiMo 2.5", Aliases: []string{"base", "standard", "normal", "default", "mimo25"}, ContextWindow: externalMillionTokenContextWindow, MaxContextWindow: externalMillionTokenContextWindow, SupportsTools: true, SupportsVision: true, SupportsReason: true, Priority: 0}, {ID: "mimo/mimo-v2.5-pro", UpstreamID: "mimo-v2.5-pro", DisplayName: "MiMo 2.5 Pro", Aliases: []string{"pro", "mimo25-pro"}, ContextWindow: externalMillionTokenContextWindow, MaxContextWindow: externalMillionTokenContextWindow, SupportsTools: true, SupportsVision: true, SupportsReason: true, Priority: 1}},
+	}
+}
+
+func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
+	spec := testExternalFamilyProvider("mimo")
 	raw, err := CodexModelCatalogJSON(spec)
 	if err != nil {
 		t.Fatalf("CodexModelCatalogJSON: %v", err)
@@ -48,8 +64,8 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 		t.Fatalf("first model metadata incomplete: %#v", decoded.Models[0])
 	}
 	for _, model := range decoded.Models {
-		if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
-			t.Fatalf("%s context window = %d/%d, want %d/%d", model.Slug, model.ContextWindow, model.MaxContextWindow, millionTokenContextWindow, millionTokenContextWindow)
+		if model.ContextWindow != externalMillionTokenContextWindow || model.MaxContextWindow != externalMillionTokenContextWindow {
+			t.Fatalf("%s context window = %d/%d, want %d/%d", model.Slug, model.ContextWindow, model.MaxContextWindow, externalMillionTokenContextWindow, externalMillionTokenContextWindow)
 		}
 	}
 	if decoded.Models[0].TruncationPolicy.Mode != "tokens" || decoded.Models[0].TruncationPolicy.Limit <= 0 {
@@ -125,17 +141,14 @@ func TestThirdPartyMillionTokenProviderCatalogWindows(t *testing.T) {
 		},
 	} {
 		t.Run(tc.provider, func(t *testing.T) {
-			spec, err := MustLookupProvider(tc.provider)
-			if err != nil {
-				t.Fatalf("lookup provider: %v", err)
-			}
+			spec := testExternalFamilyProvider(tc.provider)
 			for _, modelID := range tc.models {
 				model, ok := spec.ResolveModel(modelID)
 				if !ok {
 					t.Fatalf("ResolveModel(%q) failed", modelID)
 				}
-				if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
-					t.Fatalf("%s context window = %d/%d, want %d/%d", modelID, model.ContextWindow, model.MaxContextWindow, millionTokenContextWindow, millionTokenContextWindow)
+				if model.ContextWindow != externalMillionTokenContextWindow || model.MaxContextWindow != externalMillionTokenContextWindow {
+					t.Fatalf("%s context window = %d/%d, want %d/%d", modelID, model.ContextWindow, model.MaxContextWindow, externalMillionTokenContextWindow, externalMillionTokenContextWindow)
 				}
 			}
 		})
@@ -143,10 +156,7 @@ func TestThirdPartyMillionTokenProviderCatalogWindows(t *testing.T) {
 }
 
 func TestProviderSpecDefaultPublicModel(t *testing.T) {
-	spec, err := MustLookupProvider("deepseek")
-	if err != nil {
-		t.Fatalf("lookup deepseek: %v", err)
-	}
+	spec := testExternalFamilyProvider("deepseek")
 	if got := spec.DefaultPublicModel(); got != "deepseek/deepseek-v4-flash" {
 		t.Fatalf("DefaultPublicModel = %q", got)
 	}
@@ -185,10 +195,7 @@ func TestResponsesCompatibleProviderAcceptsConfiguredModel(t *testing.T) {
 }
 
 func TestMiMoProviderSpecResolvesTierAliases(t *testing.T) {
-	spec, err := MustLookupProvider("mimo")
-	if err != nil {
-		t.Fatalf("lookup mimo: %v", err)
-	}
+	spec := testExternalFamilyProvider("mimo")
 	for _, tc := range []struct {
 		ref  string
 		want string
@@ -217,34 +224,25 @@ func TestModelChoicesListUserFacingModelsAndCredentialScopes(t *testing.T) {
 	for _, choice := range choices {
 		byID[choice.ID] = choice
 	}
-	for _, id := range []string{"default", "deepseek-v4-flash", "deepseek-v4-pro", "mimo-v2.5", "mimo-v2.5-pro"} {
+	for _, id := range []string{"default"} {
 		if _, ok := byID[id]; !ok {
 			t.Fatalf("ModelChoices missing %q: %#v", id, choices)
 		}
 	}
-	if len(choices) != 5 {
-		t.Fatalf("ModelChoices len=%d choices=%#v, want only fully covered simple models", len(choices), choices)
+	if len(choices) != 1 {
+		t.Fatalf("ModelChoices len=%d choices=%#v, want official only without external catalogs", len(choices), choices)
 	}
-	if got := byID["deepseek-v4-flash"].CredentialScope; got != "deepseek" {
-		t.Fatalf("deepseek credential scope = %q", got)
+	if _, ok := MustLookupProvider("deepseek"); ok == nil {
+		t.Fatal("deepseek must not be a built-in provider")
 	}
-	if got := byID["deepseek-v4-pro"].CredentialScope; got != "deepseek" {
-		t.Fatalf("deepseek pro credential scope = %q", got)
-	}
-	if got := byID["mimo-v2.5"].CredentialScope; got != "mimo25" {
-		t.Fatalf("mimo base credential scope = %q", got)
-	}
-	if got := byID["mimo-v2.5-pro"].CredentialScope; got != "mimo25" {
-		t.Fatalf("mimo pro credential scope = %q", got)
-	}
-	if byID["mimo-v2.5"].RecommendedProfile != "mimo25" || byID["mimo-v2.5-pro"].RecommendedProfile != "mimo25-pro" {
-		t.Fatalf("mimo recommended profiles: base=%q pro=%q", byID["mimo-v2.5"].RecommendedProfile, byID["mimo-v2.5-pro"].RecommendedProfile)
+	if _, ok := MustLookupProvider("mimo"); ok == nil {
+		t.Fatal("mimo must not be a built-in provider")
 	}
 }
 
 func TestLookupModelChoiceRejectsAmbiguousTierAlias(t *testing.T) {
-	if got, ok := LookupModelChoice("mimo25-pro"); !ok || got.ID != "mimo-v2.5-pro" {
-		t.Fatalf("LookupModelChoice(mimo25-pro) = %#v ok=%v", got, ok)
+	if got, ok := LookupModelChoice("mimo25-pro"); ok || got.ID != "" {
+		t.Fatalf("LookupModelChoice(mimo25-pro) = %#v ok=%v, want external catalog-only miss", got, ok)
 	}
 	if got, ok := LookupModelChoice("pro"); ok || got.ID != "" {
 		t.Fatalf("LookupModelChoice(pro) = %#v ok=%v, want ambiguous miss", got, ok)

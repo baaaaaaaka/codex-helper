@@ -29,6 +29,9 @@ common commands, model selection, standard approvals, Teams basics, and upgrade 
   security boundaries and risks.
 - [Codex compatibility](codex_compatibility.md): generated compatibility data
   from release monitoring.
+- [Third-party model open issues](third-party-model-open-issues.md): the
+  DeepSeek/MiMo external-catalog experiment's unresolved implementation,
+  protocol, and live-validation items.
 
 ## Design and implementation trackers
 

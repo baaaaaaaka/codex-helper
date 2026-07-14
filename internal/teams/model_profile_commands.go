@@ -38,7 +38,41 @@ func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage,
 		}
 		return b.modelManagerList(ctx, session, "Control")
 	case "providers", "provider":
+		if manager, ok := b.modelProfileManager.(ModelCatalogManager); ok {
+			providerSub, providerArg := modelCommandParts(rest)
+			switch providerSub {
+			case "list", "ls", "status", "":
+				if providerSub == "" {
+					return b.modelManagerProviders(ctx)
+				}
+				return manager.ListModelProviders(ctx)
+			case "setup", "use", "activate":
+				if strings.TrimSpace(providerArg) == "" {
+					return "usage: `model provider setup <provider>`", nil
+				}
+				return manager.SetupModelProvider(ctx, providerArg)
+			default:
+				return manager.SetupModelProvider(ctx, rest)
+			}
+		}
 		return b.modelManagerProviders(ctx)
+	case "catalog", "catalogs", "subscription", "subscriptions":
+		manager, ok := b.modelProfileManager.(ModelCatalogManager)
+		if !ok {
+			return "Catalog management is available from the local CLI: `cxp model catalog list|sync <name>`.", nil
+		}
+		catalogSub, catalogArg := modelCommandParts(rest)
+		switch catalogSub {
+		case "", "list", "ls", "status":
+			return manager.ListModelCatalogs(ctx)
+		case "sync", "refresh":
+			if strings.TrimSpace(catalogArg) == "" {
+				return "usage: `model catalog sync <name>`", nil
+			}
+			return manager.SyncModelCatalog(ctx, catalogArg)
+		default:
+			return "usage: `model catalog list` or `model catalog sync <name>`", nil
+		}
 	case "setup", "guide", "add", "create":
 		if modelProfileSetupRequestsTeamsKeyIntake(rest) {
 			return b.startModelProfileKeyIntake(ctx, msg, rest)
@@ -102,7 +136,9 @@ func (b *Bridge) handleModelWorkCommand(ctx context.Context, session *Session, a
 	case "list", "ls", "profiles":
 		return b.modelManagerList(ctx, session, "Work")
 	case "providers", "provider":
-		return b.modelManagerProviders(ctx)
+		return "Provider configuration is Control-only; use `model provider list` or `model provider setup <provider>` in the Control chat.", nil
+	case "catalog", "catalogs", "subscription", "subscriptions":
+		return "Catalog management is Control-only; use `model catalog list` or `model catalog sync <name>` in the Control chat.", nil
 	case "setup", "guide", "add", "create":
 		return b.modelManagerSetupGuide(ctx, rest)
 	case "doctor", "check":
@@ -221,7 +257,7 @@ func (b *Bridge) modelManagerDelete(ctx context.Context, name string, confirm bo
 }
 
 func modelProfileManagerUnavailable() string {
-	return "Model management is not configured for this Teams service. Use the local CLI to inspect or configure availability: `cxp model list` and `cxp model setup <model> --no-default`."
+	return "Model management is not configured for this Teams service. Use the local CLI to inspect or configure availability: `cxp model catalog list`, `cxp model provider list`, and `cxp model provider setup <provider> --api-key-stdin`."
 }
 
 func modelControlUsage() string {
@@ -232,6 +268,9 @@ func modelControlUsage() string {
 		"- `model setup <model>` - configure a model",
 		"- `model key confirm <code>` then `model key <code> <api-key>` - finish Teams key intake",
 		"- `model doctor <model>` - validate the model backing profile",
+		"- `model catalog list|sync <name>` - inspect or refresh external Git/JSON catalogs",
+		"- `model provider list` - show provider-wide activation status",
+		"- `model provider setup <provider>` - activate all models for one provider (raw keys must be entered locally)",
 		"- `model status` - show this Control chat's effective model, selection source, effort, and any active/queued model",
 		"- `model switch <model>` - switch this Control chat",
 		"- `model reset` - switch this Control chat to the global default",

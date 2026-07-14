@@ -146,8 +146,9 @@ codex-proxy proxy doctor
 | `codex-proxy run -- codex` | 通过 CXP 标准审批 broker 启动原版 Codex TUI |
 | `codex-proxy run --aaa -- codex` | 为本次 Codex 运行开启 Agent Auto Approve |
 | `codex-proxy run --model-profile <name> -- codex` | 使用保存的模型 profile 启动 Codex |
-| `codex-proxy model list` | 显示内置和已配置的模型选择 |
-| `codex-proxy model setup <model>` | 配置内置模型选择，例如 `deepseek`、`mimo`、`kimi`、`glm`、`minimax` 或 `qwen` |
+| `codex-proxy model list` | 显示官方模型和已配置的 `provider/model` 选择器 |
+| `codex-proxy model catalog add <name> ...` | 添加 Git 或托管 JSON provider catalog |
+| `codex-proxy model provider setup <provider>` | 保存一个本地 key，并验证该 provider 的全部模型 |
 | `codex-proxy proxy doctor` | 检查本地 proxy/Codex 前置条件 |
 | `codex-proxy proxy reset` | 清除已保存的代理设置，下次启动时重新询问 |
 | `codex-proxy app` | 在 macOS、Windows 或 WSL 上启动 Codex 桌面 App |
@@ -180,10 +181,15 @@ codex-proxy proxy doctor
 | `codex-proxy history list [--pretty]` | 以 JSON 列出发现的 projects/sessions |
 | `codex-proxy history show <session-id>` | 打印某个 session 的完整历史 |
 | `codex-proxy history open <session-id>` | 在 Codex 中打开某个 session |
-| `codex-proxy model list` | 列出内置模型选择和配置状态 |
-| `codex-proxy model setup <model>` | 设置内置模型选择，并可选择设为默认 |
-| `codex-proxy model use <model>` | 把已配置的模型设为后续 Codex 启动默认值 |
-| `codex-proxy model doctor [model]` | 验证内置模型选择背后的模型 profile |
+| `codex-proxy model list` | 列出官方模型和已配置的 `provider/model` 选择器 |
+| `codex-proxy model catalog add <name> --git <url>` | 添加并同步 Git catalog |
+| `codex-proxy model catalog add <name> --json <file>` | 导入本地 JSON catalog 并托管保存 |
+| `codex-proxy model catalog sync <name>` | 刷新一个 Git 或托管 JSON catalog |
+| `codex-proxy model catalog list` | 显示 catalog revision 和路由数量 |
+| `codex-proxy model provider list` | 显示 provider 级激活状态 |
+| `codex-proxy model provider setup <provider>` | 保存一个本地 key，并验证该 provider 的全部模型 |
+| `codex-proxy model use <provider/model>` | 将已验证的 selector 设为后续 Codex 启动默认值 |
+| `codex-proxy model doctor [model]` | 验证已配置的模型 profile |
 | `codex-proxy model-profile setup [name]` | 创建或更新命名模型 profile |
 | `codex-proxy model-profile list` | 列出保存的模型 profiles |
 | `codex-proxy model-profile doctor [name]` | 验证保存的模型 profile |
@@ -311,26 +317,82 @@ model/effort、同一 thread 的跨 provider resume、可见上下文完整性�
 app-server attachment contract，因此，在声称“所有 CXP surface 都已接入 broker”之前，
 Desktop 自动审批仍是 final release blocker；CXP 不会为这个入口静默回退到已经退役的执行机制。
 
-### 内置模型选择
+### 外部 model catalogs
 
-当你想从内置 model/provider presets 中选择时，使用 `model`:
+新的第三方模型不再依赖编译进 CXP 的 family preset。DeepSeek V4 和 MiMo V2.5
+不是内置 provider，必须先通过外部 catalog 配置后才能启用；所有新的第三方模型
+都必须使用 catalog。catalog 只包含公开的
+provider/model 元数据，key 始终保存在本机；同一个模型名可以由多个 provider
+提供。模型默认使用 provider 的 default interface key；需要不同 token 的
+interface 可以单独绑定：
 
 ```bash
-codex-proxy model list
-printf '%s' "$DEEPSEEK_API_KEY" | codex-proxy model setup deepseek --api-key-stdin
-codex-proxy model use deepseek
-codex-proxy model doctor deepseek
+cxp model catalog add nvidia --git https://github.example/team/models.git
+cxp model catalog add local --json ./models.json
+cxp model catalog list
+cxp model provider list
+printf '%s' "$NVIDIA_API_KEY" | cxp model provider setup nvidia --api-key-stdin
+# 如果某个 interface 使用单独的 token，可以单独绑定：
+printf '%s' "$DEEPSEEK_ANTHROPIC_KEY" | cxp model provider setup deepseek --interface anthropic --api-key-stdin
+cxp model use nvidia/deepseek-v4
+cxp model list
 ```
 
-内置选择包括 `default`，以及 `deepseek`、`mimo`、`kimi`、`glm`、`minimax` 和
-`qwen` 等第三方 choices。第三方 choices 会在本地保存 model profile。
-OpenAI-compatible chat providers 通过 CXP 本地 Responses adapter 运行。
+catalog JSON 使用严格的 `catalogVersion: 2`、`interfaces` 和 `features`
+结构；用户选择器始终是 `provider/model`。同一个 provider 可以为 Chat、
+Responses、Anthropic 或 Beta/FIM 声明多个 interface，模型的每项 feature
+选择实际使用的 interface。`model provider setup` 会验证该
+provider 发布的全部模型，不会改变当前 chat 或全局默认值。带
+`--auto-sync` 的 Git catalog 会由长驻 Teams service 定期刷新；手动 JSON
+只通过 `model catalog sync` 显式刷新。catalog 中的 URL 凭据、credential
+header 和 raw token 都会被拒绝。
+如果某个 feature 声明了 native 能力但当前 adapter 尚未实现，CXP 会明确失败，
+不会静默丢掉工具后继续生成看似成功的答案。
+
+provider 原生工具和搜索来源也可以完整写进 JSON。MiMo Chat 的联网搜索例如：
+
+```json
+"webSearch": {
+  "support": "native",
+  "interface": "chat",
+  "nativeTool": {
+    "inputTypes": ["web_search_preview", "web_search"],
+    "upstreamType": "web_search",
+    "allowedFields": ["search_context_size"]
+  },
+  "sources": {"mode": "annotations", "requireUrl": true, "requireSources": true}
+}
+```
+
+DeepSeek 可以把 `webSearch.interface` 指向 Anthropic interface，并在
+`interfaceCredentials` 里绑定独立 key；CXP 会使用注册的
+`deepseek-anthropic-v1` 转换器，返回的 URL citation 会变成 Responses annotation。
+如果 Responses 不支持 `previousResponseId`、`background` 或
+`contextManagement`，在模型 JSON 中标记为 `"unsupported"`，请求会得到明确错误。
+缺少声明的原生工具、缺少必需 URL 的搜索结果都会 fail closed，不会被静默丢弃。
+
+需要非 OpenAI wire shape 的 interface 必须显式声明编译进程序的、带版本的
+`conversion`，profile 只是注册表 key，不能放任意 JSON template 或脚本。例如：
+
+```json
+{
+  "adapter": "deepseek-anthropic",
+  "protocol": "messages",
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "conversion": {"enabled": true, "profile": "deepseek-anthropic-v1", "strict": true},
+  "auth": {"type": "header", "header": "x-api-key"}
+}
+```
+
+Beta prefix/FIM 在 model feature 上声明 `operation: "prefix"` 或 `"fim"`；
+调用时只为这些显式操作发送 `operation`、`prefix`、`suffix`。未知 operation
+或 converter profile 会在发出上游请求前直接报错。
 
 用保存的 model profile 启动一次，而不改变默认值：
 
 ```bash
-codex-proxy run --model-profile deepseek -- codex
-codex-proxy app --model-profile deepseek
+codex-proxy run --model-profile nvidia/deepseek-v4 -- codex
+codex-proxy app --model-profile nvidia/deepseek-v4
 ```
 
 Teams 用户可以在创建或切换 Work chats 时选择 model profiles；Teams 命令列在
@@ -342,15 +404,16 @@ Teams 用户可以在创建或切换 Work chats 时选择 model profiles；Teams
 profile 时，使用 `model-profile`:
 
 ```bash
-codex-proxy model-profile setup work-deepseek \
-  --provider deepseek \
-  --model deepseek/deepseek-v4-pro \
-  --api-key-env DEEPSEEK_API_KEY \
+codex-proxy model-profile setup work-compatible \
+  --provider responses-compatible \
+  --model example/reasoning-model \
+  --base-url-env RESPONSES_BASE_URL \
+  --api-key-env RESPONSES_API_KEY \
   --set-default
 
 codex-proxy model-profile list
-codex-proxy model-profile doctor work-deepseek
-codex-proxy model-profile set-default work-deepseek
+codex-proxy model-profile doctor work-compatible
+codex-proxy model-profile set-default work-compatible
 ```
 
 对于已经提供 Responses-compatible API 的服务，使用通用的
@@ -436,9 +499,9 @@ HTTP 行为可以分别在 provider 和 model 层调优。下面两个分阶段�
 `codex-proxy model-profile explain <name>` 会输出去除 secret 后的最终生效配置及
 provider/model/catalog fingerprint，适合在启动 Teams、CLI 或 App 前核对继承和 override。
 
-模型配置也可以由 Git 仓库分发。仓库根目录默认放置 `cxp-models.json`，使用与上述
-模型配置相同的严格 schema，但 credential 只声明名称和认证方式，不包含 `apiKeyRef`
-或实际密钥：
+新的订阅请使用上面的 provider-first catalog 命令。下面的扁平
+`model-source` 命令只用于迁移旧 source 状态，不定义新的 `provider/model` 语法；
+credential 仍然只声明名称和认证方式，不包含 `apiKeyRef` 或实际密钥：
 
 ```bash
 cxp model-source sync https://github.example/team/models.git
@@ -453,7 +516,8 @@ Codex CLI/App/Teams 的统一模型目录。验证失败会保留候选和简短
 Git revision 本身不再使验证失效。如果有效 provider、模型、兼容策略或 credential
 绑定发生变化，CXP 会直接复用已保存的 key 执行最小自动复验；未变模型无需用户操作就会
 继续可用。只有复验失败的模型会保持隐藏，后续 sync 会再次尝试。私有仓库使用现有 Git credential
-helper 或 SSH agent；带内嵌 credential 的仓库 URL 会被拒绝。
+helper 或 SSH agent；带内嵌 credential 的仓库 URL 会被拒绝。新的 Git catalog 在添加时
+使用 `--auto-sync` 才会加入同样的长驻刷新；托管 JSON 不会被后台 watcher 隐式修改。
 
 长驻 Teams service 运行时，会每 30 分钟自动 shallow-sync 已配置的 model-source Git
 仓库。调度以每个 source 持久化的 `syncedAt` 为准，因此 helper 重启不会延后已经到期的
@@ -741,7 +805,9 @@ continue 1
 status
 model status
 model list
-model switch deepseek
+model catalog list
+model provider list
+model switch nvidia/deepseek-v4
 model reset
 effort status
 effort list
@@ -762,9 +828,9 @@ helper file relative/path.ext
 helper publish-history
 helper publish-history full
 model status
-model switch deepseek
+model switch nvidia/deepseek-v4
 model reset
-model fork deepseek
+model fork nvidia/deepseek-v4
 effort status
 effort list
 effort set xhigh

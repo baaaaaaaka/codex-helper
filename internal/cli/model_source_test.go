@@ -258,6 +258,59 @@ func TestSyncedModelStaysHiddenUntilRealVerificationSucceeds(t *testing.T) {
 	}
 }
 
+func TestVerifySyncedModelUsesConfiguredAnthropicAdapter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/messages" {
+			t.Errorf("request path = %q, want /messages", r.URL.Path)
+		}
+		if got := r.Header.Get("x-api-key"); got != "synthetic-anthropic-key" {
+			t.Errorf("x-api-key = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("unexpected authorization header %q", got)
+		}
+		var request struct {
+			Model   string `json:"model"`
+			Stream  bool   `json:"stream"`
+			Message []struct {
+				Role string `json:"role"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode Anthropic request: %v", err)
+		}
+		if request.Model != "deepseek-ai/deepseek-v4" || request.Stream || len(request.Message) != 1 || request.Message[0].Role != "user" {
+			t.Errorf("Anthropic request = %#v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	resolved := modelprofile.Resolved{
+		Name: "deepseek/anthropic-model",
+		Provider: modelprofile.ProviderSpec{
+			BaseURL:           server.URL,
+			AdapterProfile:    "deepseek-anthropic",
+			ConversionProfile: "deepseek-anthropic-v1",
+			UsesAdapter:       true,
+			Headers:           map[string]string{"x-test-header": "catalog"},
+			AuthType:          "header",
+			AuthHeader:        "x-api-key",
+		},
+		Model: modelprofile.ModelSpec{
+			UpstreamID:   "deepseek-ai/deepseek-v4",
+			HTTPPolicy:   config.ModelHTTPPolicy{TimeoutSeconds: 5, MaxRetries: intPtrForModelSourceTest(0)},
+			StreamPolicy: config.ModelStreamPolicy{UpstreamMode: "nonstream-buffered"},
+		},
+	}
+	if err := verifySyncedModel(context.Background(), resolved, "synthetic-anthropic-key"); err != nil {
+		t.Fatalf("verifySyncedModel: %v", err)
+	}
+}
+
+func intPtrForModelSourceTest(value int) *int { return &value }
+
 func TestMergeModelSourcePreservesVerificationAcrossEquivalentRevisions(t *testing.T) {
 	fragment := config.Config{
 		ModelConfigVersion: 1,

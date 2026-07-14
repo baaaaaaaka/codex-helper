@@ -484,7 +484,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*)|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*|ForwardsExplicitConversionOperationFields)|ProviderRegistryPinsConversionProfileInRuntime|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport|AnthropicConverter(BuildsMessagesRequestAndParsesBufferedResponse|ParsesSSEWithoutDuplicateDone)|DeepSeekBeta(ConverterUsesFIMWireShape|FIMSSERequiresDoneMarker)|ConfiguredAdapterRejects(Unknown|Mismatched)ConversionProfile)$' -v
+
+      - name: External catalog conversion contract regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/config -count=1 -run '^Test(ModelCatalogContract.*|ValidateModelConversionAndOperation.*)$' -v
+          go test ./internal/modelcatalog -count=1 -run '^Test(CatalogContract.*|CatalogV2.*|ValidateRejects.*)$' -v
+          go test ./internal/modelprofile -count=1 -run '^Test(ResolveCatalogV2.*|ResolveSnapshotUsesSelectedInterfaceCredential.*)$' -v
+          go test ./internal/responsesadapter -count=1 -run '^Test(ConfiguredAdapter.*|ChatAdapterContractMatrix.*|ProviderRegistry.*|Anthropic.*|DeepSeekBeta.*|NativeToolMapping.*|SourcePolicy.*)$' -v
+          go test ./internal/cli -count=1 -run '^Test(ModelCatalog.*|ModelProviderSetup.*|VerifySyncedModel.*)$' -v
 
       - name: Teams per-chat reasoning effort regressions
         if: matrix.shard == 'core'
@@ -2079,7 +2090,11 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/proc -c -o dist/codex_proc_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams -c -o dist/codex_teams_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
-          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/config -c -o dist/codex_config_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelcatalog -c -o dist/codex_modelcatalog_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelprofile -c -o dist/codex_modelprofile_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/responsesadapter -c -o dist/codex_responsesadapter_test
+          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test dist/codex_config_test dist/codex_modelcatalog_test dist/codex_modelprofile_test dist/codex_responsesadapter_test
 
       - name: Upload Linux distro smoke binaries
         uses: actions/upload-artifact@v4
@@ -2407,6 +2422,17 @@ jobs:
           echo "==> $img (proc zombie/parser tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
+          echo "==> $img (external catalog JSON contract tests; network disabled)"
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_config_test -test.v -test.count=1 -test.run='Test(ModelCatalogContract|ValidateModelConversionAndOperation)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_modelcatalog_test -test.v -test.count=1 -test.run='Test(CatalogContract|CatalogV2|ValidateRejects)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_modelprofile_test -test.v -test.count=1 -test.run='TestResolveCatalogV2|TestResolveSnapshotUsesSelectedInterfaceCredential'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_responsesadapter_test -test.v -test.count=1 -test.run='Test(ConfiguredAdapter|ChatAdapterContractMatrix|ProviderRegistry|Anthropic|DeepSeekBeta|NativeToolMapping|SourcePolicy)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_cli_test -test.v -test.count=1 -test.run='Test(ModelCatalog|ModelProviderSetup|VerifySyncedModel)'
           echo "==> $img (Teams resource cleanup, artifact, transcript, and simulated-live tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_resource_pattern"

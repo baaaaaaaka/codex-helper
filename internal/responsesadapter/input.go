@@ -60,7 +60,7 @@ func parseInputItem(raw json.RawMessage) (ProviderMessage, string, bool, error) 
 	case "", "message":
 		role := firstNonEmpty(rawString(obj["role"]), "user")
 		text, parts := extractMessageContent(obj["content"])
-		if strings.TrimSpace(text) == "" {
+		if strings.TrimSpace(text) == "" && len(parts) == 0 {
 			return ProviderMessage{}, "", false, nil
 		}
 		textPart := ""

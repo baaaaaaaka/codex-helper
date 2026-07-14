@@ -42,11 +42,11 @@ func TestOpenAIChatAdapterOutboundBodyStableForSameHistory(t *testing.T) {
 		},
 	}
 
-	first, err := canonicalChatCompletionBody(req, ProfileForProvider("deepseek"))
+	first, err := canonicalChatCompletionBody(req, testCatalogDeepSeekProfile())
 	if err != nil {
 		t.Fatalf("first body: %v", err)
 	}
-	second, err := canonicalChatCompletionBody(req, ProfileForProvider("deepseek"))
+	second, err := canonicalChatCompletionBody(req, testCatalogDeepSeekProfile())
 	if err != nil {
 		t.Fatalf("second body: %v", err)
 	}

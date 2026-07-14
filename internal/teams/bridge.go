@@ -239,6 +239,17 @@ type ModelProfileRuntimeWarningProvider interface {
 	ModelProfileRuntimeWarning(context.Context, modelprofile.Snapshot) (string, bool, error)
 }
 
+// ModelCatalogManager is optional so custom/test model managers that only
+// understand the legacy profile API remain valid. The built-in manager uses
+// this to expose catalog refresh and provider-wide activation in Control chat;
+// Work chats only consume the resulting provider/model selectors.
+type ModelCatalogManager interface {
+	ListModelCatalogs(context.Context) (string, error)
+	SyncModelCatalog(context.Context, string) (string, error)
+	ListModelProviders(context.Context) (string, error)
+	SetupModelProvider(context.Context, string) (string, error)
+}
+
 type ModelProfileSetupRequest struct {
 	Model      string
 	SSHProxy   string

@@ -7,14 +7,8 @@ import (
 )
 
 func TestProviderModelSelectionStressCI(t *testing.T) {
-	deepseek, err := MustLookupProvider("deepseek")
-	if err != nil {
-		t.Fatalf("lookup deepseek: %v", err)
-	}
-	mimo, err := MustLookupProvider("mimo")
-	if err != nil {
-		t.Fatalf("lookup mimo: %v", err)
-	}
+	deepseek := testExternalFamilyProvider("deepseek")
+	mimo := testExternalFamilyProvider("mimo")
 	cases := []struct {
 		provider ProviderSpec
 		ref      string

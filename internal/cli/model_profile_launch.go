@@ -323,7 +323,7 @@ func startModelProfileAdapterForCodex(
 	webSearchFallbackPath := ""
 	webSearchFallbackTOML := []byte(nil)
 	if resolved.Provider.DisableHostedWebSearch {
-		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML(resolved.Provider.SearchFallback)
 		webSearchFallbackPath, err = writeCodexWebSearchFallbackRoleConfig(catalogPath, webSearchFallbackTOML)
 		if err != nil {
 			return codexModelProfileLaunch{}, nil, err
@@ -337,7 +337,7 @@ func startModelProfileAdapterForCodex(
 		if err != nil {
 			return codexModelProfileLaunch{}, nil, err
 		}
-		baseURL, proxyCleanup, err := startNativeResponsesCompatibilityProxy(resolved.Provider.BaseURL, apiKey, proxyKey, upstreamProxyURL, log)
+		baseURL, proxyCleanup, err := startNativeResponsesCompatibilityProxyWithRoutePolicies(resolved.Provider.BaseURL, apiKey, proxyKey, upstreamProxyURL, log, responsesadapter.ResponsesPolicy{PreviousResponseID: resolved.Model.ResponsesPolicy.PreviousResponseID, Background: resolved.Model.ResponsesPolicy.Background, ContextManagement: resolved.Model.ResponsesPolicy.ContextManagement}, responsesAdapterSourcePolicy(resolved.Model), resolved.Model.UnsupportedToolPolicy, responsesAdapterNativeTools(resolved.Model))
 		if err != nil {
 			return codexModelProfileLaunch{}, nil, err
 		}
@@ -377,24 +377,15 @@ func startModelProfileAdapterForCodex(
 		return codexModelProfileLaunch{}, nil, err
 	}
 	selectedModel := resolved.Model
-	adapter := responsesadapter.OpenAIChatAdapter{
-		BaseURL: resolved.Provider.BaseURL,
-		APIKey:  apiKey,
-		Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithReasoningOverrides(
-			resolved.Provider.DefaultReasoningEffort,
-			resolved.Provider.ReasoningEffortMap,
-		).WithModelPolicies(selectedModel.ReasoningPolicy, selectedModel.ToolPolicy, selectedModel.MessagePolicy, selectedModel.SamplingPolicy),
-		RetryStatuses:      append([]int(nil), selectedModel.HTTPPolicy.RetryStatuses...),
-		MaxOutputTokens:    selectedModel.MaxOutputTokens,
-		Headers:            resolved.Provider.Headers,
-		AuthType:           resolved.Provider.AuthType,
-		AuthHeader:         resolved.Provider.AuthHeader,
-		StreamMode:         selectedModel.StreamPolicy.UpstreamMode,
-		ReasoningDeltaPath: selectedModel.StreamPolicy.ReasoningDeltaPath,
-		CachedTokensPath:   selectedModel.StreamPolicy.CachedTokensPath,
-		UsageField:         selectedModel.CachePolicy.UsageField,
+	adapter, err := newResolvedProviderAdapter(resolved, apiKey, upstreamProxyURL, log)
+	if err != nil {
+		_ = ln.Close()
+		storeCleanup()
+		return codexModelProfileLaunch{}, nil, err
 	}
-	if err := configureOpenAIChatAdapterHTTP(&adapter, selectedModel.HTTPPolicy, selectedModel.StreamPolicy, upstreamProxyURL, log); err != nil {
+	interfaceAPIKeys := resolveConfiguredInterfaceAPIKeys(cfg, []modelprofile.Resolved{resolved}, map[string]string{resolved.Name: apiKey}, store)[resolved.Name]
+	routeConfigs, err := resolvedProviderRouteConfigs(resolved, apiKey, interfaceAPIKeys, adapter, upstreamProxyURL, log)
+	if err != nil {
 		_ = ln.Close()
 		storeCleanup()
 		return codexModelProfileLaunch{}, nil, err
@@ -402,14 +393,22 @@ func startModelProfileAdapterForCodex(
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,
 		Providers: []responsesadapter.ProviderConfig{{
-			ID:             resolved.Provider.ID,
-			ProfileID:      resolved.Provider.AdapterProfile,
-			BaseURL:        resolved.Provider.BaseURL,
-			APIKey:         apiKey,
-			DefaultModel:   resolved.SelectedPublicModel(),
-			Models:         responsesAdapterModelsForProvider(resolved.Provider),
-			Adapter:        adapter,
-			CustomToolMode: selectedModel.ToolPolicy.CustomToolMode,
+			ID:                    resolved.Provider.ID,
+			ProfileID:             resolved.Provider.AdapterProfile,
+			BaseURL:               resolved.Provider.BaseURL,
+			APIKey:                apiKey,
+			DefaultModel:          resolved.SelectedPublicModel(),
+			Models:                responsesAdapterModelsForProvider(resolved.Provider),
+			Adapter:               adapter,
+			CustomToolMode:        selectedModel.ToolPolicy.CustomToolMode,
+			UnsupportedToolPolicy: selectedModel.UnsupportedToolPolicy,
+			ConversionProfile:     resolved.Provider.ConversionProfile,
+			StrictConversion:      resolved.Provider.StrictConversion,
+			Operation:             resolved.Provider.Operation,
+			NativeTools:           responsesAdapterNativeTools(resolved.Model),
+			SourcePolicy:          responsesAdapterSourcePolicy(resolved.Model),
+			ResponsesPolicy:       responsesAdapterResponsesPolicy(resolved.Model),
+			Routes:                routeConfigs,
 		}},
 		ProxyKeys: map[string]string{proxyKey: resolved.Provider.ID},
 		KeySalt:   resolved.Name + ":" + strconv.Itoa(resolved.Revision()),
@@ -458,6 +457,237 @@ func startModelProfileAdapterForCodex(
 		WebSearchFallbackTOML: webSearchFallbackTOML,
 		EnvKey:                envCXPResponsesProxyKey,
 	}), cleanup, nil
+}
+
+func newResolvedProviderAdapter(resolved modelprofile.Resolved, apiKey, upstreamProxyURL string, log io.Writer) (responsesadapter.ProviderAdapter, error) {
+	selectedModel := resolved.Model
+	var status func(string)
+	if log != nil {
+		status = func(message string) { _, _ = fmt.Fprintf(log, "CXP upstream: %s\n", message) }
+	}
+	return responsesadapter.NewConfiguredAdapter(responsesadapter.AdapterOptions{
+		AdapterID: resolved.Provider.AdapterProfile, ConversionProfile: resolved.Provider.ConversionProfile, StrictConversion: resolved.Provider.StrictConversion,
+		BaseURL: resolved.Provider.BaseURL, APIKey: apiKey, Headers: resolved.Provider.Headers, Endpoints: resolved.Provider.Endpoints,
+		AuthType: resolved.Provider.AuthType, AuthHeader: resolved.Provider.AuthHeader,
+		Profile:       responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithReasoningOverrides(resolved.Provider.DefaultReasoningEffort, resolved.Provider.ReasoningEffortMap).WithModelPolicies(selectedModel.ReasoningPolicy, selectedModel.ToolPolicy, selectedModel.MessagePolicy, selectedModel.SamplingPolicy),
+		RetryStatuses: append([]int(nil), selectedModel.HTTPPolicy.RetryStatuses...), MaxRetries: selectedModel.HTTPPolicy.MaxRetries, HonorRetryAfter: selectedModel.HTTPPolicy.HonorRetryAfter, RetryTransport: selectedModel.HTTPPolicy.RetryTransportErrors,
+		MaxOutputTokens: selectedModel.MaxOutputTokens, StreamMode: selectedModel.StreamPolicy.UpstreamMode, ReasoningDeltaPath: selectedModel.StreamPolicy.ReasoningDeltaPath, CachedTokensPath: selectedModel.StreamPolicy.CachedTokensPath, UsageField: selectedModel.CachePolicy.UsageField,
+		HTTP: selectedModel.HTTPPolicy, Stream: selectedModel.StreamPolicy, ProxyURL: upstreamProxyURL, Status: status,
+	})
+}
+
+func newResolvedProviderAdapterForInterface(resolved modelprofile.Resolved, interfaceName, operation, apiKey, upstreamProxyURL string, log io.Writer) (responsesadapter.ProviderAdapter, error) {
+	interfaceName = strings.TrimSpace(interfaceName)
+	iface, ok := findModelInterfaceSpec(resolved.Provider.Interfaces, interfaceName)
+	if !ok {
+		return nil, fmt.Errorf("model profile %q references missing route interface %q", resolved.Name, interfaceName)
+	}
+	route := resolved
+	provider := resolved.Provider
+	provider.DefaultInterface = interfaceName
+	provider.BaseURL = firstNonEmptyCLI(iface.BaseURL, provider.BaseURL)
+	provider.Headers = mergeStringMapsForRoute(provider.ProviderHeaders, iface.Headers)
+	provider.Endpoints = mergeStringMapsForRoute(provider.ProviderEndpoints, iface.Endpoints)
+	provider.HTTP = mergeRouteHTTPPolicy(iface.HTTP, provider.ProviderHTTP)
+	provider.Stream = mergeRouteStreamPolicy(iface.Stream, provider.ProviderStream)
+	provider.AdapterProfile = firstNonEmptyCLI(iface.Adapter, provider.AdapterProfile)
+	provider.ConversionProfile = firstNonEmptyCLI(iface.Conversion.Profile, provider.ConversionProfile)
+	if iface.Conversion.Enabled {
+		provider.StrictConversion = iface.Conversion.EffectiveStrict()
+	}
+	provider.AuthType = firstNonEmptyCLI(iface.Auth.Type, provider.AuthType)
+	provider.AuthHeader = firstNonEmptyCLI(iface.Auth.Header, provider.AuthHeader)
+	model := resolved.Model
+	model.DefaultInterface = interfaceName
+	model.Operation = strings.ToLower(strings.TrimSpace(operation))
+	route.Provider = provider
+	route.Model = model
+	return newResolvedProviderAdapter(route, apiKey, upstreamProxyURL, log)
+}
+
+func resolvedProviderRouteConfigs(resolved modelprofile.Resolved, defaultAPIKey string, interfaceAPIKeys map[string]string, defaultAdapter responsesadapter.ProviderAdapter, upstreamProxyURL string, log io.Writer) ([]responsesadapter.ProviderRouteConfig, error) {
+	if len(resolved.Provider.RouteInterfaces) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(resolved.Provider.RouteInterfaces))
+	for key := range resolved.Provider.RouteInterfaces {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key != "" && key != "default" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	routes := make([]responsesadapter.ProviderRouteConfig, 0, len(keys))
+	for _, key := range keys {
+		interfaceName := strings.TrimSpace(resolved.Provider.RouteInterfaces[key])
+		if interfaceName == "" {
+			continue
+		}
+		apiKey := lookupInterfaceAPIKey(interfaceAPIKeys, interfaceName)
+		if apiKey == "" && strings.EqualFold(interfaceName, resolved.Provider.DefaultInterface) {
+			apiKey = strings.TrimSpace(defaultAPIKey)
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("model profile %q route %q has no credential for interface %q", resolved.Name, key, interfaceName)
+		}
+		adapter := defaultAdapter
+		iface, ifaceOK := findModelInterfaceSpec(resolved.Provider.Interfaces, interfaceName)
+		if !ifaceOK {
+			return nil, fmt.Errorf("model profile %q references missing route interface %q", resolved.Name, interfaceName)
+		}
+		if !strings.EqualFold(interfaceName, resolved.Provider.DefaultInterface) {
+			var err error
+			adapter, err = newResolvedProviderAdapterForInterface(resolved, interfaceName, routeOperation(key), apiKey, upstreamProxyURL, log)
+			if err != nil {
+				return nil, err
+			}
+		}
+		featureName := key
+		if key == "websearch" {
+			featureName = "webSearch"
+		}
+		nativeTools := []responsesadapter.NativeToolSpec(nil)
+		sourcePolicy := responsesadapter.SourcePolicy{}
+		// webSearch may explicitly name the ordinary chat operation. It is
+		// still the feature that owns the native tool/source policy, so inspect
+		// the feature itself rather than only the route key.
+		if feature, hasFeature := resolved.Model.Features["webSearch"]; hasFeature && strings.EqualFold(strings.TrimSpace(feature.Support), "native") && (featureName == "webSearch" || strings.EqualFold(interfaceName, strings.TrimSpace(feature.Interface))) {
+			nativeTools = responsesAdapterNativeTools(resolved.Model)
+			sourcePolicy = responsesAdapterSourcePolicy(resolved.Model)
+		}
+		conversionProfile := strings.TrimSpace(iface.Conversion.Profile)
+		if conversionProfile == "" {
+			conversionProfile = strings.TrimSpace(resolved.Provider.ConversionProfile)
+		}
+		strictConversion := iface.Conversion.EffectiveStrict()
+		if !iface.Conversion.Enabled {
+			strictConversion = resolved.Provider.StrictConversion
+		}
+		routes = append(routes, responsesadapter.ProviderRouteConfig{
+			Key:                   key,
+			Operation:             routeOperation(key),
+			Adapter:               adapter,
+			ProfileID:             firstNonEmptyCLI(iface.Adapter, resolved.Provider.AdapterProfile) + ":" + key,
+			BaseURL:               firstNonEmptyCLI(iface.BaseURL, resolved.Provider.BaseURL),
+			APIKey:                apiKey,
+			CustomToolMode:        resolved.Model.ToolPolicy.CustomToolMode,
+			UnsupportedToolPolicy: resolved.Model.UnsupportedToolPolicy,
+			ConversionProfile:     conversionProfile,
+			StrictConversion:      strictConversion,
+			NativeTools:           nativeTools,
+			SourcePolicy:          sourcePolicy,
+			ResponsesPolicy:       responsesAdapterResponsesPolicy(resolved.Model),
+		})
+	}
+	return routes, nil
+}
+
+func lookupInterfaceAPIKey(keys map[string]string, interfaceName string) string {
+	for candidate, key := range keys {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(interfaceName)) {
+			return strings.TrimSpace(key)
+		}
+	}
+	return ""
+}
+
+func routeOperation(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "websearch", "chat":
+		return ""
+	default:
+		return strings.ToLower(strings.TrimSpace(key))
+	}
+}
+
+func findModelInterfaceSpec(interfaces map[string]config.ModelInterface, name string) (config.ModelInterface, bool) {
+	for candidate, iface := range interfaces {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(name)) {
+			return iface, true
+		}
+	}
+	return config.ModelInterface{}, false
+}
+
+func cloneStringMapForRoute(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func mergeStringMapsForRoute(base, override map[string]string) map[string]string {
+	if len(base) == 0 && len(override) == 0 {
+		return nil
+	}
+	out := cloneStringMapForRoute(base)
+	if out == nil {
+		out = map[string]string{}
+	}
+	for key, value := range override {
+		out[key] = value
+	}
+	return out
+}
+
+func mergeRouteHTTPPolicy(base, override config.ModelHTTPPolicy) config.ModelHTTPPolicy {
+	if base.TimeoutSeconds == 0 && base.ResponseHeaderTimeoutSeconds == 0 && base.MaxRetries == nil && len(base.RetryStatuses) == 0 && base.HonorRetryAfter == nil && base.RetryTransportErrors == nil && base.MaxConcurrentRequests == 0 {
+		return override
+	}
+	return mergeHTTPPolicyForRoute(base, override)
+}
+
+func mergeHTTPPolicyForRoute(base, override config.ModelHTTPPolicy) config.ModelHTTPPolicy {
+	out := base
+	if override.TimeoutSeconds != 0 {
+		out.TimeoutSeconds = override.TimeoutSeconds
+	}
+	if override.ResponseHeaderTimeoutSeconds != 0 {
+		out.ResponseHeaderTimeoutSeconds = override.ResponseHeaderTimeoutSeconds
+	}
+	if override.MaxRetries != nil {
+		out.MaxRetries = override.MaxRetries
+	}
+	if len(override.RetryStatuses) > 0 {
+		out.RetryStatuses = append([]int(nil), override.RetryStatuses...)
+	}
+	if override.HonorRetryAfter != nil {
+		out.HonorRetryAfter = override.HonorRetryAfter
+	}
+	if override.RetryTransportErrors != nil {
+		out.RetryTransportErrors = override.RetryTransportErrors
+	}
+	if override.MaxConcurrentRequests != 0 {
+		out.MaxConcurrentRequests = override.MaxConcurrentRequests
+	}
+	return out
+}
+
+func mergeRouteStreamPolicy(base, override config.ModelStreamPolicy) config.ModelStreamPolicy {
+	out := base
+	if override.UpstreamMode != "" {
+		out.UpstreamMode = override.UpstreamMode
+	}
+	if override.Format != "" {
+		out.Format = override.Format
+	}
+	if override.IdleTimeoutSeconds != 0 {
+		out.IdleTimeoutSeconds = override.IdleTimeoutSeconds
+	}
+	if override.SynthesizeResponsesSSE != nil {
+		out.SynthesizeResponsesSSE = override.SynthesizeResponsesSSE
+	}
+	if override.ReasoningDeltaPath != "" {
+		out.ReasoningDeltaPath = override.ReasoningDeltaPath
+	}
+	if override.CachedTokensPath != "" {
+		out.CachedTokensPath = override.CachedTokensPath
+	}
+	return out
 }
 
 func configureOpenAIChatAdapterHTTP(adapter *responsesadapter.OpenAIChatAdapter, policy config.ModelHTTPPolicy, stream config.ModelStreamPolicy, upstreamProxyURL string, log io.Writer) error {
@@ -571,13 +801,15 @@ func startConfiguredUnifiedModelGateway(
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "unified model catalog ready from %s: %s\n", catalogSource, catalogPath)
 	}
+	interfaceAPIKeys := resolveConfiguredInterfaceAPIKeys(cfg, configured, apiKeys, store)
 	baseURL, gatewayCleanup, err := startUnifiedModelGateway(unifiedModelGatewayOptions{
-		LocalKey:      localKey,
-		CatalogPath:   catalogPath,
-		Providers:     configured,
-		APIKeys:       apiKeys,
-		UpstreamProxy: upstreamProxyURL,
-		Log:           log,
+		LocalKey:         localKey,
+		CatalogPath:      catalogPath,
+		Providers:        configured,
+		APIKeys:          apiKeys,
+		InterfaceAPIKeys: interfaceAPIKeys,
+		UpstreamProxy:    upstreamProxyURL,
+		Log:              log,
 	})
 	if err != nil {
 		return codexModelProfileLaunch{}, nil, err
@@ -605,7 +837,7 @@ func startConfiguredUnifiedModelGateway(
 		launch.Name = selected.Name
 		launch.DisableHostedWebSearch = selected.Provider.DisableHostedWebSearch
 		if launch.DisableHostedWebSearch {
-			launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+			launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML(selected.Provider.SearchFallback)
 			launch.WebSearchFallbackPath, err = writeCodexWebSearchFallbackRoleConfig(catalogPath, launch.WebSearchFallbackTOML)
 			if err != nil {
 				cleanup()
@@ -685,6 +917,35 @@ func resolveRoutableConfiguredModels(cfg config.Config, store *config.Store, log
 		apiKeys[candidate.Name] = apiKey
 	}
 	return resolved, apiKeys
+}
+
+func resolveConfiguredInterfaceAPIKeys(cfg config.Config, resolved []modelprofile.Resolved, selected map[string]string, store *config.Store) map[string]map[string]string {
+	if len(resolved) == 0 || store == nil {
+		return nil
+	}
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+	out := make(map[string]map[string]string, len(resolved))
+	for _, candidate := range resolved {
+		keys := map[string]string{}
+		defaultKey := strings.TrimSpace(selected[candidate.Name])
+		if defaultKey != "" && strings.TrimSpace(candidate.Provider.DefaultInterface) != "" {
+			keys[candidate.Provider.DefaultInterface] = defaultKey
+		}
+		for interfaceName, credentialRef := range candidate.Provider.InterfaceCredentialRefs {
+			credential, ok := cfg.ModelCredentials[credentialRef]
+			if !ok || strings.TrimSpace(credential.APIKeyRef) == "" {
+				continue
+			}
+			apiKey, err := modelprofile.ResolveAPIKey(credential.APIKeyRef, secretStore, os.Getenv)
+			if err == nil && strings.TrimSpace(apiKey) != "" {
+				keys[interfaceName] = apiKey
+			}
+		}
+		if len(keys) > 0 {
+			out[candidate.Name] = keys
+		}
+	}
+	return out
 }
 
 func readUnifiedCatalogSnapshot(path string) ([]byte, string, error) {
@@ -820,11 +1081,24 @@ func writeCodexWebSearchFallbackRoleConfig(catalogPath string, configTOML []byte
 	return path, nil
 }
 
-func codexWebSearchFallbackRoleConfigTOML() []byte {
+func codexWebSearchFallbackRoleConfigTOML(fallbacks ...*config.ModelFeatureFallback) []byte {
+	model := codexWebSearchFallbackModel
+	effort := "high"
+	tier := ""
+	if len(fallbacks) > 0 && fallbacks[0] != nil {
+		fallback := fallbacks[0]
+		if strings.TrimSpace(fallback.Selector) != "" {
+			model = strings.TrimSpace(fallback.Selector)
+		}
+		if strings.TrimSpace(fallback.Effort) != "" {
+			effort = strings.TrimSpace(fallback.Effort)
+		}
+		tier = strings.TrimSpace(fallback.Tier)
+	}
 	lines := []string{
 		`model_provider = "openai"`,
-		`model = "` + codexWebSearchFallbackModel + `"`,
-		`model_reasoning_effort = "high"`,
+		`model = "` + tomlEscapeString(model) + `"`,
+		`model_reasoning_effort = "` + tomlEscapeString(effort) + `"`,
 		`web_search = "live"`,
 		`sandbox_mode = "read-only"`,
 		`approval_policy = "never"`,
@@ -836,6 +1110,9 @@ func codexWebSearchFallbackRoleConfigTOML() []byte {
 		`[tools.web_search]`,
 		`context_size = "high"`,
 		"",
+	}
+	if tier != "" {
+		lines = append(lines[:3], append([]string{`service_tier = "` + tomlEscapeString(tier) + `"`}, lines[3:]...)...)
 	}
 	return []byte(strings.Join(lines, "\n"))
 }
@@ -856,6 +1133,26 @@ func responsesAdapterModelsForProvider(provider modelprofile.ProviderSpec) []res
 		})
 	}
 	return out
+}
+
+func responsesAdapterNativeTools(model modelprofile.ModelSpec) []responsesadapter.NativeToolSpec {
+	out := make([]responsesadapter.NativeToolSpec, 0, len(model.NativeTools))
+	for _, tool := range model.NativeTools {
+		out = append(out, responsesadapter.NativeToolSpec{InputTypes: append([]string(nil), tool.InputTypes...), UpstreamType: tool.UpstreamType, Name: tool.Name, AllowedFields: append([]string(nil), tool.AllowedFields...)})
+	}
+	return out
+}
+
+func responsesAdapterSourcePolicy(model modelprofile.ModelSpec) responsesadapter.SourcePolicy {
+	policy := responsesadapter.SourcePolicy{Mode: model.SourcePolicy.Mode, RequireURL: model.SourcePolicy.RequireURL, RequireSources: model.SourcePolicy.RequireSources}
+	if feature, ok := model.Features["webSearch"]; ok {
+		policy.RequireSources = policy.RequireSources || feature.RequireSources
+	}
+	return policy
+}
+
+func responsesAdapterResponsesPolicy(model modelprofile.ModelSpec) responsesadapter.ResponsesPolicy {
+	return responsesadapter.ResponsesPolicy{PreviousResponseID: model.ResponsesPolicy.PreviousResponseID, Background: model.ResponsesPolicy.Background, ContextManagement: model.ResponsesPolicy.ContextManagement}
 }
 
 func modelProfileCatalogFingerprint(provider modelprofile.ProviderSpec) string {

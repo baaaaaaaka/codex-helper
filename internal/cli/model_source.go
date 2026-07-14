@@ -351,6 +351,8 @@ func runModelSourceAutoSyncLoop(ctx context.Context, root *rootOptions, errOut i
 }
 
 func runModelSourceAutoSyncOnce(ctx context.Context, root *rootOptions, errOut io.Writer, now time.Time, interval time.Duration) time.Duration {
+	modelSubscriptionAutoSyncMu.Lock()
+	defer modelSubscriptionAutoSyncMu.Unlock()
 	if interval <= 0 {
 		interval = defaultModelSourceAutoSyncInterval
 	}
@@ -863,11 +865,57 @@ func verifySyncedModel(ctx context.Context, resolved modelprofile.Resolved, apiK
 	if resolved.Provider.DirectResponses {
 		return verifyNativeResponsesModel(ctx, resolved, apiKey)
 	}
-	client := responsesadapter.NewUpstreamHTTPClient(nil)
-	client.Timeout = 20 * time.Second
+	// Verification must exercise the same compiled converter that the runtime
+	// will use.  Constructing OpenAIChatAdapter directly here used to make every
+	// catalog route look OpenAI-compatible, so an Anthropic/Beta route could be
+	// materialized successfully but fail verification (or worse, send the wrong
+	// wire protocol) at launch time.
+	httpPolicy := resolved.Model.HTTPPolicy
+	if httpPolicy.TimeoutSeconds <= 0 {
+		httpPolicy.TimeoutSeconds = 20
+	}
+	profile := responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).
+		WithReasoningOverrides(resolved.Provider.DefaultReasoningEffort, resolved.Provider.ReasoningEffortMap).
+		WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy)
 	max := 8
-	adapter := responsesadapter.OpenAIChatAdapter{BaseURL: resolved.Provider.BaseURL, APIKey: apiKey, HTTPClient: client, MaxRetries: -1, MaxOutputTokens: max, Headers: resolved.Provider.Headers, AuthType: resolved.Provider.AuthType, AuthHeader: resolved.Provider.AuthHeader, StreamMode: resolved.Model.StreamPolicy.UpstreamMode, ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath, CachedTokensPath: resolved.Model.StreamPolicy.CachedTokensPath, UsageField: resolved.Model.CachePolicy.UsageField, Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy)}
-	stream, err := adapter.Stream(ctx, responsesadapter.ProviderRequest{Model: resolved.Model.UpstreamModel(), InputText: "Reply with OK.", MaxOutputTokens: &max, ReasoningEffort: resolved.Provider.DefaultReasoningEffort})
+	adapter, err := responsesadapter.NewConfiguredAdapter(responsesadapter.AdapterOptions{
+		AdapterID:          resolved.Provider.AdapterProfile,
+		ConversionProfile:  resolved.Provider.ConversionProfile,
+		StrictConversion:   resolved.Provider.StrictConversion,
+		BaseURL:            resolved.Provider.BaseURL,
+		APIKey:             apiKey,
+		Headers:            resolved.Provider.Headers,
+		Endpoints:          resolved.Provider.Endpoints,
+		AuthType:           resolved.Provider.AuthType,
+		AuthHeader:         resolved.Provider.AuthHeader,
+		Profile:            profile,
+		MaxRetries:         httpPolicy.MaxRetries,
+		RetryStatuses:      httpPolicy.RetryStatuses,
+		HonorRetryAfter:    httpPolicy.HonorRetryAfter,
+		RetryTransport:     httpPolicy.RetryTransportErrors,
+		MaxOutputTokens:    max,
+		StreamMode:         resolved.Model.StreamPolicy.UpstreamMode,
+		ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath,
+		CachedTokensPath:   resolved.Model.StreamPolicy.CachedTokensPath,
+		UsageField:         resolved.Model.CachePolicy.UsageField,
+		HTTP:               httpPolicy,
+		Stream:             resolved.Model.StreamPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	request := responsesadapter.ProviderRequest{
+		Model:           resolved.Model.UpstreamModel(),
+		Operation:       resolved.Model.Operation,
+		InputText:       "Reply with OK.",
+		MaxOutputTokens: &max,
+		ReasoningEffort: resolved.Provider.DefaultReasoningEffort,
+	}
+	if strings.EqualFold(strings.TrimSpace(request.Operation), "prefix") || strings.EqualFold(strings.TrimSpace(request.Operation), "fim") {
+		request.Prefix = request.InputText
+		request.InputText = ""
+	}
+	stream, err := adapter.Stream(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -944,8 +992,30 @@ func modelVerificationConfigurationFingerprint(resolved modelprofile.Resolved) s
 }
 
 func modelProfileVerificationCurrent(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore) bool {
+	return modelProfileVerificationCurrentWithBinding(cfg, name, profile, secrets, true)
+}
+
+// modelProfileVerificationCurrentIgnoringBinding is used while a provider is
+// being activated one interface at a time. The binding is intentionally still
+// disabled during that transaction, so checking it here would make every
+// already-verified interface look stale and would prevent the final interface
+// from enabling the provider.
+func modelProfileVerificationCurrentIgnoringBinding(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore) bool {
+	return modelProfileVerificationCurrentWithBinding(cfg, name, profile, secrets, false)
+}
+
+func modelProfileVerificationCurrentWithBinding(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore, requireEnabledBinding bool) bool {
 	if strings.TrimSpace(profile.VerificationFingerprint) == "" {
 		return false
+	}
+	if requireEnabledBinding {
+		if catalogName := mapKeyFold(cfg.ModelCatalogs, profile.Source); catalogName != "" {
+			bindingName := mapKeyFold(cfg.ModelProviderBindings, profile.Provider)
+			binding, ok := cfg.ModelProviderBindings[bindingName]
+			if !ok || !binding.Enabled || !strings.EqualFold(strings.TrimSpace(binding.Catalog), catalogName) {
+				return false
+			}
+		}
 	}
 	resolved, err := modelprofile.Resolve(cfg, name)
 	if err != nil {

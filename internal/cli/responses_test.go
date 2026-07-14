@@ -223,8 +223,8 @@ func TestResponsesRegistryFromFileLoadsProvidersAndProxyKeys(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{
 		"default_provider":"mimo",
 		"providers":[
-			{"id":"mimo","profile":"mimo","api_key_env":"MIMO_TEST_KEY","default_model":"mimo-v2.5","models":["mimo-v2.5","mimo-v2.5-pro"]},
-			{"id":"deepseek","profile":"deepseek","api_key_env":"DEEPSEEK_TEST_KEY","default_model":"deepseek-v4-flash","models":["deepseek-v4-flash"]}
+			{"id":"mimo","profile":"catalog-mimo","base_url":"https://mimo.example/v1","api_key_env":"MIMO_TEST_KEY","default_model":"mimo-v2.5","models":["mimo-v2.5","mimo-v2.5-pro"]},
+			{"id":"deepseek","profile":"catalog-deepseek","base_url":"https://deepseek.example/v1","api_key_env":"DEEPSEEK_TEST_KEY","default_model":"deepseek-v4-flash","models":["deepseek-v4-flash"]}
 		],
 		"proxy_keys":{"mi-key":"mimo"}
 	}`), 0o600); err != nil {
@@ -242,7 +242,7 @@ func TestResponsesRegistryFromFileLoadsProvidersAndProxyKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve mimo: %v", err)
 	}
-	if runtime.ProviderID != "mimo" || runtime.BaseURLHash != responsesadapter.BaseURLHash("https://token-plan-cn.xiaomimimo.com/v1") {
+	if runtime.ProviderID != "mimo" || runtime.BaseURLHash != responsesadapter.BaseURLHash("https://mimo.example/v1") {
 		t.Fatalf("mimo runtime = %#v", runtime)
 	}
 	if runtime.KeyFingerprint != responsesadapter.KeyFingerprint("tp-mimo", "salt") {

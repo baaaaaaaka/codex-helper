@@ -64,10 +64,7 @@ func TestParseCodexAppArgs(t *testing.T) {
 
 func mustCodexCatalogJSONForProvider(t *testing.T, provider string) []byte {
 	t.Helper()
-	spec, err := modelprofile.MustLookupProvider(provider)
-	if err != nil {
-		t.Fatalf("lookup provider %q: %v", provider, err)
-	}
+	spec := testExternalProviderSpec(provider)
 	raw, err := modelprofile.CodexModelCatalogJSON(spec)
 	if err != nil {
 		t.Fatalf("catalog for provider %q: %v", provider, err)

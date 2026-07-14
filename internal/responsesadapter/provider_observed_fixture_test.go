@@ -10,6 +10,17 @@ import (
 	"testing"
 )
 
+func testObservedProfile(provider string) ProviderProfile {
+	switch provider {
+	case "deepseek":
+		return testCatalogDeepSeekProfile()
+	case "mimo":
+		return testCatalogMiMoProfile("allow", "preserve")
+	default:
+		return ProfileForProvider(provider)
+	}
+}
+
 func TestOpenAIChatAdapterParsesObservedProviderSSEFixtures(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -137,7 +148,7 @@ func TestOpenAIChatAdapterParsesObservedProviderSSEFixtures(t *testing.T) {
 
 			adapter := OpenAIChatAdapter{
 				BaseURL:    server.URL + "/v1",
-				Profile:    ProfileForProvider(tc.profile),
+				Profile:    testObservedProfile(tc.profile),
 				HTTPClient: server.Client(),
 				MaxRetries: -1,
 			}
@@ -219,7 +230,7 @@ func TestFacadeCompletesObservedProviderToolCallFixtures(t *testing.T) {
 			}))
 			defer server.Close()
 			facade := &Facade{
-				Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider(tc.profile), HTTPClient: server.Client(), MaxRetries: -1},
+				Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testObservedProfile(tc.profile), HTTPClient: server.Client(), MaxRetries: -1},
 				Store:        NewMemoryStore(),
 				ProviderID:   tc.profile,
 				DefaultModel: tc.model,
@@ -387,7 +398,7 @@ func TestMockedLiveProviderResponsesFlowsCI(t *testing.T) {
 			}))
 			defer server.Close()
 			facade := &Facade{
-				Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider(tc.profile), HTTPClient: server.Client(), MaxRetries: -1},
+				Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testObservedProfile(tc.profile), HTTPClient: server.Client(), MaxRetries: -1},
 				Store:        NewMemoryStore(),
 				ProviderID:   tc.profile,
 				DefaultModel: tc.model,

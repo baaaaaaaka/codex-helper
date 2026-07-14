@@ -40,18 +40,53 @@ type OpenAIChatAdapter struct {
 }
 
 type chatCompletionRequest struct {
-	Model               string             `json:"model"`
-	Messages            []chatMessage      `json:"messages"`
-	Tools               []ChatTool         `json:"tools,omitempty"`
-	ToolChoice          json.RawMessage    `json:"tool_choice,omitempty"`
-	ParallelToolCalls   *bool              `json:"parallel_tool_calls,omitempty"`
-	MaxCompletionTokens *int               `json:"max_completion_tokens,omitempty"`
-	ReasoningEffort     string             `json:"reasoning_effort,omitempty"`
-	Thinking            *thinkingConfig    `json:"thinking,omitempty"`
-	Temperature         *float64           `json:"temperature,omitempty"`
-	TopP                *float64           `json:"top_p,omitempty"`
-	Stream              bool               `json:"stream"`
-	StreamOptions       *chatStreamOptions `json:"stream_options,omitempty"`
+	Model               string               `json:"model"`
+	Messages            []chatMessage        `json:"messages"`
+	Tools               []ChatTool           `json:"tools,omitempty"`
+	NativeTools         []ProviderNativeTool `json:"-"`
+	ToolChoice          json.RawMessage      `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool                `json:"parallel_tool_calls,omitempty"`
+	MaxCompletionTokens *int                 `json:"max_completion_tokens,omitempty"`
+	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
+	Thinking            *thinkingConfig      `json:"thinking,omitempty"`
+	Temperature         *float64             `json:"temperature,omitempty"`
+	TopP                *float64             `json:"top_p,omitempty"`
+	ResponseFormat      json.RawMessage      `json:"response_format,omitempty"`
+	Stream              bool                 `json:"stream"`
+	StreamOptions       *chatStreamOptions   `json:"stream_options,omitempty"`
+}
+
+func (r chatCompletionRequest) MarshalJSON() ([]byte, error) {
+	type alias chatCompletionRequest
+	base, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	if len(r.NativeTools) == 0 {
+		return base, nil
+	}
+	var object map[string]any
+	if err := json.Unmarshal(base, &object); err != nil {
+		return nil, err
+	}
+	tools := make([]any, 0, len(r.Tools)+len(r.NativeTools))
+	for _, tool := range r.Tools {
+		tools = append(tools, tool)
+	}
+	for _, tool := range r.NativeTools {
+		payload := map[string]any{"type": tool.UpstreamType}
+		if tool.Name != "" {
+			payload["name"] = tool.Name
+		}
+		for key, value := range tool.Fields {
+			if key != "type" && key != "name" {
+				payload[key] = value
+			}
+		}
+		tools = append(tools, payload)
+	}
+	object["tools"] = tools
+	return json.Marshal(object)
 }
 
 type thinkingConfig struct {
@@ -76,11 +111,23 @@ type chatContentPart struct {
 	Type     string        `json:"type"`
 	Text     string        `json:"text,omitempty"`
 	ImageURL *chatImageURL `json:"image_url,omitempty"`
+	Audio    *chatAudio    `json:"input_audio,omitempty"`
+	VideoURL *chatVideoURL `json:"video_url,omitempty"`
 }
 
 type chatImageURL struct {
 	URL    string `json:"url"`
 	Detail string `json:"detail,omitempty"`
+}
+
+type chatAudio struct {
+	URL    string `json:"url,omitempty"`
+	Data   string `json:"data,omitempty"`
+	Format string `json:"format,omitempty"`
+}
+
+type chatVideoURL struct {
+	URL string `json:"url"`
 }
 
 type chatMessageToolCall struct {
@@ -94,19 +141,52 @@ type chatToolFunction struct {
 	Arguments string `json:"arguments"`
 }
 
+func chatRequestTools(functions []ChatTool, native []ProviderNativeTool) []any {
+	if len(functions) == 0 && len(native) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(functions)+len(native))
+	for _, tool := range functions {
+		out = append(out, tool)
+	}
+	for _, tool := range native {
+		payload := map[string]any{"type": tool.UpstreamType}
+		if tool.Name != "" {
+			payload["name"] = tool.Name
+		}
+		for key, value := range tool.Fields {
+			if key != "type" && key != "name" {
+				payload[key] = value
+			}
+		}
+		out = append(out, payload)
+	}
+	return out
+}
+
 func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-chan ProviderEvent, error) {
+	if err := validateProviderResponseFields(req, "OpenAI Chat"); err != nil {
+		return nil, err
+	}
+	switch strings.ToLower(strings.TrimSpace(req.Operation)) {
+	case "", "chat", "responses":
+	default:
+		return nil, fmt.Errorf("OpenAI Chat converter does not support operation %q", req.Operation)
+	}
 	profile := a.Profile.withDefaults()
 	buffered := strings.EqualFold(strings.TrimSpace(a.StreamMode), "nonstream-buffered")
 	body := chatCompletionRequest{
 		Model:               req.Model,
 		Messages:            chatMessagesFromProviderRequestWithProfile(req, profile),
 		Tools:               req.Tools,
+		NativeTools:         req.NativeTools,
 		ToolChoice:          chatToolChoice(req.ToolChoice, profile),
 		ParallelToolCalls:   req.ParallelToolCalls,
 		MaxCompletionTokens: req.MaxOutputTokens,
 		ReasoningEffort:     profile.reasoningEffort(req.ReasoningEffort),
 		Temperature:         req.Temperature,
 		TopP:                req.TopP,
+		ResponseFormat:      append(json.RawMessage(nil), req.ResponseFormat...),
 		Stream:              !buffered,
 	}
 	if a.MaxOutputTokens > 0 && (body.MaxCompletionTokens == nil || *body.MaxCompletionTokens > a.MaxOutputTokens) {
@@ -172,10 +252,10 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 		defer resp.Body.Close()
 		defer releaseGate()
 		if buffered {
-			parseBufferedChatCompletion(ctx, resp.Body, ch, profile.ValidateToolArguments, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
+			parseBufferedChatCompletionWithPolicy(ctx, resp.Body, ch, profile.ValidateToolArguments, a.reasoningPath(profile), a.cachedUsagePath(), a.Status, req.SourcePolicy)
 			return
 		}
-		parseChatCompletionSSEWithPolicy(ctx, resp.Body, ch, profile.ValidateToolArguments, a.StreamIdleTimeout, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
+		parseChatCompletionSSEWithPolicyAndSources(ctx, resp.Body, ch, profile.ValidateToolArguments, a.StreamIdleTimeout, a.reasoningPath(profile), a.cachedUsagePath(), a.Status, req.SourcePolicy)
 	}()
 	return ch, nil
 }
@@ -207,6 +287,10 @@ func (m *chatBufferedMessage) UnmarshalJSON(data []byte) error {
 }
 
 func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string)) {
+	parseBufferedChatCompletionWithPolicy(ctx, body, out, validateArguments, reasoningPath, cachedTokensPath, status, SourcePolicy{})
+}
+
+func parseBufferedChatCompletionWithPolicy(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string), sourcePolicy SourcePolicy) {
 	var completion bufferedChatCompletion
 	if err := json.NewDecoder(body).Decode(&completion); err != nil {
 		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("invalid buffered chat completion: %w", err)}
@@ -230,6 +314,22 @@ func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<-
 		parser := newInlineThinkParser()
 		emitSplitText(out, parser.feed(choice.Message.Content))
 		emitSplitText(out, parser.flush())
+	}
+	if strings.EqualFold(strings.TrimSpace(sourcePolicy.Mode), "unsupported") && hasSourceURLs(choice.Message.Raw) {
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned source citations but catalog marks sources unsupported")}
+		return
+	}
+	if sourcePolicy.RequireURL && hasSourceMetadata(choice.Message.Raw) && !hasSourceURLs(choice.Message.Raw) {
+		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned source metadata without a URL")}
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(sourcePolicy.Mode), "text") {
+		if text := sourceTextFromValue(choice.Message.Raw); text != "" {
+			out <- ProviderEvent{Kind: ProviderEventTextDelta, Delta: text}
+		}
+	}
+	for _, source := range sourceCitationsFromValue(choice.Message.Raw, sourcePolicy) {
+		out <- ProviderEvent{Kind: ProviderEventSource, Source: &source}
 	}
 	for index, call := range choice.Message.ToolCalls {
 		if validateArguments && !json.Valid([]byte(strings.TrimSpace(call.Function.Arguments))) {
@@ -559,12 +659,22 @@ func chatContentParts(parts []ProviderContentPart) []chatContentPart {
 				image.Detail = strings.TrimSpace(part.Detail)
 			}
 			out = append(out, chatContentPart{Type: "image_url", ImageURL: image})
+		case "audio":
+			if strings.TrimSpace(part.AudioURL) == "" && strings.TrimSpace(part.AudioData) == "" {
+				continue
+			}
+			out = append(out, chatContentPart{Type: "input_audio", Audio: &chatAudio{URL: part.AudioURL, Data: part.AudioData, Format: part.AudioFormat}})
+		case "video":
+			if strings.TrimSpace(part.VideoURL) == "" {
+				continue
+			}
+			out = append(out, chatContentPart{Type: "video_url", VideoURL: &chatVideoURL{URL: part.VideoURL}})
 		}
 	}
-	if !hasText && hasChatImagePart(out) {
-		out = append([]chatContentPart{{Type: "text", Text: "Please analyze the attached image."}}, out...)
+	if !hasText && hasChatMediaPart(out) {
+		out = append([]chatContentPart{{Type: "text", Text: "Please analyze the attached media."}}, out...)
 	}
-	if !hasChatImagePart(out) {
+	if len(out) == 0 {
 		return nil
 	}
 	return out
@@ -573,6 +683,15 @@ func chatContentParts(parts []ProviderContentPart) []chatContentPart {
 func hasChatImagePart(parts []chatContentPart) bool {
 	for _, part := range parts {
 		if part.Type == "image_url" && part.ImageURL != nil && strings.TrimSpace(part.ImageURL.URL) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasChatMediaPart(parts []chatContentPart) bool {
+	for _, part := range parts {
+		if part.Type == "image_url" || part.Type == "input_audio" || part.Type == "video_url" {
 			return true
 		}
 	}
@@ -609,6 +728,10 @@ func parseChatCompletionSSEWithIdleTimeout(ctx context.Context, body io.ReadClos
 }
 
 func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string)) {
+	parseChatCompletionSSEWithPolicyAndSources(ctx, body, out, validateArguments, idleTimeout, reasoningPath, cachedTokensPath, status, SourcePolicy{})
+}
+
+func parseChatCompletionSSEWithPolicyAndSources(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string), sourcePolicy SourcePolicy) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
@@ -661,6 +784,22 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 			}
 			if choice.Delta.Content != "" {
 				emitSplitText(out, inlineThink.feed(choice.Delta.Content))
+			}
+			if strings.EqualFold(strings.TrimSpace(sourcePolicy.Mode), "unsupported") && hasSourceURLs(choice.Delta.Raw) {
+				out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned source citations but catalog marks sources unsupported")}
+				return
+			}
+			if sourcePolicy.RequireURL && hasSourceMetadata(choice.Delta.Raw) && !hasSourceURLs(choice.Delta.Raw) {
+				out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned source metadata without a URL")}
+				return
+			}
+			if strings.EqualFold(strings.TrimSpace(sourcePolicy.Mode), "text") {
+				if text := sourceTextFromValue(choice.Delta.Raw); text != "" {
+					out <- ProviderEvent{Kind: ProviderEventTextDelta, Delta: text}
+				}
+			}
+			for _, source := range sourceCitationsFromValue(choice.Delta.Raw, sourcePolicy) {
+				out <- ProviderEvent{Kind: ProviderEventSource, Source: &source}
 			}
 			for _, toolCall := range choice.Delta.ToolCalls {
 				arguments := toolArguments[toolCall.Index]
@@ -1016,6 +1155,131 @@ func emitSplitText(out chan<- ProviderEvent, split splitText) {
 	if split.text != "" {
 		out <- ProviderEvent{Kind: ProviderEventTextDelta, Delta: split.text}
 	}
+}
+
+func sourceCitationsFromValue(value any, policy SourcePolicy) []SourceCitation {
+	if strings.EqualFold(strings.TrimSpace(policy.Mode), "unsupported") || strings.EqualFold(strings.TrimSpace(policy.Mode), "text") {
+		return nil
+	}
+	var out []SourceCitation
+	seen := map[string]bool{}
+	var walk func(any)
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case map[string]any:
+			urlValue, _ := typed["url"].(string)
+			urlValue = strings.TrimSpace(urlValue)
+			if strings.HasPrefix(urlValue, "http://") || strings.HasPrefix(urlValue, "https://") {
+				if !seen[urlValue] {
+					title, _ := typed["title"].(string)
+					out = append(out, SourceCitation{Type: "url_citation", URL: urlValue, Title: strings.TrimSpace(title)})
+					seen[urlValue] = true
+				}
+			}
+			for _, child := range typed {
+				walk(child)
+			}
+		}
+	}
+	walk(value)
+	return out
+}
+
+// sourceTextFromValue extracts provider search-result text only when the raw
+// payload contains an explicit source/search marker. This prevents text-mode
+// conversion from duplicating the assistant's ordinary message content.
+func sourceTextFromValue(value any) string {
+	var parts []string
+	var walk func(any, bool)
+	walk = func(current any, inSource bool) {
+		switch typed := current.(type) {
+		case []any:
+			for _, item := range typed {
+				walk(item, inSource)
+			}
+		case map[string]any:
+			marked := inSource
+			for key, child := range typed {
+				lower := strings.ToLower(strings.TrimSpace(key))
+				if lower == "type" {
+					if typeName, ok := child.(string); ok && strings.Contains(strings.ToLower(typeName), "search") {
+						marked = true
+					}
+				}
+				switch lower {
+				case "annotations", "annotation", "sources", "source", "citations", "citation", "web_search_results", "web_search_tool_result":
+					marked = true
+				}
+			}
+			for key, child := range typed {
+				lower := strings.ToLower(strings.TrimSpace(key))
+				if marked {
+					switch lower {
+					case "text", "snippet", "content", "title", "description":
+						if text, ok := child.(string); ok && strings.TrimSpace(text) != "" {
+							parts = append(parts, text)
+							continue
+						}
+					}
+				}
+				walk(child, marked)
+			}
+		}
+	}
+	walk(value, false)
+	return strings.Join(parts, "\n")
+}
+
+func hasSourceURLs(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if hasSourceURLs(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		if urlValue, _ := typed["url"].(string); strings.HasPrefix(strings.TrimSpace(urlValue), "http://") || strings.HasPrefix(strings.TrimSpace(urlValue), "https://") {
+			return true
+		}
+		for _, child := range typed {
+			if hasSourceURLs(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasSourceMetadata(value any) bool {
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if hasSourceMetadata(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, child := range typed {
+			if strings.EqualFold(strings.TrimSpace(key), "type") {
+				if typeName, ok := child.(string); ok && strings.Contains(strings.ToLower(typeName), "search") {
+					return true
+				}
+			}
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "annotations", "annotation", "sources", "source", "citations", "citation", "web_search_results", "web_search_tool_result":
+				return true
+			}
+			if hasSourceMetadata(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func longestSuffixPrefix(s string, prefixOf string) int {

@@ -1052,6 +1052,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				defer stopModelSourceAutoSync()
 				if !once {
 					go runModelSourceAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
+					go runModelCatalogAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
 				}
 				if autoService && !once {
 					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {

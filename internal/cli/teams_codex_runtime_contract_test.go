@@ -161,12 +161,12 @@ func TestTeamsUnifiedPreparationUsesResolvedRuntimeEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
-		"mimo": {Provider: "mimo", Model: "mimo/mimo-v2.5", APIKeyRef: "env:TEST_TEAMS_RUNTIME_MIMO_KEY", Revision: 1},
+		"kimi": {Provider: "kimi", Model: "kimi-k2", APIKeyRef: "env:TEST_TEAMS_RUNTIME_KIMI_KEY", Revision: 1},
 	}}
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("TEST_TEAMS_RUNTIME_MIMO_KEY", "test-key")
+	t.Setenv("TEST_TEAMS_RUNTIME_KIMI_KEY", "test-key")
 	previousProbe := codexLoginStatusProbeFn
 	previousCatalog := loadBundledCodexModelCatalogFn
 	t.Cleanup(func() {
@@ -191,14 +191,14 @@ func TestTeamsUnifiedPreparationUsesResolvedRuntimeEnvironment(t *testing.T) {
 		Environment: []string{"PATH=/service/without-codex", "CODEX_HOME=/target/.codex"},
 		Fingerprint: "runtime-fingerprint",
 	})
-	args, _, cleanup, err := prepareTeamsAppServerModelProfileWithContext(ctx, &rootOptions{configPath: configPath}, "mimo", modelprofile.Snapshot{}, io.Discard)
+	args, _, cleanup, err := prepareTeamsAppServerModelProfileWithContext(ctx, &rootOptions{configPath: configPath}, "kimi", modelprofile.Snapshot{}, io.Discard)
 	if cleanup != nil {
 		defer cleanup()
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	if joined := strings.Join(args, "\n"); !strings.Contains(joined, `model="mimo/mimo-v2.5"`) {
+	if joined := strings.Join(args, "\n"); !strings.Contains(joined, `model="kimi-k2"`) {
 		t.Fatalf("unified launch args missing selected model: %v", args)
 	}
 }

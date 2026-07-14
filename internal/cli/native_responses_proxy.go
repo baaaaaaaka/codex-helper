@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 )
 
 const nativeResponsesProxyBodyLimit = 32 << 20
@@ -26,22 +28,54 @@ type nativeResponsesToolName struct {
 }
 
 type nativeResponsesCompatibilityProxy struct {
-	upstream *url.URL
-	apiKey   string
-	proxyKey string
-	client   *http.Client
-	log      io.Writer
-	logMu    sync.Mutex
-	mu       sync.RWMutex
-	toWire   map[nativeResponsesToolName]string
-	fromWire map[string]nativeResponsesToolName
+	upstream        *url.URL
+	apiKey          string
+	proxyKey        string
+	client          *http.Client
+	log             io.Writer
+	logMu           sync.Mutex
+	mu              sync.RWMutex
+	toWire          map[nativeResponsesToolName]string
+	fromWire        map[string]nativeResponsesToolName
+	responsesPolicy responsesadapter.ResponsesPolicy
+	// sourcePolicy is intentionally restricted for native Responses routes.
+	// The proxy can validate request fields, but it cannot safely validate
+	// provider-generated citation events without translating the response
+	// stream. A catalog that requires structured sources must therefore use a
+	// translated/chat route instead of silently bypassing that policy here.
+	sourcePolicy responsesadapter.SourcePolicy
+	// unsupportedToolPolicy and nativeTools mirror the catalog route metadata.
+	// A native Responses pass-through cannot translate a provider-owned tool,
+	// but it can still reject a declared unsupported tool instead of forwarding
+	// it and pretending the provider supports it.
+	unsupportedToolPolicy string
+	nativeTools           []responsesadapter.NativeToolSpec
 }
 
 func startNativeResponsesCompatibilityProxy(upstream string, apiKey string, proxyKey string, upstreamProxyURL string, log io.Writer) (string, func(), error) {
+	return startNativeResponsesCompatibilityProxyWithPolicy(upstream, apiKey, proxyKey, upstreamProxyURL, log, responsesadapter.ResponsesPolicy{})
+}
+
+func startNativeResponsesCompatibilityProxyWithPolicy(upstream string, apiKey string, proxyKey string, upstreamProxyURL string, log io.Writer, policy responsesadapter.ResponsesPolicy) (string, func(), error) {
+	return startNativeResponsesCompatibilityProxyWithPolicies(upstream, apiKey, proxyKey, upstreamProxyURL, log, policy, responsesadapter.SourcePolicy{})
+}
+
+func startNativeResponsesCompatibilityProxyWithPolicies(upstream string, apiKey string, proxyKey string, upstreamProxyURL string, log io.Writer, policy responsesadapter.ResponsesPolicy, sourcePolicy responsesadapter.SourcePolicy) (string, func(), error) {
+	return startNativeResponsesCompatibilityProxyWithRoutePolicies(upstream, apiKey, proxyKey, upstreamProxyURL, log, policy, sourcePolicy, "", nil)
+}
+
+func startNativeResponsesCompatibilityProxyWithRoutePolicies(upstream string, apiKey string, proxyKey string, upstreamProxyURL string, log io.Writer, policy responsesadapter.ResponsesPolicy, sourcePolicy responsesadapter.SourcePolicy, unsupportedToolPolicy string, nativeTools []responsesadapter.NativeToolSpec) (string, func(), error) {
+	if err := responsesadapter.ValidateDirectSourcePolicy(sourcePolicy); err != nil {
+		return "", nil, err
+	}
 	handler, transportCleanup, err := newNativeResponsesCompatibilityProxy(upstream, apiKey, proxyKey, upstreamProxyURL, log)
 	if err != nil {
 		return "", nil, err
 	}
+	handler.responsesPolicy = policy
+	handler.sourcePolicy = sourcePolicy
+	handler.unsupportedToolPolicy = strings.TrimSpace(unsupportedToolPolicy)
+	handler.nativeTools = append([]responsesadapter.NativeToolSpec(nil), nativeTools...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		transportCleanup()
@@ -96,12 +130,31 @@ func (p *nativeResponsesCompatibilityProxy) ServeHTTP(w http.ResponseWriter, r *
 		http.Error(w, `{"error":{"message":"invalid proxy authorization key"}}`, http.StatusUnauthorized)
 		return
 	}
+	if err := responsesadapter.ValidateDirectSourcePolicy(p.sourcePolicy); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, nativeResponsesProxyBodyLimit+1))
 	if err != nil || len(body) > nativeResponsesProxyBodyLimit {
 		http.Error(w, `{"error":{"message":"request body is too large"}}`, http.StatusRequestEntityTooLarge)
 		return
 	}
 	if len(bytes.TrimSpace(body)) > 0 && strings.Contains(r.URL.Path, "/responses") {
+		var request responsesadapter.ResponsesRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			http.Error(w, `{"error":{"message":"invalid Responses request"}}`, http.StatusBadRequest)
+			return
+		}
+		if p.responsesPolicy != (responsesadapter.ResponsesPolicy{}) {
+			if err := responsesadapter.ValidateResponsesRequestPolicy(request, p.responsesPolicy); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+		if err := p.validateRequestTools(request.Tools); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":%q}}`, err.Error()), http.StatusBadRequest)
+			return
+		}
 		body, err = p.rewriteRequest(body)
 		if err != nil {
 			http.Error(w, `{"error":{"message":"invalid Responses request"}}`, http.StatusBadRequest)
@@ -141,6 +194,14 @@ func (p *nativeResponsesCompatibilityProxy) ServeHTTP(w http.ResponseWriter, r *
 		p.logUsage(raw)
 	}
 	_, _ = w.Write(raw)
+}
+
+func (p *nativeResponsesCompatibilityProxy) validateRequestTools(raw json.RawMessage) error {
+	if !strings.EqualFold(strings.TrimSpace(p.unsupportedToolPolicy), "error") || len(raw) == 0 {
+		return nil
+	}
+	_, _, _, err := responsesadapter.NormalizeRequestTools(raw, "", "error", p.nativeTools)
+	return err
 }
 
 func nativeResponsesTargetPath(basePath string, requestPath string) string {

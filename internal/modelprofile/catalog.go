@@ -10,8 +10,6 @@ import (
 
 const DefaultProvider = "default"
 
-const millionTokenContextWindow = 1000000
-
 type ProviderSpec struct {
 	ID                        string
 	DisplayName               string
@@ -34,13 +32,39 @@ type ProviderSpec struct {
 	HTTP                      config.ModelHTTPPolicy
 	Stream                    config.ModelStreamPolicy
 	Headers                   map[string]string
-	AuthType                  string
-	AuthHeader                string
+	Endpoints                 map[string]string
+	// ProviderHeaders and ProviderEndpoints retain shared provider-level
+	// transport fields. Headers/Endpoints are effective fields for the
+	// selected default interface; route construction uses these shared maps so
+	// another interface cannot inherit the default interface's private fields.
+	ProviderHeaders         map[string]string
+	ProviderEndpoints       map[string]string
+	ProviderHTTP            config.ModelHTTPPolicy
+	ProviderStream          config.ModelStreamPolicy
+	AuthType                string
+	AuthHeader              string
+	DefaultInterface        string
+	Interfaces              map[string]config.ModelInterface
+	InterfaceCredentialRefs map[string]string
+	// RouteInterfaces maps an operation key (chat, responses, prefix, fim,
+	// webSearch) to the concrete wire interface. The default interface remains
+	// the fallback for ordinary requests, but operation routes are resolved at
+	// request time instead of being collapsed into one adapter.
+	RouteInterfaces      map[string]string
+	ConversionProfile    string
+	StrictConversion     bool
+	Operation            string
+	SearchFallback       *config.ModelFeatureFallback
+	SearchRequireSources bool
 }
 
 type ModelSpec struct {
 	ID                      string
 	UpstreamID              string
+	DefaultInterface        string
+	Operation               string
+	ConversionProfile       string
+	StrictConversion        bool
 	DisplayName             string
 	Description             string
 	Aliases                 []string
@@ -60,6 +84,11 @@ type ModelSpec struct {
 	StreamPolicy            config.ModelStreamPolicy
 	HTTPPolicy              config.ModelHTTPPolicy
 	CachePolicy             config.ModelCachePolicy
+	Features                map[string]config.ModelFeature
+	NativeTools             []config.ModelNativeTool
+	SourcePolicy            config.ModelSourcePolicy
+	ResponsesPolicy         config.ModelResponsesPolicy
+	UnsupportedToolPolicy   string
 }
 
 type ModelChoice struct {
@@ -207,7 +236,7 @@ func (p ProviderSpec) dynamicModel(ref string) ModelSpec {
 }
 
 // WithSelectedModel ensures a dynamically selected provider model is present in
-// the generated Codex catalog while leaving the reviewed static entries intact.
+// the generated Codex catalog.
 func (p ProviderSpec) WithSelectedModel(model ModelSpec) ProviderSpec {
 	if model.PublicID() == "" {
 		return p
@@ -370,16 +399,6 @@ func RecommendedProfileName(spec ProviderSpec, model ModelSpec) string {
 		return DefaultProvider
 	}
 	publicID := model.PublicID()
-	switch {
-	case strings.EqualFold(publicID, "deepseek/deepseek-v4-flash"):
-		return "deepseek-flash"
-	case strings.EqualFold(publicID, "deepseek/deepseek-v4-pro"):
-		return "deepseek-pro"
-	case strings.EqualFold(publicID, "mimo/mimo-v2.5"):
-		return "mimo25"
-	case strings.EqualFold(publicID, "mimo/mimo-v2.5-pro"):
-		return "mimo25-pro"
-	}
 	base := strings.TrimSpace(publicID)
 	if idx := strings.LastIndex(base, "/"); idx >= 0 && idx+1 < len(base) {
 		base = base[idx+1:]
@@ -478,79 +497,6 @@ var providerCatalog = map[string]ProviderSpec{
 		ID:             DefaultProvider,
 		DisplayName:    "Codex official API",
 		AllowsAnyModel: true,
-	},
-	"deepseek": {
-		ID:              "deepseek",
-		DisplayName:     "DeepSeek",
-		DefaultModel:    "deepseek-v4-flash",
-		CredentialScope: "deepseek",
-		BaseURL:         "https://api.deepseek.com/v1",
-		AdapterProfile:  "deepseek",
-		RecommendedEnv:  "DEEPSEEK_API_KEY",
-		UsesAdapter:     true,
-		SupportsTools:   true,
-		SupportsReason:  true,
-		Models: []ModelSpec{{
-			ID:               "deepseek/deepseek-v4-flash",
-			UpstreamID:       "deepseek-v4-flash",
-			DisplayName:      "DeepSeek V4 Flash",
-			Description:      "Fast DeepSeek coding model routed by CXP.",
-			Aliases:          []string{"flash", "v4-flash", "default", "fast"},
-			ContextWindow:    millionTokenContextWindow,
-			MaxContextWindow: millionTokenContextWindow,
-			SupportsTools:    true,
-			SupportsReason:   true,
-			Priority:         0,
-		}, {
-			ID:               "deepseek/deepseek-v4-pro",
-			UpstreamID:       "deepseek-v4-pro",
-			DisplayName:      "DeepSeek V4 Pro",
-			Description:      "Higher-quality DeepSeek coding model routed by CXP.",
-			Aliases:          []string{"pro", "v4-pro"},
-			ContextWindow:    millionTokenContextWindow,
-			MaxContextWindow: millionTokenContextWindow,
-			SupportsTools:    true,
-			SupportsReason:   true,
-			Priority:         1,
-		}},
-	},
-	"mimo": {
-		ID:              "mimo",
-		DisplayName:     "MiMo",
-		DefaultModel:    "mimo-v2.5",
-		CredentialScope: "mimo25",
-		BaseURL:         "https://api.xiaomimimo.com/v1",
-		AdapterProfile:  "mimo",
-		RecommendedEnv:  "MIMO_API_KEY",
-		UsesAdapter:     true,
-		SupportsTools:   true,
-		SupportsVision:  true,
-		SupportsReason:  true,
-		Models: []ModelSpec{{
-			ID:               "mimo/mimo-v2.5",
-			UpstreamID:       "mimo-v2.5",
-			DisplayName:      "MiMo 2.5",
-			Description:      "MiMo 2.5 family model routed by CXP.",
-			Aliases:          []string{"base", "standard", "normal", "default", "mimo25"},
-			ContextWindow:    millionTokenContextWindow,
-			MaxContextWindow: millionTokenContextWindow,
-			SupportsTools:    true,
-			SupportsVision:   true,
-			SupportsReason:   true,
-			Priority:         0,
-		}, {
-			ID:               "mimo/mimo-v2.5-pro",
-			UpstreamID:       "mimo-v2.5-pro",
-			DisplayName:      "MiMo 2.5 Pro",
-			Description:      "MiMo 2.5 Pro family model routed by CXP.",
-			Aliases:          []string{"pro", "mimo25-pro"},
-			ContextWindow:    millionTokenContextWindow,
-			MaxContextWindow: millionTokenContextWindow,
-			SupportsTools:    true,
-			SupportsVision:   true,
-			SupportsReason:   true,
-			Priority:         1,
-		}},
 	},
 	"kimi": {
 		ID:             "kimi",

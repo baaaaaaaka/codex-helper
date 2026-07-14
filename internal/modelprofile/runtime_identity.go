@@ -49,8 +49,24 @@ func BaseURLHash(base string) string {
 }
 
 func CatalogFingerprint(provider ProviderSpec) string {
-	raw, err := CodexModelCatalogJSON(provider)
-	if err != nil || len(raw) == 0 {
+	catalog, err := CodexModelCatalogJSON(provider)
+	if err != nil || len(catalog) == 0 {
+		return ""
+	}
+	// The public Codex catalog does not contain transport details. Include the
+	// route/interface contract as well so changing an Anthropic/Beta endpoint
+	// or operation mapping invalidates a captured runtime snapshot and a
+	// long-lived adapter instance.
+	raw, err := json.Marshal(struct {
+		Catalog          json.RawMessage                  `json:"catalog"`
+		DefaultInterface string                           `json:"defaultInterface"`
+		Interfaces       map[string]config.ModelInterface `json:"interfaces"`
+		Routes           map[string]string                `json:"routes"`
+		Adapter          string                           `json:"adapter"`
+		Conversion       string                           `json:"conversion"`
+		StrictConversion bool                             `json:"strictConversion"`
+	}{json.RawMessage(catalog), provider.DefaultInterface, provider.Interfaces, provider.RouteInterfaces, provider.AdapterProfile, provider.ConversionProfile, provider.StrictConversion})
+	if err != nil {
 		return ""
 	}
 	sum := sha256.Sum256(raw)
@@ -63,20 +79,31 @@ func ModelFingerprint(provider ProviderSpec, modelRef string) string {
 		return ""
 	}
 	policy, _ := json.Marshal(struct {
-		Reasoning any `json:"reasoning"`
-		Tools     any `json:"tools"`
-		Messages  any `json:"messages"`
-		Sampling  any `json:"sampling"`
-		Stream    any `json:"stream"`
-		HTTP      any `json:"http"`
-		Cache     any `json:"cache"`
-	}{model.ReasoningPolicy, model.ToolPolicy, model.MessagePolicy, model.SamplingPolicy, model.StreamPolicy, model.HTTPPolicy, model.CachePolicy})
+		Reasoning          any                              `json:"reasoning"`
+		Tools              any                              `json:"tools"`
+		Messages           any                              `json:"messages"`
+		Sampling           any                              `json:"sampling"`
+		Responses          any                              `json:"responses"`
+		Stream             any                              `json:"stream"`
+		HTTP               any                              `json:"http"`
+		Cache              any                              `json:"cache"`
+		Features           any                              `json:"features"`
+		NativeTools        any                              `json:"nativeTools"`
+		SourcePolicy       any                              `json:"sourcePolicy"`
+		Interface          string                           `json:"interface"`
+		Conversion         string                           `json:"conversion"`
+		StrictConversion   bool                             `json:"strictConversion"`
+		Operation          string                           `json:"operation"`
+		ProviderInterfaces map[string]config.ModelInterface `json:"providerInterfaces"`
+		ProviderRoutes     map[string]string                `json:"providerRoutes"`
+	}{model.ReasoningPolicy, model.ToolPolicy, model.MessagePolicy, model.SamplingPolicy, model.ResponsesPolicy, model.StreamPolicy, model.HTTPPolicy, model.CachePolicy, model.Features, model.NativeTools, model.SourcePolicy, model.DefaultInterface, model.ConversionProfile, model.StrictConversion, model.Operation, provider.Interfaces, provider.RouteInterfaces})
 	material := strings.Join([]string{
 		strings.TrimSpace(provider.ID),
 		strings.TrimSpace(model.PublicID()),
 		strings.TrimSpace(model.UpstreamModel()),
 		fmt.Sprint(model.ContextWindow), fmt.Sprint(model.MaxContextWindow), fmt.Sprint(model.MaxOutputTokens),
 		fmt.Sprint(model.SupportsTools), fmt.Sprint(model.SupportsVision), fmt.Sprint(model.SupportsReason), fmt.Sprint(model.SupportsSearch),
+		strings.TrimSpace(model.ConversionProfile), fmt.Sprint(model.StrictConversion), strings.TrimSpace(model.Operation),
 		string(policy),
 	}, "\n")
 	sum := sha256.Sum256([]byte(material))

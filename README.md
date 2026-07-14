@@ -156,8 +156,9 @@ These are the commands a normal install most often needs:
 | `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
 | `codex-proxy run --aaa -- codex` | Enable agent-auto-approve for this Codex run |
 | `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
-| `codex-proxy model list` | Show built-in and configured model choices |
-| `codex-proxy model setup <model>` | Configure a built-in model choice such as `deepseek`, `mimo`, `kimi`, `glm`, `minimax`, or `qwen` |
+| `codex-proxy model list` | Show the official model and configured `provider/model` selectors |
+| `codex-proxy model catalog add <name> ...` | Add a Git or managed-JSON provider catalog |
+| `codex-proxy model provider setup <provider>` | Bind one local key and verify every model published by a provider |
 | `codex-proxy proxy doctor` | Check local proxy/Codex prerequisites |
 | `codex-proxy proxy reset` | Clear saved proxy setup and ask again on next launch |
 | `codex-proxy app` | Launch the Codex desktop app on macOS, Windows, or WSL |
@@ -191,10 +192,15 @@ walk through the normal flows in order.
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
-| `codex-proxy model list` | List built-in model choices and setup status |
-| `codex-proxy model setup <model>` | Set up a built-in model choice and optionally make it the default |
-| `codex-proxy model use <model>` | Make an already configured model the default for future Codex launches |
-| `codex-proxy model doctor [model]` | Validate the model profile backing a built-in model choice |
+| `codex-proxy model list` | List the official model and configured `provider/model` selectors |
+| `codex-proxy model catalog add <name> --git <url>` | Add and sync a Git catalog |
+| `codex-proxy model catalog add <name> --json <file>` | Import a local JSON catalog into managed storage |
+| `codex-proxy model catalog sync <name>` | Refresh one Git or managed-JSON catalog |
+| `codex-proxy model catalog list` | Show catalog revision and route counts |
+| `codex-proxy model provider list` | Show provider-wide activation status |
+| `codex-proxy model provider setup <provider>` | Store one local key and verify every model under that provider |
+| `codex-proxy model use <provider/model>` | Make an already verified selector the global default for future Codex launches |
+| `codex-proxy model doctor [model]` | Validate a configured model profile |
 | `codex-proxy model-profile setup [name]` | Create or update a named model profile |
 | `codex-proxy model-profile list` | List saved model profiles |
 | `codex-proxy model-profile doctor [name]` | Validate a saved model profile |
@@ -345,27 +351,135 @@ so Desktop automatic approval remains a final-release blocker for any claim
 that every CXP surface is brokered; CXP does not silently fall back to a retired
 execution mode for that surface.
 
-### Built-in model choices
+### External model catalogs
 
-Use `model` when you want to choose from the built-in model/provider presets:
+New catalog-defined third-party models are not compiled into CXP. DeepSeek V4 and
+MiMo V2.5 are not built-in providers; configure those families through an external
+catalog before activating them. New third-party additions must use a catalog.
+A catalog contains public provider/model metadata; the provider key is always local.
+The same model name
+can therefore be published by multiple providers. Models on a provider use its
+default interface credential by default; interfaces that require a different
+token have their own local credential binding:
 
 ```bash
-codex-proxy model list
-printf '%s' "$DEEPSEEK_API_KEY" | codex-proxy model setup deepseek --api-key-stdin
-codex-proxy model use deepseek
-codex-proxy model doctor deepseek
+# A Git subscription. models.json is the repository-relative manifest.
+cxp model catalog add nvidia --git https://github.example/team/models.git
+
+# Or import a hand-written JSON document; it is copied into managed storage.
+cxp model catalog add local --json ./models.json
+
+cxp model catalog list
+cxp model provider list
+printf '%s' "$NVIDIA_API_KEY" | cxp model provider setup nvidia --api-key-stdin
+# Interfaces that use a separate token can be bound independently.
+printf '%s' "$DEEPSEEK_ANTHROPIC_KEY" | cxp model provider setup deepseek --interface anthropic --api-key-stdin
+cxp model use nvidia/deepseek-v4
+cxp model list
 ```
 
-The built-in choices include `default` plus third-party choices such as
-`deepseek`, `mimo`, `kimi`, `glm`, `minimax`, and `qwen`. Third-party choices
-store a model profile locally. OpenAI-compatible chat providers run through
-CXP's local Responses adapter.
+The catalog document is strict JSON with this shape:
+
+```json
+{
+  "catalogVersion": 2,
+  "providers": {
+    "nvidia": {
+      "defaultInterface": "chat",
+      "interfaces": {
+        "chat": {
+          "adapter": "openai-chat",
+          "baseUrl": "https://integrate.api.nvidia.com/v1"
+        }
+      },
+      "models": {
+        "deepseek-v4": {
+          "upstreamModel": "deepseek-ai/deepseek-v4",
+          "displayName": "DeepSeek V4",
+          "defaultInterface": "chat",
+          "features": {
+            "tools": {"support": "native", "interface": "chat"},
+            "structuredOutput": {"support": "native", "interface": "chat"},
+            "webSearch": {
+              "support": "plugin",
+              "fallback": {"selector": "official/gpt-5.6-luna", "effort": "high", "tier": "flex"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+An interface that needs a non-OpenAI wire shape opts into a compiled,
+versioned converter. The profile is a registry key, not an arbitrary request
+template. For example:
+
+```json
+{
+  "adapter": "deepseek-anthropic",
+  "protocol": "messages",
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "conversion": {"enabled": true, "profile": "deepseek-anthropic-v1", "strict": true},
+  "auth": {"type": "header", "header": "x-api-key"}
+}
+```
+
+Beta prefix/FIM routes use the same mechanism and declare the request
+operation on the model feature, for example
+`{"support":"native","interface":"beta","operation":"fim"}`.
+Clients send `operation`, `prefix`, and `suffix` only for those explicit
+operations; an unknown operation or converter profile is rejected before any
+upstream request is made.
+
+Provider-native tools and source results are also declared in JSON. This is
+the required shape for a provider such as MiMo whose native search tool is
+available on Chat Completions but not on its Responses endpoint:
+
+```json
+{
+  "webSearch": {
+    "support": "native",
+    "interface": "chat",
+    "nativeTool": {
+      "inputTypes": ["web_search_preview", "web_search"],
+      "upstreamType": "web_search",
+      "allowedFields": ["search_context_size"]
+    },
+    "sources": {"mode": "annotations", "requireUrl": true, "requireSources": true}
+  },
+  "responses": {
+    "previousResponseId": "unsupported",
+    "background": "unsupported",
+    "contextManagement": "unsupported"
+  }
+}
+```
+
+For DeepSeek, set the model's native `webSearch.interface` to the named
+Anthropic interface and give that interface its own local credential binding.
+CXP then selects the compiled `deepseek-anthropic-v1` converter, forwards the
+typed server-search tool, and returns URL citations as Responses annotations.
+An unsupported native tool or a provider source result without a required URL
+fails closed; it is never silently dropped and presented as a normal answer.
+
+The user-facing selector is always `provider/model`. `model provider setup`
+verifies every model for that provider and never changes the current chat or a
+global default. Git catalogs with `--auto-sync` refresh in the long-lived Teams
+service; managed JSON catalogs are refreshed explicitly with `model catalog
+sync`. A provider may expose several named interfaces (for example Chat,
+Responses, Anthropic, or Beta/FIM), and each model feature selects the
+interface it actually supports. Provider URLs with embedded credentials,
+credential headers, and raw tokens in catalog JSON are rejected. A catalog
+feature that has no registered adapter fails closed instead of being silently
+dropped.
 
 Use a saved model profile for one launch without changing the default:
 
 ```bash
-codex-proxy run --model-profile deepseek -- codex
-codex-proxy app --model-profile deepseek
+codex-proxy run --model-profile nvidia/deepseek-v4 -- codex
+codex-proxy app --model-profile nvidia/deepseek-v4
 ```
 
 Teams users can pick model profiles when creating or switching Work chats; the
@@ -377,15 +491,16 @@ Use `model-profile` when you need a named profile with explicit provider,
 model, API-key source, or SSH proxy route:
 
 ```bash
-codex-proxy model-profile setup work-deepseek \
-  --provider deepseek \
-  --model deepseek/deepseek-v4-pro \
-  --api-key-env DEEPSEEK_API_KEY \
+codex-proxy model-profile setup work-compatible \
+  --provider responses-compatible \
+  --model example/reasoning-model \
+  --base-url-env RESPONSES_BASE_URL \
+  --api-key-env RESPONSES_API_KEY \
   --set-default
 
 codex-proxy model-profile list
-codex-proxy model-profile doctor work-deepseek
-codex-proxy model-profile set-default work-deepseek
+codex-proxy model-profile doctor work-compatible
+codex-proxy model-profile set-default work-compatible
 ```
 
 For a provider that already exposes a Responses-compatible API, use the generic
@@ -481,10 +596,10 @@ controlled independently by `maxRetries` and `retryStatuses`.
 configuration and provider/model/catalog fingerprints, so inheritance and
 overrides can be checked before launching Teams, CLI, or App.
 
-Model configuration can also be distributed in Git. Put `cxp-models.json` at
-the repository root by default. It uses the same strict model schema, but
-credentials declare only their names and authentication shape, never an
-`apiKeyRef` or raw key:
+For new subscriptions use the provider-first catalog commands above. The
+older flat `model-source` commands are retained only for reading existing
+source state while workspaces migrate; they do not define the new
+`provider/model` syntax:
 
 ```bash
 cxp model-source sync https://github.example/team/models.git
@@ -503,7 +618,9 @@ model, compatibility policy, or credential binding changes, CXP automatically
 reuses the stored key for a minimal re-verification; unchanged models remain
 available without user action. Only a failed re-verification stays hidden and
 is retried by later syncs. Private repositories use the existing Git credential helper or SSH agent;
-repository URLs with embedded credentials are rejected.
+repository URLs with embedded credentials are rejected. New Git catalogs use
+the same shallow-sync and last-known-good behavior when `--auto-sync` is set;
+managed JSON remains explicit and never runs a background watcher.
 
 While the long-lived Teams service is running, configured model-source
 repositories are shallow-synced automatically every 30 minutes. The schedule
@@ -880,7 +997,9 @@ continue 1
 status
 model status
 model list
-model switch deepseek
+model catalog list
+model provider list
+model switch nvidia/deepseek-v4
 model reset
 effort status
 effort list
@@ -901,9 +1020,9 @@ helper file relative/path.ext
 helper publish-history
 helper publish-history full
 model status
-model switch deepseek
+model switch nvidia/deepseek-v4
 model reset
-model fork deepseek
+model fork nvidia/deepseek-v4
 effort status
 effort list
 effort set xhigh
@@ -912,8 +1031,8 @@ effort reset
 
 Teams `model` and `effort` commands affect only the chat where they are sent,
 including the Control chat. `model use <model>` remains an alias for the
-chat-local `model switch <model>`. `model setup` configures availability only;
-it never selects a model or changes a default.
+chat-local `model switch <provider/model>`. `model catalog` and `model provider`
+configure availability only; they never select a model or change a default.
 
 Control-only `default` commands manage global defaults for future CXP/Codex
 launches and newly created Teams chats under the same config root. They do not

@@ -58,7 +58,13 @@ func (s Scope) withDefaults() Scope {
 }
 
 type ResponsesRequest struct {
-	Model              string          `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Operation is an optional catalog-declared operation. Empty means the
+	// provider's normal chat/responses operation; prefix and fim are explicit
+	// conversion entry points for providers such as DeepSeek Beta.
+	Operation          string          `json:"operation,omitempty"`
+	Prefix             string          `json:"prefix,omitempty"`
+	Suffix             string          `json:"suffix,omitempty"`
 	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
 	Instructions       string          `json:"instructions,omitempty"`
 	Input              json.RawMessage `json:"input,omitempty"`
@@ -71,6 +77,9 @@ type ResponsesRequest struct {
 	TopP               *float64        `json:"top_p,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	ResponseFormat     json.RawMessage `json:"response_format,omitempty"`
+	Background         *bool           `json:"background,omitempty"`
+	ContextManagement  json.RawMessage `json:"context_management,omitempty"`
 }
 
 type ReasoningInput struct {
@@ -79,11 +88,15 @@ type ReasoningInput struct {
 
 type ProviderRequest struct {
 	Model              string
+	Operation          string
+	Prefix             string
+	Suffix             string
 	Instructions       string
 	InputText          string
 	InputMessages      []ProviderMessage
 	Messages           []ProviderMessage
 	Tools              []ChatTool
+	NativeTools        []ProviderNativeTool
 	ToolWarnings       []ToolWarning
 	ToolChoice         json.RawMessage
 	ParallelToolCalls  *bool
@@ -92,6 +105,10 @@ type ProviderRequest struct {
 	Temperature        *float64
 	TopP               *float64
 	PreviousResponseID string
+	ResponseFormat     json.RawMessage
+	Background         *bool
+	ContextManagement  json.RawMessage
+	SourcePolicy       SourcePolicy
 	Scope              Scope
 	History            []ResponseRecord
 }
@@ -106,10 +123,14 @@ type ProviderMessage struct {
 }
 
 type ProviderContentPart struct {
-	Type     string
-	Text     string
-	ImageURL string
-	Detail   string
+	Type        string
+	Text        string
+	ImageURL    string
+	AudioURL    string
+	AudioData   string
+	AudioFormat string
+	VideoURL    string
+	Detail      string
 }
 
 type ProviderAdapter interface {
@@ -125,6 +146,7 @@ const (
 	ProviderEventUsage          ProviderEventKind = "usage"
 	ProviderEventDone           ProviderEventKind = "done"
 	ProviderEventError          ProviderEventKind = "error"
+	ProviderEventSource         ProviderEventKind = "source"
 )
 
 type ProviderEvent struct {
@@ -133,10 +155,41 @@ type ProviderEvent struct {
 	ToolCall *ProviderToolCallDelta
 	Usage    *Usage
 	Err      error
+	Source   *SourceCitation
 	// FinishReason preserves the terminal reason reported by an upstream
 	// Chat Completions provider. In particular, "length" must not be exposed
 	// as a completed Responses API response.
 	FinishReason string
+}
+
+// NativeToolSpec is a typed, catalog-selected mapping for provider-owned
+// tools. It intentionally contains no executable templates.
+type NativeToolSpec struct {
+	InputTypes    []string
+	UpstreamType  string
+	Name          string
+	AllowedFields []string
+}
+
+type ProviderNativeTool struct {
+	InputType    string
+	UpstreamType string
+	Name         string
+	Fields       map[string]any
+}
+
+type SourcePolicy struct {
+	Mode           string
+	RequireURL     bool
+	RequireSources bool
+}
+
+type SourceCitation struct {
+	Type       string `json:"type,omitempty"`
+	URL        string `json:"url"`
+	Title      string `json:"title,omitempty"`
+	StartIndex int    `json:"start_index,omitempty"`
+	EndIndex   int    `json:"end_index,omitempty"`
 }
 
 type ProviderToolCallDelta struct {

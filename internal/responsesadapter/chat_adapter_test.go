@@ -77,6 +77,27 @@ func TestOpenAIChatAdapterStreamsTextAndUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatAdapterForwardsResponseFormat(t *testing.T) {
+	var got map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", APIKey: "test-key", HTTPClient: server.Client(), StreamMode: "nonstream-buffered"}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "json", ResponseFormat: json.RawMessage(`{"type":"json_object"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = collectEvents(stream)
+	if string(got["response_format"]) != `{"type":"json_object"}` {
+		t.Fatalf("response_format = %s", got["response_format"])
+	}
+}
+
 func TestOpenAIChatAdapterHandlesUsageWithoutPromptTokenDetails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -426,7 +447,7 @@ func TestOpenAIChatAdapterAppliesDeepSeekProviderProfile(t *testing.T) {
 	maxTokens := 1024
 	temperature := 0.5
 	topP := 0.9
-	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("deepseek"), HTTPClient: server.Client()}
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogDeepSeekProfile(), HTTPClient: server.Client()}
 	stream, err := adapter.Stream(context.Background(), ProviderRequest{
 		Model:           "deepseek-v4-pro",
 		InputText:       "hello",
@@ -475,7 +496,12 @@ func TestOpenAIChatAdapterDeepSeekReasoningContentModelMatrix(t *testing.T) {
 			}))
 			defer server.Close()
 
-			adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("deepseek"), HTTPClient: server.Client()}
+			profile := testCatalogDeepSeekProfile()
+			if tc.model == "deepseek-reasoner" {
+				profile.EnableThinking = false
+				profile.ReasoningContentPolicy = "drop"
+			}
+			adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: profile, HTTPClient: server.Client()}
 			stream, err := adapter.Stream(context.Background(), ProviderRequest{
 				Model: tc.model,
 				Messages: []ProviderMessage{
@@ -514,7 +540,7 @@ func TestOpenAIChatAdapterAppliesMimoProviderProfile(t *testing.T) {
 
 	parallel := false
 	temperature := 0.5
-	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client()}
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogMiMoProfile("drop", "preserve"), HTTPClient: server.Client()}
 	stream, err := adapter.Stream(context.Background(), ProviderRequest{
 		Model:             "mimo-v2.5-pro",
 		InputText:         "hello",
@@ -556,7 +582,7 @@ func TestOpenAIChatAdapterMimoPreservesAutoToolChoice(t *testing.T) {
 	}))
 	defer server.Close()
 
-	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client()}
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogMiMoProfile("drop", "preserve"), HTTPClient: server.Client()}
 	stream, err := adapter.Stream(context.Background(), ProviderRequest{
 		Model:      "mimo-v2.5-pro",
 		InputText:  "hello",
@@ -583,7 +609,10 @@ func TestOpenAIChatAdapterMimoFlashKeepsSamplingWithoutThinking(t *testing.T) {
 	defer server.Close()
 
 	temperature := 0.5
-	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client()}
+	profile := testCatalogMiMoProfile("drop", "preserve")
+	profile.EnableThinking = false
+	profile.StripSamplingWhenThinking = false
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: profile, HTTPClient: server.Client()}
 	stream, err := adapter.Stream(context.Background(), ProviderRequest{
 		Model:       "mimo-v2-flash",
 		InputText:   "hello",
@@ -614,7 +643,7 @@ func TestFacadeMimo25ForwardsInputImageAsMultimodalChatContent(t *testing.T) {
 	defer server.Close()
 
 	facade := &Facade{
-		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client(), MaxRetries: -1},
+		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogMiMoProfile("allow", "preserve"), HTTPClient: server.Client(), MaxRetries: -1},
 		Store:        NewMemoryStore(),
 		ProviderID:   "mimo",
 		DefaultModel: "mimo-v2.5",
@@ -664,7 +693,7 @@ func TestFacadeMimo25AddsFallbackTextForImageOnlyMessages(t *testing.T) {
 	defer server.Close()
 
 	facade := &Facade{
-		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client(), MaxRetries: -1},
+		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogMiMoProfile("allow", "preserve"), HTTPClient: server.Client(), MaxRetries: -1},
 		Store:        NewMemoryStore(),
 		ProviderID:   "mimo",
 		DefaultModel: "mimo-v2.5",
@@ -706,7 +735,7 @@ func TestFacadeMimo25ProDropsImagePartsWithPlaceholder(t *testing.T) {
 	defer server.Close()
 
 	facade := &Facade{
-		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: ProfileForProvider("mimo"), HTTPClient: server.Client(), MaxRetries: -1},
+		Adapter:      OpenAIChatAdapter{BaseURL: server.URL + "/v1", Profile: testCatalogMiMoProfile("drop", "preserve"), HTTPClient: server.Client(), MaxRetries: -1},
 		Store:        NewMemoryStore(),
 		ProviderID:   "mimo",
 		DefaultModel: "mimo-v2.5-pro",

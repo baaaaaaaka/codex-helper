@@ -55,14 +55,15 @@ type unifiedModelGateway struct {
 }
 
 type unifiedModelGatewayOptions struct {
-	OfficialBaseURL string
-	LocalKey        string
-	CatalogPath     string
-	Providers       []modelprofile.Resolved
-	APIKeys         map[string]string
-	UpstreamProxy   string
-	Log             io.Writer
-	InstanceID      string
+	OfficialBaseURL  string
+	LocalKey         string
+	CatalogPath      string
+	Providers        []modelprofile.Resolved
+	APIKeys          map[string]string
+	InterfaceAPIKeys map[string]map[string]string
+	UpstreamProxy    string
+	Log              io.Writer
+	InstanceID       string
 }
 
 func startUnifiedModelGateway(opts unifiedModelGatewayOptions) (string, func(), error) {
@@ -149,45 +150,54 @@ func newUnifiedModelGateway(opts unifiedModelGatewayOptions) (*unifiedModelGatew
 		var handler http.Handler
 		if resolved.Provider.DirectResponses {
 			var directCleanup func()
-			handler, directCleanup, err = newNativeResponsesCompatibilityProxy(resolved.Provider.BaseURL, apiKey, providerKey, opts.UpstreamProxy, opts.Log)
+			var directHandler *nativeResponsesCompatibilityProxy
+			directHandler, directCleanup, err = newNativeResponsesCompatibilityProxy(resolved.Provider.BaseURL, apiKey, providerKey, opts.UpstreamProxy, opts.Log)
+			if err == nil {
+				directHandler.responsesPolicy = responsesadapter.ResponsesPolicy{PreviousResponseID: resolved.Model.ResponsesPolicy.PreviousResponseID, Background: resolved.Model.ResponsesPolicy.Background, ContextManagement: resolved.Model.ResponsesPolicy.ContextManagement}
+				directHandler.sourcePolicy = responsesAdapterSourcePolicy(resolved.Model)
+				directHandler.unsupportedToolPolicy = resolved.Model.UnsupportedToolPolicy
+				directHandler.nativeTools = append([]responsesadapter.NativeToolSpec(nil), responsesAdapterNativeTools(resolved.Model)...)
+				if sourceErr := responsesadapter.ValidateDirectSourcePolicy(directHandler.sourcePolicy); sourceErr != nil {
+					directCleanup()
+					err = sourceErr
+				} else {
+					handler = directHandler
+				}
+			}
 			if err == nil {
 				cleanups = append(cleanups, directCleanup)
 			}
 		} else {
 			selectedModel := resolved.Model
-			profile := responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithReasoningOverrides(
-				resolved.Provider.DefaultReasoningEffort,
-				resolved.Provider.ReasoningEffortMap,
-			).WithModelPolicies(selectedModel.ReasoningPolicy, selectedModel.ToolPolicy, selectedModel.MessagePolicy, selectedModel.SamplingPolicy)
-			adapter := responsesadapter.OpenAIChatAdapter{
-				BaseURL:            resolved.Provider.BaseURL,
-				APIKey:             apiKey,
-				Profile:            profile,
-				RetryStatuses:      append([]int(nil), selectedModel.HTTPPolicy.RetryStatuses...),
-				MaxOutputTokens:    selectedModel.MaxOutputTokens,
-				Headers:            resolved.Provider.Headers,
-				AuthType:           resolved.Provider.AuthType,
-				AuthHeader:         resolved.Provider.AuthHeader,
-				StreamMode:         selectedModel.StreamPolicy.UpstreamMode,
-				ReasoningDeltaPath: selectedModel.StreamPolicy.ReasoningDeltaPath,
-				CachedTokensPath:   selectedModel.StreamPolicy.CachedTokensPath,
-				UsageField:         selectedModel.CachePolicy.UsageField,
-			}
-			if configureErr := configureOpenAIChatAdapterHTTP(&adapter, selectedModel.HTTPPolicy, selectedModel.StreamPolicy, opts.UpstreamProxy, opts.Log); configureErr != nil {
+			adapter, configureErr := newResolvedProviderAdapter(resolved, apiKey, opts.UpstreamProxy, opts.Log)
+			if configureErr != nil {
 				cleanup()
 				return nil, nil, configureErr
+			}
+			routeConfigs, routeErr := resolvedProviderRouteConfigs(resolved, apiKey, opts.InterfaceAPIKeys[resolved.Name], adapter, opts.UpstreamProxy, opts.Log)
+			if routeErr != nil {
+				cleanup()
+				return nil, nil, routeErr
 			}
 			registry, registryErr := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 				DefaultProvider: resolved.Provider.ID,
 				Providers: []responsesadapter.ProviderConfig{{
-					ID:             resolved.Provider.ID,
-					ProfileID:      resolved.Provider.AdapterProfile,
-					BaseURL:        resolved.Provider.BaseURL,
-					APIKey:         apiKey,
-					DefaultModel:   resolved.SelectedPublicModel(),
-					Models:         responsesAdapterModelsForProvider(resolved.Provider),
-					Adapter:        adapter,
-					CustomToolMode: selectedModel.ToolPolicy.CustomToolMode,
+					ID:                    resolved.Provider.ID,
+					ProfileID:             resolved.Provider.AdapterProfile,
+					BaseURL:               resolved.Provider.BaseURL,
+					APIKey:                apiKey,
+					DefaultModel:          resolved.SelectedPublicModel(),
+					Models:                responsesAdapterModelsForProvider(resolved.Provider),
+					Adapter:               adapter,
+					CustomToolMode:        selectedModel.ToolPolicy.CustomToolMode,
+					UnsupportedToolPolicy: selectedModel.UnsupportedToolPolicy,
+					ConversionProfile:     resolved.Provider.ConversionProfile,
+					StrictConversion:      resolved.Provider.StrictConversion,
+					Operation:             resolved.Provider.Operation,
+					NativeTools:           responsesAdapterNativeTools(resolved.Model),
+					SourcePolicy:          responsesAdapterSourcePolicy(resolved.Model),
+					ResponsesPolicy:       responsesAdapterResponsesPolicy(resolved.Model),
+					Routes:                routeConfigs,
 				}},
 				ProxyKeys: map[string]string{providerKey: resolved.Provider.ID},
 				KeySalt:   resolved.Name + ":unified",
