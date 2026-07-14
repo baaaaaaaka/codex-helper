@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -146,7 +147,7 @@ func TestModelCatalogManagedImportProviderBatchSetupAndSwitch(t *testing.T) {
 		t.Fatal("raw provider key leaked into main config")
 	}
 	managedPath := filepath.Join(filepath.Dir(configPath), modelCatalogManagedDir, "nvidia.json")
-	if info, statErr := os.Stat(managedPath); statErr != nil || info.Mode().Perm() != 0o600 {
+	if info, statErr := os.Stat(managedPath); statErr != nil || (runtime.GOOS != "windows" && info.Mode().Perm() != 0o600) {
 		t.Fatalf("managed catalog permissions=%v err=%v", func() os.FileMode {
 			if info == nil {
 				return 0
