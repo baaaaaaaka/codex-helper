@@ -91,8 +91,12 @@ func TestHTTPProxyHealthProbeIsSingleFlightAndCached(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	p := NewHTTPProxy(nil, Options{
-		InstanceID:         "health-storm",
-		HealthProbeTTL:     time.Second,
+		InstanceID: "health-storm",
+		// The assertion is about one shared probe, not the exact TTL
+		// boundary. Keep the cache window comfortably above the slowest
+		// hosted macOS/Windows burst so late-arriving requests still test
+		// the same coalesced observation window.
+		HealthProbeTTL:     10 * time.Second,
 		HealthProbeTimeout: 2 * time.Second,
 		HealthProbe: func(context.Context) error {
 			probes.Add(1)
@@ -108,7 +112,10 @@ func TestHTTPProxyHealthProbeIsSingleFlightAndCached(t *testing.T) {
 	defer func() { _ = p.Close(context.Background()) }()
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxConnsPerHost = 256
+	// Keep the 256-request storm, but bound simultaneous TCP handshakes so a
+	// hosted Windows listener backlog cannot turn the test into a connection
+	// refusal test instead of a health single-flight test.
+	transport.MaxConnsPerHost = 32
 	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
 	start := make(chan struct{})
 	results := make(chan error, 256)
