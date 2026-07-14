@@ -18,6 +18,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -831,6 +832,101 @@ func TestRepairRecordedHelperEntrypointsSkipsNonManagedRecord(t *testing.T) {
 	}
 	if out, err := exec.Command(explicit, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.3") {
 		t.Fatalf("explicit target changed: out=%q err=%v", out, err)
+	}
+}
+
+func TestFinalizeHelperUpdateResultAcceptsOlderStableDispatcher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	runtimePath := filepath.Join(tmp, ".cxp-runtime", "versions", "v1.2.4", helperruntime.BinaryName(runtime.GOOS))
+	if err := helperruntime.Activate(filepath.Join(tmp, ".cxp-runtime"), "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
+	writeCLIFile(t, installPath, upgradeCXPShimTestScript("1.2.3"), 0o755)
+	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	var out bytes.Buffer
+	err := finalizeHelperUpdateResult(update.ApplyResult{
+		Version:          "1.2.4",
+		InstallPath:      installPath,
+		RuntimePath:      runtimePath,
+		RuntimeActivated: true,
+	}, &out)
+	if err != nil {
+		t.Fatalf("finalize managed runtime update: %v", err)
+	}
+	if !strings.Contains(out.String(), "reports v1.2.3") || !strings.Contains(out.String(), "immutable runtime v1.2.4 is authoritative") {
+		t.Fatalf("expected stale stable dispatcher warning, got %q", out.String())
+	}
+}
+
+func TestFinalizeHelperUpdateResultRejectsUnrunnableStableDispatcher(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	root := filepath.Join(tmp, ".cxp-runtime")
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	runtimePath := filepath.Join(root, "versions", "v1.2.4", helperruntime.BinaryName(runtime.GOOS))
+	if err := helperruntime.Activate(root, "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
+	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
+	writeCLIFile(t, installPath, "#!/bin/sh\nprintf 'v1.2.3\\n' > '"+quotedRoot+"/active'\nexit 23\n", 0o755)
+	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	err := finalizeHelperUpdateResult(update.ApplyResult{
+		Version:          "1.2.4",
+		InstallPath:      installPath,
+		RuntimePath:      runtimePath,
+		RuntimeActivated: true,
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "stable cxp entrypoint") {
+		t.Fatalf("finalize error = %v, want unrunnable stable entry failure", err)
+	}
+	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v1.2.4" {
+		t.Fatalf("active after unrunnable stable probe = %q, %v; want target restored", active, readErr)
+	}
+}
+
+func TestFinalizeHelperUpdateResultRejectsStableDispatcherThatReactivatesOlderRuntime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	root := filepath.Join(tmp, ".cxp-runtime")
+	installPath := filepath.Join(tmp, "bin", "codex-proxy")
+	runtimePath := filepath.Join(root, "versions", "v1.2.4", helperruntime.BinaryName(runtime.GOOS))
+	if err := helperruntime.Activate(root, "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
+	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
+	stableScript := "#!/bin/sh\n" +
+		"printf 'v1.2.3\\n' > '" + quotedRoot + "/active'\n" +
+		"echo 'codex-proxy version 1.2.3 (old dispatcher)'\n"
+	writeCLIFile(t, installPath, stableScript, 0o755)
+	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
+
+	err := finalizeHelperUpdateResult(update.ApplyResult{
+		Version:          "1.2.4",
+		InstallPath:      installPath,
+		RuntimePath:      runtimePath,
+		RuntimeActivated: true,
+	}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "changed active runtime") {
+		t.Fatalf("finalize error = %v, want active-pointer regression", err)
+	}
+	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v1.2.4" {
+		t.Fatalf("active after rejected stable probe = %q, %v; want target restored", active, readErr)
 	}
 }
 

@@ -68,7 +68,14 @@ type stableEntryRepair struct {
 	SourceSHA256          string
 }
 
-var replaceManagedStableEntryFn = replaceManagedStableEntry
+var (
+	replaceManagedStableEntryFn = replaceManagedStableEntry
+	// candidateExecutablePath is injectable only so the candidate-owned state
+	// transition can be tested with a real executable fixture. In production it
+	// always resolves the candidate process itself, never an inherited stable
+	// entry or the caller's executable path.
+	candidateExecutablePath = helperpath.RawExecutable
+)
 
 type Pending struct {
 	Schema         int    `json:"schema"`
@@ -171,7 +178,7 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	if err := validateContext(request, buildVersion); err != nil {
 		return Result{}, err
 	}
-	executable, err := helperpath.RawExecutable()
+	executable, err := candidateExecutablePath()
 	if err != nil {
 		return Result{}, fmt.Errorf("inspect candidate executable: %w", err)
 	}
@@ -191,10 +198,16 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
-	if err := scheduleDeferredStableEntryRepair(result); err != nil {
+	// The immutable runtime is the durable object that the parent will activate
+	// and use after restart. Do not probe request.EntryPath here: it may be an
+	// older stable launcher or a user-preserved shim that is intentionally not
+	// rewritten during this transition. The parent independently verifies the
+	// active pointer, expected runtime path, and regular-file state.
+	targetVersion, _ := helperruntime.NormalizeVersion(request.TargetVersion)
+	if err := verifyImmutableRuntime(ctx, result.RuntimePath, targetVersion); err != nil {
 		return Result{}, err
 	}
-	if err := verifyFreshEntry(request.EntryPath, targetVersion(request.TargetVersion)); err != nil {
+	if err := scheduleDeferredStableEntryRepair(result); err != nil {
 		return Result{}, err
 	}
 	return result, nil
@@ -464,11 +477,6 @@ func prepareStableEntryRepair(entry string, runningRuntime string, root string) 
 	}, nil
 }
 
-func targetVersion(value string) string {
-	version, _ := helperruntime.NormalizeVersion(value)
-	return version
-}
-
 func validateContext(request Context, buildVersion string) error {
 	if err := validateStateContext(request); err != nil {
 		return err
@@ -546,21 +554,25 @@ func updateInstallRecord(request Context, targetVersion string) error {
 	return nil
 }
 
-func verifyFreshEntry(entry string, targetVersion string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func verifyImmutableRuntime(ctx context.Context, runtimePath string, targetVersion string) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, entry, "--version")
-	cmd.Env = helperruntime.LauncherEnvironment(os.Environ())
+	runtimePath = filepath.Clean(strings.TrimSpace(runtimePath))
+	if runtimePath == "" || runtimePath == "." {
+		return fmt.Errorf("verify immutable runtime: runtime path is empty")
+	}
+	cmd := exec.CommandContext(ctx, runtimePath, "--version")
+	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("verify fresh stable entry: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("verify immutable runtime %s: %w: %s", runtimePath, err, strings.TrimSpace(string(out)))
 	}
 	for _, field := range strings.Fields(string(out)) {
 		if version, ok := helperruntime.NormalizeVersion(field); ok && version == targetVersion {
 			return nil
 		}
 	}
-	return fmt.Errorf("fresh stable entry version output %q does not contain %s", strings.TrimSpace(string(out)), targetVersion)
+	return fmt.Errorf("immutable runtime version output %q does not contain %s", strings.TrimSpace(string(out)), targetVersion)
 }
 
 func readContext(path string) (Context, error) {

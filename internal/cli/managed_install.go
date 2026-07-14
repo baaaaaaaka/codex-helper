@@ -754,9 +754,6 @@ func finalizeHelperUpdateResult(res update.ApplyResult, out io.Writer) error {
 	if err := verifyHelperEntrypointVersion(ctx, res.RuntimePath, res.Version, "published cxp runtime"); err != nil {
 		return err
 	}
-	if err := verifyFreshHelperEntrypointVersion(ctx, res.InstallPath, res.Version, "stable cxp entrypoint"); err != nil {
-		return err
-	}
 	if !strings.EqualFold(runtime.GOOS, "windows") {
 		if errs := repairRecordedHelperEntrypointsForInstallPath(res.InstallPath); len(errs) > 0 {
 			for _, err := range errs {
@@ -765,10 +762,67 @@ func finalizeHelperUpdateResult(res update.ApplyResult, out io.Writer) error {
 			return fmt.Errorf("updated helper runtime is active, but recorded legacy cxp entrypoint convergence failed: %w", errors.Join(errs...))
 		}
 	}
+	runtimeRoot, targetVersion, rootErr := runtimeStateForUpdateResult(res)
+	if rootErr != nil {
+		return rootErr
+	}
+	activeBefore, activeErr := helperruntime.ReadActive(runtimeRoot)
+	if activeErr != nil || !update.VersionMatchesTarget(activeBefore, targetVersion) {
+		return fmt.Errorf("active cxp runtime before stable entry probe = %q, want %s: %v", activeBefore, targetVersion, activeErr)
+	}
+	// The stable entry is a compatibility dispatcher, not the authoritative
+	// version after an immutable-runtime activation. It must still be runnable
+	// from a fresh environment, but its physical version may legitimately be an
+	// older stable build while the active pointer selects an explicit
+	// prerelease. Requiring its output to equal res.Version recreates the
+	// stable-to-prerelease false negative that candidateupdate avoids.
+	entryVersion, entryErr := update.ProbeFreshEntryVersion(ctx, res.InstallPath, 5*time.Second)
+	if entryErr != nil {
+		activeAfter, activeAfterErr := helperruntime.ReadActive(runtimeRoot)
+		if activeAfterErr != nil || !update.VersionMatchesTarget(activeAfter, targetVersion) {
+			restoreErr := helperruntime.Activate(runtimeRoot, targetVersion)
+			if restoreErr != nil {
+				return fmt.Errorf("stable cxp entrypoint %s is not runnable after activation: %w; active runtime became %q and target restore failed: %v", res.InstallPath, entryErr, activeAfter, restoreErr)
+			}
+			return fmt.Errorf("stable cxp entrypoint %s is not runnable after activation: %w; active runtime became %q and was restored to %s", res.InstallPath, entryErr, activeAfter, targetVersion)
+		}
+		return fmt.Errorf("stable cxp entrypoint %s is not runnable after activation: %w", res.InstallPath, entryErr)
+	}
+	activeAfter, activeAfterErr := helperruntime.ReadActive(runtimeRoot)
+	if activeAfterErr != nil || !update.VersionMatchesTarget(activeAfter, targetVersion) {
+		restoreErr := helperruntime.Activate(runtimeRoot, targetVersion)
+		if restoreErr != nil {
+			return fmt.Errorf("stable cxp entrypoint changed active runtime from %s to %q and target restore failed: %w", targetVersion, activeAfter, restoreErr)
+		}
+		return fmt.Errorf("stable cxp entrypoint changed active runtime from %s to %q during fresh probe", targetVersion, activeAfter)
+	}
+	if !update.VersionMatchesTarget(entryVersion.Version, res.Version) {
+		_, _ = fmt.Fprintf(out, "Warning: stable cxp entrypoint %s reports v%s after activation; published immutable runtime v%s is authoritative\n", res.InstallPath, entryVersion.Version, strings.TrimPrefix(strings.TrimSpace(res.Version), "v"))
+	}
 	// Keep the legacy install record valid for old updaters while all new
 	// executions converge through the stable cxp entry and active runtime.
 	saveCLIManagedInstallRecordBestEffort(res.InstallPath, res.Version)
 	return nil
+}
+
+func runtimeStateForUpdateResult(res update.ApplyResult) (string, string, error) {
+	targetVersion, ok := helperruntime.NormalizeVersion(res.Version)
+	if !ok {
+		return "", "", fmt.Errorf("published cxp runtime version %q is invalid", res.Version)
+	}
+	runtimePath := filepath.Clean(strings.TrimSpace(res.RuntimePath))
+	if runtimePath == "" || runtimePath == "." {
+		return "", "", fmt.Errorf("published cxp runtime path is empty")
+	}
+	// A managed runtime path is <root>/versions/<version>/<binary>. Deriving
+	// the root and checking the canonical target prevents a malformed result
+	// from making the finalizer inspect or rewrite an unrelated active pointer.
+	runtimeRoot := filepath.Dir(filepath.Dir(filepath.Dir(runtimePath)))
+	expectedPath := helperruntime.VersionPath(runtimeRoot, targetVersion, runtime.GOOS)
+	if expectedPath == "" || !sameHelperInstallLocation(runtimePath, expectedPath, runtime.GOOS) {
+		return "", "", fmt.Errorf("published cxp runtime path %q does not match target %s", res.RuntimePath, targetVersion)
+	}
+	return runtimeRoot, targetVersion, nil
 }
 
 func repairRecordedHelperEntrypointsForInstallPath(installPath string) []error {
@@ -1476,10 +1530,6 @@ func verifyCXPEntrypointAfterUpgradeForGOOS(installPath string, targetVersion st
 
 func verifyHelperEntrypointVersion(ctx context.Context, path string, targetVersion string, description string) error {
 	return verifyHelperVersionWithProbe(ctx, path, targetVersion, description, update.ProbePhysicalBinaryVersion)
-}
-
-func verifyFreshHelperEntrypointVersion(ctx context.Context, path string, targetVersion string, description string) error {
-	return verifyHelperVersionWithProbe(ctx, path, targetVersion, description, update.ProbeFreshEntryVersion)
 }
 
 func verifyHelperVersionWithProbe(ctx context.Context, path string, targetVersion string, description string, probe func(context.Context, string, time.Duration) (update.BinaryVersion, error)) error {

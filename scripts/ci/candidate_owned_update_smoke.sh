@@ -56,12 +56,14 @@ apply_candidate() {
 
 apply_candidate "$candidate1" "" "v0.1.13-rc.36" "first"
 test "$(tr -d '\r\n' <"$runtime_root/active")" = "v0.1.13-rc.36"
-test ! -e "$runtime_root/pending-update.json"
+test -e "$runtime_root/pending-update.json"
 "$entry" --version | grep -F "0.1.13-rc.36" >/dev/null
+test ! -e "$runtime_root/pending-update.json"
 
 apply_candidate "$candidate2" "0.1.13-rc.36" "v0.1.13-rc.37" "second"
 test "$(tr -d '\r\n' <"$runtime_root/active")" = "v0.1.13-rc.37"
 test "$(tr -d '\r\n' <"$runtime_root/previous")" = "v0.1.13-rc.36"
+test -e "$runtime_root/pending-update.json"
 "$entry" --version | grep -F "0.1.13-rc.37" >/dev/null
 test ! -e "$runtime_root/pending-update.json"
 
