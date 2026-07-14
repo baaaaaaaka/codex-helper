@@ -124,7 +124,7 @@ func TestShouldActivateEntryVersionDoesNotUndoSameBasePrerelease(t *testing.T) {
 		{entry: "v0.1.14", active: "v0.1.14-rc.19", want: false},
 		{entry: "v0.1.14", active: "v0.1.14-rc.1", want: false},
 		{entry: "v0.1.14", active: "v0.1.13-rc.99", want: true},
-		{entry: "v0.1.14-rc.20", active: "v0.1.14-rc.19", want: true},
+		{entry: "v0.1.14-rc.20", active: "v0.1.14-rc.19", want: false},
 		{entry: "v0.1.15", active: "v0.1.14", want: true},
 	} {
 		t.Run(tc.entry+"-over-"+tc.active, func(t *testing.T) {
@@ -170,12 +170,27 @@ func TestLaunchKeepsExplicitSameBasePrereleaseActive(t *testing.T) {
 	if code != 0 || !handled {
 		t.Fatalf("Launch = code %d handled %v, want successful handled launch", code, handled)
 	}
-	if gotTarget != wantTarget {
+	if !sameRuntimeFile(t, gotTarget, wantTarget) {
 		t.Fatalf("launched target = %q, want explicit active prerelease %q", gotTarget, wantTarget)
 	}
 	if active, err := ReadActive(root); err != nil || active != "v0.1.14-rc.19" {
 		t.Fatalf("active runtime = %q, %v; stable entry must not reactivate itself", active, err)
 	}
+}
+
+func sameRuntimeFile(t *testing.T, left string, right string) bool {
+	t.Helper()
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil {
+		return os.SameFile(leftInfo, rightInfo)
+	}
+	leftResolved, leftResolveErr := filepath.EvalSymlinks(left)
+	rightResolved, rightResolveErr := filepath.EvalSymlinks(right)
+	if leftResolveErr == nil && rightResolveErr == nil {
+		return filepath.Clean(leftResolved) == filepath.Clean(rightResolved)
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 func TestInstallVersionAndActivate(t *testing.T) {

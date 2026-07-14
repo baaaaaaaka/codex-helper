@@ -507,6 +507,64 @@ func TestResumePendingPreviousRuntimeCompletesPublishBeforeActivationCrash(t *te
 	}
 }
 
+func TestResumePendingRepairsStableEntryAfterTargetAlreadyActive(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	recordPath := filepath.Join(dir, "config", "install.json")
+	v1 := filepath.Join(dir, "v1")
+	v2 := filepath.Join(dir, "v2")
+	writeExecutable(t, v1, "v1")
+	writeExecutable(t, v2, "v2")
+	if _, err := helperruntime.InstallVersion(root, v1, "v1.0.0", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	target, err := helperruntime.InstallVersion(root, v2, "v2.0.0", runtime.GOOS, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := helperruntime.Activate(root, "v2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entry, []byte("v1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := fileSHA256(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writePending(filepath.Join(root, PendingFileName), Pending{
+		Schema:         ProtocolVersion,
+		TargetVersion:  "v2.0.0",
+		TargetSHA256:   hash,
+		PreviousActive: "v1.0.0",
+		TargetActive:   target,
+		RuntimeRoot:    root,
+		EntryPath:      entry,
+		RecordPath:     recordPath,
+		RequestID:      "stable-entry-repair-after-activation",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
+	t.Setenv(helperruntime.EnvEntryPath, entry)
+	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(entry); err != nil || string(data) != "v2" {
+		t.Fatalf("stable entry = %q, %v", data, err)
+	}
+	if active, err := helperruntime.ReadActive(root); err != nil || active != "v2.0.0" {
+		t.Fatalf("active = %q, %v", active, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
+		t.Fatalf("pending marker still exists: %v", err)
+	}
+}
+
 func TestResumePendingRejectsMissingPublishedTarget(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, ".cxp-runtime")

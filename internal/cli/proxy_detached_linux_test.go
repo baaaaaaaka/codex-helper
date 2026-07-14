@@ -69,6 +69,7 @@ func TestProxyStartBackgroundReapsExitedDetachedChild(t *testing.T) {
 
 	pid := cfg.Instances[0].DaemonPID
 	deadline := time.Now().Add(3 * time.Second)
+	sawZombie := false
 	for time.Now().Before(deadline) {
 		state, exists, err := linuxProcessState(pid)
 		if err != nil {
@@ -78,9 +79,15 @@ func TestProxyStartBackgroundReapsExitedDetachedChild(t *testing.T) {
 			return
 		}
 		if state == 'Z' {
-			t.Fatalf("detached proxy child pid %d became a zombie", pid)
+			// Wait owns reaping asynchronously. A child can appear as a zombie
+			// for one scheduler slice before the waiter runs; only a zombie that
+			// survives the bounded cleanup window is a leak.
+			sawZombie = true
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if sawZombie {
+		t.Fatalf("detached proxy child pid %d remained a zombie", pid)
 	}
 	t.Fatalf("detached proxy child pid %d did not exit", pid)
 }
@@ -125,6 +132,7 @@ func TestStartCodexAppProxyDaemonReapsExitedDetachedChild(t *testing.T) {
 
 	pid := cfg.Instances[0].DaemonPID
 	deadline := time.Now().Add(3 * time.Second)
+	sawZombie := false
 	for time.Now().Before(deadline) {
 		state, exists, err := linuxProcessState(pid)
 		if err != nil {
@@ -134,9 +142,12 @@ func TestStartCodexAppProxyDaemonReapsExitedDetachedChild(t *testing.T) {
 			return
 		}
 		if state == 'Z' {
-			t.Fatalf("app proxy child pid %d became a zombie", pid)
+			sawZombie = true
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if sawZombie {
+		t.Fatalf("app proxy child pid %d remained a zombie", pid)
 	}
 	t.Fatalf("app proxy child pid %d did not exit", pid)
 }

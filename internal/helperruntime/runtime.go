@@ -166,6 +166,13 @@ func shouldActivateEntryVersion(entryVersion string, activeVersion string) bool 
 	if entryPrerelease == "" && activePrerelease != "" && entryBase == activeBase {
 		return false
 	}
+	// A managed rollback can leave the stable dispatcher binary at a newer
+	// prerelease than the active pointer. Do not silently undo that rollback
+	// just because the dispatcher has a higher prerelease number. Explicit
+	// candidate-owned updates activate their requested target directly.
+	if entryPrerelease != "" && activePrerelease != "" && entryBase == activeBase {
+		return false
+	}
 	return true
 }
 

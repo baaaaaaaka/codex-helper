@@ -294,8 +294,10 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 		return Result{}, fmt.Errorf("derive target runtime path")
 	}
 	previous := ""
+	entryRuntimeVersion := ""
 	if active, err := helperruntime.ReadActive(request.RuntimeRoot); err == nil {
 		previous = active
+		entryRuntimeVersion = active
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return Result{}, fmt.Errorf("read active runtime: %w", err)
 	}
@@ -310,6 +312,10 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 		if previous != normalizedSource && previous != targetVersion {
 			return Result{}, fmt.Errorf("active runtime changed from %s to %s while preparing %s", normalizedSource, previous, targetVersion)
 		}
+		// During pending recovery active may already be the target while the
+		// stable entry is still owned by the previous runtime. Validate and
+		// repair that entry against the pending source, not against active.
+		entryRuntimeVersion = normalizedSource
 	}
 	pending := Pending{
 		Schema:         ProtocolVersion,
@@ -348,23 +354,33 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	// resuming a first-install pending marker.
 	var deferredRepair *stableEntryRepair
 	if previous != "" && entryWasPresent && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
-		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, previous, runtime.GOOS)
-		plan, err := prepareStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot)
-		if err != nil {
-			return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", err)
+		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, entryRuntimeVersion, runtime.GOOS)
+		entryAlreadyContainsCandidate := false
+		if target, targetErr := stableEntryTargetPath(request.EntryPath, request.RuntimeRoot); targetErr != nil {
+			return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", targetErr)
+		} else if same, sameErr := sameFileContent(target, installed); sameErr == nil && same {
+			entryAlreadyContainsCandidate = true
+		} else if sameErr != nil && !errors.Is(sameErr, os.ErrNotExist) {
+			return Result{}, fmt.Errorf("compare managed stable cxp entry with candidate: %w", sameErr)
 		}
-		if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot); err != nil {
-			if !shouldDeferStableEntryRepair(err) {
-				return Result{}, fmt.Errorf("refresh managed stable cxp entry: %w", err)
+		if !entryAlreadyContainsCandidate {
+			plan, err := prepareStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot)
+			if err != nil {
+				return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", err)
 			}
-			// The immutable runtime is the durable source for the worker. The
-			// downloaded candidate is removed by update.PerformUpdate as soon
-			// as Invoke returns.
-			deferredRepair = &stableEntryRepair{
-				SourcePath:            installed,
-				TargetPath:            plan.TargetPath,
-				ExpectedCurrentSHA256: plan.ExpectedCurrentSHA256,
-				SourceSHA256:          installedHash,
+			if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot); err != nil {
+				if !shouldDeferStableEntryRepair(err) {
+					return Result{}, fmt.Errorf("refresh managed stable cxp entry: %w", err)
+				}
+				// The immutable runtime is the durable source for the worker. The
+				// downloaded candidate is removed by update.PerformUpdate as soon
+				// as Invoke returns.
+				deferredRepair = &stableEntryRepair{
+					SourcePath:            installed,
+					TargetPath:            plan.TargetPath,
+					ExpectedCurrentSHA256: plan.ExpectedCurrentSHA256,
+					SourceSHA256:          installedHash,
+				}
 			}
 		}
 	}
