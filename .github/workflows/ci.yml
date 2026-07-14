@@ -97,6 +97,47 @@ jobs:
           go test -p=1 ./internal/localproxy -count=5 -run 'Test(HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyGenerationRouterRecoversAfterSOCKSFailure|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|GenerationRouterSwapKeepsListenerAndFencesOldGeneration|GenerationRouterDialContextCancelsBackend|GenerationRouterDrainRejectsLateDialAfterForcedClose|SOCKS5DialerContextCancelsHalfOpenHandshake|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive|HTTPProxyCloseClosesActiveHijackedTunnels|ProbeSOCKS5|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
           go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor(RecoversTunnelAndSwapsProxyGeneration|RetriesCandidateAfterDeadTunnel|NetworkResumeRecoversFailedRemoteProbe|CandidateFailureKeepsLiveActiveTunnel|DetectsProbeGapAsResume)|NotifyNetworkResumeCoalesces|RequestFailureRecoveryBudgetIsBounded|StackCloseIsConcurrentSafe|SetupHTTPProxyBackendFailure(SignalsAreCoalesced|StormCountsRawRequestsAndOneSignal))' -v
 
+  windows-proxy-lifecycle:
+    name: Windows proxy lifecycle and managed runtime update
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Run deterministic Windows lifecycle and exact-target tests
+        shell: pwsh
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          go test -p=1 ./internal/helperruntime -count=1 -run 'Test(ShouldActivateEntryVersionDoesNotUndoSameBasePrerelease|LaunchKeepsExplicitSameBasePrereleaseActive|Current|EnsureStableEntry|InstallVersion|PublishDownloaded)' -v
+          go test -p=1 ./internal/candidateupdate -count=1 -run 'Test(WindowsCandidateOwned|WindowsDeferred|Reconcile|ResumePending|StableReplacement|Apply|SamePath)' -v
+          go test -p=1 ./internal/update -count=1 -run 'Test(PerformUpdate|ReplaceBinary|Probe)' -v
+          go test -p=1 ./internal/cli -count=1 -run 'Test(StartDetachedProcessWaitsForExitedChild|ProxyStart|StartCodexAppProxyDaemon|WindowsProxy|CurrentRuntimeOwnsUpdateTarget)' -v
+          go test -p=1 ./internal/localproxy ./internal/stack ./internal/ssh -count=1 -run 'Test(HTTPProxyChain|HTTPProxyDNSAlias|GenerationRouter|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailure|NotifyNetworkResume|TunnelProcess)' -v
+
+      - name: Capture Windows lifecycle diagnostics
+        if: ${{ failure() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "== process tree =="
+          Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | Format-List
+          Write-Host "== listeners =="
+          Get-NetTCPConnection -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,RemoteAddress,RemotePort,State,OwningProcess | Format-Table
+
   proxy-recovery-docker:
     name: Proxy recovery Docker network fault lab
     runs-on: ubuntu-latest
@@ -348,7 +389,8 @@ jobs:
         run: |
           set -euo pipefail
           go test ./cmd/codex-proxy -count=1 -run 'TestRunMain(HandlesCandidateUpdateBeforeRuntimeDispatch|RunsLegacyPreflightBeforeRuntimeDispatch|PreflightFailureStopsBeforeRuntimeDispatch)$' -v
-          go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*)$' -v
+          go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*|ShouldActivateEntryVersion.*|LaunchKeepsExplicitSameBasePrerelease)$' -v
+          go test ./internal/cli -count=1 -run '^TestStartDetachedProcessWaitsForExitedChild$' -v
           go test ./internal/candidateupdate -count=1 -v
           go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
           go test ./internal/cli -count=1 -run 'Test(CurrentRuntimeOwnsUpdateTarget|PreferredCXPServiceEntryDoesNotUseUnrelatedRuntime|RefreshWindowsStableCXPExecutable.*|EnsureCXPShimForInstallPathNormalizesManagedWindowsCmdShim|CopyExecutableAtomicallyReplacesExistingFile)$' -v
@@ -2496,6 +2538,7 @@ jobs:
     needs:
       - targeted-test
       - proxy-recovery-loopback
+      - windows-proxy-lifecycle
       - proxy-recovery-docker
       - proxy-recovery-soak
       - full-go-test
@@ -2525,6 +2568,7 @@ jobs:
           }
           check targeted-test "${{ needs.targeted-test.result }}"
           check proxy-recovery-loopback "${{ needs.proxy-recovery-loopback.result }}"
+          check windows-proxy-lifecycle "${{ needs.windows-proxy-lifecycle.result }}"
           check proxy-recovery-docker "${{ needs.proxy-recovery-docker.result }}"
           check proxy-recovery-soak "${{ needs.proxy-recovery-soak.result }}"
           check full-go-test "${{ needs.full-go-test.result }}"

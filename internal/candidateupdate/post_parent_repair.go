@@ -18,6 +18,10 @@ type postParentRepairRequest struct {
 	ReadyPath             string
 	ExpectedCurrentSHA256 string
 	SourceSHA256          string
+	// Candidate-owned updates do not materialize the separate canonical
+	// codex-proxy.exe until the stable entry is repaired. Legacy bridge
+	// updates retain the stricter canonical-target commit check.
+	AllowUncommittedManagedTarget bool
 }
 
 // HandlePostParentRepairCommand runs before immutable-runtime dispatch. The
@@ -73,6 +77,11 @@ func parsePostParentRepairRequest(args []string) (postParentRepairRequest, error
 			request.ExpectedCurrentSHA256 = strings.ToLower(strings.TrimSpace(value))
 		case "--source-sha256":
 			request.SourceSHA256 = strings.ToLower(strings.TrimSpace(value))
+		case "--allow-uncommitted-managed-target":
+			if value != "true" {
+				return request, fmt.Errorf("--allow-uncommitted-managed-target must be true")
+			}
+			request.AllowUncommittedManagedTarget = true
 		default:
 			return request, fmt.Errorf("unsupported argument %q", name)
 		}

@@ -510,19 +510,20 @@ func startCodexAppProxyDaemonWithLease(_ context.Context, store *config.Store, p
 	c.Stderr = logFile
 	configureTeamsServiceDetachedCommand(c)
 
-	if err := c.Start(); err != nil {
+	detached, err := startDetachedProcess(c)
+	if err != nil {
 		return proxyStartupLease{}, err
 	}
-	pid := c.Process.Pid
+	pid := detached.cmd.Process.Pid
 	if err := proxyUpdateOwnedInstance(store, instanceID, identity.OwnerToken, identity.BrokerEpoch, func(inst *config.Instance) error {
 		inst.DaemonPID = pid
 		inst.LastSeenAt = proxyNow()
 		return nil
 	}); err != nil {
-		_ = proxyTerminate(c.Process, 2*time.Second)
+		_ = proxyTerminate(detached.cmd.Process, 2*time.Second)
+		_ = detached.wait(2 * time.Second)
 		return proxyStartupLease{}, fmt.Errorf("record app proxy daemon owner: %w", err)
 	}
-	_ = c.Process.Release()
 	started = true
 	return lease, nil
 }

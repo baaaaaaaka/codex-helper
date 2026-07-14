@@ -3,6 +3,7 @@
 package candidateupdate
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
@@ -106,6 +108,96 @@ func ScheduleLegacyDirectSelfUpdateRepair(args []string, buildVersion string) er
 	})
 }
 
+var (
+	managedStableEntryParentPID      = findStableEntryParentPID
+	managedStableEntryScheduleRepair = schedulePostParentRepair
+)
+
+// scheduleDeferredStableEntryRepair arms a worker only when the stable
+// launcher is an ancestor of the current candidate/runtime process. A caller
+// that directly executes an immutable runtime has no stable launcher to repair;
+// active runtime dispatch remains correct, so that case is intentionally a
+// no-op instead of turning a successful update into an error.
+func scheduleDeferredStableEntryRepair(result Result) error {
+	if result.stableEntryRepair == nil {
+		return nil
+	}
+	parentPID, err := managedStableEntryParentPID(result.stableEntryRepair.TargetPath)
+	if err != nil {
+		return fmt.Errorf("find stable cxp launcher for deferred repair: %w", err)
+	}
+	if parentPID <= 0 {
+		return nil
+	}
+	return managedStableEntryScheduleRepair(result.stableEntryRepair.SourcePath, postParentRepairRequest{
+		ParentPID:                     parentPID,
+		TargetPath:                    result.stableEntryRepair.TargetPath,
+		ExpectedCurrentSHA256:         result.stableEntryRepair.ExpectedCurrentSHA256,
+		SourceSHA256:                  result.stableEntryRepair.SourceSHA256,
+		AllowUncommittedManagedTarget: true,
+	})
+}
+
+func shouldDeferStableEntryRepair(err error) bool {
+	return errors.Is(err, windows.ERROR_ACCESS_DENIED) ||
+		errors.Is(err, windows.ERROR_SHARING_VIOLATION) ||
+		errors.Is(err, windows.ERROR_LOCK_VIOLATION)
+}
+
+func findStableEntryParentPID(target string) (int, error) {
+	target, err := filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return 0, err
+	}
+	pid := uint32(os.Getppid())
+	seen := map[uint32]bool{}
+	for depth := 0; pid != 0 && depth < 64; depth++ {
+		if seen[pid] {
+			return 0, nil
+		}
+		seen[pid] = true
+		if path, pathErr := processPathForPID(pid); pathErr == nil && samePath(path, target) {
+			return int(pid), nil
+		}
+		parent, parentErr := parentProcessID(pid)
+		if parentErr != nil || parent == pid {
+			return 0, parentErr
+		}
+		pid = parent
+	}
+	return 0, nil
+}
+
+func processPathForPID(pid uint32) (string, error) {
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return "", err
+	}
+	defer windows.CloseHandle(handle)
+	return processExecutableFromHandle(handle)
+}
+
+func parentProcessID(pid uint32) (uint32, error) {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer windows.CloseHandle(snapshot)
+	var process windows.ProcessEntry32
+	process.Size = uint32(unsafe.Sizeof(process))
+	if err := windows.Process32First(snapshot, &process); err != nil {
+		return 0, err
+	}
+	for {
+		if process.ProcessID == pid {
+			return process.ParentProcessID, nil
+		}
+		if err := windows.Process32Next(snapshot, &process); err != nil {
+			return 0, err
+		}
+	}
+}
+
 func managedLegacyWindowsEntry(stableEntry string) (bool, error) {
 	stableEntry, err := filepath.Abs(filepath.Clean(stableEntry))
 	if err != nil || !strings.EqualFold(filepath.Base(stableEntry), helperruntime.BinaryName("windows")) {
@@ -161,14 +253,18 @@ func schedulePostParentRepair(source string, request postParentRepairRequest) er
 		return fmt.Errorf("open post-parent repair log: %w", err)
 	}
 	_, _ = fmt.Fprintf(logFile, "%s scheduling post-parent repair source=%s target=%s parent=%d\n", time.Now().UTC().Format(time.RFC3339Nano), source, request.TargetPath, request.ParentPID)
-	cmd := exec.Command(source,
+	args := []string{
 		PostParentRepairCommand,
-		"--parent-pid="+strconv.Itoa(request.ParentPID),
-		"--target-path="+request.TargetPath,
-		"--ready-path="+request.ReadyPath,
-		"--expected-current-sha256="+request.ExpectedCurrentSHA256,
-		"--source-sha256="+request.SourceSHA256,
-	)
+		"--parent-pid=" + strconv.Itoa(request.ParentPID),
+		"--target-path=" + request.TargetPath,
+		"--ready-path=" + request.ReadyPath,
+		"--expected-current-sha256=" + request.ExpectedCurrentSHA256,
+		"--source-sha256=" + request.SourceSHA256,
+	}
+	if request.AllowUncommittedManagedTarget {
+		args = append(args, "--allow-uncommitted-managed-target=true")
+	}
+	cmd := exec.Command(source, args...)
 	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -307,8 +403,10 @@ func repairPostParentEntry(source string, request postParentRepairRequest, out i
 	if !owned {
 		return fmt.Errorf("repair target stopped being a managed cxp entry while waiting for parent exit")
 	}
-	if err := requireManagedTargetCommit(target, request.SourceSHA256); err != nil {
-		return err
+	if !request.AllowUncommittedManagedTarget {
+		if err := requireManagedTargetCommit(target, request.SourceSHA256); err != nil {
+			return err
+		}
 	}
 
 	deadline := time.Now().Add(30 * time.Second)

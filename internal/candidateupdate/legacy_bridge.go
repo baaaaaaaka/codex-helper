@@ -167,25 +167,9 @@ func requireSameFile(left string, right string, leftRole string, rightRole strin
 }
 
 func stableReplacementTarget(entry string, runningRuntime string, root string) (string, string, error) {
-	entry = filepath.Clean(strings.TrimSpace(entry))
-	info, err := os.Lstat(entry)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect stable cxp entry %s: %w", entry, err)
-	}
-	target := entry
-	if info.Mode()&os.ModeSymlink != 0 {
-		target, err = filepath.EvalSymlinks(entry)
-		if err != nil {
-			return "", "", fmt.Errorf("resolve stable cxp entry %s: %w", entry, err)
-		}
-	}
-	target, err = filepath.Abs(filepath.Clean(target))
+	target, err := stableEntryTargetPath(entry, root)
 	if err != nil {
 		return "", "", err
-	}
-	versionsRoot := filepath.Join(filepath.Clean(root), "versions")
-	if pathWithin(target, versionsRoot) {
-		return "", "", fmt.Errorf("refusing to replace immutable runtime through stable entry %s", entry)
 	}
 	if same, err := sameFileContent(target, runningRuntime); err != nil {
 		return "", "", fmt.Errorf("compare stable entry with running runtime: %w", err)
@@ -203,6 +187,30 @@ func stableReplacementTarget(entry string, runningRuntime string, root string) (
 		return "", "", fmt.Errorf("hash stable entry target: %w", err)
 	}
 	return target, expectedHash, nil
+}
+
+func stableEntryTargetPath(entry string, root string) (string, error) {
+	entry = filepath.Clean(strings.TrimSpace(entry))
+	info, err := os.Lstat(entry)
+	if err != nil {
+		return "", fmt.Errorf("inspect stable cxp entry %s: %w", entry, err)
+	}
+	target := entry
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err = filepath.EvalSymlinks(entry)
+		if err != nil {
+			return "", fmt.Errorf("resolve stable cxp entry %s: %w", entry, err)
+		}
+	}
+	target, err = filepath.Abs(filepath.Clean(target))
+	if err != nil {
+		return "", err
+	}
+	versionsRoot := filepath.Join(filepath.Clean(root), "versions")
+	if pathWithin(target, versionsRoot) {
+		return "", fmt.Errorf("refusing to replace immutable runtime through stable entry %s", entry)
+	}
+	return target, nil
 }
 
 func verifiedAffectedPhysicalVersion(path string) (string, error) {

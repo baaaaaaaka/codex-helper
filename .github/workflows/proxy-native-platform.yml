@@ -103,29 +103,50 @@ jobs:
               "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
             )
             if (-not ($edgeCandidates | Where-Object { Test-Path -LiteralPath $_ })) {
-              Write-Warning "Microsoft Edge is not available on this GitHub-hosted Windows image; skipping the effective-proxy test"
-              exit 0
+              $message = "Microsoft Edge is not available on this GitHub-hosted Windows image; effective-proxy test skipped"
+              Write-Warning $message
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- $message"
+              if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+                throw "Edge was explicitly requested but is not installed on this runner"
+              }
+            } else {
+              $env:CODEX_HELPER_LIVE_EDGE_PROXY_TEST = "1"
+              go test ./internal/cli -count=1 -run '^TestWindowsEdgeActuallyUsesProxyForHTTP$' -v -timeout=60s
             }
-            $env:CODEX_HELPER_LIVE_EDGE_PROXY_TEST = "1"
-            go test ./internal/cli -count=1 -run '^TestWindowsEdgeActuallyUsesProxyForHTTP$' -v -timeout=60s
           }
           if ($env:RUN_WSL -eq 'true') {
             $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
             if ($null -eq $wsl) {
-              Write-Warning "WSL2 is not available on this GitHub-hosted Windows image; skipping the WSL boundary test"
-              exit 0
+              $message = "WSL2 is not available on this GitHub-hosted Windows image; WSL boundary test skipped"
+              Write-Warning $message
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- $message"
+              if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+                throw "WSL2 was explicitly requested but is not available on this runner"
+              }
             }
-            $distros = @(& wsl.exe -l -q 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            if ($LASTEXITCODE -ne 0 -or $distros.Count -eq 0) {
-              Write-Warning "No WSL2 distribution is available on this GitHub-hosted runner; skipping the WSL boundary test"
-              exit 0
+            if ($null -ne $wsl) {
+              $distros = @(& wsl.exe -l -q 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+              if ($LASTEXITCODE -ne 0 -or $distros.Count -eq 0) {
+                $message = "No WSL2 distribution is available on this GitHub-hosted runner; WSL boundary test skipped"
+                Write-Warning $message
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- $message"
+                if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+                  throw "WSL2 was explicitly requested but no distribution is available"
+                }
+              } else {
+                $curl = @(& wsl.exe -e sh -lc "command -v curl" 2>$null)
+                if ($LASTEXITCODE -ne 0 -or $curl.Count -eq 0) {
+                  $message = "WSL2 curl is not available on this GitHub-hosted runner; WSL boundary test skipped"
+                  Write-Warning $message
+                  Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- $message"
+                  if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+                    throw "WSL2 was explicitly requested but curl is unavailable"
+                  }
+                } else {
+                  $env:CODEX_HELPER_LIVE_WSL_PROXY_TEST = "1"
+                  $env:CODEX_HELPER_LIVE_WSL_MODE = $env:WSL_MODE
+                  go test ./internal/cli -count=1 -run '^TestWindowsWSL2CanReachLiveProxy$' -v -timeout=60s
+                }
+              }
             }
-            $curl = @(& wsl.exe -e sh -lc "command -v curl" 2>$null)
-            if ($LASTEXITCODE -ne 0 -or $curl.Count -eq 0) {
-              Write-Warning "WSL2 curl is not available on this GitHub-hosted runner; skipping the WSL boundary test"
-              exit 0
-            }
-            $env:CODEX_HELPER_LIVE_WSL_PROXY_TEST = "1"
-            $env:CODEX_HELPER_LIVE_WSL_MODE = $env:WSL_MODE
-            go test ./internal/cli -count=1 -run '^TestWindowsWSL2CanReachLiveProxy$' -v -timeout=60s
           }
