@@ -27,9 +27,14 @@ func attachTunnelProcess(*exec.Cmd) tunnelProcessHandle { return tunnelProcessHa
 
 func closeTunnelProcess(tunnelProcessHandle) {}
 
-func terminateTunnelProcess(cmd *exec.Cmd, _ tunnelProcessHandle, grace time.Duration) error {
+func terminateTunnelProcess(cmd *exec.Cmd, _ tunnelProcessHandle, done <-chan struct{}, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	default:
 	}
 	pid := cmd.Process.Pid
 	if err := syscall.Kill(-pid, syscall.SIGINT); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -37,6 +42,11 @@ func terminateTunnelProcess(cmd *exec.Cmd, _ tunnelProcessHandle, grace time.Dur
 	}
 	deadline := time.Now().Add(grace)
 	for grace > 0 && time.Now().Before(deadline) {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
 		if !processGroupExists(pid) {
 			return nil
 		}

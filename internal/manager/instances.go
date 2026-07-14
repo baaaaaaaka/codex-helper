@@ -12,6 +12,64 @@ import (
 // instance after another daemon had already taken its broker lease.
 var ErrInstanceOwnershipLost = errors.New("proxy instance ownership lost")
 
+// ErrInstanceNotFound lets lifecycle callers distinguish a daemon that
+// removed its own record during shutdown from an ownership conflict.
+var ErrInstanceNotFound = errors.New("proxy instance not found")
+
+// MergeProxyRecoveryBudget merges a snapshot produced by a daemon with the
+// value currently persisted by another lifecycle participant (for example a
+// native supervisor). Recovery counters are monotonic within a window; a
+// stale snapshot must not erase attempts that were recorded concurrently.
+// A newer window represents an intentional expiry/reset and replaces the old
+// window. Blocked is a durable one-way fence and is therefore never cleared
+// by a stale or partially initialized process.
+func MergeProxyRecoveryBudget(current, proposed config.ProxyRecoveryBudget) config.ProxyRecoveryBudget {
+	merged := current
+	merged.RestartWindowStartedAt, merged.RestartAttempts = mergeRecoveryWindow(
+		current.RestartWindowStartedAt,
+		current.RestartAttempts,
+		proposed.RestartWindowStartedAt,
+		proposed.RestartAttempts,
+	)
+	merged.RequestWindowStartedAt, merged.RequestAttempts = mergeRecoveryWindow(
+		current.RequestWindowStartedAt,
+		current.RequestAttempts,
+		proposed.RequestWindowStartedAt,
+		proposed.RequestAttempts,
+	)
+	if !current.Blocked && proposed.Blocked {
+		merged.Blocked = true
+		merged.BlockedAt = proposed.BlockedAt
+		merged.LastReason = proposed.LastReason
+	} else if current.Blocked {
+		merged.Blocked = true
+		if merged.BlockedAt.IsZero() {
+			merged.BlockedAt = proposed.BlockedAt
+		}
+		if merged.LastReason == "" {
+			merged.LastReason = proposed.LastReason
+		}
+	}
+	return merged
+}
+
+func mergeRecoveryWindow(currentStart time.Time, currentAttempts int, proposedStart time.Time, proposedAttempts int) (time.Time, int) {
+	switch {
+	case currentStart.IsZero():
+		return proposedStart, proposedAttempts
+	case proposedStart.IsZero():
+		return currentStart, currentAttempts
+	case proposedStart.After(currentStart):
+		return proposedStart, proposedAttempts
+	case currentStart.After(proposedStart):
+		return currentStart, currentAttempts
+	case proposedAttempts > currentAttempts:
+		return proposedStart, proposedAttempts
+	default:
+		return currentStart, currentAttempts
+	}
+}
+
 // DefaultProxyOwnerLease is deliberately longer than the normal heartbeat
 // interval. It allows a laptop to spend a short amount of time waking its
 // user session without causing a competing starter to fence a live daemon.
@@ -73,7 +131,7 @@ func Heartbeat(store *config.Store, instanceID string, now time.Time) error {
 				return nil
 			}
 		}
-		return fmt.Errorf("instance %q not found", instanceID)
+		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
 	})
 }
 
@@ -99,7 +157,7 @@ func UpdateOwnedInstance(store *config.Store, instanceID, ownerToken, brokerEpoc
 			}
 			return nil
 		}
-		return fmt.Errorf("instance %q not found", instanceID)
+		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
 	})
 }
 
@@ -133,6 +191,6 @@ func RemoveOwnedInstance(store *config.Store, instanceID, ownerToken, brokerEpoc
 			cfg.RemoveInstance(instanceID)
 			return nil
 		}
-		return fmt.Errorf("instance %q not found", instanceID)
+		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
 	})
 }

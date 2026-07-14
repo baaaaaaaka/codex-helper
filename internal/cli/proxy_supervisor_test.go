@@ -97,6 +97,49 @@ func TestProxySupervisorStopsAfterDurableBudgetBlock(t *testing.T) {
 	}
 }
 
+func TestProxySupervisorAdoptsExistingDaemonBeforeStartingChild(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	inst := config.Instance{ID: "adopt-existing", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1", DaemonPID: 4242}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	oldExecutable, oldCommand, oldWait, oldAlive, oldLooksLike := proxyExecutable, proxySupervisorCommand, proxySupervisorWait, proxyProcessAlive, proxyLooksLikeProxyDaemon
+	t.Cleanup(func() {
+		proxyExecutable, proxySupervisorCommand, proxySupervisorWait, proxyProcessAlive, proxyLooksLikeProxyDaemon = oldExecutable, oldCommand, oldWait, oldAlive, oldLooksLike
+	})
+	proxyExecutable = func() (string, error) { return "/bin/sh", nil }
+	alive := true
+	waitCalls := 0
+	proxyProcessAlive = func(pid int) bool { return alive && pid == inst.DaemonPID }
+	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) { return pid == inst.DaemonPID, nil }
+	proxySupervisorWait = func(context.Context, time.Duration) error {
+		waitCalls++
+		if waitCalls == 1 {
+			alive = false
+		}
+		return nil
+	}
+	starts := 0
+	proxySupervisorCommand = func(string, ...string) *exec.Cmd {
+		if waitCalls == 0 {
+			t.Fatal("supervisor started a replacement before adopting the live daemon")
+		}
+		starts++
+		return exec.Command("sh", "-c", "exit 1")
+	}
+
+	if err := runProxySupervisor(context.Background(), store, inst.ID, inst.OwnerToken); err != nil {
+		t.Fatalf("runProxySupervisor: %v", err)
+	}
+	if waitCalls == 0 || starts != proxySupervisorRestartBurst {
+		t.Fatalf("adoption wait calls=%d child starts=%d, want wait and %d starts", waitCalls, starts, proxySupervisorRestartBurst)
+	}
+}
+
 func TestProxyStartSupervisedLaunchesSupervisorInsteadOfBareDaemon(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)

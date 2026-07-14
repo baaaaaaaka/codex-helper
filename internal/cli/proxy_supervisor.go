@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -167,6 +169,11 @@ func runProxySupervisor(ctx context.Context, store *config.Store, instanceID, ow
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// A native supervisor terminates the helper process directly. Convert that
+	// signal into the same cancellation path used by an explicit context so the
+	// managed daemon is stopped before the supervisor exits.
+	ctx, stopSignals := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	exe, err := proxySupervisorExecutable()
 	if err != nil {
 		return err
@@ -213,6 +220,14 @@ func runProxySupervisor(ctx context.Context, store *config.Store, instanceID, ow
 			if errors.Is(err, ErrProxyRecoveryBlocked) {
 				return nil
 			}
+			return err
+		}
+		// A supervisor may be restarted while its managed daemon is still
+		// healthy. Adopt that daemon by waiting for it to exit instead of
+		// starting a second listener/tunnel generation. Ignore the supervisor's
+		// own PID, which is recorded by detached `proxy start` before this
+		// process gets to run.
+		if err := waitForExistingProxyDaemon(ctx, store, instanceID, ownerToken); err != nil {
 			return err
 		}
 
@@ -265,6 +280,40 @@ func runProxySupervisor(ctx context.Context, store *config.Store, instanceID, ow
 			if err := proxySupervisorWait(ctx, proxySupervisorRestartDelay); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+func waitForExistingProxyDaemon(ctx context.Context, store *config.Store, instanceID, ownerToken string) error {
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := proxySupervisorOwnerCurrent(store, instanceID, ownerToken); err != nil {
+			return err
+		}
+		cfg, err := store.Load()
+		if err != nil {
+			return err
+		}
+		alive := false
+		for _, inst := range cfg.Instances {
+			if inst.ID == instanceID && inst.DaemonPID > 0 && inst.DaemonPID != os.Getpid() {
+				alive = proxyProcessAlive(inst.DaemonPID)
+				if alive {
+					// A persisted PID can be reused after a crash. Do not adopt an
+					// unrelated process merely because kill(pid, 0) succeeds.
+					looksLike, lookErr := proxyLooksLikeProxyDaemon(inst.DaemonPID)
+					alive = lookErr == nil && looksLike
+				}
+				break
+			}
+		}
+		if !alive {
+			return nil
+		}
+		if err := proxySupervisorWait(ctx, 250*time.Millisecond); err != nil {
+			return err
 		}
 	}
 }

@@ -106,6 +106,8 @@ type HTTPProxy struct {
 	server          *http.Server
 	addr            string
 	listenerHost    string
+	closing         bool
+	tunnels         map[*proxyTunnel]struct{}
 	probeCount      atomic.Uint64
 	backendFailures atomic.Uint64
 
@@ -116,6 +118,11 @@ type HTTPProxy struct {
 	healthInFlight    chan struct{}
 	healthTTL         time.Duration
 	healthTimeout     time.Duration
+}
+
+type proxyTunnel struct {
+	client   net.Conn
+	upstream net.Conn
 }
 
 type Options struct {
@@ -213,6 +220,7 @@ func NewHTTPProxy(d Dialer, opts Options) *HTTPProxy {
 		forwardChainMeta: forwardChainMeta,
 		idle:             idle,
 		tunnelIdle:       tunnelIdle,
+		tunnels:          make(map[*proxyTunnel]struct{}),
 		healthTTL:        healthTTL,
 		healthTimeout:    healthTimeout,
 	}
@@ -310,6 +318,7 @@ func (p *HTTPProxy) Start(listenAddr string) (actualAddr string, err error) {
 
 	p.listener = ln
 	p.server = srv
+	p.closing = false
 	p.addr = ln.Addr().String()
 	if host, _, splitErr := net.SplitHostPort(p.addr); splitErr == nil {
 		p.listenerHost = normalizeListenerHost(host)
@@ -323,6 +332,9 @@ func (p *HTTPProxy) Start(listenAddr string) (actualAddr string, err error) {
 }
 
 func (p *HTTPProxy) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.mu.Lock()
 	srv := p.server
 	ln := p.listener
@@ -330,7 +342,17 @@ func (p *HTTPProxy) Close(ctx context.Context) error {
 	p.listener = nil
 	p.addr = ""
 	p.listenerHost = ""
+	p.closing = true
+	tunnels := make([]*proxyTunnel, 0, len(p.tunnels))
+	for tunnel := range p.tunnels {
+		tunnels = append(tunnels, tunnel)
+	}
+	p.tunnels = make(map[*proxyTunnel]struct{})
 	p.mu.Unlock()
+	for _, tunnel := range tunnels {
+		_ = tunnel.client.Close()
+		_ = tunnel.upstream.Close()
+	}
 
 	var closeErr error
 	if ln != nil {
@@ -341,6 +363,14 @@ func (p *HTTPProxy) Close(ctx context.Context) error {
 	if srv != nil {
 		if err := srv.Shutdown(ctx); err != nil && !isClosedNetworkError(err) {
 			closeErr = errors.Join(closeErr, err)
+			// Shutdown intentionally waits for active handlers. If the caller's
+			// deadline expires, force-close ordinary HTTP connections as the final
+			// cleanup fence so a stuck dialer cannot keep the proxy process alive.
+			if ctx.Err() != nil {
+				if forceErr := srv.Close(); forceErr != nil && !isClosedNetworkError(forceErr) {
+					closeErr = errors.Join(closeErr, forceErr)
+				}
+			}
 		}
 	}
 	return closeErr
@@ -493,7 +523,7 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	upstream, err := p.dialContextWithHeaders(r.Context(), "tcp", dest, forwardHeaders)
 	if err != nil {
-		p.notifyBackendFailure(dest, err)
+		p.notifyBackendFailureContext(r.Context(), dest, err)
 		http.Error(w, "dial upstream: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -511,17 +541,53 @@ func (p *HTTPProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-		_ = clientConn.Close()
-		_ = upstream.Close()
+	tunnel, ok := p.registerTunnel(clientConn, upstream)
+	if !ok {
 		return
 	}
 
-	p.copyTunnel(clientConn, upstream)
+	if _, err := tunnel.client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		p.unregisterTunnel(tunnel)
+		_ = tunnel.client.Close()
+		_ = tunnel.upstream.Close()
+		return
+	}
+
+	p.copyTunnel(tunnel)
 }
 
-func (p *HTTPProxy) copyTunnel(clientConn net.Conn, upstream net.Conn) {
+func (p *HTTPProxy) registerTunnel(clientConn, upstream net.Conn) (*proxyTunnel, bool) {
+	tunnel := &proxyTunnel{client: clientConn, upstream: upstream}
+	p.mu.Lock()
+	if p.closing {
+		p.mu.Unlock()
+		_ = clientConn.Close()
+		_ = upstream.Close()
+		return nil, false
+	}
+	if p.tunnels == nil {
+		p.tunnels = make(map[*proxyTunnel]struct{})
+	}
+	p.tunnels[tunnel] = struct{}{}
+	p.mu.Unlock()
+	return tunnel, true
+}
+
+func (p *HTTPProxy) unregisterTunnel(tunnel *proxyTunnel) {
+	if tunnel == nil {
+		return
+	}
+	p.mu.Lock()
+	delete(p.tunnels, tunnel)
+	p.mu.Unlock()
+}
+
+func (p *HTTPProxy) copyTunnel(tunnel *proxyTunnel) {
+	if tunnel == nil {
+		return
+	}
+	defer p.unregisterTunnel(tunnel)
+	clientConn, upstream := tunnel.client, tunnel.upstream
 	var once sync.Once
 	closeBoth := func() {
 		_ = clientConn.Close()
@@ -602,7 +668,7 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := tr.RoundTrip(outReq)
 	if err != nil {
-		p.notifyBackendFailure(dest, err)
+		p.notifyBackendFailureContext(outReq.Context(), dest, err)
 		http.Error(w, "round trip: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -614,10 +680,18 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *HTTPProxy) notifyBackendFailure(target string, err error) {
+	p.notifyBackendFailureContext(context.Background(), target, err)
+}
+
+func (p *HTTPProxy) notifyBackendFailureContext(ctx context.Context, target string, err error) {
 	if err == nil {
 		return
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A transport response-header timeout can wrap context.DeadlineExceeded
+	// while the proxy request itself is still live. Suppress only a request
+	// context cancellation; a live request that times out upstream is a real
+	// backend failure and must participate in recovery admission.
+	if ctx != nil && ctx.Err() != nil {
 		return
 	}
 	p.backendFailures.Add(1)

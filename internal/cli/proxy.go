@@ -364,7 +364,7 @@ func runProxyDaemonWithOwnerTokenMode(parentCtx context.Context, store *config.S
 	opts.PersistRecoveryBudget = func(budget config.ProxyRecoveryBudget) error {
 		if strictOwnership {
 			return proxyUpdateOwnedInstance(store, instanceID, ownerToken, brokerEpoch, func(live *config.Instance) error {
-				live.RecoveryBudget = budget
+				live.RecoveryBudget = manager.MergeProxyRecoveryBudget(live.RecoveryBudget, budget)
 				return nil
 			})
 		}
@@ -373,7 +373,7 @@ func runProxyDaemonWithOwnerTokenMode(parentCtx context.Context, store *config.S
 				if cfg.Instances[i].ID != instanceID {
 					continue
 				}
-				cfg.Instances[i].RecoveryBudget = budget
+				cfg.Instances[i].RecoveryBudget = manager.MergeProxyRecoveryBudget(cfg.Instances[i].RecoveryBudget, budget)
 				return nil
 			}
 			return fmt.Errorf("instance %q not found", instanceID)
@@ -560,10 +560,49 @@ func newProxyStopCmd(root *rootOptions) *cobra.Command {
 			}
 
 			if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
+				// The process-alive check and the config read above are not an
+				// ownership claim.  A replacement broker may have won the lease
+				// while the stop command was waiting to inspect the old PID.  Do
+				// one final owner CAS-style check immediately before signalling so
+				// an explicit stop cannot kill the replacement broker's process.
+				if inst.OwnerToken != "" && inst.BrokerEpoch != "" {
+					latest, loadErr := store.Load()
+					if loadErr != nil {
+						return loadErr
+					}
+					latestFound := false
+					for _, it := range latest.Instances {
+						if it.ID != id {
+							continue
+						}
+						latestFound = true
+						if it.OwnerToken != inst.OwnerToken || it.BrokerEpoch != inst.BrokerEpoch {
+							return fmt.Errorf("stop proxy instance %q: %w", id, manager.ErrInstanceOwnershipLost)
+						}
+						inst = it
+						break
+					}
+					if !latestFound {
+						return fmt.Errorf("stop proxy instance %q: %w", id, manager.ErrInstanceNotFound)
+					}
+				}
+				looksLike, lookErr := proxyLooksLikeProxyDaemon(inst.DaemonPID)
+				if lookErr != nil {
+					return fmt.Errorf("stop proxy instance %q: inspect pid %d: %w", id, inst.DaemonPID, lookErr)
+				}
+				if !looksLike {
+					return fmt.Errorf("stop proxy instance %q: refusing to terminate pid %d because it is not a proxy daemon", id, inst.DaemonPID)
+				}
 				p, _ := proxyFindProcess(inst.DaemonPID)
 				_ = proxyTerminate(p, 2*time.Second)
 			}
-			_ = proxyRemoveInstance(store, id)
+			if inst.OwnerToken != "" && inst.BrokerEpoch != "" {
+				if removeErr := proxyRemoveOwnedInstance(store, id, inst.OwnerToken, inst.BrokerEpoch); removeErr != nil && !errors.Is(removeErr, manager.ErrInstanceNotFound) {
+					return fmt.Errorf("stop proxy instance %q: %w", id, removeErr)
+				}
+			} else {
+				_ = proxyRemoveInstance(store, id)
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Stopped instance %s\n", id)
 			return nil
 		},

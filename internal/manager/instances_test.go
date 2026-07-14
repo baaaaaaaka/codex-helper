@@ -159,3 +159,45 @@ func TestInstanceOpsErrorPaths(t *testing.T) {
 		}
 	})
 }
+
+func TestMergeProxyRecoveryBudgetPreservesConcurrentAttemptsAndBlock(t *testing.T) {
+	start := time.Unix(100, 0)
+	current := config.ProxyRecoveryBudget{
+		RestartWindowStartedAt: start,
+		RestartAttempts:        4,
+		RequestWindowStartedAt: start,
+		RequestAttempts:        7,
+	}
+	proposed := config.ProxyRecoveryBudget{
+		RestartWindowStartedAt: start,
+		RestartAttempts:        2,
+		RequestWindowStartedAt: start,
+		RequestAttempts:        9,
+		Blocked:                true,
+		BlockedAt:              time.Unix(120, 0),
+		LastReason:             "request budget exceeded",
+	}
+
+	got := MergeProxyRecoveryBudget(current, proposed)
+	if got.RestartWindowStartedAt != start || got.RestartAttempts != 4 {
+		t.Fatalf("stale restart snapshot erased attempts: %+v", got)
+	}
+	if got.RequestWindowStartedAt != start || got.RequestAttempts != 9 {
+		t.Fatalf("request attempts were not merged by maximum: %+v", got)
+	}
+	if !got.Blocked || !got.BlockedAt.Equal(proposed.BlockedAt) || got.LastReason != proposed.LastReason {
+		t.Fatalf("blocked state was not durably propagated: %+v", got)
+	}
+
+	newWindow := config.ProxyRecoveryBudget{
+		RestartWindowStartedAt: time.Unix(200, 0),
+		RestartAttempts:        1,
+	}
+	got = MergeProxyRecoveryBudget(got, newWindow)
+	if !got.RestartWindowStartedAt.Equal(newWindow.RestartWindowStartedAt) || got.RestartAttempts != 1 {
+		t.Fatalf("new restart window did not replace expired window: %+v", got)
+	}
+	if !got.Blocked {
+		t.Fatal("new snapshot cleared durable blocked fence")
+	}
+}

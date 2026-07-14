@@ -65,17 +65,32 @@ func closeTunnelProcess(handle tunnelProcessHandle) {
 	}
 }
 
-func terminateTunnelProcess(cmd *exec.Cmd, handle tunnelProcessHandle, grace time.Duration) error {
+func terminateTunnelProcess(cmd *exec.Cmd, handle tunnelProcessHandle, done <-chan struct{}, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
 	_ = cmd.Process.Signal(os.Interrupt)
 	if grace > 0 {
-		time.Sleep(grace)
+		timer := time.NewTimer(grace)
+		select {
+		case <-done:
+			_ = timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+	select {
+	case <-done:
+		return nil
+	default:
 	}
 	if handle.job != 0 {
 		_ = windows.TerminateJobObject(handle.job, 1)
-		_ = windows.CloseHandle(handle.job)
 		return nil
 	}
 	// A nested Job Object may be unavailable under a managed runner. Keep the

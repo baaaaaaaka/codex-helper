@@ -119,3 +119,74 @@ func TestGenerationRouterDialContextCancelsBackend(t *testing.T) {
 		t.Fatalf("DialContext took too long: %s", elapsed)
 	}
 }
+
+type lateConnectionDialer struct {
+	started chan struct{}
+	release chan struct{}
+	peer    net.Conn
+}
+
+func (d *lateConnectionDialer) Dial(network, addr string) (net.Conn, error) {
+	return nil, errors.New("legacy dial should not be used")
+}
+
+func (d *lateConnectionDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	close(d.started)
+	client, peer := net.Pipe()
+	d.peer = peer
+	<-d.release
+	return client, nil
+}
+
+func TestGenerationRouterDrainRejectsLateDialAfterForcedClose(t *testing.T) {
+	dialer := &lateConnectionDialer{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	router, err := NewGenerationRouter(dialer)
+	if err != nil {
+		t.Fatalf("NewGenerationRouter: %v", err)
+	}
+	defer router.Close(context.Background())
+	oldGeneration := router.CurrentGeneration()
+
+	dialResult := make(chan error, 1)
+	go func() {
+		_, err := router.DialContext(context.Background(), "tcp", "late.example:443")
+		dialResult <- err
+	}()
+	select {
+	case <-dialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("in-flight dial did not start")
+	}
+	if _, err := router.Swap(dialerFunc(func(string, string) (net.Conn, error) {
+		return nil, errors.New("candidate dial should not run")
+	})); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := router.Drain(ctx, oldGeneration); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain error = %v, want deadline", err)
+	}
+	close(dialer.release)
+
+	select {
+	case err := <-dialResult:
+		if !errors.Is(err, errGenerationForceClosed) {
+			t.Fatalf("late DialContext error = %v, want forced-close fence", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("late dial did not finish after drain")
+	}
+	if dialer.peer == nil {
+		t.Fatal("late dialer did not create a peer")
+	}
+	_ = dialer.peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := dialer.peer.Read(make([]byte, 1)); err == nil {
+		t.Fatal("late connection peer remained open after forced-close rejection")
+	}
+	_ = dialer.peer.Close()
+}

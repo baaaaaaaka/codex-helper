@@ -15,6 +15,9 @@ func looksLikeProxyDaemonCmdline(cmdline string) bool {
 	if strings.Contains(cmdline, " proxy daemon ") {
 		return true
 	}
+	if strings.Contains(cmdline, " proxy supervisor run ") {
+		return true
+	}
 	if strings.Contains(cmdline, " proxy start ") {
 		return true
 	}

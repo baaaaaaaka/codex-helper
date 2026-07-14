@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 )
 
+var errGenerationForceClosed = errors.New("generation was force-closed during dial")
+
 // GenerationRouter keeps the public HTTP proxy listener stable while its
 // backend dialer is replaced. Existing connections retain a lease on the old
 // generation; new dials use the current generation after Swap returns.
@@ -25,9 +27,14 @@ type routerGeneration struct {
 
 	mu       sync.Mutex
 	draining bool
-	refs     int
-	connSet  map[net.Conn]struct{}
-	drained  chan struct{}
+	// forcedClosed is set before a bounded drain closes the current connection
+	// set. An in-flight dial still owns a reference, so without this fence it
+	// could add a connection after the close snapshot and hand a stale socket
+	// back to the caller.
+	forcedClosed bool
+	refs         int
+	connSet      map[net.Conn]struct{}
+	drained      chan struct{}
 }
 
 func NewGenerationRouter(d Dialer) (*GenerationRouter, error) {
@@ -73,7 +80,11 @@ func (r *GenerationRouter) DialContext(ctx context.Context, network, addr string
 		g.release(nil)
 		return nil, errors.New("generation router dialer returned a nil connection")
 	}
-	g.add(conn)
+	if !g.add(conn) {
+		_ = conn.Close()
+		g.release(nil)
+		return nil, errGenerationForceClosed
+	}
 	return &leasedConn{Conn: conn, release: func() { g.release(conn) }}, nil
 }
 
@@ -219,10 +230,15 @@ func (r *GenerationRouter) Close(ctx context.Context) error {
 	return nil
 }
 
-func (g *routerGeneration) add(conn net.Conn) {
+func (g *routerGeneration) add(conn net.Conn) bool {
 	g.mu.Lock()
+	if g.forcedClosed {
+		g.mu.Unlock()
+		return false
+	}
 	g.connSet[conn] = struct{}{}
 	g.mu.Unlock()
+	return true
 }
 
 func (g *routerGeneration) release(conn net.Conn) {
@@ -253,6 +269,7 @@ func (g *routerGeneration) maybeCloseDrainedLocked() {
 
 func (g *routerGeneration) closeConnections() {
 	g.mu.Lock()
+	g.forcedClosed = true
 	connections := make([]net.Conn, 0, len(g.connSet))
 	for conn := range g.connSet {
 		connections = append(connections, conn)

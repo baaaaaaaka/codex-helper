@@ -458,8 +458,13 @@ func (t *Tunnel) Stop(grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+	select {
+	case <-t.done:
+		return t.Wait()
+	default:
+	}
 
-	_ = terminateTunnelProcess(cmd, processHandle, grace)
+	_ = terminateTunnelProcess(cmd, processHandle, t.done, grace)
 	<-t.done
 	return t.Wait()
 }

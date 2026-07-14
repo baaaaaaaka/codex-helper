@@ -34,7 +34,7 @@ func TestTunnelProcessJobObjectBoundsDescendantLifecycle(t *testing.T) {
 		_ = cmd.Wait()
 		t.Skip("runner does not permit assigning a nested Job Object")
 	}
-	if err := terminateTunnelProcess(cmd, handle, 25*time.Millisecond); err != nil {
+	if err := terminateTunnelProcess(cmd, handle, nil, 25*time.Millisecond); err != nil {
 		t.Fatalf("terminate job: %v", err)
 	}
 	if err := cmd.Wait(); err == nil {

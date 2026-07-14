@@ -325,12 +325,17 @@ func ensureCodexAppProxyURL(ctx context.Context, store *config.Store, profile co
 	return withCodexAppProxyStartupLock(ctx, store, func() (string, error) {
 		// The caller's instance snapshot may have raced another app launch.
 		// Re-read and re-probe only after winning the startup election.
-		if freshCfg, err := store.Load(); err == nil {
-			if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
-				return "", err
-			} else if inst != nil {
-				return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
-			}
+		freshCfg, err := store.Load()
+		if err != nil {
+			return "", err
+		}
+		if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
+			return "", err
+		} else if inst != nil {
+			return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
+		}
+		if proxyProfileRecoveryBlocked(freshCfg.Instances, profile.ID) {
+			return "", fmt.Errorf("%w: profile %q has a blocked proxy recovery budget; reset the proxy before starting another daemon", ErrProxyRecoveryBlocked, profile.ID)
 		}
 		if log != nil {
 			_, _ = fmt.Fprintln(log, "starting a long-lived proxy instance for the Codex desktop app...")
@@ -346,6 +351,18 @@ func ensureCodexAppProxyURL(ctx context.Context, store *config.Store, profile co
 		}
 		return proxyURL, nil
 	})
+}
+
+func proxyProfileRecoveryBlocked(instances []config.Instance, profileID string) bool {
+	for _, inst := range instances {
+		if inst.ProfileID != profileID || inst.Kind == config.InstanceKindModelAdapter {
+			continue
+		}
+		if inst.RecoveryBudget.Blocked {
+			return true
+		}
+	}
+	return false
 }
 
 // withCodexAppProxyStartupLock serializes the check-then-start sequence used

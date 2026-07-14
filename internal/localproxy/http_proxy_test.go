@@ -242,6 +242,24 @@ func TestHTTPProxyNotifiesBackendFailureForPlainHTTP(t *testing.T) {
 	}
 }
 
+func TestHTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive(t *testing.T) {
+	var failures atomic.Int32
+	p := NewHTTPProxy(nil, Options{OnBackendFailure: func(error) {
+		failures.Add(1)
+	}})
+	p.notifyBackendFailureContext(context.Background(), "example.com:443", context.DeadlineExceeded)
+	if got := failures.Load(); got != 1 {
+		t.Fatalf("live request deadline notifications = %d, want 1", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.notifyBackendFailureContext(ctx, "example.com:443", context.DeadlineExceeded)
+	if got := failures.Load(); got != 1 {
+		t.Fatalf("canceled request deadline notifications = %d, want 1", got)
+	}
+}
+
 func TestHTTPProxyReportsTargetAlongsideSharedBackendFailure(t *testing.T) {
 	targets := make(chan string, 1)
 	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
@@ -321,6 +339,42 @@ func TestHTTPProxyConnectIdleTunnelClosesBothSides(t *testing.T) {
 
 	assertConnClosesSoon(t, conn, "client tunnel")
 	assertConnClosesSoon(t, upstream, "upstream tunnel")
+}
+
+func TestHTTPProxyCloseClosesActiveHijackedTunnels(t *testing.T) {
+	upstreamCh := make(chan net.Conn, 1)
+	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
+		clientSide, upstreamSide := net.Pipe()
+		upstreamCh <- upstreamSide
+		return clientSide, nil
+	}), Options{TunnelIdleTimeout: time.Hour})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	conn, err := net.DialTimeout("tcp", httpAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	_ = openConnectTunnel(t, conn)
+	upstream := <-upstreamCh
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := p.Close(closeCtx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("active client tunnel remained open after proxy close")
+	}
+	_ = upstream.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := upstream.Read(make([]byte, 1)); err == nil {
+		t.Fatal("active upstream tunnel remained open after proxy close")
+	}
+	_ = conn.Close()
+	_ = upstream.Close()
 }
 
 func TestHTTPProxyConnectTunnelStaysOpenWithOneWayActivity(t *testing.T) {

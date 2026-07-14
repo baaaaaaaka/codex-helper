@@ -9,6 +9,7 @@ func TestLooksLikeProxyDaemonCmdline(t *testing.T) {
 		want    bool
 	}{
 		{name: "daemon subcommand", cmdline: "/home/baka/go/bin/codex-proxy proxy daemon --instance-id abc", want: true},
+		{name: "supervisor subcommand", cmdline: "/home/baka/go/bin/codex-proxy proxy supervisor run --instance-id abc", want: true},
 		{name: "foreground start", cmdline: "codex-proxy proxy start --foreground", want: true},
 		{name: "run session", cmdline: "codex-proxy run p1 -- codex", want: false},
 		{name: "regular codex", cmdline: "/home/baka/.config/codex-proxy/codex-patched-123 resume abc", want: false},

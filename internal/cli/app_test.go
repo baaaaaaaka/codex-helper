@@ -2382,6 +2382,22 @@ func TestEnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut(t *testing.T)
 	}
 }
 
+func TestProxyProfileRecoveryBlockedDoesNotCreateAnotherDaemon(t *testing.T) {
+	instances := []config.Instance{
+		{ID: "blocked", ProfileID: "p1", Kind: config.InstanceKindDaemon, RecoveryBudget: config.ProxyRecoveryBudget{Blocked: true}},
+		{ID: "adapter", ProfileID: "p1", Kind: config.InstanceKindModelAdapter, RecoveryBudget: config.ProxyRecoveryBudget{Blocked: true}},
+	}
+	if !proxyProfileRecoveryBlocked(instances, "p1") {
+		t.Fatal("blocked daemon profile was not rejected")
+	}
+	if proxyProfileRecoveryBlocked(instances, "other") {
+		t.Fatal("blocked instance from another profile was considered")
+	}
+	if proxyProfileRecoveryBlocked([]config.Instance{{ProfileID: "p1", Kind: config.InstanceKindModelAdapter, RecoveryBudget: config.ProxyRecoveryBudget{Blocked: true}}}, "p1") {
+		t.Fatal("model adapter budget blocked desktop proxy startup")
+	}
+}
+
 func TestWithCodexAppProxyStartupLockSerializesCallers(t *testing.T) {
 	store := newTempStore(t)
 	entered := make(chan struct{})

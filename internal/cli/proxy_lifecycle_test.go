@@ -904,14 +904,17 @@ func TestProxyStopTerminatesAliveInstanceAndRemovesConfigEntry(t *testing.T) {
 	prevFind := proxyFindProcess
 	prevTerminate := proxyTerminate
 	prevRemove := proxyRemoveInstance
+	prevLooksLike := proxyLooksLikeProxyDaemon
 	t.Cleanup(func() {
 		proxyProcessAlive = prevAlive
 		proxyFindProcess = prevFind
 		proxyTerminate = prevTerminate
 		proxyRemoveInstance = prevRemove
+		proxyLooksLikeProxyDaemon = prevLooksLike
 	})
 
 	proxyProcessAlive = func(int) bool { return true }
+	proxyLooksLikeProxyDaemon = func(int) (bool, error) { return true, nil }
 	proxyFindProcess = func(pid int) (*os.Process, error) {
 		return &os.Process{Pid: pid}, nil
 	}
@@ -950,6 +953,146 @@ func TestProxyStopTerminatesAliveInstanceAndRemovesConfigEntry(t *testing.T) {
 	}
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("expected instance removal, got %+v", cfg.Instances)
+	}
+}
+
+func TestProxyStopDoesNotRemoveReplacementOwner(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	old := config.Instance{
+		ID: "inst-replaced", ProfileID: "p1", Kind: config.InstanceKindDaemon,
+		OwnerToken: "owner-a", BrokerEpoch: "epoch-a", DaemonPID: 4242,
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{old}}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive, prevFind, prevTerminate, prevRemoveOwned, prevLooksLike := proxyProcessAlive, proxyFindProcess, proxyTerminate, proxyRemoveOwnedInstance, proxyLooksLikeProxyDaemon
+	t.Cleanup(func() {
+		proxyProcessAlive, proxyFindProcess, proxyTerminate, proxyRemoveOwnedInstance, proxyLooksLikeProxyDaemon = prevAlive, prevFind, prevTerminate, prevRemoveOwned, prevLooksLike
+	})
+	proxyProcessAlive = func(int) bool { return true }
+	proxyLooksLikeProxyDaemon = func(int) (bool, error) { return true, nil }
+	proxyFindProcess = func(pid int) (*os.Process, error) { return &os.Process{Pid: pid}, nil }
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		return store.Update(func(cfg *config.Config) error {
+			cfg.Instances[0].OwnerToken = "owner-b"
+			cfg.Instances[0].BrokerEpoch = "epoch-b"
+			return nil
+		})
+	}
+	proxyRemoveOwnedInstance = manager.RemoveOwnedInstance
+
+	cmd := newProxyStopCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{old.ID})
+	if err := cmd.Execute(); !errors.Is(err, manager.ErrInstanceOwnershipLost) {
+		t.Fatalf("stop error = %v, want ownership loss", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 1 || cfg.Instances[0].OwnerToken != "owner-b" || cfg.Instances[0].BrokerEpoch != "epoch-b" {
+		t.Fatalf("replacement owner was modified: %+v", cfg.Instances)
+	}
+}
+
+func TestProxyStopDoesNotSignalReplacementBeforeTerminate(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	old := config.Instance{
+		ID: "inst-stop-race", ProfileID: "p1", Kind: config.InstanceKindDaemon,
+		OwnerToken: "owner-a", BrokerEpoch: "epoch-a", DaemonPID: 4242,
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{old}}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive, prevFind, prevTerminate, prevRemoveOwned, prevLooksLike := proxyProcessAlive, proxyFindProcess, proxyTerminate, proxyRemoveOwnedInstance, proxyLooksLikeProxyDaemon
+	t.Cleanup(func() {
+		proxyProcessAlive, proxyFindProcess, proxyTerminate, proxyRemoveOwnedInstance, proxyLooksLikeProxyDaemon = prevAlive, prevFind, prevTerminate, prevRemoveOwned, prevLooksLike
+	})
+	replaced := false
+	proxyProcessAlive = func(int) bool {
+		if !replaced {
+			replaced = true
+			if err := store.Update(func(cfg *config.Config) error {
+				cfg.Instances[0].OwnerToken = "owner-b"
+				cfg.Instances[0].BrokerEpoch = "epoch-b"
+				cfg.Instances[0].DaemonPID = 5252
+				return nil
+			}); err != nil {
+				t.Fatalf("replace owner: %v", err)
+			}
+		}
+		return true
+	}
+	proxyLooksLikeProxyDaemon = func(int) (bool, error) { return true, nil }
+	proxyFindProcess = func(pid int) (*os.Process, error) {
+		t.Fatalf("replacement process %d must not be inspected", pid)
+		return nil, nil
+	}
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		t.Fatal("replacement process must not be terminated")
+		return nil
+	}
+	proxyRemoveOwnedInstance = manager.RemoveOwnedInstance
+
+	cmd := newProxyStopCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{old.ID})
+	if err := cmd.Execute(); !errors.Is(err, manager.ErrInstanceOwnershipLost) {
+		t.Fatalf("stop error = %v, want ownership loss", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 1 || cfg.Instances[0].OwnerToken != "owner-b" || cfg.Instances[0].BrokerEpoch != "epoch-b" || cfg.Instances[0].DaemonPID != 5252 {
+		t.Fatalf("replacement owner was modified: %+v", cfg.Instances)
+	}
+}
+
+func TestProxyStopRefusesPIDReuseForUnrelatedProcess(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	inst := config.Instance{
+		ID: "inst-pid-reuse", ProfileID: "p1", Kind: config.InstanceKindDaemon,
+		OwnerToken: "owner-a", BrokerEpoch: "epoch-a", DaemonPID: 4242,
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevAlive, prevLooksLike, prevFind, prevTerminate := proxyProcessAlive, proxyLooksLikeProxyDaemon, proxyFindProcess, proxyTerminate
+	t.Cleanup(func() {
+		proxyProcessAlive, proxyLooksLikeProxyDaemon, proxyFindProcess, proxyTerminate = prevAlive, prevLooksLike, prevFind, prevTerminate
+	})
+	proxyProcessAlive = func(int) bool { return true }
+	proxyLooksLikeProxyDaemon = func(int) (bool, error) { return false, nil }
+	proxyFindProcess = func(int) (*os.Process, error) {
+		t.Fatal("unrelated PID must not be inspected")
+		return nil, nil
+	}
+	proxyTerminate = func(*os.Process, time.Duration) error {
+		t.Fatal("unrelated PID must not be terminated")
+		return nil
+	}
+
+	cmd := newProxyStopCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs([]string{inst.ID})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "not a proxy daemon") {
+		t.Fatalf("stop error = %v, want PID reuse refusal", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 1 || cfg.Instances[0].ID != inst.ID {
+		t.Fatalf("instance record was unexpectedly removed: %+v", cfg.Instances)
 	}
 }
 
