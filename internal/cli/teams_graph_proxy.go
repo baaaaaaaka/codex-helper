@@ -40,7 +40,7 @@ func (l teamsGraphHTTPClientLease) RetireSuspects(ctx context.Context, out io.Wr
 	if l.store == nil || len(l.suspectReusableProxies) == 0 {
 		return
 	}
-	hc := manager.HealthClient{Timeout: 3 * time.Second}
+	hc := healthClientForProxyTarget(3*time.Second, "graph.microsoft.com", 443)
 	seen := make(map[string]struct{}, len(l.suspectReusableProxies))
 	for _, inst := range l.suspectReusableProxies {
 		if ctx != nil {
@@ -77,7 +77,7 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, fmt.Errorf("Teams Graph proxy is enabled but no unambiguous proxy profile is configured: %w", err)
 	}
-	hc := manager.HealthClient{Timeout: 3 * time.Second}
+	hc := healthClientForProxyTarget(3*time.Second, "graph.microsoft.com", 443)
 	var suspects []config.Instance
 	if lease, suspect, ok, err := reusableTeamsGraphProxyLease(cfg, profile.ID, hc); ok || err != nil {
 		return lease, err
@@ -147,6 +147,8 @@ func loadTeamsGraphProxyLocalStatus(ctx context.Context, root *rootOptions) (tea
 	if err != nil {
 		return teamsGraphProxyLocalStatus{}, err
 	}
+	// This is a diagnostic status path. It intentionally checks only the
+	// listener; the actual Graph reuse path below performs the route CONNECT.
 	hc := manager.HealthClient{Timeout: teamsGraphProxyLocalStatusTimeout}
 	return teamsGraphProxyLocalStatusFromConfig(checkCtx, cfg, hc)
 }

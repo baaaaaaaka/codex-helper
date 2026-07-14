@@ -1,10 +1,12 @@
 package stack
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -214,7 +216,7 @@ func TestSetupHTTPProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setupHTTPProxy: %v", err)
 	}
-	defer ps.proxy.Close(context.Background())
+	defer closeProxySetup(ps)
 
 	if ps.httpPort <= 0 {
 		t.Fatalf("invalid httpPort: %d", ps.httpPort)
@@ -228,11 +230,30 @@ func TestSetupHTTPProxy(t *testing.T) {
 }
 
 func TestSetupHTTPProxyHealthEndpoint(t *testing.T) {
-	ps, err := setupHTTPProxy("127.0.0.1:19999", "127.0.0.1:0", "inst-health-42")
+	socks, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen socks: %v", err)
+	}
+	defer socks.Close()
+	socksDone := make(chan struct{})
+	go func() {
+		defer close(socksDone)
+		conn, err := socks.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		greeting := make([]byte, 3)
+		if _, err := io.ReadFull(conn, greeting); err == nil {
+			_, _ = conn.Write([]byte{5, 0})
+		}
+	}()
+
+	ps, err := setupHTTPProxyWithIdentity(socks.Addr().String(), "127.0.0.1:0", "inst-health-42", "broker-stable-42", "epoch-7")
 	if err != nil {
 		t.Fatalf("setupHTTPProxy: %v", err)
 	}
-	defer ps.proxy.Close(context.Background())
+	defer closeProxySetup(ps)
 
 	client := &http.Client{
 		Transport: &http.Transport{Proxy: nil},
@@ -253,6 +274,194 @@ func TestSetupHTTPProxyHealthEndpoint(t *testing.T) {
 	}
 	if body["instanceId"] != "inst-health-42" {
 		t.Fatalf("unexpected instanceId: %v", body["instanceId"])
+	}
+	if body["brokerId"] != "broker-stable-42" {
+		t.Fatalf("unexpected brokerId: %v", body["brokerId"])
+	}
+	if body["brokerEpoch"] != "epoch-7" {
+		t.Fatalf("unexpected brokerEpoch: %v", body["brokerEpoch"])
+	}
+	if body["alive"] != true || body["tunnelReady"] != true {
+		t.Fatalf("unexpected health readiness: %#v", body)
+	}
+	if generation, ok := body["activeGeneration"].(float64); !ok || generation < 1 {
+		t.Fatalf("unexpected activeGeneration: %#v", body["activeGeneration"])
+	}
+	_ = socks.Close()
+	<-socksDone
+}
+
+func TestSetupHTTPProxyHealthFollowsActiveSocksAddress(t *testing.T) {
+	listenGreeting := func() (net.Listener, <-chan struct{}) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen socks: %v", err)
+		}
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+					greeting := make([]byte, 3)
+					if _, err := io.ReadFull(conn, greeting); err == nil {
+						_, _ = conn.Write([]byte{5, 0})
+					}
+				}(conn)
+			}
+		}()
+		return ln, done
+	}
+
+	first, firstDone := listenGreeting()
+	second, secondDone := listenGreeting()
+	ps, err := setupHTTPProxy(first.Addr().String(), "127.0.0.1:0", "inst-health-switch")
+	if err != nil {
+		t.Fatalf("setupHTTPProxy: %v", err)
+	}
+	defer closeProxySetup(ps)
+
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: time.Second}
+	check := func() {
+		t.Helper()
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/_codex_proxy/health", ps.httpPort))
+		if err != nil {
+			t.Fatalf("GET health: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+	}
+	check()
+	if ps.setSocksAddr == nil {
+		t.Fatal("setupHTTPProxy did not expose active SOCKS address setter")
+	}
+	ps.setSocksAddr(second.Addr().String())
+	first.Close()
+	<-firstDone
+	check()
+	second.Close()
+	<-secondDone
+}
+
+func TestSetupHTTPProxyBackendFailureSignalsAreCoalesced(t *testing.T) {
+	ps, err := setupHTTPProxy("127.0.0.1:1", "127.0.0.1:0", "inst-failure-coalesce")
+	if err != nil {
+		t.Fatalf("setupHTTPProxy: %v", err)
+	}
+	defer closeProxySetup(ps)
+
+	for i := 0; i < 20; i++ {
+		conn, err := net.DialTimeout("tcp", ps.httpAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial proxy %d: %v", i, err)
+		}
+		_, _ = fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, _ = bufio.NewReader(conn).ReadString('\n')
+		_ = conn.Close()
+	}
+
+	signals := 0
+	for {
+		select {
+		case <-ps.failureCh:
+			signals++
+		default:
+			if signals != 1 {
+				t.Fatalf("coalesced backend failure signals = %d, want 1", signals)
+			}
+			select {
+			case <-ps.probeCh:
+				t.Fatal("backend failure also queued a generic resume probe")
+			default:
+			}
+			return
+		}
+	}
+}
+
+func TestSetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal(t *testing.T) {
+	ps, err := setupHTTPProxy("127.0.0.1:1", "127.0.0.1:0", "inst-failure-storm")
+	if err != nil {
+		t.Fatalf("setupHTTPProxy: %v", err)
+	}
+	defer closeProxySetup(ps)
+
+	start := make(chan struct{})
+	connections := make(chan struct{}, 32)
+	results := make(chan error, 256)
+	var wg sync.WaitGroup
+	for i := 0; i < 256; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			connections <- struct{}{}
+			defer func() { <-connections }()
+
+			conn, err := net.DialTimeout("tcp", ps.httpAddr, 2*time.Second)
+			if err != nil {
+				results <- fmt.Errorf("dial proxy: %w", err)
+				return
+			}
+			if _, err := fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+				_ = conn.Close()
+				results <- fmt.Errorf("write proxy request: %w", err)
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+				_ = conn.Close()
+				results <- fmt.Errorf("read proxy response: %w", err)
+				return
+			}
+			_ = conn.Close()
+			results <- nil
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("failure storm request did not reach handler: %v", err)
+		}
+	}
+
+	signals := 0
+	for {
+		select {
+		case <-ps.failureCh:
+			signals++
+		default:
+			if signals != 1 {
+				t.Fatalf("coalesced backend failure signals = %d, want 1", signals)
+			}
+			goto drained
+		}
+	}
+
+drained:
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s/_codex_proxy/health", ps.httpAddr))
+	if err != nil {
+		t.Fatalf("health after failure storm: %v", err)
+	}
+	defer resp.Body.Close()
+	var body struct {
+		BackendFailures uint64 `json:"backendFailures"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode health after failure storm: %v", err)
+	}
+	if body.BackendFailures != 256 {
+		t.Fatalf("raw backend failures = %d, want 256", body.BackendFailures)
 	}
 }
 

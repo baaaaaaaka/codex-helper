@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -47,6 +48,233 @@ func TestHTTPProxy_HealthEndpoint(t *testing.T) {
 	}
 	if !body.OK || body.InstanceID != "health-id" {
 		t.Fatalf("body=%#v", body)
+	}
+}
+
+func TestHTTPProxyHealthProbeReportsBackendFailure(t *testing.T) {
+	p := NewHTTPProxy(dialerFunc(func(network, addr string) (net.Conn, error) {
+		return nil, errors.New("backend unavailable")
+	}), Options{
+		InstanceID: "unhealthy-id",
+		HealthProbe: func(context.Context) error {
+			return errors.New("SOCKS handshake failed")
+		},
+	})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close(context.Background())
+
+	resp, err := http.Get("http://" + httpAddr + "/_codex_proxy/health")
+	if err != nil {
+		t.Fatalf("GET health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %s, want 503", resp.Status)
+	}
+	var body struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.OK {
+		t.Fatal("unhealthy backend was reported as healthy")
+	}
+}
+
+func TestHTTPProxyHealthProbeIsSingleFlightAndCached(t *testing.T) {
+	var probes atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	p := NewHTTPProxy(nil, Options{
+		InstanceID: "health-storm",
+		// The assertion is about one shared probe, not the exact TTL
+		// boundary. Keep the cache window comfortably above the slowest
+		// hosted macOS/Windows burst so late-arriving requests still test
+		// the same coalesced observation window.
+		HealthProbeTTL:     10 * time.Second,
+		HealthProbeTimeout: 2 * time.Second,
+		HealthProbe: func(context.Context) error {
+			probes.Add(1)
+			once.Do(func() { close(entered) })
+			<-release
+			return nil
+		},
+	})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Keep the 256-request storm, but bound simultaneous TCP handshakes so a
+	// hosted Windows listener backlog cannot turn the test into a connection
+	// refusal test instead of a health single-flight test.
+	transport.MaxConnsPerHost = 32
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
+	start := make(chan struct{})
+	results := make(chan error, 256)
+	var wg sync.WaitGroup
+	for i := 0; i < 256; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := client.Get("http://" + httpAddr + "/_codex_proxy/health")
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("health probe did not start")
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("health probes while 256 requests are waiting = %d, want 1", got)
+	}
+	close(release)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("health request failed: %v", err)
+		}
+	}
+	if got := probes.Load(); got != 1 {
+		t.Fatalf("health probes after coalesced burst = %d, want 1", got)
+	}
+	transport.CloseIdleConnections()
+}
+
+func TestHTTPProxyNotifiesBackendFailureWithoutBlockingRequest(t *testing.T) {
+	failures := make(chan error, 1)
+	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
+		return nil, errors.New("SOCKS connection reset")
+	}), Options{
+		OnBackendFailure: func(err error) {
+			select {
+			case failures <- err:
+			default:
+			}
+		},
+	})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close(context.Background())
+
+	conn, err := net.DialTimeout("tcp", httpAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	status, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !strings.HasPrefix(status, "HTTP/1.1 502") {
+		t.Fatalf("status = %q, want 502", status)
+	}
+	select {
+	case got := <-failures:
+		if !strings.Contains(got.Error(), "SOCKS connection reset") {
+			t.Fatalf("failure = %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backend failure notification was not delivered")
+	}
+}
+
+func TestHTTPProxyNotifiesBackendFailureForPlainHTTP(t *testing.T) {
+	failures := make(chan error, 1)
+	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
+		return nil, errors.New("plain HTTP route reset")
+	}), Options{
+		OnBackendFailure: func(err error) {
+			select {
+			case failures <- err:
+			default:
+			}
+		},
+	})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close(context.Background())
+
+	proxyURL, err := url.Parse("http://" + httpAddr)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+	resp, err := client.Get("http://example.com/health")
+	if err != nil {
+		t.Fatalf("GET via proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %s, want 502", resp.Status)
+	}
+	select {
+	case got := <-failures:
+		if !strings.Contains(got.Error(), "plain HTTP route reset") {
+			t.Fatalf("failure = %v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("plain HTTP backend failure notification was not delivered")
+	}
+}
+
+func TestHTTPProxyReportsTargetAlongsideSharedBackendFailure(t *testing.T) {
+	targets := make(chan string, 1)
+	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
+		return nil, errors.New("route reset")
+	}), Options{
+		OnTargetFailure: func(target string, _ error) {
+			targets <- target
+		},
+	})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close(context.Background())
+
+	conn, err := net.DialTimeout("tcp", httpAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "CONNECT graph.microsoft.com:443 HTTP/1.1\r\nHost: graph.microsoft.com:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	select {
+	case got := <-targets:
+		if got != "graph.microsoft.com:443" {
+			t.Fatalf("target = %q, want graph.microsoft.com:443", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("target failure was not reported")
 	}
 }
 
@@ -322,7 +550,7 @@ func TestHTTPProxyServeHTTPRejectsSelfLoopTargets(t *testing.T) {
 }
 
 func TestHTTPProxySelfTargetDetection(t *testing.T) {
-	p := &HTTPProxy{addr: "127.0.0.1:4751"}
+	p := &HTTPProxy{addr: "127.0.0.1:4751", listenerHost: "127.0.0.1"}
 
 	tests := []struct {
 		name string
@@ -332,7 +560,8 @@ func TestHTTPProxySelfTargetDetection(t *testing.T) {
 		{name: "ipv4 loopback", addr: "127.0.0.1:4751", want: true},
 		{name: "localhost", addr: "localhost:4751", want: true},
 		{name: "localhost trailing dot", addr: "localhost.:4751", want: true},
-		{name: "ipv6 loopback", addr: "[::1]:4751", want: true},
+		{name: "different ipv6 loopback", addr: "[::1]:4751", want: false},
+		{name: "different ipv4 loopback", addr: "127.0.0.2:4751", want: false},
 		{name: "different loopback port", addr: "127.0.0.1:4752", want: false},
 		{name: "non loopback same port", addr: "192.0.2.10:4751", want: false},
 		{name: "hostname same port", addr: "example.com:4751", want: false},
@@ -347,6 +576,62 @@ func TestHTTPProxySelfTargetDetection(t *testing.T) {
 				t.Fatalf("isSelfTarget(%q) = %v, want %v", tt.addr, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHTTPProxySelfTargetDetectionRespectsListenerAddressFamily(t *testing.T) {
+	tests := []struct {
+		name         string
+		listenerHost string
+		target       string
+		want         bool
+	}{
+		{name: "ipv4 wildcard owns ipv4 loopback", listenerHost: "0.0.0.0", target: "127.0.0.2:4751", want: true},
+		{name: "ipv4 wildcard does not claim ipv6 loopback", listenerHost: "0.0.0.0", target: "[::1]:4751", want: false},
+		{name: "ipv6 wildcard owns ipv6 loopback", listenerHost: "::", target: "[::1]:4751", want: true},
+		{name: "ipv6 wildcard does not claim ipv4 loopback", listenerHost: "::", target: "127.0.0.1:4751", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &HTTPProxy{addr: "127.0.0.1:4751", listenerHost: tt.listenerHost}
+			if got := p.isSelfTarget(tt.target); got != tt.want {
+				t.Fatalf("listener %q target %q = %v, want %v", tt.listenerHost, tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHTTPProxyAllowsDistinctLoopbackListenerOnSamePort(t *testing.T) {
+	var dialed atomic.Bool
+	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
+		dialed.Store(true)
+		return nil, errors.New("distinct loopback test backend")
+	}), Options{InstanceID: "distinct-loopback"})
+	addr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close(context.Background())
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	other, err := net.Listen("tcp", net.JoinHostPort("127.0.0.2", port))
+	if err != nil {
+		t.Skipf("runner does not expose a second IPv4 loopback address: %v", err)
+	}
+	defer other.Close()
+
+	rec := httptest.NewRecorder()
+	target := net.JoinHostPort("127.0.0.2", port)
+	req := httptest.NewRequest(http.MethodConnect, "http://"+target, nil)
+	req.Host = target
+	p.handleConnect(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("distinct loopback CONNECT status = %d, want 502", rec.Code)
+	}
+	if !dialed.Load() {
+		t.Fatal("proxy incorrectly treated a distinct loopback listener as itself")
 	}
 }
 

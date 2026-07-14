@@ -27,10 +27,11 @@ import (
 )
 
 type proxyStartedStack struct {
-	httpPort  int
-	socksPort int
-	fatalCh   <-chan error
-	close     func(context.Context) error
+	httpPort         int
+	socksPort        int
+	currentSocksPort func() int
+	fatalCh          <-chan error
+	close            func(context.Context) error
 }
 
 var (
@@ -41,15 +42,19 @@ var (
 			return proxyStartedStack{}, err
 		}
 		return proxyStartedStack{
-			httpPort:  st.HTTPPort,
-			socksPort: st.SocksPort,
-			fatalCh:   st.Fatal(),
-			close:     st.Close,
+			httpPort:         st.HTTPPort,
+			socksPort:        st.SocksPort,
+			currentSocksPort: st.CurrentSocksPort,
+			fatalCh:          st.Fatal(),
+			close:            st.Close,
 		}, nil
 	}
 	proxyRecordInstance       = manager.RecordInstance
+	proxyUpdateOwnedInstance  = manager.UpdateOwnedInstance
 	proxyRemoveInstance       = manager.RemoveInstance
+	proxyRemoveOwnedInstance  = manager.RemoveOwnedInstance
 	proxyHeartbeat            = manager.Heartbeat
+	proxyHeartbeatOwned       = manager.HeartbeatOwned
 	proxyProcessAlive         = proc.IsAlive
 	proxyLooksLikeProxyDaemon = proc.LooksLikeProxyDaemon
 	proxyFindProcess          = os.FindProcess
@@ -58,9 +63,10 @@ var (
 	proxyCheckHTTPProxy       = func(hc manager.HealthClient, port int, expectedInstanceID string) error {
 		return hc.CheckHTTPProxy(port, expectedInstanceID)
 	}
-	proxyExecutable    = helperpath.RawExecutable
-	proxyCommand       = exec.Command
-	runProxyDaemonFunc = runProxyDaemon
+	proxyExecutable         = helperpath.RawExecutable
+	proxyCommand            = exec.Command
+	runProxyDaemonFunc      = runProxyDaemonClaiming
+	runProxyDaemonOwnedFunc = runProxyDaemonWithOwnerToken
 )
 
 func newProxyCmd(root *rootOptions) *cobra.Command {
@@ -72,6 +78,7 @@ func newProxyCmd(root *rootOptions) *cobra.Command {
 	cmd.AddCommand(
 		newProxyStartCmd(root),
 		newProxyDaemonCmd(root),
+		newProxySupervisorCmd(root),
 		newProxyListCmd(root),
 		newProxyStopCmd(root),
 		newProxyPruneCmd(root),
@@ -84,6 +91,7 @@ func newProxyCmd(root *rootOptions) *cobra.Command {
 
 func newProxyStartCmd(root *rootOptions) *cobra.Command {
 	var foreground bool
+	var supervised bool
 
 	cmd := &cobra.Command{
 		Use:   "start [profile]",
@@ -94,99 +102,138 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := store.Load()
-			if err != nil {
-				return err
-			}
-
-			profileRef := ""
-			if len(cmd.Flags().Args()) > 0 {
-				profileRef = cmd.Flags().Args()[0]
-			}
-			profile, err := selectProfile(cfg, profileRef)
-			if err != nil {
-				return err
-			}
-
-			instanceID, err := ids.New()
-			if err != nil {
-				return err
-			}
-
-			now := proxyNow()
-			inst := config.Instance{
-				ID:         instanceID,
-				ProfileID:  profile.ID,
-				Kind:       config.InstanceKindDaemon,
-				HTTPPort:   0,
-				SocksPort:  0,
-				DaemonPID:  0,
-				StartedAt:  now,
-				LastSeenAt: now,
-			}
-			if err := proxyRecordInstance(store, inst); err != nil {
-				return err
-			}
-
-			if foreground {
-				return runProxyDaemonFunc(cmd.Context(), store, instanceID)
-			}
-
-			exe, err := proxyExecutable()
-			if err != nil {
-				return err
-			}
-			resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{})
-			if err != nil {
-				return err
-			}
-			exe = resolvedExe.Path
-
-			args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID}
-
-			c := proxyCommand(exe, args...)
-			c.Stdin = nil
-
-			logPath := filepath.Join(filepath.Dir(store.Path()), "instances", instanceID+".log")
-			if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-				return err
-			}
-			logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-			if err != nil {
-				return err
-			}
-			defer logFile.Close()
-			c.Stdout = logFile
-			c.Stderr = logFile
-
-			if err := c.Start(); err != nil {
-				return err
-			}
-
-			pid := c.Process.Pid
-			_ = store.Update(func(cfg *config.Config) error {
-				for i := range cfg.Instances {
-					if cfg.Instances[i].ID == instanceID {
-						cfg.Instances[i].DaemonPID = pid
-						cfg.Instances[i].LastSeenAt = proxyNow()
-						return nil
-					}
-				}
-				return nil
+			return withProxyStartupLockError(cmd.Context(), store, func() error {
+				return runProxyStartCommand(cmd, store, foreground)
 			})
-
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started instance %s (pid %d). Logs: %s\n", instanceID, pid, logPath)
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Use `codex-proxy proxy list` to see assigned ports.")
-			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&foreground, "foreground", false, "Run in the foreground (do not fork)")
+	cmd.Flags().BoolVar(&supervised, "supervised", false, "Run the proxy through the bounded local supervisor")
 	return cmd
+}
+
+func runProxyStartCommand(cmd *cobra.Command, store *config.Store, foreground bool) error {
+	supervised, _ := cmd.Flags().GetBool("supervised")
+	cfg, err := store.Load()
+	if err != nil {
+		return err
+	}
+
+	profileRef := ""
+	if len(cmd.Flags().Args()) > 0 {
+		profileRef = cmd.Flags().Args()[0]
+	}
+	profile, err := selectProfile(cfg, profileRef)
+	if err != nil {
+		return err
+	}
+
+	instanceID, err := ids.New()
+	if err != nil {
+		return err
+	}
+	identity, err := newProxyBrokerIdentity(instanceID)
+	if err != nil {
+		return err
+	}
+
+	now := proxyNow()
+	inst := config.Instance{
+		ID:                  instanceID,
+		ProfileID:           profile.ID,
+		Kind:                config.InstanceKindDaemon,
+		BrokerID:            identity.BrokerID,
+		BrokerEpoch:         identity.BrokerEpoch,
+		OwnerToken:          identity.OwnerToken,
+		HTTPPort:            0,
+		SocksPort:           0,
+		DaemonPID:           0,
+		StartedAt:           now,
+		LastSeenAt:          now,
+		OwnerAcquiredAt:     now,
+		OwnerLastSeenAt:     now,
+		OwnerLeaseExpiresAt: now.Add(manager.DefaultProxyOwnerLease),
+	}
+	if err := proxyRecordInstance(store, inst); err != nil {
+		return err
+	}
+	startupComplete := false
+	defer func() {
+		if !startupComplete {
+			_ = proxyRemoveOwnedInstance(store, instanceID, identity.OwnerToken, identity.BrokerEpoch)
+		}
+	}()
+
+	if foreground {
+		if supervised {
+			err := runProxySupervisor(cmd.Context(), store, instanceID, identity.OwnerToken)
+			startupComplete = true
+			return err
+		}
+		err := runProxyDaemonOwnedFunc(cmd.Context(), store, instanceID, identity.OwnerToken)
+		startupComplete = true
+		return err
+	}
+
+	exe, err := proxyExecutable()
+	if err != nil {
+		return err
+	}
+	resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{})
+	if err != nil {
+		return err
+	}
+	exe = resolvedExe.Path
+
+	args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID, "--owner-token", identity.OwnerToken}
+	if supervised {
+		args = []string{"--config", store.Path(), "proxy", "supervisor", "run", "--instance-id", instanceID, "--owner-token", identity.OwnerToken}
+	}
+
+	c := proxyCommand(exe, args...)
+	c.Stdin = nil
+
+	logPath := filepath.Join(filepath.Dir(store.Path()), "instances", instanceID+".log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer logFile.Close()
+	c.Stdout = logFile
+	c.Stderr = logFile
+
+	if err := c.Start(); err != nil {
+		return err
+	}
+
+	pid := c.Process.Pid
+	if err := proxyUpdateOwnedInstance(store, instanceID, identity.OwnerToken, identity.BrokerEpoch, func(live *config.Instance) error {
+		now := proxyNow()
+		live.DaemonPID = pid
+		live.LastSeenAt = now
+		live.OwnerLastSeenAt = now
+		live.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
+		return nil
+	}); err != nil {
+		_ = proxyTerminate(c.Process, 2*time.Second)
+		return fmt.Errorf("record proxy daemon owner: %w", err)
+	}
+	_ = c.Process.Release()
+	startupComplete = true
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started instance %s (pid %d). Logs: %s\n", instanceID, pid, logPath)
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Use `codex-proxy proxy list` to see assigned ports.")
+	return nil
 }
 
 func newProxyDaemonCmd(root *rootOptions) *cobra.Command {
 	var instanceID string
+	var ownerToken string
+	var managed bool
 
 	cmd := &cobra.Command{
 		Use:    "daemon --instance-id <id>",
@@ -198,18 +245,43 @@ func newProxyDaemonCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runProxyDaemonFunc(cmd.Context(), store, instanceID)
+			if ownerToken == "" {
+				return runProxyDaemonFunc(cmd.Context(), store, instanceID)
+			}
+			if managed {
+				return runProxyDaemonWithOwnerTokenMode(cmd.Context(), store, instanceID, ownerToken, true)
+			}
+			return runProxyDaemonOwnedFunc(cmd.Context(), store, instanceID, ownerToken)
 		},
 	}
 
 	cmd.Flags().StringVar(&instanceID, "instance-id", "", "Instance id")
+	cmd.Flags().StringVar(&ownerToken, "owner-token", "", "Proxy owner lease token (internal)")
+	cmd.Flags().BoolVar(&managed, "managed", false, "Keep the owner record for a supervisor restart (internal)")
 	_ = cmd.MarkFlagRequired("instance-id")
 	return cmd
 }
 
 func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID string) error {
+	return runProxyDaemonWithOwnerToken(parentCtx, store, instanceID, "")
+}
+
+func runProxyDaemonClaiming(parentCtx context.Context, store *config.Store, instanceID string) error {
+	identity, err := claimLegacyProxyInstance(store, instanceID)
+	if err != nil {
+		return err
+	}
+	return runProxyDaemonWithOwnerToken(parentCtx, store, instanceID, identity.OwnerToken)
+}
+
+func runProxyDaemonWithOwnerToken(parentCtx context.Context, store *config.Store, instanceID, presentedOwnerToken string) error {
+	return runProxyDaemonWithOwnerTokenMode(parentCtx, store, instanceID, presentedOwnerToken, false)
+}
+
+func runProxyDaemonWithOwnerTokenMode(parentCtx context.Context, store *config.Store, instanceID, presentedOwnerToken string, managed bool) error {
 	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	strictOwnership := strings.TrimSpace(presentedOwnerToken) != ""
 
 	cfg, err := store.Load()
 	if err != nil {
@@ -228,6 +300,47 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 	if !found {
 		return fmt.Errorf("instance %q not found in config", instanceID)
 	}
+	if strictOwnership && inst.OwnerToken != "" && inst.OwnerToken != presentedOwnerToken {
+		return fmt.Errorf("%w: instance %q is owned by another daemon", manager.ErrInstanceOwnershipLost, instanceID)
+	}
+	if _, err := ensureProxyInstanceIdentity(&inst, presentedOwnerToken); err != nil {
+		return err
+	}
+	ownerToken := inst.OwnerToken
+	brokerEpoch := inst.BrokerEpoch
+	now := proxyNow()
+	if inst.OwnerAcquiredAt.IsZero() {
+		inst.OwnerAcquiredAt = now
+	}
+	if inst.OwnerLastSeenAt.IsZero() {
+		inst.OwnerLastSeenAt = now
+	}
+	inst.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
+	startupComplete := false
+	defer func() {
+		if !startupComplete && !managed {
+			_ = proxyRemoveOwnedInstance(store, instanceID, ownerToken, brokerEpoch)
+		}
+	}()
+	// Persist the identity before opening any listeners. This makes a legacy
+	// record explicit before it can be reused, and lets a replacement daemon
+	// fence the previous process by changing the epoch/token pair.
+	if err := store.Update(func(cfg *config.Config) error {
+		for i := range cfg.Instances {
+			if cfg.Instances[i].ID != instanceID {
+				continue
+			}
+			live := &cfg.Instances[i]
+			if strictOwnership && live.OwnerToken != "" && live.OwnerToken != ownerToken {
+				return manager.ErrInstanceOwnershipLost
+			}
+			*live = inst
+			return nil
+		}
+		return fmt.Errorf("instance %q not found", instanceID)
+	}); err != nil {
+		return err
+	}
 
 	var prof config.Profile
 	pfound := false
@@ -243,7 +356,28 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 	}
 
 	opts := stack.Options{
-		SocksPort: inst.SocksPort,
+		BrokerID:       inst.BrokerID,
+		BrokerEpoch:    inst.BrokerEpoch,
+		SocksPort:      inst.SocksPort,
+		RecoveryBudget: inst.RecoveryBudget,
+	}
+	opts.PersistRecoveryBudget = func(budget config.ProxyRecoveryBudget) error {
+		if strictOwnership {
+			return proxyUpdateOwnedInstance(store, instanceID, ownerToken, brokerEpoch, func(live *config.Instance) error {
+				live.RecoveryBudget = budget
+				return nil
+			})
+		}
+		return store.Update(func(cfg *config.Config) error {
+			for i := range cfg.Instances {
+				if cfg.Instances[i].ID != instanceID {
+					continue
+				}
+				cfg.Instances[i].RecoveryBudget = budget
+				return nil
+			}
+			return fmt.Errorf("instance %q not found", instanceID)
+		})
 	}
 	if inst.HTTPPort > 0 {
 		opts.HTTPListenAddr = fmt.Sprintf("127.0.0.1:%d", inst.HTTPPort)
@@ -255,7 +389,7 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 	}
 	defer func() { _ = st.close(context.Background()) }()
 
-	now := proxyNow()
+	now = proxyNow()
 	inst.DaemonPID = os.Getpid()
 	inst.Kind = config.InstanceKindDaemon
 	inst.SocksPort = st.socksPort
@@ -264,7 +398,34 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 		inst.StartedAt = now
 	}
 	inst.LastSeenAt = now
-	_ = proxyRecordInstance(store, inst)
+	inst.OwnerLastSeenAt = now
+	inst.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
+	var recordErr error
+	if strictOwnership {
+		recordErr = proxyUpdateOwnedInstance(store, instanceID, ownerToken, brokerEpoch, func(live *config.Instance) error {
+			*live = inst
+			return nil
+		})
+	} else {
+		recordErr = proxyRecordInstance(store, inst)
+	}
+	if err := recordErr; err != nil {
+		if st.close != nil {
+			_ = st.close(context.Background())
+		}
+		return err
+	}
+	startupComplete = true
+	removeInstance := func() {
+		if managed {
+			return
+		}
+		if strictOwnership {
+			_ = proxyRemoveOwnedInstance(store, instanceID, ownerToken, brokerEpoch)
+			return
+		}
+		_ = proxyRemoveInstance(store, instanceID)
+	}
 
 	t := time.NewTicker(10 * time.Second)
 	defer t.Stop()
@@ -272,13 +433,40 @@ func runProxyDaemon(parentCtx context.Context, store *config.Store, instanceID s
 	for {
 		select {
 		case err := <-st.fatalCh:
-			_ = proxyRemoveInstance(store, instanceID)
+			removeInstance()
 			return err
 		case <-ctx.Done():
-			_ = proxyRemoveInstance(store, instanceID)
+			removeInstance()
 			return nil
 		case <-t.C:
-			_ = proxyHeartbeat(store, instanceID, proxyNow())
+			if st.currentSocksPort != nil {
+				if current := st.currentSocksPort(); current > 0 && current != inst.SocksPort {
+					inst.SocksPort = current
+					inst.LastSeenAt = proxyNow()
+					inst.OwnerLastSeenAt = inst.LastSeenAt
+					inst.OwnerLeaseExpiresAt = inst.LastSeenAt.Add(manager.DefaultProxyOwnerLease)
+					if strictOwnership {
+						_ = proxyUpdateOwnedInstance(store, instanceID, ownerToken, brokerEpoch, func(live *config.Instance) error {
+							live.SocksPort = current
+							live.LastSeenAt = inst.LastSeenAt
+							live.OwnerLastSeenAt = inst.OwnerLastSeenAt
+							live.OwnerLeaseExpiresAt = inst.OwnerLeaseExpiresAt
+							return nil
+						})
+					} else {
+						_ = proxyRecordInstance(store, inst)
+					}
+				}
+			}
+			if strictOwnership {
+				if err := proxyHeartbeatOwned(store, instanceID, ownerToken, brokerEpoch, proxyNow()); err != nil {
+					if errors.Is(err, manager.ErrInstanceOwnershipLost) {
+						return err
+					}
+				}
+			} else {
+				_ = proxyHeartbeat(store, instanceID, proxyNow())
+			}
 		}
 	}
 }
@@ -298,7 +486,6 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 
-			hc := manager.HealthClient{Timeout: 500 * time.Millisecond}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
 			_, _ = fmt.Fprintln(w, "INSTANCE\tTYPE\tPROFILE\tPID\tHTTP\tSOCKS\tSTATUS\tLAST_SEEN")
 			for _, inst := range cfg.Instances {
@@ -306,7 +493,7 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 				if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
 					status = "alive"
 					if inst.HTTPPort > 0 {
-						if err := proxyCheckHTTPProxy(hc, inst.HTTPPort, inst.ID); err != nil {
+						if err := proxyCheckHTTPProxy(healthClientForProxyInstance(cfg, inst, 500*time.Millisecond), inst.HTTPPort, inst.ID); err != nil {
 							status = "unhealthy"
 						}
 					}
@@ -395,7 +582,6 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 
-			hc := manager.HealthClient{Timeout: 500 * time.Millisecond}
 			removed := 0
 
 			if err := store.Update(func(cfg *config.Config) error {
@@ -406,7 +592,7 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 						continue
 					}
 					if inst.HTTPPort > 0 {
-						if err := proxyCheckHTTPProxy(hc, inst.HTTPPort, inst.ID); err != nil {
+						if err := proxyCheckHTTPProxy(healthClientForProxyInstance(*cfg, inst, 500*time.Millisecond), inst.HTTPPort, inst.ID); err != nil {
 							removed++
 							continue
 						}

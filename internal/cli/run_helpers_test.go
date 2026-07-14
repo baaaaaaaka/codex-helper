@@ -343,11 +343,18 @@ func TestRunWithProfileUsesExistingInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/_codex_proxy/health", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"ok":true,"instanceId":"inst-1"}`))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/_codex_proxy/health" {
+			_, _ = w.Write([]byte(`{"ok":true,"instanceId":"inst-1"}`))
+			return
+		}
+		http.NotFound(w, r)
 	})
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: handler}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() {
 		_ = srv.Close()

@@ -45,6 +45,109 @@ jobs:
           bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_TEST_TEAMS_MATH_RUNTIME=1 \
             go test ./internal/teams -count=1 -run '^TestManagedTeamsMathRendererLive$' -v
 
+  proxy-recovery-loopback:
+    name: Proxy recovery loopback fault lab (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Run deterministic proxy fault lab
+        shell: bash
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          go test -p=1 ./internal/proxysupervisor -count=1 -run 'Test(RenderAllPlatforms|SpecValidation|ChildArgs)' -v
+          go test -p=1 ./internal/localproxy -count=1 -run 'Test(GenerationRouter|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|HTTPProxyGenerationRouter|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|ProxyHop|ProbeSOCKS5|SOCKS5Dialer|HTTPProxyHealthProbe|HTTPProxyNotifiesBackendFailure|HTTPProxyRealSocketFaultRelay|DistinctLoopback)' -v
+          go test -p=1 ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyRouteTargetUsesRealConnect|OwnedInstanceOpsFenceStaleDaemon|IsProxyOwnerLeaseStale)' -v
+          go test -p=1 ./internal/stack -count=1 -run 'Test(WaitForSOCKS5|NotifyNetworkResume|RequestFailureRecoveryBudgetIsBounded|StackHelpers|StackCloseIsConcurrentSafe|Monitor|SetupHTTPProxy)' -v
+          go test -p=1 ./internal/ssh -count=1 -run 'Test(BuildArgs|TunnelStopTerminatesProcessGroupDescendants)' -v
+          go test -p=1 ./internal/cli -count=1 -run '^Test(Claim(LegacyProxyInstancePersistsOwnerLease|ProxyInstance)|ProxyStartRemovesPlaceholderWhenExecutableResolutionFails|RunProxyDaemonWithOwnerToken(CleansPlaceholderWhenProfileMissing|DoesNotOverwriteReplacement)|ProxySupervisor|ManagedProxyDaemon)' -v
+          go test -p=1 ./internal/cli -count=1 -run 'Test(WindowsProxyReachabilityScriptExecutesAgainstLiveProxy|CodexAppAuth(MacProxyBrowser.*|WindowsProxy(ReachabilityScriptChecksHealthEndpoint|BrowserScriptUsesChromiumProxy)))$' -v
+
+      - name: macOS unprivileged proxy fault matrix
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          # These tests inject connection close, half-open SOCKS, route
+          # failure, candidate failure, resume bursts, and request-failure
+          # storms entirely through loopback. They do not require sudo,
+          # pfctl, networksetup, or suspending the hosted macOS runner.
+          go test -p=1 ./internal/localproxy -count=5 -run 'Test(HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyGenerationRouterRecoversAfterSOCKSFailure|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|GenerationRouterSwapKeepsListenerAndFencesOldGeneration|GenerationRouterDialContextCancelsBackend|SOCKS5DialerContextCancelsHalfOpenHandshake|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|ProbeSOCKS5|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
+          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor(RecoversTunnelAndSwapsProxyGeneration|RetriesCandidateAfterDeadTunnel|NetworkResumeRecoversFailedRemoteProbe|CandidateFailureKeepsLiveActiveTunnel|DetectsProbeGapAsResume)|NotifyNetworkResumeCoalesces|RequestFailureRecoveryBudgetIsBounded|StackCloseIsConcurrentSafe|SetupHTTPProxyBackendFailure(SignalsAreCoalesced|StormCountsRawRequestsAndOneSignal))' -v
+
+  proxy-recovery-docker:
+    name: Proxy recovery Docker network fault lab
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Run SSH/SOCKS network disconnect and reconnect smoke
+        shell: bash
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          bash scripts/ci/proxy_recovery_docker_smoke.sh
+
+  proxy-recovery-soak:
+    name: Proxy recovery bounded soak and resource budget
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Repeat fault and resource budgets
+        shell: bash
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          go test -p=1 ./internal/localproxy -count=5 -run '^Test(HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached)$' -v
+          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|SetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal)' -v
+
   targeted-test:
     name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
@@ -2392,6 +2495,9 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - targeted-test
+      - proxy-recovery-loopback
+      - proxy-recovery-docker
+      - proxy-recovery-soak
       - full-go-test
       - race-test
       - runtime-env-contract
@@ -2418,6 +2524,9 @@ jobs:
             fi
           }
           check targeted-test "${{ needs.targeted-test.result }}"
+          check proxy-recovery-loopback "${{ needs.proxy-recovery-loopback.result }}"
+          check proxy-recovery-docker "${{ needs.proxy-recovery-docker.result }}"
+          check proxy-recovery-soak "${{ needs.proxy-recovery-soak.result }}"
           check full-go-test "${{ needs.full-go-test.result }}"
           check race-test "${{ needs.race-test.result }}"
           check runtime-env-contract "${{ needs.runtime-env-contract.result }}"

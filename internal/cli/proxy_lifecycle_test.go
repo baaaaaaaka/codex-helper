@@ -35,12 +35,15 @@ func TestProxyStartForegroundRecordsInstanceAndRunsDaemon(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	prevRunDaemon := runProxyDaemonFunc
-	t.Cleanup(func() { runProxyDaemonFunc = prevRunDaemon })
+	prevRunDaemon := runProxyDaemonOwnedFunc
+	t.Cleanup(func() { runProxyDaemonOwnedFunc = prevRunDaemon })
 
 	var gotInstanceID string
-	runProxyDaemonFunc = func(_ context.Context, gotStore *config.Store, instanceID string) error {
+	runProxyDaemonOwnedFunc = func(_ context.Context, gotStore *config.Store, instanceID, ownerToken string) error {
 		gotInstanceID = instanceID
+		if strings.TrimSpace(ownerToken) == "" {
+			t.Fatal("expected strict owner token")
+		}
 		if gotStore.Path() != store.Path() {
 			t.Fatalf("expected store path %q, got %q", store.Path(), gotStore.Path())
 		}
@@ -125,13 +128,13 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 	if gotName != exePath {
 		t.Fatalf("expected daemon executable %q, got %q", exePath, gotName)
 	}
-	if len(gotArgs) != 6 {
+	if len(gotArgs) != 8 {
 		t.Fatalf("unexpected daemon args: %v", gotArgs)
 	}
 	if gotArgs[0] != "--config" || gotArgs[1] != store.Path() {
 		t.Fatalf("expected daemon config args %q, got %v", store.Path(), gotArgs)
 	}
-	if gotArgs[2] != "proxy" || gotArgs[3] != "daemon" || gotArgs[4] != "--instance-id" || strings.TrimSpace(gotArgs[5]) == "" {
+	if gotArgs[2] != "proxy" || gotArgs[3] != "daemon" || gotArgs[4] != "--instance-id" || strings.TrimSpace(gotArgs[5]) == "" || gotArgs[6] != "--owner-token" || strings.TrimSpace(gotArgs[7]) == "" {
 		t.Fatalf("unexpected daemon args: %v", gotArgs)
 	}
 	if !strings.Contains(out.String(), "Started instance ") {
@@ -191,6 +194,40 @@ func TestProxyStartBackgroundUsesStableExecutableForTransientRawPath(t *testing.
 	}
 	if gotName != stable {
 		t.Fatalf("daemon executable = %q, want stable %q", gotName, stable)
+	}
+}
+
+func TestProxyStartRemovesPlaceholderWhenExecutableResolutionFails(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+			Host: "host",
+			Port: 22,
+			User: "alice",
+		}},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	prevExecutable := proxyExecutable
+	t.Cleanup(func() { proxyExecutable = prevExecutable })
+	proxyExecutable = func() (string, error) { return "", errors.New("executable unavailable") }
+
+	cmd := newProxyStartCmd(&rootOptions{configPath: store.Path()})
+	cmd.SetContext(context.Background())
+	cmd.SetArgs(nil)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "executable unavailable") {
+		t.Fatalf("proxy start error = %v, want executable failure", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("placeholder instance survived startup failure: %+v", cfg.Instances)
 	}
 }
 
@@ -286,6 +323,80 @@ func TestRunProxyDaemonRemovesInstanceOnFatal(t *testing.T) {
 	}
 }
 
+func TestRunProxyDaemonWithOwnerTokenDoesNotOverwriteReplacement(t *testing.T) {
+	lockCLITestHooks(t)
+	store := newTempStore(t)
+	inst := config.Instance{
+		ID:          "owned-daemon",
+		ProfileID:   "p1",
+		Kind:        config.InstanceKindDaemon,
+		BrokerID:    "owned-daemon",
+		BrokerEpoch: "epoch-a",
+		OwnerToken:  "token-a",
+	}
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		Profiles: []config.Profile{{
+			ID:   "p1",
+			Name: "dev",
+			Host: "host",
+			Port: 22,
+			User: "alice",
+		}},
+		Instances: []config.Instance{inst},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	prevStart := proxyStartStack
+	prevNow := proxyNow
+	t.Cleanup(func() {
+		proxyStartStack = prevStart
+		proxyNow = prevNow
+	})
+	proxyNow = func() time.Time { return time.Unix(100, 0) }
+	closed := false
+	proxyStartStack = func(config.Profile, string, stack.Options) (proxyStartedStack, error) {
+		// Simulate a replacement broker winning while the stale process is
+		// still bringing its listener up.
+		if err := store.Update(func(cfg *config.Config) error {
+			for i := range cfg.Instances {
+				if cfg.Instances[i].ID == inst.ID {
+					cfg.Instances[i].BrokerEpoch = "epoch-b"
+					cfg.Instances[i].OwnerToken = "token-b"
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("install replacement owner: %v", err)
+		}
+		return proxyStartedStack{
+			httpPort:  18080,
+			socksPort: 19080,
+			fatalCh:   make(chan error, 1),
+			close: func(context.Context) error {
+				closed = true
+				return nil
+			},
+		}, nil
+	}
+
+	err := runProxyDaemonWithOwnerToken(context.Background(), store, inst.ID, inst.OwnerToken)
+	if !errors.Is(err, manager.ErrInstanceOwnershipLost) {
+		t.Fatalf("stale daemon error = %v, want %v", err, manager.ErrInstanceOwnershipLost)
+	}
+	if !closed {
+		t.Fatal("stale daemon did not close its stack")
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 1 || cfg.Instances[0].OwnerToken != "token-b" || cfg.Instances[0].BrokerEpoch != "epoch-b" {
+		t.Fatalf("stale daemon changed replacement owner: %+v", cfg.Instances)
+	}
+}
+
 func TestRunProxyDaemonRemovesInstanceOnContextCancel(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)
@@ -354,6 +465,33 @@ func TestRunProxyDaemonReturnsErrorWhenProfileMissing(t *testing.T) {
 	err := runProxyDaemon(context.Background(), store, "inst-1")
 	if err == nil || !strings.Contains(err.Error(), `profile "missing" not found`) {
 		t.Fatalf("expected missing-profile error, got %v", err)
+	}
+}
+
+func TestRunProxyDaemonWithOwnerTokenCleansPlaceholderWhenProfileMissing(t *testing.T) {
+	store := newTempStore(t)
+	inst := config.Instance{
+		ID:          "strict-missing-profile",
+		ProfileID:   "missing",
+		OwnerToken:  "token-a",
+		BrokerEpoch: "epoch-a",
+		BrokerID:    "strict-missing-profile",
+	}
+	if err := store.Save(config.Config{
+		Version:   config.CurrentVersion,
+		Instances: []config.Instance{inst},
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	if err := runProxyDaemonWithOwnerToken(context.Background(), store, inst.ID, inst.OwnerToken); err == nil || !strings.Contains(err.Error(), `profile "missing" not found`) {
+		t.Fatalf("strict daemon error = %v, want missing-profile error", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Instances) != 0 {
+		t.Fatalf("strict startup placeholder survived profile failure: %+v", cfg.Instances)
 	}
 }
 
