@@ -67,7 +67,7 @@ jobs:
           NO_PROXY: "127.0.0.1,localhost"
         run: |
           set -euo pipefail
-          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
 
   windows-native:
     name: Windows native proxy validation
@@ -94,7 +94,7 @@ jobs:
           NO_PROXY: "127.0.0.1,localhost"
         run: |
           $ErrorActionPreference = "Stop"
-          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+          go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
           go test ./internal/cli -count=1 -run '^TestWindowsProxyReachabilityScriptExecutesAgainstLiveProxy$' -v
           if ($env:RUN_EDGE -eq 'true') {
             $edgeCandidates = @(
