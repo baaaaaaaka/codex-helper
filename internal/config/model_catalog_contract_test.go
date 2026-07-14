@@ -53,11 +53,14 @@ func TestModelCatalogContractRejectsInvalidSourceCombinations(t *testing.T) {
 		{"git managed file", ModelCatalog{Type: ModelCatalogTypeGit, URL: baseGit.URL, File: baseGit.File, ManagedFile: "catalog.json"}, "must not set managedFile"},
 		{"git embedded credentials", ModelCatalog{Type: ModelCatalogTypeGit, URL: "https://user:secret@example.invalid/models.git", File: "catalog.json"}, "credentials"},
 		{"git absolute manifest", ModelCatalog{Type: ModelCatalogTypeGit, URL: baseGit.URL, File: "/tmp/catalog.json"}, "repository-relative"},
+		{"git windows absolute manifest", ModelCatalog{Type: ModelCatalogTypeGit, URL: baseGit.URL, File: `C:\tmp\catalog.json`}, "repository-relative"},
 		{"managed url", ModelCatalog{Type: ModelCatalogTypeManagedJSON, URL: baseGit.URL, ManagedFile: baseManaged.ManagedFile}, "must not set url"},
 		{"managed ref", ModelCatalog{Type: ModelCatalogTypeManagedJSON, Ref: "main", ManagedFile: baseManaged.ManagedFile}, "must not set url or ref"},
 		{"managed file field", ModelCatalog{Type: ModelCatalogTypeManagedJSON, File: "catalog.json", ManagedFile: baseManaged.ManagedFile}, "must not set file"},
 		{"managed absolute path", ModelCatalog{Type: ModelCatalogTypeManagedJSON, ManagedFile: "/tmp/catalog.json"}, "must be relative"},
+		{"managed windows absolute path", ModelCatalog{Type: ModelCatalogTypeManagedJSON, ManagedFile: `C:\tmp\catalog.json`}, "must be relative"},
 		{"managed traversal", ModelCatalog{Type: ModelCatalogTypeManagedJSON, ManagedFile: "../catalog.json"}, "must be relative"},
+		{"managed windows traversal", ModelCatalog{Type: ModelCatalogTypeManagedJSON, ManagedFile: `..\catalog.json`}, "must be relative"},
 		{"uppercase type", ModelCatalog{Type: "GIT", URL: baseGit.URL, File: baseGit.File}, "must be lowercase"},
 	}
 	for _, tt := range tests {

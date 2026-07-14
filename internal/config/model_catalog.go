@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -42,6 +43,31 @@ const (
 
 var modelCatalogIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
+// normalizeModelCatalogPath normalizes separators before validating a path. Catalog
+// files are persisted and consumed on more than one operating system, so a
+// Windows-style absolute or traversal path must not become valid merely
+// because validation happens on Unix (or vice versa).
+func normalizeModelCatalogPath(value string) string {
+	return path.Clean(strings.ReplaceAll(strings.TrimSpace(value), "\\", "/"))
+}
+
+func isAbsoluteModelCatalogPath(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || filepath.IsAbs(value) {
+		return value != ""
+	}
+	normalized := strings.ReplaceAll(value, "\\", "/")
+	if strings.HasPrefix(normalized, "/") {
+		return true
+	}
+	// Reject both drive-absolute (C:/x) and drive-relative (C:x) paths. A
+	// drive-relative path has process-dependent meaning and is not a safe
+	// repository-relative catalog path.
+	return len(normalized) >= 2 && normalized[1] == ':' &&
+		((normalized[0] >= 'A' && normalized[0] <= 'Z') ||
+			(normalized[0] >= 'a' && normalized[0] <= 'z'))
+}
+
 func ValidateModelCatalogID(id string) error {
 	id = strings.TrimSpace(id)
 	if !modelCatalogIDPattern.MatchString(id) {
@@ -78,7 +104,8 @@ func (c ModelCatalog) Validate(name string) error {
 	case ModelCatalogTypeGit:
 		urlValue := strings.TrimSpace(c.URL)
 		parsed, err := url.Parse(urlValue)
-		localPath := filepath.IsAbs(urlValue) || strings.HasPrefix(urlValue, "./") || strings.HasPrefix(urlValue, "../")
+		normalizedURL := strings.ReplaceAll(urlValue, "\\", "/")
+		localPath := isAbsoluteModelCatalogPath(urlValue) || normalizedURL == "." || normalizedURL == ".." || strings.HasPrefix(normalizedURL, "./") || strings.HasPrefix(normalizedURL, "../")
 		scpLike := strings.HasPrefix(urlValue, "git@") && strings.Contains(urlValue, ":") && !strings.Contains(urlValue, "://") && !strings.ContainsAny(urlValue, " \t\r\n")
 		if (err != nil && !localPath && !scpLike) || (!localPath && !scpLike && (parsed == nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "ssh" && parsed.Scheme != "git"))) {
 			return fmt.Errorf("model catalog %q requires a Git URL or local repository path", name)
@@ -99,8 +126,8 @@ func (c ModelCatalog) Validate(name string) error {
 		if strings.TrimSpace(c.ManagedFile) == "" {
 			return fmt.Errorf("managed JSON catalog %q requires managedFile", name)
 		}
-		managedClean := filepath.ToSlash(filepath.Clean(c.ManagedFile))
-		if filepath.IsAbs(c.ManagedFile) || managedClean == "." || managedClean == "" || strings.HasPrefix(managedClean, "../") || managedClean == ".." {
+		managedClean := normalizeModelCatalogPath(c.ManagedFile)
+		if isAbsoluteModelCatalogPath(c.ManagedFile) || managedClean == "." || managedClean == "" || strings.HasPrefix(managedClean, "../") || managedClean == ".." {
 			return fmt.Errorf("managed JSON catalog %q managedFile must be relative", name)
 		}
 		if strings.TrimSpace(c.File) != "" {
@@ -112,14 +139,14 @@ func (c ModelCatalog) Validate(name string) error {
 	if typ != ModelCatalogTypeGit {
 		return nil
 	}
-	cleanFile := filepath.ToSlash(filepath.Clean(c.File))
+	cleanFile := normalizeModelCatalogPath(c.File)
 	parts := strings.Split(cleanFile, "/")
 	for _, part := range parts {
 		if part == ".." {
 			return fmt.Errorf("model catalog %q file must be repository-relative", name)
 		}
 	}
-	if filepath.IsAbs(c.File) || cleanFile == "." || cleanFile == "" {
+	if isAbsoluteModelCatalogPath(c.File) || cleanFile == "." || cleanFile == "" {
 		return fmt.Errorf("model catalog %q file must be repository-relative", name)
 	}
 	return nil
