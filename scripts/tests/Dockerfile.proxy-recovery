@@ -1,0 +1,15 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update -o Acquire::Retries=5 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        openssh-client \
+        openssh-server \
+        socat \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY proxy_recovery_sshd_entrypoint.sh /usr/local/bin/proxy-recovery-sshd
+RUN chmod 0755 /usr/local/bin/proxy-recovery-sshd
+
+ENTRYPOINT ["/usr/local/bin/proxy-recovery-sshd"]

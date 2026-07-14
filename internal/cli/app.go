@@ -21,6 +21,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
+	"github.com/gofrs/flock"
 )
 
 const (
@@ -315,32 +316,74 @@ func defaultCodexAppWSLPath(path string) (string, error) {
 }
 
 func ensureCodexAppProxyURL(ctx context.Context, store *config.Store, profile config.Profile, instances []config.Instance, log io.Writer) (string, error) {
-	hc := manager.HealthClient{Timeout: 1 * time.Second}
+	hc := healthClientForProxyProfile(profile, 1*time.Second)
 	if inst, err := manager.FindReusableInstanceContext(ctx, instances, profile.ID, hc); err != nil {
 		return "", err
 	} else if inst != nil {
 		return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
 	}
-	if freshCfg, err := store.Load(); err == nil {
-		if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
-			return "", err
-		} else if inst != nil {
-			return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
+	return withCodexAppProxyStartupLock(ctx, store, func() (string, error) {
+		// The caller's instance snapshot may have raced another app launch.
+		// Re-read and re-probe only after winning the startup election.
+		if freshCfg, err := store.Load(); err == nil {
+			if inst, err := manager.FindReusableInstanceContext(ctx, freshCfg.Instances, profile.ID, hc); err != nil {
+				return "", err
+			} else if inst != nil {
+				return fmt.Sprintf("http://127.0.0.1:%d", inst.HTTPPort), nil
+			}
 		}
+		if log != nil {
+			_, _ = fmt.Fprintln(log, "starting a long-lived proxy instance for the Codex desktop app...")
+		}
+		lease, err := startCodexAppProxyDaemonWithLease(ctx, store, profile)
+		if err != nil {
+			return "", err
+		}
+		proxyURL, err := waitForCodexAppProxyURL(ctx, store, profile.ID, lease.instanceID, hc)
+		if err != nil {
+			cleanupCodexAppProxyStartupOwned(store, lease.instanceID, lease.ownerToken, lease.brokerEpoch)
+			return "", err
+		}
+		return proxyURL, nil
+	})
+}
+
+// withCodexAppProxyStartupLock serializes the check-then-start sequence used
+// by desktop-app launches. The config store lock only protects individual
+// reads/writes; it cannot prevent two callers from both observing "no healthy
+// daemon" and starting two detached proxies.
+func withCodexAppProxyStartupLock(ctx context.Context, store *config.Store, fn func() (string, error)) (string, error) {
+	return withProxyStartupLock(ctx, store, fn)
+}
+
+// withProxyStartupLock serializes every proxy check-then-record-then-start
+// path, including desktop-app launches and the explicit proxy start command.
+// The config store lock alone is insufficient because it is released between
+// the health check and detached-process creation.
+func withProxyStartupLock(ctx context.Context, store *config.Store, fn func() (string, error)) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if log != nil {
-		_, _ = fmt.Fprintln(log, "starting a long-lived proxy instance for the Codex desktop app...")
+	if store == nil {
+		return "", errors.New("proxy startup store is required")
 	}
-	instanceID, err := startCodexAppProxyDaemon(ctx, store, profile)
+	lock := flock.New(store.Path() + ".proxy-start.lock")
+	locked, err := lock.TryLockContext(ctx, 50*time.Millisecond)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("lock proxy startup: %w", err)
 	}
-	proxyURL, err := waitForCodexAppProxyURL(ctx, store, profile.ID, instanceID, hc)
-	if err != nil {
-		cleanupCodexAppProxyStartup(store, instanceID)
-		return "", err
+	if !locked {
+		return "", errors.New("proxy startup lock was not acquired")
 	}
-	return proxyURL, nil
+	defer func() { _ = lock.Unlock() }()
+	return fn()
+}
+
+func withProxyStartupLockError(ctx context.Context, store *config.Store, fn func() error) error {
+	_, err := withProxyStartupLock(ctx, store, func() (string, error) {
+		return "", fn()
+	})
+	return err
 }
 
 func cleanupCodexAppProxyStartup(store *config.Store, instanceID string) {
@@ -355,54 +398,95 @@ func cleanupCodexAppProxyStartup(store *config.Store, instanceID string) {
 	_ = proxyRemoveInstance(store, instanceID)
 }
 
-func startCodexAppProxyDaemon(_ context.Context, store *config.Store, profile config.Profile) (string, error) {
-	instanceID, err := ids.New()
+func cleanupCodexAppProxyStartupOwned(store *config.Store, instanceID, ownerToken, brokerEpoch string) {
+	if cfg, err := store.Load(); err == nil {
+		for _, inst := range cfg.Instances {
+			if inst.ID == instanceID && inst.OwnerToken == ownerToken && inst.BrokerEpoch == brokerEpoch {
+				_ = stopProxyInstances([]config.Instance{inst})
+				break
+			}
+		}
+	}
+	_ = proxyRemoveOwnedInstance(store, instanceID, ownerToken, brokerEpoch)
+}
+
+type proxyStartupLease struct {
+	instanceID  string
+	ownerToken  string
+	brokerEpoch string
+}
+
+// startCodexAppProxyDaemon keeps the legacy string-returning helper used by
+// callers and tests. The app launch path uses the lease-returning variant so
+// a timeout cannot accidentally clean up a replacement daemon's record.
+func startCodexAppProxyDaemon(ctx context.Context, store *config.Store, profile config.Profile) (string, error) {
+	lease, err := startCodexAppProxyDaemonWithLease(ctx, store, profile)
 	if err != nil {
 		return "", err
+	}
+	return lease.instanceID, nil
+}
+
+func startCodexAppProxyDaemonWithLease(_ context.Context, store *config.Store, profile config.Profile) (proxyStartupLease, error) {
+	instanceID, err := ids.New()
+	if err != nil {
+		return proxyStartupLease{}, err
+	}
+	identity, err := newProxyBrokerIdentity(instanceID)
+	if err != nil {
+		return proxyStartupLease{}, err
+	}
+	lease := proxyStartupLease{
+		instanceID:  instanceID,
+		ownerToken:  identity.OwnerToken,
+		brokerEpoch: identity.BrokerEpoch,
 	}
 
 	now := proxyNow()
 	inst := config.Instance{
-		ID:         instanceID,
-		ProfileID:  profile.ID,
-		Kind:       config.InstanceKindDaemon,
-		HTTPPort:   0,
-		SocksPort:  0,
-		DaemonPID:  0,
-		StartedAt:  now,
-		LastSeenAt: now,
+		ID:          instanceID,
+		ProfileID:   profile.ID,
+		Kind:        config.InstanceKindDaemon,
+		BrokerID:    identity.BrokerID,
+		BrokerEpoch: identity.BrokerEpoch,
+		OwnerToken:  identity.OwnerToken,
+		HTTPPort:    0,
+		SocksPort:   0,
+		DaemonPID:   0,
+		StartedAt:   now,
+		LastSeenAt:  now,
 	}
 	if err := proxyRecordInstance(store, inst); err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
 	started := false
 	defer func() {
 		if !started {
-			cleanupCodexAppProxyStartup(store, instanceID)
+			cleanupCodexAppProxyStartupOwned(store, instanceID, identity.OwnerToken, identity.BrokerEpoch)
 		}
 	}()
 
 	exe, err := proxyExecutable()
 	if err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
 	resolvedExe, err := helperpath.StableRunnablePathFromSources(exe, restartArgv0(), helperpath.Options{})
 	if err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
 	exe = resolvedExe.Path
 
-	args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID}
+	args := []string{"--config", store.Path(), "proxy", "daemon", "--instance-id", instanceID, "--owner-token", identity.OwnerToken}
 	c := proxyCommand(exe, args...)
 	c.Stdin = nil
 
 	logPath := filepath.Join(filepath.Dir(store.Path()), "instances", instanceID+".log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
 	defer logFile.Close()
 	c.Stdout = logFile
@@ -410,22 +494,20 @@ func startCodexAppProxyDaemon(_ context.Context, store *config.Store, profile co
 	configureTeamsServiceDetachedCommand(c)
 
 	if err := c.Start(); err != nil {
-		return "", err
+		return proxyStartupLease{}, err
 	}
-	started = true
 	pid := c.Process.Pid
-	_ = c.Process.Release()
-	_ = store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			if cfg.Instances[i].ID == instanceID {
-				cfg.Instances[i].DaemonPID = pid
-				cfg.Instances[i].LastSeenAt = proxyNow()
-				return nil
-			}
-		}
+	if err := proxyUpdateOwnedInstance(store, instanceID, identity.OwnerToken, identity.BrokerEpoch, func(inst *config.Instance) error {
+		inst.DaemonPID = pid
+		inst.LastSeenAt = proxyNow()
 		return nil
-	})
-	return instanceID, nil
+	}); err != nil {
+		_ = proxyTerminate(c.Process, 2*time.Second)
+		return proxyStartupLease{}, fmt.Errorf("record app proxy daemon owner: %w", err)
+	}
+	_ = c.Process.Release()
+	started = true
+	return lease, nil
 }
 
 func waitForCodexAppProxyURL(ctx context.Context, store *config.Store, profileID string, instanceID string, hc manager.HealthClient) (string, error) {

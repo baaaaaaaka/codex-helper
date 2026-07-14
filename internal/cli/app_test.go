@@ -2382,6 +2382,38 @@ func TestEnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut(t *testing.T)
 	}
 }
 
+func TestWithCodexAppProxyStartupLockSerializesCallers(t *testing.T) {
+	store := newTempStore(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := withCodexAppProxyStartupLock(context.Background(), store, func() (string, error) {
+			close(entered)
+			<-release
+			return "first", nil
+		})
+		firstDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first startup caller did not acquire lock")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := withCodexAppProxyStartupLock(ctx, store, func() (string, error) {
+		return "second", nil
+	}); err == nil {
+		t.Fatal("second startup caller acquired an already-held lock")
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first startup caller failed: %v", err)
+	}
+}
+
 func TestCodexAppProxyDaemonHelperProcess(t *testing.T) {
 	if os.Getenv("CODEX_APP_PROXY_DAEMON_HELPER") != "1" {
 		return

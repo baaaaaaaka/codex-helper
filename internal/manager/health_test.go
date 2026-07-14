@@ -22,6 +22,52 @@ func TestHealthClient_CheckHTTPProxy(t *testing.T) {
 	}
 }
 
+func TestHealthClient_CheckHTTPProxyRouteTargetUsesRealConnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	seenTarget := make(chan string, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/_codex_proxy/health" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "instanceId": "inst-route"})
+			return
+		}
+		if r.Method != http.MethodConnect {
+			http.Error(w, "expected CONNECT", http.StatusMethodNotAllowed)
+			return
+		}
+		select {
+		case seenTarget <- r.Host:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: handler}
+	go func() { _ = srv.Serve(ln) }()
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+		_ = ln.Close()
+	}()
+
+	tcp, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address type = %T", ln.Addr())
+	}
+	const target = "graph.example.test:443"
+	if err := (HealthClient{Timeout: time.Second, RouteTarget: target}).CheckHTTPProxy(tcp.Port, "inst-route"); err != nil {
+		t.Fatalf("CheckHTTPProxy with route target: %v", err)
+	}
+	select {
+	case got := <-seenTarget:
+		if got != target {
+			t.Fatalf("CONNECT target = %q, want %q", got, target)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("route CONNECT was not observed")
+	}
+}
+
 func TestHealthClient_CheckHTTPProxyContextCancellation(t *testing.T) {
 	port, closeFn := startBlockingHealthServer(t)
 	defer closeFn()

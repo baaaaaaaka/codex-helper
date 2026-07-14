@@ -1312,6 +1312,10 @@ func TestCodexAppAuthWindowsProxyReachabilityScriptChecksHealthEndpoint(t *testi
 		"http://127.0.0.1:23123/_codex_proxy/health",
 		"Invoke-RestMethod",
 		"$response.ok",
+		"System.Net.Sockets.TcpClient",
+		"CONNECT ",
+		"ReadLine()",
+		"(200|502)",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("reachability script missing %q:\n%s", want, script)
