@@ -58,6 +58,7 @@ go test -c -o "$tmp_dir/localproxy.test" ./internal/localproxy
 go test -c -o "$tmp_dir/stack.test" ./internal/stack
 go test -c -o "$tmp_dir/ssh.test" ./internal/ssh
 go test -c -o "$tmp_dir/cli.test" ./internal/cli
+go test -c -o "$tmp_dir/update.test" ./internal/update
 go test -race -c -o "$tmp_dir/localproxy-race.test" ./internal/localproxy
 go test -race -c -o "$tmp_dir/stack-race.test" ./internal/stack
 
@@ -117,7 +118,8 @@ docker run --detach \
     /lab/ssh.test -test.run "^Test.*$" -test.v
     /lab/localproxy-race.test -test.run "^Test.*$" -test.v
     /lab/stack-race.test -test.run "^Test.*$" -test.v
-    /lab/cli.test -test.run "Test(WithCodexAppProxyStartupLockSerializesCallers|CodexAppAuth(MacProxyBrowser.*|WindowsProxy(ReachabilityScriptChecksHealthEndpoint|BrowserScriptUsesChromiumProxy)))$" -test.v
+    /lab/cli.test -test.run "Test(WithCodexAppProxyStartupLockSerializesCallers|ProxyStartBackgroundReapsExitedDetachedChild|StartCodexAppProxyDaemonReapsExitedDetachedChild|CodexAppAuth(MacProxyBrowser.*|WindowsProxy(ReachabilityScriptChecksHealthEndpoint|BrowserScriptUsesChromiumProxy)))$" -test.v
+    /lab/update.test -test.run "Test(ReplaceBinaryDoesNotInterruptLiveProcess|ReplaceBinary.*|WindowsDeferredMoveScript.*)$" -test.v
     export SSH_TEST_ENABLED=1 SSH_STACK_INTEGRATION_TEST=1
     export STACK_DOCKER_TARGET_HOST=proxy-upstream STACK_DOCKER_TARGET_PORT=3333
     export STACK_DOCKER_HEALTHY_TEST=1

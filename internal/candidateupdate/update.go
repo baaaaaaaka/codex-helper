@@ -52,7 +52,23 @@ type Result struct {
 	EntryPath       string `json:"entry_path"`
 	RestartRequired bool   `json:"restart_required"`
 	Noop            bool   `json:"noop,omitempty"`
+
+	// stableEntryRepair is deliberately kept out of the candidate-update ABI.
+	// On Windows the stable cxp.exe can still be held by the launcher that
+	// started the current immutable runtime. In that case reconcileLocked
+	// records enough state for the current process to arm a post-parent repair
+	// worker before it returns the JSON result to its caller.
+	stableEntryRepair *stableEntryRepair `json:"-"`
 }
+
+type stableEntryRepair struct {
+	SourcePath            string
+	TargetPath            string
+	ExpectedCurrentSHA256 string
+	SourceSHA256          string
+}
+
+var replaceManagedStableEntryFn = replaceManagedStableEntry
 
 type Pending struct {
 	Schema         int    `json:"schema"`
@@ -175,6 +191,9 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	if err != nil {
 		return Result{}, err
 	}
+	if err := scheduleDeferredStableEntryRepair(result); err != nil {
+		return Result{}, err
+	}
 	if err := verifyFreshEntry(request.EntryPath, targetVersion(request.TargetVersion)); err != nil {
 		return Result{}, err
 	}
@@ -254,7 +273,11 @@ func ResumePending(ctx context.Context, currentVersion string) error {
 		if !strings.EqualFold(targetHash, pending.TargetSHA256) {
 			return fmt.Errorf("pending update target sha256 = %s, want %s", targetHash, pending.TargetSHA256)
 		}
-		if _, err := reconcileLocked(request, pending.TargetActive, true); err != nil {
+		result, err := reconcileLocked(request, pending.TargetActive, true)
+		if err != nil {
+			return err
+		}
+		if err := scheduleDeferredStableEntryRepair(result); err != nil {
 			return err
 		}
 		if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -310,8 +333,40 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	if !strings.EqualFold(installedHash, request.CandidateSHA256) {
 		return Result{}, fmt.Errorf("immutable runtime sha256 = %s, want %s", installedHash, request.CandidateSHA256)
 	}
+	_, entryStatErr := os.Lstat(request.EntryPath)
+	entryWasPresent := entryStatErr == nil
+	if entryStatErr != nil && !errors.Is(entryStatErr, os.ErrNotExist) {
+		return Result{}, fmt.Errorf("inspect stable cxp entry: %w", entryStatErr)
+	}
 	if err := helperruntime.EnsureStableEntry(installed, request.EntryPath, runtime.GOOS); err != nil {
 		return Result{}, fmt.Errorf("ensure stable cxp entry: %w", err)
+	}
+	// A first install with no prior active runtime may be upgrading an
+	// explicitly supplied, user-owned entry. Do not overwrite that entry. Once
+	// a managed runtime already owns the profile, refresh only the physical
+	// launcher that still contains that runtime. The same rule applies when
+	// resuming a first-install pending marker.
+	var deferredRepair *stableEntryRepair
+	if previous != "" && entryWasPresent && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
+		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, previous, runtime.GOOS)
+		plan, err := prepareStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot)
+		if err != nil {
+			return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", err)
+		}
+		if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot); err != nil {
+			if !shouldDeferStableEntryRepair(err) {
+				return Result{}, fmt.Errorf("refresh managed stable cxp entry: %w", err)
+			}
+			// The immutable runtime is the durable source for the worker. The
+			// downloaded candidate is removed by update.PerformUpdate as soon
+			// as Invoke returns.
+			deferredRepair = &stableEntryRepair{
+				SourcePath:            installed,
+				TargetPath:            plan.TargetPath,
+				ExpectedCurrentSHA256: plan.ExpectedCurrentSHA256,
+				SourceSHA256:          installedHash,
+			}
+		}
 	}
 	// Publish recovery intent only after the immutable target and stable entry
 	// are usable. A previous runtime can then safely finish the transition if
@@ -339,8 +394,49 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 		// Managed runtimes are already activated atomically. The caller still
 		// performs its normal service restart, but no file replacement is
 		// pending and the legacy RestartRequired path must not be selected.
-		RestartRequired: false,
-		Noop:            previous == targetVersion,
+		RestartRequired:   false,
+		Noop:              previous == targetVersion,
+		stableEntryRepair: deferredRepair,
+	}, nil
+}
+
+// replaceManagedStableEntry updates the physical managed launcher while
+// preserving a user-authored shim or multi-hop symlink around it. The current
+// entry must still contain the runtime that owns this update; otherwise the
+// updater fails closed rather than overwriting an unrelated executable.
+func replaceManagedStableEntry(candidate string, entry string, runningRuntime string, root string) error {
+	plan, err := prepareStableEntryRepair(entry, runningRuntime, root)
+	if err != nil {
+		return err
+	}
+	if same, err := sameFileContent(candidate, plan.TargetPath); err == nil && same {
+		return nil
+	}
+	if err := copyExecutableAtomically(candidate, plan.TargetPath, plan.ExpectedCurrentSHA256); err != nil {
+		return err
+	}
+	actualHash, err := fileSHA256(plan.TargetPath)
+	if err != nil {
+		return fmt.Errorf("verify managed stable entry: %w", err)
+	}
+	candidateHash, err := fileSHA256(candidate)
+	if err != nil {
+		return fmt.Errorf("hash candidate after stable entry replacement: %w", err)
+	}
+	if !strings.EqualFold(actualHash, candidateHash) {
+		return fmt.Errorf("managed stable entry hash = %s, want candidate %s", actualHash, candidateHash)
+	}
+	return nil
+}
+
+func prepareStableEntryRepair(entry string, runningRuntime string, root string) (stableEntryRepair, error) {
+	target, expectedHash, err := stableReplacementTarget(entry, runningRuntime, root)
+	if err != nil {
+		return stableEntryRepair{}, err
+	}
+	return stableEntryRepair{
+		TargetPath:            target,
+		ExpectedCurrentSHA256: expectedHash,
 	}, nil
 }
 

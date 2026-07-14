@@ -114,6 +114,70 @@ func TestCurrentKeepsLaunchedVersionAfterConcurrentActivation(t *testing.T) {
 	}
 }
 
+func TestShouldActivateEntryVersionDoesNotUndoSameBasePrerelease(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		entry  string
+		active string
+		want   bool
+	}{
+		{entry: "v0.1.14", active: "v0.1.14-rc.19", want: false},
+		{entry: "v0.1.14", active: "v0.1.14-rc.1", want: false},
+		{entry: "v0.1.14", active: "v0.1.13-rc.99", want: true},
+		{entry: "v0.1.14-rc.20", active: "v0.1.14-rc.19", want: true},
+		{entry: "v0.1.15", active: "v0.1.14", want: true},
+	} {
+		t.Run(tc.entry+"-over-"+tc.active, func(t *testing.T) {
+			if got := shouldActivateEntryVersion(tc.entry, tc.active); got != tc.want {
+				t.Fatalf("shouldActivateEntryVersion(%q, %q) = %v, want %v", tc.entry, tc.active, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLaunchKeepsExplicitSameBasePrereleaseActive(t *testing.T) {
+	dir := t.TempDir()
+	entry := filepath.Join(dir, BinaryName(runtime.GOOS))
+	writeExecutable(t, entry, "stable-entry")
+	root := filepath.Join(dir, ".cxp-runtime")
+	prerelease := filepath.Join(t.TempDir(), "prerelease")
+	writeExecutable(t, prerelease, "prerelease-runtime")
+	wantTarget, err := InstallVersion(root, prerelease, "v0.1.14-rc.19", runtime.GOOS, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Activate(root, "v0.1.14-rc.19"); err != nil {
+		t.Fatal(err)
+	}
+
+	oldExecutablePath := executablePath
+	oldLaunchRuntime := launchRuntimeFn
+	t.Cleanup(func() {
+		executablePath = oldExecutablePath
+		launchRuntimeFn = oldLaunchRuntime
+	})
+	executablePath = func() (string, error) { return entry, nil }
+	var gotTarget string
+	launchRuntimeFn = func(target string, _ []string, _ []string) (int, bool, error) {
+		gotTarget = target
+		return 0, true, nil
+	}
+
+	code, handled, err := Launch("v0.1.14", []string{entry, "--version"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 || !handled {
+		t.Fatalf("Launch = code %d handled %v, want successful handled launch", code, handled)
+	}
+	if gotTarget != wantTarget {
+		t.Fatalf("launched target = %q, want explicit active prerelease %q", gotTarget, wantTarget)
+	}
+	if active, err := ReadActive(root); err != nil || active != "v0.1.14-rc.19" {
+		t.Fatalf("active runtime = %q, %v; stable entry must not reactivate itself", active, err)
+	}
+}
+
 func TestInstallVersionAndActivate(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

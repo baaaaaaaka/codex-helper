@@ -206,11 +206,12 @@ func runProxyStartCommand(cmd *cobra.Command, store *config.Store, foreground bo
 	c.Stdout = logFile
 	c.Stderr = logFile
 
-	if err := c.Start(); err != nil {
+	detached, err := startDetachedProcess(c)
+	if err != nil {
 		return err
 	}
 
-	pid := c.Process.Pid
+	pid := detached.cmd.Process.Pid
 	if err := proxyUpdateOwnedInstance(store, instanceID, identity.OwnerToken, identity.BrokerEpoch, func(live *config.Instance) error {
 		now := proxyNow()
 		live.DaemonPID = pid
@@ -219,10 +220,10 @@ func runProxyStartCommand(cmd *cobra.Command, store *config.Store, foreground bo
 		live.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
 		return nil
 	}); err != nil {
-		_ = proxyTerminate(c.Process, 2*time.Second)
+		_ = proxyTerminate(detached.cmd.Process, 2*time.Second)
+		_ = detached.wait(2 * time.Second)
 		return fmt.Errorf("record proxy daemon owner: %w", err)
 	}
-	_ = c.Process.Release()
 	startupComplete = true
 
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started instance %s (pid %d). Logs: %s\n", instanceID, pid, logPath)

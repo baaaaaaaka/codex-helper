@@ -35,6 +35,10 @@ type Context struct {
 
 var executablePath = helperpath.RawExecutable
 
+// launchRuntimeFn is kept injectable for the runtime-selection tests. The
+// production value is the platform-specific process replacement/runner.
+var launchRuntimeFn = launchRuntime
+
 func BinaryName(goos string) string {
 	if strings.EqualFold(strings.TrimSpace(goos), "windows") {
 		return "cxp.exe"
@@ -121,7 +125,7 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 		active = normalized
 	} else if activeErr != nil {
 		return 0, false, activeErr
-	} else if semver.Compare(normalized, active) > 0 {
+	} else if shouldActivateEntryVersion(normalized, active) {
 		if _, err := InstallVersion(root, physical, normalized, runtime.GOOS, runtime.GOOS == "linux"); err != nil {
 			return 0, false, err
 		}
@@ -143,7 +147,34 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	locked = false
 	launchArgs := append([]string{target}, args[1:]...)
 	env := setRuntimeEnvironment(os.Environ(), root, entry, active)
-	return launchRuntime(target, launchArgs, env)
+	return launchRuntimeFn(target, launchArgs, env)
+}
+
+// shouldActivateEntryVersion decides whether the physical stable entry should
+// become the active runtime. An explicit candidate-owned update can select a
+// prerelease whose SemVer is lower than the stable entry that launched the
+// update (for example v0.1.14-rc.19 while the stable entry is v0.1.14). The
+// stable entry is a dispatcher in that state and must not silently undo the
+// explicit selection. For unrelated versions, preserve the historical
+// monotonic migration behavior used by older installations.
+func shouldActivateEntryVersion(entryVersion string, activeVersion string) bool {
+	if semver.Compare(entryVersion, activeVersion) <= 0 {
+		return false
+	}
+	entryBase, entryPrerelease := splitVersionPrerelease(entryVersion)
+	activeBase, activePrerelease := splitVersionPrerelease(activeVersion)
+	if entryPrerelease == "" && activePrerelease != "" && entryBase == activeBase {
+		return false
+	}
+	return true
+}
+
+func splitVersionPrerelease(version string) (string, string) {
+	parts := strings.SplitN(version, "-", 2)
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
 }
 
 func RecoverPrevious(ctx context.Context) (string, error) {
