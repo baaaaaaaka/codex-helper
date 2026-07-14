@@ -394,24 +394,45 @@ func TestSetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal(t *testi
 	defer closeProxySetup(ps)
 
 	start := make(chan struct{})
+	connections := make(chan struct{}, 32)
+	results := make(chan error, 256)
 	var wg sync.WaitGroup
 	for i := 0; i < 256; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, err := net.DialTimeout("tcp", ps.httpAddr, time.Second)
+			connections <- struct{}{}
+			defer func() { <-connections }()
+
+			conn, err := net.DialTimeout("tcp", ps.httpAddr, 2*time.Second)
 			if err != nil {
+				results <- fmt.Errorf("dial proxy: %w", err)
 				return
 			}
-			_, _ = fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-			_, _ = bufio.NewReader(conn).ReadString('\n')
+			if _, err := fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+				_ = conn.Close()
+				results <- fmt.Errorf("write proxy request: %w", err)
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+				_ = conn.Close()
+				results <- fmt.Errorf("read proxy response: %w", err)
+				return
+			}
 			_ = conn.Close()
+			results <- nil
 		}()
 	}
 	close(start)
 	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("failure storm request did not reach handler: %v", err)
+		}
+	}
 
 	signals := 0
 	for {

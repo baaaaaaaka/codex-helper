@@ -197,11 +197,14 @@ func TestStackIntegrationDockerNetworkRecovery(t *testing.T) {
 		},
 	}, "docker-recovery", Options{
 		SocksReadyTimeout: 3 * time.Second,
-		MaxRestarts:       12,
-		RestartBackoff:    100 * time.Millisecond,
-		TunnelStopGrace:   500 * time.Millisecond,
-		RestartWindow:     30 * time.Second,
-		ProbeInterval:     100 * time.Millisecond,
+		// Four Docker fault rounds can include short DNS convergence after SSH
+		// container reattach. Keep recovery finite while avoiding a tight
+		// restart loop that exhausts the budget before DNS settles.
+		MaxRestarts:     32,
+		RestartBackoff:  250 * time.Millisecond,
+		TunnelStopGrace: 500 * time.Millisecond,
+		RestartWindow:   30 * time.Second,
+		ProbeInterval:   100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("Start Docker recovery stack: %v", err)
