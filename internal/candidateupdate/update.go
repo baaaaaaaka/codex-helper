@@ -353,7 +353,15 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	// launcher that still contains that runtime. The same rule applies when
 	// resuming a first-install pending marker.
 	var deferredRepair *stableEntryRepair
-	if previous != "" && entryWasPresent && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
+	// A Windows legacy bridge may be running the candidate as a child of the
+	// previous immutable runtime. Once that child has activated the target,
+	// rewriting cxp.exe during ResumePending is both unnecessary and unsafe:
+	// the old launcher is still the parent-owned entry and already dispatches
+	// through the active pointer. Leave physical-entry repair to the normal
+	// post-parent/managed repair path; only non-resuming updates may refresh it
+	// synchronously here.
+	deferWindowsResumeEntryRepair := runtime.GOOS == "windows" && resuming && previous == targetVersion
+	if previous != "" && entryWasPresent && !deferWindowsResumeEntryRepair && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
 		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, entryRuntimeVersion, runtime.GOOS)
 		entryAlreadyContainsCandidate := false
 		if target, targetErr := stableEntryTargetPath(request.EntryPath, request.RuntimeRoot); targetErr != nil {

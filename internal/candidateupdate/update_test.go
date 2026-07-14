@@ -554,8 +554,14 @@ func TestResumePendingRepairsStableEntryAfterTargetAlreadyActive(t *testing.T) {
 	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(entry); err != nil || string(data) != "v2" {
-		t.Fatalf("stable entry = %q, %v", data, err)
+	wantEntry := "v2"
+	if runtime.GOOS == "windows" {
+		// A legacy Windows candidate can still be a child of the old launcher;
+		// ResumePending must not rewrite that parent-owned entry.
+		wantEntry = "v1"
+	}
+	if data, err := os.ReadFile(entry); err != nil || string(data) != wantEntry {
+		t.Fatalf("stable entry = %q, %v; want %q", data, err, wantEntry)
 	}
 	if active, err := helperruntime.ReadActive(root); err != nil || active != "v2.0.0" {
 		t.Fatalf("active = %q, %v", active, err)
