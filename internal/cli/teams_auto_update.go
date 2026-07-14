@@ -222,8 +222,10 @@ func teamsAutoUpdateActivationAfterApply(preUpdatePending bool, preUpdateReason 
 		)
 	}
 	// RuntimeActivated is the authoritative postcondition for an immutable
-	// runtime update. finalizeHelperUpdateResult still verifies both the
-	// published runtime and the stable entry before Apply returns this state.
+	// runtime update. finalizeHelperUpdateResult verifies the published runtime
+	// exactly and requires the stable compatibility entry to remain runnable;
+	// the entry's physical version string may be older than an explicitly
+	// selected prerelease.
 	// The pre-update executable can legitimately remain the old immutable
 	// runtime until the normal fresh-launch restart crosses the stable entry.
 	return false, "", nil

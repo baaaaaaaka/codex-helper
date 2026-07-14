@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -52,26 +53,101 @@ func TestApplyRejectsCandidateHashMismatchBeforeWritingState(t *testing.T) {
 	}
 }
 
+func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX executable fixture")
+	}
+
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	oldRuntime := filepath.Join(dir, "old-runtime")
+	candidate := filepath.Join(dir, "candidate-runtime")
+	writeVersionScript(t, oldRuntime, "0.1.14")
+	writeVersionScript(t, candidate, "0.1.14-rc.20")
+	if _, err := helperruntime.InstallVersion(root, oldRuntime, "v0.1.14", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperruntime.Activate(root, "v0.1.14"); err != nil {
+		t.Fatal(err)
+	}
+	oldEntry, err := os.ReadFile(oldRuntime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entry, oldEntry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidateHash, err := fileSHA256(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousCandidateExecutablePath := candidateExecutablePath
+	previousReplaceManagedStableEntry := replaceManagedStableEntryFn
+	t.Cleanup(func() {
+		candidateExecutablePath = previousCandidateExecutablePath
+		replaceManagedStableEntryFn = previousReplaceManagedStableEntry
+	})
+	candidateExecutablePath = func() (string, error) { return candidate, nil }
+	// This models a split install whose stable launcher is intentionally kept
+	// by the owner of the running process. Apply must still validate and return
+	// the newly published immutable runtime instead of rejecting its version
+	// because the preserved launcher reports the old stable version.
+	replaceManagedStableEntryFn = func(string, string, string, string) error { return nil }
+
+	result, err := Apply(context.Background(), Context{
+		Schema:          ProtocolVersion,
+		CandidateSHA256: candidateHash,
+		SourceVersion:   "v0.1.14",
+		TargetVersion:   "v0.1.14-rc.20",
+		RuntimeRoot:     root,
+		EntryPath:       entry,
+		RecordPath:      filepath.Join(dir, "install.json"),
+		RequestID:       "split-entry-rc20",
+	}, "v0.1.14-rc.20")
+	if err != nil {
+		t.Fatalf("Apply split-entry update: %v", err)
+	}
+	wantRuntime := helperruntime.VersionPath(root, "v0.1.14-rc.20", runtime.GOOS)
+	if result.RuntimePath != wantRuntime || result.Version != "0.1.14-rc.20" {
+		t.Fatalf("result = %#v, want runtime %q", result, wantRuntime)
+	}
+	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v0.1.14-rc.20" {
+		t.Fatalf("active = %q, %v", active, readErr)
+	}
+	if err := verifyImmutableRuntime(context.Background(), result.RuntimePath, "v0.1.14-rc.20"); err != nil {
+		t.Fatalf("published immutable runtime verification: %v", err)
+	}
+	// The preserved stable entry is deliberately still the old physical
+	// launcher. Its output must not participate in candidate-owned success.
+	out, err := exec.Command(entry, "--version").CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "0.1.14") || strings.Contains(string(out), "rc.20") {
+		t.Fatalf("preserved stable entry output = %q, %v", out, err)
+	}
+}
+
 func TestHandleInternalCommandAppliesCurrentCandidate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX launcher fixture")
 	}
-	executable, err := helperpath.RawExecutable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	hash, err := fileSHA256(executable)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	root := filepath.Join(dir, ".cxp-runtime")
 	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	candidate := filepath.Join(dir, "candidate")
 	recordPath := filepath.Join(dir, "config", "install.json")
 	writeDynamicLauncher(t, entry, root)
+	writeVersionScript(t, candidate, "9.8.7")
+	hash, err := fileSHA256(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousCandidateExecutablePath := candidateExecutablePath
+	candidateExecutablePath = func() (string, error) { return candidate, nil }
+	t.Cleanup(func() { candidateExecutablePath = previousCandidateExecutablePath })
 	request := Context{
 		Schema:          ProtocolVersion,
-		CandidatePath:   executable,
+		CandidatePath:   candidate,
 		CandidateSHA256: hash,
 		TargetVersion:   "v9.8.7",
 		RuntimeRoot:     root,
@@ -876,6 +952,19 @@ func writeDynamicLauncher(t *testing.T, path string, root string) {
 	t.Helper()
 	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
 	script := "#!/bin/sh\nactive=$(cat '" + quotedRoot + "/active')\necho \"codex-proxy version ${active#v}\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeVersionScript(t *testing.T, path string, version string) {
+	t.Helper()
+	script := "#!/bin/sh\n" +
+		"if [ \"${1-}\" = \"--version\" ]; then\n" +
+		"  echo 'codex-proxy version " + version + "'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 2\n"
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

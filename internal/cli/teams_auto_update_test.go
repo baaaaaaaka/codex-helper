@@ -607,6 +607,9 @@ func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *tes
 	writeCLIFile(t, oldRuntime, upgradeCXPShimTestScript("1.2.3"), 0o755)
 	writeCLIFile(t, targetRuntime, upgradeCXPShimTestScript("1.2.4"), 0o755)
 	writeCLIFile(t, entry, upgradeCXPShimTestScript("1.2.4"), 0o755)
+	if err := helperruntime.Activate(runtimeRoot, "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
 
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:  "linux",
