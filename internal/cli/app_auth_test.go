@@ -1313,6 +1313,7 @@ func TestCodexAppAuthWindowsProxyReachabilityScriptChecksHealthEndpoint(t *testi
 		"Invoke-RestMethod",
 		"$response.ok",
 		"System.Net.Sockets.TcpClient",
+		"[Environment]::NewLine",
 		"CONNECT ",
 		"ReadLine()",
 		"(200|502)",
