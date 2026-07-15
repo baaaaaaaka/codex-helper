@@ -603,7 +603,12 @@ func validateResolvedModelSource(source config.ModelSource) error {
 
 func modelSourceName(raw string) string {
 	value := strings.TrimSuffix(strings.TrimRight(raw, "/"), ".git")
-	if i := strings.LastIndexAny(value, "/:"); i >= 0 {
+	// Model source references can be supplied by a different platform (for
+	// example, a Windows path can be persisted and later resolved by a Unix
+	// process, or vice versa).  Treat both slash styles as path separators so
+	// the derived name remains the final path component instead of leaking the
+	// whole path into model-source-name validation.
+	if i := strings.LastIndexAny(value, "/\\:"); i >= 0 {
 		value = value[i+1:]
 	}
 	return strings.ToLower(strings.TrimSpace(value))

@@ -248,6 +248,17 @@ func TestResolveModelSourceTreatsManifestPathAsCatalogDirectory(t *testing.T) {
 	}
 }
 
+func TestModelSourceNameHandlesWindowsPathSeparators(t *testing.T) {
+	for raw, want := range map[string]string{
+		`C:\\Users\\runner\\catalog\\manifest.json`: "manifest.json",
+		`\\Users\\runner\\catalog\\models.git`:      "models",
+	} {
+		if got := modelSourceName(raw); got != want {
+			t.Errorf("modelSourceName(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
 func TestSafeRepoFileCanonicalizesRepositoryRootAndRejectsEscapes(t *testing.T) {
 	realParent := t.TempDir()
 	repo := filepath.Join(realParent, "repo")
