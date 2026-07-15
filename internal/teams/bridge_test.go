@@ -17452,6 +17452,39 @@ func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	}
 }
 
+func TestBridgePollDropsMarkedHelperAttachmentEchoWithoutLedger(t *testing.T) {
+	msg := bridgePollMessage("marked-helper-artifact", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = `<p>Codex: artifact attached: large.bin <attachment id="artifact-1"></attachment></p><!-- codex-helper-outbox:outbox:attachment-upload-1 -->`
+	msg.Attachments = []MessageAttachment{{
+		ID:          "artifact-1",
+		ContentType: "reference",
+		Name:        "large.bin",
+	}}
+	graph := newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{msg}}})
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
+		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(handled) != 0 || !bridge.reg.HasSent("chat-1", msg.ID) {
+		t.Fatalf("marked helper attachment was processed: handled=%#v sent=%v", handled, bridge.reg.HasSent("chat-1", msg.ID))
+	}
+	lookup, err := store.MessageLookup(context.Background(), "chat-1", msg.ID)
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.Origin != teamstore.MessageOriginHelperOutbox || lookup.Provenance.OutboxID != "outbox:attachment-upload-1" {
+		t.Fatalf("marker provenance was not persisted: %#v", lookup)
+	}
+}
+
 func TestBridgePollDropsFreshHelperAttachmentEchoFromSendingOutbox(t *testing.T) {
 	for _, tt := range []struct {
 		name   string

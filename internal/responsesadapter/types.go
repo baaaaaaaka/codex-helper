@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type Scope struct {
@@ -69,6 +71,7 @@ type ResponsesRequest struct {
 	Reasoning          *ReasoningInput `json:"reasoning,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	TopP               *float64        `json:"top_p,omitempty"`
+	ResponseFormat     json.RawMessage `json:"response_format,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 }
@@ -78,22 +81,25 @@ type ReasoningInput struct {
 }
 
 type ProviderRequest struct {
-	Model              string
-	Instructions       string
-	InputText          string
-	InputMessages      []ProviderMessage
-	Messages           []ProviderMessage
-	Tools              []ChatTool
-	ToolWarnings       []ToolWarning
-	ToolChoice         json.RawMessage
-	ParallelToolCalls  *bool
-	MaxOutputTokens    *int
-	ReasoningEffort    string
-	Temperature        *float64
-	TopP               *float64
-	PreviousResponseID string
-	Scope              Scope
-	History            []ResponseRecord
+	Model                  string
+	Instructions           string
+	InputText              string
+	InputMessages          []ProviderMessage
+	Messages               []ProviderMessage
+	Tools                  []ChatTool
+	ToolWarnings           []ToolWarning
+	ToolChoice             json.RawMessage
+	ParallelToolCalls      *bool
+	MaxOutputTokens        *int
+	ReasoningEffort        string
+	Temperature            *float64
+	TopP                   *float64
+	ResponseFormat         json.RawMessage
+	ParallelEnforcement    string
+	StructuredOutputPolicy config.ModelStructuredOutputPolicy
+	PreviousResponseID     string
+	Scope                  Scope
+	History                []ResponseRecord
 }
 
 type ProviderMessage struct {
@@ -140,9 +146,13 @@ type ProviderEvent struct {
 }
 
 type ProviderToolCallDelta struct {
-	Index          int
-	ID             string
-	Name           string
+	Index int
+	ID    string
+	Name  string
+	// Namespace is Responses API metadata that is not part of the Chat
+	// Completions wire format. It is restored from the request tool when the
+	// provider returns only a bare function name.
+	Namespace      string
 	ArgumentsDelta string
 }
 
@@ -152,6 +162,7 @@ type ToolCallRecord struct {
 	ItemID      string
 	ID          string
 	Name        string
+	Namespace   string
 	Arguments   string
 	Status      string
 	Type        string
@@ -219,6 +230,8 @@ type ChatTool struct {
 	Type       string       `json:"type"`
 	Function   ChatFunction `json:"function"`
 	SourceType string       `json:"-"`
+	// Namespace is internal metadata. Never send it to a Chat provider.
+	Namespace string `json:"-"`
 }
 
 type ChatFunction struct {

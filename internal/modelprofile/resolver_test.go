@@ -84,6 +84,23 @@ func TestResolveStructuredModelInheritsProviderCredentialAndPolicies(t *testing.
 	}
 }
 
+func TestResolveStructuredModelAppliesProfileReasoningOverride(t *testing.T) {
+	yes := true
+	cfg := config.Config{ModelConfigVersion: 1,
+		ModelCredentials: map[string]config.ModelCredential{"p-key": {APIKeyRef: "env:P_KEY"}},
+		ModelProviders:   map[string]config.ModelProvider{"p": {Protocol: "chat-completions", BaseURL: "https://p.example.invalid/v1", Credential: "p-key"}},
+		Models:           map[string]config.ModelDefinition{"p/model": {Provider: "p", UpstreamModel: "vendor/model", Capabilities: config.ModelCapabilities{Reasoning: &yes}, Reasoning: config.ModelReasoningPolicy{SupportedEfforts: []string{"low", "high"}, DefaultEffort: "low", EffortMap: map[string]string{"high": "medium"}}}},
+		ModelProfiles:    map[string]config.ModelProfile{"p/model": {Provider: "p", Model: "p/model", Credential: "p-key", DefaultReasoningEffort: "high", SupportedReasoningEfforts: []string{"high"}, ReasoningEffortMap: map[string]string{"high": "max"}, Revision: 1}},
+	}
+	got, err := Resolve(cfg, "p/model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider.DefaultReasoningEffort != "high" || got.Model.ReasoningPolicy.DefaultEffort != "high" || got.Model.ReasoningPolicy.EffortMap["high"] != "max" || len(got.Model.ReasoningPolicy.SupportedEfforts) != 1 {
+		t.Fatalf("profile reasoning override was ignored: provider=%#v model=%#v", got.Provider, got.Model)
+	}
+}
+
 func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 	now := time.Now()
 	cfg := config.Config{

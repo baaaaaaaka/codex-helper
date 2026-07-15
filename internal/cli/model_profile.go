@@ -415,7 +415,12 @@ func runModelProfileDoctor(out io.Writer, store *config.Store, name string) erro
 			_, _ = fmt.Fprintf(out, "OK  model %s\n", resolved.SelectedPublicModel())
 			_, _ = fmt.Fprintf(out, "OK  base URL configured fingerprint=%s\n", modelprofile.BaseURLHash(resolved.Provider.BaseURL))
 			if resolved.Provider.DisableHostedWebSearch {
-				_, _ = fmt.Fprintf(out, "OK  web search fallback %s reasoning=high mode=live\n", codexWebSearchFallbackModel)
+				enabled, fallbackModel, fallbackEffort := webSearchFallbackForModel(resolved.Model.SearchPolicy)
+				if enabled {
+					_, _ = fmt.Fprintf(out, "OK  web search fallback %s reasoning=%s mode=live\n", fallbackModel, fallbackEffort)
+				} else {
+					_, _ = fmt.Fprintln(out, "OK  web search fallback disabled by model policy")
+				}
 			}
 		}
 	}

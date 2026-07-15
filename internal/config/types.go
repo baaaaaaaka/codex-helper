@@ -64,10 +64,14 @@ type GlobalDefaults struct {
 const CurrentModelConfigVersion = 1
 
 type ModelSource struct {
+	Kind                    string    `json:"kind,omitempty"` // git, file, or directory
 	URL                     string    `json:"url"`
+	Path                    string    `json:"path,omitempty"`
 	Ref                     string    `json:"ref,omitempty"`
 	File                    string    `json:"file,omitempty"`
+	Manifest                string    `json:"manifest,omitempty"`
 	Revision                string    `json:"revision,omitempty"`
+	Digest                  string    `json:"digest,omitempty"`
 	SyncedAt                time.Time `json:"syncedAt,omitempty"`
 	BackupActive            bool      `json:"backupActive,omitempty"`
 	BackupSince             time.Time `json:"backupSince,omitempty"`
@@ -106,11 +110,23 @@ type ModelHTTPPolicy struct {
 }
 
 type ModelStreamPolicy struct {
-	UpstreamMode           string `json:"upstreamMode,omitempty"`
-	Format                 string `json:"format,omitempty"`
-	IdleTimeoutSeconds     int    `json:"idleTimeoutSeconds,omitempty"`
+	UpstreamMode       string `json:"upstreamMode,omitempty"`
+	Format             string `json:"format,omitempty"`
+	IdleTimeoutSeconds int    `json:"idleTimeoutSeconds,omitempty"`
+	// FirstEventTimeoutSeconds bounds the time to the first semantic provider
+	// event. Transport heartbeats/comments do not satisfy this bound.
+	FirstEventTimeoutSeconds int `json:"firstEventTimeoutSeconds,omitempty"`
+	// SemanticProgressTimeoutSeconds distinguishes a live transport from a
+	// provider that is no longer producing reasoning, text, tools, or usage.
+	SemanticProgressTimeoutSeconds int `json:"semanticProgressTimeoutSeconds,omitempty"`
+	// MaxDurationSeconds is a hard wall-clock deadline for a streamed request.
+	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
+	// HeartbeatMode is ignore, transport-only, or semantic. The latter lets
+	// provider-declared SSE heartbeats reset semantic-progress watchdogs.
+	HeartbeatMode          string `json:"heartbeatMode,omitempty"`
 	SynthesizeResponsesSSE *bool  `json:"synthesizeResponsesSSE,omitempty"`
 	ReasoningDeltaPath     string `json:"reasoningDeltaPath,omitempty"`
+	ReasoningTokensPath    string `json:"reasoningTokensPath,omitempty"`
 	CachedTokensPath       string `json:"cachedTokensPath,omitempty"`
 }
 
@@ -134,6 +150,21 @@ type ModelCapabilities struct {
 	Reasoning        *bool `json:"reasoning,omitempty"`
 	ReasoningSummary *bool `json:"reasoningSummary,omitempty"`
 	NativeWebSearch  *bool `json:"nativeWebSearch,omitempty"`
+}
+
+// ModelCapabilityModes preserves the provider-facing implementation mode that
+// a schema-v2 catalog declared. The legacy boolean fields above answer whether
+// a capability is usable; these fields retain whether it is native, translated
+// by CXP, supplied by a plugin, advisory only, unsupported, or explicitly
+// unknown. Keeping both lets runtime code fail closed without losing the
+// declaration needed by catalog/status tooling.
+type ModelCapabilityModes struct {
+	Tools            string `json:"tools,omitempty"`
+	ParallelTools    string `json:"parallelTools,omitempty"`
+	Vision           string `json:"vision,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningSummary string `json:"reasoningSummary,omitempty"`
+	WebSearch        string `json:"webSearch,omitempty"`
 }
 
 type ModelLimits struct {
@@ -160,6 +191,7 @@ type ModelReasoningPolicy struct {
 type ModelToolPolicy struct {
 	ToolChoice            string `json:"toolChoice,omitempty"`
 	Parallel              string `json:"parallel,omitempty"`
+	ParallelEnforcement   string `json:"parallelEnforcement,omitempty"`
 	StrictSchema          string `json:"strictSchema,omitempty"`
 	EmptyAssistantContent string `json:"emptyAssistantContent,omitempty"`
 	InvalidArguments      string `json:"invalidArguments,omitempty"`
@@ -168,6 +200,28 @@ type ModelToolPolicy struct {
 	ToolNameMaxLength     int    `json:"toolNameMaxLength,omitempty"`
 	ValidateArguments     *bool  `json:"validateArguments,omitempty"`
 	CustomToolMode        string `json:"customToolMode,omitempty"`
+}
+
+// ModelStructuredOutputPolicy records each Responses structured-output
+// format independently. Providers often support json_schema while returning
+// unusable output for json_object.
+type ModelStructuredOutputPolicy struct {
+	JSONObject string `json:"jsonObject,omitempty"`
+	JSONSchema string `json:"jsonSchema,omitempty"`
+}
+
+type ModelResponsesPolicy struct {
+	StructuredOutput ModelStructuredOutputPolicy `json:"structuredOutput,omitempty"`
+}
+
+// ModelRoute identifies the wire interface used for one operation. Routes
+// are kept separate from provider transport defaults so a future operation-
+// aware dispatcher can select an adapter without guessing from model names.
+type ModelRoute struct {
+	Interface  string `json:"interface"`
+	Adapter    string `json:"adapter"`
+	Protocol   string `json:"protocol"`
+	Conversion string `json:"conversion,omitempty"`
 }
 
 type ModelMessagePolicy struct {
@@ -201,22 +255,25 @@ type ModelSearchFallback struct {
 }
 
 type ModelDefinition struct {
-	Provider      string               `json:"provider"`
-	UpstreamModel string               `json:"upstreamModel"`
-	DisplayName   string               `json:"displayName,omitempty"`
-	Aliases       []string             `json:"aliases,omitempty"`
-	Description   string               `json:"description,omitempty"`
-	Priority      int                  `json:"priority,omitempty"`
-	Capabilities  ModelCapabilities    `json:"capabilities,omitempty"`
-	Limits        ModelLimits          `json:"limits,omitempty"`
-	Reasoning     ModelReasoningPolicy `json:"reasoning,omitempty"`
-	Tools         ModelToolPolicy      `json:"tools,omitempty"`
-	Messages      ModelMessagePolicy   `json:"messages,omitempty"`
-	Sampling      ModelSamplingPolicy  `json:"sampling,omitempty"`
-	Stream        ModelStreamPolicy    `json:"stream,omitempty"`
-	HTTP          ModelHTTPPolicy      `json:"http,omitempty"`
-	Cache         ModelCachePolicy     `json:"cache,omitempty"`
-	Search        ModelSearchPolicy    `json:"search,omitempty"`
+	Provider        string                `json:"provider"`
+	UpstreamModel   string                `json:"upstreamModel"`
+	DisplayName     string                `json:"displayName,omitempty"`
+	Aliases         []string              `json:"aliases,omitempty"`
+	Description     string                `json:"description,omitempty"`
+	Priority        int                   `json:"priority,omitempty"`
+	Capabilities    ModelCapabilities     `json:"capabilities,omitempty"`
+	CapabilityModes ModelCapabilityModes  `json:"capabilityModes,omitempty"`
+	Limits          ModelLimits           `json:"limits,omitempty"`
+	Reasoning       ModelReasoningPolicy  `json:"reasoning,omitempty"`
+	Tools           ModelToolPolicy       `json:"tools,omitempty"`
+	Messages        ModelMessagePolicy    `json:"messages,omitempty"`
+	Sampling        ModelSamplingPolicy   `json:"sampling,omitempty"`
+	Stream          ModelStreamPolicy     `json:"stream,omitempty"`
+	HTTP            ModelHTTPPolicy       `json:"http,omitempty"`
+	Cache           ModelCachePolicy      `json:"cache,omitempty"`
+	Responses       ModelResponsesPolicy  `json:"responses,omitempty"`
+	Routes          map[string]ModelRoute `json:"routes,omitempty"`
+	Search          ModelSearchPolicy     `json:"search,omitempty"`
 }
 
 // TeamsCodexPathPolicy controls which executable search path is exposed to

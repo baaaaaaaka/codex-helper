@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -34,6 +35,8 @@ const (
 	codexWebSearchFallbackAgentName  = "gpt_search"
 	codexWebSearchFallbackModel      = "gpt-5.6-luna"
 	codexWebSearchFallbackConfigName = "gpt-search.toml"
+	codexWebSearchRuntimeDirName     = "runtime"
+	codexWebSearchRuntimePrefix      = "web-search-"
 )
 
 const codexWebSearchFallbackAgentDescription = "Use this agent only for live web research when the current model cannot search the web. Give it the standalone search task without parent conversation context, wait for completion, and use its cited answer."
@@ -200,24 +203,27 @@ func prepareCodexModelProfileForRun(
 }
 
 type codexModelProfileLaunch struct {
-	Enabled                bool
-	Unified                bool
-	Name                   string
-	ProviderID             string
-	Model                  string
-	ReasoningEffort        string
-	BaseURL                string
-	ProxyKey               string
-	Revision               int
-	ProviderName           string
-	CatalogPath            string
-	CatalogJSON            []byte
-	WebSearchFallbackPath  string
-	WebSearchFallbackTOML  []byte
-	Direct                 bool
-	Native                 bool
-	DisableHostedWebSearch bool
-	EnvKey                 string
+	Enabled                  bool
+	Unified                  bool
+	Name                     string
+	ProviderID               string
+	Model                    string
+	ReasoningEffort          string
+	BaseURL                  string
+	ProxyKey                 string
+	Revision                 int
+	ProviderName             string
+	CatalogPath              string
+	CatalogJSON              []byte
+	WebSearchFallbackPath    string
+	WebSearchFallbackTOML    []byte
+	WebSearchFallbackModel   string
+	WebSearchFallbackEffort  string
+	WebSearchFallbackEnabled bool
+	Direct                   bool
+	Native                   bool
+	DisableHostedWebSearch   bool
+	EnvKey                   string
 }
 
 func (l codexModelProfileLaunch) effectiveEnvKey() string {
@@ -225,6 +231,19 @@ func (l codexModelProfileLaunch) effectiveEnvKey() string {
 		return strings.TrimSpace(l.EnvKey)
 	}
 	return envCXPResponsesProxyKey
+}
+
+func webSearchFallbackForModel(policy config.ModelSearchPolicy) (bool, string, string) {
+	enabled := policy.Fallback.Enabled == nil || *policy.Fallback.Enabled
+	model := strings.TrimSpace(policy.Fallback.Model)
+	if model == "" {
+		model = codexWebSearchFallbackModel
+	}
+	effort := strings.TrimSpace(policy.Fallback.Effort)
+	if effort == "" {
+		effort = "high"
+	}
+	return enabled, model, effort
 }
 
 func startModelProfileAdapterForCodex(
@@ -322,9 +341,21 @@ func startModelProfileAdapterForCodex(
 	}
 	webSearchFallbackPath := ""
 	webSearchFallbackTOML := []byte(nil)
-	if resolved.Provider.DisableHostedWebSearch {
-		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
-		webSearchFallbackPath, err = writeCodexWebSearchFallbackRoleConfig(catalogPath, webSearchFallbackTOML)
+	fallbackCleanup := func() {}
+	fallbackRuntimeCommitted := false
+	defer func() {
+		if !fallbackRuntimeCommitted {
+			fallbackCleanup()
+		}
+	}()
+	var launchIdentity *execIdentity
+	if invocation, ok := codexInvocationFromContext(ctx); ok {
+		launchIdentity = invocation.Identity
+	}
+	fallbackEnabled, fallbackModel, fallbackEffort := webSearchFallbackForModel(resolved.Model.SearchPolicy)
+	if resolved.Provider.DisableHostedWebSearch && fallbackEnabled {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(fallbackModel, fallbackEffort)
+		webSearchFallbackPath, fallbackCleanup, err = writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath, webSearchFallbackTOML, launchIdentity)
 		if err != nil {
 			return codexModelProfileLaunch{}, nil, err
 		}
@@ -344,23 +375,30 @@ func startModelProfileAdapterForCodex(
 		if log != nil {
 			_, _ = fmt.Fprintf(log, "using model profile %q through the native Responses compatibility proxy at %s\n", resolved.Name, baseURL)
 		}
+		fallbackRuntimeCommitted = true
 		return applyGlobalDefaults(codexModelProfileLaunch{
-			Enabled:                true,
-			Direct:                 true,
-			DisableHostedWebSearch: resolved.Provider.DisableHostedWebSearch,
-			Name:                   resolved.Name,
-			ProviderID:             resolved.Provider.ID,
-			Model:                  resolved.SelectedPublicModel(),
-			BaseURL:                baseURL,
-			ProxyKey:               proxyKey,
-			Revision:               resolved.Revision(),
-			ProviderName:           resolved.Provider.DisplayName,
-			CatalogPath:            catalogPath,
-			CatalogJSON:            catalogJSON,
-			WebSearchFallbackPath:  webSearchFallbackPath,
-			WebSearchFallbackTOML:  webSearchFallbackTOML,
-			EnvKey:                 envCXPResponsesProxyKey,
-		}), proxyCleanup, nil
+				Enabled:                  true,
+				Direct:                   true,
+				DisableHostedWebSearch:   resolved.Provider.DisableHostedWebSearch,
+				Name:                     resolved.Name,
+				ProviderID:               resolved.Provider.ID,
+				Model:                    resolved.SelectedPublicModel(),
+				BaseURL:                  baseURL,
+				ProxyKey:                 proxyKey,
+				Revision:                 resolved.Revision(),
+				ProviderName:             resolved.Provider.DisplayName,
+				CatalogPath:              catalogPath,
+				CatalogJSON:              catalogJSON,
+				WebSearchFallbackPath:    webSearchFallbackPath,
+				WebSearchFallbackTOML:    webSearchFallbackTOML,
+				WebSearchFallbackModel:   fallbackModel,
+				WebSearchFallbackEffort:  fallbackEffort,
+				WebSearchFallbackEnabled: fallbackEnabled,
+				EnvKey:                   envCXPResponsesProxyKey,
+			}), func() {
+				proxyCleanup()
+				fallbackCleanup()
+			}, nil
 	}
 	proxyKey, err := ids.New()
 	if err != nil {
@@ -402,14 +440,17 @@ func startModelProfileAdapterForCodex(
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,
 		Providers: []responsesadapter.ProviderConfig{{
-			ID:             resolved.Provider.ID,
-			ProfileID:      resolved.Provider.AdapterProfile,
-			BaseURL:        resolved.Provider.BaseURL,
-			APIKey:         apiKey,
-			DefaultModel:   resolved.SelectedPublicModel(),
-			Models:         responsesAdapterModelsForProvider(resolved.Provider),
-			Adapter:        adapter,
-			CustomToolMode: selectedModel.ToolPolicy.CustomToolMode,
+			ID:                      resolved.Provider.ID,
+			ProfileID:               resolved.Provider.AdapterProfile,
+			BaseURL:                 resolved.Provider.BaseURL,
+			APIKey:                  apiKey,
+			DefaultModel:            resolved.SelectedPublicModel(),
+			Models:                  responsesAdapterModelsForProvider(resolved.Provider),
+			Adapter:                 adapter,
+			Route:                   responsesRouteForModel(selectedModel),
+			CustomToolMode:          selectedModel.ToolPolicy.CustomToolMode,
+			ParallelToolEnforcement: selectedModel.ToolPolicy.ParallelEnforcement,
+			ResponsesPolicy:         selectedModel.ResponsesPolicy,
 		}},
 		ProxyKeys: map[string]string{proxyKey: resolved.Provider.ID},
 		KeySalt:   resolved.Name + ":" + strconv.Itoa(resolved.Revision()),
@@ -434,6 +475,7 @@ func startModelProfileAdapterForCodex(
 		_ = server.Shutdown(shutdownCtx)
 		<-done
 		storeCleanup()
+		fallbackCleanup()
 	}
 	if err := ctx.Err(); err != nil {
 		cleanup()
@@ -443,20 +485,24 @@ func startModelProfileAdapterForCodex(
 	if log != nil {
 		_, _ = fmt.Fprintf(log, "using model profile %q through local Responses adapter at %s\n", resolved.Name, baseURL)
 	}
+	fallbackRuntimeCommitted = true
 	return applyGlobalDefaults(codexModelProfileLaunch{
-		Enabled:               true,
-		Name:                  resolved.Name,
-		ProviderID:            resolved.Provider.ID,
-		Model:                 resolved.SelectedPublicModel(),
-		BaseURL:               baseURL,
-		ProxyKey:              proxyKey,
-		Revision:              resolved.Revision(),
-		ProviderName:          resolved.Provider.DisplayName,
-		CatalogPath:           catalogPath,
-		CatalogJSON:           catalogJSON,
-		WebSearchFallbackPath: webSearchFallbackPath,
-		WebSearchFallbackTOML: webSearchFallbackTOML,
-		EnvKey:                envCXPResponsesProxyKey,
+		Enabled:                  true,
+		Name:                     resolved.Name,
+		ProviderID:               resolved.Provider.ID,
+		Model:                    resolved.SelectedPublicModel(),
+		BaseURL:                  baseURL,
+		ProxyKey:                 proxyKey,
+		Revision:                 resolved.Revision(),
+		ProviderName:             resolved.Provider.DisplayName,
+		CatalogPath:              catalogPath,
+		CatalogJSON:              catalogJSON,
+		WebSearchFallbackPath:    webSearchFallbackPath,
+		WebSearchFallbackTOML:    webSearchFallbackTOML,
+		WebSearchFallbackModel:   fallbackModel,
+		WebSearchFallbackEffort:  fallbackEffort,
+		WebSearchFallbackEnabled: fallbackEnabled,
+		EnvKey:                   envCXPResponsesProxyKey,
 	}), cleanup, nil
 }
 
@@ -472,6 +518,11 @@ func configureOpenAIChatAdapterHTTP(adapter *responsesadapter.OpenAIChatAdapter,
 	adapter.RetryTransportErrors = policy.RetryTransportErrors
 	adapter.ResponseHeaderTimeout = time.Duration(policy.ResponseHeaderTimeoutSeconds) * time.Second
 	adapter.StreamIdleTimeout = time.Duration(stream.IdleTimeoutSeconds) * time.Second
+	adapter.FirstEventTimeout = time.Duration(stream.FirstEventTimeoutSeconds) * time.Second
+	adapter.SemanticProgressTimeout = time.Duration(stream.SemanticProgressTimeoutSeconds) * time.Second
+	adapter.MaxDuration = time.Duration(stream.MaxDurationSeconds) * time.Second
+	adapter.HeartbeatMode = stream.HeartbeatMode
+	adapter.ReasoningTokensPath = stream.ReasoningTokensPath
 	if policy.MaxConcurrentRequests > 0 {
 		adapter.RequestGate = make(chan struct{}, policy.MaxConcurrentRequests)
 	}
@@ -582,9 +633,20 @@ func startConfiguredUnifiedModelGateway(
 	if err != nil {
 		return codexModelProfileLaunch{}, nil, err
 	}
+	fallbackCleanup := func() {}
+	fallbackRuntimeCommitted := false
+	defer func() {
+		if !fallbackRuntimeCommitted {
+			fallbackCleanup()
+		}
+	}()
+	var launchIdentity *execIdentity
+	if invocation, ok := codexInvocationFromContext(ctx); ok {
+		launchIdentity = invocation.Identity
+	}
 	cleanup := func() {
 		gatewayCleanup()
-		_ = os.Remove(filepath.Join(filepath.Dir(catalogPath), codexWebSearchFallbackConfigName))
+		fallbackCleanup()
 	}
 	launch := codexModelProfileLaunch{
 		Enabled:      true,
@@ -604,9 +666,10 @@ func startConfiguredUnifiedModelGateway(
 	if !selected.IsDefault() {
 		launch.Name = selected.Name
 		launch.DisableHostedWebSearch = selected.Provider.DisableHostedWebSearch
-		if launch.DisableHostedWebSearch {
-			launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
-			launch.WebSearchFallbackPath, err = writeCodexWebSearchFallbackRoleConfig(catalogPath, launch.WebSearchFallbackTOML)
+		launch.WebSearchFallbackEnabled, launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort = webSearchFallbackForModel(selected.Model.SearchPolicy)
+		if launch.DisableHostedWebSearch && launch.WebSearchFallbackEnabled {
+			launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort)
+			launch.WebSearchFallbackPath, fallbackCleanup, err = writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath, launch.WebSearchFallbackTOML, launchIdentity)
 			if err != nil {
 				cleanup()
 				return codexModelProfileLaunch{}, nil, err
@@ -617,6 +680,7 @@ func startConfiguredUnifiedModelGateway(
 		cleanup()
 		return codexModelProfileLaunch{}, nil, err
 	}
+	fallbackRuntimeCommitted = true
 	return launch, cleanup, nil
 }
 
@@ -807,24 +871,71 @@ func writeCodexModelProfileCatalog(store *config.Store, resolved modelprofile.Re
 }
 
 func writeCodexWebSearchFallbackRoleConfig(catalogPath string, configTOML []byte) (string, error) {
+	path, _, err := writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath, configTOML, nil)
+	return path, err
+}
+
+func writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath string, configTOML []byte, identity *execIdentity) (string, func(), error) {
 	if strings.TrimSpace(catalogPath) == "" || len(configTOML) == 0 {
-		return "", nil
+		return "", func() {}, nil
 	}
-	path := filepath.Join(filepath.Dir(catalogPath), codexWebSearchFallbackConfigName)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", err
+	root := filepath.Join(filepath.Dir(catalogPath), codexWebSearchRuntimeDirName)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", func() {}, err
 	}
-	if err := os.WriteFile(path, configTOML, 0o600); err != nil {
-		return "", err
+	if err := os.Chmod(root, 0o700); err != nil && runtime.GOOS != "windows" {
+		return "", func() {}, fmt.Errorf("secure web-search runtime root: %w", err)
 	}
-	return path, nil
+	if err := ensurePathOwnedByIdentity(root, identity); err != nil {
+		return "", func() {}, fmt.Errorf("set web-search runtime ownership: %w", err)
+	}
+	launchID, err := ids.New()
+	if err != nil {
+		return "", func() {}, err
+	}
+	runtimeDir := filepath.Join(root, codexWebSearchRuntimePrefix+launchID)
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		return "", func() {}, fmt.Errorf("create web-search runtime directory: %w", err)
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil && runtime.GOOS != "windows" {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, fmt.Errorf("secure web-search runtime directory: %w", err)
+	}
+	if err := ensurePathOwnedByIdentity(runtimeDir, identity); err != nil {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, fmt.Errorf("set web-search runtime directory ownership: %w", err)
+	}
+	path := filepath.Join(runtimeDir, codexWebSearchFallbackConfigName)
+	if err := writeFileAtomicallyForIdentity(path, configTOML, 0o600, identity); err != nil {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, err
+	}
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			_ = os.RemoveAll(runtimeDir)
+		})
+	}
+	return path, cleanup, nil
 }
 
 func codexWebSearchFallbackRoleConfigTOML() []byte {
+	return codexWebSearchFallbackRoleConfigTOMLFor(codexWebSearchFallbackModel, "high")
+}
+
+func codexWebSearchFallbackRoleConfigTOMLFor(model, effort string) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = codexWebSearchFallbackModel
+	}
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		effort = "high"
+	}
 	lines := []string{
 		`model_provider = "openai"`,
-		`model = "` + codexWebSearchFallbackModel + `"`,
-		`model_reasoning_effort = "high"`,
+		`model = "` + tomlEscapeString(model) + `"`,
+		`model_reasoning_effort = "` + tomlEscapeString(effort) + `"`,
 		`web_search = "live"`,
 		`sandbox_mode = "read-only"`,
 		`approval_policy = "never"`,
@@ -856,6 +967,11 @@ func responsesAdapterModelsForProvider(provider modelprofile.ProviderSpec) []res
 		})
 	}
 	return out
+}
+
+func responsesRouteForModel(model modelprofile.ModelSpec) config.ModelRoute {
+	route, _ := model.Route("responses")
+	return route
 }
 
 func modelProfileCatalogFingerprint(provider modelprofile.ProviderSpec) string {
@@ -1100,6 +1216,7 @@ func appendCodexModelProfileArgs(cmdArgs []string, launch codexModelProfileLaunc
 		overrides = append(overrides, `web_search="disabled"`)
 		if strings.TrimSpace(launch.WebSearchFallbackPath) != "" {
 			overrides = append(overrides,
+				`features.multi_agent_v2.enabled=true`,
 				`features.multi_agent_v2.hide_spawn_agent_metadata=false`,
 				`features.multi_agent_v2.root_agent_usage_hint_text="`+tomlEscapeString(codexWebSearchFallbackRootHint)+`"`,
 				`agents.`+codexWebSearchFallbackAgentName+`.description="`+tomlEscapeString(codexWebSearchFallbackAgentDescription)+`"`,

@@ -346,19 +346,16 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 				metadata = item
 			}
 		}
-		value, err := b.readClient().GetSharedDriveItemContentWithoutRateLimitRetry(ctx, attachment.ContentURL)
+		originalName := bestReferenceAttachmentName(attachment.Name, metadata.Name)
+		contentTypeHint := preferredAttachmentContentType("", driveItemMimeType(metadata), attachment.ContentType, originalName)
+		name := referenceAttachmentLocalName(dir, originalName, contentTypeHint, i+1, usedNames)
+		path := filepath.Join(dir, name)
+		contentType, _, err := b.readClient().DownloadSharedDriveItemContentToFileWithoutRateLimitRetry(ctx, attachment.ContentURL, path)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
 		}
-		originalName := bestReferenceAttachmentName(attachment.Name, metadata.Name)
-		contentType := preferredAttachmentContentType(value.ContentType, driveItemMimeType(metadata), attachment.ContentType, originalName)
-		name := referenceAttachmentLocalName(dir, originalName, contentType, i+1, usedNames)
-		path := filepath.Join(dir, name)
-		if err := writePrivateFile(path, value.Bytes); err != nil {
-			cleanup()
-			return nil, func() {}, "", err
-		}
+		contentType = preferredAttachmentContentType(contentType, driveItemMimeType(metadata), attachment.ContentType, originalName)
 		files = append(files, LocalAttachment{
 			Path:         path,
 			PromptPath:   promptAttachmentPath(session, path),

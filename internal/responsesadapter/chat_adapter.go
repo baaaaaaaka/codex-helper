@@ -15,28 +15,36 @@ import (
 )
 
 type OpenAIChatAdapter struct {
-	BaseURL               string
-	APIKey                string
-	Profile               ProviderProfile
-	HTTPClient            *http.Client
-	MaxRetries            int
-	MaxRetriesSet         bool
-	RetryBase             time.Duration
-	RetryStatuses         []int
-	HonorRetryAfter       *bool
-	RetryTransportErrors  *bool
-	ResponseHeaderTimeout time.Duration
-	StreamIdleTimeout     time.Duration
-	Status                func(string)
-	MaxOutputTokens       int
-	Headers               map[string]string
-	AuthType              string
-	AuthHeader            string
-	StreamMode            string
-	ReasoningDeltaPath    string
-	CachedTokensPath      string
-	UsageField            string
-	RequestGate           chan struct{}
+	BaseURL                 string
+	APIKey                  string
+	Profile                 ProviderProfile
+	HTTPClient              *http.Client
+	MaxRetries              int
+	MaxRetriesSet           bool
+	RetryBase               time.Duration
+	RetryStatuses           []int
+	HonorRetryAfter         *bool
+	RetryTransportErrors    *bool
+	ResponseHeaderTimeout   time.Duration
+	StreamIdleTimeout       time.Duration
+	FirstEventTimeout       time.Duration
+	SemanticProgressTimeout time.Duration
+	MaxDuration             time.Duration
+	Status                  func(string)
+	MaxOutputTokens         int
+	Headers                 map[string]string
+	AuthType                string
+	AuthHeader              string
+	StreamMode              string
+	// HeartbeatMode controls how SSE comment heartbeats affect watchdogs:
+	// ignore counts only semantic events, transport-only keeps the transport
+	// timer alive, and semantic also counts heartbeats as semantic progress.
+	HeartbeatMode       string
+	ReasoningDeltaPath  string
+	ReasoningTokensPath string
+	CachedTokensPath    string
+	UsageField          string
+	RequestGate         chan struct{}
 }
 
 type chatCompletionRequest struct {
@@ -52,6 +60,7 @@ type chatCompletionRequest struct {
 	TopP                *float64           `json:"top_p,omitempty"`
 	Stream              bool               `json:"stream"`
 	StreamOptions       *chatStreamOptions `json:"stream_options,omitempty"`
+	ResponseFormat      json.RawMessage    `json:"response_format,omitempty"`
 }
 
 type thinkingConfig struct {
@@ -84,14 +93,16 @@ type chatImageURL struct {
 }
 
 type chatMessageToolCall struct {
-	ID       string           `json:"id"`
-	Type     string           `json:"type"`
-	Function chatToolFunction `json:"function"`
+	ID        string           `json:"id"`
+	Type      string           `json:"type"`
+	Namespace string           `json:"namespace,omitempty"`
+	Function  chatToolFunction `json:"function"`
 }
 
 type chatToolFunction struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+	Namespace string `json:"namespace,omitempty"`
 }
 
 func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-chan ProviderEvent, error) {
@@ -107,6 +118,7 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 		ReasoningEffort:     profile.reasoningEffort(req.ReasoningEffort),
 		Temperature:         req.Temperature,
 		TopP:                req.TopP,
+		ResponseFormat:      req.ResponseFormat,
 		Stream:              !buffered,
 	}
 	if a.MaxOutputTokens > 0 && (body.MaxCompletionTokens == nil || *body.MaxCompletionTokens > a.MaxOutputTokens) {
@@ -172,10 +184,10 @@ func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-c
 		defer resp.Body.Close()
 		defer releaseGate()
 		if buffered {
-			parseBufferedChatCompletion(ctx, resp.Body, ch, profile.ValidateToolArguments, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
+			parseBufferedChatCompletion(ctx, resp.Body, ch, profile.ValidateToolArguments, profile.PlainTextToolCall, a.reasoningPath(profile), a.cachedUsagePath(), a.reasoningTokensPath(), a.Status)
 			return
 		}
-		parseChatCompletionSSEWithPolicy(ctx, resp.Body, ch, profile.ValidateToolArguments, a.StreamIdleTimeout, a.reasoningPath(profile), a.cachedUsagePath(), a.Status)
+		parseChatCompletionSSEWithPolicy(ctx, resp.Body, ch, profile.ValidateToolArguments, profile.PlainTextToolCall, a.heartbeatMode(), a.StreamIdleTimeout, a.FirstEventTimeout, a.SemanticProgressTimeout, a.MaxDuration, a.reasoningPath(profile), a.cachedUsagePath(), a.reasoningTokensPath(), a.Status)
 	}()
 	return ch, nil
 }
@@ -206,7 +218,7 @@ func (m *chatBufferedMessage) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &m.Raw)
 }
 
-func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string)) {
+func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, plainTextToolCall, reasoningPath, cachedTokensPath, reasoningTokensPath string, status func(string)) {
 	var completion bufferedChatCompletion
 	if err := json.NewDecoder(body).Decode(&completion); err != nil {
 		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("invalid buffered chat completion: %w", err)}
@@ -227,6 +239,10 @@ func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<-
 		out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: reasoning}
 	}
 	if choice.Message.Content != "" {
+		if plainTextToolCall == "reject" && containsPlainTextToolCall(choice.Message.Content) {
+			out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned a plain-text tool call that the configured route rejects")}
+			return
+		}
 		parser := newInlineThinkParser()
 		emitSplitText(out, parser.feed(choice.Message.Content))
 		emitSplitText(out, parser.flush())
@@ -237,11 +253,13 @@ func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<-
 			return
 		}
 		out <- ProviderEvent{Kind: ProviderEventToolCallDelta, ToolCall: &ProviderToolCallDelta{
-			Index: index, ID: call.ID, Name: call.Function.Name, ArgumentsDelta: call.Function.Arguments,
+			Index: index, ID: call.ID, Name: call.Function.Name,
+			Namespace:      firstNonEmpty(call.Namespace, call.Function.Namespace),
+			ArgumentsDelta: call.Function.Arguments,
 		}}
 	}
 	if completion.Usage != nil {
-		out <- ProviderEvent{Kind: ProviderEventUsage, Usage: completion.Usage.toUsage(cachedTokensPath, status)}
+		out <- ProviderEvent{Kind: ProviderEventUsage, Usage: completion.Usage.toUsage(cachedTokensPath, reasoningTokensPath, status)}
 	}
 	out <- ProviderEvent{Kind: ProviderEventDone, FinishReason: choice.FinishReason}
 }
@@ -258,6 +276,24 @@ func (a OpenAIChatAdapter) cachedUsagePath() string {
 		return value
 	}
 	return strings.TrimSpace(a.UsageField)
+}
+
+func (a OpenAIChatAdapter) reasoningTokensPath() string {
+	return strings.TrimSpace(a.ReasoningTokensPath)
+}
+
+func (a OpenAIChatAdapter) heartbeatMode() string {
+	switch value := strings.ToLower(strings.TrimSpace(a.HeartbeatMode)); value {
+	case "ignore", "transport-only", "semantic":
+		return value
+	default:
+		return "transport-only"
+	}
+}
+
+func containsPlainTextToolCall(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Contains(value, "<tool_call") || strings.Contains(value, "<|tool_call|") || strings.Contains(value, "<|python_tag|")
 }
 
 // marshalChatCompletionRequest applies model-specific request fragments only
@@ -601,24 +637,28 @@ func chatCompletionsURL(base string) (string, error) {
 }
 
 func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool) {
-	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, 0, "", "", nil)
+	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, "", "transport-only", 0, 0, 0, 0, "", "", "", nil)
 }
 
 func parseChatCompletionSSEWithIdleTimeout(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration) {
-	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, idleTimeout, "", "", nil)
+	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, "", "transport-only", idleTimeout, 0, 0, 0, "", "", "", nil)
 }
 
-func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string)) {
-	scanner := bufio.NewScanner(body)
+func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, plainTextToolCall, heartbeatMode string, idleTimeout, firstEventTimeout, semanticTimeout, maxDuration time.Duration, reasoningPath, cachedTokensPath, reasoningTokensPath string, status func(string)) {
+	progress := watchUpstreamProgress(ctx, body, idleTimeout, firstEventTimeout, semanticTimeout, maxDuration)
+	defer progress.stop()
+	transportTouch := progress.touchTransport
+	if heartbeatMode == "ignore" {
+		transportTouch = nil
+	}
+	reader := activityReader{Reader: body, touch: transportTouch}
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	sawDone := false
 	finishReason := ""
 	inlineThink := newInlineThinkParser()
 	toolArguments := map[int]*strings.Builder{}
-	idleExpired, touchIdleWatch, stopIdleWatch := watchUpstreamStreamIdle(ctx, body, idleTimeout)
-	defer stopIdleWatch()
 	for scanner.Scan() {
-		touchIdleWatch()
 		select {
 		case <-ctx.Done():
 			return
@@ -626,6 +666,9 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, ":") {
+			if heartbeatMode == "semantic" {
+				progress.touchSemantic()
+			}
 			continue
 		}
 		if !strings.HasPrefix(line, "data:") {
@@ -643,6 +686,7 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 			}
 			sawDone = true
 			emitSplitText(out, inlineThink.flush())
+			progress.touchSemantic()
 			out <- ProviderEvent{Kind: ProviderEventDone, FinishReason: finishReason}
 			return
 		}
@@ -657,12 +701,19 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 			}
 			reasoning := firstNonEmptyJSONPath(choice.Delta.Raw, reasoningPath, choice.Delta.ReasoningContent, choice.Delta.Reasoning)
 			if reasoning != "" {
+				progress.touchSemantic()
 				out <- ProviderEvent{Kind: ProviderEventReasoningDelta, Delta: reasoning}
 			}
 			if choice.Delta.Content != "" {
+				if strings.EqualFold(strings.TrimSpace(plainTextToolCall), "reject") && containsPlainTextToolCall(choice.Delta.Content) {
+					out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("provider returned a plain-text tool call that the configured route rejects")}
+					return
+				}
+				progress.touchSemantic()
 				emitSplitText(out, inlineThink.feed(choice.Delta.Content))
 			}
 			for _, toolCall := range choice.Delta.ToolCalls {
+				progress.touchSemantic()
 				arguments := toolArguments[toolCall.Index]
 				if arguments == nil {
 					arguments = &strings.Builder{}
@@ -675,18 +726,20 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 						Index:          toolCall.Index,
 						ID:             toolCall.ID,
 						Name:           toolCall.Function.Name,
+						Namespace:      firstNonEmpty(toolCall.Namespace, toolCall.Function.Namespace),
 						ArgumentsDelta: toolCall.Function.Arguments,
 					},
 				}
 			}
 		}
 		if chunk.Usage != nil {
-			out <- ProviderEvent{Kind: ProviderEventUsage, Usage: chunk.Usage.toUsage(cachedTokensPath, status)}
+			progress.touchSemantic()
+			out <- ProviderEvent{Kind: ProviderEventUsage, Usage: chunk.Usage.toUsage(cachedTokensPath, reasoningTokensPath, status)}
 		}
 	}
 	select {
-	case <-idleExpired:
-		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream idle timeout after %s", effectiveUpstreamStreamIdleTimeout(idleTimeout))}
+	case timeout := <-progress.expired:
+		out <- ProviderEvent{Kind: ProviderEventError, Err: timeout}
 		return
 	default:
 	}
@@ -700,6 +753,141 @@ func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, o
 	if !sawDone {
 		out <- ProviderEvent{Kind: ProviderEventError, Err: fmt.Errorf("upstream chat stream ended before [DONE]")}
 	}
+}
+
+type ProviderTimeoutKind string
+
+const (
+	ProviderTimeoutTransportIdle    ProviderTimeoutKind = "transport_idle_timeout"
+	ProviderTimeoutFirstEvent       ProviderTimeoutKind = "first_event_timeout"
+	ProviderTimeoutSemanticProgress ProviderTimeoutKind = "semantic_progress_timeout"
+	ProviderTimeoutDeadline         ProviderTimeoutKind = "deadline_exceeded"
+)
+
+type ProviderTimeoutError struct {
+	Kind     ProviderTimeoutKind
+	Duration time.Duration
+}
+
+func (e ProviderTimeoutError) Error() string {
+	switch e.Kind {
+	case ProviderTimeoutTransportIdle:
+		return fmt.Sprintf("upstream chat stream idle timeout after %s", e.Duration)
+	case ProviderTimeoutFirstEvent:
+		return fmt.Sprintf("upstream chat stream first semantic event timeout after %s", e.Duration)
+	case ProviderTimeoutSemanticProgress:
+		return fmt.Sprintf("upstream chat stream semantic progress timeout after %s", e.Duration)
+	case ProviderTimeoutDeadline:
+		return fmt.Sprintf("upstream chat stream hard deadline exceeded after %s", e.Duration)
+	default:
+		return fmt.Sprintf("upstream chat stream timeout after %s", e.Duration)
+	}
+}
+
+type activityReader struct {
+	io.Reader
+	touch func()
+}
+
+func (r activityReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && r.touch != nil {
+		r.touch()
+	}
+	return n, err
+}
+
+type upstreamProgressWatch struct {
+	expired        <-chan ProviderTimeoutError
+	touchTransport func()
+	touchSemantic  func()
+	stop           func()
+}
+
+func watchUpstreamProgress(ctx context.Context, body io.Closer, idleTimeout, firstEventTimeout, semanticTimeout, maxDuration time.Duration) upstreamProgressWatch {
+	idleTimeout = effectiveUpstreamStreamIdleTimeout(idleTimeout)
+	if firstEventTimeout <= 0 && semanticTimeout <= 0 && maxDuration <= 0 && idleTimeout <= 0 {
+		return upstreamProgressWatch{expired: make(chan ProviderTimeoutError), touchTransport: func() {}, touchSemantic: func() {}, stop: func() {}}
+	}
+	expired := make(chan ProviderTimeoutError, 1)
+	transport := make(chan struct{}, 1)
+	semantic := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	go func() {
+		start := time.Now()
+		lastTransport := start
+		lastSemantic := start
+		seenSemantic := false
+		interval := 25 * time.Millisecond
+		if maxDuration > 0 && maxDuration < interval {
+			interval = maxDuration / 4
+		}
+		if interval <= 0 {
+			interval = time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		timeout := func(kind ProviderTimeoutKind, duration time.Duration) {
+			select {
+			case expired <- ProviderTimeoutError{Kind: kind, Duration: duration}:
+			default:
+			}
+			_ = body.Close()
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				_ = body.Close()
+				return
+			case <-stop:
+				return
+			case <-transport:
+				lastTransport = time.Now()
+			case <-semantic:
+				lastSemantic = time.Now()
+				seenSemantic = true
+			case now := <-ticker.C:
+				switch {
+				case maxDuration > 0 && now.Sub(start) >= maxDuration:
+					timeout(ProviderTimeoutDeadline, maxDuration)
+					return
+				case firstEventTimeout > 0 && !seenSemantic && now.Sub(start) >= firstEventTimeout:
+					timeout(ProviderTimeoutFirstEvent, firstEventTimeout)
+					return
+				case semanticTimeout > 0 && seenSemantic && now.Sub(lastSemantic) >= semanticTimeout:
+					timeout(ProviderTimeoutSemanticProgress, semanticTimeout)
+					return
+				case idleTimeout > 0 && now.Sub(lastTransport) >= idleTimeout:
+					timeout(ProviderTimeoutTransportIdle, idleTimeout)
+					return
+				}
+			}
+		}
+	}()
+	touchTransport := func() {
+		select {
+		case transport <- struct{}{}:
+		default:
+		}
+	}
+	touchSemantic := func() {
+		select {
+		case transport <- struct{}{}:
+		default:
+		}
+		select {
+		case semantic <- struct{}{}:
+		default:
+		}
+	}
+	stopFn := func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+	}
+	return upstreamProgressWatch{expired: expired, touchTransport: touchTransport, touchSemantic: touchSemantic, stop: stopFn}
 }
 
 func watchUpstreamStreamIdle(ctx context.Context, body io.Closer, configured time.Duration) (<-chan struct{}, func(), func()) {
@@ -778,12 +966,14 @@ type chatCompletionDelta struct {
 }
 
 type chatToolCallDelta struct {
-	Index    int    `json:"index"`
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
+	Index     int    `json:"index"`
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Namespace string `json:"namespace,omitempty"`
+	Function  struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
+		Namespace string `json:"namespace,omitempty"`
 	} `json:"function"`
 }
 
@@ -820,7 +1010,7 @@ func (d *chatCompletionDelta) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &d.Raw)
 }
 
-func (u chatUsage) toUsage(cachedTokensPath string, status func(string)) *Usage {
+func (u chatUsage) toUsage(cachedTokensPath, reasoningTokensPath string, status func(string)) *Usage {
 	result := &Usage{
 		InputTokens:     u.PromptTokens,
 		OutputTokens:    u.CompletionTokens,
@@ -830,6 +1020,9 @@ func (u chatUsage) toUsage(cachedTokensPath string, status func(string)) *Usage 
 	}
 	if value, ok := intAtJSONPath(u.Raw, cachedTokensPath, "usage"); ok {
 		result.CachedTokens = value
+	}
+	if value, ok := intAtJSONPath(u.Raw, reasoningTokensPath, "usage"); ok {
+		result.ReasoningTokens = value
 	}
 	if result.CachedTokens < 0 {
 		warnUsage(status, "upstream reported negative cached token count; clamped to zero")

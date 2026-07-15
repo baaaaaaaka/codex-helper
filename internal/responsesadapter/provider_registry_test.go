@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 func TestProviderRegistryRoutesByModelAndProviderLock(t *testing.T) {
@@ -17,7 +19,7 @@ func TestProviderRegistryRoutesByModelAndProviderLock(t *testing.T) {
 			"all-key": "*",
 		},
 		Providers: []ProviderConfig{
-			{ID: "mimo", ProfileID: "mimo", APIKey: "sk-mimo", DefaultModel: "mimo-v2.5", Models: []ModelInfo{{ID: "mimo-v2.5"}, {ID: "mimo-v2.5-pro"}}, Adapter: fakeAdapter{}},
+			{ID: "mimo", ProfileID: "mimo", APIKey: "sk-mimo", DefaultModel: "mimo-v2.5", Models: []ModelInfo{{ID: "mimo-v2.5"}, {ID: "mimo-v2.5-pro"}}, Adapter: fakeAdapter{}, Route: config.ModelRoute{Interface: "chat", Adapter: "openai-chat", Protocol: "chat-completions"}},
 			{ID: "deepseek", ProfileID: "deepseek", APIKey: "sk-ds", DefaultModel: "deepseek-v4-flash", Models: []ModelInfo{{ID: "deepseek-v4-flash"}}, Adapter: fakeAdapter{}},
 		},
 	})
@@ -28,6 +30,9 @@ func TestProviderRegistryRoutesByModelAndProviderLock(t *testing.T) {
 	}
 	if runtime.ProviderID != "mimo" || runtime.Model != "mimo-v2.5-pro" {
 		t.Fatalf("runtime = %#v", runtime)
+	}
+	if runtime.Route.Adapter != "openai-chat" || runtime.Route.Protocol != "chat-completions" {
+		t.Fatalf("runtime route = %#v", runtime.Route)
 	}
 
 	runtime, err = registry.Resolve(authorizedRequest("ds-key"), ResponsesRequest{})

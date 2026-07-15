@@ -673,12 +673,16 @@ func asciiFoldByte(ch byte) byte {
 }
 
 func ArtifactUploadName(sessionID string, turnID string, name string, data []byte) string {
+	sum := sha256.Sum256(data)
+	return ArtifactUploadNameFromSHA256(sessionID, turnID, name, hex.EncodeToString(sum[:]))
+}
+
+func ArtifactUploadNameFromSHA256(sessionID string, turnID string, name string, sha256Hex string) string {
 	name = safeAttachmentName(path.Base(strings.ReplaceAll(name, "\\", "/")))
 	if name == "" || strings.HasPrefix(name, ".") {
 		name = "artifact"
 	}
-	sum := sha256.Sum256(data)
-	hash := hex.EncodeToString(sum[:])
+	hash := strings.TrimSpace(sha256Hex)
 	if len(hash) > 16 {
 		hash = hash[:16]
 	}

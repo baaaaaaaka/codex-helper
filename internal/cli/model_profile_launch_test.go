@@ -18,6 +18,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -737,6 +738,7 @@ func TestPrepareCodexResponsesCompatibleProfileUsesNativeResponsesAPI(t *testing
 		`model_providers.cxp-unified.base_url="http://127.0.0.1:`,
 		`model_providers.cxp-unified.wire_api="responses"`,
 		`web_search="disabled"`,
+		`features.multi_agent_v2.enabled=true`,
 		`features.multi_agent_v2.hide_spawn_agent_metadata=false`,
 		`agents.gpt_search.description="`,
 		`agents.gpt_search.config_file="`,
@@ -817,6 +819,23 @@ func TestCodexDesktopModelProfileConfigAddsSearchFallbackOnlyWhenNeeded(t *testi
 	}
 }
 
+func TestCodexWebSearchFallbackUsesJSONPolicy(t *testing.T) {
+	enabled, model, effort := webSearchFallbackForModel(config.ModelSearchPolicy{Fallback: config.ModelSearchFallback{Model: "search-model", Effort: "low"}})
+	if !enabled || model != "search-model" || effort != "low" {
+		t.Fatalf("fallback policy = enabled=%v model=%q effort=%q", enabled, model, effort)
+	}
+	raw := string(codexWebSearchFallbackRoleConfigTOMLFor(model, effort))
+	for _, want := range []string{`model = "search-model"`, `model_reasoning_effort = "low"`} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("fallback TOML missing %q:\n%s", want, raw)
+		}
+	}
+	disabled, _, _ := webSearchFallbackForModel(config.ModelSearchPolicy{Fallback: config.ModelSearchFallback{Enabled: boolPtr(false), Model: "search-model", Effort: "low"}})
+	if disabled {
+		t.Fatal("explicitly disabled search fallback was enabled")
+	}
+}
+
 func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testing.T) {
 	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	if err != nil {
@@ -840,7 +859,17 @@ func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testi
 	if err != nil {
 		t.Fatalf("read generated desktop config: %v", err)
 	}
-	fallbackPath := filepath.Join(codexHome, codexWebSearchFallbackConfigName)
+	fallbackPath := ""
+	for _, line := range strings.Split(string(configRaw), "\n") {
+		const prefix = `config_file = "`
+		if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, `"`) {
+			fallbackPath = strings.TrimSuffix(strings.TrimPrefix(line, prefix), `"`)
+			break
+		}
+	}
+	if fallbackPath == "" {
+		t.Fatalf("desktop config omitted fallback path:\n%s", configRaw)
+	}
 	fallbackRaw, err := os.ReadFile(fallbackPath)
 	if err != nil {
 		t.Fatalf("read generated desktop fallback config: %v", err)
@@ -851,12 +880,161 @@ func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testi
 	if !strings.Contains(string(fallbackRaw), `model = "gpt-5.6-luna"`) || strings.Contains(string(fallbackRaw), "example/model") || strings.Contains(string(fallbackRaw), "127.0.0.1") {
 		t.Fatalf("desktop fallback config is missing Luna or leaked parent provider details:\n%s", fallbackRaw)
 	}
+	if filepath.Base(filepath.Dir(fallbackPath)) == "" || filepath.Dir(fallbackPath) == codexHome {
+		t.Fatalf("desktop fallback config is not launch-isolated: %q", fallbackPath)
+	}
 	info, err := os.Stat(fallbackPath)
 	if err != nil {
 		t.Fatalf("stat generated desktop fallback config: %v", err)
 	}
 	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("desktop fallback permissions = %o, want 600", got)
+	}
+}
+
+func TestWriteCodexWebSearchFallbackRoleConfigForLaunchIsolatedAndCleanup(t *testing.T) {
+	catalogPath := filepath.Join(t.TempDir(), "model-profiles", "unified-hash", "catalog.json")
+	pathA, cleanupA, err := writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath, []byte("model = \"search-a\"\n"), nil)
+	if err != nil {
+		t.Fatalf("write fallback A: %v", err)
+	}
+	pathB, cleanupB, err := writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath, []byte("model = \"search-b\"\n"), nil)
+	if err != nil {
+		cleanupA()
+		t.Fatalf("write fallback B: %v", err)
+	}
+	if pathA == pathB || filepath.Dir(pathA) == filepath.Dir(pathB) {
+		cleanupA()
+		cleanupB()
+		t.Fatalf("fallback paths are not launch-isolated: %q and %q", pathA, pathB)
+	}
+	if got, err := os.ReadFile(pathA); err != nil || string(got) != "model = \"search-a\"\n" {
+		cleanupA()
+		cleanupB()
+		t.Fatalf("fallback A = %q, err=%v", got, err)
+	}
+	if got, err := os.ReadFile(pathB); err != nil || string(got) != "model = \"search-b\"\n" {
+		cleanupA()
+		cleanupB()
+		t.Fatalf("fallback B = %q, err=%v", got, err)
+	}
+	cleanupA()
+	cleanupA()
+	if _, err := os.Stat(pathA); !os.IsNotExist(err) {
+		cleanupB()
+		t.Fatalf("cleanup A left %q, err=%v", pathA, err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		cleanupB()
+		t.Fatalf("cleanup A removed B: %v", err)
+	}
+	cleanupB()
+	if _, err := os.Stat(pathB); !os.IsNotExist(err) {
+		t.Fatalf("cleanup B left %q, err=%v", pathB, err)
+	}
+	if runtime.GOOS != "windows" {
+		if info, err := os.Stat(filepath.Dir(pathA)); !os.IsNotExist(err) || info != nil {
+			t.Fatalf("runtime directory A still exists: info=%v err=%v", info, err)
+		}
+	}
+}
+
+func TestWriteCodexWebSearchFallbackRoleConfigForLaunchConcurrent(t *testing.T) {
+	catalogPath := filepath.Join(t.TempDir(), "model-profiles", "unified-hash", "catalog.json")
+	const count = 32
+	paths := make([]string, count)
+	cleanups := make([]func(), count)
+	errs := make([]error, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			paths[i], cleanups[i], errs[i] = writeCodexWebSearchFallbackRoleConfigForLaunch(
+				catalogPath,
+				[]byte(fmt.Sprintf("model = \"search-%d\"\n", i)),
+				nil,
+			)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			for _, cleanup := range cleanups {
+				if cleanup != nil {
+					cleanup()
+				}
+			}
+			t.Fatalf("concurrent fallback %d: %v", i, err)
+		}
+	}
+	seen := make(map[string]struct{}, count)
+	for i, path := range paths {
+		if _, ok := seen[path]; ok {
+			t.Fatalf("concurrent fallback %d reused path %q", i, path)
+		}
+		seen[path] = struct{}{}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("concurrent fallback %d missing %q: %v", i, path, err)
+		}
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	for path := range seen {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("concurrent cleanup left %q: %v", path, err)
+		}
+	}
+}
+
+func TestWriteCodexDesktopModelProfileConfigUsesIndependentFallbackFiles(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	launch := codexModelProfileLaunch{
+		Enabled:                true,
+		Name:                   "private-responses",
+		Model:                  "example/model",
+		BaseURL:                "http://127.0.0.1:12345/v1",
+		Revision:               2,
+		ProviderName:           "Example",
+		DisableHostedWebSearch: true,
+		WebSearchFallbackTOML:  codexWebSearchFallbackRoleConfigTOML(),
+	}
+	homeA, err := writeCodexDesktopModelProfileConfig(store, launch, codexDesktopPlatformMac)
+	if err != nil {
+		t.Fatalf("write desktop fallback A: %v", err)
+	}
+	homeB, err := writeCodexDesktopModelProfileConfig(store, launch, codexDesktopPlatformMac)
+	if err != nil {
+		t.Fatalf("write desktop fallback B: %v", err)
+	}
+	pathFromConfig := func(home string) string {
+		raw, err := os.ReadFile(filepath.Join(home, "config.toml"))
+		if err != nil {
+			t.Fatalf("read desktop config %q: %v", home, err)
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			const prefix = `config_file = "`
+			if strings.HasPrefix(line, prefix) && strings.HasSuffix(line, `"`) {
+				return strings.TrimSuffix(strings.TrimPrefix(line, prefix), `"`)
+			}
+		}
+		t.Fatalf("desktop config %q omitted fallback path:\n%s", home, raw)
+		return ""
+	}
+	pathA := pathFromConfig(homeA)
+	pathB := pathFromConfig(homeB)
+	if pathA == pathB {
+		t.Fatalf("desktop launches reused fallback path %q", pathA)
+	}
+	if _, err := os.Stat(pathA); err != nil {
+		t.Fatalf("desktop fallback A missing: %v", err)
+	}
+	if _, err := os.Stat(pathB); err != nil {
+		t.Fatalf("desktop fallback B missing: %v", err)
 	}
 }
 
@@ -899,6 +1077,34 @@ func TestAppendCodexModelProfileArgsInsertsConfigInExecScopeCI(t *testing.T) {
 				t.Fatalf("missing requires_openai_auth override:\n%#v", got)
 			}
 		})
+	}
+}
+
+func TestAppendCodexModelProfileArgsEnablesMultiAgentForSearchFallback(t *testing.T) {
+	launch := codexModelProfileLaunch{
+		Enabled:                true,
+		Model:                  "nvidia/deepseek-ai/deepseek-v4-pro",
+		BaseURL:                "http://127.0.0.1:12345/v1",
+		ProviderName:           "NVIDIA Inference Hub",
+		DisableHostedWebSearch: true,
+		WebSearchFallbackPath:  "/tmp/gpt-search.toml",
+	}
+	args := appendCodexModelProfileArgs([]string{"codex", "exec", "-"}, launch)
+	for _, want := range []string{
+		`features.multi_agent_v2.enabled=true`,
+		`features.multi_agent_v2.hide_spawn_agent_metadata=false`,
+		`agents.gpt_search.config_file="/tmp/gpt-search.toml"`,
+	} {
+		if !slices.Contains(args, want) {
+			t.Fatalf("fallback launch missing %q: %#v", want, args)
+		}
+	}
+
+	nativeSearch := launch
+	nativeSearch.WebSearchFallbackPath = ""
+	args = appendCodexModelProfileArgs([]string{"codex", "exec", "-"}, nativeSearch)
+	if slices.Contains(args, `features.multi_agent_v2.enabled=true`) {
+		t.Fatalf("native-search launch unexpectedly enabled multi-agent fallback: %#v", args)
 	}
 }
 

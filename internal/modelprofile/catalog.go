@@ -60,6 +60,9 @@ type ModelSpec struct {
 	StreamPolicy            config.ModelStreamPolicy
 	HTTPPolicy              config.ModelHTTPPolicy
 	CachePolicy             config.ModelCachePolicy
+	ResponsesPolicy         config.ModelResponsesPolicy
+	Routes                  map[string]config.ModelRoute
+	SearchPolicy            config.ModelSearchPolicy
 }
 
 type ModelChoice struct {
@@ -92,6 +95,23 @@ func (m ModelSpec) UpstreamModel() string {
 
 func (m ModelSpec) Label() string {
 	return strings.TrimSpace(firstNonEmpty(m.DisplayName, m.PublicID()))
+}
+
+// Route returns the explicitly declared operation route, using
+// case-insensitive operation names. Schema-v2 catalogs currently expose the
+// Responses route to the runtime; keeping the lookup on ModelSpec makes that
+// boundary explicit and leaves room for additional operation dispatchers.
+func (m ModelSpec) Route(operation string) (config.ModelRoute, bool) {
+	want := strings.ToLower(strings.TrimSpace(operation))
+	if want == "" {
+		return config.ModelRoute{}, false
+	}
+	for name, route := range m.Routes {
+		if strings.EqualFold(strings.TrimSpace(name), want) {
+			return route, true
+		}
+	}
+	return config.ModelRoute{}, false
 }
 
 func (p ProviderSpec) ModelCatalog() []ModelSpec {

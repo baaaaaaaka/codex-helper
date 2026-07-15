@@ -3,17 +3,22 @@ package responsesadapter
 import (
 	"fmt"
 	"net/http"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type ProviderRuntime struct {
-	Adapter        ProviderAdapter
-	ProviderID     string
-	PublicModel    string
-	Model          string
-	KeyFingerprint string
-	BaseURLHash    string
-	ProfileVersion string
-	CustomToolMode string
+	Adapter                 ProviderAdapter
+	ProviderID              string
+	PublicModel             string
+	Model                   string
+	Route                   config.ModelRoute
+	KeyFingerprint          string
+	BaseURLHash             string
+	ProfileVersion          string
+	CustomToolMode          string
+	ParallelToolEnforcement string
+	ResponsesPolicy         config.ModelResponsesPolicy
 }
 
 type ProviderRouter interface {

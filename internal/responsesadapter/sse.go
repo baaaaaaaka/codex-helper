@@ -32,6 +32,7 @@ type outputItem struct {
 	Status           string             `json:"status,omitempty"`
 	CallID           string             `json:"call_id,omitempty"`
 	Name             string             `json:"name,omitempty"`
+	Namespace        string             `json:"namespace,omitempty"`
 	Arguments        string             `json:"arguments,omitempty"`
 	Input            string             `json:"input,omitempty"`
 	Summary          []reasoningSummary `json:"summary,omitempty"`
@@ -83,6 +84,9 @@ func (i outputItem) MarshalJSON() ([]byte, error) {
 		item["call_id"] = i.CallID
 		item["name"] = i.Name
 		item["arguments"] = i.Arguments
+		if i.Namespace != "" {
+			item["namespace"] = i.Namespace
+		}
 	case "custom_tool_call":
 		if i.Status != "" {
 			item["status"] = i.Status
@@ -90,6 +94,9 @@ func (i outputItem) MarshalJSON() ([]byte, error) {
 		item["call_id"] = i.CallID
 		item["name"] = i.Name
 		item["input"] = i.Input
+		if i.Namespace != "" {
+			item["namespace"] = i.Namespace
+		}
 	default:
 		if i.Role != "" {
 			item["role"] = i.Role
@@ -122,7 +129,15 @@ func (i outputItem) MarshalJSON() ([]byte, error) {
 func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, responseID string, req ResponsesRequest, providerReq ProviderRequest, stream <-chan ProviderEvent) {
 	result, ok := f.collectProviderResult(ctx, stream)
 	if !ok {
-		writeJSON(w, http.StatusBadGateway, errorBody("provider stream ended before completion"))
+		message := "provider stream ended before completion"
+		if result.providerErr != nil {
+			message = result.providerErr.Error()
+		}
+		writeJSON(w, http.StatusBadGateway, errorBody(message))
+		return
+	}
+	if err := validateProviderResultContract(result, providerReq); err != nil {
+		writeJSON(w, http.StatusBadGateway, errorBody(err.Error()))
 		return
 	}
 	result.toolCalls = markProviderToolCallTypes(result.toolCalls, providerReq.Tools)
@@ -217,6 +232,9 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	emitToolCallAdded := func(call *toolCallState) {
 		record := call.record("in_progress")
 		record.Type = providerToolSourceType(record.Name, providerReq.Tools)
+		if record.Namespace == "" {
+			record.Namespace = providerToolNamespace(record.Name, providerReq.Tools)
+		}
 		writeEvent("response.output_item.added", map[string]any{
 			"output_index": call.OutputIndex,
 			"item":         buildToolCallItem(record),
@@ -299,6 +317,11 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 					emitFailure(err.Error())
 					return
 				}
+				completedResult := providerResult{text: text, reasoningText: reasoning, usage: usage, toolCalls: toolCalls.records(), finishReason: finishReason}
+				if err := validateProviderResultContract(completedResult, providerReq); err != nil {
+					emitFailure(err.Error())
+					return
+				}
 				if !startedMessageItem && toolCalls.len() == 0 && !startedReasoningItem {
 					ensureMessageItem()
 				}
@@ -351,6 +374,14 @@ type providerResult struct {
 	usage                *Usage
 	toolCalls            []ToolCallRecord
 	finishReason         string
+	providerErr          error
+}
+
+func validateProviderResultContract(result providerResult, req ProviderRequest) error {
+	if strings.EqualFold(strings.TrimSpace(req.ParallelEnforcement), "strict") && len(result.toolCalls) > 1 {
+		return fmt.Errorf("provider returned %d parallel tool calls but the configured route requires serial tool calls", len(result.toolCalls))
+	}
+	return validateStructuredOutputResponse(req.ResponseFormat, result.text, req.StructuredOutputPolicy)
 }
 
 func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan ProviderEvent) (providerResult, bool) {
@@ -389,7 +420,8 @@ func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan Provid
 			case ProviderEventUsage:
 				result.usage = event.Usage
 			case ProviderEventError:
-				return providerResult{}, false
+				result.providerErr = event.Err
+				return result, false
 			case ProviderEventDone:
 				if err := toolCalls.validateComplete(); err != nil {
 					return providerResult{}, false
@@ -506,7 +538,7 @@ func buildToolCallItem(call ToolCallRecord) outputItem {
 	if call.Type == "custom" {
 		return outputItem{
 			ID: call.ItemID, Type: "custom_tool_call", Status: firstNonEmpty(call.Status, "completed"),
-			CallID: call.ID, Name: call.Name, Input: customToolInput(call.Arguments),
+			CallID: call.ID, Name: call.Name, Namespace: call.Namespace, Input: customToolInput(call.Arguments),
 		}
 	}
 	return outputItem{
@@ -515,6 +547,7 @@ func buildToolCallItem(call ToolCallRecord) outputItem {
 		Status:    firstNonEmpty(call.Status, "completed"),
 		CallID:    call.ID,
 		Name:      call.Name,
+		Namespace: call.Namespace,
 		Arguments: call.Arguments,
 	}
 }
@@ -571,6 +604,7 @@ type toolCallState struct {
 	ItemID      string
 	CallID      string
 	Name        string
+	Namespace   string
 	Arguments   string
 	Added       bool
 }
@@ -605,6 +639,12 @@ func (a *toolCallAccumulator) apply(delta *ProviderToolCallDelta, nextOutputInde
 			return nil, false, fmt.Errorf("tool call %d changed name from %q to %q", call.Index, call.Name, delta.Name)
 		}
 		call.Name = delta.Name
+	}
+	if delta.Namespace != "" {
+		if call.Added && call.Namespace != "" && call.Namespace != delta.Namespace {
+			return nil, false, fmt.Errorf("tool call %d changed namespace from %q to %q", call.Index, call.Namespace, delta.Namespace)
+		}
+		call.Namespace = delta.Namespace
 	}
 	call.Arguments += delta.ArgumentsDelta
 
@@ -675,6 +715,7 @@ func (c *toolCallState) record(status string) ToolCallRecord {
 		ItemID:      c.ItemID,
 		ID:          c.CallID,
 		Name:        c.Name,
+		Namespace:   c.Namespace,
 		Arguments:   arguments,
 		Status:      status,
 	}

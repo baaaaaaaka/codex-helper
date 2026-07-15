@@ -10,6 +10,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/ids"
 )
 
 var codexAppWSLHostForWindowsFn = defaultCodexAppWSLHostForWindows
@@ -69,6 +70,11 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 	if launch.Revision <= 0 {
 		dirName = name
 	}
+	launchID, err := ids.New()
+	if err != nil {
+		return "", fmt.Errorf("create desktop model profile launch id: %w", err)
+	}
+	dirName += "-" + launchID
 	codexHome := filepath.Join(filepath.Dir(store.Path()), "model-profiles", dirName, "codex")
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		return "", err
@@ -101,17 +107,30 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 	}
 	webSearchFallbackConfigPath := strings.TrimSpace(launch.WebSearchFallbackPath)
 	webSearchFallbackTOML := launch.WebSearchFallbackTOML
-	if launch.DisableHostedWebSearch && len(webSearchFallbackTOML) == 0 {
-		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+	fallbackCleanup := func() {}
+	fallbackRuntimeCommitted := false
+	defer func() {
+		if !fallbackRuntimeCommitted {
+			fallbackCleanup()
+		}
+	}()
+	if launch.DisableHostedWebSearch && (launch.WebSearchFallbackEnabled || (launch.WebSearchFallbackModel == "" && launch.WebSearchFallbackEffort == "")) && len(webSearchFallbackTOML) == 0 {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort)
 	}
-	if len(webSearchFallbackTOML) > 0 {
-		webSearchFallbackPath := filepath.Join(codexHome, codexWebSearchFallbackConfigName)
-		if err := os.WriteFile(webSearchFallbackPath, webSearchFallbackTOML, 0o600); err != nil {
+	if len(webSearchFallbackTOML) > 0 && webSearchFallbackConfigPath == "" {
+		// Desktop launches do not have a synchronous process cleanup hook. Keep
+		// the fallback file outside the shared profile home and give every launch
+		// its own runtime directory so concurrent app launches cannot overwrite
+		// one another.
+		runtimeCatalogPath := filepath.Join(filepath.Dir(store.Path()), "model-profiles", "desktop-runtime", "catalog.json")
+		fallbackPath, cleanup, err := writeCodexWebSearchFallbackRoleConfigForLaunch(runtimeCatalogPath, webSearchFallbackTOML, nil)
+		if err != nil {
 			return "", err
 		}
-		webSearchFallbackConfigPath = webSearchFallbackPath
+		fallbackCleanup = cleanup
+		webSearchFallbackConfigPath = fallbackPath
 		if platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
-			converted, err := codexAppWSLPathFn(webSearchFallbackPath)
+			converted, err := codexAppWSLPathFn(webSearchFallbackConfigPath)
 			if err != nil {
 				return "", fmt.Errorf("convert web search fallback config path for Windows launch: %w", err)
 			}
@@ -132,6 +151,7 @@ func writeCodexDesktopModelProfileConfig(store *config.Store, launch codexModelP
 	if err := os.WriteFile(configPath, []byte(generatedConfig), 0o600); err != nil {
 		return "", err
 	}
+	fallbackRuntimeCommitted = true
 	return codexHome, nil
 }
 

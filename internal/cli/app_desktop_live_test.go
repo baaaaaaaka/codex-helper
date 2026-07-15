@@ -64,7 +64,8 @@ func TestLiveCodexDesktopWindowsModelProfileFromWSLOptIn(t *testing.T) {
 	if inst.HTTPPort <= 0 || strings.TrimSpace(inst.ModelProxyKey) == "" {
 		t.Fatalf("model adapter instance missing port/key: %#v", inst)
 	}
-	baseURL := readLiveDesktopModelBaseURL(t, filepath.Join(tmp, "model-profiles", "mimo25-live-rev1", "codex", "config.toml"))
+	codexHome := liveDesktopGeneratedCodexHome(t, tmp, "mimo25-live")
+	baseURL := readLiveDesktopModelBaseURL(t, filepath.Join(codexHome, "config.toml"))
 	if strings.Contains(baseURL, "127.0.0.1") || strings.Contains(baseURL, "localhost") {
 		t.Fatalf("desktop model profile base URL is not Windows-reachable from WSL: %s", baseURL)
 	}
@@ -129,7 +130,7 @@ func TestLiveCodexDesktopGUIChatModelProfileOptIn(t *testing.T) {
 	if inst.HTTPPort <= 0 || strings.TrimSpace(inst.ModelProxyKey) == "" {
 		t.Fatalf("model adapter instance missing port/key: %#v", inst)
 	}
-	codexHome := filepath.Join(tmp, "model-profiles", "mimo25-live-rev1", "codex")
+	codexHome := liveDesktopGeneratedCodexHome(t, tmp, "mimo25-live")
 	baseURL := readLiveDesktopModelBaseURL(t, filepath.Join(codexHome, "config.toml"))
 	switch platform {
 	case "windows":
@@ -197,7 +198,8 @@ func TestLiveCodexDesktopMacModelProfileFromHostOptIn(t *testing.T) {
 		stop.Env = env
 		_ = stop.Run()
 	})
-	baseURL := readLiveDesktopModelBaseURL(t, filepath.Join(tmp, "model-profiles", "mimo25-live-rev1", "codex", "config.toml"))
+	codexHome := liveDesktopGeneratedCodexHome(t, tmp, "mimo25-live")
+	baseURL := readLiveDesktopModelBaseURL(t, filepath.Join(codexHome, "config.toml"))
 	if !strings.Contains(baseURL, "127.0.0.1") && !strings.Contains(baseURL, "localhost") {
 		t.Fatalf("macOS model profile base URL should stay host-local, got %s", baseURL)
 	}
@@ -213,6 +215,18 @@ func setupLiveDesktopMimoModelProfile(t *testing.T, cxpPath string, configPath s
 	if out, err := setup.CombinedOutput(); err != nil {
 		t.Fatalf("model-profile setup failed: %v\n%s", err, strings.TrimSpace(string(out)))
 	}
+}
+
+func liveDesktopGeneratedCodexHome(t *testing.T, root string, profile string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(root, "model-profiles", profile+"-rev1-*", "codex"))
+	if err != nil {
+		t.Fatalf("glob generated desktop Codex homes: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("generated desktop Codex homes = %v, want exactly one", matches)
+	}
+	return matches[0]
 }
 
 func liveDesktopPowerShellPath(t *testing.T) string {

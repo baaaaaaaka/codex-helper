@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type ProviderRegistryOptions struct {
@@ -14,14 +16,17 @@ type ProviderRegistryOptions struct {
 }
 
 type ProviderConfig struct {
-	ID             string
-	ProfileID      string
-	BaseURL        string
-	APIKey         string
-	DefaultModel   string
-	Models         []ModelInfo
-	Adapter        ProviderAdapter
-	CustomToolMode string
+	ID                      string
+	ProfileID               string
+	BaseURL                 string
+	APIKey                  string
+	DefaultModel            string
+	Models                  []ModelInfo
+	Adapter                 ProviderAdapter
+	Route                   config.ModelRoute
+	CustomToolMode          string
+	ParallelToolEnforcement string
+	ResponsesPolicy         config.ModelResponsesPolicy
 }
 
 type ProviderRegistry struct {
@@ -241,14 +246,17 @@ func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProv
 		listModels: listModels,
 		openModel:  len(models) == 0,
 		runtime: ProviderRuntime{
-			Adapter:        adapter,
-			ProviderID:     id,
-			PublicModel:    strings.TrimSpace(cfg.DefaultModel),
-			Model:          strings.TrimSpace(cfg.DefaultModel),
-			KeyFingerprint: KeyFingerprint(cfg.APIKey, keySalt),
-			BaseURLHash:    BaseURLHash(baseURL),
-			ProfileVersion: firstNonEmpty(profileID, id) + ":v1",
-			CustomToolMode: strings.TrimSpace(cfg.CustomToolMode),
+			Adapter:                 adapter,
+			ProviderID:              id,
+			PublicModel:             strings.TrimSpace(cfg.DefaultModel),
+			Model:                   strings.TrimSpace(cfg.DefaultModel),
+			Route:                   cfg.Route,
+			KeyFingerprint:          KeyFingerprint(cfg.APIKey, keySalt),
+			BaseURLHash:             BaseURLHash(baseURL),
+			ProfileVersion:          firstNonEmpty(profileID, id) + ":v1",
+			CustomToolMode:          strings.TrimSpace(cfg.CustomToolMode),
+			ParallelToolEnforcement: strings.TrimSpace(cfg.ParallelToolEnforcement),
+			ResponsesPolicy:         cfg.ResponsesPolicy,
 		},
 	}, nil
 }

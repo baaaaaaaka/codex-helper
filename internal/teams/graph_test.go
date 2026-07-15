@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1096,6 +1098,9 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 			if !strings.Contains(payload.Body.Content, `<attachment id="1176c944-0cb9-4304-974c-5837185efd6a"></attachment>`) {
 				t.Fatalf("message body missing attachment tag: %q", payload.Body.Content)
 			}
+			if !strings.Contains(payload.Body.Content, "<!-- codex-helper-outbox:outbox:attachment-1 -->") {
+				t.Fatalf("message body missing helper provenance marker: %q", payload.Body.Content)
+			}
 			if !strings.Contains(payload.Body.Content, "Codex: attached") {
 				t.Fatalf("attachment message should be helper-prefixed, got %q", payload.Body.Content)
 			}
@@ -1121,7 +1126,7 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDriveItemMetadata error: %v", err)
 	}
-	msg, err := graph.SendDriveItemAttachment(context.Background(), "chat-1", meta, "attached")
+	msg, err := graph.SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(context.Background(), "chat-1", meta, "attached", "outbox:attachment-1")
 	if err != nil {
 		t.Fatalf("SendDriveItemAttachment error: %v", err)
 	}
@@ -1533,6 +1538,213 @@ func TestGraphGetSharedDriveItemContentReturnsBytes(t *testing.T) {
 	}
 }
 
+func TestGraphUploadDriveItemFromFileUsesNearLimitUploadSessionChunks(t *testing.T) {
+	var ranges []string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.EscapedPath() == "/me/drive/root:/folder/large.bin:/createUploadSession":
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			if got := r.Header.Get("Authorization"); got != "" {
+				t.Fatalf("upload session chunk must not forward Graph Authorization header: %q", got)
+			}
+			ranges = append(ranges, r.Header.Get("Content-Range"))
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upload chunk: %v", err)
+			}
+			if got := r.Header.Get("Content-Length"); got != fmt.Sprint(len(body)) {
+				t.Fatalf("chunk content length = %q, want %d", got, len(body))
+			}
+			if len(ranges) < 3 {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = fmt.Fprintf(w, `{"nextExpectedRanges":["%d-"]}`, len(body)*len(ranges))
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-large","name":"large.bin"}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "large.bin")
+	if err := os.WriteFile(filePath, []byte("0123456789"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 4
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	item, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "large.bin", filePath, 10, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("UploadDriveItemFromFile error: %v", err)
+	}
+	if item.ID != "item-large" {
+		t.Fatalf("uploaded item = %#v", item)
+	}
+	wantRanges := []string{"bytes 0-3/10", "bytes 4-7/10", "bytes 8-9/10"}
+	if strings.Join(ranges, ",") != strings.Join(wantRanges, ",") {
+		t.Fatalf("upload ranges = %#v, want %#v", ranges, wantRanges)
+	}
+}
+
+func TestGraphUploadDriveItemFromFileRetriesTransientUploadChunk(t *testing.T) {
+	var puts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut:
+			puts++
+			if puts == 1 {
+				http.Error(w, `{"error":{"code":"serviceUnavailable"}}`, http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-retried","name":"retry.bin"}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "retry.bin")
+	if err := os.WriteFile(filePath, []byte("retry"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 8
+	graph.transferMaxRetries = 1
+	item, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "retry.bin", filePath, 5, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("UploadDriveItemFromFile retry error: %v", err)
+	}
+	if item.ID != "item-retried" || puts != 2 {
+		t.Fatalf("item=%#v, PUTs=%d, want retried final upload", item, puts)
+	}
+}
+
+func TestGraphUploadDriveItemFromFileResumesAfterRangeConflict(t *testing.T) {
+	var puts, statusGets int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut:
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body)
+			if puts == 1 {
+				http.Error(w, `{"error":{"code":"invalidRange"}}`, http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-resumed","name":"resume.bin"}`)
+		case r.Method == http.MethodGet:
+			statusGets++
+			_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["5-"]}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "resume.bin")
+	if err := os.WriteFile(filePath, []byte("resume"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 5
+	graph.transferMaxRetries = 0
+	item, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "resume.bin", filePath, 6, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("UploadDriveItemFromFile resume error: %v", err)
+	}
+	if item.ID != "item-resumed" || puts != 2 || statusGets != 1 {
+		t.Fatalf("item=%#v PUTs=%d statusGETs=%d, want one status query and resumed final PUT", item, puts, statusGets)
+	}
+}
+
+func TestGraphFileTransferDoesNotUseWholeRequestClientTimeout(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut:
+			_, _ = io.Copy(io.Discard, r.Body)
+			time.Sleep(60 * time.Millisecond)
+			_, _ = fmt.Fprint(w, `{"id":"item-slow","name":"slow.bin"}`)
+		default:
+			t.Fatalf("unexpected transfer request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "slow.bin")
+	if err := os.WriteFile(filePath, []byte("slow"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	baseClient := server.Client()
+	client := &http.Client{Transport: baseClient.Transport, Timeout: 10 * time.Millisecond}
+	graph := &GraphClient{
+		auth:               &fakeGraphAuth{token: "access"},
+		client:             client,
+		baseURL:            server.URL,
+		maxRetries:         0,
+		transferMaxRetries: 0,
+		singlePutMaxBytes:  1,
+		transferChunkSize:  8,
+		sleep:              func(context.Context, time.Duration) error { return nil },
+		jitter:             func(d time.Duration) time.Duration { return d },
+	}
+	if _, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "slow.bin", filePath, 4, "application/octet-stream"); err != nil {
+		t.Fatalf("slow transfer should ignore normal client timeout: %v", err)
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentToFileStreamsPastClientTimeout(t *testing.T) {
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
+	wantPath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem/content"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != wantPath {
+			t.Fatalf("unexpected download request: %s %s", r.Method, r.URL.String())
+		}
+		time.Sleep(60 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = fmt.Fprint(w, "streamed-file")
+	}))
+	defer server.Close()
+
+	baseClient := server.Client()
+	graph := &GraphClient{
+		auth:    &fakeGraphAuth{token: "access"},
+		client:  &http.Client{Transport: baseClient.Transport, Timeout: 10 * time.Millisecond},
+		baseURL: server.URL,
+		sleep:   func(context.Context, time.Duration) error { return nil },
+		jitter:  func(d time.Duration) time.Duration { return d },
+	}
+	destination := filepath.Join(t.TempDir(), "file.txt")
+	contentType, size, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), rawURL, destination)
+	if err != nil {
+		t.Fatalf("streaming download error: %v", err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if string(data) != "streamed-file" || size != int64(len(data)) || contentType != "text/plain" {
+		t.Fatalf("download result type=%q size=%d data=%q", contentType, size, data)
+	}
+}
+
 func TestGraphGetSharedDriveItemMetadataReturnsNameAndMimeType(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
@@ -1731,6 +1943,19 @@ func newTestGraphClient(auth graphAuth, server *httptest.Server, sleeps *[]time.
 		jitter: func(delay time.Duration) time.Duration {
 			return delay
 		},
+	}
+}
+
+func TestGraphControlTimeoutIsNotInheritedByFileTransfers(t *testing.T) {
+	graph := newGraphClientWithHTTPClient(&fakeGraphAuth{token: "access"}, nil, nil)
+	if graph.client.Timeout != defaultGraphHTTPTimeout {
+		t.Fatalf("control client timeout = %s, want %s", graph.client.Timeout, defaultGraphHTTPTimeout)
+	}
+	if got := graph.transferHTTPClient().Timeout; got != 0 {
+		t.Fatalf("transfer client timeout = %s, want no whole-request timeout", got)
+	}
+	if got := graph.transferIdle(); got != defaultTransferIdleTimeout {
+		t.Fatalf("transfer idle timeout = %s, want %s", got, defaultTransferIdleTimeout)
 	}
 }
 

@@ -23,10 +23,10 @@ func NormalizeToolsWithMode(raw json.RawMessage, customToolMode string) ([]ChatT
 	var tools []ChatTool
 	var warnings []ToolWarning
 	for _, item := range items {
-		normalized, toolWarnings := normalizeTool(item)
+		normalized, toolWarnings := normalizeToolWithNamespace(item, "")
 		warnings = append(warnings, toolWarnings...)
 		for _, tool := range normalized {
-			nameKey := strings.ToLower(tool.Function.Name)
+			nameKey := toolIdentityKey(tool.Namespace, tool.Function.Name)
 			if seen[nameKey] {
 				warnings = append(warnings, ToolWarning{Type: tool.Type, Name: tool.Function.Name, Reason: "duplicate tool name dropped"})
 				continue
@@ -63,6 +63,10 @@ func NormalizeToolsWithMode(raw json.RawMessage, customToolMode string) ([]ChatT
 }
 
 func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
+	return normalizeToolWithNamespace(raw, "")
+}
+
+func normalizeToolWithNamespace(raw json.RawMessage, namespace string) ([]ChatTool, []ToolWarning) {
 	var input struct {
 		Type        string            `json:"type"`
 		Name        string            `json:"name"`
@@ -99,10 +103,10 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 		if fn.Name == "" {
 			return nil, []ToolWarning{{Type: toolType, Reason: "function tool missing name dropped"}}
 		}
-		return []ChatTool{{Type: "function", Function: fn, SourceType: "function"}}, nil
+		return []ChatTool{{Type: "function", Function: fn, SourceType: "function", Namespace: namespace}}, nil
 	case "local_shell":
 		return []ChatTool{{
-			Type: "function", SourceType: "local_shell",
+			Type: "function", SourceType: "local_shell", Namespace: namespace,
 			Function: ChatFunction{
 				Name:        "shell",
 				Description: "Run a shell command.",
@@ -115,7 +119,7 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 			name = "custom_tool"
 		}
 		return []ChatTool{{
-			Type: "function", SourceType: "custom",
+			Type: "function", SourceType: "custom", Namespace: namespace,
 			Function: ChatFunction{
 				Name:        name,
 				Description: firstNonEmpty(input.Description, "Accepts freeform custom tool input."),
@@ -129,7 +133,7 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 			parameters = json.RawMessage(`{"type":"object","additionalProperties":true}`)
 		}
 		return []ChatTool{{
-			Type: "function", SourceType: "tool_search",
+			Type: "function", SourceType: "tool_search", Namespace: namespace,
 			Function: ChatFunction{
 				Name:        name,
 				Description: firstNonEmpty(input.Description, "Search available tools."),
@@ -139,8 +143,9 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 	case "namespace":
 		var tools []ChatTool
 		var warnings []ToolWarning
+		childNamespace := joinToolNamespace(namespace, input.Name)
 		for _, child := range input.Tools {
-			childTools, childWarnings := normalizeTool(child)
+			childTools, childWarnings := normalizeToolWithNamespace(child, childNamespace)
 			tools = append(tools, childTools...)
 			warnings = append(warnings, childWarnings...)
 		}
@@ -151,6 +156,22 @@ func normalizeTool(raw json.RawMessage) ([]ChatTool, []ToolWarning) {
 	default:
 		return nil, []ToolWarning{{Type: toolType, Name: input.Name, Reason: "unsupported tool type dropped"}}
 	}
+}
+
+func joinToolNamespace(parent, name string) string {
+	parent = strings.TrimSpace(parent)
+	name = strings.TrimSpace(name)
+	if parent == "" {
+		return name
+	}
+	if name == "" {
+		return parent
+	}
+	return parent + "." + name
+}
+
+func toolIdentityKey(namespace, name string) string {
+	return strings.ToLower(strings.TrimSpace(namespace)) + "\x00" + strings.ToLower(strings.TrimSpace(name))
 }
 
 func strictBool(raw json.RawMessage) *bool {

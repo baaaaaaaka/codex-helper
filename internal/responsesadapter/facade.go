@@ -297,6 +297,10 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, routeErrorStatus(err), errorBody(err.Error()))
 		return
 	}
+	if err := validateStructuredOutputRequest(req.ResponseFormat, runtime.ResponsesPolicy.StructuredOutput); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
+		return
+	}
 	publicModel := firstNonEmpty(runtime.PublicModel, req.Model)
 	upstreamModel := firstNonEmpty(runtime.Model, publicModel)
 	req.Model = publicModel
@@ -356,22 +360,25 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerReq := ProviderRequest{
-		Model:              upstreamModel,
-		Instructions:       req.Instructions,
-		InputText:          parsedInput.Text,
-		InputMessages:      parsedInput.Messages,
-		Messages:           buildProviderMessages(history, parsedInput.Messages),
-		Tools:              tools,
-		ToolWarnings:       toolWarnings,
-		ToolChoice:         req.ToolChoice,
-		ParallelToolCalls:  req.ParallelToolCalls,
-		MaxOutputTokens:    req.MaxOutputTokens,
-		ReasoningEffort:    reasoningEffort(req.Reasoning),
-		Temperature:        req.Temperature,
-		TopP:               req.TopP,
-		PreviousResponseID: req.PreviousResponseID,
-		Scope:              scope,
-		History:            history,
+		Model:                  upstreamModel,
+		Instructions:           req.Instructions,
+		InputText:              parsedInput.Text,
+		InputMessages:          parsedInput.Messages,
+		Messages:               buildProviderMessages(history, parsedInput.Messages),
+		Tools:                  tools,
+		ToolWarnings:           toolWarnings,
+		ToolChoice:             req.ToolChoice,
+		ParallelToolCalls:      req.ParallelToolCalls,
+		MaxOutputTokens:        req.MaxOutputTokens,
+		ReasoningEffort:        reasoningEffort(req.Reasoning),
+		Temperature:            req.Temperature,
+		TopP:                   req.TopP,
+		ResponseFormat:         req.ResponseFormat,
+		ParallelEnforcement:    runtime.ParallelToolEnforcement,
+		StructuredOutputPolicy: runtime.ResponsesPolicy.StructuredOutput,
+		PreviousResponseID:     req.PreviousResponseID,
+		Scope:                  scope,
+		History:                history,
 	}
 	stream, err := runtime.Adapter.Stream(r.Context(), providerReq)
 	if err != nil {
@@ -414,12 +421,23 @@ func markProviderToolCallTypes(records []ToolCallRecord, tools []ChatTool) []Too
 		return records
 	}
 	types := make(map[string]string, len(tools))
+	namespaces := make(map[string]string, len(tools))
 	for _, tool := range tools {
-		types[strings.ToLower(strings.TrimSpace(tool.Function.Name))] = tool.SourceType
+		name := strings.ToLower(strings.TrimSpace(tool.Function.Name))
+		if _, exists := types[name]; !exists {
+			types[name] = tool.SourceType
+			namespaces[name] = tool.Namespace
+		}
 	}
 	out := append([]ToolCallRecord(nil), records...)
 	for index := range out {
-		out[index].Type = types[strings.ToLower(strings.TrimSpace(out[index].Name))]
+		name := strings.ToLower(strings.TrimSpace(out[index].Name))
+		if out[index].Type == "" {
+			out[index].Type = types[name]
+		}
+		if out[index].Namespace == "" {
+			out[index].Namespace = namespaces[name]
+		}
 	}
 	return out
 }
@@ -428,6 +446,15 @@ func providerToolSourceType(name string, tools []ChatTool) string {
 	for _, tool := range tools {
 		if strings.EqualFold(strings.TrimSpace(tool.Function.Name), strings.TrimSpace(name)) {
 			return tool.SourceType
+		}
+	}
+	return ""
+}
+
+func providerToolNamespace(name string, tools []ChatTool) string {
+	for _, tool := range tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Function.Name), strings.TrimSpace(name)) {
+			return tool.Namespace
 		}
 	}
 	return ""

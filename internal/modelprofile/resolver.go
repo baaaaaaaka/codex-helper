@@ -193,7 +193,8 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 	}
 	forceProfile := strings.HasPrefix(strings.ToLower(name), "profile:")
 	forceOfficial := strings.HasPrefix(strings.ToLower(name), "official:")
-	if forceProfile || forceOfficial {
+	forceModel := strings.HasPrefix(strings.ToLower(name), "model:")
+	if forceProfile || forceOfficial || forceModel {
 		_, name, _ = strings.Cut(name, ":")
 		name = strings.TrimSpace(name)
 	}
@@ -241,6 +242,7 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 		profile.Model = canonicalModel
 		profile.Provider = definition.Provider
 		resolvedProvider, selected := structuredProviderSpec(definition.Provider, provider, credential, canonicalModel, definition)
+		applyModelProfileOverrides(&resolvedProvider, &selected, profile)
 		return finishResolvedModel(cfg, name, profile, resolvedProvider, selected)
 	}
 	if strings.TrimSpace(providerID) == "" {
@@ -300,6 +302,9 @@ func structuredProviderSpec(name string, provider config.ModelProvider, credenti
 	vision := boolValue(model.Capabilities.Vision, false)
 	reasoning := boolValue(model.Capabilities.Reasoning, false)
 	search := boolValue(model.Capabilities.NativeWebSearch, false)
+	if model.Search.Native != nil {
+		search = *model.Search.Native
+	}
 	contextWindow := model.Limits.ContextWindow
 	if contextWindow <= 0 {
 		contextWindow = 128000
@@ -316,6 +321,8 @@ func structuredProviderSpec(name string, provider config.ModelProvider, credenti
 		SupportsReason: reasoning, SupportsSearch: search, ReasoningPolicy: model.Reasoning, ToolPolicy: model.Tools,
 		MessagePolicy: model.Messages, SamplingPolicy: model.Sampling, StreamPolicy: mergeStreamPolicy(provider.Stream, model.Stream),
 		HTTPPolicy: mergeHTTPPolicy(provider.HTTP, model.HTTP), CachePolicy: model.Cache,
+		ResponsesPolicy: model.Responses, Routes: cloneModelRoutes(model.Routes),
+		SearchPolicy: model.Search,
 	}
 	spec := ProviderSpec{
 		ID: name, DisplayName: name, DefaultModel: publicID, Models: []ModelSpec{selected}, BaseURL: strings.TrimRight(provider.BaseURL, "/"),
@@ -327,6 +334,28 @@ func structuredProviderSpec(name string, provider config.ModelProvider, credenti
 		AuthType: strings.ToLower(strings.TrimSpace(credential.AuthType)), AuthHeader: strings.TrimSpace(credential.Header),
 	}
 	return spec, selected
+}
+
+// applyModelProfileOverrides applies only local selection overrides after the
+// catalog model defaults have been resolved. Catalog files remain the source
+// of provider capabilities, while a profile can intentionally choose a
+// different default effort or provider mapping for one chat.
+func applyModelProfileOverrides(provider *ProviderSpec, model *ModelSpec, profile config.ModelProfile) {
+	if provider == nil || model == nil {
+		return
+	}
+	if value := strings.TrimSpace(profile.DefaultReasoningEffort); value != "" {
+		provider.DefaultReasoningEffort = value
+		model.ReasoningPolicy.DefaultEffort = value
+	}
+	if len(profile.SupportedReasoningEfforts) > 0 {
+		provider.SupportedReasoningEfforts = normalizeStringList(profile.SupportedReasoningEfforts)
+		model.ReasoningPolicy.SupportedEfforts = normalizeStringList(profile.SupportedReasoningEfforts)
+	}
+	if len(profile.ReasoningEffortMap) > 0 {
+		provider.ReasoningEffortMap = cloneStringMap(profile.ReasoningEffortMap)
+		model.ReasoningPolicy.EffortMap = cloneStringMap(profile.ReasoningEffortMap)
+	}
 }
 
 func mergeStringMaps(base, override map[string]string) map[string]string {
@@ -396,6 +425,18 @@ func mergeStreamPolicy(base, override config.ModelStreamPolicy) config.ModelStre
 	if override.IdleTimeoutSeconds != 0 {
 		out.IdleTimeoutSeconds = override.IdleTimeoutSeconds
 	}
+	if override.FirstEventTimeoutSeconds != 0 {
+		out.FirstEventTimeoutSeconds = override.FirstEventTimeoutSeconds
+	}
+	if override.SemanticProgressTimeoutSeconds != 0 {
+		out.SemanticProgressTimeoutSeconds = override.SemanticProgressTimeoutSeconds
+	}
+	if override.MaxDurationSeconds != 0 {
+		out.MaxDurationSeconds = override.MaxDurationSeconds
+	}
+	if override.HeartbeatMode != "" {
+		out.HeartbeatMode = override.HeartbeatMode
+	}
 	if override.UpstreamMode != "" {
 		out.UpstreamMode = override.UpstreamMode
 	}
@@ -407,6 +448,9 @@ func mergeStreamPolicy(base, override config.ModelStreamPolicy) config.ModelStre
 	}
 	if override.ReasoningDeltaPath != "" {
 		out.ReasoningDeltaPath = override.ReasoningDeltaPath
+	}
+	if override.ReasoningTokensPath != "" {
+		out.ReasoningTokensPath = override.ReasoningTokensPath
 	}
 	if override.CachedTokensPath != "" {
 		out.CachedTokensPath = override.CachedTokensPath
@@ -504,6 +548,17 @@ func cloneStringMap(in map[string]string) map[string]string {
 		if key != "" && value != "" {
 			out[key] = value
 		}
+	}
+	return out
+}
+
+func cloneModelRoutes(in map[string]config.ModelRoute) map[string]config.ModelRoute {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]config.ModelRoute, len(in))
+	for key, value := range in {
+		out[key] = value
 	}
 	return out
 }

@@ -127,15 +127,17 @@ func ValidateModelConfig(cfg Config) error {
 		if _, ok := findModelProvider(cfg.ModelProviders, model.Provider); !ok {
 			return fmt.Errorf("model %q references missing provider %q", name, model.Provider)
 		}
+		scope := strings.ToLower(strings.TrimSpace(model.Provider))
 		for _, alias := range append([]string{name}, model.Aliases...) {
 			key := strings.ToLower(strings.TrimSpace(alias))
 			if key == "" {
 				continue
 			}
-			if previous, ok := seenAliases[key]; ok && !strings.EqualFold(previous, name) {
-				return fmt.Errorf("model alias %q conflicts between %q and %q", alias, previous, name)
+			scopedKey := scope + "\x00" + key
+			if previous, ok := seenAliases[scopedKey]; ok && !strings.EqualFold(previous, name) {
+				return fmt.Errorf("model alias %q conflicts within provider %q between %q and %q", alias, model.Provider, previous, name)
 			}
-			seenAliases[key] = name
+			seenAliases[scopedKey] = name
 		}
 		if err := validateModelDefinition(name, model); err != nil {
 			return err
@@ -157,8 +159,20 @@ func ValidateModelConfig(cfg Config) error {
 		return err
 	}
 	for name, source := range cfg.ModelSources {
-		if strings.TrimSpace(name) == "" || strings.TrimSpace(source.URL) == "" {
-			return fmt.Errorf("model source %q requires url", name)
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("model source name is empty")
+		}
+		switch strings.ToLower(strings.TrimSpace(source.Kind)) {
+		case "", "git":
+			if strings.TrimSpace(source.URL) == "" {
+				return fmt.Errorf("model source %q requires url", name)
+			}
+		case "file", "directory":
+			if strings.TrimSpace(source.Path) == "" {
+				return fmt.Errorf("model source %q requires path", name)
+			}
+		default:
+			return fmt.Errorf("model source %q has invalid kind %q", name, source.Kind)
 		}
 		for _, credential := range source.Credentials {
 			if _, ok := cfg.ModelCredentials[credential]; !ok {
@@ -197,7 +211,7 @@ func validateGlobalDefaults(cfg Config) error {
 	if selector != "" && !strings.EqualFold(selector, DefaultModelProfileName) {
 		prefix, value, qualified := strings.Cut(selector, ":")
 		if !qualified || strings.TrimSpace(value) == "" {
-			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, `model:<provider>/<model>`, or `profile:<name>`", selector)
 		}
 		switch strings.ToLower(strings.TrimSpace(prefix)) {
 		case "official":
@@ -208,8 +222,12 @@ func validateGlobalDefaults(cfg Config) error {
 			if _, ok := cfg.FindModelProfile(strings.TrimSpace(value)); !ok {
 				return fmt.Errorf("defaults.model references missing profile %q", strings.TrimSpace(value))
 			}
+		case "model":
+			if _, _, ok := FindModelDefinition(cfg, strings.TrimSpace(value)); !ok {
+				return fmt.Errorf("defaults.model references missing model %q", strings.TrimSpace(value))
+			}
 		default:
-			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, `model:<provider>/<model>`, or `profile:<name>`", selector)
 		}
 	}
 	rawEffort := cfg.Defaults.ReasoningEffort
@@ -261,13 +279,43 @@ func validateModelDefinition(name string, model ModelDefinition) error {
 	if model.Capabilities.Reasoning != nil && !*model.Capabilities.Reasoning && (len(model.Reasoning.SupportedEfforts) > 0 || strings.TrimSpace(model.Reasoning.DefaultEffort) != "") {
 		return fmt.Errorf("model %q cannot configure reasoning efforts while reasoning=false", name)
 	}
+	if model.Search.Native != nil && model.Capabilities.NativeWebSearch != nil && *model.Search.Native != *model.Capabilities.NativeWebSearch {
+		return fmt.Errorf("model %q has conflicting native web-search declarations", name)
+	}
+	for _, declaration := range []struct {
+		field string
+		value string
+	}{
+		{field: "capabilityModes.tools", value: model.CapabilityModes.Tools},
+		{field: "capabilityModes.parallelTools", value: model.CapabilityModes.ParallelTools},
+		{field: "capabilityModes.vision", value: model.CapabilityModes.Vision},
+		{field: "capabilityModes.reasoning", value: model.CapabilityModes.Reasoning},
+		{field: "capabilityModes.reasoningSummary", value: model.CapabilityModes.ReasoningSummary},
+		{field: "capabilityModes.webSearch", value: model.CapabilityModes.WebSearch},
+	} {
+		validator := validateModelCapabilityMode
+		if declaration.field == "capabilityModes.webSearch" {
+			validator = validateModelWebSearchMode
+		}
+		if err := validator(name, declaration.field, declaration.value); err != nil {
+			return err
+		}
+	}
+	if value := model.Search.Fallback.Model; strings.TrimSpace(value) != value {
+		return fmt.Errorf("model %q search fallback model must not contain surrounding whitespace", name)
+	}
+	if value := model.Search.Fallback.Effort; value != strings.TrimSpace(value) || len(value) > 64 || strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("model %q search fallback effort must be a single model value", name)
+	}
 	for field, value := range map[string]string{
 		"thinkingMode":          model.Reasoning.ThinkingMode,
 		"historyPolicy":         model.Reasoning.HistoryPolicy,
 		"toolChoice":            model.Tools.ToolChoice,
 		"parallel":              model.Tools.Parallel,
+		"parallelEnforcement":   model.Tools.ParallelEnforcement,
 		"strictSchema":          model.Tools.StrictSchema,
 		"emptyAssistantContent": model.Tools.EmptyAssistantContent,
+		"plainTextToolCall":     model.Tools.PlainTextToolCall,
 		"customToolMode":        model.Tools.CustomToolMode,
 		"temperature":           model.Sampling.Temperature,
 		"topP":                  model.Sampling.TopP,
@@ -279,7 +327,29 @@ func validateModelDefinition(name string, model ModelDefinition) error {
 	if err := validateHTTPPolicy("model "+name, model.HTTP); err != nil {
 		return err
 	}
-	return validateStreamPolicy("model "+name, model.Stream)
+	if err := validateStreamPolicy("model "+name, model.Stream); err != nil {
+		return err
+	}
+	for operation, route := range model.Routes {
+		operation = strings.TrimSpace(operation)
+		if operation == "" || strings.TrimSpace(route.Interface) == "" || strings.TrimSpace(route.Adapter) == "" || strings.TrimSpace(route.Protocol) == "" {
+			return fmt.Errorf("model %q has incomplete route %q", name, operation)
+		}
+		switch strings.ToLower(strings.TrimSpace(route.Protocol)) {
+		case "responses", "chat-completions", "anthropic", "beta", "fim":
+		default:
+			return fmt.Errorf("model %q route %q has invalid protocol %q", name, operation, route.Protocol)
+		}
+	}
+	for field, value := range map[string]string{
+		"responses.structuredOutput.jsonObject": model.Responses.StructuredOutput.JSONObject,
+		"responses.structuredOutput.jsonSchema": model.Responses.StructuredOutput.JSONSchema,
+	} {
+		if err := validateCapabilityMode(name, field, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateModelEnum(model, field, value string) error {
@@ -292,8 +362,10 @@ func validateModelEnum(model, field, value string) error {
 		"historyPolicy":         {"never", "tool-calls-only", "always", "provider-default"},
 		"toolChoice":            {"full", "auto-only", "omit"},
 		"parallel":              {"auto", "enabled", "disabled"},
+		"parallelEnforcement":   {"advisory", "strict"},
 		"strictSchema":          {"preserve", "strip"},
 		"emptyAssistantContent": {"preserve", "empty-string", "omit"},
+		"plainTextToolCall":     {"allow", "reject"},
 		"customToolMode":        {"function", "shell-fallback", "omit"},
 		"temperature":           {"forward", "strip", "strip-when-reasoning"},
 		"topP":                  {"forward", "strip", "strip-when-reasoning"},
@@ -304,6 +376,39 @@ func validateModelEnum(model, field, value string) error {
 		}
 	}
 	return fmt.Errorf("model %q has invalid %s %q (allowed: %s)", model, field, value, strings.Join(allowed[field], ", "))
+}
+
+func validateCapabilityMode(model, field, value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	for _, allowed := range []string{"native", "advisory", "unsupported"} {
+		if value == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q has invalid %s %q (allowed: native, advisory, unsupported)", model, field, value)
+}
+
+func validateModelCapabilityMode(model, field, value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	for _, allowed := range []string{"native", "translated", "plugin", "advisory", "unsupported", "unknown"} {
+		if value == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q has invalid %s %q (allowed: native, translated, plugin, advisory, unsupported, unknown)", model, field, value)
+}
+
+func validateModelWebSearchMode(model, field, value string) error {
+	if strings.EqualFold(strings.TrimSpace(value), "fallback") {
+		return nil
+	}
+	return validateModelCapabilityMode(model, field, value)
 }
 
 func validateHTTPPolicy(owner string, policy ModelHTTPPolicy) error {
@@ -319,14 +424,20 @@ func validateHTTPPolicy(owner string, policy ModelHTTPPolicy) error {
 }
 
 func validateStreamPolicy(owner string, policy ModelStreamPolicy) error {
-	if policy.IdleTimeoutSeconds < 0 {
-		return fmt.Errorf("%s has invalid stream idle timeout", owner)
+	if policy.IdleTimeoutSeconds < 0 || policy.FirstEventTimeoutSeconds < 0 || policy.SemanticProgressTimeoutSeconds < 0 || policy.MaxDurationSeconds < 0 {
+		return fmt.Errorf("%s has invalid stream timeout", owner)
 	}
 	switch strings.ToLower(strings.TrimSpace(policy.UpstreamMode)) {
 	case "", "stream", "nonstream-buffered", "auto":
-		return nil
+		break
 	default:
 		return fmt.Errorf("%s has invalid stream upstreamMode %q", owner, policy.UpstreamMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(policy.HeartbeatMode)) {
+	case "", "ignore", "transport-only", "semantic":
+		return nil
+	default:
+		return fmt.Errorf("%s has invalid stream heartbeatMode %q", owner, policy.HeartbeatMode)
 	}
 }
 
@@ -349,7 +460,12 @@ func findModelProvider(values map[string]ModelProvider, ref string) (ModelProvid
 }
 
 func FindModelDefinition(cfg Config, ref string) (string, ModelDefinition, bool) {
-	ref = strings.ToLower(strings.TrimSpace(ref))
+	rawRef := strings.TrimSpace(ref)
+	ref = strings.ToLower(rawRef)
+	qualifiedProvider, qualifiedModel, qualified := SplitQualifiedModelID(rawRef)
+	qualifiedProvider = strings.ToLower(qualifiedProvider)
+	qualifiedModel = strings.ToLower(qualifiedModel)
+	matches := make([]modelMatch, 0, 1)
 	names := make([]string, 0, len(cfg.Models))
 	for name := range cfg.Models {
 		names = append(names, name)
@@ -357,11 +473,32 @@ func FindModelDefinition(cfg Config, ref string) (string, ModelDefinition, bool)
 	sort.Strings(names)
 	for _, name := range names {
 		model := cfg.Models[name]
-		for _, alias := range append([]string{name}, model.Aliases...) {
-			if strings.ToLower(strings.TrimSpace(alias)) == ref {
+		if qualified {
+			if !strings.EqualFold(strings.TrimSpace(model.Provider), qualifiedProvider) {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(name), QualifiedModelID(qualifiedProvider, qualifiedModel)) || strings.EqualFold(strings.TrimSpace(name), qualifiedModel) {
 				return name, model, true
 			}
 		}
+		for _, alias := range append([]string{name}, model.Aliases...) {
+			candidate := strings.ToLower(strings.TrimSpace(alias))
+			if candidate != ref && (!qualified || candidate != qualifiedModel) {
+				continue
+			}
+			if qualified && !strings.EqualFold(strings.TrimSpace(model.Provider), qualifiedProvider) {
+				continue
+			}
+			matches = append(matches, modelMatch{name: name, model: model})
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0].name, matches[0].model, true
 	}
 	return "", ModelDefinition{}, false
+}
+
+type modelMatch struct {
+	name  string
+	model ModelDefinition
 }

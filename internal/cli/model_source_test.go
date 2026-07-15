@@ -40,6 +40,29 @@ func TestDueModelSourcesUsesPerSourceSyncedAtAndStableOrder(t *testing.T) {
 	}
 }
 
+func TestModelSourceHelpDescribesJSONCatalogWorkflow(t *testing.T) {
+	parent := runRootCommandForModelProfileTest(t, "model-source", "--help")
+	for _, want := range []string{"Git repository", "single JSON file", "schema-v2 manifest directory", "bind verifies one profile"} {
+		if !strings.Contains(parent, want) {
+			t.Fatalf("model-source help missing %q:\n%s", want, parent)
+		}
+	}
+
+	sync := runRootCommandForModelProfileTest(t, "model-source", "sync", "--help")
+	for _, want := range []string{"Git URL", "single legacy JSON file", "manifest.json", "providers/", "models/", "--kind", "git, file, or directory", "hidden from"} {
+		if !strings.Contains(sync, want) {
+			t.Fatalf("model-source sync help missing %q:\n%s", want, sync)
+		}
+	}
+
+	bind := runRootCommandForModelProfileTest(t, "model-source", "bind", "--help")
+	for _, want := range []string{"local", "secret store", "timeout-bounded", "never put a key in JSON", "--api-key-env", "--api-key-stdin"} {
+		if !strings.Contains(bind, want) {
+			t.Fatalf("model-source bind help missing %q:\n%s", want, bind)
+		}
+	}
+}
+
 func TestModelSourceAutoSyncOnceRunsOnlyDueSourcesAndKeepsServiceAliveOnFailure(t *testing.T) {
 	now := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
 	configPath := filepath.Join(t.TempDir(), "config.json")
@@ -159,6 +182,69 @@ func TestModelSourceSyncClonesLocalRepoWithoutKey(t *testing.T) {
 	}
 	if source := cfg.ModelSources["local"]; source.BackupActive || source.BackupReason != "" || !source.BackupSince.IsZero() {
 		t.Fatalf("successful sync did not clear backup state: %#v", source)
+	}
+}
+
+func TestModelSourceSyncAcceptsSplitCatalogFromLocalDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "catalog")
+	if err := os.MkdirAll(filepath.Join(root, "providers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := config.CatalogManifest{SchemaVersion: config.CurrentCatalogSchemaVersion, Kind: "catalog", Providers: []config.CatalogProviderRef{{ID: "hub", File: "providers/hub.json"}}, Models: []config.CatalogModelRef{{Provider: "hub", ID: "deepseek-v4-pro", File: "models/deepseek-v4-pro.json"}}}
+	provider := config.CatalogProviderDocument{SchemaVersion: config.CurrentCatalogSchemaVersion, Kind: "provider", ID: "hub", Interfaces: map[string]config.CatalogInterface{"chat": {Adapter: "openai-chat", Protocol: "chat-completions", BaseURL: "https://example.invalid/v1", CredentialRef: "hub-key", Auth: config.CatalogAuth{Type: "bearer"}}}}
+	yes := "native"
+	model := config.CatalogModelDocument{SchemaVersion: config.CurrentCatalogSchemaVersion, Kind: "model", Provider: "hub", ID: "deepseek-v4-pro", UpstreamModel: "vendor/deepseek-v4-pro", Capabilities: config.CatalogCapabilities{Tools: yes, ParallelTools: "unsupported", Reasoning: yes, ReasoningSummary: "unknown", Vision: "unsupported", WebSearch: "unsupported"}, Reasoning: config.CatalogReasoningPolicy{Efforts: []string{"high"}, Default: "high"}, Routes: map[string]config.ModelRoute{"responses": {Interface: "chat", Adapter: "openai-chat", Protocol: "chat-completions"}}}
+	for name, value := range map[string]any{"manifest.json": manifest, filepath.Join("providers", "hub.json"): provider, filepath.Join("models", "deepseek-v4-pro.json"): model} {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	out := runRootCommandForModelProfileTest(t, "--config", configPath, "model-source", "sync", root, "--name", "split")
+	if !strings.Contains(out, "0 verified and available") || !strings.Contains(out, "model-source bind split hub/deepseek-v4-pro") {
+		t.Fatalf("sync output = %q", out)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Models["hub/deepseek-v4-pro"]; !ok {
+		t.Fatalf("split model was not qualified: %#v", cfg.Models)
+	}
+	if _, ok := cfg.ModelProfiles["hub/deepseek-v4-pro"]; !ok {
+		t.Fatalf("split profile was not derived: %#v", cfg.ModelProfiles)
+	}
+	if cfg.ModelSources["split"].Kind != "directory" || cfg.ModelSources["split"].Manifest != "manifest.json" {
+		t.Fatalf("source metadata = %#v", cfg.ModelSources["split"])
+	}
+}
+
+func TestResolveModelSourceTreatsManifestPathAsCatalogDirectory(t *testing.T) {
+	root := t.TempDir()
+	manifest := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(manifest, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name, source, err := resolveModelSource(config.Config{}, manifest, modelSourceSyncOptions{name: "local", kind: "directory"})
+	if err != nil {
+		t.Fatalf("resolve manifest path: %v", err)
+	}
+	if name != "local" || source.Kind != "directory" || source.Path != root || source.File != "manifest.json" || source.Manifest != "manifest.json" {
+		t.Fatalf("resolved source = %#v (name=%q)", source, name)
+	}
+	if _, _, err := resolveModelSource(config.Config{}, manifest, modelSourceSyncOptions{kind: "file"}); err == nil || !strings.Contains(err.Error(), "not a file source") {
+		t.Fatalf("manifest file kind mismatch error = %v", err)
 	}
 }
 

@@ -208,30 +208,35 @@ func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst 
 		if !resolved.IsDefault() {
 			launch.Name = resolved.Name
 			launch.DisableHostedWebSearch = resolved.Provider.DisableHostedWebSearch
-			if launch.DisableHostedWebSearch {
-				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+			launch.WebSearchFallbackEnabled, launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort = webSearchFallbackForModel(resolved.Model.SearchPolicy)
+			if launch.DisableHostedWebSearch && launch.WebSearchFallbackEnabled {
+				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort)
 			}
 		}
 		return launch
 	}
 	catalogJSON, _ := modelprofile.CodexModelCatalogJSON(resolved.Provider)
 	webSearchFallbackTOML := []byte(nil)
-	if resolved.Provider.DisableHostedWebSearch {
-		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML()
+	fallbackEnabled, fallbackModel, fallbackEffort := webSearchFallbackForModel(resolved.Model.SearchPolicy)
+	if resolved.Provider.DisableHostedWebSearch && fallbackEnabled {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(fallbackModel, fallbackEffort)
 	}
 	return codexModelProfileLaunch{
-		Enabled:                true,
-		Name:                   resolved.Name,
-		ProviderID:             resolved.Provider.ID,
-		Model:                  resolved.SelectedPublicModel(),
-		BaseURL:                fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
-		ProxyKey:               inst.ModelProxyKey,
-		Revision:               resolved.Revision(),
-		ProviderName:           resolved.Provider.DisplayName,
-		CatalogJSON:            catalogJSON,
-		WebSearchFallbackTOML:  webSearchFallbackTOML,
-		Direct:                 resolved.Provider.DirectResponses,
-		DisableHostedWebSearch: resolved.Provider.DisableHostedWebSearch,
+		Enabled:                  true,
+		Name:                     resolved.Name,
+		ProviderID:               resolved.Provider.ID,
+		Model:                    resolved.SelectedPublicModel(),
+		BaseURL:                  fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
+		ProxyKey:                 inst.ModelProxyKey,
+		Revision:                 resolved.Revision(),
+		ProviderName:             resolved.Provider.DisplayName,
+		CatalogJSON:              catalogJSON,
+		WebSearchFallbackTOML:    webSearchFallbackTOML,
+		WebSearchFallbackModel:   fallbackModel,
+		WebSearchFallbackEffort:  fallbackEffort,
+		WebSearchFallbackEnabled: fallbackEnabled,
+		Direct:                   resolved.Provider.DirectResponses,
+		DisableHostedWebSearch:   resolved.Provider.DisableHostedWebSearch,
 	}
 }
 
@@ -534,14 +539,16 @@ func modelProfileAdapterFacade(
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,
 		Providers: []responsesadapter.ProviderConfig{{
-			ID:             resolved.Provider.ID,
-			ProfileID:      resolved.Provider.AdapterProfile,
-			BaseURL:        resolved.Provider.BaseURL,
-			APIKey:         apiKey,
-			DefaultModel:   resolved.SelectedPublicModel(),
-			Models:         responsesAdapterModelsForProvider(resolved.Provider),
-			Adapter:        adapter,
-			CustomToolMode: resolved.Model.ToolPolicy.CustomToolMode,
+			ID:                      resolved.Provider.ID,
+			ProfileID:               resolved.Provider.AdapterProfile,
+			BaseURL:                 resolved.Provider.BaseURL,
+			APIKey:                  apiKey,
+			DefaultModel:            resolved.SelectedPublicModel(),
+			Models:                  responsesAdapterModelsForProvider(resolved.Provider),
+			Adapter:                 adapter,
+			CustomToolMode:          resolved.Model.ToolPolicy.CustomToolMode,
+			ParallelToolEnforcement: resolved.Model.ToolPolicy.ParallelEnforcement,
+			ResponsesPolicy:         resolved.Model.ResponsesPolicy,
 		}},
 		ProxyKeys: map[string]string{proxyKey: resolved.Provider.ID},
 		KeySalt:   resolved.Name + ":" + strconv.Itoa(resolved.Revision()),

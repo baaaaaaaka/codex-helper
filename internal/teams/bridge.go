@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -3239,6 +3240,17 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 					return true, nil
 				}
 			}
+		}
+	}
+	if authoredByCurrentUser {
+		if outboxID := helperOutboxProvenanceMarkerID(msg.Body.Content); outboxID != "" {
+			// The marker is carried by the message itself, so a process crash in
+			// the narrow Graph-accepted-before-ledger-write window cannot turn a
+			// helper attachment into a fresh user prompt. Keep the durable record
+			// as an audit/backfill aid, but suppress even if that write fails.
+			_ = b.recordHelperOutboxMarkerProvenance(ctx, chatID, msg.ID, outboxID)
+			b.markRegistrySent(chatID, msg.ID)
+			return true, nil
 		}
 	}
 	if legacyGeneratedOutputFallback && isHelperAttachmentEchoMessage(msg) {
@@ -9584,7 +9596,7 @@ func (b *Bridge) uploadArtifactsFromResult(ctx context.Context, session *Session
 			if err != nil {
 				return b.sendToChat(ctx, session.ChatID, fmt.Sprintf("artifact upload rejected: %v", err))
 			}
-			file.UploadName = ArtifactUploadName(session.ID, turn.ID, file.Name, file.Bytes)
+			file.UploadName = ArtifactUploadNameFromSHA256(session.ID, turn.ID, file.Name, file.SHA256)
 			artifactID := artifactRecordID(session.ID, turn.ID, planned.CleanPath, file.UploadName)
 			if err := b.recordArtifactPlanned(ctx, session, turn, planned, file.UploadName, artifactID, "", "queued", ""); err != nil {
 				return err
@@ -9624,7 +9636,7 @@ func (b *Bridge) queueAndSendAttachmentUploadOutbox(ctx context.Context, session
 		AttachmentContentType:  strings.TrimSpace(staged.ContentType),
 		AttachmentUploadFolder: uploadFolder,
 		AttachmentSize:         staged.Size,
-		AttachmentHash:         attachmentContentHash(staged.Bytes),
+		AttachmentHash:         firstNonEmptyString(staged.SHA256, attachmentContentHash(staged.Bytes)),
 		ArtifactIDs:            append([]string(nil), opts.ArtifactIDs...),
 	})
 	if err != nil {
@@ -9653,17 +9665,8 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 	if err := ensureOutboundRoot(root); err != nil {
 		return OutboundAttachmentFile{}, err
 	}
-	hash := attachmentContentHash(file.Bytes)
-	hashPrefix := hash
-	if len(hashPrefix) > 16 {
-		hashPrefix = hashPrefix[:16]
-	}
 	stageRoot := filepath.Join(root, ".outbox")
 	if err := ensurePrivateDirectory(stageRoot); err != nil {
-		return OutboundAttachmentFile{}, err
-	}
-	stageDir := filepath.Join(stageRoot, hashPrefix)
-	if err := ensurePrivateDirectory(stageDir); err != nil {
 		return OutboundAttachmentFile{}, err
 	}
 	uploadName := strings.TrimSpace(file.UploadName)
@@ -9673,8 +9676,7 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 	if uploadName == "" || strings.HasPrefix(uploadName, ".") || !safeDrivePathSegment(uploadName) {
 		return OutboundAttachmentFile{}, fmt.Errorf("unsafe staged upload file name")
 	}
-	stagePath := filepath.Join(stageDir, uploadName)
-	tmp, err := os.CreateTemp(stageDir, ".stage-*.tmp")
+	tmp, err := os.CreateTemp(stageRoot, ".stage-*.tmp")
 	if err != nil {
 		return OutboundAttachmentFile{}, outboundPathError("create staged Teams upload file", err)
 	}
@@ -9689,13 +9691,53 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 		_ = tmp.Close()
 		return OutboundAttachmentFile{}, err
 	}
-	if _, err := tmp.Write(file.Bytes); err != nil {
+	hasher := sha256.New()
+	var source io.Reader
+	var sourceFile *os.File
+	if file.Bytes != nil {
+		source = bytes.NewReader(file.Bytes)
+	} else if strings.TrimSpace(file.Path) != "" {
+		sourceFile, err = openValidatedOutboundAttachmentFile(file.Path, "", true, maxOutboundAttachmentBytes)
+		if err != nil {
+			_ = tmp.Close()
+			return OutboundAttachmentFile{}, err
+		}
+		defer sourceFile.Close()
+		source = sourceFile
+	} else {
 		_ = tmp.Close()
-		return OutboundAttachmentFile{}, outboundPathError("write staged Teams upload file", err)
+		return OutboundAttachmentFile{}, fmt.Errorf("outbound attachment has no source data")
+	}
+	written, err := io.Copy(io.MultiWriter(tmp, hasher), source)
+	if err != nil {
+		_ = tmp.Close()
+		return OutboundAttachmentFile{}, outboundPathError("stage Teams upload file", err)
+	}
+	if written > maxOutboundAttachmentBytes {
+		_ = tmp.Close()
+		return OutboundAttachmentFile{}, fmt.Errorf("refusing to stage file larger than %d bytes", maxOutboundAttachmentBytes)
+	}
+	if file.Size > 0 && written != file.Size {
+		_ = tmp.Close()
+		return OutboundAttachmentFile{}, fmt.Errorf("outbound attachment size changed from %d to %d bytes", file.Size, written)
+	}
+	if expected := strings.TrimSpace(file.SHA256); expected != "" && !strings.EqualFold(expected, hex.EncodeToString(hasher.Sum(nil))) {
+		_ = tmp.Close()
+		return OutboundAttachmentFile{}, fmt.Errorf("outbound attachment content changed during staging")
 	}
 	if err := tmp.Close(); err != nil {
 		return OutboundAttachmentFile{}, outboundPathError("close staged Teams upload file", err)
 	}
+	hash := hex.EncodeToString(hasher.Sum(nil))
+	hashPrefix := hash
+	if len(hashPrefix) > 16 {
+		hashPrefix = hashPrefix[:16]
+	}
+	stageDir := filepath.Join(stageRoot, hashPrefix)
+	if err := ensurePrivateDirectory(stageDir); err != nil {
+		return OutboundAttachmentFile{}, err
+	}
+	stagePath := filepath.Join(stageDir, uploadName)
 	if err := os.Rename(tmpPath, stagePath); err != nil {
 		return OutboundAttachmentFile{}, outboundPathError("publish staged Teams upload file", err)
 	}
@@ -9706,6 +9748,8 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 	staged := file
 	staged.Path = stagePath
 	staged.UploadName = uploadName
+	staged.Size = written
+	staged.SHA256 = hash
 	return staged, nil
 }
 
@@ -13749,7 +13793,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	var msg ChatMessage
 	if outbox.DriveItemID != "" {
-		msg, err = b.graph.SendDriveItemAttachmentWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body)
+		msg, err = b.graph.SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(ctx, outbox.TeamsChatID, driveItemFromOutbox(outbox), outbox.Body, outbox.ID)
 	} else if strings.TrimSpace(outbox.QuoteReplyToMessageID) != "" {
 		msg, err = b.sendOutboxQuoteReplyWithoutRateLimitRetry(ctx, outbox)
 		if err != nil && shouldFallbackFromQuoteReplyError(err) && !shouldFallbackTeamsMathMediaError(err) {
@@ -13856,15 +13900,16 @@ func (b *Bridge) sendOutboxHTMLWithoutRateLimitRetry(ctx context.Context, outbox
 
 func (b *Bridge) renderOutboxHTMLForSend(ctx context.Context, outbox teamstore.OutboxMessage) (string, []ChatMention, []OutboundHostedContent) {
 	assets, hosted := b.renderOutboxMathAssets(ctx, outbox)
+	var rendered string
+	var mentions []ChatMention
 	if outbox.MentionOwner {
-		html, mentions := renderOutboxMentionHTMLWithFallback(outbox, b.user, "owner", assets)
-		return html, mentions, hosted
+		rendered, mentions = renderOutboxMentionHTMLWithFallback(outbox, b.user, "owner", assets)
+	} else if user, ok := outboxMentionUser(outbox); ok {
+		rendered, mentions = renderOutboxMentionHTMLWithFallback(outbox, user, "user", assets)
+	} else {
+		rendered = renderOutboxHTMLWithMathAssets(outbox, assets)
 	}
-	if user, ok := outboxMentionUser(outbox); ok {
-		html, mentions := renderOutboxMentionHTMLWithFallback(outbox, user, "user", assets)
-		return html, mentions, hosted
-	}
-	return renderOutboxHTMLWithMathAssets(outbox, assets), nil, hosted
+	return rendered + helperOutboxProvenanceMarker(outbox.ID), mentions, hosted
 }
 
 func shouldFallbackFromQuoteReplyError(err error) bool {
@@ -14019,7 +14064,12 @@ func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamst
 	if uploadFolder == "" {
 		uploadFolder = defaultOutboundUploadFolder
 	}
-	item, err := graph.UploadSmallDriveItemWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
+	var item DriveItem
+	if file.Bytes != nil || strings.TrimSpace(file.Path) == "" {
+		item, err = graph.UploadSmallDriveItemWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
+	} else {
+		item, err = graph.UploadDriveItemFromFileWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Path, file.Size, file.ContentType)
+	}
 	if err != nil {
 		return DriveItem{}, err
 	}
@@ -14054,14 +14104,13 @@ func outboundAttachmentFileFromOutbox(outbox teamstore.OutboxMessage) (OutboundA
 	if err != nil {
 		return OutboundAttachmentFile{}, OutboundAttachmentOptions{}, err
 	}
-	data, size, err := readOutboundAttachmentFile(path, root, false, maxOutboundAttachmentBytes)
+	size, hash, err := hashOutboundAttachmentFile(path, root, false, maxOutboundAttachmentBytes)
 	if err != nil {
 		return OutboundAttachmentFile{}, OutboundAttachmentOptions{}, err
 	}
 	if outbox.AttachmentSize > 0 && outbox.AttachmentSize != size {
 		return OutboundAttachmentFile{}, OutboundAttachmentOptions{}, fmt.Errorf("queued attachment size changed from %d to %d bytes", outbox.AttachmentSize, size)
 	}
-	hash := attachmentContentHash(data)
 	if outbox.AttachmentHash != "" && outbox.AttachmentHash != hash {
 		return OutboundAttachmentFile{}, OutboundAttachmentOptions{}, fmt.Errorf("queued attachment content changed since it was accepted")
 	}
@@ -14089,8 +14138,8 @@ func outboundAttachmentFileFromOutbox(outbox teamstore.OutboxMessage) (OutboundA
 		Name:        name,
 		UploadName:  uploadName,
 		ContentType: contentType,
-		Bytes:       data,
 		Size:        size,
+		SHA256:      hash,
 	}, OutboundAttachmentOptions{UploadFolder: uploadFolder}, nil
 }
 

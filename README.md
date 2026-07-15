@@ -200,6 +200,9 @@ walk through the normal flows in order.
 | `codex-proxy model-profile doctor [name]` | Validate a saved model profile |
 | `codex-proxy model-profile set-default <name>` | Set the default model profile |
 | `codex-proxy model-profile delete <name>` | Delete a non-default model profile |
+| `codex-proxy model-source sync <source>` | Import Git, single-file JSON, or schema-v2 manifest-directory model candidates without a key |
+| `codex-proxy model-source list` | List synced sources and verification state |
+| `codex-proxy model-source bind <source> <profile>` | Store a local key and verify one candidate before exposing it |
 | `codex-proxy responses serve` | Run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream |
 | `codex-proxy skills install-builtin` | Install or repair bundled skills in `$HOME/.agents/skills`, including the built-in `cxp` usage skill |
 | `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
@@ -481,18 +484,27 @@ controlled independently by `maxRetries` and `retryStatuses`.
 configuration and provider/model/catalog fingerprints, so inheritance and
 overrides can be checked before launching Teams, CLI, or App.
 
-Model configuration can also be distributed in Git. Put `cxp-models.json` at
-the repository root by default. It uses the same strict model schema, but
-credentials declare only their names and authentication shape, never an
+Model configuration can also be distributed in Git or as a manually managed
+JSON file/directory. The current subscription format uses a strict
+`manifest.json` with one provider document under `providers/` and one model
+document under `models/` for each provider/model binding. `provider/model` is
+the canonical identity, so the same model ID can safely exist behind multiple
+providers and provider-scoped aliases cannot silently collide. Credentials
+declare only symbolic references and authentication shape, never an
 `apiKeyRef` or raw key:
 
 ```bash
-cxp model-source sync https://github.example/team/models.git
+cxp model-source sync https://github.example/team/models.git --kind git
+cxp model-source sync /path/to/catalog-directory --kind directory
+cxp model-source sync /path/to/catalog.json --kind file
 cxp model-source list
 cxp model-source bind models work-glm --api-key-stdin
 ```
 
-The first sync uses a shallow filtered clone and asks for no key. Candidates
+The source kind is inferred from the argument when `--kind` is omitted. A
+`manifest.json` argument denotes its containing catalog directory. The first
+sync uses a shallow filtered clone or an isolated copy of the local source and
+asks for no key. Candidates
 appear only in `model-source list`, not in Codex. `bind` asks only for the
 source, profile, and missing key, then sends one timeout-bounded minimal real
 inference request. A model enters the CXP/Teams model list and the shared Codex
@@ -503,7 +515,24 @@ model, compatibility policy, or credential binding changes, CXP automatically
 reuses the stored key for a minimal re-verification; unchanged models remain
 available without user action. Only a failed re-verification stays hidden and
 is retried by later syncs. Private repositories use the existing Git credential helper or SSH agent;
-repository URLs with embedded credentials are rejected.
+repository URLs with embedded credentials are rejected. Schema-v2 parsing is
+fail-closed: unknown fields, path escapes/symlinks, raw secrets, missing
+capability declarations, ambiguous identities, and unsupported
+adapter/protocol routes are rejected atomically. The runtime currently
+consumes the `responses` route with the declared OpenAI-compatible chat or
+native Responses pair; an unimplemented Anthropic/Beta/FIM operation is
+reported as unsupported rather than silently routed through the wrong wire
+format. Historical `catalogs/` or `/models` snapshots are evidence only and
+are not valid subscription manifests.
+
+The public reference repository
+[`baaaaaaaka/codex-helper-providers`](https://github.com/baaaaaaaka/codex-helper-providers)
+contains a small credential-free schema-v2 catalog for official DeepSeek V4 and
+MiMo 2.5 routes. It is useful as a starting point for `model-source sync` and
+for reviewing provider/model declarations; it is not a key store and it does
+not make a provider capability available unless the provider actually supports
+that route. Bind credentials locally after importing it, and treat the files as
+examples that should be verified against the provider you intend to use.
 
 While the long-lived Teams service is running, configured model-source
 repositories are shallow-synced automatically every 30 minutes. The schedule

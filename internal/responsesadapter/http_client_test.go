@@ -99,6 +99,138 @@ func TestOpenAIChatAdapterUsesConfiguredStreamIdleTimeout(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatAdapterDistinguishesSemanticProgressFromTransportHeartbeats(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"start\"}}]}\n\n"))
+		flusher.Flush()
+		for i := 0; i < 10; i++ {
+			_, _ = w.Write([]byte(": heartbeat\n\n"))
+			flusher.Flush()
+			time.Sleep(8 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+	adapter := OpenAIChatAdapter{
+		BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1,
+		StreamIdleTimeout: 200 * time.Millisecond, SemanticProgressTimeout: 25 * time.Millisecond,
+	}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(stream)
+	if len(events) == 0 || events[len(events)-1].Kind != ProviderEventError {
+		t.Fatalf("events = %#v", events)
+	}
+	timeout, ok := events[len(events)-1].Err.(ProviderTimeoutError)
+	if !ok || timeout.Kind != ProviderTimeoutSemanticProgress {
+		t.Fatalf("error = %#v, want semantic progress timeout", events[len(events)-1].Err)
+	}
+
+	t.Run("semantic heartbeat counts as progress", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 20; i++ {
+				_, _ = w.Write([]byte(": heartbeat\n\n"))
+				flusher.Flush()
+				time.Sleep(3 * time.Millisecond)
+			}
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+		}))
+		defer server.Close()
+		adapter := OpenAIChatAdapter{
+			BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1,
+			StreamIdleTimeout: 200 * time.Millisecond, SemanticProgressTimeout: 20 * time.Millisecond,
+			HeartbeatMode: "semantic",
+		}
+		stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := collectEvents(stream)
+		if len(events) == 0 || events[len(events)-1].Kind != ProviderEventDone {
+			t.Fatalf("events = %#v, semantic heartbeats should keep the request alive", events)
+		}
+	})
+}
+
+func TestOpenAIChatAdapterFirstEventAndHardDeadline(t *testing.T) {
+	t.Run("first event", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(200 * time.Millisecond)
+		}))
+		defer server.Close()
+		adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1, StreamIdleTimeout: time.Second, FirstEventTimeout: 25 * time.Millisecond}
+		stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := collectEvents(stream)
+		if len(events) == 0 {
+			t.Fatal("no events")
+		}
+		timeout, ok := events[len(events)-1].Err.(ProviderTimeoutError)
+		if !ok || timeout.Kind != ProviderTimeoutFirstEvent {
+			t.Fatalf("error = %#v", events[len(events)-1].Err)
+		}
+	})
+	t.Run("hard deadline", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 20; i++ {
+				_, _ = w.Write([]byte(": heartbeat\n\n"))
+				flusher.Flush()
+				time.Sleep(8 * time.Millisecond)
+			}
+		}))
+		defer server.Close()
+		adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1, StreamIdleTimeout: time.Second, MaxDuration: 30 * time.Millisecond}
+		stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := collectEvents(stream)
+		if len(events) == 0 {
+			t.Fatal("no events")
+		}
+		timeout, ok := events[len(events)-1].Err.(ProviderTimeoutError)
+		if !ok || timeout.Kind != ProviderTimeoutDeadline {
+			t.Fatalf("error = %#v", events[len(events)-1].Err)
+		}
+	})
+}
+
+func TestOpenAIChatAdapterRejectsConfiguredPlainTextToolCall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"<tool_call>read_file\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+	profile := ProviderProfile{ID: "generic", PlainTextToolCall: "reject"}
+	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1, Profile: profile}
+	stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := collectEvents(stream)
+	if len(events) == 0 || events[len(events)-1].Kind != ProviderEventError || !strings.Contains(events[len(events)-1].Err.Error(), "plain-text tool call") {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
 func TestOpenAIChatAdapterExplicitZeroRetries(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -189,6 +189,9 @@ codex-proxy proxy doctor
 | `codex-proxy model-profile doctor [name]` | 验证保存的模型 profile |
 | `codex-proxy model-profile set-default <name>` | 设置默认模型 profile |
 | `codex-proxy model-profile delete <name>` | 删除非默认模型 profile |
+| `codex-proxy model-source sync <source>` | 无需密钥导入 Git、单文件 JSON 或 schema-v2 manifest 目录中的模型候选 |
+| `codex-proxy model-source list` | 列出已同步的 source 和验证状态 |
+| `codex-proxy model-source bind <source> <profile>` | 把 key 保存在本地并验证一个候选，成功后才使其可用 |
 | `codex-proxy responses serve` | 运行本地 `/v1/responses` adapter，后端是 OpenAI-compatible chat upstream |
 | `codex-proxy skills install-builtin` | 在 `$HOME/.agents/skills` 中安装或修复 bundled skills，包括内置 `cxp` 使用 skill |
 | `codex-proxy skills add <git-url>` | 从 git source 安装 skills 并保持更新 |
@@ -436,17 +439,20 @@ HTTP 行为可以分别在 provider 和 model 层调优。下面两个分阶段�
 `codex-proxy model-profile explain <name>` 会输出去除 secret 后的最终生效配置及
 provider/model/catalog fingerprint，适合在启动 Teams、CLI 或 App 前核对继承和 override。
 
-模型配置也可以由 Git 仓库分发。仓库根目录默认放置 `cxp-models.json`，使用与上述
-模型配置相同的严格 schema，但 credential 只声明名称和认证方式，不包含 `apiKeyRef`
-或实际密钥：
+模型配置也可以由 Git 仓库、手动 JSON 文件或目录分发。当前订阅格式使用严格的
+`manifest.json`：每个 provider 放在 `providers/`，每个 provider/model 绑定放在
+`models/`。规范身份是 `provider/model`，因此不同 provider 可以安全地使用相同的模型
+ID；credential 只声明符号引用和认证方式，不包含实际密钥：
 
 ```bash
-cxp model-source sync https://github.example/team/models.git
+cxp model-source sync https://github.com/baaaaaaaka/codex-helper-providers.git --kind git
+cxp model-source sync /path/to/catalog-directory --kind directory
+cxp model-source sync /path/to/catalog.json --kind file
 cxp model-source list
-cxp model-source bind models work-glm --api-key-stdin
+cxp model-source bind <source-name> <profile-name> --api-key-stdin
 ```
 
-首次 `sync` 使用 shallow/filter clone，并且不索取密钥。候选 profile 此时只会出现在
+首次 `sync` 使用 shallow/filter clone 或隔离的本地副本，并且不索取密钥。候选 profile 此时只会出现在
 `model-source list`，不会进入 Codex。`bind` 只询问 source、profile 和缺少的 key，随后
 发送一次有超时的最小真实推理请求；只有成功后才会出现在 CXP/Teams model list 以及
 Codex CLI/App/Teams 的统一模型目录。验证失败会保留候选和简短错误但继续隐藏模型。
@@ -454,6 +460,12 @@ Git revision 本身不再使验证失效。如果有效 provider、模型、兼�
 绑定发生变化，CXP 会直接复用已保存的 key 执行最小自动复验；未变模型无需用户操作就会
 继续可用。只有复验失败的模型会保持隐藏，后续 sync 会再次尝试。私有仓库使用现有 Git credential
 helper 或 SSH agent；带内嵌 credential 的仓库 URL 会被拒绝。
+`manifest.json` 中引用的 provider/model 文件会在加载时严格校验；未知字段、路径穿越、
+悬空引用、未声明能力和不匹配的 adapter/protocol 会原子拒绝。历史 `catalogs/` 或
+`/models` 快照不是有效订阅源。公开参考仓库
+[`baaaaaaaka/codex-helper-providers`](https://github.com/baaaaaaaka/codex-helper-providers)
+只包含不带凭据的官方 DeepSeek V4/MiMo 2.5 配置；导入后仍需在本地绑定 key，并根据实际
+provider 能力重新验证，不能把配置声明当作 provider 能力保证。
 
 长驻 Teams service 运行时，会每 30 分钟自动 shallow-sync 已配置的 model-source Git
 仓库。调度以每个 source 持久化的 `syncedAt` 为准，因此 helper 重启不会延后已经到期的

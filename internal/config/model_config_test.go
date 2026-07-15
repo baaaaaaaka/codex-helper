@@ -62,6 +62,29 @@ func TestValidateModelHTTPConcurrency(t *testing.T) {
 	}
 }
 
+func TestValidateModelProgressAndCapabilityPolicies(t *testing.T) {
+	falseValue := false
+	trueValue := true
+	if err := validateStreamPolicy("model m", ModelStreamPolicy{SemanticProgressTimeoutSeconds: -1}); err == nil {
+		t.Fatal("negative semantic timeout accepted")
+	}
+	if err := validateStreamPolicy("model m", ModelStreamPolicy{HeartbeatMode: "unknown"}); err == nil {
+		t.Fatal("unknown heartbeat mode accepted")
+	}
+	if err := validateCapabilityMode("m", "responses.structuredOutput.jsonSchema", "unsupported"); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCapabilityMode("m", "responses.structuredOutput.jsonSchema", "broken"); err == nil {
+		t.Fatal("unknown structured output capability accepted")
+	}
+	if err := validateModelDefinition("m", ModelDefinition{Provider: "p", UpstreamModel: "m", Capabilities: ModelCapabilities{NativeWebSearch: &falseValue}, Search: ModelSearchPolicy{Native: &trueValue}}); err == nil {
+		t.Fatal("conflicting native web-search declarations accepted")
+	}
+	if err := validateModelDefinition("m", ModelDefinition{Provider: "p", UpstreamModel: "m", Tools: ModelToolPolicy{ParallelEnforcement: "strict"}, Responses: ModelResponsesPolicy{StructuredOutput: ModelStructuredOutputPolicy{JSONSchema: "native"}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestValidateGlobalDefaultsRejectsMalformedOrDanglingValues(t *testing.T) {
 	cfg := Config{Defaults: &GlobalDefaults{Model: "work"}}
 	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "defaults.model") {

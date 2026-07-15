@@ -2,6 +2,8 @@ package teams
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +18,9 @@ import (
 )
 
 const (
-	defaultOutboundUploadFolder = "Microsoft Teams Chat Files"
-	maxOutboundAttachmentBytes  = 20 << 20
+	defaultOutboundUploadFolder   = "Microsoft Teams Chat Files"
+	maxOutboundAttachmentBytes    = maxTeamsTransferBytes
+	outboundAttachmentInlineBytes = 20 << 20
 )
 
 type OutboundAttachmentOptions struct {
@@ -38,6 +41,7 @@ type OutboundAttachmentFile struct {
 	ContentType string
 	Bytes       []byte
 	Size        int64
+	SHA256      string
 }
 
 type OutboundAttachmentResult struct {
@@ -111,7 +115,7 @@ func PrepareOutboundAttachment(path string, opts OutboundAttachmentOptions) (Out
 	if maxBytes <= 0 {
 		maxBytes = maxOutboundAttachmentBytes
 	}
-	data, size, err := readOutboundAttachmentFile(resolved, root, opts.AllowAnyPath, maxBytes)
+	size, hash, data, err := inspectOutboundAttachmentFile(resolved, root, opts.AllowAnyPath, maxBytes)
 	if err != nil {
 		return OutboundAttachmentFile{}, err
 	}
@@ -138,6 +142,7 @@ func PrepareOutboundAttachment(path string, opts OutboundAttachmentOptions) (Out
 		ContentType: contentType,
 		Bytes:       data,
 		Size:        size,
+		SHA256:      hash,
 	}, nil
 }
 
@@ -150,7 +155,8 @@ func SendOutboundAttachment(ctx context.Context, graph *GraphClient, chatID stri
 	if message == "" {
 		message = "file attached: " + file.Name
 	}
-	msg, err := graph.SendDriveItemAttachment(ctx, chatID, meta, message)
+	provenanceID := attachmentUploadOutboxID(chatID, "direct", file)
+	msg, err := graph.SendDriveItemAttachmentWithProvenance(ctx, chatID, meta, message, provenanceID)
 	if err != nil {
 		return OutboundAttachmentResult{}, err
 	}
@@ -165,7 +171,13 @@ func UploadOutboundAttachment(ctx context.Context, graph *GraphClient, file Outb
 	if uploadFolder == "" {
 		uploadFolder = defaultOutboundUploadFolder
 	}
-	item, err := graph.UploadSmallDriveItem(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
+	var item DriveItem
+	var err error
+	if file.Bytes != nil || strings.TrimSpace(file.Path) == "" {
+		item, err = graph.UploadSmallDriveItem(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
+	} else {
+		item, err = graph.UploadDriveItemFromFile(ctx, uploadFolder, file.UploadName, file.Path, file.Size, file.ContentType)
+	}
 	if err != nil {
 		return DriveItem{}, err
 	}
@@ -273,6 +285,118 @@ func readOutboundAttachmentFile(path string, root string, allowAny bool, maxByte
 		return nil, 0, fmt.Errorf("refusing to upload file larger than %d bytes", maxBytes)
 	}
 	return data, int64(len(data)), nil
+}
+
+// inspectOutboundAttachmentFile validates the file without materializing a
+// large upload in memory. Small files keep the historical Bytes field so the
+// existing simple-upload path and callers remain compatible.
+func inspectOutboundAttachmentFile(path string, root string, allowAny bool, maxBytes int64) (int64, string, []byte, error) {
+	f, err := openValidatedOutboundAttachmentFile(path, root, allowAny, maxBytes)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, "", nil, outboundPathError("inspect Teams upload file", err)
+	}
+	initialSize := info.Size()
+	hasher := sha256.New()
+	var data []byte
+	if initialSize <= outboundAttachmentInlineBytes {
+		probe, err := io.ReadAll(io.LimitReader(f, outboundAttachmentInlineBytes+1))
+		if err != nil {
+			return 0, "", nil, outboundPathError("read Teams upload file", err)
+		}
+		if int64(len(probe)) <= outboundAttachmentInlineBytes {
+			_, _ = hasher.Write(probe)
+			data = probe
+		} else {
+			_, _ = hasher.Write(probe)
+			if _, err := io.Copy(hasher, f); err != nil {
+				return 0, "", nil, outboundPathError("read Teams upload file", err)
+			}
+		}
+	} else if _, err := io.Copy(hasher, io.LimitReader(f, maxBytes+1)); err != nil {
+		return 0, "", nil, outboundPathError("read Teams upload file", err)
+	}
+	finalInfo, err := f.Stat()
+	if err != nil {
+		return 0, "", nil, outboundPathError("inspect Teams upload file", err)
+	}
+	if finalInfo.Size() != initialSize {
+		return 0, "", nil, fmt.Errorf("Teams upload file changed during read")
+	}
+	if initialSize > maxBytes {
+		return 0, "", nil, fmt.Errorf("refusing to upload file larger than %d bytes", maxBytes)
+	}
+	return initialSize, hex.EncodeToString(hasher.Sum(nil)), data, nil
+}
+
+func hashOutboundAttachmentFile(path string, root string, allowAny bool, maxBytes int64) (int64, string, error) {
+	f, err := openValidatedOutboundAttachmentFile(path, root, allowAny, maxBytes)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, "", outboundPathError("inspect Teams upload file", err)
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, io.LimitReader(f, maxBytes+1)); err != nil {
+		return 0, "", outboundPathError("read Teams upload file", err)
+	}
+	finalInfo, err := f.Stat()
+	if err != nil {
+		return 0, "", outboundPathError("inspect Teams upload file", err)
+	}
+	if finalInfo.Size() != info.Size() {
+		return 0, "", fmt.Errorf("Teams upload file changed during read")
+	}
+	return info.Size(), hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func openValidatedOutboundAttachmentFile(path string, root string, allowAny bool, maxBytes int64) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, outboundPathError("open Teams upload file", err)
+	}
+	closeOnError := func(err error) (*os.File, error) {
+		_ = f.Close()
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return closeOnError(outboundPathError("inspect Teams upload file", err))
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return closeOnError(outboundPathError("inspect Teams upload path", err))
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 {
+		return closeOnError(fmt.Errorf("refusing to upload symlink: %s", filepath.Base(path)))
+	}
+	if !info.Mode().IsRegular() {
+		return closeOnError(fmt.Errorf("refusing to upload non-regular file: %s", filepath.Base(path)))
+	}
+	if info.Size() > maxBytes {
+		return closeOnError(fmt.Errorf("refusing to upload %d-byte file; limit is %d bytes", info.Size(), maxBytes))
+	}
+	if !allowAny {
+		if err := ensureResolvedPathUnderRoot(path, root); err != nil {
+			return closeOnError(err)
+		}
+		currentInfo, err := os.Stat(path)
+		if err != nil {
+			return closeOnError(outboundPathError("inspect Teams upload path", err))
+		}
+		if !os.SameFile(info, currentInfo) {
+			return closeOnError(fmt.Errorf("Teams upload file changed during safety checks"))
+		}
+	}
+	return f, nil
 }
 
 func ensureResolvedPathUnderRoot(path string, root string) error {
