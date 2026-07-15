@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-15T16:43:20Z",
+  "generated_at": "2026-07-15T19:32:21Z",
   "releases": [
     {
       "assets": [
@@ -41,6 +41,47 @@
       "published_at": "2026-07-13T05:42:17Z",
       "tag_name": "v0.1.14",
       "version": "0.1.14"
+    },
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.14-rc.26_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.14-rc.26_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.14-rc.26_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.14-rc.26_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.14-rc.26 \u2014 external model catalogs and fail-closed routes",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-07-15T19:24:32Z",
+      "tag_name": "v0.1.14-rc.26",
+      "version": "0.1.14-rc.26"
     },
     {
       "assets": [
@@ -4059,47 +4100,6 @@
       "published_at": "2026-06-14T14:22:22Z",
       "tag_name": "v0.1.10-rc.11",
       "version": "0.1.10-rc.11"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.10-rc.10_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.10-rc.10_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.10-rc.10_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.10-rc.10_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.10-rc.10",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-06-14T14:17:26Z",
-      "tag_name": "v0.1.10-rc.10",
-      "version": "0.1.10-rc.10"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
