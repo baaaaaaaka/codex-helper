@@ -115,3 +115,132 @@ func TestValidateGlobalDefaultsRejectsMalformedOrDanglingValues(t *testing.T) {
 		t.Fatalf("valid global defaults: %v", err)
 	}
 }
+
+func TestValidateModelCatalogAndProviderBinding(t *testing.T) {
+	cfg := Config{
+		ModelConfigVersion: 1,
+		ModelCatalogs: map[string]ModelCatalog{
+			"nvidia": {Type: ModelCatalogTypeGit, URL: "https://github.com/example/catalog.git", File: "models.json"},
+		},
+		ModelProviderBindings: map[string]ModelProviderBinding{
+			"nvidia": {Catalog: "NVIDIA", SecretRef: "secret:model-credential/catalog-provider/nvidia/default/api-key", InterfaceSecrets: map[string]string{"anthropic": "secret:deepseek/anthropic"}},
+		},
+	}
+	if err := ValidateModelConfig(cfg); err != nil {
+		t.Fatalf("valid catalog config rejected: %v", err)
+	}
+	cfg.ModelProviderBindings["nvidia"] = ModelProviderBinding{Catalog: "missing"}
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "missing catalog") {
+		t.Fatalf("missing catalog binding accepted: %v", err)
+	}
+}
+
+func TestStoreStrictlyRejectsUnknownCatalogField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	raw := `{"version":6,"profiles":[],"modelConfigVersion":1,"modelCatalogs":{"test":{"type":"managed-json","file":"models.json","managedFile":"model-catalogs/test.json","unexpected":true}}}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(); err == nil || !strings.Contains(err.Error(), `unknown field "unexpected"`) {
+		t.Fatalf("Load error = %v", err)
+	}
+}
+
+func TestValidateModelCatalogRejectsPathTraversalOnlyAtSegmentBoundary(t *testing.T) {
+	valid := ModelCatalog{Type: ModelCatalogTypeGit, URL: "https://example.invalid/catalog.git", File: "foo..bar/models.json"}
+	if err := valid.Validate("catalog"); err != nil {
+		t.Fatalf("filename containing dots was rejected: %v", err)
+	}
+	traversal := valid
+	traversal.File = "../models.json"
+	if err := traversal.Validate("catalog"); err == nil {
+		t.Fatal("path traversal was accepted")
+	}
+	scp := valid
+	scp.URL = "git@github.example:team/catalog.git"
+	if err := scp.Validate("catalog"); err != nil {
+		t.Fatalf("scp-style Git URL rejected: %v", err)
+	}
+}
+
+func TestCatalogModelAliasesAreProviderScoped(t *testing.T) {
+	cfg := Config{
+		ModelConfigVersion: 1,
+		ModelProviders: map[string]ModelProvider{
+			"nvidia": {Protocol: "chat-completions", BaseURL: "https://nvidia.example/v1"},
+			"hub":    {Protocol: "chat-completions", BaseURL: "https://hub.example/v1"},
+		},
+		Models: map[string]ModelDefinition{
+			"nvidia/deepseek-v4": {Provider: "nvidia", UpstreamModel: "deepseek-ai/deepseek-v4", Aliases: []string{"deepseek-v4"}},
+			"hub/deepseek-v4":    {Provider: "hub", UpstreamModel: "deepseek-ai/deepseek-v4", Aliases: []string{"deepseek-v4"}},
+		},
+	}
+	if err := ValidateModelConfig(cfg); err != nil {
+		t.Fatalf("same alias across providers was rejected: %v", err)
+	}
+	if name, _, ok := FindModelDefinition(cfg, "nvidia/deepseek-v4"); !ok || name != "nvidia/deepseek-v4" {
+		t.Fatalf("exact provider/model selector did not resolve: %q %v", name, ok)
+	}
+	if _, _, ok := FindModelDefinition(cfg, "deepseek-v4"); ok {
+		t.Fatal("ambiguous short alias resolved without a provider")
+	}
+}
+
+func TestValidateModelConversionAndOperation(t *testing.T) {
+	strict := true
+	cfg := Config{
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]ModelCredential{"key": {APIKeyRef: "env:KEY"}},
+		ModelProviders: map[string]ModelProvider{"deepseek": {
+			Protocol: "chat-completions", BaseURL: "https://example.invalid",
+			Interfaces: map[string]ModelInterface{"anthropic": {
+				Adapter: "deepseek-anthropic", BaseURL: "https://example.invalid/anthropic",
+				Conversion: ModelConversion{Enabled: true, Profile: "deepseek-anthropic-v1", Strict: &strict},
+			}},
+		}},
+		Models: map[string]ModelDefinition{"m": {Provider: "deepseek", UpstreamModel: "m", DefaultInterface: "anthropic", Features: map[string]ModelFeature{
+			"fim": {Support: "native", Interface: "anthropic", Operation: "fim"},
+		}}},
+	}
+	if err := ValidateModelConfig(cfg); err != nil {
+		t.Fatalf("valid conversion config rejected: %v", err)
+	}
+	cfg.ModelProviders["deepseek"].Interfaces["anthropic"] = ModelInterface{Adapter: "deepseek-anthropic", BaseURL: "https://example.invalid/anthropic", Conversion: ModelConversion{Enabled: true}}
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "conversion.profile") {
+		t.Fatalf("missing conversion profile accepted: %v", err)
+	}
+}
+
+func TestValidateModelFeatureRoutesRejectsConflictingOperationInterfaces(t *testing.T) {
+	cfg := Config{
+		ModelConfigVersion: 1,
+		ModelProviders: map[string]ModelProvider{
+			"provider": {
+				Protocol:         "chat-completions",
+				BaseURL:          "https://example.invalid/v1",
+				DefaultInterface: "chat",
+				Interfaces: map[string]ModelInterface{
+					"chat": {Adapter: "openai-chat", Protocol: "chat-completions", BaseURL: "https://example.invalid/v1"},
+					"beta": {Adapter: "deepseek-beta", Protocol: "beta", BaseURL: "https://example.invalid/beta", Conversion: ModelConversion{Enabled: true, Profile: "deepseek-beta-v1"}},
+				},
+			},
+		},
+		Models: map[string]ModelDefinition{
+			"model": {
+				Provider:      "provider",
+				UpstreamModel: "vendor/model",
+				Features: map[string]ModelFeature{
+					"chat":      {Support: "native", Interface: "chat", Operation: "chat"},
+					"responses": {Support: "translated", Interface: "beta", Operation: "chat"},
+				},
+			},
+		},
+	}
+	if err := ValidateModelConfig(cfg); err == nil || !strings.Contains(err.Error(), "conflicting interfaces") {
+		t.Fatalf("conflicting operation routes accepted: %v", err)
+	}
+}

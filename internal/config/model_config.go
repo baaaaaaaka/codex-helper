@@ -21,11 +21,13 @@ func validateRawModelConfig(raw []byte) error {
 		Models             map[string]json.RawMessage `json:"models"`
 		ModelProfiles      map[string]json.RawMessage `json:"modelProfiles"`
 		ModelSources       map[string]json.RawMessage `json:"modelSources"`
+		ModelCatalogs      map[string]json.RawMessage `json:"modelCatalogs"`
+		ProviderBindings   map[string]json.RawMessage `json:"modelProviderBindings"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return err
 	}
-	if envelope.ModelConfigVersion == 0 && len(envelope.ModelCredentials) == 0 && len(envelope.ModelProviders) == 0 && len(envelope.Models) == 0 {
+	if envelope.ModelConfigVersion == 0 && len(envelope.ModelCredentials) == 0 && len(envelope.ModelProviders) == 0 && len(envelope.Models) == 0 && len(envelope.ModelProfiles) == 0 && len(envelope.ModelSources) == 0 && len(envelope.ModelCatalogs) == 0 && len(envelope.ProviderBindings) == 0 {
 		return nil
 	}
 	for name, value := range envelope.ModelCredentials {
@@ -58,6 +60,18 @@ func validateRawModelConfig(raw []byte) error {
 			return fmt.Errorf("model source %q: %w", name, err)
 		}
 	}
+	for name, value := range envelope.ModelCatalogs {
+		var out ModelCatalog
+		if err := strictModelJSON(value, &out); err != nil {
+			return fmt.Errorf("model catalog %q: %w", name, err)
+		}
+	}
+	for name, value := range envelope.ProviderBindings {
+		var out ModelProviderBinding
+		if err := strictModelJSON(value, &out); err != nil {
+			return fmt.Errorf("model provider binding %q: %w", name, err)
+		}
+	}
 	return nil
 }
 
@@ -81,8 +95,8 @@ func ValidateModelConfig(cfg Config) error {
 	if cfg.ModelConfigVersion < 0 || cfg.ModelConfigVersion > CurrentModelConfigVersion {
 		return fmt.Errorf("unsupported model config version %d (supported: %d)", cfg.ModelConfigVersion, CurrentModelConfigVersion)
 	}
-	if (len(cfg.ModelCredentials) > 0 || len(cfg.ModelProviders) > 0 || len(cfg.Models) > 0) && cfg.ModelConfigVersion == 0 {
-		return fmt.Errorf("modelConfigVersion is required when modelCredentials, modelProviders, or models are configured")
+	if (len(cfg.ModelCredentials) > 0 || len(cfg.ModelProviders) > 0 || len(cfg.Models) > 0 || len(cfg.ModelCatalogs) > 0 || len(cfg.ModelProviderBindings) > 0) && cfg.ModelConfigVersion == 0 {
+		return fmt.Errorf("modelConfigVersion is required when model credentials, providers, models, catalogs, or provider bindings are configured")
 	}
 	for name, credential := range cfg.ModelCredentials {
 		if strings.TrimSpace(name) == "" || (strings.TrimSpace(credential.APIKeyRef) == "" && !credential.Pending) {
@@ -94,14 +108,23 @@ func ValidateModelConfig(cfg Config) error {
 			return fmt.Errorf("model credential %q has invalid authType %q", name, credential.AuthType)
 		}
 	}
+	seenProviders := map[string]string{}
 	for name, provider := range cfg.ModelProviders {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("model provider name is empty")
 		}
+		providerKey := strings.ToLower(strings.TrimSpace(name))
+		if previous, ok := seenProviders[providerKey]; ok && !strings.EqualFold(previous, name) {
+			return fmt.Errorf("model provider names %q and %q differ only by case", previous, name)
+		}
+		seenProviders[providerKey] = name
 		switch strings.ToLower(strings.TrimSpace(provider.Protocol)) {
 		case "responses", "chat-completions":
 		default:
 			return fmt.Errorf("model provider %q has invalid protocol %q", name, provider.Protocol)
+		}
+		if err := validateProviderConversion(name, provider); err != nil {
+			return err
 		}
 		parsed, err := url.Parse(strings.TrimSpace(provider.BaseURL))
 		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
@@ -112,13 +135,59 @@ func ValidateModelConfig(cfg Config) error {
 				return fmt.Errorf("model provider %q references missing credential %q", name, ref)
 			}
 		}
+		for interfaceName, ref := range provider.InterfaceCredentials {
+			if _, ok := findModelInterface(provider.Interfaces, interfaceName); !ok {
+				return fmt.Errorf("model provider %q interfaceCredentials references missing interface %q", name, interfaceName)
+			}
+			if _, ok := findModelCredential(cfg.ModelCredentials, ref); !ok {
+				return fmt.Errorf("model provider %q interface %q references missing credential %q", name, interfaceName, ref)
+			}
+		}
 		if err := validateHTTPPolicy("model provider "+name, provider.HTTP); err != nil {
 			return err
 		}
 		if err := validateStreamPolicy("model provider "+name, provider.Stream); err != nil {
 			return err
 		}
+		if len(provider.Interfaces) > 0 {
+			if provider.DefaultInterface != "" {
+				if _, ok := findModelInterface(provider.Interfaces, provider.DefaultInterface); !ok {
+					return fmt.Errorf("model provider %q references missing defaultInterface %q", name, provider.DefaultInterface)
+				}
+			}
+			for interfaceName, iface := range provider.Interfaces {
+				if err := ValidateModelCatalogID(interfaceName); err != nil {
+					return fmt.Errorf("model provider %q interface %q: %w", name, interfaceName, err)
+				}
+				if strings.TrimSpace(iface.Adapter) == "" {
+					return fmt.Errorf("model provider %q interface %q requires adapter", name, interfaceName)
+				}
+				protocol := strings.ToLower(strings.TrimSpace(iface.Protocol))
+				if protocol == "" {
+					protocol = modelProtocolForAdapter(iface.Adapter)
+				}
+				if !modelProtocolSupported(protocol) {
+					return fmt.Errorf("model provider %q interface %q has invalid protocol %q", name, interfaceName, iface.Protocol)
+				}
+				if expected := modelProtocolForAdapter(iface.Adapter); expected != "" && !modelProtocolsCompatible(expected, protocol) {
+					return fmt.Errorf("model provider %q interface %q protocol %q is incompatible with adapter %q", name, interfaceName, protocol, iface.Adapter)
+				}
+				parsed, err := url.Parse(strings.TrimSpace(iface.BaseURL))
+				if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+					return fmt.Errorf("model provider %q interface %q requires an absolute http(s) baseUrl", name, interfaceName)
+				}
+				if parsed.User != nil {
+					return fmt.Errorf("model provider %q interface %q baseUrl must not contain credentials", name, interfaceName)
+				}
+				if err := validateModelConversion("model provider "+name+" interface "+interfaceName, iface.Conversion); err != nil {
+					return err
+				}
+			}
+		}
 	}
+	// Catalog routes are provider-scoped: two providers may legitimately
+	// publish the same short model name. Keep aliases unique within a provider
+	// and require callers to use provider/model when an alias is ambiguous.
 	seenAliases := map[string]string{}
 	for name, model := range cfg.Models {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(model.UpstreamModel) == "" {
@@ -127,19 +196,100 @@ func ValidateModelConfig(cfg Config) error {
 		if _, ok := findModelProvider(cfg.ModelProviders, model.Provider); !ok {
 			return fmt.Errorf("model %q references missing provider %q", name, model.Provider)
 		}
-		scope := strings.ToLower(strings.TrimSpace(model.Provider))
+		if model.DefaultInterface != "" {
+			provider, _ := findModelProvider(cfg.ModelProviders, model.Provider)
+			if _, ok := findModelInterface(provider.Interfaces, model.DefaultInterface); !ok {
+				return fmt.Errorf("model %q references missing defaultInterface %q", name, model.DefaultInterface)
+			}
+		}
 		for _, alias := range append([]string{name}, model.Aliases...) {
 			key := strings.ToLower(strings.TrimSpace(alias))
 			if key == "" {
 				continue
 			}
-			scopedKey := scope + "\x00" + key
-			if previous, ok := seenAliases[scopedKey]; ok && !strings.EqualFold(previous, name) {
-				return fmt.Errorf("model alias %q conflicts within provider %q between %q and %q", alias, model.Provider, previous, name)
+			scope := strings.ToLower(strings.TrimSpace(model.Provider)) + "\x00" + key
+			if previous, ok := seenAliases[scope]; ok && !strings.EqualFold(previous, name) {
+				return fmt.Errorf("model alias %q conflicts between %q and %q", alias, previous, name)
 			}
-			seenAliases[scopedKey] = name
+			seenAliases[scope] = name
 		}
-		if err := validateModelDefinition(name, model); err != nil {
+		if err := ValidateModelDefinition(name, model); err != nil {
+			return err
+		}
+		for featureName, feature := range model.Features {
+			switch feature.Support {
+			case "native", "translated", "plugin", "unsupported":
+			default:
+				return fmt.Errorf("model %q feature %q has invalid support %q", name, featureName, feature.Support)
+			}
+			featureName = strings.TrimSpace(featureName)
+			if featureName == "" {
+				return fmt.Errorf("model %q has an empty feature name", name)
+			}
+			if feature.RequireSources || feature.Sources != nil || feature.NativeTool != nil || feature.Fallback != nil {
+				if featureName != "webSearch" {
+					return fmt.Errorf("model %q feature %q has web-search-only fields", name, featureName)
+				}
+			}
+			if feature.Interface != "" && !featureRouteCapable(featureName, feature.Operation) {
+				return fmt.Errorf("model %q feature %q interface is not bound to an operation", name, featureName)
+			}
+			if feature.Support == "unsupported" && (feature.Interface != "" || feature.Operation != "" || feature.Fallback != nil || feature.NativeTool != nil) {
+				return fmt.Errorf("model %q unsupported feature %q must not declare a route or fallback", name, featureName)
+			}
+			if feature.Interface != "" {
+				provider, ok := findModelProvider(cfg.ModelProviders, model.Provider)
+				if !ok || len(provider.Interfaces) == 0 {
+					return fmt.Errorf("model %q feature %q references interface without provider interfaces", name, featureName)
+				}
+				if _, ok := findModelInterface(provider.Interfaces, feature.Interface); !ok {
+					return fmt.Errorf("model %q feature %q references missing interface %q", name, featureName, feature.Interface)
+				}
+			}
+			if feature.Support == "plugin" && featureName == "webSearch" && (feature.Fallback == nil || strings.TrimSpace(feature.Fallback.Selector) == "") {
+				return fmt.Errorf("model %q plugin feature %q requires fallback.selector", name, featureName)
+			}
+			if (feature.Support == "native" || feature.Support == "translated") && featureRouteCapable(featureName, feature.Operation) && feature.Interface == "" {
+				return fmt.Errorf("model %q %s feature %q requires interface", name, feature.Support, featureName)
+			}
+			if feature.Support == "plugin" && (feature.Interface != "" || feature.Operation != "") {
+				return fmt.Errorf("model %q plugin feature %q must not declare an upstream route", name, featureName)
+			}
+			if feature.NativeTool != nil {
+				if feature.Support != "native" {
+					return fmt.Errorf("model %q feature %q nativeTool requires support=native", name, featureName)
+				}
+				if len(feature.NativeTool.InputTypes) == 0 || strings.TrimSpace(feature.NativeTool.UpstreamType) == "" {
+					return fmt.Errorf("model %q feature %q nativeTool requires inputTypes and upstreamType", name, featureName)
+				}
+				seenNativeTypes := map[string]bool{}
+				for _, value := range feature.NativeTool.InputTypes {
+					value = strings.TrimSpace(value)
+					if value == "" || strings.ContainsAny(value, " \t\r\n") || seenNativeTypes[strings.ToLower(value)] {
+						return fmt.Errorf("model %q feature %q nativeTool has invalid inputType %q", name, featureName, value)
+					}
+					seenNativeTypes[strings.ToLower(value)] = true
+				}
+			}
+			if feature.Sources != nil {
+				mode := strings.ToLower(strings.TrimSpace(feature.Sources.Mode))
+				switch mode {
+				case "", "annotations", "text", "unsupported":
+				default:
+					return fmt.Errorf("model %q feature %q has invalid sources.mode %q", name, featureName, feature.Sources.Mode)
+				}
+				if mode == "unsupported" && (feature.Sources.RequireURL || feature.Sources.RequireSources || feature.RequireSources) {
+					return fmt.Errorf("model %q feature %q cannot require sources when sources.mode is unsupported", name, featureName)
+				}
+				if mode == "text" && (feature.Sources.RequireURL || feature.Sources.RequireSources || feature.RequireSources) {
+					return fmt.Errorf("model %q feature %q cannot require URL/structured sources when sources.mode is text", name, featureName)
+				}
+			}
+			if err := validateModelOperation(name, featureName, feature.Operation); err != nil {
+				return err
+			}
+		}
+		if err := ValidateModelFeatureRoutes(name, model.Features); err != nil {
 			return err
 		}
 	}
@@ -162,7 +312,7 @@ func ValidateModelConfig(cfg Config) error {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("model source name is empty")
 		}
-		switch strings.ToLower(strings.TrimSpace(source.Kind)) {
+		switch kind := strings.ToLower(strings.TrimSpace(source.Kind)); kind {
 		case "", "git":
 			if strings.TrimSpace(source.URL) == "" {
 				return fmt.Errorf("model source %q requires url", name)
@@ -170,6 +320,9 @@ func ValidateModelConfig(cfg Config) error {
 		case "file", "directory":
 			if strings.TrimSpace(source.Path) == "" {
 				return fmt.Errorf("model source %q requires path", name)
+			}
+			if strings.TrimSpace(source.URL) != "" {
+				return fmt.Errorf("model source %q local kind %q must not include url", name, kind)
 			}
 		default:
 			return fmt.Errorf("model source %q has invalid kind %q", name, source.Kind)
@@ -196,6 +349,16 @@ func ValidateModelConfig(cfg Config) error {
 			}
 		}
 	}
+	for name, catalog := range cfg.ModelCatalogs {
+		if err := catalog.Validate(name); err != nil {
+			return err
+		}
+	}
+	for provider, binding := range cfg.ModelProviderBindings {
+		if err := binding.Validate(provider, cfg.ModelCatalogs); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -211,7 +374,7 @@ func validateGlobalDefaults(cfg Config) error {
 	if selector != "" && !strings.EqualFold(selector, DefaultModelProfileName) {
 		prefix, value, qualified := strings.Cut(selector, ":")
 		if !qualified || strings.TrimSpace(value) == "" {
-			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, `model:<provider>/<model>`, or `profile:<name>`", selector)
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
 		}
 		switch strings.ToLower(strings.TrimSpace(prefix)) {
 		case "official":
@@ -222,12 +385,8 @@ func validateGlobalDefaults(cfg Config) error {
 			if _, ok := cfg.FindModelProfile(strings.TrimSpace(value)); !ok {
 				return fmt.Errorf("defaults.model references missing profile %q", strings.TrimSpace(value))
 			}
-		case "model":
-			if _, _, ok := FindModelDefinition(cfg, strings.TrimSpace(value)); !ok {
-				return fmt.Errorf("defaults.model references missing model %q", strings.TrimSpace(value))
-			}
 		default:
-			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, `model:<provider>/<model>`, or `profile:<name>`", selector)
+			return fmt.Errorf("defaults.model %q must be `default`, `official:<slug>`, or `profile:<name>`", selector)
 		}
 	}
 	rawEffort := cfg.Defaults.ReasoningEffort
@@ -236,6 +395,15 @@ func validateGlobalDefaults(cfg Config) error {
 		return fmt.Errorf("defaults.reasoningEffort %q must be a single model-advertised value", effort)
 	}
 	return nil
+}
+
+func findModelInterface(interfaces map[string]ModelInterface, ref string) (ModelInterface, bool) {
+	for name, iface := range interfaces {
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(ref)) {
+			return iface, true
+		}
+	}
+	return ModelInterface{}, false
 }
 
 // ParseModelConfigFragment parses a repository-owned model configuration using
@@ -269,7 +437,11 @@ func ParseModelConfigFragment(raw []byte) (Config, error) {
 	return cfg, nil
 }
 
-func validateModelDefinition(name string, model ModelDefinition) error {
+// ValidateModelDefinition validates the policy-bearing portion of a model
+// definition. External catalog readers use the same validator so a catalog
+// cannot pass its own parser and then fail later when it is materialized into
+// the local config schema.
+func ValidateModelDefinition(name string, model ModelDefinition) error {
 	if model.Limits.ContextWindow < 0 || model.Limits.MaxContextWindow < 0 || model.Limits.MaxOutputTokens < 0 || model.Limits.EffectiveContextPercent < 0 || model.Limits.EffectiveContextPercent > 100 {
 		return fmt.Errorf("model %q has invalid limits", name)
 	}
@@ -319,6 +491,9 @@ func validateModelDefinition(name string, model ModelDefinition) error {
 		"customToolMode":        model.Tools.CustomToolMode,
 		"temperature":           model.Sampling.Temperature,
 		"topP":                  model.Sampling.TopP,
+		"images":                model.Messages.Images,
+		"audio":                 model.Messages.Audio,
+		"video":                 model.Messages.Video,
 	} {
 		if err := validateModelEnum(name, field, value); err != nil {
 			return err
@@ -349,7 +524,159 @@ func validateModelDefinition(name string, model ModelDefinition) error {
 			return err
 		}
 	}
+	for field, value := range map[string]string{
+		"responses.previousResponseId": model.Responses.PreviousResponseID,
+		"responses.background":         model.Responses.Background,
+		"responses.contextManagement":  model.Responses.ContextManagement,
+	} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "", "native", "unsupported", "delegated":
+		default:
+			return fmt.Errorf("model %q has invalid %s policy %q", name, field, value)
+		}
+	}
 	return nil
+}
+
+// validateModelDefinition is kept as a private compatibility shim for the
+// split-catalog loader. The canonical validator is exported so the newer
+// model-catalog package can share exactly the same policy checks.
+func validateModelDefinition(name string, model ModelDefinition) error {
+	return ValidateModelDefinition(name, model)
+}
+
+// ValidateModelFeatureRoutes rejects ambiguous operation selectors before
+// they can be projected into the runtime route map. Without this check, two
+// JSON features could publish the same operation with different interfaces;
+// map iteration order would then silently decide which credential and wire
+// protocol was used.
+func ValidateModelFeatureRoutes(name string, features map[string]ModelFeature) error {
+	routes := map[string]string{}
+	for featureName, feature := range features {
+		if feature.Support == "unsupported" || feature.Support == "plugin" || strings.TrimSpace(feature.Interface) == "" {
+			continue
+		}
+		key := modelFeatureRouteKey(featureName, feature.Operation)
+		if key == "" {
+			continue
+		}
+		interfaceName := strings.TrimSpace(feature.Interface)
+		if previous, ok := routes[key]; ok && !strings.EqualFold(previous, interfaceName) {
+			return fmt.Errorf("model %q operation route %q maps to conflicting interfaces %q and %q", name, key, previous, interfaceName)
+		}
+		routes[key] = interfaceName
+	}
+	return nil
+}
+
+func modelFeatureRouteKey(featureName, operation string) string {
+	featureName = strings.ToLower(strings.TrimSpace(featureName))
+	if featureName == "websearch" {
+		return "websearch"
+	}
+	if operation = strings.ToLower(strings.TrimSpace(operation)); operation != "" {
+		return operation
+	}
+	switch featureName {
+	case "chat", "responses", "prefix", "fim":
+		return featureName
+	default:
+		return ""
+	}
+}
+
+func validateModelConversion(owner string, conversion ModelConversion) error {
+	profile := strings.TrimSpace(conversion.Profile)
+	if conversion.Enabled && profile == "" {
+		return fmt.Errorf("%s conversion.enabled requires conversion.profile", owner)
+	}
+	if !conversion.Enabled && profile != "" {
+		return fmt.Errorf("%s conversion.profile requires conversion.enabled", owner)
+	}
+	if conversion.Strict != nil && !conversion.Enabled {
+		return fmt.Errorf("%s conversion.strict requires conversion.enabled", owner)
+	}
+	if len(profile) > 128 || strings.ContainsAny(profile, " \t\r\n/\\") {
+		return fmt.Errorf("%s conversion.profile %q is invalid", owner, profile)
+	}
+	return nil
+}
+
+func validateProviderConversion(name string, provider ModelProvider) error {
+	profile := strings.TrimSpace(provider.ConversionProfile)
+	if profile != "" && (len(profile) > 128 || strings.ContainsAny(profile, " \t\r\n/\\")) {
+		return fmt.Errorf("model provider %q conversionProfile %q is invalid", name, profile)
+	}
+	operation := strings.ToLower(strings.TrimSpace(provider.Operation))
+	if operation != "" && operation != "chat" && operation != "responses" && operation != "prefix" && operation != "fim" {
+		return fmt.Errorf("model provider %q has invalid operation %q", name, provider.Operation)
+	}
+	return nil
+}
+
+func validateModelOperation(model, feature, operation string) error {
+	operation = strings.ToLower(strings.TrimSpace(operation))
+	feature = strings.ToLower(strings.TrimSpace(feature))
+	if operation == "" {
+		if feature == "fim" || feature == "prefix" {
+			return fmt.Errorf("model %q feature %q requires operation %q", model, feature, feature)
+		}
+		return nil
+	}
+	switch operation {
+	case "chat", "responses", "prefix", "fim":
+	default:
+		return fmt.Errorf("model %q feature %q has invalid operation %q (allowed: chat, responses, prefix, fim)", model, feature, operation)
+	}
+	if (feature == "fim" || feature == "prefix") && operation != feature {
+		return fmt.Errorf("model %q feature %q must use operation %q", model, feature, feature)
+	}
+	return nil
+}
+
+func featureRouteCapable(feature, operation string) bool {
+	feature = strings.ToLower(strings.TrimSpace(feature))
+	operation = strings.ToLower(strings.TrimSpace(operation))
+	if operation != "" {
+		return true
+	}
+	switch feature {
+	case "chat", "responses", "websearch", "prefix", "fim":
+		return true
+	default:
+		return false
+	}
+}
+
+func modelProtocolForAdapter(adapter string) string {
+	switch strings.ToLower(strings.TrimSpace(adapter)) {
+	case "openai-responses", "mimo-responses":
+		return "responses"
+	case "deepseek-anthropic":
+		return "messages"
+	case "deepseek-beta":
+		return "beta"
+	default:
+		return "chat-completions"
+	}
+}
+
+func modelProtocolSupported(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "chat-completions", "responses", "messages", "anthropic", "beta", "fim":
+		return true
+	default:
+		return false
+	}
+}
+
+func modelProtocolsCompatible(expected, actual string) bool {
+	expected = strings.ToLower(strings.TrimSpace(expected))
+	actual = strings.ToLower(strings.TrimSpace(actual))
+	if expected == actual {
+		return true
+	}
+	return (expected == "messages" && actual == "anthropic") || (expected == "anthropic" && actual == "messages") || (expected == "beta" && actual == "fim") || (expected == "fim" && actual == "beta")
 }
 
 func validateModelEnum(model, field, value string) error {
@@ -359,7 +686,7 @@ func validateModelEnum(model, field, value string) error {
 	}
 	allowed := map[string][]string{
 		"thinkingMode":          {"disabled", "auto", "always", "effort-dependent", "provider-default"},
-		"historyPolicy":         {"never", "tool-calls-only", "always", "provider-default"},
+		"historyPolicy":         {"never", "tool-calls-only", "always", "omit", "drop", "text-only", "preserve", "keep", "provider-default"},
 		"toolChoice":            {"full", "auto-only", "omit"},
 		"parallel":              {"auto", "enabled", "disabled"},
 		"parallelEnforcement":   {"advisory", "strict"},
@@ -369,6 +696,9 @@ func validateModelEnum(model, field, value string) error {
 		"customToolMode":        {"function", "shell-fallback", "omit"},
 		"temperature":           {"forward", "strip", "strip-when-reasoning"},
 		"topP":                  {"forward", "strip", "strip-when-reasoning"},
+		"images":                {"allow", "enabled", "forward", "multimodal", "omit", "drop", "provider-default"},
+		"audio":                 {"allow", "enabled", "forward", "multimodal", "omit", "drop", "provider-default"},
+		"video":                 {"allow", "enabled", "forward", "multimodal", "omit", "drop", "provider-default"},
 	}
 	for _, candidate := range allowed[field] {
 		if value == candidate {
@@ -427,17 +757,16 @@ func validateStreamPolicy(owner string, policy ModelStreamPolicy) error {
 	if policy.IdleTimeoutSeconds < 0 || policy.FirstEventTimeoutSeconds < 0 || policy.SemanticProgressTimeoutSeconds < 0 || policy.MaxDurationSeconds < 0 {
 		return fmt.Errorf("%s has invalid stream timeout", owner)
 	}
-	switch strings.ToLower(strings.TrimSpace(policy.UpstreamMode)) {
-	case "", "stream", "nonstream-buffered", "auto":
-		break
-	default:
-		return fmt.Errorf("%s has invalid stream upstreamMode %q", owner, policy.UpstreamMode)
-	}
 	switch strings.ToLower(strings.TrimSpace(policy.HeartbeatMode)) {
-	case "", "ignore", "transport-only", "semantic":
-		return nil
+	case "", "ignore", "transport", "transport-only", "semantic":
 	default:
 		return fmt.Errorf("%s has invalid stream heartbeatMode %q", owner, policy.HeartbeatMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(policy.UpstreamMode)) {
+	case "", "stream", "nonstream-buffered", "auto":
+		return nil
+	default:
+		return fmt.Errorf("%s has invalid stream upstreamMode %q", owner, policy.UpstreamMode)
 	}
 }
 
@@ -460,45 +789,31 @@ func findModelProvider(values map[string]ModelProvider, ref string) (ModelProvid
 }
 
 func FindModelDefinition(cfg Config, ref string) (string, ModelDefinition, bool) {
-	rawRef := strings.TrimSpace(ref)
-	ref = strings.ToLower(rawRef)
-	qualifiedProvider, qualifiedModel, qualified := SplitQualifiedModelID(rawRef)
-	qualifiedProvider = strings.ToLower(qualifiedProvider)
-	qualifiedModel = strings.ToLower(qualifiedModel)
-	matches := make([]modelMatch, 0, 1)
+	ref = strings.ToLower(strings.TrimSpace(ref))
 	names := make([]string, 0, len(cfg.Models))
 	for name := range cfg.Models {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	// Exact provider/model selectors are stable even when their short aliases
+	// are also published by another provider.
+	for _, name := range names {
+		if strings.ToLower(strings.TrimSpace(name)) == ref {
+			return name, cfg.Models[name], true
+		}
+	}
+	matchedName := ""
+	var matched ModelDefinition
 	for _, name := range names {
 		model := cfg.Models[name]
-		if qualified {
-			if !strings.EqualFold(strings.TrimSpace(model.Provider), qualifiedProvider) {
-				continue
-			}
-			if strings.EqualFold(strings.TrimSpace(name), QualifiedModelID(qualifiedProvider, qualifiedModel)) || strings.EqualFold(strings.TrimSpace(name), qualifiedModel) {
-				return name, model, true
-			}
-		}
 		for _, alias := range append([]string{name}, model.Aliases...) {
-			candidate := strings.ToLower(strings.TrimSpace(alias))
-			if candidate != ref && (!qualified || candidate != qualifiedModel) {
-				continue
+			if strings.ToLower(strings.TrimSpace(alias)) == ref {
+				if matchedName != "" && !strings.EqualFold(matchedName, name) {
+					return "", ModelDefinition{}, false
+				}
+				matchedName, matched = name, model
 			}
-			if qualified && !strings.EqualFold(strings.TrimSpace(model.Provider), qualifiedProvider) {
-				continue
-			}
-			matches = append(matches, modelMatch{name: name, model: model})
 		}
 	}
-	if len(matches) == 1 {
-		return matches[0].name, matches[0].model, true
-	}
-	return "", ModelDefinition{}, false
-}
-
-type modelMatch struct {
-	name  string
-	model ModelDefinition
+	return matchedName, matched, matchedName != ""
 }

@@ -41,8 +41,9 @@ type outputItem struct {
 }
 
 type contentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type        string           `json:"type"`
+	Text        string           `json:"text"`
+	Annotations []SourceCitation `json:"annotations,omitempty"`
 }
 
 type reasoningSummary struct {
@@ -127,7 +128,7 @@ func (i outputItem) MarshalJSON() ([]byte, error) {
 }
 
 func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, responseID string, req ResponsesRequest, providerReq ProviderRequest, stream <-chan ProviderEvent) {
-	result, ok := f.collectProviderResult(ctx, stream)
+	result, ok := f.collectProviderResult(ctx, stream, providerReq.Tools)
 	if !ok {
 		message := "provider stream ended before completion"
 		if result.providerErr != nil {
@@ -140,9 +141,17 @@ func (f *Facade) completeResponse(w http.ResponseWriter, ctx context.Context, re
 		writeJSON(w, http.StatusBadGateway, errorBody(err.Error()))
 		return
 	}
+	if len(result.sources) > 0 && strings.EqualFold(strings.TrimSpace(providerReq.SourcePolicy.Mode), "unsupported") {
+		writeJSON(w, http.StatusBadGateway, errorBody("provider returned source citations but catalog marks sources unsupported"))
+		return
+	}
+	if providerReq.SourcePolicy.RequireSources && len(result.sources) == 0 {
+		writeJSON(w, http.StatusBadGateway, errorBody("provider returned no source citations for a source-required search route"))
+		return
+	}
 	result.toolCalls = markProviderToolCallTypes(result.toolCalls, providerReq.Tools)
 	visibleToolCalls := f.prepareProviderToolCalls(result.toolCalls)
-	response := buildResponseObject(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, visibleToolCalls)
+	response := buildResponseObjectWithSources(responseID, req, req.Model, result.text, result.messageOutputIndex, result.reasoningText, result.reasoningOutputIndex, result.usage, visibleToolCalls, result.sources)
 	status := ResponseStatusCompleted
 	if isLengthFinishReason(result.finishReason) {
 		status = ResponseStatusIncomplete
@@ -199,6 +208,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	var usage *Usage
 	finishReason := ""
 	toolCalls := newToolCallAccumulator(responseID)
+	var sources []SourceCitation
 	created := buildResponseObject(responseID, req, req.Model, "", 0, "", -1, nil, nil)
 	created.Status = string(ResponseStatusInProgress)
 	writeEvent("response.created", map[string]any{"response": created})
@@ -290,7 +300,25 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 					"content_index": 0,
 					"delta":         event.Delta,
 				})
+			case ProviderEventSource:
+				if event.Source != nil {
+					if strings.EqualFold(strings.TrimSpace(providerReq.SourcePolicy.Mode), "unsupported") {
+						emitFailure("provider returned source citations but catalog marks sources unsupported")
+						return
+					}
+					ensureMessageItem()
+					sources = appendUniqueSources(sources, *event.Source)
+					writeEvent("response.output_text.annotation.added", map[string]any{
+						"output_index":     messageOutputIndex,
+						"content_index":    0,
+						"annotation_index": len(sources) - 1,
+						"annotation":       *event.Source,
+					})
+				}
 			case ProviderEventToolCallDelta:
+				if event.ToolCall != nil && strings.TrimSpace(event.ToolCall.Namespace) == "" {
+					event.ToolCall.Namespace = providerToolNamespace(event.ToolCall.Name, providerReq.Tools)
+				}
 				call, added, err := toolCalls.apply(event.ToolCall, &nextOutputIndex)
 				if err != nil {
 					emitFailure(err.Error())
@@ -313,6 +341,10 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				return
 			case ProviderEventDone:
 				finishReason = event.FinishReason
+				if providerReq.SourcePolicy.RequireSources && len(sources) == 0 {
+					emitFailure("provider returned no source citations for a source-required search route")
+					return
+				}
 				if err := toolCalls.validateComplete(); err != nil {
 					emitFailure(err.Error())
 					return
@@ -327,13 +359,13 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				}
 				records := markProviderToolCallTypes(toolCalls.records(), providerReq.Tools)
 				visibleRecords := f.prepareProviderToolCalls(records)
-				for _, doneItem := range buildDoneItems(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, visibleRecords, startedMessageItem, startedReasoningItem) {
+				for _, doneItem := range buildDoneItemsWithSources(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, visibleRecords, startedMessageItem, startedReasoningItem, sources) {
 					writeEvent("response.output_item.done", map[string]any{
 						"output_index": doneItem.outputIndex,
 						"item":         doneItem.item,
 					})
 				}
-				response := buildResponseObject(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, visibleRecords)
+				response := buildResponseObjectWithSources(responseID, req, req.Model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, visibleRecords, sources)
 				status := ResponseStatusCompleted
 				terminalEvent := "response.completed"
 				if isLengthFinishReason(finishReason) {
@@ -373,6 +405,7 @@ type providerResult struct {
 	reasoningOutputIndex int
 	usage                *Usage
 	toolCalls            []ToolCallRecord
+	sources              []SourceCitation
 	finishReason         string
 	providerErr          error
 }
@@ -384,7 +417,7 @@ func validateProviderResultContract(result providerResult, req ProviderRequest) 
 	return validateStructuredOutputResponse(req.ResponseFormat, result.text, req.StructuredOutputPolicy)
 }
 
-func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan ProviderEvent) (providerResult, bool) {
+func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan ProviderEvent, tools []ChatTool) (providerResult, bool) {
 	result := providerResult{messageOutputIndex: -1, reasoningOutputIndex: -1}
 	toolCalls := newToolCallAccumulator("")
 	nextOutputIndex := 0
@@ -414,11 +447,18 @@ func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan Provid
 				}
 				result.text += event.Delta
 			case ProviderEventToolCallDelta:
+				if event.ToolCall != nil && strings.TrimSpace(event.ToolCall.Namespace) == "" {
+					event.ToolCall.Namespace = providerToolNamespace(event.ToolCall.Name, tools)
+				}
 				if _, _, err := toolCalls.apply(event.ToolCall, &nextOutputIndex); err != nil {
 					return providerResult{}, false
 				}
 			case ProviderEventUsage:
 				result.usage = event.Usage
+			case ProviderEventSource:
+				if event.Source != nil {
+					result.sources = appendUniqueSources(result.sources, *event.Source)
+				}
 			case ProviderEventError:
 				result.providerErr = event.Err
 				return result, false
@@ -447,13 +487,17 @@ func markResponseIncomplete(response *responseObject) {
 }
 
 func buildResponseObject(responseID string, req ResponsesRequest, model string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, usage *Usage, toolCalls []ToolCallRecord) responseObject {
+	return buildResponseObjectWithSources(responseID, req, model, text, messageOutputIndex, reasoning, reasoningOutputIndex, usage, toolCalls, nil)
+}
+
+func buildResponseObjectWithSources(responseID string, req ResponsesRequest, model string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, usage *Usage, toolCalls []ToolCallRecord, sources []SourceCitation) responseObject {
 	return responseObject{
 		ID:                 responseID,
 		Object:             "response",
 		Status:             string(ResponseStatusCompleted),
 		Model:              model,
 		PreviousResponseID: req.PreviousResponseID,
-		Output:             buildOutputItems(responseID, text, messageOutputIndex, reasoning, reasoningOutputIndex, toolCalls),
+		Output:             buildOutputItemsWithSources(responseID, text, messageOutputIndex, reasoning, reasoningOutputIndex, toolCalls, sources),
 		OutputText:         text,
 		Usage:              usage,
 	}
@@ -478,6 +522,10 @@ func failedResponseObject(responseID string, req ResponsesRequest, model string,
 }
 
 func buildOutputItems(responseID string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, toolCalls []ToolCallRecord) []outputItem {
+	return buildOutputItemsWithSources(responseID, text, messageOutputIndex, reasoning, reasoningOutputIndex, toolCalls, nil)
+}
+
+func buildOutputItemsWithSources(responseID string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, toolCalls []ToolCallRecord, sources []SourceCitation) []outputItem {
 	doneItems := make([]doneItem, 0, 1+len(toolCalls))
 	if reasoning != "" {
 		if reasoningOutputIndex < 0 {
@@ -489,7 +537,7 @@ func buildOutputItems(responseID string, text string, messageOutputIndex int, re
 		if messageOutputIndex < 0 {
 			messageOutputIndex = 0
 		}
-		doneItems = append(doneItems, doneItem{outputIndex: messageOutputIndex, item: buildMessageItem(responseID, text)})
+		doneItems = append(doneItems, doneItem{outputIndex: messageOutputIndex, item: buildMessageItemWithSources(responseID, text, sources)})
 	}
 	for _, call := range sortedToolCalls(toolCalls) {
 		doneItems = append(doneItems, doneItem{outputIndex: call.OutputIndex, item: buildToolCallItem(call)})
@@ -505,13 +553,36 @@ func buildOutputItems(responseID string, text string, messageOutputIndex int, re
 }
 
 func buildMessageItem(responseID string, text string) outputItem {
+	return buildMessageItemWithSources(responseID, text, nil)
+}
+
+func buildMessageItemWithSources(responseID string, text string, sources []SourceCitation) outputItem {
 	item := outputItem{
 		ID:      "msg_" + responseID,
 		Type:    "message",
 		Role:    "assistant",
-		Content: []contentPart{{Type: "output_text", Text: text}},
+		Content: []contentPart{{Type: "output_text", Text: text, Annotations: appendUniqueSources(nil, sources...)}},
 	}
 	return item
+}
+
+func appendUniqueSources(existing []SourceCitation, sources ...SourceCitation) []SourceCitation {
+	seen := make(map[string]bool, len(existing)+len(sources))
+	for _, source := range existing {
+		if strings.TrimSpace(source.URL) != "" {
+			seen[strings.TrimSpace(source.URL)] = true
+		}
+	}
+	out := append([]SourceCitation(nil), existing...)
+	for _, source := range sources {
+		urlValue := strings.TrimSpace(source.URL)
+		if urlValue == "" || seen[urlValue] {
+			continue
+		}
+		seen[urlValue] = true
+		out = append(out, source)
+	}
+	return out
 }
 
 func buildReasoningItem(responseID string, text string) outputItem {
@@ -568,12 +639,16 @@ type doneItem struct {
 }
 
 func buildDoneItems(responseID string, messageOutputIndex int, text string, reasoningOutputIndex int, reasoning string, toolCalls []ToolCallRecord, includeMessage bool, includeReasoning bool) []doneItem {
+	return buildDoneItemsWithSources(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, toolCalls, includeMessage, includeReasoning, nil)
+}
+
+func buildDoneItemsWithSources(responseID string, messageOutputIndex int, text string, reasoningOutputIndex int, reasoning string, toolCalls []ToolCallRecord, includeMessage bool, includeReasoning bool, sources []SourceCitation) []doneItem {
 	items := make([]doneItem, 0, 1+len(toolCalls))
 	if includeReasoning {
 		items = append(items, doneItem{outputIndex: reasoningOutputIndex, item: buildReasoningItem(responseID, reasoning)})
 	}
 	if includeMessage {
-		items = append(items, doneItem{outputIndex: messageOutputIndex, item: buildMessageItem(responseID, text)})
+		items = append(items, doneItem{outputIndex: messageOutputIndex, item: buildMessageItemWithSources(responseID, text, sources)})
 	}
 	for _, call := range sortedToolCalls(toolCalls) {
 		items = append(items, doneItem{outputIndex: call.OutputIndex, item: buildToolCallItem(call)})

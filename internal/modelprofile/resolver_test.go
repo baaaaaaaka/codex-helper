@@ -84,45 +84,230 @@ func TestResolveStructuredModelInheritsProviderCredentialAndPolicies(t *testing.
 	}
 }
 
-func TestResolveStructuredModelAppliesProfileReasoningOverride(t *testing.T) {
+func TestResolveCatalogV2UsesModelDefaultInterfaceAndFeatureRoute(t *testing.T) {
 	yes := true
-	cfg := config.Config{ModelConfigVersion: 1,
-		ModelCredentials: map[string]config.ModelCredential{"p-key": {APIKeyRef: "env:P_KEY"}},
-		ModelProviders:   map[string]config.ModelProvider{"p": {Protocol: "chat-completions", BaseURL: "https://p.example.invalid/v1", Credential: "p-key"}},
-		Models:           map[string]config.ModelDefinition{"p/model": {Provider: "p", UpstreamModel: "vendor/model", Capabilities: config.ModelCapabilities{Reasoning: &yes}, Reasoning: config.ModelReasoningPolicy{SupportedEfforts: []string{"low", "high"}, DefaultEffort: "low", EffortMap: map[string]string{"high": "medium"}}}},
-		ModelProfiles:    map[string]config.ModelProfile{"p/model": {Provider: "p", Model: "p/model", Credential: "p-key", DefaultReasoningEffort: "high", SupportedReasoningEfforts: []string{"high"}, ReasoningEffortMap: map[string]string{"high": "max"}, Revision: 1}},
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]config.ModelCredential{"ds": {APIKeyRef: "env:DS_KEY"}},
+		ModelProviders: map[string]config.ModelProvider{
+			"deepseek": {
+				Protocol: "chat-completions", BaseURL: "https://api.deepseek.com", Credential: "ds",
+				DefaultInterface: "openai", AdapterProfile: "deepseek-openai",
+				Interfaces: map[string]config.ModelInterface{
+					"openai":    {Adapter: "deepseek-openai", Protocol: "chat-completions", BaseURL: "https://api.deepseek.com"},
+					"anthropic": {Adapter: "deepseek-anthropic", Protocol: "messages", BaseURL: "https://api.deepseek.com/anthropic", Auth: config.ModelInterfaceAuth{Type: "header", Header: "x-api-key"}, Conversion: config.ModelConversion{Enabled: true, Profile: "deepseek-anthropic-v1"}},
+				},
+			},
+		},
+		Models: map[string]config.ModelDefinition{
+			"deepseek/deepseek-v4-pro": {
+				Provider: "deepseek", UpstreamModel: "deepseek-v4-pro", DefaultInterface: "openai",
+				Capabilities: config.ModelCapabilities{Reasoning: &yes},
+				Features: map[string]config.ModelFeature{
+					"webSearch": {Support: "native", Interface: "anthropic", Fallback: &config.ModelFeatureFallback{Selector: "openai/gpt-5.6-luna", Effort: "high", Tier: "flex"}},
+				},
+			},
+		},
+		ModelProfiles: map[string]config.ModelProfile{"work": {Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", Revision: 1}},
 	}
-	got, err := Resolve(cfg, "p/model")
+	got, err := Resolve(cfg, "work")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider.DefaultReasoningEffort != "high" || got.Model.ReasoningPolicy.DefaultEffort != "high" || got.Model.ReasoningPolicy.EffortMap["high"] != "max" || len(got.Model.ReasoningPolicy.SupportedEfforts) != 1 {
-		t.Fatalf("profile reasoning override was ignored: provider=%#v model=%#v", got.Provider, got.Model)
+	if got.Provider.BaseURL != "https://api.deepseek.com" || got.Provider.AdapterProfile != "deepseek-openai" || got.Model.DefaultInterface != "openai" {
+		t.Fatalf("model default interface was not retained: %#v", got)
+	}
+	if !got.Provider.DisableHostedWebSearch || got.Provider.SearchFallback == nil || got.Provider.SearchFallback.Tier != "flex" {
+		t.Fatalf("search fallback = %#v", got.Provider)
+	}
+	if feature := got.Model.Features["webSearch"]; feature.Interface != "anthropic" || feature.Support != "native" {
+		t.Fatalf("feature route = %#v", feature)
+	}
+	if got.Provider.RouteInterfaces["chat"] != "openai" || got.Provider.RouteInterfaces["websearch"] != "anthropic" {
+		t.Fatalf("feature routes = %#v", got.Provider.RouteInterfaces)
+	}
+	if got.Provider.ConversionProfile != "" || got.Model.ConversionProfile != "" || got.Provider.StrictConversion {
+		t.Fatalf("ordinary route unexpectedly inherited feature conversion: provider=%#v model=%#v", got.Provider, got.Model)
+	}
+}
+
+func TestResolveCatalogV2RetainsSharedProviderTransportFields(t *testing.T) {
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]config.ModelCredential{"key": {APIKeyRef: "env:MODEL_KEY"}},
+		ModelProviders: map[string]config.ModelProvider{
+			"vendor": {
+				Protocol: "chat-completions", BaseURL: "https://vendor.example/v1", Credential: "key",
+				Headers:          map[string]string{"X-Provider-Shared": "provider"},
+				Endpoints:        map[string]string{"messages": "/provider-messages"},
+				DefaultInterface: "chat",
+				Interfaces: map[string]config.ModelInterface{
+					"chat":   {Adapter: "openai-chat", Protocol: "chat-completions", BaseURL: "https://vendor.example/v1", Headers: map[string]string{"X-Interface": "chat"}},
+					"search": {Adapter: "openai-chat", Protocol: "chat-completions", BaseURL: "https://vendor.example/search", Headers: map[string]string{"X-Interface": "search"}},
+				},
+			},
+		},
+		Models: map[string]config.ModelDefinition{
+			"vendor/model": {Provider: "vendor", UpstreamModel: "vendor-model", DefaultInterface: "search", Features: map[string]config.ModelFeature{"webSearch": {Support: "native", Interface: "search"}}},
+		},
+		ModelProfiles: map[string]config.ModelProfile{"work": {Provider: "vendor", Model: "vendor/model", Revision: 1}},
+	}
+	resolved, err := Resolve(cfg, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Provider.Headers["x-provider-shared"] != "provider" || resolved.Provider.Headers["x-interface"] != "search" {
+		t.Fatalf("effective headers lost provider/interface fields: %#v", resolved.Provider.Headers)
+	}
+	if resolved.Provider.ProviderHeaders["X-Provider-Shared"] != "provider" || resolved.Provider.ProviderHeaders["X-Interface"] != "" {
+		t.Fatalf("shared provider headers polluted by selected interface: %#v", resolved.Provider.ProviderHeaders)
+	}
+	if resolved.Provider.Endpoints["messages"] != "/provider-messages" {
+		t.Fatalf("effective endpoints lost provider field: %#v", resolved.Provider.Endpoints)
+	}
+}
+
+func TestResolveCatalogV2TurnsResponsesRouteIntoChatWhenNativeToolNeedsIt(t *testing.T) {
+	yes := true
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]config.ModelCredential{"mimo": {APIKeyRef: "env:MIMO_KEY"}},
+		ModelProviders: map[string]config.ModelProvider{"mimo": {
+			Protocol: "responses", BaseURL: "https://api.example.invalid/v1", Credential: "mimo", DefaultInterface: "responses",
+			Interfaces: map[string]config.ModelInterface{
+				"responses": {Adapter: "mimo-responses", Protocol: "responses", BaseURL: "https://api.example.invalid/v1"},
+			},
+		}},
+		Models: map[string]config.ModelDefinition{"mimo/mimo-v2.5": {
+			Provider: "mimo", UpstreamModel: "mimo-v2.5", DefaultInterface: "responses", Capabilities: config.ModelCapabilities{NativeWebSearch: &yes},
+			Features: map[string]config.ModelFeature{"webSearch": {Support: "native", Interface: "responses", NativeTool: &config.ModelNativeTool{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search"}}},
+		}},
+		ModelProfiles: map[string]config.ModelProfile{"work": {Provider: "mimo", Model: "mimo/mimo-v2.5", Revision: 1}},
+	}
+	got, err := Resolve(cfg, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider.DirectResponses || got.Provider.AdapterProfile != "openai-chat" || len(got.Model.NativeTools) != 1 {
+		t.Fatalf("native tool did not select chat adapter: provider=%#v model=%#v", got.Provider, got.Model)
+	}
+}
+
+func TestResolveCatalogV2NativeSearchSelectsFeatureInterfaceCredential(t *testing.T) {
+	yes := true
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials: map[string]config.ModelCredential{
+			"openai":    {APIKeyRef: "env:DEEPSEEK_OPENAI"},
+			"anthropic": {APIKeyRef: "env:DEEPSEEK_ANTHROPIC"},
+		},
+		ModelProviders: map[string]config.ModelProvider{
+			"deepseek": {
+				Protocol: "chat-completions", BaseURL: "https://api.deepseek.com", DefaultInterface: "openai",
+				InterfaceCredentials: map[string]string{"openai": "openai", "anthropic": "anthropic"},
+				Interfaces: map[string]config.ModelInterface{
+					"openai":    {Adapter: "deepseek-openai", Protocol: "chat-completions", BaseURL: "https://api.deepseek.com"},
+					"anthropic": {Adapter: "deepseek-anthropic", Protocol: "messages", BaseURL: "https://api.deepseek.com/anthropic", Auth: config.ModelInterfaceAuth{Type: "header", Header: "x-api-key"}, Conversion: config.ModelConversion{Enabled: true, Profile: "deepseek-anthropic-v1"}},
+				},
+			},
+		},
+		Models: map[string]config.ModelDefinition{
+			"deepseek/deepseek-v4": {
+				Provider: "deepseek", UpstreamModel: "deepseek-v4", DefaultInterface: "openai", Capabilities: config.ModelCapabilities{NativeWebSearch: &yes},
+				Features: map[string]config.ModelFeature{"webSearch": {Support: "native", Interface: "anthropic", NativeTool: &config.ModelNativeTool{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search"}, Sources: &config.ModelSourcePolicy{Mode: "annotations", RequireURL: true, RequireSources: true}}},
+			},
+		},
+		ModelProfiles: map[string]config.ModelProfile{"work": {Provider: "deepseek", Model: "deepseek/deepseek-v4", Revision: 1}},
+	}
+	resolved, err := Resolve(cfg, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Provider.DefaultInterface != "openai" || resolved.Provider.AdapterProfile != "deepseek-openai" || resolved.Provider.BaseURL != "https://api.deepseek.com" {
+		t.Fatalf("ordinary interface was not retained: %#v", resolved.Provider)
+	}
+	if resolved.Profile.APIKeyRef != "env:DEEPSEEK_OPENAI" || resolved.Provider.AuthType != "" || resolved.Provider.AuthHeader != "" {
+		t.Fatalf("default interface credential/auth was not selected: profile=%#v provider=%#v", resolved.Profile, resolved.Provider)
+	}
+	if !resolved.Model.SourcePolicy.RequireSources {
+		t.Fatalf("sources.requireSources was lost during route resolution: %#v", resolved.Model.SourcePolicy)
+	}
+	if resolved.Provider.RouteInterfaces["chat"] != "openai" || resolved.Provider.RouteInterfaces["websearch"] != "anthropic" {
+		t.Fatalf("native search route map = %#v", resolved.Provider.RouteInterfaces)
+	}
+}
+
+func TestResolveCatalogV2BindsFIMOperationToSelectedInterface(t *testing.T) {
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]config.ModelCredential{"beta": {APIKeyRef: "env:DEEPSEEK_BETA"}},
+		ModelProviders: map[string]config.ModelProvider{
+			"deepseek": {
+				Protocol: "chat-completions", BaseURL: "https://api.deepseek.com", Credential: "beta", DefaultInterface: "beta",
+				Interfaces: map[string]config.ModelInterface{
+					"beta": {Adapter: "deepseek-beta", Protocol: "beta", BaseURL: "https://api.deepseek.com/beta", Conversion: config.ModelConversion{Enabled: true, Profile: "deepseek-beta-v1"}},
+				},
+			},
+		},
+		Models: map[string]config.ModelDefinition{
+			"deepseek/deepseek-v4": {
+				Provider: "deepseek", UpstreamModel: "deepseek-v4", DefaultInterface: "beta",
+				Features: map[string]config.ModelFeature{"fim": {Support: "native", Interface: "beta", Operation: "fim"}},
+			},
+		},
+		ModelProfiles: map[string]config.ModelProfile{"work": {Provider: "deepseek", Model: "deepseek/deepseek-v4", Revision: 1}},
+	}
+	resolved, err := Resolve(cfg, "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Model.Operation != "fim" || resolved.Provider.Operation != "fim" {
+		t.Fatalf("FIM operation was not bound: model=%#v provider=%#v", resolved.Model, resolved.Provider)
+	}
+}
+
+func TestResolveSnapshotUsesSelectedInterfaceCredential(t *testing.T) {
+	cfg := config.Config{
+		ModelConfigVersion: 1,
+		ModelCredentials: map[string]config.ModelCredential{
+			"deepseek-default":   {APIKeyRef: "env:DEEPSEEK_DEFAULT"},
+			"deepseek-anthropic": {APIKeyRef: "env:DEEPSEEK_ANTHROPIC", AuthType: "header", Header: "x-api-key"},
+		},
+		ModelProviders: map[string]config.ModelProvider{
+			"deepseek": {
+				Protocol: "chat-completions", BaseURL: "https://api.deepseek.com", Credential: "deepseek-default",
+				DefaultInterface: "openai", InterfaceCredentials: map[string]string{"openai": "deepseek-default", "anthropic": "deepseek-anthropic"},
+				Interfaces: map[string]config.ModelInterface{
+					"openai":    {Adapter: "deepseek-openai", Protocol: "chat-completions", BaseURL: "https://api.deepseek.com"},
+					"anthropic": {Adapter: "deepseek-anthropic", Protocol: "messages", BaseURL: "https://api.deepseek.com/anthropic", Auth: config.ModelInterfaceAuth{Type: "header", Header: "x-api-key"}},
+				},
+			},
+		},
+		Models: map[string]config.ModelDefinition{
+			"deepseek/deepseek-v4-pro": {Provider: "deepseek", UpstreamModel: "deepseek-v4-pro", DefaultInterface: "anthropic"},
+		},
+	}
+	got, err := ResolveSnapshot(cfg, Snapshot{Name: "deepseek-work", Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_ANTHROPIC", Revision: 1})
+	if err != nil {
+		t.Fatalf("ResolveSnapshot: %v", err)
+	}
+	if got.Provider.BaseURL != "https://api.deepseek.com/anthropic" || got.Provider.AuthHeader != "x-api-key" || got.Provider.AuthType != "header" {
+		t.Fatalf("snapshot selected wrong interface auth: %#v", got.Provider)
 	}
 }
 
 func TestResolveThirdPartyModelProfileWithSSHProxy(t *testing.T) {
 	now := time.Now()
-	cfg := config.Config{
-		Version: config.CurrentVersion,
-		Profiles: []config.Profile{{
-			ID:        "ssh-1",
-			Name:      "work",
-			Host:      "host",
-			Port:      22,
-			User:      "user",
-			CreatedAt: now,
-		}},
-		ModelProfiles: map[string]config.ModelProfile{
-			"deepseek-work": {
-				Provider:  "deepseek",
-				Model:     "deepseek/deepseek-v4-pro",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				SSHProxy:  "work",
-				Revision:  3,
-			},
-		},
-	}
+	cfg := structuredExternalFamilyConfig("deepseek", "deepseek/deepseek-v4-pro", "deepseek-work", "env:DEEPSEEK_API_KEY")
+	cfg.Profiles = []config.Profile{{
+		ID:        "ssh-1",
+		Name:      "work",
+		Host:      "host",
+		Port:      22,
+		User:      "user",
+		CreatedAt: now,
+	}}
+	cfg.ModelProfiles["deepseek-work"] = config.ModelProfile{Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_API_KEY", SSHProxy: "work", Revision: 3}
 
 	got, err := Resolve(cfg, "DeepSeek-Work")
 	if err != nil {
@@ -188,25 +373,15 @@ func TestResolveChatCompatibleProfileAppliesExternalReasoningOverrides(t *testin
 
 func TestResolveSnapshotPinsProfileFields(t *testing.T) {
 	now := time.Now()
-	cfg := config.Config{
-		Version: config.CurrentVersion,
-		Profiles: []config.Profile{{
-			ID:        "ssh-1",
-			Name:      "jump",
-			Host:      "host",
-			Port:      22,
-			User:      "user",
-			CreatedAt: now,
-		}},
-		ModelProfiles: map[string]config.ModelProfile{
-			"mimo25": {
-				Provider:  "mimo",
-				APIKeyRef: "env:NEW_MIMO_KEY",
-				SSHProxy:  "jump",
-				Revision:  9,
-			},
-		},
-	}
+	cfg := structuredExternalFamilyConfig("mimo", "mimo/mimo-v2.5-pro", "mimo25", "")
+	cfg.Profiles = []config.Profile{{
+		ID:        "ssh-1",
+		Name:      "jump",
+		Host:      "host",
+		Port:      22,
+		User:      "user",
+		CreatedAt: now,
+	}}
 	snapshot := Snapshot{
 		Name:      "mimo25",
 		Provider:  "mimo",
@@ -228,25 +403,15 @@ func TestResolveSnapshotPinsProfileFields(t *testing.T) {
 }
 
 func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
-	cfg := config.Config{
-		Version: config.CurrentVersion,
-		Profiles: []config.Profile{{
-			ID:   "ssh-1",
-			Name: "jump",
-			Host: "host",
-			Port: 22,
-			User: "user",
-		}},
-		ModelProfiles: map[string]config.ModelProfile{
-			"mimo25": {
-				Provider:  "mimo",
-				Model:     "mimo/mimo-v2.5-pro",
-				APIKeyRef: "env:MIMO_API_KEY",
-				SSHProxy:  "jump",
-				Revision:  2,
-			},
-		},
-	}
+	cfg := structuredExternalFamilyConfig("mimo", "mimo/mimo-v2.5-pro", "mimo25", "")
+	cfg.Profiles = []config.Profile{{
+		ID:   "ssh-1",
+		Name: "jump",
+		Host: "host",
+		Port: 22,
+		User: "user",
+	}}
+	cfg.ModelProfiles["mimo25"] = config.ModelProfile{Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_API_KEY", SSHProxy: "jump", Revision: 2}
 	resolved, err := Resolve(cfg, "mimo25")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -287,83 +452,42 @@ func TestRuntimeSnapshotCapturesAndValidatesRuntimeIdentity(t *testing.T) {
 	}
 }
 
-func TestRuntimeSnapshotAllowsLegacyContextWindowFingerprint(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		profile  string
-		provider string
-		model    string
-		keyRef   string
-	}{
-		{
-			name:     "deepseek-flash",
-			profile:  "deepseek-flash",
-			provider: "deepseek",
-			model:    "deepseek/deepseek-v4-flash",
-			keyRef:   "env:DEEPSEEK_API_KEY",
-		},
-		{
-			name:     "deepseek-pro",
-			profile:  "deepseek-pro",
-			provider: "deepseek",
-			model:    "deepseek/deepseek-v4-pro",
-			keyRef:   "env:DEEPSEEK_API_KEY",
-		},
-		{
-			name:     "mimo25",
-			profile:  "mimo25",
-			provider: "mimo",
-			model:    "mimo/mimo-v2.5",
-			keyRef:   "env:MIMO_API_KEY",
-		},
-		{
-			name:     "mimo25-pro",
-			profile:  "mimo25-pro",
-			provider: "mimo",
-			model:    "mimo/mimo-v2.5-pro",
-			keyRef:   "env:MIMO_API_KEY",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := config.Config{
-				Version: config.CurrentVersion,
-				ModelProfiles: map[string]config.ModelProfile{
-					tc.profile: {
-						Provider:  tc.provider,
-						Model:     tc.model,
-						APIKeyRef: tc.keyRef,
-						Revision:  1,
-					},
-				},
-			}
-			resolved, err := Resolve(cfg, tc.profile)
-			if err != nil {
-				t.Fatalf("Resolve: %v", err)
-			}
-			oldProvider := providerWithLegacy128KContext(resolved.Provider)
-			snapshot := resolved.Snapshot(time.Now())
-			snapshot.ModelFingerprint = legacyModelFingerprintV1(oldProvider, snapshot.Model)
-			snapshot.CatalogFingerprint = CatalogFingerprint(oldProvider)
+func TestRuntimeSnapshotRejectsLegacyContextWindowFingerprint(t *testing.T) {
+	cfg := structuredExternalFamilyConfig("mimo", "mimo/mimo-v2.5-pro", "mimo25", "")
+	cfg.ModelProfiles["mimo25"] = config.ModelProfile{Provider: "mimo", Model: "mimo/mimo-v2.5-pro", APIKeyRef: "env:MIMO_API_KEY", Revision: 1}
+	resolved, err := Resolve(cfg, "mimo25")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	oldProvider := providerWithLegacy128KContext(resolved.Provider)
+	snapshot := resolved.Snapshot(time.Now())
+	snapshot.ModelFingerprint = legacyModelFingerprintV1(oldProvider, snapshot.Model)
+	snapshot.CatalogFingerprint = CatalogFingerprint(oldProvider)
+	if err := ValidateSnapshotRuntime(snapshot, resolved, "sk-test"); err == nil || !strings.Contains(err.Error(), "selected model mapping changed") {
+		t.Fatalf("ValidateSnapshotRuntime legacy context fingerprint err=%v, want strict rejection", err)
+	}
+}
 
-			if err := ValidateSnapshotRuntime(snapshot, resolved, "sk-test"); err != nil {
-				t.Fatalf("ValidateSnapshotRuntime legacy context fingerprint: %v", err)
-			}
-		})
+func TestRuntimeSnapshotRejectsRouteInterfaceChange(t *testing.T) {
+	cfg := structuredExternalFamilyConfig("deepseek", "deepseek/deepseek-v4-pro", "deepseek-pro", "")
+	cfg.ModelProfiles["deepseek-pro"] = config.ModelProfile{Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_API_KEY", Revision: 1}
+	resolved, err := Resolve(cfg, "deepseek-pro")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	resolved.Provider.RouteInterfaces = map[string]string{"chat": "openai", "fim": "beta"}
+	snapshot := resolved.Snapshot(time.Now())
+	changed := resolved
+	changed.Provider = resolved.Provider
+	changed.Provider.RouteInterfaces = map[string]string{"chat": "openai", "fim": "anthropic"}
+	if err := ValidateSnapshotRuntime(snapshot, changed, "sk-test"); err == nil || !strings.Contains(err.Error(), "selected model mapping changed") {
+		t.Fatalf("ValidateSnapshotRuntime route change err=%v, want selected model mapping changed", err)
 	}
 }
 
 func TestRuntimeSnapshotRejectsLegacyFingerprintWhenUpstreamMappingChanges(t *testing.T) {
-	cfg := config.Config{
-		Version: config.CurrentVersion,
-		ModelProfiles: map[string]config.ModelProfile{
-			"deepseek-pro": {
-				Provider:  "deepseek",
-				Model:     "deepseek/deepseek-v4-pro",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				Revision:  1,
-			},
-		},
-	}
+	cfg := structuredExternalFamilyConfig("deepseek", "deepseek/deepseek-v4-pro", "deepseek-pro", "")
+	cfg.ModelProfiles["deepseek-pro"] = config.ModelProfile{Provider: "deepseek", Model: "deepseek/deepseek-v4-pro", APIKeyRef: "env:DEEPSEEK_API_KEY", Revision: 1}
 	resolved, err := Resolve(cfg, "deepseek-pro")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
@@ -397,15 +521,12 @@ func providerWithLegacy128KContext(provider ProviderSpec) ProviderSpec {
 }
 
 func TestResolveModelProfileErrors(t *testing.T) {
-	cfg := config.Config{
-		Version: config.CurrentVersion,
-		ModelProfiles: map[string]config.ModelProfile{
-			"missing-key": {Provider: "deepseek"},
-			"missing-ssh": {Provider: "deepseek", APIKeyRef: "env:DEEPSEEK_API_KEY", SSHProxy: "none"},
-			"bad-model":   {Provider: "deepseek", Model: "nope", APIKeyRef: "env:DEEPSEEK_API_KEY"},
-			"unknown":     {Provider: "unknown", APIKeyRef: "env:KEY"},
-		},
-	}
+	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"missing-key": {Provider: "kimi", Model: "kimi-k2"},
+		"missing-ssh": {Provider: "kimi", Model: "kimi-k2", APIKeyRef: "env:KIMI_API_KEY", SSHProxy: "missing"},
+		"bad-model":   {Provider: "kimi", Model: "nope", APIKeyRef: "env:KIMI_API_KEY"},
+		"unknown":     {Provider: "unknown", APIKeyRef: "env:KEY"},
+	}}
 	for _, tc := range []struct {
 		name string
 		want string
@@ -424,6 +545,19 @@ func TestResolveModelProfileErrors(t *testing.T) {
 		})
 	}
 }
+
+func structuredExternalFamilyConfig(provider, model, profileName, apiKeyRef string) config.Config {
+	upstream := strings.TrimPrefix(model, provider+"/")
+	return config.Config{
+		Version:            config.CurrentVersion,
+		ModelConfigVersion: 1,
+		ModelProviders:     map[string]config.ModelProvider{provider: {Protocol: "chat-completions", BaseURL: "https://catalog.example/" + provider + "/v1"}},
+		Models:             map[string]config.ModelDefinition{model: {Provider: provider, UpstreamModel: upstream, DisplayName: model, Capabilities: config.ModelCapabilities{Tools: boolPtr(true), Reasoning: boolPtr(true)}, Limits: config.ModelLimits{ContextWindow: 1000000, MaxContextWindow: 1000000}}},
+		ModelProfiles:      map[string]config.ModelProfile{profileName: {Provider: provider, Model: model, APIKeyRef: apiKeyRef, Revision: 1}},
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
 
 func TestSecretStoreAndAPIKeyRefs(t *testing.T) {
 	store := NewSecretStore(filepath.Join(t.TempDir(), "secrets.json"))

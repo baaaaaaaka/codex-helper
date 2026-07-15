@@ -343,20 +343,23 @@ Model/profile commands:
 ```text
 model status
 model list
-model setup deepseek
-model switch deepseek
+model catalog list
+model provider list
+model switch example-provider/deepseek-v4
 model reset
-new /absolute/path --model deepseek
-model fork deepseek
+new /absolute/path --model example-provider/deepseek-v4
+model fork example-provider/deepseek-v4
 effort status
 effort set high
 effort reset
 default status
-default model set profile:deepseek
+default model set profile:example-provider/deepseek-v4
 default effort set high
 ```
 
 `model` and `effort` always affect only the current Control or Work chat.
+Catalog/provider management is Control-only; `model provider setup <provider>`
+activates every model under one provider after a local key is configured.
 `model setup` changes availability only. Global `default` commands are accepted
 only in the Control chat and affect future launches and newly created chats;
 they never rewrite an existing chat.

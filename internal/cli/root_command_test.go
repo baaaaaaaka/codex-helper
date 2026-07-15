@@ -52,7 +52,7 @@ func TestModelCommandWiresSimpleSubcommands(t *testing.T) {
 		names = append(names, sub.Name())
 	}
 	sort.Strings(names)
-	want := []string{"doctor", "list", "setup", "use"}
+	want := []string{"catalog", "doctor", "list", "provider", "setup", "use"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected model subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -63,6 +63,24 @@ func TestModelCommandWiresSimpleSubcommands(t *testing.T) {
 	for _, name := range []string{"api-key-env", "api-key-stdin", "ssh-proxy", "no-default", "no-doctor"} {
 		if setupCmd.Flags().Lookup(name) == nil {
 			t.Fatalf("model setup should expose --%s", name)
+		}
+	}
+	catalogCmd, _, err := modelCmd.Find([]string{"catalog"})
+	if err != nil {
+		t.Fatalf("find model catalog: %v", err)
+	}
+	for _, name := range []string{"add", "list", "remove", "replace", "sync"} {
+		if _, _, err := catalogCmd.Find([]string{name}); err != nil {
+			t.Fatalf("model catalog should expose %s: %v", name, err)
+		}
+	}
+	providerCmd, _, err := modelCmd.Find([]string{"provider"})
+	if err != nil {
+		t.Fatalf("find model provider: %v", err)
+	}
+	for _, name := range []string{"doctor", "list", "setup"} {
+		if _, _, err := providerCmd.Find([]string{name}); err != nil {
+			t.Fatalf("model provider should expose %s: %v", name, err)
 		}
 	}
 }

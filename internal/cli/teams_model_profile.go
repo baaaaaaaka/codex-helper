@@ -374,7 +374,7 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 		var out bytes.Buffer
 		secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
 		printModelChoices(&out, cfg, secretStore)
-		return strings.TrimSpace(out.String()) + "\n\nReply with `model setup <model>`, for example `model setup mimo-v2.5-pro`.", nil
+		return strings.TrimSpace(out.String()) + "\n\nFor a third-party model, add or sync its external catalog first, then run `model provider setup <provider>`.", nil
 	}
 	if choice, ok := modelprofile.LookupModelChoice(arg); ok {
 		if !choice.RequiresAPIKey {
@@ -388,13 +388,10 @@ func (m teamsModelProfileManager) ModelProfileSetupGuide(ctx context.Context, ar
 	}
 	spec, err := modelprofile.MustLookupProvider(provider)
 	if err != nil {
-		return "", err
+		return fmt.Sprintf("Provider `%s` is not built into CXP. Add or sync an external catalog first (for example `cxp model catalog add <name> --json <file>`), then run `cxp model provider setup %s --api-key-stdin`.", shellQuoteForTeams(provider), shellQuoteForTeams(provider)), nil
 	}
 	if name == "" {
 		name = spec.ID
-		if spec.ID == "mimo" {
-			name = "mimo25"
-		}
 	}
 	if spec.ID == modelprofile.DefaultProvider {
 		return "The official Codex model is already available. Use `model switch default` for this Control chat or `default model reset` for the global default.", nil

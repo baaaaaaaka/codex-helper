@@ -15,6 +15,21 @@ func TestControlFallbackPromptUsesCodexhistoryMarker(t *testing.T) {
 	}
 }
 
+func TestArtifactUploadNameFromSHA256NormalizesMalformedHashInput(t *testing.T) {
+	valid := ArtifactUploadNameFromSHA256("session", "turn", "report.txt", strings.Repeat("a", 64))
+	malformed := ArtifactUploadNameFromSHA256("session", "turn", "report.txt", "not-a-sha256")
+	if !strings.Contains(valid, "-"+strings.Repeat("a", 16)+"-") {
+		t.Fatalf("valid SHA-256 filename = %q, want validated prefix", valid)
+	}
+	if strings.Contains(malformed, "-not-a-sha256-") {
+		t.Fatalf("malformed SHA-256 input was copied into filename: %q", malformed)
+	}
+	parts := strings.Split(malformed, "-")
+	if len(parts) < 5 || len(parts[len(parts)-2]) != 16 {
+		t.Fatalf("malformed SHA-256 filename = %q, want a 16-character normalized hash component", malformed)
+	}
+}
+
 func TestControlFallbackPromptWithContextIncludesHelpAndRedactsSecrets(t *testing.T) {
 	got := ControlFallbackCodexPromptWithContext("helper upgrade 怎么用", ControlFallbackPromptContext{
 		HelperVersion:    "v-test",

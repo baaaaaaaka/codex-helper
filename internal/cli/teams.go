@@ -1052,6 +1052,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				defer stopModelSourceAutoSync()
 				if !once {
 					go runModelSourceAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
+					go runModelCatalogAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
 				}
 				if autoService && !once {
 					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {
@@ -1620,6 +1621,9 @@ func newTeamsSendFileCmd(root *rootOptions, registryPath *string) *cobra.Command
 			})
 			if err != nil {
 				return err
+			}
+			if err := teams.RecordDirectOutboundAttachmentProvenance(cmd.Context(), *registryPath, targetChatID, result.Message); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: Teams outbound provenance ledger update failed: %v\n", err)
 			}
 			httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Sent Teams file attachment: %s\n", result.Item.Name)

@@ -20,6 +20,10 @@ type ProviderProfile struct {
 	DropNonAutoToolChoice                  bool
 	ReasoningEffortMap                     map[string]string
 	ThinkingMode                           string
+	ReasoningContentPolicy                 string
+	ImagePolicy                            string
+	AudioPolicy                            string
+	VideoPolicy                            string
 	HistoryPolicy                          string
 	TemperaturePolicy                      string
 	TopPPolicy                             string
@@ -41,17 +45,6 @@ func ProfileForProvider(provider string) ProviderProfile {
 		OmitEmptyAssistantContentWithToolCalls: true,
 	}
 	switch {
-	case strings.Contains(id, "deepseek"):
-		profile.DefaultReasoningEffort = "high"
-		profile.EnableThinking = true
-		profile.StripSamplingWhenThinking = true
-	case strings.Contains(id, "mimo"):
-		forceParallel := true
-		profile.DefaultReasoningEffort = "high"
-		profile.EnableThinking = true
-		profile.ForceParallelToolCalls = &forceParallel
-		profile.StripSamplingWhenThinking = true
-		profile.DropNonAutoToolChoice = true
 	case strings.Contains(id, "glm"):
 		profile.DefaultReasoningEffort = "high"
 		profile.ReasoningEffortMap = map[string]string{"xhigh": "max"}
@@ -83,9 +76,6 @@ func (p ProviderProfile) reasoningEffort(requested string) string {
 	}
 	switch requested {
 	case "xhigh":
-		if strings.Contains(p.ID, "deepseek") {
-			return "max"
-		}
 		return "high"
 	case "none", "minimal", "low", "medium", "high":
 		return requested
@@ -96,9 +86,9 @@ func (p ProviderProfile) reasoningEffort(requested string) string {
 	}
 }
 
-// WithReasoningOverrides applies model-profile configuration after built-in
-// compatibility defaults. This keeps provider changes out of the binary while
-// retaining safe defaults for well-known adapters.
+// WithReasoningOverrides applies model-profile configuration after the generic
+// adapter defaults. Provider-specific behavior belongs in the external model
+// catalog rather than in this binary.
 func (p ProviderProfile) WithReasoningOverrides(defaultEffort string, effortMap map[string]string) ProviderProfile {
 	if value := strings.ToLower(strings.TrimSpace(defaultEffort)); value != "" {
 		p.DefaultReasoningEffort = value
@@ -126,6 +116,20 @@ func (p ProviderProfile) WithModelPolicies(reasoning config.ModelReasoningPolicy
 	}
 	if value := strings.ToLower(strings.TrimSpace(reasoning.HistoryPolicy)); value != "" {
 		p.HistoryPolicy = value
+		if value == "never" || value == "omit" || value == "drop" || value == "text-only" {
+			p.ReasoningContentPolicy = "drop"
+		} else if value == "always" || value == "tool-calls-only" || value == "preserve" || value == "keep" {
+			p.ReasoningContentPolicy = "preserve"
+		}
+	}
+	if value := strings.ToLower(strings.TrimSpace(messages.Images)); value != "" {
+		p.ImagePolicy = value
+	}
+	if value := strings.ToLower(strings.TrimSpace(messages.Audio)); value != "" {
+		p.AudioPolicy = value
+	}
+	if value := strings.ToLower(strings.TrimSpace(messages.Video)); value != "" {
+		p.VideoPolicy = value
 	}
 	if reasoning.StripSamplingWhenEnabled != nil {
 		p.StripSamplingWhenThinking = *reasoning.StripSamplingWhenEnabled
@@ -206,53 +210,68 @@ func (p ProviderProfile) shouldEnableThinking(model string) bool {
 		return false
 	}
 	model = strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(p.ID, "deepseek"):
-		return strings.Contains(model, "deepseek-v4")
-	case strings.Contains(p.ID, "mimo"):
-		return strings.HasPrefix(model, "mimo-v2.5") || strings.Contains(model, "mimo-v2-pro") || strings.Contains(model, "mimo-v2-omni")
-	default:
-		return true
-	}
+	_ = model
+	return true
 }
 
 func (p ProviderProfile) shouldStripSampling(model string) bool {
 	if !p.StripSamplingWhenThinking || !p.shouldEnableThinking(model) {
 		return false
 	}
-	model = strings.ToLower(strings.TrimSpace(model))
-	if strings.Contains(p.ID, "mimo") {
-		return strings.HasPrefix(model, "mimo-v2.5")
-	}
 	return true
 }
 
 func (p ProviderProfile) shouldForwardImages(model string, parts []ProviderContentPart, role string, _ string) bool {
-	if role != "user" || !hasProviderImagePart(parts) {
+	if role != "user" || !hasProviderMediaPart(parts) {
 		return false
 	}
-	model = strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(p.ID, "mimo"):
-		return model == "mimo-v2.5" || strings.Contains(model, "mimo-v2-omni")
-	case strings.Contains(p.ID, "deepseek"):
-		return strings.Contains(model, "deepseek-v4-pro")
-	default:
-		return false
+	_ = model
+	for _, part := range parts {
+		var policy string
+		switch part.Type {
+		case "image_url":
+			policy = p.ImagePolicy
+		case "audio":
+			policy = p.AudioPolicy
+		case "video":
+			policy = p.VideoPolicy
+		default:
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(policy)) {
+		case "allow", "enabled", "forward", "multimodal":
+			continue
+		default:
+			return false
+		}
 	}
+	return true
 }
 
 func (p ProviderProfile) shouldSendReasoningContent(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(model))
-	if strings.Contains(p.ID, "deepseek") && strings.Contains(model, "deepseek-reasoner") {
+	_ = model
+	switch strings.ToLower(strings.TrimSpace(p.ReasoningContentPolicy)) {
+	case "drop", "omit", "text-only":
 		return false
+	default:
+		return true
 	}
-	return true
 }
 
 func hasProviderImagePart(parts []ProviderContentPart) bool {
 	for _, part := range parts {
 		if part.Type == "image_url" && strings.TrimSpace(part.ImageURL) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProviderMediaPart(parts []ProviderContentPart) bool {
+	for _, part := range parts {
+		if (part.Type == "image_url" && strings.TrimSpace(part.ImageURL) != "") ||
+			(part.Type == "audio" && (strings.TrimSpace(part.AudioURL) != "" || strings.TrimSpace(part.AudioData) != "")) ||
+			(part.Type == "video" && strings.TrimSpace(part.VideoURL) != "") {
 			return true
 		}
 	}

@@ -347,15 +347,19 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 			}
 		}
 		originalName := bestReferenceAttachmentName(attachment.Name, metadata.Name)
-		contentTypeHint := preferredAttachmentContentType("", driveItemMimeType(metadata), attachment.ContentType, originalName)
-		name := referenceAttachmentLocalName(dir, originalName, contentTypeHint, i+1, usedNames)
-		path := filepath.Join(dir, name)
-		contentType, _, err := b.readClient().DownloadSharedDriveItemContentToFileWithoutRateLimitRetry(ctx, attachment.ContentURL, path)
+		downloadPath := filepath.Join(dir, fmt.Sprintf(".download-%03d", i+1))
+		contentType, _, err := b.readClient().DownloadSharedDriveItemContentToFileWithoutRateLimitRetry(ctx, attachment.ContentURL, downloadPath)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, "", err
 		}
 		contentType = preferredAttachmentContentType(contentType, driveItemMimeType(metadata), attachment.ContentType, originalName)
+		name := referenceAttachmentLocalName(dir, originalName, contentType, i+1, usedNames)
+		path := filepath.Join(dir, name)
+		if err := os.Rename(downloadPath, path); err != nil {
+			cleanup()
+			return nil, func() {}, "", err
+		}
 		files = append(files, LocalAttachment{
 			Path:         path,
 			PromptPath:   promptAttachmentPath(session, path),
@@ -937,6 +941,10 @@ func referenceAttachmentLocalName(dir string, originalName string, contentType s
 	name := safeLocalAttachmentFileName(originalName)
 	if name == "" {
 		name = fmt.Sprintf("file-%03d%s", index, attachmentExtension(contentType))
+	} else if filepath.Ext(name) == "" || isGenericAttachmentFileName(name) {
+		if ext := attachmentExtension(contentType); ext != ".bin" {
+			name = strings.TrimSuffix(name, filepath.Ext(name)) + ext
+		}
 	}
 	return uniqueLocalAttachmentName(dir, name, used)
 }

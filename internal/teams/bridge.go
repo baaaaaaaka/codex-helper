@@ -64,8 +64,11 @@ const (
 	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages             = 2
 	outboxFlushPendingPageSize                 = 64
+	stagedAttachmentReconcileGrace             = 24 * time.Hour
 	mainLoopWorkflowFlushMaxNotifications      = 1
 	maxQueuedTurnStartsPerCycle                = 16
+	attachmentUploadCheckpointBytes            = 64 * 1024 * 1024
+	attachmentUploadCheckpointInterval         = 30 * time.Second
 	maxParkNoticeSendsPerPollCycle             = maxWorkChatPollsPerCycle
 	autoParkSweepInterval                      = time.Minute
 	autoParkCandidatePrefetch                  = 16
@@ -238,6 +241,17 @@ type ModelProfileManager interface {
 // Work-chat turn while a last-known-good JSON source is active.
 type ModelProfileRuntimeWarningProvider interface {
 	ModelProfileRuntimeWarning(context.Context, modelprofile.Snapshot) (string, bool, error)
+}
+
+// ModelCatalogManager is optional so custom/test model managers that only
+// understand the legacy profile API remain valid. The built-in manager uses
+// this to expose catalog refresh and provider-wide activation in Control chat;
+// Work chats only consume the resulting provider/model selectors.
+type ModelCatalogManager interface {
+	ListModelCatalogs(context.Context) (string, error)
+	SyncModelCatalog(context.Context, string) (string, error)
+	ListModelProviders(context.Context) (string, error)
+	SetupModelProvider(context.Context, string) (string, error)
 }
 
 type ModelProfileSetupRequest struct {
@@ -947,6 +961,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	}
 	if err := b.restoreRegistryFromStore(ctx); err != nil {
 		return err
+	}
+	if err := b.reconcileStagedOutboundAttachments(ctx); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams staged attachment reconciliation skipped: %v\n", err)
 	}
 	if opts.Runner != nil {
 		b.executor = RunnerExecutor{Runner: opts.Runner}
@@ -3244,13 +3261,17 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 	}
 	if authoredByCurrentUser {
 		if outboxID := helperOutboxProvenanceMarkerID(msg.Body.Content); outboxID != "" {
-			// The marker is carried by the message itself, so a process crash in
-			// the narrow Graph-accepted-before-ledger-write window cannot turn a
-			// helper attachment into a fresh user prompt. Keep the durable record
-			// as an audit/backfill aid, but suppress even if that write fails.
-			_ = b.recordHelperOutboxMarkerProvenance(ctx, chatID, msg.ID, outboxID)
-			b.markRegistrySent(chatID, msg.ID)
-			return true, nil
+			// A marker is only a transport hint. Require the referenced outbox
+			// record and chat binding before suppressing the message; otherwise a
+			// user-authored comment that happens to contain this marker must still
+			// be processed as user input.
+			if matched, err := b.markerMatchesDurableOutbox(ctx, chatID, outboxID, msg); err != nil {
+				return false, err
+			} else if matched {
+				_ = b.recordHelperOutboxMarkerProvenance(ctx, chatID, msg.ID, outboxID)
+				b.markRegistrySent(chatID, msg.ID)
+				return true, nil
+			}
 		}
 	}
 	if legacyGeneratedOutputFallback && isHelperAttachmentEchoMessage(msg) {
@@ -3303,6 +3324,49 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		return true, nil
 	}
 	return false, nil
+}
+
+const helperOutboxMarkerCrashRecoveryWindow = 10 * time.Minute
+
+func (b *Bridge) markerMatchesDurableOutbox(ctx context.Context, chatID string, outboxID string, msg ChatMessage) (bool, error) {
+	if b == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(outboxID) == "" {
+		return false, nil
+	}
+	if err := b.ensureStore(); err != nil {
+		return false, err
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return false, err
+	}
+	outbox, ok := state.OutboxMessages[strings.TrimSpace(outboxID)]
+	if !ok || strings.TrimSpace(outbox.TeamsChatID) != strings.TrimSpace(chatID) {
+		return false, nil
+	}
+	// Once the message ID is durable, require an exact ID match. This prevents a
+	// user from replaying a marker copied from an old helper message in a new
+	// message. A sending record without a message ID is the narrow crash window
+	// after Graph accepted the POST; only accept it when the returned message is
+	// recent and its rendered body matches the durable outbox.
+	switch outbox.Status {
+	case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
+		return strings.TrimSpace(outbox.TeamsMessageID) != "" && strings.TrimSpace(outbox.TeamsMessageID) == strings.TrimSpace(msg.ID), nil
+	case teamstore.OutboxStatusSending:
+		if storedMessageID := strings.TrimSpace(outbox.TeamsMessageID); storedMessageID != "" {
+			return storedMessageID == strings.TrimSpace(msg.ID), nil
+		}
+		if strings.TrimSpace(msg.ID) == "" || outbox.LastSendAttempt.IsZero() {
+			return false, nil
+		}
+		activityAt := chatMessageActivityTime(msg)
+		if activityAt.IsZero() || activityAt.Before(outbox.LastSendAttempt.Add(-helperOutboxMarkerCrashRecoveryWindow)) || activityAt.After(outbox.LastSendAttempt.Add(helperOutboxMarkerCrashRecoveryWindow)) {
+			return false, nil
+		}
+		incomingKey := comparableTeamsPlainText(PlainTextFromTeamsHTML(msg.Body.Content))
+		return outboxRenderedPlainTextMatches(outbox, b.user, incomingKey), nil
+	default:
+		return false, nil
+	}
 }
 
 func (b *Bridge) prepareWorkChatMessageForAudience(ctx context.Context, chatID string, msg ChatMessage, text string) (ChatMessage, string, bool, error) {
@@ -3506,7 +3570,29 @@ func (b *Bridge) hasDeliveredAttachmentOutboxEcho(ctx context.Context, chatID st
 		}
 		teamsMessageID := strings.TrimSpace(msg.ID)
 		outboxMessageID := strings.TrimSpace(outbox.TeamsMessageID)
-		if teamsMessageID != "" && outboxMessageID != "" && outboxMessageID != teamsMessageID {
+		switch outbox.Status {
+		case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
+			// A settled attachment outbox is only authoritative for the exact
+			// Teams message ID it recorded. Attachment IDs and helper text alone
+			// are not sufficient: a user can legitimately send the same shared
+			// file with similar wording.
+			if teamsMessageID == "" || outboxMessageID == "" || outboxMessageID != teamsMessageID {
+				continue
+			}
+		case teamstore.OutboxStatusSending:
+			// The only unresolved crash window is the interval after Graph
+			// accepted POST but before the response was persisted. Bound this
+			// heuristic to the active send attempt so an old sending row cannot
+			// swallow a later user message.
+			activityAt := chatMessageActivityTime(msg)
+			if outboxMessageID != "" {
+				if outboxMessageID != teamsMessageID {
+					continue
+				}
+			} else if activityAt.IsZero() || outbox.LastSendAttempt.IsZero() || activityAt.Before(outbox.LastSendAttempt.Add(-outboxEchoActivitySkew)) || activityAt.After(outbox.LastSendAttempt.Add(outboxEchoAttemptTTL)) {
+				continue
+			}
+		default:
 			continue
 		}
 		attachmentID := normalizedTeamsAttachmentID(driveItemAttachmentID(driveItemFromOutbox(outbox)))
@@ -9640,6 +9726,7 @@ func (b *Bridge) queueAndSendAttachmentUploadOutbox(ctx context.Context, session
 		ArtifactIDs:            append([]string(nil), opts.ArtifactIDs...),
 	})
 	if err != nil {
+		_ = cleanupStagedOutboundAttachment(staged.Path)
 		return teamstore.OutboxMessage{}, err
 	}
 	if queued.Status != teamstore.OutboxStatusSent {
@@ -9708,7 +9795,10 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 		_ = tmp.Close()
 		return OutboundAttachmentFile{}, fmt.Errorf("outbound attachment has no source data")
 	}
-	written, err := io.Copy(io.MultiWriter(tmp, hasher), source)
+	// The source may grow after preflight. Limit the staging copy before the
+	// first write so a changing or malicious source cannot consume the entire
+	// staging filesystem before the size check runs.
+	written, err := io.Copy(io.MultiWriter(tmp, hasher), io.LimitReader(source, maxOutboundAttachmentBytes+1))
 	if err != nil {
 		_ = tmp.Close()
 		return OutboundAttachmentFile{}, outboundPathError("stage Teams upload file", err)
@@ -9725,32 +9815,225 @@ func stageOutboundAttachmentForOutbox(file OutboundAttachmentFile) (OutboundAtta
 		_ = tmp.Close()
 		return OutboundAttachmentFile{}, fmt.Errorf("outbound attachment content changed during staging")
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return OutboundAttachmentFile{}, outboundPathError("sync staged Teams upload file", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return OutboundAttachmentFile{}, outboundPathError("close staged Teams upload file", err)
 	}
 	hash := hex.EncodeToString(hasher.Sum(nil))
-	hashPrefix := hash
-	if len(hashPrefix) > 16 {
-		hashPrefix = hashPrefix[:16]
-	}
-	stageDir := filepath.Join(stageRoot, hashPrefix)
+	// Keep the complete digest in the directory name.  The staged file is
+	// private and content-addressed; truncating the digest would make rare
+	// hash-prefix collisions share a directory and complicate cleanup and
+	// tamper detection.
+	stageDir := filepath.Join(stageRoot, hash)
 	if err := ensurePrivateDirectory(stageDir); err != nil {
 		return OutboundAttachmentFile{}, err
 	}
 	stagePath := filepath.Join(stageDir, uploadName)
-	if err := os.Rename(tmpPath, stagePath); err != nil {
-		return OutboundAttachmentFile{}, outboundPathError("publish staged Teams upload file", err)
+	// Publish without replacing an existing deterministic stage. Replacing a
+	// queued transfer here would make its outbox point at an unrelated inode.
+	if err := os.Link(tmpPath, stagePath); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return OutboundAttachmentFile{}, outboundPathError("publish staged Teams upload file", err)
+		}
+		existing, statErr := os.Lstat(stagePath)
+		if statErr != nil {
+			return OutboundAttachmentFile{}, outboundPathError("inspect existing staged Teams upload file", statErr)
+		}
+		if existing.Mode()&os.ModeSymlink != 0 || !existing.Mode().IsRegular() || existing.Size() != written {
+			return OutboundAttachmentFile{}, fmt.Errorf("existing staged Teams upload file conflicts with %s", stagePath)
+		}
+		existingSize, existingHash, hashErr := hashOutboundAttachmentFile(stagePath, stageRoot, false, maxOutboundAttachmentBytes)
+		if hashErr != nil || existingSize != written || !strings.EqualFold(existingHash, hash) {
+			return OutboundAttachmentFile{}, fmt.Errorf("existing staged Teams upload file content conflicts with %s", stagePath)
+		}
+		if err := os.Remove(tmpPath); err != nil {
+			return OutboundAttachmentFile{}, outboundPathError("discard duplicate staged Teams upload file", err)
+		}
+	} else if err := os.Remove(tmpPath); err != nil {
+		_ = os.Remove(stagePath)
+		return OutboundAttachmentFile{}, outboundPathError("discard published staging temporary file", err)
 	}
 	keep = true
 	if err := os.Chmod(stagePath, 0o600); err != nil {
+		_ = os.Remove(stagePath)
+		keep = false
 		return OutboundAttachmentFile{}, err
 	}
 	staged := file
 	staged.Path = stagePath
+	// The staged inode is now the source of truth. Do not retain a potentially
+	// huge in-memory copy, otherwise callers can accidentally select the simple
+	// byte PUT path even though the file was staged for resumable upload.
+	staged.Bytes = nil
 	staged.UploadName = uploadName
 	staged.Size = written
 	staged.SHA256 = hash
 	return staged, nil
+}
+
+func cleanupStagedOutboundAttachment(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		return err
+	}
+	stageRoot, err := filepath.Abs(filepath.Join(root, ".outbox"))
+	if err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(stageRoot)
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return fmt.Errorf("refusing to clean staged file through a non-directory outbox root")
+	}
+	cleanPath, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(stageRoot, cleanPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("refusing to clean staged file outside Teams outbox: %s", path)
+	}
+	info, err := os.Lstat(cleanPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(cleanPath)
+	if parent != stageRoot {
+		parentInfo, parentErr := os.Lstat(parent)
+		if parentErr != nil {
+			return parentErr
+		}
+		if parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() || filepath.Dir(parent) != stageRoot {
+			return fmt.Errorf("refusing to clean staged file through an unsafe parent directory")
+		}
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to clean non-regular staged file: %s", path)
+	}
+	if err := os.Remove(cleanPath); err != nil {
+		return err
+	}
+	// Remove only empty hash directories. Never recursively delete the
+	// outbox root, because it may contain another transfer or a temp file.
+	if parent != stageRoot {
+		if entries, readErr := os.ReadDir(parent); readErr == nil && len(entries) == 0 {
+			_ = os.Remove(parent)
+		}
+	}
+	return nil
+}
+
+func (b *Bridge) cleanupOutboxAttachment(outbox teamstore.OutboxMessage) {
+	if strings.TrimSpace(outbox.AttachmentPath) == "" {
+		return
+	}
+	if err := cleanupStagedOutboundAttachment(outbox.AttachmentPath); err != nil && b != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams staged attachment cleanup error: %v\n", err)
+	}
+}
+
+func (b *Bridge) reconcileStagedOutboundAttachments(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		return err
+	}
+	stageRoot, err := filepath.Abs(filepath.Join(root, ".outbox"))
+	if err != nil {
+		return err
+	}
+	rootInfo, err := os.Lstat(stageRoot)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return fmt.Errorf("Teams staging root is not a private directory")
+	}
+	state, err := b.store.Load(ctx)
+	if err != nil {
+		return err
+	}
+	protected := make(map[string]bool)
+	for _, outbox := range state.OutboxMessages {
+		switch outbox.Status {
+		case teamstore.OutboxStatusQueued, teamstore.OutboxStatusSending, teamstore.OutboxStatusAccepted:
+			if path := strings.TrimSpace(outbox.AttachmentPath); path != "" {
+				if absolute, absErr := filepath.Abs(path); absErr == nil {
+					protected[absolute] = true
+				}
+			}
+		}
+	}
+	entries, err := os.ReadDir(stageRoot)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		entryPath := filepath.Join(stageRoot, entry.Name())
+		info, infoErr := os.Lstat(entryPath)
+		if infoErr != nil {
+			if errors.Is(infoErr, os.ErrNotExist) {
+				continue
+			}
+			return infoErr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		if info.IsDir() {
+			children, readErr := os.ReadDir(entryPath)
+			if readErr != nil {
+				return readErr
+			}
+			for _, child := range children {
+				childPath, pathErr := filepath.Abs(filepath.Join(entryPath, child.Name()))
+				if pathErr != nil {
+					return pathErr
+				}
+				childInfo, childErr := os.Lstat(childPath)
+				if childErr != nil {
+					if errors.Is(childErr, os.ErrNotExist) {
+						continue
+					}
+					return childErr
+				}
+				if childInfo.Mode()&os.ModeSymlink != 0 || !childInfo.Mode().IsRegular() || protected[childPath] || now.Sub(childInfo.ModTime()) < stagedAttachmentReconcileGrace {
+					continue
+				}
+				if err := os.Remove(childPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			if remaining, readErr := os.ReadDir(entryPath); readErr == nil && len(remaining) == 0 {
+				_ = os.Remove(entryPath)
+			}
+			continue
+		}
+		if info.Mode().IsRegular() && strings.HasPrefix(entry.Name(), ".stage-") && now.Sub(info.ModTime()) >= stagedAttachmentReconcileGrace {
+			if err := os.Remove(entryPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func ensurePrivateDirectory(path string) error {
@@ -13768,7 +14051,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			}
 			return err
 		}
-		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
+		outbox, err = b.store.MarkOutboxDriveItemForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
 		if err != nil {
 			return err
 		}
@@ -13782,7 +14065,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			}
 			return err
 		}
-		outbox, err = b.store.MarkOutboxDriveItem(ctx, outbox.ID, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
+		outbox, err = b.store.MarkOutboxDriveItemForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL)
 		if err != nil {
 			return err
 		}
@@ -13865,6 +14148,7 @@ func (b *Bridge) sendOutboxQuoteReplyWithoutRateLimitRetry(ctx context.Context, 
 		return ChatMessage{}, fmt.Errorf("session %q quarantined before Graph quote reply", outbox.SessionID)
 	}
 	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	body = appendHelperOutboxProvenanceMarker(body, outbox.ID)
 	b.rememberOutboxEchoAttempt(outbox, body)
 	if len(hosted) > 0 {
 		msg, err := b.graph.SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outbox.QuoteReplyToMessageID, body, mentions, hosted)
@@ -13884,6 +14168,7 @@ func (b *Bridge) sendOutboxHTMLWithoutRateLimitRetry(ctx context.Context, outbox
 		return ChatMessage{}, fmt.Errorf("session %q quarantined before Graph send", outbox.SessionID)
 	}
 	body, mentions, hosted := b.renderOutboxHTMLForSend(ctx, outbox)
+	body = appendHelperOutboxProvenanceMarker(body, outbox.ID)
 	b.rememberOutboxEchoAttempt(outbox, body)
 	if len(hosted) > 0 {
 		msg, err := b.graph.SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx, outbox.TeamsChatID, body, mentions, hosted)
@@ -13909,7 +14194,15 @@ func (b *Bridge) renderOutboxHTMLForSend(ctx context.Context, outbox teamstore.O
 	} else {
 		rendered = renderOutboxHTMLWithMathAssets(outbox, assets)
 	}
-	return rendered + helperOutboxProvenanceMarker(outbox.ID), mentions, hosted
+	return rendered, mentions, hosted
+}
+
+func appendHelperOutboxProvenanceMarker(body string, outboxID string) string {
+	marker := helperOutboxProvenanceMarker(outboxID)
+	if marker == "" {
+		return body
+	}
+	return body + marker
 }
 
 func shouldFallbackFromQuoteReplyError(err error) bool {
@@ -13972,6 +14265,7 @@ func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstor
 }
 
 func (b *Bridge) recordSentOutboxSideEffectWithOptions(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions, sideOpts sentOutboxSideEffectOptions) {
+	b.cleanupOutboxAttachment(outbox)
 	if !sideOpts.GlobalOutboundRecorded {
 		if err := b.recordGlobalOutboundMessage(ctx, outbox, msg); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams global outbound ledger record error: %v\n", err)
@@ -14052,6 +14346,9 @@ func (b *Bridge) boostWorkPollAfterSentLiveFinalAnswer(ctx context.Context, outb
 }
 
 func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamstore.OutboxMessage) (DriveItem, error) {
+	if b == nil || b.store == nil {
+		return DriveItem{}, fmt.Errorf("Teams file upload store is not configured")
+	}
 	graph, err := b.fileWriteGraph()
 	if err != nil {
 		return DriveItem{}, fmt.Errorf("Teams file upload setup failed: %w", err)
@@ -14068,10 +14365,110 @@ func (b *Bridge) uploadQueuedOutboxAttachment(ctx context.Context, outbox teamst
 	if file.Bytes != nil || strings.TrimSpace(file.Path) == "" {
 		item, err = graph.UploadSmallDriveItemWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Bytes, file.ContentType)
 	} else {
-		item, err = graph.UploadDriveItemFromFileWithoutRateLimitRetry(ctx, uploadFolder, file.UploadName, file.Path, file.Size, file.ContentType)
+		var checkpoint *driveUploadSessionCheckpoint
+		if uploadURL := strings.TrimSpace(outbox.AttachmentUploadURL); uploadURL != "" {
+			checkpoint = &driveUploadSessionCheckpoint{
+				UploadURL: uploadURL,
+				Offset:    outbox.AttachmentUploadOffset,
+			}
+			if !outbox.AttachmentUploadExpiry.IsZero() {
+				checkpoint.ExpirationDateTime = outbox.AttachmentUploadExpiry.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		lastURL := ""
+		lastOffset := int64(-1)
+		lastPersistedAt := time.Time{}
+		persist := func(progress driveUploadSessionCheckpoint) error {
+			progress.UploadURL = strings.TrimSpace(progress.UploadURL)
+			if progress.UploadURL == "" || progress.Offset < 0 || progress.Offset > file.Size {
+				return fmt.Errorf("invalid upload session checkpoint for %q", file.UploadName)
+			}
+			if progress.UploadURL == lastURL && lastOffset >= 0 && progress.Offset != file.Size && progress.Offset-lastOffset < attachmentUploadCheckpointBytes && !lastPersistedAt.IsZero() && time.Since(lastPersistedAt) < attachmentUploadCheckpointInterval {
+				return nil
+			}
+			expiresAt := parseGraphTime(progress.ExpirationDateTime)
+			if _, err := b.store.MarkOutboxUploadSessionForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, progress.UploadURL, expiresAt, progress.Offset); err != nil {
+				return err
+			}
+			lastURL = progress.UploadURL
+			lastOffset = progress.Offset
+			lastPersistedAt = time.Now()
+			return nil
+		}
+		if checkpoint != nil {
+			lastURL = checkpoint.UploadURL
+			lastOffset = checkpoint.Offset
+			lastPersistedAt = time.Now()
+		}
+		// A single 10 MiB Graph chunk can remain in-flight longer than the
+		// two-minute outbox send lease on a very slow but healthy connection.
+		// Renew the lease with the last acknowledged offset while that request
+		// is making body progress; do not start another Graph request or create
+		// a parallel upload. The mutex also protects the throttling state inside
+		// persist from the heartbeat and chunk-completion callbacks.
+		var checkpointMu sync.Mutex
+		latestCheckpoint := driveUploadSessionCheckpoint{}
+		latestCheckpointReady := false
+		var heartbeatErr error
+		recordProgress := func(progress driveUploadSessionCheckpoint) error {
+			checkpointMu.Lock()
+			defer checkpointMu.Unlock()
+			latestCheckpoint = progress
+			latestCheckpointReady = true
+			return persist(progress)
+		}
+		heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+		uploadCtx, cancelUpload := context.WithCancel(ctx)
+		heartbeatDone := make(chan struct{})
+		go func() {
+			defer close(heartbeatDone)
+			ticker := time.NewTicker(attachmentUploadCheckpointInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					checkpointMu.Lock()
+					var progressErr error
+					if latestCheckpointReady && heartbeatErr == nil {
+						progressErr = persist(latestCheckpoint)
+						if progressErr != nil {
+							heartbeatErr = progressErr
+						}
+					}
+					checkpointMu.Unlock()
+					if progressErr != nil {
+						cancelUpload()
+						return
+					}
+				case <-heartbeatCtx.Done():
+					return
+				}
+			}
+		}()
+		item, err = graph.uploadDriveItemFromFileWithCheckpoint(uploadCtx, uploadFolder, file.UploadName, file.Path, file.Size, file.ContentType, graphRequestOptions{returnRateLimitWithoutRetry: true}, checkpoint, recordProgress)
+		stopHeartbeat()
+		cancelUpload()
+		<-heartbeatDone
+		checkpointMu.Lock()
+		heartbeatFailure := heartbeatErr
+		checkpointMu.Unlock()
+		if heartbeatFailure != nil && ctx.Err() == nil {
+			err = heartbeatFailure
+		}
 	}
 	if err != nil {
 		return DriveItem{}, err
+	}
+	// Persist the DriveItem ID before the metadata lookup. If the process dies
+	// after Graph accepts the upload but before metadata is returned, the next
+	// outbox attempt can refresh metadata instead of uploading a duplicate.
+	if strings.TrimSpace(item.ID) != "" {
+		if _, markErr := b.store.MarkOutboxDriveItemForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, item.ID, item.Name, item.ETag, item.WebURL, item.WebDavURL); markErr != nil {
+			return DriveItem{}, markErr
+		}
+		if _, clearErr := b.store.MarkOutboxUploadSessionForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "", time.Time{}, 0); clearErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams upload-session checkpoint cleanup error: %v\n", clearErr)
+		}
 	}
 	meta, err := graph.GetDriveItemMetadataWithoutRateLimitRetry(ctx, item.ID)
 	if err != nil {

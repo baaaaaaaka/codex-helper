@@ -98,8 +98,8 @@ func newModelSourceBindCmd(root *rootOptions) *cobra.Command {
 			return runModelSourceBind(cmd, root, args[0], args[1], opts)
 		},
 	}
-	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the provider key")
-	cmd.Flags().BoolVar(&opts.apiKeyStdin, "api-key-stdin", false, "Read and save the provider key from stdin (never write it to JSON)")
+	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the key")
+	cmd.Flags().BoolVar(&opts.apiKeyStdin, "api-key-stdin", false, "Read and save the key from stdin")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", 20*time.Second, "Verification timeout")
 	return cmd
 }
@@ -142,9 +142,7 @@ func runModelSourceSync(cmd *cobra.Command, root *rootOptions, ref string, opts 
 	}
 	defer os.RemoveAll(staging)
 	repoDir := filepath.Join(staging, "repo")
-	kind := strings.ToLower(strings.TrimSpace(source.Kind))
-	localSource := kind == "file" || kind == "directory"
-	if localSource {
+	if kind := strings.ToLower(strings.TrimSpace(source.Kind)); kind == "file" || kind == "directory" {
 		if kind == "file" {
 			source.File = filepath.Base(strings.TrimSpace(source.Path))
 		}
@@ -152,8 +150,7 @@ func runModelSourceSync(cmd *cobra.Command, root *rootOptions, ref string, opts 
 			return fmt.Errorf("stage model source %q: %w", name, err)
 		}
 	} else {
-		args := []string{"clone", "--depth", "1", "--filter=blob:none", "--no-checkout"}
-		args = append(args, "--", source.URL, repoDir)
+		args := []string{"clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--", source.URL, repoDir}
 		git := exec.CommandContext(cmd.Context(), "git", args...)
 		if raw, cloneErr := git.CombinedOutput(); cloneErr != nil {
 			return fmt.Errorf("sync model source %q: %w: %s", name, cloneErr, strings.TrimSpace(string(raw)))
@@ -173,9 +170,9 @@ func runModelSourceSync(cmd *cobra.Command, root *rootOptions, ref string, opts 
 				return fmt.Errorf("checkout model source %q: %w: %s", name, checkoutErr, strings.TrimSpace(string(raw)))
 			}
 		}
-		revisionRaw, err := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output()
-		if err != nil {
-			return fmt.Errorf("read synced revision: %w", err)
+		revisionRaw, revisionErr := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output()
+		if revisionErr != nil {
+			return fmt.Errorf("read synced revision: %w", revisionErr)
 		}
 		attemptedRevision = strings.TrimSpace(string(revisionRaw))
 	}
@@ -200,10 +197,9 @@ func runModelSourceSync(cmd *cobra.Command, root *rootOptions, ref string, opts 
 		if readErr != nil {
 			return fmt.Errorf("read %s: %w", source.File, readErr)
 		}
-		var parseErr error
-		fragment, parseErr = config.ParseModelConfigFragment(raw)
-		if parseErr != nil {
-			return fmt.Errorf("validate %s: %w", source.File, parseErr)
+		fragment, err = config.ParseModelConfigFragment(raw)
+		if err != nil {
+			return fmt.Errorf("validate %s: %w", source.File, err)
 		}
 	}
 	source.Revision = attemptedRevision
@@ -395,6 +391,8 @@ func runModelSourceAutoSyncLoop(ctx context.Context, root *rootOptions, errOut i
 }
 
 func runModelSourceAutoSyncOnce(ctx context.Context, root *rootOptions, errOut io.Writer, now time.Time, interval time.Duration) time.Duration {
+	modelSubscriptionAutoSyncMu.Lock()
+	defer modelSubscriptionAutoSyncMu.Unlock()
 	if interval <= 0 {
 		interval = defaultModelSourceAutoSyncInterval
 	}
@@ -1056,11 +1054,57 @@ func verifySyncedModel(ctx context.Context, resolved modelprofile.Resolved, apiK
 	if resolved.Provider.DirectResponses {
 		return verifyNativeResponsesModel(ctx, resolved, apiKey)
 	}
-	client := responsesadapter.NewUpstreamHTTPClient(nil)
-	client.Timeout = 20 * time.Second
+	// Verification must exercise the same compiled converter that the runtime
+	// will use.  Constructing OpenAIChatAdapter directly here used to make every
+	// catalog route look OpenAI-compatible, so an Anthropic/Beta route could be
+	// materialized successfully but fail verification (or worse, send the wrong
+	// wire protocol) at launch time.
+	httpPolicy := resolved.Model.HTTPPolicy
+	if httpPolicy.TimeoutSeconds <= 0 {
+		httpPolicy.TimeoutSeconds = 20
+	}
+	profile := responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).
+		WithReasoningOverrides(resolved.Provider.DefaultReasoningEffort, resolved.Provider.ReasoningEffortMap).
+		WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy)
 	max := 8
-	adapter := responsesadapter.OpenAIChatAdapter{BaseURL: resolved.Provider.BaseURL, APIKey: apiKey, HTTPClient: client, MaxRetries: -1, MaxOutputTokens: max, Headers: resolved.Provider.Headers, AuthType: resolved.Provider.AuthType, AuthHeader: resolved.Provider.AuthHeader, StreamMode: resolved.Model.StreamPolicy.UpstreamMode, StreamIdleTimeout: time.Duration(resolved.Model.StreamPolicy.IdleTimeoutSeconds) * time.Second, FirstEventTimeout: time.Duration(resolved.Model.StreamPolicy.FirstEventTimeoutSeconds) * time.Second, SemanticProgressTimeout: time.Duration(resolved.Model.StreamPolicy.SemanticProgressTimeoutSeconds) * time.Second, MaxDuration: time.Duration(resolved.Model.StreamPolicy.MaxDurationSeconds) * time.Second, HeartbeatMode: resolved.Model.StreamPolicy.HeartbeatMode, ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath, ReasoningTokensPath: resolved.Model.StreamPolicy.ReasoningTokensPath, CachedTokensPath: resolved.Model.StreamPolicy.CachedTokensPath, UsageField: resolved.Model.CachePolicy.UsageField, Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy)}
-	stream, err := adapter.Stream(ctx, responsesadapter.ProviderRequest{Model: resolved.Model.UpstreamModel(), InputText: "Reply with OK.", MaxOutputTokens: &max, ReasoningEffort: resolved.Provider.DefaultReasoningEffort})
+	adapter, err := responsesadapter.NewConfiguredAdapter(responsesadapter.AdapterOptions{
+		AdapterID:          resolved.Provider.AdapterProfile,
+		ConversionProfile:  resolved.Provider.ConversionProfile,
+		StrictConversion:   resolved.Provider.StrictConversion,
+		BaseURL:            resolved.Provider.BaseURL,
+		APIKey:             apiKey,
+		Headers:            resolved.Provider.Headers,
+		Endpoints:          resolved.Provider.Endpoints,
+		AuthType:           resolved.Provider.AuthType,
+		AuthHeader:         resolved.Provider.AuthHeader,
+		Profile:            profile,
+		MaxRetries:         httpPolicy.MaxRetries,
+		RetryStatuses:      httpPolicy.RetryStatuses,
+		HonorRetryAfter:    httpPolicy.HonorRetryAfter,
+		RetryTransport:     httpPolicy.RetryTransportErrors,
+		MaxOutputTokens:    max,
+		StreamMode:         resolved.Model.StreamPolicy.UpstreamMode,
+		ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath,
+		CachedTokensPath:   resolved.Model.StreamPolicy.CachedTokensPath,
+		UsageField:         resolved.Model.CachePolicy.UsageField,
+		HTTP:               httpPolicy,
+		Stream:             resolved.Model.StreamPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	request := responsesadapter.ProviderRequest{
+		Model:           resolved.Model.UpstreamModel(),
+		Operation:       resolved.Model.Operation,
+		InputText:       "Reply with OK.",
+		MaxOutputTokens: &max,
+		ReasoningEffort: resolved.Provider.DefaultReasoningEffort,
+	}
+	if strings.EqualFold(strings.TrimSpace(request.Operation), "prefix") || strings.EqualFold(strings.TrimSpace(request.Operation), "fim") {
+		request.Prefix = request.InputText
+		request.InputText = ""
+	}
+	stream, err := adapter.Stream(ctx, request)
 	if err != nil {
 		return err
 	}
@@ -1137,8 +1181,30 @@ func modelVerificationConfigurationFingerprint(resolved modelprofile.Resolved) s
 }
 
 func modelProfileVerificationCurrent(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore) bool {
+	return modelProfileVerificationCurrentWithBinding(cfg, name, profile, secrets, true)
+}
+
+// modelProfileVerificationCurrentIgnoringBinding is used while a provider is
+// being activated one interface at a time. The binding is intentionally still
+// disabled during that transaction, so checking it here would make every
+// already-verified interface look stale and would prevent the final interface
+// from enabling the provider.
+func modelProfileVerificationCurrentIgnoringBinding(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore) bool {
+	return modelProfileVerificationCurrentWithBinding(cfg, name, profile, secrets, false)
+}
+
+func modelProfileVerificationCurrentWithBinding(cfg config.Config, name string, profile config.ModelProfile, secrets *modelprofile.SecretStore, requireEnabledBinding bool) bool {
 	if strings.TrimSpace(profile.VerificationFingerprint) == "" {
 		return false
+	}
+	if requireEnabledBinding {
+		if catalogName := mapKeyFold(cfg.ModelCatalogs, profile.Source); catalogName != "" {
+			bindingName := mapKeyFold(cfg.ModelProviderBindings, profile.Provider)
+			binding, ok := cfg.ModelProviderBindings[bindingName]
+			if !ok || !binding.Enabled || !strings.EqualFold(strings.TrimSpace(binding.Catalog), catalogName) {
+				return false
+			}
+		}
 	}
 	resolved, err := modelprofile.Resolve(cfg, name)
 	if err != nil {
@@ -1194,12 +1260,7 @@ func printModelSources(out io.Writer, cfg config.Config) {
 	sort.Strings(names)
 	for _, name := range names {
 		source := cfg.ModelSources[name]
-		kind := firstNonEmptyCLI(source.Kind, "git")
-		location := source.URL
-		if strings.TrimSpace(location) == "" {
-			location = source.Path
-		}
-		_, _ = fmt.Fprintf(out, "%s  kind=%s revision=%.12s profiles=%d source=%s\n", name, kind, source.Revision, len(source.Profiles), location)
+		_, _ = fmt.Fprintf(out, "%s  revision=%.12s profiles=%d url=%s\n", name, source.Revision, len(source.Profiles), source.URL)
 		if source.BackupActive {
 			_, _ = fmt.Fprintf(out, "  WARNING: backup JSON active; attempted=%s reason=%s\n", firstNonEmptyCLI(shortModelSourceRevision(source.BackupAttemptedRevision), "unknown"), shortenModelProfileWarning(source.BackupReason, 240))
 		}

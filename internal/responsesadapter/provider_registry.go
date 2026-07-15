@@ -1,6 +1,7 @@
 package responsesadapter
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -25,8 +26,39 @@ type ProviderConfig struct {
 	Adapter                 ProviderAdapter
 	Route                   config.ModelRoute
 	CustomToolMode          string
+	UnsupportedToolPolicy   string
+	ConversionProfile       string
+	StrictConversion        bool
+	Operation               string
+	NativeTools             []NativeToolSpec
+	SourcePolicy            SourcePolicy
+	ResponsesPolicy         ResponsesPolicy
 	ParallelToolEnforcement string
-	ResponsesPolicy         config.ModelResponsesPolicy
+	// Routes contains operation-specific adapters. The default ProviderConfig
+	// fields remain the fallback route; a request with an explicit operation or
+	// a declared native web-search tool selects the matching route before any
+	// upstream request is made.
+	Routes []ProviderRouteConfig
+}
+
+type ProviderRouteConfig struct {
+	Key       string
+	Operation string
+	Adapter   ProviderAdapter
+	ProfileID string
+	// BaseURL and APIKey are in-memory route metadata used only to derive
+	// runtime identity. APIKey is never serialized or emitted; keeping it here
+	// makes cache/stats scopes distinguish interfaces that use different
+	// credentials while the adapter itself retains the actual secret.
+	BaseURL               string
+	APIKey                string
+	CustomToolMode        string
+	UnsupportedToolPolicy string
+	ConversionProfile     string
+	StrictConversion      bool
+	NativeTools           []NativeToolSpec
+	SourcePolicy          SourcePolicy
+	ResponsesPolicy       ResponsesPolicy
 }
 
 type ProviderRegistry struct {
@@ -39,12 +71,13 @@ type ProviderRegistry struct {
 }
 
 type registeredProvider struct {
-	id         string
-	models     map[string]bool
-	routes     map[string]string
-	listModels []ModelInfo
-	openModel  bool
-	runtime    ProviderRuntime
+	id            string
+	models        map[string]bool
+	routes        map[string]string
+	listModels    []ModelInfo
+	openModel     bool
+	runtime       ProviderRuntime
+	routesRuntime map[string]ProviderRuntime
 }
 
 func NewProviderRegistry(opts ProviderRegistryOptions) (*ProviderRegistry, error) {
@@ -69,6 +102,29 @@ func NewProviderRegistry(opts ProviderRegistryOptions) (*ProviderRegistry, error
 		registry.proxyKeys[key] = normalizedProvider
 	}
 	for _, cfg := range opts.Providers {
+		if err := ValidateConversionProfile(cfg.ConversionProfile); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", cfg.ID, err)
+		}
+		if err := validateSourcePolicy(cfg.SourcePolicy); err != nil {
+			return nil, fmt.Errorf("provider %q: %w", cfg.ID, err)
+		}
+		for _, route := range cfg.Routes {
+			key := strings.ToLower(strings.TrimSpace(route.Key))
+			if key == "" {
+				return nil, fmt.Errorf("provider %q has a route without a key", cfg.ID)
+			}
+			if route.Adapter == nil {
+				return nil, fmt.Errorf("provider %q route %q has no adapter", cfg.ID, route.Key)
+			}
+			if err := validateSourcePolicy(route.SourcePolicy); err != nil {
+				return nil, fmt.Errorf("provider %q route %q: %w", cfg.ID, route.Key, err)
+			}
+			switch operation := strings.ToLower(strings.TrimSpace(route.Operation)); operation {
+			case "", "chat", "responses", "prefix", "fim":
+			default:
+				return nil, fmt.Errorf("provider %q route %q has invalid operation %q", cfg.ID, route.Key, route.Operation)
+			}
+		}
 		registered, err := buildRegisteredProvider(cfg, opts.KeySalt)
 		if err != nil {
 			return nil, err
@@ -128,22 +184,22 @@ func (r *ProviderRegistry) Resolve(req *http.Request, body ResponsesRequest) (Pr
 		explicit = lock
 	}
 	if explicit != "" {
-		return r.resolveWithProvider(explicit, body.Model)
+		return r.resolveWithProvider(explicit, body.Model, body)
 	}
 	model := strings.TrimSpace(body.Model)
 	if model == "" {
-		return r.resolveWithProvider(r.defaultProvider, "")
+		return r.resolveWithProvider(r.defaultProvider, "", body)
 	}
 	matches := r.byModel[normalizeModelID(model)]
 	switch len(matches) {
 	case 0:
 		defaultProvider := r.providers[r.byID[r.defaultProvider]]
 		if defaultProvider.openModel {
-			return runtimeForModel(defaultProvider, model), nil
+			return checkedRuntimeForRequest(defaultProvider, model, body)
 		}
 		return ProviderRuntime{}, routeErrorf(http.StatusBadRequest, "model %q is not configured for any provider", model)
 	case 1:
-		return runtimeForModel(r.providers[matches[0]], model), nil
+		return checkedRuntimeForRequest(r.providers[matches[0]], model, body)
 	default:
 		return ProviderRuntime{}, routeErrorf(http.StatusConflict, "model %q is configured by multiple providers; set x-codex-provider or use a provider-locked proxy key", model)
 	}
@@ -180,7 +236,7 @@ func (r *ProviderRegistry) resolveProxyLock(req *http.Request) (string, error) {
 	return lock, nil
 }
 
-func (r *ProviderRegistry) resolveWithProvider(providerID string, model string) (ProviderRuntime, error) {
+func (r *ProviderRegistry) resolveWithProvider(providerID string, model string, body ResponsesRequest) (ProviderRuntime, error) {
 	idx, ok := r.byID[normalizeProviderID(providerID)]
 	if !ok {
 		return ProviderRuntime{}, routeErrorf(http.StatusBadRequest, "provider %q is not configured", providerID)
@@ -193,7 +249,19 @@ func (r *ProviderRegistry) resolveWithProvider(providerID string, model string) 
 	if !provider.openModel && !provider.models[normalizeModelID(model)] {
 		return ProviderRuntime{}, routeErrorf(http.StatusBadRequest, "model %q is not configured for provider %q", model, provider.id)
 	}
-	return runtimeForModel(provider, model), nil
+	return checkedRuntimeForRequest(provider, model, body)
+}
+
+func checkedRuntimeForRequest(provider registeredProvider, model string, body ResponsesRequest) (ProviderRuntime, error) {
+	runtime := runtimeForRequest(provider, model, body)
+	if requestRouteKey(body) != "" && runtime.Adapter == nil {
+		key := requestRouteKey(body)
+		if key == "websearch" {
+			return ProviderRuntime{}, routeErrorf(http.StatusBadRequest, "provider %q has no configured web-search route", provider.id)
+		}
+		return ProviderRuntime{}, routeErrorf(http.StatusBadRequest, "provider %q has no configured %q route", provider.id, key)
+	}
+	return runtime, nil
 }
 
 func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProvider, error) {
@@ -233,11 +301,18 @@ func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProv
 	}
 	adapter := cfg.Adapter
 	if adapter == nil {
-		adapter = OpenAIChatAdapter{
-			BaseURL: baseURL,
-			APIKey:  cfg.APIKey,
-			Profile: ProfileForProvider(profileID),
+		var err error
+		adapter, err = NewConfiguredAdapter(AdapterOptions{
+			AdapterID: profileID, ConversionProfile: cfg.ConversionProfile, StrictConversion: cfg.StrictConversion,
+			BaseURL: baseURL, APIKey: cfg.APIKey, Profile: ProfileForProvider(profileID),
+		})
+		if err != nil {
+			return registeredProvider{}, fmt.Errorf("provider %q adapter: %w", id, err)
 		}
+	}
+	profileVersion := firstNonEmpty(profileID, id) + ":v1"
+	if conversion := strings.TrimSpace(cfg.ConversionProfile); conversion != "" {
+		profileVersion += ":" + conversion
 	}
 	return registeredProvider{
 		id:         id,
@@ -250,14 +325,21 @@ func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProv
 			ProviderID:              id,
 			PublicModel:             strings.TrimSpace(cfg.DefaultModel),
 			Model:                   strings.TrimSpace(cfg.DefaultModel),
-			Route:                   cfg.Route,
 			KeyFingerprint:          KeyFingerprint(cfg.APIKey, keySalt),
 			BaseURLHash:             BaseURLHash(baseURL),
-			ProfileVersion:          firstNonEmpty(profileID, id) + ":v1",
+			ProfileVersion:          profileVersion,
 			CustomToolMode:          strings.TrimSpace(cfg.CustomToolMode),
-			ParallelToolEnforcement: strings.TrimSpace(cfg.ParallelToolEnforcement),
+			UnsupportedToolPolicy:   strings.TrimSpace(cfg.UnsupportedToolPolicy),
+			ConversionProfile:       strings.TrimSpace(cfg.ConversionProfile),
+			StrictConversion:        cfg.StrictConversion,
+			Operation:               strings.TrimSpace(cfg.Operation),
+			NativeTools:             append([]NativeToolSpec(nil), cfg.NativeTools...),
+			SourcePolicy:            cfg.SourcePolicy,
 			ResponsesPolicy:         cfg.ResponsesPolicy,
+			ParallelToolEnforcement: strings.TrimSpace(cfg.ParallelToolEnforcement),
+			Route:                   cfg.Route,
 		},
+		routesRuntime: buildRouteRuntimes(cfg, id, baseURL, profileVersion, cfg.APIKey, keySalt),
 	}, nil
 }
 
@@ -285,6 +367,110 @@ func runtimeForModel(provider registeredProvider, model string) ProviderRuntime 
 	return runtime
 }
 
+func runtimeForRequest(provider registeredProvider, model string, body ResponsesRequest) ProviderRuntime {
+	runtime := runtimeForModel(provider, model)
+	key := requestRouteKey(body)
+	if key == "" {
+		// A model may use a capability-specific default interface (for example
+		// DeepSeek's Anthropic web-search route) while ordinary chat remains on
+		// a different interface. Codex does not send an operation for ordinary
+		// turns, so prefer the explicitly declared chat route before falling
+		// back to the provider-level adapter.
+		if _, ok := provider.routesRuntime["chat"]; ok {
+			key = "chat"
+		} else if _, ok := provider.routesRuntime["responses"]; ok {
+			key = "responses"
+		}
+	}
+	if key == "" {
+		return runtime
+	}
+	if route, ok := provider.routesRuntime[key]; ok {
+		route.PublicModel = strings.TrimSpace(model)
+		route.Model = strings.TrimSpace(provider.routes[normalizeModelID(model)])
+		if route.Model == "" {
+			route.Model = strings.TrimSpace(model)
+		}
+		return route
+	}
+	if strings.TrimSpace(body.Operation) != "" {
+		// Never let an explicit operation fall through to a chat adapter. This
+		// was the source of silent DeepSeek Beta/FIM misrouting.
+		return ProviderRuntime{ProviderID: provider.id, PublicModel: model, Model: model, Operation: strings.ToLower(strings.TrimSpace(body.Operation)), UnsupportedToolPolicy: "error"}
+	}
+	return runtime
+}
+
+func requestRouteKey(body ResponsesRequest) string {
+	if operation := strings.ToLower(strings.TrimSpace(body.Operation)); operation != "" {
+		return operation
+	}
+	if hasNativeWebSearchTool(body.Tools) {
+		return "websearch"
+	}
+	return ""
+}
+
+func hasNativeWebSearchTool(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	return containsNativeWebSearchTool(value)
+}
+
+func containsNativeWebSearchTool(value any) bool {
+	switch item := value.(type) {
+	case []any:
+		for _, child := range item {
+			if containsNativeWebSearchTool(child) {
+				return true
+			}
+		}
+	case map[string]any:
+		// Only a tool definition's type identifies a native search request.
+		// Looking at name/upstream_type (or recursively walking arbitrary
+		// parameter schemas) misclassifies an ordinary function named
+		// "web_search" and can route it to an unconfigured search endpoint.
+		if text, ok := item["type"].(string); ok && (strings.EqualFold(text, "web_search") || strings.EqualFold(text, "web_search_preview")) {
+			return true
+		}
+		// Namespaced tool declarations are the one supported nested shape. Do
+		// not recurse into function parameters or arbitrary metadata.
+		if nested, ok := item["tools"]; ok && containsNativeWebSearchTool(nested) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildRouteRuntimes(cfg ProviderConfig, id, baseURL, profileVersion, apiKey, keySalt string) map[string]ProviderRuntime {
+	if len(cfg.Routes) == 0 {
+		return nil
+	}
+	out := make(map[string]ProviderRuntime, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		key := strings.ToLower(strings.TrimSpace(route.Key))
+		if key == "" || route.Adapter == nil {
+			continue
+		}
+		version := profileVersion + ":" + firstNonEmpty(route.ProfileID, key)
+		if conversion := strings.TrimSpace(route.ConversionProfile); conversion != "" {
+			version += ":" + conversion
+		}
+		routeBaseURL := firstNonEmpty(route.BaseURL, baseURL)
+		routeAPIKey := firstNonEmpty(route.APIKey, apiKey)
+		out[key] = ProviderRuntime{
+			Adapter: route.Adapter, ProviderID: id, KeyFingerprint: KeyFingerprint(routeAPIKey, keySalt), BaseURLHash: BaseURLHash(routeBaseURL), ProfileVersion: version,
+			CustomToolMode: strings.TrimSpace(route.CustomToolMode), UnsupportedToolPolicy: strings.TrimSpace(route.UnsupportedToolPolicy), ConversionProfile: strings.TrimSpace(route.ConversionProfile), StrictConversion: route.StrictConversion, Operation: strings.ToLower(strings.TrimSpace(route.Operation)), NativeTools: append([]NativeToolSpec(nil), route.NativeTools...), SourcePolicy: route.SourcePolicy, ResponsesPolicy: route.ResponsesPolicy,
+		}
+	}
+	return out
+}
+
 func inferProviderBaseURL(profileID string, baseURL string, apiKey string) string {
 	baseURL = strings.TrimSpace(baseURL)
 	if baseURL != "" {
@@ -292,13 +478,6 @@ func inferProviderBaseURL(profileID string, baseURL string, apiKey string) strin
 	}
 	profile := strings.ToLower(strings.TrimSpace(profileID))
 	switch {
-	case strings.Contains(profile, "mimo"):
-		if strings.HasPrefix(strings.TrimSpace(apiKey), "tp-") {
-			return "https://token-plan-cn.xiaomimimo.com/v1"
-		}
-		return "https://api.xiaomimimo.com/v1"
-	case strings.Contains(profile, "deepseek"):
-		return "https://api.deepseek.com/v1"
 	case strings.Contains(profile, "openai"):
 		return "https://api.openai.com/v1"
 	default:

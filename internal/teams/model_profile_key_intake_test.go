@@ -57,13 +57,8 @@ func TestParseModelProfileKeyIntakeSetupOptionsSimpleModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	if got.Provider != "mimo" ||
-		got.ProfileName != "mimo25-pro" ||
-		got.Model != "mimo/mimo-v2.5-pro" ||
-		got.CredentialScope != "mimo25" ||
-		got.SetDefault ||
-		!got.SimpleModel {
-		t.Fatalf("parsed simple model = %#v", got)
+	if got.Provider != "mimo-v2.5-pro" || got.ProfileName != "" || got.Model != "" || got.SimpleModel {
+		t.Fatalf("removed built-in selector parsed as legacy simple model = %#v", got)
 	}
 }
 
@@ -84,11 +79,11 @@ func TestBridgeModelProfileTeamsKeyIntakeSimpleModelStoresCredentialScope(t *tes
 	newModelProfileKeyIntakeCode = func() (string, error) { return "MIMO25P1", nil }
 	t.Cleanup(func() { newModelProfileKeyIntakeCode = oldCode })
 
-	out, err := bridge.startModelProfileKeyIntake(ctx, bridgeTestMessage("setup-mimo-pro"), "mimo-v2.5-pro")
+	out, err := bridge.startModelProfileKeyIntake(ctx, bridgeTestMessage("setup-compat"), "responses-compatible compat-work --model example/reasoning-model --teams-key-intake")
 	if err != nil {
 		t.Fatalf("startModelProfileKeyIntake: %v", err)
 	}
-	if !strings.Contains(out, "MiMo 2.5 Pro") || !strings.Contains(out, "model key confirm MIMO25P1") {
+	if !strings.Contains(out, "example/reasoning-model") || !strings.Contains(out, "model key confirm MIMO25P1") {
 		t.Fatalf("intake output:\n%s", out)
 	}
 	state, err := store.Load(ctx)
@@ -99,7 +94,7 @@ func TestBridgeModelProfileTeamsKeyIntakeSimpleModelStoresCredentialScope(t *tes
 		t.Fatalf("pending intakes = %#v", state.ModelProfileKeyIntakes)
 	}
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.Provider != "mimo" || intake.ProfileName != "mimo25-pro" || intake.Model != "mimo/mimo-v2.5-pro" || intake.CredentialScope != "mimo25" || intake.SetDefault {
+		if intake.Provider != "responses-compatible" || intake.ProfileName != "compat-work" || intake.Model != "example/reasoning-model" || intake.CredentialScope != "" || intake.SetDefault {
 			t.Fatalf("stored intake = %#v", intake)
 		}
 	}

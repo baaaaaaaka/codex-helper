@@ -193,8 +193,7 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 	}
 	forceProfile := strings.HasPrefix(strings.ToLower(name), "profile:")
 	forceOfficial := strings.HasPrefix(strings.ToLower(name), "official:")
-	forceModel := strings.HasPrefix(strings.ToLower(name), "model:")
-	if forceProfile || forceOfficial || forceModel {
+	if forceProfile || forceOfficial {
 		_, name, _ = strings.Cut(name, ":")
 		name = strings.TrimSpace(name)
 	}
@@ -225,6 +224,11 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 		}
 		credentialRef := strings.TrimSpace(profile.Credential)
 		if credentialRef == "" {
+			if interfaceName := modelInterfaceForDefinition(provider, definition); interfaceName != "" {
+				credentialRef = interfaceCredentialRef(provider, interfaceName)
+			}
+		}
+		if credentialRef == "" {
 			credentialRef = strings.TrimSpace(provider.Credential)
 		}
 		credential := config.ModelCredential{}
@@ -242,7 +246,6 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 		profile.Model = canonicalModel
 		profile.Provider = definition.Provider
 		resolvedProvider, selected := structuredProviderSpec(definition.Provider, provider, credential, canonicalModel, definition)
-		applyModelProfileOverrides(&resolvedProvider, &selected, profile)
 		return finishResolvedModel(cfg, name, profile, resolvedProvider, selected)
 	}
 	if strings.TrimSpace(providerID) == "" {
@@ -292,9 +295,39 @@ func Resolve(cfg config.Config, ref string) (Resolved, error) {
 }
 
 func structuredProviderSpec(name string, provider config.ModelProvider, credential config.ModelCredential, publicID string, model config.ModelDefinition) (ProviderSpec, ModelSpec) {
+	providerHeaders := cloneStringMapPreserve(provider.Headers)
+	providerEndpoints := cloneStringMapPreserve(provider.Endpoints)
+	providerHTTP := provider.HTTP
+	providerStream := provider.Stream
+	selectedInterface := modelInterfaceForDefinition(provider, model)
+	if selectedInterface != "" {
+		if iface, ok := findModelInterface(provider.Interfaces, selectedInterface); ok {
+			if strings.TrimSpace(iface.Auth.Type) != "" {
+				credential.AuthType = strings.TrimSpace(iface.Auth.Type)
+			}
+			if strings.TrimSpace(iface.Auth.Header) != "" {
+				credential.Header = strings.TrimSpace(iface.Auth.Header)
+			}
+			provider.DefaultInterface = selectedInterface
+			provider.Protocol = firstNonEmpty(iface.Protocol, provider.Protocol)
+			provider.BaseURL = firstNonEmpty(iface.BaseURL, provider.BaseURL)
+			provider.Headers = mergeStringMaps(providerHeaders, iface.Headers)
+			provider.Endpoints = mergeStringMaps(providerEndpoints, iface.Endpoints)
+			provider.HTTP = mergeHTTPPolicy(iface.HTTP, provider.HTTP)
+			provider.Stream = mergeStreamPolicy(iface.Stream, provider.Stream)
+			provider.AdapterProfile = firstNonEmpty(iface.Adapter, provider.AdapterProfile)
+			if iface.Conversion.Enabled {
+				provider.ConversionProfile = strings.TrimSpace(iface.Conversion.Profile)
+				provider.StrictConversion = iface.Conversion.EffectiveStrict()
+			}
+		}
+	}
 	protocol := strings.ToLower(strings.TrimSpace(provider.Protocol))
-	direct := protocol == "responses"
+	direct := protocol == "responses" || strings.Contains(strings.ToLower(strings.TrimSpace(provider.AdapterProfile)), "responses")
 	adapterProfile := "openai-chat"
+	if strings.TrimSpace(provider.AdapterProfile) != "" {
+		adapterProfile = strings.TrimSpace(provider.AdapterProfile)
+	}
 	if direct {
 		adapterProfile = "openai-responses"
 	}
@@ -302,8 +335,47 @@ func structuredProviderSpec(name string, provider config.ModelProvider, credenti
 	vision := boolValue(model.Capabilities.Vision, false)
 	reasoning := boolValue(model.Capabilities.Reasoning, false)
 	search := boolValue(model.Capabilities.NativeWebSearch, false)
-	if model.Search.Native != nil {
-		search = *model.Search.Native
+	var searchFallback *config.ModelFeatureFallback
+	searchRequireSources := false
+	sourcePolicy := config.ModelSourcePolicy{}
+	var nativeTools []config.ModelNativeTool
+	if feature, ok := model.Features["tools"]; ok {
+		tools = featureRuntimeSupported(feature.Support)
+	}
+	if feature, ok := model.Features["vision"]; ok {
+		vision = featureRuntimeSupported(feature.Support)
+	}
+	if feature, ok := model.Features["reasoning"]; ok {
+		reasoning = featureRuntimeSupported(feature.Support)
+	}
+	if feature, ok := model.Features["webSearch"]; ok {
+		search = feature.Support == "native"
+		searchRequireSources = feature.RequireSources
+		sourcePolicy.RequireSources = feature.RequireSources
+		if feature.Fallback != nil {
+			fallback := *feature.Fallback
+			fallback.On = append([]string(nil), feature.Fallback.On...)
+			searchFallback = &fallback
+		}
+		if feature.NativeTool != nil {
+			copy := *feature.NativeTool
+			copy.InputTypes = append([]string(nil), feature.NativeTool.InputTypes...)
+			copy.AllowedFields = append([]string(nil), feature.NativeTool.AllowedFields...)
+			nativeTools = append(nativeTools, copy)
+		}
+		if feature.Sources != nil {
+			sourcePolicy = *feature.Sources
+			sourcePolicy.RequireSources = sourcePolicy.RequireSources || feature.RequireSources
+			searchRequireSources = searchRequireSources || sourcePolicy.RequireSources
+		}
+	}
+	// A provider Responses surface may advertise a native tool on its Chat
+	// surface (MiMo web_search is the concrete example). Route the facade
+	// through the compiled Chat adapter when such a typed tool is present so
+	// the catalog declaration is actionable instead of merely descriptive.
+	if direct && len(nativeTools) > 0 {
+		direct = false
+		adapterProfile = "openai-chat"
 	}
 	contextWindow := model.Limits.ContextWindow
 	if contextWindow <= 0 {
@@ -314,48 +386,181 @@ func structuredProviderSpec(name string, provider config.ModelProvider, credenti
 		maxContextWindow = contextWindow
 	}
 	selected := ModelSpec{
-		ID: publicID, UpstreamID: strings.TrimSpace(model.UpstreamModel), DisplayName: firstNonEmpty(model.DisplayName, publicID),
+		ID: publicID, UpstreamID: strings.TrimSpace(model.UpstreamModel), DefaultInterface: model.DefaultInterface, DisplayName: firstNonEmpty(model.DisplayName, publicID),
 		Description: model.Description, Aliases: append([]string(nil), model.Aliases...), Priority: model.Priority,
 		ContextWindow: contextWindow, MaxContextWindow: maxContextWindow, MaxOutputTokens: model.Limits.MaxOutputTokens,
 		EffectiveContextPercent: model.Limits.EffectiveContextPercent, SupportsTools: tools, SupportsVision: vision,
 		SupportsReason: reasoning, SupportsSearch: search, ReasoningPolicy: model.Reasoning, ToolPolicy: model.Tools,
-		MessagePolicy: model.Messages, SamplingPolicy: model.Sampling, StreamPolicy: mergeStreamPolicy(provider.Stream, model.Stream),
-		HTTPPolicy: mergeHTTPPolicy(provider.HTTP, model.HTTP), CachePolicy: model.Cache,
-		ResponsesPolicy: model.Responses, Routes: cloneModelRoutes(model.Routes),
-		SearchPolicy: model.Search,
+		MessagePolicy: model.Messages, SamplingPolicy: model.Sampling, ResponsesPolicy: model.Responses, StreamPolicy: mergeStreamPolicy(provider.Stream, model.Stream),
+		HTTPPolicy: mergeHTTPPolicy(provider.HTTP, model.HTTP), CachePolicy: model.Cache, Features: cloneModelFeatures(model.Features),
+		ConversionProfile: provider.ConversionProfile, StrictConversion: provider.StrictConversion,
+		NativeTools: nativeTools, SourcePolicy: sourcePolicy,
+	}
+	selected.Operation = operationForInterface(model.Features, selectedInterface)
+	if _, declared := model.Features["webSearch"]; declared {
+		// The Responses facade cannot safely translate arbitrary native search
+		// tools yet. Do not drop such a tool and let the model hallucinate a
+		// result; the runtime must return an explicit unsupported-feature error.
+		selected.UnsupportedToolPolicy = "error"
+	}
+	routeInterfaces := routeInterfacesForModel(model.Features, selectedInterface)
+	disableHostedSearch := !search
+	if searchFallback != nil {
+		// A configured fallback is authoritative: keep hosted search off in the
+		// parent so the delegated role, rather than an unimplemented native tool,
+		// performs the research.
+		disableHostedSearch = true
 	}
 	spec := ProviderSpec{
 		ID: name, DisplayName: name, DefaultModel: publicID, Models: []ModelSpec{selected}, BaseURL: strings.TrimRight(provider.BaseURL, "/"),
 		AdapterProfile: adapterProfile, UsesAdapter: true, DirectResponses: direct, AllowsAnyModel: false,
-		DisableHostedWebSearch: !search, SupportsTools: tools, SupportsVision: vision, SupportsReason: reasoning,
+		DisableHostedWebSearch: disableHostedSearch, SupportsTools: tools, SupportsVision: vision, SupportsReason: reasoning,
 		DefaultReasoningEffort: model.Reasoning.DefaultEffort, SupportedReasoningEfforts: normalizeStringList(model.Reasoning.SupportedEfforts),
 		ReasoningEffortMap: cloneStringMap(model.Reasoning.EffortMap), HTTP: mergeHTTPPolicy(provider.HTTP, model.HTTP),
 		Stream: mergeStreamPolicy(provider.Stream, model.Stream), Headers: mergeStringMaps(provider.Headers, credential.Headers),
 		AuthType: strings.ToLower(strings.TrimSpace(credential.AuthType)), AuthHeader: strings.TrimSpace(credential.Header),
+		DefaultInterface: provider.DefaultInterface, Interfaces: cloneModelInterfaces(provider.Interfaces), InterfaceCredentialRefs: cloneStringMapPreserve(provider.InterfaceCredentials), RouteInterfaces: routeInterfaces, Endpoints: cloneStringMap(provider.Endpoints),
+		ProviderHeaders: providerHeaders, ProviderEndpoints: providerEndpoints, ProviderHTTP: providerHTTP, ProviderStream: providerStream,
+		ConversionProfile: provider.ConversionProfile, StrictConversion: provider.StrictConversion, Operation: selected.Operation,
+		SearchFallback: searchFallback, SearchRequireSources: searchRequireSources,
 	}
 	return spec, selected
 }
 
-// applyModelProfileOverrides applies only local selection overrides after the
-// catalog model defaults have been resolved. Catalog files remain the source
-// of provider capabilities, while a profile can intentionally choose a
-// different default effort or provider mapping for one chat.
-func applyModelProfileOverrides(provider *ProviderSpec, model *ModelSpec, profile config.ModelProfile) {
-	if provider == nil || model == nil {
-		return
+func featureRuntimeSupported(support string) bool {
+	support = strings.ToLower(strings.TrimSpace(support))
+	return support == "native" || support == "translated"
+}
+
+// modelInterfaceForDefinition chooses the concrete wire surface for ordinary
+// model requests. Feature-specific interfaces are kept in RouteInterfaces and
+// selected by the request router; they must not replace the model's default
+// interface (for example, DeepSeek search uses Anthropic while ordinary chat
+// still uses the OpenAI-compatible endpoint).
+func modelInterfaceForDefinition(provider config.ModelProvider, model config.ModelDefinition) string {
+	return firstNonEmpty(model.DefaultInterface, provider.DefaultInterface)
+}
+
+// operationForInterface binds an operation to the interface that was
+// actually selected. Previously only features.chat.operation was copied into
+// ModelSpec, so prefix/FIM declarations could select the beta adapter while
+// leaving the runtime operation empty. That made the request look like normal
+// chat and allowed the wrong wire shape to be sent. If multiple features share
+// the selected interface, prefer the explicit operation-bearing declaration in
+// a deterministic order.
+func operationForInterface(features map[string]config.ModelFeature, interfaceName string) string {
+	interfaceName = strings.TrimSpace(interfaceName)
+	for _, featureName := range []string{"fim", "prefix", "responses", "chat", "webSearch"} {
+		feature, ok := features[featureName]
+		if !ok || feature.Support == "unsupported" || strings.TrimSpace(feature.Interface) == "" || !strings.EqualFold(strings.TrimSpace(feature.Interface), interfaceName) {
+			continue
+		}
+		if operation := strings.ToLower(strings.TrimSpace(feature.Operation)); operation != "" {
+			return operation
+		}
+		if featureName == "fim" || featureName == "prefix" {
+			return featureName
+		}
 	}
-	if value := strings.TrimSpace(profile.DefaultReasoningEffort); value != "" {
-		provider.DefaultReasoningEffort = value
-		model.ReasoningPolicy.DefaultEffort = value
+	return ""
+}
+
+func routeInterfacesForModel(features map[string]config.ModelFeature, defaultInterface string) map[string]string {
+	if len(features) == 0 && strings.TrimSpace(defaultInterface) == "" {
+		return nil
 	}
-	if len(profile.SupportedReasoningEfforts) > 0 {
-		provider.SupportedReasoningEfforts = normalizeStringList(profile.SupportedReasoningEfforts)
-		model.ReasoningPolicy.SupportedEfforts = normalizeStringList(profile.SupportedReasoningEfforts)
+	out := map[string]string{}
+	if strings.TrimSpace(defaultInterface) != "" {
+		out["default"] = strings.TrimSpace(defaultInterface)
+		// Ordinary Responses requests have no operation field. Keep an explicit
+		// chat route so a feature-specific route can never become the fallback.
+		out["chat"] = strings.TrimSpace(defaultInterface)
 	}
-	if len(profile.ReasoningEffortMap) > 0 {
-		provider.ReasoningEffortMap = cloneStringMap(profile.ReasoningEffortMap)
-		model.ReasoningPolicy.EffortMap = cloneStringMap(profile.ReasoningEffortMap)
+	for featureName, feature := range features {
+		if strings.EqualFold(strings.TrimSpace(feature.Support), "unsupported") || strings.EqualFold(strings.TrimSpace(feature.Support), "plugin") {
+			continue
+		}
+		interfaceName := strings.TrimSpace(feature.Interface)
+		if interfaceName == "" {
+			interfaceName = strings.TrimSpace(defaultInterface)
+		}
+		if interfaceName == "" {
+			continue
+		}
+		// webSearch is selected by the typed native tool, not by the model's
+		// declared wire operation. Its operation may be "chat" on the upstream
+		// surface, but using that as the route key would overwrite ordinary chat.
+		key := ""
+		if strings.EqualFold(strings.TrimSpace(featureName), "webSearch") {
+			key = "websearch"
+		} else {
+			key = strings.ToLower(strings.TrimSpace(feature.Operation))
+		}
+		if key == "" {
+			switch strings.ToLower(strings.TrimSpace(featureName)) {
+			case "chat", "responses", "prefix", "fim":
+				key = strings.ToLower(strings.TrimSpace(featureName))
+			case "websearch":
+				// webSearch is a routing signal, not a Responses operation;
+				// the facade keeps the request operation empty while the
+				// registry chooses this interface from the native tool.
+				key = "websearch"
+			default:
+				continue
+			}
+		}
+		out[key] = interfaceName
 	}
+	return out
+}
+
+func interfaceCredentialRef(provider config.ModelProvider, interfaceName string) string {
+	for name, ref := range provider.InterfaceCredentials {
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(interfaceName)) {
+			return strings.TrimSpace(ref)
+		}
+	}
+	return ""
+}
+
+func findModelInterface(interfaces map[string]config.ModelInterface, name string) (config.ModelInterface, bool) {
+	for candidate, iface := range interfaces {
+		if strings.EqualFold(strings.TrimSpace(candidate), strings.TrimSpace(name)) {
+			return iface, true
+		}
+	}
+	return config.ModelInterface{}, false
+}
+
+func cloneModelFeatures(in map[string]config.ModelFeature) map[string]config.ModelFeature {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]config.ModelFeature, len(in))
+	for name, feature := range in {
+		copy := feature
+		if feature.Fallback != nil {
+			fallback := *feature.Fallback
+			fallback.On = append([]string(nil), feature.Fallback.On...)
+			copy.Fallback = &fallback
+		}
+		out[name] = copy
+	}
+	return out
+}
+
+func cloneModelInterfaces(in map[string]config.ModelInterface) map[string]config.ModelInterface {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]config.ModelInterface, len(in))
+	for name, iface := range in {
+		copy := iface
+		copy.Headers = cloneStringMap(iface.Headers)
+		copy.Endpoints = cloneStringMap(iface.Endpoints)
+		out[name] = copy
+	}
+	return out
 }
 
 func mergeStringMaps(base, override map[string]string) map[string]string {
@@ -425,18 +630,6 @@ func mergeStreamPolicy(base, override config.ModelStreamPolicy) config.ModelStre
 	if override.IdleTimeoutSeconds != 0 {
 		out.IdleTimeoutSeconds = override.IdleTimeoutSeconds
 	}
-	if override.FirstEventTimeoutSeconds != 0 {
-		out.FirstEventTimeoutSeconds = override.FirstEventTimeoutSeconds
-	}
-	if override.SemanticProgressTimeoutSeconds != 0 {
-		out.SemanticProgressTimeoutSeconds = override.SemanticProgressTimeoutSeconds
-	}
-	if override.MaxDurationSeconds != 0 {
-		out.MaxDurationSeconds = override.MaxDurationSeconds
-	}
-	if override.HeartbeatMode != "" {
-		out.HeartbeatMode = override.HeartbeatMode
-	}
 	if override.UpstreamMode != "" {
 		out.UpstreamMode = override.UpstreamMode
 	}
@@ -448,9 +641,6 @@ func mergeStreamPolicy(base, override config.ModelStreamPolicy) config.ModelStre
 	}
 	if override.ReasoningDeltaPath != "" {
 		out.ReasoningDeltaPath = override.ReasoningDeltaPath
-	}
-	if override.ReasoningTokensPath != "" {
-		out.ReasoningTokensPath = override.ReasoningTokensPath
 	}
 	if override.CachedTokensPath != "" {
 		out.CachedTokensPath = override.CachedTokensPath
@@ -502,6 +692,37 @@ func ResolveSnapshot(cfg config.Config, snapshot Snapshot) (Resolved, error) {
 	if profile.Revision <= 0 {
 		profile.Revision = 1
 	}
+	if canonicalModel, definition, ok := config.FindModelDefinition(cfg, profile.Model); ok && (strings.TrimSpace(providerID) == "" || strings.EqualFold(providerID, definition.Provider)) {
+		provider, providerOK := findStructuredProvider(cfg.ModelProviders, definition.Provider)
+		if !providerOK {
+			return Resolved{}, fmt.Errorf("model profile %q references missing provider %q", name, definition.Provider)
+		}
+		credential := config.ModelCredential{}
+		credentialRef := interfaceCredentialRef(provider, modelInterfaceForDefinition(provider, definition))
+		if credentialRef == "" {
+			credentialRef = strings.TrimSpace(provider.Credential)
+		}
+		if credentialRef != "" {
+			var credentialOK bool
+			credential, credentialOK = findStructuredCredential(cfg.ModelCredentials, credentialRef)
+			if !credentialOK {
+				return Resolved{}, fmt.Errorf("model profile %q references missing credential %q", name, credentialRef)
+			}
+			if strings.TrimSpace(profile.APIKeyRef) == "" {
+				profile.APIKeyRef = credential.APIKeyRef
+			}
+		}
+		if strings.TrimSpace(profile.SSHProxy) == "" {
+			profile.SSHProxy = strings.TrimSpace(provider.SSHProxy)
+		}
+		profile.Model = canonicalModel
+		profile.Provider = definition.Provider
+		resolvedProvider, selected := structuredProviderSpec(definition.Provider, provider, credential, canonicalModel, definition)
+		if baseURL := strings.TrimSpace(profile.BaseURL); baseURL != "" {
+			resolvedProvider.BaseURL = baseURL
+		}
+		return finishResolvedModel(cfg, name, profile, resolvedProvider, selected)
+	}
 	spec, err := MustLookupProvider(providerID)
 	if err != nil {
 		return Resolved{}, err
@@ -552,13 +773,15 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
-func cloneModelRoutes(in map[string]config.ModelRoute) map[string]config.ModelRoute {
+func cloneStringMapPreserve(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[string]config.ModelRoute, len(in))
+	out := make(map[string]string, len(in))
 	for key, value := range in {
-		out[key] = value
+		if strings.TrimSpace(key) != "" && strings.TrimSpace(value) != "" {
+			out[key] = value
+		}
 	}
 	return out
 }
@@ -658,37 +881,7 @@ func snapshotModelFingerprintStillCompatible(snapshot Snapshot, resolved Resolve
 	if fingerprint == legacyModelFingerprintV1ForModel(resolved.Provider.ID, model) {
 		return true
 	}
-	for _, legacy := range legacyContextWindowModelVariants(model) {
-		if fingerprint == legacyModelFingerprintV1ForModel(resolved.Provider.ID, legacy) {
-			return true
-		}
-	}
 	return false
-}
-
-func legacyContextWindowModelVariants(model ModelSpec) []ModelSpec {
-	if !knownLegacyContextWindowCorrection(model) {
-		return nil
-	}
-	legacy := model
-	legacy.ContextWindow = 128000
-	legacy.MaxContextWindow = 128000
-	return []ModelSpec{legacy}
-}
-
-func knownLegacyContextWindowCorrection(model ModelSpec) bool {
-	if model.ContextWindow != millionTokenContextWindow || model.MaxContextWindow != millionTokenContextWindow {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(model.PublicID())) {
-	case "deepseek/deepseek-v4-flash",
-		"deepseek/deepseek-v4-pro",
-		"mimo/mimo-v2.5",
-		"mimo/mimo-v2.5-pro":
-		return true
-	default:
-		return false
-	}
 }
 
 func unknownModelForProfileError(name string, spec ProviderSpec, ref string) error {

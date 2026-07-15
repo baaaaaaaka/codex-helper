@@ -34,6 +34,8 @@ func newModelCmd(root *rootOptions) *cobra.Command {
 		newModelUseCmd(root),
 		newModelListCmd(root),
 		newModelDoctorCmd(root),
+		newModelCatalogCmd(root),
+		newModelProviderCmd(root),
 	)
 	return cmd
 }
@@ -42,7 +44,7 @@ func newModelSetupCmd(root *rootOptions) *cobra.Command {
 	opts := modelSetupOptions{}
 	cmd := &cobra.Command{
 		Use:   "setup [model]",
-		Short: "Set up a model by choosing the model first",
+		Short: "Configure model availability without changing chat or global selection",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			modelRef := ""
@@ -55,7 +57,7 @@ func newModelSetupCmd(root *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the provider API key")
 	cmd.Flags().BoolVar(&opts.apiKeyStdin, "api-key-stdin", false, "Read the provider API key from stdin and save it to the local secret store")
 	cmd.Flags().StringVar(&opts.sshProxy, "ssh-proxy", "", "SSH proxy profile id or name to use for this model")
-	cmd.Flags().BoolVar(&opts.noDefault, "no-default", false, "Save the model without making it the default")
+	cmd.Flags().BoolVar(&opts.noDefault, "no-default", false, "Deprecated: setup never changes the default")
 	cmd.Flags().BoolVar(&opts.noDoctor, "no-doctor", false, "Skip static profile validation after saving")
 	return cmd
 }
@@ -120,19 +122,23 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 	if err != nil {
 		return err
 	}
+	if strings.Contains(strings.TrimSpace(modelRef), "/") {
+		if profile, ok := cfg.FindModelProfile(modelRef); ok {
+			if mapKeyFold(cfg.ModelCatalogs, profile.Source) != "" {
+				providerOpts := modelProviderSetupOptions{apiKeyEnv: opts.apiKeyEnv, apiKeyStdin: opts.apiKeyStdin, timeout: 20 * time.Second}
+				return runModelProviderSetup(cmd, root, profile.Provider, providerOpts)
+			}
+		}
+		return fmt.Errorf("catalog selector %q is not configured; add or sync a model catalog first", strings.TrimSpace(modelRef))
+	}
 	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
 	choice, err := modelChoiceForCLI(cmd, modelRef, cfg, secretStore)
 	if err != nil {
 		return err
 	}
 	if !choice.RequiresAPIKey {
-		if err := store.Update(func(cfg *config.Config) error {
-			cfg.SetDefaultModelProfile("")
-			return nil
-		}); err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Default model: Codex Official")
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Model available: Codex Official")
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Current chats and global defaults are unchanged.")
 		return nil
 	}
 	profileName := choice.RecommendedProfile
@@ -175,9 +181,8 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 		profile.VerificationFingerprint = existing.VerificationFingerprint
 	}
 	cfg.UpsertModelProfile(profileName, profile)
-	if !opts.noDefault {
-		cfg.SetDefaultModelProfile(profileName)
-	}
+	// Availability and selection are separate operations. `model setup` never
+	// changes a global default; use `model use` explicitly after verification.
 	var verifyErr error
 	if !currentVerification {
 		apiKey, resolveErr := modelprofile.ResolveAPIKey(apiKeyRef, secretStore, os.Getenv)
@@ -197,9 +202,6 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 		action = "Updated"
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s model %s as profile %q (api_key=%s)\n", action, choice.DisplayName, profileName, modelprofile.MaskRef(apiKeyRef))
-	if !opts.noDefault {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Default model: %s\n", choice.DisplayName)
-	}
 	if !opts.noDoctor {
 		return runModelProfileDoctor(cmd.OutOrStdout(), store, profileName)
 	}
@@ -214,6 +216,28 @@ func runModelUse(cmd *cobra.Command, root *rootOptions, modelRef string) error {
 	cfg, err := store.Load()
 	if err != nil {
 		return err
+	}
+	// External catalogs use stable provider/model selectors. They are already
+	// materialized as named profiles, so switching one must not fall through to
+	// the built-in static model table (which would silently select another
+	// family).
+	if profile, ok := cfg.FindModelProfile(modelRef); ok && !strings.EqualFold(profile.Provider, modelprofile.DefaultProvider) {
+		if mapKeyFold(cfg.ModelCatalogs, profile.Source) != "" {
+			profileRef := canonicalConfiguredProfileName(cfg, modelRef)
+			if profileRef == "" {
+				profileRef = strings.TrimSpace(modelRef)
+			}
+			secrets := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(store.Path()))
+			if !modelProfileVerificationCurrent(cfg, profileRef, profile, secrets) {
+				return fmt.Errorf("model %s is not authentication-verified; run `cxp model provider setup %s --api-key-stdin`", modelRef, profile.Provider)
+			}
+			cfg.SetDefaultModelProfile(profileRef)
+			if err := store.Save(cfg); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Default model: %s (provider %s)\n", profileRef, profile.Provider)
+			return nil
+		}
 	}
 	choice, err := modelprofile.MustLookupModelChoice(modelRef)
 	if err != nil {
@@ -255,6 +279,15 @@ func verifiedModelChoiceProfileName(cfg config.Config, secrets *modelprofile.Sec
 		}
 		resolved, err := modelprofile.Resolve(cfg, name)
 		if err == nil && resolvedModelChoiceMatches(resolved, choice) {
+			return name
+		}
+	}
+	return ""
+}
+
+func canonicalConfiguredProfileName(cfg config.Config, ref string) string {
+	for name := range cfg.ModelProfiles {
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(ref)) {
 			return name
 		}
 	}
@@ -442,8 +475,9 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 		return
 	}
 	defaultName := cfg.EffectiveDefaultModelProfile()
-	_, _ = fmt.Fprintln(out, "Models")
+	_, _ = fmt.Fprintln(out, "Models (official and configured catalog selectors)")
 	_, _ = fmt.Fprintln(out, "[global default] marks the model used by future launches; it does not describe the current chat")
+	_, _ = fmt.Fprintln(out, "Catalog provider setup verifies all models under one provider")
 	for i, choice := range modelprofile.ModelChoices() {
 		status := modelChoiceStatus(cfg, secretStore, choice)
 		marker := "-"
@@ -453,9 +487,35 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 		_, _ = fmt.Fprintf(out, "%s %d. %-20s %-22s %s\n", marker, i+1, choice.ID, choice.DisplayName, status)
 	}
 	verified := make([]string, 0)
+	catalogProfiles := make([]string, 0)
 	for name, profile := range cfg.ModelProfiles {
+		if mapKeyFold(cfg.ModelCatalogs, profile.Source) != "" {
+			catalogProfiles = append(catalogProfiles, name)
+			continue
+		}
 		if strings.TrimSpace(profile.Source) != "" && strings.TrimSpace(profile.VerificationFingerprint) != "" {
 			verified = append(verified, name)
+		}
+	}
+	sort.Strings(catalogProfiles)
+	if len(catalogProfiles) > 0 {
+		_, _ = fmt.Fprintln(out, "Catalog models (selector is provider/model)")
+		for _, name := range catalogProfiles {
+			profile := cfg.ModelProfiles[name]
+			marker := "-"
+			if strings.EqualFold(name, defaultName) || strings.EqualFold("profile:"+name, cfg.EffectiveDefaultModelSelector()) {
+				marker = "[global default]"
+			}
+			status := "needs provider setup"
+			if strings.TrimSpace(profile.VerificationFingerprint) != "" && modelProfileVerificationCurrent(cfg, name, profile, secretStore) {
+				status = "ready"
+			}
+			label := name
+			if resolved, err := modelprofile.Resolve(cfg, name); err == nil {
+				label = resolved.Model.Label()
+				label += " [" + modelRouteSummary(resolved) + "]"
+			}
+			_, _ = fmt.Fprintf(out, "%s %-30s %-22s catalog %s (%s)\n", marker, name, label, profile.Source, status)
 		}
 	}
 	sort.Strings(verified)
@@ -473,6 +533,48 @@ func printModelChoices(out io.Writer, cfg config.Config, secretStore *modelprofi
 			_, _ = fmt.Fprintf(out, "%s %-20s %-22s verified (model `%s`, selector `profile:%s`, source %s)\n", marker, name, resolved.Model.Label(), resolved.Model.PublicID(), name, cfg.ModelProfiles[name].Source)
 		}
 	}
+}
+
+func modelRouteSummary(resolved modelprofile.Resolved) string {
+	interfaceName := strings.TrimSpace(resolved.Provider.DefaultInterface)
+	if interfaceName == "" {
+		interfaceName = "default"
+	}
+	adapter := strings.TrimSpace(resolved.Provider.AdapterProfile)
+	if adapter == "" {
+		adapter = "generic"
+	}
+	parts := []string{"interface=" + interfaceName, "adapter=" + adapter}
+	featureNames := make([]string, 0, len(resolved.Model.Features))
+	for name := range resolved.Model.Features {
+		featureNames = append(featureNames, name)
+	}
+	sort.Strings(featureNames)
+	for _, name := range featureNames {
+		feature := resolved.Model.Features[name]
+		value := feature.Support
+		if feature.Interface != "" {
+			value += "@" + feature.Interface
+		}
+		if feature.NativeTool != nil {
+			value += ":tool=" + feature.NativeTool.UpstreamType
+		}
+		if feature.Operation != "" {
+			value += ":op=" + feature.Operation
+		}
+		if feature.Sources != nil {
+			mode := strings.TrimSpace(feature.Sources.Mode)
+			if mode == "" {
+				mode = "default"
+			}
+			value += ":sources=" + mode
+			if feature.Sources.RequireURL || feature.Sources.RequireSources || feature.RequireSources {
+				value += "+required"
+			}
+		}
+		parts = append(parts, name+"="+value)
+	}
+	return strings.Join(parts, ",")
 }
 
 func modelChoiceIsDefault(cfg config.Config, choice modelprofile.ModelChoice, defaultName string) bool {

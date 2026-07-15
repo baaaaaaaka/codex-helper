@@ -73,30 +73,41 @@ func newModelProfileExplainCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			model := resolved.Model
+			capabilities := map[string]bool{"tools": model.SupportsTools, "vision": model.SupportsVision, "reasoning": model.SupportsReason, "nativeWebSearch": model.SupportsSearch}
+			for featureName, feature := range model.Features {
+				capabilities[featureName] = !strings.EqualFold(strings.TrimSpace(feature.Support), "unsupported")
+			}
 			effective := struct {
-				Name               string                      `json:"name"`
-				Provider           string                      `json:"provider"`
-				PublicModel        string                      `json:"publicModel"`
-				UpstreamModel      string                      `json:"upstreamModel"`
-				BaseURLFingerprint string                      `json:"baseUrlFingerprint"`
-				Credential         string                      `json:"credential"`
-				SSHProxy           string                      `json:"sshProxy,omitempty"`
-				Capabilities       map[string]bool             `json:"capabilities"`
-				Limits             config.ModelLimits          `json:"limits"`
-				Reasoning          config.ModelReasoningPolicy `json:"reasoning"`
-				Tools              config.ModelToolPolicy      `json:"tools"`
-				Messages           config.ModelMessagePolicy   `json:"messages"`
-				Sampling           config.ModelSamplingPolicy  `json:"sampling"`
-				Stream             config.ModelStreamPolicy    `json:"stream"`
-				HTTP               config.ModelHTTPPolicy      `json:"http"`
-				Cache              config.ModelCachePolicy     `json:"cache"`
-				Fingerprints       map[string]string           `json:"fingerprints"`
+				Name               string                         `json:"name"`
+				Provider           string                         `json:"provider"`
+				PublicModel        string                         `json:"publicModel"`
+				UpstreamModel      string                         `json:"upstreamModel"`
+				BaseURLFingerprint string                         `json:"baseUrlFingerprint"`
+				Credential         string                         `json:"credential"`
+				SSHProxy           string                         `json:"sshProxy,omitempty"`
+				Capabilities       map[string]bool                `json:"capabilities"`
+				Limits             config.ModelLimits             `json:"limits"`
+				Reasoning          config.ModelReasoningPolicy    `json:"reasoning"`
+				Tools              config.ModelToolPolicy         `json:"tools"`
+				Messages           config.ModelMessagePolicy      `json:"messages"`
+				Sampling           config.ModelSamplingPolicy     `json:"sampling"`
+				Responses          config.ModelResponsesPolicy    `json:"responses"`
+				Stream             config.ModelStreamPolicy       `json:"stream"`
+				HTTP               config.ModelHTTPPolicy         `json:"http"`
+				Cache              config.ModelCachePolicy        `json:"cache"`
+				Features           map[string]config.ModelFeature `json:"features"`
+				NativeTools        []config.ModelNativeTool       `json:"nativeTools,omitempty"`
+				SourcePolicy       config.ModelSourcePolicy       `json:"sourcePolicy"`
+				Operation          string                         `json:"operation,omitempty"`
+				ConversionProfile  string                         `json:"conversionProfile,omitempty"`
+				Fingerprints       map[string]string              `json:"fingerprints"`
 			}{
 				Name: resolved.Name, Provider: resolved.Provider.ID, PublicModel: model.PublicID(), UpstreamModel: model.UpstreamModel(),
 				BaseURLFingerprint: modelprofile.BaseURLHash(resolved.Provider.BaseURL), Credential: modelprofile.MaskRef(resolved.Profile.APIKeyRef), SSHProxy: resolved.Profile.SSHProxy,
-				Capabilities: map[string]bool{"tools": model.SupportsTools, "vision": model.SupportsVision, "reasoning": model.SupportsReason, "nativeWebSearch": model.SupportsSearch},
+				Capabilities: capabilities,
 				Limits:       config.ModelLimits{ContextWindow: model.ContextWindow, MaxContextWindow: model.MaxContextWindow, MaxOutputTokens: model.MaxOutputTokens, EffectiveContextPercent: model.EffectiveContextPercent},
-				Reasoning:    model.ReasoningPolicy, Tools: model.ToolPolicy, Messages: model.MessagePolicy, Sampling: model.SamplingPolicy, Stream: model.StreamPolicy, HTTP: model.HTTPPolicy, Cache: model.CachePolicy,
+				Reasoning:    model.ReasoningPolicy, Tools: model.ToolPolicy, Messages: model.MessagePolicy, Sampling: model.SamplingPolicy, Responses: model.ResponsesPolicy, Stream: model.StreamPolicy, HTTP: model.HTTPPolicy, Cache: model.CachePolicy,
+				Features: model.Features, NativeTools: model.NativeTools, SourcePolicy: model.SourcePolicy, Operation: model.Operation, ConversionProfile: model.ConversionProfile,
 				Fingerprints: map[string]string{"model": modelprofile.ModelFingerprint(resolved.Provider, model.PublicID()), "catalog": modelprofile.CatalogFingerprint(resolved.Provider)},
 			}
 			raw, err := json.MarshalIndent(effective, "", "  ")
@@ -124,8 +135,8 @@ func newModelProfileSetupCmd(root *rootOptions) *cobra.Command {
 			return runModelProfileSetup(cmd, root, name, opts)
 		},
 	}
-	cmd.Flags().StringVar(&opts.provider, "provider", "", "Model provider: default, deepseek, mimo, kimi, glm, minimax, qwen, responses-compatible, chat-compatible")
-	cmd.Flags().StringVar(&opts.model, "model", "", "Provider model to use by default, for example pro or deepseek/deepseek-v4-pro")
+	cmd.Flags().StringVar(&opts.provider, "provider", "", "Model provider: default, a configured catalog provider, or a generic compatibility provider")
+	cmd.Flags().StringVar(&opts.model, "model", "", "Provider model selector; catalog-backed models use provider/model")
 	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "Base URL for a configurable provider")
 	cmd.Flags().StringVar(&opts.baseURLEnv, "base-url-env", "", "Environment variable containing the configurable provider base URL")
 	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", "", "Environment variable containing the provider API key")
@@ -413,14 +424,16 @@ func runModelProfileDoctor(out io.Writer, store *config.Store, name string) erro
 		_, _ = fmt.Fprintf(out, "OK  provider %s\n", resolved.Provider.ID)
 		if resolved.Provider.UsesAdapter {
 			_, _ = fmt.Fprintf(out, "OK  model %s\n", resolved.SelectedPublicModel())
+			_, _ = fmt.Fprintf(out, "OK  route %s\n", modelRouteSummary(resolved))
 			_, _ = fmt.Fprintf(out, "OK  base URL configured fingerprint=%s\n", modelprofile.BaseURLHash(resolved.Provider.BaseURL))
 			if resolved.Provider.DisableHostedWebSearch {
-				enabled, fallbackModel, fallbackEffort := webSearchFallbackForModel(resolved.Model.SearchPolicy)
-				if enabled {
-					_, _ = fmt.Fprintf(out, "OK  web search fallback %s reasoning=%s mode=live\n", fallbackModel, fallbackEffort)
-				} else {
-					_, _ = fmt.Fprintln(out, "OK  web search fallback disabled by model policy")
+				fallbackModel := codexWebSearchFallbackModel
+				fallbackEffort := "high"
+				if resolved.Provider.SearchFallback != nil {
+					fallbackModel = firstNonEmptyCLI(resolved.Provider.SearchFallback.Selector, fallbackModel)
+					fallbackEffort = firstNonEmptyCLI(resolved.Provider.SearchFallback.Effort, fallbackEffort)
 				}
+				_, _ = fmt.Fprintf(out, "OK  web search fallback %s reasoning=%s mode=live\n", fallbackModel, fallbackEffort)
 			}
 		}
 	}

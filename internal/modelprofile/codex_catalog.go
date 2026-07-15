@@ -200,8 +200,15 @@ func supportedReasoningLevels(provider ProviderSpec, model ModelSpec) []codexRea
 }
 
 func inputModalities(model ModelSpec) []string {
-	if model.SupportsVision {
-		return []string{"text", "image"}
+	modalities := []string{"text"}
+	if model.SupportsVision || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Images), "allow") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Images), "forward") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Images), "multimodal") {
+		modalities = append(modalities, "image")
 	}
-	return []string{"text"}
+	if strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Audio), "allow") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Audio), "forward") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Audio), "multimodal") {
+		modalities = append(modalities, "audio")
+	}
+	if strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Video), "allow") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Video), "forward") || strings.EqualFold(strings.TrimSpace(model.MessagePolicy.Video), "multimodal") {
+		modalities = append(modalities, "video")
+	}
+	return modalities
 }

@@ -208,35 +208,30 @@ func modelProfileAdapterLaunchFromInstance(resolved modelprofile.Resolved, inst 
 		if !resolved.IsDefault() {
 			launch.Name = resolved.Name
 			launch.DisableHostedWebSearch = resolved.Provider.DisableHostedWebSearch
-			launch.WebSearchFallbackEnabled, launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort = webSearchFallbackForModel(resolved.Model.SearchPolicy)
-			if launch.DisableHostedWebSearch && launch.WebSearchFallbackEnabled {
-				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(launch.WebSearchFallbackModel, launch.WebSearchFallbackEffort)
+			if launch.DisableHostedWebSearch {
+				launch.WebSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML(resolved.Provider.SearchFallback)
 			}
 		}
 		return launch
 	}
 	catalogJSON, _ := modelprofile.CodexModelCatalogJSON(resolved.Provider)
 	webSearchFallbackTOML := []byte(nil)
-	fallbackEnabled, fallbackModel, fallbackEffort := webSearchFallbackForModel(resolved.Model.SearchPolicy)
-	if resolved.Provider.DisableHostedWebSearch && fallbackEnabled {
-		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOMLFor(fallbackModel, fallbackEffort)
+	if resolved.Provider.DisableHostedWebSearch {
+		webSearchFallbackTOML = codexWebSearchFallbackRoleConfigTOML(resolved.Provider.SearchFallback)
 	}
 	return codexModelProfileLaunch{
-		Enabled:                  true,
-		Name:                     resolved.Name,
-		ProviderID:               resolved.Provider.ID,
-		Model:                    resolved.SelectedPublicModel(),
-		BaseURL:                  fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
-		ProxyKey:                 inst.ModelProxyKey,
-		Revision:                 resolved.Revision(),
-		ProviderName:             resolved.Provider.DisplayName,
-		CatalogJSON:              catalogJSON,
-		WebSearchFallbackTOML:    webSearchFallbackTOML,
-		WebSearchFallbackModel:   fallbackModel,
-		WebSearchFallbackEffort:  fallbackEffort,
-		WebSearchFallbackEnabled: fallbackEnabled,
-		Direct:                   resolved.Provider.DirectResponses,
-		DisableHostedWebSearch:   resolved.Provider.DisableHostedWebSearch,
+		Enabled:                true,
+		Name:                   resolved.Name,
+		ProviderID:             resolved.Provider.ID,
+		Model:                  resolved.SelectedPublicModel(),
+		BaseURL:                fmt.Sprintf("http://127.0.0.1:%d/v1", inst.HTTPPort),
+		ProxyKey:               inst.ModelProxyKey,
+		Revision:               resolved.Revision(),
+		ProviderName:           resolved.Provider.DisplayName,
+		CatalogJSON:            catalogJSON,
+		WebSearchFallbackTOML:  webSearchFallbackTOML,
+		Direct:                 resolved.Provider.DirectResponses,
+		DisableHostedWebSearch: resolved.Provider.DisableHostedWebSearch,
 	}
 }
 
@@ -455,8 +450,24 @@ func runModelProfileAdapterDaemon(parentCtx context.Context, store *config.Store
 		})
 	} else if resolved.Provider.DirectResponses {
 		handler, cleanup, err = newNativeResponsesCompatibilityProxy(resolved.Provider.BaseURL, apiKey, inst.ModelProxyKey, upstreamProxyURL, os.Stderr)
+		if err == nil {
+			policy := responsesAdapterSourcePolicy(resolved.Model)
+			if policyErr := responsesadapter.ValidateDirectSourcePolicy(policy); policyErr != nil {
+				cleanup()
+				handler = nil
+				cleanup = nil
+				err = policyErr
+			} else {
+				if direct, ok := handler.(*nativeResponsesCompatibilityProxy); ok {
+					direct.sourcePolicy = policy
+					direct.responsesPolicy = responsesAdapterResponsesPolicy(resolved.Model)
+					direct.unsupportedToolPolicy = resolved.Model.UnsupportedToolPolicy
+					direct.nativeTools = append([]responsesadapter.NativeToolSpec(nil), responsesAdapterNativeTools(resolved.Model)...)
+				}
+			}
+		}
 	} else {
-		handler, cleanup, err = modelProfileAdapterFacade(resolved, apiKey, inst.ModelProxyKey, upstreamProxyURL, instanceID)
+		handler, cleanup, err = modelProfileAdapterFacade(cfg, store, resolved, apiKey, inst.ModelProxyKey, upstreamProxyURL, instanceID)
 	}
 	if err != nil {
 		return err
@@ -504,6 +515,8 @@ func runModelProfileAdapterDaemon(parentCtx context.Context, store *config.Store
 }
 
 func modelProfileAdapterFacade(
+	cfg config.Config,
+	store *config.Store,
 	resolved modelprofile.Resolved,
 	apiKey string,
 	proxyKey string,
@@ -515,40 +528,36 @@ func modelProfileAdapterFacade(
 	if err != nil {
 		return nil, nil, err
 	}
-	adapter := responsesadapter.OpenAIChatAdapter{
-		BaseURL: resolved.Provider.BaseURL,
-		APIKey:  apiKey,
-		Profile: responsesadapter.ProfileForProvider(resolved.Provider.AdapterProfile).WithReasoningOverrides(
-			resolved.Provider.DefaultReasoningEffort,
-			resolved.Provider.ReasoningEffortMap,
-		).WithModelPolicies(resolved.Model.ReasoningPolicy, resolved.Model.ToolPolicy, resolved.Model.MessagePolicy, resolved.Model.SamplingPolicy),
-		RetryStatuses:      append([]int(nil), resolved.Model.HTTPPolicy.RetryStatuses...),
-		MaxOutputTokens:    resolved.Model.MaxOutputTokens,
-		Headers:            resolved.Provider.Headers,
-		AuthType:           resolved.Provider.AuthType,
-		AuthHeader:         resolved.Provider.AuthHeader,
-		StreamMode:         resolved.Model.StreamPolicy.UpstreamMode,
-		ReasoningDeltaPath: resolved.Model.StreamPolicy.ReasoningDeltaPath,
-		CachedTokensPath:   resolved.Model.StreamPolicy.CachedTokensPath,
-		UsageField:         resolved.Model.CachePolicy.UsageField,
+	adapter, err := newResolvedProviderAdapter(resolved, apiKey, upstreamProxyURL, nil)
+	if err != nil {
+		storeCleanup()
+		return nil, nil, err
 	}
-	if err := configureOpenAIChatAdapterHTTP(&adapter, resolved.Model.HTTPPolicy, resolved.Model.StreamPolicy, upstreamProxyURL, nil); err != nil {
+	interfaceAPIKeys := resolveConfiguredInterfaceAPIKeys(cfg, []modelprofile.Resolved{resolved}, map[string]string{resolved.Name: apiKey}, store)[resolved.Name]
+	routeConfigs, err := resolvedProviderRouteConfigs(resolved, apiKey, interfaceAPIKeys, adapter, upstreamProxyURL, nil)
+	if err != nil {
 		storeCleanup()
 		return nil, nil, err
 	}
 	registry, err := responsesadapter.NewProviderRegistry(responsesadapter.ProviderRegistryOptions{
 		DefaultProvider: resolved.Provider.ID,
 		Providers: []responsesadapter.ProviderConfig{{
-			ID:                      resolved.Provider.ID,
-			ProfileID:               resolved.Provider.AdapterProfile,
-			BaseURL:                 resolved.Provider.BaseURL,
-			APIKey:                  apiKey,
-			DefaultModel:            resolved.SelectedPublicModel(),
-			Models:                  responsesAdapterModelsForProvider(resolved.Provider),
-			Adapter:                 adapter,
-			CustomToolMode:          resolved.Model.ToolPolicy.CustomToolMode,
-			ParallelToolEnforcement: resolved.Model.ToolPolicy.ParallelEnforcement,
-			ResponsesPolicy:         resolved.Model.ResponsesPolicy,
+			ID:                    resolved.Provider.ID,
+			ProfileID:             resolved.Provider.AdapterProfile,
+			BaseURL:               resolved.Provider.BaseURL,
+			APIKey:                apiKey,
+			DefaultModel:          resolved.SelectedPublicModel(),
+			Models:                responsesAdapterModelsForProvider(resolved.Provider),
+			Adapter:               adapter,
+			CustomToolMode:        resolved.Model.ToolPolicy.CustomToolMode,
+			UnsupportedToolPolicy: resolved.Model.UnsupportedToolPolicy,
+			ConversionProfile:     resolved.Provider.ConversionProfile,
+			StrictConversion:      resolved.Provider.StrictConversion,
+			Operation:             resolved.Provider.Operation,
+			NativeTools:           responsesAdapterNativeTools(resolved.Model),
+			SourcePolicy:          responsesAdapterSourcePolicy(resolved.Model),
+			ResponsesPolicy:       responsesAdapterResponsesPolicy(resolved.Model),
+			Routes:                routeConfigs,
 		}},
 		ProxyKeys: map[string]string{proxyKey: resolved.Provider.ID},
 		KeySalt:   resolved.Name + ":" + strconv.Itoa(resolved.Revision()),

@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,14 +28,16 @@ const (
 	maxHostedContentBytes   = 20 << 20
 	maxSharedFileBytes      = 20 << 20
 	maxDriveItemJSONBytes   = 2 << 20
-	// Microsoft Graph's simple drive-item upload is capped at 250 MB. Keep
-	// the boundary in one place so the file path can transparently switch to
-	// an upload session instead of buffering a large file in memory.
-	maxSingleDriveItemBytes = 250_000_000
-	// Upload-session chunks must be smaller than 60 MiB and aligned to 320 KiB.
-	// 191 aligned blocks are just below the service limit, minimizing the
-	// number of requests for large files.
-	defaultUploadSessionChunkSize = 191 * 320 * 1024
+	// Use Graph's documented resumable-upload path above 10 MiB. This is a
+	// protocol boundary, not an application file-size limit: larger files are
+	// still accepted up to maxTeamsTransferBytes and are sent in sessions.
+	maxSingleDriveItemBytes = 10 * 1024 * 1024
+	// Upload-session fragments must be smaller than 60 MiB and aligned to
+	// 320 KiB. Ten MiB is exactly 32 aligned blocks, which keeps the request
+	// count low while leaving a conservative margin below the service limit.
+	defaultUploadSessionChunkSize = 10 * 1024 * 1024
+	defaultTransferDialTimeout    = 15 * time.Second
+	defaultTransferHeaderTimeout  = 30 * time.Second
 	defaultTransferIdleTimeout    = 2 * time.Minute
 	defaultTransferMaxRetries     = 3
 	// Keep an application ceiling at the documented OneDrive/SharePoint file
@@ -63,6 +66,8 @@ type GraphClient struct {
 	transferChunkSize   int64
 	transferMaxRetries  int
 	singlePutMaxBytes   int64
+	transferClientOnce  *sync.Once
+	transferClient      *http.Client
 }
 
 type User struct {
@@ -143,12 +148,14 @@ type OutboundHostedContent struct {
 }
 
 type DriveItem struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	ETag      string `json:"eTag"`
-	WebURL    string `json:"webUrl"`
-	WebDavURL string `json:"webDavUrl"`
-	File      *struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ETag        string `json:"eTag"`
+	WebURL      string `json:"webUrl"`
+	WebDavURL   string `json:"webDavUrl"`
+	Size        int64  `json:"size,omitempty"`
+	DownloadURL string `json:"@microsoft.graph.downloadUrl,omitempty"`
+	File        *struct {
 		MimeType string `json:"mimeType"`
 	} `json:"file,omitempty"`
 }
@@ -236,6 +243,7 @@ func newGraphClientWithHTTPClient(auth graphAuth, out io.Writer, client *http.Cl
 		sleep:              sleepContext,
 		jitter:             jitterDuration,
 		transferMaxRetries: -1,
+		transferClientOnce: &sync.Once{},
 	}
 }
 
@@ -960,7 +968,7 @@ func (g *GraphClient) getDriveItemMetadataWithOptions(ctx context.Context, itemI
 	if itemID == "" {
 		return DriveItem{}, fmt.Errorf("drive item id is required")
 	}
-	path := "/me/drive/items/" + url.PathEscape(itemID) + "?$select=id,name,eTag,webUrl,webDavUrl"
+	path := "/me/drive/items/" + url.PathEscape(itemID) + "?$select=id,name,size,eTag,webUrl,webDavUrl"
 	var item DriveItem
 	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
 	return item, err
@@ -987,7 +995,7 @@ func (g *GraphClient) getSharedDriveItemMetadataWithOptions(ctx context.Context,
 	if shareID == "" {
 		return DriveItem{}, fmt.Errorf("sharing URL is required")
 	}
-	path := "/shares/" + url.PathEscape(shareID) + "/driveItem?$select=id,name,eTag,webUrl,webDavUrl,file"
+	path := "/shares/" + url.PathEscape(shareID) + "/driveItem?$select=id,name,size,eTag,webUrl,webDavUrl,file"
 	var item DriveItem
 	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
 	return item, err
@@ -1792,7 +1800,7 @@ func allowedListChatsQuery(values url.Values) bool {
 func allowedDriveItemMetadataQuery(values url.Values) bool {
 	selectValues := values["$select"]
 	return len(values) == 1 && len(selectValues) == 1 &&
-		(selectValues[0] == "id,name,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,eTag,webUrl,webDavUrl,file")
+		(selectValues[0] == "id,name,size,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,size,eTag,webUrl,webDavUrl,file")
 }
 
 func allowedOnlineMeetingQuery(values url.Values) bool {

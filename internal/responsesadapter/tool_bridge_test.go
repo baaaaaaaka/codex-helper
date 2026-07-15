@@ -213,3 +213,31 @@ func TestNormalizeToolsDropsUnsupportedDuplicateAndNamelessTools(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeToolsFailClosedForDeclaredNativeTool(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"web_search"},{"type":"function","name":"read_file","parameters":{"type":"object"}}]`)
+	tools, warnings, err := NormalizeToolsWithPolicy(raw, "function", "error")
+	if err == nil || !strings.Contains(err.Error(), "unsupported upstream tool") {
+		t.Fatalf("expected fail-closed unsupported-tool error, tools=%#v warnings=%#v err=%v", tools, warnings, err)
+	}
+	if len(warnings) == 0 || warnings[0].Type != "web_search" {
+		t.Fatalf("warnings = %#v", warnings)
+	}
+}
+
+func TestNormalizeRequestToolsMapsNativeToolsInsideNamespace(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"namespace","name":"search","tools":[{"type":"web_search_preview","search_context_size":"high","ignored":true},{"type":"function","name":"read_file","parameters":{"type":"object"}}]}]`)
+	tools, native, warnings, err := NormalizeRequestTools(raw, "function", "error", []NativeToolSpec{{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search", AllowedFields: []string{"search_context_size"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 || len(native) != 1 || len(tools) != 1 || tools[0].Function.Name != "read_file" {
+		t.Fatalf("tools=%#v native=%#v warnings=%#v", tools, native, warnings)
+	}
+	if native[0].UpstreamType != "web_search" || native[0].Fields["search_context_size"] != "high" {
+		t.Fatalf("native mapping=%#v", native[0])
+	}
+	if _, ok := native[0].Fields["ignored"]; ok {
+		t.Fatalf("undeclared native field leaked: %#v", native[0].Fields)
+	}
+}

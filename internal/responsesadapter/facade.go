@@ -297,9 +297,39 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, routeErrorStatus(err), errorBody(err.Error()))
 		return
 	}
-	if err := validateStructuredOutputRequest(req.ResponseFormat, runtime.ResponsesPolicy.StructuredOutput); err != nil {
+	operation := strings.ToLower(strings.TrimSpace(req.Operation))
+	configuredOperation := strings.ToLower(strings.TrimSpace(runtime.Operation))
+	if configuredOperation != "" {
+		if operation != "" && operation != configuredOperation {
+			writeJSON(w, http.StatusBadRequest, errorBody(fmt.Sprintf("provider operation %q cannot handle requested operation %q", configuredOperation, operation)))
+			return
+		}
+		operation = configuredOperation
+	}
+	switch operation {
+	case "", "chat", "responses", "prefix", "fim":
+	default:
+		writeJSON(w, http.StatusBadRequest, errorBody(fmt.Sprintf("unsupported provider operation %q", operation)))
+		return
+	}
+	req.Operation = operation
+	if err := validateResponsesPolicy(req, runtime.ResponsesPolicy); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 		return
+	}
+	if err := validateSourcePolicy(runtime.SourcePolicy); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody(err.Error()))
+		return
+	}
+	if operation == "prefix" || operation == "fim" {
+		if strings.TrimSpace(req.PreviousResponseID) != "" {
+			writeJSON(w, http.StatusBadRequest, errorBody(fmt.Sprintf("provider operation %q cannot continue a Responses conversation", operation)))
+			return
+		}
+		if len(req.Tools) > 0 {
+			writeJSON(w, http.StatusBadRequest, errorBody(fmt.Sprintf("provider operation %q does not support tools", operation)))
+			return
+		}
 	}
 	publicModel := firstNonEmpty(runtime.PublicModel, req.Model)
 	upstreamModel := firstNonEmpty(runtime.Model, publicModel)
@@ -339,7 +369,7 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, errorBody(err.Error()))
 		return
 	}
-	tools, toolWarnings, err := NormalizeToolsWithMode(req.Tools, runtime.CustomToolMode)
+	tools, nativeTools, toolWarnings, err := NormalizeRequestTools(req.Tools, runtime.CustomToolMode, runtime.UnsupportedToolPolicy, runtime.NativeTools)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody(err.Error()))
 		return
@@ -361,11 +391,15 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	providerReq := ProviderRequest{
 		Model:                  upstreamModel,
+		Operation:              operation,
+		Prefix:                 req.Prefix,
+		Suffix:                 req.Suffix,
 		Instructions:           req.Instructions,
 		InputText:              parsedInput.Text,
 		InputMessages:          parsedInput.Messages,
 		Messages:               buildProviderMessages(history, parsedInput.Messages),
 		Tools:                  tools,
+		NativeTools:            nativeTools,
 		ToolWarnings:           toolWarnings,
 		ToolChoice:             req.ToolChoice,
 		ParallelToolCalls:      req.ParallelToolCalls,
@@ -373,10 +407,13 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		ReasoningEffort:        reasoningEffort(req.Reasoning),
 		Temperature:            req.Temperature,
 		TopP:                   req.TopP,
-		ResponseFormat:         req.ResponseFormat,
+		PreviousResponseID:     req.PreviousResponseID,
+		ResponseFormat:         append(json.RawMessage(nil), req.ResponseFormat...),
+		Background:             req.Background,
+		ContextManagement:      append(json.RawMessage(nil), req.ContextManagement...),
 		ParallelEnforcement:    runtime.ParallelToolEnforcement,
 		StructuredOutputPolicy: runtime.ResponsesPolicy.StructuredOutput,
-		PreviousResponseID:     req.PreviousResponseID,
+		SourcePolicy:           runtime.SourcePolicy,
 		Scope:                  scope,
 		History:                history,
 	}
@@ -421,23 +458,12 @@ func markProviderToolCallTypes(records []ToolCallRecord, tools []ChatTool) []Too
 		return records
 	}
 	types := make(map[string]string, len(tools))
-	namespaces := make(map[string]string, len(tools))
 	for _, tool := range tools {
-		name := strings.ToLower(strings.TrimSpace(tool.Function.Name))
-		if _, exists := types[name]; !exists {
-			types[name] = tool.SourceType
-			namespaces[name] = tool.Namespace
-		}
+		types[strings.ToLower(strings.TrimSpace(tool.Function.Name))] = tool.SourceType
 	}
 	out := append([]ToolCallRecord(nil), records...)
 	for index := range out {
-		name := strings.ToLower(strings.TrimSpace(out[index].Name))
-		if out[index].Type == "" {
-			out[index].Type = types[name]
-		}
-		if out[index].Namespace == "" {
-			out[index].Namespace = namespaces[name]
-		}
+		out[index].Type = types[strings.ToLower(strings.TrimSpace(out[index].Name))]
 	}
 	return out
 }
@@ -598,11 +624,49 @@ func extractMessageContent(raw json.RawMessage) (string, []ProviderContentPart) 
 			}
 			textOut = append(textOut, "image attachment omitted")
 		}
+		if partType == "input_audio" || partType == "audio" || partType == "audio_url" {
+			url, data, format := audioPart(part)
+			if url != "" || data != "" {
+				contentParts = append(contentParts, ProviderContentPart{Type: "audio", AudioURL: url, AudioData: data, AudioFormat: format})
+			}
+			textOut = append(textOut, "audio attachment omitted")
+		}
+		if partType == "input_video" || partType == "video" || partType == "video_url" {
+			url := rawString(part["url"])
+			if url == "" {
+				url = rawString(part["video_url"])
+				if url == "" {
+					var nested map[string]json.RawMessage
+					if json.Unmarshal(part["video_url"], &nested) == nil {
+						url = rawString(nested["url"])
+					}
+				}
+			}
+			if url != "" {
+				contentParts = append(contentParts, ProviderContentPart{Type: "video", VideoURL: url})
+			}
+			textOut = append(textOut, "video attachment omitted")
+		}
 	}
-	if !hasImagePart(contentParts) {
+	if len(contentParts) == 0 {
 		contentParts = nil
 	}
 	return strings.Join(textOut, "\n"), contentParts
+}
+
+func audioPart(part map[string]json.RawMessage) (string, string, string) {
+	raw := part["audio_url"]
+	if len(raw) == 0 {
+		raw = part["input_audio"]
+	}
+	if value := rawString(raw); value != "" {
+		return value, "", rawString(part["format"])
+	}
+	var nested map[string]json.RawMessage
+	if json.Unmarshal(raw, &nested) == nil {
+		return firstNonEmpty(rawString(nested["url"]), rawString(nested["audio_url"])), rawString(nested["data"]), firstNonEmpty(rawString(nested["format"]), rawString(part["format"]))
+	}
+	return rawString(part["url"]), rawString(part["data"]), rawString(part["format"])
 }
 
 func imageURLPart(raw json.RawMessage) (string, string) {

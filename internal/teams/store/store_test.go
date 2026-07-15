@@ -2684,6 +2684,131 @@ func TestSQLiteMarkOutboxDriveItemDoesNotLoadColdState(t *testing.T) {
 	}
 }
 
+func TestMarkOutboxUploadSessionForAttemptPersistsAndFences(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if useSQLite {
+				if err := store.Update(ctx, func(state *State) error {
+					state.ControlChat = ControlChatBinding{TeamsChatID: "upload-checkpoint-chat"}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed store before SQLite migration: %v", err)
+				}
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:             "upload-checkpoint-outbox",
+				TeamsChatID:    "upload-checkpoint-chat",
+				Kind:           "attachment",
+				AttachmentPath: "/private/attachment.bin",
+			})
+			if err != nil || !created {
+				t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, msg.ID)
+			if err != nil {
+				t.Fatalf("MarkOutboxSendAttempt: %v", err)
+			}
+			expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+			saved, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, claimed.SendAttemptToken, "https://upload.example/session?sig=secret", expiresAt, 64*1024*1024)
+			if err != nil {
+				t.Fatalf("MarkOutboxUploadSessionForAttempt: %v", err)
+			}
+			if saved.AttachmentUploadURL == "" || saved.AttachmentUploadOffset != 64*1024*1024 || !saved.AttachmentUploadExpiry.Equal(expiresAt) || saved.LastSendAttempt.IsZero() {
+				t.Fatalf("saved checkpoint = %#v", saved)
+			}
+			if _, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, "wrong-attempt-token", saved.AttachmentUploadURL, expiresAt, 1); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("wrong-token checkpoint error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			if _, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, claimed.SendAttemptToken, saved.AttachmentUploadURL, expiresAt, -1); err == nil {
+				t.Fatal("negative checkpoint offset unexpectedly succeeded")
+			}
+			cleared, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, claimed.SendAttemptToken, "", time.Time{}, 0)
+			if err != nil {
+				t.Fatalf("clear upload checkpoint: %v", err)
+			}
+			if cleared.AttachmentUploadURL != "" || !cleared.AttachmentUploadExpiry.IsZero() || cleared.AttachmentUploadOffset != 0 {
+				t.Fatalf("cleared checkpoint = %#v", cleared)
+			}
+		})
+	}
+}
+
+func TestOutboxSendAttemptTokenChangesWhenClockResolutionRepeats(t *testing.T) {
+	now := time.Date(2026, 7, 15, 16, 0, 0, 123456789, time.UTC)
+	first := outboxSendAttemptToken("same-outbox", now, "")
+	second := outboxSendAttemptToken("same-outbox", now, first)
+	if first == "" || second == "" || first == second {
+		t.Fatalf("same-timestamp attempt tokens = %q and %q, want distinct non-empty tokens", first, second)
+	}
+	if got := outboxSendAttemptToken("same-outbox", now, second); got == second {
+		t.Fatalf("third same-timestamp attempt reused token %q", got)
+	}
+}
+
+func TestMarkOutboxDriveItemForAttemptPersistsAndFences(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if useSQLite {
+				if err := store.Update(ctx, func(state *State) error {
+					state.ControlChat = ControlChatBinding{TeamsChatID: "drive-item-fence-chat"}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed store before SQLite migration: %v", err)
+				}
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			msg, created, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:             "drive-item-fence-outbox",
+				TeamsChatID:    "drive-item-fence-chat",
+				Kind:           "attachment",
+				AttachmentPath: "/private/attachment.bin",
+			})
+			if err != nil || !created {
+				t.Fatalf("QueueOutbox created=%v err=%v", created, err)
+			}
+			first, err := store.MarkOutboxSendAttempt(ctx, msg.ID)
+			if err != nil {
+				t.Fatalf("first MarkOutboxSendAttempt: %v", err)
+			}
+			saved, err := store.MarkOutboxDriveItemForAttempt(ctx, msg.ID, first.SendAttemptToken, "drive-item-first", "first.bin", "etag-first", "https://sharepoint/first", "dav://first")
+			if err != nil {
+				t.Fatalf("first fenced DriveItem update: %v", err)
+			}
+			if saved.DriveItemID != "drive-item-first" {
+				t.Fatalf("saved first DriveItem = %#v", saved)
+			}
+			if _, err := store.MarkOutboxDriveItemForAttempt(ctx, msg.ID, "wrong-attempt-token", "drive-item-forged", "forged.bin", "", "", ""); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("wrong-token DriveItem error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			if _, err := store.MarkOutboxSendErrorForAttempt(ctx, msg.ID, first.SendAttemptToken, "simulated lease loss"); err != nil {
+				t.Fatalf("release first send attempt: %v", err)
+			}
+			second, err := store.MarkOutboxSendAttempt(ctx, msg.ID)
+			if err != nil {
+				t.Fatalf("second MarkOutboxSendAttempt: %v", err)
+			}
+			if second.SendAttemptToken == first.SendAttemptToken {
+				t.Fatal("second send attempt reused the first token")
+			}
+			if _, err := store.MarkOutboxDriveItemForAttempt(ctx, msg.ID, first.SendAttemptToken, "drive-item-stale", "stale.bin", "", "", ""); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("stale-token DriveItem error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			current, err := store.MarkOutboxDriveItemForAttempt(ctx, msg.ID, second.SendAttemptToken, "drive-item-second", "second.bin", "etag-second", "https://sharepoint/second", "dav://second")
+			if err != nil {
+				t.Fatalf("second fenced DriveItem update: %v", err)
+			}
+			if current.DriveItemID != "drive-item-second" || current.DriveItemName != "second.bin" {
+				t.Fatalf("current DriveItem after fenced update = %#v", current)
+			}
+		})
+	}
+}
+
 func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

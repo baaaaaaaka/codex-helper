@@ -683,8 +683,14 @@ func ArtifactUploadNameFromSHA256(sessionID string, turnID string, name string, 
 		name = "artifact"
 	}
 	hash := strings.TrimSpace(sha256Hex)
-	if len(hash) > 16 {
-		hash = hash[:16]
+	if decoded, err := hex.DecodeString(hash); err != nil || len(decoded) != sha256.Size {
+		// This helper has no error return because it is also used while
+		// rendering an already-validated artifact plan. Keep the filename
+		// deterministic and collision-resistant even if a legacy caller passes
+		// malformed input instead of silently emitting an empty/shared prefix.
+		sum := sha256.Sum256([]byte(hash))
+		hash = hex.EncodeToString(sum[:])
 	}
+	hash = hash[:16]
 	return "codex-artifact-" + safePathPart(sessionID) + "-" + safePathPart(turnID) + "-" + hash + "-" + name
 }

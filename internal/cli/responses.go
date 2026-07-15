@@ -63,14 +63,14 @@ func newResponsesServeCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&opts.listen, "listen", opts.listen, "Listen address for the local Responses adapter")
-	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "OpenAI-compatible upstream base URL, for example https://api.deepseek.com/v1")
+	cmd.Flags().StringVar(&opts.baseURL, "base-url", "", "OpenAI-compatible upstream base URL, for example https://provider.example/v1")
 	cmd.Flags().StringVar(&opts.apiKey, "api-key", "", "Upstream API key; prefer --api-key-env for normal use")
 	cmd.Flags().StringVar(&opts.apiKeyEnv, "api-key-env", opts.apiKeyEnv, "Environment variable containing the upstream API key")
 	cmd.Flags().StringVar(&opts.model, "model", "", "Default model to advertise when Codex omits model")
 	cmd.Flags().StringVar(&opts.provider, "provider", opts.provider, "Provider id used for response-store scoping")
 	cmd.Flags().StringVar(&opts.storePath, "store-path", opts.storePath, "SQLite response store path; set empty to use in-memory store")
 	cmd.Flags().StringVar(&opts.providersJSON, "providers-json", "", "JSON file declaring multiple upstream providers")
-	cmd.Flags().StringVar(&opts.proxyKeys, "proxy-keys", "", "Comma-separated inbound key locks, e.g. key1:deepseek,key2:mimo,key3:*")
+	cmd.Flags().StringVar(&opts.proxyKeys, "proxy-keys", "", "Comma-separated inbound key locks, e.g. key1:provider-a,key2:provider-b,key3:*")
 	cmd.Flags().StringVar(&opts.scopeSalt, "scope-salt", "", "Salt used to fingerprint upstream API keys for response-store scoping")
 	cmd.Flags().StringVar(&opts.modelProfileInstanceID, "model-profile-instance-id", "", "Internal model profile adapter instance id")
 	_ = cmd.Flags().MarkHidden("model-profile-instance-id")

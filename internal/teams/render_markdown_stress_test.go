@@ -913,6 +913,10 @@ func TestRenderTeamsHTMLUserMessagesUseSafeMarkdown(t *testing.T) {
 
 func assertTeamsRenderedHTMLSafe(t *testing.T, got string) {
 	t.Helper()
+	if markerID := helperOutboxProvenanceMarkerID(got); markerID != "" {
+		marker := helperOutboxProvenanceMarker(markerID)
+		got = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(got), marker))
+	}
 	for _, forbidden := range []string{
 		"<script",
 		"</script",

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/beacon"
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
@@ -3341,6 +3343,59 @@ func teamsServiceEnvironmentAllowlist() []string {
 			names = append(names, strings.TrimSpace(spec.RecommendedEnv))
 		}
 	}
+	names = append(names, teamsServiceConfiguredModelEnvNames()...)
+	return names
+}
+
+// External catalog providers may intentionally use env: references instead of
+// the local secret store. Include only those explicitly configured key
+// variable names in the background service environment; static provider
+// registries cannot know these names.
+func teamsServiceConfiguredModelEnvNames() []string {
+	path := strings.TrimSpace(os.Getenv("CODEX_HELPER_CONFIG"))
+	if path == "" {
+		var err error
+		path, err = config.DefaultPath()
+		if err != nil {
+			return nil
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var envelope struct {
+		ModelCredentials map[string]struct {
+			APIKeyRef string `json:"apiKeyRef"`
+		} `json:"modelCredentials"`
+		ModelProfiles map[string]struct {
+			APIKeyRef string `json:"apiKeyRef"`
+		} `json:"modelProfiles"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var names []string
+	appendRef := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if !strings.HasPrefix(ref, modelprofile.EnvRefPrefix) {
+			return
+		}
+		name := strings.TrimSpace(strings.TrimPrefix(ref, modelprofile.EnvRefPrefix))
+		if name == "" || strings.ContainsAny(name, "=\x00\r\n") || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	for _, credential := range envelope.ModelCredentials {
+		appendRef(credential.APIKeyRef)
+	}
+	for _, profile := range envelope.ModelProfiles {
+		appendRef(profile.APIKeyRef)
+	}
+	sort.Strings(names)
 	return names
 }
 

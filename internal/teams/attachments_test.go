@@ -343,7 +343,7 @@ func TestDownloadReferenceFileAttachmentsUsesDriveItemMetadataName(t *testing.T)
 	sharePath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.EscapedPath() == sharePath && r.URL.Query().Get("$select") == "id,name,eTag,webUrl,webDavUrl,file":
+		case r.Method == http.MethodGet && r.URL.EscapedPath() == sharePath && r.URL.Query().Get("$select") == "id,name,size,eTag,webUrl,webDavUrl,file":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":"item-1","name":"Design Review v2.pdf","file":{"mimeType":"application/pdf"}}`))
 		case r.Method == http.MethodGet && r.URL.EscapedPath() == sharePath+"/content":

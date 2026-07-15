@@ -203,6 +203,24 @@ func TestParseInputKeepsImageOnlyMessageVisibleAsTextPlaceholder(t *testing.T) {
 	}
 }
 
+func TestParseInputPreservesAudioAndVideoOnlyMessages(t *testing.T) {
+	parsed, err := parseInput(json.RawMessage(`[
+		{"type":"message","role":"user","content":[{"type":"input_audio","input_audio":{"data":"AQI=","format":"wav"}},{"type":"input_video","video_url":{"url":"https://example.test/video.mp4"}}]}
+	]`))
+	if err != nil {
+		t.Fatalf("parseInput error: %v", err)
+	}
+	if len(parsed.Messages) != 1 || len(parsed.Messages[0].ContentParts) != 2 {
+		t.Fatalf("parsed = %#v", parsed)
+	}
+	if parsed.Messages[0].ContentParts[0].Type != "audio" || parsed.Messages[0].ContentParts[0].AudioData != "AQI=" || parsed.Messages[0].ContentParts[0].AudioFormat != "wav" {
+		t.Fatalf("audio part = %#v", parsed.Messages[0].ContentParts[0])
+	}
+	if parsed.Messages[0].ContentParts[1].Type != "video" || parsed.Messages[0].ContentParts[1].VideoURL != "https://example.test/video.mp4" {
+		t.Fatalf("video part = %#v", parsed.Messages[0].ContentParts[1])
+	}
+}
+
 func TestParseInputReplaysCustomToolCallAsChatFunction(t *testing.T) {
 	parsed, err := parseInput(json.RawMessage(`[
 		{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"},

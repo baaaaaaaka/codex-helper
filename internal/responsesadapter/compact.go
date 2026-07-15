@@ -75,7 +75,7 @@ func (f *Facade) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errorBody(err.Error()))
 		return
 	}
-	result, ok := f.collectProviderResult(r.Context(), stream)
+	result, ok := f.collectProviderResult(r.Context(), stream, providerReq.Tools)
 	if !ok {
 		writeJSON(w, http.StatusBadGateway, errorBody("provider stream ended before completion"))
 		return

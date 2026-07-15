@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/responsesadapter"
 )
 
 func TestNativeResponsesCompatibilityProxyFlattensNamespacesAndRestoresCalls(t *testing.T) {
@@ -104,6 +106,79 @@ func TestNativeResponsesCompatibilityProxyRejectsWrongProxyKey(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestNativeResponsesCompatibilityProxyEnforcesResponsesPolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unsupported request reached native upstream")
+	}))
+	defer upstream.Close()
+	baseURL, cleanup, err := startNativeResponsesCompatibilityProxyWithPolicy(upstream.URL, "upstream-key", "proxy-key", "", nil, responsesadapter.ResponsesPolicy{Background: "unsupported"})
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer cleanup()
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/responses", strings.NewReader(`{"model":"m","background":true,"input":"x"}`))
+	req.Header.Set("Authorization", "Bearer proxy-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "does not support background") {
+		t.Fatalf("policy error = %s", body)
+	}
+}
+
+func TestNativeResponsesCompatibilityProxyRejectsUnsupportedNativeTool(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("unsupported native tool reached native upstream")
+	}))
+	defer upstream.Close()
+	baseURL, cleanup, err := startNativeResponsesCompatibilityProxyWithRoutePolicies(
+		upstream.URL, "upstream-key", "proxy-key", "", nil,
+		responsesadapter.ResponsesPolicy{}, responsesadapter.SourcePolicy{}, "error", nil,
+	)
+	if err != nil {
+		t.Fatalf("start proxy: %v", err)
+	}
+	defer cleanup()
+	req, _ := http.NewRequest(http.MethodPost, baseURL+"/responses", strings.NewReader(`{"model":"m","tools":[{"type":"web_search_preview"}],"input":"x"}`))
+	req.Header.Set("Authorization", "Bearer proxy-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "unsupported upstream tool") {
+		t.Fatalf("tool policy error = %s", body)
+	}
+}
+
+func TestNativeResponsesCompatibilityProxyRejectsUnenforceableSourcePolicy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("unsupported source route should not start")
+	}))
+	defer upstream.Close()
+	_, cleanup, err := startNativeResponsesCompatibilityProxyWithPolicies(
+		upstream.URL, "upstream-key", "proxy-key", "", nil,
+		responsesadapter.ResponsesPolicy{},
+		responsesadapter.SourcePolicy{Mode: "annotations", RequireURL: true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "cannot enforce source policy") {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatalf("expected source policy rejection, err=%v", err)
 	}
 }
 

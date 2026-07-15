@@ -484,7 +484,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*)|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport)$' -v
+          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*|ForwardsExplicitConversionOperationFields)|ProviderRegistryPinsConversionProfileInRuntime|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport|AnthropicConverter(BuildsMessagesRequestAndParsesBufferedResponse|ParsesSSEWithoutDuplicateDone)|DeepSeekBeta(ConverterUsesFIMWireShape|FIMSSERequiresDoneMarker)|ConfiguredAdapterRejects(Unknown|Mismatched)ConversionProfile)$' -v
+
+      - name: External catalog conversion contract regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/config -count=1 -run '^Test(ModelCatalogContract.*|ValidateModelConversionAndOperation.*)$' -v
+          go test ./internal/modelcatalog -count=1 -run '^Test(CatalogContract.*|CatalogV2.*|ValidateRejects.*)$' -v
+          go test ./internal/modelprofile -count=1 -run '^Test(ResolveCatalogV2.*|ResolveSnapshotUsesSelectedInterfaceCredential.*)$' -v
+          go test ./internal/responsesadapter -count=1 -run '^Test(ConfiguredAdapter.*|ChatAdapterContractMatrix.*|ProviderRegistry.*|Anthropic.*|DeepSeekBeta.*|NativeToolMapping.*|SourcePolicy.*)$' -v
+          go test ./internal/cli -count=1 -run '^Test(ModelCatalog.*|ModelProviderSetup.*|VerifySyncedModel.*)$' -v
 
       - name: Teams per-chat reasoning effort regressions
         if: matrix.shard == 'core'
@@ -639,6 +650,15 @@ jobs:
           attachment_echo_pattern='TestBridgePoll(DropsFreshHelperAttachmentEchoFromSendingOutbox|AllowsFreshHelperAttachmentEchoWhenOutboxAttachmentIDDiffers|AllowsFreshHelperAttachmentEchoWhenAttachmentIsMessageReference|AllowsFreshArtifactEchoShapedUserMessageWithAttachment|DropsHelperAttachmentEchoWithoutDurableMatch|DropsGlobalOutboundFromSiblingScope)$'
           go test ./internal/teams -count=1 -run "$attachment_echo_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestMarkOutboxSentIsIdempotent$' -v
+
+      - name: Teams file transfer durability and provenance regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          transfer_pattern='Test(GraphUploadDriveItemFromFile(PersistsSessionCheckpoint|ResumesPersistedSessionCheckpoint)|GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
+          go test ./internal/teams -count=1 -run "$transfer_pattern" -v
+          go test ./internal/teams/store -count=1 -run '^TestMarkOutbox(UploadSessionForAttemptPersistsAndFences|DriveItemForAttemptPersistsAndFences)$' -v
 
       - name: Teams watchdog lifecycle drain regressions
         if: matrix.shard == 'core'
@@ -2079,7 +2099,11 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/proc -c -o dist/codex_proc_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams -c -o dist/codex_teams_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
-          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/config -c -o dist/codex_config_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelcatalog -c -o dist/codex_modelcatalog_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelprofile -c -o dist/codex_modelprofile_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/responsesadapter -c -o dist/codex_responsesadapter_test
+          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test dist/codex_config_test dist/codex_modelcatalog_test dist/codex_modelprofile_test dist/codex_responsesadapter_test
 
       - name: Upload Linux distro smoke binaries
         uses: actions/upload-artifact@v4
@@ -2141,6 +2165,10 @@ jobs:
             dist/codex_proc_test
             dist/codex_teams_test
             dist/codex_teams_store_test
+            dist/codex_config_test
+            dist/codex_modelcatalog_test
+            dist/codex_modelprofile_test
+            dist/codex_responsesadapter_test
           )
           missing_required() {
             local missing=0
@@ -2393,6 +2421,7 @@ jobs:
           set -euo pipefail
           trap 'status=$?; echo "::error title=Linux distro smoke command failed::${BASH_COMMAND} (exit ${status})"' ERR
           teams_resource_pattern='Test(BridgePollDrops(HelperAttachmentEchoWithoutDurableMatch|RenderedHelperLabelOutputInWorkChat)|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
+          teams_transfer_pattern='Test(GraphUploadDriveItemFromFile(PersistsSessionCheckpoint|ResumesPersistedSessionCheckpoint)|GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
           teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|CompletesTurnWithTranscriptFinalForCanonicalDedupe|StreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder|StreamingErrorDoesNotSuppressPendingFinalLikeProgress|TranscriptCanonicalFinal(PreservesObservedArtifactManifest|RequiresSameCodexTurn)|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|KnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
           img="$DISTRO_IMAGE"
           echo "==> $img (Codex contract tests)"
@@ -2407,9 +2436,25 @@ jobs:
           echo "==> $img (proc zombie/parser tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
+          echo "==> $img (external catalog JSON contract tests; network disabled)"
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_config_test -test.v -test.count=1 -test.run='Test(ModelCatalogContract|ValidateModelConversionAndOperation)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_modelcatalog_test -test.v -test.count=1 -test.run='Test(CatalogContract|CatalogV2|ValidateRejects)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_modelprofile_test -test.v -test.count=1 -test.run='TestResolveCatalogV2|TestResolveSnapshotUsesSelectedInterfaceCredential'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_responsesadapter_test -test.v -test.count=1 -test.run='Test(ConfiguredAdapter|ChatAdapterContractMatrix|ProviderRegistry|Anthropic|DeepSeekBeta|NativeToolMapping|SourcePolicy)'
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_cli_test -test.v -test.count=1 -test.run='Test(ModelCatalog|ModelProviderSetup|VerifySyncedModel)'
           echo "==> $img (Teams resource cleanup, artifact, transcript, and simulated-live tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_resource_pattern"
+          echo "==> $img (Teams file transfer durability and provenance tests)"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_transfer_pattern"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestMarkOutbox(UploadSessionForAttemptPersistsAndFences|DriveItemForAttemptPersistsAndFences)$'
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestChatPollSchedule(NoopDoesNotRewriteState|BlockedNoopPreservesPreviousState|ParkedNoopPreservesParkedAt)$'
           echo "==> $img (Teams replay fencing tests)"
@@ -2424,6 +2469,7 @@ jobs:
           set -euo pipefail
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep|FlushPromotesAcceptedOutboxDuringRateLimitWithoutPosting|ReloadDraining(SessionMessage|ControlNew)IsDeferredAndReplayed)|BridgeControlRestart(DoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain|RunsAfterExpiredHelperUpgradeDrain|DoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine|NowBlocksExpiredHelperUpgradeWithActiveTurn|ForceRunsAfterExpiredHelperUpgradeWithActiveTurn|RunsAfterStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn|ForceRunsAfterStaleHelperReloadWithActiveTurn)|BridgeControlReload(RetriesStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn)|Bridge(CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Helper(UpgradeDrainExpired|ReloadDrainStale)|OwnerAppearsLocal|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           teams_nonroot_artifact='Test(CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
+          teams_nonroot_transfer='Test(GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
           img="$DISTRO_IMAGE"
           echo "==> $img (Teams keepalive tests as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
@@ -2472,6 +2518,16 @@ jobs:
             -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_nonroot_artifact"
+          echo "==> $img (Teams file transfer tests as non-root uid 1000)"
+          docker run --rm --user 1000:1000 \
+            -e HOME=/tmp/codex-home \
+            -e XDG_CONFIG_HOME=/tmp/codex-config \
+            -e XDG_CACHE_HOME=/tmp/codex-cache \
+            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
+            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
+            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
+            -v "$PWD/dist:/dist:ro" "$img" \
+            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_nonroot_transfer"
           echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \

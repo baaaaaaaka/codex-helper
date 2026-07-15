@@ -15,12 +15,16 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 const (
-	defaultOutboundUploadFolder   = "Microsoft Teams Chat Files"
-	maxOutboundAttachmentBytes    = maxTeamsTransferBytes
-	outboundAttachmentInlineBytes = 20 << 20
+	defaultOutboundUploadFolder = "Microsoft Teams Chat Files"
+	maxOutboundAttachmentBytes  = maxTeamsTransferBytes
+	// Keep the in-memory path within the same simple-PUT boundary used by the
+	// Graph file client. Files above this limit must be staged and uploaded via
+	// an upload session.
+	outboundAttachmentInlineBytes = maxSingleDriveItemBytes
 )
 
 type OutboundAttachmentOptions struct {
@@ -147,6 +151,18 @@ func PrepareOutboundAttachment(path string, opts OutboundAttachmentOptions) (Out
 }
 
 func SendOutboundAttachment(ctx context.Context, graph *GraphClient, chatID string, file OutboundAttachmentFile, opts OutboundAttachmentOptions) (OutboundAttachmentResult, error) {
+	if (file.Bytes == nil && strings.TrimSpace(file.Path) != "") || int64(len(file.Bytes)) > maxSingleDriveItemBytes {
+		// The CLI path is synchronous rather than store-backed, but it still
+		// needs a stable immutable source. Reuse the same private staging path as
+		// the durable bridge outbox so a source file cannot change between the
+		// preflight hash and the Graph upload.
+		staged, err := stageOutboundAttachmentForOutbox(file)
+		if err != nil {
+			return OutboundAttachmentResult{}, err
+		}
+		file = staged
+		defer func() { _ = cleanupStagedOutboundAttachment(staged.Path) }()
+	}
 	meta, err := UploadOutboundAttachment(ctx, graph, file, opts)
 	if err != nil {
 		return OutboundAttachmentResult{}, err
@@ -163,9 +179,46 @@ func SendOutboundAttachment(ctx context.Context, graph *GraphClient, chatID stri
 	return OutboundAttachmentResult{File: file, Item: meta, Message: msg}, nil
 }
 
+// RecordDirectOutboundAttachmentProvenance closes the small crash window for
+// the standalone send-file command, whose caller does not own a Bridge outbox
+// transaction. The message ID is the authoritative key used by inbound
+// polling; the marker remains only a supplementary hint.
+func RecordDirectOutboundAttachmentProvenance(ctx context.Context, registryPath string, chatID string, msg ChatMessage) error {
+	path, ok := globalOutboundLedgerPathForRegistry(registryPath)
+	if !ok || strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" {
+		return nil
+	}
+	return recordGlobalOutbound(ctx, path, globalOutboundItem{
+		ChatID:     strings.TrimSpace(chatID),
+		MessageID:  strings.TrimSpace(msg.ID),
+		Kind:       "direct-attachment",
+		Origin:     teamstore.MessageOriginHelperOutbox,
+		RecordedAt: time.Now(),
+	}, time.Now())
+}
+
 func UploadOutboundAttachment(ctx context.Context, graph *GraphClient, file OutboundAttachmentFile, opts OutboundAttachmentOptions) (DriveItem, error) {
 	if graph == nil {
 		return DriveItem{}, fmt.Errorf("Graph client is required")
+	}
+	if len(file.Bytes) > 0 || file.Bytes != nil {
+		if file.Size != 0 && file.Size != int64(len(file.Bytes)) {
+			return DriveItem{}, fmt.Errorf("outbound attachment size does not match its byte payload")
+		}
+		if expected := strings.TrimSpace(file.SHA256); expected != "" {
+			actual := attachmentContentHash(file.Bytes)
+			if !strings.EqualFold(expected, actual) {
+				return DriveItem{}, fmt.Errorf("outbound attachment content does not match its integrity hash")
+			}
+		}
+	}
+	if int64(len(file.Bytes)) > maxSingleDriveItemBytes {
+		staged, err := stageOutboundAttachmentForOutbox(file)
+		if err != nil {
+			return DriveItem{}, err
+		}
+		file = staged
+		defer func() { _ = cleanupStagedOutboundAttachment(staged.Path) }()
 	}
 	uploadFolder := strings.TrimSpace(opts.UploadFolder)
 	if uploadFolder == "" {
@@ -184,6 +237,9 @@ func UploadOutboundAttachment(ctx context.Context, graph *GraphClient, file Outb
 	meta, err := graph.GetDriveItemMetadata(ctx, item.ID)
 	if err != nil {
 		return DriveItem{}, err
+	}
+	if meta.Size != 0 && meta.Size != file.Size {
+		return DriveItem{}, fmt.Errorf("uploaded DriveItem size %d does not match staged file size %d", meta.Size, file.Size)
 	}
 	return meta, nil
 }

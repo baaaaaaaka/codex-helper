@@ -17,6 +17,32 @@ type recordingSetupModelProfileManager struct {
 	requests []ModelProfileSetupRequest
 }
 
+type fakeModelCatalogManager struct {
+	*fakeModelProfileManager
+	catalogs  string
+	providers string
+	synced    string
+	setup     string
+}
+
+func (m *fakeModelCatalogManager) ListModelCatalogs(context.Context) (string, error) {
+	return m.catalogs, nil
+}
+
+func (m *fakeModelCatalogManager) SyncModelCatalog(_ context.Context, name string) (string, error) {
+	m.synced = name
+	return "synced " + name, nil
+}
+
+func (m *fakeModelCatalogManager) ListModelProviders(context.Context) (string, error) {
+	return m.providers, nil
+}
+
+func (m *fakeModelCatalogManager) SetupModelProvider(_ context.Context, provider string) (string, error) {
+	m.setup = provider
+	return "setup " + provider, nil
+}
+
 func (m *recordingSetupModelProfileManager) SetupModelProfile(ctx context.Context, req ModelProfileSetupRequest) (ModelProfileSetupResult, error) {
 	m.requests = append(m.requests, req)
 	return m.fakeModelProfileManager.SetupModelProfile(ctx, req)
@@ -220,5 +246,34 @@ func TestModelSetupDoesNotSelectCurrentChatOrGlobalDefault(t *testing.T) {
 	}
 	if !strings.Contains(message, "Current chats and global defaults are unchanged") {
 		t.Fatalf("setup message = %q", message)
+	}
+}
+
+func TestControlCatalogAndProviderCommandsUseOptionalManager(t *testing.T) {
+	manager := &fakeModelCatalogManager{fakeModelProfileManager: &fakeModelProfileManager{}, catalogs: "catalogs", providers: "providers"}
+	bridge := &Bridge{modelProfileManager: manager}
+	got, err := bridge.handleModelControlCommand(context.Background(), ChatMessage{}, "catalog list")
+	if err != nil || got != "catalogs" {
+		t.Fatalf("catalog list = %q err=%v", got, err)
+	}
+	got, err = bridge.handleModelControlCommand(context.Background(), ChatMessage{}, "catalog sync nvidia")
+	if err != nil || got != "synced nvidia" || manager.synced != "nvidia" {
+		t.Fatalf("catalog sync = %q err=%v", got, err)
+	}
+	got, err = bridge.handleModelControlCommand(context.Background(), ChatMessage{}, "provider list")
+	if err != nil || got != "providers" {
+		t.Fatalf("provider list = %q err=%v", got, err)
+	}
+	got, err = bridge.handleModelControlCommand(context.Background(), ChatMessage{}, "provider setup nvidia")
+	if err != nil || got != "setup nvidia" || manager.setup != "nvidia" {
+		t.Fatalf("provider setup = %q err=%v", got, err)
+	}
+	got, err = bridge.handleModelWorkCommand(context.Background(), &Session{ID: "s1"}, "catalog list")
+	if err != nil || !strings.Contains(got, "Control-only") {
+		t.Fatalf("work catalog = %q err=%v", got, err)
+	}
+	got, err = bridge.handleModelWorkCommand(context.Background(), &Session{ID: "s1"}, "provider list")
+	if err != nil || !strings.Contains(got, "Control-only") {
+		t.Fatalf("work provider = %q err=%v", got, err)
 	}
 }

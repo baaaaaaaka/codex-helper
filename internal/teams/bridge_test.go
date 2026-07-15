@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17296,7 +17297,6 @@ func TestBridgeSendQueuedOutboxRecordsGlobalOutbound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueueOutbox: %v", err)
 	}
-
 	if err := bridge.sendQueuedOutbox(ctx, outbox); err != nil {
 		t.Fatalf("sendQueuedOutbox: %v", err)
 	}
@@ -17452,7 +17452,7 @@ func TestBridgePollDropsHelperAttachmentEchoWithoutDurableMatch(t *testing.T) {
 	}
 }
 
-func TestBridgePollDropsMarkedHelperAttachmentEchoWithoutLedger(t *testing.T) {
+func TestBridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox(t *testing.T) {
 	msg := bridgePollMessage("marked-helper-artifact", "2026-04-30T01:05:00Z", "")
 	msg.Body.Content = `<p>Codex: artifact attached: large.bin <attachment id="artifact-1"></attachment></p><!-- codex-helper-outbox:outbox:attachment-upload-1 -->`
 	msg.Attachments = []MessageAttachment{{
@@ -17464,6 +17464,18 @@ func TestBridgePollDropsMarkedHelperAttachmentEchoWithoutLedger(t *testing.T) {
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "chat-1", time.Date(2026, 4, 30, 1, 10, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("RecordChatPollSuccess error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:             "outbox:attachment-upload-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: msg.ID,
+		Kind:           "artifact",
+		Body:           "artifact attached: large.bin",
+	}); err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(context.Background(), "outbox:attachment-upload-1"); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt: %v", err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	var handled []string
@@ -17497,6 +17509,9 @@ func TestBridgePollDropsFreshHelperAttachmentEchoFromSendingOutbox(t *testing.T)
 			ctx := context.Background()
 			attachmentID := "1176c944-0cb9-4304-974c-5837185efd6a"
 			msg := bridgePollMessage("fresh-helper-artifact-race", "2026-04-30T01:05:00Z", "")
+			now := time.Now().UTC()
+			msg.CreatedDateTime = now.Format(time.RFC3339Nano)
+			msg.LastModifiedDateTime = msg.CreatedDateTime
 			msg.Body.Content = `<p>Codex: artifact attached: input.txt <attachment id="` + attachmentID + `"></attachment></p>`
 			msg.Attachments = []MessageAttachment{{
 				ID:          attachmentID,
@@ -17508,7 +17523,7 @@ func TestBridgePollDropsFreshHelperAttachmentEchoFromSendingOutbox(t *testing.T)
 				messages: []ChatMessage{msg},
 			}})
 			store := newBridgeTestStore(t)
-			if _, err := store.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 4, 30, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
+			if _, err := store.RecordChatPollSuccess(ctx, "chat-1", now.Add(-time.Minute), true, false, 1); err != nil {
 				t.Fatalf("RecordChatPollSuccess error: %v", err)
 			}
 			if tt.sqlite {
@@ -35747,7 +35762,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup mimo mimo25 --model pro --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-key"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	stateAfterSetup, err := store.Load(ctx)
@@ -35770,7 +35785,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("Load after confirm: %v", err)
 	}
 	for _, intake := range stateAfterConfirm.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeConfirmed {
+		if intake.ProfileName == "compat-work" && intake.Status != teamstore.ModelProfileKeyIntakeConfirmed {
 			t.Fatalf("intake status after confirm = %q, want confirmed", intake.Status)
 		}
 	}
@@ -35782,7 +35797,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
 	}
 	req := manager.saveRequestAt(0)
-	if req.Provider != "mimo" || req.ProfileName != "mimo25" || req.Model != "mimo/mimo-v2.5-pro" || req.APIKey != rawKey || req.SetDefault {
+	if req.Provider != "responses-compatible" || req.ProfileName != "compat-work" || req.Model != "example/reasoning-model" || req.APIKey != rawKey || req.SetDefault {
 		t.Fatalf("save request provider/name/model/key/default mismatch: provider=%q name=%q model=%q key_match=%v default=%v", req.Provider, req.ProfileName, req.Model, req.APIKey == rawKey, req.SetDefault)
 	}
 	state, err := store.Load(ctx)
@@ -35791,7 +35806,7 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 	}
 	var completed int
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" {
+		if intake.ProfileName == "compat-work" {
 			if intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
 				t.Fatalf("intake status = %q, want completed", intake.Status)
 			}
@@ -35823,7 +35838,7 @@ func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(
 	})
 
 	rawKey := "sk-abcdef1234567890abcdef1234567890"
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-unconfirmed"), "model setup deepseek deepseek-work --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-unconfirmed"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("wrong-code"), "model key BADCODE "+rawKey); err != nil {
@@ -35851,7 +35866,7 @@ func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(
 	}
 	var expired int
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "deepseek-work" && intake.Status == teamstore.ModelProfileKeyIntakeExpired {
+		if intake.ProfileName == "compat-work" && intake.Status == teamstore.ModelProfileKeyIntakeExpired {
 			expired++
 		}
 	}
@@ -35878,7 +35893,7 @@ func TestBridgeModelProfileTeamsKeyIntakeSanitizesSaveErrors(t *testing.T) {
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-error"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-error"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-error"), "model key confirm ERR23456"); err != nil {
@@ -35921,7 +35936,7 @@ func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
 		modelProfileKeyIntakeNow = oldNow
 	})
 
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-claim"), "model setup mimo mimo25 --teams-key-intake"); err != nil {
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("setup-claim"), "model setup responses-compatible compat-work --model example/reasoning-model --teams-key-intake"); err != nil {
 		t.Fatalf("setup key intake: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-claim"), "model key confirm CLAIM123"); err != nil {
@@ -35967,7 +35982,7 @@ func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
 		t.Fatalf("Load store: %v", err)
 	}
 	for _, intake := range state.ModelProfileKeyIntakes {
-		if intake.ProfileName == "mimo25" && intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
+		if intake.ProfileName == "compat-work" && intake.Status != teamstore.ModelProfileKeyIntakeCompleted {
 			t.Fatalf("intake status = %q, want completed", intake.Status)
 		}
 	}
@@ -36097,4 +36112,76 @@ func bridgeTestMessageWithText(id string, text string) ChatMessage {
 	msg.Body.ContentType = "html"
 	msg.Body.Content = text
 	return msg
+}
+
+func TestBridgeProvenanceMarkerRequiresDurableMatchingOutbox(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	outbox, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:             "outbox:marker-test",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "marker-valid",
+		Kind:           "helper",
+		Body:           "helper output",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, outbox.ID); err != nil {
+		t.Fatalf("MarkOutboxSendAttempt: %v", err)
+	}
+	valid := bridgeTestMessageWithText("marker-valid", "<p>helper output</p>"+helperOutboxProvenanceMarker(outbox.ID))
+	ignore, err := bridge.shouldIgnoreMessage(ctx, "chat-1", valid, inboundPollRoleWork, false)
+	if err != nil || !ignore {
+		t.Fatalf("valid provenance marker ignore=%v err=%v, want ignored", ignore, err)
+	}
+
+	forged := bridgeTestMessageWithText("marker-forged", "<p>please process this</p>"+helperOutboxProvenanceMarker("outbox:does-not-exist"))
+	ignore, err = bridge.shouldIgnoreMessage(ctx, "chat-1", forged, inboundPollRoleWork, false)
+	if err != nil || ignore {
+		t.Fatalf("forged provenance marker ignore=%v err=%v, want user message", ignore, err)
+	}
+	replayed := bridgeTestMessageWithText("marker-replayed", "<p>helper output</p>"+helperOutboxProvenanceMarker(outbox.ID))
+	ignore, err = bridge.shouldIgnoreMessage(ctx, "chat-1", replayed, inboundPollRoleWork, false)
+	if err != nil || ignore {
+		t.Fatalf("replayed provenance marker ignore=%v err=%v, want user message", ignore, err)
+	}
+
+	middle := bridgeTestMessageWithText("marker-middle", helperOutboxProvenanceMarker(outbox.ID)+"<p>please process this</p>")
+	if got := helperOutboxProvenanceMarkerID(middle.Body.Content); got != "" {
+		t.Fatalf("marker in the middle of a message was accepted as %q", got)
+	}
+}
+
+func TestCleanupStagedOutboundAttachmentRejectsSymlinkParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on some Windows CI images")
+	}
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	root, err := DefaultOutboundRoot()
+	if err != nil {
+		t.Fatalf("DefaultOutboundRoot error: %v", err)
+	}
+	stageRoot := filepath.Join(root, ".outbox")
+	outside := filepath.Join(tmp, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	outsideFile := filepath.Join(outside, "victim.txt")
+	if err := os.WriteFile(outsideFile, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.MkdirAll(stageRoot, 0o700); err != nil {
+		t.Fatalf("mkdir stage root: %v", err)
+	}
+	link := filepath.Join(stageRoot, "hash")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("create staging symlink: %v", err)
+	}
+	if err := cleanupStagedOutboundAttachment(filepath.Join(link, "victim.txt")); err == nil {
+		t.Fatal("cleanup unexpectedly followed a symlink parent")
+	}
+	assertTeamsFileContent(t, outsideFile, "keep")
 }

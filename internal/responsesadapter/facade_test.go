@@ -234,6 +234,102 @@ func TestFacadeKeepsPublicModelWhenProviderUsesUpstreamModel(t *testing.T) {
 	}
 }
 
+func TestFacadeRoutesCatalogNativeToolAndSourcePolicy(t *testing.T) {
+	adapter := &recordingAdapter{events: []ProviderEvent{
+		{Kind: ProviderEventTextDelta, Delta: "searched"},
+		{Kind: ProviderEventSource, Source: &SourceCitation{Type: "url_citation", URL: "https://example.test/result", Title: "Result"}},
+		{Kind: ProviderEventDone},
+	}}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{
+		DefaultProvider: "mimo",
+		ProxyKeys:       map[string]string{"mimo-key": "mimo"},
+		Providers: []ProviderConfig{{
+			ID: "mimo", ProfileID: "mimo-chat", APIKey: "synthetic", DefaultModel: "mimo/mimo-v2.5",
+			Models: []ModelInfo{{ID: "mimo/mimo-v2.5", UpstreamID: "mimo-v2.5"}}, Adapter: adapter,
+			UnsupportedToolPolicy: "error",
+			NativeTools:           []NativeToolSpec{{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search", AllowedFields: []string{"search_context_size"}}},
+			SourcePolicy:          SourcePolicy{Mode: "annotations", RequireURL: true},
+		}},
+	})
+	facade := &Facade{Router: registry, Store: NewMemoryStore(), NewID: func(string) (string, error) { return "resp_native", nil }}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"mimo/mimo-v2.5","input":"find it","tools":[{"type":"web_search_preview","search_context_size":"high"}]}`))
+	req.Header.Set("Authorization", "Bearer mimo-key")
+	req.Header.Set("x-codex-thread-id", "native-thread")
+	rec := httptest.NewRecorder()
+	facade.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(adapter.requests) != 1 || len(adapter.requests[0].NativeTools) != 1 || adapter.requests[0].NativeTools[0].UpstreamType != "web_search" {
+		t.Fatalf("native tool was not forwarded: %#v", adapter.requests)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	output, _ := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%#v", response["output"])
+	}
+	content, _ := output[0].(map[string]any)["content"].([]any)
+	if len(content) != 1 || len(content[0].(map[string]any)["annotations"].([]any)) != 1 {
+		t.Fatalf("source annotation missing: %#v", output)
+	}
+}
+
+func TestFacadeRejectsUnsupportedResponsesFieldsFromCatalogPolicy(t *testing.T) {
+	adapter := &recordingAdapter{events: []ProviderEvent{{Kind: ProviderEventTextDelta, Delta: "should not run"}, {Kind: ProviderEventDone}}}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{
+		DefaultProvider: "mimo", ProxyKeys: map[string]string{"mimo-key": "mimo"},
+		Providers: []ProviderConfig{{ID: "mimo", ProfileID: "mimo", APIKey: "synthetic", DefaultModel: "mimo-v2.5", Models: []ModelInfo{{ID: "mimo-v2.5"}}, Adapter: adapter, ResponsesPolicy: ResponsesPolicy{PreviousResponseID: "unsupported", Background: "unsupported", ContextManagement: "unsupported"}}},
+	})
+	facade := &Facade{Router: registry, Store: NewMemoryStore(), NewID: func(string) (string, error) { return "resp_policy", nil }}
+	for name, body := range map[string]string{
+		"previous response":  `{"model":"mimo-v2.5","previous_response_id":"resp_old","input":"x"}`,
+		"background":         `{"model":"mimo-v2.5","background":true,"input":"x"}`,
+		"context management": `{"model":"mimo-v2.5","context_management":{"type":"compact"},"input":"x"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer mimo-key")
+			rec := httptest.NewRecorder()
+			facade.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "does not support") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if len(adapter.requests) != 0 {
+		t.Fatalf("unsupported requests reached adapter: %#v", adapter.requests)
+	}
+}
+
+func TestFacadeRejectsUnimplementedDelegatedResponsesFields(t *testing.T) {
+	adapter := &recordingAdapter{events: []ProviderEvent{{Kind: ProviderEventTextDelta, Delta: "should not run"}, {Kind: ProviderEventDone}}}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{
+		DefaultProvider: "mimo", ProxyKeys: map[string]string{"mimo-key": "mimo"},
+		Providers: []ProviderConfig{{ID: "mimo", ProfileID: "mimo", APIKey: "synthetic", DefaultModel: "mimo-v2.5", Models: []ModelInfo{{ID: "mimo-v2.5"}}, Adapter: adapter, ResponsesPolicy: ResponsesPolicy{Background: "delegated", ContextManagement: "delegated"}}},
+	})
+	facade := &Facade{Router: registry, Store: NewMemoryStore(), NewID: func(string) (string, error) { return "resp_delegated", nil }}
+	for name, body := range map[string]string{
+		"background":         `{"model":"mimo-v2.5","background":true,"input":"x"}`,
+		"context management": `{"model":"mimo-v2.5","context_management":{"type":"compact"},"input":"x"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer mimo-key")
+			rec := httptest.NewRecorder()
+			facade.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "marked delegated") {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if len(adapter.requests) != 0 {
+		t.Fatalf("delegated requests reached adapter: %#v", adapter.requests)
+	}
+}
+
 func TestFacadeExposesReusableInstanceHealth(t *testing.T) {
 	facade := &Facade{InstanceID: "adapter-inst"}
 	req := httptest.NewRequest(http.MethodGet, "/_codex_proxy/health", nil)
@@ -1141,6 +1237,22 @@ func newTestFacade(store ResponseStore, adapter ProviderAdapter) *Facade {
 			next++
 			return prefix + "_00" + string(rune('0'+next)), nil
 		},
+	}
+}
+
+func TestFacadeForwardsExplicitConversionOperationFields(t *testing.T) {
+	adapter := &recordingAdapter{events: []ProviderEvent{{Kind: ProviderEventTextDelta, Delta: "middle"}, {Kind: ProviderEventDone}}}
+	facade := newTestFacade(NewMemoryStore(), adapter)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"model-a","operation":"fim","prefix":"before","suffix":"after"}`))
+	rec := httptest.NewRecorder()
+	facade.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	if len(adapter.requests) != 1 || adapter.requests[0].Operation != "fim" || adapter.requests[0].Prefix != "before" || adapter.requests[0].Suffix != "after" {
+		t.Fatalf("forwarded request = %#v", adapter.requests)
 	}
 }
 

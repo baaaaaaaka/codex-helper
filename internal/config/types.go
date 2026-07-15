@@ -48,7 +48,14 @@ type Config struct {
 	ModelProviders          map[string]ModelProvider   `json:"modelProviders,omitempty"`
 	Models                  map[string]ModelDefinition `json:"models,omitempty"`
 	ModelSources            map[string]ModelSource     `json:"modelSources,omitempty"`
-	TeamsCodexPath          TeamsCodexPathPolicy       `json:"teamsCodexPath,omitempty"`
+	// ModelCatalogs and ModelProviderBindings are the user-facing model
+	// configuration surface. Catalogs may be Git-backed or managed local JSON
+	// documents; provider bindings contain only local secret references and
+	// never raw credentials. The flattened model maps above are materialized
+	// runtime state owned by the catalog importer, not a second provider registry.
+	ModelCatalogs         map[string]ModelCatalog         `json:"modelCatalogs,omitempty"`
+	ModelProviderBindings map[string]ModelProviderBinding `json:"modelProviderBindings,omitempty"`
+	TeamsCodexPath        TeamsCodexPathPolicy            `json:"teamsCodexPath,omitempty"`
 }
 
 // GlobalDefaults contains explicit defaults shared by future launches and
@@ -64,14 +71,17 @@ type GlobalDefaults struct {
 const CurrentModelConfigVersion = 1
 
 type ModelSource struct {
-	Kind                    string    `json:"kind,omitempty"` // git, file, or directory
-	URL                     string    `json:"url"`
+	// Kind and Path describe a local split-catalog source. They are optional
+	// for Git-backed sources and are intentionally metadata-only: credentials
+	// remain in the local secret store.
+	Kind                    string    `json:"kind,omitempty"`
 	Path                    string    `json:"path,omitempty"`
+	Manifest                string    `json:"manifest,omitempty"`
+	Digest                  string    `json:"digest,omitempty"`
+	URL                     string    `json:"url"`
 	Ref                     string    `json:"ref,omitempty"`
 	File                    string    `json:"file,omitempty"`
-	Manifest                string    `json:"manifest,omitempty"`
 	Revision                string    `json:"revision,omitempty"`
-	Digest                  string    `json:"digest,omitempty"`
 	SyncedAt                time.Time `json:"syncedAt,omitempty"`
 	BackupActive            bool      `json:"backupActive,omitempty"`
 	BackupSince             time.Time `json:"backupSince,omitempty"`
@@ -110,35 +120,76 @@ type ModelHTTPPolicy struct {
 }
 
 type ModelStreamPolicy struct {
-	UpstreamMode       string `json:"upstreamMode,omitempty"`
-	Format             string `json:"format,omitempty"`
-	IdleTimeoutSeconds int    `json:"idleTimeoutSeconds,omitempty"`
-	// FirstEventTimeoutSeconds bounds the time to the first semantic provider
-	// event. Transport heartbeats/comments do not satisfy this bound.
-	FirstEventTimeoutSeconds int `json:"firstEventTimeoutSeconds,omitempty"`
-	// SemanticProgressTimeoutSeconds distinguishes a live transport from a
-	// provider that is no longer producing reasoning, text, tools, or usage.
-	SemanticProgressTimeoutSeconds int `json:"semanticProgressTimeoutSeconds,omitempty"`
-	// MaxDurationSeconds is a hard wall-clock deadline for a streamed request.
-	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
-	// HeartbeatMode is ignore, transport-only, or semantic. The latter lets
-	// provider-declared SSE heartbeats reset semantic-progress watchdogs.
-	HeartbeatMode          string `json:"heartbeatMode,omitempty"`
-	SynthesizeResponsesSSE *bool  `json:"synthesizeResponsesSSE,omitempty"`
-	ReasoningDeltaPath     string `json:"reasoningDeltaPath,omitempty"`
-	ReasoningTokensPath    string `json:"reasoningTokensPath,omitempty"`
-	CachedTokensPath       string `json:"cachedTokensPath,omitempty"`
+	UpstreamMode                   string `json:"upstreamMode,omitempty"`
+	Format                         string `json:"format,omitempty"`
+	IdleTimeoutSeconds             int    `json:"idleTimeoutSeconds,omitempty"`
+	FirstEventTimeoutSeconds       int    `json:"firstEventTimeoutSeconds,omitempty"`
+	SemanticProgressTimeoutSeconds int    `json:"semanticProgressTimeoutSeconds,omitempty"`
+	MaxDurationSeconds             int    `json:"maxDurationSeconds,omitempty"`
+	HeartbeatMode                  string `json:"heartbeatMode,omitempty"`
+	SynthesizeResponsesSSE         *bool  `json:"synthesizeResponsesSSE,omitempty"`
+	ReasoningDeltaPath             string `json:"reasoningDeltaPath,omitempty"`
+	ReasoningTokensPath            string `json:"reasoningTokensPath,omitempty"`
+	CachedTokensPath               string `json:"cachedTokensPath,omitempty"`
 }
 
 type ModelProvider struct {
-	Protocol   string            `json:"protocol"`
-	BaseURL    string            `json:"baseUrl"`
-	Credential string            `json:"credential,omitempty"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Endpoints  map[string]string `json:"endpoints,omitempty"`
-	HTTP       ModelHTTPPolicy   `json:"http,omitempty"`
-	Stream     ModelStreamPolicy `json:"stream,omitempty"`
-	SSHProxy   string            `json:"sshProxy,omitempty"`
+	// Protocol/BaseURL remain the compiled default interface used by the
+	// existing runtime. Interfaces contains the complete catalog v2 transport
+	// map; it is never populated from arbitrary request fragments.
+	Protocol             string                    `json:"protocol"`
+	BaseURL              string                    `json:"baseUrl"`
+	Credential           string                    `json:"credential,omitempty"`
+	Headers              map[string]string         `json:"headers,omitempty"`
+	Endpoints            map[string]string         `json:"endpoints,omitempty"`
+	HTTP                 ModelHTTPPolicy           `json:"http,omitempty"`
+	Stream               ModelStreamPolicy         `json:"stream,omitempty"`
+	SSHProxy             string                    `json:"sshProxy,omitempty"`
+	DefaultInterface     string                    `json:"defaultInterface,omitempty"`
+	AdapterProfile       string                    `json:"adapterProfile,omitempty"`
+	ConversionProfile    string                    `json:"conversionProfile,omitempty"`
+	StrictConversion     bool                      `json:"strictConversion,omitempty"`
+	Operation            string                    `json:"operation,omitempty"`
+	Interfaces           map[string]ModelInterface `json:"interfaces,omitempty"`
+	InterfaceCredentials map[string]string         `json:"interfaceCredentials,omitempty"`
+}
+
+// ModelInterface is one concrete upstream API surface. The adapter name is
+// selected from the compiled adapter registry; catalogs cannot provide
+// executable request templates or arbitrary headers.
+type ModelInterface struct {
+	Adapter    string             `json:"adapter"`
+	Protocol   string             `json:"protocol,omitempty"`
+	BaseURL    string             `json:"baseUrl"`
+	Conversion ModelConversion    `json:"conversion,omitempty"`
+	Auth       ModelInterfaceAuth `json:"auth,omitempty"`
+	Headers    map[string]string  `json:"headers,omitempty"`
+	Endpoints  map[string]string  `json:"endpoints,omitempty"`
+	HTTP       ModelHTTPPolicy    `json:"http,omitempty"`
+	Stream     ModelStreamPolicy  `json:"stream,omitempty"`
+}
+
+// ModelConversion selects a compiled, versioned wire-protocol converter.
+// Catalogs may select a converter by name, but cannot provide executable
+// templates or scripts. Strict defaults to true when conversion is enabled so
+// an unsupported operation fails closed instead of silently falling back to a
+// different protocol.
+type ModelConversion struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	Profile string `json:"profile,omitempty"`
+	Strict  *bool  `json:"strict,omitempty"`
+}
+
+func (c ModelConversion) EffectiveStrict() bool {
+	if c.Strict != nil {
+		return *c.Strict
+	}
+	return c.Enabled
+}
+
+type ModelInterfaceAuth struct {
+	Type   string `json:"type,omitempty"`
+	Header string `json:"header,omitempty"`
 }
 
 // OptionalBool is a tri-state value: nil inherits, true enables and false
@@ -152,12 +203,10 @@ type ModelCapabilities struct {
 	NativeWebSearch  *bool `json:"nativeWebSearch,omitempty"`
 }
 
-// ModelCapabilityModes preserves the provider-facing implementation mode that
-// a schema-v2 catalog declared. The legacy boolean fields above answer whether
-// a capability is usable; these fields retain whether it is native, translated
-// by CXP, supplied by a plugin, advisory only, unsupported, or explicitly
-// unknown. Keeping both lets runtime code fail closed without losing the
-// declaration needed by catalog/status tooling.
+// ModelCapabilityModes preserves the explicit schema-v2 declaration. The
+// legacy tri-state booleans above are materialized for existing consumers;
+// modes retain whether support is native, translated, plugin, advisory,
+// unsupported, or unknown.
 type ModelCapabilityModes struct {
 	Tools            string `json:"tools,omitempty"`
 	ParallelTools    string `json:"parallelTools,omitempty"`
@@ -202,26 +251,11 @@ type ModelToolPolicy struct {
 	CustomToolMode        string `json:"customToolMode,omitempty"`
 }
 
-// ModelStructuredOutputPolicy records each Responses structured-output
-// format independently. Providers often support json_schema while returning
-// unusable output for json_object.
+// ModelStructuredOutputPolicy distinguishes json_object from json_schema;
+// providers commonly support one format reliably but not the other.
 type ModelStructuredOutputPolicy struct {
 	JSONObject string `json:"jsonObject,omitempty"`
 	JSONSchema string `json:"jsonSchema,omitempty"`
-}
-
-type ModelResponsesPolicy struct {
-	StructuredOutput ModelStructuredOutputPolicy `json:"structuredOutput,omitempty"`
-}
-
-// ModelRoute identifies the wire interface used for one operation. Routes
-// are kept separate from provider transport defaults so a future operation-
-// aware dispatcher can select an adapter without guessing from model names.
-type ModelRoute struct {
-	Interface  string `json:"interface"`
-	Adapter    string `json:"adapter"`
-	Protocol   string `json:"protocol"`
-	Conversion string `json:"conversion,omitempty"`
 }
 
 type ModelMessagePolicy struct {
@@ -229,6 +263,45 @@ type ModelMessagePolicy struct {
 	DeveloperRole       string `json:"developerRole,omitempty"`
 	MergeSystemMessages *bool  `json:"mergeSystemMessages,omitempty"`
 	Images              string `json:"images,omitempty"`
+	Audio               string `json:"audio,omitempty"`
+	Video               string `json:"video,omitempty"`
+}
+
+// ModelNativeTool describes a provider-owned tool whose wire shape is not a
+// function tool. The catalog selects a compiled adapter mapping; it cannot
+// inject an arbitrary request template.
+type ModelNativeTool struct {
+	InputTypes    []string `json:"inputTypes"`
+	UpstreamType  string   `json:"upstreamType"`
+	Name          string   `json:"name,omitempty"`
+	AllowedFields []string `json:"allowedFields,omitempty"`
+}
+
+// ModelSourcePolicy controls how provider search results are represented in
+// the Responses facade.
+type ModelSourcePolicy struct {
+	Mode           string `json:"mode,omitempty"`
+	RequireURL     bool   `json:"requireUrl,omitempty"`
+	RequireSources bool   `json:"requireSources,omitempty"`
+}
+
+// ModelResponsesPolicy advertises fields whose semantics differ between
+// provider APIs. A value of "unsupported" makes the facade fail closed.
+type ModelResponsesPolicy struct {
+	PreviousResponseID string                      `json:"previousResponseId,omitempty"`
+	Background         string                      `json:"background,omitempty"`
+	ContextManagement  string                      `json:"contextManagement,omitempty"`
+	StructuredOutput   ModelStructuredOutputPolicy `json:"structuredOutput,omitempty"`
+}
+
+// ModelRoute selects a compiled wire adapter for one operation. It is kept
+// separate from the provider's default interface so the catalog can declare
+// operation-specific protocol conversion without executable templates.
+type ModelRoute struct {
+	Interface  string `json:"interface"`
+	Adapter    string `json:"adapter"`
+	Protocol   string `json:"protocol"`
+	Conversion string `json:"conversion,omitempty"`
 }
 
 type ModelSamplingPolicy struct {
@@ -243,6 +316,28 @@ type ModelCachePolicy struct {
 	UsageField         string `json:"usageField,omitempty"`
 }
 
+// ModelFeature describes one named capability and, when needed, the
+// interface through which that capability is available. Support is one of
+// native, translated, plugin, or unsupported. This keeps capability
+// reporting and routing in one typed object instead of duplicating
+// search/operation flags.
+type ModelFeature struct {
+	Support        string                `json:"support"`
+	Interface      string                `json:"interface,omitempty"`
+	Operation      string                `json:"operation,omitempty"`
+	Fallback       *ModelFeatureFallback `json:"fallback,omitempty"`
+	RequireSources bool                  `json:"requireSources,omitempty"`
+	NativeTool     *ModelNativeTool      `json:"nativeTool,omitempty"`
+	Sources        *ModelSourcePolicy    `json:"sources,omitempty"`
+}
+
+type ModelFeatureFallback struct {
+	Selector string   `json:"selector"`
+	Effort   string   `json:"effort,omitempty"`
+	Tier     string   `json:"tier,omitempty"`
+	On       []string `json:"on,omitempty"`
+}
+
 type ModelSearchPolicy struct {
 	Native   *bool               `json:"native,omitempty"`
 	Fallback ModelSearchFallback `json:"fallback,omitempty"`
@@ -255,25 +350,27 @@ type ModelSearchFallback struct {
 }
 
 type ModelDefinition struct {
-	Provider        string                `json:"provider"`
-	UpstreamModel   string                `json:"upstreamModel"`
-	DisplayName     string                `json:"displayName,omitempty"`
-	Aliases         []string              `json:"aliases,omitempty"`
-	Description     string                `json:"description,omitempty"`
-	Priority        int                   `json:"priority,omitempty"`
-	Capabilities    ModelCapabilities     `json:"capabilities,omitempty"`
-	CapabilityModes ModelCapabilityModes  `json:"capabilityModes,omitempty"`
-	Limits          ModelLimits           `json:"limits,omitempty"`
-	Reasoning       ModelReasoningPolicy  `json:"reasoning,omitempty"`
-	Tools           ModelToolPolicy       `json:"tools,omitempty"`
-	Messages        ModelMessagePolicy    `json:"messages,omitempty"`
-	Sampling        ModelSamplingPolicy   `json:"sampling,omitempty"`
-	Stream          ModelStreamPolicy     `json:"stream,omitempty"`
-	HTTP            ModelHTTPPolicy       `json:"http,omitempty"`
-	Cache           ModelCachePolicy      `json:"cache,omitempty"`
-	Responses       ModelResponsesPolicy  `json:"responses,omitempty"`
-	Routes          map[string]ModelRoute `json:"routes,omitempty"`
-	Search          ModelSearchPolicy     `json:"search,omitempty"`
+	Provider         string                  `json:"provider"`
+	UpstreamModel    string                  `json:"upstreamModel"`
+	DefaultInterface string                  `json:"defaultInterface,omitempty"`
+	DisplayName      string                  `json:"displayName,omitempty"`
+	Aliases          []string                `json:"aliases,omitempty"`
+	Description      string                  `json:"description,omitempty"`
+	Priority         int                     `json:"priority,omitempty"`
+	Capabilities     ModelCapabilities       `json:"capabilities,omitempty"`
+	CapabilityModes  ModelCapabilityModes    `json:"capabilityModes,omitempty"`
+	Limits           ModelLimits             `json:"limits,omitempty"`
+	Reasoning        ModelReasoningPolicy    `json:"reasoning,omitempty"`
+	Tools            ModelToolPolicy         `json:"tools,omitempty"`
+	Messages         ModelMessagePolicy      `json:"messages,omitempty"`
+	Sampling         ModelSamplingPolicy     `json:"sampling,omitempty"`
+	Responses        ModelResponsesPolicy    `json:"responses,omitempty"`
+	Routes           map[string]ModelRoute   `json:"routes,omitempty"`
+	Stream           ModelStreamPolicy       `json:"stream,omitempty"`
+	HTTP             ModelHTTPPolicy         `json:"http,omitempty"`
+	Cache            ModelCachePolicy        `json:"cache,omitempty"`
+	Search           ModelSearchPolicy       `json:"search,omitempty"`
+	Features         map[string]ModelFeature `json:"features,omitempty"`
 }
 
 // TeamsCodexPathPolicy controls which executable search path is exposed to

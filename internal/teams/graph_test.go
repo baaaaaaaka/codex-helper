@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -496,8 +498,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPut, "/me/drive/root:/folder/bad%0Aname.txt:/content"},
 		{http.MethodGet, "/me/drive/items/item-id"},
 		{http.MethodGet, "/me/drive/items/item-id?$select=*"},
-		{http.MethodGet, "/me/drive/items/item%0Aevil?$select=id,name,eTag,webUrl,webDavUrl"},
-		{http.MethodGet, "/me/drive/items/item%2Fevil?$select=id,name,eTag,webUrl,webDavUrl"},
+		{http.MethodGet, "/me/drive/items/item%0Aevil?$select=id,name,size,eTag,webUrl,webDavUrl"},
+		{http.MethodGet, "/me/drive/items/item%2Fevil?$select=id,name,size,eTag,webUrl,webDavUrl"},
 		{http.MethodGet, "/chats/a/messages?$top=51"},
 		{http.MethodPost, "/chats/a/messages?$top=1"},
 		{http.MethodGet, "/chats/a/messages?$filter=createdDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
@@ -528,10 +530,10 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats/chat-id/unhideForUser"},
 		{http.MethodPost, "/chats/chat-id/markChatUnreadForUser"},
 		{http.MethodGet, "/chats/chat-id/messages/message-id/hostedContents/content-id/$value"},
-		{http.MethodGet, "/shares/u!abc/driveItem?$select=id,name,eTag,webUrl,webDavUrl,file"},
+		{http.MethodGet, "/shares/u!abc/driveItem?$select=id,name,size,eTag,webUrl,webDavUrl,file"},
 		{http.MethodGet, "/shares/u!abc/driveItem/content"},
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
-		{http.MethodGet, "/me/drive/items/item-id?$select=id,name,eTag,webUrl,webDavUrl"},
+		{http.MethodGet, "/me/drive/items/item-id?$select=id,name,size,eTag,webUrl,webDavUrl"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$skiptoken=abc123"},
 		{http.MethodPost, "/chats/chat-id/messages"},
@@ -546,7 +548,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 
 func TestGraphListChats(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodGet || r.URL.Path != "/me/chats" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
@@ -1080,7 +1083,7 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"id":"item-1","name":"file.txt"}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/me/drive/items/item-1":
 			sawMetadata = true
-			if r.URL.Query().Get("$select") != "id,name,eTag,webUrl,webDavUrl" {
+			if r.URL.Query().Get("$select") != "id,name,size,eTag,webUrl,webDavUrl" {
 				t.Fatalf("metadata query = %q", r.URL.RawQuery)
 			}
 			_, _ = fmt.Fprint(w, `{"id":"item-1","name":"file.txt","eTag":"\"{1176C944-0CB9-4304-974C-5837185EFD6A},1\"","webDavUrl":"https://contoso.sharepoint.com/file.txt"}`)
@@ -1629,6 +1632,44 @@ func TestGraphUploadDriveItemFromFileRetriesTransientUploadChunk(t *testing.T) {
 	}
 }
 
+func TestGraphUploadDriveItemFromFileRetriesTransportFailureForSimplePut(t *testing.T) {
+	var attempts int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, errors.New("simulated connection reset")
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer access" {
+				t.Fatalf("simple upload authorization = %q", got)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"item-simple-retry","name":"small.txt"}`)),
+				Request:    r,
+			}, nil
+		})},
+		baseURL:            "https://graph.example.test",
+		transferMaxRetries: 1,
+		sleep:              func(context.Context, time.Duration) error { return nil },
+		jitter:             func(d time.Duration) time.Duration { return d },
+		singlePutMaxBytes:  10,
+	}
+	filePath := filepath.Join(t.TempDir(), "small.txt")
+	if err := os.WriteFile(filePath, []byte("small"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	item, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "small.txt", filePath, 5, "text/plain")
+	if err != nil {
+		t.Fatalf("simple upload retry error: %v", err)
+	}
+	if item.ID != "item-simple-retry" || attempts != 2 {
+		t.Fatalf("item=%#v attempts=%d, want one retry", item, attempts)
+	}
+}
+
 func TestGraphUploadDriveItemFromFileResumesAfterRangeConflict(t *testing.T) {
 	var puts, statusGets int
 	var server *httptest.Server
@@ -1671,6 +1712,211 @@ func TestGraphUploadDriveItemFromFileResumesAfterRangeConflict(t *testing.T) {
 	}
 }
 
+func TestGraphUploadDriveItemFromFilePersistsSessionCheckpoint(t *testing.T) {
+	var puts int
+	var checkpoints []driveUploadSessionCheckpoint
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q,"expirationDateTime":%q}`, server.URL+"/upload-session", time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upload chunk: %v", err)
+			}
+			wantRange := []string{"bytes 0-3/8", "bytes 4-7/8"}
+			if puts > len(wantRange) || r.Header.Get("Content-Range") != wantRange[puts-1] {
+				t.Fatalf("PUT %d Content-Range = %q", puts, r.Header.Get("Content-Range"))
+			}
+			if string(body) != string([]byte("01234567"))[(puts-1)*4:puts*4] {
+				t.Fatalf("PUT %d body = %q", puts, body)
+			}
+			if puts == 1 {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["4-"]}`)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-checkpoint","name":"checkpoint.bin","size":8}`)
+		default:
+			t.Fatalf("unexpected checkpoint upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "checkpoint.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	item, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "checkpoint.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, nil, func(checkpoint driveUploadSessionCheckpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("checkpoint upload error: %v", err)
+	}
+	if item.ID != "item-checkpoint" || puts != 2 {
+		t.Fatalf("item=%#v puts=%d, want completed two-chunk upload", item, puts)
+	}
+	if len(checkpoints) != 3 || checkpoints[0].Offset != 0 || checkpoints[1].Offset != 4 || checkpoints[2].Offset != 8 {
+		t.Fatalf("checkpoints = %#v, want offsets 0, 4, 8", checkpoints)
+	}
+	for _, checkpoint := range checkpoints {
+		if checkpoint.UploadURL != server.URL+"/upload-session" || checkpoint.ExpirationDateTime == "" {
+			t.Fatalf("checkpoint missing session identity/expiry: %#v", checkpoint)
+		}
+	}
+}
+
+func TestGraphUploadDriveItemFromFileResumesPersistedSessionCheckpoint(t *testing.T) {
+	var posts, statusGets, puts int
+	var persisted []driveUploadSessionCheckpoint
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			posts++
+			t.Fatalf("resuming checkpoint unexpectedly created a new upload session")
+		case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+			statusGets++
+			if got := r.Header.Get("Authorization"); got != "" {
+				t.Fatalf("upload session status query forwarded Graph Authorization: %q", got)
+			}
+			_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["4-"]}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			if got := r.Header.Get("Content-Range"); got != "bytes 4-7/8" {
+				t.Fatalf("resumed Content-Range = %q, want bytes 4-7/8", got)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read resumed upload chunk: %v", err)
+			}
+			if string(body) != "4567" {
+				t.Fatalf("resumed upload body = %q, want 4567", body)
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-resumed-checkpoint","name":"checkpoint.bin","size":8}`)
+		default:
+			t.Fatalf("unexpected persisted checkpoint request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "checkpoint.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	item, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "checkpoint.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, &driveUploadSessionCheckpoint{
+		UploadURL:          server.URL + "/upload-session",
+		ExpirationDateTime: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+		Offset:             0,
+	}, func(checkpoint driveUploadSessionCheckpoint) error {
+		persisted = append(persisted, checkpoint)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("persisted checkpoint resume error: %v", err)
+	}
+	if item.ID != "item-resumed-checkpoint" || posts != 0 || statusGets != 1 || puts != 1 {
+		t.Fatalf("item=%#v posts=%d statusGets=%d puts=%d, want status query plus one resumed PUT", item, posts, statusGets, puts)
+	}
+	if len(persisted) != 2 || persisted[0].Offset != 4 || persisted[1].Offset != 8 {
+		t.Fatalf("persisted checkpoints = %#v, want offsets 4, 8", persisted)
+	}
+}
+
+func TestGraphUploadDriveItemFromFileRejectsUploadSessionOffsetRollback(t *testing.T) {
+	var puts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut:
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body)
+			if puts == 1 {
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["4-"]}`)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["2-"]}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "rollback.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	if _, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "rollback.bin", filePath, 8, "application/octet-stream"); err == nil || !strings.Contains(err.Error(), "moved backward") {
+		t.Fatalf("rollback upload error = %v, want fail-closed offset error", err)
+	}
+	if puts != 2 {
+		t.Fatalf("upload PUTs = %d, want exactly two chunks before rejecting rollback", puts)
+	}
+}
+
+func TestGraphUploadDriveItemFromFileRecreatesExpiredUploadSessionBoundedly(t *testing.T) {
+	var sessions, puts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			sessions++
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+fmt.Sprintf("/upload-session/%d", sessions))
+		case r.Method == http.MethodPut:
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body)
+			if strings.HasSuffix(r.URL.Path, "/1") {
+				http.Error(w, `{"error":{"code":"uploadSessionExpired"}}`, http.StatusNotFound)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-recreated","name":"recreated.bin","size":5}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "recreated.bin")
+	if err := os.WriteFile(filePath, []byte("12345"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 8
+	graph.transferMaxRetries = 1
+	graph.sleep = func(context.Context, time.Duration) error { return nil }
+	item, err := graph.UploadDriveItemFromFile(context.Background(), "folder", "recreated.bin", filePath, 5, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("expired upload session recovery error: %v", err)
+	}
+	if item.ID != "item-recreated" || sessions != 2 || puts != 2 {
+		t.Fatalf("item=%#v sessions=%d PUTs=%d, want one bounded session recreation", item, sessions, puts)
+	}
+}
+
 func TestGraphFileTransferDoesNotUseWholeRequestClientTimeout(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1710,6 +1956,26 @@ func TestGraphFileTransferDoesNotUseWholeRequestClientTimeout(t *testing.T) {
 	}
 }
 
+func TestGraphFileTransferReusesItsTransportPool(t *testing.T) {
+	base := &http.Client{Transport: http.DefaultTransport, Timeout: 30 * time.Second}
+	graph := &GraphClient{client: base}
+	first := graph.transferHTTPClient()
+	second := graph.transferHTTPClient()
+	if first != second || first.Transport != second.Transport {
+		t.Fatalf("transfer client/transport was recreated: first=%p/%p second=%p/%p", first, first.Transport, second, second.Transport)
+	}
+	if first.Timeout != 0 {
+		t.Fatalf("transfer client Timeout=%s, want zero whole-transfer timeout", first.Timeout)
+	}
+	transport, ok := first.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transfer transport type = %T, want *http.Transport", first.Transport)
+	}
+	if transport.MaxConnsPerHost != 4 || transport.MaxIdleConnsPerHost != 4 {
+		t.Fatalf("transfer host connection limits = %d/%d, want 4/4", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+}
+
 func TestGraphDownloadSharedDriveItemContentToFileStreamsPastClientTimeout(t *testing.T) {
 	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
 	wantPath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem/content"
@@ -1745,12 +2011,275 @@ func TestGraphDownloadSharedDriveItemContentToFileStreamsPastClientTimeout(t *te
 	}
 }
 
+func TestGraphDownloadSharedDriveItemContentResumesPartialRange(t *testing.T) {
+	data := []byte("0123456789")
+	var graphRequests, downloadRequests int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/shares/") && strings.HasSuffix(r.URL.Path, "/driveItem/content"):
+			graphRequests++
+			w.Header().Set("Location", server.URL+"/preauth")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/preauth":
+			downloadRequests++
+			switch downloadRequests {
+			case 1:
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+				_, _ = w.Write(data[:3])
+			case 2:
+				if got := r.Header.Get("Range"); got != "bytes=3-" {
+					t.Fatalf("resume Range = %q, want bytes=3-", got)
+				}
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Content-Range", "bytes 3-9/10")
+				w.Header().Set("Content-Length", "7")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[3:])
+			default:
+				t.Fatalf("unexpected extra preauthenticated download request: %d", downloadRequests)
+			}
+		default:
+			t.Fatalf("unexpected download request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.transferMaxRetries = 1
+	destination := filepath.Join(t.TempDir(), "resumed.txt")
+	contentType, size, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), "https://contoso.sharepoint.com/file.txt", destination)
+	if err != nil {
+		t.Fatalf("resumable download error: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read resumed download: %v", err)
+	}
+	if string(got) != string(data) || size != int64(len(data)) || contentType != "text/plain" {
+		t.Fatalf("download result type=%q size=%d data=%q", contentType, size, got)
+	}
+	if graphRequests != 2 || downloadRequests != 2 {
+		t.Fatalf("Graph resolve requests=%d preauth requests=%d, want two each", graphRequests, downloadRequests)
+	}
+	if _, err := os.Stat(destination + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("partial file was not atomically cleaned up: %v", err)
+	}
+	if _, err := os.Stat(destination + ".part.meta"); !os.IsNotExist(err) {
+		t.Fatalf("partial metadata was not cleaned up: %v", err)
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentRefreshesExpiredPreauthenticatedURL(t *testing.T) {
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
+	var graphResolves, preauthRequests int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/shares/"):
+			graphResolves++
+			w.Header().Set("Location", server.URL+"/preauth")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/preauth":
+			preauthRequests++
+			if preauthRequests == 1 {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = fmt.Fprint(w, "fresh-url-content")
+		default:
+			t.Fatalf("unexpected download request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.transferMaxRetries = 1
+	destination := filepath.Join(t.TempDir(), "fresh-url.txt")
+	_, size, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), rawURL, destination)
+	if err != nil {
+		t.Fatalf("expired preauthenticated URL recovery error: %v", err)
+	}
+	data, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read refreshed download: %v", err)
+	}
+	if string(data) != "fresh-url-content" || size != int64(len(data)) || graphResolves != 2 || preauthRequests != 2 {
+		t.Fatalf("data=%q size=%d Graph resolves=%d preauth requests=%d, want fresh URL retry", data, size, graphResolves, preauthRequests)
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentResumesCrashPartialWithMetadata(t *testing.T) {
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
+	want := []byte("0123456789")
+	var preauthRequests int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/shares/"):
+			w.Header().Set("Location", server.URL+"/preauth")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/preauth":
+			preauthRequests++
+			w.Header().Set("Content-Type", "application/octet-stream")
+			switch preauthRequests {
+			case 1:
+				w.Header().Set("Content-Range", "bytes 0-9/10")
+				w.Header().Set("Content-Length", "10")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(want[:3])
+			case 2:
+				if got := r.Header.Get("Range"); got != "bytes=3-" {
+					t.Fatalf("resumed Range = %q, want bytes=3-", got)
+				}
+				w.Header().Set("Content-Range", "bytes 3-9/10")
+				w.Header().Set("Content-Length", "7")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(want[3:])
+			default:
+				t.Fatalf("unexpected extra preauthenticated request: %d", preauthRequests)
+			}
+		default:
+			t.Fatalf("unexpected download request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.transferMaxRetries = 0
+	destination := filepath.Join(t.TempDir(), "crash-resume.bin")
+	if _, _, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), rawURL, destination); err == nil {
+		t.Fatal("short first response unexpectedly succeeded")
+	}
+	partial, err := os.ReadFile(destination + ".part")
+	if err != nil || string(partial) != string(want[:3]) {
+		t.Fatalf("preserved partial = %q err=%v, want first 3 bytes", partial, err)
+	}
+	if _, err := os.Stat(destination + ".part.meta"); err != nil {
+		t.Fatalf("preserved partial metadata missing: %v", err)
+	}
+	_, size, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), rawURL, destination)
+	if err != nil {
+		t.Fatalf("crash partial resume error: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read resumed crash partial: %v", err)
+	}
+	if string(got) != string(want) || size != int64(len(want)) || preauthRequests != 2 {
+		t.Fatalf("resumed data=%q size=%d preauth requests=%d, want complete file", got, size, preauthRequests)
+	}
+	for _, suffix := range []string{".part", ".part.meta", ".part.lock"} {
+		if _, err := os.Stat(destination + suffix); !os.IsNotExist(err) {
+			t.Fatalf("download residue %q remains: %v", suffix, err)
+		}
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentRejectsConcurrentDestinationWriter(t *testing.T) {
+	destination := filepath.Join(t.TempDir(), "locked.bin")
+	lock := flock.New(destination + ".part.lock")
+	locked, err := lock.TryLock()
+	if err != nil || !locked {
+		t.Fatalf("acquire test destination lock: locked=%v err=%v", locked, err)
+	}
+	defer func() {
+		_ = lock.Unlock()
+		_ = os.Remove(destination + ".part.lock")
+	}()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("concurrent download reached Graph: %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	if _, _, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), "https://contoso.sharepoint.com/file.bin", destination); err == nil || !strings.Contains(err.Error(), "already being written") {
+		t.Fatalf("concurrent destination error = %v, want lock rejection", err)
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentRetriesShortPartialResponse(t *testing.T) {
+	data := []byte("0123456789")
+	var downloadRequests int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/shares/"):
+			w.Header().Set("Location", server.URL+"/preauth")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/preauth":
+			downloadRequests++
+			w.Header().Set("Content-Type", "application/octet-stream")
+			switch downloadRequests {
+			case 1:
+				w.Header().Set("Content-Range", "bytes 0-9/10")
+				w.Header().Set("Content-Length", "10")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[:3])
+			case 2:
+				if got := r.Header.Get("Range"); got != "bytes=3-" {
+					t.Fatalf("retry Range = %q, want bytes=3-", got)
+				}
+				w.Header().Set("Content-Range", "bytes 3-9/10")
+				w.Header().Set("Content-Length", "7")
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[3:])
+			default:
+				t.Fatalf("unexpected extra preauthenticated download request: %d", downloadRequests)
+			}
+		default:
+			t.Fatalf("unexpected download request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.transferMaxRetries = 1
+	destination := filepath.Join(t.TempDir(), "short-partial.bin")
+	_, size, err := graph.DownloadSharedDriveItemContentToFile(context.Background(), "https://contoso.sharepoint.com/file.bin", destination)
+	if err != nil {
+		t.Fatalf("short partial download error: %v", err)
+	}
+	got, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read short partial download: %v", err)
+	}
+	if string(got) != string(data) || size != int64(len(data)) || downloadRequests != 2 {
+		t.Fatalf("downloaded data=%q size=%d requests=%d", got, size, downloadRequests)
+	}
+}
+
+func TestParseUploadSessionOffsetFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ranges []string
+		total  int64
+	}{
+		{name: "empty", ranges: nil, total: 10},
+		{name: "malformed", ranges: []string{"not-a-range"}, total: 10},
+		{name: "negative", ranges: []string{"-1-"}, total: 10},
+		{name: "past end", ranges: []string{"11-"}, total: 10},
+		{name: "bad end", ranges: []string{"5-4"}, total: 10},
+		{name: "end past file", ranges: []string{"5-10"}, total: 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := parseUploadSessionOffset(tc.ranges, tc.total); err == nil {
+				t.Fatalf("parseUploadSessionOffset(%#v, %d) unexpectedly succeeded", tc.ranges, tc.total)
+			}
+		})
+	}
+	if got, err := parseUploadSessionOffset([]string{"8-"}, 10); err != nil || got != 8 {
+		t.Fatalf("valid upload session offset = %d, %v; want 8", got, err)
+	}
+}
+
 func TestGraphGetSharedDriveItemMetadataReturnsNameAndMimeType(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/file.txt"
 	wantPath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.EscapedPath() != wantPath || r.URL.Query().Get("$select") != "id,name,eTag,webUrl,webDavUrl,file" {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != wantPath || r.URL.Query().Get("$select") != "id,name,size,eTag,webUrl,webDavUrl,file" {
 			t.Fatalf("unexpected request: %s %s want %s", r.Method, r.URL.String(), wantPath)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1956,6 +2485,13 @@ func TestGraphControlTimeoutIsNotInheritedByFileTransfers(t *testing.T) {
 	}
 	if got := graph.transferIdle(); got != defaultTransferIdleTimeout {
 		t.Fatalf("transfer idle timeout = %s, want %s", got, defaultTransferIdleTimeout)
+	}
+	transport, ok := graph.transferHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transfer transport = %T, want *http.Transport", graph.transferHTTPClient().Transport)
+	}
+	if transport.TLSHandshakeTimeout != defaultTransferDialTimeout || transport.ResponseHeaderTimeout != defaultTransferHeaderTimeout {
+		t.Fatalf("transfer transport timeouts = TLS %s/header %s, want TLS %s/header %s", transport.TLSHandshakeTimeout, transport.ResponseHeaderTimeout, defaultTransferDialTimeout, defaultTransferHeaderTimeout)
 	}
 }
 

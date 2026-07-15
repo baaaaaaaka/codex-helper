@@ -1,6 +1,7 @@
 package responsesadapter
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -120,22 +121,22 @@ func TestProviderRegistryRequiresExplicitProviderForAmbiguousModel(t *testing.T)
 	}
 }
 
-func TestProviderRegistryInfersMimoBaseURLAndFingerprints(t *testing.T) {
+func TestProviderRegistryRequiresExplicitExternalBaseURLAndFingerprints(t *testing.T) {
 	registry := mustProviderRegistry(t, ProviderRegistryOptions{
 		KeySalt: "test-salt",
 		Providers: []ProviderConfig{
-			{ID: "mimo-payg", ProfileID: "mimo", APIKey: "sk-payg", DefaultModel: "mimo-v2.5-pro"},
-			{ID: "mimo-token", ProfileID: "mimo", APIKey: "tp-token", DefaultModel: "mimo-v2.5"},
+			{ID: "catalog-payg", ProfileID: "catalog-payg", BaseURL: "https://payg.example/v1", APIKey: "sk-payg", DefaultModel: "vendor/model-pro"},
+			{ID: "catalog-token", ProfileID: "catalog-token", BaseURL: "https://token.example/v1", APIKey: "tp-token", DefaultModel: "vendor/model"},
 		},
 	})
 
 	paygReq := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	paygReq.Header.Set("x-codex-provider", "mimo-payg")
+	paygReq.Header.Set("x-codex-provider", "catalog-payg")
 	payg, err := registry.Resolve(paygReq, ResponsesRequest{})
 	if err != nil {
 		t.Fatalf("payg resolve: %v", err)
 	}
-	if payg.BaseURLHash != BaseURLHash("https://api.xiaomimimo.com/v1") {
+	if payg.BaseURLHash != BaseURLHash("https://payg.example/v1") {
 		t.Fatalf("payg base hash = %q", payg.BaseURLHash)
 	}
 	if payg.KeyFingerprint != KeyFingerprint("sk-payg", "test-salt") {
@@ -143,12 +144,12 @@ func TestProviderRegistryInfersMimoBaseURLAndFingerprints(t *testing.T) {
 	}
 
 	tokenReq := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	tokenReq.Header.Set("x-codex-provider", "mimo-token")
+	tokenReq.Header.Set("x-codex-provider", "catalog-token")
 	token, err := registry.Resolve(tokenReq, ResponsesRequest{})
 	if err != nil {
 		t.Fatalf("token resolve: %v", err)
 	}
-	if token.BaseURLHash != BaseURLHash("https://token-plan-cn.xiaomimimo.com/v1") {
+	if token.BaseURLHash != BaseURLHash("https://token.example/v1") {
 		t.Fatalf("token base hash = %q", token.BaseURLHash)
 	}
 }
@@ -167,6 +168,103 @@ func TestProviderRegistryModelsIncludeOwners(t *testing.T) {
 	}
 	if seen["mimo-v2.5-pro"] != "mimo" || seen["mimo-v2.5"] != "mimo" || seen["deepseek-v4-flash"] != "deepseek" {
 		t.Fatalf("models = %#v", models)
+	}
+}
+
+func TestProviderRegistryPinsConversionProfileInRuntime(t *testing.T) {
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{Providers: []ProviderConfig{{
+		ID: "deepseek", ProfileID: "deepseek-anthropic", BaseURL: "https://example.invalid", APIKey: "test-key", DefaultModel: "deepseek-v4",
+		ConversionProfile: "deepseek-anthropic-v1", StrictConversion: true,
+	}}})
+	runtime, err := registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.ConversionProfile != "deepseek-anthropic-v1" || !runtime.StrictConversion || !strings.Contains(runtime.ProfileVersion, "deepseek-anthropic-v1") {
+		t.Fatalf("runtime conversion metadata = %#v", runtime)
+	}
+	if _, ok := runtime.Adapter.(AnthropicAdapter); !ok {
+		t.Fatalf("adapter type = %T, want AnthropicAdapter", runtime.Adapter)
+	}
+}
+
+func TestProviderRegistrySelectsOperationAndNativeSearchRoutes(t *testing.T) {
+	chat := &recordingAdapter{}
+	chatRoute := &recordingAdapter{}
+	fim := &recordingAdapter{}
+	search := &recordingAdapter{}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{Providers: []ProviderConfig{{
+		ID: "deepseek", ProfileID: "deepseek", BaseURL: "https://example.invalid", APIKey: "key", DefaultModel: "deepseek-v4", Adapter: chat,
+		Routes: []ProviderRouteConfig{
+			{Key: "chat", Adapter: chatRoute, ProfileID: "deepseek-chat"},
+			{Key: "fim", Operation: "fim", Adapter: fim, ProfileID: "deepseek-beta", BaseURL: "https://beta.example/v1", APIKey: "beta-key"},
+			{Key: "websearch", Adapter: search, ProfileID: "deepseek-anthropic", NativeTools: []NativeToolSpec{{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search"}}, SourcePolicy: SourcePolicy{Mode: "annotations"}},
+		},
+	}}})
+
+	runtime, err := registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4", Operation: "fim"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Adapter != fim || runtime.Operation != "fim" {
+		t.Fatalf("FIM route = %#v, want beta adapter and fim operation", runtime)
+	}
+	if runtime.BaseURLHash != BaseURLHash("https://beta.example/v1") || runtime.KeyFingerprint != KeyFingerprint("beta-key", "") {
+		t.Fatalf("FIM route identity = %#v, want route-specific URL/key scope", runtime)
+	}
+	runtime, err = registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4", Tools: json.RawMessage(`[{"type":"web_search_preview"}]`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Adapter != search || runtime.SourcePolicy.Mode != "annotations" {
+		t.Fatalf("web-search route = %#v, want search adapter", runtime)
+	}
+	runtime, err = registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Adapter != chatRoute {
+		t.Fatalf("default route = %#v, want explicit chat route adapter", runtime)
+	}
+}
+
+func TestProviderRegistryDoesNotTreatFunctionNameOrSchemaAsNativeSearch(t *testing.T) {
+	chat := &recordingAdapter{}
+	search := &recordingAdapter{}
+	registry := mustProviderRegistry(t, ProviderRegistryOptions{Providers: []ProviderConfig{{
+		ID: "deepseek", ProfileID: "deepseek", BaseURL: "https://example.invalid", APIKey: "key", DefaultModel: "deepseek-v4", Adapter: chat,
+		Routes: []ProviderRouteConfig{{Key: "websearch", Adapter: search, ProfileID: "deepseek-anthropic", NativeTools: []NativeToolSpec{{InputTypes: []string{"web_search_preview"}, UpstreamType: "web_search"}}}},
+	}}})
+	for _, raw := range []string{
+		`[{"type":"function","name":"web_search","parameters":{"type":"object","properties":{"query":{"type":"web_search"}}}}]`,
+		`[{"type":"function","function":{"name":"web_search"}}]`,
+	} {
+		runtime, err := registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4", Tools: json.RawMessage(raw)})
+		if err != nil {
+			t.Fatalf("Resolve(%s): %v", raw, err)
+		}
+		if runtime.Adapter != chat {
+			t.Fatalf("function tool %s selected native search route: %#v", raw, runtime)
+		}
+	}
+	runtime, err := registry.Resolve(httptest.NewRequest(http.MethodPost, "/v1/responses", nil), ResponsesRequest{Model: "deepseek-v4", Tools: json.RawMessage(`[{"type":"namespace","tools":[{"type":"web_search_preview"}]}]`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Adapter != search {
+		t.Fatalf("nested native search tool selected wrong route: %#v", runtime)
+	}
+}
+
+func TestProviderRegistryRejectsImpossibleSourcePolicy(t *testing.T) {
+	for _, mode := range []string{"text", "unsupported"} {
+		_, err := NewProviderRegistry(ProviderRegistryOptions{Providers: []ProviderConfig{{
+			ID: "mimo", ProfileID: "mimo", BaseURL: "https://example.invalid", APIKey: "synthetic", DefaultModel: "mimo-v2.5",
+			SourcePolicy: SourcePolicy{Mode: mode, RequireSources: true}, Adapter: fakeAdapter{},
+		}}})
+		if err == nil || !strings.Contains(err.Error(), "cannot require") {
+			t.Fatalf("source mode %q accepted impossible policy: %v", mode, err)
+		}
 	}
 }
 

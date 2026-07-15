@@ -395,6 +395,9 @@ func TestBridgeMachineDelegationWorkerUsesNewRemoteThreadSessionID(t *testing.T)
 	if executor.sessionID() != "rth-new-thread" {
 		t.Fatalf("executor session id = %q, want new remote thread id", executor.sessionID())
 	}
+	if !waitPublishersIdle(time.Second, publisher) {
+		t.Fatal("publisher did not finish delegation goroutine")
+	}
 }
 
 func TestBridgeMachineDelegationWorkerPublishesReuseRejected(t *testing.T) {

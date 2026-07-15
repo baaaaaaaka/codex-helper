@@ -10,7 +10,11 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-var helperOutboxProvenanceMarkerPattern = regexp.MustCompile(`(?i)<!--\s*codex-helper-outbox:([A-Za-z0-9._:-]{1,200})\s*-->`)
+// The marker is deliberately a strict transport-boundary suffix. It must not
+// be accepted from arbitrary prose or from an HTML comment in the middle of a
+// user message, otherwise a user can accidentally (or deliberately) make the
+// helper suppress a real inbound message.
+var helperOutboxProvenanceMarkerPattern = regexp.MustCompile(`(?i)<!--\s*codex-helper-outbox:([A-Za-z0-9._:-]{1,200})\s*-->\s*$`)
 
 func helperOutboxProvenanceMarker(outboxID string) string {
 	outboxID = strings.TrimSpace(outboxID)
@@ -21,7 +25,7 @@ func helperOutboxProvenanceMarker(outboxID string) string {
 }
 
 func helperOutboxProvenanceMarkerID(content string) string {
-	match := helperOutboxProvenanceMarkerPattern.FindStringSubmatch(content)
+	match := helperOutboxProvenanceMarkerPattern.FindStringSubmatch(strings.TrimSpace(content))
 	if len(match) != 2 {
 		return ""
 	}
