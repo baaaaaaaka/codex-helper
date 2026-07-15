@@ -345,15 +345,15 @@ model status
 model list
 model catalog list
 model provider list
-model switch nvidia/deepseek-v4
+model switch example-provider/deepseek-v4
 model reset
-new /absolute/path --model nvidia/deepseek-v4
-model fork nvidia/deepseek-v4
+new /absolute/path --model example-provider/deepseek-v4
+model fork example-provider/deepseek-v4
 effort status
 effort set high
 effort reset
 default status
-default model set profile:nvidia/deepseek-v4
+default model set profile:example-provider/deepseek-v4
 default effort set high
 ```
 

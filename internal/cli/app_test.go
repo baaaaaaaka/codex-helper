@@ -630,12 +630,60 @@ func TestRunCodexAppModelProfileFromWSLWritesWindowsReachableAdapterURL(t *testi
 	if modelHome := envValue(got.ExtraEnv, envCodexHome); !strings.HasPrefix(modelHome, `\\wsl.localhost\Ubuntu`) {
 		t.Fatalf("CODEX_HOME = %q, want Windows WSL path", modelHome)
 	}
-	raw, err := os.ReadFile(filepath.Join(filepath.Dir(cfgPath), "model-profiles", "mimo25-rev3", "codex", "config.toml"))
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(cfgPath), "model-profiles", "mimo25-rev3-*", "codex"))
+	if err != nil {
+		t.Fatalf("glob generated Codex homes: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("generated Codex homes = %v, want exactly one", matches)
+	}
+	raw, err := os.ReadFile(filepath.Join(matches[0], "config.toml"))
 	if err != nil {
 		t.Fatalf("read generated config.toml: %v", err)
 	}
 	if !strings.Contains(string(raw), `base_url = "http://172.22.174.179:34567/v1"`) {
 		t.Fatalf("generated config did not use Windows-reachable WSL adapter URL:\n%s", raw)
+	}
+}
+
+func TestWriteCodexDesktopModelProfileConfigCleansFallbackOnPathConversionFailure(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	prevGOOS := codexAppGOOS
+	prevIsWSL := codexAppIsWSL
+	prevWSLPath := codexAppWSLPathFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppIsWSL = prevIsWSL
+		codexAppWSLPathFn = prevWSLPath
+	})
+	codexAppGOOS = func() string { return "linux" }
+	codexAppIsWSL = func() bool { return true }
+	codexAppWSLPathFn = func(string) (string, error) {
+		return "", errors.New("synthetic WSL path conversion failure")
+	}
+
+	_, err = writeCodexDesktopModelProfileConfig(store, codexModelProfileLaunch{
+		Enabled:                true,
+		Name:                   "private-responses",
+		Model:                  "example/model",
+		BaseURL:                "http://127.0.0.1:12345/v1",
+		Revision:               2,
+		DisableHostedWebSearch: true,
+		WebSearchFallbackTOML:  codexWebSearchFallbackRoleConfigTOML(),
+	}, codexDesktopPlatformWindows)
+	if err == nil || !strings.Contains(err.Error(), "convert web search fallback config path") {
+		t.Fatalf("write desktop config error = %v, want WSL fallback path conversion error", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(cfgPath), "model-profiles", "desktop-runtime", "runtime", "web-search-*"))
+	if err != nil {
+		t.Fatalf("glob fallback runtime directories: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("failed desktop launch left fallback runtime directories: %v", matches)
 	}
 }
 

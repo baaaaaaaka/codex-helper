@@ -40,6 +40,8 @@ type codexModelInfo struct {
 	ExperimentalSupportedTools    []string               `json:"experimental_supported_tools"`
 	InputModalities               []string               `json:"input_modalities"`
 	SupportsSearchTool            bool                   `json:"supports_search_tool"`
+	MultiAgentVersion             *string                `json:"multi_agent_version"`
+	ToolMode                      string                 `json:"tool_mode,omitempty"`
 }
 
 type codexReasoningPreset struct {
@@ -118,12 +120,41 @@ func CodexModelCatalogJSON(provider ProviderSpec) ([]byte, error) {
 			ExperimentalSupportedTools:    []string{},
 			InputModalities:               inputModalities(model),
 			SupportsSearchTool:            model.SupportsSearch,
+			MultiAgentVersion:             codexMultiAgentVersion(provider, model),
+			ToolMode:                      codexToolMode(provider, model),
 		})
 	}
 	if len(catalog.Models) == 0 {
 		return nil, fmt.Errorf("provider %q has no valid models for Codex catalog", provider.ID)
 	}
 	return json.MarshalIndent(catalog, "", "  ")
+}
+
+// codexMultiAgentVersion advertises the Codex collaboration protocol only for
+// models that have a configured web-search fallback. The fallback is
+// implemented by a named Codex agent, so the model catalog must expose the
+// collaboration version before Codex will register spawn_agent. A provider
+// with hosted/native search does not need this capability, and an explicitly
+// disabled fallback must remain fail-closed.
+func codexMultiAgentVersion(provider ProviderSpec, model ModelSpec) *string {
+	if !provider.DisableHostedWebSearch {
+		return nil
+	}
+	if model.SearchPolicy.Fallback.Enabled != nil && !*model.SearchPolicy.Fallback.Enabled {
+		return nil
+	}
+	// The chat adapter cannot preserve the encrypted inter-agent payloads used
+	// by multi-agent v2. Advertise the plaintext v1 protocol until a Responses
+	// route explicitly proves that it can carry those opaque payloads.
+	version := "v1"
+	return &version
+}
+
+func codexToolMode(provider ProviderSpec, model ModelSpec) string {
+	if codexMultiAgentVersion(provider, model) == nil {
+		return ""
+	}
+	return "code_mode_only"
 }
 
 func defaultReasoningLevel(provider ProviderSpec, model ModelSpec) string {

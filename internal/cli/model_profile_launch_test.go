@@ -860,7 +860,11 @@ func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testi
 	if err != nil {
 		t.Fatalf("read generated desktop config: %v", err)
 	}
-	fallbackPath := filepath.Join(codexHome, codexWebSearchFallbackConfigName)
+	fallbackMatches, err := filepath.Glob(filepath.Join(filepath.Dir(store.Path()), "model-profiles", "desktop-runtime", "runtime", "web-search-*", codexWebSearchFallbackConfigName))
+	if err != nil || len(fallbackMatches) != 1 {
+		t.Fatalf("find generated desktop fallback config: matches=%v err=%v", fallbackMatches, err)
+	}
+	fallbackPath := fallbackMatches[0]
 	fallbackRaw, err := os.ReadFile(fallbackPath)
 	if err != nil {
 		t.Fatalf("read generated desktop fallback config: %v", err)
@@ -877,6 +881,9 @@ func TestWriteCodexDesktopModelProfileConfigWritesPrivateSearchFallback(t *testi
 	}
 	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
 		t.Fatalf("desktop fallback permissions = %o, want 600", got)
+	}
+	if strings.Contains(fallbackPath, filepath.Join("codex", codexWebSearchFallbackConfigName)) {
+		t.Fatalf("desktop fallback unexpectedly uses shared profile path: %s", fallbackPath)
 	}
 }
 

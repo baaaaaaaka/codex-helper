@@ -36,9 +36,11 @@
 - `cxp model-profile doctor [name]`: validate a saved model profile.
 - `cxp model-profile set-default <name>`: set the default model profile.
 - `cxp model-profile delete <name>`: delete a non-default model profile.
-- `cxp model-source sync <git-url-or-source> [--name <name>] [--ref <ref>] [--file <path>]`: shallow-sync repository model candidates without asking for a key; candidates remain hidden from Codex until verified.
+- `cxp model-source sync <repository-or-source> [--kind git|file|directory] [--name <name>] [--ref <ref>] [--file <path>]`: shallow-sync candidates without asking for a key. The source can be a Git URL, a single legacy JSON file, or a local directory containing a schema-v2 `manifest.json` with `providers/` and `models/` documents. The kind is inferred when omitted; a `manifest.json` path denotes its containing directory.
 - `cxp model-source list`: list synced sources, candidates, and verification state.
-- `cxp model-source bind <source> <profile> --api-key-stdin|--api-key-env <ENV>`: bind one credential and run a minimal real inference probe; only a successful profile enters CLI, App, and Teams model catalogs.
+- `cxp model-source bind <source> <profile> --api-key-stdin|--api-key-env <ENV>`: store a key only in the local secret store and run a timeout-bounded minimal real inference probe; only a successful, fingerprint-current profile enters CLI, App, and Teams model catalogs. Never put a key in the subscription JSON.
+- Schema-v2 model identity is `provider/model`, so the same model id may exist behind multiple providers. A provider credential reference may be shared by its models, while each provider/interface can use its own auth shape and route policy.
+- Schema-v2 parsing is fail-closed and atomic: unknown fields, trailing JSON, raw secrets, path escapes or symlinks, dangling manifest references, alias collisions, missing capability declarations, and unsupported adapter/protocol routes are rejected.
 - Model-source refreshes preserve verification across Git-only changes. Effective model/config changes reuse the stored key for automatic verification, and a removed or failed default safely falls back to Codex Official.
 - A failed refresh of a previously activated source records its last-known-good JSON as an active backup. `model-source list` and every accepted Teams turn using that source show a warning until sync recovers.
 - CXP checks official login with `codex login status`. Logged-in launches merge the current Codex binary's complete bundled GPT catalog first; logged-out launches remain third-party-only and do not require OpenAI auth. Catalog preparation is local and cached: it never runs the old synchronous `model/list` prewarm or blocks third-party inference on official catalog readiness.

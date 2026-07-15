@@ -71,6 +71,7 @@ func parseInputItem(raw json.RawMessage) (ProviderMessage, string, bool, error) 
 	case "function_call":
 		callID := rawString(obj["call_id"])
 		name := rawString(obj["name"])
+		namespace := rawString(obj["namespace"])
 		if callID == "" || name == "" {
 			return ProviderMessage{}, "", false, fmt.Errorf("function_call input requires call_id and name")
 		}
@@ -79,6 +80,7 @@ func parseInputItem(raw json.RawMessage) (ProviderMessage, string, bool, error) 
 			ToolCalls: []ToolCallRecord{{
 				ID:        callID,
 				Name:      name,
+				Namespace: namespace,
 				Arguments: sanitizeToolArguments(rawString(obj["arguments"])),
 				Status:    "completed",
 			}},
@@ -86,12 +88,13 @@ func parseInputItem(raw json.RawMessage) (ProviderMessage, string, bool, error) 
 	case "custom_tool_call":
 		callID := rawString(obj["call_id"])
 		name := rawString(obj["name"])
+		namespace := rawString(obj["namespace"])
 		if callID == "" || name == "" {
 			return ProviderMessage{}, "", false, fmt.Errorf("custom_tool_call input requires call_id and name")
 		}
 		arguments, _ := json.Marshal(map[string]string{"input": rawString(obj["input"])})
 		return ProviderMessage{Role: "assistant", ToolCalls: []ToolCallRecord{{
-			ID: callID, Name: name, Arguments: string(arguments), Status: "completed", Type: "custom",
+			ID: callID, Name: name, Namespace: namespace, Arguments: string(arguments), Status: "completed", Type: "custom",
 		}}}, "", true, nil
 	case "reasoning":
 		reasoning := extractReasoningInputText(obj)

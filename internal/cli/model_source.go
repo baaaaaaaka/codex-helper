@@ -32,7 +32,7 @@ const defaultModelSourceAutoSyncInterval = 30 * time.Minute
 var verifyConfiguredModelAuthenticationFn = verifySyncedModel
 var runModelSourceSyncFn = runModelSourceSync
 
-type modelSourceSyncOptions struct{ name, ref, file string }
+type modelSourceSyncOptions struct{ name, ref, file, kind string }
 type modelSourceBindOptions struct {
 	apiKeyEnv   string
 	apiKeyStdin bool
@@ -40,7 +40,14 @@ type modelSourceBindOptions struct {
 }
 
 func newModelSourceCmd(root *rootOptions) *cobra.Command {
-	cmd := &cobra.Command{Use: "model-source", Aliases: []string{"models-repo"}, Short: "Sync and activate model profiles from a Git repository"}
+	cmd := &cobra.Command{
+		Use:     "model-source",
+		Aliases: []string{"models-repo"},
+		Short:   "Sync and activate model profiles from Git or local JSON catalogs",
+		Long: "Import credential-free model declarations from a Git repository, a single JSON file, " +
+			"or a schema-v2 manifest directory. Sync stages candidates without asking for a key; " +
+			"bind verifies one profile before it becomes selectable.",
+	}
 	cmd.AddCommand(newModelSourceSyncCmd(root), newModelSourceListCmd(root), newModelSourceBindCmd(root))
 	return cmd
 }
@@ -48,12 +55,18 @@ func newModelSourceCmd(root *rootOptions) *cobra.Command {
 func newModelSourceSyncCmd(root *rootOptions) *cobra.Command {
 	opts := modelSourceSyncOptions{file: defaultModelSourceFile}
 	cmd := &cobra.Command{
-		Use: "sync <repository-or-source>", Short: "Shallow-sync model candidates without requiring a key", Args: cobra.ExactArgs(1),
+		Use:   "sync <repository-or-source>",
+		Short: "Shallow-sync Git, JSON-file, or manifest-directory candidates without requiring a key",
+		Long: "The source may be a Git URL, a single legacy JSON file, or a directory containing " +
+			"manifest.json plus its providers/ and models/ documents. Candidates remain hidden from " +
+			"Codex until a later bind succeeds.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error { return runModelSourceSync(cmd, root, args[0], opts) },
 	}
-	cmd.Flags().StringVar(&opts.name, "name", "", "Local source name (derived from the repository when omitted)")
+	cmd.Flags().StringVar(&opts.name, "name", "", "Local source name (derived from the Git URL or local path when omitted)")
+	cmd.Flags().StringVar(&opts.kind, "kind", "", "Source kind: git, file, or directory (inferred from the argument when omitted)")
 	cmd.Flags().StringVar(&opts.ref, "ref", "", "Git branch, tag, or commit (repository default when omitted)")
-	cmd.Flags().StringVar(&opts.file, "file", defaultModelSourceFile, "Repository-relative model config file")
+	cmd.Flags().StringVar(&opts.file, "file", defaultModelSourceFile, "Legacy single-file config path (Git default: cxp-models.json; manifest directories use manifest.json)")
 	return cmd
 }
 
@@ -75,7 +88,12 @@ func newModelSourceListCmd(root *rootOptions) *cobra.Command {
 func newModelSourceBindCmd(root *rootOptions) *cobra.Command {
 	opts := modelSourceBindOptions{timeout: 20 * time.Second}
 	cmd := &cobra.Command{
-		Use: "bind <source> <profile>", Short: "Bind a key and verify one synced profile before exposing it", Args: cobra.ExactArgs(2),
+		Use:   "bind <source> <profile>",
+		Short: "Bind a key and verify one synced profile before exposing it",
+		Long: "Read a provider key from stdin or an environment variable, keep it in the local " +
+			"secret store, and run one timeout-bounded minimal inference. Only a successful, " +
+			"current profile enters the CLI, App, and Teams model catalogs; never put a key in JSON.",
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runModelSourceBind(cmd, root, args[0], args[1], opts)
 		},
@@ -124,43 +142,65 @@ func runModelSourceSync(cmd *cobra.Command, root *rootOptions, ref string, opts 
 	}
 	defer os.RemoveAll(staging)
 	repoDir := filepath.Join(staging, "repo")
-	args := []string{"clone", "--depth", "1", "--filter=blob:none", "--no-checkout"}
-	args = append(args, "--", source.URL, repoDir)
-	git := exec.CommandContext(cmd.Context(), "git", args...)
-	if raw, cloneErr := git.CombinedOutput(); cloneErr != nil {
-		return fmt.Errorf("sync model source %q: %w: %s", name, cloneErr, strings.TrimSpace(string(raw)))
-	}
-	if source.Ref != "" {
-		fetch := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "fetch", "--depth", "1", "origin", source.Ref)
-		if raw, fetchErr := fetch.CombinedOutput(); fetchErr != nil {
-			return fmt.Errorf("fetch ref %q for model source %q: %w: %s", source.Ref, name, fetchErr, strings.TrimSpace(string(raw)))
+	if kind := strings.ToLower(strings.TrimSpace(source.Kind)); kind == "file" || kind == "directory" {
+		if kind == "file" {
+			source.File = filepath.Base(strings.TrimSpace(source.Path))
 		}
-		checkout := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "checkout", "--detach", "FETCH_HEAD")
-		if raw, checkoutErr := checkout.CombinedOutput(); checkoutErr != nil {
-			return fmt.Errorf("checkout ref %q for model source %q: %w: %s", source.Ref, name, checkoutErr, strings.TrimSpace(string(raw)))
+		if err := copyModelSourceToStaging(source.Path, repoDir); err != nil {
+			return fmt.Errorf("stage model source %q: %w", name, err)
 		}
 	} else {
-		checkout := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "checkout", "--detach", "HEAD")
-		if raw, checkoutErr := checkout.CombinedOutput(); checkoutErr != nil {
-			return fmt.Errorf("checkout model source %q: %w: %s", name, checkoutErr, strings.TrimSpace(string(raw)))
+		args := []string{"clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--", source.URL, repoDir}
+		git := exec.CommandContext(cmd.Context(), "git", args...)
+		if raw, cloneErr := git.CombinedOutput(); cloneErr != nil {
+			return fmt.Errorf("sync model source %q: %w: %s", name, cloneErr, strings.TrimSpace(string(raw)))
 		}
+		if source.Ref != "" {
+			fetch := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "fetch", "--depth", "1", "origin", source.Ref)
+			if raw, fetchErr := fetch.CombinedOutput(); fetchErr != nil {
+				return fmt.Errorf("fetch ref %q for model source %q: %w: %s", source.Ref, name, fetchErr, strings.TrimSpace(string(raw)))
+			}
+			checkout := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "checkout", "--detach", "FETCH_HEAD")
+			if raw, checkoutErr := checkout.CombinedOutput(); checkoutErr != nil {
+				return fmt.Errorf("checkout ref %q for model source %q: %w: %s", source.Ref, name, checkoutErr, strings.TrimSpace(string(raw)))
+			}
+		} else {
+			checkout := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "checkout", "--detach", "HEAD")
+			if raw, checkoutErr := checkout.CombinedOutput(); checkoutErr != nil {
+				return fmt.Errorf("checkout model source %q: %w: %s", name, checkoutErr, strings.TrimSpace(string(raw)))
+			}
+		}
+		revisionRaw, revisionErr := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output()
+		if revisionErr != nil {
+			return fmt.Errorf("read synced revision: %w", revisionErr)
+		}
+		attemptedRevision = strings.TrimSpace(string(revisionRaw))
 	}
-	revisionRaw, err := exec.CommandContext(cmd.Context(), "git", "-C", repoDir, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return fmt.Errorf("read synced revision: %w", err)
-	}
-	attemptedRevision = strings.TrimSpace(string(revisionRaw))
-	manifestPath, err := safeRepoFile(repoDir, source.File)
-	if err != nil {
-		return err
-	}
-	raw, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", source.File, err)
-	}
-	fragment, err := config.ParseModelConfigFragment(raw)
-	if err != nil {
-		return fmt.Errorf("validate %s: %w", source.File, err)
+	var fragment config.Config
+	if _, statErr := os.Stat(filepath.Join(repoDir, "manifest.json")); statErr == nil {
+		snapshot, parseErr := config.ParseCatalogV2(repoDir)
+		if parseErr != nil {
+			return fmt.Errorf("validate manifest.json: %w", parseErr)
+		}
+		fragment = snapshot.Config
+		if attemptedRevision == "" {
+			attemptedRevision = snapshot.Digest
+		}
+		source.Manifest = "manifest.json"
+		source.Digest = snapshot.Digest
+	} else {
+		manifestPath, pathErr := safeRepoFile(repoDir, source.File)
+		if pathErr != nil {
+			return pathErr
+		}
+		raw, readErr := os.ReadFile(manifestPath)
+		if readErr != nil {
+			return fmt.Errorf("read %s: %w", source.File, readErr)
+		}
+		fragment, err = config.ParseModelConfigFragment(raw)
+		if err != nil {
+			return fmt.Errorf("validate %s: %w", source.File, err)
+		}
 	}
 	source.Revision = attemptedRevision
 	source.SyncedAt = time.Now().UTC()
@@ -448,19 +488,68 @@ func modelSourceAutoSyncWarning(out io.Writer, operation string, err error) {
 
 func resolveModelSource(cfg config.Config, ref string, opts modelSourceSyncOptions) (string, config.ModelSource, error) {
 	ref = strings.TrimSpace(ref)
+	requestedKind, err := normalizeModelSourceKind(opts.kind)
+	if err != nil {
+		return "", config.ModelSource{}, err
+	}
 	for name, source := range cfg.ModelSources {
 		if strings.EqualFold(name, ref) {
+			if requestedKind != "" {
+				source.Kind = requestedKind
+			}
 			if opts.ref != "" {
 				source.Ref = strings.TrimSpace(opts.ref)
 			}
-			if opts.file != "" {
+			if opts.file != "" && (opts.file != defaultModelSourceFile || strings.TrimSpace(source.File) == "") {
 				source.File = strings.TrimSpace(opts.file)
+			}
+			if source.Kind == "file" && strings.TrimSpace(source.Path) != "" {
+				source.File = filepath.Base(source.Path)
+			}
+			if err := validateResolvedModelSource(source); err != nil {
+				return "", config.ModelSource{}, fmt.Errorf("model source %q: %w", name, err)
 			}
 			return name, source, nil
 		}
 	}
 	if ref == "" || strings.HasPrefix(ref, "-") {
 		return "", config.ModelSource{}, fmt.Errorf("repository URL is required")
+	}
+	if info, statErr := os.Stat(ref); statErr == nil {
+		path, absErr := filepath.Abs(ref)
+		if absErr != nil {
+			return "", config.ModelSource{}, absErr
+		}
+		name := strings.TrimSpace(opts.name)
+		if name == "" {
+			name = modelSourceName(path)
+		}
+		if err := validateModelSourceName(name); err != nil {
+			return "", config.ModelSource{}, err
+		}
+		kind := "file"
+		file := filepath.Base(path)
+		if info.IsDir() {
+			kind = "directory"
+			file = strings.TrimSpace(opts.file)
+			if file == "" {
+				file = defaultModelSourceFile
+			}
+		} else if strings.EqualFold(filepath.Base(path), "manifest.json") {
+			// A manifest path denotes the whole catalog root because its
+			// provider/model references are relative to the containing directory.
+			kind = "directory"
+			path = filepath.Dir(path)
+			file = "manifest.json"
+		}
+		if requestedKind != "" && requestedKind != kind {
+			return "", config.ModelSource{}, fmt.Errorf("source path %q is a %s, not a %s source", ref, kind, requestedKind)
+		}
+		source := config.ModelSource{Kind: kind, Path: path, File: file}
+		if kind == "directory" && file == "manifest.json" {
+			source.Manifest = "manifest.json"
+		}
+		return name, source, nil
 	}
 	if parsed, err := url.Parse(ref); err == nil && parsed.User != nil {
 		return "", config.ModelSource{}, fmt.Errorf("repository URLs containing credentials are not accepted; use the Git credential helper or SSH authentication")
@@ -476,12 +565,50 @@ func resolveModelSource(cfg config.Config, ref string, opts modelSourceSyncOptio
 	if file == "" {
 		file = defaultModelSourceFile
 	}
-	return name, config.ModelSource{URL: ref, Ref: strings.TrimSpace(opts.ref), File: file}, nil
+	if requestedKind != "" && requestedKind != "git" {
+		return "", config.ModelSource{}, fmt.Errorf("remote source %q can only be used with kind=git", ref)
+	}
+	return name, config.ModelSource{Kind: "git", URL: ref, Ref: strings.TrimSpace(opts.ref), File: file}, nil
+}
+
+func normalizeModelSourceKind(raw string) (string, error) {
+	kind := strings.ToLower(strings.TrimSpace(raw))
+	if kind == "" {
+		return "", nil
+	}
+	switch kind {
+	case "git", "file", "directory":
+		return kind, nil
+	default:
+		return "", fmt.Errorf("invalid model source kind %q (allowed: git, file, directory)", raw)
+	}
+}
+
+func validateResolvedModelSource(source config.ModelSource) error {
+	kind := strings.ToLower(strings.TrimSpace(source.Kind))
+	switch kind {
+	case "git", "":
+		if strings.TrimSpace(source.URL) == "" {
+			return fmt.Errorf("kind=%q requires url", firstNonEmptyCLI(kind, "git"))
+		}
+	case "file", "directory":
+		if strings.TrimSpace(source.Path) == "" {
+			return fmt.Errorf("kind=%q requires path", kind)
+		}
+	default:
+		return fmt.Errorf("invalid source kind %q", source.Kind)
+	}
+	return nil
 }
 
 func modelSourceName(raw string) string {
 	value := strings.TrimSuffix(strings.TrimRight(raw, "/"), ".git")
-	if i := strings.LastIndexAny(value, "/:"); i >= 0 {
+	// Model source references can be supplied by a different platform (for
+	// example, a Windows path can be persisted and later resolved by a Unix
+	// process, or vice versa).  Treat both slash styles as path separators so
+	// the derived name remains the final path component instead of leaking the
+	// whole path into model-source-name validation.
+	if i := strings.LastIndexAny(value, "/\\:"); i >= 0 {
 		value = value[i+1:]
 	}
 	return strings.ToLower(strings.TrimSpace(value))
@@ -518,6 +645,73 @@ func safeRepoFile(repoDir, name string) (string, error) {
 		return "", fmt.Errorf("model config file escapes the repository")
 	}
 	return real, nil
+}
+
+// copyModelSourceToStaging copies a manually managed catalog into the same
+// isolated staging directory used by Git sources. Symlinks are rejected so a
+// local JSON source cannot escape its declared root during validation.
+func copyModelSourceToStaging(sourcePath, destination string) error {
+	sourcePath = filepath.Clean(strings.TrimSpace(sourcePath))
+	if sourcePath == "" {
+		return fmt.Errorf("model source path is empty")
+	}
+	info, err := os.Lstat(sourcePath)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("model source path must not be a symlink")
+	}
+	if !info.IsDir() {
+		if err := os.MkdirAll(destination, 0o700); err != nil {
+			return err
+		}
+		name := filepath.Base(sourcePath)
+		return copyModelSourceFile(sourcePath, filepath.Join(destination, name))
+	}
+	return filepath.WalkDir(sourcePath, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("model source contains symlink %q", path)
+		}
+		rel, err := filepath.Rel(sourcePath, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return os.MkdirAll(destination, 0o700)
+		}
+		if entry.IsDir() {
+			if rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
+			return os.MkdirAll(filepath.Join(destination, rel), 0o700)
+		}
+		return copyModelSourceFile(path, filepath.Join(destination, rel))
+	})
+}
+
+func copyModelSourceFile(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func mergeModelSource(cfg *config.Config, name string, source config.ModelSource, fragment config.Config) error {

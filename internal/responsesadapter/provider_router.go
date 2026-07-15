@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type ProviderRuntime struct {
@@ -18,20 +20,21 @@ type ProviderRuntime struct {
 	// UnsupportedToolPolicy is "error" for catalog routes that declare a
 	// native feature the selected adapter cannot translate. The default remains
 	// drop for legacy programmatic providers that do not declare capabilities.
-	UnsupportedToolPolicy string
-	ConversionProfile     string
-	StrictConversion      bool
-	Operation             string
-	NativeTools           []NativeToolSpec
-	SourcePolicy          SourcePolicy
-	ResponsesPolicy       ResponsesPolicy
+	UnsupportedToolPolicy   string
+	ConversionProfile       string
+	StrictConversion        bool
+	Operation               string
+	NativeTools             []NativeToolSpec
+	SourcePolicy            SourcePolicy
+	ResponsesPolicy         ResponsesPolicy
+	ParallelToolEnforcement string
+	Route                   config.ModelRoute
 }
 
-type ResponsesPolicy struct {
-	PreviousResponseID string
-	Background         string
-	ContextManagement  string
-}
+// ResponsesPolicy is the runtime view of the JSON model contract. Keeping an
+// alias here prevents structured-output declarations from being dropped when
+// a catalog is materialized into the adapter registry.
+type ResponsesPolicy = config.ModelResponsesPolicy
 
 func validateSourcePolicy(policy SourcePolicy) error {
 	mode := strings.ToLower(strings.TrimSpace(policy.Mode))
@@ -135,6 +138,9 @@ func routeErrorf(status int, format string, args ...any) RouteError {
 }
 
 func validateResponsesPolicy(req ResponsesRequest, policy ResponsesPolicy) error {
+	if err := validateStructuredOutputRequest(req.ResponseFormat, policy.StructuredOutput); err != nil {
+		return err
+	}
 	previousPolicy := strings.ToLower(strings.TrimSpace(policy.PreviousResponseID))
 	if strings.TrimSpace(req.PreviousResponseID) != "" {
 		switch previousPolicy {

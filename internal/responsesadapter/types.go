@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type Scope struct {
@@ -87,30 +89,32 @@ type ReasoningInput struct {
 }
 
 type ProviderRequest struct {
-	Model              string
-	Operation          string
-	Prefix             string
-	Suffix             string
-	Instructions       string
-	InputText          string
-	InputMessages      []ProviderMessage
-	Messages           []ProviderMessage
-	Tools              []ChatTool
-	NativeTools        []ProviderNativeTool
-	ToolWarnings       []ToolWarning
-	ToolChoice         json.RawMessage
-	ParallelToolCalls  *bool
-	MaxOutputTokens    *int
-	ReasoningEffort    string
-	Temperature        *float64
-	TopP               *float64
-	PreviousResponseID string
-	ResponseFormat     json.RawMessage
-	Background         *bool
-	ContextManagement  json.RawMessage
-	SourcePolicy       SourcePolicy
-	Scope              Scope
-	History            []ResponseRecord
+	Model                  string
+	Operation              string
+	Prefix                 string
+	Suffix                 string
+	Instructions           string
+	InputText              string
+	InputMessages          []ProviderMessage
+	Messages               []ProviderMessage
+	Tools                  []ChatTool
+	NativeTools            []ProviderNativeTool
+	ToolWarnings           []ToolWarning
+	ToolChoice             json.RawMessage
+	ParallelToolCalls      *bool
+	MaxOutputTokens        *int
+	ReasoningEffort        string
+	Temperature            *float64
+	TopP                   *float64
+	PreviousResponseID     string
+	ResponseFormat         json.RawMessage
+	Background             *bool
+	ContextManagement      json.RawMessage
+	ParallelEnforcement    string
+	StructuredOutputPolicy config.ModelStructuredOutputPolicy
+	SourcePolicy           SourcePolicy
+	Scope                  Scope
+	History                []ResponseRecord
 }
 
 type ProviderMessage struct {
@@ -196,6 +200,7 @@ type ProviderToolCallDelta struct {
 	Index          int
 	ID             string
 	Name           string
+	Namespace      string
 	ArgumentsDelta string
 }
 
@@ -205,6 +210,7 @@ type ToolCallRecord struct {
 	ItemID      string
 	ID          string
 	Name        string
+	Namespace   string
 	Arguments   string
 	Status      string
 	Type        string
@@ -272,6 +278,9 @@ type ChatTool struct {
 	Type       string       `json:"type"`
 	Function   ChatFunction `json:"function"`
 	SourceType string       `json:"-"`
+	// Namespace is internal metadata used to restore Responses MCP tool
+	// identity after a flat Chat Completions request.
+	Namespace string `json:"-"`
 }
 
 type ChatFunction struct {

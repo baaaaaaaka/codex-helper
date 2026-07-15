@@ -14,6 +14,8 @@ type ProviderProfile struct {
 	DefaultReasoningEffort                 string
 	EnableThinking                         bool
 	ForceParallelToolCalls                 *bool
+	ParallelToolEnforcement                string
+	PlainTextToolCall                      string
 	StripSamplingWhenThinking              bool
 	DropNonAutoToolChoice                  bool
 	ReasoningEffortMap                     map[string]string
@@ -52,7 +54,17 @@ func ProfileForProvider(provider string) ProviderProfile {
 
 func (p ProviderProfile) withDefaults() ProviderProfile {
 	if p.ID == "" {
-		return ProfileForProvider("generic")
+		defaults := ProfileForProvider("generic")
+		p.ID = defaults.ID
+		if !p.IncludeUsageStreamOptions {
+			p.IncludeUsageStreamOptions = defaults.IncludeUsageStreamOptions
+		}
+		if !p.MergeSystemMessages {
+			p.MergeSystemMessages = defaults.MergeSystemMessages
+		}
+		if !p.OmitEmptyAssistantContentWithToolCalls {
+			p.OmitEmptyAssistantContentWithToolCalls = defaults.OmitEmptyAssistantContentWithToolCalls
+		}
 	}
 	return p
 }
@@ -145,8 +157,15 @@ func (p ProviderProfile) WithModelPolicies(reasoning config.ModelReasoningPolicy
 		value := false
 		p.ForceParallelToolCalls = &value
 	}
+	switch strings.ToLower(strings.TrimSpace(tools.ParallelEnforcement)) {
+	case "advisory", "strict":
+		p.ParallelToolEnforcement = strings.ToLower(strings.TrimSpace(tools.ParallelEnforcement))
+	}
 	if tools.ValidateArguments != nil {
 		p.ValidateToolArguments = *tools.ValidateArguments
+	}
+	if value := strings.ToLower(strings.TrimSpace(tools.PlainTextToolCall)); value != "" {
+		p.PlainTextToolCall = value
 	}
 	p.TemperaturePolicy = strings.ToLower(strings.TrimSpace(sampling.Temperature))
 	p.TopPPolicy = strings.ToLower(strings.TrimSpace(sampling.TopP))

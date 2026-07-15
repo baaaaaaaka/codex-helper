@@ -143,6 +143,18 @@ func TestNormalizeToolsFlattensNamespaceTools(t *testing.T) {
 	if strings.Join(names, ",") != strings.Join(wantNames, ",") {
 		t.Fatalf("names = %#v, want %#v; warnings=%#v", names, wantNames, warnings)
 	}
+	for index := 1; index < len(tools); index++ {
+		if tools[index].Namespace != "mcp__codex_apps__github" {
+			t.Fatalf("tool %q namespace = %q, want mcp__codex_apps__github", tools[index].Function.Name, tools[index].Namespace)
+		}
+		encoded, err := json.Marshal(tools[index])
+		if err != nil {
+			t.Fatalf("marshal namespaced tool: %v", err)
+		}
+		if strings.Contains(string(encoded), `"namespace"`) {
+			t.Fatalf("internal namespace leaked into Chat provider tool: %s", encoded)
+		}
+	}
 	if len(warnings) != 3 {
 		t.Fatalf("warnings = %#v", warnings)
 	}

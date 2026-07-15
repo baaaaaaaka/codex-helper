@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type ProviderRegistryOptions struct {
@@ -15,21 +17,23 @@ type ProviderRegistryOptions struct {
 }
 
 type ProviderConfig struct {
-	ID                    string
-	ProfileID             string
-	BaseURL               string
-	APIKey                string
-	DefaultModel          string
-	Models                []ModelInfo
-	Adapter               ProviderAdapter
-	CustomToolMode        string
-	UnsupportedToolPolicy string
-	ConversionProfile     string
-	StrictConversion      bool
-	Operation             string
-	NativeTools           []NativeToolSpec
-	SourcePolicy          SourcePolicy
-	ResponsesPolicy       ResponsesPolicy
+	ID                      string
+	ProfileID               string
+	BaseURL                 string
+	APIKey                  string
+	DefaultModel            string
+	Models                  []ModelInfo
+	Adapter                 ProviderAdapter
+	Route                   config.ModelRoute
+	CustomToolMode          string
+	UnsupportedToolPolicy   string
+	ConversionProfile       string
+	StrictConversion        bool
+	Operation               string
+	NativeTools             []NativeToolSpec
+	SourcePolicy            SourcePolicy
+	ResponsesPolicy         ResponsesPolicy
+	ParallelToolEnforcement string
 	// Routes contains operation-specific adapters. The default ProviderConfig
 	// fields remain the fallback route; a request with an explicit operation or
 	// a declared native web-search tool selects the matching route before any
@@ -317,21 +321,23 @@ func buildRegisteredProvider(cfg ProviderConfig, keySalt string) (registeredProv
 		listModels: listModels,
 		openModel:  len(models) == 0,
 		runtime: ProviderRuntime{
-			Adapter:               adapter,
-			ProviderID:            id,
-			PublicModel:           strings.TrimSpace(cfg.DefaultModel),
-			Model:                 strings.TrimSpace(cfg.DefaultModel),
-			KeyFingerprint:        KeyFingerprint(cfg.APIKey, keySalt),
-			BaseURLHash:           BaseURLHash(baseURL),
-			ProfileVersion:        profileVersion,
-			CustomToolMode:        strings.TrimSpace(cfg.CustomToolMode),
-			UnsupportedToolPolicy: strings.TrimSpace(cfg.UnsupportedToolPolicy),
-			ConversionProfile:     strings.TrimSpace(cfg.ConversionProfile),
-			StrictConversion:      cfg.StrictConversion,
-			Operation:             strings.TrimSpace(cfg.Operation),
-			NativeTools:           append([]NativeToolSpec(nil), cfg.NativeTools...),
-			SourcePolicy:          cfg.SourcePolicy,
-			ResponsesPolicy:       cfg.ResponsesPolicy,
+			Adapter:                 adapter,
+			ProviderID:              id,
+			PublicModel:             strings.TrimSpace(cfg.DefaultModel),
+			Model:                   strings.TrimSpace(cfg.DefaultModel),
+			KeyFingerprint:          KeyFingerprint(cfg.APIKey, keySalt),
+			BaseURLHash:             BaseURLHash(baseURL),
+			ProfileVersion:          profileVersion,
+			CustomToolMode:          strings.TrimSpace(cfg.CustomToolMode),
+			UnsupportedToolPolicy:   strings.TrimSpace(cfg.UnsupportedToolPolicy),
+			ConversionProfile:       strings.TrimSpace(cfg.ConversionProfile),
+			StrictConversion:        cfg.StrictConversion,
+			Operation:               strings.TrimSpace(cfg.Operation),
+			NativeTools:             append([]NativeToolSpec(nil), cfg.NativeTools...),
+			SourcePolicy:            cfg.SourcePolicy,
+			ResponsesPolicy:         cfg.ResponsesPolicy,
+			ParallelToolEnforcement: strings.TrimSpace(cfg.ParallelToolEnforcement),
+			Route:                   cfg.Route,
 		},
 		routesRuntime: buildRouteRuntimes(cfg, id, baseURL, profileVersion, cfg.APIKey, keySalt),
 	}, nil

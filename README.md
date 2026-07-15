@@ -364,17 +364,17 @@ token have their own local credential binding:
 
 ```bash
 # A Git subscription. models.json is the repository-relative manifest.
-cxp model catalog add nvidia --git https://github.example/team/models.git
+cxp model catalog add example-provider --git https://example.invalid/team/models.git
 
 # Or import a hand-written JSON document; it is copied into managed storage.
 cxp model catalog add local --json ./models.json
 
 cxp model catalog list
 cxp model provider list
-printf '%s' "$NVIDIA_API_KEY" | cxp model provider setup nvidia --api-key-stdin
+printf '%s' "$EXAMPLE_PROVIDER_API_KEY" | cxp model provider setup example-provider --api-key-stdin
 # Interfaces that use a separate token can be bound independently.
 printf '%s' "$DEEPSEEK_ANTHROPIC_KEY" | cxp model provider setup deepseek --interface anthropic --api-key-stdin
-cxp model use nvidia/deepseek-v4
+cxp model use example-provider/deepseek-v4
 cxp model list
 ```
 
@@ -384,12 +384,12 @@ The catalog document is strict JSON with this shape:
 {
   "catalogVersion": 2,
   "providers": {
-    "nvidia": {
+    "example-provider": {
       "defaultInterface": "chat",
       "interfaces": {
         "chat": {
           "adapter": "openai-chat",
-          "baseUrl": "https://integrate.api.nvidia.com/v1"
+          "baseUrl": "https://api.example.invalid/v1"
         }
       },
       "models": {
@@ -478,8 +478,8 @@ dropped.
 Use a saved model profile for one launch without changing the default:
 
 ```bash
-codex-proxy run --model-profile nvidia/deepseek-v4 -- codex
-codex-proxy app --model-profile nvidia/deepseek-v4
+codex-proxy run --model-profile example-provider/deepseek-v4 -- codex
+codex-proxy app --model-profile example-provider/deepseek-v4
 ```
 
 Teams users can pick model profiles when creating or switching Work chats; the
@@ -999,7 +999,7 @@ model status
 model list
 model catalog list
 model provider list
-model switch nvidia/deepseek-v4
+model switch example-provider/deepseek-v4
 model reset
 effort status
 effort list
@@ -1020,9 +1020,9 @@ helper file relative/path.ext
 helper publish-history
 helper publish-history full
 model status
-model switch nvidia/deepseek-v4
+model switch example-provider/deepseek-v4
 model reset
-model fork nvidia/deepseek-v4
+model fork example-provider/deepseek-v4
 effort status
 effort list
 effort set xhigh

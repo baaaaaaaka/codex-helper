@@ -88,7 +88,11 @@ type ModelSpec struct {
 	NativeTools             []config.ModelNativeTool
 	SourcePolicy            config.ModelSourcePolicy
 	ResponsesPolicy         config.ModelResponsesPolicy
-	UnsupportedToolPolicy   string
+	// SearchPolicy is retained on the materialized model spec so Codex catalog
+	// generation can distinguish a provider-native search route from a named
+	// fallback agent.
+	SearchPolicy          config.ModelSearchPolicy
+	UnsupportedToolPolicy string
 }
 
 type ModelChoice struct {

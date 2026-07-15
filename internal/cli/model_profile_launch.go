@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -34,6 +35,8 @@ const (
 	codexWebSearchFallbackAgentName  = "gpt_search"
 	codexWebSearchFallbackModel      = "gpt-5.6-luna"
 	codexWebSearchFallbackConfigName = "gpt-search.toml"
+	codexWebSearchRuntimeDirName     = "runtime"
+	codexWebSearchRuntimePrefix      = "web-search-"
 )
 
 const codexWebSearchFallbackAgentDescription = "Use this agent only for live web research when the current model cannot search the web. Give it the standalone search task without parent conversation context, wait for completion, and use its cited answer."
@@ -200,24 +203,27 @@ func prepareCodexModelProfileForRun(
 }
 
 type codexModelProfileLaunch struct {
-	Enabled                bool
-	Unified                bool
-	Name                   string
-	ProviderID             string
-	Model                  string
-	ReasoningEffort        string
-	BaseURL                string
-	ProxyKey               string
-	Revision               int
-	ProviderName           string
-	CatalogPath            string
-	CatalogJSON            []byte
-	WebSearchFallbackPath  string
-	WebSearchFallbackTOML  []byte
-	Direct                 bool
-	Native                 bool
-	DisableHostedWebSearch bool
-	EnvKey                 string
+	Enabled                  bool
+	Unified                  bool
+	Name                     string
+	ProviderID               string
+	Model                    string
+	ReasoningEffort          string
+	BaseURL                  string
+	ProxyKey                 string
+	Revision                 int
+	ProviderName             string
+	CatalogPath              string
+	CatalogJSON              []byte
+	WebSearchFallbackPath    string
+	WebSearchFallbackTOML    []byte
+	WebSearchFallbackModel   string
+	WebSearchFallbackEffort  string
+	WebSearchFallbackEnabled bool
+	Direct                   bool
+	Native                   bool
+	DisableHostedWebSearch   bool
+	EnvKey                   string
 }
 
 func (l codexModelProfileLaunch) effectiveEnvKey() string {
@@ -1081,6 +1087,50 @@ func writeCodexWebSearchFallbackRoleConfig(catalogPath string, configTOML []byte
 	return path, nil
 }
 
+// writeCodexWebSearchFallbackRoleConfigForLaunch gives each Codex process its
+// own runtime directory. A shared gpt-search.toml would race when multiple
+// launches refresh or clean it up concurrently, and would also make one
+// launch's credentials/policy visible to another process.
+func writeCodexWebSearchFallbackRoleConfigForLaunch(catalogPath string, configTOML []byte, identity *execIdentity) (string, func(), error) {
+	if strings.TrimSpace(catalogPath) == "" || len(configTOML) == 0 {
+		return "", func() {}, nil
+	}
+	root := filepath.Join(filepath.Dir(catalogPath), codexWebSearchRuntimeDirName)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", func() {}, err
+	}
+	if err := os.Chmod(root, 0o700); err != nil && runtime.GOOS != "windows" {
+		return "", func() {}, fmt.Errorf("secure web-search runtime root: %w", err)
+	}
+	if err := ensurePathOwnedByIdentity(root, identity); err != nil {
+		return "", func() {}, fmt.Errorf("set web-search runtime ownership: %w", err)
+	}
+	launchID, err := ids.New()
+	if err != nil {
+		return "", func() {}, err
+	}
+	runtimeDir := filepath.Join(root, codexWebSearchRuntimePrefix+launchID)
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		return "", func() {}, fmt.Errorf("create web-search runtime directory: %w", err)
+	}
+	if err := os.Chmod(runtimeDir, 0o700); err != nil && runtime.GOOS != "windows" {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, fmt.Errorf("secure web-search runtime directory: %w", err)
+	}
+	if err := ensurePathOwnedByIdentity(runtimeDir, identity); err != nil {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, fmt.Errorf("set web-search runtime directory ownership: %w", err)
+	}
+	path := filepath.Join(runtimeDir, codexWebSearchFallbackConfigName)
+	if err := writeFileAtomicallyForIdentity(path, configTOML, 0o600, identity); err != nil {
+		_ = os.RemoveAll(runtimeDir)
+		return "", func() {}, err
+	}
+	var once sync.Once
+	cleanup := func() { once.Do(func() { _ = os.RemoveAll(runtimeDir) }) }
+	return path, cleanup, nil
+}
+
 func codexWebSearchFallbackRoleConfigTOML(fallbacks ...*config.ModelFeatureFallback) []byte {
 	model := codexWebSearchFallbackModel
 	effort := "high"
@@ -1115,6 +1165,33 @@ func codexWebSearchFallbackRoleConfigTOML(fallbacks ...*config.ModelFeatureFallb
 		lines = append(lines[:3], append([]string{`service_tier = "` + tomlEscapeString(tier) + `"`}, lines[3:]...)...)
 	}
 	return []byte(strings.Join(lines, "\n"))
+}
+
+func codexWebSearchFallbackRoleConfigTOMLFor(model, effort string) []byte {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = codexWebSearchFallbackModel
+	}
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		effort = "high"
+	}
+	return []byte(strings.Join([]string{
+		`model_provider = "openai"`,
+		`model = "` + tomlEscapeString(model) + `"`,
+		`model_reasoning_effort = "` + tomlEscapeString(effort) + `"`,
+		`web_search = "live"`,
+		`sandbox_mode = "read-only"`,
+		`approval_policy = "never"`,
+		`developer_instructions = "` + tomlEscapeString(codexWebSearchFallbackInstructions) + `"`,
+		"",
+		`[features.multi_agent_v2]`,
+		`enabled = false`,
+		"",
+		`[tools.web_search]`,
+		`context_size = "high"`,
+		"",
+	}, "\n"))
 }
 
 func responsesAdapterModelsForProvider(provider modelprofile.ProviderSpec) []responsesadapter.ModelInfo {

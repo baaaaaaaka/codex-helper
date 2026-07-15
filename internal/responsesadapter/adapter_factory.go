@@ -77,10 +77,14 @@ func NewConfiguredAdapter(opts AdapterOptions) (ProviderAdapter, error) {
 			RetryStatuses: append([]int(nil), opts.RetryStatuses...), MaxRetries: maxRetries, MaxRetriesSet: maxRetriesSet,
 			HonorRetryAfter: opts.HonorRetryAfter, RetryTransportErrors: opts.RetryTransport,
 			MaxOutputTokens: opts.MaxOutputTokens, Headers: cloneAdapterStringMap(opts.Headers), AuthType: opts.AuthType, AuthHeader: opts.AuthHeader,
-			StreamMode: streamMode, ReasoningDeltaPath: opts.ReasoningDeltaPath, CachedTokensPath: opts.CachedTokensPath, UsageField: opts.UsageField,
-			ResponseHeaderTimeout: time.Duration(opts.HTTP.ResponseHeaderTimeoutSeconds) * time.Second,
-			StreamIdleTimeout:     time.Duration(opts.Stream.IdleTimeoutSeconds) * time.Second,
-			HTTPClient:            client, Status: opts.Status,
+			StreamMode: streamMode, ReasoningDeltaPath: opts.ReasoningDeltaPath, ReasoningTokensPath: opts.Stream.ReasoningTokensPath, CachedTokensPath: opts.CachedTokensPath, UsageField: opts.UsageField,
+			ResponseHeaderTimeout:   time.Duration(opts.HTTP.ResponseHeaderTimeoutSeconds) * time.Second,
+			StreamIdleTimeout:       time.Duration(opts.Stream.IdleTimeoutSeconds) * time.Second,
+			FirstEventTimeout:       time.Duration(opts.Stream.FirstEventTimeoutSeconds) * time.Second,
+			SemanticProgressTimeout: time.Duration(opts.Stream.SemanticProgressTimeoutSeconds) * time.Second,
+			MaxDuration:             time.Duration(opts.Stream.MaxDurationSeconds) * time.Second,
+			HeartbeatMode:           opts.Stream.HeartbeatMode,
+			HTTPClient:              client, Status: opts.Status,
 		}
 		if opts.HTTP.MaxConcurrentRequests > 0 {
 			adapter.RequestGate = make(chan struct{}, opts.HTTP.MaxConcurrentRequests)

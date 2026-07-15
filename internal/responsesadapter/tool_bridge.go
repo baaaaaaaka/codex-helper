@@ -53,7 +53,7 @@ func NormalizeRequestTools(raw json.RawMessage, customToolMode string, unsupport
 			nativeTools = append(nativeTools, native)
 		}
 		for _, tool := range normalized {
-			nameKey := strings.ToLower(tool.Function.Name)
+			nameKey := strings.ToLower(strings.TrimSpace(tool.Namespace) + "\x00" + strings.TrimSpace(tool.Function.Name))
 			if seen[nameKey] {
 				warnings = append(warnings, ToolWarning{Type: tool.Type, Name: tool.Function.Name, Reason: "duplicate tool name dropped"})
 				continue
@@ -97,6 +97,10 @@ func NormalizeRequestTools(raw json.RawMessage, customToolMode string, unsupport
 }
 
 func normalizeRequestTool(raw json.RawMessage, specs []NativeToolSpec) ([]ChatTool, []ProviderNativeTool, []ToolWarning) {
+	return normalizeRequestToolInNamespace(raw, specs, "")
+}
+
+func normalizeRequestToolInNamespace(raw json.RawMessage, specs []NativeToolSpec, namespace string) ([]ChatTool, []ProviderNativeTool, []ToolWarning) {
 	if len(specs) > 0 {
 		if native, ok, warning := normalizeNativeTool(raw, specs); ok {
 			return nil, []ProviderNativeTool{native}, nil
@@ -106,14 +110,16 @@ func normalizeRequestTool(raw json.RawMessage, specs []NativeToolSpec) ([]ChatTo
 	}
 	var object struct {
 		Type  string            `json:"type"`
+		Name  string            `json:"name"`
 		Tools []json.RawMessage `json:"tools"`
 	}
 	if err := json.Unmarshal(raw, &object); err == nil && strings.EqualFold(strings.TrimSpace(object.Type), "namespace") {
+		nestedNamespace := strings.TrimSpace(object.Name)
 		var tools []ChatTool
 		var natives []ProviderNativeTool
 		var warnings []ToolWarning
 		for _, child := range object.Tools {
-			childTools, childNatives, childWarnings := normalizeRequestTool(child, specs)
+			childTools, childNatives, childWarnings := normalizeRequestToolInNamespace(child, specs, nestedNamespace)
 			tools = append(tools, childTools...)
 			natives = append(natives, childNatives...)
 			warnings = append(warnings, childWarnings...)
@@ -124,6 +130,11 @@ func normalizeRequestTool(raw json.RawMessage, specs []NativeToolSpec) ([]ChatTo
 		return tools, natives, warnings
 	}
 	tools, warnings := normalizeTool(raw)
+	for index := range tools {
+		if namespace != "" {
+			tools[index].Namespace = namespace
+		}
+	}
 	return tools, nil, warnings
 }
 

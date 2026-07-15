@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 const externalMillionTokenContextWindow = 1000000
@@ -46,6 +48,8 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 			} `json:"truncation_policy"`
 			DefaultReasoningLevel    string                 `json:"default_reasoning_level"`
 			SupportedReasoningLevels []codexReasoningPreset `json:"supported_reasoning_levels"`
+			MultiAgentVersion        *string                `json:"multi_agent_version"`
+			ToolMode                 string                 `json:"tool_mode"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -80,6 +84,44 @@ func TestCodexModelCatalogJSONUsesPublicModelIDs(t *testing.T) {
 	}
 	if got := strings.Join(efforts, ","); got != "low,medium,high,xhigh" {
 		t.Fatalf("supported reasoning levels = %q", got)
+	}
+}
+
+func TestCodexModelCatalogJSONOnlyAdvertisesMultiAgentForEnabledFallback(t *testing.T) {
+	disabled := false
+	provider := ProviderSpec{
+		ID:                     "fallback",
+		DisplayName:            "Fallback",
+		DefaultModel:           "fallback/model",
+		DisableHostedWebSearch: true,
+		Models: []ModelSpec{{
+			ID:            "fallback/model",
+			UpstreamID:    "fallback/model",
+			SupportsTools: true,
+			SearchPolicy:  config.ModelSearchPolicy{Fallback: config.ModelSearchFallback{Enabled: &disabled}},
+		}, {
+			ID:            "fallback/enabled",
+			UpstreamID:    "fallback/enabled",
+			SupportsTools: true,
+			SearchPolicy:  config.ModelSearchPolicy{Fallback: config.ModelSearchFallback{Model: "official/gpt-5.6-luna"}},
+		}},
+	}
+	raw, err := CodexModelCatalogJSON(provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog codexCatalog
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if got := catalog.Models[0].MultiAgentVersion; got != nil {
+		t.Fatalf("disabled fallback advertised multi-agent version %#v", got)
+	}
+	if got := catalog.Models[1].MultiAgentVersion; got == nil || *got != "v1" {
+		t.Fatalf("enabled fallback multi-agent version = %#v, want v1 for chat adapters", got)
+	}
+	if got := catalog.Models[1].ToolMode; got != "code_mode_only" {
+		t.Fatalf("enabled fallback tool mode = %q, want code_mode_only", got)
 	}
 }
 

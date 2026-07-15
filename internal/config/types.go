@@ -71,6 +71,13 @@ type GlobalDefaults struct {
 const CurrentModelConfigVersion = 1
 
 type ModelSource struct {
+	// Kind and Path describe a local split-catalog source. They are optional
+	// for Git-backed sources and are intentionally metadata-only: credentials
+	// remain in the local secret store.
+	Kind                    string    `json:"kind,omitempty"`
+	Path                    string    `json:"path,omitempty"`
+	Manifest                string    `json:"manifest,omitempty"`
+	Digest                  string    `json:"digest,omitempty"`
 	URL                     string    `json:"url"`
 	Ref                     string    `json:"ref,omitempty"`
 	File                    string    `json:"file,omitempty"`
@@ -113,12 +120,17 @@ type ModelHTTPPolicy struct {
 }
 
 type ModelStreamPolicy struct {
-	UpstreamMode           string `json:"upstreamMode,omitempty"`
-	Format                 string `json:"format,omitempty"`
-	IdleTimeoutSeconds     int    `json:"idleTimeoutSeconds,omitempty"`
-	SynthesizeResponsesSSE *bool  `json:"synthesizeResponsesSSE,omitempty"`
-	ReasoningDeltaPath     string `json:"reasoningDeltaPath,omitempty"`
-	CachedTokensPath       string `json:"cachedTokensPath,omitempty"`
+	UpstreamMode                   string `json:"upstreamMode,omitempty"`
+	Format                         string `json:"format,omitempty"`
+	IdleTimeoutSeconds             int    `json:"idleTimeoutSeconds,omitempty"`
+	FirstEventTimeoutSeconds       int    `json:"firstEventTimeoutSeconds,omitempty"`
+	SemanticProgressTimeoutSeconds int    `json:"semanticProgressTimeoutSeconds,omitempty"`
+	MaxDurationSeconds             int    `json:"maxDurationSeconds,omitempty"`
+	HeartbeatMode                  string `json:"heartbeatMode,omitempty"`
+	SynthesizeResponsesSSE         *bool  `json:"synthesizeResponsesSSE,omitempty"`
+	ReasoningDeltaPath             string `json:"reasoningDeltaPath,omitempty"`
+	ReasoningTokensPath            string `json:"reasoningTokensPath,omitempty"`
+	CachedTokensPath               string `json:"cachedTokensPath,omitempty"`
 }
 
 type ModelProvider struct {
@@ -191,6 +203,19 @@ type ModelCapabilities struct {
 	NativeWebSearch  *bool `json:"nativeWebSearch,omitempty"`
 }
 
+// ModelCapabilityModes preserves the explicit schema-v2 declaration. The
+// legacy tri-state booleans above are materialized for existing consumers;
+// modes retain whether support is native, translated, plugin, advisory,
+// unsupported, or unknown.
+type ModelCapabilityModes struct {
+	Tools            string `json:"tools,omitempty"`
+	ParallelTools    string `json:"parallelTools,omitempty"`
+	Vision           string `json:"vision,omitempty"`
+	Reasoning        string `json:"reasoning,omitempty"`
+	ReasoningSummary string `json:"reasoningSummary,omitempty"`
+	WebSearch        string `json:"webSearch,omitempty"`
+}
+
 type ModelLimits struct {
 	ContextWindow           int    `json:"contextWindow,omitempty"`
 	MaxContextWindow        int    `json:"maxContextWindow,omitempty"`
@@ -215,6 +240,7 @@ type ModelReasoningPolicy struct {
 type ModelToolPolicy struct {
 	ToolChoice            string `json:"toolChoice,omitempty"`
 	Parallel              string `json:"parallel,omitempty"`
+	ParallelEnforcement   string `json:"parallelEnforcement,omitempty"`
 	StrictSchema          string `json:"strictSchema,omitempty"`
 	EmptyAssistantContent string `json:"emptyAssistantContent,omitempty"`
 	InvalidArguments      string `json:"invalidArguments,omitempty"`
@@ -223,6 +249,13 @@ type ModelToolPolicy struct {
 	ToolNameMaxLength     int    `json:"toolNameMaxLength,omitempty"`
 	ValidateArguments     *bool  `json:"validateArguments,omitempty"`
 	CustomToolMode        string `json:"customToolMode,omitempty"`
+}
+
+// ModelStructuredOutputPolicy distinguishes json_object from json_schema;
+// providers commonly support one format reliably but not the other.
+type ModelStructuredOutputPolicy struct {
+	JSONObject string `json:"jsonObject,omitempty"`
+	JSONSchema string `json:"jsonSchema,omitempty"`
 }
 
 type ModelMessagePolicy struct {
@@ -255,9 +288,20 @@ type ModelSourcePolicy struct {
 // ModelResponsesPolicy advertises fields whose semantics differ between
 // provider APIs. A value of "unsupported" makes the facade fail closed.
 type ModelResponsesPolicy struct {
-	PreviousResponseID string `json:"previousResponseId,omitempty"`
-	Background         string `json:"background,omitempty"`
-	ContextManagement  string `json:"contextManagement,omitempty"`
+	PreviousResponseID string                      `json:"previousResponseId,omitempty"`
+	Background         string                      `json:"background,omitempty"`
+	ContextManagement  string                      `json:"contextManagement,omitempty"`
+	StructuredOutput   ModelStructuredOutputPolicy `json:"structuredOutput,omitempty"`
+}
+
+// ModelRoute selects a compiled wire adapter for one operation. It is kept
+// separate from the provider's default interface so the catalog can declare
+// operation-specific protocol conversion without executable templates.
+type ModelRoute struct {
+	Interface  string `json:"interface"`
+	Adapter    string `json:"adapter"`
+	Protocol   string `json:"protocol"`
+	Conversion string `json:"conversion,omitempty"`
 }
 
 type ModelSamplingPolicy struct {
@@ -314,12 +358,14 @@ type ModelDefinition struct {
 	Description      string                  `json:"description,omitempty"`
 	Priority         int                     `json:"priority,omitempty"`
 	Capabilities     ModelCapabilities       `json:"capabilities,omitempty"`
+	CapabilityModes  ModelCapabilityModes    `json:"capabilityModes,omitempty"`
 	Limits           ModelLimits             `json:"limits,omitempty"`
 	Reasoning        ModelReasoningPolicy    `json:"reasoning,omitempty"`
 	Tools            ModelToolPolicy         `json:"tools,omitempty"`
 	Messages         ModelMessagePolicy      `json:"messages,omitempty"`
 	Sampling         ModelSamplingPolicy     `json:"sampling,omitempty"`
 	Responses        ModelResponsesPolicy    `json:"responses,omitempty"`
+	Routes           map[string]ModelRoute   `json:"routes,omitempty"`
 	Stream           ModelStreamPolicy       `json:"stream,omitempty"`
 	HTTP             ModelHTTPPolicy         `json:"http,omitempty"`
 	Cache            ModelCachePolicy        `json:"cache,omitempty"`

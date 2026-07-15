@@ -941,6 +941,11 @@ func assertTeamsRenderedHTMLSafe(t *testing.T, got string) {
 	got = strings.ReplaceAll(got, "<hr/>", "")
 	got = strings.ReplaceAll(got, "<hr>", "")
 	got = stripAllowedAnchorOpenTags(got)
+	// Outbox messages intentionally carry a narrowly validated HTML comment
+	// marker so Graph deliveries can be tied back to their durable provenance
+	// record. Strip only that exact marker before rejecting any other markup;
+	// arbitrary comments must still fail this safety assertion.
+	got = helperOutboxProvenanceMarkerPattern.ReplaceAllString(got, "")
 	if strings.Contains(got, "<") || strings.Contains(got, ">") {
 		unescaped := html.UnescapeString(got)
 		if strings.Contains(unescaped, "<") || strings.Contains(unescaped, ">") {

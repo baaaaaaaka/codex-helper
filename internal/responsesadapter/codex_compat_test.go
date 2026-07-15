@@ -80,6 +80,34 @@ func TestCodexCompatToolCallSSEMaintainsFunctionCallDeltas(t *testing.T) {
 	assertCodexCompatibleSSE(t, events)
 }
 
+func TestCodexCompatNamespacedToolCallRestoresNamespace(t *testing.T) {
+	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
+		events: []ProviderEvent{
+			{Kind: ProviderEventToolCallDelta, ToolCall: &ProviderToolCallDelta{Index: 0, ID: "call_spawn", Name: "spawn_agent", ArgumentsDelta: `{"task":"inspect"}`}},
+			{Kind: ProviderEventDone},
+		},
+	})
+	tools := `[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]`
+	events := streamEventsForCodexCompat(t, facade, `{"model":"model-a","stream":true,"tools":`+tools+`,"input":"delegate"}`)
+	seen := 0
+	for _, event := range events {
+		if event.name != "response.output_item.added" && event.name != "response.output_item.done" {
+			continue
+		}
+		item := eventItem(t, event)
+		if stringField(t, item, "type") != "function_call" {
+			continue
+		}
+		if got := stringField(t, item, "namespace"); got != "collaboration" {
+			t.Fatalf("%s namespace = %q, want collaboration: %#v", event.name, got, item)
+		}
+		seen++
+	}
+	if seen != 2 {
+		t.Fatalf("saw %d namespaced function_call items, want added and done", seen)
+	}
+}
+
 func TestCodexCompatMixedTextAndToolCallSSE(t *testing.T) {
 	facade := newTestFacade(NewMemoryStore(), fakeAdapter{
 		events: []ProviderEvent{

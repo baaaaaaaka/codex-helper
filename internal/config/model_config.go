@@ -309,8 +309,23 @@ func ValidateModelConfig(cfg Config) error {
 		return err
 	}
 	for name, source := range cfg.ModelSources {
-		if strings.TrimSpace(name) == "" || strings.TrimSpace(source.URL) == "" {
-			return fmt.Errorf("model source %q requires url", name)
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("model source name is empty")
+		}
+		switch kind := strings.ToLower(strings.TrimSpace(source.Kind)); kind {
+		case "", "git":
+			if strings.TrimSpace(source.URL) == "" {
+				return fmt.Errorf("model source %q requires url", name)
+			}
+		case "file", "directory":
+			if strings.TrimSpace(source.Path) == "" {
+				return fmt.Errorf("model source %q requires path", name)
+			}
+			if strings.TrimSpace(source.URL) != "" {
+				return fmt.Errorf("model source %q local kind %q must not include url", name, kind)
+			}
+		default:
+			return fmt.Errorf("model source %q has invalid kind %q", name, source.Kind)
 		}
 		for _, credential := range source.Credentials {
 			if _, ok := cfg.ModelCredentials[credential]; !ok {
@@ -436,13 +451,43 @@ func ValidateModelDefinition(name string, model ModelDefinition) error {
 	if model.Capabilities.Reasoning != nil && !*model.Capabilities.Reasoning && (len(model.Reasoning.SupportedEfforts) > 0 || strings.TrimSpace(model.Reasoning.DefaultEffort) != "") {
 		return fmt.Errorf("model %q cannot configure reasoning efforts while reasoning=false", name)
 	}
+	if model.Search.Native != nil && model.Capabilities.NativeWebSearch != nil && *model.Search.Native != *model.Capabilities.NativeWebSearch {
+		return fmt.Errorf("model %q has conflicting native web-search declarations", name)
+	}
+	for _, declaration := range []struct {
+		field string
+		value string
+	}{
+		{field: "capabilityModes.tools", value: model.CapabilityModes.Tools},
+		{field: "capabilityModes.parallelTools", value: model.CapabilityModes.ParallelTools},
+		{field: "capabilityModes.vision", value: model.CapabilityModes.Vision},
+		{field: "capabilityModes.reasoning", value: model.CapabilityModes.Reasoning},
+		{field: "capabilityModes.reasoningSummary", value: model.CapabilityModes.ReasoningSummary},
+		{field: "capabilityModes.webSearch", value: model.CapabilityModes.WebSearch},
+	} {
+		validator := validateModelCapabilityMode
+		if declaration.field == "capabilityModes.webSearch" {
+			validator = validateModelWebSearchMode
+		}
+		if err := validator(name, declaration.field, declaration.value); err != nil {
+			return err
+		}
+	}
+	if value := model.Search.Fallback.Model; strings.TrimSpace(value) != value {
+		return fmt.Errorf("model %q search fallback model must not contain surrounding whitespace", name)
+	}
+	if value := model.Search.Fallback.Effort; value != strings.TrimSpace(value) || len(value) > 64 || strings.ContainsAny(value, " \t\r\n") {
+		return fmt.Errorf("model %q search fallback effort must be a single model value", name)
+	}
 	for field, value := range map[string]string{
 		"thinkingMode":          model.Reasoning.ThinkingMode,
 		"historyPolicy":         model.Reasoning.HistoryPolicy,
 		"toolChoice":            model.Tools.ToolChoice,
 		"parallel":              model.Tools.Parallel,
+		"parallelEnforcement":   model.Tools.ParallelEnforcement,
 		"strictSchema":          model.Tools.StrictSchema,
 		"emptyAssistantContent": model.Tools.EmptyAssistantContent,
+		"plainTextToolCall":     model.Tools.PlainTextToolCall,
 		"customToolMode":        model.Tools.CustomToolMode,
 		"temperature":           model.Sampling.Temperature,
 		"topP":                  model.Sampling.TopP,
@@ -457,6 +502,28 @@ func ValidateModelDefinition(name string, model ModelDefinition) error {
 	if err := validateHTTPPolicy("model "+name, model.HTTP); err != nil {
 		return err
 	}
+	if err := validateStreamPolicy("model "+name, model.Stream); err != nil {
+		return err
+	}
+	for operation, route := range model.Routes {
+		operation = strings.TrimSpace(operation)
+		if operation == "" || strings.TrimSpace(route.Interface) == "" || strings.TrimSpace(route.Adapter) == "" || strings.TrimSpace(route.Protocol) == "" {
+			return fmt.Errorf("model %q has incomplete route %q", name, operation)
+		}
+		switch strings.ToLower(strings.TrimSpace(route.Protocol)) {
+		case "responses", "chat-completions", "anthropic", "beta", "fim":
+		default:
+			return fmt.Errorf("model %q route %q has invalid protocol %q", name, operation, route.Protocol)
+		}
+	}
+	for field, value := range map[string]string{
+		"responses.structuredOutput.jsonObject": model.Responses.StructuredOutput.JSONObject,
+		"responses.structuredOutput.jsonSchema": model.Responses.StructuredOutput.JSONSchema,
+	} {
+		if err := validateCapabilityMode(name, field, value); err != nil {
+			return err
+		}
+	}
 	for field, value := range map[string]string{
 		"responses.previousResponseId": model.Responses.PreviousResponseID,
 		"responses.background":         model.Responses.Background,
@@ -468,7 +535,14 @@ func ValidateModelDefinition(name string, model ModelDefinition) error {
 			return fmt.Errorf("model %q has invalid %s policy %q", name, field, value)
 		}
 	}
-	return validateStreamPolicy("model "+name, model.Stream)
+	return nil
+}
+
+// validateModelDefinition is kept as a private compatibility shim for the
+// split-catalog loader. The canonical validator is exported so the newer
+// model-catalog package can share exactly the same policy checks.
+func validateModelDefinition(name string, model ModelDefinition) error {
+	return ValidateModelDefinition(name, model)
 }
 
 // ValidateModelFeatureRoutes rejects ambiguous operation selectors before
@@ -615,8 +689,10 @@ func validateModelEnum(model, field, value string) error {
 		"historyPolicy":         {"never", "tool-calls-only", "always", "omit", "drop", "text-only", "preserve", "keep", "provider-default"},
 		"toolChoice":            {"full", "auto-only", "omit"},
 		"parallel":              {"auto", "enabled", "disabled"},
+		"parallelEnforcement":   {"advisory", "strict"},
 		"strictSchema":          {"preserve", "strip"},
 		"emptyAssistantContent": {"preserve", "empty-string", "omit"},
+		"plainTextToolCall":     {"allow", "reject"},
 		"customToolMode":        {"function", "shell-fallback", "omit"},
 		"temperature":           {"forward", "strip", "strip-when-reasoning"},
 		"topP":                  {"forward", "strip", "strip-when-reasoning"},
@@ -632,6 +708,39 @@ func validateModelEnum(model, field, value string) error {
 	return fmt.Errorf("model %q has invalid %s %q (allowed: %s)", model, field, value, strings.Join(allowed[field], ", "))
 }
 
+func validateCapabilityMode(model, field, value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	for _, allowed := range []string{"native", "advisory", "unsupported"} {
+		if value == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q has invalid %s %q (allowed: native, advisory, unsupported)", model, field, value)
+}
+
+func validateModelCapabilityMode(model, field, value string) error {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return nil
+	}
+	for _, allowed := range []string{"native", "translated", "plugin", "advisory", "unsupported", "unknown"} {
+		if value == allowed {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q has invalid %s %q (allowed: native, translated, plugin, advisory, unsupported, unknown)", model, field, value)
+}
+
+func validateModelWebSearchMode(model, field, value string) error {
+	if strings.EqualFold(strings.TrimSpace(value), "fallback") {
+		return nil
+	}
+	return validateModelCapabilityMode(model, field, value)
+}
+
 func validateHTTPPolicy(owner string, policy ModelHTTPPolicy) error {
 	if policy.TimeoutSeconds < 0 || policy.ResponseHeaderTimeoutSeconds < 0 || policy.MaxConcurrentRequests < 0 || (policy.MaxRetries != nil && *policy.MaxRetries < 0) {
 		return fmt.Errorf("%s has invalid http timeout or retries", owner)
@@ -645,8 +754,13 @@ func validateHTTPPolicy(owner string, policy ModelHTTPPolicy) error {
 }
 
 func validateStreamPolicy(owner string, policy ModelStreamPolicy) error {
-	if policy.IdleTimeoutSeconds < 0 {
-		return fmt.Errorf("%s has invalid stream idle timeout", owner)
+	if policy.IdleTimeoutSeconds < 0 || policy.FirstEventTimeoutSeconds < 0 || policy.SemanticProgressTimeoutSeconds < 0 || policy.MaxDurationSeconds < 0 {
+		return fmt.Errorf("%s has invalid stream timeout", owner)
+	}
+	switch strings.ToLower(strings.TrimSpace(policy.HeartbeatMode)) {
+	case "", "ignore", "transport", "transport-only", "semantic":
+	default:
+		return fmt.Errorf("%s has invalid stream heartbeatMode %q", owner, policy.HeartbeatMode)
 	}
 	switch strings.ToLower(strings.TrimSpace(policy.UpstreamMode)) {
 	case "", "stream", "nonstream-buffered", "auto":

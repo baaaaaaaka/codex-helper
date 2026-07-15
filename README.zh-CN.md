@@ -327,14 +327,14 @@ provider/model 元数据，key 始终保存在本机；同一个模型名可以�
 interface 可以单独绑定：
 
 ```bash
-cxp model catalog add nvidia --git https://github.example/team/models.git
+cxp model catalog add example-provider --git https://example.invalid/team/models.git
 cxp model catalog add local --json ./models.json
 cxp model catalog list
 cxp model provider list
-printf '%s' "$NVIDIA_API_KEY" | cxp model provider setup nvidia --api-key-stdin
+printf '%s' "$EXAMPLE_PROVIDER_API_KEY" | cxp model provider setup example-provider --api-key-stdin
 # 如果某个 interface 使用单独的 token，可以单独绑定：
 printf '%s' "$DEEPSEEK_ANTHROPIC_KEY" | cxp model provider setup deepseek --interface anthropic --api-key-stdin
-cxp model use nvidia/deepseek-v4
+cxp model use example-provider/deepseek-v4
 cxp model list
 ```
 
@@ -391,8 +391,8 @@ Beta prefix/FIM 在 model feature 上声明 `operation: "prefix"` 或 `"fim"`；
 用保存的 model profile 启动一次，而不改变默认值：
 
 ```bash
-codex-proxy run --model-profile nvidia/deepseek-v4 -- codex
-codex-proxy app --model-profile nvidia/deepseek-v4
+codex-proxy run --model-profile example-provider/deepseek-v4 -- codex
+codex-proxy app --model-profile example-provider/deepseek-v4
 ```
 
 Teams 用户可以在创建或切换 Work chats 时选择 model profiles；Teams 命令列在
@@ -807,7 +807,7 @@ model status
 model list
 model catalog list
 model provider list
-model switch nvidia/deepseek-v4
+model switch example-provider/deepseek-v4
 model reset
 effort status
 effort list
@@ -828,9 +828,9 @@ helper file relative/path.ext
 helper publish-history
 helper publish-history full
 model status
-model switch nvidia/deepseek-v4
+model switch example-provider/deepseek-v4
 model reset
-model fork nvidia/deepseek-v4
+model fork example-provider/deepseek-v4
 effort status
 effort list
 effort set xhigh

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,8 +41,9 @@ func TestOpenAIChatAdapterStreamsTextAndUsage(t *testing.T) {
 
 	adapter := OpenAIChatAdapter{BaseURL: server.URL + "/v1", APIKey: "test-key", HTTPClient: server.Client()}
 	stream, err := adapter.Stream(context.Background(), ProviderRequest{
-		Model:     "model-a",
-		InputText: "hello",
+		Model:          "model-a",
+		InputText:      "hello",
+		ResponseFormat: json.RawMessage(`{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}`),
 		Tools: []ChatTool{{
 			Type:     "function",
 			Function: ChatFunction{Name: "read_file", Parameters: json.RawMessage(`{"type":"object"}`)},
@@ -71,6 +73,10 @@ func TestOpenAIChatAdapterStreamsTextAndUsage(t *testing.T) {
 	}
 	if gotBody.StreamOptions == nil || !gotBody.StreamOptions.IncludeUsage {
 		t.Fatalf("stream_options = %#v", gotBody.StreamOptions)
+	}
+	var gotFormat, wantFormat any
+	if json.Unmarshal(gotBody.ResponseFormat, &gotFormat) != nil || json.Unmarshal([]byte(`{"type":"json_schema","json_schema":{"name":"answer","schema":{"type":"object"}}}`), &wantFormat) != nil || !reflect.DeepEqual(gotFormat, wantFormat) {
+		t.Fatalf("response_format = %s", gotBody.ResponseFormat)
 	}
 	if len(gotBody.Tools) != 1 || gotBody.Tools[0].Function.Name != "read_file" {
 		t.Fatalf("tools = %#v", gotBody.Tools)

@@ -390,30 +390,32 @@ func (f *Facade) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerReq := ProviderRequest{
-		Model:              upstreamModel,
-		Operation:          operation,
-		Prefix:             req.Prefix,
-		Suffix:             req.Suffix,
-		Instructions:       req.Instructions,
-		InputText:          parsedInput.Text,
-		InputMessages:      parsedInput.Messages,
-		Messages:           buildProviderMessages(history, parsedInput.Messages),
-		Tools:              tools,
-		NativeTools:        nativeTools,
-		ToolWarnings:       toolWarnings,
-		ToolChoice:         req.ToolChoice,
-		ParallelToolCalls:  req.ParallelToolCalls,
-		MaxOutputTokens:    req.MaxOutputTokens,
-		ReasoningEffort:    reasoningEffort(req.Reasoning),
-		Temperature:        req.Temperature,
-		TopP:               req.TopP,
-		PreviousResponseID: req.PreviousResponseID,
-		ResponseFormat:     append(json.RawMessage(nil), req.ResponseFormat...),
-		Background:         req.Background,
-		ContextManagement:  append(json.RawMessage(nil), req.ContextManagement...),
-		SourcePolicy:       runtime.SourcePolicy,
-		Scope:              scope,
-		History:            history,
+		Model:                  upstreamModel,
+		Operation:              operation,
+		Prefix:                 req.Prefix,
+		Suffix:                 req.Suffix,
+		Instructions:           req.Instructions,
+		InputText:              parsedInput.Text,
+		InputMessages:          parsedInput.Messages,
+		Messages:               buildProviderMessages(history, parsedInput.Messages),
+		Tools:                  tools,
+		NativeTools:            nativeTools,
+		ToolWarnings:           toolWarnings,
+		ToolChoice:             req.ToolChoice,
+		ParallelToolCalls:      req.ParallelToolCalls,
+		MaxOutputTokens:        req.MaxOutputTokens,
+		ReasoningEffort:        reasoningEffort(req.Reasoning),
+		Temperature:            req.Temperature,
+		TopP:                   req.TopP,
+		PreviousResponseID:     req.PreviousResponseID,
+		ResponseFormat:         append(json.RawMessage(nil), req.ResponseFormat...),
+		Background:             req.Background,
+		ContextManagement:      append(json.RawMessage(nil), req.ContextManagement...),
+		ParallelEnforcement:    runtime.ParallelToolEnforcement,
+		StructuredOutputPolicy: runtime.ResponsesPolicy.StructuredOutput,
+		SourcePolicy:           runtime.SourcePolicy,
+		Scope:                  scope,
+		History:                history,
 	}
 	stream, err := runtime.Adapter.Stream(r.Context(), providerReq)
 	if err != nil {
@@ -470,6 +472,15 @@ func providerToolSourceType(name string, tools []ChatTool) string {
 	for _, tool := range tools {
 		if strings.EqualFold(strings.TrimSpace(tool.Function.Name), strings.TrimSpace(name)) {
 			return tool.SourceType
+		}
+	}
+	return ""
+}
+
+func providerToolNamespace(name string, tools []ChatTool) string {
+	for _, tool := range tools {
+		if strings.EqualFold(strings.TrimSpace(tool.Function.Name), strings.TrimSpace(name)) {
+			return tool.Namespace
 		}
 	}
 	return ""
