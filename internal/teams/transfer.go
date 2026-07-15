@@ -760,15 +760,16 @@ func (g *GraphClient) downloadSharedDriveItemContentToFileWithOptions(ctx contex
 	}
 	published := false
 	defer func() {
-		// Do not remove a lock file while a partial file is still live: a
-		// waiter may already have opened the old inode, and a new caller could
-		// otherwise create a second lock file and write concurrently. Once the
-		// partial has been renamed to the final destination, no caller can write
-		// through this path anymore, so removing the lock file is safe.
-		if published {
+		// Unlock before removing the lock file. Windows does not allow an open
+		// lock-file handle to be unlinked, while on Unix a waiter that already
+		// opened the old inode remains serialized. Once the partial has been
+		// renamed to the final destination, every waiter checks that destination
+		// before writing, so removing the path after releasing the lock cannot
+		// create a second writer for this transfer.
+		unlockErr := partLock.Unlock()
+		if published && unlockErr == nil {
 			_ = os.Remove(partLockPath)
 		}
-		_ = partLock.Unlock()
 	}()
 	if _, err := os.Lstat(destination); err == nil {
 		return "", 0, fmt.Errorf("download destination already exists: %s", destination)
