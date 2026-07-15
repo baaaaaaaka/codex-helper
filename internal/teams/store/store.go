@@ -5113,15 +5113,24 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	}
 	msg.Status = OutboxStatusSending
 	msg.LastSendAttempt = now
-	msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now)
+	msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now, msg.SendAttemptToken)
 	msg.LastSendError = ""
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
 	return msg, nil
 }
 
-func outboxSendAttemptToken(outboxID string, now time.Time) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(outboxID) + "\x00" + now.UTC().Format(time.RFC3339Nano)))
-	return hex.EncodeToString(sum[:16])
+func outboxSendAttemptToken(outboxID string, now time.Time, previousToken string) string {
+	previousToken = strings.TrimSpace(previousToken)
+	payload := strings.TrimSpace(outboxID) + "\x00" + now.UTC().Format(time.RFC3339Nano) + "\x00" + previousToken
+	sum := sha256.Sum256([]byte(payload))
+	token := hex.EncodeToString(sum[:16])
+	if token == previousToken {
+		// Keep the invariant explicit even in the astronomically unlikely event
+		// of a truncated digest collision.
+		sum = sha256.Sum256([]byte(payload + "\x00next"))
+		token = hex.EncodeToString(sum[:16])
+	}
+	return token
 }
 
 func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string) (OutboxMessage, error) {

@@ -2736,6 +2736,18 @@ func TestMarkOutboxUploadSessionForAttemptPersistsAndFences(t *testing.T) {
 	}
 }
 
+func TestOutboxSendAttemptTokenChangesWhenClockResolutionRepeats(t *testing.T) {
+	now := time.Date(2026, 7, 15, 16, 0, 0, 123456789, time.UTC)
+	first := outboxSendAttemptToken("same-outbox", now, "")
+	second := outboxSendAttemptToken("same-outbox", now, first)
+	if first == "" || second == "" || first == second {
+		t.Fatalf("same-timestamp attempt tokens = %q and %q, want distinct non-empty tokens", first, second)
+	}
+	if got := outboxSendAttemptToken("same-outbox", now, second); got == second {
+		t.Fatalf("third same-timestamp attempt reused token %q", got)
+	}
+}
+
 func TestMarkOutboxDriveItemForAttemptPersistsAndFences(t *testing.T) {
 	for _, useSQLite := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
