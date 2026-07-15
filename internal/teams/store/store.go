@@ -820,6 +820,9 @@ type OutboxMessage struct {
 	AttachmentUploadFolder string           `json:"attachment_upload_folder,omitempty"`
 	AttachmentSize         int64            `json:"attachment_size,omitempty"`
 	AttachmentHash         string           `json:"attachment_hash,omitempty"`
+	AttachmentUploadURL    string           `json:"attachment_upload_url,omitempty"`
+	AttachmentUploadExpiry time.Time        `json:"attachment_upload_expiry,omitempty"`
+	AttachmentUploadOffset int64            `json:"attachment_upload_offset,omitempty"`
 	DriveItemID            string           `json:"drive_item_id,omitempty"`
 	DriveItemName          string           `json:"drive_item_name,omitempty"`
 	DriveItemETag          string           `json:"drive_item_etag,omitempty"`
@@ -5289,7 +5292,26 @@ func markOutboxSendErrorLocked(state *State, msg OutboxMessage, attemptToken str
 }
 
 func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.markOutboxDriveItem(ctx, outboxID, "", itemID, name, eTag, webURL, webDavURL, false)
+}
+
+// MarkOutboxDriveItemForAttempt records an uploaded DriveItem only while the
+// caller still owns the send lease. A large upload can outlive the lease if it
+// stops making progress; without this fence an old worker could attach its
+// DriveItem to a newer attempt after another worker reclaimed the outbox row.
+func (s *Store) MarkOutboxDriveItemForAttempt(ctx context.Context, outboxID string, attemptToken string, itemID string, name string, eTag string, webURL string, webDavURL string) (OutboxMessage, error) {
+	attemptToken = strings.TrimSpace(attemptToken)
+	if strings.TrimSpace(outboxID) == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	return s.markOutboxDriveItem(ctx, outboxID, attemptToken, itemID, name, eTag, webURL, webDavURL, true)
+}
+
+func (s *Store) markOutboxDriveItem(ctx context.Context, outboxID string, attemptToken string, itemID string, name string, eTag string, webURL string, webDavURL string, requireAttempt bool) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if requireAttempt && (msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken) {
+			return msg, ErrOutboxSendNotClaimed
+		}
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
@@ -5298,19 +5320,48 @@ func (s *Store) MarkOutboxDriveItem(ctx context.Context, outboxID string, itemID
 		msg.LastSendError = ""
 		updateArtifactRecordsForOutboxLocked(state, msg, now, "drive_uploaded", "", "")
 		return msg, nil
-	}); handled || err != nil {
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
 		return out, err
 	}
-	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		msg.DriveItemID = strings.TrimSpace(itemID)
-		msg.DriveItemName = strings.TrimSpace(name)
-		msg.DriveItemETag = strings.TrimSpace(eTag)
-		msg.DriveItemWebURL = strings.TrimSpace(webURL)
-		msg.DriveItemWebDav = strings.TrimSpace(webDavURL)
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// MarkOutboxUploadSessionForAttempt durably records the resumable upload
+// session owned by the current send lease. The URL is pre-authenticated and
+// must never be reused by a different outbox attempt, so updates are fenced by
+// the send-attempt token. Recording progress also renews the send lease while
+// a large file is actively making progress.
+func (s *Store) MarkOutboxUploadSessionForAttempt(ctx context.Context, outboxID string, attemptToken string, uploadURL string, expiresAt time.Time, offset int64) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	if offset < 0 {
+		return OutboxMessage{}, fmt.Errorf("upload session offset must not be negative")
+	}
+	update := func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if strings.TrimSpace(uploadURL) == "" {
+			msg.AttachmentUploadURL = ""
+			msg.AttachmentUploadExpiry = time.Time{}
+			msg.AttachmentUploadOffset = 0
+		} else {
+			msg.AttachmentUploadURL = strings.TrimSpace(uploadURL)
+			msg.AttachmentUploadExpiry = expiresAt
+			msg.AttachmentUploadOffset = offset
+		}
+		msg.LastSendAttempt = now
 		msg.LastSendError = ""
-		updateArtifactRecordsForOutboxLocked(state, msg, now, "drive_uploaded", "", "")
 		return msg, nil
-	})
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 func (s *Store) MarkOutboxAccepted(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {

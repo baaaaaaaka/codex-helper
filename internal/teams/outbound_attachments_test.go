@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,128 @@ func TestPrepareOutboundAttachmentRestrictsToRootAndAllowedFiles(t *testing.T) {
 				t.Fatalf("expected %s path to be rejected", tc.name)
 			}
 		})
+	}
+}
+
+func TestPrepareOutboundAttachmentStreamsLargeFilesWithoutMaterializingBytes(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "large.bin")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("create large fixture: %v", err)
+	}
+	if err := f.Truncate(outboundAttachmentInlineBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("truncate large fixture: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close large fixture: %v", err)
+	}
+
+	file, err := PrepareOutboundAttachment("large.bin", OutboundAttachmentOptions{Root: root})
+	if err != nil {
+		t.Fatalf("PrepareOutboundAttachment error: %v", err)
+	}
+	if file.Size != outboundAttachmentInlineBytes+1 || file.Bytes != nil || len(file.SHA256) != 64 {
+		t.Fatalf("large prepared file should be streamed: size=%d bytes=%d sha=%q", file.Size, len(file.Bytes), file.SHA256)
+	}
+}
+
+func TestStageOutboundAttachmentStreamsLargeFileAndRetainsIntegrityHash(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	root := filepath.Join(tmp, "source")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir source root: %v", err)
+	}
+	path := filepath.Join(root, "large.bin")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("create large fixture: %v", err)
+	}
+	if err := f.Truncate(outboundAttachmentInlineBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("truncate large fixture: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close large fixture: %v", err)
+	}
+	file, err := PrepareOutboundAttachment(path, OutboundAttachmentOptions{Root: root, AllowAnyPath: true, GeneratedName: "large-upload.bin"})
+	if err != nil {
+		t.Fatalf("PrepareOutboundAttachment error: %v", err)
+	}
+	staged, err := stageOutboundAttachmentForOutbox(file)
+	if err != nil {
+		t.Fatalf("stageOutboundAttachmentForOutbox error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cleanupStagedOutboundAttachment(staged.Path); err != nil {
+			t.Errorf("cleanupStagedOutboundAttachment: %v", err)
+		}
+	})
+	if staged.Bytes != nil || staged.Size != file.Size || staged.SHA256 != file.SHA256 || !strings.Contains(staged.Path, string(filepath.Separator)+".outbox"+string(filepath.Separator)) {
+		t.Fatalf("large staged file lost streaming/integrity metadata: %#v", staged)
+	}
+	info, err := os.Stat(staged.Path)
+	if err != nil {
+		t.Fatalf("stat staged file: %v", err)
+	}
+	if info.Size() != file.Size {
+		t.Fatalf("staged size=%d, want %d", info.Size(), file.Size)
+	}
+}
+
+func TestStageOutboundAttachmentDropsLargeInMemoryPayload(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	data := bytes.Repeat([]byte("x"), maxSingleDriveItemBytes+1)
+	file := OutboundAttachmentFile{
+		Name:        "large.bin",
+		UploadName:  "large-upload.bin",
+		ContentType: "application/octet-stream",
+		Bytes:       data,
+		Size:        int64(len(data)),
+		SHA256:      attachmentContentHash(data),
+	}
+	staged, err := stageOutboundAttachmentForOutbox(file)
+	if err != nil {
+		t.Fatalf("stageOutboundAttachmentForOutbox error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cleanupStagedOutboundAttachment(staged.Path); err != nil {
+			t.Errorf("cleanupStagedOutboundAttachment: %v", err)
+		}
+	})
+	if staged.Bytes != nil || staged.Size != int64(len(data)) || staged.SHA256 != file.SHA256 {
+		t.Fatalf("large in-memory payload was retained or metadata changed: bytes=%d size=%d hash=%q", len(staged.Bytes), staged.Size, staged.SHA256)
+	}
+}
+
+func TestStageOutboundAttachmentRejectsTamperedDeterministicExistingFile(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	source := filepath.Join(tmp, "source.bin")
+	if err := os.WriteFile(source, []byte("original"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	file, err := PrepareOutboundAttachment(source, OutboundAttachmentOptions{Root: tmp, AllowAnyPath: true, GeneratedName: "same.bin"})
+	if err != nil {
+		t.Fatalf("PrepareOutboundAttachment error: %v", err)
+	}
+	staged, err := stageOutboundAttachmentForOutbox(file)
+	if err != nil {
+		t.Fatalf("initial stageOutboundAttachmentForOutbox error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cleanupStagedOutboundAttachment(staged.Path); err != nil {
+			t.Errorf("cleanupStagedOutboundAttachment: %v", err)
+		}
+	})
+	if err := os.WriteFile(staged.Path, []byte("tampered"), 0o600); err != nil {
+		t.Fatalf("tamper staged file: %v", err)
+	}
+	if _, err := stageOutboundAttachmentForOutbox(file); err == nil || !strings.Contains(err.Error(), "content conflicts") {
+		t.Fatalf("tampered deterministic stage error = %v, want content conflict", err)
 	}
 }
 
@@ -294,6 +417,9 @@ func TestSendOutboundAttachmentUploadsMetadataAndMessage(t *testing.T) {
 	}
 	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "attachment") {
 		t.Fatalf("sent messages = %#v", *sent)
+	}
+	if !strings.Contains((*sent)[0].Content, "codex-helper-outbox:") {
+		t.Fatalf("direct attachment send is missing provenance marker: %#v", *sent)
 	}
 }
 

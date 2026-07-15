@@ -386,6 +386,14 @@ jobs:
           attachment_file_pattern='Test(DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink)$'
           go test ./internal/teams -count=1 -run "$attachment_file_pattern" -v
 
+      - name: Teams file transfer durability and provenance regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          transfer_pattern='Test(GraphUploadDriveItemFromFile(PersistsSessionCheckpoint|ResumesPersistedSessionCheckpoint)|GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
+          go test ./internal/teams -count=1 -run "$transfer_pattern" -v
+          go test ./internal/teams/store -count=1 -run '^TestMarkOutbox(UploadSessionForAttemptPersistsAndFences|DriveItemForAttemptPersistsAndFences)$' -v
+
       - name: Teams control chat scope isolation regressions
         shell: bash
         run: |

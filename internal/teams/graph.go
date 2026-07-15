@@ -15,17 +15,34 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	graphBaseURL          = "https://graph.microsoft.com/v1.0"
-	defaultGraphRetries   = 3
-	defaultBackoffBase    = 200 * time.Millisecond
-	defaultBackoffMax     = 2 * time.Second
-	maxHostedContentBytes = 20 << 20
-	maxSharedFileBytes    = 20 << 20
-	maxDriveItemJSONBytes = 2 << 20
+	graphBaseURL            = "https://graph.microsoft.com/v1.0"
+	defaultGraphRetries     = 3
+	defaultBackoffBase      = 200 * time.Millisecond
+	defaultBackoffMax       = 2 * time.Second
+	defaultGraphHTTPTimeout = 30 * time.Second
+	maxHostedContentBytes   = 20 << 20
+	maxSharedFileBytes      = 20 << 20
+	maxDriveItemJSONBytes   = 2 << 20
+	// Use Graph's documented resumable-upload path above 10 MiB. This is a
+	// protocol boundary, not an application file-size limit: larger files are
+	// still accepted up to maxTeamsTransferBytes and are sent in sessions.
+	maxSingleDriveItemBytes = 10 * 1024 * 1024
+	// Upload-session fragments must be smaller than 60 MiB and aligned to
+	// 320 KiB. Ten MiB is exactly 32 aligned blocks, which keeps the request
+	// count low while leaving a conservative margin below the service limit.
+	defaultUploadSessionChunkSize = 10 * 1024 * 1024
+	defaultTransferDialTimeout    = 15 * time.Second
+	defaultTransferHeaderTimeout  = 30 * time.Second
+	defaultTransferIdleTimeout    = 2 * time.Minute
+	defaultTransferMaxRetries     = 3
+	// Keep an application ceiling at the documented OneDrive/SharePoint file
+	// size rather than silently accepting an unbounded local path.
+	maxTeamsTransferBytes = 250 * 1000 * 1000 * 1000
 )
 
 var guidPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
@@ -36,15 +53,21 @@ type graphAuth interface {
 }
 
 type GraphClient struct {
-	auth       graphAuth
-	client     *http.Client
-	out        io.Writer
-	baseURL    string
-	maxRetries int
-	backoffMin time.Duration
-	backoffMax time.Duration
-	sleep      func(context.Context, time.Duration) error
-	jitter     func(time.Duration) time.Duration
+	auth                graphAuth
+	client              *http.Client
+	out                 io.Writer
+	baseURL             string
+	maxRetries          int
+	backoffMin          time.Duration
+	backoffMax          time.Duration
+	sleep               func(context.Context, time.Duration) error
+	jitter              func(time.Duration) time.Duration
+	transferIdleTimeout time.Duration
+	transferChunkSize   int64
+	transferMaxRetries  int
+	singlePutMaxBytes   int64
+	transferClientOnce  *sync.Once
+	transferClient      *http.Client
 }
 
 type User struct {
@@ -125,12 +148,14 @@ type OutboundHostedContent struct {
 }
 
 type DriveItem struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	ETag      string `json:"eTag"`
-	WebURL    string `json:"webUrl"`
-	WebDavURL string `json:"webDavUrl"`
-	File      *struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ETag        string `json:"eTag"`
+	WebURL      string `json:"webUrl"`
+	WebDavURL   string `json:"webDavUrl"`
+	Size        int64  `json:"size,omitempty"`
+	DownloadURL string `json:"@microsoft.graph.downloadUrl,omitempty"`
+	File        *struct {
 		MimeType string `json:"mimeType"`
 	} `json:"file,omitempty"`
 }
@@ -204,19 +229,21 @@ func newGraphClient(auth graphAuth, out io.Writer) *GraphClient {
 func newGraphClientWithHTTPClient(auth graphAuth, out io.Writer, client *http.Client) *GraphClient {
 	if client == nil {
 		client = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: defaultGraphHTTPTimeout,
 		}
 	}
 	return &GraphClient{
-		auth:       auth,
-		client:     client,
-		out:        out,
-		baseURL:    graphBaseURL,
-		maxRetries: defaultGraphRetries,
-		backoffMin: defaultBackoffBase,
-		backoffMax: defaultBackoffMax,
-		sleep:      sleepContext,
-		jitter:     jitterDuration,
+		auth:               auth,
+		client:             client,
+		out:                out,
+		baseURL:            graphBaseURL,
+		maxRetries:         defaultGraphRetries,
+		backoffMin:         defaultBackoffBase,
+		backoffMax:         defaultBackoffMax,
+		sleep:              sleepContext,
+		jitter:             jitterDuration,
+		transferMaxRetries: -1,
+		transferClientOnce: &sync.Once{},
 	}
 }
 
@@ -810,14 +837,22 @@ func HTMLMessageMentioningOwner(prefix string, text string, owner User) (string,
 }
 
 func (g *GraphClient) SendDriveItemAttachment(ctx context.Context, chatID string, item DriveItem, message string) (ChatMessage, error) {
-	return g.sendDriveItemAttachmentWithOptions(ctx, chatID, item, message, graphRequestOptions{})
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, "", graphRequestOptions{})
 }
 
 func (g *GraphClient) SendDriveItemAttachmentWithoutRateLimitRetry(ctx context.Context, chatID string, item DriveItem, message string) (ChatMessage, error) {
-	return g.sendDriveItemAttachmentWithOptions(ctx, chatID, item, message, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, "", graphRequestOptions{returnRateLimitWithoutRetry: true})
 }
 
-func (g *GraphClient) sendDriveItemAttachmentWithOptions(ctx context.Context, chatID string, item DriveItem, message string, opts graphRequestOptions) (ChatMessage, error) {
+func (g *GraphClient) SendDriveItemAttachmentWithProvenance(ctx context.Context, chatID string, item DriveItem, message string, outboxID string) (ChatMessage, error) {
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, outboxID, graphRequestOptions{})
+}
+
+func (g *GraphClient) SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(ctx context.Context, chatID string, item DriveItem, message string, outboxID string) (ChatMessage, error) {
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, outboxID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) sendDriveItemAttachmentWithProvenanceAndOptions(ctx context.Context, chatID string, item DriveItem, message string, outboxID string, opts graphRequestOptions) (ChatMessage, error) {
 	contentURL := strings.TrimSpace(firstNonEmptyString(item.WebDavURL, item.WebURL))
 	if contentURL == "" {
 		return ChatMessage{}, fmt.Errorf("drive item %q has no webDavUrl or webUrl", item.ID)
@@ -837,7 +872,7 @@ func (g *GraphClient) sendDriveItemAttachmentWithOptions(ctx context.Context, ch
 	body := map[string]any{
 		"body": map[string]any{
 			"contentType": "html",
-			"content":     bodyText + `<attachment id="` + html.EscapeString(attachmentID) + `"></attachment>`,
+			"content":     bodyText + `<attachment id="` + html.EscapeString(attachmentID) + `"></attachment>` + helperOutboxProvenanceMarker(outboxID),
 		},
 		"attachments": []map[string]any{{
 			"id":          attachmentID,
@@ -933,7 +968,7 @@ func (g *GraphClient) getDriveItemMetadataWithOptions(ctx context.Context, itemI
 	if itemID == "" {
 		return DriveItem{}, fmt.Errorf("drive item id is required")
 	}
-	path := "/me/drive/items/" + url.PathEscape(itemID) + "?$select=id,name,eTag,webUrl,webDavUrl"
+	path := "/me/drive/items/" + url.PathEscape(itemID) + "?$select=id,name,size,eTag,webUrl,webDavUrl"
 	var item DriveItem
 	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
 	return item, err
@@ -960,7 +995,7 @@ func (g *GraphClient) getSharedDriveItemMetadataWithOptions(ctx context.Context,
 	if shareID == "" {
 		return DriveItem{}, fmt.Errorf("sharing URL is required")
 	}
-	path := "/shares/" + url.PathEscape(shareID) + "/driveItem?$select=id,name,eTag,webUrl,webDavUrl,file"
+	path := "/shares/" + url.PathEscape(shareID) + "/driveItem?$select=id,name,size,eTag,webUrl,webDavUrl,file"
 	var item DriveItem
 	err := g.doWithOptions(ctx, http.MethodGet, path, nil, &item, opts)
 	return item, err
@@ -1444,6 +1479,10 @@ func isAllowedGraphRequest(method string, path string) bool {
 		q, ok := allowedGraphQuery(path)
 		return ok && len(q) == 0
 	}
+	if method == http.MethodPost && isMeDriveRootUploadSessionPath(clean) {
+		q, ok := allowedGraphQuery(path)
+		return ok && len(q) == 0
+	}
 	if method == http.MethodGet && isMeDriveItemMetadataPath(clean) {
 		q, ok := allowedGraphQuery(path)
 		return ok && allowedDriveItemMetadataQuery(q)
@@ -1545,7 +1584,7 @@ func (g *GraphClient) retryLimit() int {
 }
 
 func (g *GraphClient) retryDelay(resp *http.Response, attempt int) time.Duration {
-	if resp.StatusCode == http.StatusTooManyRequests {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		if delay := retryAfter(resp.Header.Get("Retry-After")); delay > 0 {
 			return delay
 		}
@@ -1761,7 +1800,7 @@ func allowedListChatsQuery(values url.Values) bool {
 func allowedDriveItemMetadataQuery(values url.Values) bool {
 	selectValues := values["$select"]
 	return len(values) == 1 && len(selectValues) == 1 &&
-		(selectValues[0] == "id,name,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,eTag,webUrl,webDavUrl,file")
+		(selectValues[0] == "id,name,size,eTag,webUrl,webDavUrl" || selectValues[0] == "id,name,size,eTag,webUrl,webDavUrl,file")
 }
 
 func allowedOnlineMeetingQuery(values url.Values) bool {
@@ -1929,6 +1968,14 @@ func isMeDriveRootContentPath(path string) bool {
 	return safeColonPathSegments(inside)
 }
 
+func isMeDriveRootUploadSessionPath(path string) bool {
+	if !strings.HasPrefix(path, "/me/drive/root:/") || !strings.HasSuffix(path, ":/createUploadSession") {
+		return false
+	}
+	inside := strings.TrimSuffix(strings.TrimPrefix(path, "/me/drive/root:/"), ":/createUploadSession")
+	return safeColonPathSegments(inside)
+}
+
 func isMeDriveItemMetadataPath(path string) bool {
 	parts := strings.Split(path, "/")
 	if len(parts) != 5 || parts[0] != "" || parts[1] != "me" || parts[2] != "drive" || parts[3] != "items" || parts[4] == "" {
@@ -1950,6 +1997,14 @@ func safeGraphDynamicID(value string) bool {
 }
 
 func meDriveRootContentPath(folder string, name string) (string, error) {
+	return meDriveRootPath(folder, name, ":/content")
+}
+
+func meDriveRootUploadSessionPath(folder string, name string) (string, error) {
+	return meDriveRootPath(folder, name, ":/createUploadSession")
+}
+
+func meDriveRootPath(folder string, name string, suffix string) (string, error) {
 	segments := safeDrivePathSegments(folder)
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -1966,7 +2021,7 @@ func meDriveRootContentPath(folder string, name string) (string, error) {
 		}
 		escaped = append(escaped, url.PathEscape(segment))
 	}
-	return "/me/drive/root:/" + strings.Join(escaped, "/") + ":/content", nil
+	return "/me/drive/root:/" + strings.Join(escaped, "/") + suffix, nil
 }
 
 func safeDrivePathSegments(folder string) []string {

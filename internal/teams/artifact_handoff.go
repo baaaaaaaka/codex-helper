@@ -673,14 +673,24 @@ func asciiFoldByte(ch byte) byte {
 }
 
 func ArtifactUploadName(sessionID string, turnID string, name string, data []byte) string {
+	sum := sha256.Sum256(data)
+	return ArtifactUploadNameFromSHA256(sessionID, turnID, name, hex.EncodeToString(sum[:]))
+}
+
+func ArtifactUploadNameFromSHA256(sessionID string, turnID string, name string, sha256Hex string) string {
 	name = safeAttachmentName(path.Base(strings.ReplaceAll(name, "\\", "/")))
 	if name == "" || strings.HasPrefix(name, ".") {
 		name = "artifact"
 	}
-	sum := sha256.Sum256(data)
-	hash := hex.EncodeToString(sum[:])
-	if len(hash) > 16 {
-		hash = hash[:16]
+	hash := strings.TrimSpace(sha256Hex)
+	if decoded, err := hex.DecodeString(hash); err != nil || len(decoded) != sha256.Size {
+		// This helper has no error return because it is also used while
+		// rendering an already-validated artifact plan. Keep the filename
+		// deterministic and collision-resistant even if a legacy caller passes
+		// malformed input instead of silently emitting an empty/shared prefix.
+		sum := sha256.Sum256([]byte(hash))
+		hash = hex.EncodeToString(sum[:])
 	}
+	hash = hash[:16]
 	return "codex-artifact-" + safePathPart(sessionID) + "-" + safePathPart(turnID) + "-" + hash + "-" + name
 }
