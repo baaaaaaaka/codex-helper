@@ -201,3 +201,58 @@ func TestCloseCancelsAndCleansActiveCandidate(t *testing.T) {
 		t.Fatal("candidate remained alive after Stack.Close")
 	}
 }
+
+func TestCandidateConstructionFailureConsumesRecoveryBudget(t *testing.T) {
+	initial := newProbeTestTunnel(0, errors.New("initial tunnel failure"))
+	close(initial.done)
+	previousFactory := newStackTunnel
+	var constructionAttempts atomic.Int32
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		constructionAttempts.Add(1)
+		return nil, errors.New("candidate construction unavailable")
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+
+	var persisted config.ProxyRecoveryBudget
+	s := &Stack{
+		Profile:               config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:                initial,
+		fatalCh:               make(chan error, 1),
+		stopCh:                make(chan struct{}),
+		persistRecoveryBudget: func(budget config.ProxyRecoveryBudget) error { persisted = budget; return nil },
+	}
+	restarts := []time.Time{}
+	opts := Options{
+		MaxRestarts:       1,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+	}
+	now := time.Now()
+	if !s.recoverTunnelAt(opts, &restarts, errors.New("tunnel exited"), now) {
+		t.Fatal("first candidate construction failure unexpectedly blocked recovery")
+	}
+	if got := constructionAttempts.Load(); got != 1 {
+		t.Fatalf("candidate construction attempts after first failure = %d, want 1", got)
+	}
+	if persisted.RestartAttempts != 1 || persisted.Blocked {
+		t.Fatalf("persisted budget after first failure = %#v, want one unblocked attempt", persisted)
+	}
+	if s.recoverTunnelAt(opts, &restarts, errors.New("tunnel exited again"), now.Add(time.Second)) {
+		t.Fatal("second candidate construction failure unexpectedly remained recoverable")
+	}
+	if got := constructionAttempts.Load(); got != 1 {
+		t.Fatalf("candidate construction attempts after budget exhaustion = %d, want 1", got)
+	}
+	if !persisted.Blocked || persisted.RestartAttempts != 2 {
+		t.Fatalf("persisted budget after exhaustion = %#v, want blocked after two admissions", persisted)
+	}
+	select {
+	case err := <-s.fatalCh:
+		if !errors.Is(err, ErrRecoveryBudgetBlocked) {
+			t.Fatalf("fatal error = %v, want blocked budget", err)
+		}
+	default:
+		t.Fatal("budget exhaustion did not report a fatal blocked state")
+	}
+}

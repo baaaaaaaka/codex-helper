@@ -1330,6 +1330,19 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	oldTun := s.currentTunnel()
 	oldPort := s.CurrentSocksPort()
 	s.setRecoveryStateNow("building-candidate", cause)
+	// Admission happens after the host gate, recovery backoff, and generation
+	// check, but before any candidate resource allocation. A failed port
+	// reservation or tunnel construction is still a recovery attempt and must
+	// not be able to spin forever without consuming the bounded budget.
+	if opts.MaxRestarts >= 0 && !s.admitPersistentRecoveryBudget("restart", now, opts.MaxRestarts, opts.RestartWindow, cause, nil) {
+		return false
+	}
+	*restarts = append(*restarts, now)
+	if opts.MaxRestarts >= 0 && len(*restarts) > opts.MaxRestarts {
+		s.setRecoveryStateNow("blocked", cause)
+		s.reportFatal(fmt.Errorf("ssh tunnel recovery budget exceeded: %w", cause))
+		return false
+	}
 
 	// Build the candidate on a separate port while the current generation is
 	// still serving. A failed candidate must not destroy a backend that may
@@ -1362,20 +1375,6 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	}()
 	if !s.recoveryGenerationCurrent(recoveryGeneration) {
 		return s.recoveryCandidateFailed(opts, oldTun, errors.New("host state changed before candidate start"))
-	}
-	// Admission happens immediately before starting a candidate process. Host
-	// wait, sleep, interface changes, and candidate construction do not consume
-	// the durable restart budget.
-	if opts.MaxRestarts >= 0 && !s.admitPersistentRecoveryBudget("restart", now, opts.MaxRestarts, opts.RestartWindow, cause, nil) {
-		_ = tun.Stop(opts.TunnelStopGrace)
-		return false
-	}
-	*restarts = append(*restarts, now)
-	if opts.MaxRestarts >= 0 && len(*restarts) > opts.MaxRestarts {
-		s.setRecoveryStateNow("blocked", cause)
-		s.reportFatal(fmt.Errorf("ssh tunnel recovery budget exceeded: %w", cause))
-		_ = tun.Stop(opts.TunnelStopGrace)
-		return false
 	}
 	if terr := tun.Start(); terr != nil {
 		_ = tun.Stop(opts.TunnelStopGrace)
