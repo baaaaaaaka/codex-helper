@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -64,15 +65,25 @@ func ensureLongLivedModelProfileAdapterForApp(ctx context.Context, store *config
 			Enabled: true, Native: true, Name: resolved.Name, ProviderID: modelprofile.DefaultProvider, Model: model,
 		})
 	}
-	if modelprofile.HasConfiguredThirdPartyModels(cfg) {
+	// Proxy-backed App launches use the unified gateway even when only the
+	// official provider is configured. The desktop's bundled app-server is a
+	// separate process from Electron and can otherwise bypass Chromium's
+	// --proxy-server route.
+	if modelprofile.HasConfiguredThirdPartyModels(cfg) || (resolved.IsDefault() && strings.TrimSpace(proxyRef) != "") {
 		launch, gatewayErr := ensureLongLivedUnifiedModelGatewayForApp(ctx, store, cfg, resolved, proxyRef, log)
 		if gatewayErr != nil && resolved.IsDefault() {
+			if strings.TrimSpace(proxyRef) != "" {
+				return codexModelProfileLaunch{}, fmt.Errorf("start proxied official model gateway: %w", gatewayErr)
+			}
 			if log != nil {
 				_, _ = fmt.Fprintf(log, "warning: unified App model gateway unavailable; using native Codex provider: %v\n", gatewayErr)
 			}
 			return nativeLaunch(), nil
 		}
 		if gatewayErr == nil && resolved.IsDefault() && !launch.Enabled {
+			if strings.TrimSpace(proxyRef) != "" {
+				return codexModelProfileLaunch{}, errors.New("proxied official model gateway did not produce a launch configuration")
+			}
 			return nativeLaunch(), nil
 		}
 		return applyGlobalDefaults(launch), gatewayErr
@@ -126,7 +137,7 @@ func ensureLongLivedUnifiedModelGatewayForApp(
 	log io.Writer,
 ) (codexModelProfileLaunch, error) {
 	configured, apiKeys := resolveRoutableConfiguredModels(cfg, store, log)
-	if len(configured) == 0 {
+	if len(configured) == 0 && strings.TrimSpace(proxyRef) == "" {
 		if selected.IsDefault() {
 			return codexModelProfileLaunch{}, nil
 		}
@@ -147,7 +158,11 @@ func ensureLongLivedUnifiedModelGatewayForApp(
 		}
 	}
 	if log != nil {
-		_, _ = fmt.Fprintf(log, "starting a long-lived unified model gateway for %d third-party profile(s)...\n", len(configured))
+		if len(configured) == 0 {
+			_, _ = fmt.Fprintln(log, "starting a long-lived official model gateway for the proxied Codex desktop app...")
+		} else {
+			_, _ = fmt.Fprintf(log, "starting a long-lived unified model gateway for %d third-party profile(s)...\n", len(configured))
+		}
 	}
 	instanceID, err := startModelProfileAdapterDaemon(ctx, store, selected, instanceProfileID, listenHost, upstreamProfile, true)
 	if err != nil {
@@ -634,6 +649,17 @@ func unifiedModelUpstreamProxyProfile(cfg config.Config, profiles []modelprofile
 			return nil, fmt.Errorf("configured third-party model profiles require different SSH proxies (%q and %q); a unified gateway currently requires one upstream proxy", selected.ID, profile.ID)
 		}
 		copy := *profile
+		selected = &copy
+	}
+	// Official-only desktop gateways have no third-party profiles to carry the
+	// fallback route. Resolve it explicitly so their outbound ChatGPT traffic
+	// is still pinned to the proxy selected by `cxp app <profile>`.
+	if selected == nil && strings.TrimSpace(fallbackProxyRef) != "" {
+		profile, err := selectProfile(cfg, fallbackProxyRef)
+		if err != nil {
+			return nil, err
+		}
+		copy := profile
 		selected = &copy
 	}
 	return selected, nil
