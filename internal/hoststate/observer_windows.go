@@ -26,6 +26,7 @@ type deviceNotifySubscribeParameters struct {
 type windowsObserver struct {
 	interval time.Duration
 
+	lifecycleMu sync.Mutex
 	mu          sync.Mutex
 	closed      bool
 	started     bool
@@ -60,7 +61,13 @@ func newPlatformObserver(opts Options) Observer {
 func (o *windowsObserver) Events() <-chan Event { return o.events }
 
 func (o *windowsObserver) Start() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return ErrObserverClosed
+	}
 	if o.started {
 		o.mu.Unlock()
 		return nil
@@ -89,10 +96,15 @@ func (o *windowsObserver) registerPower() {
 	o.callbacks = append(o.callbacks, callback)
 	o.mu.Unlock()
 	params := deviceNotifySubscribeParameters{callback: callback}
-	result, _, _ := procPowerRegister.Call(deviceNotifyCallback, uintptr(unsafe.Pointer(&params)), uintptr(unsafe.Pointer(&o.powerHandle)))
-	if result != 0 {
+	var handle windows.Handle
+	result, _, _ := procPowerRegister.Call(deviceNotifyCallback, uintptr(unsafe.Pointer(&params)), uintptr(unsafe.Pointer(&handle)))
+	o.mu.Lock()
+	if result == 0 {
+		o.powerHandle = handle
+	} else {
 		o.powerHandle = 0
 	}
+	o.mu.Unlock()
 }
 
 func (o *windowsObserver) registerNetwork() {
@@ -105,7 +117,9 @@ func (o *windowsObserver) registerNetwork() {
 	o.mu.Unlock()
 	var handle windows.Handle
 	if err := windows.NotifyIpInterfaceChange(windows.AF_UNSPEC, callback, nil, false, &handle); err == nil {
+		o.mu.Lock()
 		o.ipHandle = handle
+		o.mu.Unlock()
 	}
 }
 
@@ -113,14 +127,15 @@ func (o *windowsObserver) run() {
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 	previous := interfaceFingerprint()
-	lastTick := time.Now()
+	lastTick := time.Now().Round(0)
 	for {
 		select {
 		case <-o.stop:
 			close(o.closeCh)
 			return
 		case now := <-ticker.C:
-			if now.Sub(lastTick) > 2*o.interval {
+			now = now.Round(0)
+			if wallElapsed(now, lastTick) > 2*o.interval {
 				o.emit(Event{Kind: EventPowerDidWake, At: now, Source: "windows-poll-gap"})
 			}
 			lastTick = now
@@ -149,6 +164,8 @@ func (o *windowsObserver) emit(event Event) {
 }
 
 func (o *windowsObserver) Close() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.closeFn.Do(func() {
 		o.mu.Lock()
 		wasStarted := o.started

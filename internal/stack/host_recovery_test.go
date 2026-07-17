@@ -178,6 +178,67 @@ func TestWaitForHostResumeBlocksUntilWake(t *testing.T) {
 	}
 }
 
+func TestTunnelExitAfterWallClockGapWaitsForHostBeforeRecovery(t *testing.T) {
+	initial := newProbeTestTunnel(0, nil)
+	close(initial.done)
+	observer := hoststate.NewChannelObserver(8)
+	previousFactory := newStackTunnel
+	created := make(chan struct{}, 1)
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		created <- struct{}{}
+		return nil, errors.New("candidate must wait for host readiness")
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+	var persisted atomic.Int32
+	s := &Stack{
+		Profile:      config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:       initial,
+		fatalCh:      make(chan error, 1),
+		stopCh:       make(chan struct{}),
+		probeCh:      make(chan struct{}, 1),
+		failureCh:    make(chan error, 1),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe:    func(context.Context) error { return errors.New("network still unavailable") },
+		powerState:   hoststate.PowerAwake,
+		networkState: hoststate.NetworkReady,
+		hostReady:    true,
+		persistRecoveryBudget: func(config.ProxyRecoveryBudget) error {
+			persisted.Add(1)
+			return nil
+		},
+	}
+	clock := time.Unix(100, 0)
+	var clockCalls atomic.Int32
+	go s.monitor(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    time.Millisecond,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+		HostProbeTimeout:  10 * time.Millisecond,
+		ProbeInterval:     10 * time.Millisecond,
+		Now: func() time.Time {
+			if clockCalls.Add(1) == 1 {
+				return clock
+			}
+			return clock.Add(100 * time.Millisecond)
+		},
+	})
+
+	select {
+	case <-created:
+		t.Fatal("tunnel exit after a sleep-sized gap started recovery before host probe")
+	case <-time.After(80 * time.Millisecond):
+	}
+	if got := persisted.Load(); got != 0 {
+		t.Fatalf("sleep-sized gap persisted %d recovery budget updates", got)
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestHostProbeTargetSkipsFinalDestinationForProxyRoute(t *testing.T) {
 	tests := []config.Profile{
 		{Host: "target.internal", Port: 22, SSHArgs: []string{"-J", "jump.internal"}},

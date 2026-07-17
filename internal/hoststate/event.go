@@ -1,9 +1,15 @@
 package hoststate
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
+
+// ErrObserverClosed is returned when a caller tries to start an observer after
+// it has been closed. Refusing the transition prevents a second run loop from
+// racing the already-closed event and completion channels.
+var ErrObserverClosed = errors.New("host state observer is closed")
 
 // EventKind identifies a host-level lifecycle hint. These events are hints,
 // not proof that a remote backend is usable; consumers must still run their
@@ -81,7 +87,17 @@ func (o *ChannelObserver) Events() <-chan Event {
 	return o.events
 }
 
-func (o *ChannelObserver) Start() error { return nil }
+func (o *ChannelObserver) Start() error {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed {
+		return ErrObserverClosed
+	}
+	return nil
+}
 
 func (o *ChannelObserver) Emit(event Event) {
 	if o == nil {

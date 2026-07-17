@@ -8,13 +8,14 @@ import (
 type pollingObserver struct {
 	interval time.Duration
 
-	mu      sync.Mutex
-	closed  bool
-	started bool
-	events  chan Event
-	stop    chan struct{}
-	closeCh chan struct{}
-	closeFn sync.Once
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
+	closed      bool
+	started     bool
+	events      chan Event
+	stop        chan struct{}
+	closeCh     chan struct{}
+	closeFn     sync.Once
 }
 
 func newPollingObserver(opts Options) Observer {
@@ -33,7 +34,13 @@ func newPollingObserver(opts Options) Observer {
 func (o *pollingObserver) Events() <-chan Event { return o.events }
 
 func (o *pollingObserver) Start() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return ErrObserverClosed
+	}
 	if o.started {
 		o.mu.Unlock()
 		return nil
@@ -48,14 +55,15 @@ func (o *pollingObserver) run() {
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 	previous := interfaceFingerprint()
-	lastTick := time.Now()
+	lastTick := time.Now().Round(0)
 	for {
 		select {
 		case <-o.stop:
 			close(o.closeCh)
 			return
 		case now := <-ticker.C:
-			if now.Sub(lastTick) > 2*o.interval {
+			now = now.Round(0)
+			if wallElapsed(now, lastTick) > 2*o.interval {
 				o.emit(Event{Kind: EventPowerDidWake, At: now, Source: "poll-gap"})
 			}
 			lastTick = now
@@ -81,6 +89,8 @@ func (o *pollingObserver) emit(event Event) {
 }
 
 func (o *pollingObserver) Close() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.closeFn.Do(func() {
 		o.mu.Lock()
 		wasStarted := o.started

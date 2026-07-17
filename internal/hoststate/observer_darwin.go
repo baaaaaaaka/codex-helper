@@ -11,6 +11,7 @@ package hoststate
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 enum {
 	CXP_POWER_WILL_SLEEP = 1,
@@ -29,7 +30,7 @@ typedef struct cxp_power_observer {
 	SCDynamicStoreRef config_store;
 	CFRunLoopSourceRef config_source;
 	uintptr_t context;
-	volatile int stop_requested;
+	atomic_int stop_requested;
 } cxp_power_observer;
 
 static void cxp_network_callback(SCDynamicStoreRef store, CFArrayRef changed_keys, void *info) {
@@ -70,6 +71,7 @@ static cxp_power_observer *cxp_power_start(void) {
 	if (observer == NULL) {
 		return NULL;
 	}
+	atomic_init(&observer->stop_requested, 0);
 	observer->root_power = IORegisterForSystemPower(
 		observer,
 		&observer->notification_port,
@@ -135,7 +137,7 @@ static void cxp_power_set_context(cxp_power_observer *observer, uintptr_t contex
 
 static void cxp_power_run(cxp_power_observer *observer) {
 	if (observer != NULL) {
-		while (!observer->stop_requested) {
+		while (!atomic_load(&observer->stop_requested)) {
 			// The bounded mode makes Close safe even if it races with the
 			// goroutine immediately before CFRunLoopRunInMode starts.
 			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
@@ -145,7 +147,7 @@ static void cxp_power_run(cxp_power_observer *observer) {
 
 static void cxp_power_request_stop(cxp_power_observer *observer) {
 	if (observer != NULL) {
-		observer->stop_requested = 1;
+		atomic_store(&observer->stop_requested, 1);
 		if (observer->run_loop != NULL) {
 			CFRunLoopStop(observer->run_loop);
 		}
@@ -194,12 +196,13 @@ var darwinObserverRegistry sync.Map
 type darwinObserver struct {
 	interval time.Duration
 
-	mu      sync.Mutex
-	closed  bool
-	started bool
-	events  chan Event
-	stop    chan struct{}
-	closeFn sync.Once
+	lifecycleMu sync.Mutex
+	mu          sync.Mutex
+	closed      bool
+	started     bool
+	events      chan Event
+	stop        chan struct{}
+	closeFn     sync.Once
 
 	powerHandle *C.cxp_power_observer
 	powerDone   chan struct{}
@@ -224,7 +227,13 @@ func newPlatformObserver(opts Options) Observer {
 func (o *darwinObserver) Events() <-chan Event { return o.events }
 
 func (o *darwinObserver) Start() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.mu.Lock()
+	if o.closed {
+		o.mu.Unlock()
+		return ErrObserverClosed
+	}
 	if o.started {
 		o.mu.Unlock()
 		return nil
@@ -268,13 +277,14 @@ func (o *darwinObserver) runNetwork() {
 	ticker := time.NewTicker(o.interval)
 	defer ticker.Stop()
 	previous := interfaceFingerprint()
-	lastTick := time.Now()
+	lastTick := time.Now().Round(0)
 	for {
 		select {
 		case <-o.stop:
 			return
 		case now := <-ticker.C:
-			if now.Sub(lastTick) > 2*o.interval {
+			now = now.Round(0)
+			if wallElapsed(now, lastTick) > 2*o.interval {
 				o.emit(Event{Kind: EventPowerDidWake, At: now, Source: "darwin-poll-gap"})
 			}
 			lastTick = now
@@ -323,6 +333,8 @@ func (o *darwinObserver) emit(event Event) {
 }
 
 func (o *darwinObserver) Close() error {
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
 	o.closeFn.Do(func() {
 		o.mu.Lock()
 		wasStarted := o.started

@@ -106,6 +106,7 @@ type Stack struct {
 	recoveryMu     sync.Mutex
 	recoveryCancel context.CancelFunc
 	candidate      tunnelProcess
+	lifecycleMu    sync.Mutex
 
 	tunnelMu sync.Mutex
 	socksMu  sync.RWMutex
@@ -233,6 +234,15 @@ func optionsNow(opts Options) time.Time {
 		return opts.Now()
 	}
 	return time.Now()
+}
+
+func probeGapDetected(now, previous time.Time, interval time.Duration) bool {
+	if interval <= 0 || now.IsZero() || previous.IsZero() {
+		return false
+	}
+	// Strip the monotonic component so a suspend interval is still visible on
+	// platforms whose monotonic clock stops while the machine sleeps.
+	return now.Round(0).Sub(previous.Round(0)) > 2*interval
 }
 
 const routeEvidenceTTL = 30 * time.Second
@@ -660,6 +670,11 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 	}
 	s.hostEvents = opts.HostObserver.Events()
 	if err := opts.HostObserver.Start(); err != nil {
+		// Start may have allocated native notification resources before
+		// reporting an error. Close the observer on the failed ownership path so
+		// a rejected stack cannot leave a callback, goroutine, or event channel
+		// behind.
+		_ = opts.HostObserver.Close()
 		_ = tun.Stop(opts.TunnelStopGrace)
 		closeProxySetup(ps)
 		return nil, fmt.Errorf("start host state observer: %w", err)
@@ -1023,16 +1038,20 @@ func (s *Stack) Close(ctx context.Context) error {
 		}
 	}()
 
-	if candidate := s.currentCandidate(); candidate != nil && candidate != s.currentTunnel() {
+	s.lifecycleMu.Lock()
+	candidate := s.currentCandidate()
+	tun := s.currentTunnel()
+	if candidate != nil && candidate != tun {
 		if err := candidate.Stop(2 * time.Second); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	if tun := s.currentTunnel(); tun != nil {
+	if tun != nil {
 		if err := tun.Stop(2 * time.Second); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	s.lifecycleMu.Unlock()
 	if s.proxy != nil {
 		if err := s.proxy.Close(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -1112,7 +1131,12 @@ func (s *Stack) monitor(opts Options) {
 			lastProbe = now()
 		case <-tun.Done():
 			s.drainHostEvents()
-			if s.hostGateRequired() && !s.hostReadyNow() {
+			current := now()
+			resumed := probeGapDetected(current, lastProbe, opts.ProbeInterval)
+			if resumed && s.hostGateRequired() {
+				s.handleHostEvent(hoststate.Event{Kind: hoststate.EventPowerDidWake, At: current, Source: "tunnel-exit-gap"})
+			}
+			if s.hostGateRequired() && (resumed || !s.hostReadyNow()) {
 				if err := s.waitForHostReady(opts); err != nil {
 					if errors.Is(err, context.Canceled) && s.stopped() {
 						return
@@ -1193,7 +1217,7 @@ func (s *Stack) monitor(opts Options) {
 			lastProbe = now()
 		case <-probeTicker.C:
 			current := now()
-			resumed := current.Sub(lastProbe) > 2*opts.ProbeInterval
+			resumed := probeGapDetected(current, lastProbe, opts.ProbeInterval)
 			lastProbe = current
 			if resumed && s.hostGateRequired() {
 				s.handleHostEvent(hoststate.Event{Kind: hoststate.EventPowerDidWake, At: current, Source: "probe-gap"})
@@ -1345,7 +1369,7 @@ func (s *Stack) recoverTunnel(opts Options, restarts *[]time.Time, cause error) 
 }
 
 func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error, now time.Time) bool {
-	if s.stopped() {
+	if s.stopped() || s.isClosing() {
 		return false
 	}
 	if s.hostGateRequired() && !s.hostReadyNow() {
@@ -1369,6 +1393,9 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	*restarts = kept
 
 	if s.waitStopped(opts.RestartBackoff) {
+		return false
+	}
+	if s.stopped() || s.isClosing() {
 		return false
 	}
 	s.drainHostEvents()
@@ -1465,9 +1492,15 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	}
 
 	var oldGeneration uint64
+	s.lifecycleMu.Lock()
+	if s.stopped() || s.isClosing() {
+		s.lifecycleMu.Unlock()
+		return false
+	}
 	if s.router != nil {
 		dialer, derr := localproxy.NewSOCKS5Dialer(candidateAddr, 10*time.Second)
 		if derr != nil {
+			s.lifecycleMu.Unlock()
 			_ = tun.Stop(opts.TunnelStopGrace)
 			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("create candidate dialer: %w", derr))
 		}
@@ -1475,6 +1508,7 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 		s.setRecoveryStateNow("switching", nil)
 		oldGeneration, swapErr = s.router.Swap(dialer)
 		if swapErr != nil {
+			s.lifecycleMu.Unlock()
 			_ = tun.Stop(opts.TunnelStopGrace)
 			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("switch proxy generation: %w", swapErr))
 		}
@@ -1487,6 +1521,7 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	s.socksMu.Unlock()
 	s.setTunnel(tun)
 	candidateInstalled = true
+	s.lifecycleMu.Unlock()
 
 	// The swap is complete before the old tunnel is stopped. Existing leased
 	// connections get a bounded opportunity to drain on the old generation;
@@ -1601,6 +1636,15 @@ func (s *Stack) currentTunnel() tunnelProcess {
 	s.tunnelMu.Lock()
 	defer s.tunnelMu.Unlock()
 	return s.tunnel
+}
+
+func (s *Stack) isClosing() bool {
+	if s == nil {
+		return true
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closing
 }
 
 func (s *Stack) setTunnel(tun tunnelProcess) {

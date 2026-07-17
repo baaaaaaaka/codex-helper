@@ -1,6 +1,7 @@
 package hoststate
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -41,5 +42,29 @@ func TestDefaultObserverCanStartAndClose(t *testing.T) {
 	}
 	if err := o.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestObserversRefuseStartAfterClose(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		new  func() Observer
+	}{
+		{name: "default", new: func() Observer {
+			return NewDefaultObserver(Options{Interval: time.Millisecond})
+		}},
+		{name: "channel", new: func() Observer {
+			return NewChannelObserver(1)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := test.new()
+			if err := o.Close(); err != nil {
+				t.Fatalf("Close before Start: %v", err)
+			}
+			if err := o.Start(); !errors.Is(err, ErrObserverClosed) {
+				t.Fatalf("Start after Close = %v, want %v", err, ErrObserverClosed)
+			}
+		})
 	}
 }

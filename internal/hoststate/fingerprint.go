@@ -5,7 +5,20 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 )
+
+// wallElapsed deliberately strips Go's monotonic component. On Linux and
+// some other platforms CLOCK_MONOTONIC pauses while the machine is suspended,
+// so comparing the monotonic components would hide the very sleep gap that
+// the fallback observer is meant to detect. A wall-clock jump can cause an
+// extra harmless wake hint; it must never suppress a real wake hint.
+func wallElapsed(now, previous time.Time) time.Duration {
+	if now.IsZero() || previous.IsZero() {
+		return 0
+	}
+	return now.Round(0).Sub(previous.Round(0))
+}
 
 func interfaceFingerprint() string {
 	interfaces, err := net.Interfaces()
