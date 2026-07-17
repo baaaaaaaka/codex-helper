@@ -96,10 +96,16 @@ static cxp_power_observer *cxp_power_start(void) {
 			NULL, kSCDynamicStoreDomainState, CFSTR(".*"), kSCEntNetIPv4);
 		CFStringRef global_key = SCDynamicStoreKeyCreateNetworkGlobalEntity(
 			NULL, kSCDynamicStoreDomainState, kSCEntNetIPv4);
-		const void *keys[] = {interface_key, global_key};
-		CFArrayRef key_array = CFArrayCreate(NULL, keys, 2, &kCFTypeArrayCallBacks);
-		if (interface_key != NULL && global_key != NULL && key_array != NULL &&
-			SCDynamicStoreSetNotificationKeys(observer->config_store, key_array, NULL)) {
+		const void *keys[] = {global_key};
+		CFArrayRef key_array = global_key != NULL
+			? CFArrayCreate(NULL, keys, 1, &kCFTypeArrayCallBacks)
+			: NULL;
+		const void *patterns[] = {interface_key};
+		CFArrayRef pattern_array = interface_key != NULL
+			? CFArrayCreate(NULL, patterns, 1, &kCFTypeArrayCallBacks)
+			: NULL;
+		if ((key_array != NULL || pattern_array != NULL) &&
+			SCDynamicStoreSetNotificationKeys(observer->config_store, key_array, pattern_array)) {
 			observer->config_source = SCDynamicStoreCreateRunLoopSource(NULL, observer->config_store, 0);
 			if (observer->config_source != NULL) {
 				CFRunLoopAddSource(observer->run_loop, observer->config_source, kCFRunLoopDefaultMode);
@@ -107,6 +113,9 @@ static cxp_power_observer *cxp_power_start(void) {
 		}
 		if (key_array != NULL) {
 			CFRelease(key_array);
+		}
+		if (pattern_array != NULL) {
+			CFRelease(pattern_array);
 		}
 		if (interface_key != NULL) {
 			CFRelease(interface_key);
@@ -174,6 +183,7 @@ static void cxp_power_destroy(cxp_power_observer *observer) {
 import "C"
 
 import (
+	"runtime"
 	"sync"
 	"time"
 	"unsafe"
@@ -228,6 +238,8 @@ func (o *darwinObserver) Start() error {
 }
 
 func (o *darwinObserver) runPower() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	defer close(o.powerDone)
 	handle := C.cxp_power_start()
 	if handle == nil {

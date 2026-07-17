@@ -144,6 +144,53 @@ func TestWakeWaitsForHostBeforeCreatingCandidate(t *testing.T) {
 	}
 }
 
+func TestWaitForHostResumeBlocksUntilWake(t *testing.T) {
+	observer := hoststate.NewChannelObserver(8)
+	s := &Stack{
+		stopCh:       make(chan struct{}),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe:    func(context.Context) error { return nil },
+		powerState:   hoststate.PowerSuspended,
+		networkState: hoststate.NetworkUnknown,
+		hostReady:    false,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.waitForHostResume() }()
+	select {
+	case err := <-done:
+		t.Fatalf("waitForHostResume returned before wake: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	observer.Emit(hoststate.Event{Kind: hoststate.EventPowerDidWake})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitForHostResume after wake: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForHostResume did not return after wake")
+	}
+	if s.hostSuspended() {
+		t.Fatal("wake event left host suspended")
+	}
+}
+
+func TestHostProbeTargetSkipsFinalDestinationForProxyRoute(t *testing.T) {
+	tests := []config.Profile{
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-J", "jump.internal"}},
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-o", "ProxyJump=jump.internal"}},
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-oProxyCommand=ssh jump.internal -W %h:%p"}},
+	}
+	for _, profile := range tests {
+		if host, port, direct := hostProbeTarget(profile); direct || host != "" || port != 0 {
+			t.Fatalf("hostProbeTarget(%#v) = (%q, %d, %v), want interface-only gate", profile.SSHArgs, host, port, direct)
+		}
+	}
+}
+
 func TestCloseCancelsAndCleansActiveCandidate(t *testing.T) {
 	initial := newProbeTestTunnel(0, nil)
 	close(initial.done)

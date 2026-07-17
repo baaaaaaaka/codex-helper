@@ -695,8 +695,6 @@ func (s *Stack) setRecoveryStateNow(state string, err error) {
 	}
 }
 
-var errHostSuspended = errors.New("host is suspended")
-
 func (s *Stack) publishHostState(eventAt, probeAt time.Time) {
 	if s == nil {
 		return
@@ -838,7 +836,10 @@ func (s *Stack) waitForHostReady(opts Options) error {
 			return context.Canceled
 		}
 		if s.hostSuspended() {
-			return errHostSuspended
+			if err := s.waitForHostResume(); err != nil {
+				return err
+			}
+			continue
 		}
 		probeAt := optionsNow(opts)
 		ctx, cancel := context.WithTimeout(context.Background(), minProbeTimeout(opts.HostProbeTimeout))
@@ -872,11 +873,68 @@ func (s *Stack) waitForHostReady(opts Options) error {
 			s.handleHostEvent(event)
 			s.drainHostEvents()
 			if s.hostSuspended() {
-				return errHostSuspended
+				if err := s.waitForHostResume(); err != nil {
+					return err
+				}
 			}
 		case <-timer.C:
 		}
 	}
+}
+
+// waitForHostResume blocks while the host is suspended. In particular, it
+// must not return to monitor's select loop while a dead tunnel's Done channel
+// is already closed, otherwise that channel stays permanently ready and the
+// monitor can spin at full CPU until a wake event arrives.
+func (s *Stack) waitForHostResume() error {
+	if s == nil || !s.hostGateRequired() {
+		return nil
+	}
+	for {
+		if s.stopped() {
+			return context.Canceled
+		}
+		if !s.hostSuspended() {
+			return nil
+		}
+		events := s.hostEvents
+		if events == nil {
+			select {
+			case <-s.stopCh:
+				return context.Canceled
+			}
+		}
+		select {
+		case <-s.stopCh:
+			return context.Canceled
+		case event, ok := <-events:
+			if !ok {
+				s.hostEvents = nil
+				continue
+			}
+			s.handleHostEvent(event)
+			s.drainHostEvents()
+		}
+	}
+}
+
+func hostProbeTarget(profile config.Profile) (host string, port int, direct bool) {
+	if ssh.ArgsUseProxyRoute(profile.SSHArgs) {
+		// The final destination may only be reachable through the SSH jump
+		// route. The local interface gate remains useful; the candidate SSH
+		// connection is the authoritative endpoint probe.
+		return "", 0, false
+	}
+	host = profile.Host
+	port = profile.Port
+	if ssh.ArgsUseConfigFile(profile.SSHArgs) {
+		if profile.RouteTargetHost == "" || profile.RouteTargetPort <= 0 {
+			return "", 0, false
+		}
+		host = profile.RouteTargetHost
+		port = profile.RouteTargetPort
+	}
+	return host, port, true
 }
 
 func probeHostNetwork(ctx context.Context, profile config.Profile) error {
@@ -894,18 +952,9 @@ func probeHostNetwork(ctx context.Context, profile config.Profile) error {
 	if !hasUsableInterface {
 		return errors.New("no usable network interface")
 	}
-	host := profile.Host
-	port := profile.Port
-	// An SSH config alias is not necessarily DNS-resolvable locally. When an
-	// explicit route target exists it is a useful network admission endpoint;
-	// otherwise the interface gate is the only safe local fact and the actual
-	// ssh candidate remains the authoritative endpoint probe.
-	if ssh.ArgsUseConfigFile(profile.SSHArgs) {
-		if profile.RouteTargetHost == "" || profile.RouteTargetPort <= 0 {
-			return nil
-		}
-		host = profile.RouteTargetHost
-		port = profile.RouteTargetPort
+	host, port, direct := hostProbeTarget(profile)
+	if !direct {
+		return nil
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
 	dialer := net.Dialer{}
