@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/hoststate"
 	"github.com/baaaaaaaka/codex-helper/internal/localproxy"
 	"github.com/baaaaaaaka/codex-helper/internal/ssh"
 )
@@ -68,6 +69,13 @@ type Options struct {
 	// time.Now; CI fault labs can advance a deterministic clock without
 	// suspending the runner or changing its network interfaces.
 	Now func() time.Time
+	// HostObserver supplies user-mode power/network lifecycle hints. Events are
+	// advisory; host/backend probes remain the source of truth.
+	HostObserver hoststate.Observer
+	// HostProbe is the host-network admission gate used after wake/network
+	// events. It must be cheap and bounded; nil uses the built-in probe.
+	HostProbe        func(context.Context) error
+	HostProbeTimeout time.Duration
 }
 
 type Stack struct {
@@ -82,6 +90,24 @@ type Stack struct {
 	router *localproxy.GenerationRouter
 	tunnel tunnelProcess
 
+	hostObserver hoststate.Observer
+	hostEvents   <-chan hoststate.Event
+	hostProbe    func(context.Context) error
+
+	hostMu          sync.RWMutex
+	powerState      hoststate.PowerState
+	networkState    hoststate.NetworkState
+	hostReady       bool
+	lastHostEventAt time.Time
+	hostProbeAt     time.Time
+	hostProbeCount  uint64
+	recoveryGen     uint64
+
+	recoveryMu     sync.Mutex
+	recoveryCancel context.CancelFunc
+	candidate      tunnelProcess
+	lifecycleMu    sync.Mutex
+
 	tunnelMu sync.Mutex
 	socksMu  sync.RWMutex
 	// setProxySocksAddr is owned by the HTTP proxy setup and lets health
@@ -90,6 +116,7 @@ type Stack struct {
 	setProxySocksAddr   func(string)
 	setRecoveryState    func(string, error)
 	recordRouteEvidence func(string, error)
+	setHostState        func(hoststate.PowerState, hoststate.NetworkState, bool, time.Time, time.Time, uint64, uint64, bool)
 
 	fatalCh   chan error
 	stopCh    chan struct{}
@@ -126,6 +153,7 @@ type proxySetup struct {
 	failureCh           chan error
 	setRecoveryState    func(string, error)
 	recordRouteEvidence func(string, error)
+	setHostState        func(hoststate.PowerState, hoststate.NetworkState, bool, time.Time, time.Time, uint64, uint64, bool)
 }
 
 type proxyHealthState struct {
@@ -137,6 +165,15 @@ type proxyHealthState struct {
 	recoveryCount   uint64
 	backendFailures uint64
 	routeEvidence   map[string]localproxy.RouteEvidence
+	powerState      hoststate.PowerState
+	networkState    hoststate.NetworkState
+	hostReady       bool
+	lastHostEventAt time.Time
+	hostProbeAt     time.Time
+	hostProbeCount  uint64
+	recoveryGen     uint64
+	candidateActive bool
+	lastRecovery    string
 }
 
 type requestFailureKind string
@@ -199,6 +236,15 @@ func optionsNow(opts Options) time.Time {
 	return time.Now()
 }
 
+func probeGapDetected(now, previous time.Time, interval time.Duration) bool {
+	if interval <= 0 || now.IsZero() || previous.IsZero() {
+		return false
+	}
+	// Strip the monotonic component so a suspend interval is still visible on
+	// platforms whose monotonic clock stops while the machine sleeps.
+	return now.Round(0).Sub(previous.Round(0)) > 2*interval
+}
+
 const routeEvidenceTTL = 30 * time.Second
 
 func (h *proxyHealthState) set(state string, err error) {
@@ -218,9 +264,30 @@ func (h *proxyHealthState) set(state string, err error) {
 	}
 	if err != nil {
 		h.lastProbeError = err.Error()
+		h.lastRecovery = err.Error()
 	} else if state == "ready" {
 		h.lastProbeError = ""
 	}
+	h.mu.Unlock()
+}
+
+func (h *proxyHealthState) setHostState(power hoststate.PowerState, network hoststate.NetworkState, ready bool, eventAt, probeAt time.Time, probeCount, generation uint64, candidate bool) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.powerState = power
+	h.networkState = network
+	h.hostReady = ready
+	if !eventAt.IsZero() {
+		h.lastHostEventAt = eventAt
+	}
+	if !probeAt.IsZero() {
+		h.hostProbeAt = probeAt
+	}
+	h.hostProbeCount = probeCount
+	h.recoveryGen = generation
+	h.candidateActive = candidate
 	h.mu.Unlock()
 }
 
@@ -283,6 +350,15 @@ func (h *proxyHealthState) snapshot() localproxy.HealthStatus {
 		ProbeCount:           h.probeCount,
 		RecoveryCount:        h.recoveryCount,
 		BackendFailures:      h.backendFailures,
+		PowerState:           string(h.powerState),
+		HostNetworkState:     string(h.networkState),
+		HostReady:            h.hostReady,
+		LastHostEventAt:      h.lastHostEventAt,
+		LastHostProbeAt:      h.hostProbeAt,
+		HostProbeCount:       h.hostProbeCount,
+		RecoveryGeneration:   h.recoveryGen,
+		CandidateActive:      h.candidateActive,
+		LastRecoveryCause:    h.lastRecovery,
 	}
 }
 
@@ -383,6 +459,7 @@ func setupHTTPProxyWithIdentity(socksAddr, httpListenAddr, instanceID, brokerID,
 		failureCh:           failureCh,
 		setRecoveryState:    healthState.set,
 		recordRouteEvidence: healthState.recordRouteEvidence,
+		setHostState:        healthState.setHostState,
 	}, nil
 }
 
@@ -456,6 +533,9 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 	if opts.ProbeInterval <= 0 {
 		opts.ProbeInterval = 5 * time.Second
 	}
+	if opts.HostProbeTimeout <= 0 {
+		opts.HostProbeTimeout = minProbeTimeout(opts.SocksReadyTimeout)
+	}
 	if opts.RouteProbe == nil {
 		opts.RouteProbe = localproxy.ProbeSOCKS5Target
 	}
@@ -464,6 +544,14 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 	}
 	if opts.RouteTargetPort == 0 {
 		opts.RouteTargetPort = profile.Port
+	}
+	if opts.HostObserver == nil {
+		opts.HostObserver = hoststate.NewDefaultObserver(hoststate.Options{Interval: opts.ProbeInterval})
+	}
+	if opts.HostProbe == nil {
+		opts.HostProbe = func(ctx context.Context) error {
+			return probeHostNetwork(ctx, profile)
+		}
 	}
 	if opts.RecoveryBudget.Blocked {
 		return nil, fmt.Errorf("%w: %s", ErrRecoveryBudgetBlocked, opts.RecoveryBudget.LastReason)
@@ -571,9 +659,27 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 		setProxySocksAddr:     ps.setSocksAddr,
 		setRecoveryState:      ps.setRecoveryState,
 		recordRouteEvidence:   ps.recordRouteEvidence,
+		setHostState:          ps.setHostState,
+		hostObserver:          opts.HostObserver,
+		hostProbe:             opts.HostProbe,
+		powerState:            hoststate.PowerAwake,
+		networkState:          hoststate.NetworkReady,
+		hostReady:             true,
 		recoveryBudget:        opts.RecoveryBudget,
 		persistRecoveryBudget: opts.PersistRecoveryBudget,
 	}
+	s.hostEvents = opts.HostObserver.Events()
+	if err := opts.HostObserver.Start(); err != nil {
+		// Start may have allocated native notification resources before
+		// reporting an error. Close the observer on the failed ownership path so
+		// a rejected stack cannot leave a callback, goroutine, or event channel
+		// behind.
+		_ = opts.HostObserver.Close()
+		_ = tun.Stop(opts.TunnelStopGrace)
+		closeProxySetup(ps)
+		return nil, fmt.Errorf("start host state observer: %w", err)
+	}
+	s.publishHostState(time.Time{}, time.Time{})
 	s.setRecoveryStateNow("ready", nil)
 
 	go s.monitor(opts)
@@ -602,6 +708,277 @@ func (s *Stack) setRecoveryStateNow(state string, err error) {
 	if s != nil && s.setRecoveryState != nil {
 		s.setRecoveryState(state, err)
 	}
+}
+
+func (s *Stack) publishHostState(eventAt, probeAt time.Time) {
+	if s == nil {
+		return
+	}
+	s.hostMu.RLock()
+	power := s.powerState
+	network := s.networkState
+	ready := s.hostReady
+	probeCount := s.hostProbeCount
+	generation := s.recoveryGen
+	s.hostMu.RUnlock()
+	candidate := s.currentCandidate() != nil
+	if s.setHostState != nil {
+		s.setHostState(power, network, ready, eventAt, probeAt, probeCount, generation, candidate)
+	}
+}
+
+func (s *Stack) hostGateRequired() bool {
+	return s != nil && s.hostObserver != nil && s.hostProbe != nil
+}
+
+func (s *Stack) hostSuspended() bool {
+	if s == nil {
+		return false
+	}
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
+	return s.powerState == hoststate.PowerSuspended
+}
+
+func (s *Stack) hostReadyNow() bool {
+	if s == nil || !s.hostGateRequired() {
+		return true
+	}
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
+	return s.hostReady && s.powerState != hoststate.PowerSuspended
+}
+
+func (s *Stack) currentRecoveryGeneration() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
+	return s.recoveryGen
+}
+
+func (s *Stack) recoveryGenerationCurrent(generation uint64) bool {
+	if s == nil || s.stopped() {
+		return false
+	}
+	s.drainHostEvents()
+	if s.hostGateRequired() && !s.hostReadyNow() {
+		return false
+	}
+	return s.currentRecoveryGeneration() == generation
+}
+
+func (s *Stack) handleHostEvent(event hoststate.Event) bool {
+	if s == nil {
+		return false
+	}
+	if event.At.IsZero() {
+		event.At = time.Now()
+	}
+	s.hostMu.Lock()
+	s.lastHostEventAt = event.At
+	s.recoveryGen++
+	switch event.Kind {
+	case hoststate.EventPowerWillSleep:
+		s.powerState = hoststate.PowerSuspended
+		s.networkState = hoststate.NetworkUnknown
+		s.hostReady = false
+	case hoststate.EventPowerDidWake:
+		s.powerState = hoststate.PowerWaking
+		s.networkState = hoststate.NetworkUnknown
+		s.hostReady = false
+	case hoststate.EventNetworkChanged, hoststate.EventObserverError:
+		if s.powerState != hoststate.PowerSuspended {
+			s.powerState = hoststate.PowerAwake
+		}
+		s.networkState = hoststate.NetworkUnknown
+		s.hostReady = false
+	default:
+		s.networkState = hoststate.NetworkUnknown
+		s.hostReady = false
+	}
+	s.hostMu.Unlock()
+	s.publishHostState(event.At, time.Time{})
+
+	switch event.Kind {
+	case hoststate.EventPowerWillSleep:
+		s.setRecoveryStateNow("suspended", nil)
+		return false
+	case hoststate.EventPowerDidWake, hoststate.EventNetworkChanged, hoststate.EventObserverError:
+		s.setRecoveryStateNow("waiting-for-network", nil)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Stack) recordHostProbe(probeAt time.Time, err error) {
+	s.hostMu.Lock()
+	s.hostProbeAt = probeAt
+	s.hostProbeCount++
+	if err == nil {
+		s.powerState = hoststate.PowerAwake
+		s.networkState = hoststate.NetworkReady
+		s.hostReady = true
+	} else if s.powerState != hoststate.PowerSuspended {
+		s.networkState = hoststate.NetworkDown
+		s.hostReady = false
+	}
+	s.hostMu.Unlock()
+	s.publishHostState(time.Time{}, probeAt)
+}
+
+func (s *Stack) waitForHostReady(opts Options) error {
+	if s == nil || !s.hostGateRequired() {
+		return nil
+	}
+	if opts.HostProbeTimeout <= 0 {
+		opts.HostProbeTimeout = minProbeTimeout(opts.SocksReadyTimeout)
+	}
+	delays := []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		15 * time.Second,
+		30 * time.Second,
+	}
+	for attempt := 0; ; attempt++ {
+		if s.stopped() {
+			return context.Canceled
+		}
+		if s.hostSuspended() {
+			if err := s.waitForHostResume(); err != nil {
+				return err
+			}
+			continue
+		}
+		probeAt := optionsNow(opts)
+		ctx, cancel := context.WithTimeout(context.Background(), minProbeTimeout(opts.HostProbeTimeout))
+		err := s.hostProbe(ctx)
+		cancel()
+		s.recordHostProbe(probeAt, err)
+		if err == nil {
+			s.setRecoveryStateNow("revalidating-after-wake", nil)
+			return nil
+		}
+		s.setRecoveryStateNow("waiting-for-network", err)
+		delay := delays[len(delays)-1]
+		if attempt < len(delays) {
+			delay = delays[attempt]
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-s.stopCh:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return context.Canceled
+		case event, ok := <-s.hostEvents:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			if !ok {
+				s.hostEvents = nil
+				continue
+			}
+			s.handleHostEvent(event)
+			s.drainHostEvents()
+			if s.hostSuspended() {
+				if err := s.waitForHostResume(); err != nil {
+					return err
+				}
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+// waitForHostResume blocks while the host is suspended. In particular, it
+// must not return to monitor's select loop while a dead tunnel's Done channel
+// is already closed, otherwise that channel stays permanently ready and the
+// monitor can spin at full CPU until a wake event arrives.
+func (s *Stack) waitForHostResume() error {
+	if s == nil || !s.hostGateRequired() {
+		return nil
+	}
+	for {
+		if s.stopped() {
+			return context.Canceled
+		}
+		if !s.hostSuspended() {
+			return nil
+		}
+		events := s.hostEvents
+		if events == nil {
+			select {
+			case <-s.stopCh:
+				return context.Canceled
+			}
+		}
+		select {
+		case <-s.stopCh:
+			return context.Canceled
+		case event, ok := <-events:
+			if !ok {
+				s.hostEvents = nil
+				continue
+			}
+			s.handleHostEvent(event)
+			s.drainHostEvents()
+		}
+	}
+}
+
+func hostProbeTarget(profile config.Profile) (host string, port int, direct bool) {
+	if ssh.ArgsUseProxyRoute(profile.SSHArgs) {
+		// The final destination may only be reachable through the SSH jump
+		// route. The local interface gate remains useful; the candidate SSH
+		// connection is the authoritative endpoint probe.
+		return "", 0, false
+	}
+	host = profile.Host
+	port = profile.Port
+	if ssh.ArgsUseConfigFile(profile.SSHArgs) {
+		if profile.RouteTargetHost == "" || profile.RouteTargetPort <= 0 {
+			return "", 0, false
+		}
+		host = profile.RouteTargetHost
+		port = profile.RouteTargetPort
+	}
+	return host, port, true
+}
+
+func probeHostNetwork(ctx context.Context, profile config.Profile) error {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("list network interfaces: %w", err)
+	}
+	hasUsableInterface := false
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			hasUsableInterface = true
+			break
+		}
+	}
+	if !hasUsableInterface {
+		return errors.New("no usable network interface")
+	}
+	host, port, direct := hostProbeTarget(profile)
+	if !direct {
+		return nil
+	}
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("ssh endpoint %s unavailable: %w", address, err)
+	}
+	_ = conn.Close()
+	return nil
 }
 
 // NotifyNetworkResume asks the stack to re-establish the tunnel. Calls are
@@ -641,6 +1018,7 @@ func (s *Stack) Close(ctx context.Context) error {
 		close(done)
 		s.closeMu.Unlock()
 	}()
+	var firstErr error
 
 	select {
 	case <-s.stopCh:
@@ -648,18 +1026,32 @@ func (s *Stack) Close(ctx context.Context) error {
 	default:
 		close(s.stopCh)
 	}
+	s.cancelRecovery()
+	if s.hostObserver != nil {
+		if err := s.hostObserver.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	defer func() {
 		if s.closeHook != nil {
 			s.closeHook()
 		}
 	}()
 
-	var firstErr error
-	if tun := s.currentTunnel(); tun != nil {
+	s.lifecycleMu.Lock()
+	candidate := s.currentCandidate()
+	tun := s.currentTunnel()
+	if candidate != nil && candidate != tun {
+		if err := candidate.Stop(2 * time.Second); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if tun != nil {
 		if err := tun.Stop(2 * time.Second); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	s.lifecycleMu.Unlock()
 	if s.proxy != nil {
 		if err := s.proxy.Close(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -713,7 +1105,45 @@ func (s *Stack) monitor(opts Options) {
 		select {
 		case <-s.stopCh:
 			return
+		case event, ok := <-s.hostEvents:
+			if !ok {
+				s.hostEvents = nil
+				continue
+			}
+			if !s.handleHostEvent(event) {
+				continue
+			}
+			s.drainHostEvents()
+			if s.hostSuspended() {
+				continue
+			}
+			if err := s.waitForHostReady(opts); err != nil {
+				if errors.Is(err, context.Canceled) && s.stopped() {
+					return
+				}
+				continue
+			}
+			if err := s.probeTunnel(opts, true); err != nil {
+				if !s.recoverTunnelAt(opts, &restarts, fmt.Errorf("host event probe failed: %w", err), now()) {
+					return
+				}
+			}
+			lastProbe = now()
 		case <-tun.Done():
+			s.drainHostEvents()
+			current := now()
+			resumed := probeGapDetected(current, lastProbe, opts.ProbeInterval)
+			if resumed && s.hostGateRequired() {
+				s.handleHostEvent(hoststate.Event{Kind: hoststate.EventPowerDidWake, At: current, Source: "tunnel-exit-gap"})
+			}
+			if s.hostGateRequired() && (resumed || !s.hostReadyNow()) {
+				if err := s.waitForHostReady(opts); err != nil {
+					if errors.Is(err, context.Canceled) && s.stopped() {
+						return
+					}
+					continue
+				}
+			}
 			if err := tun.Wait(); err != nil {
 				if !s.recoverTunnelAt(opts, &restarts, err, now()) {
 					return
@@ -726,6 +1156,15 @@ func (s *Stack) monitor(opts Options) {
 		case <-s.probeCh:
 			if s.stopped() {
 				return
+			}
+			if s.hostGateRequired() {
+				s.handleHostEvent(hoststate.Event{Kind: hoststate.EventNetworkChanged, Source: "legacy-resume-signal"})
+				if err := s.waitForHostReady(opts); err != nil {
+					if errors.Is(err, context.Canceled) && s.stopped() {
+						return
+					}
+					continue
+				}
 			}
 			if err := s.probeTunnel(opts, true); err != nil {
 				if !s.recoverTunnelAt(opts, &restarts, fmt.Errorf("network resume probe failed: %w", err), now()) {
@@ -744,6 +1183,15 @@ func (s *Stack) monitor(opts Options) {
 				requestGate.reset()
 				s.drainFailureSignals()
 				continue
+			}
+			if s.hostGateRequired() {
+				if err := s.waitForHostReady(opts); err != nil {
+					if errors.Is(err, context.Canceled) && s.stopped() {
+						return
+					}
+					s.drainFailureSignals()
+					continue
+				}
 			}
 			requestGate.observe(now(), opts.RequestFailureAdmissionWindow)
 			if err := s.probeTunnel(opts, true); err != nil {
@@ -769,8 +1217,19 @@ func (s *Stack) monitor(opts Options) {
 			lastProbe = now()
 		case <-probeTicker.C:
 			current := now()
-			resumed := current.Sub(lastProbe) > 2*opts.ProbeInterval
+			resumed := probeGapDetected(current, lastProbe, opts.ProbeInterval)
 			lastProbe = current
+			if resumed && s.hostGateRequired() {
+				s.handleHostEvent(hoststate.Event{Kind: hoststate.EventPowerDidWake, At: current, Source: "probe-gap"})
+			}
+			if s.hostGateRequired() && !s.hostReadyNow() {
+				if err := s.waitForHostReady(opts); err != nil {
+					if errors.Is(err, context.Canceled) && s.stopped() {
+						return
+					}
+					continue
+				}
+			}
 			if err := s.probeTunnel(opts, resumed); err != nil {
 				if !s.recoverTunnelAt(opts, &restarts, fmt.Errorf("periodic proxy probe failed: %w", err), now()) {
 					return
@@ -835,6 +1294,24 @@ func (s *Stack) drainProbeSignals() {
 	}
 }
 
+func (s *Stack) drainHostEvents() {
+	if s == nil || s.hostEvents == nil {
+		return
+	}
+	for {
+		select {
+		case event, ok := <-s.hostEvents:
+			if !ok {
+				s.hostEvents = nil
+				return
+			}
+			s.handleHostEvent(event)
+		default:
+			return
+		}
+	}
+}
+
 func (s *Stack) drainFailureSignals() {
 	if s == nil || s.failureCh == nil {
 		return
@@ -892,16 +1369,21 @@ func (s *Stack) recoverTunnel(opts Options, restarts *[]time.Time, cause error) 
 }
 
 func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error, now time.Time) bool {
-	if s.stopped() {
+	if s.stopped() || s.isClosing() {
 		return false
 	}
+	if s.hostGateRequired() && !s.hostReadyNow() {
+		if err := s.waitForHostReady(opts); err != nil {
+			return !s.stopped()
+		}
+	}
+	attemptCtx, cancel := context.WithCancel(context.Background())
+	s.setRecoveryCancel(cancel)
+	defer s.clearRecoveryCancel(cancel)
 	if opts.RestartWindow <= 0 {
 		opts.RestartWindow = time.Minute
 	}
 	cutoff := now.Add(-opts.RestartWindow)
-	if opts.MaxRestarts >= 0 && !s.admitPersistentRecoveryBudget("restart", now, opts.MaxRestarts, opts.RestartWindow, cause, nil) {
-		return false
-	}
 	kept := (*restarts)[:0]
 	for _, at := range *restarts {
 		if at.After(cutoff) {
@@ -909,19 +1391,34 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 		}
 	}
 	*restarts = kept
+
+	if s.waitStopped(opts.RestartBackoff) {
+		return false
+	}
+	if s.stopped() || s.isClosing() {
+		return false
+	}
+	s.drainHostEvents()
+	if s.hostGateRequired() && !s.hostReadyNow() {
+		return !s.stopped()
+	}
+	recoveryGeneration := s.currentRecoveryGeneration()
+	oldTun := s.currentTunnel()
+	oldPort := s.CurrentSocksPort()
+	s.setRecoveryStateNow("building-candidate", cause)
+	// Admission happens after the host gate, recovery backoff, and generation
+	// check, but before any candidate resource allocation. A failed port
+	// reservation or tunnel construction is still a recovery attempt and must
+	// not be able to spin forever without consuming the bounded budget.
+	if opts.MaxRestarts >= 0 && !s.admitPersistentRecoveryBudget("restart", now, opts.MaxRestarts, opts.RestartWindow, cause, nil) {
+		return false
+	}
 	*restarts = append(*restarts, now)
 	if opts.MaxRestarts >= 0 && len(*restarts) > opts.MaxRestarts {
 		s.setRecoveryStateNow("blocked", cause)
 		s.reportFatal(fmt.Errorf("ssh tunnel recovery budget exceeded: %w", cause))
 		return false
 	}
-
-	if s.waitStopped(opts.RestartBackoff) {
-		return false
-	}
-	oldTun := s.currentTunnel()
-	oldPort := s.CurrentSocksPort()
-	s.setRecoveryStateNow("building-candidate", cause)
 
 	// Build the candidate on a separate port while the current generation is
 	// still serving. A failed candidate must not destroy a backend that may
@@ -944,6 +1441,17 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	if terr != nil {
 		return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("create candidate tunnel: %w", terr))
 	}
+	s.setCandidate(tun)
+	candidateInstalled := false
+	defer func() {
+		s.clearCandidate(tun)
+		if !candidateInstalled {
+			_ = tun.Stop(opts.TunnelStopGrace)
+		}
+	}()
+	if !s.recoveryGenerationCurrent(recoveryGeneration) {
+		return s.recoveryCandidateFailed(opts, oldTun, errors.New("host state changed before candidate start"))
+	}
 	if terr := tun.Start(); terr != nil {
 		_ = tun.Stop(opts.TunnelStopGrace)
 		return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("start candidate tunnel: %w", terr))
@@ -953,17 +1461,20 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 		return false
 	}
 	candidateAddr := fmt.Sprintf("127.0.0.1:%d", candidatePort)
-	if terr := waitForTCPTunnel(candidateAddr, opts.SocksReadyTimeout, tun); terr != nil {
+	if terr := waitForTCPTunnelContext(attemptCtx, candidateAddr, opts.SocksReadyTimeout, tun); terr != nil {
 		_ = tun.Stop(opts.TunnelStopGrace)
 		return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("candidate TCP readiness: %w", terr))
 	}
-	if terr := waitForSOCKS5(candidateAddr, opts.SocksReadyTimeout, tun); terr != nil {
+	if terr := waitForSOCKS5Context(attemptCtx, candidateAddr, opts.SocksReadyTimeout, tun); terr != nil {
 		_ = tun.Stop(opts.TunnelStopGrace)
 		return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("candidate SOCKS5 readiness: %w", terr))
 	}
+	if !s.recoveryGenerationCurrent(recoveryGeneration) {
+		return s.recoveryCandidateFailed(opts, oldTun, errors.New("host state changed during candidate readiness"))
+	}
 	if opts.RouteProbe != nil {
 		probeTimeout := minProbeTimeout(opts.SocksReadyTimeout)
-		probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		probeCtx, cancel := context.WithTimeout(attemptCtx, probeTimeout)
 		targetHost, targetPort := routeTarget(s.Profile, opts)
 		target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
 		probeErr := opts.RouteProbe(probeCtx, candidateAddr, targetHost, targetPort, probeTimeout)
@@ -976,11 +1487,20 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("candidate route capability probe: %w", probeErr))
 		}
 	}
+	if !s.recoveryGenerationCurrent(recoveryGeneration) {
+		return s.recoveryCandidateFailed(opts, oldTun, errors.New("host state changed before generation switch"))
+	}
 
 	var oldGeneration uint64
+	s.lifecycleMu.Lock()
+	if s.stopped() || s.isClosing() {
+		s.lifecycleMu.Unlock()
+		return false
+	}
 	if s.router != nil {
 		dialer, derr := localproxy.NewSOCKS5Dialer(candidateAddr, 10*time.Second)
 		if derr != nil {
+			s.lifecycleMu.Unlock()
 			_ = tun.Stop(opts.TunnelStopGrace)
 			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("create candidate dialer: %w", derr))
 		}
@@ -988,6 +1508,7 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 		s.setRecoveryStateNow("switching", nil)
 		oldGeneration, swapErr = s.router.Swap(dialer)
 		if swapErr != nil {
+			s.lifecycleMu.Unlock()
 			_ = tun.Stop(opts.TunnelStopGrace)
 			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("switch proxy generation: %w", swapErr))
 		}
@@ -999,12 +1520,14 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	s.SocksPort = candidatePort
 	s.socksMu.Unlock()
 	s.setTunnel(tun)
+	candidateInstalled = true
+	s.lifecycleMu.Unlock()
 
 	// The swap is complete before the old tunnel is stopped. Existing leased
 	// connections get a bounded opportunity to drain on the old generation;
 	// new requests use the candidate immediately.
 	if oldGeneration != 0 && s.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), opts.TunnelStopGrace)
+		ctx, cancel := context.WithTimeout(attemptCtx, opts.TunnelStopGrace)
 		_ = s.router.Drain(ctx, oldGeneration)
 		cancel()
 	}
@@ -1115,10 +1638,86 @@ func (s *Stack) currentTunnel() tunnelProcess {
 	return s.tunnel
 }
 
+func (s *Stack) isClosing() bool {
+	if s == nil {
+		return true
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.closing
+}
+
 func (s *Stack) setTunnel(tun tunnelProcess) {
 	s.tunnelMu.Lock()
 	s.tunnel = tun
 	s.tunnelMu.Unlock()
+}
+
+func (s *Stack) setCandidate(tun tunnelProcess) {
+	if s == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	s.candidate = tun
+	s.recoveryMu.Unlock()
+	s.publishHostState(time.Time{}, time.Time{})
+}
+
+func (s *Stack) clearCandidate(tun tunnelProcess) {
+	if s == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	if s.candidate == tun {
+		s.candidate = nil
+	}
+	s.recoveryMu.Unlock()
+	s.publishHostState(time.Time{}, time.Time{})
+}
+
+func (s *Stack) currentCandidate() tunnelProcess {
+	if s == nil {
+		return nil
+	}
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	return s.candidate
+}
+
+func (s *Stack) setRecoveryCancel(cancel context.CancelFunc) {
+	if s == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	s.recoveryCancel = cancel
+	s.recoveryMu.Unlock()
+}
+
+func (s *Stack) clearRecoveryCancel(cancel context.CancelFunc) {
+	if s == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	if s.recoveryCancel != nil {
+		// A CancelFunc is not comparable. Clearing the current operation is safe
+		// because the monitor owns recovery serialization; Close can still call
+		// the function while this operation is unwinding.
+		s.recoveryCancel = nil
+	}
+	s.recoveryMu.Unlock()
+}
+
+func (s *Stack) cancelRecovery() {
+	if s == nil {
+		return
+	}
+	s.recoveryMu.Lock()
+	cancel := s.recoveryCancel
+	s.recoveryCancel = nil
+	s.recoveryMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (s *Stack) stopped() bool {
@@ -1191,9 +1790,21 @@ func waitForTCP(addr string, timeout time.Duration) error {
 }
 
 func waitForTCPTunnel(addr string, timeout time.Duration, tun tunnelProcess) error {
+	return waitForTCPTunnelContext(context.Background(), addr, timeout, tun)
+}
+
+func waitForTCPTunnelContext(ctx context.Context, addr string, timeout time.Duration, tun tunnelProcess) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if tun != nil {
 			select {
 			case <-tun.Done():
@@ -1208,7 +1819,19 @@ func waitForTCPTunnel(addr string, timeout time.Duration, tun tunnelProcess) err
 			return nil
 		}
 		lastErr = err
-		time.Sleep(100 * time.Millisecond)
+		delay := 100 * time.Millisecond
+		if remaining := time.Until(deadline); remaining < delay {
+			delay = remaining
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 	if lastErr != nil {
 		return fmt.Errorf("timeout waiting for %s: %w", addr, lastErr)
@@ -1217,9 +1840,21 @@ func waitForTCPTunnel(addr string, timeout time.Duration, tun tunnelProcess) err
 }
 
 func waitForSOCKS5(addr string, timeout time.Duration, tun tunnelProcess) error {
+	return waitForSOCKS5Context(context.Background(), addr, timeout, tun)
+}
+
+func waitForSOCKS5Context(ctx context.Context, addr string, timeout time.Duration, tun tunnelProcess) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if tun != nil {
 			select {
 			case <-tun.Done():
@@ -1231,12 +1866,27 @@ func waitForSOCKS5(addr string, timeout time.Duration, tun tunnelProcess) error 
 		if remaining > 200*time.Millisecond {
 			remaining = 200 * time.Millisecond
 		}
-		if err := localproxy.ProbeSOCKS5(context.Background(), addr, remaining); err == nil {
+		probeCtx, cancel := context.WithTimeout(ctx, remaining)
+		if err := localproxy.ProbeSOCKS5(probeCtx, addr, remaining); err == nil {
+			cancel()
 			return nil
 		} else {
+			cancel()
 			lastErr = err
 		}
-		time.Sleep(50 * time.Millisecond)
+		delay := 50 * time.Millisecond
+		if left := time.Until(deadline); left < delay {
+			delay = left
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 	if lastErr != nil {
 		return fmt.Errorf("timeout waiting for SOCKS5 handshake on %s: %w", addr, lastErr)

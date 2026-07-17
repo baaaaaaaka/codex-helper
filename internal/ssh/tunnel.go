@@ -320,6 +320,40 @@ func ArgsUseConfigFile(args []string) bool {
 	return false
 }
 
+// ArgsUseProxyRoute reports whether ExtraArgs make the SSH destination
+// reachable through another SSH route rather than by dialing the destination
+// directly. A local host-network probe must not dial the final destination in
+// that case: the destination may only be reachable from the jump host.
+func ArgsUseProxyRoute(args []string) bool {
+	for i, arg := range args {
+		arg = strings.TrimSpace(arg)
+		switch {
+		case arg == "-J" || arg == "-W":
+			return true
+		case strings.HasPrefix(arg, "-J") || strings.HasPrefix(arg, "-W"):
+			return len(arg) > 2
+		case arg == "-o" && i+1 < len(args):
+			if sshProxyOption(args[i+1]) {
+				return true
+			}
+		case strings.HasPrefix(arg, "-o"):
+			if sshProxyOption(strings.TrimPrefix(arg, "-o")) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sshProxyOption(arg string) bool {
+	for _, name := range []string{"ProxyJump", "ProxyCommand"} {
+		if value, ok := sshOptionValue(strings.TrimSpace(arg), name); ok {
+			return value != "" && !strings.EqualFold(value, "none")
+		}
+	}
+	return false
+}
+
 func BuildArgs(c TunnelConfig) ([]string, error) {
 	return buildArgs(c, DefaultHostKeyArgs())
 }

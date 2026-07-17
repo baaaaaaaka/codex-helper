@@ -70,6 +70,15 @@ type HealthStatus struct {
 	BrokerEpoch          string                   `json:"brokerEpoch,omitempty"`
 	ActiveGeneration     uint64                   `json:"activeGeneration,omitempty"`
 	Recovery             string                   `json:"recovery,omitempty"`
+	PowerState           string                   `json:"powerState,omitempty"`
+	HostNetworkState     string                   `json:"hostNetworkState,omitempty"`
+	HostReady            bool                     `json:"hostReady"`
+	LastHostEventAt      time.Time                `json:"lastHostEventAt,omitempty"`
+	LastHostProbeAt      time.Time                `json:"lastHostProbeAt,omitempty"`
+	HostProbeCount       uint64                   `json:"hostProbeCount,omitempty"`
+	RecoveryGeneration   uint64                   `json:"recoveryGeneration,omitempty"`
+	CandidateActive      bool                     `json:"candidateActive"`
+	LastRecoveryCause    string                   `json:"lastRecoveryCause,omitempty"`
 	LastProbeAt          time.Time                `json:"lastProbeAt,omitempty"`
 	LastProbeError       string                   `json:"lastProbeError,omitempty"`
 	ProbeCount           uint64                   `json:"probeCount,omitempty"`
@@ -409,6 +418,15 @@ func (p *HTTPProxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			details.BrokerEpoch = extra.BrokerEpoch
 			details.ActiveGeneration = extra.ActiveGeneration
 			details.Recovery = extra.Recovery
+			details.PowerState = extra.PowerState
+			details.HostNetworkState = extra.HostNetworkState
+			details.HostReady = extra.HostReady
+			details.LastHostEventAt = extra.LastHostEventAt
+			details.LastHostProbeAt = extra.LastHostProbeAt
+			details.HostProbeCount = extra.HostProbeCount
+			details.RecoveryGeneration = extra.RecoveryGeneration
+			details.CandidateActive = extra.CandidateActive
+			details.LastRecoveryCause = extra.LastRecoveryCause
 			details.LastProbeAt = extra.LastProbeAt
 			details.LastProbeError = extra.LastProbeError
 			details.RouteEvidence = extra.RouteEvidence

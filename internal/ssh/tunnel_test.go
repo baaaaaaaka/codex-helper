@@ -93,6 +93,31 @@ func TestBuildArgs_UsesConfigTargetWithoutOverridingUserOrPort(t *testing.T) {
 	}
 }
 
+func TestArgsUseProxyRoute(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "jump separated", args: []string{"-J", "jump.example"}, want: true},
+		{name: "jump attached", args: []string{"-Jjump.example"}, want: true},
+		{name: "stdio forward", args: []string{"-W", "target:22", "jump.example"}, want: true},
+		{name: "proxy jump separated option", args: []string{"-o", "ProxyJump=jump.example"}, want: true},
+		{name: "proxy jump attached option", args: []string{"-oProxyJump=jump.example"}, want: true},
+		{name: "proxy command separated option", args: []string{"-o", "ProxyCommand=ssh jump.example -W %h:%p"}, want: true},
+		{name: "proxy command attached option", args: []string{"-oProxyCommand=ssh jump.example -W %h:%p"}, want: true},
+		{name: "disabled proxy jump", args: []string{"-o", "ProxyJump=none"}, want: false},
+		{name: "ordinary args", args: []string{"-i", "/tmp/key"}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ArgsUseProxyRoute(test.args); got != test.want {
+				t.Fatalf("ArgsUseProxyRoute(%#v) = %v, want %v", test.args, got, test.want)
+			}
+		})
+	}
+}
+
 func TestBuildArgs_ValidatesPorts(t *testing.T) {
 	_, err := BuildArgs(TunnelConfig{
 		Host:      "h",

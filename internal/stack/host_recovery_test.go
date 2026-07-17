@@ -1,0 +1,366 @@
+package stack
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/hoststate"
+)
+
+func TestSuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit(t *testing.T) {
+	initial := newProbeTestTunnel(0, nil)
+	observer := hoststate.NewChannelObserver(8)
+	fatal := make(chan error, 1)
+	states := make(chan string, 8)
+	var persisted atomic.Int32
+	s := &Stack{
+		Profile:      config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:       initial,
+		fatalCh:      fatal,
+		stopCh:       make(chan struct{}),
+		probeCh:      make(chan struct{}, 1),
+		failureCh:    make(chan error, 1),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe:    func(context.Context) error { return errors.New("offline") },
+		powerState:   hoststate.PowerAwake,
+		networkState: hoststate.NetworkReady,
+		hostReady:    true,
+		persistRecoveryBudget: func(config.ProxyRecoveryBudget) error {
+			persisted.Add(1)
+			return nil
+		},
+		setRecoveryState: func(state string, _ error) {
+			select {
+			case states <- state:
+			default:
+			}
+		},
+	}
+	if err := initial.Start(); err != nil {
+		t.Fatalf("initial Start: %v", err)
+	}
+	if err := observer.Start(); err != nil {
+		t.Fatalf("observer Start: %v", err)
+	}
+	go s.monitor(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    time.Millisecond,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+		ProbeInterval:     time.Hour,
+	})
+
+	observer.Emit(hoststate.Event{Kind: hoststate.EventPowerWillSleep})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case state := <-states:
+			if state == "suspended" {
+				close(initial.done)
+				goto exited
+			}
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("monitor did not enter suspended state")
+
+exited:
+	select {
+	case err := <-fatal:
+		t.Fatalf("sleep-related tunnel exit became fatal: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := persisted.Load(); got != 0 {
+		t.Fatalf("sleep-related tunnel exit persisted %d budget updates", got)
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestWakeWaitsForHostBeforeCreatingCandidate(t *testing.T) {
+	initial := newProbeTestTunnel(0, nil)
+	observer := hoststate.NewChannelObserver(32)
+	created := make(chan struct{}, 1)
+	previousFactory := newStackTunnel
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		created <- struct{}{}
+		return nil, fmt.Errorf("candidate should not start while offline")
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+	var hostProbes atomic.Int32
+	s := &Stack{
+		Profile:      config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:       initial,
+		fatalCh:      make(chan error, 1),
+		stopCh:       make(chan struct{}),
+		probeCh:      make(chan struct{}, 1),
+		failureCh:    make(chan error, 1),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe: func(context.Context) error {
+			hostProbes.Add(1)
+			return errors.New("offline")
+		},
+		powerState:   hoststate.PowerAwake,
+		networkState: hoststate.NetworkReady,
+		hostReady:    true,
+	}
+	if err := initial.Start(); err != nil {
+		t.Fatalf("initial Start: %v", err)
+	}
+	if err := observer.Start(); err != nil {
+		t.Fatalf("observer Start: %v", err)
+	}
+	go s.monitor(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    time.Millisecond,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+		HostProbeTimeout:  10 * time.Millisecond,
+		ProbeInterval:     time.Hour,
+	})
+	observer.Emit(hoststate.Event{Kind: hoststate.EventPowerDidWake})
+	time.Sleep(80 * time.Millisecond)
+	select {
+	case <-created:
+		t.Fatal("candidate started while host probe was failing")
+	default:
+	}
+	if got := hostProbes.Load(); got == 0 {
+		t.Fatal("wake did not run host probes")
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestWaitForHostResumeBlocksUntilWake(t *testing.T) {
+	observer := hoststate.NewChannelObserver(8)
+	s := &Stack{
+		stopCh:       make(chan struct{}),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe:    func(context.Context) error { return nil },
+		powerState:   hoststate.PowerSuspended,
+		networkState: hoststate.NetworkUnknown,
+		hostReady:    false,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.waitForHostResume() }()
+	select {
+	case err := <-done:
+		t.Fatalf("waitForHostResume returned before wake: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	observer.Emit(hoststate.Event{Kind: hoststate.EventPowerDidWake})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waitForHostResume after wake: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForHostResume did not return after wake")
+	}
+	if s.hostSuspended() {
+		t.Fatal("wake event left host suspended")
+	}
+}
+
+func TestTunnelExitAfterWallClockGapWaitsForHostBeforeRecovery(t *testing.T) {
+	initial := newProbeTestTunnel(0, nil)
+	close(initial.done)
+	observer := hoststate.NewChannelObserver(8)
+	previousFactory := newStackTunnel
+	created := make(chan struct{}, 1)
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		created <- struct{}{}
+		return nil, errors.New("candidate must wait for host readiness")
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+	var persisted atomic.Int32
+	s := &Stack{
+		Profile:      config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:       initial,
+		fatalCh:      make(chan error, 1),
+		stopCh:       make(chan struct{}),
+		probeCh:      make(chan struct{}, 1),
+		failureCh:    make(chan error, 1),
+		hostObserver: observer,
+		hostEvents:   observer.Events(),
+		hostProbe:    func(context.Context) error { return errors.New("network still unavailable") },
+		powerState:   hoststate.PowerAwake,
+		networkState: hoststate.NetworkReady,
+		hostReady:    true,
+		persistRecoveryBudget: func(config.ProxyRecoveryBudget) error {
+			persisted.Add(1)
+			return nil
+		},
+	}
+	clock := time.Unix(100, 0)
+	var clockCalls atomic.Int32
+	go s.monitor(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    time.Millisecond,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+		HostProbeTimeout:  10 * time.Millisecond,
+		ProbeInterval:     10 * time.Millisecond,
+		Now: func() time.Time {
+			if clockCalls.Add(1) == 1 {
+				return clock
+			}
+			return clock.Add(100 * time.Millisecond)
+		},
+	})
+
+	select {
+	case <-created:
+		t.Fatal("tunnel exit after a sleep-sized gap started recovery before host probe")
+	case <-time.After(80 * time.Millisecond):
+	}
+	if got := persisted.Load(); got != 0 {
+		t.Fatalf("sleep-sized gap persisted %d recovery budget updates", got)
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestHostProbeTargetSkipsFinalDestinationForProxyRoute(t *testing.T) {
+	tests := []config.Profile{
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-J", "jump.internal"}},
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-o", "ProxyJump=jump.internal"}},
+		{Host: "target.internal", Port: 22, SSHArgs: []string{"-oProxyCommand=ssh jump.internal -W %h:%p"}},
+	}
+	for _, profile := range tests {
+		if host, port, direct := hostProbeTarget(profile); direct || host != "" || port != 0 {
+			t.Fatalf("hostProbeTarget(%#v) = (%q, %d, %v), want interface-only gate", profile.SSHArgs, host, port, direct)
+		}
+	}
+}
+
+func TestCloseCancelsAndCleansActiveCandidate(t *testing.T) {
+	initial := newProbeTestTunnel(0, nil)
+	close(initial.done)
+	previousFactory := newStackTunnel
+	created := make(chan *probeTestTunnel, 1)
+	newStackTunnel = func(_ config.Profile, port int) (tunnelProcess, error) {
+		candidate := newProbeTestTunnel(port, nil)
+		created <- candidate
+		return candidate, nil
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+	probeStarted := make(chan struct{})
+	var probeOnce atomic.Bool
+	s := &Stack{
+		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:    initial,
+		fatalCh:   make(chan error, 1),
+		stopCh:    make(chan struct{}),
+		probeCh:   make(chan struct{}, 1),
+		failureCh: make(chan error, 1),
+	}
+	go s.monitor(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    time.Millisecond,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   time.Second,
+		SocksReadyTimeout: time.Second,
+		ProbeInterval:     time.Hour,
+		RouteProbe: func(ctx context.Context, _ string, _ string, _ int, _ time.Duration) error {
+			if probeOnce.CompareAndSwap(false, true) {
+				close(probeStarted)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	var candidate *probeTestTunnel
+	select {
+	case candidate = <-created:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for candidate")
+	}
+	select {
+	case <-probeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("candidate route probe did not start")
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-candidate.Done():
+	default:
+		t.Fatal("candidate remained alive after Stack.Close")
+	}
+}
+
+func TestCandidateConstructionFailureConsumesRecoveryBudget(t *testing.T) {
+	initial := newProbeTestTunnel(0, errors.New("initial tunnel failure"))
+	close(initial.done)
+	previousFactory := newStackTunnel
+	var constructionAttempts atomic.Int32
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		constructionAttempts.Add(1)
+		return nil, errors.New("candidate construction unavailable")
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+
+	var persisted config.ProxyRecoveryBudget
+	s := &Stack{
+		Profile:               config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		tunnel:                initial,
+		fatalCh:               make(chan error, 1),
+		stopCh:                make(chan struct{}),
+		persistRecoveryBudget: func(budget config.ProxyRecoveryBudget) error { persisted = budget; return nil },
+	}
+	restarts := []time.Time{}
+	opts := Options{
+		MaxRestarts:       1,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   10 * time.Millisecond,
+		SocksReadyTimeout: 50 * time.Millisecond,
+	}
+	now := time.Now()
+	if !s.recoverTunnelAt(opts, &restarts, errors.New("tunnel exited"), now) {
+		t.Fatal("first candidate construction failure unexpectedly blocked recovery")
+	}
+	if got := constructionAttempts.Load(); got != 1 {
+		t.Fatalf("candidate construction attempts after first failure = %d, want 1", got)
+	}
+	if persisted.RestartAttempts != 1 || persisted.Blocked {
+		t.Fatalf("persisted budget after first failure = %#v, want one unblocked attempt", persisted)
+	}
+	if s.recoverTunnelAt(opts, &restarts, errors.New("tunnel exited again"), now.Add(time.Second)) {
+		t.Fatal("second candidate construction failure unexpectedly remained recoverable")
+	}
+	if got := constructionAttempts.Load(); got != 1 {
+		t.Fatalf("candidate construction attempts after budget exhaustion = %d, want 1", got)
+	}
+	if !persisted.Blocked || persisted.RestartAttempts != 2 {
+		t.Fatalf("persisted budget after exhaustion = %#v, want blocked after two admissions", persisted)
+	}
+	select {
+	case err := <-s.fatalCh:
+		if !errors.Is(err, ErrRecoveryBudgetBlocked) {
+			t.Fatalf("fatal error = %v, want blocked budget", err)
+		}
+	default:
+		t.Fatal("budget exhaustion did not report a fatal blocked state")
+	}
+}

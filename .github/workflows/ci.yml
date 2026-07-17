@@ -75,7 +75,8 @@ jobs:
           go test -p=1 ./internal/proxysupervisor -count=1 -run 'Test(RenderAllPlatforms|SpecValidation|ChildArgs)' -v
           go test -p=1 ./internal/localproxy -count=1 -run 'Test(GenerationRouter|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|HTTPProxyGenerationRouter|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|ProxyHop|ProbeSOCKS5|SOCKS5Dialer|HTTPProxyHealthProbe|HTTPProxyNotifiesBackendFailure|HTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive|HTTPProxyCloseClosesActiveHijackedTunnels|HTTPProxyRealSocketFaultRelay|DistinctLoopback)' -v
           go test -p=1 ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyRouteTargetUsesRealConnect|OwnedInstanceOpsFenceStaleDaemon|IsProxyOwnerLeaseStale)' -v
-          go test -p=1 ./internal/stack -count=1 -run 'Test(WaitForSOCKS5|NotifyNetworkResume|RequestFailureRecoveryBudgetIsBounded|StackHelpers|StackCloseIsConcurrentSafe|Monitor|SetupHTTPProxy)' -v
+          go test -p=1 ./internal/hoststate -count=1 -v
+          go test -p=1 ./internal/stack -count=1 -run 'Test(WaitForSOCKS5|NotifyNetworkResume|RequestFailureRecoveryBudgetIsBounded|StackHelpers|StackCloseIsConcurrentSafe|Monitor|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|SetupHTTPProxy)' -v
           go test -p=1 ./internal/ssh -count=1 -run 'Test(BuildArgs|TunnelStopTerminatesProcessGroupDescendants)' -v
           go test -p=1 ./internal/cli -count=1 -run '^Test(Claim(LegacyProxyInstancePersistsOwnerLease|ProxyInstance)|ProxyStartRemovesPlaceholderWhenExecutableResolutionFails|RunProxyDaemonWithOwnerToken(CleansPlaceholderWhenProfileMissing|DoesNotOverwriteReplacement)|ProxyStop|ProxySupervisor|ManagedProxyDaemon)' -v
           go test -p=1 ./internal/cli -count=1 -run 'Test(WindowsProxyReachabilityScriptExecutesAgainstLiveProxy|CodexAppAuth(MacProxyBrowser.*|WindowsProxy(ReachabilityScriptChecksHealthEndpoint|BrowserScriptUsesChromiumProxy)))$' -v
@@ -95,7 +96,8 @@ jobs:
           # storms entirely through loopback. They do not require sudo,
           # pfctl, networksetup, or suspending the hosted macOS runner.
           go test -p=1 ./internal/localproxy -count=5 -run 'Test(HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyGenerationRouterRecoversAfterSOCKSFailure|HTTPProxyGenerationSwapHasNoListenerRefusedWindow|GenerationRouterSwapKeepsListenerAndFencesOldGeneration|GenerationRouterDialContextCancelsBackend|GenerationRouterDrainRejectsLateDialAfterForcedClose|SOCKS5DialerContextCancelsHalfOpenHandshake|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive|HTTPProxyCloseClosesActiveHijackedTunnels|ProbeSOCKS5|HTTPProxyNotifiesBackendFailure|DistinctLoopback)' -v
-          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor(RecoversTunnelAndSwapsProxyGeneration|RetriesCandidateAfterDeadTunnel|NetworkResumeRecoversFailedRemoteProbe|CandidateFailureKeepsLiveActiveTunnel|DetectsProbeGapAsResume)|NotifyNetworkResumeCoalesces|RequestFailureRecoveryBudgetIsBounded|StackCloseIsConcurrentSafe|SetupHTTPProxyBackendFailure(SignalsAreCoalesced|StormCountsRawRequestsAndOneSignal))' -v
+          go test -p=1 ./internal/hoststate -count=5 -v
+          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor(RecoversTunnelAndSwapsProxyGeneration|RetriesCandidateAfterDeadTunnel|NetworkResumeRecoversFailedRemoteProbe|CandidateFailureKeepsLiveActiveTunnel|DetectsProbeGapAsResume)|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|NotifyNetworkResumeCoalesces|RequestFailureRecoveryBudgetIsBounded|StackCloseIsConcurrentSafe|SetupHTTPProxyBackendFailure(SignalsAreCoalesced|StormCountsRawRequestsAndOneSignal))' -v
 
   windows-proxy-lifecycle:
     name: Windows proxy lifecycle and managed runtime update
@@ -126,7 +128,8 @@ jobs:
           go test -p=1 ./internal/candidateupdate -count=1 -run 'Test(WindowsCandidateOwned|WindowsDeferred|Reconcile|ResumePending|StableReplacement|Apply|SamePath)' -v
           go test -p=1 ./internal/update -count=1 -run 'Test(PerformUpdate|ReplaceBinary|Probe)' -v
           go test -p=1 ./internal/cli -count=1 -run 'Test(StartDetachedProcessWaitsForExitedChild|ProxyStart|StartCodexAppProxyDaemon|WindowsProxy|CurrentRuntimeOwnsUpdateTarget)' -v
-          go test -p=1 ./internal/localproxy ./internal/stack ./internal/ssh -count=1 -run 'Test(HTTPProxyChain|HTTPProxyDNSAlias|GenerationRouter|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|RequestFailure|NotifyNetworkResume|TunnelProcess)' -v
+          go test -p=1 ./internal/hoststate -count=1 -v
+          go test -p=1 ./internal/localproxy ./internal/stack ./internal/ssh -count=1 -run 'Test(HTTPProxyChain|HTTPProxyDNSAlias|GenerationRouter|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|RequestFailure|NotifyNetworkResume|TunnelProcess)' -v
 
       - name: Capture Windows lifecycle diagnostics
         if: ${{ failure() }}
@@ -187,7 +190,8 @@ jobs:
         run: |
           set -euo pipefail
           go test -p=1 ./internal/localproxy -count=5 -run '^Test(HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached)$' -v
-          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|SetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal)' -v
+          go test -p=1 ./internal/hoststate -count=5 -v
+          go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|SetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal)' -v
 
   targeted-test:
     name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})
