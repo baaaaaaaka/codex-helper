@@ -96,8 +96,9 @@ func (o *windowsObserver) registerPower() {
 }
 
 func (o *windowsObserver) registerNetwork() {
-	callback := windows.NewCallback(func(_ uintptr, _ uintptr, _ uint32) {
+	callback := windows.NewCallback(func(_ uintptr, _ uintptr, _ uint32) uintptr {
 		o.emit(Event{Kind: EventNetworkChanged, Source: "windows-ip-interface"})
+		return 0
 	})
 	o.mu.Lock()
 	o.callbacks = append(o.callbacks, callback)

@@ -90,7 +90,7 @@ static cxp_power_observer *cxp_power_start(void) {
 	}
 	CFRunLoopAddSource(observer->run_loop, observer->run_loop_source, kCFRunLoopDefaultMode);
 	SCDynamicStoreContext store_context = {0, observer, NULL, NULL, NULL};
-	observer->config_store = SCDynamicStoreCreate(NULL, cxp_network_callback, &store_context);
+	observer->config_store = SCDynamicStoreCreate(NULL, CFSTR("codex-helper.hoststate"), cxp_network_callback, &store_context);
 	if (observer->config_store != NULL) {
 		CFStringRef interface_key = SCDynamicStoreKeyCreateNetworkInterfaceEntity(
 			NULL, kSCDynamicStoreDomainState, CFSTR(".*"), kSCEntNetIPv4);
