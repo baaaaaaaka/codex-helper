@@ -1019,10 +1019,10 @@ func startCodexDesktopProcess(ctx context.Context, executable string, opts codex
 		cmd.Dir = opts.Cwd
 	}
 	envVars := os.Environ()
+	envVars = append(envVars, opts.ExtraEnv...)
 	if strings.TrimSpace(opts.ProxyURL) != "" {
 		envVars = codexAppProxyEnv(envVars, opts.ProxyURL)
 	}
-	envVars = append(envVars, opts.ExtraEnv...)
 	updatedEnv, err := applyExecIdentity(cmd, envVars, opts.ExecIdentity)
 	if err != nil {
 		return err
@@ -1044,7 +1044,7 @@ func codexDesktopAppProcessArgs(opts codexDesktopAppOptions) []string {
 
 func codexAppProxyEnv(base []string, proxyURL string) []string {
 	envVars := env.WithProxy(base, proxyURL)
-	for _, key := range []string{"ALL_PROXY", "all_proxy", "WS_PROXY", "WSS_PROXY"} {
+	for _, key := range []string{"WS_PROXY", "WSS_PROXY"} {
 		envVars = append(envVars, key+"="+proxyURL)
 	}
 	return envVars

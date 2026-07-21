@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+type appServerProcessHandle struct{}
+
 // configureAppServerProcess gives the complete app-server process tree its own
 // process group. The npm Codex entry point can remain as a wrapper process with
 // the native Codex binary as a child, so killing only cmd.Process is not enough
@@ -24,7 +26,11 @@ func configureAppServerProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = attr
 }
 
-func terminateAppServerProcess(cmd *exec.Cmd) {
+func attachAppServerProcess(*exec.Cmd) appServerProcessHandle { return appServerProcessHandle{} }
+
+func closeAppServerProcess(appServerProcessHandle) {}
+
+func terminateAppServerProcess(cmd *exec.Cmd, _ appServerProcessHandle) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}

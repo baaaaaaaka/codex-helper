@@ -1875,7 +1875,14 @@ func stubTeamsCodexUpgradePath(t *testing.T, path string) {
 
 func TestTeamsCodexUpgradeProxyEnvironmentPreservesTargetPATH(t *testing.T) {
 	got := teamsCodexUpgradeProxyEnvironment(
-		[]string{"PATH=/target/bin:/usr/bin", "HOME=/home/target", "HTTP_PROXY=http://stale"},
+		[]string{
+			"PATH=/target/bin:/usr/bin",
+			"HOME=/home/target",
+			"HTTP_PROXY=http://stale",
+			"ALL_PROXY=socks5://127.0.0.1:11080",
+			"all_proxy=socks5://127.0.0.1:11080",
+			"All_Proxy=socks5://127.0.0.1:11080",
+		},
 		[]string{"PATH=/service/bin", "HOME=/service", "HTTP_PROXY=http://127.0.0.1:18080"},
 	)
 	if path := envValue(got, "PATH"); path != "/target/bin:/usr/bin" {
@@ -1886,6 +1893,15 @@ func TestTeamsCodexUpgradeProxyEnvironmentPreservesTargetPATH(t *testing.T) {
 	}
 	if proxy := envValue(got, "HTTP_PROXY"); proxy != "http://127.0.0.1:18080" {
 		t.Fatalf("HTTP_PROXY = %q", proxy)
+	}
+	if proxy := envValue(got, "ALL_PROXY"); proxy != "http://127.0.0.1:18080" {
+		t.Fatalf("ALL_PROXY = %q", proxy)
+	}
+	for _, kv := range got {
+		key, value, _ := strings.Cut(kv, "=")
+		if strings.EqualFold(key, "ALL_PROXY") && value == "socks5://127.0.0.1:11080" {
+			t.Fatalf("stale ALL_PROXY survived: %q", kv)
+		}
 	}
 }
 

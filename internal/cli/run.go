@@ -660,11 +660,14 @@ func runTargetOnceWithOptions(
 		cmd.Dir = opts.Cwd
 	}
 	envVars := os.Environ()
-	if opts.UseProxy {
-		envVars = env.WithProxy(envVars, proxyURL)
-	}
 	if len(opts.ExtraEnv) > 0 {
 		envVars = mergeCLIEnvironment(envVars, opts.ExtraEnv)
+	}
+	if opts.UseProxy {
+		// A selected profile owns the standard proxy variables even when a
+		// caller supplies ExtraEnv. Otherwise an inherited or overlay ALL_PROXY
+		// can bypass the managed proxy after WithProxy has normalized it.
+		envVars = env.WithProxy(envVars, proxyURL)
 	}
 	envVars = applyExecIdentityEnv(envVars, opts.ExecIdentity)
 	guardCleanup := func() {}
