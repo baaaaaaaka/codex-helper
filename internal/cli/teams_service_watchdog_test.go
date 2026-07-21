@@ -1623,8 +1623,9 @@ func TestCollectTeamsServiceWatchdogSnapshotSQLiteResourceStability(t *testing.T
 			if afterOpenDBRefs > beforeOpenDBRefs {
 				t.Fatalf("OpenDB stack references grew from %d to %d", beforeOpenDBRefs, afterOpenDBRefs)
 			}
-			if delta := runtime.NumGoroutine() - beforeGoroutines; delta > 8 {
-				t.Fatalf("goroutines grew by %d; before=%d after=%d", delta, beforeGoroutines, runtime.NumGoroutine())
+			afterGoroutines := waitForTeamsServiceWatchdogGoroutinesAtMost(t, beforeGoroutines+8)
+			if delta := afterGoroutines - beforeGoroutines; delta > 8 {
+				t.Fatalf("goroutines grew by %d; before=%d after=%d", delta, beforeGoroutines, afterGoroutines)
 			}
 			afterHeap := teamsServiceWatchdogHeapAllocForTest()
 			if delta := int64(afterHeap) - int64(beforeHeap); delta > 8*1024*1024 {
@@ -1660,10 +1661,11 @@ func BenchmarkTeamsServiceWatchdogSnapshotSQLiteResourceStability(b *testing.B) 
 			b.StopTimer()
 
 			afterOpeners, afterOpenDBRefs := waitForTeamsServiceWatchdogOpenDBCountsAtMost(b, beforeOpeners, beforeOpenDBRefs)
+			afterGoroutines := waitForTeamsServiceWatchdogGoroutinesAtMost(b, beforeGoroutines+8)
 			afterHeap := teamsServiceWatchdogHeapAllocForTest()
 			b.ReportMetric(float64(afterOpeners-beforeOpeners), "opendb_goroutines_delta")
 			b.ReportMetric(float64(afterOpenDBRefs-beforeOpenDBRefs), "opendb_refs_delta")
-			b.ReportMetric(float64(runtime.NumGoroutine()-beforeGoroutines), "goroutines_delta")
+			b.ReportMetric(float64(afterGoroutines-beforeGoroutines), "goroutines_delta")
 			b.ReportMetric(float64(int64(afterHeap)-int64(beforeHeap)), "heap_alloc_delta_bytes")
 		})
 	}
@@ -1782,6 +1784,19 @@ func waitForTeamsServiceWatchdogOpenDBCountsAtMost(tb testing.TB, maxOpeners int
 		openers, openDBRefs := teamsServiceWatchdogOpenDBCountsForTest()
 		if (openers <= maxOpeners && openDBRefs <= maxOpenDBRefs) || time.Now().After(deadline) {
 			return openers, openDBRefs
+		}
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForTeamsServiceWatchdogGoroutinesAtMost(tb testing.TB, maxGoroutines int) int {
+	tb.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		goroutines := runtime.NumGoroutine()
+		if goroutines <= maxGoroutines || time.Now().After(deadline) {
+			return goroutines
 		}
 		runtime.Gosched()
 		time.Sleep(10 * time.Millisecond)
