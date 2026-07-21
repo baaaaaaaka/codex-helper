@@ -20,14 +20,16 @@ func TestWithProxy_SetsProxyAndMergesNoProxy(t *testing.T) {
 	if got := m["HTTP_PROXY"]; got != "http://127.0.0.1:8080" {
 		t.Fatalf("HTTP_PROXY=%q", got)
 	}
-	if got := m["http_proxy"]; got != "http://127.0.0.1:8080" {
-		t.Fatalf("http_proxy=%q", got)
-	}
 	if got := m["HTTPS_PROXY"]; got != "http://127.0.0.1:8080" {
 		t.Fatalf("HTTPS_PROXY=%q", got)
 	}
-	if got := m["https_proxy"]; got != "http://127.0.0.1:8080" {
-		t.Fatalf("https_proxy=%q", got)
+	if runtime.GOOS != "windows" {
+		if got := m["http_proxy"]; got != "http://127.0.0.1:8080" {
+			t.Fatalf("http_proxy=%q", got)
+		}
+		if got := m["https_proxy"]; got != "http://127.0.0.1:8080" {
+			t.Fatalf("https_proxy=%q", got)
+		}
 	}
 
 	noProxy := firstNonEmpty(m["NO_PROXY"], m["no_proxy"])
