@@ -155,6 +155,65 @@ func TestRunTargetRuntimeEnvironmentHelper(t *testing.T) {
 	}
 }
 
+func TestRunTargetOnceWithOptionsProxyReplacesInheritedAllProxy(t *testing.T) {
+	lockCLITestHooks(t)
+	previousRunTargetCommand := runTargetCommand
+	t.Cleanup(func() { runTargetCommand = previousRunTargetCommand })
+	runTargetCommand = func(string, ...string) *exec.Cmd {
+		return exec.Command(os.Args[0], "-test.run=^TestRunTargetProxyEnvironmentHelper$")
+	}
+
+	const stale = "socks5://127.0.0.1:11080"
+	t.Setenv("ALL_PROXY", stale)
+	t.Setenv("all_proxy", stale)
+	if runtime.GOOS != "windows" {
+		t.Setenv("All_Proxy", stale)
+	}
+	outFile := filepath.Join(t.TempDir(), "target-environment.txt")
+	err := runTargetOnceWithOptions(
+		context.Background(),
+		[]string{"proxy-environment-helper"},
+		"http://127.0.0.1:18080",
+		nil,
+		nil,
+		nil,
+		nil,
+		runTargetOptions{
+			UseProxy: true,
+			ExtraEnv: []string{
+				"CODEX_HELPER_RUN_PROXY_ENV_HELPER=1",
+				"CODEX_HELPER_RUN_PROXY_ENV_FILE=" + outFile,
+				"All_Proxy=" + stale,
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("runTargetOnceWithOptions error: %v", err)
+	}
+	raw, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read target environment: %v", err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		key, value, _ := strings.Cut(line, "=")
+		if (strings.EqualFold(key, "HTTP_PROXY") || strings.EqualFold(key, "HTTPS_PROXY") || strings.EqualFold(key, "ALL_PROXY")) && value == stale {
+			t.Fatalf("target retained stale proxy environment %q\n%s", line, raw)
+		}
+	}
+	if !strings.Contains(string(raw), "ALL_PROXY=http://127.0.0.1:18080") {
+		t.Fatalf("target did not receive managed ALL_PROXY:\n%s", raw)
+	}
+}
+
+func TestRunTargetProxyEnvironmentHelper(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_RUN_PROXY_ENV_HELPER") != "1" {
+		return
+	}
+	if err := os.WriteFile(os.Getenv("CODEX_HELPER_RUN_PROXY_ENV_FILE"), []byte(strings.Join(os.Environ(), "\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runtimeMarkerEnvironmentNamesForTest() []string {
 	return []string{
 		helperruntime.EnvRuntime,

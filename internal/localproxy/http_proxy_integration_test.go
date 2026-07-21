@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,6 +80,73 @@ func TestHTTPProxy_CONNECT_GoesThroughSOCKS(t *testing.T) {
 	}
 	if socks.LastDest() != echoAddr {
 		t.Fatalf("SOCKS last dest got=%q want=%q", socks.LastDest(), echoAddr)
+	}
+}
+
+// This is a deliberately small ALL_PROXY consumer fixture. It verifies the
+// contract CXP publishes: ALL_PROXY may contain the local HTTP proxy URL, and
+// that endpoint supports an HTTPS-style CONNECT tunnel.
+func TestHTTPProxyAllProxyHTTPURLSupportsCONNECT(t *testing.T) {
+	echoAddr, closeEcho := startTCPEchoServer(t)
+	defer closeEcho()
+
+	socks := startSOCKS5Server(t)
+	defer socks.Close()
+	dialer, err := NewSOCKS5Dialer(socks.Addr(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewSOCKS5Dialer: %v", err)
+	}
+	p := NewHTTPProxy(dialer, Options{InstanceID: "all-proxy"})
+	httpAddr, err := p.Start("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Start HTTP proxy: %v", err)
+	}
+	defer func() { _ = p.Close(context.Background()) }()
+
+	t.Setenv("ALL_PROXY", "http://"+httpAddr)
+	connectViaAllProxy(t, os.Getenv("ALL_PROXY"), echoAddr)
+
+	if socks.ConnectCount() != 1 || socks.LastDest() != echoAddr {
+		t.Fatalf("SOCKS route count=%d dest=%q, want 1 and %q", socks.ConnectCount(), socks.LastDest(), echoAddr)
+	}
+}
+
+func connectViaAllProxy(t *testing.T, allProxy string, target string) {
+	t.Helper()
+	proxyURL, err := url.Parse(allProxy)
+	if err != nil || proxyURL.Scheme != "http" || proxyURL.Host == "" {
+		t.Fatalf("ALL_PROXY=%q is not an HTTP proxy URL: %v", allProxy, err)
+	}
+	conn, err := net.DialTimeout("tcp", proxyURL.Host, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial ALL_PROXY endpoint: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		t.Fatalf("write CONNECT through ALL_PROXY: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "200") {
+		t.Fatalf("ALL_PROXY CONNECT status=%q err=%v", status, err)
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read CONNECT header: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	payload := []byte("all-proxy-ping")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write tunnel payload: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(reader, got); err != nil || string(got) != string(payload) {
+		t.Fatalf("read tunnel payload got=%q err=%v", got, err)
 	}
 }
 

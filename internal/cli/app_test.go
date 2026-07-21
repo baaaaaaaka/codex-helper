@@ -1107,6 +1107,11 @@ func TestCodexDesktopWindowsScriptWaitForExitOption(t *testing.T) {
 
 func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 	lockCLITestHooks(t)
+	t.Setenv("ALL_PROXY", "socks5://127.0.0.1:11080")
+	t.Setenv("all_proxy", "socks5://127.0.0.1:11080")
+	if runtime.GOOS != "windows" {
+		t.Setenv("All_Proxy", "socks5://127.0.0.1:11080")
+	}
 	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
 		t.Setenv(name, "inherited")
 	}
@@ -1130,6 +1135,7 @@ func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 		ExtraEnv: []string{
 			envCodexHome + "=" + filepath.Join(t.TempDir(), ".codex"),
 			"CODEX_HELPER_ENV_KEEP=desktop",
+			"All_Proxy=socks5://127.0.0.1:11080",
 			helperruntime.EnvForce + "=configured",
 		},
 	})
@@ -1145,6 +1151,12 @@ func TestStartCodexDesktopProcessPassesProxyArgAndEnv(t *testing.T) {
 	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "WS_PROXY", "WSS_PROXY"} {
 		if got := envValue(capturedCmd.Env, key); got != "http://127.0.0.1:61272" {
 			t.Fatalf("%s = %q, want proxy URL", key, got)
+		}
+	}
+	for _, kv := range capturedCmd.Env {
+		key, value, _ := strings.Cut(kv, "=")
+		if (strings.EqualFold(key, "HTTP_PROXY") || strings.EqualFold(key, "HTTPS_PROXY") || strings.EqualFold(key, "ALL_PROXY")) && value == "socks5://127.0.0.1:11080" {
+			t.Fatalf("desktop process retained stale proxy environment %q", kv)
 		}
 	}
 	for _, name := range runtimeMarkerEnvironmentNamesForTest() {
@@ -1210,6 +1222,12 @@ func main() {
 		"WS_PROXY=" + os.Getenv("WS_PROXY"),
 		"WSS_PROXY=" + os.Getenv("WSS_PROXY"),
 	}
+	for _, pair := range os.Environ() {
+		key, value, _ := strings.Cut(pair, "=")
+		if strings.EqualFold(key, "HTTP_PROXY") || strings.EqualFold(key, "HTTPS_PROXY") || strings.EqualFold(key, "ALL_PROXY") {
+			lines = append(lines, "standard_proxy="+key+"="+value)
+		}
+	}
 	if err := os.WriteFile(%q, []byte(strings.Join(lines, "\n")), 0600); err != nil {
 		panic(err)
 	}
@@ -1235,9 +1253,11 @@ func main() {
 		WaitForExit: true,
 		ExtraEnv: []string{
 			envCodexHome + "=" + filepath.Join(dir, ".codex"),
+			"All_Proxy=socks5://127.0.0.1:11080",
 		},
 	})
 	cmd := exec.Command(powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	cmd.Env = append(os.Environ(), "All_Proxy=socks5://127.0.0.1:11080")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("PowerShell launch failed: %v\n%s", err, out)
@@ -1263,6 +1283,9 @@ func main() {
 		if !strings.Contains(data, want) {
 			t.Fatalf("fake Codex app output missing %q:\n%s\nPowerShell output:\n%s", want, data, out)
 		}
+	}
+	if strings.Contains(data, "socks5://127.0.0.1:11080") {
+		t.Fatalf("fake Codex app retained stale standard proxy environment:\n%s", data)
 	}
 }
 
