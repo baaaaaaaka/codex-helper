@@ -29,7 +29,7 @@ func directParentExecutable() (string, error) {
 }
 
 func replaceLegacyStableEntry(candidate string, entry string, runningRuntime string, root string) error {
-	target, expectedHash, err := stableReplacementTarget(entry, runningRuntime, root)
+	target, expectedHash, err := legacyStableReplacementTarget(entry, runningRuntime, root)
 	if err != nil {
 		return err
 	}

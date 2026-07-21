@@ -2,6 +2,7 @@ package managedinstall
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -304,6 +305,52 @@ func IsCanonicalTargetPath(path string, goos string) bool {
 		return false
 	}
 	return strings.EqualFold(filepath.Base(clean), helperpath.BinaryName(goos))
+}
+
+// RecordOwnsTarget reports whether the install record identifies target as the
+// managed helper entry for this platform. An empty TargetState is accepted for
+// records written by older helpers; an explicit non-managed state is rejected.
+// Missing records are reported as not owned so callers can choose a safe
+// migration or fail-closed policy without conflating absence with I/O errors.
+func RecordOwnsTarget(recordPath string, target string, goos string) (bool, error) {
+	record, err := LoadRecord(recordPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if state := strings.TrimSpace(record.TargetState); state != "" && state != string(StateManaged) {
+		return false, nil
+	}
+	if recordedGOOS := strings.TrimSpace(record.GOOS); recordedGOOS != "" && !strings.EqualFold(recordedGOOS, strings.TrimSpace(goos)) {
+		return false, nil
+	}
+	recorded := strings.TrimSpace(record.TargetPath)
+	if !IsCanonicalTargetPath(recorded, goos) || !IsCanonicalTargetPath(target, goos) {
+		return false, nil
+	}
+	return ComparisonKey(recorded, goos) == ComparisonKey(target, goos), nil
+}
+
+// IsKnownHelperBinary verifies the lightweight identity shared by managed
+// entrypoint repair paths. It intentionally does not execute the file; callers
+// that need a version should perform their own clean-process probe afterwards.
+func IsKnownHelperBinary(path string, goos string) (bool, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false, nil
+	}
+	probe := helperpath.ProbePath(path, helperpath.Options{GOOS: goos})
+	if !probe.Exists || probe.IsDir || !probe.Executable || !probe.PlausibleHelperEntry {
+		return false, nil
+	}
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	const modulePath = "github.com/baaaaaaaka/codex-helper"
+	return strings.HasPrefix(strings.TrimSpace(info.Path), modulePath+"/") || strings.TrimSpace(info.Main.Path) == modulePath, nil
 }
 
 func IsShimEntryPath(path string, goos string) bool {

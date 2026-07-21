@@ -43,7 +43,7 @@ func TestWindowsCandidateOwnedUpdateDefersLockedStableEntry(t *testing.T) {
 		RequestID:       "windows-locked-entry",
 	}
 	previousReplace := replaceManagedStableEntryFn
-	replaceManagedStableEntryFn = func(string, string, string, string) error {
+	replaceManagedStableEntryFn = func(string, string, string, string, string) error {
 		return windows.ERROR_SHARING_VIOLATION
 	}
 	t.Cleanup(func() { replaceManagedStableEntryFn = previousReplace })

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"debug/buildinfo"
 	"errors"
 	"fmt"
 	"io"
@@ -877,12 +876,7 @@ func recordedHelperEntrypointLooksManaged(path string) (bool, error) {
 	if probe.IsDir || !probe.Executable || !probe.PlausibleHelperEntry {
 		return false, nil
 	}
-	info, err := buildinfo.ReadFile(path)
-	if err != nil {
-		return false, nil
-	}
-	const modulePath = "github.com/baaaaaaaka/codex-helper"
-	return strings.HasPrefix(strings.TrimSpace(info.Path), modulePath+"/") || strings.TrimSpace(info.Main.Path) == modulePath, nil
+	return managedinstall.IsKnownHelperBinary(path, runtime.GOOS)
 }
 
 func helperUpdateExecutionPath(res update.ApplyResult) string {
