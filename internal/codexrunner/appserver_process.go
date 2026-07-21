@@ -108,6 +108,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 
 	transport := &appServerProcessTransport{
 		cmd:           cmd,
+		processHandle: attachAppServerProcess(cmd),
 		cancelProcess: cancelProcess,
 		stdin:         stdinWrite,
 		stdout:        stdoutRead,
@@ -178,6 +179,7 @@ func appServerProcessExecutable(command string) string {
 
 type appServerProcessTransport struct {
 	cmd           *exec.Cmd
+	processHandle appServerProcessHandle
 	cancelProcess context.CancelFunc
 	stdin         *os.File
 	stdout        *os.File
@@ -261,9 +263,13 @@ func (p *appServerProcessTransport) Close() error {
 	p.closeOnce.Do(func() {
 		close(p.done)
 		_ = p.stdin.Close()
+		// On Windows, canceling CommandContext first kills only the direct
+		// process. Terminate the managed tree first so a wrapper cannot orphan a
+		// native Codex child that keeps CODEX_HOME files open during test cleanup.
+		terminateAppServerProcess(p.cmd, p.processHandle)
 		p.cancelProcess()
-		terminateAppServerProcess(p.cmd)
 		<-p.waitDone
+		closeAppServerProcess(p.processHandle)
 		_ = p.stdout.Close()
 		_ = p.stderr.Close()
 		p.wg.Wait()
