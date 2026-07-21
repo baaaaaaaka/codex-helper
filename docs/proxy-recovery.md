@@ -13,6 +13,12 @@ same-port target, with a short timeout, and are compared using the listener's
 actual IPv4/IPv6 address family. An unresolved alias is not assumed to be a
 self-loop.
 
+When a profile has no explicit route target, CXP performs only the local SOCKS
+readiness check. It must not infer a remote probe target from the profile's SSH
+Host/Port: those fields can be a local SSH config alias or the SSH endpoint
+itself, neither of which is necessarily a valid destination through the
+remote SOCKS server.
+
 Health requests use a short TTL and a single in-flight probe. A burst of
 clients therefore produces one SOCKS probe, while the health response still
 reports the raw backend-failure counter. Recovery admission has a durable

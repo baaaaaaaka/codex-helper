@@ -12,17 +12,16 @@ import (
 
 // healthClientForProxyProfile is the single policy point for reusable proxy
 // daemons. A local /health response proves only that the HTTP listener exists;
-// the profile target is also probed so a dead SSH/SOCKS route is not reused.
+// an explicitly configured route target is also probed so a dead SSH/SOCKS
+// route is not reused.
 func healthClientForProxyProfile(profile config.Profile, timeout time.Duration) manager.HealthClient {
-	host := profile.RouteTargetHost
-	port := profile.RouteTargetPort
-	if strings.TrimSpace(host) == "" {
-		host = profile.Host
-	}
-	if port <= 0 {
-		port = profile.Port
-	}
-	return healthClientForProxyTarget(timeout, host, port)
+	// A profile's Host/Port identify the SSH endpoint, not necessarily a
+	// destination that the remote SOCKS backend can dial. In particular, an
+	// SSH config alias is only meaningful to the local SSH client. Probe a
+	// remote route only when the caller explicitly provides the real target;
+	// otherwise the local proxy health endpoint is the only safe readiness
+	// signal.
+	return healthClientForProxyTarget(timeout, profile.RouteTargetHost, profile.RouteTargetPort)
 }
 
 func healthClientForProxyTarget(timeout time.Duration, host string, port int) manager.HealthClient {

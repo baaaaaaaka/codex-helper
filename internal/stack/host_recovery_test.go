@@ -266,7 +266,13 @@ func TestCloseCancelsAndCleansActiveCandidate(t *testing.T) {
 	probeStarted := make(chan struct{})
 	var probeOnce atomic.Bool
 	s := &Stack{
-		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		Profile: config.Profile{
+			Host:            "example.com",
+			Port:            22,
+			User:            "alice",
+			RouteTargetHost: "api.example.com",
+			RouteTargetPort: 443,
+		},
 		tunnel:    initial,
 		fatalCh:   make(chan error, 1),
 		stopCh:    make(chan struct{}),

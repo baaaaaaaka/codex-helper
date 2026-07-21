@@ -8,10 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2424,6 +2426,56 @@ func TestEnsureCodexAppProxyURLCleansInstanceWhenReadinessTimesOut(t *testing.T)
 	}
 	if len(cfg.Instances) != 0 {
 		t.Fatalf("timed-out proxy instance was not cleaned up: %#v", cfg.Instances)
+	}
+}
+
+func TestEnsureCodexAppProxyURLDoesNotProbeSSHConfigAliasWithoutRouteTarget(t *testing.T) {
+	lockCLITestHooks(t)
+	var methods []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		if r.Method != http.MethodGet || r.URL.Path != "/_codex_proxy/health" {
+			http.Error(w, "unexpected health request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"instanceId":"alias-instance"}`)
+	}))
+	defer server.Close()
+
+	store := newTempStore(t)
+	profile := config.Profile{
+		ID:      "alias-profile",
+		Name:    "pdx-ssh-session",
+		Host:    "pdx-ssh-session",
+		Port:    4081,
+		User:    "alice",
+		SSHArgs: []string{"-F", "/home/example/.ssh/config"},
+	}
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	port, err := strconv.Atoi(serverURL.Port())
+	if err != nil {
+		t.Fatalf("parse test server port: %v", err)
+	}
+	got, err := ensureCodexAppProxyURL(context.Background(), store, profile, []config.Instance{{
+		ID:         "alias-instance",
+		ProfileID:  profile.ID,
+		Kind:       config.InstanceKindDaemon,
+		DaemonPID:  os.Getpid(),
+		HTTPPort:   port,
+		LastSeenAt: time.Now(),
+	}}, io.Discard)
+	if err != nil {
+		t.Fatalf("ensureCodexAppProxyURL error: %v", err)
+	}
+	if got != server.URL {
+		t.Fatalf("proxy URL = %q, want %q", got, server.URL)
+	}
+	if strings.Join(methods, ",") != http.MethodGet {
+		t.Fatalf("health request methods = %v, want only GET without an implicit alias CONNECT", methods)
 	}
 }
 

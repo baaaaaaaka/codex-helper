@@ -194,6 +194,9 @@ Host work
 	if got := prof.SSHArgs; len(got) != 2 || got[0] != "-F" || got[1] != sshConfigPath {
 		t.Fatalf("SSHArgs = %#v, want -F config", got)
 	}
+	if prof.RouteTargetHost != "" || prof.RouteTargetPort != 0 {
+		t.Fatalf("SSH config alias unexpectedly became a remote route target: %+v", prof)
+	}
 	if len(ops.probes) != 1 || ops.probes[0].Name != "work" {
 		t.Fatalf("probes = %#v, want selected ssh config profile probe", ops.probes)
 	}

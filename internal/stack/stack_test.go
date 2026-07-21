@@ -403,7 +403,13 @@ func TestMonitorNetworkResumeRecoversFailedRemoteProbe(t *testing.T) {
 	}
 	defer router.Close(context.Background())
 	s := &Stack{
-		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		Profile: config.Profile{
+			Host:            "example.com",
+			Port:            22,
+			User:            "alice",
+			RouteTargetHost: "api.example.com",
+			RouteTargetPort: 443,
+		},
 		SocksPort: port,
 		tunnel:    initial,
 		router:    router,
@@ -497,6 +503,125 @@ func TestRouteProbeUsesExplicitTargetForSSHConfigAlias(t *testing.T) {
 	}
 }
 
+func TestRouteProbeSkipsSSHConfigAliasWithoutExplicitTarget(t *testing.T) {
+	port, err := pickFreePort()
+	if err != nil {
+		t.Fatalf("pickFreePort: %v", err)
+	}
+	initial := newProbeTestTunnel(port, errors.New("initial tunnel failure"))
+	close(initial.done)
+	previousFactory := newStackTunnel
+	defer func() { newStackTunnel = previousFactory }()
+	var probeCalls int
+	newStackTunnel = func(_ config.Profile, socksPort int) (tunnelProcess, error) {
+		return newProbeTestTunnel(socksPort, nil), nil
+	}
+	s := &Stack{
+		Profile: config.Profile{
+			Host:    "pdx-ssh-session",
+			Port:    4081,
+			User:    "alice",
+			SSHArgs: []string{"-F", "/home/example/.ssh/config"},
+		},
+		SocksPort: port,
+		tunnel:    initial,
+		fatalCh:   make(chan error, 1),
+		stopCh:    make(chan struct{}),
+	}
+	if !s.recoverTunnelAt(Options{
+		MaxRestarts:       1,
+		RestartBackoff:    0,
+		RestartWindow:     time.Minute,
+		TunnelStopGrace:   100 * time.Millisecond,
+		SocksReadyTimeout: 500 * time.Millisecond,
+		RouteProbe: func(context.Context, string, string, int, time.Duration) error {
+			probeCalls++
+			return errors.New("the SSH alias must not be probed as a remote target")
+		},
+	}, &[]time.Time{}, errors.New("resume"), time.Now()) {
+		t.Fatal("SSH config alias recovery was unexpectedly rejected")
+	}
+	if probeCalls != 0 {
+		t.Fatalf("route probe calls = %d, want 0 without an explicit route target", probeCalls)
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestRouteTargetRequiresExplicitDestination(t *testing.T) {
+	tests := []struct {
+		name        string
+		profile     config.Profile
+		options     Options
+		wantHost    string
+		wantPort    int
+		wantPresent bool
+	}{
+		{
+			name: "ssh config alias endpoint is not inferred",
+			profile: config.Profile{
+				Host:    "pdx-ssh-session",
+				Port:    4081,
+				SSHArgs: []string{"-F", "/home/example/.ssh/config"},
+			},
+		},
+		{
+			name: "ProxyJump endpoint is not inferred",
+			profile: config.Profile{
+				Host:    "target.internal",
+				Port:    22,
+				SSHArgs: []string{"-J", "jump-alias"},
+			},
+		},
+		{
+			name: "profile target is preserved",
+			profile: config.Profile{
+				Host:            "ssh-alias",
+				Port:            22,
+				RouteTargetHost: "api.example.com",
+				RouteTargetPort: 443,
+			},
+			wantHost:    "api.example.com",
+			wantPort:    443,
+			wantPresent: true,
+		},
+		{
+			name: "options target overrides profile target",
+			profile: config.Profile{
+				Host:            "ssh-alias",
+				Port:            22,
+				RouteTargetHost: "profile.example.com",
+				RouteTargetPort: 443,
+			},
+			options: Options{
+				RouteTargetHost: "options.example.com",
+				RouteTargetPort: 8443,
+			},
+			wantHost:    "options.example.com",
+			wantPort:    8443,
+			wantPresent: true,
+		},
+		{
+			name: "invalid explicit port is rejected",
+			profile: config.Profile{
+				Host:            "ssh-alias",
+				Port:            22,
+				RouteTargetHost: "api.example.com",
+				RouteTargetPort: 65536,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, present := routeTarget(tt.profile, tt.options)
+			if present != tt.wantPresent || host != tt.wantHost || port != tt.wantPort {
+				t.Fatalf("routeTarget = %q:%d present=%t, want %q:%d present=%t", host, port, present, tt.wantHost, tt.wantPort, tt.wantPresent)
+			}
+		})
+	}
+}
+
 func TestRecoveryBudgetPersistsBlockedAcrossStackReplacement(t *testing.T) {
 	var persisted config.ProxyRecoveryBudget
 	s := &Stack{
@@ -561,7 +686,13 @@ func TestMonitorDetectsProbeGapAsResume(t *testing.T) {
 	}
 	remoteProbes := make(chan struct{}, 1)
 	s := &Stack{
-		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		Profile: config.Profile{
+			Host:            "example.com",
+			Port:            22,
+			User:            "alice",
+			RouteTargetHost: "api.example.com",
+			RouteTargetPort: 443,
+		},
 		SocksPort: port,
 		tunnel:    initial,
 		router:    router,
@@ -632,7 +763,13 @@ func TestMonitorCandidateFailureKeepsLiveActiveTunnel(t *testing.T) {
 	}
 	defer router.Close(context.Background())
 	s := &Stack{
-		Profile:   config.Profile{Host: "example.com", Port: 22, User: "alice"},
+		Profile: config.Profile{
+			Host:            "example.com",
+			Port:            22,
+			User:            "alice",
+			RouteTargetHost: "api.example.com",
+			RouteTargetPort: 443,
+		},
 		SocksPort: port,
 		tunnel:    initial,
 		router:    router,

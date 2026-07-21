@@ -539,12 +539,6 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 	if opts.RouteProbe == nil {
 		opts.RouteProbe = localproxy.ProbeSOCKS5Target
 	}
-	if opts.RouteTargetHost == "" {
-		opts.RouteTargetHost = profile.Host
-	}
-	if opts.RouteTargetPort == 0 {
-		opts.RouteTargetPort = profile.Port
-	}
 	if opts.HostObserver == nil {
 		opts.HostObserver = hoststate.NewDefaultObserver(hoststate.Options{Interval: opts.ProbeInterval})
 	}
@@ -1256,13 +1250,14 @@ func (s *Stack) probeTunnel(opts Options, remotePath bool) error {
 	defer cancel()
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", s.CurrentSocksPort())
 	if remotePath && opts.RouteProbe != nil {
-		targetHost, targetPort := routeTarget(s.Profile, opts)
-		target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-		err := opts.RouteProbe(ctx, socksAddr, targetHost, targetPort, minProbeTimeout(opts.SocksReadyTimeout))
-		if s.recordRouteEvidence != nil {
-			s.recordRouteEvidence(target, err)
+		if targetHost, targetPort, ok := routeTarget(s.Profile, opts); ok {
+			target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+			err := opts.RouteProbe(ctx, socksAddr, targetHost, targetPort, minProbeTimeout(opts.SocksReadyTimeout))
+			if s.recordRouteEvidence != nil {
+				s.recordRouteEvidence(target, err)
+			}
+			return s.probeResult(err)
 		}
-		return s.probeResult(err)
 	}
 	return s.probeResult(localproxy.ProbeSOCKS5(ctx, socksAddr, minProbeTimeout(opts.SocksReadyTimeout)))
 }
@@ -1474,17 +1469,18 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	}
 	if opts.RouteProbe != nil {
 		probeTimeout := minProbeTimeout(opts.SocksReadyTimeout)
-		probeCtx, cancel := context.WithTimeout(attemptCtx, probeTimeout)
-		targetHost, targetPort := routeTarget(s.Profile, opts)
-		target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
-		probeErr := opts.RouteProbe(probeCtx, candidateAddr, targetHost, targetPort, probeTimeout)
-		cancel()
-		if s.recordRouteEvidence != nil {
-			s.recordRouteEvidence(target, probeErr)
-		}
-		if probeErr != nil {
-			_ = tun.Stop(opts.TunnelStopGrace)
-			return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("candidate route capability probe: %w", probeErr))
+		if targetHost, targetPort, ok := routeTarget(s.Profile, opts); ok {
+			probeCtx, cancel := context.WithTimeout(attemptCtx, probeTimeout)
+			target := net.JoinHostPort(targetHost, strconv.Itoa(targetPort))
+			probeErr := opts.RouteProbe(probeCtx, candidateAddr, targetHost, targetPort, probeTimeout)
+			cancel()
+			if s.recordRouteEvidence != nil {
+				s.recordRouteEvidence(target, probeErr)
+			}
+			if probeErr != nil {
+				_ = tun.Stop(opts.TunnelStopGrace)
+				return s.recoveryCandidateFailed(opts, oldTun, fmt.Errorf("candidate route capability probe: %w", probeErr))
+			}
 		}
 	}
 	if !s.recoveryGenerationCurrent(recoveryGeneration) {
@@ -1538,22 +1534,19 @@ func (s *Stack) recoverTunnelAt(opts Options, restarts *[]time.Time, cause error
 	return true
 }
 
-func routeTarget(profile config.Profile, opts Options) (string, int) {
+func routeTarget(profile config.Profile, opts Options) (string, int, bool) {
 	host := strings.TrimSpace(opts.RouteTargetHost)
 	if host == "" {
 		host = strings.TrimSpace(profile.RouteTargetHost)
-	}
-	if host == "" {
-		host = profile.Host
 	}
 	port := opts.RouteTargetPort
 	if port <= 0 {
 		port = profile.RouteTargetPort
 	}
-	if port <= 0 {
-		port = profile.Port
+	if host == "" || port <= 0 || port > 65535 {
+		return "", 0, false
 	}
-	return host, port
+	return host, port, true
 }
 
 // admitPersistentRecoveryBudget is the cross-process circuit breaker. It is
