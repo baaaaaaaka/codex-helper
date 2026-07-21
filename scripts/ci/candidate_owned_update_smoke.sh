@@ -72,4 +72,43 @@ test "$(tr -d '\r\n' <"$runtime_root/active")" = "v0.1.13-rc.36"
 test "$(tr -d '\r\n' <"$runtime_root/previous")" = "v0.1.13-rc.37"
 "$entry" --version | grep -F "0.1.13-rc.36" >/dev/null
 
+split_install_dir="$tmp/split-install"
+split_runtime_root="$split_install_dir/.cxp-runtime"
+split_entry="$split_install_dir/cxp"
+split_stable="$split_install_dir/codex-proxy"
+split_record="$tmp/split-config/install.json"
+split_active_source="$tmp/split-active-v0.1.15"
+split_active_runtime="$split_runtime_root/versions/v0.1.15/cxp"
+split_candidate="$tmp/split-candidate-v0.1.16"
+split_context="$tmp/context-split-stable.json"
+split_result="$tmp/result-split-stable.json"
+split_stderr="$tmp/stderr-split-stable.log"
+
+mkdir -p "$(dirname "$split_active_runtime")" "$(dirname "$split_record")"
+build_candidate v0.1.13 "$split_stable"
+build_candidate v0.1.15 "$split_active_source"
+build_candidate v0.1.16 "$split_candidate"
+install -m 0755 "$split_active_source" "$split_active_runtime"
+ln -s codex-proxy "$split_entry"
+printf '%s\n' "v0.1.15" >"$split_runtime_root/active"
+printf '{"schema_version":1,"target_path":"%s","target_source":"installer","target_state":"managed","repo":"baaaaaaaka/codex-helper","version":"0.1.15","shims":["%s"]}\n' \
+  "$split_stable" "$split_entry" >"$split_record"
+
+split_hash="$(sha256_file "$split_candidate")"
+printf '{"schema":1,"candidate_path":"%s","candidate_sha256":"%s","source_version":"v0.1.15","target_version":"v0.1.16","runtime_root":"%s","entry_path":"%s","record_path":"%s","request_id":"split-stable-v0.1.13"}\n' \
+  "$split_candidate" "$split_hash" "$split_runtime_root" "$split_entry" "$split_record" >"$split_context"
+chmod 600 "$split_context"
+
+if ! "$split_candidate" __internal-update-apply --protocol=1 --context-file="$split_context" >"$split_result" 2>"$split_stderr"; then
+  echo "candidate-owned update failed for a verified managed split entry: stable=v0.1.13 active=v0.1.15 target=v0.1.16" >&2
+  cat "$split_stderr" >&2
+  exit 1
+fi
+
+test "$(tr -d '\r\n' <"$split_runtime_root/active")" = "v0.1.16"
+test "$(tr -d '\r\n' <"$split_runtime_root/previous")" = "v0.1.15"
+test -e "$split_runtime_root/pending-update.json"
+"$split_entry" --version | grep -F "0.1.16" >/dev/null
+test ! -e "$split_runtime_root/pending-update.json"
+
 echo "candidate-owned update smoke passed"
