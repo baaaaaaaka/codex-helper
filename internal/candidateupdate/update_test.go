@@ -94,7 +94,7 @@ func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 	// by the owner of the running process. Apply must still validate and return
 	// the newly published immutable runtime instead of rejecting its version
 	// because the preserved launcher reports the old stable version.
-	replaceManagedStableEntryFn = func(string, string, string, string) error { return nil }
+	replaceManagedStableEntryFn = func(string, string, string, string, string) error { return nil }
 
 	result, err := Apply(context.Background(), Context{
 		Schema:          ProtocolVersion,
@@ -854,7 +854,7 @@ func TestStableReplacementTargetPreservesManagedSymlinkLeaf(t *testing.T) {
 	if err := os.Symlink(filepath.Base(managed), entry); err != nil {
 		t.Fatal(err)
 	}
-	target, expectedHash, err := stableReplacementTarget(entry, running, root)
+	target, expectedHash, err := legacyStableReplacementTarget(entry, running, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -890,7 +890,7 @@ func TestStableReplacementTargetRejectsImmutableRuntimeSymlink(t *testing.T) {
 	if err := os.Symlink(running, entry); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := stableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
+	if _, _, err := legacyStableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -918,7 +918,7 @@ func TestStableReplacementTargetRejectsImmutableRuntimeThroughSymlinkedRoot(t *t
 	if err := os.Symlink(physicalRunning, entry); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := stableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
+	if _, _, err := legacyStableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -936,7 +936,7 @@ func TestStableReplacementRejectsTargetChangedAfterValidation(t *testing.T) {
 	}
 	writeExecutable(t, running, "old-runtime")
 	writeExecutable(t, entry, "old-runtime")
-	target, expectedHash, err := stableReplacementTarget(entry, running, root)
+	target, expectedHash, err := legacyStableReplacementTarget(entry, running, root)
 	if err != nil {
 		t.Fatal(err)
 	}

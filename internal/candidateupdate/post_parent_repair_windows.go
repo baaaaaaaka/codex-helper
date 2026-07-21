@@ -27,7 +27,7 @@ const legacyDirectSelfUpdateParentVersion = "v0.1.12"
 var (
 	legacyDirectExecutablePath   = helperpath.RawExecutable
 	legacyDirectParentExecutable = directParentExecutable
-	legacyDirectParentVersion    = verifiedAffectedPhysicalVersion
+	legacyDirectParentVersion    = verifiedPhysicalVersion
 	legacyDirectScheduleRepair   = schedulePostParentRepair
 )
 

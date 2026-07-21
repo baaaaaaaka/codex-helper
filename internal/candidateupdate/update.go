@@ -385,11 +385,11 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 			return Result{}, fmt.Errorf("compare managed stable cxp entry with candidate: %w", sameErr)
 		}
 		if !entryAlreadyContainsCandidate {
-			plan, err := prepareStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot)
+			plan, err := prepareManagedStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot, request.RecordPath)
 			if err != nil {
 				return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", err)
 			}
-			if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot); err != nil {
+			if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot, request.RecordPath); err != nil {
 				if !shouldDeferStableEntryRepair(err) {
 					return Result{}, fmt.Errorf("refresh managed stable cxp entry: %w", err)
 				}
@@ -441,8 +441,8 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 // preserving a user-authored shim or multi-hop symlink around it. The current
 // entry must still contain the runtime that owns this update; otherwise the
 // updater fails closed rather than overwriting an unrelated executable.
-func replaceManagedStableEntry(candidate string, entry string, runningRuntime string, root string) error {
-	plan, err := prepareStableEntryRepair(entry, runningRuntime, root)
+func replaceManagedStableEntry(candidate string, entry string, runningRuntime string, root string, recordPath string) error {
+	plan, err := prepareManagedStableEntryRepair(entry, runningRuntime, root, recordPath)
 	if err != nil {
 		return err
 	}
@@ -466,8 +466,8 @@ func replaceManagedStableEntry(candidate string, entry string, runningRuntime st
 	return nil
 }
 
-func prepareStableEntryRepair(entry string, runningRuntime string, root string) (stableEntryRepair, error) {
-	target, expectedHash, err := stableReplacementTarget(entry, runningRuntime, root)
+func prepareManagedStableEntryRepair(entry string, runningRuntime string, root string, recordPath string) (stableEntryRepair, error) {
+	target, expectedHash, err := managedStableReplacementTarget(entry, runningRuntime, root, recordPath)
 	if err != nil {
 		return stableEntryRepair{}, err
 	}

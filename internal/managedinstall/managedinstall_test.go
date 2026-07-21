@@ -397,6 +397,44 @@ func TestSaveRecordWritesJSONWithoutBOM(t *testing.T) {
 	}
 }
 
+func TestRecordOwnsTargetUsesManagedRecordAndCanonicalPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "codex-proxy")
+	recordPath := filepath.Join(dir, "install.json")
+	if err := SaveRecord(recordPath, Record{
+		TargetPath:  target,
+		TargetState: string(StateManaged),
+		GOOS:        "linux",
+	}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+
+	owned, err := RecordOwnsTarget(recordPath, target, "linux")
+	if err != nil || !owned {
+		t.Fatalf("RecordOwnsTarget = %v, %v; want true", owned, err)
+	}
+
+	if owned, err := RecordOwnsTarget(recordPath, filepath.Join(dir, "other", "codex-proxy"), "linux"); err != nil || owned {
+		t.Fatalf("RecordOwnsTarget(other) = %v, %v; want false", owned, err)
+	}
+}
+
+func TestRecordOwnsTargetRejectsExplicitStateAndMissingRecord(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "codex-proxy")
+	recordPath := filepath.Join(dir, "install.json")
+	if err := SaveRecord(recordPath, Record{TargetPath: target, TargetState: string(StateExplicit)}); err != nil {
+		t.Fatalf("SaveRecord: %v", err)
+	}
+	if owned, err := RecordOwnsTarget(recordPath, target, "linux"); err != nil || owned {
+		t.Fatalf("RecordOwnsTarget(explicit) = %v, %v; want false", owned, err)
+	}
+
+	if owned, err := RecordOwnsTarget(filepath.Join(dir, "missing.json"), target, "linux"); err != nil || owned {
+		t.Fatalf("RecordOwnsTarget(missing) = %v, %v; want false", owned, err)
+	}
+}
+
 func writeExecutable(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

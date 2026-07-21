@@ -14,6 +14,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 	"golang.org/x/mod/semver"
 )
 
@@ -166,7 +167,11 @@ func requireSameFile(left string, right string, leftRole string, rightRole strin
 	return nil
 }
 
-func stableReplacementTarget(entry string, runningRuntime string, root string) (string, string, error) {
+// legacyStableReplacementTarget authorizes the one-time bridge used by
+// rc.28-rc.35 runtimes. Its version window is intentionally narrow: this
+// policy protects the legacy bridge and must not be reused for ordinary
+// managed-runtime upgrades.
+func legacyStableReplacementTarget(entry string, runningRuntime string, root string) (string, string, error) {
 	target, err := stableEntryTargetPath(entry, root)
 	if err != nil {
 		return "", "", err
@@ -174,12 +179,42 @@ func stableReplacementTarget(entry string, runningRuntime string, root string) (
 	if same, err := sameFileContent(target, runningRuntime); err != nil {
 		return "", "", fmt.Errorf("compare stable entry with running runtime: %w", err)
 	} else if !same {
-		version, verifyErr := verifiedAffectedPhysicalVersion(target)
+		version, verifyErr := verifiedPhysicalVersion(target)
 		if verifyErr != nil {
 			return "", "", fmt.Errorf("stable entry target %s does not match the running runtime and is not a verified affected launcher: %w", target, verifyErr)
 		}
 		if !legacyRuntimeNeedsBridge(version) {
 			return "", "", fmt.Errorf("stable entry target %s has unsupported partial-state version %s", target, version)
+		}
+	}
+	expectedHash, err := fileSHA256(target)
+	if err != nil {
+		return "", "", fmt.Errorf("hash stable entry target: %w", err)
+	}
+	return target, expectedHash, nil
+}
+
+// managedStableReplacementTarget authorizes a normal candidate-owned repair.
+// Unlike the legacy bridge, a managed entry may contain any older helper
+// version: the install record and helper identity establish ownership, while
+// the active runtime remains the authoritative version.
+func managedStableReplacementTarget(entry string, runningRuntime string, root string, recordPath string) (string, string, error) {
+	target, err := stableEntryTargetPath(entry, root)
+	if err != nil {
+		return "", "", err
+	}
+	if same, err := sameFileContent(target, runningRuntime); err != nil {
+		return "", "", fmt.Errorf("compare stable entry with running runtime: %w", err)
+	} else if !same {
+		owned, recordErr := managedinstall.RecordOwnsTarget(recordPath, target, runtime.GOOS)
+		if recordErr != nil {
+			return "", "", fmt.Errorf("inspect managed install record: %w", recordErr)
+		}
+		if !owned {
+			return "", "", fmt.Errorf("stable entry target %s does not match the running runtime and is not a recorded managed helper", target)
+		}
+		if _, verifyErr := verifiedPhysicalVersion(target); verifyErr != nil {
+			return "", "", fmt.Errorf("stable entry target %s is recorded as managed but is not a verified helper: %w", target, verifyErr)
 		}
 	}
 	expectedHash, err := fileSHA256(target)
@@ -213,7 +248,14 @@ func stableEntryTargetPath(entry string, root string) (string, error) {
 	return target, nil
 }
 
-func verifiedAffectedPhysicalVersion(path string) (string, error) {
+func verifiedPhysicalVersion(path string) (string, error) {
+	known, err := managedinstall.IsKnownHelperBinary(path, runtime.GOOS)
+	if err != nil {
+		return "", fmt.Errorf("inspect helper identity: %w", err)
+	}
+	if !known {
+		return "", fmt.Errorf("file is not a known codex-helper executable")
+	}
 	info, err := buildinfo.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read Go build info: %w", err)
