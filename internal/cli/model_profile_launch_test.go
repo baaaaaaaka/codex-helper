@@ -1433,6 +1433,20 @@ func TestModelProfileAdapterInstanceIdentitySeparatesSelectedModel(t *testing.T)
 	}
 }
 
+func TestUnifiedModelUpstreamProxyProfileUsesFallbackWithoutThirdPartyProfiles(t *testing.T) {
+	profile := config.Profile{ID: "p1", Name: "remote", Host: "host", Port: 22, User: "me"}
+	got, err := unifiedModelUpstreamProxyProfile(config.Config{
+		Version:  config.CurrentVersion,
+		Profiles: []config.Profile{profile},
+	}, nil, profile.ID)
+	if err != nil {
+		t.Fatalf("unifiedModelUpstreamProxyProfile: %v", err)
+	}
+	if got == nil || got.ID != profile.ID {
+		t.Fatalf("upstream proxy = %#v, want %q", got, profile.ID)
+	}
+}
+
 func TestResponsesCompatibleLongLivedAdapterPreservesDirectCapabilities(t *testing.T) {
 	cfg := config.Config{
 		Version: config.CurrentVersion,

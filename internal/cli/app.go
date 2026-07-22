@@ -215,7 +215,12 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 		launchOpts.ProxyURL = proxyURL
 	}
 
-	if strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults() {
+	// A proxied desktop launch must also prepare the local model gateway. The
+	// Electron network service honors --proxy-server, but the bundled Codex
+	// app-server is a separate process with its own HTTP client. Routing that
+	// client through CXP's loopback gateway avoids relying on proxy environment
+	// inheritance or the app-server's system-proxy feature selection.
+	if useProxy || strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults() {
 		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
