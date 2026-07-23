@@ -4,6 +4,8 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -18,6 +20,7 @@ func TestProxyStartBackgroundConfiguresDetachedCommand(t *testing.T) {
 		os.Exit(0)
 	}
 	lockCLITestHooks(t)
+	configureDetachedContractStablePathForWindows(t)
 	store := newTempStore(t)
 	if err := store.Save(config.Config{
 		Version: config.CurrentVersion,
@@ -59,6 +62,7 @@ func TestAppProxyLaunchConfiguresDetachedCommand(t *testing.T) {
 		os.Exit(0)
 	}
 	lockCLITestHooks(t)
+	configureDetachedContractStablePathForWindows(t)
 	store := newTempStore(t)
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatalf("seed config: %v", err)
@@ -90,6 +94,7 @@ func TestModelAdapterLaunchConfiguresDetachedCommand(t *testing.T) {
 		os.Exit(0)
 	}
 	lockCLITestHooks(t)
+	configureDetachedContractStablePathForWindows(t)
 	store := newTempStore(t)
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatalf("seed config: %v", err)
@@ -120,6 +125,18 @@ func TestModelAdapterLaunchConfiguresDetachedCommand(t *testing.T) {
 		t.Fatalf("start model adapter daemon: %v", err)
 	}
 	assertDetachedCommandConfigured(t, launched)
+}
+
+func configureDetachedContractStablePathForWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		return
+	}
+	path := filepath.Join(t.TempDir(), helperpath.BinaryName(runtime.GOOS))
+	if err := os.WriteFile(path, []byte("test helper"), 0o755); err != nil {
+		t.Fatalf("write stable helper path: %v", err)
+	}
+	restartArgv0 = func() string { return path }
 }
 
 func TestProxyStartForegroundDoesNotLaunchDetachedCommand(t *testing.T) {
