@@ -82,6 +82,7 @@ jobs:
           go test -p=1 ./internal/stack -count=1 -run '^Test(RouteProbe(UsesExplicitTargetForSSHConfigAlias|SkipsSSHConfigAliasWithoutExplicitTarget)|RouteTargetRequiresExplicitDestination)$' -v
           go test -p=1 ./internal/cli -count=1 -run '^Test(Claim(LegacyProxyInstancePersistsOwnerLease|ProxyInstance)|ProxyStartRemovesPlaceholderWhenExecutableResolutionFails|RunProxyDaemonWithOwnerToken(CleansPlaceholderWhenProfileMissing|DoesNotOverwriteReplacement)|ProxyStop|ProxySupervisor|ManagedProxyDaemon)' -v
           go test -p=1 ./internal/cli -count=1 -run 'Test(WindowsProxyReachabilityScriptExecutesAgainstLiveProxy|EnsureCodexAppProxyURLDoesNotProbeSSHConfigAliasWithoutRouteTarget|CodexAppAuth(MacProxyBrowser.*|WindowsProxy(ReachabilityScriptChecksHealthEndpoint|BrowserScriptUsesChromiumProxy)))$' -v
+          go test -p=1 ./internal/cli -count=1 -run 'Test(DetachedDaemonSurvives(ParentSessionHangup|ConsoleControlEvent)|ProxyStartBackgroundConfiguresDetachedCommand|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand)$' -v -timeout=60s
 
       - name: macOS unprivileged proxy fault matrix
         if: runner.os == 'macOS'
@@ -129,7 +130,7 @@ jobs:
           go test -p=1 ./internal/helperruntime -count=1 -run 'Test(ShouldActivateEntryVersionDoesNotUndoSameBasePrerelease|LaunchKeepsExplicitSameBasePrereleaseActive|Current|EnsureStableEntry|InstallVersion|PublishDownloaded)' -v
           go test -p=1 ./internal/candidateupdate -count=1 -run 'Test(WindowsCandidateOwned|WindowsDeferred|Reconcile|ResumePending|StableReplacement|Apply|SamePath)' -v
           go test -p=1 ./internal/update -count=1 -run 'Test(PerformUpdate|ReplaceBinary|Probe)' -v
-          go test -p=1 ./internal/cli -count=1 -run 'Test(StartDetachedProcessWaitsForExitedChild|ProxyStart|StartCodexAppProxyDaemon|WindowsProxy|CurrentRuntimeOwnsUpdateTarget)' -v
+          go test -p=1 ./internal/cli -count=1 -run 'Test(StartDetachedProcessWaitsForExitedChild|ProxyStart|StartCodexAppProxyDaemon|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand|WindowsProxy|TeamsServiceDetachedCommandSetsHideWindowAndPreservesSysProcAttr|DetachedDaemonSurvivesConsoleControlEvent|CurrentRuntimeOwnsUpdateTarget)' -v
           go test -p=1 ./internal/hoststate -count=1 -v
           go test -p=1 ./internal/localproxy ./internal/stack ./internal/ssh -count=1 -run 'Test(HTTPProxyChain|HTTPProxyDNSAlias|GenerationRouter|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|RequestFailure|NotifyNetworkResume|TunnelProcess)' -v
 

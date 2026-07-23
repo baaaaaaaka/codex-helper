@@ -198,6 +198,46 @@ func TestWindowsWSL2CanReachLiveProxy(t *testing.T) {
 	}
 }
 
+// TestWindowsWSL2LauncherExitKeepsDetachedProcess verifies the WSL boundary
+// relevant to cxp app: the wsl.exe invocation that starts a Linux detached
+// process may exit, while a later invocation can still observe that process.
+// The Linux lifecycle test covers CXP's production setsid configuration; this
+// test covers the Windows-to-WSL launcher lifetime separately.
+func TestWindowsWSL2LauncherExitKeepsDetachedProcess(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("native WSL2 launcher test runs on Windows")
+	}
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_LIVE_WSL_PROXY_TEST")) == "" {
+		t.Skip("set CODEX_HELPER_LIVE_WSL_PROXY_TEST=1 to run the WSL2 launcher test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := exec.LookPath("wsl.exe"); err != nil {
+		t.Fatalf("WSL2 launcher test enabled but wsl.exe was not found: %v", err)
+	}
+	statePath := fmt.Sprintf("/tmp/codex-helper-wsl-detached-%d", time.Now().UnixNano())
+	cleanup := func() {
+		cleanupScript := "state=" + shellQuoteForWSL(statePath) + "; if test -s \"$state\"; then pid=$(cat \"$state\"); kill \"$pid\" 2>/dev/null || true; fi; rm -f \"$state\""
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		cleanupCmd := exec.CommandContext(cleanupCtx, "wsl.exe", "-e", "sh", "-lc", cleanupScript)
+		_, _ = cleanupCmd.CombinedOutput()
+	}
+	t.Cleanup(cleanup)
+
+	launchScript := "state=" + shellQuoteForWSL(statePath) + "; setsid sh -c 'echo $$ > \"$1\"; exec sleep 30' sh \"$state\" >/dev/null 2>&1 &"
+	launchCmd := exec.CommandContext(ctx, "wsl.exe", "-e", "sh", "-lc", launchScript)
+	if output, err := launchCmd.CombinedOutput(); err != nil {
+		t.Fatalf("launch detached WSL process: %v\n%s", err, output)
+	}
+	probeScript := "state=" + shellQuoteForWSL(statePath) + "; i=0; while test ! -s \"$state\" && test $i -lt 50; do i=$((i+1)); sleep 0.1; done; test -s \"$state\"; pid=$(cat \"$state\"); kill -0 \"$pid\""
+	probeCmd := exec.CommandContext(ctx, "wsl.exe", "-e", "sh", "-lc", probeScript)
+	if output, err := probeCmd.CombinedOutput(); err != nil {
+		t.Fatalf("detached WSL process did not survive launcher exit: %v\n%s", err, output)
+	}
+}
+
 func shellQuoteForWSL(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

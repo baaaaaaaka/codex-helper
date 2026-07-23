@@ -173,6 +173,12 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Detached terminal lifecycle regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli -count=1 -run 'Test(DetachedDaemonSurvives(ParentSessionHangup|ConsoleControlEvent)|ProxyStartBackgroundConfiguresDetachedCommand|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand|TeamsServiceDetachedCommandSetsHideWindowAndPreservesSysProcAttr)$' -v -timeout=60s
+
       - name: Install account shells (Ubuntu)
         if: runner.os == 'Linux'
         shell: bash

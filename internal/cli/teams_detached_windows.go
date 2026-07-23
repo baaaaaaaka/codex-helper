@@ -15,4 +15,5 @@ func configureTeamsServiceDetachedCommand(cmd *exec.Cmd) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.HideWindow = true
+	cmd.SysProcAttr.CreationFlags |= windowsCreateNoWindow
 }

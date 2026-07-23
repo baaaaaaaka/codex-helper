@@ -205,6 +205,7 @@ func runProxyStartCommand(cmd *cobra.Command, store *config.Store, foreground bo
 	defer logFile.Close()
 	c.Stdout = logFile
 	c.Stderr = logFile
+	configureTeamsServiceDetachedCommand(c)
 
 	detached, err := startDetachedProcess(c)
 	if err != nil {

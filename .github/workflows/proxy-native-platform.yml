@@ -69,6 +69,7 @@ jobs:
           set -euo pipefail
           go test -p=1 ./internal/hoststate -count=5 -v
           go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|GenerationRouterDrainRejectsLateDialAfterForcedClose|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive|HTTPProxyCloseClosesActiveHijackedTunnels|Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+          go test -p=1 ./internal/cli -count=1 -run '^Test(DetachedDaemonSurvivesParentSessionHangup|ProxyStartBackgroundConfiguresDetachedCommand|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand)$' -v -timeout=60s
 
   windows-native:
     name: Windows native proxy validation
@@ -97,6 +98,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           go test -p=1 ./internal/hoststate -count=5 -v
           go test -p=1 ./internal/proxysupervisor ./internal/localproxy ./internal/stack ./internal/ssh -count=5 -run 'Test(Render|NativeSupervisorDefinitionLint|GenerationRouterDrainRejectsLateDialAfterForcedClose|HTTPProxyChainMatrix|HTTPProxyDNSAlias|ProxyHopHeaderParsing|HTTPProxyRealSocketFaultRelay|HTTPProxyRepeatedStartCloseResourceBudget|HTTPProxyHealthProbeIsSingleFlightAndCached|HTTPProxyBackendDeadlineNotifiesWhenRequestContextIsLive|HTTPProxyCloseClosesActiveHijackedTunnels|Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|TunnelStopTerminatesProcessGroupDescendants|TunnelProcessJobObject)' -v
+          go test -p=1 ./internal/cli -count=1 -run '^Test(DetachedDaemonSurvivesConsoleControlEvent|ProxyStartBackgroundConfiguresDetachedCommand|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand)$' -v -timeout=60s
           go test ./internal/cli -count=1 -run '^TestWindowsProxyReachabilityScriptExecutesAgainstLiveProxy$' -v
           if ($env:RUN_EDGE -eq 'true') {
             $edgeCandidates = @(
@@ -147,7 +149,7 @@ jobs:
                 } else {
                   $env:CODEX_HELPER_LIVE_WSL_PROXY_TEST = "1"
                   $env:CODEX_HELPER_LIVE_WSL_MODE = $env:WSL_MODE
-                  go test ./internal/cli -count=1 -run '^TestWindowsWSL2CanReachLiveProxy$' -v -timeout=60s
+                  go test ./internal/cli -count=1 -run '^TestWindowsWSL2(CanReachLiveProxy|LauncherExitKeepsDetachedProcess)$' -v -timeout=60s
                 }
               }
             }
