@@ -20,7 +20,13 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, targetedJob,
 		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
-		"shard: [core, platform-integration, state-perf]",
+		"shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]",
+		"- os: macos-latest\n            shard: ubuntu-stress",
+		"- os: windows-latest\n            shard: ubuntu-stress",
+		"- os: ubuntu-latest\n            shard: windows-skills-desktop",
+		"- os: ubuntu-latest\n            shard: windows-codex-e2e",
+		"- os: macos-latest\n            shard: windows-skills-desktop",
+		"- os: macos-latest\n            shard: windows-codex-e2e",
 	)
 	requireStepNotContains(t, targetedJob,
 		"go test (with coverage, Linux only)",
@@ -41,6 +47,60 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"HOMEBREW_NO_AUTO_UPDATE=1 brew install fish",
 		"for attempt in 1 2 3",
 		"CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh",
+	)
+	windowsSkills := workflowStepBlock(t, targetedJob, "Skills local git smoke (Windows)")
+	requireStepContains(t, windowsSkills,
+		"if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'",
+		`.\scripts\ci\skills_smoke.ps1`,
+		`.\scripts\ci\skills_migration_smoke.ps1`,
+	)
+	windowsDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app network install smoke (Windows)")
+	requireStepContains(t, windowsDesktop,
+		"if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'",
+		`.\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper`,
+	)
+	for _, name := range []string{
+		"Install Codex for integration (Windows)",
+		"Teams app-server probe (Windows)",
+		"Codex upgrade integration (system npm, Windows)",
+		"Codex upgrade integration (local npm, Windows)",
+		"Teams target-account PATH Codex upgrade (Windows)",
+		"Codex approval, history, and cancellation runtime integration (Windows)",
+		"Native managed-node install integration (Windows)",
+	} {
+		step := workflowStepBlock(t, targetedJob, name)
+		requireStepContains(t, step,
+			"if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'",
+		)
+	}
+	for _, name := range []string{
+		"Teams recreate and full-history race regressions (Linux only)",
+		"Cross-compile check (Linux only)",
+		"Teams Graph 429 stress (Linux only)",
+	} {
+		step := workflowStepBlock(t, targetedJob, name)
+		requireStepContains(t, step,
+			"if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'",
+		)
+	}
+	stateMigration := workflowStepBlock(t, targetedJob, "Teams SQLite schema and path migration regressions")
+	requireStepContains(t, stateMigration,
+		"if: matrix.shard == 'state-migration'",
+		"git fetch --force --tags --prune origin",
+		"CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1",
+		"SubprocessMigrationStressCI",
+	)
+	stateStore := workflowStepBlock(t, targetedJob, "Teams SQLite store runtime and perf regressions")
+	requireStepContains(t, stateStore,
+		"if: matrix.shard == 'state-store-perf'",
+		"BenchmarkSQLiteManualWALCheckpointHotWrite",
+		"SQLiteRecordTranscript",
+	)
+	stateRuntime := workflowStepBlock(t, targetedJob, "Teams SQLite bridge runtime and perf regressions")
+	requireStepContains(t, stateRuntime,
+		"if: matrix.shard == 'state-runtime-perf'",
+		"TestCXPPerfModelSQLite",
+		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)
 
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
