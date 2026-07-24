@@ -20,16 +20,9 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, targetedJob,
 		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
-		"shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-state-runtime-tests, windows-state-mixed-bench, windows-state-ledger-bench, windows-skills-desktop, windows-codex-e2e]",
+		"shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]",
 		"- os: macos-latest\n            shard: ubuntu-stress",
 		"- os: windows-latest\n            shard: ubuntu-stress",
-		"- os: windows-latest\n            shard: state-runtime-perf",
-		"- os: ubuntu-latest\n            shard: windows-state-runtime-tests",
-		"- os: ubuntu-latest\n            shard: windows-state-mixed-bench",
-		"- os: ubuntu-latest\n            shard: windows-state-ledger-bench",
-		"- os: macos-latest\n            shard: windows-state-runtime-tests",
-		"- os: macos-latest\n            shard: windows-state-mixed-bench",
-		"- os: macos-latest\n            shard: windows-state-ledger-bench",
 		"- os: ubuntu-latest\n            shard: windows-skills-desktop",
 		"- os: ubuntu-latest\n            shard: windows-codex-e2e",
 		"- os: macos-latest\n            shard: windows-skills-desktop",
@@ -103,22 +96,12 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"BenchmarkSQLiteManualWALCheckpointHotWrite",
 		"SQLiteRecordTranscript",
 	)
-	stateRuntime := workflowStepBlock(t, targetedJob, "Teams SQLite bridge runtime and perf regressions (Linux/macOS)")
+	stateRuntime := workflowStepBlock(t, targetedJob, "Teams SQLite bridge runtime and perf regressions")
 	requireStepContains(t, stateRuntime,
-		"if: matrix.shard == 'state-runtime-perf' && runner.os != 'Windows'",
-		"bash scripts/ci/teams_sqlite_runtime_shard.sh all",
+		"if: matrix.shard == 'state-runtime-perf'",
+		"TestCXPPerfModelSQLite",
+		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)
-	for name, expected := range map[string]string{
-		"Teams SQLite bridge runtime regressions (Windows)": "windows-state-runtime-tests",
-		"Teams SQLite mixed-write benchmarks (Windows)":     "windows-state-mixed-bench",
-		"Teams SQLite ledger benchmarks (Windows)":          "windows-state-ledger-bench",
-	} {
-		step := workflowStepBlock(t, targetedJob, name)
-		requireStepContains(t, step,
-			"if: matrix.shard == '"+expected+"' && runner.os == 'Windows'",
-			"bash scripts/ci/teams_sqlite_runtime_shard.sh",
-		)
-	}
 
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
 	requireStepContains(t, fullJob,

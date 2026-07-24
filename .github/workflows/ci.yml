@@ -203,26 +203,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-state-runtime-tests, windows-state-mixed-bench, windows-state-ledger-bench, windows-skills-desktop, windows-codex-e2e]
+        shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]
         exclude:
           - os: macos-latest
             shard: ubuntu-stress
           - os: windows-latest
             shard: ubuntu-stress
-          - os: windows-latest
-            shard: state-runtime-perf
-          - os: ubuntu-latest
-            shard: windows-state-runtime-tests
-          - os: ubuntu-latest
-            shard: windows-state-mixed-bench
-          - os: ubuntu-latest
-            shard: windows-state-ledger-bench
-          - os: macos-latest
-            shard: windows-state-runtime-tests
-          - os: macos-latest
-            shard: windows-state-mixed-bench
-          - os: macos-latest
-            shard: windows-state-ledger-bench
           - os: ubuntu-latest
             shard: windows-skills-desktop
           - os: ubuntu-latest
@@ -1243,33 +1229,28 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'Test(Has(QueuedTurns|PendingWorkflowNotifications)AcrossBackends|PendingWorkflowNotificationsAcrossBackendsFiltersAndOrders|UpdateNotificationAcrossBackendsTouchesOnlyNotification|ReadAutoUpdateControlSQLiteDoesNotLoadHotTables|UpgradeBlockingStateSnapshotSQLiteDoesNotLoadUnneededHotTables)$' -v
           go test ./internal/teams/store -count=1 -run 'Test(SQLiteRecordTranscript(DeliveryDoesNotLoadColdStateAndPreservesDedupe|CheckpointDoesNotLoadColdStateAndTouchesOnlyCheckpointAndLedger)|RecordTranscriptCheckpointPreservesLegacySemantics|SQLiteQueueTranscriptDeliveryOutbox(DoesNotLoadColdStateAndTouchesOnlyQueueRows|LinksExistingOutboxWithoutAllocatingSequence|SuppressesDeliveredWithoutColdLoad)|SQLiteMarkTurnLifecycleDoesNotLoadColdState|SQLiteUpsertArtifactRecordDoesNotLoadColdStateAndPreservesMergeFields|SQLiteMarkOutbox(SendError|DriveItem)DoesNotLoadColdState|RecordChatPollErrorWithBlockSQLiteUsesNarrowRows)$' -v
 
-      - name: Teams SQLite bridge runtime and perf regressions (Linux/macOS)
-        if: matrix.shard == 'state-runtime-perf' && runner.os != 'Windows'
+      - name: Teams SQLite bridge runtime and perf regressions
+        if: matrix.shard == 'state-runtime-perf'
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/teams_sqlite_runtime_shard.sh all
-
-      - name: Teams SQLite bridge runtime regressions (Windows)
-        if: matrix.shard == 'windows-state-runtime-tests' && runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_sqlite_runtime_shard.sh tests
-
-      - name: Teams SQLite mixed-write benchmarks (Windows)
-        if: matrix.shard == 'windows-state-mixed-bench' && runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_sqlite_runtime_shard.sh mixed-bench
-
-      - name: Teams SQLite ledger benchmarks (Windows)
-        if: matrix.shard == 'windows-state-ledger-bench' && runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_sqlite_runtime_shard.sh ledger-bench
+          sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
+          go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
+          go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables$' -v
+          go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushEnabledNoPendingSkipsWebhookSecretRead$' -v
+          go test ./internal/teams -count=1 -run 'TestBridge(HelperAutoUpdate(NotDueSkipsHotSQLiteTablesAndCheck|BackoffSkipsHotSQLiteTablesAndCheck|NotDueCachesMainLoopProbe)|ManualHelperUpdateClearsCachedAutoUpdateProbe)$' -v
+          go test ./internal/teams -count=1 -run 'TestBridge(PendingCodexUpgradeNoUpgradeSkipsHotSQLiteTablesAndUpgrade|SaveRepairsMissingRegistryDuringThrottleWindow|CodexVersionFailureSchedulesUpgradeAfterActiveWork)$' -v
+          go test ./internal/teams -count=1 -run 'TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications$' -v
+          go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow|BridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegressionSQLite|BridgeSyncLinkedTranscriptsBackfillsLegacyCheckpoint(Metadata|ThenImportsTail)|FindTranscriptCheckpointPositionSupportsFallbackCheckpoint)$' -v
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/light-user$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles/light-user$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/light-user/pending-workflow-notifications$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUser(ChatPollError|OutboxSendError|OutboxDriveItem|ArtifactUpsert|TranscriptDelivery|TranscriptCheckpoint|TranscriptQueue)StageWrites$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
 
       - name: Teams Codex runner classification regressions
         if: matrix.shard == 'core'
