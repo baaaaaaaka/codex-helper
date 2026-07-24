@@ -20,7 +20,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, targetedJob,
 		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
-		"shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]",
+		"shard: [core, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]",
 		"- os: macos-latest\n            shard: ubuntu-stress",
 		"- os: windows-latest\n            shard: ubuntu-stress",
 		"- os: ubuntu-latest\n            shard: windows-skills-desktop",
@@ -83,22 +83,14 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 			"if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'",
 		)
 	}
-	stateMigration := workflowStepBlock(t, targetedJob, "Teams SQLite schema and path migration regressions")
-	requireStepContains(t, stateMigration,
-		"if: matrix.shard == 'state-migration'",
+	statePerf := workflowStepBlock(t, targetedJob, "Teams SQLite store migration and perf regressions")
+	requireStepContains(t, statePerf,
+		"if: matrix.shard == 'state-perf'",
 		"git fetch --force --tags --prune origin",
 		"CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1",
 		"SubprocessMigrationStressCI",
-	)
-	stateStore := workflowStepBlock(t, targetedJob, "Teams SQLite store runtime and perf regressions")
-	requireStepContains(t, stateStore,
-		"if: matrix.shard == 'state-store-perf'",
 		"BenchmarkSQLiteManualWALCheckpointHotWrite",
 		"SQLiteRecordTranscript",
-	)
-	stateRuntime := workflowStepBlock(t, targetedJob, "Teams SQLite bridge runtime and perf regressions")
-	requireStepContains(t, stateRuntime,
-		"if: matrix.shard == 'state-runtime-perf'",
 		"TestCXPPerfModelSQLite",
 		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)

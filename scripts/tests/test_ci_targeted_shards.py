@@ -27,8 +27,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
     def test_declares_parallel_shards_and_limits_platform_only_shards(self):
         job = targeted_job()
         self.assertIn(
-            "shard: [core, platform-integration, state-migration, "
-            "state-store-perf, state-runtime-perf, ubuntu-stress, "
+            "shard: [core, platform-integration, state-perf, ubuntu-stress, "
             "windows-skills-desktop, windows-codex-e2e]",
             job,
         )
@@ -54,8 +53,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 continue
             matches = re.findall(
                 r"^        if: matrix\.shard == '("
-                r"core|platform-integration|state-migration|"
-                r"state-store-perf|state-runtime-perf|ubuntu-stress|"
+                r"core|platform-integration|state-perf|ubuntu-stress|"
                 r"windows-skills-desktop|windows-codex-e2e"
                 r")'(?: && .+)?$",
                 block,
@@ -69,14 +67,12 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Teams recreate and full-history race regressions (Linux only)": "ubuntu-stress",
             "Cross-compile check (Linux only)": "ubuntu-stress",
             "Teams Graph 429 stress (Linux only)": "ubuntu-stress",
-            "Teams SQLite row-level runtime regressions": "state-store-perf",
-            "CXP preview SQLite correctness, concurrency, and write budgets": "state-store-perf",
-            "CXP preview SQLite actual syscall write budget (Linux only)": "state-store-perf",
-            "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-store-perf",
-            "Teams SQLite schema and path migration regressions": "state-migration",
-            "Teams SQLite store runtime and perf regressions": "state-store-perf",
-            "Teams SQLite bridge runtime and perf regressions": "state-runtime-perf",
-            "Teams perf benchmark smoke": "state-runtime-perf",
+            "Teams SQLite row-level migration regressions": "state-perf",
+            "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
+            "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
+            "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
+            "Teams SQLite store migration and perf regressions": "state-perf",
+            "Teams perf benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
             "Codex desktop app network install smoke (Windows)": "windows-skills-desktop",
             "Install Codex for integration (Windows)": "windows-codex-e2e",
@@ -94,31 +90,17 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 name,
             )
 
-    def test_state_migration_fixture_setup_is_isolated_to_migration_shard(self):
+    def test_state_perf_keeps_fixture_and_runtime_commands_together(self):
         blocks = step_blocks(targeted_job())
-        migration = blocks["Teams SQLite schema and path migration regressions"]
-        self.assertIn("git fetch --force --tags --prune origin", migration)
-        self.assertIn("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1", migration)
-        self.assertIn("OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)", migration)
-        self.assertIn("SubprocessMigrationStressCI", migration)
-
-        for name in (
-            "Teams SQLite store runtime and perf regressions",
-            "Teams SQLite bridge runtime and perf regressions",
-        ):
-            self.assertNotIn("git fetch --force --tags --prune origin", blocks[name])
-            self.assertNotIn("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES", blocks[name])
-
-    def test_state_runtime_commands_remain_in_their_owning_shards(self):
-        blocks = step_blocks(targeted_job())
-        store = blocks["Teams SQLite store runtime and perf regressions"]
-        self.assertIn("BenchmarkSQLiteManualWALCheckpointHotWrite", store)
-        self.assertIn("SQLiteRecordTranscript", store)
-
-        runtime = blocks["Teams SQLite bridge runtime and perf regressions"]
-        self.assertIn("TestCXPPerfModelSQLite", runtime)
-        self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", runtime)
-        self.assertIn("Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)", runtime)
+        state = blocks["Teams SQLite store migration and perf regressions"]
+        self.assertIn("git fetch --force --tags --prune origin", state)
+        self.assertIn("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1", state)
+        self.assertIn("OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)", state)
+        self.assertIn("SubprocessMigrationStressCI", state)
+        self.assertIn("BenchmarkSQLiteManualWALCheckpointHotWrite", state)
+        self.assertIn("TestCXPPerfModelSQLite", state)
+        self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", state)
+        self.assertIn("Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)", state)
 
     def test_windows_codex_e2e_installs_before_runtime_consumers(self):
         job = targeted_job()

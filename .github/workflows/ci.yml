@@ -203,7 +203,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: [core, platform-integration, state-migration, state-store-perf, state-runtime-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]
+        shard: [core, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]
         exclude:
           - os: macos-latest
             shard: ubuntu-stress
@@ -615,30 +615,30 @@ jobs:
           go test -race ./internal/teams -count=1 -run "$teams_pattern" -v
           go test -race ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases|TeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags)$' -v
 
-      - name: Teams SQLite row-level runtime regressions
-        if: matrix.shard == 'state-store-perf'
+      - name: Teams SQLite row-level migration regressions
+        if: matrix.shard == 'state-perf'
         shell: bash
         run: |
           set -euo pipefail
-          row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows)$'
+          row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
       - name: CXP preview SQLite correctness, concurrency, and write budgets
-        if: matrix.shard == 'state-store-perf'
+        if: matrix.shard == 'state-perf'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
 
       - name: CXP preview SQLite actual syscall write budget (Linux only)
-        if: matrix.shard == 'state-store-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/session_preview_sqlite_io_smoke.sh
 
       - name: CXP cache v2 real NFS concurrency smoke (Linux only)
-        if: matrix.shard == 'state-store-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1201,40 +1201,21 @@ jobs:
           set -euo pipefail
           bash scripts/ci/teams_graph_429_stress.sh
 
-      - name: Teams SQLite schema and path migration regressions
-        if: matrix.shard == 'state-migration'
+      - name: Teams SQLite store migration and perf regressions
+        if: matrix.shard == 'state-perf'
         shell: bash
         run: |
           set -euo pipefail
           git fetch --force --tags --prune origin '+refs/tags/*:refs/tags/*'
           export CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1
-          sqlite_migration_pattern='TestSQLite(Migration(RoundTripAndHotPaths|UpgradesLegacySchemaWithRecoverableBackup|ThresholdSkipLeavesLegacyStateUntouched|MissingStateDoesNotCreatePointerOrDB|UnsupportedFutureSchemaFailsClosed|RetryReplacesStaleDBAndSidecars|FailureLeavesLegacyStateLoadableAndRetryable|CrashStageMatrixLeavesLegacyStateRetryable|FailureOnStaleSidecarLeavesLegacyState|ProcessBoundaryStressAfterUpgrade)|Pointer(MissingDBFailsClosedAndDoesNotCreateEmptyStore|UninitializedOrCorruptDBFailsClosed|PathValidationFailsClosed|SchemaRejectsLegacyV5Loaders|UnsupportedSchemaFailsClosed)|ExistingDBMissingHotTablesFailsClosed|OpenMigratesLegacyChatPollColumns|OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags))$'
-          sqlite_bridge_migration_pattern='TestBridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending|MigrateRegistryProjectionSkips(SaveWhenAlreadyMigrated|SentOnlyRegistryHistoryStoreWrite))$'
-          go test ./internal/teams/store -count=1 -run "$sqlite_migration_pattern" -v
-          go test ./internal/teams -count=1 -run "$sqlite_bridge_migration_pattern" -v
-          go test ./internal/teams ./internal/teams/store -count=1 -run 'Test(GlobalOutboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|GlobalInboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|ControlChatHistory(MigratesLegacyJSONLWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|SQLiteSuppressOutboxOwnerMentionDoesNotLoadColdState)$' -v
-          go test ./internal/appdirs ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(CleanupStaleMigrationTemps(RemovesOnlyOldMatchingFileTempsCI|RemovesOnlyOldMatchingDirTempsCI|DoesNotBlockMigrationOnRemoveFailureCI)|ResolveMigrated(File(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|Dir(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|DirWithRequired(RefreshesStaleRequiredFileCI|KeepsNewerRequiredFileCI|SkipsUnsafeLegacySideFilesCI|RejectsSymlinkRequiredFileCI)|RelatedFilesRequiresRegularSidecarsCI)|DefaultStorePathRefreshes(StaleMigratedStateCI|CorruptNewStateCI)|DefaultRegistryPath(ForScope)?RefreshesCorruptNewRegistryCI|DefaultAuthConfigRefreshesCorruptScopedCacheFromLegacyDefaultCI|TeamsServiceLocalSupervisorRuntimeDir(MigratesLegacyStatusWhenNewDirExists|Refreshes(StaleNewStatusCI|CorruptNewStatusCI))|TeamsBackgroundKeepaliveResolveStorePath(CompletesPartialNewScopeCI|FallsBackWhenPartialNewScopeCannotCompleteCI|RejectsNonRegularSQLiteSidecarCI|RepairsCorruptNewScope(CI|WithoutRegistryCI)|ConcurrentMigrationCI|SubprocessMigrationStressCI|MigratesLegacyGlobalStoreCI|CleansEligibleLegacyScopeFilesCI)|CleanupMigratedFileFamilySkips(FreshLegacyCI|NewerLegacyCI|LockedLegacyCI|SameFileAliasCI)|CleanupMigratedScopeLegacyFilesKeepsStoreWhenRegistryCleanupBlockedCI)$' -v
-          go test ./internal/appdirs -count=1 -run 'Test(StateDir(ExpandsHomeAndPreservesSpacesCI|UsesConfigFallbackOnWindowsAndDarwinCI)|ResolveMigratedFile(Refreshes(StaleExistingNewCI|EqualMTimeDifferentExistingNewCI)|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|ResolveMigratedDirWithRequired(RefreshesEqualMTimeDifferentRequiredFileCI|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|CopyFileReplacingActiveTempDoesNotInheritOldSourceMTimeCI)$' -v
-          go test ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(DefaultStorePath(RefreshesEqualMTimeDivergentStateCI|SubprocessMigrationStressCI)|DefaultResponsesStorePath(FallsBackWhenNewSidecarIsNonRegularCI|SubprocessMigrationStressCI)|DefaultOutboundRootFallsBackWhenLegacyContainsSymlinkCI|DefaultAuthConfigRefreshes(CorruptProfileScopedCacheFromLegacyScopedCI|EqualMTimeProfileScopedCacheFromLegacyScopedCI)|DefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI|TeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateCI|CleanupMigratedFileFamilyRemoveFailureIsRetryableCI)$' -v
-          go test ./internal/teams/store -count=1 -run 'TestDefaultPathRefreshes(CorruptNewStateBeforePromotionCI|StaleLoadableNewStateBeforePromotionCI|EqualMTimeDivergentStateBeforePromotionCI)$' -v
-
-      - name: Teams SQLite store runtime and perf regressions
-        if: matrix.shard == 'state-store-perf'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sqlite_store_runtime_pattern='TestSQLite((DeferredInboundFiltersAndSortsLargeTable|HistoryWatchColdUpdatePreservesSplitTables|OwnerLeaseColdUpdatesPreserveHotTables|ColdSaveBackfillsSplitTablesFromLegacyStateJSON)|RecordTranscriptCheckpointPrunesSplitTranscriptLedger|TranscriptDeliveryPruneKeepsNewestRows|StoreUsesNormalSynchronousModeAndManualWALCheckpoint)$'
-          go test ./internal/teams/store -count=1 -run "$sqlite_store_runtime_pattern" -v
+          sqlite_store_pattern='TestSQLite((DeferredInboundFiltersAndSortsLargeTable|HistoryWatchColdUpdatePreservesSplitTables|OwnerLeaseColdUpdatesPreserveHotTables|ColdSaveBackfillsSplitTablesFromLegacyStateJSON)|Migration(RoundTripAndHotPaths|UpgradesLegacySchemaWithRecoverableBackup|ThresholdSkipLeavesLegacyStateUntouched|MissingStateDoesNotCreatePointerOrDB|UnsupportedFutureSchemaFailsClosed|RetryReplacesStaleDBAndSidecars|FailureLeavesLegacyStateLoadableAndRetryable|CrashStageMatrixLeavesLegacyStateRetryable|FailureOnStaleSidecarLeavesLegacyState|ProcessBoundaryStressAfterUpgrade)|Pointer(MissingDBFailsClosedAndDoesNotCreateEmptyStore|UninitializedOrCorruptDBFailsClosed|PathValidationFailsClosed|SchemaRejectsLegacyV5Loaders|UnsupportedSchemaFailsClosed)|ExistingDBMissingHotTablesFailsClosed|OpenMigratesLegacyChatPollColumns|OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)|RecordTranscriptCheckpointPrunesSplitTranscriptLedger|TranscriptDeliveryPruneKeepsNewestRows|StoreUsesNormalSynchronousModeAndManualWALCheckpoint)$'
+          sqlite_bridge_pattern='TestBridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending|MigrateRegistryProjectionSkips(SaveWhenAlreadyMigrated|SentOnlyRegistryHistoryStoreWrite))$'
+          sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
+          go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
           go test ./internal/teams/store -run '^$' -bench 'BenchmarkSQLiteManualWALCheckpointHotWrite$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams/store -count=1 -run 'Test(Has(QueuedTurns|PendingWorkflowNotifications)AcrossBackends|PendingWorkflowNotificationsAcrossBackendsFiltersAndOrders|UpdateNotificationAcrossBackendsTouchesOnlyNotification|ReadAutoUpdateControlSQLiteDoesNotLoadHotTables|UpgradeBlockingStateSnapshotSQLiteDoesNotLoadUnneededHotTables)$' -v
           go test ./internal/teams/store -count=1 -run 'Test(SQLiteRecordTranscript(DeliveryDoesNotLoadColdStateAndPreservesDedupe|CheckpointDoesNotLoadColdStateAndTouchesOnlyCheckpointAndLedger)|RecordTranscriptCheckpointPreservesLegacySemantics|SQLiteQueueTranscriptDeliveryOutbox(DoesNotLoadColdStateAndTouchesOnlyQueueRows|LinksExistingOutboxWithoutAllocatingSequence|SuppressesDeliveredWithoutColdLoad)|SQLiteMarkTurnLifecycleDoesNotLoadColdState|SQLiteUpsertArtifactRecordDoesNotLoadColdStateAndPreservesMergeFields|SQLiteMarkOutbox(SendError|DriveItem)DoesNotLoadColdState|RecordChatPollErrorWithBlockSQLiteUsesNarrowRows)$' -v
-
-      - name: Teams SQLite bridge runtime and perf regressions
-        if: matrix.shard == 'state-runtime-perf'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths)$'
+          go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
           go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
           go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables$' -v
           go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushEnabledNoPendingSkipsWebhookSecretRead$' -v
@@ -1250,6 +1231,11 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUser(ChatPollError|OutboxSendError|OutboxDriveItem|ArtifactUpsert|TranscriptDelivery|TranscriptCheckpoint|TranscriptQueue)StageWrites$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams ./internal/teams/store -count=1 -run 'Test(GlobalOutboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|GlobalInboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|ControlChatHistory(MigratesLegacyJSONLWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|SQLiteSuppressOutboxOwnerMentionDoesNotLoadColdState)$' -v
+          go test ./internal/appdirs ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(CleanupStaleMigrationTemps(RemovesOnlyOldMatchingFileTempsCI|RemovesOnlyOldMatchingDirTempsCI|DoesNotBlockMigrationOnRemoveFailureCI)|ResolveMigrated(File(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|Dir(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|DirWithRequired(RefreshesStaleRequiredFileCI|KeepsNewerRequiredFileCI|SkipsUnsafeLegacySideFilesCI|RejectsSymlinkRequiredFileCI)|RelatedFilesRequiresRegularSidecarsCI)|DefaultStorePathRefreshes(StaleMigratedStateCI|CorruptNewStateCI)|DefaultRegistryPath(ForScope)?RefreshesCorruptNewRegistryCI|DefaultAuthConfigRefreshesCorruptScopedCacheFromLegacyDefaultCI|TeamsServiceLocalSupervisorRuntimeDir(MigratesLegacyStatusWhenNewDirExists|Refreshes(StaleNewStatusCI|CorruptNewStatusCI))|TeamsBackgroundKeepaliveResolveStorePath(CompletesPartialNewScopeCI|FallsBackWhenPartialNewScopeCannotCompleteCI|RejectsNonRegularSQLiteSidecarCI|RepairsCorruptNewScope(CI|WithoutRegistryCI)|ConcurrentMigrationCI|SubprocessMigrationStressCI|MigratesLegacyGlobalStoreCI|CleansEligibleLegacyScopeFilesCI)|CleanupMigratedFileFamilySkips(FreshLegacyCI|NewerLegacyCI|LockedLegacyCI|SameFileAliasCI)|CleanupMigratedScopeLegacyFilesKeepsStoreWhenRegistryCleanupBlockedCI)$' -v
+          go test ./internal/appdirs -count=1 -run 'Test(StateDir(ExpandsHomeAndPreservesSpacesCI|UsesConfigFallbackOnWindowsAndDarwinCI)|ResolveMigratedFile(Refreshes(StaleExistingNewCI|EqualMTimeDifferentExistingNewCI)|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|ResolveMigratedDirWithRequired(RefreshesEqualMTimeDifferentRequiredFileCI|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|CopyFileReplacingActiveTempDoesNotInheritOldSourceMTimeCI)$' -v
+          go test ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(DefaultStorePath(RefreshesEqualMTimeDivergentStateCI|SubprocessMigrationStressCI)|DefaultResponsesStorePath(FallsBackWhenNewSidecarIsNonRegularCI|SubprocessMigrationStressCI)|DefaultOutboundRootFallsBackWhenLegacyContainsSymlinkCI|DefaultAuthConfigRefreshes(CorruptProfileScopedCacheFromLegacyScopedCI|EqualMTimeProfileScopedCacheFromLegacyScopedCI)|DefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI|TeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateCI|CleanupMigratedFileFamilyRemoveFailureIsRetryableCI)$' -v
+          go test ./internal/teams/store -count=1 -run 'TestDefaultPathRefreshes(CorruptNewStateBeforePromotionCI|StaleLoadableNewStateBeforePromotionCI|EqualMTimeDivergentStateBeforePromotionCI)$' -v
           go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
 
       - name: Teams Codex runner classification regressions
@@ -1504,7 +1490,7 @@ jobs:
         run: go vet ./...
 
       - name: Teams perf benchmark smoke
-        if: matrix.shard == 'state-runtime-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
         shell: bash
         run: |
           go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
