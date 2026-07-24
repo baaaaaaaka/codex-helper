@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,6 +31,64 @@ var (
 )
 
 const defaultRefreshInterval = 5 * time.Second
+
+var historyTuiExcludedProjectRoots = [...]string{
+	"/tmp",
+	// macOS exposes /tmp as a symlink to /private/tmp, and Codex may record
+	// either spelling as the session working directory.
+	"/private/tmp",
+}
+
+func loadHistoryTuiProjects(ctx context.Context, codexDir string) ([]codexhistory.Project, error) {
+	projects, err := codexhistory.DiscoverProjectsContext(ctx, codexDir)
+	return filterHistoryTuiProjects(projects), err
+}
+
+func filterHistoryTuiProjects(projects []codexhistory.Project) []codexhistory.Project {
+	if len(projects) == 0 {
+		return projects
+	}
+
+	filtered := make([]codexhistory.Project, 0, len(projects))
+	for _, project := range projects {
+		if historyTuiPathUnderExcludedRoot(historyTuiProjectPath(project)) {
+			continue
+		}
+		filtered = append(filtered, project)
+	}
+	return filtered
+}
+
+func historyTuiProjectPath(project codexhistory.Project) string {
+	if path := strings.TrimSpace(project.Path); path != "" {
+		return path
+	}
+	for _, session := range project.Sessions {
+		if path := strings.TrimSpace(session.ProjectPath); path != "" {
+			return path
+		}
+	}
+	return ""
+}
+
+func historyTuiPathUnderExcludedRoot(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+
+	path = filepath.Clean(path)
+	for _, root := range historyTuiExcludedProjectRoots {
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			continue
+		}
+		if relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))) {
+			return true
+		}
+	}
+	return false
+}
 
 func newHistoryCmd(root *rootOptions) *cobra.Command {
 	var codexDir string
@@ -238,7 +297,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		defaultCwd, _ := os.Getwd()
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
-				return codexhistory.DiscoverProjectsContext(ctx, paths.CodexDir)
+				return loadHistoryTuiProjects(ctx, paths.CodexDir)
 			},
 			Version:         version,
 			ProxyEnabled:    useProxy,

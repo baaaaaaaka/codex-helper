@@ -358,8 +358,10 @@ jobs:
         run: |
           set -euo pipefail
           history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix))$'
+          history_tui_pattern='^Test(HistoryTuiPathUnderExcludedRoot|FilterHistoryTuiProjects|LoadHistoryTuiProjectsFiltersDiscoveredTempProjects)$'
           tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused|RefreshState(UpdatesOrPreserves|PreservesSelectionIdentityAcrossListChanges)|SelectionIdentityLookupDoesNotAllocate|SelectSessionAutoRefreshPreservesSelection)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
+          go test ./internal/cli -count=1 -run "$history_tui_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
           go test ./internal/tui -run '^$' -bench '^BenchmarkResolveSelectionForDrawLargeHistory$' -benchtime=10x -count=1 -benchmem
           thread_name_history_pattern='^Test(ReadThreadNameIndexUsesLatestValidName|LoadThreadNameIndex(CachesUntilFileChanges|IsOptionalMetadata)|DiscoverProjects(AndFindSessionUseThreadNameIndex|PreservesPromptWithoutValidThreadName|RefreshesThreadNameWhenIndexChanges)|SessionThreadNameJSONIsBackwardCompatibleWhenEmpty)$'
