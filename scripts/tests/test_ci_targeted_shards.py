@@ -5,6 +5,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+SQLITE_RUNTIME_SHARD = ROOT / "scripts" / "ci" / "teams_sqlite_runtime_shard.sh"
 
 
 def targeted_job() -> str:
@@ -29,6 +30,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn(
             "shard: [core, platform-integration, state-migration, "
             "state-store-perf, state-runtime-perf, ubuntu-stress, "
+            "windows-state-runtime-tests, windows-state-mixed-bench, "
+            "windows-state-ledger-bench, "
             "windows-skills-desktop, windows-codex-e2e]",
             job,
         )
@@ -37,7 +40,20 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 f"- os: {os_name}\n            shard: ubuntu-stress",
                 job,
             )
+        self.assertIn(
+            "- os: windows-latest\n            shard: state-runtime-perf",
+            job,
+        )
         for os_name in ("ubuntu-latest", "macos-latest"):
+            for shard in (
+                "windows-state-runtime-tests",
+                "windows-state-mixed-bench",
+                "windows-state-ledger-bench",
+            ):
+                self.assertIn(
+                    f"- os: {os_name}\n            shard: {shard}",
+                    job,
+                )
             self.assertIn(
                 f"- os: {os_name}\n            shard: windows-skills-desktop",
                 job,
@@ -56,6 +72,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 r"^        if: matrix\.shard == '("
                 r"core|platform-integration|state-migration|"
                 r"state-store-perf|state-runtime-perf|ubuntu-stress|"
+                r"windows-state-runtime-tests|windows-state-mixed-bench|"
+                r"windows-state-ledger-bench|"
                 r"windows-skills-desktop|windows-codex-e2e"
                 r")'(?: && .+)?$",
                 block,
@@ -75,7 +93,10 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-store-perf",
             "Teams SQLite schema and path migration regressions": "state-migration",
             "Teams SQLite store runtime and perf regressions": "state-store-perf",
-            "Teams SQLite bridge runtime and perf regressions": "state-runtime-perf",
+            "Teams SQLite bridge runtime and perf regressions (Linux/macOS)": "state-runtime-perf",
+            "Teams SQLite bridge runtime regressions (Windows)": "windows-state-runtime-tests",
+            "Teams SQLite mixed-write benchmarks (Windows)": "windows-state-mixed-bench",
+            "Teams SQLite ledger benchmarks (Windows)": "windows-state-ledger-bench",
             "Teams perf benchmark smoke": "state-runtime-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
             "Codex desktop app network install smoke (Windows)": "windows-skills-desktop",
@@ -104,7 +125,10 @@ class TargetedShardWorkflowTests(unittest.TestCase):
 
         for name in (
             "Teams SQLite store runtime and perf regressions",
-            "Teams SQLite bridge runtime and perf regressions",
+            "Teams SQLite bridge runtime and perf regressions (Linux/macOS)",
+            "Teams SQLite bridge runtime regressions (Windows)",
+            "Teams SQLite mixed-write benchmarks (Windows)",
+            "Teams SQLite ledger benchmarks (Windows)",
         ):
             self.assertNotIn("git fetch --force --tags --prune origin", blocks[name])
             self.assertNotIn("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES", blocks[name])
@@ -115,10 +139,31 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn("BenchmarkSQLiteManualWALCheckpointHotWrite", store)
         self.assertIn("SQLiteRecordTranscript", store)
 
-        runtime = blocks["Teams SQLite bridge runtime and perf regressions"]
-        self.assertIn("TestCXPPerfModelSQLite", runtime)
-        self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", runtime)
-        self.assertIn("Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)", runtime)
+        runtime = blocks["Teams SQLite bridge runtime and perf regressions (Linux/macOS)"]
+        self.assertIn("teams_sqlite_runtime_shard.sh all", runtime)
+        self.assertIn(
+            "teams_sqlite_runtime_shard.sh tests",
+            blocks["Teams SQLite bridge runtime regressions (Windows)"],
+        )
+        self.assertIn(
+            "teams_sqlite_runtime_shard.sh mixed-bench",
+            blocks["Teams SQLite mixed-write benchmarks (Windows)"],
+        )
+        self.assertIn(
+            "teams_sqlite_runtime_shard.sh ledger-bench",
+            blocks["Teams SQLite ledger benchmarks (Windows)"],
+        )
+
+        script = SQLITE_RUNTIME_SHARD.read_text(encoding="utf-8")
+        self.assertIn("run_runtime_tests", script)
+        self.assertIn("run_mixed_write_benchmarks", script)
+        self.assertIn("run_ledger_benchmarks", script)
+        self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", script)
+        self.assertIn("BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn", script)
+        self.assertIn(
+            "Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)",
+            script,
+        )
 
     def test_windows_codex_e2e_installs_before_runtime_consumers(self):
         job = targeted_job()
