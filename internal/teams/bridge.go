@@ -2772,9 +2772,19 @@ func (b *Bridge) appendFreezeNoticeToLatestMessage(ctx context.Context, session 
 	if !ok {
 		return freezeNoticeAppendResult{}, nil
 	}
+	allowHostedContentContext := false
+	if messageHasTeamsAttachmentContext(msg) {
+		var provenanceErr error
+		allowHostedContentContext, provenanceErr = b.trustedMathHostedContentMessage(ctx, session, msg)
+		if provenanceErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams freeze hosted-content provenance lookup failed; using standalone notice: %v\n", provenanceErr)
+			allowHostedContentContext = false
+		}
+	}
 	outcome := b.applyTeamsMessageEdit(ctx, session.ChatID, msg, updated, teamsMessageEditOptions{
-		ProtectAttachmentContext: true,
-		NonRetryable:             nonRetryableFreezeNoticePatchTargetError,
+		ProtectAttachmentContext:  true,
+		AllowHostedContentContext: allowHostedContentContext,
+		NonRetryable:              nonRetryableFreezeNoticePatchTargetError,
 	})
 	if outcome.Applied {
 		return freezeNoticeAppendResult{Appended: true}, nil
@@ -3369,6 +3379,67 @@ func (b *Bridge) markerMatchesDurableOutbox(ctx context.Context, chatID string, 
 	}
 }
 
+func (b *Bridge) trustedMathHostedContentMessage(ctx context.Context, session Session, msg ChatMessage) (bool, error) {
+	if b == nil || strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(msg.ID) == "" || !hostedContentOnlyMessageContext(msg) {
+		return false, nil
+	}
+
+	if b.store != nil {
+		lookup, err := b.store.MessageLookup(ctx, session.ChatID, msg.ID)
+		if err != nil {
+			return false, err
+		}
+		if lookup.HasProvenance {
+			if strings.EqualFold(strings.TrimSpace(lookup.Provenance.Origin), teamstore.MessageOriginUserInbound) {
+				return false, nil
+			}
+			if trustedMathMessageProvenance(lookup.Provenance, session, msg.ID) {
+				return true, nil
+			}
+		}
+		if lookup.HasInbound {
+			return false, nil
+		}
+	}
+
+	item, found, err := b.globalOutboundMessage(ctx, session.ChatID, msg.ID)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return trustedMathMessageProvenance(teamstore.MessageProvenanceRecord{
+		TeamsChatID:    item.ChatID,
+		TeamsMessageID: item.MessageID,
+		Origin:         item.Origin,
+		SessionID:      item.SessionID,
+		TurnID:         item.TurnID,
+		OutboxID:       item.OutboxID,
+		Kind:           item.Kind,
+		CreatedAt:      item.RecordedAt,
+		UpdatedAt:      item.UpdatedAt,
+	}, session, msg.ID), nil
+}
+
+func trustedMathMessageProvenance(record teamstore.MessageProvenanceRecord, session Session, messageID string) bool {
+	if !strings.EqualFold(strings.TrimSpace(record.Origin), teamstore.MessageOriginHelperOutbox) || !outboxKindTrustsMath(record.Kind) {
+		return false
+	}
+	chatID := strings.TrimSpace(record.TeamsChatID)
+	if chatID == "" || !strings.EqualFold(chatID, strings.TrimSpace(session.ChatID)) {
+		return false
+	}
+	teamsMessageID := strings.TrimSpace(record.TeamsMessageID)
+	if teamsMessageID == "" || teamsMessageID != strings.TrimSpace(messageID) {
+		return false
+	}
+	if sessionID := strings.TrimSpace(record.SessionID); sessionID != "" && !strings.EqualFold(sessionID, strings.TrimSpace(session.ID)) {
+		return false
+	}
+	return true
+}
+
 func (b *Bridge) prepareWorkChatMessageForAudience(ctx context.Context, chatID string, msg ChatMessage, text string) (ChatMessage, string, bool, error) {
 	if b == nil || !b.workChatRequiresCodexMention(ctx, chatID) {
 		return msg, text, false, nil
@@ -3961,8 +4032,9 @@ func comparableTeamsPlainText(text string) string {
 }
 
 type teamsMessageEditOptions struct {
-	ProtectAttachmentContext bool
-	NonRetryable             func(error) bool
+	ProtectAttachmentContext  bool
+	AllowHostedContentContext bool
+	NonRetryable              func(error) bool
 }
 
 type teamsMessageEditOutcome struct {
@@ -3977,8 +4049,12 @@ func (b *Bridge) applyTeamsMessageEdit(ctx context.Context, chatID string, msg C
 	if b == nil || b.graph == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(msg.ID) == "" || strings.TrimSpace(html) == "" {
 		return teamsMessageEditOutcome{SkippedUnsafe: true}
 	}
-	if opts.ProtectAttachmentContext && messageHasTeamsAttachmentContext(msg) && !messageAttachmentContextLosslessPatchable(msg) {
-		return teamsMessageEditOutcome{SkippedUnsafe: true}
+	if opts.ProtectAttachmentContext && messageHasTeamsAttachmentContext(msg) {
+		lossless := messageAttachmentContextLosslessPatchable(msg)
+		hostedContentOptIn := opts.AllowHostedContentContext && hostedContentOnlyMessageContext(msg)
+		if !lossless && !hostedContentOptIn {
+			return teamsMessageEditOutcome{SkippedUnsafe: true}
+		}
 	}
 	var err error
 	if teamsMessageEditNeedsPreservingPayload(msg) {
@@ -4102,6 +4178,64 @@ func (b *Bridge) queueIncomingUserMarkerMirror(ctx context.Context, chatID strin
 
 func messageHasTeamsAttachmentContext(msg ChatMessage) bool {
 	return len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 || hasTeamsAttachmentPlaceholder(msg.Body.Content)
+}
+
+// hostedContentOnlyMessageContext recognizes the narrow hosted-content shape
+// emitted by the trusted TeX renderer. Hosted content from a user message or
+// an arbitrary Teams card must remain protected by the generic edit guard.
+func hostedContentOnlyMessageContext(msg ChatMessage) bool {
+	if len(msg.Attachments) > 0 || hasTeamsAttachmentPlaceholder(msg.Body.Content) {
+		return false
+	}
+	ids, truncated := hostedContentIDsFromHTML(msg.Body.Content, maxHostedContentPerMessage)
+	if len(ids) == 0 || truncated {
+		return false
+	}
+
+	root, err := xhtml.Parse(strings.NewReader("<div>" + msg.Body.Content + "</div>"))
+	if err != nil {
+		return false
+	}
+	seen := make(map[string]bool, len(ids))
+	valid := true
+	var walk func(*xhtml.Node)
+	walk = func(node *xhtml.Node) {
+		if node == nil || !valid {
+			return
+		}
+		if node.Type == xhtml.ElementNode && strings.EqualFold(node.Data, "img") {
+			src := ""
+			alt := ""
+			for _, attr := range node.Attr {
+				switch {
+				case strings.EqualFold(attr.Key, "src"):
+					src = attr.Val
+				case strings.EqualFold(attr.Key, "alt"):
+					alt = strings.TrimSpace(attr.Val)
+				}
+			}
+			for _, id := range HostedContentIDsFromHTML(src) {
+				if alt != "Rendered TeX formula" {
+					valid = false
+					return
+				}
+				seen[id] = true
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(root)
+	if !valid || len(seen) != len(ids) {
+		return false
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			return false
+		}
+	}
+	return true
 }
 
 func messageAttachmentContextLosslessPatchable(msg ChatMessage) bool {

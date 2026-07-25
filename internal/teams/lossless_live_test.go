@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,117 @@ import (
 
 	xhtml "golang.org/x/net/html"
 )
+
+func TestLiveGraphHostedContentFreezeEditOptIn(t *testing.T) {
+	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_HOSTED_FREEZE_EDIT")) != "1" {
+		t.Skip("set CODEX_HELPER_TEAMS_LIVE_HOSTED_FREEZE_EDIT=1 to create a live single-member Teams chat and test a freeze edit on hosted formula content")
+	}
+	if got := strings.TrimSpace(os.Getenv(liveJasonWeiSafetyAckEnv)); got != liveJasonWeiSafetyAckValue {
+		t.Fatalf("%s=%s is required before live Teams write tests", liveJasonWeiSafetyAckEnv, liveJasonWeiSafetyAckValue)
+	}
+	requireLiveWriteOnce(t, "teams-hosted-freeze-edit")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	writeCfg, err := DefaultEffectiveAuthConfig()
+	if err != nil {
+		t.Fatalf("DefaultEffectiveAuthConfig error: %v", err)
+	}
+	graph := NewGraphClient(NewAuthManager(writeCfg), io.Discard)
+	me, err := graph.Me(ctx)
+	if err != nil {
+		t.Fatalf("Graph /me failed: %v", err)
+	}
+	nonce := safeLiveMarkerPart(strings.TrimSpace(os.Getenv(liveWriteOnceEnv)))
+	chat, err := graph.CreateSingleMemberGroupChat(ctx, me.ID, "Codex Hosted Formula Freeze Edit "+nonce)
+	if err != nil {
+		t.Fatalf("create live hosted formula edit chat failed: %v", err)
+	}
+	requireLiveCreatedJasonWeiSingleMemberChat(ctx, t, graph, chat.ID)
+	if refreshed, err := graph.GetChat(ctx, chat.ID); err == nil && strings.TrimSpace(refreshed.WebURL) != "" {
+		chat = refreshed
+	}
+	t.Logf("LIVE_HOSTED_FREEZE_EDIT_CHAT_ID=%s", chat.ID)
+	t.Logf("LIVE_HOSTED_FREEZE_EDIT_CHAT_URL=%s", chat.WebURL)
+
+	const hostedID = "math-freeze-live"
+	formulaHTML := `<p><strong>🤖 Codex:</strong></p>` +
+		`<pre><code>\frac{1}{2}</code></pre>` +
+		`<p><img src="../hostedContents/` + hostedID + `/$value" alt="Rendered TeX formula"></p>`
+	sent, err := graph.SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx, chat.ID, formulaHTML, nil, []OutboundHostedContent{{
+		TemporaryID: hostedID,
+		ContentType: "image/png",
+		Bytes:       testMathPNG(),
+	}})
+	if err != nil {
+		t.Fatalf("send live hosted formula message failed: %v", err)
+	}
+	original := waitForLiveMessageID(ctx, t, graph, chat.ID, sent.ID)
+	original, err = graph.GetMessage(ctx, chat.ID, original.ID)
+	if err != nil {
+		t.Fatalf("get original hosted formula message failed: %v", err)
+	}
+	originalHostedIDs := HostedContentIDsFromHTML(original.Body.Content)
+	if len(originalHostedIDs) != 1 {
+		t.Fatalf("original hosted formula ids = %#v, want exactly one; body=%q", originalHostedIDs, original.Body.Content)
+	}
+	originalHosted := make(map[string]HostedContentValue, len(originalHostedIDs))
+	for _, id := range originalHostedIDs {
+		value, err := graph.GetHostedContentValue(ctx, chat.ID, original.ID, id)
+		if err != nil {
+			t.Fatalf("get original hosted content %q failed: %v", id, err)
+		}
+		originalHosted[id] = value
+	}
+
+	const resumeCommand = "r hosted-freeze-live"
+	noticeHTML := renderTeamsFreezeNoticeHTML(
+		"https://teams.microsoft.com/l/chat/19%3Alive-hosted-freeze-control%40thread.v2/conversations",
+		resumeCommand,
+		"Your Codex work is safe. Paused after 48h idle.",
+	)
+	updatedHTML, ok := appendFreezeNoticeToMessageHTML(original, resumeCommand, noticeHTML)
+	if !ok {
+		t.Fatalf("hosted formula message was not appendable before Graph PATCH: %#v", original)
+	}
+	if err := graph.UpdateChatMessageHTML(ctx, chat.ID, original.ID, updatedHTML); err != nil {
+		t.Fatalf("body-only hosted formula freeze PATCH failed: %v", err)
+	}
+
+	var after ChatMessage
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		after, err = graph.GetMessage(ctx, chat.ID, original.ID)
+		if err == nil && graphMessageContainsFreezeNotice(after, resumeCommand) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hosted formula freeze edit did not become visible; lastErr=%v body=%q", err, after.Body.Content)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context expired waiting for hosted formula freeze edit: %v", ctx.Err())
+		case <-time.After(time.Second):
+		}
+	}
+	afterHostedIDs := HostedContentIDsFromHTML(after.Body.Content)
+	if len(afterHostedIDs) != len(originalHostedIDs) {
+		t.Fatalf("hosted content reference count changed after freeze PATCH: before=%v after=%v body=%q", originalHostedIDs, afterHostedIDs, after.Body.Content)
+	}
+	for i, afterID := range afterHostedIDs {
+		value, err := graph.GetHostedContentValue(ctx, chat.ID, after.ID, afterID)
+		if err != nil {
+			t.Fatalf("get hosted content %q after freeze PATCH failed: %v", afterID, err)
+		}
+		beforeID := originalHostedIDs[i]
+		before := originalHosted[beforeID]
+		if !bytes.Equal(value.Bytes, before.Bytes) || !strings.EqualFold(strings.TrimSpace(value.ContentType), strings.TrimSpace(before.ContentType)) {
+			t.Fatalf("hosted content %q -> %q changed after freeze PATCH: bytes=%d->%d contentType=%q->%q", beforeID, afterID, len(before.Bytes), len(value.Bytes), before.ContentType, value.ContentType)
+		}
+	}
+	t.Logf("LIVE_HOSTED_FREEZE_EDIT_RESULT message=%s hosted_ids_before=%v hosted_ids_after=%v ids_stable=%v bytes_preserved=true freeze_appended=true", after.ID, originalHostedIDs, afterHostedIDs, sameStringList(afterHostedIDs, originalHostedIDs))
+}
 
 func TestLiveGraphLosslessAttachmentEditOptIn(t *testing.T) {
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_LIVE_LOSSLESS_EDIT")) != "1" {
