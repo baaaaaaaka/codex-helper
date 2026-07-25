@@ -203,7 +203,20 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: [core, platform-integration, state-perf]
+        shard: [core, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]
+        exclude:
+          - os: macos-latest
+            shard: ubuntu-stress
+          - os: windows-latest
+            shard: ubuntu-stress
+          - os: ubuntu-latest
+            shard: windows-skills-desktop
+          - os: ubuntu-latest
+            shard: windows-codex-e2e
+          - os: macos-latest
+            shard: windows-skills-desktop
+          - os: macos-latest
+            shard: windows-codex-e2e
 
     steps:
       - name: Checkout
@@ -594,7 +607,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainFor(ChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|HistoryPublishUsesDistinctFenceAndReleases)|TeamsChat(RecreateDrainReleaseDoesNotClearNewerFence|RecreateAndPublishHistoryExposeSafeRepairFlags)|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
 
       - name: Teams recreate and full-history race regressions (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -874,7 +887,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
 
       - name: Cross-compile check (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
         shell: bash
         run: |
           GOOS=darwin  GOARCH=arm64 go build ./...
@@ -1182,7 +1195,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)|TeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipal)CI$' -v
 
       - name: Teams Graph 429 stress (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1510,7 +1523,7 @@ jobs:
           bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_GIT_LFS_DOWNLOAD_TEST=1 go test ./internal/skills -count=1 -run 'TestEnsureManagedGitLFSIntegrationDownload$' -v
 
       - name: Skills local git smoke (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1552,7 +1565,7 @@ jobs:
           bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy chatgpt
 
       - name: Codex desktop app network install smoke (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1581,7 +1594,7 @@ jobs:
           codex app-server --help >/dev/null
 
       - name: Install Codex for integration (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1616,7 +1629,7 @@ jobs:
           go run ./cmd/codex-proxy teams doctor --appserver-probe --codex-path "$(command -v codex)" --workdir "$RUNNER_TEMP" --probe-timeout 20s --appserver-probe-runs 2
 
       - name: Teams app-server probe (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1707,7 +1720,7 @@ jobs:
           esac
 
       - name: Codex upgrade integration (system npm, Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1745,7 +1758,7 @@ jobs:
           }
 
       - name: Codex upgrade integration (local npm, Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1800,7 +1813,7 @@ jobs:
             go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: Teams target-account PATH Codex upgrade (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1831,7 +1844,7 @@ jobs:
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
 
       - name: Codex approval, history, and cancellation runtime integration (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_REMOTE_TUI_CONTRACT_TEST: "1"
@@ -1857,7 +1870,7 @@ jobs:
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
       - name: Native managed-node install integration (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         env:
           CODEX_INSTALL_TEST: "1"
