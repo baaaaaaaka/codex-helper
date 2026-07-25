@@ -172,6 +172,18 @@ class CIHelperScriptTests(unittest.TestCase):
             script,
         )
 
+    def test_windows_legacy_external_target_upgrade_retries_transient_failures(self) -> None:
+        script = (CI_DIR / "helper_upgrade_compat_smoke.ps1").read_text(encoding="utf-8")
+
+        start = script.index("function Invoke-LegacyExternalTargetUpgrade")
+        end = script.index("function Download-Binary", start)
+        block = script[start:end]
+        self.assertIn("$attempts = 5", block)
+        self.assertIn("for ($attempt = 1; $attempt -le $attempts; $attempt++)", block)
+        self.assertIn("Start-Sleep -Seconds 5", block)
+        self.assertIn("legacy external-target update failed for an unexpected reason", block)
+        self.assertIn("after verified binary replacement", block)
+
     def test_windows_locked_cxp_regression_and_release_gates_are_both_wired(self) -> None:
         script = (CI_DIR / "windows_locked_cxp_self_upgrade.ps1").read_text(
             encoding="utf-8"
