@@ -55,24 +55,32 @@ function Invoke-LegacyExternalTargetUpgrade([string]$Runner, [string]$InstallPat
   # physical target is already current without launching it, then let the
   # common fresh-target convergence below repair the stable aliases.
   $oldNativePreference = $PSNativeCommandUseErrorActionPreference
-  $upgradeStatus = -1
-  $output = ""
-  $PSNativeCommandUseErrorActionPreference = $false
-  try {
-    $output = (& $Runner upgrade --repo $Repo --version $TargetTag --install-path $InstallPath 2>&1 | Out-String)
-    $upgradeStatus = $LASTEXITCODE
-  } finally {
-    $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+  $attempts = 5
+  for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+    $upgradeStatus = -1
+    $output = ""
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+      $output = (& $Runner upgrade --repo $Repo --version $TargetTag --install-path $InstallPath 2>&1 | Out-String)
+      $upgradeStatus = $LASTEXITCODE
+    } finally {
+      $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+    }
+    $output | Write-Host
+    if ($upgradeStatus -eq 0) {
+      return
+    }
+    if ($output -match 'cxp entrypoint' -and $output -match 'after repair') {
+      Assert-PhysicalVersion $InstallPath $TargetTag
+      Write-Warning "accepted rc.28/rc.29 external-target alias finalizer limitation after verified binary replacement"
+      return
+    }
+    if ($attempt -eq $attempts) {
+      throw "legacy external-target update failed for an unexpected reason (exit=$upgradeStatus): $output"
+    }
+    Write-Warning ("legacy external-target update failed (attempt {0}/{1}), retrying in 5s: {2}" -f $attempt, $attempts, $output.Trim())
+    Start-Sleep -Seconds 5
   }
-  $output | Write-Host
-  if ($upgradeStatus -eq 0) {
-    return
-  }
-  if ($output -notmatch 'cxp entrypoint' -or $output -notmatch 'after repair') {
-    throw "legacy external-target update failed for an unexpected reason (exit=$upgradeStatus): $output"
-  }
-  Assert-PhysicalVersion $InstallPath $TargetTag
-  Write-Warning "accepted rc.28/rc.29 external-target alias finalizer limitation after verified binary replacement"
 }
 
 function Download-Binary([string]$Tag, [string]$Destination) {
