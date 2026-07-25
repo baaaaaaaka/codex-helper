@@ -1263,7 +1263,8 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 			{Kind: codexrunner.StreamEventCommandStarted, Command: "/usr/bin/zsh -lc 'go test ./...'"},
 			{Kind: codexrunner.StreamEventCommandCompleted, Command: "/usr/bin/zsh -lc 'go test ./...'", Status: "completed", ExitCode: &exitCode, AggregatedOutput: "--- FAIL: TestAdd\nFAIL\n"},
 			{Kind: codexrunner.StreamEventContextCompacted},
-			{Kind: codexrunner.StreamEventAgentMessage, Text: "FINAL MARKER\nFixed the bug."},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "The compacted context is ready; continuing the fix.", Phase: "commentary"},
+			{Kind: codexrunner.StreamEventAgentMessage, Text: "FINAL MARKER\nFixed the bug.", Phase: "final_answer"},
 			{Kind: codexrunner.StreamEventTurnCompleted},
 		},
 		result: ExecutionResult{Text: "FINAL MARKER\nFixed the bug.", CodexThreadID: "thread-1", CodexTurnID: "turn-1"},
@@ -1282,6 +1283,7 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 		"Codex is working",
 		"🤖 ⏳ Codex status:\nI am checking the failing test first.",
 		"🤖 ⏳ Codex status:\n" + transcriptContextCompactMessage,
+		"🤖 ⏳ Codex status:\nThe compacted context is ready; continuing the fix.",
 		"🔧 Helper: ✅ Codex finished responding.",
 		"🤖 ✅ Codex answer:\nFINAL MARKER",
 	} {
@@ -1294,6 +1296,12 @@ func TestBridgeStreamsCodexProgressButNotCommandsToTeams(t *testing.T) {
 	}
 	if strings.Index(joined, transcriptContextCompactMessage) > strings.Index(joined, "🤖 ✅ Codex answer:\nFINAL MARKER") {
 		t.Fatalf("context compact status should be sent before the final answer:\n%s", joined)
+	}
+	compactIndex := strings.Index(joined, transcriptContextCompactMessage)
+	postCompactIndex := strings.Index(joined, "The compacted context is ready; continuing the fix.")
+	finalIndex := strings.Index(joined, "🤖 ✅ Codex answer:\nFINAL MARKER")
+	if compactIndex < 0 || postCompactIndex < 0 || finalIndex < 0 || compactIndex >= postCompactIndex || postCompactIndex >= finalIndex {
+		t.Fatalf("expected compact < first post-compact Codex message < final answer:\n%s", joined)
 	}
 	for _, leaked := range []string{
 		"🤖 🛠️ Codex command",

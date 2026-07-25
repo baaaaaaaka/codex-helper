@@ -870,7 +870,7 @@ func emitAppServerStreamEventDeduplicated(handler EventHandler, line []byte, see
 	if !ok {
 		return
 	}
-	if event.Kind == StreamEventAgentMessage && strings.TrimSpace(event.ItemID) != "" {
+	if (event.Kind == StreamEventAgentMessage || event.Kind == StreamEventContextCompacted) && strings.TrimSpace(event.ItemID) != "" {
 		key := event.TurnID + "\x00" + event.ItemID
 		if _, duplicate := seen[key]; duplicate {
 			return
@@ -1931,6 +1931,16 @@ func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {
 			} else {
 				event.Kind = StreamEventCommandCompleted
 			}
+		case params.Item.Type == "contextCompaction":
+			// The started notification marks the beginning of compaction, so do
+			// not expose it as completed status. The completed notification is
+			// ordered before the next item by the app-server protocol and is the
+			// point at which the Teams status can be sent without getting ahead
+			// of the actual compaction.
+			if msg.Method != "item/completed" {
+				return StreamEvent{}, false
+			}
+			event.Kind = StreamEventContextCompacted
 		default:
 			return StreamEvent{}, false
 		}
