@@ -30,6 +30,33 @@ func TestEmitAppServerStreamEventDeduplicatesAgentMessageItemID(t *testing.T) {
 	}
 }
 
+func TestEmitAppServerStreamEventRecognizesCompletedContextCompactionOnly(t *testing.T) {
+	started := []byte(`{"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"compact-1","type":"contextCompaction"}}}`)
+	completed := []byte(`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"compact-1","type":"contextCompaction"}}}`)
+	seen := map[string]struct{}{}
+	var events []StreamEvent
+	handler := func(event StreamEvent) { events = append(events, event) }
+
+	emitAppServerStreamEventDeduplicated(handler, started, seen)
+	if len(events) != 0 {
+		t.Fatalf("started context compaction was emitted: %#v", events)
+	}
+	emitAppServerStreamEventDeduplicated(handler, completed, seen)
+	emitAppServerStreamEventDeduplicated(handler, completed, seen)
+	if len(events) != 1 {
+		t.Fatalf("completed context compaction events = %#v, want one", events)
+	}
+	if events[0].Kind != StreamEventContextCompacted || events[0].ItemID != "compact-1" || events[0].TurnID != "turn-1" {
+		t.Fatalf("context compaction event = %#v", events[0])
+	}
+
+	otherTurn := bytes.ReplaceAll(completed, []byte(`"turn-1"`), []byte(`"turn-2"`))
+	emitAppServerStreamEventDeduplicated(handler, otherTurn, seen)
+	if len(events) != 2 {
+		t.Fatalf("same item id in another turn was dropped: %#v", events)
+	}
+}
+
 func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{"userAgent":"codex-helper-test/0","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}`,
@@ -459,6 +486,51 @@ func TestAppServerRunnerStreamsNotifications(t *testing.T) {
 	}
 	if events[7].Kind != StreamEventTurnCompleted || events[7].TurnID != "turn-1" {
 		t.Fatalf("turn completed event = %#v", events[7])
+	}
+}
+
+func TestAppServerRunnerStreamsCanonicalContextCompactionBeforeNextItem(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-new"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}`,
+		`{"method":"turn/started","params":{"threadId":"thread-new","turnId":"turn-1"}}`,
+		`{"method":"item/started","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"compact-1","type":"contextCompaction"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"compact-1","type":"contextCompaction"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"compact-1","type":"contextCompaction"}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-new","turnId":"turn-1","item":{"id":"item-1","type":"agentMessage","text":"after compact"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-new","turnId":"turn-1","turn":{"id":"turn-1","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	var events []StreamEvent
+
+	got, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt: "hello",
+		EventHandler: func(event StreamEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+	if got.FinalAgentMessage != "after compact" {
+		t.Fatalf("final message = %q, want after compact", got.FinalAgentMessage)
+	}
+	if len(events) != 4 {
+		t.Fatalf("events = %#v, want turn started, compact, agent, turn completed", events)
+	}
+	if events[0].Kind != StreamEventTurnStarted {
+		t.Fatalf("turn started event = %#v", events[0])
+	}
+	if events[1].Kind != StreamEventContextCompacted || events[1].ItemID != "compact-1" {
+		t.Fatalf("compact event = %#v", events[1])
+	}
+	if events[2].Kind != StreamEventAgentMessage || events[2].ItemID != "item-1" || events[2].Text != "after compact" {
+		t.Fatalf("post-compact agent event = %#v", events[2])
+	}
+	if events[3].Kind != StreamEventTurnCompleted {
+		t.Fatalf("turn completed event = %#v", events[3])
 	}
 }
 
