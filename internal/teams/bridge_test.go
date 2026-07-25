@@ -24749,6 +24749,85 @@ func TestBridgeSyncLinkedTranscriptSeedsThenImportsNewRecords(t *testing.T) {
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptSkipsInternalAgentMessagesAndAdvancesCheckpoint(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-internal"}}` + "\n" +
+		`{"id":"old","thread_id":"thread-internal","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-internal", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-internal")
+	checkpointID := transcriptCheckpointID(session.ID)
+
+	internalTail := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"child-message","type":"agent_message","author":"/root/child","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nPayload: encrypted"}],"encrypted_content":"sealed","internal_chat_message_metadata_passthrough":{"turn_id":"child-turn"}}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"agent_message","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload: private answer"}],"internal_chat_message_metadata_passthrough":{}}}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(initial+internalTail), 0o600); err != nil {
+		t.Fatalf("append internal transcript records: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync internal-only tail: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("internal transcript records sent to Teams: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after internal-only tail: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "child-final" || checkpoint.LastOffset != int64(len(initial+internalTail)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after internal-only tail = %#v, want child-final at EOF", checkpoint)
+	}
+	if len(state.TranscriptDeliveries) != 0 {
+		t.Fatalf("internal records created transcript deliveries: %#v", state.TranscriptDeliveries)
+	}
+	assertFileDoesNotContain(t, store.Path(), "private answer")
+
+	visibleTail := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"visible-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"real final answer"}]}}`,
+		`{"type":"response_item","payload":{"id":"child-final-2","type":"agent_message","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload: another private answer"}],"internal_chat_message_metadata_passthrough":{}}}`,
+		``,
+	}, "\n")
+	wantBody := initial + internalTail + visibleTail
+	if err := os.WriteFile(transcriptPath, []byte(wantBody), 0o600); err != nil {
+		t.Fatalf("append visible final transcript record: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync visible final after internal tail: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if len(*sent) != 1 || !strings.Contains(joined, "real final answer") {
+		t.Fatalf("visible final sync = %#v, want one visible final", *sent)
+	}
+	if strings.Contains(joined, "private answer") || strings.Contains(joined, "Message Type") {
+		t.Fatalf("internal collaboration text leaked into Teams output: %s", joined)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load final state: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "child-final-2" || checkpoint.LastOffset != int64(len(wantBody)) {
+		t.Fatalf("checkpoint after visible final = %#v, want final hidden tail at EOF", checkpoint)
+	}
+
+	sentBeforeRepeat := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("repeat sync after internal tail: %v", err)
+	}
+	if len(*sent) != sentBeforeRepeat {
+		t.Fatalf("repeat sync replayed transcript output: %#v", *sent)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptRefreshesAutoWorkTitleFromCodexHistory(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"fix alpha bug"}`+"\n"), 0o600); err != nil {
@@ -29914,6 +29993,67 @@ func TestBridgeHistoryWatchSkipsSubagentFinal(t *testing.T) {
 		if checkpoint.Offset == 0 || checkpoint.Size == 0 {
 			t.Fatalf("subagent checkpoint was not advanced to avoid repeated scans: %#v", checkpoint)
 		}
+	}
+}
+
+func TestBridgeHistoryWatchSkipsInternalAgentMessagesAndAdvancesCheckpoint(t *testing.T) {
+	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
+	codexRoot := newBridgeTestCodexRoot(t)
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "05", "11", "rollout-2026-05-11T09-00-00-thread-internal-watch.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-internal-watch"}}`,
+		`{"type":"response_item","payload":{"id":"child-message","type":"agent_message","author":"/root/child","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nPayload: encrypted"}],"encrypted_content":"sealed","internal_chat_message_metadata_passthrough":{"turn_id":"child-turn"}}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"agent_message","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload: private answer"}],"internal_chat_message_metadata_passthrough":{}}}`,
+		`{"type":"turn.completed","thread_id":"thread-internal-watch","turn_id":"turn-child"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-internal-watch", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("mark history watch ready: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now, true); err != nil {
+		t.Fatalf("history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("internal history records sent to Teams: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load history watch state: %v", err)
+	}
+	if len(state.HistoryWatch) != 1 {
+		t.Fatalf("history watch checkpoint count = %d, want 1", len(state.HistoryWatch))
+	}
+	for _, checkpoint := range state.HistoryWatch {
+		if checkpoint.Offset != int64(len(body)) || checkpoint.Size != int64(len(body)) {
+			t.Fatalf("internal history checkpoint = %#v, want EOF offset %d", checkpoint, len(body))
+		}
+		if checkpoint.PendingAssistantText != "" {
+			t.Fatalf("internal agent message became pending assistant text: %#v", checkpoint)
+		}
+	}
+	assertFileDoesNotContain(t, store.Path(), "private answer")
+
+	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(time.Minute), true); err != nil {
+		t.Fatalf("repeat history watch sync error: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("repeat history watch sync sent internal records: %#v", *sent)
 	}
 }
 
