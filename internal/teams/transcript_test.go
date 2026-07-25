@@ -74,6 +74,36 @@ func TestParseCodexTranscriptClassifiesEventCommentaryAsStatus(t *testing.T) {
 	assertTranscriptRecord(t, got.Records[1], "final-1", "source:final-1", TranscriptKindAssistant, "done", 2)
 }
 
+func TestParseCodexTranscriptHidesInternalResponseItemAgentMessages(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"child-message","type":"agent_message","author":"/root/child","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nTask name: /root/child\nPayload: encrypted"}],"encrypted_content":"sealed","internal_chat_message_metadata_passthrough":{"turn_id":"child-turn"}}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"agent_message","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nTask name: /root/child\nPayload: private answer"}],"internal_chat_message_metadata_passthrough":{}}}`,
+		`{"type":"event_msg","payload":{"id":"visible-status","type":"agent_message","phase":"commentary","message":"working"}}`,
+		`{"type":"response_item","payload":{"id":"visible-agent","type":"agent_message","content":[{"type":"output_text","text":"legacy visible agent message"}]}}`,
+		`{"type":"response_item","payload":{"id":"visible-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"real final answer"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 5 {
+		t.Fatalf("records = %#v, want five source records including hidden collaboration records", got.Records)
+	}
+	for _, index := range []int{0, 1} {
+		record := got.Records[index]
+		if !record.Internal {
+			t.Fatalf("record %d = %#v, want Internal=true", index, record)
+		}
+		if record.Kind != TranscriptKindAssistant || record.Text != "" || record.SourceType != "agent_message" {
+			t.Fatalf("internal record %d = %#v, want empty hidden assistant agent_message", index, record)
+		}
+	}
+	assertTranscriptRecord(t, got.Records[2], "visible-status", "source:visible-status", TranscriptKindStatus, "working", 3)
+	assertTranscriptRecord(t, got.Records[3], "visible-agent", "source:visible-agent", TranscriptKindAssistant, "legacy visible agent message", 4)
+	assertTranscriptRecord(t, got.Records[4], "visible-final", "source:visible-final", TranscriptKindAssistant, "real final answer", 5)
+}
+
 func TestParseCodexTranscriptClassifiesResponseItemCommentaryAsStatus(t *testing.T) {
 	input := strings.Join([]string{
 		`{"type":"response_item","payload":{"id":"commentary-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,

@@ -16107,6 +16107,13 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		checkpointKey := transcriptRecordCheckpointKey(record)
+		if record.Internal {
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
+				return transcriptImportResult{}, err
+			}
+			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
+			continue
+		}
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
@@ -16580,6 +16587,9 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 		return false, errTranscriptCheckpointNotFound
 	}
 	for _, record := range transcript.Records {
+		if record.Internal {
+			continue
+		}
 		if strings.TrimSpace(record.Text) != "" {
 			return true, nil
 		}
@@ -16832,6 +16842,9 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	dedupe := newTranscriptDedupeState()
 	active := false
 	for i, record := range transcript.Records {
+		if record.Internal {
+			continue
+		}
 		body := formatTranscriptRecordForTeams(record)
 		if strings.TrimSpace(body) == "" {
 			continue
@@ -16918,7 +16931,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 	var lastOffset int64
 	for i, record := range transcript.Records {
 		body := formatTranscriptRecordForTeams(record)
-		skip := strings.TrimSpace(body) == ""
+		skip := record.Internal || strings.TrimSpace(body) == ""
 		if !skip && (shouldSkipBackgroundTranscriptRecord(record) || transcriptRecordIsTerminal(record)) {
 			skip = true
 		}
@@ -17063,7 +17076,7 @@ func (s *recentCompletedTeamsTranscriptMirrorSkipper) matchesRecentCodexTurn(rec
 }
 
 func transcriptRecordIsRecentTeamsMirrorFollower(record TranscriptRecord) bool {
-	return record.Kind == TranscriptKindStatus || transcriptRecordIsLiveAgentMirrorCandidate(record)
+	return !record.Internal && (record.Kind == TranscriptKindStatus || transcriptRecordIsLiveAgentMirrorCandidate(record))
 }
 
 func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
@@ -17084,6 +17097,9 @@ func (b *Bridge) localTranscriptHasActionableDelta(ctx context.Context, session 
 }
 
 func transcriptRecordIsTerminal(record TranscriptRecord) bool {
+	if record.Internal {
+		return false
+	}
 	source := strings.ToLower(strings.TrimSpace(record.SourceType))
 	switch source {
 	case "task_complete", "turn.failed", "turn/completed", "turn.completed":
@@ -17104,6 +17120,9 @@ func transcriptHasDiagnostic(transcript Transcript, kind string) bool {
 }
 
 func formatTranscriptRecordForTeams(record TranscriptRecord) string {
+	if record.Internal {
+		return ""
+	}
 	text := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(record.Text)))
 	if record.Kind == TranscriptKindAssistant {
 		text = StripOAIMemoryCitationBlocks(text)
@@ -17118,7 +17137,7 @@ func formatTranscriptRecordForTeams(record TranscriptRecord) string {
 }
 
 func shouldSkipImportedTranscriptRecord(record TranscriptRecord) bool {
-	return record.Kind == TranscriptKindTool
+	return record.Internal || record.Kind == TranscriptKindTool
 }
 
 func transcriptRecordOutboxKind(prefix string, record TranscriptRecord, fallback int) string {
@@ -17499,10 +17518,30 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	dedupe := newTranscriptDedupeState()
 	queued := 0
+	var pendingInternal transcriptImportCheckpointRecord
+	rememberInternal := func(record TranscriptRecord, line int, offset int64) {
+		key := transcriptRecordCheckpointKey(record)
+		if strings.TrimSpace(key) == "" {
+			return
+		}
+		pendingInternal = transcriptImportCheckpointRecord{Key: key, SourceLine: line, SourceOffset: offset}
+	}
+	flushInternal := func() error {
+		if strings.TrimSpace(pendingInternal.Key) == "" {
+			return nil
+		}
+		checkpoint := pendingInternal
+		pendingInternal = transcriptImportCheckpointRecord{}
+		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
+		if record.Internal {
+			rememberInternal(record, checkpointLine, checkpointOffset)
+			continue
+		}
 		if transcriptRecordIsFinalCheckpoint(record) {
 			if hasFinalCheckpoint {
 				return queued, b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, finalCheckpointKey, finalCheckpointLine, finalCheckpointOffset, checkpointID)
@@ -17536,9 +17575,15 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 			}
 			queued++
 			if queued >= transcriptSyncMaxRecordsPerSessionPerCycle {
+				if err := flushInternal(); err != nil {
+					return queued, err
+				}
 				return queued, nil
 			}
 		}
+	}
+	if err := flushInternal(); err != nil {
+		return queued, err
 	}
 	return queued, nil
 }
@@ -17559,6 +17604,9 @@ func activeTurnTranscriptFinalCheckpoint(records []TranscriptRecord) (string, in
 }
 
 func transcriptRecordIsFinalCheckpoint(record TranscriptRecord) bool {
+	if record.Internal {
+		return false
+	}
 	return record.Kind == TranscriptKindAssistant ||
 		strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer") ||
 		transcriptRecordIsTerminal(record)
@@ -17626,11 +17674,31 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 	known := newKnownTranscriptOutboxDedupeState(state, sessionCopy.ID, checkpoint.UpdatedAt)
 	dedupe := newTranscriptDedupeState()
 	queued := 0
+	var pendingInternal transcriptImportCheckpointRecord
+	rememberInternal := func(record TranscriptRecord, line int, offset int64) {
+		key := transcriptRecordCheckpointKey(record)
+		if strings.TrimSpace(key) == "" {
+			return
+		}
+		pendingInternal = transcriptImportCheckpointRecord{Key: key, SourceLine: line, SourceOffset: offset}
+	}
+	flushInternal := func() error {
+		if strings.TrimSpace(pendingInternal.Key) == "" {
+			return nil
+		}
+		checkpoint := pendingInternal
+		pendingInternal = transcriptImportCheckpointRecord{}
+		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, sessionCopy, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
 		if !liveTranscriptRecordMatchesRunningTurn(record, turn, threadID) {
+			continue
+		}
+		if record.Internal {
+			rememberInternal(record, checkpointLine, checkpointOffset)
 			continue
 		}
 		if record.Kind == TranscriptKindAssistant || transcriptRecordIsTerminal(record) {
@@ -17658,6 +17726,9 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 				break
 			}
 		}
+	}
+	if err := flushInternal(); err != nil {
+		return queued, err
 	}
 	if queued == 0 {
 		return 0, nil
@@ -17844,6 +17915,10 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
+		if record.Internal {
+			rememberCheckpoint(transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset)
+			continue
+		}
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
@@ -17875,7 +17950,10 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		hasPendingCheckpoint = false
 		sent++
 		if sent >= transcriptSyncMaxRecordsPerSessionPerCycle {
-			return nil
+			// A hidden collaboration record may follow the last visible record
+			// admitted to this cycle.  Persist its checkpoint before returning so
+			// the next 10-second scan does not re-read the same internal tail.
+			return flushPendingCheckpoint()
 		}
 	}
 	return flushPendingCheckpoint()
@@ -18211,6 +18289,9 @@ func countVisibleTranscriptSyncRecords(state teamstore.State, session Session, l
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
+		if record.Internal {
+			continue
+		}
 		if strings.TrimSpace(record.Text) == "" {
 			continue
 		}
@@ -18913,6 +18994,9 @@ func formatKnownOutboxBodyForTranscriptDedupe(kind TranscriptKind, body string) 
 }
 
 func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string, hashes map[TranscriptKind]map[string]bool) bool {
+	if record.Internal {
+		return true
+	}
 	if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus && record.Kind != TranscriptKindCompact {
 		return false
 	}
@@ -18945,10 +19029,13 @@ func shouldSkipBackgroundTranscriptRecord(record TranscriptRecord) bool {
 }
 
 func transcriptRecordIsLiveAgentMirrorCandidate(record TranscriptRecord) bool {
-	return record.Kind == TranscriptKindAssistant && transcriptRecordCanBeStreamingAssistantPrefix(record)
+	return !record.Internal && record.Kind == TranscriptKindAssistant && transcriptRecordCanBeStreamingAssistantPrefix(record)
 }
 
 func transcriptRecordIsKnownLiveStatusMirrorCandidate(record TranscriptRecord) bool {
+	if record.Internal {
+		return false
+	}
 	if transcriptRecordIsLiveAgentMirrorCandidate(record) {
 		return true
 	}
@@ -19141,6 +19228,9 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Co
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if transcriptCheckpointProgressAlreadyAhead(previous, sourcePath, lastLine, lastOffset) {
+			return previous, false, nil
+		}
 		status := previous.Status
 		if status == "" || status == importCheckpointStatusBlocked {
 			status = importCheckpointStatusComplete
@@ -19165,6 +19255,16 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Co
 		return next, true, nil
 	})
 	return err
+}
+
+func transcriptCheckpointProgressAlreadyAhead(previous teamstore.ImportCheckpoint, sourcePath string, lastLine int, lastOffset int64) bool {
+	if cleanComparablePath(previous.SourcePath) == "" || cleanComparablePath(sourcePath) == "" || cleanComparablePath(previous.SourcePath) != cleanComparablePath(sourcePath) {
+		return false
+	}
+	if previous.LastOffset > 0 && lastOffset > 0 {
+		return previous.LastOffset > lastOffset
+	}
+	return previous.LastOffset == 0 && lastOffset == 0 && previous.LastSourceLine > lastLine
 }
 
 func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right teamstore.ImportCheckpoint) bool {

@@ -193,6 +193,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				}
 				result.Records = append(result.Records, records...)
 				for _, record := range records {
+					if record.Internal {
+						continue
+					}
 					if record.Kind == TranscriptKindAssistant && strings.TrimSpace(record.Text) != "" {
 						pending = historyTieredAssistantCandidate{Record: record}
 						if signals.FinalAnswer {

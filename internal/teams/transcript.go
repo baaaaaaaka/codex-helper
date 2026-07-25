@@ -61,6 +61,7 @@ type TranscriptRecord struct {
 	SourceOffset      int64
 	SourceType        string
 	Phase             string
+	Internal          bool
 }
 
 type TranscriptDiagnostic struct {
@@ -411,6 +412,12 @@ func compactTranscriptRecords(records []TranscriptRecord) []TranscriptRecord {
 	}
 	out := records[:0]
 	for i := 0; i < len(records); i++ {
+		// Internal collaboration records are retained for checkpoint progress,
+		// but must not participate in visible assistant prefix compaction.
+		if records[i].Internal {
+			out = append(out, records[i])
+			continue
+		}
 		if compactedRecordIsShadowedByEvent(records, i) {
 			continue
 		}
@@ -480,11 +487,17 @@ func transcriptRecordsCanShadowSameAssistant(left TranscriptRecord, right Transc
 }
 
 func transcriptRecordCanBeStreamingAssistantPrefix(record TranscriptRecord) bool {
+	if record.Internal {
+		return false
+	}
 	sourceType := strings.ToLower(strings.TrimSpace(record.SourceType))
 	return sourceType == "agent_message" || sourceType == "agentmessage" || sourceType == "assistant_message"
 }
 
 func transcriptRecordCanShadowStreamingAssistantPrefix(record TranscriptRecord) bool {
+	if record.Internal {
+		return false
+	}
 	sourceType := strings.ToLower(strings.TrimSpace(record.SourceType))
 	return sourceType == "message" || sourceType == "agent_message" || sourceType == "agentmessage" || sourceType == "assistant_message"
 }
@@ -505,6 +518,7 @@ type pendingTranscriptRecord struct {
 	sourceLine   int
 	sourceType   string
 	phase        string
+	internal     bool
 }
 
 func parseTranscriptLine(line []byte, lineNo int, state *transcriptParseState) ([]TranscriptRecord, []TranscriptDiagnostic) {
@@ -645,11 +659,28 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 	sourceID := jsonStringField(payload, "id", "item_id", "itemId", "call_id", "callId")
 	threadID = firstNonEmptyString(jsonStringField(payload, "thread_id", "threadId"), threadID)
 	turnID = firstNonEmptyString(jsonStringField(payload, "turn_id", "turnId"), nestedJSONID(payload, "turn"), turnID)
+	phase := jsonStringField(payload, "phase")
+	if responseItemIsInternalAgentMessage(payload) {
+		// Keep only the source identity and position.  The collaboration
+		// envelope can contain encrypted content or a plaintext FINAL_ANSWER;
+		// neither belongs in the in-memory visible transcript or history-watch
+		// pending-assistant state.
+		return pendingTranscriptRecord{
+			sourceItemID: sourceID,
+			threadID:     threadID,
+			turnID:       turnID,
+			kind:         TranscriptKindAssistant,
+			createdAt:    createdAt,
+			sourceLine:   lineNo,
+			sourceType:   itemType,
+			phase:        phase,
+			internal:     true,
+		}, true
+	}
 	kind, text, ok := responseItemKindText(payload)
 	if !ok {
 		return pendingTranscriptRecord{}, false
 	}
-	phase := jsonStringField(payload, "phase")
 	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
 	}
@@ -664,6 +695,17 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 		sourceType:   itemType,
 		phase:        phase,
 	}, true
+}
+
+func responseItemIsInternalAgentMessage(payload map[string]json.RawMessage) bool {
+	if !strings.EqualFold(strings.TrimSpace(jsonStringField(payload, "type")), "agent_message") {
+		return false
+	}
+	if _, ok := payload["internal_chat_message_metadata_passthrough"]; ok {
+		return true
+	}
+	return strings.TrimSpace(jsonStringField(payload, "author")) != "" &&
+		strings.TrimSpace(jsonStringField(payload, "recipient")) != ""
 }
 
 func eventMsgTranscriptRecord(payload map[string]json.RawMessage, lineNo int, createdAt time.Time, threadID string, turnID string) (pendingTranscriptRecord, bool) {
@@ -998,6 +1040,7 @@ func (p pendingTranscriptRecord) toRecord() TranscriptRecord {
 		SourceLine:   p.sourceLine,
 		SourceType:   p.sourceType,
 		Phase:        p.phase,
+		Internal:     p.internal,
 	}
 }
 
