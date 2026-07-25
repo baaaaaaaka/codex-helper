@@ -92,6 +92,22 @@ func (b *Bridge) hasGlobalOutboundMessage(ctx context.Context, chatID string, me
 	return hasGlobalOutboundLedgerItem(ctx, path, chatID, messageID)
 }
 
+func (b *Bridge) globalOutboundMessage(ctx context.Context, chatID string, messageID string) (globalOutboundItem, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	if b == nil || chatID == "" || messageID == "" {
+		return globalOutboundItem{}, false, nil
+	}
+	path, ok := b.globalOutboundLedgerPath()
+	if !ok {
+		return globalOutboundItem{}, false, nil
+	}
+	if err := b.ensureGlobalOutboundBackfilled(ctx, path); err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	return readGlobalOutboundLedgerItem(ctx, path, chatID, messageID)
+}
+
 func (b *Bridge) recordGlobalOutboundMessage(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
 	if b == nil {
 		return nil
@@ -407,6 +423,51 @@ func hasGlobalOutboundLedgerItem(ctx context.Context, path string, chatID string
 		return false, err
 	}
 	return true, nil
+}
+
+func readGlobalOutboundLedgerItem(ctx context.Context, path string, chatID string, messageID string) (globalOutboundItem, bool, error) {
+	path = strings.TrimSpace(path)
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	if path == "" || chatID == "" || messageID == "" {
+		return globalOutboundItem{}, false, nil
+	}
+	lock := flock.New(path + ".lock")
+	ok, err := lock.TryLockContext(ctx, globalOutboundLockTimeout)
+	if err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	if !ok {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return globalOutboundItem{}, false, ctxErr
+		}
+		return globalOutboundItem{}, false, fmt.Errorf("global Teams outbound ledger is locked: %s", path)
+	}
+	defer func() { _ = lock.Unlock() }()
+	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	defer func() { _ = db.Close() }()
+	if err := ensureGlobalOutboundSQLite(ctx, db); err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	if err := importLegacyGlobalOutboundJSON(ctx, db, path, time.Now()); err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	var raw []byte
+	err = db.QueryRowContext(ctx, `SELECT json FROM outbound_ledger WHERE key = ?`, globalOutboundKey(chatID, messageID)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return globalOutboundItem{}, false, nil
+	}
+	if err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	var item globalOutboundItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return globalOutboundItem{}, false, err
+	}
+	return item, true, nil
 }
 
 func readGlobalOutboundSQLite(path string) (globalOutboundLedger, bool, error) {

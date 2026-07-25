@@ -21564,6 +21564,225 @@ func TestBridgeFreezeNoticePatchPreservesMentions(t *testing.T) {
 	}
 }
 
+func TestHostedContentOnlyMessageContextRecognizesFormulaImages(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  ChatMessage
+		want bool
+	}{
+		{
+			name: "formula image",
+			msg:  bridgeTestMessageWithText("formula", `<p>answer</p><pre><code>x</code></pre><p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p>`),
+			want: true,
+		},
+		{
+			name: "multiple formula images",
+			msg:  bridgeTestMessageWithText("formula-multiple", `<p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p><p><img src="../hostedContents/math-2/$value" alt="Rendered TeX formula"></p>`),
+			want: true,
+		},
+		{
+			name: "wrong alt text",
+			msg:  bridgeTestMessageWithText("wrong-alt", `<p><img src="../hostedContents/img-1/$value" alt="Uploaded image"></p>`),
+		},
+		{
+			name: "hosted audio element",
+			msg:  bridgeTestMessageWithText("audio", `<audio src="../hostedContents/audio-1/$value"></audio>`),
+		},
+		{
+			name: "attachment placeholder",
+			msg:  bridgeTestMessageWithText("placeholder", `<p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p><attachment id="file-1"></attachment>`),
+		},
+		{
+			name: "attachment payload",
+			msg:  bridgeTestMessageWithText("payload", `<p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p>`),
+		},
+	}
+	tests[len(tests)-1].msg.Attachments = []MessageAttachment{{ID: "file-1", ContentType: "reference"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hostedContentOnlyMessageContext(tt.msg); got != tt.want {
+				t.Fatalf("hostedContentOnlyMessageContext = %v, want %v for %#v", got, tt.want, tt.msg)
+			}
+		})
+	}
+}
+
+func TestTrustedMathHostedContentRequiresBoundProvenance(t *testing.T) {
+	ctx := context.Background()
+	session := Session{ID: "s001", ChatID: "chat-1"}
+	msg := bridgeTestMessageWithText("formula-provenance", `<p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p>`)
+	tests := []struct {
+		name       string
+		provenance *teamstore.MessageProvenanceRecord
+		bindChat   bool
+		bindMsg    bool
+		want       bool
+	}{
+		{name: "missing", want: false},
+		{name: "user inbound", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginUserInbound}, want: false},
+		{name: "untrusted kind", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginHelperOutbox, SessionID: session.ID, Kind: "helper"}, want: false},
+		{name: "wrong session", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginHelperOutbox, SessionID: "other-session", Kind: "final"}, bindChat: true, bindMsg: true, want: false},
+		{name: "missing chat binding", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginHelperOutbox, SessionID: session.ID, Kind: "final"}, bindMsg: true, want: false},
+		{name: "missing message binding", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginHelperOutbox, SessionID: session.ID, Kind: "final"}, bindChat: true, want: false},
+		{name: "trusted final", provenance: &teamstore.MessageProvenanceRecord{Origin: teamstore.MessageOriginHelperOutbox, SessionID: session.ID, Kind: "final"}, bindChat: true, bindMsg: true, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			if tt.provenance != nil {
+				record := *tt.provenance
+				if tt.bindChat {
+					record.TeamsChatID = session.ChatID
+				}
+				if tt.bindMsg {
+					record.TeamsMessageID = msg.ID
+				}
+				if _, err := store.RecordMessageProvenance(ctx, record); err != nil {
+					t.Fatalf("RecordMessageProvenance: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			got, err := bridge.trustedMathHostedContentMessage(ctx, session, msg)
+			if err != nil {
+				t.Fatalf("trustedMathHostedContentMessage error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("trustedMathHostedContentMessage = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBridgeFreezeNoticePatchAllowsTrustedMathHostedContent(t *testing.T) {
+	ctx := context.Background()
+	latest := bridgeTestMessageWithText("helper-math", `<p>Codex: answer</p><pre><code>\frac{a}{b}</code></pre><p><img src="../hostedContents/math-1/$value" alt="Rendered TeX formula"></p>`)
+	latest.CreatedDateTime = "2026-05-02T01:00:00Z"
+	latest.LastModifiedDateTime = latest.CreatedDateTime
+	store := newBridgeTestStore(t)
+	if _, err := store.RecordMessageProvenance(ctx, teamstore.MessageProvenanceRecord{
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: latest.ID,
+		Origin:         teamstore.MessageOriginHelperOutbox,
+		SessionID:      "s001",
+		OutboxID:       "outbox:math",
+		Kind:           "final",
+	}); err != nil {
+		t.Fatalf("RecordMessageProvenance: %v", err)
+	}
+	var patched map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{latest}}); err != nil {
+				t.Fatalf("encode list messages response: %v", err)
+			}
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/helper-math":
+			if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+				t.Fatalf("decode freeze notice patch: %v", err)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = graph
+	session := *bridge.reg.SessionByID("s001")
+	body := renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle.")
+
+	result, err := bridge.appendFreezeNoticeToLatestMessage(ctx, session, "r "+resumeKeyForSession(session), time.Now().Add(-49*time.Hour), body)
+	if err != nil {
+		t.Fatalf("appendFreezeNoticeToLatestMessage error: %v", err)
+	}
+	if !result.Appended {
+		t.Fatalf("append result = %#v, want appended", result)
+	}
+	var patchBody struct {
+		Body struct {
+			Content string `json:"content"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal(patched["body"], &patchBody.Body); err != nil {
+		t.Fatalf("decode patch body: %v", err)
+	}
+	if !strings.Contains(patchBody.Body.Content, `hostedContents/math-1/$value`) || !strings.Contains(PlainTextFromTeamsHTML(patchBody.Body.Content), "This chat is paused") {
+		t.Fatalf("patched formula body lost content or freeze notice: %s", patchBody.Body.Content)
+	}
+	for _, key := range []string{"attachments", "hostedContents"} {
+		if _, ok := patched[key]; ok {
+			t.Fatalf("body-only formula patch unexpectedly included %s: %#v", key, patched[key])
+		}
+	}
+}
+
+func TestBridgeFreezeNoticePatchUsesGlobalMathProvenance(t *testing.T) {
+	ctx := context.Background()
+	latest := bridgeTestMessageWithText("helper-global-math", `<p>Codex: answer</p><p><img src="../hostedContents/math-global/$value" alt="Rendered TeX formula"></p>`)
+	latest.CreatedDateTime = "2026-05-02T01:00:00Z"
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	path, ok := bridge.globalOutboundLedgerPath()
+	if !ok {
+		t.Fatal("global outbound ledger path unavailable")
+	}
+	if err := recordGlobalOutbound(ctx, path, globalOutboundItem{
+		ChatID:    "chat-1",
+		MessageID: latest.ID,
+		SessionID: "s001",
+		OutboxID:  "outbox:global-math",
+		Kind:      "final-001",
+		Origin:    teamstore.MessageOriginHelperOutbox,
+	}, time.Now()); err != nil {
+		t.Fatalf("recordGlobalOutbound: %v", err)
+	}
+	var patches int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{latest}}); err != nil {
+				t.Fatalf("encode list messages response: %v", err)
+			}
+		case r.Method == http.MethodPatch && r.URL.Path == "/chats/chat-1/messages/helper-global-math":
+			patches++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge.graph = graph
+	bridge.readGraph = graph
+	session := *bridge.reg.SessionByID("s001")
+	body := renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle.")
+
+	result, err := bridge.appendFreezeNoticeToLatestMessage(ctx, session, "r "+resumeKeyForSession(session), time.Now().Add(-49*time.Hour), body)
+	if err != nil {
+		t.Fatalf("appendFreezeNoticeToLatestMessage error: %v", err)
+	}
+	if !result.Appended || patches != 1 {
+		t.Fatalf("append result=%#v patches=%d, want one global-provenance patch", result, patches)
+	}
+}
+
 func TestAppendFreezeNoticeToMessageHTMLConvertsNonHTMLContentToEscapedHTML(t *testing.T) {
 	msg := bridgeTestMessageWithText("helper-text", `<helper status> & "quoted"`)
 	msg.Body.ContentType = "text"
