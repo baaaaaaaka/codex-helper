@@ -96,6 +96,10 @@ func waitForProxyResourceGoroutines(baseline int, timeout time.Duration) int {
 
 func exerciseProxyResourceRound(t *testing.T, round int) {
 	t.Helper()
+	// Hosted macOS Intel runners can briefly pause between listener creation
+	// and the first proxied request; keep the resource assertions strict while
+	// avoiding a false failure from a one-second wall-clock budget.
+	const proxyRoundTimeout = 3 * time.Second
 	p := NewHTTPProxy(dialerFunc(func(string, string) (net.Conn, error) {
 		return nil, io.EOF
 	}), Options{InstanceID: fmt.Sprintf("resource-short-%d", round)})
@@ -105,7 +109,7 @@ func exerciseProxyResourceRound(t *testing.T, round int) {
 	}
 
 	healthTransport := &http.Transport{DisableKeepAlives: true}
-	healthClient := &http.Client{Transport: healthTransport, Timeout: time.Second}
+	healthClient := &http.Client{Transport: healthTransport, Timeout: proxyRoundTimeout}
 	resp, err := healthClient.Get("http://" + addr + "/_codex_proxy/health")
 	if err != nil {
 		_ = p.Close(context.Background())
@@ -120,7 +124,7 @@ func exerciseProxyResourceRound(t *testing.T, round int) {
 		t.Fatalf("round %d proxy URL: %v", round, err)
 	}
 	requestTransport := &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableKeepAlives: true}
-	requestClient := &http.Client{Transport: requestTransport, Timeout: time.Second}
+	requestClient := &http.Client{Transport: requestTransport, Timeout: proxyRoundTimeout}
 	request, err := requestClient.Get("http://resource-test.invalid/round")
 	if err != nil {
 		_ = p.Close(context.Background())
