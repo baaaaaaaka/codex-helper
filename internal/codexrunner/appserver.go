@@ -31,6 +31,14 @@ const (
 
 var errAppServerTurnStartUnconfirmed = errors.New("turn/start response was not confirmed")
 
+func unconfirmedTurnStartError(err error) error {
+	return &Error{
+		Kind:    ErrorCodex,
+		Message: "Codex turn cancel was requested before turn/start returned an exact turn id",
+		Err:     errors.Join(errAppServerTurnStartUnconfirmed, err),
+	}
+}
+
 type AppServerLineTransport interface {
 	WriteLine(ctx context.Context, line []byte) error
 	ReadLine(ctx context.Context) ([]byte, error)
@@ -886,11 +894,18 @@ func (r *AppServerRunner) requestTurnStart(ctx context.Context, params any) (jso
 		return nil, err
 	}
 	raw, err := r.awaitRequest(ctx, id, delivery, false)
-	if err == nil || !explicitTurnInterruptRequested(ctx) || !IsKind(err, ErrorCanceled) {
+	if err == nil || !explicitTurnInterruptRequested(ctx) {
 		if err != nil {
 			r.unregisterPendingRequest(id, delivery)
 		}
 		return raw, err
+	}
+	if !IsKind(err, ErrorCanceled) {
+		r.unregisterPendingRequest(id, delivery)
+		if IsKind(err, ErrorCodex) {
+			return raw, err
+		}
+		return nil, unconfirmedTurnStartError(err)
 	}
 
 	confirmationCtx, cancelConfirmation := r.turnInterruptConfirmationContext()
@@ -900,11 +915,7 @@ func (r *AppServerRunner) requestTurnStart(ctx context.Context, params any) (jso
 		if IsKind(err, ErrorCodex) {
 			return nil, err
 		}
-		return nil, &Error{
-			Kind:    ErrorCodex,
-			Message: "Codex turn cancel was requested before turn/start returned an exact turn id",
-			Err:     errors.Join(errAppServerTurnStartUnconfirmed, err),
-		}
+		return nil, unconfirmedTurnStartError(err)
 	}
 	return raw, nil
 }
