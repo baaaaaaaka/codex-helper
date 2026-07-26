@@ -7,11 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3158,6 +3162,165 @@ func TestNativeWindowsResolveNodeZip(t *testing.T) {
 	}
 	if sha != strings.Repeat("b", 64) || zipName != "node-v22.3.4-win-x64.zip" {
 		t.Fatalf("unexpected resolved zip: sha=%s zip=%s", sha, zipName)
+	}
+}
+
+func TestNativeWindowsHTTPClientUsesExplicitInstallerEnvironment(t *testing.T) {
+	const targetURL = "http://node-download.invalid/SHASUMS256.txt"
+
+	var staleHit atomic.Bool
+	staleProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		staleHit.Store(true)
+		http.Error(w, "stale proxy must not be used", http.StatusBadGateway)
+	}))
+	defer staleProxy.Close()
+
+	var selectedProxyHit atomic.Bool
+	selectedProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host != "node-download.invalid" || r.URL.Path != "/SHASUMS256.txt" {
+			http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+			return
+		}
+		selectedProxyHit.Store(true)
+		_, _ = io.WriteString(w, "checksums from selected proxy")
+	}))
+	defer selectedProxy.Close()
+
+	t.Setenv("HTTP_PROXY", staleProxy.URL)
+	t.Setenv("HTTPS_PROXY", staleProxy.URL)
+	installerEnv := []string{
+		"HTTP_PROXY=" + selectedProxy.URL,
+		"HTTPS_PROXY=" + selectedProxy.URL,
+		"NO_PROXY=",
+	}
+	client, err := nativeWindowsHTTPClientForEnv(installerEnv)
+	if err != nil {
+		t.Fatalf("nativeWindowsHTTPClientForEnv error: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "SHASUMS256.txt")
+	if err := nativeWindowsDownloadFile(context.Background(), client, targetURL, path); err != nil {
+		t.Fatalf("nativeWindowsDownloadFile error: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read downloaded file: %v", err)
+	}
+	if string(data) != "checksums from selected proxy" {
+		t.Fatalf("downloaded data = %q, want selected proxy response", data)
+	}
+	if staleHit.Load() || !selectedProxyHit.Load() {
+		t.Fatalf("proxy selection staleHit=%v selectedProxyHit=%v", staleHit.Load(), selectedProxyHit.Load())
+	}
+
+	requestURL, err := url.Parse("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T, want *http.Transport", client.Transport)
+	}
+	proxyURL, err := transport.Proxy(&http.Request{URL: requestURL})
+	if err != nil {
+		t.Fatalf("resolve HTTPS proxy: %v", err)
+	}
+	if proxyURL == nil || proxyURL.String() != selectedProxy.URL {
+		t.Fatalf("HTTPS proxy = %v, want %s", proxyURL, selectedProxy.URL)
+	}
+}
+
+func TestNativeWindowsHTTPClientRebuildsForEachInstallerEnvironment(t *testing.T) {
+	proxies := []struct {
+		body string
+	}{
+		{body: "first proxy"},
+		{body: "second proxy"},
+	}
+	servers := make([]*httptest.Server, 0, len(proxies))
+	for _, proxy := range proxies {
+		proxy := proxy
+		servers = append(servers, httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Host != "node-download.invalid" {
+				http.Error(w, "unexpected proxy target", http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, proxy.body)
+		})))
+	}
+	t.Cleanup(func() {
+		for _, server := range servers {
+			server.Close()
+		}
+	})
+
+	for index, proxy := range servers {
+		client, err := nativeWindowsHTTPClientForEnv([]string{"HTTP_PROXY=" + proxy.URL, "NO_PROXY="})
+		if err != nil {
+			t.Fatalf("create client %d: %v", index, err)
+		}
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("download-%d.txt", index))
+		if err := nativeWindowsDownloadFile(context.Background(), client, "http://node-download.invalid/file", path); err != nil {
+			t.Fatalf("download %d: %v", index, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read download %d: %v", index, err)
+		}
+		if string(data) != proxies[index].body {
+			t.Fatalf("download %d = %q, want %q", index, data, proxies[index].body)
+		}
+	}
+}
+
+func TestNativeWindowsHTTPClientHonorsExplicitNoProxy(t *testing.T) {
+	var proxyHit atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyHit.Store(true)
+		http.Error(w, "NO_PROXY was ignored", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host != "" {
+			http.Error(w, "request was sent through a proxy", http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, "direct response")
+	}))
+	defer target.Close()
+
+	client, err := nativeWindowsHTTPClientForEnv([]string{
+		"HTTP_PROXY=" + proxy.URL,
+		"NO_PROXY=127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("nativeWindowsHTTPClientForEnv error: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "direct.txt")
+	if err := nativeWindowsDownloadFile(context.Background(), client, target.URL, path); err != nil {
+		t.Fatalf("direct download: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read direct download: %v", err)
+	}
+	if string(data) != "direct response" || proxyHit.Load() {
+		t.Fatalf("direct response = %q, proxyHit=%v", data, proxyHit.Load())
+	}
+	requestURL, err := url.Parse("https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport = %T, want *http.Transport", client.Transport)
+	}
+	resolvedProxy, err := transport.Proxy(&http.Request{URL: requestURL})
+	if err != nil {
+		t.Fatalf("resolve NO_PROXY: %v", err)
+	}
+	if resolvedProxy != nil {
+		t.Fatalf("HTTPS proxy for NO_PROXY host = %s, want direct", resolvedProxy)
 	}
 }
 
