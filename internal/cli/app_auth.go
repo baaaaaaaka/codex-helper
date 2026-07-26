@@ -1180,7 +1180,7 @@ func codexAppAuthWindowsProxyBrowserScript(rawURL string, proxyURL string, runID
 		"$browserPaths = @($candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)",
 		"if ($browserPaths.Count -eq 0) { throw 'No supported Edge or Chrome browser was found. Install Microsoft Edge or Chrome, or open the printed URL manually in a browser that uses the selected proxy.' }",
 		"$failures = @()",
-		"foreach ($browser in $browserPaths) { $browserId = [IO.Path]::GetFileNameWithoutExtension($browser); $profile = Join-Path $profileRoot ($runId + '-' + $browserId); New-Item -ItemType Directory -Force -Path $profile | Out-Null; $args = @('--user-data-dir=' + $profile, '--proxy-server=' + $proxy, '--new-window', '--no-first-run', '--disable-extensions', $url); try { & $browser @args | Out-Null; return } catch { $failures += ($browser + ': ' + $_.Exception.Message) } }",
+		"foreach ($browser in $browserPaths) { $browserId = [IO.Path]::GetFileNameWithoutExtension($browser); $profile = Join-Path $profileRoot ($runId + '-' + $browserId); New-Item -ItemType Directory -Force -Path $profile | Out-Null; $browserArgs = @(\"--user-data-dir=$profile\", \"--proxy-server=$proxy\", '--new-window', '--no-first-run', '--disable-extensions', $url); try { & $browser @browserArgs | Out-Null; return } catch { $failures += ($browser + ': ' + $_.Exception.Message) } }",
 		"throw ('Could not launch a proxy-managed Edge or Chrome browser: ' + ($failures -join '; '))",
 	}, "; ")
 }

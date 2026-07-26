@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -1341,12 +1342,107 @@ func TestCodexAppAuthWindowsProxyBrowserScriptUsesChromiumProxy(t *testing.T) {
 		"--disable-extensions",
 		"http://127.0.0.1:23123",
 		"https://chatgpt.example/codex/device",
-		"& $browser @args",
+		"$browserArgs = @(\"--user-data-dir=$profile\", \"--proxy-server=$proxy\", '--new-window', '--no-first-run', '--disable-extensions', $url)",
+		"& $browser @browserArgs",
 		"$failures += ($browser + ': ' + $_.Exception.Message)",
 		"Could not launch a proxy-managed Edge or Chrome browser",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestCodexAppAuthWindowsProxyBrowserScriptPassesIndependentArgsIntegration(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell browser launch integration is Windows-only")
+	}
+	powershell := teamsServicePowerShellExecutable()
+	if _, err := exec.LookPath(powershell); err != nil {
+		t.Skipf("%s not found: %v", powershell, err)
+	}
+	goExe, err := exec.LookPath("go")
+	if err != nil {
+		t.Skipf("go executable not found for fake Edge build: %v", err)
+	}
+	lockCLITestHooks(t)
+	previousRunID := codexAppAuthBrowserRunIDFn
+	t.Cleanup(func() { codexAppAuthBrowserRunIDFn = previousRunID })
+	codexAppAuthBrowserRunIDFn = func(string) string { return "run one" }
+
+	localAppData := t.TempDir()
+	edgePath := filepath.Join(localAppData, "Microsoft", "Edge", "Application", "msedge.exe")
+	if err := os.MkdirAll(filepath.Dir(edgePath), 0o755); err != nil {
+		t.Fatalf("create fake Edge directory: %v", err)
+	}
+	argsPath := filepath.Join(localAppData, "edge-args.json")
+	helperSrc := filepath.Join(localAppData, "fake-edge.go")
+	helperBody := fmt.Sprintf(`package main
+
+import (
+	"encoding/json"
+	"os"
+)
+
+func main() {
+	args, err := json.Marshal(os.Args[1:])
+	if err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(%q, args, 0600); err != nil {
+		panic(err)
+	}
+}
+`, argsPath)
+	if err := os.WriteFile(helperSrc, []byte(helperBody), 0o600); err != nil {
+		t.Fatalf("write fake Edge source: %v", err)
+	}
+	build := exec.Command(goExe, "build", "-o", edgePath, helperSrc)
+	build.Env = setEnvValue(os.Environ(), "CGO_ENABLED", "0")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fake Edge: %v\n%s", err, output)
+	}
+	t.Setenv("LOCALAPPDATA", localAppData)
+
+	const (
+		rawURL   = "https://chatgpt.example/codex/device"
+		proxyURL = "http://127.0.0.1:23123"
+	)
+	if err := openCodexAppAuthURLWithWindowsProxyBrowser(context.Background(), rawURL, proxyURL); err != nil {
+		t.Fatalf("open proxy-managed browser: %v", err)
+	}
+
+	rawArgs, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read fake Edge args: %v", err)
+	}
+	var got []string
+	if err := json.Unmarshal(rawArgs, &got); err != nil {
+		t.Fatalf("decode fake Edge args: %v\n%s", err, rawArgs)
+	}
+	if len(got) != 6 {
+		t.Fatalf("fake Edge received %d args, want 6: %#v", len(got), got)
+	}
+	profileArg := strings.TrimPrefix(got[0], "--user-data-dir=")
+	if profileArg == got[0] || !strings.HasPrefix(profileArg, filepath.Join(localAppData, "codex-helper", "app-auth-browser")+string(filepath.Separator)) {
+		t.Fatalf("user-data-dir arg = %q, want profile below LOCALAPPDATA", got[0])
+	}
+	if got[1] != "--proxy-server="+proxyURL {
+		t.Fatalf("proxy arg = %q, want %q", got[1], "--proxy-server="+proxyURL)
+	}
+	if !strings.HasSuffix(got[0], "-msedge") {
+		t.Fatalf("user-data-dir arg = %q, want msedge profile", got[0])
+	}
+	if _, err := os.Stat(profileArg); err != nil {
+		t.Fatalf("Edge profile %q was not created: %v", profileArg, err)
+	}
+	wantTail := []string{"--new-window", "--no-first-run", "--disable-extensions", rawURL}
+	if !reflect.DeepEqual(got[2:], wantTail) {
+		t.Fatalf("browser args tail = %#v, want %#v", got[2:], wantTail)
+	}
+	for _, arg := range got {
+		if strings.Contains(arg, " --proxy-server=") {
+			t.Fatalf("browser arg contains a second flag: %#v", got)
 		}
 	}
 }

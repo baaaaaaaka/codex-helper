@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,10 +17,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
 var (
-	codexNativeHTTPClient      = http.DefaultClient
 	codexNativeNodeDistBaseURL = "https://nodejs.org/dist"
 	codexCmdJSRelPattern       = regexp.MustCompile(`(?i)(?:%~?dp0%[\\/]|%~dp0)([^"\r\n]+\.js)`)
 )
@@ -178,9 +180,17 @@ func nativeWindowsInstallManagedNode(ctx context.Context, out io.Writer, cfg nat
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
+	client, err := nativeWindowsHTTPClientForEnv(installerEnv)
+	if err != nil {
+		return "", "", err
+	}
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		defer transport.CloseIdleConnections()
+	}
+
 	versionDirURL := strings.TrimRight(codexNativeNodeDistBaseURL, "/") + fmt.Sprintf("/latest-v%d.x", cfg.targetMajor)
 	shasumsPath := filepath.Join(tmpDir, "SHASUMS256.txt")
-	if err := nativeWindowsDownloadFile(ctx, versionDirURL+"/SHASUMS256.txt", shasumsPath); err != nil {
+	if err := nativeWindowsDownloadFile(ctx, client, versionDirURL+"/SHASUMS256.txt", shasumsPath); err != nil {
 		return "", "", fmt.Errorf("download Node.js checksums: %w", err)
 	}
 	expected, zipName, err := nativeWindowsResolveNodeZip(shasumsPath, cfg.targetMajor, cfg.arch)
@@ -189,7 +199,7 @@ func nativeWindowsInstallManagedNode(ctx context.Context, out io.Writer, cfg nat
 	}
 
 	zipPath := filepath.Join(tmpDir, zipName)
-	if err := nativeWindowsDownloadFile(ctx, versionDirURL+"/"+zipName, zipPath); err != nil {
+	if err := nativeWindowsDownloadFile(ctx, client, versionDirURL+"/"+zipName, zipPath); err != nil {
 		return "", "", fmt.Errorf("download Node.js archive: %w", err)
 	}
 	actual, err := fileSHA256Hex(zipPath)
@@ -301,10 +311,42 @@ func nativeWindowsEnvWithPath(base []string, dirs ...string) []string {
 	return setEnvValue(base, "PATH", strings.Join(parts, string(os.PathListSeparator)))
 }
 
-func nativeWindowsDownloadFile(ctx context.Context, url string, path string) error {
-	client := codexNativeHTTPClient
+func nativeWindowsHTTPClientForEnv(installerEnv []string) (*http.Client, error) {
+	environment := installerEnv
+	if len(environment) == 0 {
+		environment = os.Environ()
+	}
+
+	environmentValue := func(key string) string {
+		if value, ok := explicitEnvironmentValue(environment, key); ok && value != "" {
+			return value
+		}
+		value, _ := explicitEnvironmentValue(environment, strings.ToLower(key))
+		return value
+	}
+	proxyConfig := &httpproxy.Config{
+		HTTPProxy:  environmentValue("HTTP_PROXY"),
+		HTTPSProxy: environmentValue("HTTPS_PROXY"),
+		NoProxy:    environmentValue("NO_PROXY"),
+		CGI:        environmentValue("REQUEST_METHOD") != "",
+	}
+
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || transport == nil {
+		transport = &http.Transport{}
+	} else {
+		transport = transport.Clone()
+	}
+	proxyFunc := proxyConfig.ProxyFunc()
+	transport.Proxy = func(req *http.Request) (*url.URL, error) {
+		return proxyFunc(req.URL)
+	}
+	return &http.Client{Transport: transport}, nil
+}
+
+func nativeWindowsDownloadFile(ctx context.Context, client *http.Client, url string, path string) error {
 	if client == nil {
-		client = http.DefaultClient
+		return fmt.Errorf("native Windows download client is nil")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

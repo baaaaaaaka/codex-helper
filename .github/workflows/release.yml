@@ -313,6 +313,8 @@ jobs:
           set -euo pipefail
           cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
           process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
+          go test ./internal/cli -count=1 -run '^TestNativeWindowsHTTPClient.*$' -v
+          go test ./internal/cli -count=1 -run '^TestCodexAppAuthWindowsProxyBrowserScriptPassesIndependentArgsIntegration$' -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
           go test ./internal/teams -count=1 -run 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure|RunQueuedTurnReportsSharedAuthMigrationBlocker)$' -v
