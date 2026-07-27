@@ -3149,6 +3149,7 @@ func TestBridgeControlCancelLastRunningFallbackCancelsExecutor(t *testing.T) {
 		t.Fatalf("control cancel should not finish or surface context cancellation:\n%s", joined)
 	}
 	close(executor.release)
+	waitForBridgeAsyncTurns(t, bridge)
 }
 
 func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
