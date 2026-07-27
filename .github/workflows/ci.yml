@@ -485,7 +485,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          group_guard_pattern='Test(BridgeGroup(WorkChat|Guard).*|Graph(CreateGroupChatUsesConfiguredMembers|SendHTMLReplyWithQuoteUsesReplyAction))$'
+          group_guard_pattern='Test(Bridge(Group(WorkChat|Guard).*|PreFinalStatusBackfill.*|SingleMemberQueuesStatusBeforeFinal.*|ActiveTurnTranscriptFinalCheckpoint.*)|Graph(CreateGroupChatUsesConfiguredMembers|SendHTMLReplyWithQuoteUsesReplyAction))$'
           bench_pattern='Test(ValidateMembersRequiresExactOwnerAndTestUser|BenchSummaryPredicates|SanitizeMarkerKeepsGraphBenchNonceStable)$'
           go test ./internal/teams -count=1 -run "$group_guard_pattern" -v
           go test ./cmd/teams-graph-bench -count=1 -run "$bench_pattern" -v

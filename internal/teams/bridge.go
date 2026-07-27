@@ -11297,12 +11297,12 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 			result = executionResultWithTranscriptFinal(result, transcriptResult)
 		}
 	}
-	preFinalQueued, err := b.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	transcriptTurn := turn
+	transcriptTurn.CodexThreadID = firstNonEmptyString(result.CodexThreadID, turn.CodexThreadID, session.CodexThreadID)
+	transcriptTurn.CodexTurnID = firstNonEmptyString(result.CodexTurnID, turn.CodexTurnID)
+	preFinal, err := b.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, transcriptTurn)
 	if err != nil {
-		if b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams pre-final transcript status skipped: %v\n", err)
-		}
-		preFinalQueued = 0
+		return err
 	}
 	mentionOwner := true
 	visibleText := StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(result.Text)))
@@ -11316,6 +11316,11 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 	if err != nil {
 		return err
 	}
+	if preFinal.HasFinalCheckpoint() {
+		if err := b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, preFinal.FinalSourcePath, preFinal.FinalCheckpoint.Key, preFinal.FinalCheckpoint.SourceLine, preFinal.FinalCheckpoint.SourceOffset, preFinal.FinalCheckpointID); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams final transcript checkpoint update skipped: %v\n", err)
+		}
+	}
 	session.UpdatedAt = time.Now()
 	b.markRegistryProjectionDirty()
 	if _, err := b.store.MarkTurnCompleted(ctx, turn.ID, firstNonEmptyString(result.CodexThreadID, session.CodexThreadID), result.CodexTurnID); err != nil {
@@ -11328,7 +11333,7 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 			}
 		}
 	}
-	if preFinalQueued > 0 || len(queued) > 0 {
+	if preFinal.Queued > 0 || len(queued) > 0 {
 		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil {
 			if isOutboxDeliveryDeferred(err) || isGraphTransientServerError(err) {
 				if b.out != nil {
@@ -13623,10 +13628,10 @@ func validateFinalOutboxChunk(intended teamstore.OutboxMessage, queued teamstore
 }
 
 func (b *Bridge) queueAndSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions) error {
-	return b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, "sync:"+session.ID, transcriptCheckpointID(session.ID), false, "")
+	return b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, "sync:"+session.ID, transcriptCheckpointID(session.ID), true, false, "")
 }
 
-func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions, turnID string, checkpointID string, queueOnly bool, deliveryNamespace string) error {
+func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions, turnID string, checkpointID string, advanceCheckpoint bool, queueOnly bool, deliveryNamespace string) error {
 	queued, err := b.queueTranscriptDeliveryChunksWithNamespace(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, turnID, deliveryNamespace)
 	if err != nil {
 		return err
@@ -13636,6 +13641,9 @@ func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Cont
 			return err
 		}
 		b.boostPolling(time.Now())
+	}
+	if !advanceCheckpoint {
+		return nil
 	}
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
@@ -16343,6 +16351,17 @@ type transcriptImportCheckpointRecord struct {
 	SourceOffset int64
 }
 
+type activeTurnTranscriptPreparation struct {
+	Queued            int
+	FinalCheckpoint   transcriptImportCheckpointRecord
+	FinalSourcePath   string
+	FinalCheckpointID string
+}
+
+func (p activeTurnTranscriptPreparation) HasFinalCheckpoint() bool {
+	return strings.TrimSpace(p.FinalCheckpoint.Key) != "" && strings.TrimSpace(p.FinalSourcePath) != "" && strings.TrimSpace(p.FinalCheckpointID) != ""
+}
+
 type transcriptImportBatcher struct {
 	bridge        *Bridge
 	session       Session
@@ -16392,7 +16411,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 			ProjectPath: b.session.Cwd,
 			FilePath:    b.filePath,
 		}
-		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, b.queueOnly, b.deliveryNS); err != nil {
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
 			return err
 		}
 		b.queuedBatches++
@@ -16415,7 +16434,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 			ProjectPath: b.session.Cwd,
 			FilePath:    b.filePath,
 		}
-		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, b.queueOnly, b.deliveryNS); err != nil {
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
 			return err
 		}
 		b.queuedBatches++
@@ -17427,6 +17446,14 @@ func transcriptDeliveryCheckpoint(session Session, sourcePath string, lastRecord
 }
 
 func (b *Bridge) recordSkippedTranscriptDelivery(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string) error {
+	return b.recordSkippedTranscriptDeliveryWithCheckpoint(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, transcriptDeliveryCheckpoint(session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset))
+}
+
+func (b *Bridge) recordSkippedTranscriptDeliveryWithoutCheckpoint(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string) error {
+	return b.recordSkippedTranscriptDeliveryWithCheckpoint(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, teamstore.ImportCheckpoint{})
+}
+
+func (b *Bridge) recordSkippedTranscriptDeliveryWithCheckpoint(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, checkpoint teamstore.ImportCheckpoint) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -17434,7 +17461,7 @@ func (b *Bridge) recordSkippedTranscriptDelivery(ctx context.Context, session Se
 	record.SourceOffset = checkpointOffset
 	delivery := transcriptDeliveryRecord(session, local, record, kind, body)
 	delivery.Status = teamstore.TranscriptDeliveryStatusSkipped
-	_, _, err := b.store.RecordTranscriptDelivery(ctx, delivery, transcriptDeliveryCheckpoint(session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset))
+	_, _, err := b.store.RecordTranscriptDelivery(ctx, delivery, checkpoint)
 	return err
 }
 
@@ -17598,133 +17625,184 @@ func linkedTranscriptLocalFromCheckpoint(session Session, checkpoint teamstore.I
 	}, true
 }
 
-func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context, session *Session, turn teamstore.Turn) (int, error) {
+func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context, session *Session, turn teamstore.Turn) (activeTurnTranscriptPreparation, error) {
+	var preparation activeTurnTranscriptPreparation
 	if b == nil || session == nil || b.store == nil || strings.TrimSpace(session.ID) == "" || strings.TrimSpace(session.ChatID) == "" || strings.TrimSpace(turn.ID) == "" {
-		return 0, nil
+		return preparation, nil
 	}
-	if b.suppressIntermediateWorkChatOutbox(session.ChatID) {
-		return 0, nil
-	}
+	suppressIntermediate := b.suppressIntermediateWorkChatOutbox(session.ChatID)
 	if strings.TrimSpace(session.CodexThreadID) == "" {
-		return 0, nil
+		return preparation, nil
 	}
 	checkpointID := transcriptCheckpointID(session.ID)
 	checkpoint, _, err := b.store.ImportCheckpoint(ctx, checkpointID)
 	if err != nil {
-		return 0, err
+		return preparation, err
 	}
 	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
-		return 0, nil
+		return preparation, nil
 	}
 	switch checkpoint.Status {
 	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
-		return 0, nil
+		return preparation, nil
 	}
-	state, err := b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
-	if err != nil {
-		return 0, err
-	}
-	checkpoint = state.ImportCheckpoints[checkpointID]
-	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
-		return 0, nil
-	}
-	switch checkpoint.Status {
-	case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
-		return 0, nil
+	var state teamstore.State
+	if !suppressIntermediate {
+		state, err = b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, checkpointID)
+		if err != nil {
+			return preparation, err
+		}
+		checkpoint = state.ImportCheckpoints[checkpointID]
+		if strings.TrimSpace(checkpoint.LastRecordID) == "" {
+			return preparation, nil
+		}
+		switch checkpoint.Status {
+		case importCheckpointStatusImporting, importCheckpointStatusFailed, importCheckpointStatusBlocked:
+			return preparation, nil
+		}
 	}
 	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
 	if !ok {
-		return 0, nil
+		return preparation, nil
 	}
-	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
+	threadID := firstNonEmptyString(turn.CodexThreadID, local.SessionID, session.CodexThreadID)
+	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), threadID)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, nil
+			return preparation, nil
 		}
-		return 0, err
+		return preparation, err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) == 0 {
-		return 0, nil
+		return preparation, nil
 	}
-	finalCheckpointKey, finalCheckpointLine, finalCheckpointOffset, hasFinalCheckpoint := activeTurnTranscriptFinalCheckpoint(transcript.Records)
-	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
-	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
-	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
+	finalCheckpoint, finalIndex, hasFinalCheckpoint := activeTurnTranscriptFinalCheckpoint(transcript.Records, turn, threadID)
+	teamsOriginHashes := map[string]bool(nil)
+	teamsOriginDisplays := map[string]string(nil)
+	var known *knownTranscriptOutboxDedupeState
+	if !suppressIntermediate {
+		teamsOriginHashes = teamsOriginTextHashes(state, session.ID)
+		teamsOriginDisplays = teamsOriginDisplayTexts(state, session.ID)
+		known = newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
+	}
 	dedupe := newTranscriptDedupeState()
-	queued := 0
-	var pendingInternal transcriptImportCheckpointRecord
-	rememberInternal := func(record TranscriptRecord, line int, offset int64) {
+	pendingCheckpoint := transcriptImportCheckpointRecord{}
+	checkpointAdvanceAllowed := true
+	rememberCheckpoint := func(record TranscriptRecord, line int, offset int64) {
 		key := transcriptRecordCheckpointKey(record)
-		if strings.TrimSpace(key) == "" {
+		if strings.TrimSpace(key) == "" || !checkpointAdvanceAllowed {
 			return
 		}
-		pendingInternal = transcriptImportCheckpointRecord{Key: key, SourceLine: line, SourceOffset: offset}
+		pendingCheckpoint = transcriptImportCheckpointRecord{Key: key, SourceLine: line, SourceOffset: offset}
 	}
-	flushInternal := func() error {
-		if strings.TrimSpace(pendingInternal.Key) == "" {
+	flushCheckpoint := func() error {
+		if strings.TrimSpace(pendingCheckpoint.Key) == "" {
 			return nil
 		}
-		checkpoint := pendingInternal
-		pendingInternal = transcriptImportCheckpointRecord{}
-		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+		pending := pendingCheckpoint
+		pendingCheckpoint = transcriptImportCheckpointRecord{}
+		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, pending.Key, pending.SourceLine, pending.SourceOffset, checkpointID)
+	}
+	markOtherTurn := func() error {
+		if !checkpointAdvanceAllowed {
+			return nil
+		}
+		if err := flushCheckpoint(); err != nil {
+			return err
+		}
+		checkpointAdvanceAllowed = false
+		return nil
 	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
 		record.SourceLine = checkpointLine
 		record.SourceOffset = checkpointOffset
+		if hasFinalCheckpoint && i > finalIndex {
+			break
+		}
+		matchesTurn := activeTurnTranscriptNonFinalRecordMatches(record, turn, threadID)
 		if record.Internal {
-			rememberInternal(record, checkpointLine, checkpointOffset)
+			if matchesTurn || checkpointAdvanceAllowed {
+				rememberCheckpoint(record, checkpointLine, checkpointOffset)
+			}
 			continue
 		}
-		if transcriptRecordIsFinalCheckpoint(record) {
-			if hasFinalCheckpoint {
-				return queued, b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, finalCheckpointKey, finalCheckpointLine, finalCheckpointOffset, checkpointID)
+		if !matchesTurn {
+			if err := markOtherTurn(); err != nil {
+				return preparation, err
 			}
-			return queued, nil
+			continue
 		}
-		if hasFinalCheckpoint && record.Kind == TranscriptKindStatus {
+		if hasFinalCheckpoint && i == finalIndex {
+			if err := flushCheckpoint(); err != nil {
+				return preparation, err
+			}
+			if checkpointAdvanceAllowed {
+				preparation.FinalCheckpoint = finalCheckpoint
+				preparation.FinalSourcePath = local.FilePath
+				preparation.FinalCheckpointID = checkpointID
+			}
+			return preparation, nil
+		}
+		if suppressIntermediate && (record.Kind == TranscriptKindStatus || record.Kind == TranscriptKindCompact) {
+			if checkpointAdvanceAllowed {
+				rememberCheckpoint(record, checkpointLine, checkpointOffset)
+			} else if err := b.recordSkippedTranscriptDeliveryWithoutCheckpoint(ctx, *session, local, record, checkpointLine, checkpointOffset, transcriptRecordOutboxKind("codex", record, i+1), formatTranscriptRecordForTeams(record)); err != nil {
+				return preparation, err
+			}
+			continue
+		}
+		if hasFinalCheckpoint && record.Kind == TranscriptKindStatus && checkpointAdvanceAllowed {
+			rememberCheckpoint(record, checkpointLine, checkpointOffset)
 			continue
 		}
 		body := formatTranscriptRecordForTeams(record)
 		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
 		if strings.TrimSpace(body) == "" || shouldSkipBackgroundTranscriptRecord(record) {
+			rememberCheckpoint(record, checkpointLine, checkpointOffset)
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) || dedupe.shouldSkip(record, body) {
+			rememberCheckpoint(record, checkpointLine, checkpointOffset)
 			continue
 		}
 		kind := transcriptRecordOutboxKind("codex", record, i+1)
 		if known.shouldSkip(record, body) {
-			if record.Kind == TranscriptKindStatus || record.Kind == TranscriptKindCompact {
-				if err := b.recordSkippedTranscriptDelivery(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
-					return queued, err
+			if checkpointAdvanceAllowed {
+				rememberCheckpoint(record, checkpointLine, checkpointOffset)
+			} else if record.Kind == TranscriptKindStatus || record.Kind == TranscriptKindCompact {
+				if err := b.recordSkippedTranscriptDeliveryWithoutCheckpoint(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
+					return preparation, err
 				}
 			}
 			continue
 		}
 		switch record.Kind {
 		case TranscriptKindStatus, TranscriptKindCompact:
-			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, transcriptCheckpointID(session.ID), true, ""); err != nil {
-				return queued, err
+			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, *session, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, "", false, true, ""); err != nil {
+				return preparation, err
 			}
-			queued++
-			if queued >= transcriptSyncMaxRecordsPerSessionPerCycle {
-				if err := flushInternal(); err != nil {
-					return queued, err
+			preparation.Queued++
+			rememberCheckpoint(record, checkpointLine, checkpointOffset)
+			if preparation.Queued >= transcriptSyncMaxRecordsPerSessionPerCycle {
+				if err := flushCheckpoint(); err != nil {
+					return preparation, err
 				}
-				return queued, nil
+				return preparation, nil
 			}
 		}
 	}
-	if err := flushInternal(); err != nil {
-		return queued, err
+	if err := flushCheckpoint(); err != nil {
+		return preparation, err
 	}
-	return queued, nil
+	return preparation, nil
 }
 
-func activeTurnTranscriptFinalCheckpoint(records []TranscriptRecord) (string, int, int64, bool) {
+func activeTurnTranscriptFinalCheckpoint(records []TranscriptRecord, turn teamstore.Turn, expectedThreadID string) (transcriptImportCheckpointRecord, int, bool) {
+	var selected transcriptImportCheckpointRecord
+	selectedIndex := -1
 	for i, record := range records {
-		if !transcriptRecordIsFinalCheckpoint(record) {
+		if !activeTurnTranscriptRecordMatches(record, turn, expectedThreadID) || !transcriptRecordIsFinalCheckpoint(record) {
 			continue
 		}
 		key := transcriptRecordCheckpointKey(record)
@@ -17732,9 +17810,44 @@ func activeTurnTranscriptFinalCheckpoint(records []TranscriptRecord) (string, in
 			continue
 		}
 		line, offset := transcriptCheckpointPositionForRecord(records, i)
-		return key, line, offset, true
+		selected = transcriptImportCheckpointRecord{Key: key, SourceLine: line, SourceOffset: offset}
+		selectedIndex = i
 	}
-	return "", 0, 0, false
+	return selected, selectedIndex, selectedIndex >= 0
+}
+
+func activeTurnTranscriptRecordMatches(record TranscriptRecord, turn teamstore.Turn, expectedThreadID string) bool {
+	if !liveTranscriptRecordMatchesRunningTurn(record, turn, expectedThreadID) {
+		return false
+	}
+	if expectedTurnID := strings.TrimSpace(turn.CodexTurnID); expectedTurnID != "" && strings.TrimSpace(record.TurnID) != expectedTurnID {
+		return false
+	}
+	var threshold time.Time
+	if !turn.StartedAt.IsZero() {
+		threshold = turn.StartedAt.Add(-2 * time.Second)
+	} else if !turn.QueuedAt.IsZero() {
+		threshold = turn.QueuedAt.Add(-2 * time.Second)
+	}
+	if !threshold.IsZero() && (record.CreatedAt.IsZero() || record.CreatedAt.Before(threshold)) {
+		return false
+	}
+	return true
+}
+
+func activeTurnTranscriptNonFinalRecordMatches(record TranscriptRecord, turn teamstore.Turn, expectedThreadID string) bool {
+	if recordThreadID := strings.TrimSpace(record.ThreadID); recordThreadID != "" && strings.TrimSpace(expectedThreadID) != "" && recordThreadID != strings.TrimSpace(expectedThreadID) {
+		return false
+	}
+	if record.Kind == TranscriptKindCompact {
+		return true
+	}
+	if expectedTurnID := strings.TrimSpace(turn.CodexTurnID); expectedTurnID != "" {
+		if recordTurnID := strings.TrimSpace(record.TurnID); recordTurnID != "" && recordTurnID != expectedTurnID {
+			return false
+		}
+	}
+	return true
 }
 
 func transcriptRecordIsFinalCheckpoint(record TranscriptRecord) bool {
@@ -17852,7 +17965,7 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 		switch record.Kind {
 		case TranscriptKindStatus, TranscriptKindCompact:
 			kind := transcriptRecordOutboxKind("codex", record, i+1)
-			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, sessionCopy, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, checkpointID, true, ""); err != nil {
+			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, sessionCopy, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, checkpointID, true, true, ""); err != nil {
 				return queued, err
 			}
 			queued++

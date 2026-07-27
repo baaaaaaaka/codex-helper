@@ -10919,10 +10919,10 @@ func TestBridgePublishImportsExistingTranscriptOnDemand(t *testing.T) {
 	}
 }
 
-func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
+func TestBridgePreFinalStatusBackfillDefersFinalCheckpointUntilAfterQueue(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
-	graph, _ := newBridgeTestGraph(t)
+	graph, sent := newBridgeTestGraph(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := bridge.reg.SessionByID("s001")
 	if session == nil {
@@ -10931,6 +10931,7 @@ func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
 	session.CodexThreadID = "thread-final-checkpoint"
 	session.Cwd = t.TempDir()
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	startedAt := time.Now().UTC().Add(-time.Minute)
 	var lines []string
 	var offset int64
 	appendLine := func(line string) int64 {
@@ -10938,9 +10939,9 @@ func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
 		offset += int64(len(line) + 1)
 		return offset
 	}
-	checkpointOffset := appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-1","thread_id":"thread-final-checkpoint","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`)
-	appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"status-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"commentary","message":"working"}}`)
-	appendLine(`{"type":"event_msg","payload":{"type":"agent_message","id":"final-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"final_answer","message":"done"}}`)
+	checkpointOffset := appendLine(`{"timestamp":"2026-07-27T09:58:00Z","type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-1","thread_id":"thread-final-checkpoint","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`)
+	appendLine(fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"status-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"commentary","message":"working"}}`, strconv.Quote(startedAt.Add(30*time.Second).Format(time.RFC3339Nano))))
+	appendLine(fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"final-1","thread_id":"thread-final-checkpoint","turn_id":"codex-turn-final-checkpoint","phase":"final_answer","message":"done"}}`, strconv.Quote(startedAt.Add(31*time.Second).Format(time.RFC3339Nano))))
 	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}
@@ -10954,7 +10955,7 @@ func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
 		Status:        teamstore.TurnStatusRunning,
 		CodexThreadID: session.CodexThreadID,
 		CodexTurnID:   "codex-turn-final-checkpoint",
-		StartedAt:     time.Now().Add(-time.Minute),
+		StartedAt:     startedAt,
 	}
 	sentAt := time.Now().Add(-30 * time.Second)
 	if err := store.Update(ctx, func(state *teamstore.State) error {
@@ -10998,30 +10999,374 @@ func TestBridgePreFinalStatusBackfillAdvancesCheckpointToFinal(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed store: %v", err)
 	}
-	queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
 	if err != nil {
 		t.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
 	}
-	if queued != 0 {
-		t.Fatalf("queued = %d, want no stale pre-final status deliveries", queued)
+	if preFinal.Queued != 0 {
+		t.Fatalf("queued = %d, want no stale pre-final status deliveries", preFinal.Queued)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "status-1" || checkpoint.LastSourceLine != 2 {
+		t.Fatalf("checkpoint = %#v, want pre-final status record", checkpoint)
+	}
+	if !preFinal.HasFinalCheckpoint() || preFinal.FinalCheckpoint.Key != "final-1" || preFinal.FinalCheckpoint.SourceLine != 3 {
+		t.Fatalf("pre-final result = %#v, want deferred final checkpoint", preFinal)
+	}
+	if _, err := store.MarkTurnInterrupted(ctx, turn.ID, "simulated restart before final queue"); err != nil {
+		t.Fatalf("mark turn interrupted: %v", err)
+	}
+	storePath := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before simulated restart: %v", err)
+	}
+	reopened, err := teamstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("reopen store before simulated restart: %v", err)
+	}
+	bridge.store = reopened
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened store: %v", err)
+		}
+	})
+	bridge.chatAudienceMu.Lock()
+	bridge.chatAudiences = make(map[string]chatAudienceSnapshot)
+	bridge.chatAudienceMu.Unlock()
+	if err := bridge.syncSessionTranscript(ctx, *session, codexhistory.Session{SessionID: session.CodexThreadID, ProjectPath: session.Cwd, FilePath: transcriptPath}); err != nil {
+		t.Fatalf("recover final after simulated restart: %v", err)
+	}
+	if !strings.Contains(sentPlainJoined(*sent), "done") {
+		t.Fatalf("restarted transcript sync did not recover final: %#v", *sent)
+	}
+	if err := bridge.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, preFinal.FinalSourcePath, preFinal.FinalCheckpoint.Key, preFinal.FinalCheckpoint.SourceLine, preFinal.FinalCheckpoint.SourceOffset, preFinal.FinalCheckpointID); err != nil {
+		t.Fatalf("commit final checkpoint after simulated durable queue: %v", err)
+	}
+	state, err = reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state after final checkpoint: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	if checkpoint.LastRecordID != "final-1" || checkpoint.LastSourceLine != 3 {
-		t.Fatalf("checkpoint = %#v, want final record", checkpoint)
+		t.Fatalf("checkpoint after final commit = %#v, want final record", checkpoint)
 	}
 	for _, delivery := range state.TranscriptDeliveries {
-		if delivery.SessionID == session.ID {
-			t.Fatalf("unexpected transcript delivery queued: %#v", delivery)
+		if delivery.SessionID == session.ID && delivery.SourceRecordID == "status-1" {
+			t.Fatalf("restarted sync replayed pre-final status: %#v", delivery)
 		}
 	}
 	for _, outbox := range state.OutboxMessages {
-		if outbox.SessionID == session.ID && strings.HasPrefix(outbox.ID, "outbox:transcript-delivery:") {
-			t.Fatalf("unexpected transcript outbox queued: %#v", outbox)
+		if outbox.SessionID == session.ID && strings.HasPrefix(outbox.ID, "outbox:transcript-delivery:") && strings.Contains(outbox.Body, "working") {
+			t.Fatalf("restarted sync replayed pre-final status: %#v", outbox)
 		}
+	}
+}
+
+func TestBridgePreFinalStatusBackfillPropagatesStoreError(t *testing.T) {
+	ctx := context.Background()
+	parent := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parent, []byte("store parent"), 0o600); err != nil {
+		t.Fatalf("write invalid store parent: %v", err)
+	}
+	store, err := teamstore.Open(filepath.Join(parent, "state.json"))
+	if err != nil {
+		t.Fatalf("Open invalid store path: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close invalid store: %v", err)
+		}
+	})
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-pre-final-error"
+	turn := teamstore.Turn{
+		ID:            "turn-pre-final-error",
+		SessionID:     session.ID,
+		CodexThreadID: session.CodexThreadID,
+		CodexTurnID:   "codex-turn-pre-final-error",
+	}
+	if _, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn); err == nil {
+		t.Fatal("queueActiveTurnTranscriptStatusBeforeFinal error = nil, want store error")
+	}
+}
+
+func TestBridgeGroupWorkChatAdvancesSuppressedTranscriptCheckpointBeforeFinalFlush(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-group-checkpoint"
+	session.Cwd = t.TempDir()
+	bridge.cacheChatAudience(session.ChatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, Members: 2, CheckedAt: time.Now()})
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	var lines []string
+	var offset int64
+	appendLine := func(line string) int64 {
+		lines = append(lines, line)
+		offset += int64(len(line) + 1)
+		return offset
+	}
+	checkpointOffset := appendLine(`{"timestamp":"2026-07-27T09:58:00Z","type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-1","thread_id":"thread-group-checkpoint","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`)
+	appendLine(fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"context_compacted"}}`, strconv.Quote(startedAt.Add(10*time.Second).Format(time.RFC3339Nano))))
+	statusOffset := appendLine(fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"status-1","thread_id":"thread-group-checkpoint","turn_id":"codex-turn-group-checkpoint","phase":"commentary","message":"suppressed status"}}`, strconv.Quote(startedAt.Add(30*time.Second).Format(time.RFC3339Nano))))
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	turn := teamstore.Turn{
+		ID:            "turn-group-checkpoint",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: session.CodexThreadID,
+		CodexTurnID:   "codex-turn-group-checkpoint",
+		StartedAt:     startedAt,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "checkpoint-1",
+			LastSourceLine: 1,
+			LastOffset:     checkpointOffset,
+			SourceSize:     checkpointOffset,
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Now().Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+
+	preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if err != nil {
+		t.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+	}
+	if preFinal.Queued != 0 {
+		t.Fatalf("queued = %d, want suppressed transcript only", preFinal.Queued)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "status-1" || checkpoint.LastSourceLine != 3 || checkpoint.LastOffset != statusOffset {
+		t.Fatalf("checkpoint = %#v, want last suppressed status", checkpoint)
+	}
+	if len(state.TranscriptDeliveries) != 0 {
+		t.Fatalf("suppressed group transcript created per-record deliveries: %#v", state.TranscriptDeliveries)
+	}
+	for _, outbox := range state.OutboxMessages {
+		if outbox.SessionID == session.ID && strings.HasPrefix(outbox.ID, "outbox:transcript-delivery:") {
+			t.Fatalf("suppressed group transcript queued outbox: %#v", outbox)
+		}
+	}
+}
+
+func TestBridgeGroupWorkChatDoesNotAdvanceCheckpointAcrossOtherTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-group-interleaved"
+	session.Cwd = t.TempDir()
+	bridge.cacheChatAudience(session.ChatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, Members: 2, CheckedAt: time.Now()})
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	lines := []string{
+		`{"timestamp":"2026-07-27T09:58:00Z","type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-interleaved","thread_id":"thread-group-interleaved","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`,
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"other-status","thread_id":"thread-group-interleaved","turn_id":"other-turn","phase":"commentary","message":"other turn status"}}`, strconv.Quote(startedAt.Add(10*time.Second).Format(time.RFC3339Nano))),
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"current-status","thread_id":"thread-group-interleaved","turn_id":"codex-turn-interleaved","phase":"commentary","message":"current suppressed status"}}`, strconv.Quote(startedAt.Add(20*time.Second).Format(time.RFC3339Nano))),
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"current-final","thread_id":"thread-group-interleaved","turn_id":"codex-turn-interleaved","phase":"final_answer","message":"current final"}}`, strconv.Quote(startedAt.Add(21*time.Second).Format(time.RFC3339Nano))),
+	}
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	turn := teamstore.Turn{
+		ID:            "turn-group-interleaved",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: session.CodexThreadID,
+		CodexTurnID:   "codex-turn-interleaved",
+		StartedAt:     startedAt,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "checkpoint-interleaved",
+			LastSourceLine: 1,
+			LastOffset:     int64(len(lines[0]) + 1),
+			SourceSize:     int64(len(lines[0]) + 1),
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Now().Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+
+	preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if err != nil {
+		t.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+	}
+	if preFinal.HasFinalCheckpoint() {
+		t.Fatalf("pre-final result crossed interleaved record: %#v", preFinal)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "checkpoint-interleaved" {
+		t.Fatalf("checkpoint = %#v, want unchanged before other turn", checkpoint)
+	}
+	if !transcriptDeliveryWithTextStatusExists(state, session.ID, "current suppressed status", teamstore.TranscriptDeliveryStatusSkipped) {
+		t.Fatalf("missing skipped delivery for interleaved current-turn status: %#v", state.TranscriptDeliveries)
+	}
+}
+
+func TestBridgeSingleMemberQueuesStatusBeforeFinalAcrossOtherTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing test session")
+	}
+	session.CodexThreadID = "thread-single-interleaved"
+	session.Cwd = t.TempDir()
+	bridge.cacheChatAudience(session.ChatID, chatAudienceSnapshot{Mode: chatAudienceSingleMember, Members: 1, CheckedAt: time.Now()})
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+
+	startedAt := time.Now().UTC().Add(-time.Minute)
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"timestamp":"2026-07-27T09:58:00Z","type":"event_msg","payload":{"type":"agent_message","id":"checkpoint-single","thread_id":"thread-single-interleaved","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`,
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"other-status-single","thread_id":"thread-single-interleaved","turn_id":"other-turn","phase":"commentary","message":"other turn status"}}`, strconv.Quote(startedAt.Add(10*time.Second).Format(time.RFC3339Nano))),
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"current-status-single","thread_id":"thread-single-interleaved","turn_id":"codex-turn-single-interleaved","phase":"commentary","message":"current status"}}`, strconv.Quote(startedAt.Add(20*time.Second).Format(time.RFC3339Nano))),
+		fmt.Sprintf(`{"timestamp":%s,"type":"event_msg","payload":{"type":"agent_message","id":"current-final-single","thread_id":"thread-single-interleaved","turn_id":"codex-turn-single-interleaved","phase":"final_answer","message":"current final"}}`, strconv.Quote(startedAt.Add(21*time.Second).Format(time.RFC3339Nano))),
+	}
+	if err := os.WriteFile(transcriptPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	turn := teamstore.Turn{
+		ID:            "turn-single-interleaved",
+		SessionID:     session.ID,
+		Status:        teamstore.TurnStatusRunning,
+		CodexThreadID: session.CodexThreadID,
+		CodexTurnID:   "codex-turn-single-interleaved",
+		StartedAt:     startedAt,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:             transcriptCheckpointID(session.ID),
+			SessionID:      session.ID,
+			SourcePath:     transcriptPath,
+			LastRecordID:   "checkpoint-single",
+			LastSourceLine: 1,
+			LastOffset:     int64(len(lines[0]) + 1),
+			SourceSize:     int64(len(lines[0]) + 1),
+			SourceModTime:  info.ModTime(),
+			Status:         importCheckpointStatusComplete,
+			UpdatedAt:      time.Now().Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+
+	preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if err != nil {
+		t.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+	}
+	if preFinal.HasFinalCheckpoint() {
+		t.Fatalf("pre-final result crossed interleaved record: %#v", preFinal)
+	}
+	if preFinal.Queued != 1 {
+		t.Fatalf("queued = %d, want current status queued before final", preFinal.Queued)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "checkpoint-single" {
+		t.Fatalf("checkpoint = %#v, want unchanged before other turn", checkpoint)
+	}
+	if !transcriptDeliveryWithTextStatusExists(state, session.ID, "current status", teamstore.TranscriptDeliveryStatusQueued) {
+		t.Fatalf("missing queued delivery for interleaved current-turn status: %#v", state.TranscriptDeliveries)
+	}
+}
+
+func TestBridgeActiveTurnTranscriptFinalCheckpointSelectsLastMatchingTurn(t *testing.T) {
+	started := time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC)
+	turn := teamstore.Turn{
+		ID:            "turn-final-selection",
+		CodexThreadID: "thread-final-selection",
+		CodexTurnID:   "codex-turn-final-selection",
+		StartedAt:     started,
+	}
+	records := []TranscriptRecord{
+		{ItemID: "old-final", ThreadID: turn.CodexThreadID, TurnID: "old-turn", Kind: TranscriptKindAssistant, CreatedAt: started.Add(-time.Minute)},
+		{ItemID: "stale-same-turn", ThreadID: turn.CodexThreadID, TurnID: turn.CodexTurnID, Kind: TranscriptKindAssistant, CreatedAt: started.Add(-time.Minute)},
+		{ItemID: "first-final", ThreadID: turn.CodexThreadID, TurnID: turn.CodexTurnID, Kind: TranscriptKindAssistant, CreatedAt: started.Add(time.Second)},
+		{ItemID: "other-final", ThreadID: turn.CodexThreadID, TurnID: "other-turn", Kind: TranscriptKindAssistant, CreatedAt: started.Add(2 * time.Second)},
+		{ItemID: "last-final", ThreadID: turn.CodexThreadID, TurnID: turn.CodexTurnID, Kind: TranscriptKindAssistant, CreatedAt: started.Add(3 * time.Second)},
+	}
+	checkpoint, index, ok := activeTurnTranscriptFinalCheckpoint(records, turn, turn.CodexThreadID)
+	if !ok || index != 4 || checkpoint.Key != "last-final" {
+		t.Fatalf("checkpoint=%#v index=%d ok=%v, want last matching final", checkpoint, index, ok)
+	}
+	staleOnly := []TranscriptRecord{records[1]}
+	if checkpoint, index, ok := activeTurnTranscriptFinalCheckpoint(staleOnly, turn, turn.CodexThreadID); ok {
+		t.Fatalf("stale matching final = %#v index=%d ok=%v, want no candidate", checkpoint, index, ok)
 	}
 }
 
@@ -27464,6 +27809,95 @@ func TestBridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer(t *testing.T)
 	}
 	if len(*sent) != sentCount {
 		t.Fatalf("post-final transcript sync sent duplicate compact/final messages: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
+	}
+}
+
+func TestBridgeGroupWorkChatDoesNotBackfillSuppressedTranscriptAfterFinal(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-group-transcript"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-group-transcript", transcriptPath)
+	defer restoreDiscover()
+	transcriptBase := time.Now().UTC().Add(2 * time.Second)
+	msg := bridgePollMessage("message-group-transcript", transcriptBase.Format(time.RFC3339Nano), "@codex fix group transcript ordering")
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	statusText := "suppressed group commentary"
+	finalText := "GROUP FINAL"
+	executor := &transcriptWritingStreamingExecutor{
+		write: func() error {
+			updated := initial +
+				`{"timestamp":` + strconv.Quote(transcriptBase.Add(1*time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"context_compacted"}}` + "\n" +
+				`{"timestamp":` + strconv.Quote(transcriptBase.Add(2*time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"status-group","message":` + strconv.Quote(statusText) + `,"phase":"commentary","turn_id":"turn-group-transcript"}}` + "\n" +
+				`{"timestamp":` + strconv.Quote(transcriptBase.Add(3*time.Second).Format(time.RFC3339Nano)) + `,"type":"event_msg","payload":{"type":"agent_message","id":"final-group","message":` + strconv.Quote(finalText) + `,"phase":"final_answer","turn_id":"turn-group-transcript"}}` + "\n"
+			return os.WriteFile(transcriptPath, []byte(updated), 0o600)
+		},
+		result: ExecutionResult{Text: finalText, CodexThreadID: "thread-group-transcript", CodexTurnID: "turn-group-transcript"},
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-group-transcript")
+	*sent = nil
+
+	if _, err := bridge.pollChat(context.Background(), session.ChatID, 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, session.ChatID, msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if len(*sent) != 2 || !strings.Contains(joined, "Request accepted") || !strings.Contains(joined, "🤖 ✅ Codex answer:\n"+finalText) {
+		t.Fatalf("group turn sent %#v, want ack and final only:\n%s", *sent, joined)
+	}
+	for _, leaked := range []string{transcriptContextCompactMessage, statusText} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("group turn leaked suppressed transcript %q before sync:\n%s", leaked, joined)
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load completed group state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "final-group" {
+		t.Fatalf("completed group checkpoint = %#v, want final-group after durable final queue", checkpoint)
+	}
+
+	// A helper restart loses both the in-memory audience cache and the open
+	// SQLite handle. Durable transcript progress must still prevent the next
+	// ordinary sync from posting status records after the final answer.
+	storePath := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store before restart simulation: %v", err)
+	}
+	reopened, err := teamstore.Open(storePath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Fatalf("close reopened store: %v", err)
+		}
+	})
+	bridge.store = reopened
+	bridge.chatAudienceMu.Lock()
+	bridge.chatAudiences = make(map[string]chatAudienceSnapshot)
+	bridge.chatAudienceMu.Unlock()
+	sentCount := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("post-final transcript sync error: %v", err)
+	}
+	if len(*sent) != sentCount {
+		t.Fatalf("post-final transcript sync backfilled suppressed group status: before=%d after=%d sent=%#v", sentCount, len(*sent), *sent)
 	}
 }
 

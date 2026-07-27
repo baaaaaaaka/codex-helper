@@ -2661,9 +2661,11 @@ func BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival(b *testing.B) {
 	cases := []struct {
 		name              string
 		observedCodexTurn bool
+		group             bool
 	}{
 		{name: "observed-turn-id", observedCodexTurn: true},
 		{name: "missing-turn-id", observedCodexTurn: false},
+		{name: "multi-member-observed-turn-id", observedCodexTurn: true, group: true},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
@@ -2677,6 +2679,9 @@ func BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				_, bridge, session, turn, result := newCXPPerfLongTranscriptFinalArrivalFixture(b, i)
+				if tc.group {
+					bridge.cacheChatAudience(session.ChatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, Members: 2, CheckedAt: time.Now()})
+				}
 				if !tc.observedCodexTurn {
 					result.CodexTurnID = ""
 				}
@@ -2703,11 +2708,11 @@ func BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival(b *testing.B) {
 					return nil
 				})
 				runStage("pre_final_status", func() error {
-					queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+					preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
 					if err != nil {
 						return err
 					}
-					preFinalQueued = queued
+					preFinalQueued = preFinal.Queued
 					return nil
 				})
 				totalQueued += preFinalQueued
@@ -2753,42 +2758,55 @@ func BenchmarkCXPPerfModelSQLiteLongTranscriptFinalArrival(b *testing.B) {
 }
 
 func BenchmarkCXPPerfModelSQLiteStatusOnlyFinalArrival(b *testing.B) {
-	ctx := context.Background()
-	var total cxpPerfProcIO
-	var duration time.Duration
-	var totalQueued int
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		store, bridge, session, turn := newCXPPerfStatusOnlyFinalArrivalFixture(b, i)
-		b.StartTimer()
-		start := time.Now()
-		delta, err := cxpPerfMeasureProcIO(func() error {
-			queued, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
-			totalQueued += queued
-			return err
+	for _, tc := range []struct {
+		name  string
+		group bool
+	}{
+		{name: "single-member"},
+		{name: "multi-member", group: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			ctx := context.Background()
+			var total cxpPerfProcIO
+			var duration time.Duration
+			var totalQueued int
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				store, bridge, session, turn := newCXPPerfStatusOnlyFinalArrivalFixture(b, i)
+				if tc.group {
+					bridge.cacheChatAudience(session.ChatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember, Members: 2, CheckedAt: time.Now()})
+				}
+				b.StartTimer()
+				start := time.Now()
+				delta, err := cxpPerfMeasureProcIO(func() error {
+					preFinal, err := bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+					totalQueued += preFinal.Queued
+					return err
+				})
+				elapsed := time.Since(start)
+				b.StopTimer()
+				total.add(delta)
+				duration += elapsed
+				if err != nil {
+					b.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
+				}
+				state, err := store.Load(ctx)
+				if err != nil {
+					b.Fatalf("Load state: %v", err)
+				}
+				checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+				if checkpoint.LastRecordID != "perf-status-only-status-0007" {
+					b.Fatalf("checkpoint = %#v, want last pre-final status", checkpoint)
+				}
+			}
+			cxpPerfReportNamedProcIO(b, "pre_final_status", total, b.N)
+			if b.N > 0 {
+				b.ReportMetric(float64(duration)/float64(b.N), "pre_final_status_ns/op")
+				b.ReportMetric(float64(totalQueued)/float64(b.N), "pre_final_status_queued/op")
+			}
 		})
-		elapsed := time.Since(start)
-		b.StopTimer()
-		total.add(delta)
-		duration += elapsed
-		if err != nil {
-			b.Fatalf("queueActiveTurnTranscriptStatusBeforeFinal: %v", err)
-		}
-		state, err := store.Load(ctx)
-		if err != nil {
-			b.Fatalf("Load state: %v", err)
-		}
-		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-		if checkpoint.LastRecordID != "perf-status-only-final" {
-			b.Fatalf("checkpoint = %#v, want final", checkpoint)
-		}
-	}
-	cxpPerfReportNamedProcIO(b, "pre_final_status", total, b.N)
-	if b.N > 0 {
-		b.ReportMetric(float64(duration)/float64(b.N), "pre_final_status_ns/op")
-		b.ReportMetric(float64(totalQueued)/float64(b.N), "pre_final_status_queued/op")
 	}
 }
 
