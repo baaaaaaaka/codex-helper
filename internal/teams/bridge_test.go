@@ -15989,6 +15989,101 @@ func TestBridgeGroupWorkChatIgnoresUnmentionedConversation(t *testing.T) {
 	}
 }
 
+func TestBridgeGroupWorkChatAcceptsAudioCardWithoutCodexMention(t *testing.T) {
+	messageID := "group-audio-without-codex"
+	msg := bridgePollMessage(messageID, "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = ""
+	msg.Attachments = []MessageAttachment{{
+		ID:          "audio-card-1",
+		ContentType: "application/vnd.microsoft.card.audio",
+		Content:     fmt.Sprintf(`{"media":[{"url":"https://graph.microsoft.com/v1.0/chats/chat-1/messages/%s/hostedContents/audio-1/$value"}]}`, messageID),
+	}}
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+		HostedMedia: []bridgeHostedMedia{{ID: "audio-1", ContentType: "audio/mp4", Bytes: []byte("audio-bytes")}},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "group audio answer",
+		CodexThreadID: "thread-1",
+		CodexTurnID:   "turn-1",
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+	asr := &fakeASRTranscriber{}
+	bridge.asrTranscriber = asr
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(asr.calls) != 1 {
+		t.Fatalf("ASR calls = %d, want one audio transcription", len(asr.calls))
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "Automatic local ASR transcript") || !strings.Contains(executor.prompts[0], "transcript for") {
+		t.Fatalf("executor prompts = %#v, want the audio transcript", executor.prompts)
+	}
+	if len(*sent) != 2 || !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "group audio answer") {
+		t.Fatalf("sent = %#v, want ack and final audio response", *sent)
+	}
+	lookup, err := store.MessageLookup(context.Background(), "chat-1", messageID)
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasInbound {
+		t.Fatalf("audio message lookup = %#v, want persisted inbound message", lookup)
+	}
+	if lookup.HasProvenance && lookup.Provenance.Kind == "ignored_group_chat" {
+		t.Fatalf("audio message was incorrectly ignored: %#v", lookup)
+	}
+}
+
+func TestBridgeGroupWorkChatStillRequiresCodexMentionForNonMediaAttachments(t *testing.T) {
+	msg := bridgePollMessage("group-file-without-codex", "2026-04-30T01:05:00Z", "")
+	msg.Body.Content = ""
+	msg.Attachments = []MessageAttachment{{
+		ID:          "image-1",
+		ContentType: "image/png",
+	}}
+	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
+		Messages: []ChatMessage{msg},
+		Members: []ChatMember{
+			{ID: "member-1", UserID: "user-1", DisplayName: "Owner"},
+			{ID: "member-2", UserID: "user-2", DisplayName: "Alex"},
+		},
+	})
+	store := newBridgeTestStore(t)
+	seedBridgeGroupGuardPollState(t, store)
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.groupChatGuardEnabled = true
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleSessionMessage(ctx, "chat-1", msg, text)
+	}); err != nil {
+		t.Fatalf("pollChat error: %v", err)
+	}
+	if len(executor.prompts) != 0 {
+		t.Fatalf("executor prompts = %#v, want non-media attachment ignored", executor.prompts)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("sent = %#v, want no visible response", *sent)
+	}
+	lookup, err := store.MessageLookup(context.Background(), "chat-1", "group-file-without-codex")
+	if err != nil {
+		t.Fatalf("MessageLookup error: %v", err)
+	}
+	if !lookup.HasProvenance || lookup.Provenance.Kind != "ignored_group_chat" {
+		t.Fatalf("non-media attachment provenance = %#v, want ignored_group_chat", lookup)
+	}
+}
+
 func TestBridgeGroupWorkChatAcceptsCodexMentionAnywhereWithQuotedAck(t *testing.T) {
 	msg := bridgePollMessage("group-codex-1", "2026-04-30T01:05:00Z", "please @codex debug this failure")
 	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
@@ -34682,6 +34777,7 @@ func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 type bridgeGroupGuardGraphOptions struct {
 	Messages      []ChatMessage
 	Members       []ChatMember
+	HostedMedia   []bridgeHostedMedia
 	MembersStatus int
 	ReplyStatus   int
 }
@@ -34691,6 +34787,14 @@ func newBridgeGroupGuardGraph(t *testing.T, opts bridgeGroupGuardGraphOptions) (
 	var sent []bridgeSentMessage
 	var sentMu sync.Mutex
 	polled := false
+	hostedByPath := make(map[string]bridgeHostedMedia, len(opts.HostedMedia))
+	for _, message := range opts.Messages {
+		for _, media := range opts.HostedMedia {
+			path := fmt.Sprintf("/chats/chat-1/messages/%s/hostedContents/%s/$value", message.ID, media.ID)
+			hostedByPath[path] = media
+		}
+	}
+	gotHosted := make(map[string]bool, len(hostedByPath))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -34702,6 +34806,14 @@ func newBridgeGroupGuardGraph(t *testing.T, opts bridgeGroupGuardGraphOptions) (
 			if err := json.NewEncoder(w).Encode(map[string]any{"value": opts.Messages}); err != nil {
 				t.Fatalf("encode poll response: %v", err)
 			}
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/hostedContents/"):
+			media, ok := hostedByPath[r.URL.Path]
+			if !ok {
+				t.Fatalf("unexpected Graph media request: %s %s", r.Method, r.URL.String())
+			}
+			gotHosted[r.URL.Path] = true
+			w.Header().Set("Content-Type", media.ContentType)
+			_, _ = w.Write(media.Bytes)
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/members":
 			if opts.MembersStatus != 0 && opts.MembersStatus != http.StatusOK {
 				w.WriteHeader(opts.MembersStatus)
@@ -34766,6 +34878,11 @@ func newBridgeGroupGuardGraph(t *testing.T, opts bridgeGroupGuardGraphOptions) (
 		server.Close()
 		if !polled {
 			t.Fatal("Graph poll was not exercised")
+		}
+		for path := range hostedByPath {
+			if !gotHosted[path] {
+				t.Fatalf("hosted media %s was not downloaded", path)
+			}
 		}
 	})
 	return &GraphClient{

@@ -3454,6 +3454,9 @@ func (b *Bridge) prepareWorkChatMessageForAudience(ctx context.Context, chatID s
 			return msg, text, false, nil
 		}
 	}
+	if hasSupportedTeamsMediaCardAttachment(msg.Attachments) {
+		return msg, text, false, nil
+	}
 	if err := b.recordIgnoredGroupChatMessage(ctx, chatID, msg, "multi_member_without_codex_mention"); err != nil {
 		return msg, text, false, err
 	}
