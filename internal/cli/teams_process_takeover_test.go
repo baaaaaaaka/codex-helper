@@ -144,6 +144,15 @@ func TestTeamsServiceRetireLocalDuplicateProcessesDoesNotCrossStateRoots(t *test
 	tmp := t.TempDir()
 	smokeState := filepath.Join(tmp, "smoke-state")
 	productionState := filepath.Join(tmp, "production-state")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+	})
 	spec := teamsServiceSpec{
 		Executable: filepath.Join(tmp, "codex-proxy"),
 		Environment: map[string]string{
