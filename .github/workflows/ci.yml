@@ -1577,13 +1577,54 @@ jobs:
           $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-network-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
           go test ./internal/cli -run 'TestCodexDesktopWindows(AppXEntrySelectionIntegration|ManifestExecutableCandidateIntegration|Script)' -count=1 -v
+          $oldBackend = $env:CXP_WINDOWS_APP_BACKEND
+          $env:CXP_WINDOWS_APP_BACKEND = "legacy"
+          try {
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+              try {
+                .\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper
+                break
+              } catch {
+                if ($attempt -eq 2) { throw }
+                Write-Warning "Codex desktop app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
+                Start-Sleep -Seconds 10
+              }
+            }
+          } finally {
+            if ($null -eq $oldBackend) { Remove-Item Env:CXP_WINDOWS_APP_BACKEND -ErrorAction SilentlyContinue } else { $env:CXP_WINDOWS_APP_BACKEND = $oldBackend }
+          }
+
+      - name: Codex desktop app managed runtime smoke (Windows)
+        if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          # This job is deliberately credential-free.  The proxy and the
+          # desktop child are local fixtures; no GitHub, SSH, ChatGPT, or
+          # third-party model credential may be needed to reach the code path.
+          foreach ($name in @(
+            'GITHUB_TOKEN', 'GH_TOKEN', 'OPENAI_API_KEY', 'MIMO_API_KEY', 'ANTHROPIC_API_KEY',
+            'CODEX_LIVE_AUTH_JSON', 'CHATGPT_AUTH_TOKEN', 'CODEX_AUTH_TOKEN',
+            'CODEX_HELPER_TEAMS_TOKEN_CACHE', 'CODEX_HELPER_TEAMS_READ_TOKEN_CACHE',
+            'CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE', 'CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE'
+          )) {
+            Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
+          }
+          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-smoke.exe"
+          go build -o $helper .\cmd\codex-proxy
+          $listed = @(go test ./internal/cli -list '^TestWindowsManagedApp' | Select-String '^TestWindowsManagedApp')
+          if ($listed.Count -lt 1) {
+            throw "Windows managed app test selector matched no tests; refusing a silent fake pass"
+          }
+          go test ./internal/cli -run '^TestWindowsManagedApp' -count=1 -v
           for ($attempt = 1; $attempt -le 2; $attempt++) {
             try {
-              .\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper
+              .\scripts\ci\codex_app_managed_install_smoke.ps1 -Helper $helper
               break
             } catch {
               if ($attempt -eq 2) { throw }
-              Write-Warning "Codex desktop app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
+              Write-Warning "Managed ChatGPT app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
               Start-Sleep -Seconds 10
             }
           }

@@ -795,7 +795,12 @@ codex-proxy app
 ```
 
 On macOS and Windows this installs the desktop app if needed, uses the saved
-direct/proxy preference, asks on first setup, and launches the desktop app. WSL
+direct/proxy preference, asks on first setup, and launches the desktop app. On
+Windows, proxy/model-profile launches use a cxp-managed unpacked copy of the
+official signed x64 ChatGPT MSIX under `%LOCALAPPDATA%\cxp\apps\chatgpt`,
+so `CODEX_HOME`, proxy environment variables, and Chromium's
+`--proxy-server` argument reach the process without changing the system proxy.
+Ordinary direct Windows launches keep the existing Store/AppX path. WSL
 launches the Windows desktop app. Linux outside WSL has no official Codex
 desktop app, so the command exits with an unsupported-platform message there.
 OpenAI now exposes Codex from the unified ChatGPT desktop app. Current macOS
@@ -803,14 +808,20 @@ packages use `ChatGPT.app` with a `ChatGPT` executable, while older packages use
 `Codex.app` with a `Codex` executable; `codex-proxy app` supports both and
 prefers the current ChatGPT entry when both are installed. Windows keeps the
 Codex Store product/package identity for update compatibility, while direct
-launch accepts either `ChatGPT.exe` or the legacy `Codex.exe`. On macOS the
+launch accepts either `ChatGPT.exe` or the legacy `Codex.exe`. The ordinary
+Windows Store path keeps the Codex product/package identity for update
+compatibility. The managed
+Windows copy is deliberately not registered as an AppX package and does not
+take over ChatGPT's updater; a later `cxp app` run reuses the verified cache.
+On macOS the
 launcher also requires bundle identifier `com.openai.codex`, so a separately
 installed classic `ChatGPT.app` is never mistaken for Codex or overwritten; a
 name conflict is installed safely as `Codex.app` instead.
-Use `codex-proxy app <profile>` to force a proxy profile. If proxy mode is
-enabled, the command passes proxy environment variables to the desktop app and
-prints a warning for WSL/AppX cases where the desktop app may not inherit or
-reach that environment directly.
+Use `codex-proxy app <profile>` to force a proxy profile. If the managed
+Windows runtime cannot be downloaded, verified, or started before creating a
+process, `cxp` makes one legacy direct-launch attempt; it never falls back to
+AppX activation when launch-time environment would be lost. Set
+`CXP_WINDOWS_APP_BACKEND=managed-only` or `legacy` only for diagnostics and CI.
 
 Use `codex-proxy app --model-profile <name>` when the desktop app should launch
 with a saved model profile. If the desktop app is already running, quit it first

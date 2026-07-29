@@ -245,6 +245,9 @@ func TestRunCodexAppDirectLaunchesDesktopApp(t *testing.T) {
 	if got.AppPath != "/Applications/Codex.app" {
 		t.Fatalf("app path = %q", got.AppPath)
 	}
+	if got.RequiresDirectLaunch {
+		t.Fatalf("explicit --app-path should keep the direct path and not select the managed backend")
+	}
 	if got := envValue(got.ExtraEnv, envCodexHome); got != filepath.Join(cwd, "codex-home") {
 		t.Fatalf("CODEX_HOME = %q", got)
 	}
@@ -349,6 +352,9 @@ func TestRunCodexAppModelProfileLaunchUsesIsolatedCodexHome(t *testing.T) {
 	}
 	if got.ModelProfileName != "mimo25" {
 		t.Fatalf("desktop model profile name = %q, want mimo25", got.ModelProfileName)
+	}
+	if !got.RequiresDirectLaunch {
+		t.Fatalf("model profile launch should require direct process inheritance")
 	}
 	modelHome := envValue(got.ExtraEnv, envCodexHome)
 	if modelHome == "" || modelHome == filepath.Join(cwd, "codex-home") {
@@ -782,6 +788,9 @@ func TestRunCodexAppProxyLaunchUsesLongLivedProxy(t *testing.T) {
 	}
 	if got.ProxyURL != "http://127.0.0.1:23123" {
 		t.Fatalf("proxy URL = %q", got.ProxyURL)
+	}
+	if !got.RequiresDirectLaunch {
+		t.Fatalf("proxy launch should require direct process inheritance")
 	}
 }
 
