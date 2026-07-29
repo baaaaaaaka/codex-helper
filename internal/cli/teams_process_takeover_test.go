@@ -32,16 +32,17 @@ func TestTeamsServiceRetireLocalDuplicateProcessesFiltersAndTerminates(t *testin
 		wslDistro:      "Debian",
 		wslLinuxUser:   "alice",
 	})
+	registryPath := filepath.Join(tmp, "registry.json")
 	spec := teamsServiceSpec{
 		Executable:   filepath.Join(tmp, "codex-proxy"),
-		RegistryPath: filepath.Join(tmp, "registry.json"),
+		RegistryPath: registryPath,
 		Environment:  map[string]string{},
 	}
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 1001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
-			{PID: 1002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
-			{PID: 1007, Args: []string{"/home/alice/.local/bin/cxp", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
+			{PID: 1001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
+			{PID: 1002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath}, Env: map[string]string{}},
+			{PID: 1007, Args: []string{"/home/alice/.local/bin/cxp", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
 			{PID: os.Getpid(), Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
 			{PID: 1003, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
 			{PID: 1004, Args: []string{"/home/alice/go/bin/codex-proxy", "proxy", "daemon"}, Env: map[string]string{}},
@@ -76,6 +77,7 @@ func TestTeamsServiceRetireLocalDuplicateProcessesDefaultRegistryTakesLegacyExpl
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "linux",
 		exe:            filepath.Join(tmp, "codex-proxy"),
@@ -85,10 +87,20 @@ func TestTeamsServiceRetireLocalDuplicateProcessesDefaultRegistryTakesLegacyExpl
 		wslDistro:      "Debian",
 		wslLinuxUser:   "alice",
 	})
-	spec := teamsServiceSpec{Executable: filepath.Join(tmp, "codex-proxy"), Environment: map[string]string{}}
+	spec := teamsServiceSpec{
+		Executable: filepath.Join(tmp, "codex-proxy"),
+		Environment: map[string]string{
+			"HOME": home,
+		},
+	}
+	legacyRegistry := filepath.Join(home, ".cache", "codex-helper", "teams-registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 2001, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--registry", filepath.Join(tmp, "legacy-registry.json")}, Env: map[string]string{}},
+			{
+				PID:  2001,
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--registry", legacyRegistry},
+				Env:  map[string]string{"HOME": home},
+			},
 		}, nil
 	}
 	var terminated []int
@@ -103,6 +115,133 @@ func TestTeamsServiceRetireLocalDuplicateProcessesDefaultRegistryTakesLegacyExpl
 	}
 	if result.Matched != 1 || result.Retired != 1 || !reflect.DeepEqual(terminated, []int{2001}) {
 		t.Fatalf("result=%#v terminated=%#v, want legacy explicit registry retired", result, terminated)
+	}
+}
+
+func TestTeamsServiceRetireLocalDuplicateProcessesDoesNotTreatMissingRegistryAsWildcard(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	home := filepath.Join(tmp, "home")
+	spec := teamsServiceSpec{
+		Executable:   filepath.Join(tmp, "codex-proxy"),
+		RegistryPath: filepath.Join(tmp, "isolated-registry.json"),
+		Environment:  map[string]string{"HOME": home},
+	}
+	proc := teamsServiceLocalProcess{
+		PID:  2051,
+		Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+		Env:  map[string]string{"HOME": home},
+	}
+	if teamsServiceShouldRetireLocalProcess(proc, spec, map[string]bool{"run": true}) {
+		t.Fatal("missing --registry must not wildcard-match an unrelated explicit registry")
+	}
+}
+
+func TestTeamsServiceRetireLocalDuplicateProcessesDoesNotCrossStateRoots(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	smokeState := filepath.Join(tmp, "smoke-state")
+	productionState := filepath.Join(tmp, "production-state")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		exe:            filepath.Join(tmp, "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		isWSL:          true,
+		wslDistro:      "Debian",
+		wslLinuxUser:   "alice",
+	})
+	spec := teamsServiceSpec{
+		Executable: filepath.Join(tmp, "codex-proxy"),
+		Environment: map[string]string{
+			"XDG_STATE_HOME": smokeState,
+		},
+	}
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return []teamsServiceLocalProcess{
+			{
+				PID:  2101,
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+				Env: map[string]string{
+					"HOME": filepath.Join(tmp, "production-home"),
+				},
+			},
+			{
+				PID:  2102,
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+				Env: map[string]string{
+					"XDG_STATE_HOME": productionState,
+				},
+			},
+			{
+				PID:  2103,
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+				Env: map[string]string{
+					"XDG_STATE_HOME": smokeState,
+				},
+			},
+		}, nil
+	}
+	var terminated []int
+	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
+		terminated = append(terminated, pid)
+		return nil
+	}
+
+	result, err := teamsServiceRetireLocalDuplicateProcesses(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("retire local duplicate processes: %v", err)
+	}
+	if result.Matched != 1 || result.Retired != 1 || !reflect.DeepEqual(terminated, []int{2103}) {
+		t.Fatalf("result=%#v terminated=%#v, want only same-state-root process retired", result, terminated)
+	}
+}
+
+func TestTeamsServiceRetireLocalDuplicateProcessesStateDirOverrideWins(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	spec := teamsServiceSpec{
+		Executable: filepath.Join(tmp, "codex-proxy"),
+		Environment: map[string]string{
+			"CODEX_HELPER_STATE_DIR": filepath.Join(tmp, "shared-state"),
+			"XDG_STATE_HOME":         filepath.Join(tmp, "spec-xdg"),
+		},
+	}
+	proc := teamsServiceLocalProcess{
+		PID:  2201,
+		Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+		Env: map[string]string{
+			"CODEX_HELPER_STATE_DIR": filepath.Join(tmp, "shared-state"),
+			"XDG_STATE_HOME":         filepath.Join(tmp, "proc-xdg"),
+		},
+	}
+	if !teamsServiceShouldRetireLocalProcess(proc, spec, map[string]bool{"run": true}) {
+		t.Fatal("same CODEX_HELPER_STATE_DIR should match even when XDG_STATE_HOME differs")
+	}
+}
+
+func TestTeamsServiceRetireLocalDuplicateProcessesRejectsUnresolvedRelativeStateRoot(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	spec := teamsServiceSpec{
+		Executable: filepath.Join(tmp, "codex-proxy"),
+		Environment: map[string]string{
+			"XDG_STATE_HOME": "relative-state",
+		},
+	}
+	proc := teamsServiceLocalProcess{
+		PID:  2301,
+		Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"},
+		Env: map[string]string{
+			"XDG_STATE_HOME": "relative-state",
+		},
+	}
+	if teamsServiceShouldRetireLocalProcess(proc, spec, map[string]bool{"run": true}) {
+		t.Fatal("relative state roots must fail closed because process working directories may differ")
 	}
 }
 
@@ -141,8 +280,8 @@ func TestTeamsServiceRetireLocalBridgeProcessesFiltersRegistryProfileAndWatchdog
 	if err != nil {
 		t.Fatalf("retire bridge processes: %v", err)
 	}
-	if result.Matched != 2 || result.Retired != 2 || !reflect.DeepEqual(terminated, []int{2501, 2502}) {
-		t.Fatalf("result=%#v terminated=%#v, want explicit and legacy bridge only", result, terminated)
+	if result.Matched != 1 || result.Retired != 1 || !reflect.DeepEqual(terminated, []int{2501}) {
+		t.Fatalf("result=%#v terminated=%#v, want only the explicitly matching bridge", result, terminated)
 	}
 }
 
@@ -197,9 +336,10 @@ func TestTeamsServiceBootstrapRetiresLocalDuplicateProcessesBeforeRepair(t *test
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 4001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
+			{PID: 4001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -207,7 +347,7 @@ func TestTeamsServiceBootstrapRetiresLocalDuplicateProcessesBeforeRepair(t *test
 		return nil
 	}
 
-	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(filepath.Join(tmp, "registry.json")))
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(registryPath))
 	cmd.SetArgs([]string{"bootstrap", "--yes"})
 	cmd.SetIn(strings.NewReader(""))
 	var out bytes.Buffer
@@ -238,16 +378,17 @@ func TestTeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired(t *testin
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 4501, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
+			{PID: 4501, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
 		return errors.New("still alive")
 	}
 
-	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(filepath.Join(tmp, "registry.json")))
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(registryPath))
 	cmd.SetArgs([]string{"bootstrap", "--yes"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -276,10 +417,11 @@ func TestTeamsServiceUpgradeRetiresLocalDuplicateProcessesBeforeRestart(t *testi
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 5001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
-			{PID: 5002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
+			{PID: 5001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
+			{PID: 5002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath}, Env: map[string]string{}},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -287,7 +429,7 @@ func TestTeamsServiceUpgradeRetiresLocalDuplicateProcessesBeforeRestart(t *testi
 		return nil
 	}
 
-	finalizer, err := stopTeamsServiceForHelperUpgrade(context.Background(), strings.NewReader(""), &bytes.Buffer{}, nil, stringPtr(filepath.Join(tmp, "registry.json")))
+	finalizer, err := stopTeamsServiceForHelperUpgrade(context.Background(), strings.NewReader(""), &bytes.Buffer{}, nil, stringPtr(registryPath))
 	if err != nil {
 		t.Fatalf("stop service for upgrade: %v", err)
 	}
@@ -318,20 +460,21 @@ func TestTeamsServiceUpgradeRetiresLargeRunAndWatchdogPileBeforeRestart(t *testi
 		wslLinuxUser:   "alice",
 		runner:         runner,
 	})
+	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		basePID := os.Getpid() + 10000
 		processes := make([]teamsServiceLocalProcess, 0, 183)
 		for i := 0; i < 150; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
 				PID:  basePID + i,
-				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s"},
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s", "--registry", registryPath},
 				Env:  map[string]string{},
 			})
 		}
 		for i := 0; i < 30; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
 				PID:  basePID + 200 + i,
-				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"},
+				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath},
 				Env:  map[string]string{},
 			})
 		}
@@ -349,7 +492,7 @@ func TestTeamsServiceUpgradeRetiresLargeRunAndWatchdogPileBeforeRestart(t *testi
 		return nil
 	}
 
-	finalizer, err := stopTeamsServiceForHelperUpgrade(context.Background(), strings.NewReader(""), &bytes.Buffer{}, nil, stringPtr(filepath.Join(tmp, "registry.json")))
+	finalizer, err := stopTeamsServiceForHelperUpgrade(context.Background(), strings.NewReader(""), &bytes.Buffer{}, nil, stringPtr(registryPath))
 	if err != nil {
 		t.Fatalf("stop service for upgrade: %v", err)
 	}

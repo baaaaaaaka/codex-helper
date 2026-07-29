@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 )
 
 type teamsServiceLocalProcess struct {
@@ -83,7 +85,10 @@ func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec te
 	if !teamsServiceLocalProcessProfilesMatch(proc.Env, spec.Environment) {
 		return false
 	}
-	return teamsServiceLocalProcessRegistryMatches(proc.Args, spec.RegistryPath)
+	if !teamsServiceLocalProcessStateRootMatches(proc.Env, spec.Environment) {
+		return false
+	}
+	return teamsServiceLocalProcessRegistryMatches(proc.Args, proc.Env, spec.RegistryPath, spec.Environment)
 }
 
 func teamsServiceLocalProcessKind(args []string) string {
@@ -131,13 +136,94 @@ func teamsServiceProfileValue(value string) string {
 	return value
 }
 
-func teamsServiceLocalProcessRegistryMatches(args []string, current string) bool {
-	current = teamsServiceCleanRegistryPath(current)
-	other := teamsServiceCleanRegistryPath(teamsServiceRegistryArg(args))
-	if current != "" && other != "" {
-		return current == other
+func teamsServiceLocalProcessStateRootMatches(procEnv map[string]string, specEnv map[string]string) bool {
+	current, currentOK := teamsServiceLocalProcessStateRoot(specEnv)
+	other, otherOK := teamsServiceLocalProcessStateRoot(procEnv)
+	return currentOK && otherOK && current == other
+}
+
+func teamsServiceLocalProcessStateRoot(env map[string]string) (string, bool) {
+	home := strings.TrimSpace(env["HOME"])
+	if home == "" {
+		home, _ = os.UserHomeDir()
 	}
-	return true
+	if override := strings.TrimSpace(env[appdirs.EnvStateDir]); override != "" {
+		return teamsServiceLocalProcessAbsoluteStateRoot(override, home)
+	}
+	if base := strings.TrimSpace(env["XDG_STATE_HOME"]); base != "" {
+		base, ok := teamsServiceLocalProcessAbsoluteStateRoot(base, home)
+		if !ok {
+			return "", false
+		}
+		return filepath.Join(base, appdirs.AppName), true
+	}
+	home, ok := teamsServiceLocalProcessAbsoluteStateRoot(home, home)
+	if !ok {
+		return "", false
+	}
+	return filepath.Join(home, ".local", "state", appdirs.AppName), true
+}
+
+func teamsServiceLocalProcessAbsoluteStateRoot(path string, home string) (string, bool) {
+	path = strings.TrimSpace(path)
+	home = strings.TrimSpace(home)
+	switch {
+	case path == "~" && home != "":
+		path = home
+	case strings.HasPrefix(path, "~/") && home != "":
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	if path == "" || !filepath.IsAbs(path) {
+		return "", false
+	}
+	return filepath.Clean(path), true
+}
+
+func teamsServiceLocalProcessRegistryMatches(args []string, procEnv map[string]string, current string, specEnv map[string]string) bool {
+	currentCandidates := teamsServiceLocalProcessRegistryCandidates(current, specEnv)
+	otherCandidates := teamsServiceLocalProcessRegistryCandidates(teamsServiceRegistryArg(args), procEnv)
+	for _, currentCandidate := range currentCandidates {
+		for _, otherCandidate := range otherCandidates {
+			if currentCandidate == otherCandidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func teamsServiceLocalProcessRegistryCandidates(explicit string, env map[string]string) []string {
+	explicit = strings.TrimSpace(explicit)
+	if explicit != "" {
+		if !filepath.IsAbs(explicit) {
+			return nil
+		}
+		return []string{filepath.Clean(explicit)}
+	}
+	stateRoot, ok := teamsServiceLocalProcessStateRoot(env)
+	if !ok {
+		return nil
+	}
+	candidates := []string{filepath.Join(stateRoot, "teams", "registry.json")}
+	if legacyRoot, ok := teamsServiceLocalProcessLegacyCacheRoot(env); ok {
+		candidates = append(candidates, filepath.Join(legacyRoot, appdirs.AppName, "teams-registry.json"))
+	}
+	return candidates
+}
+
+func teamsServiceLocalProcessLegacyCacheRoot(env map[string]string) (string, bool) {
+	home := strings.TrimSpace(env["HOME"])
+	if home == "" {
+		home, _ = os.UserHomeDir()
+	}
+	if base := strings.TrimSpace(env["XDG_CACHE_HOME"]); base != "" {
+		return teamsServiceLocalProcessAbsoluteStateRoot(base, home)
+	}
+	home, ok := teamsServiceLocalProcessAbsoluteStateRoot(home, home)
+	if !ok {
+		return "", false
+	}
+	return filepath.Join(home, ".cache"), true
 }
 
 func teamsServiceRegistryArg(args []string) string {
