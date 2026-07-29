@@ -135,6 +135,102 @@ func TestWindowsManagedAppVerifyPackageRejectsSignerPublisherMismatch(t *testing
 	}
 }
 
+func TestWindowsManagedAppAuthenticodeFallsBackToPowerShellSeven(t *testing.T) {
+	lockCLITestHooks(t)
+	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")
+	writeTestCodexWindowsManagedMSIX(t, packagePath, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt"))
+
+	prevOutput := codexAppCommandOutput
+	prevLookPath := codexAppLookPath
+	prevPowerShell := teamsServicePowerShellExecutable
+	t.Cleanup(func() {
+		codexAppCommandOutput = prevOutput
+		codexAppLookPath = prevLookPath
+		teamsServicePowerShellExecutable = prevPowerShell
+	})
+	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
+	codexAppLookPath = func(name string) (string, error) {
+		if strings.EqualFold(name, "pwsh.exe") {
+			return name, nil
+		}
+		return "", os.ErrNotExist
+	}
+	var shells []string
+	codexAppCommandOutput = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		shells = append(shells, name)
+		if !strings.Contains(strings.Join(args, " "), "Get-AuthenticodeSignature") {
+			return nil, errors.New("missing Authenticode verification command")
+		}
+		if strings.EqualFold(name, "powershell.exe") {
+			return nil, errors.New("Get-AuthenticodeSignature: Microsoft.PowerShell.Security could not be loaded")
+		}
+		return []byte("CN=TestPublisher\n"), nil
+	}
+
+	if _, _, err := verifyCodexWindowsManagedPackage(context.Background(), packagePath); err != nil {
+		t.Fatalf("PowerShell 7 Authenticode fallback: %v", err)
+	}
+	if len(shells) != 2 || !strings.EqualFold(shells[0], "powershell.exe") || !strings.EqualFold(shells[1], "pwsh.exe") {
+		t.Fatalf("Authenticode shells = %v, want powershell.exe then pwsh.exe", shells)
+	}
+}
+
+func TestWindowsManagedAppAuthenticodeNeverAcceptsUnavailableVerifiers(t *testing.T) {
+	lockCLITestHooks(t)
+	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")
+	writeTestCodexWindowsManagedMSIX(t, packagePath, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt"))
+
+	prevOutput := codexAppCommandOutput
+	prevLookPath := codexAppLookPath
+	prevPowerShell := teamsServicePowerShellExecutable
+	t.Cleanup(func() {
+		codexAppCommandOutput = prevOutput
+		codexAppLookPath = prevLookPath
+		teamsServicePowerShellExecutable = prevPowerShell
+	})
+	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
+	codexAppLookPath = func(string) (string, error) { return "", os.ErrNotExist }
+	codexAppCommandOutput = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("Authenticode verifier unavailable")
+	}
+
+	if _, _, err := verifyCodexWindowsManagedPackage(context.Background(), packagePath); err == nil || !strings.Contains(err.Error(), "Authenticode verifier unavailable") {
+		t.Fatalf("unavailable verifier error = %v", err)
+	}
+}
+
+func TestWindowsManagedAppAuthenticodeRejectionNeverFallsBack(t *testing.T) {
+	lockCLITestHooks(t)
+	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")
+	writeTestCodexWindowsManagedMSIX(t, packagePath, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt"))
+
+	prevOutput := codexAppCommandOutput
+	prevLookPath := codexAppLookPath
+	prevPowerShell := teamsServicePowerShellExecutable
+	t.Cleanup(func() {
+		codexAppCommandOutput = prevOutput
+		codexAppLookPath = prevLookPath
+		teamsServicePowerShellExecutable = prevPowerShell
+	})
+	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
+	codexAppLookPath = func(name string) (string, error) { return name, nil }
+	var shells []string
+	codexAppCommandOutput = func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		shells = append(shells, name)
+		if strings.EqualFold(name, "pwsh.exe") {
+			return []byte("CN=TestPublisher\n"), nil
+		}
+		return nil, errors.New("Authenticode status is NotSigned")
+	}
+
+	if _, _, err := verifyCodexWindowsManagedPackage(context.Background(), packagePath); err == nil || !strings.Contains(err.Error(), "Authenticode status is NotSigned") {
+		t.Fatalf("signature rejection error = %v", err)
+	}
+	if len(shells) != 1 || !strings.EqualFold(shells[0], "powershell.exe") {
+		t.Fatalf("signature rejection shells = %v, want no fallback", shells)
+	}
+}
+
 func TestWindowsManagedAppFallbackRunsOnceWithoutStoreOrAppX(t *testing.T) {
 	lockCLITestHooks(t)
 	prevRoot := codexAppWindowsManagedRootFn

@@ -499,15 +499,52 @@ func verifyCodexWindowsManagedAuthenticode(ctx context.Context, packagePath, pub
 		return err
 	}
 	script := "$signature = Get-AuthenticodeSignature -LiteralPath " + powershellSingleQuote(launchPath) + "; if ($signature.Status -ne 'Valid') { throw ('Authenticode status is ' + $signature.Status) }; if ($null -eq $signature.SignerCertificate) { throw 'Authenticode signer certificate is missing' }; Write-Output $signature.SignerCertificate.Subject"
-	out, err := codexAppCommandOutput(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
-	if err != nil {
-		return fmt.Errorf("verify ChatGPT MSIX Authenticode signature: %w", err)
+	// Windows PowerShell 5.1 is the normal helper runtime, but some current
+	// Windows runner images ship a broken Microsoft.PowerShell.Security module
+	// there while PowerShell 7 can still load Get-AuthenticodeSignature. Try the
+	// configured helper shell first and use pwsh.exe only when it is available;
+	// this keeps older machines working without making signature verification
+	// dependent on PowerShell 7.
+	powershells := []string{teamsServicePowerShellExecutable()}
+	if _, lookPathErr := codexAppLookPath("pwsh.exe"); lookPathErr == nil && !strings.EqualFold(filepath.Base(powershells[0]), "pwsh.exe") {
+		powershells = append(powershells, "pwsh.exe")
 	}
-	signer := strings.TrimSpace(string(out))
-	if signer == "" || !strings.EqualFold(signer, strings.TrimSpace(publisher)) {
-		return fmt.Errorf("ChatGPT MSIX signer %q does not match manifest publisher %q", signer, publisher)
+	var lastErr error
+	for index, powershell := range powershells {
+		out, commandErr := codexAppCommandOutput(ctx, powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+		if commandErr != nil {
+			lastErr = commandErr
+			if index+1 < len(powershells) && codexWindowsManagedAuthenticodeVerifierUnavailable(commandErr) {
+				continue
+			}
+			return fmt.Errorf("verify ChatGPT MSIX Authenticode signature: %w", commandErr)
+		}
+		signer := strings.TrimSpace(string(out))
+		if signer == "" || !strings.EqualFold(signer, strings.TrimSpace(publisher)) {
+			return fmt.Errorf("ChatGPT MSIX signer %q does not match manifest publisher %q", signer, publisher)
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("verify ChatGPT MSIX Authenticode signature: %w", lastErr)
+}
+
+func codexWindowsManagedAuthenticodeVerifierUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "couldnotautoloadmatchingmodule") {
+		return true
+	}
+	if !strings.Contains(message, "get-authenticodesignature") {
+		return false
+	}
+	return strings.Contains(message, "could not be loaded") ||
+		strings.Contains(message, "commandnotfoundexception") ||
+		strings.Contains(message, "not recognized")
 }
 
 func extractCodexWindowsManagedPackage(packagePath, destination string) error {
