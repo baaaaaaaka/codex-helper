@@ -27,7 +27,14 @@ func TestMain(m *testing.M) {
 		"XDG_DATA_HOME":   filepath.Join(tmp, "data"),
 		"XDG_STATE_HOME":  filepath.Join(tmp, "state"),
 	}
+	liveTeamsCodexUpgrade := os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_LIVE") == "1"
 	for name, value := range isolatedEnv {
+		// The opt-in live upgrade integration intentionally exercises the
+		// caller's Windows account PATH and npm profile. All ordinary unit,
+		// service, and bootstrap tests keep the complete isolation below.
+		if liveTeamsCodexUpgrade && runtime.GOOS == "windows" && (name == "USERPROFILE" || name == "APPDATA") {
+			continue
+		}
 		if err := os.MkdirAll(value, 0o700); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "create isolated %s: %v\n", name, err)
 			_ = os.RemoveAll(tmp)
