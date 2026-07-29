@@ -20,6 +20,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 )
 
+func forceCodexWindowsManagedX64(t *testing.T) {
+	t.Helper()
+	previous := codexAppGOARCH
+	t.Cleanup(func() { codexAppGOARCH = previous })
+	codexAppGOARCH = func() string { return "amd64" }
+}
+
 func TestWindowsManagedAppReadManifestAndRejectsUnsafeZipPath(t *testing.T) {
 	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")
 	writeTestCodexWindowsManagedMSIX(t, packagePath, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt"))
@@ -233,6 +240,7 @@ func TestWindowsManagedAppAuthenticodeRejectionNeverFallsBack(t *testing.T) {
 
 func TestWindowsManagedAppFallbackRunsOnceWithoutStoreOrAppX(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	prevRoot := codexAppWindowsManagedRootFn
 	prevLookPath := codexAppLookPath
 	prevRun := codexAppRunCommand
@@ -276,6 +284,7 @@ func TestWindowsManagedAppFallbackRunsOnceWithoutStoreOrAppX(t *testing.T) {
 
 func TestWindowsManagedAppManagedOnlyDoesNotFallback(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	prevRoot := codexAppWindowsManagedRootFn
 	prevLookPath := codexAppLookPath
 	prevRun := codexAppRunCommand
@@ -310,6 +319,7 @@ func TestWindowsManagedAppManagedOnlyDoesNotFallback(t *testing.T) {
 
 func TestWindowsManagedAppConflictDoesNotFallback(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	root := t.TempDir()
 	exePath := filepath.Join(root, "versions", "v", "app", codexDesktopWindowsCurrentExecutable)
 	if err := os.MkdirAll(filepath.Dir(exePath), 0o700); err != nil {
@@ -370,6 +380,7 @@ func TestWindowsManagedAppConflictDoesNotFallback(t *testing.T) {
 
 func TestWindowsManagedAppStartedUncertainDoesNotFallback(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	root := t.TempDir()
 	exePath := filepath.Join(root, "versions", "cached", "app", codexDesktopWindowsCurrentExecutable)
 	if err := os.MkdirAll(filepath.Dir(exePath), 0o700); err != nil {
@@ -607,6 +618,7 @@ func TestWindowsManagedAppEmptyExecutableHashCannotWarmStart(t *testing.T) {
 
 func TestWindowsManagedAppCancelledStartupNeverFallsBack(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	prevRoot := codexAppWindowsManagedRootFn
 	prevLookPath := codexAppLookPath
 	prevRun := codexAppRunCommand
@@ -697,6 +709,7 @@ func TestWindowsManagedAppDirectModeUsesLegacyBackend(t *testing.T) {
 
 func TestWindowsManagedAppModelProfileUsesDirectBackendAndSafeFallback(t *testing.T) {
 	lockCLITestHooks(t)
+	forceCodexWindowsManagedX64(t)
 	prevRoot := codexAppWindowsManagedRootFn
 	prevLookPath := codexAppLookPath
 	prevRun := codexAppRunCommand
