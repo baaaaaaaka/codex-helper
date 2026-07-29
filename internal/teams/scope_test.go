@@ -67,7 +67,7 @@ func TestTeamsBackgroundKeepaliveScopeIdentityStableAcrossLocalEnvCI(t *testing.
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverMigratesLegacyScopeOutOfCandidateScanCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -147,8 +147,8 @@ func TestTeamsBackgroundKeepaliveResolveStorePathInheritsLegacyScopeCI(t *testin
 		t.Fatalf("resolved registry = %#v %q, want %q", registryScope, registryPath, wantRegistryPath)
 	}
 
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("legacy state should remain in place after migration: %v", err)
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy state remained in the normal candidate scan after migration: %v", err)
 	}
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("migrated state should exist: %v", err)
@@ -837,7 +837,7 @@ func TestResolveStorePathForSessionMaintenanceRejectsOverrideWithoutSelector(t *
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathUsesControlBindingWhenScopeMissingCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverMigratesLegacyControlBindingOutOfCandidateScanCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -884,8 +884,8 @@ func TestTeamsBackgroundKeepaliveResolveStorePathUsesControlBindingWhenScopeMiss
 	if resolved.ID != current.ID {
 		t.Fatalf("resolved scope = %#v, want current canonical scope id %q for legacy state without recorded scope", resolved, current.ID)
 	}
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("legacy state should remain in place after migration: %v", err)
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy state remained in the normal candidate scan after migration: %v", err)
 	}
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("migrated state should exist: %v", err)
@@ -1079,7 +1079,7 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateC
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathFallsBackWhenPartialNewScopeCannotCompleteCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedWhenPartialNewScopeCannotCompleteCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -1137,23 +1137,13 @@ func TestTeamsBackgroundKeepaliveResolveStorePathFallsBackWhenPartialNewScopeCan
 	}
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-	resolved, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope error: %v", err)
-	}
-	if resolved.ID != scope.ID || path != oldPath {
-		t.Fatalf("resolved scope/path = %#v %q, want legacy %q at %q", resolved, path, scope.ID, oldPath)
-	}
-	registryScope, registryPath, err := ResolveRegistryPathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveRegistryPathForScope error: %v", err)
-	}
-	if registryScope.ID != scope.ID || registryPath != oldRegistryPath {
-		t.Fatalf("resolved registry = %#v %q, want legacy registry %q", registryScope, registryPath, oldRegistryPath)
+	_, path, err := ResolveStorePathForScope(current)
+	if err == nil {
+		t.Fatalf("runtime resolver selected %q while canonical migration could not complete; want fail-closed error", path)
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathRejectsNonRegularSQLiteSidecarCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedForNonRegularCanonicalSQLiteSidecarCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -1220,16 +1210,13 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRejectsNonRegularSQLiteSidecarC
 	}
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-	resolved, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope error: %v", err)
-	}
-	if resolved.ID != scope.ID || path != oldPath {
-		t.Fatalf("resolved scope/path = %#v %q, want legacy fallback %q at %q", resolved, path, scope.ID, oldPath)
+	_, path, err := ResolveStorePathForScope(current)
+	if err == nil {
+		t.Fatalf("runtime resolver selected %q after detecting a non-regular canonical SQLite sidecar; want fail-closed error", path)
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathRepairsCorruptNewScopeCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalFromLegacyCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -1283,30 +1270,16 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRepairsCorruptNewScopeCI(t *tes
 	}
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-	resolved, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope error: %v", err)
+	_, path, err := ResolveStorePathForScope(current)
+	if err == nil {
+		t.Fatalf("runtime resolver selected %q after canonical corruption; want fail-closed error", path)
 	}
-	if resolved.ID != scope.ID || path != newPath {
-		t.Fatalf("resolved scope/path = %#v %q, want repaired new path %q at %q", resolved, path, scope.ID, newPath)
-	}
-	st, err := teamstore.Open(path)
-	if err != nil {
-		t.Fatalf("Open repaired store: %v", err)
-	}
-	state, err := st.Load(context.Background())
-	if closeErr := st.Close(); err == nil && closeErr != nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("Load repaired store: %v", err)
-	}
-	if _, ok := state.OutboxMessages["outbox:corrupt-new"]; !ok {
-		t.Fatalf("repaired store lost legacy outbox: %#v", state.OutboxMessages)
+	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
+		t.Fatalf("runtime resolver mutated corrupt canonical store while probing: raw=%q err=%v", raw, readErr)
 	}
 }
 
-func TestTeamsBackgroundKeepaliveResolveStorePathRepairsCorruptNewScopeWithoutRegistryCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalWithoutRegistryCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -1350,26 +1323,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRepairsCorruptNewScopeWithoutRe
 	}
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-	resolved, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope error: %v", err)
+	_, path, err := ResolveStorePathForScope(current)
+	if err == nil {
+		t.Fatalf("runtime resolver selected %q after canonical corruption; want fail-closed error", path)
 	}
-	if resolved.ID != scope.ID || path != newPath {
-		t.Fatalf("resolved scope/path = %#v %q, want repaired new path %q at %q", resolved, path, scope.ID, newPath)
-	}
-	st, err := teamstore.Open(path)
-	if err != nil {
-		t.Fatalf("Open repaired store: %v", err)
-	}
-	state, err := st.Load(context.Background())
-	if closeErr := st.Close(); err == nil && closeErr != nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatalf("Load repaired store: %v", err)
-	}
-	if _, ok := state.OutboxMessages["outbox:corrupt-no-registry"]; !ok {
-		t.Fatalf("repaired store lost legacy outbox: %#v", state.OutboxMessages)
+	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
+		t.Fatalf("runtime resolver mutated corrupt canonical store while probing: raw=%q err=%v", raw, readErr)
 	}
 }
 

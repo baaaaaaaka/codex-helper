@@ -16,6 +16,7 @@ printf '%s\n' \
   >"$service_config"
 before_hash="$(sha256sum "$service_config")"
 
+test_status=0
 (
   cd "$repo_root"
   HOME="$probe_root/home" \
@@ -25,13 +26,18 @@ before_hash="$(sha256sum "$service_config")"
   XDG_CACHE_HOME="$probe_root/cache" \
   GOMODCACHE="$go_mod_cache" \
   GOCACHE="$go_build_cache" \
-  go test ./internal/cli -count=1 -run '^TestTeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired$'
-)
+  GOTELEMETRY=off \
+  go test ./internal/cli -count=1 -run '^TestTeamsService'
+) || test_status=$?
 
-after_hash="$(sha256sum "$service_config")"
+after_hash="missing"
+if [[ -f "$service_config" ]]; then
+  after_hash="$(sha256sum "$service_config")"
+fi
 unexpected_files="$(
-  find "$probe_root/config/codex-helper" "$probe_root/state/codex-helper" -type f \
+  find "$probe_root/config" "$probe_root/state" -type f \
     ! -path "$service_config" \
+    ! -path "$probe_root/config/go/telemetry/*" \
     -print
 )"
 if [[ "$before_hash" != "$after_hash" || -n "$unexpected_files" ]]; then
@@ -43,4 +49,8 @@ if [[ "$before_hash" != "$after_hash" || -n "$unexpected_files" ]]; then
     printf '%s\n' "$unexpected_files" >&2
   fi
   exit 1
+fi
+if [[ "$test_status" -ne 0 ]]; then
+  echo "Teams service/bootstrap tests did not complete cleanly under caller-owned config/state sentinels." >&2
+  exit "$test_status"
 fi

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,5 +55,10 @@ func TestTeamsRuntimeSafetyStableEntryCanManageActivatedImmutableRuntimeCI(t *te
 	identity := &teamsServiceLocalSupervisorProcessIdentity{Executable: stable}
 	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err != nil {
 		t.Fatalf("stable managed entry must recognize its activated immutable runtime: %v", err)
+	}
+	identity.ProcStartTime = "definitely-not-the-live-process-start-time"
+	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err == nil ||
+		!strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("managed-runtime lineage must not bypass PID-reuse protection; error = %v", err)
 	}
 }

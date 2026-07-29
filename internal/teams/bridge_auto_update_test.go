@@ -1624,11 +1624,11 @@ func TestTeamsRuntimeSafetyBridgeHelperAutoUpdateRestarterFailureDoesNotComplete
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "" {
-		t.Fatalf("LastInstalledTag = %q, want empty until the restarted listener verifies activation", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag = %q, want v1.2.4 because installation completed before restart failed", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase == teamstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade = %#v, restart failure must not be persisted as completed", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted {
+		t.Fatalf("upgrade = %#v, want aborted activation after restart failure", state.Upgrade)
 	}
 	if !strings.Contains(strings.ToLower(state.AutoUpdate.LastError), "restart") &&
 		!strings.Contains(strings.ToLower(state.Upgrade.AbortReason), "restart") {
@@ -1664,7 +1664,17 @@ func TestTeamsRuntimeSafetyHelperUpdateStatusReportsPhaseBlockerAndRetryCI(t *te
 			t.Fatalf("handle helper update status: %v", err)
 		}
 		joined := sentPlainJoined(*sent)
-		for _, want := range []string{"Phase:", "Blocker:", "Next retry:", "v1.2.4"} {
+		for _, want := range []string{
+			"Phase:",
+			"Blocker:",
+			"Blocking turn:",
+			"Drain:",
+			"Install:",
+			"Activation:",
+			"Restart:",
+			"Next retry:",
+			"v1.2.4",
+		} {
 			if !strings.Contains(joined, want) {
 				t.Fatalf("helper update status omitted %q:\n%s", want, joined)
 			}

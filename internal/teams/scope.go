@@ -39,6 +39,16 @@ var (
 	scopeMigrationLegacyCleanupGrace = 7 * 24 * time.Hour
 	scopeMigrationCleanupNow         = time.Now
 	scopeMigrationCleanupRemove      = os.Remove
+
+	// Resolver seams make Open, Load, and Close failures deterministic in
+	// fail-closed regression tests without changing production behavior.
+	resolveScopeStoreOpen = teamstore.Open
+	resolveScopeStoreLoad = func(st *teamstore.Store, ctx context.Context) (teamstore.State, error) {
+		return st.Load(ctx)
+	}
+	resolveScopeStoreClose = func(st *teamstore.Store) error {
+		return st.Close()
+	}
 )
 
 func ScopeIdentityForUser(user User) teamstore.ScopeIdentity {
@@ -373,7 +383,7 @@ func resolveExistingScopeStoreWithOptions(scope teamstore.ScopeIdentity, current
 				return teamstore.ScopeIdentity{}, "", false, err
 			}
 		}
-		st, err := teamstore.Open(path)
+		st, err := resolveScopeStoreOpen(path)
 		if err != nil {
 			if firstLoadErr == nil {
 				firstLoadErr = err
@@ -381,9 +391,9 @@ func resolveExistingScopeStoreWithOptions(scope teamstore.ScopeIdentity, current
 			continue
 		}
 		loadCtx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		state, err := st.Load(loadCtx)
+		state, err := resolveScopeStoreLoad(st, loadCtx)
 		cancel()
-		closeErr := st.Close()
+		closeErr := resolveScopeStoreClose(st)
 		if err != nil {
 			if firstLoadErr == nil {
 				firstLoadErr = err

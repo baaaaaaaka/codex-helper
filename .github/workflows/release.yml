@@ -430,7 +430,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli ./internal/teams -count=1 -run '^TestTeamsRuntimeSafety' -v
+          go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run '^TestTeamsRuntimeSafety' -v
 
       - name: Teams read-only diagnostics regressions
         shell: bash
