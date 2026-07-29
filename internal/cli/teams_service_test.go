@@ -7410,6 +7410,7 @@ type teamsServiceTestHooks struct {
 	windowsTaskDir             string
 	userID                     string
 	isWSL                      bool
+	wslInteropAvailable        *bool
 	wslDistro                  string
 	wslLinuxUser               string
 	powerShellExecutable       string
@@ -7445,6 +7446,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevWindowsTaskXMLDir := teamsServiceWindowsTaskXMLDir
 	prevUserID := teamsServiceUserID
 	prevIsWSL := teamsServiceIsWSL
+	prevWSLInteropAvailable := teamsServiceWSLInteropAvailable
 	prevWSLDistroName := teamsServiceWSLDistroName
 	prevWSLLinuxUserName := teamsServiceWSLLinuxUserName
 	prevPowerShellExecutable := teamsServicePowerShellExecutable
@@ -7482,6 +7484,9 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	teamsServiceWindowsTaskXMLDir = func() (string, error) { return hooks.windowsTaskDir, nil }
 	teamsServiceUserID = func() string { return hooks.userID }
 	teamsServiceIsWSL = func() bool { return hooks.isWSL }
+	if hooks.wslInteropAvailable != nil {
+		teamsServiceWSLInteropAvailable = func() bool { return *hooks.wslInteropAvailable }
+	}
 	teamsServiceWSLDistroName = func() string { return hooks.wslDistro }
 	teamsServiceWSLLinuxUserName = func() string { return hooks.wslLinuxUser }
 	teamsServicePowerShellExecutable = func() string {
@@ -7572,6 +7577,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceWindowsTaskXMLDir = prevWindowsTaskXMLDir
 		teamsServiceUserID = prevUserID
 		teamsServiceIsWSL = prevIsWSL
+		teamsServiceWSLInteropAvailable = prevWSLInteropAvailable
 		teamsServiceWSLDistroName = prevWSLDistroName
 		teamsServiceWSLLinuxUserName = prevWSLLinuxUserName
 		teamsServicePowerShellExecutable = prevPowerShellExecutable

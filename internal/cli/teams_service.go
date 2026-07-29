@@ -91,6 +91,7 @@ var (
 	teamsServiceWindowsTaskXMLDir                                     = defaultTeamsServiceWindowsTaskXMLDir
 	teamsServiceUserID                                                = defaultTeamsServiceUserID
 	teamsServiceIsWSL                                                 = defaultTeamsServiceIsWSL
+	teamsServiceWSLInteropAvailable                                   = defaultTeamsServiceWSLInteropAvailable
 	teamsServiceWSLDistroName                                         = defaultTeamsServiceWSLDistroName
 	teamsServiceWSLLinuxUserName                                      = defaultTeamsServiceWSLLinuxUserName
 	teamsServiceCurrentUser                                           = user.Current
@@ -4600,7 +4601,7 @@ func teamsServiceIsWSLFromSignals(goos string, procVersion string, interopAvaila
 	return interopAvailable
 }
 
-func teamsServiceWSLInteropAvailable() bool {
+func defaultTeamsServiceWSLInteropAvailable() bool {
 	info, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop")
 	return err == nil && !info.IsDir()
 }

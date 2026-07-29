@@ -21,6 +21,28 @@ func TestTeamsRuntimeSafetyManagedRuntimeHelperProcess(t *testing.T) {
 }
 
 func TestTeamsRuntimeSafetyStableEntryCanManageActivatedImmutableRuntimeCI(t *testing.T) {
+	cmd, stable, _ := startTeamsRuntimeSafetyManagedRuntimeFixture(t)
+
+	identity := &teamsServiceLocalSupervisorProcessIdentity{Executable: stable}
+	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err != nil {
+		t.Fatalf("stable managed entry must recognize its activated immutable runtime: %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyManagedRuntimeLineageStillRejectsReusedPIDStartTimeCI(t *testing.T) {
+	cmd, _, runtimePath := startTeamsRuntimeSafetyManagedRuntimeFixture(t)
+	identity := &teamsServiceLocalSupervisorProcessIdentity{
+		Executable:    runtimePath,
+		ProcStartTime: "definitely-not-the-live-process-start-time",
+	}
+	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err == nil ||
+		!strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("managed-runtime lineage must not bypass PID-reuse protection; error = %v", err)
+	}
+}
+
+func startTeamsRuntimeSafetyManagedRuntimeFixture(t *testing.T) (*exec.Cmd, string, string) {
+	t.Helper()
 	tmp := t.TempDir()
 	testBinary, err := os.Executable()
 	if err != nil {
@@ -51,14 +73,5 @@ func TestTeamsRuntimeSafetyStableEntryCanManageActivatedImmutableRuntimeCI(t *te
 		_ = cmd.Wait()
 	})
 	time.Sleep(50 * time.Millisecond)
-
-	identity := &teamsServiceLocalSupervisorProcessIdentity{Executable: stable}
-	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err != nil {
-		t.Fatalf("stable managed entry must recognize its activated immutable runtime: %v", err)
-	}
-	identity.ProcStartTime = "definitely-not-the-live-process-start-time"
-	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(cmd.Process.Pid, identity, "local supervisor child"); err == nil ||
-		!strings.Contains(err.Error(), "start time changed") {
-		t.Fatalf("managed-runtime lineage must not bypass PID-reuse protection; error = %v", err)
-	}
+	return cmd, stable, runtimePath
 }

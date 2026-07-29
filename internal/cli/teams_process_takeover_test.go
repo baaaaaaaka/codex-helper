@@ -19,6 +19,24 @@ func (fn teamsServiceCommandRunnerFunc) Run(ctx context.Context, name string, ar
 	return fn(ctx, name, args...)
 }
 
+func teamsServiceCurrentProcessScopeEnvForTest(overrides ...string) map[string]string {
+	env := make(map[string]string)
+	for _, key := range []string{
+		"HOME",
+		"XDG_STATE_HOME",
+		"XDG_CACHE_HOME",
+		"CODEX_HELPER_STATE_DIR",
+	} {
+		if value := os.Getenv(key); value != "" {
+			env[key] = value
+		}
+	}
+	for i := 0; i+1 < len(overrides); i += 2 {
+		env[overrides[i]] = overrides[i+1]
+	}
+	return env
+}
+
 func TestTeamsServiceRetireLocalDuplicateProcessesFiltersAndTerminates(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -339,7 +357,7 @@ func TestTeamsServiceBootstrapRetiresLocalDuplicateProcessesBeforeRepair(t *test
 	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 4001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
+			{PID: 4001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -430,8 +448,8 @@ func TestTeamsServiceUpgradeRetiresLocalDuplicateProcessesBeforeRestart(t *testi
 	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 5001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
-			{PID: 5002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath}, Env: map[string]string{}},
+			{PID: 5001, Args: []string{"/home/alice/.cache/codex-helper/dev/bin/codex-proxy-teams-dev", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 5002, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -478,14 +496,14 @@ func TestTeamsServiceUpgradeRetiresLargeRunAndWatchdogPileBeforeRestart(t *testi
 			processes = append(processes, teamsServiceLocalProcess{
 				PID:  basePID + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s", "--registry", registryPath},
-				Env:  map[string]string{},
+				Env:  teamsServiceCurrentProcessScopeEnvForTest(),
 			})
 		}
 		for i := 0; i < 30; i++ {
 			processes = append(processes, teamsServiceLocalProcess{
 				PID:  basePID + 200 + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop", "--registry", registryPath},
-				Env:  map[string]string{},
+				Env:  teamsServiceCurrentProcessScopeEnvForTest(),
 			})
 		}
 		processes = append(processes,
@@ -544,8 +562,8 @@ func TestTeamsServicePrimaryRestartRetiresOnlyLocalBridgeProcessesBeforeStart(t 
 	})
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 5101, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
-			{PID: 5102, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
+			{PID: 5101, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 5102, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -591,10 +609,10 @@ func TestTeamsServiceStartRetiresLocalBridgeProcessesOnlyWhenWSLTaskInactive(t *
 	})
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 5201, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: map[string]string{}},
-			{PID: 5202, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: map[string]string{}},
-			{PID: 5203, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: map[string]string{}},
-			{PID: 5204, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{"CODEX_HELPER_TEAMS_PROFILE": "work"}},
+			{PID: 5201, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 5202, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "service", "watchdog", "--loop"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 5203, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--once"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 5204, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: teamsServiceCurrentProcessScopeEnvForTest("CODEX_HELPER_TEAMS_PROFILE", "work")},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -725,7 +743,7 @@ func TestTeamsServiceRestartRetiresLargeLocalBridgePileBeforeStart(t *testing.T)
 			processes = append(processes, teamsServiceLocalProcess{
 				PID:  basePID + i,
 				Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--owner-stale-after", "18s"},
-				Env:  map[string]string{},
+				Env:  teamsServiceCurrentProcessScopeEnvForTest(),
 			})
 		}
 		processes = append(processes,
@@ -780,8 +798,8 @@ func TestTeamsServiceRestartDoesNotStartWhenBridgeCleanupFails(t *testing.T) {
 	})
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 7301, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{}},
-			{PID: 7302, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: map[string]string{}},
+			{PID: 7301, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
+			{PID: 7302, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run"}, Env: teamsServiceCurrentProcessScopeEnvForTest()},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {

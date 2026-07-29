@@ -577,12 +577,30 @@ jobs:
         shell: bash
         run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
 
-      - name: Teams runtime safety invariant regressions
+      - name: Teams runtime safety test isolation
         if: always() && matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run '^TestTeamsRuntimeSafety' -v
+        run: go test ./internal/appdirs ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(PackageTestMain|TestPathGuard)' -v
+
+      - name: Teams runtime safety scope resolution and migration
+        if: always() && matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: go test ./internal/teams ./internal/teams/store -count=1 -run '^TestTeamsRuntimeSafety(RuntimeResolver|Legacy|Resolver|SuccessfulMigration|StoreLoad)' -v
+
+      - name: Teams runtime safety service and update lifecycle
+        if: always() && matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: go test ./internal/cli ./internal/teams -count=1 -run '^TestTeamsRuntimeSafety(ServiceSpec|AutoUpdate|ServiceConfig|DoesNotRestore|ExplicitStable|ServiceEnvironment|BridgeHelperAutoUpdate|HelperUpdateStatus)' -v
+
+      - name: Teams runtime safety WSL and process lifecycle
+        if: always() && matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: go test ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(WSL|Doctor|StableEntry|ManagedRuntime|Watchdog)' -v
+
+      - name: Teams runtime safety readiness and diagnostics
+        if: always() && matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: go test ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|Status|UnavailableModel)' -v
 
       - name: Teams read-only diagnostics regressions
         if: matrix.shard == 'core'

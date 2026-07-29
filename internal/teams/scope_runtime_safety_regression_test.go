@@ -490,7 +490,15 @@ func TestTeamsRuntimeSafetyResolverMetadataProbeIsStrictlyReadOnlyCI(t *testing.
 	}
 }
 
-func TestTeamsRuntimeSafetySuccessfulMigrationWritesReceiptAndQuarantinesLegacyCI(t *testing.T) {
+type runtimeSafetyMigrationFixture struct {
+	Scope        teamstore.ScopeIdentity
+	LegacyPath   string
+	CurrentPath  string
+	ResolvedPath string
+}
+
+func seedRuntimeSafetyMigrationFixture(t *testing.T) runtimeSafetyMigrationFixture {
+	t.Helper()
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -538,6 +546,17 @@ func TestTeamsRuntimeSafetySuccessfulMigrationWritesReceiptAndQuarantinesLegacyC
 	if resolvedPath != currentPath {
 		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
 	}
+	return runtimeSafetyMigrationFixture{
+		Scope:        scope,
+		LegacyPath:   legacyPath,
+		CurrentPath:  currentPath,
+		ResolvedPath: resolvedPath,
+	}
+}
+
+func TestTeamsRuntimeSafetySuccessfulMigrationQuarantinesLegacyOutOfCandidateScanCI(t *testing.T) {
+	fixture := seedRuntimeSafetyMigrationFixture(t)
+	legacyPath := fixture.LegacyPath
 	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
 		t.Fatalf("successful migration left legacy store in the normal candidate scan at %q (stat err=%v)", legacyPath, err)
 	}
@@ -546,16 +565,25 @@ func TestTeamsRuntimeSafetySuccessfulMigrationWritesReceiptAndQuarantinesLegacyC
 	} else if len(matches) != 0 {
 		t.Fatalf("successful migration left legacy SQLite files in the candidate directory: %v", matches)
 	}
-	receipt := readRuntimeSafetyMigrationReceipt(t, currentPath)
-	if receipt.Version < 1 || receipt.ScopeID != scope.ID || receipt.LegacyPath != legacyPath ||
+}
+
+func TestTeamsRuntimeSafetySuccessfulMigrationWritesCompleteReceiptCI(t *testing.T) {
+	fixture := seedRuntimeSafetyMigrationFixture(t)
+	receipt := readRuntimeSafetyMigrationReceipt(t, fixture.CurrentPath)
+	if receipt.Version < 1 || receipt.ScopeID != fixture.Scope.ID || receipt.LegacyPath != fixture.LegacyPath ||
 		receipt.BackupPath == "" || receipt.CompletedAt.IsZero() {
 		t.Fatalf("migration receipt is incomplete: %#v", receipt)
 	}
-	legacyDir := filepath.Clean(filepath.Dir(legacyPath))
+	legacyDir := filepath.Clean(filepath.Dir(fixture.LegacyPath))
 	backupDir := filepath.Clean(filepath.Dir(receipt.BackupPath))
 	if backupDir == legacyDir || strings.HasPrefix(backupDir+string(filepath.Separator), legacyDir+string(filepath.Separator)) {
 		t.Fatalf("migration backup %q remains inside the normal legacy candidate directory %q", receipt.BackupPath, legacyDir)
 	}
+}
+
+func TestTeamsRuntimeSafetySuccessfulMigrationPreservesQuarantinedLogicalDataCI(t *testing.T) {
+	fixture := seedRuntimeSafetyMigrationFixture(t)
+	receipt := readRuntimeSafetyMigrationReceipt(t, fixture.CurrentPath)
 	backup, err := teamstore.Open(receipt.BackupPath)
 	if err != nil {
 		t.Fatalf("open quarantined backup: %v", err)

@@ -85,11 +85,15 @@ type teamsServiceLocalSupervisorActivation struct {
 }
 
 var (
-	teamsServiceLocalSupervisorStartDetached    = defaultTeamsServiceLocalSupervisorStartDetached
-	teamsServiceLocalSupervisorRestartDelay     = time.Duration(teamsServiceTaskRestartInterval) * time.Second
-	teamsServiceLocalSupervisorHeartbeatEvery   = 5 * time.Second
-	teamsServiceLocalSupervisorTerminationWait  = 5 * time.Second
-	teamsServiceLocalSupervisorReadyTimeout     = 5 * time.Second
+	teamsServiceLocalSupervisorStartDetached   = defaultTeamsServiceLocalSupervisorStartDetached
+	teamsServiceLocalSupervisorRestartDelay    = time.Duration(teamsServiceTaskRestartInterval) * time.Second
+	teamsServiceLocalSupervisorHeartbeatEvery  = 5 * time.Second
+	teamsServiceLocalSupervisorTerminationWait = 5 * time.Second
+	teamsServiceLocalSupervisorReadyTimeout    = 5 * time.Second
+	teamsServiceLocalSupervisorReadyTicker     = func(interval time.Duration) (<-chan time.Time, func()) {
+		ticker := time.NewTicker(interval)
+		return ticker.C, ticker.Stop
+	}
 	teamsServiceLocalSupervisorReleaseWait      = 2 * time.Second
 	teamsServiceLocalSupervisorReleaseProcess   = func(process *os.Process) error { return process.Release() }
 	teamsServiceLocalSupervisorCheckChildHealth = defaultTeamsServiceLocalSupervisorCheckChildHealth
@@ -901,8 +905,8 @@ func waitTeamsServiceLocalSupervisorReady(ctx context.Context, pid int, configPa
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	ticker, stopTicker := teamsServiceLocalSupervisorReadyTicker(100 * time.Millisecond)
+	defer stopTicker()
 	var lastErr error
 	for {
 		if !teamsLocalSupervisorProcessAlive(pid) {
@@ -927,7 +931,7 @@ func waitTeamsServiceLocalSupervisorReady(ctx context.Context, pid int, configPa
 				return fmt.Errorf("local supervisor pid %d did not report ready within %s: %w", pid, timeout, lastErr)
 			}
 			return fmt.Errorf("local supervisor pid %d did not report ready within %s", pid, timeout)
-		case <-ticker.C:
+		case <-ticker:
 		}
 	}
 }
