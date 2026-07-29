@@ -37,6 +37,7 @@ const (
 	codexDesktopWindowsPackageName         = "OpenAI.Codex"
 	codexDesktopWindowsCurrentExecutable   = "ChatGPT.exe"
 	codexDesktopWindowsLegacyExecutable    = "Codex.exe"
+	codexDesktopWindowsManagedDownloadURL  = "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix"
 )
 
 var (
@@ -53,6 +54,7 @@ var (
 	codexAppUserHomeDir           = os.UserHomeDir
 	codexAppMacSystemAppsDir      = "/Applications"
 	codexAppWSLPathFn             = defaultCodexAppWSLPath
+	codexAppWindowsManagedRootFn  = defaultCodexAppWindowsManagedRoot
 	codexAppProxyPollInterval     = 200 * time.Millisecond
 	codexAppProxyReadyTimeout     = 15 * time.Second
 	codexAppMacInstallURL         = func() string { return codexDesktopMacDownloadURLForArch(codexAppGOARCH()) }
@@ -76,9 +78,12 @@ type codexDesktopAppOptions struct {
 	ExtraEnv         []string
 	ProxyURL         string
 	ModelProfileName string
-	WaitForExit      bool
-	ExecIdentity     *execIdentity
-	Log              io.Writer
+	// RequiresDirectLaunch is set when launch-time state must be inherited by
+	// the desktop process. AppX activation cannot preserve that state.
+	RequiresDirectLaunch bool
+	WaitForExit          bool
+	ExecIdentity         *execIdentity
+	Log                  io.Writer
 }
 
 type codexDesktopPlatform string
@@ -98,7 +103,7 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "app [profile]",
 		Short: "Install and launch the Codex desktop app",
-		Long: "Install and launch the Codex desktop app. macOS uses the official OpenAI DMG; Windows uses the Microsoft Store package. " +
+		Long: "Install and launch the Codex desktop app. macOS uses the official OpenAI DMG; Windows uses a cxp-managed copy of the official ChatGPT package when proxy or isolated launch state is required, and keeps the Microsoft Store path for ordinary direct launches. " +
 			"Linux outside WSL is not supported by the official Codex desktop app.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -225,6 +230,15 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 			return err
 		}
 	}
+
+	// AppX activation is allowed only when no launch-time state needs to be
+	// inherited by ChatGPT. This includes the proxy, model-profile isolation,
+	// and an explicitly selected Codex data directory. Keep this decision on
+	// the launch options so every Windows backend applies the same rule.
+	launchOpts.RequiresDirectLaunch = strings.TrimSpace(opts.appPath) == "" &&
+		(strings.TrimSpace(launchOpts.ProxyURL) != "" ||
+			strings.TrimSpace(launchOpts.ModelProfileName) != "" ||
+			strings.TrimSpace(opts.codexDir) != "")
 
 	return codexAppLaunchDesktopFn(ctx, launchOpts)
 }
@@ -907,7 +921,35 @@ func codexDesktopMacExecutableNames(appPath string) []string {
 }
 
 func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptions) error {
-	script := codexDesktopWindowsInstallAndLaunchScript(opts)
+	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CXP_WINDOWS_APP_BACKEND")))
+	if backend == "legacy" || strings.TrimSpace(opts.AppPath) != "" || (backend != "managed-only" && !opts.RequiresDirectLaunch) {
+		return launchCodexDesktopAppWindowsLegacy(ctx, opts, true, !opts.RequiresDirectLaunch)
+	}
+
+	managedState, managedErr := launchCodexDesktopAppWindowsManaged(ctx, opts)
+	if managedErr == nil && managedState == codexWindowsManagedLaunchReady {
+		return nil
+	}
+	if managedState == codexWindowsManagedLaunchStartedUncertain || managedState == codexWindowsManagedLaunchNoFallback || backend == "managed-only" {
+		if managedErr == nil {
+			managedErr = errors.New("managed ChatGPT launch state is uncertain")
+		}
+		return managedErr
+	}
+
+	if managedErr == nil {
+		managedErr = errors.New("managed ChatGPT launch did not start a process")
+	}
+	codexAppWarn(opts.Log, "managed Windows ChatGPT launch unavailable; attempting legacy launcher once: %v", managedErr)
+	legacyErr := launchCodexDesktopAppWindowsLegacy(ctx, opts, false, false)
+	if legacyErr != nil {
+		return fmt.Errorf("managed Windows ChatGPT launch failed: %v; legacy fallback failed: %w", managedErr, legacyErr)
+	}
+	return nil
+}
+
+func launchCodexDesktopAppWindowsLegacy(ctx context.Context, opts codexDesktopAppOptions, allowStoreInstall, allowAppXFallback bool) error {
+	script := codexDesktopWindowsInstallAndLaunchScriptWithPolicy(opts, allowStoreInstall, allowAppXFallback)
 	name := teamsServicePowerShellExecutable()
 	if _, err := codexAppLookPath(name); err != nil {
 		return fmt.Errorf("PowerShell is required to install and launch the Windows Codex desktop app: %s not found. Run from a Windows session with powershell.exe available, or install PowerShell and retry: %w", name, err)
@@ -917,6 +959,10 @@ func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptio
 }
 
 func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) string {
+	return codexDesktopWindowsInstallAndLaunchScriptWithPolicy(opts, true, !opts.RequiresDirectLaunch)
+}
+
+func codexDesktopWindowsInstallAndLaunchScriptWithPolicy(opts codexDesktopAppOptions, allowStoreInstall, allowAppXFallback bool) string {
 	envAssignments := codexDesktopWindowsEnvPowerShell(opts)
 	appArgs := codexDesktopWindowsAppArgsPowerShell(opts)
 	waitForExit := "$codexWaitForExit = $false"
@@ -927,8 +973,17 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 	appPath := powershellSingleQuote(opts.AppPath)
 	packageName := powershellSingleQuote(codexDesktopWindowsPackageName)
 	storeID := powershellSingleQuote(codexDesktopWindowsStoreID)
+	allowInstall := "$allowStoreInstall = $false"
+	if allowStoreInstall {
+		allowInstall = "$allowStoreInstall = $true"
+	}
+	allowAppX := "$allowAppXFallback = $false"
+	if allowAppXFallback {
+		allowAppX = "$allowAppXFallback = $true"
+	}
 	return strings.Join([]string{
 		"$ErrorActionPreference = 'Stop'",
+		codexDesktopWindowsRuntimeMarkerCleanupPowerShell(),
 		envAssignments,
 		appArgs,
 		waitForExit,
@@ -936,6 +991,8 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"$cwd = " + cwd,
 		"$packageName = " + packageName,
 		"$storeId = " + storeID,
+		allowInstall,
+		allowAppX,
 		"function Get-CodexPackage { Get-AppxPackage -Name $packageName -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1 }",
 		"function Get-CodexWinget { $cmd = Get-Command winget -ErrorAction SilentlyContinue; if ($null -eq $cmd) { throw 'winget was not found. Install or update App Installer, enable Microsoft Store/winget, or pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; return $cmd }",
 		"function Warn-NonInteractiveDesktop { if (-not ([Environment]::UserInteractive)) { Write-Warning 'Current Windows session is non-interactive. The Codex desktop app may install successfully but no visible window may appear; run from an interactive Windows desktop session if launch is not visible.' } }",
@@ -943,20 +1000,30 @@ func codexDesktopWindowsInstallAndLaunchScript(opts codexDesktopAppOptions) stri
 		"function Get-CodexDirectLaunchFailureMessage([string]$FilePath, [System.Exception]$Exception) { $message = 'direct ChatGPT/Codex desktop executable launch failed: ' + $Exception.Message; if ($FilePath.IndexOf('\\WindowsApps\\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $message += ' The selected path is inside the protected WindowsApps package directory. Microsoft Store apps usually cannot be launched directly from that path; they must be started through AppX activation, which cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; return $message }",
 		"Warn-NonInteractiveDesktop",
 		"$pkg = Get-CodexPackage",
-		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
+		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { if (-not $allowStoreInstall) { throw 'legacy Store backend is disabled for managed-launch fallback because it cannot preserve direct-launch environment' }; $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
 		"if (-not [string]::IsNullOrWhiteSpace($appPath)) { if (-not (Test-Path -LiteralPath $appPath)) { throw ('Codex desktop app path not found: ' + $appPath) }; try { Start-CodexDesktopProcess $appPath; return } catch { throw (Get-CodexDirectLaunchFailureMessage $appPath $_.Exception) } }",
 		"if ($null -eq $pkg) { throw 'OpenAI.Codex package was not found after installation. Microsoft Store/winget may be blocked by policy or source availability.' }",
 		"$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName",
 		"$applications = @($manifest.Package.Applications.Application)",
 		codexDesktopWindowsExecutableCandidatesPowerShell(),
 		"$exe = $exeCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1",
-		"if (-not [string]::IsNullOrWhiteSpace($exe)) { try { Start-CodexDesktopProcess $exe; return } catch { $directLaunchError = Get-CodexDirectLaunchFailureMessage $exe $_.Exception; if ($codexArgs.Count -gt 0) { throw ($directLaunchError + ' proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost.') }; Write-Warning ($directLaunchError + '; falling back to AppX activation') } }",
-		"if ($codexArgs.Count -gt 0) { throw 'ChatGPT.exe and Codex.exe were not found in the Microsoft Store package and proxy mode cannot use AppX activation because Chromium --proxy-server would be lost. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }",
+		"if (-not [string]::IsNullOrWhiteSpace($exe)) { try { Start-CodexDesktopProcess $exe; return } catch { $directLaunchError = Get-CodexDirectLaunchFailureMessage $exe $_.Exception; if (-not $allowAppXFallback) { if ($codexArgs.Count -gt 0) { throw ($directLaunchError + ' proxy mode cannot fall back to AppX activation because Chromium --proxy-server would be lost.') }; throw ($directLaunchError + ' AppX activation is disabled because the launch requires inherited environment or Chromium --proxy-server arguments.') }; Write-Warning ($directLaunchError + '; falling back to AppX activation') } }",
+		"if (-not $allowAppXFallback) { if ($codexArgs.Count -gt 0) { throw 'ChatGPT.exe and Codex.exe were not found in the Microsoft Store package and proxy mode cannot use AppX activation because Chromium --proxy-server would be lost. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; throw 'ChatGPT.exe and Codex.exe were not found in the Microsoft Store package and legacy AppX activation is disabled because the launch requires inherited environment or Chromium --proxy-server arguments. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }",
 		codexDesktopWindowsAppXSelectionPowerShell(),
 		"$aumid = $pkg.PackageFamilyName + '!' + $app[0].Id",
 		"Write-Warning 'Falling back to AppX activation; CODEX_HOME/proxy environment may not be inherited by the desktop app. If ChatGPT auth or proxy support is required, pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.'",
 		"Start-Process -FilePath ('shell:AppsFolder\\' + $aumid) -WorkingDirectory $cwd | Out-Null",
 	}, "; ")
+}
+
+// Runtime markers select the helper's private runtime and are meaningful only
+// to the cxp process that was launched by the updater.  A desktop app is a
+// user workload: inheriting these markers would make a later ChatGPT/Codex
+// child unexpectedly re-enter (or disable) cxp's runtime activation logic.
+// Clear them in the PowerShell boundary as well as in native process launches
+// so the Windows Store and managed backends share the same inheritance rule.
+func codexDesktopWindowsRuntimeMarkerCleanupPowerShell() string {
+	return "$codexRuntimeMarkerNames = @('CXP_RUNTIME','CXP_RUNTIME_ROOT','CXP_RUNTIME_VERSION','CXP_ENTRY_PATH','CXP_RUNTIME_DISABLE','CXP_RUNTIME_FORCE'); foreach ($codexRuntimeMarkerName in $codexRuntimeMarkerNames) { Remove-Item -LiteralPath ('Env:' + $codexRuntimeMarkerName) -ErrorAction SilentlyContinue }"
 }
 
 func codexDesktopWindowsExecutableCandidatesPowerShell() string {
