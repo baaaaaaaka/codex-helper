@@ -420,6 +420,18 @@ jobs:
           go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
           go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
 
+      - name: Teams test user-directory isolation guard
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
+
+      - name: Teams runtime safety invariant regressions
+        if: always() && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/cli ./internal/teams -count=1 -run '^TestTeamsRuntimeSafety' -v
+
       - name: Teams read-only diagnostics regressions
         shell: bash
         run: |

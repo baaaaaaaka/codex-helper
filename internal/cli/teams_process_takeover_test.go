@@ -364,13 +364,16 @@ func TestTeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired(t *testin
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND", "local-supervisor")
+	exePath := filepath.Join(tmp, "codex-proxy")
 	runner := teamsServiceCommandRunnerFunc(func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		t.Fatal("Scheduled Task repair should not run when duplicate process takeover fails")
+		t.Fatalf("external service command should not run when duplicate process takeover fails: %s %s", name, strings.Join(args, " "))
 		return nil, nil
 	})
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:           "linux",
-		exe:            filepath.Join(tmp, "codex-proxy"),
+		exe:            exePath,
 		cwd:            tmp,
 		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
 		isWSL:          true,
@@ -381,7 +384,14 @@ func TestTeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired(t *testin
 	registryPath := filepath.Join(tmp, "registry.json")
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{
-			{PID: 4501, Args: []string{"/home/alice/go/bin/codex-proxy", "teams", "run", "--auto-service=false", "--registry", registryPath}, Env: map[string]string{}},
+			{
+				PID:  4501,
+				Args: []string{exePath, "teams", "run", "--auto-service=false", "--registry", registryPath},
+				Env: map[string]string{
+					"HOME":           os.Getenv("HOME"),
+					"XDG_STATE_HOME": os.Getenv("XDG_STATE_HOME"),
+				},
+			},
 		}, nil
 	}
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {

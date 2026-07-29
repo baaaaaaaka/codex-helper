@@ -121,6 +121,27 @@ func TestTeamsServiceWatchdogRestartsWhenControlPollStaleDespiteFreshOwner(t *te
 	}
 }
 
+func TestTeamsRuntimeSafetyWatchdogIgnoresHistoricalPollFromPreviousOwnerGenerationCI(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:           true,
+		Active:              true,
+		StateFiles:          1,
+		OwnerFound:          true,
+		OwnerFresh:          true,
+		LastOwnerHeartbeat:  now.Add(-2 * time.Second),
+		FreshOwnerStartedAt: now.Add(-5 * time.Second),
+		PollActivityFound:   true,
+		PollActivityAt:      now.Add(-30 * time.Minute),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale {
+		t.Fatalf("decision = %+v, want startup grace because the only poll predates the current owner generation", decision)
+	}
+}
+
 func TestTeamsServiceWatchdogDoesNotRestartFreshOwnerWithActiveTurn(t *testing.T) {
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})

@@ -4591,7 +4591,22 @@ func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *te
 	}
 }
 
-func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
+func TestTeamsRuntimeSafetyServiceEnvironmentDoesNotPersistWSLDynamicLoopbackProxyByDefaultCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		exe:            filepath.Join(tmp, "bin", "codex-proxy"),
+		argv0:          filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{},
+	})
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
 	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
 	t.Setenv("ALL_PROXY", "socks5://[::1]:38471")
@@ -4603,8 +4618,8 @@ func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 
 	env := teamsServiceEnvironment()
 	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
-		if value := env[name]; value == "" {
-			t.Fatalf("%s should be preserved for the background service, got %#v", name, env)
+		if value := env[name]; value != "" {
+			t.Fatalf("%s persisted dynamic WSL loopback proxy %q in the background service: %#v", name, value, env)
 		}
 	}
 	if env["NO_PROXY"] == "" || env["no_proxy"] == "" {

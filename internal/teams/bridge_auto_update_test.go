@@ -1596,7 +1596,7 @@ func TestBridgeHelperAutoUpdateApplyFailureBacksOffAndAbortsDrain(t *testing.T) 
 	}
 }
 
-func TestBridgeHelperAutoUpdateRestarterFailureKeepsInstalledState(t *testing.T) {
+func TestTeamsRuntimeSafetyBridgeHelperAutoUpdateRestarterFailureDoesNotCompleteUpgradeCI(t *testing.T) {
 	st, bridge := newBridgeAutoUpdateTest(t)
 	now := time.Date(2026, 5, 4, 0, 0, 0, 0, time.UTC)
 	updater := &fakeHelperAutoUpdater{decision: HelperAutoUpdateDecision{
@@ -1624,15 +1624,52 @@ func TestBridgeHelperAutoUpdateRestarterFailureKeepsInstalledState(t *testing.T)
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
-		t.Fatalf("LastInstalledTag = %q, want v1.2.4", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "" {
+		t.Fatalf("LastInstalledTag = %q, want empty until the restarted listener verifies activation", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade = %#v, want completed before restart failure is reported", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase == teamstore.UpgradePhaseCompleted {
+		t.Fatalf("upgrade = %#v, restart failure must not be persisted as completed", state.Upgrade)
 	}
-	if state.ServiceControl.Draining {
-		t.Fatalf("ServiceControl still draining after completed install: %#v", state.ServiceControl)
+	if !strings.Contains(strings.ToLower(state.AutoUpdate.LastError), "restart") &&
+		!strings.Contains(strings.ToLower(state.Upgrade.AbortReason), "restart") {
+		t.Fatalf("restart failure was not preserved as actionable update state: auto=%#v upgrade=%#v", state.AutoUpdate, state.Upgrade)
 	}
+}
+
+func TestTeamsRuntimeSafetyHelperUpdateStatusReportsPhaseBlockerAndRetryCI(t *testing.T) {
+	st := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	bridge.helperAutoUpdater = &fakeHelperAutoUpdater{}
+	now := time.Now()
+	if _, err := st.RecordAutoUpdateCheck(context.Background(), teamstore.AutoUpdateRecord{
+		Now:              now,
+		NextCheckAt:      now.Add(30 * time.Minute),
+		BackoffUntil:     now.Add(10 * time.Minute),
+		LastError:        "restart failed: WorkingDir is unavailable",
+		CandidateTag:     "v1.2.4",
+		CandidateVersion: "1.2.4",
+	}); err != nil {
+		t.Fatalf("RecordAutoUpdateCheck: %v", err)
+	}
+
+	t.Run("routes without Codex", func(t *testing.T) {
+		cmd := ParseDashboardCommand(ChatScopeControl, "helper update status")
+		if cmd.Name != DashboardCommandUpdate || cmd.Argument != "status" {
+			t.Fatalf("command = %#v, want helper update status to route to the local update handler", cmd)
+		}
+	})
+	t.Run("reports durable progress", func(t *testing.T) {
+		if err := bridge.updateHelperFromControl(context.Background(), bridgeTestMessage("control-update-status"), "status"); err != nil {
+			t.Fatalf("handle helper update status: %v", err)
+		}
+		joined := sentPlainJoined(*sent)
+		for _, want := range []string{"Phase:", "Blocker:", "Next retry:", "v1.2.4"} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("helper update status omitted %q:\n%s", want, joined)
+			}
+		}
+	})
 }
 
 func TestBridgeHelperUpgradeCompletionDoesNotUseLastAttemptAsInstalledVersion(t *testing.T) {
