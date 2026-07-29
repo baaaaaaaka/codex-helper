@@ -52,7 +52,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             if name in {"Checkout", "Setup Go"}:
                 continue
             matches = re.findall(
-                r"^        if: matrix\.shard == '("
+                r"^        if: (?:always\(\) && )?matrix\.shard == '("
                 r"core|platform-integration|state-perf|ubuntu-stress|"
                 r"windows-skills-desktop|windows-codex-e2e"
                 r")'(?: && .+)?$",

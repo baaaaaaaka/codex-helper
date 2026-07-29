@@ -573,7 +573,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
       - name: Teams test user-directory isolation guard
-        if: matrix.shard == 'core' && runner.os == 'Linux'
+        if: always() && matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
 
