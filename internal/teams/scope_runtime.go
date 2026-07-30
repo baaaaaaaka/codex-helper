@@ -654,16 +654,31 @@ func ExecuteAutomaticScopeTakeover(
 		}
 	}
 
-	if found {
+	if len(pending) > 0 {
 		// Prove every source-family lock is immediately obtainable before the
-		// first persistent drain write. The locks are released before asking
-		// Store to set the drain because Store owns the same state lock.
+		// first persistent write. The locks are released before asking Store
+		// to set the drain because Store owns the same state lock.
 		preflightLocks, lockErr := acquireScopeTakeoverLocks(ctx, takeoverLockPaths(pending))
 		if lockErr != nil {
 			return result, deferRuntimeStoreTakeover(lockErr.Error())
 		}
 		releaseScopeTakeoverLocks(preflightLocks)
 
+		// All read-only safety checks and the zero-mutation lock probe have
+		// succeeded. Serialize the mutating phase through a lock that lives
+		// with the canonical store and therefore is not part of any legacy
+		// directory we may rename. The legacy store lock is still used below
+		// to prove the writer is fenced and the store generation is stable,
+		// but Windows cannot rename a directory while that in-directory lock
+		// handle remains open.
+		coordinatorLocks, coordinatorErr := acquireScopeTakeoverLocks(ctx, []string{canonicalPath + ".takeover.lock"})
+		if coordinatorErr != nil {
+			return result, deferRuntimeStoreTakeover(coordinatorErr.Error())
+		}
+		defer releaseScopeTakeoverLocks(coordinatorLocks)
+	}
+
+	if found {
 		drainedState := legacyState
 		if !legacyState.ServiceControl.Draining ||
 			legacyState.ServiceControl.DrainOperationID != runtimeStoreTakeoverDrainOperationID(scope.ID) {
@@ -740,6 +755,15 @@ func ExecuteAutomaticScopeTakeover(
 			return result, err
 		}
 	}
+
+	// Store locks live inside scoped legacy directories. Release their file
+	// handles only after the post-fence identity check and shared-state phase,
+	// immediately before quarantine. The canonical coordinator lock above
+	// remains held across the rename, so another takeover cannot enter this
+	// hand-off window. Known writers have already been fenced and prevented
+	// from restarting by the managed supervisor boundary.
+	releaseScopeTakeoverLocks(locks)
+	locks = nil
 
 	for _, root := range []string{"config", "cache", "data", "other"} {
 		var sources []string

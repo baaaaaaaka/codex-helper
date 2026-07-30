@@ -197,6 +197,50 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverAnyFileFamilyLockFailureIsZeroMutati
 	)
 }
 
+func TestTeamsRuntimeSafetyTakeoverReleasesLegacyLockButKeepsCoordinatorBeforeRenameCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	observed := false
+	_, err := exerciseRuntimeSafetyTakeoverContract(
+		fixture.Scope,
+		runtimeSafetyTakeoverContractOptions{
+			OnStage: func(stage string) {
+				if stage != "before-rename-config" {
+					return
+				}
+				observed = true
+				legacyLock := flock.New(fixture.LegacyPath + ".lock")
+				locked, lockErr := legacyLock.TryLock()
+				if lockErr != nil {
+					t.Fatalf("probe released legacy lock: %v", lockErr)
+				}
+				if !locked {
+					t.Fatal("legacy store lock is still held immediately before directory rename")
+				}
+				if err := legacyLock.Unlock(); err != nil {
+					t.Fatalf("release probed legacy lock: %v", err)
+				}
+
+				coordinatorLock := flock.New(fixture.CanonicalPath + ".takeover.lock")
+				locked, lockErr = coordinatorLock.TryLock()
+				if lockErr != nil {
+					t.Fatalf("probe canonical takeover coordinator: %v", lockErr)
+				}
+				if locked {
+					_ = coordinatorLock.Unlock()
+					t.Fatal("canonical takeover coordinator was released before directory rename")
+				}
+			},
+		},
+		fixture.LegacyPath,
+	)
+	if err != nil {
+		t.Fatalf("automatic takeover: %v", err)
+	}
+	if !observed {
+		t.Fatal("takeover did not reach the pre-rename lock hand-off stage")
+	}
+}
+
 func TestTeamsRuntimeSafetyAutomaticTakeoverRepreflightsWhenIdentityChangesAfterFencingCI(t *testing.T) {
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
 	preflightCalls := 0
