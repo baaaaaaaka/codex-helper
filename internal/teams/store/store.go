@@ -3328,6 +3328,7 @@ func (s *Store) MarkUpgradeCompletionNoticeQueued(ctx context.Context, upgradeID
 func (s *Store) AbortUpgrade(ctx context.Context, upgradeID string, reason string) (UpgradeRequest, error) {
 	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
 		req.Phase = UpgradePhaseAborted
+		req.CompletedAt = time.Time{}
 		req.AbortReason = trimDiagnostic(reason, 240)
 		if req.AbortedAt.IsZero() {
 			req.AbortedAt = now

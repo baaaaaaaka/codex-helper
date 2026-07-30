@@ -1147,6 +1147,27 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					MachineRegistryGraph:               machineRegistryGraph,
 					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
 					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
+					LegacyStoreSafetyCheck: func(ctx context.Context) error {
+						if teamsServiceIsWSL() {
+							return runTeamsServiceWSLReadinessCheck(ctx, nil)
+						}
+						return nil
+					},
+					LegacyStoreWriterValidator: func(ctx context.Context, state teamsstore.State) error {
+						spec, err := buildTeamsServiceSpec(registryPath)
+						if err != nil {
+							return err
+						}
+						return teamsServiceValidateLegacyStoreWriters(ctx, state, spec)
+					},
+					LegacyStoreWriterFencer: func(ctx context.Context) error {
+						spec, err := buildTeamsServiceSpec(registryPath)
+						if err != nil {
+							return err
+						}
+						_, err = teamsServiceRetireLocalBridgeProcesses(ctx, spec)
+						return err
+					},
 				})
 			}
 			if teamsRunShouldRetryInProcess(once) {
@@ -1272,7 +1293,9 @@ func teamsRunShouldRetryInProcess(once bool) bool {
 }
 
 func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
+	attempt := 0
 	for {
+		attempt++
 		err := runOnce()
 		if err == nil || !isRecoverableTeamsRunError(err) {
 			return err
@@ -1282,7 +1305,18 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 			delay = 30 * time.Second
 		}
 		if errOut != nil {
-			_, _ = fmt.Fprintf(errOut, "Teams service recoverable error: %v; retrying in %s\n", err, delay)
+			deadline := "unknown"
+			if value, ok := ctx.Deadline(); ok {
+				deadline = value.Format(time.RFC3339Nano)
+			}
+			_, _ = fmt.Fprintf(
+				errOut,
+				"Teams service recoverable error: operation=teams-listener scope=unknown attempt=%d deadline=%s error=%v; retrying in %s\n",
+				attempt,
+				deadline,
+				err,
+				delay,
+			)
 		}
 		if sleepErr := teamsRunServiceSleep(ctx, delay); sleepErr != nil {
 			return sleepErr
@@ -2437,10 +2471,30 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	var owners []teamsstore.OwnerMetadata
 	var serviceControls []teamsstore.ServiceControl
 	var controlLeases []string
+	var canonicalLoadErrors []string
+	authoritativeStore := ""
+	storeIdentity := "unavailable"
+	activeSessions := 0
+	parkedSessions := 0
+	historicalSessions := 0
+	pollableSessions := 0
 	for _, statePath := range statePaths {
+		if teamsStatusStoreLayer(statePath) == "legacy" {
+			continue
+		}
 		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
 		if err != nil {
-			return err
+			canonicalLoadErrors = append(canonicalLoadErrors, fmt.Sprintf("%s: %v", statePath, err))
+			continue
+		}
+		if authoritativeStore == "" || statePath == defaultStatePath {
+			authoritativeStore = statePath
+			storeIdentity = fmt.Sprintf(
+				"scope=%s account=%s profile=%s",
+				firstNonEmptyCLI(state.Scope.ID, "unknown"),
+				firstNonEmptyCLI(state.Scope.AccountID, "unknown"),
+				firstNonEmptyCLI(state.Scope.Profile, "default"),
+			)
 		}
 		owner, ownerKind := teamsStatusOwner(state, now)
 		statusStores = append(statusStores, teamsStatusStoreSnapshot{
@@ -2456,6 +2510,17 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			}
 			stateSessions++
 			addStatusSession(statusSessions, session.ID, session.TeamsChatID, string(session.Status))
+			if session.Status == teamsstore.SessionStatusActive {
+				activeSessions++
+				poll := state.ChatPolls[session.TeamsChatID]
+				if strings.EqualFold(strings.TrimSpace(poll.PollState), "parked") {
+					parkedSessions++
+				} else if strings.TrimSpace(session.TeamsChatID) != "" {
+					pollableSessions++
+				}
+			} else {
+				historicalSessions++
+			}
 		}
 		for _, msg := range state.OutboxMessages {
 			if msg.Status == teamsstore.OutboxStatusQueued {
@@ -2484,10 +2549,50 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			controlChatSource = statePath
 		}
 	}
+	if authoritativeStore == "" {
+		authoritativeStore = defaultStatePath + " (not present)"
+	}
 	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
 	authorityDiagnostics := buildTeamsAuthorityDiagnostics(statusStores, reg, controlChatID)
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
+	_, _ = fmt.Fprintf(out, "Authoritative store: %s\n", authoritativeStore)
+	_, _ = fmt.Fprintf(out, "Store identity: %s\n", storeIdentity)
+	for _, statePath := range statePaths {
+		layer := teamsStatusStoreLayer(statePath)
+		authority := "non-authoritative"
+		if layer == "canonical" && filepath.Clean(statePath) == filepath.Clean(strings.TrimSuffix(authoritativeStore, " (not present)")) {
+			authority = "authoritative"
+		}
+		_, _ = fmt.Fprintf(out, "Store candidate: %s %s %s\n", layer, authority, statePath)
+	}
+	for _, loadErr := range canonicalLoadErrors {
+		_, _ = fmt.Fprintf(out, "Canonical load error: %s\n", loadErr)
+	}
+	_, _ = fmt.Fprintln(out, "Desired service state: configured")
+	_, _ = fmt.Fprintln(out, "Supervisor state: see OS service")
+	_, _ = fmt.Fprintln(out, "Child state: see OS service")
+	listenerState := "stopped"
+	if len(owners) > 0 {
+		listenerState = "running"
+	}
+	_, _ = fmt.Fprintf(out, "Listener state: %s\n", listenerState)
+	if len(owners) == 0 {
+		_, _ = fmt.Fprintln(out, "Live owner: none")
+	} else {
+		owner := owners[0]
+		_, _ = fmt.Fprintf(out, "Live owner: machine=%s pid=%d generation=%d heartbeat=%s\n", owner.MachineID, owner.PID, owner.LeaseGeneration, owner.LastHeartbeat.Format(time.RFC3339))
+	}
+	if len(controlLeases) == 0 {
+		_, _ = fmt.Fprintln(out, "Control lease: none")
+	} else {
+		_, _ = fmt.Fprintln(out, controlLeases[0])
+	}
+	_, _ = fmt.Fprintf(out, "Active sessions: %d\n", activeSessions)
+	_, _ = fmt.Fprintf(out, "Parked sessions: %d\n", parkedSessions)
+	_, _ = fmt.Fprintf(out, "Historical sessions: %d\n", historicalSessions)
+	_, _ = fmt.Fprintf(out, "Pollable sessions: %d\n", pollableSessions)
+	_, _ = fmt.Fprintln(out, "Remediation: run `cxp teams service doctor` for actionable checks.")
 	if controlChatID == "" {
 		_, _ = fmt.Fprintln(out, "Control chat: unavailable")
 	} else if len(owners) == 0 {
@@ -3576,7 +3681,11 @@ func teamsStorePathsWithMode(readOnly bool) ([]string, error) {
 	}
 	paths := []string{defaultPath}
 	if legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "state.json"); legacyErr == nil {
-		paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
+		if readOnly {
+			paths = append(paths, legacyPath)
+		} else {
+			paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
+		}
 	}
 	for _, globPath := range []string{mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "state.json"))} {
 		paths, err = appendGlobMatches(paths, globPath)
@@ -3591,6 +3700,10 @@ func teamsStorePathsWithMode(readOnly bool) ([]string, error) {
 		}
 		sort.Strings(matches)
 		for _, match := range matches {
+			if readOnly {
+				paths = append(paths, match)
+				continue
+			}
 			mirrorPath, ok := stateScopedStorePathForLegacyStore(match)
 			if !ok {
 				paths = append(paths, match)
@@ -3711,6 +3824,17 @@ func uniquePaths(paths []string) []string {
 		out = append(out, path)
 	}
 	return out
+}
+
+func teamsStatusStoreLayer(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if legacyRoot, err := appdirs.LegacyConfigPath("teams"); err == nil {
+		legacyRoot = filepath.Clean(legacyRoot)
+		if path == legacyRoot || strings.HasPrefix(path, legacyRoot+string(filepath.Separator)) {
+			return "legacy"
+		}
+	}
+	return "canonical"
 }
 
 func existingTeamsStorePaths() ([]string, error) {

@@ -52,6 +52,7 @@ var teamsAppServerModelProfilePrepareTimeout = defaultTeamsAppServerModelProfile
 var codexLoginStatusCommand = exec.CommandContext
 var codexLoginStatusProbeFn = probeCodexLoginStatus
 var loadBundledCodexModelCatalogFn = loadBundledCodexModelCatalog
+var modelProfileAvailabilityWarnings sync.Map
 
 type codexLoginProbePathContextKey struct{}
 type codexInvocationContextKey struct{}
@@ -900,29 +901,34 @@ func resolveRoutableConfiguredModels(cfg config.Config, store *config.Store, log
 	for _, name := range names {
 		profile := cfg.ModelProfiles[name]
 		if strings.TrimSpace(profile.Source) != "" && !modelProfileVerificationCurrent(cfg, name, profile, secretStore) {
-			if log != nil {
-				_, _ = fmt.Fprintf(log, "warning: third-party model profile %q is hidden because its verification is missing or stale\n", name)
-			}
+			writeModelProfileAvailabilityWarningOnce(log, name, "verification is missing or stale")
 			continue
 		}
 		candidate, err := modelprofile.Resolve(cfg, name)
 		if err != nil || candidate.IsDefault() || !candidate.Provider.UsesAdapter {
-			if log != nil {
-				_, _ = fmt.Fprintf(log, "warning: third-party model profile %q is hidden because its configuration is invalid\n", name)
-			}
+			writeModelProfileAvailabilityWarningOnce(log, name, "configuration is invalid")
 			continue
 		}
 		apiKey, err := modelprofile.ResolveAPIKey(candidate.Profile.APIKeyRef, secretStore, os.Getenv)
 		if err != nil {
-			if log != nil {
-				_, _ = fmt.Fprintf(log, "warning: third-party model profile %q is hidden because its credential is unavailable\n", name)
-			}
+			writeModelProfileAvailabilityWarningOnce(log, name, "credential is unavailable")
 			continue
 		}
 		resolved = append(resolved, candidate)
 		apiKeys[candidate.Name] = apiKey
 	}
 	return resolved, apiKeys
+}
+
+func writeModelProfileAvailabilityWarningOnce(log io.Writer, name string, reason string) {
+	if log == nil {
+		return
+	}
+	key := name + "\x00" + reason
+	if _, loaded := modelProfileAvailabilityWarnings.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	_, _ = fmt.Fprintf(log, "warning: third-party model profile %q is hidden because its %s\n", name, reason)
 }
 
 func resolveConfiguredInterfaceAPIKeys(cfg config.Config, resolved []modelprofile.Resolved, selected map[string]string, store *config.Store) map[string]map[string]string {

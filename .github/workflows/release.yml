@@ -422,47 +422,47 @@ jobs:
           go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
 
       - name: Teams test user-directory isolation guard
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
 
       - name: Teams runtime safety test isolation
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
 
       - name: Teams runtime safety Windows paths and service environment
-        if: always() && runner.os == 'Windows'
+        if: runner.os == 'Windows'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh windows
 
       - name: Teams runtime safety scope resolution and migration
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
 
       - name: Teams runtime safety resolver syscall budget
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
 
       - name: Teams runtime safety real-process takeover
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
 
       - name: Teams runtime safety service and update lifecycle
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh service-update
 
       - name: Teams runtime safety WSL and process lifecycle
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh wsl-process
 
       - name: Teams runtime safety readiness and diagnostics
-        if: always() && runner.os == 'Linux'
+        if: runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh diagnostics
 

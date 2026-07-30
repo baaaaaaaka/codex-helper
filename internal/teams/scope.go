@@ -78,7 +78,19 @@ func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIde
 	if err != nil {
 		return scope, "", err
 	}
-	resolved, path, ok, err := resolveExistingScopeStore(scope, currentPath)
+	// The canonical state-layer store is the runtime authority. Keep this hot
+	// path to one metadata lookup: opening the store, scanning legacy roots, or
+	// acquiring a writable lock here can both add startup I/O and allow a
+	// retained migration copy to influence listener selection.
+	if info, err := os.Lstat(currentPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return scope, "", fmt.Errorf("canonical Teams store %s is not a regular file", currentPath)
+		}
+		return scope, currentPath, nil
+	} else if !os.IsNotExist(err) {
+		return scope, "", fmt.Errorf("inspect canonical Teams store %s: %w", currentPath, err)
+	}
+	resolved, path, ok, err := discoverRuntimeScopeMigrationSource(scope, currentPath)
 	if err != nil {
 		return scope, "", err
 	}
@@ -87,10 +99,11 @@ func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIde
 		if !resolved.CreatedAt.IsZero() {
 			scope.CreatedAt = resolved.CreatedAt
 		}
-		if migratedPath, err := migrateResolvedScopeStore(resolved, path); err == nil && strings.TrimSpace(migratedPath) != "" {
-			path = migratedPath
+		migratedPath, err := executeLegacyOnlyMigration(scope, path)
+		if err != nil {
+			return scope, "", err
 		}
-		return scope, path, nil
+		return scope, migratedPath, nil
 	}
 	return scope, currentPath, nil
 }

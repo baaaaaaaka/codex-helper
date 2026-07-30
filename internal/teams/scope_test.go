@@ -230,7 +230,7 @@ func TestResolveStorePathForMaintenancePinsLiveLegacyStoreWithoutMigrating(t *te
 	}
 }
 
-func TestResolveStorePathForScopeKeepsMaintenanceAuthorityAfterOwnerClears(t *testing.T) {
+func TestResolveStorePathForScopeCanonicalWinsAfterLegacyOwnerClears(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -313,11 +313,14 @@ func TestResolveStorePathForScopeKeepsMaintenanceAuthorityAfterOwnerClears(t *te
 	if loadErr != nil || closeErr != nil {
 		t.Fatalf("load resolved store: load=%v close=%v", loadErr, closeErr)
 	}
-	if got := state.Sessions["s014"].TeamsChatID; got != "authoritative-chat" {
-		t.Fatalf("normal restart selected stale store %q at %s", got, resolvedPath)
+	if !samePath(resolvedPath, currentPath) {
+		t.Fatalf("runtime resolver path = %q, want canonical %q", resolvedPath, currentPath)
 	}
-	if state.ServiceControl.LastDrainOperationID != "operation-authority" || state.ServiceControl.LastDrainOperationAt.IsZero() {
-		t.Fatalf("maintenance authority marker was not preserved: %#v", state.ServiceControl)
+	if got := state.Sessions["s014"].TeamsChatID; got != "stale-chat" {
+		t.Fatalf("runtime resolver merged legacy session into canonical: got %q at %s", got, resolvedPath)
+	}
+	if state.ServiceControl.LastDrainOperationID != "older-operation" {
+		t.Fatalf("runtime resolver merged legacy maintenance authority into canonical: %#v", state.ServiceControl)
 	}
 }
 
@@ -947,16 +950,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCompletesPartialNewScopeCI(t *t
 	}
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-	resolved, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope error: %v", err)
+	if _, _, err := ResolveStorePathForScope(current); err == nil || !strings.Contains(err.Error(), "multiple Teams migration candidates") {
+		t.Fatalf("ResolveStorePathForScope error = %v, want ambiguous migration candidates", err)
 	}
-	if resolved.ID != scope.ID || path != newPath {
-		t.Fatalf("resolved scope/path = %#v %q, want %q at %q", resolved, path, scope.ID, newPath)
-	}
-	newStore, err := teamstore.Open(path)
+	newStore, err := teamstore.Open(newPath)
 	if err != nil {
-		t.Fatalf("Open resolved store: %v", err)
+		t.Fatalf("Open retained partial store: %v", err)
 	}
 	state, err := newStore.Load(context.Background())
 	if closeErr := newStore.Close(); err == nil && closeErr != nil {
@@ -965,17 +964,13 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCompletesPartialNewScopeCI(t *t
 	if err != nil {
 		t.Fatalf("Load resolved store: %v", err)
 	}
-	if _, ok := state.OutboxMessages["outbox:newer"]; !ok {
-		t.Fatalf("resolved store did not refresh stale partial state: %#v", state.OutboxMessages)
+	if _, ok := state.OutboxMessages["outbox:stale"]; !ok {
+		t.Fatalf("fail-closed resolver modified partial state: %#v", state.OutboxMessages)
 	}
-	if _, ok := state.OutboxMessages["outbox:stale"]; ok {
-		t.Fatalf("resolved store kept stale partial state: %#v", state.OutboxMessages)
+	wantRegistryPath := filepath.Join(filepath.Dir(newPath), "registry.json")
+	if _, err := os.Stat(wantRegistryPath); !os.IsNotExist(err) {
+		t.Fatalf("fail-closed resolver created canonical registry %s: %v", wantRegistryPath, err)
 	}
-	wantRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
-	if err != nil {
-		t.Fatalf("DefaultRegistryPathForScope: %v", err)
-	}
-	assertTeamsFileContent(t, wantRegistryPath, `{"version":1,"control_chat_id":"legacy-control"}`)
 }
 
 func TestTeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateCI(t *testing.T) {
@@ -1051,16 +1046,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateC
 			}
 
 			current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-			resolved, path, err := ResolveStorePathForScope(current)
-			if err != nil {
-				t.Fatalf("ResolveStorePathForScope error: %v", err)
+			if _, _, err := ResolveStorePathForScope(current); err == nil || !strings.Contains(err.Error(), "multiple Teams migration candidates") {
+				t.Fatalf("ResolveStorePathForScope error = %v, want ambiguous migration candidates", err)
 			}
-			if resolved.ID != scope.ID || path != newPath {
-				t.Fatalf("resolved scope/path = %#v %q, want %q at %q", resolved, path, scope.ID, newPath)
-			}
-			gotStore, err := teamstore.Open(path)
+			gotStore, err := teamstore.Open(newPath)
 			if err != nil {
-				t.Fatalf("Open resolved store: %v", err)
+				t.Fatalf("Open retained state-layer candidate: %v", err)
 			}
 			state, err := gotStore.Load(context.Background())
 			if closeErr := gotStore.Close(); err == nil && closeErr != nil {
@@ -1069,11 +1060,8 @@ func TestTeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateC
 			if err != nil {
 				t.Fatalf("Load resolved store: %v", err)
 			}
-			if _, ok := state.OutboxMessages["outbox:fresh"]; !ok {
-				t.Fatalf("resolved store did not refresh from legacy: %#v", state.OutboxMessages)
-			}
-			if _, ok := state.OutboxMessages["outbox:stale"]; ok {
-				t.Fatalf("resolved store kept stale new state: %#v", state.OutboxMessages)
+			if _, ok := state.OutboxMessages["outbox:stale"]; !ok {
+				t.Fatalf("fail-closed resolver modified state-layer candidate: %#v", state.OutboxMessages)
 			}
 		})
 	}
@@ -1216,6 +1204,41 @@ func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedForNonRegularCanonicalSQLit
 	}
 }
 
+func TestTeamsRuntimeSafetyRuntimeResolverRejectsNonRegularCanonicalPointerCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	if err := os.MkdirAll(canonicalPath, 0o700); err != nil {
+		t.Fatalf("create non-regular canonical pointer: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	legacy, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy fallback fixture: %v", err)
+	}
+	if _, err := legacy.RecordScope(context.Background(), scope); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("record legacy scope: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy fallback fixture: %v", err)
+	}
+
+	if _, path, err := ResolveStorePathForScope(scope); err == nil {
+		t.Fatalf("runtime resolver selected %q with a non-regular canonical pointer", path)
+	}
+}
+
 func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalFromLegacyCI(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, _ := isolateTeamsScopeUserDirsForTest(t, tmp)
@@ -1271,11 +1294,8 @@ func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalFromLegac
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	_, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("runtime path selection opened the corrupt canonical store: %v", err)
-	}
-	if path != newPath {
-		t.Fatalf("runtime path = %q, want canonical %q", path, newPath)
+	if err == nil {
+		t.Fatalf("runtime discovery selected %q despite an unreadable state-layer candidate", path)
 	}
 	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
 		t.Fatalf("runtime path selection mutated corrupt canonical store: raw=%q err=%v", raw, readErr)
@@ -1327,11 +1347,8 @@ func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalWithoutRe
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	_, path, err := ResolveStorePathForScope(current)
-	if err != nil {
-		t.Fatalf("runtime path selection opened the corrupt canonical store: %v", err)
-	}
-	if path != newPath {
-		t.Fatalf("runtime path = %q, want canonical %q", path, newPath)
+	if err == nil {
+		t.Fatalf("runtime discovery selected %q despite an unreadable state-layer candidate", path)
 	}
 	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
 		t.Fatalf("runtime path selection mutated corrupt canonical store: raw=%q err=%v", raw, readErr)
@@ -1662,8 +1679,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathMigratesLegacyGlobalStoreCI(t *
 	if !state.ServiceControl.Paused || state.ServiceControl.Reason != "legacy maintenance" {
 		t.Fatalf("migrated service control = %#v, want legacy paused state", state.ServiceControl)
 	}
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("legacy global state should remain: %v", err)
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy global state should be quarantined, stat error = %v", err)
+	}
+	backupPath := migrationBackupPath(oldPath, current.ID)
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("quarantined legacy global state missing at %s: %v", backupPath, err)
 	}
 	for suffix, body := range map[string]string{"": "db", "-wal": "wal", "-shm": "shm"} {
 		assertTeamsFileContent(t, filepath.Join(filepath.Dir(path), teamstore.SQLiteFileName)+suffix, body)

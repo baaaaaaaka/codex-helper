@@ -469,7 +469,15 @@ func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts
 	if snapshot.OwnerActiveTurn {
 		return false, "helper owner is fresh and a turn is active"
 	}
-	if snapshot.PollActivityFound {
+	// A poll from an earlier owner generation says nothing about the child that
+	// just started. Ignore it until the current owner records its first poll, so
+	// a healthy replacement receives the same startup grace as a brand-new
+	// listener.
+	currentOwnerPollFound := snapshot.PollActivityFound
+	if currentOwnerPollFound && !snapshot.FreshOwnerStartedAt.IsZero() && snapshot.PollActivityAt.Before(snapshot.FreshOwnerStartedAt) {
+		currentOwnerPollFound = false
+	}
+	if currentOwnerPollFound {
 		if !snapshot.PollActivityAt.After(opts.Now) && opts.Now.Sub(snapshot.PollActivityAt) > opts.PollStaleAfter {
 			return true, "control chat polling is stale"
 		}

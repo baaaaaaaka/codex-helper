@@ -25,6 +25,56 @@ def fail(message: str, lines: list[str] | None = None) -> None:
     raise SystemExit(1)
 
 
+def trace_phase(lines: list[str], begin_marker: str, end_marker: str) -> list[str]:
+    begin = next((i for i, line in enumerate(lines) if begin_marker in line), -1)
+    end = next(
+        (i for i, line in enumerate(lines[begin + 1 :], begin + 1) if end_marker in line),
+        -1,
+    )
+    if begin < 0 or end <= begin:
+        fail(f"resolver trace is missing phase markers {begin_marker}/{end_marker}")
+    return lines[begin + 1 : end]
+
+
+def verify_phase(
+    phase: list[str],
+    root: str,
+    label: str,
+    *,
+    allow_legacy_metadata: bool,
+    metadata_limit: int,
+) -> int:
+    rooted = [line for line in phase if root in line]
+    legacy = [line for line in rooted if f"{root}/config/" in line]
+    sqlite = [line for line in rooted if ".sqlite" in line or "-wal" in line or "-shm" in line]
+    opened = [line for line in rooted if OPEN.search(line)]
+    scanned = [line for line in rooted if DIRECTORY_SCAN.search(line)]
+    mutated = [line for line in rooted if MUTATING.search(line)]
+    metadata = [line for line in rooted if METADATA.search(line)]
+
+    if legacy and not allow_legacy_metadata:
+        fail(f"{label} accessed the legacy config tree", legacy)
+    if sqlite:
+        fail("steady canonical resolver opened or inspected SQLite sidecars", sqlite)
+    if opened:
+        fail("steady canonical resolver opened files instead of using path metadata only", opened)
+    if scanned:
+        fail("steady canonical resolver enumerated a directory", scanned)
+    if mutated:
+        fail("steady canonical resolver issued mutating filesystem syscalls", mutated)
+    if len(metadata) > metadata_limit:
+        fail(
+            f"{label} used {len(metadata)} metadata syscalls; want at most {metadata_limit}",
+            metadata,
+        )
+    if len(metadata) < 2:
+        fail(
+            f"{label} used only {len(metadata)} rooted metadata syscalls; probe may not cover the path",
+            metadata,
+        )
+    return len(metadata)
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         fail("usage: verify_teams_runtime_resolver_io.py TRACE ROOT_FILE")
@@ -35,47 +85,25 @@ def main() -> None:
         fail("resolver probe root file is empty")
 
     lines = trace_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    begin = next((i for i, line in enumerate(lines) if "CXP_TEAMS_RESOLVER_IO_BEGIN" in line), -1)
-    end = next(
-        (i for i, line in enumerate(lines[begin + 1 :], begin + 1) if "CXP_TEAMS_RESOLVER_IO_END" in line),
-        -1,
+    resolver_metadata = verify_phase(
+        trace_phase(lines, "CXP_TEAMS_RESOLVER_IO_BEGIN", "CXP_TEAMS_RESOLVER_IO_END"),
+        root,
+        "two steady canonical resolutions",
+        allow_legacy_metadata=False,
+        metadata_limit=4,
     )
-    if begin < 0 or end <= begin:
-        fail("resolver trace is missing phase markers")
-
-    phase = lines[begin + 1 : end]
-    rooted = [line for line in phase if root in line]
-    legacy = [line for line in rooted if f"{root}/config/" in line]
-    sqlite = [line for line in rooted if ".sqlite" in line or "-wal" in line or "-shm" in line]
-    opened = [line for line in rooted if OPEN.search(line)]
-    scanned = [line for line in rooted if DIRECTORY_SCAN.search(line)]
-    mutated = [line for line in rooted if MUTATING.search(line)]
-    metadata = [line for line in rooted if METADATA.search(line)]
-
-    if legacy:
-        fail("steady canonical resolver accessed the legacy config tree", legacy)
-    if sqlite:
-        fail("steady canonical resolver opened or inspected SQLite sidecars", sqlite)
-    if opened:
-        fail("steady canonical resolver opened files instead of using path metadata only", opened)
-    if scanned:
-        fail("steady canonical resolver enumerated a directory", scanned)
-    if mutated:
-        fail("steady canonical resolver issued mutating filesystem syscalls", mutated)
-    if len(metadata) > 4:
-        fail(
-            f"two steady canonical resolutions used {len(metadata)} metadata syscalls; want at most four",
-            metadata,
-        )
-    if len(metadata) < 2:
-        fail(
-            f"two steady canonical resolutions used only {len(metadata)} rooted metadata syscalls; probe may not cover the resolver",
-            metadata,
-        )
+    listener_metadata = verify_phase(
+        trace_phase(lines, "CXP_TEAMS_LISTENER_PREP_IO_BEGIN", "CXP_TEAMS_LISTENER_PREP_IO_END"),
+        root,
+        "two steady listener preparations",
+        allow_legacy_metadata=True,
+        metadata_limit=4,
+    )
 
     print(
         "Teams resolver syscall budget passed: "
-        f"metadata={len(metadata)} open=0 scan=0 sqlite=0 mutate=0"
+        f"resolver_metadata={resolver_metadata} listener_metadata={listener_metadata} "
+        "open=0 scan=0 sqlite=0 mutate=0"
     )
 
 

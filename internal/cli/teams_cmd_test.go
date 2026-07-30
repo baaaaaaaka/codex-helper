@@ -434,8 +434,8 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	isolateTeamsUserDirsForTest(t, tmp)
+	scopedStatePath := cliStatePathForTest(t, "teams", "scopes", "scope-a", "state.json")
 	st, err := teamsstore.Open(scopedStatePath)
 	if err != nil {
 		t.Fatalf("Open scoped store: %v", err)
@@ -671,17 +671,20 @@ func TestTeamsStatusPrefersScopedDrainingServiceControl(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	legacyStatePath := filepath.Join(configBase, "codex-helper", "teams", "state.json")
-	legacyStore, err := teamsstore.Open(legacyStatePath)
+	isolateTeamsUserDirsForTest(t, tmp)
+	defaultStatePath, err := teamsStorePathReadOnly()
 	if err != nil {
-		t.Fatalf("Open legacy store: %v", err)
+		t.Fatalf("resolve default state path: %v", err)
 	}
-	if _, err := legacyStore.ClearDrain(context.Background()); err != nil {
-		t.Fatalf("ClearDrain legacy: %v", err)
+	defaultStore, err := teamsstore.Open(defaultStatePath)
+	if err != nil {
+		t.Fatalf("Open default store: %v", err)
+	}
+	if _, err := defaultStore.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain default: %v", err)
 	}
 
-	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	scopedStatePath := cliStatePathForTest(t, "teams", "scopes", "scope-a", "state.json")
 	scopedStore, err := teamsstore.Open(scopedStatePath)
 	if err != nil {
 		t.Fatalf("Open scoped store: %v", err)
@@ -1088,11 +1091,11 @@ func TestTeamsStatusSeparatesCatchupBacklogAndInactiveRows(t *testing.T) {
 	out := executeRootForTeamsTest(t, "teams", "status")
 	for _, want := range []string{
 		"Active summary: 2 pollable chats, 1 active catchup, 1 pollable backlog",
-		"Poll summary: 6 chats",
+		"Poll summary: 4 chats",
 		"1 active catchup",
-		"5 backlog continuations",
-		"Work row layers: pollable=2 parked=1 closed=1 archived=1 stale_scope=2 closed_legacy=1 test_e2e_stale=1",
-		"Scope layers: live=1 stale_owner=2 dead_owner=0 stopped=0",
+		"3 backlog continuations",
+		"Work row layers: pollable=2 parked=1 closed=1 archived=1 stale_scope=0 closed_legacy=1 test_e2e_stale=0",
+		"Scope layers: live=1 stale_owner=0 dead_owner=0 stopped=0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("teams status output missing %q:\n%s", want, out)

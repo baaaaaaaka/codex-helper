@@ -960,7 +960,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(configData)
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
 	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/teams registry.json")
 	for _, want := range []string{
@@ -1481,7 +1481,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap should not print raw access-denied repair errors before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
 	for _, want := range []string{
 		"Start-Process",

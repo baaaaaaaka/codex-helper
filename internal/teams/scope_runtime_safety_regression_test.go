@@ -247,8 +247,11 @@ func TestTeamsRuntimeSafetyLegacyFallbackCannotCreateSelfReinforcingAuthorityCI(
 	if err := lock.Unlock(); err != nil {
 		t.Fatalf("unlock canonical store: %v", err)
 	}
-	if firstErr == nil && firstPath != legacyPath {
-		t.Fatalf("unexpected first resolution path %q; want fail-closed error or historical legacy fallback %q", firstPath, legacyPath)
+	if firstErr != nil {
+		t.Fatalf("canonical hot path was affected by a busy store lock: %v", firstErr)
+	}
+	if firstPath != currentPath {
+		t.Fatalf("canonical hot path selected %q while locked, want %q", firstPath, currentPath)
 	}
 
 	// Reproduce the historical self-reinforcing step explicitly: a listener that
@@ -835,25 +838,18 @@ func seedRuntimeSafetyTakeoverFixture(t *testing.T) runtimeSafetyTakeoverFixture
 	}
 }
 
-// exerciseRuntimeSafetyTakeoverCoordinator is the test adapter for the
-// listener/service entrypoint that will own process fencing and dual-store
-// takeover. The production coordinator does not exist yet, so the adapter
-// deliberately reports any legacy source left behind by today's resolver.
-// The implementation PR must replace this adapter call with the coordinator,
-// without changing the behavioral assertions below.
+// exerciseRuntimeSafetyTakeoverCoordinator is the narrow test adapter for the
+// production takeover coordinator. Process and Windows fencing have no work in
+// these in-process fixtures; the contract tests below inject those boundaries
+// explicitly.
 func exerciseRuntimeSafetyTakeoverCoordinator(scope teamstore.ScopeIdentity, legacySources ...string) (string, error) {
-	_, resolvedPath, err := ResolveStorePathForScope(scope)
-	if err != nil {
-		return resolvedPath, err
-	}
-	for _, source := range legacySources {
-		if exists, existsErr := pathExists(source); existsErr != nil {
-			return resolvedPath, existsErr
-		} else if exists {
-			return resolvedPath, fmt.Errorf("automatic takeover coordinator is not implemented; legacy source remains")
-		}
-	}
-	return resolvedPath, nil
+	result, err := ExecuteAutomaticScopeTakeover(
+		context.Background(),
+		scope,
+		legacySources,
+		AutomaticScopeTakeoverOptions{},
+	)
+	return result.CanonicalPath, err
 }
 
 func TestTeamsRuntimeSafetyAutomaticTakeoverCanonicalWinsAndPreservesLegacyBackupCI(t *testing.T) {

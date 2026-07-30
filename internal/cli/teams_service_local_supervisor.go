@@ -420,7 +420,12 @@ func (b teamsServiceLocalSupervisorBackend) status(_ context.Context) ([]byte, e
 		return out.Bytes(), nil
 	}
 	active := teamsServiceLocalSupervisorStatusActive(status, time.Now())
-	fmt.Fprintf(&out, "Active: %t\n", active)
+	statusFresh := !status.UpdatedAt.IsZero() && time.Since(status.UpdatedAt) <= teamsServiceLocalSupervisorStatusFreshness
+	if !active && statusFresh && status.SupervisorPID > 0 && strings.EqualFold(strings.TrimSpace(status.State), "running") {
+		fmt.Fprintln(&out, "Active: unknown (process not visible from current PID namespace)")
+	} else {
+		fmt.Fprintf(&out, "Active: %t\n", active)
+	}
 	fmt.Fprintf(&out, "SupervisorPID: %d\n", status.SupervisorPID)
 	fmt.Fprintf(&out, "SupervisorPGID: %d\n", status.SupervisorPGID)
 	fmt.Fprintf(&out, "ChildPID: %d\n", status.ChildPID)
@@ -442,6 +447,9 @@ func (b teamsServiceLocalSupervisorBackend) status(_ context.Context) ([]byte, e
 	}
 	writeTeamsServiceLocalSupervisorActivationSummary(&out)
 	fmt.Fprintln(&out, "Autostart: not guaranteed after machine/container reboot")
+	fmt.Fprintln(&out, "Local supervisor: terminal-independent")
+	fmt.Fprintln(&out, "Windows autostart: not installed by local-supervisor")
+	fmt.Fprintln(&out, "Reboot persistence: not guaranteed")
 	return out.Bytes(), nil
 }
 
@@ -1482,9 +1490,10 @@ func openTeamsServiceLocalSupervisorLog(path string) (*os.File, error) {
 }
 
 type teamsServiceLocalSupervisorLogWriter struct {
-	mu   sync.Mutex
-	path string
-	file *os.File
+	mu          sync.Mutex
+	path        string
+	file        *os.File
+	atLineStart bool
 }
 
 func openTeamsServiceLocalSupervisorLogWriter(path string) (*teamsServiceLocalSupervisorLogWriter, error) {
@@ -1492,7 +1501,7 @@ func openTeamsServiceLocalSupervisorLogWriter(path string) (*teamsServiceLocalSu
 	if err != nil {
 		return nil, err
 	}
-	return &teamsServiceLocalSupervisorLogWriter{path: path, file: file}, nil
+	return &teamsServiceLocalSupervisorLogWriter{path: path, file: file, atLineStart: true}, nil
 }
 
 func (w *teamsServiceLocalSupervisorLogWriter) Write(p []byte) (int, error) {
@@ -1504,7 +1513,39 @@ func (w *teamsServiceLocalSupervisorLogWriter) Write(p []byte) (int, error) {
 	if err := w.rotateLocked(); err != nil {
 		return 0, err
 	}
-	return w.file.Write(p)
+	var encoded bytes.Buffer
+	remaining := p
+	for len(remaining) > 0 {
+		if w.atLineStart {
+			fmt.Fprintf(
+				&encoded,
+				"%s pid=%d component=local-supervisor generation=unknown scope=unknown ",
+				time.Now().Format(time.RFC3339Nano),
+				os.Getpid(),
+			)
+			w.atLineStart = false
+		}
+		newline := bytes.IndexByte(remaining, '\n')
+		if newline < 0 {
+			_, _ = encoded.Write(remaining)
+			break
+		}
+		_, _ = encoded.Write(remaining[:newline+1])
+		remaining = remaining[newline+1:]
+		w.atLineStart = true
+	}
+	data := encoded.Bytes()
+	for len(data) > 0 {
+		n, err := w.file.Write(data)
+		if err != nil {
+			return 0, err
+		}
+		if n <= 0 {
+			return 0, io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return len(p), nil
 }
 
 func (w *teamsServiceLocalSupervisorLogWriter) RotateIfNeeded() error {

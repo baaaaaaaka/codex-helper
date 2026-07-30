@@ -83,6 +83,17 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverRealWriterProcessDockerCI(t *testing
 			WriterIdentity: "verified-local-managed-writer",
 			WriterPID:      cmd.Process.Pid,
 			PIDVisibility:  "visible",
+			FenceWriter: func(ctx context.Context) error {
+				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+					return err
+				}
+				select {
+				case <-waited:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			},
 		},
 		fixture.LegacyPath,
 	)

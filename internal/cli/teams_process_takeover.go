@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 type teamsServiceLocalProcess struct {
@@ -75,6 +76,10 @@ func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec te
 	if proc.PID <= 0 || proc.PID == os.Getpid() {
 		return false
 	}
+	return teamsServiceLocalProcessMatchesSpec(proc, spec, kinds)
+}
+
+func teamsServiceLocalProcessMatchesSpec(proc teamsServiceLocalProcess, spec teamsServiceSpec, kinds map[string]bool) bool {
 	kind := teamsServiceLocalProcessKind(proc.Args)
 	if kind == "" || !kinds[kind] {
 		return false
@@ -89,6 +94,57 @@ func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec te
 		return false
 	}
 	return teamsServiceLocalProcessRegistryMatches(proc.Args, proc.Env, spec.RegistryPath, spec.Environment)
+}
+
+func teamsServiceValidateLegacyStoreWriters(ctx context.Context, state teamsstore.State, spec teamsServiceSpec) error {
+	var freshOwners []*teamsstore.OwnerMetadata
+	for _, owner := range []*teamsstore.OwnerMetadata{state.ServiceOwner, state.LockOwner} {
+		if owner != nil && !teamsstore.IsStale(*owner, defaultTeamsOwnerStaleAfter, time.Now()) {
+			freshOwners = append(freshOwners, owner)
+		}
+	}
+	if len(freshOwners) == 0 {
+		return nil
+	}
+	if teamsServiceGOOS() != "linux" {
+		return fmt.Errorf("fresh legacy Teams writer validation is not supported on %s", teamsServiceGOOS())
+	}
+	processes, err := teamsServiceListLocalProcesses()
+	if err != nil {
+		return fmt.Errorf("list local Teams writer processes: %w", err)
+	}
+	byPID := make(map[int]teamsServiceLocalProcess, len(processes))
+	for _, process := range processes {
+		byPID[process.PID] = process
+	}
+	seen := map[int]struct{}{}
+	for _, owner := range freshOwners {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if owner.PID <= 0 {
+			return fmt.Errorf("fresh legacy Teams owner has no verifiable PID")
+		}
+		if _, ok := seen[owner.PID]; ok {
+			continue
+		}
+		seen[owner.PID] = struct{}{}
+		process, ok := byPID[owner.PID]
+		if !ok {
+			return fmt.Errorf("legacy Teams owner pid %d is not visible from the current PID namespace", owner.PID)
+		}
+		if !teamsServiceLocalProcessMatchesSpec(process, spec, map[string]bool{"run": true}) {
+			return fmt.Errorf("legacy Teams owner pid %d does not match the managed profile, state root, and registry", owner.PID)
+		}
+		executable := strings.TrimSpace(owner.ExecutablePath)
+		if executable == "" {
+			return fmt.Errorf("legacy Teams owner pid %d has no executable identity", owner.PID)
+		}
+		if err := teamsLocalSupervisorExecutableMatches(owner.PID, executable, process.Args); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func teamsServiceLocalProcessKind(args []string) string {
@@ -262,7 +318,7 @@ func teamsServiceCleanRegistryPath(path string) string {
 func defaultTeamsServiceListLocalProcesses() ([]teamsServiceLocalProcess, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	out := make([]teamsServiceLocalProcess, 0)
 	for _, entry := range entries {

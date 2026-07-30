@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -155,6 +156,9 @@ func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.Help
 }
 
 func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate teams.HelperAutoUpdateCandidate, applyOpts teams.HelperAutoUpdateApplyOptions) (teams.HelperAutoUpdateApplyResult, error) {
+	if err := preflightPersistedTeamsServiceForUpdate(); err != nil {
+		return teams.HelperAutoUpdateApplyResult{}, err
+	}
 	installPath, err := teamsAutoUpdateResolveInstallPath("")
 	if err != nil {
 		return teams.HelperAutoUpdateApplyResult{}, err
@@ -207,6 +211,59 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 		ActivationPending:  activationPending,
 		ActivationReason:   activationReason,
 	}, nil
+}
+
+// preflightPersistedTeamsServiceForUpdate rejects service specifications that
+// cannot launch before replacing or activating a helper runtime. Keep this
+// deliberately structural: it does not open Teams state, run doctor, or start a
+// dry-run supervisor.
+func preflightPersistedTeamsServiceForUpdate() error {
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		return nil
+	}
+	path, err := backend.Path()
+	if err != nil {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect persisted Teams service configuration %s: %w", path, err)
+	}
+	if backend.ID() != teamsServiceLocalSupervisorID {
+		// Native system service formats are validated when installed/repaired.
+		// The local-supervisor JSON is the format that can outlive a temporary
+		// invocation directory and is therefore checked at this boundary.
+		return nil
+	}
+	cfg, err := readTeamsServiceLocalSupervisorConfig(path)
+	if err != nil {
+		return fmt.Errorf("read persisted Teams service configuration %s: %w", path, err)
+	}
+	workingDir := strings.TrimSpace(cfg.Spec.WorkingDir)
+	if workingDir == "" {
+		return fmt.Errorf("persisted Teams service WorkingDir is empty")
+	}
+	if info, err := os.Stat(workingDir); err != nil {
+		return fmt.Errorf("persisted Teams service WorkingDir %s is unavailable: %w", workingDir, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("persisted Teams service WorkingDir %s is not a directory", workingDir)
+	}
+	executable := strings.TrimSpace(cfg.Spec.Executable)
+	if executable == "" {
+		return fmt.Errorf("persisted Teams service executable is empty")
+	}
+	if info, err := os.Stat(executable); err != nil {
+		return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
+	} else if info.IsDir() {
+		return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
+	}
+	if registryPath := strings.TrimSpace(cfg.Spec.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
+		return fmt.Errorf("persisted Teams service registry path must be absolute: %s", registryPath)
+	}
+	return nil
 }
 
 func teamsAutoUpdateActivationAfterApply(preUpdatePending bool, preUpdateReason string, res update.ApplyResult) (bool, string, error) {

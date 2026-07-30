@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 type teamsServiceCommandRunnerFunc func(context.Context, string, ...string) ([]byte, error)
@@ -822,5 +824,56 @@ func TestTeamsServiceRestartDoesNotStartWhenBridgeCleanupFails(t *testing.T) {
 	}
 	if powershellCalls != 1 {
 		t.Fatalf("events = %#v, want stop only and no start after cleanup failure", events)
+	}
+}
+
+func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "linux"})
+	previousList := teamsServiceListLocalProcesses
+	t.Cleanup(func() { teamsServiceListLocalProcesses = previousList })
+
+	const ownerPID = 424242
+	executable := filepath.Join(tmp, "bin", "cxp")
+	env := teamsServiceCurrentProcessScopeEnvForTest()
+	spec := teamsServiceSpec{Executable: executable, Environment: env}
+	owner := &teamsstore.OwnerMetadata{
+		PID:            ownerPID,
+		Hostname:       "local",
+		ExecutablePath: executable,
+		StartedAt:      time.Now(),
+		LastHeartbeat:  time.Now(),
+	}
+	state := teamsstore.State{ServiceOwner: owner}
+	matching := teamsServiceLocalProcess{
+		PID:  ownerPID,
+		Args: []string{executable, "teams", "run", "--auto-service=false"},
+		Env:  env,
+	}
+
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return []teamsServiceLocalProcess{matching}, nil
+	}
+	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err != nil {
+		t.Fatalf("visible managed writer rejected: %v", err)
+	}
+
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) { return nil, nil }
+	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
+		!strings.Contains(err.Error(), "not visible from the current PID namespace") {
+		t.Fatalf("invisible writer error = %v", err)
+	}
+
+	mismatch := matching
+	mismatch.Env = map[string]string{}
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return []teamsServiceLocalProcess{mismatch}, nil
+	}
+	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
+		!strings.Contains(err.Error(), "does not match the managed profile") {
+		t.Fatalf("writer identity mismatch error = %v", err)
 	}
 }

@@ -26,6 +26,7 @@ type runtimeSafetyTakeoverContractOptions struct {
 	WriterPID        int
 	PIDVisibility    string
 	WindowsTaskState string
+	FenceWriter      func(context.Context) error
 	FailAfterStage   string
 	OnStage          func(string)
 }
@@ -42,13 +43,68 @@ func exerciseRuntimeSafetyTakeoverContract(
 	options runtimeSafetyTakeoverContractOptions,
 	legacySources ...string,
 ) (runtimeSafetyTakeoverContractResult, error) {
-	// The runtime coordinator intentionally does not exist on the test-first
-	// branch. Do not simulate its options here: doing so would make the tests
-	// green without exercising production fencing. The implementation PR must
-	// replace this call with the real coordinator and remove this placeholder.
-	_ = options
-	path, err := exerciseRuntimeSafetyTakeoverCoordinator(scope, legacySources...)
-	return runtimeSafetyTakeoverContractResult{CanonicalPath: path}, err
+	safetyCheck := func(context.Context) error {
+		switch {
+		case options.WriterIdentity == "mismatch":
+			return fmt.Errorf("writer identity mismatch")
+		case options.PIDVisibility == "unknown":
+			return fmt.Errorf("writer PID visibility is unknown")
+		case options.WindowsTaskState == "unknown":
+			return fmt.Errorf("Windows task state is unknown")
+		default:
+			return nil
+		}
+	}
+	startCanonical := func(ctx context.Context, scope teamstore.ScopeIdentity, path string) error {
+		st, err := teamstore.Open(path)
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		user := User{ID: scope.AccountID, UserPrincipalName: scope.UserPrincipal}
+		machine := MachineRecordForUser(user, scope)
+		now := time.Now()
+		owner, err := teamstore.CurrentOwner("v-takeover-test", "", "", now)
+		if err != nil {
+			return err
+		}
+		owner.ScopeID = scope.ID
+		owner.MachineID = machine.ID
+		decision, err := st.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
+			Scope:    scope,
+			Machine:  machine,
+			Owner:    owner,
+			Duration: time.Minute,
+			Now:      now,
+		})
+		if err != nil {
+			return err
+		}
+		if decision.Mode != teamstore.LeaseModeActive {
+			return fmt.Errorf("canonical listener lease mode is %q", decision.Mode)
+		}
+		owner.LeaseGeneration = decision.Lease.Generation
+		_, err = st.RecordOwnerHeartbeat(ctx, owner, time.Minute, now)
+		return err
+	}
+	result, err := ExecuteAutomaticScopeTakeover(
+		context.Background(),
+		scope,
+		legacySources,
+		AutomaticScopeTakeoverOptions{
+			SafetyCheck:    safetyCheck,
+			FenceWriter:    options.FenceWriter,
+			StartCanonical: startCanonical,
+			OnStage:        options.OnStage,
+			FailAfterStage: options.FailAfterStage,
+		},
+	)
+	return runtimeSafetyTakeoverContractResult{
+		CanonicalPath:            result.CanonicalPath,
+		RecoveryInventory:        result.RecoveryInventory,
+		PreflightCount:           result.PreflightCount,
+		StartedCanonicalListener: result.StartedCanonical,
+	}, err
 }
 
 func loadRuntimeSafetyTakeoverState(t *testing.T, path string) teamstore.State {
@@ -635,6 +691,13 @@ func TestTeamsRuntimeSafetyCanonicalSecondStartupAddsNoWritesCI(t *testing.T) {
 	openAndSeedRuntimeSafetyScopeStore(t, path, scope, "canonical-control")
 	before := snapshotRuntimeSafetyFiles(t, tmp)
 	for i := 0; i < 2; i++ {
+		prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
+		if err != nil {
+			t.Fatalf("listener preparation %d: %v", i+1, err)
+		}
+		if !prepared.Resolved || prepared.CanonicalPath != path {
+			t.Fatalf("listener preparation %d = %#v, want resolved canonical %q", i+1, prepared, path)
+		}
 		if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
 			t.Fatalf("resolution %d: %v", i+1, err)
 		} else if resolvedPath != path {
@@ -728,4 +791,15 @@ func TestTeamsRuntimeSafetyCanonicalResolverSyscallProbeCI(t *testing.T) {
 		}
 	}
 	fmt.Fprintln(os.Stderr, "CXP_TEAMS_RESOLVER_IO_END")
+	fmt.Fprintln(os.Stderr, "CXP_TEAMS_LISTENER_PREP_IO_BEGIN")
+	for i := 0; i < 2; i++ {
+		prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
+		if err != nil {
+			t.Fatalf("probe listener preparation %d: %v", i+1, err)
+		}
+		if !prepared.Resolved || prepared.CanonicalPath != path {
+			t.Fatalf("probe listener preparation %d = %#v, want resolved canonical %q", i+1, prepared, path)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "CXP_TEAMS_LISTENER_PREP_IO_END")
 }

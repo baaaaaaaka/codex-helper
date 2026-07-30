@@ -280,10 +280,11 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
 	for _, want := range []string{
 		"[Unit]",
 		"Description=Codex Helper Teams bridge",
-		"WorkingDirectory=" + strconv.Quote(cwd),
+		"WorkingDirectory=" + systemdQuoteArg(stableHome),
 		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(registryPath),
 		"Restart=on-failure",
 		"RestartSec=10s",
@@ -855,8 +856,9 @@ func TestTeamsServiceInstallWritesLocalSupervisorConfigWhenSystemdUserUnavailabl
 	if cfg.Spec.Executable != exePath {
 		t.Fatalf("config executable = %q, want %q", cfg.Spec.Executable, exePath)
 	}
-	if cfg.Spec.WorkingDir != cwd {
-		t.Fatalf("config working dir = %q, want %q", cfg.Spec.WorkingDir, cwd)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
+	if cfg.Spec.WorkingDir != stableHome {
+		t.Fatalf("config working dir = %q, want stable home %q", cfg.Spec.WorkingDir, stableHome)
 	}
 	if cfg.Spec.RegistryPath != registryPath {
 		t.Fatalf("config registry path = %q, want %q", cfg.Spec.RegistryPath, registryPath)
@@ -4517,6 +4519,9 @@ func TestTeamsServiceInstallDefaultsCodexHomeForScope(t *testing.T) {
 
 	tmp := t.TempDir()
 	home := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir effective home: %v", err)
+	}
 	prevUserHome := effectivePathsUserHomeDir
 	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
@@ -4554,7 +4559,7 @@ func TestTeamsServiceInstallDefaultsCodexHomeForScope(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *testing.T) {
+func TestTeamsServiceInstallFailsClosedWhenStableHomeCannotBeDerived(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
@@ -4575,19 +4580,11 @@ func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *te
 
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
 	cmd.SetArgs([]string{"install"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("service install should not fail only because default Codex home cannot be derived: %v", err)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "resolve stable Teams service home") {
+		t.Fatalf("service install error = %v, want stable-home resolution failure", err)
 	}
-	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
-	if err != nil {
-		t.Fatalf("read unit file: %v", err)
-	}
-	unit := string(data)
-	if strings.Contains(unit, "CODEX_HOME=") || strings.Contains(unit, "CODEX_DIR=") {
-		t.Fatalf("unit should omit default Codex home env when it cannot be derived:\n%s", unit)
-	}
-	if !strings.Contains(unit, "CODEX_HELPER_TEAMS_SERVICE=1") {
-		t.Fatalf("unit missing required helper service env:\n%s", unit)
+	if _, err := os.Stat(filepath.Join(unitDir, teamsServiceUnitName)); !os.IsNotExist(err) {
+		t.Fatalf("failed service install should not write a unit, stat error = %v", err)
 	}
 }
 
@@ -5233,6 +5230,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		t.Fatalf("read task xml: %v", err)
 	}
 	taskXML := string(data)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
 	for _, want := range []string{
 		"<LogonType>InteractiveToken</LogonType>",
 		"<RunLevel>LeastPrivilege</RunLevel>",
@@ -5242,7 +5240,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<Command>wscript.exe</Command>",
 		"//B //Nologo",
 		"codex-helper-teams-task.vbs",
-		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
+		"<WorkingDirectory>" + stableHome + "</WorkingDirectory>",
 		"<RestartOnFailure>",
 		"<Count>999</Count>",
 	} {
@@ -5559,6 +5557,9 @@ func TestTeamsServiceBootstrapPreparesControlChatWithServiceCodexHomeEnv(t *test
 
 	tmp := t.TempDir()
 	home := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir effective home: %v", err)
+	}
 	prevUserHome := effectivePathsUserHomeDir
 	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
@@ -7229,7 +7230,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(data)
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
 	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/registry.json")
 	for _, want := range []string{
