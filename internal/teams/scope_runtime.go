@@ -461,7 +461,12 @@ func validateRuntimeStoreMigrationStaging(ctx context.Context, scope teamstore.S
 			return fmt.Errorf("staging registry is not valid")
 		}
 	}
-	return syncParentDir(stagingPath)
+	// Directory fsync is available on Unix but opening a directory for Sync
+	// fails with access denied on Windows. The staged files have already been
+	// closed and validated; keep the directory durability hint best-effort,
+	// matching the atomic publish and quarantine paths below.
+	_ = syncParentDir(stagingPath)
+	return nil
 }
 
 func acquireScopeMigrationCoordinatorLock(ctx context.Context, path string) (heldScopeTakeoverLock, error) {
