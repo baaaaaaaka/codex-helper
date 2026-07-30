@@ -66,9 +66,50 @@ func (r *contextReader) Read(p []byte) (int, error) {
 }
 
 func discoverRuntimeScopeMigrationSource(scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
-	paths, err := candidateScopeStorePaths(currentPath)
+	matches, err := discoverRuntimeScopeMigrationMatches(scope, currentPath)
 	if err != nil {
 		return teamstore.ScopeIdentity{}, "", false, err
+	}
+	// A concurrent migrator briefly exposes both the newly copied canonical
+	// store and its not-yet-quarantined legacy source. Wait on that canonical
+	// store's migration coordinator and probe again. A pre-existing divergent
+	// dual store remains ambiguous after the lock is acquired and still fails
+	// closed; this only removes the copy/quarantine race between resolvers.
+	if len(matches) > 1 {
+		if canonical, ok := singleCanonicalMigrationCandidate(matches); ok {
+			coordinator, lockErr := acquireScopeMigrationCoordinatorLock(filepath.Join(filepath.Dir(canonical.path), ".migration.lock"))
+			if lockErr != nil {
+				return teamstore.ScopeIdentity{}, "", false, lockErr
+			}
+			matches, err = discoverRuntimeScopeMigrationMatches(scope, currentPath)
+			releaseScopeTakeoverLocks([]heldScopeTakeoverLock{coordinator})
+			if err != nil {
+				return teamstore.ScopeIdentity{}, "", false, err
+			}
+		}
+	}
+	if len(matches) == 0 {
+		return teamstore.ScopeIdentity{}, "", false, nil
+	}
+	if len(matches) > 1 {
+		paths := make([]string, 0, len(matches))
+		for _, match := range matches {
+			paths = append(paths, match.path)
+		}
+		sort.Strings(paths)
+		return teamstore.ScopeIdentity{}, "", false, fmt.Errorf(
+			"multiple Teams migration candidates match scope %q; refusing to guess: %s",
+			scope.ID,
+			strings.Join(paths, ", "),
+		)
+	}
+	return matches[0].scope, matches[0].path, true, nil
+}
+
+func discoverRuntimeScopeMigrationMatches(scope teamstore.ScopeIdentity, currentPath string) ([]resolvedScopeStoreCandidate, error) {
+	paths, err := candidateScopeStorePaths(currentPath)
+	if err != nil {
+		return nil, err
 	}
 	var matches []resolvedScopeStoreCandidate
 	for _, path := range paths {
@@ -77,14 +118,14 @@ func discoverRuntimeScopeMigrationSource(scope teamstore.ScopeIdentity, currentP
 		}
 		exists, err := pathExists(path)
 		if err != nil {
-			return teamstore.ScopeIdentity{}, "", false, fmt.Errorf("inspect Teams migration candidate %s: %w", path, err)
+			return nil, fmt.Errorf("inspect Teams migration candidate %s: %w", path, err)
 		}
 		if !exists {
 			continue
 		}
 		metadata, err := ProbeScopeMetadataReadOnly(context.Background(), path)
 		if err != nil {
-			return teamstore.ScopeIdentity{}, "", false, fmt.Errorf("probe Teams migration candidate %s: %w", path, err)
+			return nil, fmt.Errorf("probe Teams migration candidate %s: %w", path, err)
 		}
 		state := teamstore.State{
 			Scope:          metadata.Scope,
@@ -103,22 +144,33 @@ func discoverRuntimeScopeMigrationSource(scope teamstore.ScopeIdentity, currentP
 		}
 		matches = append(matches, resolvedScopeStoreCandidate{scope: candidateScope, path: path})
 	}
-	if len(matches) == 0 {
-		return teamstore.ScopeIdentity{}, "", false, nil
-	}
-	if len(matches) > 1 {
-		paths := make([]string, 0, len(matches))
-		for _, match := range matches {
-			paths = append(paths, match.path)
+	return matches, nil
+}
+
+func singleCanonicalMigrationCandidate(matches []resolvedScopeStoreCandidate) (resolvedScopeStoreCandidate, bool) {
+	var canonical resolvedScopeStoreCandidate
+	canonicalCount := 0
+	scopeID := ""
+	for _, match := range matches {
+		matchScopeID := strings.TrimSpace(match.scope.ID)
+		if matchScopeID == "" {
+			return resolvedScopeStoreCandidate{}, false
 		}
-		sort.Strings(paths)
-		return teamstore.ScopeIdentity{}, "", false, fmt.Errorf(
-			"multiple Teams migration candidates match scope %q; refusing to guess: %s",
-			scope.ID,
-			strings.Join(paths, ", "),
-		)
+		if scopeID == "" {
+			scopeID = matchScopeID
+		} else if scopeID != matchScopeID {
+			return resolvedScopeStoreCandidate{}, false
+		}
+		path, err := DefaultStorePathForScope(matchScopeID)
+		if err != nil {
+			return resolvedScopeStoreCandidate{}, false
+		}
+		if samePath(match.path, path) {
+			canonical = match
+			canonicalCount++
+		}
 	}
-	return matches[0].scope, matches[0].path, true, nil
+	return canonical, canonicalCount == 1
 }
 
 func executeLegacyOnlyMigration(scope teamstore.ScopeIdentity, sourcePath string) (string, error) {

@@ -7487,6 +7487,11 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	teamsServiceIsWSL = func() bool { return hooks.isWSL }
 	if hooks.wslInteropAvailable != nil {
 		teamsServiceWSLInteropAvailable = func() bool { return *hooks.wslInteropAvailable }
+	} else if hooks.isWSL {
+		// Unit tests that explicitly simulate WSL should not inherit the host
+		// runner's binfmt state. Tests for unavailable interop opt out via the
+		// explicit hook above.
+		teamsServiceWSLInteropAvailable = func() bool { return true }
 	}
 	teamsServiceWSLDistroName = func() string { return hooks.wslDistro }
 	teamsServiceWSLLinuxUserName = func() string { return hooks.wslLinuxUser }

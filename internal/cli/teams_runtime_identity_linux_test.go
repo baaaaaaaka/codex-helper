@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const teamsRuntimeIdentityHelperEnv = "CXP_TEST_TEAMS_RUNTIME_IDENTITY_HELPER"
@@ -44,9 +46,9 @@ func TestTeamsRuntimeSafetyManagedRuntimeLineageStillRejectsReusedPIDStartTimeCI
 func startTeamsRuntimeSafetyManagedRuntimeFixture(t *testing.T) (*exec.Cmd, string, string) {
 	t.Helper()
 	tmp := t.TempDir()
-	testBinary, err := os.Executable()
+	testBinary, err := helperpath.RawExecutable()
 	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
+		t.Fatalf("helperpath.RawExecutable: %v", err)
 	}
 	raw, err := os.ReadFile(testBinary)
 	if err != nil {
