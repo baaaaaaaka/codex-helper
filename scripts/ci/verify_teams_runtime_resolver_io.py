@@ -107,8 +107,8 @@ def main() -> None:
             phase,
             root,
             f"canonical resolution process {index}",
-            allow_legacy_metadata=False,
-            metadata_minimum=1,
+            allow_legacy_metadata=True,
+            metadata_minimum=2,
             metadata_limit=2,
         )
         for index, phase in enumerate(

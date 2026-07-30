@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -816,6 +818,149 @@ func TestTeamsServiceWatchdogPollActivityTreatsFutureBlockedUntilAsActivity(t *t
 	activity, ok := teamsServiceWatchdogPollActivity(state, now)
 	if !ok || !activity.Equal(now) {
 		t.Fatalf("activity = %s ok=%t, want current time while poll is intentionally blocked", activity, ok)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *testing.T) {
+	lockCLITestHooks(t)
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	ownerPath := filepath.Join(t.TempDir(), "owner", "state.json")
+	pollPath := filepath.Join(t.TempDir(), "poll", "state.json")
+	ownerStore, err := teamsstore.Open(ownerPath)
+	if err != nil {
+		t.Fatalf("open owner store: %v", err)
+	}
+	if err := ownerStore.Update(context.Background(), func(state *teamsstore.State) error {
+		owner := teamsstore.OwnerMetadata{
+			PID:           os.Getpid(),
+			Hostname:      hostname,
+			StartedAt:     now.Add(-5 * time.Minute),
+			LastHeartbeat: now.Add(-5 * time.Second),
+		}
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		state.ControlChat = teamsstore.ControlChatBinding{TeamsChatID: "owner-control"}
+		return nil
+	}); err != nil {
+		_ = ownerStore.Close()
+		t.Fatalf("seed owner store: %v", err)
+	}
+	if err := ownerStore.Close(); err != nil {
+		t.Fatalf("close owner store: %v", err)
+	}
+	pollStore, err := teamsstore.Open(pollPath)
+	if err != nil {
+		t.Fatalf("open poll store: %v", err)
+	}
+	if err := pollStore.Update(context.Background(), func(state *teamsstore.State) error {
+		state.ControlChat = teamsstore.ControlChatBinding{TeamsChatID: "poll-control"}
+		state.ChatPolls["poll-control"] = teamsstore.ChatPollState{
+			ChatID:               "poll-control",
+			LastSuccessfulPollAt: now.Add(-5 * time.Second),
+		}
+		return nil
+	}); err != nil {
+		_ = pollStore.Close()
+		t.Fatalf("seed poll store: %v", err)
+	}
+	if err := pollStore.Close(); err != nil {
+		t.Fatalf("close poll store: %v", err)
+	}
+
+	installTeamsServiceWatchdogResourceHooks(t, []string{ownerPath, pollPath}, teamsServiceWatchdogResourceScenario{installed: true, active: true})
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect watchdog snapshot: %v", err)
+	}
+	if !snapshot.OwnerFresh || snapshot.PollActivityFound {
+		t.Fatalf("snapshot combined cross-store health evidence: %+v", snapshot)
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !strings.Contains(decision.Reason, "never became active") {
+		t.Fatalf("decision = %+v, want stale owner-store poll restart", decision)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogRefusesLifecycleChangesWithMultipleFreshOwnerStoresCI(t *testing.T) {
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:                true,
+		Active:                   true,
+		StateFiles:               2,
+		MultipleFreshOwnerStores: true,
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, teamsServiceWatchdogOptions{
+		Now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+	})
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "multiple canonical") {
+		t.Fatalf("decision = %+v, want fail-closed multiple-owner noop", decision)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogIgnoresLegacyAndPerformsZeroStoreWritesCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	scopeID := "scope-watchdog-read-only"
+	canonicalPath, err := appdirs.StatePath("teams", "scopes", scopeID, "state.json")
+	if err != nil {
+		t.Fatalf("canonical path: %v", err)
+	}
+	legacyPath, err := appdirs.LegacyConfigPath("teams", "scopes", scopeID, "state.json")
+	if err != nil {
+		t.Fatalf("legacy path: %v", err)
+	}
+	for path, chatID := range map[string]string{canonicalPath: "canonical", legacyPath: "legacy"} {
+		store, err := teamsstore.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", path, err)
+		}
+		if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+			state.ControlChat = teamsstore.ControlChatBinding{TeamsChatID: chatID}
+			return nil
+		}); err != nil {
+			_ = store.Close()
+			t.Fatalf("seed %s: %v", path, err)
+		}
+		if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+			_ = store.Close()
+			t.Fatalf("migrate %s to sqlite: %v", path, err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close %s: %v", path, err)
+		}
+	}
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	prevPaths := teamsServiceWatchdogStorePaths
+	prevInstalled := teamsServiceWatchdogInstalled
+	t.Cleanup(func() {
+		teamsServiceWatchdogStorePaths = prevPaths
+		teamsServiceWatchdogInstalled = prevInstalled
+	})
+	teamsServiceWatchdogStorePaths = existingCanonicalTeamsStorePathsReadOnly
+	teamsServiceWatchdogInstalled = func() (bool, error) { return false, nil }
+
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), teamsServiceWatchdogOptions{
+		Now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("collect watchdog snapshot: %v", err)
+	}
+	if snapshot.StateFiles != 1 {
+		t.Fatalf("watchdog state files = %d, want only canonical store", snapshot.StateFiles)
+	}
+	if err := reconcileTeamsServiceWatchdogLifecycleDrains(context.Background(), teamsServiceWatchdogOptions{
+		Now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("reconcile healthy stores: %v", err)
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("watchdog modified canonical or legacy store files: before=%v after=%v", before, after)
 	}
 }
 

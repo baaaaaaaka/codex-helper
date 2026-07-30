@@ -1086,20 +1086,19 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				}
 				bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
 				if err != nil {
-					return err
-				}
-				migratedStore, err := prepareManagedTeamsRuntimeStore(
-					cmd.Context(),
-					bridge.RuntimeScopeIdentity(),
-					once,
-				)
-				if err != nil {
-					return err
-				}
-				if migratedStore {
-					// The initial bridge may have loaded the legacy registry
-					// projection before the offline handoff. Recreate it so
-					// every persisted path is resolved from canonical state.
+					plan, actionRequired := teams.RuntimeStorePlanFromError(err)
+					if !actionRequired {
+						return err
+					}
+					if !teamsRunShouldRetryInProcess(once) {
+						return fmt.Errorf(
+							"%w; run the managed Teams service to complete offline migration",
+							err,
+						)
+					}
+					if err := teams.CompleteOfflineRuntimeStorePlan(cmd.Context(), plan); err != nil {
+						return err
+					}
 					bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
 					if err != nil {
 						return err
@@ -1289,11 +1288,11 @@ func prepareManagedTeamsRuntimeStore(
 	scope teamsstore.ScopeIdentity,
 	once bool,
 ) (bool, error) {
-	prepared, err := teams.PrepareRuntimeStoreForListener(ctx, scope)
+	plan, err := teams.InspectRuntimeStoreForScope(ctx, scope)
 	if err != nil {
 		return false, err
 	}
-	if !prepared.TakeoverRequired {
+	if plan.Action == teams.RuntimeStoreActionReady || plan.Action == teams.RuntimeStoreActionCreate {
 		return false, nil
 	}
 	if !teamsRunShouldRetryInProcess(once) {
@@ -1305,7 +1304,7 @@ func prepareManagedTeamsRuntimeStore(
 	// stopped or excluded the previous child. Keep process and Scheduled Task
 	// management in that existing lifecycle boundary; this pre-listener child
 	// step is intentionally limited to deterministic store operations.
-	if err := teams.CompleteOfflineRuntimeStoreTakeover(ctx, scope, prepared.LegacyPath); err != nil {
+	if err := teams.CompleteOfflineRuntimeStorePlan(ctx, plan); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -3866,6 +3865,21 @@ func existingTeamsStorePaths() ([]string, error) {
 
 func existingTeamsStorePathsReadOnly() ([]string, error) {
 	return existingTeamsStorePathsWithMode(true)
+}
+
+func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
+	paths, err := existingTeamsStorePathsReadOnly()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if teamsStatusStoreLayer(path) == "legacy" {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out, nil
 }
 
 func existingTeamsStorePathsWithMode(readOnly bool) ([]string, error) {

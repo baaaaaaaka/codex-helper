@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -48,6 +50,24 @@ func openAndSeedRuntimeSafetyScopeStore(t *testing.T, path string, scope teamsto
 	}
 }
 
+func requireRuntimeStoreActionPlan(
+	t *testing.T,
+	err error,
+	action RuntimeStoreAction,
+	canonicalPath string,
+	legacyPath string,
+) RuntimeStorePlan {
+	t.Helper()
+	plan, ok := RuntimeStorePlanFromError(err)
+	if !ok {
+		t.Fatalf("error = %v, want structured runtime store action", err)
+	}
+	if plan.Action != action || plan.CanonicalPath != canonicalPath || plan.LegacyPath != legacyPath {
+		t.Fatalf("runtime store plan = %#v, want action=%q canonical=%q legacy=%q", plan, action, canonicalPath, legacyPath)
+	}
+	return plan
+}
+
 func TestTeamsRuntimeSafetyRuntimeResolverNeverReturnsLegacyPathCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
@@ -61,16 +81,54 @@ func TestTeamsRuntimeSafetyRuntimeResolverNeverReturnsLegacyPathCI(t *testing.T)
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
-	_, runtimePath, err := ResolveStorePathForScope(scope)
-	if err != nil {
-		t.Fatalf("ResolveStorePathForScope: %v", err)
-	}
 	currentPath, err := DefaultStorePathForScope(scope.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	if runtimePath != currentPath {
-		t.Fatalf("runtime resolver returned %q, want canonical state-layer path %q", runtimePath, currentPath)
+	_, runtimePath, err := ResolveStorePathForScope(scope)
+	if runtimePath != "" {
+		t.Fatalf("runtime resolver returned path %q while migration is required", runtimePath)
+	}
+	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionMigrateLegacy, currentPath, legacyPath)
+}
+
+func TestTeamsRuntimeSafetyBridgeConstructionReturnsPlanBeforeRegistryMutationCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/me" {
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"user-1","displayName":"User One","userPrincipalName":"user@example.test"}`)
+	}))
+	t.Cleanup(server.Close)
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	scope := ScopeIdentityForUser(User{ID: "user-1", UserPrincipalName: "user@example.test"})
+	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, canonicalPath, scope, "canonical-control")
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+
+	before := snapshotRuntimeSafetyFiles(t, tmp)
+	var out bytes.Buffer
+	bridge, err := newBridgeWithGraphClients(context.Background(), graph, graph, "", &out)
+	if bridge != nil {
+		t.Fatal("Bridge construction returned a bridge while offline quarantine is required")
+	}
+	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, canonicalPath, legacyPath)
+	after := snapshotRuntimeSafetyFiles(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("Bridge construction modified files before returning its plan: %v", runtimeSafetySnapshotChanges(before, after))
 	}
 }
 
@@ -85,12 +143,7 @@ func TestTeamsRuntimeSafetyRuntimeResolverCanonicalFastPathIgnoresLegacyAndStore
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-	if err != nil {
-		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
-	}
 	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
-	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
 	lock := flock.New(currentPath + ".lock")
 	if err := lock.Lock(); err != nil {
@@ -129,12 +182,7 @@ func TestTeamsRuntimeSafetyRuntimeResolverCanonicalFastPathDoesNotOpenLoadOrClos
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-	if err != nil {
-		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
-	}
 	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
-	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
 	prevOpen := resolveScopeStoreOpen
 	prevLoad := resolveScopeStoreLoad
@@ -195,11 +243,11 @@ func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedButMaintenanceCanLocateLega
 	if err != nil {
 		t.Fatalf("read corrupt canonical before resolution: %v", err)
 	}
-	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
-		t.Fatalf("runtime path selection must not open or repair the canonical store: %v", err)
-	} else if resolvedPath != currentPath {
-		t.Fatalf("runtime resolver returned %q, want canonical %q", resolvedPath, currentPath)
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if resolvedPath != "" {
+		t.Fatalf("runtime path selection returned %q while dual-store quarantine is required", resolvedPath)
 	}
+	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, currentPath, legacyPath)
 	after, err := os.ReadFile(currentPath)
 	if err != nil {
 		t.Fatalf("read corrupt canonical after resolution: %v", err)
@@ -249,12 +297,10 @@ func TestTeamsRuntimeSafetyLegacyFallbackCannotCreateSelfReinforcingAuthorityCI(
 	if err := lock.Unlock(); err != nil {
 		t.Fatalf("unlock canonical store: %v", err)
 	}
-	if firstErr != nil {
-		t.Fatalf("canonical hot path was affected by a busy store lock: %v", firstErr)
+	if firstPath != "" {
+		t.Fatalf("dual-store resolver returned %q while locked", firstPath)
 	}
-	if firstPath != currentPath {
-		t.Fatalf("canonical hot path selected %q while locked, want %q", firstPath, currentPath)
-	}
+	requireRuntimeStoreActionPlan(t, firstErr, RuntimeStoreActionQuarantineLegacy, currentPath, legacyPath)
 
 	// Reproduce the historical self-reinforcing step explicitly: a listener that
 	// was allowed onto legacy immediately wrote a fresh owner and control lease.
@@ -289,11 +335,11 @@ func TestTeamsRuntimeSafetyLegacyFallbackCannotCreateSelfReinforcingAuthorityCI(
 		t.Fatalf("close legacy store: %v", err)
 	}
 
-	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
-		t.Fatalf("runtime resolver let legacy authority affect canonical path selection: %v", err)
-	} else if resolvedPath != currentPath {
-		t.Fatalf("fresh legacy authority selected %q, want canonical %q", resolvedPath, currentPath)
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if resolvedPath != "" {
+		t.Fatalf("dual-store resolver returned %q after legacy authority changed", resolvedPath)
 	}
+	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, currentPath, legacyPath)
 }
 
 func TestTeamsRuntimeSafetyRuntimeResolverCanonicalPathCannotLoseToLiveDivergentLegacyStoreCI(t *testing.T) {
@@ -362,12 +408,10 @@ func TestTeamsRuntimeSafetyRuntimeResolverCanonicalPathCannotLoseToLiveDivergent
 	}
 
 	_, resolvedPath, err := ResolveStorePathForScope(scope)
-	if err != nil {
-		t.Fatalf("live legacy authority affected canonical path selection: %v", err)
+	if resolvedPath != "" {
+		t.Fatalf("dual-store resolver selected %q instead of returning a quarantine plan", resolvedPath)
 	}
-	if resolvedPath != currentPath {
-		t.Fatalf("runtime resolver selected legacy %q instead of canonical %q", resolvedPath, currentPath)
-	}
+	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, currentPath, legacyPath)
 }
 
 func TestTeamsRuntimeSafetyCanonicalFastPathDoesNotLoadSessionOrOutboxTablesCI(t *testing.T) {
@@ -381,12 +425,7 @@ func TestTeamsRuntimeSafetyCanonicalFastPathDoesNotLoadSessionOrOutboxTablesCI(t
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-	if err != nil {
-		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
-	}
 	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
-	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
 	current, err := teamstore.Open(currentPath)
 	if err != nil {
@@ -692,13 +731,23 @@ func seedRuntimeSafetyMigrationFixture(t *testing.T) runtimeSafetyMigrationFixtu
 		t.Fatalf("close legacy store: %v", err)
 	}
 
-	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
 	if err != nil {
-		t.Fatalf("ResolveStorePathForScope: %v", err)
+		t.Fatalf("InspectRuntimeStoreForScope: %v", err)
+	}
+	if plan.Action != RuntimeStoreActionMigrateLegacy || plan.LegacyPath != legacyPath {
+		t.Fatalf("migration plan = %#v, want exact legacy migration", plan)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("CompleteOfflineRuntimeStorePlan: %v", err)
 	}
 	currentPath, err := DefaultStorePathForScope(scope.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if err != nil {
+		t.Fatalf("ResolveStorePathForScope after migration: %v", err)
 	}
 	if resolvedPath != currentPath {
 		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
@@ -751,6 +800,89 @@ func TestTeamsRuntimeSafetySuccessfulMigrationPreservesQuarantinedLogicalDataCI(
 	}
 }
 
+func TestTeamsRuntimeSafetyStagedLegacyMigrationRetriesEveryDurableBoundaryCI(t *testing.T) {
+	stages := []string{
+		runtimeStoreMigrationStageStagingReady,
+		runtimeStoreMigrationStageStagingCopied,
+		runtimeStoreMigrationStageStagingValidated,
+		runtimeStoreMigrationStageReplayFencesMerged,
+		runtimeStoreMigrationStageCanonicalPublished,
+		runtimeStoreMigrationStageRegistryQuarantined,
+	}
+	for _, failStage := range stages {
+		t.Run(failStage, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsScopeUserDirsForTest(t, tmp)
+			t.Setenv("USER", "alice")
+			t.Setenv(envTeamsProfile, "default")
+
+			scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+			legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+			if err != nil {
+				t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+			}
+			openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+			legacyRegistry, err := legacyDefaultRegistryPathForScope(scope.ID)
+			if err != nil {
+				t.Fatalf("legacyDefaultRegistryPathForScope: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(legacyRegistry), 0o700); err != nil {
+				t.Fatalf("mkdir legacy registry: %v", err)
+			}
+			if err := os.WriteFile(legacyRegistry, []byte(`{"version":1,"control_chat_id":"legacy-control"}`), 0o600); err != nil {
+				t.Fatalf("write legacy registry: %v", err)
+			}
+
+			plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+			if err != nil || plan.Action != RuntimeStoreActionMigrateLegacy {
+				t.Fatalf("initial migration plan = %#v err=%v", plan, err)
+			}
+			failed := false
+			runtimeStoreMigrationTestHook = func(stage string) error {
+				if stage == failStage && !failed {
+					failed = true
+					return fmt.Errorf("injected migration crash at %s", stage)
+				}
+				return nil
+			}
+			t.Cleanup(func() { runtimeStoreMigrationTestHook = nil })
+			if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err == nil || !strings.Contains(err.Error(), failStage) {
+				t.Fatalf("migration error = %v, want injected %s failure", err, failStage)
+			}
+			runtimeStoreMigrationTestHook = nil
+
+			retryPlan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+			if err != nil {
+				t.Fatalf("inspect retry plan: %v", err)
+			}
+			wantRetryAction := RuntimeStoreActionMigrateLegacy
+			if failStage == runtimeStoreMigrationStageCanonicalPublished || failStage == runtimeStoreMigrationStageRegistryQuarantined {
+				wantRetryAction = RuntimeStoreActionQuarantineLegacy
+			}
+			if retryPlan.Action != wantRetryAction {
+				t.Fatalf("retry plan action = %q, want %q after %s", retryPlan.Action, wantRetryAction, failStage)
+			}
+			if err := CompleteOfflineRuntimeStorePlan(context.Background(), retryPlan); err != nil {
+				t.Fatalf("retry migration after %s: %v", failStage, err)
+			}
+			finalPlan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+			if err != nil || finalPlan.Action != RuntimeStoreActionReady {
+				t.Fatalf("final plan = %#v err=%v, want ready", finalPlan, err)
+			}
+			state, err := teamstore.LoadPathReadOnly(context.Background(), finalPlan.CanonicalPath)
+			if err != nil {
+				t.Fatalf("load canonical store after retry: %v", err)
+			}
+			if state.ControlChat.TeamsChatID != "legacy-control" {
+				t.Fatalf("canonical control binding after retry = %#v", state.ControlChat)
+			}
+			if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("legacy source remains after retry: %v", err)
+			}
+		})
+	}
+}
+
 func TestTeamsRuntimeSafetyLegacyReappearanceAfterFixedBackupIsConflictCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
@@ -777,6 +909,59 @@ func TestTeamsRuntimeSafetyLegacyReappearanceAfterFixedBackupIsConflictCI(t *tes
 		t.Fatalf("runtime resolver selected %q after legacy reappeared post-migration; want explicit conflict", resolvedPath)
 	} else if !stringsContainAnyFold(err.Error(), "reappear", "conflict", "split-brain") {
 		t.Fatalf("legacy reappearance error = %v, want an explicit conflict classification", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyScopedQuarantineSourceBackupStateMatrixCI(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     bool
+		backup     bool
+		wantErr    bool
+		wantSource bool
+		wantBackup bool
+	}{
+		{name: "neither", wantSource: false, wantBackup: false},
+		{name: "source_only", source: true, wantSource: false, wantBackup: true},
+		{name: "backup_only", backup: true, wantSource: false, wantBackup: true},
+		{name: "both", source: true, backup: true, wantErr: true, wantSource: true, wantBackup: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsScopeUserDirsForTest(t, tmp)
+			scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+			sourcePath, err := legacyDefaultStorePathForScope(scope.ID)
+			if err != nil {
+				t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+			}
+			backupPath := runtimeSafetyMigrationBackupPath(sourcePath, scope.ID)
+			if tc.source {
+				openAndSeedRuntimeSafetyScopeStore(t, sourcePath, scope, "source")
+			}
+			if tc.backup {
+				openAndSeedRuntimeSafetyScopeStore(t, backupPath, scope, "backup")
+			}
+			handled, err := quarantineScopedStoreDirectory(scope.ID, sourcePath)
+			if !handled {
+				t.Fatal("scoped quarantine did not recognize exact legacy path")
+			}
+			if tc.wantErr {
+				if err == nil || !strings.Contains(strings.ToLower(err.Error()), "conflict") {
+					t.Fatalf("quarantine error = %v, want conflict", err)
+				}
+			} else if err != nil {
+				t.Fatalf("quarantine error: %v", err)
+			}
+			sourceExists, sourceErr := pathExists(sourcePath)
+			if sourceErr != nil || sourceExists != tc.wantSource {
+				t.Fatalf("source exists=%v err=%v, want %v", sourceExists, sourceErr, tc.wantSource)
+			}
+			backupExists, backupErr := pathExists(backupPath)
+			if backupErr != nil || backupExists != tc.wantBackup {
+				t.Fatalf("backup exists=%v err=%v, want %v", backupExists, backupErr, tc.wantBackup)
+			}
+		})
 	}
 }
 
@@ -1274,8 +1459,13 @@ func TestTeamsRuntimeSafetyGlobalLedgerUnionNeverOverwritesCanonicalRecordsCI(t 
 		t.Fatalf("seed canonical outbound: %v", err)
 	}
 
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
 	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
 		t.Fatalf("global ledger union: %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("done legacy plus claimed canonical replay fence caused an empty write: %v", runtimeSafetySnapshotChanges(before, after))
 	}
 	inboundLedger, err := readGlobalInboundLedger(canonicalInbound)
 	if err != nil {
@@ -1364,8 +1554,12 @@ func TestTeamsRuntimeSafetyDiscoveryUsesBoundedMetadataReadsAcrossUnrelatedScope
 		resolveScopeStoreLoad = prevLoad
 	})
 
-	if _, _, err := ResolveStorePathForScope(target); err != nil {
+	plan, err := InspectRuntimeStoreForScope(context.Background(), target)
+	if err != nil {
 		t.Fatalf("cold migration discovery: %v", err)
+	}
+	if plan.Action != RuntimeStoreActionMigrateLegacy || plan.LegacyPath != targetLegacy {
+		t.Fatalf("cold migration plan = %#v, want target legacy source", plan)
 	}
 	if opens > 105 {
 		t.Errorf("cold discovery opened %d stores for 100 unrelated scopes; want bounded linear discovery", opens)
@@ -1390,9 +1584,19 @@ func TestTeamsRuntimeSafetyHistoricalScopeMigrationSecondStartupUsesCanonicalOnl
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, historicalPath, historical, "legacy-control")
 
+	plan, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil {
+		t.Fatalf("inspect historical migration: %v", err)
+	}
+	if plan.Action != RuntimeStoreActionMigrateLegacy || plan.LegacyPath != historicalPath {
+		t.Fatalf("historical migration plan = %#v, want source %q", plan, historicalPath)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete historical migration: %v", err)
+	}
 	resolved, canonicalPath, err := ResolveStorePathForScope(current)
 	if err != nil {
-		t.Fatalf("first historical migration: %v", err)
+		t.Fatalf("first canonical resolution after historical migration: %v", err)
 	}
 	wantCanonical, err := DefaultStorePathForScope(current.ID)
 	if err != nil {

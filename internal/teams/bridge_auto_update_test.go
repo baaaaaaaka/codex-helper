@@ -176,11 +176,11 @@ func TestBridgeHelperAutoUpdateDefersActivationWithoutRestarting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "" {
-		t.Fatalf("LastInstalledTag = %q, want empty until activation is verified", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag = %q, want installed version while activation is pending", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "transient") {
-		t.Fatalf("upgrade = %#v, want aborted pending activation", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseReady {
+		t.Fatalf("upgrade = %#v, want ready until the replacement verifies its version", state.Upgrade)
 	}
 }
 
@@ -593,11 +593,11 @@ func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestartsInstalledPa
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "" {
-		t.Fatalf("LastInstalledTag = %q, want empty until restarted helper verifies target", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4-rc.1" {
+		t.Fatalf("LastInstalledTag = %q, want installed target while restart is pending", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, goBin) {
-		t.Fatalf("upgrade = %#v, want aborted with running executable reason", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseReady {
+		t.Fatalf("upgrade = %#v, want ready until the replacement verifies its version", state.Upgrade)
 	}
 	noticePath, err := bridge.pendingHelperRestartNoticePath()
 	if err != nil {
@@ -686,6 +686,16 @@ func TestBridgeControlHelperUpdatePrereleaseActivationPendingRestarterFailureKee
 			t.Fatalf("restart failure exposed pre-recovery detail %q in:\n%s", hidden, joined)
 		}
 	}
+	state, err := st.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load after restarter failure: %v", err)
+	}
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4-rc.1" {
+		t.Fatalf("LastInstalledTag = %q, want installed version preserved after restarter failure", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "restart failed") {
+		t.Fatalf("upgrade = %#v, want aborted only after restarter failure", state.Upgrade)
+	}
 }
 
 func TestBridgeControlHelperUpdateActivationPendingWithoutRestarterRequestsAction(t *testing.T) {
@@ -737,6 +747,12 @@ func TestBridgeControlHelperUpdateActivationPendingWithoutRestarterRequestsActio
 	}
 	if !found {
 		t.Fatalf("action-required outbox missing: %#v", state.OutboxMessages)
+	}
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag = %q, want installed version while manual activation is pending", state.AutoUpdate.LastInstalledTag)
+	}
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseReady {
+		t.Fatalf("upgrade = %#v, want ready while awaiting manual activation", state.Upgrade)
 	}
 }
 
@@ -1201,11 +1217,11 @@ func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *test
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "" {
-		t.Fatalf("LastInstalledTag = %q, want empty before verified restart", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag = %q, want installed version before verified restart", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseAborted || !strings.Contains(state.Upgrade.AbortReason, "replacement is pending") {
-		t.Fatalf("upgrade = %#v, want aborted pending replacement", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseReady {
+		t.Fatalf("upgrade = %#v, want ready pending replacement", state.Upgrade)
 	}
 
 	restartedOld := newBridgeTestBridge(graph, st, &recordingExecutor{})
@@ -1223,8 +1239,8 @@ func TestBridgeHelperAutoUpdatePendingReplacementWaitsForVerifiedVersion(t *test
 	if err != nil {
 		t.Fatalf("Load after old restart error: %v", err)
 	}
-	if state.AutoUpdate.LastInstalledTag != "" {
-		t.Fatalf("LastInstalledTag after old restart = %q, want empty", state.AutoUpdate.LastInstalledTag)
+	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
+		t.Fatalf("LastInstalledTag after old restart = %q, want installed version retained", state.AutoUpdate.LastInstalledTag)
 	}
 
 	restartedNew := newBridgeTestBridge(graph, st, &recordingExecutor{})

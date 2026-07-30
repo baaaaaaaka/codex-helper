@@ -42,6 +42,10 @@ const (
 // at durable migration boundaries.
 var sqliteMigrationTestHook func(stage string) error
 
+// sqliteRuntimeMetadataConnectionTestHook is nil in production. It lets tests
+// verify that one metadata attempt acquires exactly one physical connection.
+var sqliteRuntimeMetadataConnectionTestHook func()
+
 type storeSQLitePointer struct {
 	SchemaVersion       int       `json:"schema_version"`
 	StorageBackend      string    `json:"storage_backend"`
@@ -792,18 +796,25 @@ func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path stri
 		return RuntimeMetadata{}, err
 	}
 	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(0)
 	defer db.Close()
-	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		return RuntimeMetadata{}, err
 	}
-	if err := validateSQLiteRequiredTablesContext(ctx, db); err != nil {
+	defer conn.Close()
+	if sqliteRuntimeMetadataConnectionTestHook != nil {
+		sqliteRuntimeMetadataConnectionTestHook()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if err := validateSQLiteRuntimeMetadataTablesContext(ctx, conn); err != nil {
 		return RuntimeMetadata{}, err
 	}
 
 	var metadata RuntimeMetadata
 	var controlChatJSON string
-	if err := db.QueryRowContext(
+	if err := conn.QueryRowContext(
 		ctx,
 		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
 	).Scan(&controlChatJSON); err != nil {
@@ -813,7 +824,7 @@ func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path stri
 		return RuntimeMetadata{}, err
 	}
 
-	rows, err := db.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
 		sqliteRuntimeKeyScope,
 		sqliteRuntimeKeyControlLease,
 		sqliteRuntimeKeyServiceOwner,
@@ -857,6 +868,20 @@ func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path stri
 		return RuntimeMetadata{}, err
 	}
 	return metadata, nil
+}
+
+func validateSQLiteRuntimeMetadataTablesContext(ctx context.Context, conn *sql.Conn) error {
+	var count int
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('state_meta', 'runtime_state')`,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count != 2 {
+		return fmt.Errorf("sqlite teams store is missing runtime metadata tables")
+	}
+	return nil
 }
 
 type sqliteReadOnlyFileIdentity struct {

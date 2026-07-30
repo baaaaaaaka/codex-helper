@@ -281,6 +281,9 @@ func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(
 	}
 
 	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	connections := 0
+	sqliteRuntimeMetadataConnectionTestHook = func() { connections++ }
+	t.Cleanup(func() { sqliteRuntimeMetadataConnectionTestHook = nil })
 	metadata, err := LoadPathRuntimeMetadataReadOnly(ctx, store.Path())
 	if err != nil {
 		t.Fatalf("LoadPathRuntimeMetadataReadOnly: %v", err)
@@ -297,6 +300,9 @@ func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(
 	}
 	if metadata.ControlLease.HolderMachineID != "machine-1" || metadata.ControlLease.Status != ControlLeaseStatusActive {
 		t.Fatalf("runtime metadata lease = %#v", metadata.ControlLease)
+	}
+	if connections != 1 {
+		t.Fatalf("runtime metadata probe acquired %d SQLite connections, want exactly one", connections)
 	}
 }
 

@@ -29,6 +29,59 @@ type ScopeStoreMetadata struct {
 	ServiceControl teamstore.ServiceControl     `json:"service_control"`
 }
 
+type RuntimeStoreAction string
+
+const (
+	RuntimeStoreActionReady            RuntimeStoreAction = "ready"
+	RuntimeStoreActionCreate           RuntimeStoreAction = "create"
+	RuntimeStoreActionMigrateLegacy    RuntimeStoreAction = "migrate-legacy"
+	RuntimeStoreActionQuarantineLegacy RuntimeStoreAction = "quarantine-legacy"
+
+	runtimeStoreMigrationStageStagingReady        = "staging-ready"
+	runtimeStoreMigrationStageStagingCopied       = "staging-copied"
+	runtimeStoreMigrationStageStagingValidated    = "staging-validated"
+	runtimeStoreMigrationStageReplayFencesMerged  = "replay-fences-merged"
+	runtimeStoreMigrationStageCanonicalPublished  = "canonical-published"
+	runtimeStoreMigrationStageRegistryQuarantined = "registry-quarantined"
+)
+
+// runtimeStoreMigrationTestHook is nil in production. Tests use it to inject
+// failures only at durable cold-path migration boundaries.
+var runtimeStoreMigrationTestHook func(stage string) error
+
+type RuntimeStorePlan struct {
+	Action        RuntimeStoreAction
+	Scope         teamstore.ScopeIdentity
+	CanonicalPath string
+	LegacyPath    string
+}
+
+type RuntimeStoreActionRequiredError struct {
+	Plan RuntimeStorePlan
+}
+
+func (e *RuntimeStoreActionRequiredError) Error() string {
+	if e == nil {
+		return "Teams runtime store action is required"
+	}
+	switch e.Plan.Action {
+	case RuntimeStoreActionMigrateLegacy:
+		return fmt.Sprintf("Teams runtime store migration is required: %s -> %s", e.Plan.LegacyPath, e.Plan.CanonicalPath)
+	case RuntimeStoreActionQuarantineLegacy:
+		return fmt.Sprintf("canonical and legacy Teams stores both exist: canonical=%s legacy=%s", e.Plan.CanonicalPath, e.Plan.LegacyPath)
+	default:
+		return "Teams runtime store action is required"
+	}
+}
+
+func RuntimeStorePlanFromError(err error) (RuntimeStorePlan, bool) {
+	var required *RuntimeStoreActionRequiredError
+	if !errors.As(err, &required) || required == nil {
+		return RuntimeStorePlan{}, false
+	}
+	return required.Plan, true
+}
+
 // inspectRuntimeStorePath is the single runtime path primitive. It deliberately
 // uses Lstat so a retained or attacker-controlled symlink can never redirect a
 // listener outside the selected state root.
@@ -67,28 +120,10 @@ func ProbeScopeMetadataReadOnly(ctx context.Context, path string) (ScopeStoreMet
 	}, nil
 }
 
-func discoverRuntimeScopeMigrationSource(scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
-	matches, err := discoverRuntimeScopeMigrationMatches(scope, currentPath)
+func discoverRuntimeScopeMigrationSource(ctx context.Context, scope teamstore.ScopeIdentity, currentPath string) (teamstore.ScopeIdentity, string, bool, error) {
+	matches, err := discoverRuntimeScopeMigrationMatches(ctx, scope, currentPath)
 	if err != nil {
 		return teamstore.ScopeIdentity{}, "", false, err
-	}
-	// A concurrent migrator briefly exposes both the newly copied canonical
-	// store and its not-yet-quarantined legacy source. Wait on that canonical
-	// store's migration coordinator and probe again. A pre-existing divergent
-	// dual store remains ambiguous after the lock is acquired and still fails
-	// closed; this only removes the copy/quarantine race between resolvers.
-	if len(matches) > 1 {
-		if canonical, ok := singleCanonicalMigrationCandidate(matches); ok {
-			coordinator, lockErr := acquireScopeMigrationCoordinatorLock(filepath.Join(filepath.Dir(canonical.path), ".migration.lock"))
-			if lockErr != nil {
-				return teamstore.ScopeIdentity{}, "", false, lockErr
-			}
-			matches, err = discoverRuntimeScopeMigrationMatches(scope, currentPath)
-			releaseScopeTakeoverLocks([]heldScopeTakeoverLock{coordinator})
-			if err != nil {
-				return teamstore.ScopeIdentity{}, "", false, err
-			}
-		}
 	}
 	if len(matches) == 0 {
 		return teamstore.ScopeIdentity{}, "", false, nil
@@ -108,7 +143,13 @@ func discoverRuntimeScopeMigrationSource(scope teamstore.ScopeIdentity, currentP
 	return matches[0].scope, matches[0].path, true, nil
 }
 
-func discoverRuntimeScopeMigrationMatches(scope teamstore.ScopeIdentity, currentPath string) ([]resolvedScopeStoreCandidate, error) {
+func discoverRuntimeScopeMigrationMatches(ctx context.Context, scope teamstore.ScopeIdentity, currentPath string) ([]resolvedScopeStoreCandidate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	paths, err := candidateScopeStorePaths(currentPath)
 	if err != nil {
 		return nil, err
@@ -125,7 +166,7 @@ func discoverRuntimeScopeMigrationMatches(scope teamstore.ScopeIdentity, current
 		if !exists {
 			continue
 		}
-		metadata, err := ProbeScopeMetadataReadOnly(context.Background(), path)
+		metadata, err := ProbeScopeMetadataReadOnly(ctx, path)
 		if err != nil {
 			// A concurrent migrator can quarantine the exact legacy path after
 			// Lstat and before the metadata probe. Treat that as a vanished
@@ -156,33 +197,71 @@ func discoverRuntimeScopeMigrationMatches(scope teamstore.ScopeIdentity, current
 	return matches, nil
 }
 
-func singleCanonicalMigrationCandidate(matches []resolvedScopeStoreCandidate) (resolvedScopeStoreCandidate, bool) {
-	var canonical resolvedScopeStoreCandidate
-	canonicalCount := 0
-	scopeID := ""
-	for _, match := range matches {
-		matchScopeID := strings.TrimSpace(match.scope.ID)
-		if matchScopeID == "" {
-			return resolvedScopeStoreCandidate{}, false
+func InspectRuntimeStoreForScope(ctx context.Context, scope teamstore.ScopeIdentity) (RuntimeStorePlan, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return RuntimeStorePlan{}, err
+	}
+	scope = normalizeScopeForResolution(scope)
+	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		return RuntimeStorePlan{}, err
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		return RuntimeStorePlan{}, err
+	}
+	plan := RuntimeStorePlan{
+		Scope:         scope,
+		CanonicalPath: canonicalPath,
+		LegacyPath:    legacyPath,
+	}
+	canonicalExists, err := inspectRuntimeStorePath(canonicalPath)
+	if err != nil {
+		return plan, err
+	}
+	legacyExists, err := inspectRuntimeStorePath(legacyPath)
+	if err != nil {
+		return plan, err
+	}
+	if canonicalExists {
+		if legacyExists {
+			plan.Action = RuntimeStoreActionQuarantineLegacy
+		} else {
+			plan.Action = RuntimeStoreActionReady
 		}
-		if scopeID == "" {
-			scopeID = matchScopeID
-		} else if scopeID != matchScopeID {
-			return resolvedScopeStoreCandidate{}, false
-		}
-		path, err := DefaultStorePathForScope(matchScopeID)
-		if err != nil {
-			return resolvedScopeStoreCandidate{}, false
-		}
-		if samePath(match.path, path) {
-			canonical = match
-			canonicalCount++
+		return plan, nil
+	}
+	if legacyExists {
+		plan.Action = RuntimeStoreActionMigrateLegacy
+		return plan, nil
+	}
+	resolved, sourcePath, ok, err := discoverRuntimeScopeMigrationSource(ctx, scope, canonicalPath)
+	if err != nil {
+		return plan, err
+	}
+	if !ok {
+		plan.Action = RuntimeStoreActionCreate
+		plan.LegacyPath = ""
+		return plan, nil
+	}
+	if strings.TrimSpace(resolved.ID) != "" {
+		plan.Scope = resolved
+		if plan.Scope.ID != scope.ID {
+			plan.Scope.ID = scope.ID
 		}
 	}
-	return canonical, canonicalCount == 1
+	plan.Action = RuntimeStoreActionMigrateLegacy
+	plan.LegacyPath = sourcePath
+	return plan, nil
 }
 
-func executeLegacyOnlyMigration(scope teamstore.ScopeIdentity, sourcePath string) (string, error) {
+func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.ScopeIdentity, sourcePath string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	scope = normalizeScopeForResolution(scope)
 	canonicalPath, err := DefaultStorePathForScope(scope.ID)
 	if err != nil {
@@ -191,10 +270,12 @@ func executeLegacyOnlyMigration(scope teamstore.ScopeIdentity, sourcePath string
 	if samePath(sourcePath, canonicalPath) {
 		return canonicalPath, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(canonicalPath), 0o700); err != nil {
+	canonicalDir := filepath.Dir(canonicalPath)
+	canonicalParent := filepath.Dir(canonicalDir)
+	if err := os.MkdirAll(canonicalParent, 0o700); err != nil {
 		return "", fmt.Errorf("prepare canonical Teams migration directory: %w", err)
 	}
-	coordinator, err := acquireScopeMigrationCoordinatorLock(filepath.Join(filepath.Dir(canonicalPath), ".migration.lock"))
+	coordinator, err := acquireScopeMigrationCoordinatorLock(ctx, canonicalDir+".migration.lock")
 	if err != nil {
 		return "", err
 	}
@@ -211,14 +292,22 @@ func executeLegacyOnlyMigration(scope teamstore.ScopeIdentity, sourcePath string
 	if canonicalExists && !sourceExists {
 		return canonicalPath, nil
 	}
+	if canonicalExists && sourceExists {
+		return "", fmt.Errorf("canonical and legacy Teams stores both exist; retry with an offline quarantine plan")
+	}
 	if !sourceExists {
 		return "", fmt.Errorf("legacy Teams migration source disappeared before migration: %s", sourcePath)
 	}
-	locks, err := acquireScopeTakeoverLocks(context.Background(), migrationLockPathsForStore(sourcePath))
+	locks, err := acquireScopeTakeoverLocks(ctx, migrationLockPathsForStore(sourcePath))
 	if err != nil {
 		return "", fmt.Errorf("lock legacy Teams migration source: %w", err)
 	}
-	defer releaseScopeTakeoverLocks(locks)
+	locksHeld := true
+	defer func() {
+		if locksHeld {
+			releaseScopeTakeoverLocks(locks)
+		}
+	}()
 
 	// Another process can finish the migration between discovery and the
 	// coordinator handoff. Recheck after all source-family locks are held so a
@@ -234,27 +323,153 @@ func executeLegacyOnlyMigration(scope teamstore.ScopeIdentity, sourcePath string
 	if canonicalExists && !sourceExists {
 		return canonicalPath, nil
 	}
+	if canonicalExists && sourceExists {
+		return "", fmt.Errorf("canonical and legacy Teams stores both exist after acquiring migration locks; retry with an offline quarantine plan")
+	}
 	if !sourceExists {
 		return "", fmt.Errorf("legacy Teams migration source disappeared while acquiring migration locks: %s", sourcePath)
 	}
-	if err := copyLegacyStoreToCanonical(scope.ID, canonicalPath, sourcePath); err != nil {
+	stagingDir := canonicalDir + ".migrating"
+	if err := resetRuntimeStoreMigrationStagingDir(stagingDir); err != nil {
+		return "", fmt.Errorf("prepare Teams migration staging directory: %w", err)
+	}
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageStagingReady); err != nil {
+		return "", err
+	}
+	stagingPath := filepath.Join(stagingDir, filepath.Base(canonicalPath))
+	if err := copyLegacyStoreToTarget(scope.ID, stagingPath, sourcePath); err != nil {
 		return "", fmt.Errorf("copy legacy Teams store to canonical path: %w", err)
 	}
-	if err := UnionLegacyGlobalLedgers(context.Background(), scope, sourcePath); err != nil {
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageStagingCopied); err != nil {
+		return "", err
+	}
+	if err := validateRuntimeStoreMigrationStaging(ctx, scope, stagingPath, sourcePath); err != nil {
+		return "", fmt.Errorf("validate Teams migration staging directory: %w", err)
+	}
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageStagingValidated); err != nil {
+		return "", err
+	}
+	if err := UnionLegacyGlobalLedgers(ctx, scope, sourcePath); err != nil {
 		return "", fmt.Errorf("merge legacy Teams replay fences: %w", err)
 	}
-	if !scopeMigrationComplete(scope.ID, canonicalPath, sourcePath) {
-		return "", fmt.Errorf("legacy Teams migration validation did not complete for %s", sourcePath)
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageReplayFencesMerged); err != nil {
+		return "", err
 	}
-	if err := quarantineStoreMigrationSource(scope.ID, sourcePath); err != nil {
-		return "", fmt.Errorf("quarantine migrated legacy Teams store: %w", err)
+	if err := os.Rename(stagingDir, canonicalDir); err != nil {
+		return "", fmt.Errorf("publish canonical Teams migration directory: %w", err)
+	}
+	_ = syncParentDir(canonicalDir)
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageCanonicalPublished); err != nil {
+		return "", err
+	}
+	releaseScopeTakeoverLocks(locks)
+	locksHeld = false
+
+	expectedLegacyPath, expectedErr := legacyDefaultStorePathForScope(scope.ID)
+	if expectedErr == nil && samePath(sourcePath, expectedLegacyPath) {
+		if registryPath, ok := registryPathForStoreMigrationSource(sourcePath); ok {
+			if err := quarantineRelatedFileFamily(scope.ID, registryPath); err != nil {
+				return "", fmt.Errorf("quarantine migrated legacy Teams registry: %w", err)
+			}
+			if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageRegistryQuarantined); err != nil {
+				return "", err
+			}
+		}
+		if handled, err := quarantineScopedStoreDirectory(scope.ID, sourcePath); err != nil {
+			return "", fmt.Errorf("quarantine migrated legacy Teams scope: %w", err)
+		} else if !handled {
+			return "", fmt.Errorf("legacy Teams scope is not a scoped store: %s", sourcePath)
+		}
 	}
 	return canonicalPath, nil
 }
 
-func acquireScopeMigrationCoordinatorLock(path string) (heldScopeTakeoverLock, error) {
+func runRuntimeStoreMigrationTestHook(stage string) error {
+	if runtimeStoreMigrationTestHook == nil {
+		return nil
+	}
+	return runtimeStoreMigrationTestHook(stage)
+}
+
+func resetRuntimeStoreMigrationStagingDir(path string) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("refusing to replace non-directory Teams migration staging path %s", path)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.MkdirAll(path, 0o700)
+}
+
+func copyLegacyStoreToTarget(scopeID string, targetPath string, sourcePath string) error {
+	targetDir := filepath.Dir(targetPath)
+	sourceDir := filepath.Dir(sourcePath)
+	for _, suffix := range []string{"", "-wal"} {
+		source := filepath.Join(sourceDir, teamstore.SQLiteFileName) + suffix
+		if exists, err := pathExists(source); err != nil {
+			return err
+		} else if exists {
+			if err := appdirs.CopyFileIfMissing(filepath.Join(targetDir, teamstore.SQLiteFileName)+suffix, source); err != nil {
+				return err
+			}
+		}
+	}
+	for _, name := range storeSidecarNames() {
+		source := filepath.Join(sourceDir, name)
+		if exists, err := pathExists(source); err != nil {
+			return err
+		} else if exists {
+			if err := appdirs.CopyFileIfMissing(filepath.Join(targetDir, name), source); err != nil {
+				return err
+			}
+		}
+	}
+	if oldRegistryPath, ok := registryPathForStoreMigrationSource(sourcePath); ok {
+		if err := copyRelatedFileFamilyIfPresent(filepath.Join(targetDir, "registry.json"), oldRegistryPath); err != nil {
+			return err
+		}
+	}
+	return appdirs.CopyFileReplacing(targetPath, sourcePath)
+}
+
+func validateRuntimeStoreMigrationStaging(ctx context.Context, scope teamstore.ScopeIdentity, stagingPath string, sourcePath string) error {
+	stagingStore, err := teamstore.Open(stagingPath)
+	if err != nil {
+		return err
+	}
+	state, loadErr := stagingStore.Load(ctx)
+	closeErr := stagingStore.Close()
+	_ = os.Remove(stagingPath + ".lock")
+	if loadErr != nil {
+		return loadErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if !scopeStateMatches(scope, state) && !defaultGlobalStoreCanSeedScope(scope, sourcePath, state) {
+		return fmt.Errorf("staging store identity does not match scope %q", scope.ID)
+	}
+	if oldRegistryPath, ok := registryPathForStoreMigrationSource(sourcePath); ok {
+		if exists, err := pathExists(oldRegistryPath); err != nil {
+			return err
+		} else if exists && !registryFileValid(filepath.Join(filepath.Dir(stagingPath), "registry.json")) {
+			return fmt.Errorf("staging registry is not valid")
+		}
+	}
+	return syncParentDir(stagingPath)
+}
+
+func acquireScopeMigrationCoordinatorLock(ctx context.Context, path string) (heldScopeTakeoverLock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	lock := flock.New(path)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	locked, err := lock.TryLockContext(ctx, 25*time.Millisecond)
 	if err != nil {
@@ -264,23 +479,6 @@ func acquireScopeMigrationCoordinatorLock(path string) (heldScopeTakeoverLock, e
 		return heldScopeTakeoverLock{}, fmt.Errorf("acquire Teams migration coordinator %s: lock is busy", path)
 	}
 	return heldScopeTakeoverLock{path: path, lock: lock}, nil
-}
-
-func copyLegacyStoreToCanonical(scopeID string, canonicalPath string, sourcePath string) error {
-	if err := migrateStoreDirRelatedFiles(filepath.Dir(canonicalPath), filepath.Dir(sourcePath)); err != nil {
-		return err
-	}
-	oldRegistryPath, hasRegistry := registryPathForStoreMigrationSource(sourcePath)
-	newRegistryPath, err := appdirs.StatePath("teams", "scopes", safeScopePathPart(scopeID), "registry.json")
-	if err != nil {
-		return err
-	}
-	if hasRegistry {
-		if err := copyRelatedFileFamilyIfPresent(newRegistryPath, oldRegistryPath); err != nil {
-			return err
-		}
-	}
-	return appdirs.CopyFileReplacing(canonicalPath, sourcePath)
 }
 
 func migrationLockPathsForStore(sourcePath string) []string {
@@ -362,32 +560,6 @@ func migrationBackupPath(sourcePath string, scopeID string) string {
 		teamsRoot = filepath.Dir(filepath.Dir(sourceDir))
 	}
 	return filepath.Join(teamsRoot, "migration-backups", safeScopePathPart(scopeID), filepath.Base(clean))
-}
-
-func quarantineStoreMigrationSource(scopeID string, sourcePath string) error {
-	if err := quarantineStoreFileFamily(scopeID, sourcePath); err != nil {
-		return err
-	}
-	registryPath, hasRegistry := registryPathForStoreMigrationSource(sourcePath)
-	if hasRegistry {
-		if err := quarantineRelatedFileFamily(scopeID, registryPath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func quarantineStoreFileFamily(scopeID string, sourcePath string) error {
-	sourceDir := filepath.Dir(sourcePath)
-	if err := quarantineRelatedFileFamily(scopeID, filepath.Join(sourceDir, teamstore.SQLiteFileName), "-wal", "-shm"); err != nil {
-		return err
-	}
-	for _, name := range storeSidecarNames() {
-		if err := quarantineRelatedFileFamily(scopeID, filepath.Join(sourceDir, name)); err != nil {
-			return err
-		}
-	}
-	return quarantineRelatedFileFamily(scopeID, sourcePath)
 }
 
 func quarantineScopedStoreDirectory(scopeID string, sourcePath string) (bool, error) {
@@ -507,43 +679,35 @@ func PrepareRuntimeStoreForListener(
 	ctx context.Context,
 	scope teamstore.ScopeIdentity,
 ) (RuntimeStorePreparation, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return RuntimeStorePreparation{}, err
-	}
-	scope = normalizeScopeForResolution(scope)
-	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+	plan, err := InspectRuntimeStoreForScope(ctx, scope)
 	if err != nil {
 		return RuntimeStorePreparation{}, err
 	}
-	result := RuntimeStorePreparation{CanonicalPath: canonicalPath}
-	canonicalExists, err := inspectRuntimeStorePath(canonicalPath)
-	if err != nil {
-		return result, err
+	result := RuntimeStorePreparation{
+		CanonicalPath: plan.CanonicalPath,
+		LegacyPath:    plan.LegacyPath,
 	}
-
-	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-	if err != nil {
-		return result, err
-	}
-	result.LegacyPath = legacyPath
-	legacyExists, err := inspectRuntimeStorePath(legacyPath)
-	if err != nil {
-		return result, err
-	}
-	if canonicalExists && !legacyExists {
+	switch plan.Action {
+	case RuntimeStoreActionReady, RuntimeStoreActionCreate:
 		result.Resolved = true
-		return result, nil
-	}
-	if canonicalExists && legacyExists {
+	case RuntimeStoreActionMigrateLegacy, RuntimeStoreActionQuarantineLegacy:
 		result.TakeoverRequired = true
-		return result, nil
 	}
-	// Canonical-missing resolution remains the existing migration cold path,
-	// which retains compatibility with historical scope IDs and global stores.
 	return result, nil
+}
+
+func CompleteOfflineRuntimeStorePlan(ctx context.Context, plan RuntimeStorePlan) error {
+	switch plan.Action {
+	case RuntimeStoreActionReady, RuntimeStoreActionCreate:
+		return nil
+	case RuntimeStoreActionMigrateLegacy:
+		_, err := executeLegacyOnlyMigrationContext(ctx, plan.Scope, plan.LegacyPath)
+		return err
+	case RuntimeStoreActionQuarantineLegacy:
+		return CompleteOfflineRuntimeStoreTakeover(ctx, plan.Scope, plan.LegacyPath)
+	default:
+		return fmt.Errorf("unsupported Teams runtime store action %q", plan.Action)
+	}
 }
 
 // CompleteOfflineRuntimeStoreTakeover performs the dual-store filesystem
@@ -607,7 +771,7 @@ func CompleteOfflineRuntimeStoreTakeover(
 	if err != nil {
 		return deferRuntimeStoreTakeover("lock offline Teams store takeover source: " + err.Error())
 	}
-	coordinator, err := acquireScopeMigrationCoordinatorLock(canonicalPath + ".takeover.lock")
+	coordinator, err := acquireScopeMigrationCoordinatorLock(ctx, canonicalPath+".takeover.lock")
 	if err != nil {
 		releaseScopeTakeoverLocks(locks)
 		return deferRuntimeStoreTakeover(err.Error())
@@ -691,6 +855,55 @@ func readCompletedGlobalInboundForUnion(ctx context.Context, path string) (map[s
 	return items, nil
 }
 
+func readGlobalInboundKeysForUnion(ctx context.Context, path string) (map[string]struct{}, error) {
+	keys := make(map[string]struct{})
+	jsonExists, err := inspectRuntimeStorePath(path)
+	if err != nil {
+		return nil, err
+	}
+	if jsonExists {
+		jsonLedger, err := readGlobalInboundJSON(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range jsonLedger.Items {
+			if strings.TrimSpace(item.ChatID) == "" || strings.TrimSpace(item.MessageID) == "" {
+				continue
+			}
+			keys[globalInboundKey(item.ChatID, item.MessageID)] = struct{}{}
+		}
+	}
+	sqlitePath := teamsLedgerSQLitePath(path)
+	if _, err := os.Lstat(sqlitePath); errors.Is(err, os.ErrNotExist) {
+		return keys, nil
+	} else if err != nil {
+		return nil, err
+	}
+	db, err := openTeamsLedgerSQLiteReadOnly(ctx, sqlitePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(ctx, `SELECT key FROM inbound_ledger`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		if key = strings.TrimSpace(key); key != "" {
+			keys[key] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 func readGlobalOutboundForUnion(ctx context.Context, path string) (map[string]globalOutboundItem, error) {
 	items := make(map[string]globalOutboundItem)
 	jsonExists, err := inspectRuntimeStorePath(path)
@@ -758,21 +971,6 @@ func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity
 	if !ok {
 		return nil
 	}
-	var legacyLockPaths []string
-	if path, ok := globalInboundLedgerPathForRegistry(legacyRegistryPath); ok &&
-		relatedMigrationFamilyExists(path, teamsLedgerSQLitePath(path)) {
-		legacyLockPaths = append(legacyLockPaths, path+".lock")
-	}
-	if path, ok := globalOutboundLedgerPathForRegistry(legacyRegistryPath); ok &&
-		relatedMigrationFamilyExists(path, teamsLedgerSQLitePath(path)) {
-		legacyLockPaths = append(legacyLockPaths, path+".lock")
-	}
-	locks, err := acquireScopeTakeoverLocks(ctx, legacyLockPaths)
-	if err != nil {
-		return fmt.Errorf("lock legacy global Teams ledgers: %w", err)
-	}
-	defer releaseScopeTakeoverLocks(locks)
-
 	canonicalRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
 	if err != nil {
 		return err
@@ -781,17 +979,25 @@ func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity
 	legacyInboundPath, legacyInboundOK := globalInboundLedgerPathForRegistry(legacyRegistryPath)
 	canonicalInboundPath, canonicalInboundOK := globalInboundLedgerPathForRegistry(canonicalRegistryPath)
 	if legacyInboundOK && canonicalInboundOK && !samePath(legacyInboundPath, canonicalInboundPath) {
+		var locks []heldScopeTakeoverLock
+		if relatedMigrationFamilyExists(legacyInboundPath, teamsLedgerSQLitePath(legacyInboundPath)) {
+			locks, err = acquireScopeTakeoverLocks(ctx, []string{legacyInboundPath + ".lock"})
+			if err != nil {
+				return fmt.Errorf("lock legacy global Teams inbound ledger: %w", err)
+			}
+		}
 		legacyItems, err := readCompletedGlobalInboundForUnion(ctx, legacyInboundPath)
+		releaseScopeTakeoverLocks(locks)
 		if err != nil {
 			return fmt.Errorf("read legacy global inbound ledger: %w", err)
 		}
-		canonicalItems, err := readCompletedGlobalInboundForUnion(ctx, canonicalInboundPath)
+		canonicalKeys, err := readGlobalInboundKeysForUnion(ctx, canonicalInboundPath)
 		if err != nil {
 			return fmt.Errorf("read canonical global inbound ledger: %w", err)
 		}
 		var delta []globalInboundItem
 		for key, item := range legacyItems {
-			if _, ok := canonicalItems[key]; ok {
+			if _, ok := canonicalKeys[key]; ok {
 				continue
 			}
 			delta = append(delta, item)
@@ -814,7 +1020,15 @@ func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity
 	legacyOutboundPath, legacyOutboundOK := globalOutboundLedgerPathForRegistry(legacyRegistryPath)
 	canonicalOutboundPath, canonicalOutboundOK := globalOutboundLedgerPathForRegistry(canonicalRegistryPath)
 	if legacyOutboundOK && canonicalOutboundOK && !samePath(legacyOutboundPath, canonicalOutboundPath) {
+		var locks []heldScopeTakeoverLock
+		if relatedMigrationFamilyExists(legacyOutboundPath, teamsLedgerSQLitePath(legacyOutboundPath)) {
+			locks, err = acquireScopeTakeoverLocks(ctx, []string{legacyOutboundPath + ".lock"})
+			if err != nil {
+				return fmt.Errorf("lock legacy global Teams outbound ledger: %w", err)
+			}
+		}
 		legacyItems, err := readGlobalOutboundForUnion(ctx, legacyOutboundPath)
+		releaseScopeTakeoverLocks(locks)
 		if err != nil {
 			return fmt.Errorf("read legacy global outbound ledger: %w", err)
 		}

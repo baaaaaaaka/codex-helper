@@ -73,35 +73,16 @@ func ScopeIdentityForUser(user User) teamstore.ScopeIdentity {
 }
 
 func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
-	scope = normalizeScopeForResolution(scope)
-	currentPath, err := DefaultStorePathForScope(scope.ID)
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
 	if err != nil {
 		return scope, "", err
 	}
-	// The canonical state-layer store is the runtime authority. Keep this hot
-	// path to one metadata lookup: opening the store, scanning legacy roots, or
-	// acquiring a writable lock here can both add startup I/O and allow a
-	// retained migration copy to influence listener selection.
-	if exists, err := inspectRuntimeStorePath(currentPath); err != nil {
-		return scope, "", err
-	} else if exists {
-		return scope, currentPath, nil
+	switch plan.Action {
+	case RuntimeStoreActionReady, RuntimeStoreActionCreate:
+		return plan.Scope, plan.CanonicalPath, nil
+	default:
+		return plan.Scope, "", &RuntimeStoreActionRequiredError{Plan: plan}
 	}
-	resolved, path, ok, err := discoverRuntimeScopeMigrationSource(scope, currentPath)
-	if err != nil {
-		return scope, "", err
-	}
-	if ok {
-		if !resolved.CreatedAt.IsZero() {
-			scope.CreatedAt = resolved.CreatedAt
-		}
-		migratedPath, err := executeLegacyOnlyMigration(scope, path)
-		if err != nil {
-			return scope, "", err
-		}
-		return scope, migratedPath, nil
-	}
-	return scope, currentPath, nil
 }
 
 // ResolveStorePathForMaintenance selects the authoritative existing store
@@ -337,24 +318,7 @@ func DefaultStorePathForScope(scopeID string) (string, error) {
 }
 
 func DefaultRegistryPathForScope(scopeID string) (string, error) {
-	path, err := appdirs.StatePath("teams", "scopes", safeScopePathPart(scopeID), "registry.json")
-	if err != nil {
-		return "", err
-	}
-	legacyPath, legacyErr := legacyDefaultRegistryPathForScope(scopeID)
-	if legacyErr != nil {
-		return path, nil
-	}
-	resolved, err := appdirs.ResolveMigratedFile(path, legacyPath)
-	if err != nil {
-		return "", err
-	}
-	if sameRegistryPath(resolved, path) && !sameRegistryPath(path, legacyPath) && !registryFileValid(path) && registryFileValid(legacyPath) {
-		if err := appdirs.CopyFileReplacing(path, legacyPath); err != nil {
-			return legacyPath, nil
-		}
-	}
-	return resolved, nil
+	return appdirs.StatePath("teams", "scopes", safeScopePathPart(scopeID), "registry.json")
 }
 
 type resolvedScopeStoreCandidate struct {

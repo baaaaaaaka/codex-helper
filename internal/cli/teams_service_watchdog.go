@@ -45,6 +45,7 @@ type teamsServiceWatchdogSnapshot struct {
 	Installed                          bool
 	Active                             bool
 	StateFiles                         int
+	MultipleFreshOwnerStores           bool
 	ServicePaused                      bool
 	ServiceDraining                    bool
 	HelperUpgradeDrainExpired          bool
@@ -89,7 +90,7 @@ var (
 	teamsServiceWatchdogNow             = time.Now
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
 	teamsServiceWatchdogCollectSnapshot = collectTeamsServiceWatchdogSnapshot
-	teamsServiceWatchdogStorePaths      = existingTeamsStorePaths
+	teamsServiceWatchdogStorePaths      = existingCanonicalTeamsStorePathsReadOnly
 	teamsServiceWatchdogInstalled       = teamsServiceInstalled
 	teamsServiceWatchdogActive          = teamsServiceActive
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
@@ -230,15 +231,54 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	if err != nil {
 		return snapshot, err
 	}
+	var selected teamsServiceWatchdogSnapshot
+	selectedFound := false
+	freshOwnerStores := 0
 	for _, path := range paths {
-		state, err := loadTeamsStoreStateAndClose(ctx, path)
+		state, err := teamsstore.LoadPathReadOnly(ctx, path)
 		if err != nil {
 			return snapshot, err
 		}
 		snapshot.StateFiles++
-		mergeTeamsServiceWatchdogState(&snapshot, state, opts)
+		var candidate teamsServiceWatchdogSnapshot
+		mergeTeamsServiceWatchdogState(&candidate, state, opts)
+		if candidate.OwnerFresh {
+			freshOwnerStores++
+		}
+		if !selectedFound || teamsServiceWatchdogSnapshotPreferred(candidate, selected) {
+			selected = candidate
+			selectedFound = true
+		}
+	}
+	if selectedFound {
+		installed := snapshot.Installed
+		active := snapshot.Active
+		stateFiles := snapshot.StateFiles
+		snapshot = selected
+		snapshot.Installed = installed
+		snapshot.Active = active
+		snapshot.StateFiles = stateFiles
+		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
 	}
 	return snapshot, nil
+}
+
+func teamsServiceWatchdogSnapshotPreferred(candidate, current teamsServiceWatchdogSnapshot) bool {
+	if candidate.OwnerFresh != current.OwnerFresh {
+		return candidate.OwnerFresh
+	}
+	if candidate.OwnerFound != current.OwnerFound {
+		return candidate.OwnerFound
+	}
+	candidateActivity := candidate.LastOwnerHeartbeat
+	if candidate.PollActivityAt.After(candidateActivity) {
+		candidateActivity = candidate.PollActivityAt
+	}
+	currentActivity := current.LastOwnerHeartbeat
+	if current.PollActivityAt.After(currentActivity) {
+		currentActivity = current.PollActivityAt
+	}
+	return candidateActivity.After(currentActivity)
 }
 
 func mergeTeamsServiceWatchdogState(snapshot *teamsServiceWatchdogSnapshot, state teamsstore.State, opts teamsServiceWatchdogOptions) {
@@ -356,6 +396,9 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
 	}
+	if snapshot.MultipleFreshOwnerStores {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores have fresh owners; refusing automatic lifecycle changes"}
+	}
 	if snapshot.ServiceDraining {
 		if snapshot.HelperUpgradeDrainExpired {
 			return evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot)
@@ -420,11 +463,20 @@ func reconcileTeamsServiceWatchdogLifecycleDrains(ctx context.Context, opts team
 		return err
 	}
 	for _, path := range paths {
+		state, err := teamsstore.LoadPathReadOnly(ctx, path)
+		if err != nil {
+			return err
+		}
+		upgradeExpired := teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != ""
+		reloadStale := teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter)
+		if !upgradeExpired && !reloadStale {
+			continue
+		}
 		st, err := teamsstore.Open(path)
 		if err != nil {
 			return err
 		}
-		state, err := st.Load(ctx)
+		state, err = st.Load(ctx)
 		if err != nil {
 			_ = st.Close()
 			return err

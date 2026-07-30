@@ -640,13 +640,23 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 		return nil, err
 	}
 	scope := ScopeIdentityForUser(user)
+	plan, err := InspectRuntimeStoreForScope(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	switch plan.Action {
+	case RuntimeStoreActionReady, RuntimeStoreActionCreate:
+		scope = plan.Scope
+	case RuntimeStoreActionMigrateLegacy, RuntimeStoreActionQuarantineLegacy:
+		return nil, &RuntimeStoreActionRequiredError{Plan: plan}
+	default:
+		return nil, fmt.Errorf("unsupported Teams runtime store action %q", plan.Action)
+	}
 	if strings.TrimSpace(registryPath) == "" {
-		var resolvedScope teamstore.ScopeIdentity
-		resolvedScope, registryPath, err = ResolveRegistryPathForScope(scope)
+		registryPath, err = DefaultRegistryPathForScope(scope.ID)
 		if err != nil {
 			return nil, err
 		}
-		scope = resolvedScope
 	}
 	reg, err := LoadRegistry(registryPath)
 	if err != nil {
@@ -950,7 +960,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 				return err
 			}
 			if prepared.TakeoverRequired {
-				return deferRuntimeStoreTakeover("dual store requires offline service takeover before listener start")
+				return deferRuntimeStoreTakeover("runtime store action requires offline service migration before listener start")
 			}
 			if prepared.Resolved {
 				storePath = prepared.CanonicalPath
@@ -7023,9 +7033,12 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 	if strings.TrimSpace(tag) == "" && strings.TrimSpace(res.Version) != "" {
 		tag = "v" + strings.TrimPrefix(strings.TrimSpace(res.Version), "v")
 	}
+	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		return err
+	}
 	if res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != "" {
 		pendingReason := "helper update replacement is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		if completionChatID != "" {
 			if err := b.writePendingHelperUpgradeNoticeWithReplacement(completionChatID, completionCommandID, tag, manualNotice, res.PendingReplacePath, res.InstallPath); err != nil {
@@ -7037,6 +7050,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 				if completionChatID != "" {
 					_ = b.clearPendingHelperRestartNotice()
 				}
+				_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 				return err
 			}
 			return nil
@@ -7048,6 +7062,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 			if completionChatID != "" {
 				_ = b.clearPendingHelperRestartNotice()
 			}
+			_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 			return err
 		}
 		return nil
@@ -7057,7 +7072,6 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		if pendingReason == "" {
 			pendingReason = "helper update activation is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
 		}
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		canRecoverAutomatically := opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != ""
 		if completionChatID != "" {
@@ -7072,14 +7086,11 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		}
 		if canRecoverAutomatically {
 			if err := opts.HelperPendingRestarter(ctx, "", res.InstallPath); err != nil {
+				_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 				return err
 			}
 		}
 		return nil
-	}
-	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
-		return err
 	}
 	// Installation and activation are distinct. The old helper may schedule a
 	// restart successfully even when the replacement never becomes healthy, so
