@@ -19,13 +19,28 @@ $goModCache = (& go env GOMODCACHE).Trim()
 $goBuildCache = (& go env GOCACHE).Trim()
 
 function Get-ProbeSnapshot {
-  $goConfigRoot = Join-Path $roots.XDG_CONFIG_HOME "go"
+  $goToolRoots = @(
+    (Join-Path $roots.HOME "go"),
+    (Join-Path $roots.USERPROFILE "go"),
+    (Join-Path $roots.APPDATA "go"),
+    (Join-Path $roots.LOCALAPPDATA "go"),
+    (Join-Path $roots.XDG_CONFIG_HOME "go")
+  )
   $items = foreach ($root in ($roots.Values | Sort-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $root)) {
       continue
     }
     Get-ChildItem -LiteralPath $root -Force -Recurse |
-      Where-Object { -not $_.FullName.StartsWith($goConfigRoot, [System.StringComparison]::OrdinalIgnoreCase) } |
+      Where-Object {
+        $path = $_.FullName
+        -not ($goToolRoots | Where-Object {
+          $path.Equals($_, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $path.StartsWith(
+              $_ + [System.IO.Path]::DirectorySeparatorChar,
+              [System.StringComparison]::OrdinalIgnoreCase
+            )
+        })
+      } |
       Sort-Object FullName | ForEach-Object {
       $hash = if (-not $_.PSIsContainer) {
         (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
@@ -69,10 +84,9 @@ try {
 
   if ($before -ne $after) {
     Write-Host "Caller-owned directory snapshot differences:"
-    Compare-Object ($before -split "`n") ($after -split "`n") |
-      Format-Table -AutoSize |
-      Out-String |
-      Write-Host
+    Compare-Object ($before -split "`n") ($after -split "`n") | ForEach-Object {
+      Write-Host "$($_.SideIndicator) $($_.InputObject)"
+    }
     throw "Teams CLI tests modified caller-owned Windows profile/config/state sentinels."
   }
   if ($testStatus -ne 0) {
