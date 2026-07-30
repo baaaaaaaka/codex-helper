@@ -75,8 +75,9 @@ func exerciseRuntimeSafetyTakeoverContract(
 				}
 				return options.FenceWriter(ctx)
 			},
-			OnStage:        options.OnStage,
-			FailAfterStage: options.FailAfterStage,
+			MigrateSharedState: MigrateLegacyGlobalLedgersAfterWriterFence,
+			OnStage:            options.OnStage,
+			FailAfterStage:     options.FailAfterStage,
 		},
 	)
 	return runtimeSafetyTakeoverContractResult{
@@ -428,13 +429,35 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverSkippedOutboxIsInventoryOnlyCI(t *te
 	if _, ok := state.OutboxMessages["legacy-skipped"]; ok {
 		t.Fatal("skipped legacy outbox was imported into the canonical send queue")
 	}
-	if result.RecoveryInventory.SkippedOutbox != 1 {
-		t.Fatalf("skipped legacy outbox count = %d, want 1: %#v", result.RecoveryInventory.SkippedOutbox, result.RecoveryInventory)
+	if result.RecoveryInventory != (AutomaticScopeTakeoverInventory{}) {
+		t.Fatalf("scope takeover loaded legacy outbox inventory: %#v", result.RecoveryInventory)
 	}
 }
 
 func TestTeamsRuntimeSafetyAutomaticTakeoverGraphRereadDoesNotCreateDuplicateInboundCI(t *testing.T) {
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacyRegistryPath, ok := registryPathForStoreMigrationSource(fixture.LegacyPath)
+	if !ok {
+		t.Fatal("legacy registry path unavailable")
+	}
+	legacyLedgerPath, ok := globalInboundLedgerPathForRegistry(legacyRegistryPath)
+	if !ok {
+		t.Fatal("legacy inbound ledger path unavailable")
+	}
+	claim, claimed, err := claimGlobalInbound(
+		context.Background(),
+		legacyLedgerPath,
+		"legacy-only-chat",
+		"teams-terminal",
+		"legacy-listener",
+		time.Now(),
+	)
+	if err != nil || !claimed {
+		t.Fatalf("seed completed legacy global claim: claimed=%v err=%v", claimed, err)
+	}
+	if err := completeGlobalInbound(context.Background(), claim); err != nil {
+		t.Fatalf("complete legacy global claim: %v", err)
+	}
 	if _, err := exerciseRuntimeSafetyTakeoverContract(fixture.Scope, runtimeSafetyTakeoverContractOptions{}, fixture.LegacyPath); err != nil {
 		t.Fatalf("automatic takeover: %v", err)
 	}
@@ -446,7 +469,7 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverGraphRereadDoesNotCreateDuplicateInb
 	if !ok {
 		t.Fatal("canonical inbound ledger path unavailable")
 	}
-	_, claimed, err := claimGlobalInbound(
+	_, claimed, err = claimGlobalInbound(
 		context.Background(),
 		ledgerPath,
 		"legacy-only-chat",
@@ -512,14 +535,10 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverCrashRecoveryMatrixCI(t *testing.T) 
 	stages := []string{
 		"after-drain",
 		"after-writer-exit",
-		"before-replay-fence",
-		"after-replay-fence",
+		"before-shared-state-migration",
+		"after-shared-state-migration",
 		"before-rename-config",
 		"after-rename-config",
-		"before-rename-cache",
-		"after-rename-cache",
-		"before-rename-data",
-		"after-rename-data",
 		"before-canonical-listener-start",
 	}
 	for _, stage := range stages {
@@ -649,7 +668,7 @@ func TestTeamsRuntimeSafetyCanonicalResolutionCostDoesNotGrowWithSessionOrOutbox
 	}
 }
 
-func TestTeamsRuntimeSafetyCanonicalSecondStartupAddsNoWritesCI(t *testing.T) {
+func TestTeamsRuntimeSafetyCanonicalStartupAddsNoWritesCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -660,14 +679,9 @@ func TestTeamsRuntimeSafetyCanonicalSecondStartupAddsNoWritesCI(t *testing.T) {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, path, scope, "canonical-control")
-	if prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{}); err != nil {
-		t.Fatalf("first listener preparation: %v", err)
-	} else if !prepared.Resolved || prepared.CanonicalPath != path {
-		t.Fatalf("first listener preparation = %#v, want resolved canonical %q", prepared, path)
-	}
 	before := snapshotRuntimeSafetyFiles(t, tmp)
-	for i := 0; i < 2; i++ {
-		prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
+	for i := 0; i < 3; i++ {
+		prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope)
 		if err != nil {
 			t.Fatalf("listener preparation %d: %v", i+1, err)
 		}
@@ -686,7 +700,118 @@ func TestTeamsRuntimeSafetyCanonicalSecondStartupAddsNoWritesCI(t *testing.T) {
 	}
 }
 
-func TestTeamsRuntimeSafetyListenerPreparationDiscoversHistoricalLegacyScopeIDCI(t *testing.T) {
+func TestTeamsRuntimeSafetyDualStoreResolverOnlyReportsStructuredTakeoverCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+
+	result, err := PrepareRuntimeStoreForListener(context.Background(), fixture.Scope)
+	if err != nil {
+		t.Fatalf("resolve dual store: %v", err)
+	}
+	if result.Resolved || !result.TakeoverRequired {
+		t.Fatalf("dual-store resolution = %#v, want unresolved structured takeover request", result)
+	}
+	if result.CanonicalPath != fixture.CanonicalPath || result.LegacyPath != fixture.LegacyPath {
+		t.Fatalf("dual-store paths = canonical %q legacy %q, want %q and %q",
+			result.CanonicalPath, result.LegacyPath, fixture.CanonicalPath, fixture.LegacyPath)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("pure dual-store resolver mutated files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+	if _, ok, err := ReadRuntimeStoreTakeoverSummary(fixture.CanonicalPath); err != nil {
+		t.Fatalf("read takeover summary: %v", err)
+	} else if ok {
+		t.Fatal("pure dual-store resolver wrote a takeover summary")
+	}
+}
+
+func TestTeamsRuntimeSafetyDeferredTakeoverRetriesAddNoWritesCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacy, err := teamstore.Open(fixture.LegacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if err := legacy.Update(context.Background(), func(state *teamstore.State) error {
+		state.Turns["turn-running"] = teamstore.Turn{
+			ID:        "turn-running",
+			SessionID: "legacy-only-session",
+			Status:    teamstore.TurnStatusRunning,
+			StartedAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed active turn: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	if _, err := CoordinateAutomaticScopeTakeover(context.Background(), fixture.Scope, fixture.LegacyPath, AutomaticScopeTakeoverOptions{}); err == nil {
+		t.Fatal("first active-turn takeover unexpectedly completed")
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	for i := 0; i < 120; i++ {
+		if _, err := CoordinateAutomaticScopeTakeover(context.Background(), fixture.Scope, fixture.LegacyPath, AutomaticScopeTakeoverOptions{}); err == nil {
+			t.Fatalf("deferred takeover retry %d unexpectedly completed", i+1)
+		}
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("unchanged deferred takeover retries wrote files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+}
+
+func TestTeamsRuntimeSafetyTakeoverDefersFreshControlLeaseBeforeOwnerHeartbeatCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacy, err := teamstore.Open(fixture.LegacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if err := legacy.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = nil
+		state.LockOwner = nil
+		state.ControlLease = teamstore.ControlLease{
+			ScopeID:         fixture.Scope.ID,
+			HolderMachineID: "legacy-machine",
+			Generation:      7,
+			Status:          teamstore.ControlLeaseStatusActive,
+			LeaseUntil:      time.Now().Add(time.Minute),
+			LastHeartbeat:   time.Now(),
+		}
+		return nil
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed fresh control lease: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	result, err := ExecuteAutomaticScopeTakeover(
+		context.Background(),
+		fixture.Scope,
+		takeoverSourcesForStore(fixture.LegacyPath),
+		AutomaticScopeTakeoverOptions{
+			ValidateLegacyState: func(context.Context, teamstore.State) (AutomaticScopeTakeoverFence, error) {
+				return AutomaticScopeTakeoverFence{}, nil
+			},
+			FenceWriter: func(context.Context, AutomaticScopeTakeoverFence) error { return nil },
+		},
+	)
+	if err == nil {
+		t.Fatalf("fresh lease without owner heartbeat completed takeover: %#v", result)
+	}
+	if !stringsContainAnyFold(err.Error(), "lease", "owner", "deferred") {
+		t.Fatalf("fresh lease deferral error = %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("fresh lease preflight modified files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+}
+
+func TestTeamsRuntimeSafetyCanonicalHotPathDoesNotScanHistoricalLegacyScopeIDCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -703,30 +828,33 @@ func TestTeamsRuntimeSafetyListenerPreparationDiscoversHistoricalLegacyScopeIDCI
 		t.Fatalf("historical legacy path: %v", err)
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, historicalPath, scope, "legacy-control")
+	before := snapshotRuntimeSafetyFiles(t, tmp)
 
-	result, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
+	result, err := PrepareRuntimeStoreForListener(context.Background(), scope)
 	if err != nil {
-		t.Fatalf("prepare historical legacy takeover: %v", err)
+		t.Fatalf("prepare canonical hot path: %v", err)
 	}
 	if !result.Resolved || result.CanonicalPath != canonicalPath {
 		t.Fatalf("prepare result = %#v, want canonical %q", result, canonicalPath)
 	}
-	if _, err := os.Stat(historicalPath); !os.IsNotExist(err) {
-		t.Fatalf("historical legacy source remains visible: %v", err)
+	if _, err := os.Stat(historicalPath); err != nil {
+		t.Fatalf("canonical hot path modified historical diagnostic source: %v", err)
 	}
-	if _, err := os.Stat(migrationBackupPath(historicalPath, scope.ID)); err != nil {
-		t.Fatalf("historical legacy backup unavailable: %v", err)
+	if _, err := os.Stat(migrationBackupPath(historicalPath, scope.ID)); !os.IsNotExist(err) {
+		t.Fatalf("canonical hot path created historical backup: %v", err)
 	}
-	summary, ok, err := ReadRuntimeStoreTakeoverSummary(canonicalPath)
-	if err != nil || !ok {
-		t.Fatalf("read takeover summary: ok=%v err=%v", ok, err)
+	if _, ok, err := ReadRuntimeStoreTakeoverSummary(canonicalPath); err != nil {
+		t.Fatalf("read takeover summary: %v", err)
+	} else if ok {
+		t.Fatal("canonical hot path wrote a takeover summary for a historical diagnostic store")
 	}
-	if summary.Status != "completed" || summary.LegacyStorePath != historicalPath {
-		t.Fatalf("takeover summary = %#v", summary)
+	after := snapshotRuntimeSafetyFiles(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("canonical hot path scanned or modified historical stores: %v", runtimeSafetySnapshotChanges(before, after))
 	}
 }
 
-func TestTeamsRuntimeSafetyListenerPreparationRejectsMultipleMatchingLegacyStoresReadOnlyCI(t *testing.T) {
+func TestTeamsRuntimeSafetyCanonicalHotPathIgnoresMultipleHistoricalLegacyStoresReadOnlyCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -746,12 +874,12 @@ func TestTeamsRuntimeSafetyListenerPreparationRejectsMultipleMatchingLegacyStore
 		openAndSeedRuntimeSafetyScopeStore(t, path, scope, "legacy-control")
 	}
 	before := snapshotRuntimeSafetyFiles(t, tmp)
-	result, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
-	if err == nil {
-		t.Fatalf("multiple matching stores resolved to %#v", result)
+	result, err := PrepareRuntimeStoreForListener(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("canonical hot path consulted historical stores: %v", err)
 	}
-	if !stringsContainAnyFold(err.Error(), "multiple", "match", "deferred") {
-		t.Fatalf("multiple-match error = %v", err)
+	if !result.Resolved || result.CanonicalPath != canonicalPath {
+		t.Fatalf("prepare result = %#v, want canonical %q", result, canonicalPath)
 	}
 	after := snapshotRuntimeSafetyFiles(t, tmp)
 	if !reflect.DeepEqual(before, after) {
@@ -785,12 +913,12 @@ func TestTeamsRuntimeSafetyTakeoverSummaryIsBoundedAndContainsNoMessageBodiesCI(
 		t.Fatalf("close legacy: %v", err)
 	}
 
-	result, err := PrepareRuntimeStoreForListener(context.Background(), fixture.Scope, AutomaticScopeTakeoverOptions{})
+	result, err := CoordinateAutomaticScopeTakeover(context.Background(), fixture.Scope, fixture.LegacyPath, AutomaticScopeTakeoverOptions{})
 	if err != nil {
 		t.Fatalf("prepare takeover: %v", err)
 	}
-	if result.RecoveryInventory.QueuedOutbox != 4097 {
-		t.Fatalf("queued recovery count = %d, want 4097", result.RecoveryInventory.QueuedOutbox)
+	if result.RecoveryInventory != (AutomaticScopeTakeoverInventory{}) {
+		t.Fatalf("takeover loaded unbounded legacy recovery inventory: %#v", result.RecoveryInventory)
 	}
 	summaryPath := runtimeStoreTakeoverSummaryPath(fixture.CanonicalPath)
 	raw, err := os.ReadFile(summaryPath)
@@ -876,6 +1004,11 @@ func TestTeamsRuntimeSafetyBridgeListenUsesCanonicalStoreAfterAutomaticTakeoverC
 		OwnerStaleAfter: time.Minute,
 		Executor:        EchoExecutor{},
 		HelperVersion:   "v-takeover-bridge-test",
+		LegacyStoreTakeoverCoordinator: func(ctx context.Context, scope teamstore.ScopeIdentity, legacyPath string) (AutomaticScopeTakeoverResult, error) {
+			return CoordinateAutomaticScopeTakeover(ctx, scope, legacyPath, AutomaticScopeTakeoverOptions{
+				MigrateSharedState: MigrateLegacyGlobalLedgersAfterWriterFence,
+			})
+		},
 	}); err != nil {
 		t.Fatalf("Bridge.Listen automatic takeover: %v", err)
 	}
@@ -951,7 +1084,13 @@ func TestTeamsRuntimeSafetyCanonicalResolverSyscallProbeCI(t *testing.T) {
 	if rootFile == "" {
 		t.Fatal("CXP_TEAMS_RESOLVER_IO_ROOT_FILE is required")
 	}
-	tmp := t.TempDir()
+	tmp := strings.TrimSpace(os.Getenv("CXP_TEAMS_RESOLVER_IO_ROOT"))
+	if tmp == "" {
+		t.Fatal("CXP_TEAMS_RESOLVER_IO_ROOT is required")
+	}
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		t.Fatalf("create persistent resolver probe root: %v", err)
+	}
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
 	t.Setenv(envTeamsProfile, "default")
@@ -960,34 +1099,29 @@ func TestTeamsRuntimeSafetyCanonicalResolverSyscallProbeCI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	openAndSeedRuntimeSafetyScopeStore(t, path, scope, "canonical-control")
+	if os.Getenv("CXP_TEAMS_RESOLVER_IO_SEED") == "1" {
+		openAndSeedRuntimeSafetyScopeStore(t, path, scope, "canonical-control")
+	} else if _, err := os.Stat(path); err != nil {
+		t.Fatalf("second-process canonical fixture is unavailable: %v", err)
+	}
 	if err := os.WriteFile(rootFile, []byte(tmp), 0o600); err != nil {
 		t.Fatalf("write probe root: %v", err)
 	}
 
 	fmt.Fprintln(os.Stderr, "CXP_TEAMS_RESOLVER_IO_BEGIN")
-	for i := 0; i < 2; i++ {
-		if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
-			t.Fatalf("probe resolution %d: %v", i+1, err)
-		} else if resolvedPath != path {
-			t.Fatalf("probe resolution %d path = %q, want %q", i+1, resolvedPath, path)
-		}
+	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
+		t.Fatalf("probe resolution: %v", err)
+	} else if resolvedPath != path {
+		t.Fatalf("probe resolution path = %q, want %q", resolvedPath, path)
 	}
 	fmt.Fprintln(os.Stderr, "CXP_TEAMS_RESOLVER_IO_END")
-	if prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{}); err != nil {
-		t.Fatalf("initial listener preparation: %v", err)
-	} else if !prepared.Resolved || prepared.CanonicalPath != path {
-		t.Fatalf("initial listener preparation = %#v, want resolved canonical %q", prepared, path)
-	}
 	fmt.Fprintln(os.Stderr, "CXP_TEAMS_LISTENER_PREP_IO_BEGIN")
-	for i := 0; i < 2; i++ {
-		prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope, AutomaticScopeTakeoverOptions{})
-		if err != nil {
-			t.Fatalf("probe listener preparation %d: %v", i+1, err)
-		}
-		if !prepared.Resolved || prepared.CanonicalPath != path {
-			t.Fatalf("probe listener preparation %d = %#v, want resolved canonical %q", i+1, prepared, path)
-		}
+	prepared, err := PrepareRuntimeStoreForListener(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("probe listener preparation: %v", err)
+	}
+	if !prepared.Resolved || prepared.CanonicalPath != path {
+		t.Fatalf("probe listener preparation = %#v, want resolved canonical %q", prepared, path)
 	}
 	fmt.Fprintln(os.Stderr, "CXP_TEAMS_LISTENER_PREP_IO_END")
 }

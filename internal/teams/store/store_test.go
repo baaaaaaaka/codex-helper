@@ -234,6 +234,122 @@ func TestLoadPathReadOnlySQLiteLiveWALWithoutSHMFailsWithoutCreatingSidecar(t *t
 	}
 }
 
+func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	scope := ScopeIdentity{ID: "scope-runtime-metadata", AccountID: "account-1", Profile: "default"}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = scope
+		state.ControlChat = ControlChatBinding{ScopeID: scope.ID, AccountID: scope.AccountID, Profile: scope.Profile, TeamsChatID: "control-chat"}
+		state.ServiceOwner = &OwnerMetadata{PID: 1234, ScopeID: scope.ID, LastHeartbeat: now}
+		state.ControlLease = ControlLease{
+			ScopeID:         scope.ID,
+			HolderMachineID: "machine-1",
+			Status:          ControlLeaseStatusActive,
+			LeaseUntil:      now.Add(time.Minute),
+		}
+		state.Sessions["corrupt-session"] = SessionContext{ID: "corrupt-session", TeamsChatID: "work-chat", Status: SessionStatusActive}
+		state.Turns["active-turn"] = Turn{ID: "active-turn", SessionID: "corrupt-session", Status: TurnStatusRunning}
+		state.OutboxMessages["corrupt-outbox"] = OutboxMessage{ID: "corrupt-outbox", TeamsChatID: "work-chat", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{broken-session' WHERE id = 'corrupt-session'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt session sentinel: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = 'corrupt-outbox'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	metadata, err := LoadPathRuntimeMetadataReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathRuntimeMetadataReadOnly: %v", err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("runtime metadata probe modified the SQLite family:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if metadata.Scope != scope || metadata.ControlChat.TeamsChatID != "control-chat" {
+		t.Fatalf("runtime metadata identity = %#v", metadata)
+	}
+	if metadata.ServiceOwner == nil || metadata.ServiceOwner.PID != 1234 {
+		t.Fatalf("runtime metadata owner = %#v", metadata.ServiceOwner)
+	}
+	if metadata.ControlLease.HolderMachineID != "machine-1" || metadata.ControlLease.Status != ControlLeaseStatusActive {
+		t.Fatalf("runtime metadata lease = %#v", metadata.ControlLease)
+	}
+	takeover, err := LoadPathRuntimeTakeoverMetadataReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathRuntimeTakeoverMetadataReadOnly: %v", err)
+	}
+	if !takeover.HasActiveTurns {
+		t.Fatal("bounded takeover metadata missed an active turn")
+	}
+}
+
+func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	scope := ScopeIdentity{ID: "scope-large-json", AccountID: "account-large", Profile: "default"}
+	raw, err := json.Marshal(map[string]any{
+		"schema_version": SchemaVersion,
+		"scope":          scope,
+		"control_chat":   ControlChatBinding{ScopeID: scope.ID, TeamsChatID: "control-large"},
+		"service_owner":  OwnerMetadata{PID: 4321, ScopeID: scope.ID},
+		"sessions": map[string]any{
+			"large-session": map[string]any{"ignored_blob": strings.Repeat("session-data-", 8192)},
+		},
+		"turns": map[string]any{
+			"active-turn": map[string]any{"status": TurnStatusRunning, "ignored_blob": strings.Repeat("turn-data-", 4096)},
+		},
+		"outbox_messages": map[string]any{
+			"large-outbox": map[string]any{"body": strings.Repeat("outbox-data-", 8192)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal large JSON store: %v", err)
+	}
+	if len(raw) <= maxStatePointerSize {
+		t.Fatalf("large JSON fixture size = %d, want larger than pointer threshold", len(raw))
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write large JSON store: %v", err)
+	}
+
+	metadata, err := LoadPathRuntimeTakeoverMetadataReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("load large JSON runtime metadata: %v", err)
+	}
+	if metadata.Scope != scope || metadata.ControlChat.TeamsChatID != "control-large" {
+		t.Fatalf("large JSON metadata = %#v", metadata)
+	}
+	if metadata.ServiceOwner == nil || metadata.ServiceOwner.PID != 4321 {
+		t.Fatalf("large JSON owner = %#v", metadata.ServiceOwner)
+	}
+	if !metadata.HasActiveTurns {
+		t.Fatal("large JSON metadata missed active turn")
+	}
+}
+
 type readOnlyFileSnapshot struct {
 	Mode    os.FileMode
 	Size    int64
@@ -15278,6 +15394,7 @@ func testOwner(activeSessionID string, activeTurnID string, startedAt time.Time)
 func sameControl(a ServiceControl, b ServiceControl) bool {
 	return a.Paused == b.Paused &&
 		a.Draining == b.Draining &&
+		a.DrainKind == b.DrainKind &&
 		a.Reason == b.Reason &&
 		a.DrainOperationID == b.DrainOperationID &&
 		a.LastDrainOperationID == b.LastDrainOperationID &&

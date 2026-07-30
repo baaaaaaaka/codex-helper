@@ -222,9 +222,7 @@ type BridgeOptions struct {
 	MachineRegistryInterval            time.Duration
 	MachineRegistryTTL                 time.Duration
 	MachineRegistryNow                 func() time.Time
-	LegacyStoreSafetyCheck             func(context.Context) error
-	LegacyStoreWriterValidator         func(context.Context, teamstore.State) (AutomaticScopeTakeoverFence, error)
-	LegacyStoreWriterFencer            func(context.Context, AutomaticScopeTakeoverFence) error
+	LegacyStoreTakeoverCoordinator     func(context.Context, teamstore.ScopeIdentity, string) (AutomaticScopeTakeoverResult, error)
 }
 
 type ModelProfileResolver func(context.Context, string) (modelprofile.Snapshot, error)
@@ -938,13 +936,21 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if b.store == nil {
 		storePath := opts.StorePath
 		if strings.TrimSpace(storePath) == "" {
-			prepared, err := PrepareRuntimeStoreForListener(ctx, b.scope, AutomaticScopeTakeoverOptions{
-				SafetyCheck:         opts.LegacyStoreSafetyCheck,
-				ValidateLegacyState: opts.LegacyStoreWriterValidator,
-				FenceWriter:         opts.LegacyStoreWriterFencer,
-			})
+			prepared, err := PrepareRuntimeStoreForListener(ctx, b.scope)
 			if err != nil {
 				return err
+			}
+			if prepared.TakeoverRequired {
+				if opts.LegacyStoreTakeoverCoordinator == nil {
+					return deferRuntimeStoreTakeover("managed service/supervisor coordinator is unavailable")
+				}
+				prepared, err = opts.LegacyStoreTakeoverCoordinator(ctx, b.scope, prepared.LegacyPath)
+				if err != nil {
+					return err
+				}
+				if !prepared.Resolved {
+					return deferRuntimeStoreTakeover("managed service/supervisor coordinator did not complete takeover")
+				}
 			}
 			if prepared.Resolved {
 				storePath = prepared.CanonicalPath
@@ -5960,6 +5966,7 @@ func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamst
 		}
 		next := previous
 		next.Draining = true
+		next.DrainKind = ""
 		next.Reason = teamstore.HelperReloadReason
 		next.DrainOperationID = ""
 		next.UpdatedAt = now
@@ -5993,6 +6000,7 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 
 func clearStaleHelperReloadControl(control teamstore.ServiceControl, now time.Time) teamstore.ServiceControl {
 	control.Draining = false
+	control.DrainKind = ""
 	control.DrainOperationID = ""
 	if !control.Paused {
 		control.Reason = ""
@@ -12842,7 +12850,17 @@ func serviceControlDefersInput(control teamstore.ServiceControl) bool {
 	}
 }
 
+var ErrRuntimeStoreTakeoverDraining = errors.New("Teams runtime store takeover is draining")
+
 func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg ChatMessage, control teamstore.ServiceControl) error {
+	if control.Draining && control.DrainKind == teamstore.DrainKindRuntimeStoreTakeover {
+		// Do not persist this message into the legacy scope that is about to be
+		// quarantined, and do not let the caller complete its global inbound
+		// claim. Returning an error makes the poll wrapper release that claim so
+		// the canonical listener can fetch and process the message after the
+		// takeover.
+		return ErrRuntimeStoreTakeoverDraining
+	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}

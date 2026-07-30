@@ -734,6 +734,150 @@ func loadSQLiteStateFileReadOnly(ctx context.Context, path string) (State, error
 	return loadSQLiteStateFileReadOnlyWithHook(ctx, path, nil)
 }
 
+func loadSQLiteRuntimeMetadataFileReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	metadata, err := loadSQLiteRuntimeTakeoverMetadataFileReadOnly(ctx, path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	return metadata.RuntimeMetadata, nil
+}
+
+func loadSQLiteRuntimeTakeoverMetadataFileReadOnly(ctx context.Context, path string) (RuntimeTakeoverMetadata, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		if !dbBefore.Exists {
+			return RuntimeTakeoverMetadata{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if _, err := os.Stat(path + "-shm"); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return RuntimeTakeoverMetadata{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
+				}
+				return RuntimeTakeoverMetadata{}, err
+			}
+		}
+		metadata, err := loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		if !immutable {
+			return metadata, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return metadata, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable metadata attempt %d", attempt+1)
+	}
+	return RuntimeTakeoverMetadata{}, fmt.Errorf("read stable sqlite runtime metadata after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (RuntimeTakeoverMetadata, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	if err := validateSQLiteRequiredTablesContext(ctx, db); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+
+	var metadata RuntimeMetadata
+	var controlChatJSON string
+	if err := db.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
+	).Scan(&controlChatJSON); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	if err := json.Unmarshal([]byte(controlChatJSON), &metadata.ControlChat); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+
+	rows, err := db.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+		sqliteRuntimeKeyScope,
+		sqliteRuntimeKeyControlLease,
+		sqliteRuntimeKeyServiceOwner,
+		sqliteRuntimeKeyLockOwner,
+		sqliteRuntimeKeyServiceControl,
+	)
+	if err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		switch key {
+		case sqliteRuntimeKeyScope:
+			if err := json.Unmarshal(raw, &metadata.Scope); err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+		case sqliteRuntimeKeyControlLease:
+			if err := json.Unmarshal(raw, &metadata.ControlLease); err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+		case sqliteRuntimeKeyServiceOwner:
+			if err := json.Unmarshal(raw, &metadata.ServiceOwner); err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+		case sqliteRuntimeKeyLockOwner:
+			if err := json.Unmarshal(raw, &metadata.LockOwner); err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+		case sqliteRuntimeKeyServiceControl:
+			if err := json.Unmarshal(raw, &metadata.ServiceControl); err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	var active int
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM turns WHERE status IN (?, ?) LIMIT 1)`,
+		string(TurnStatusQueued),
+		string(TurnStatusRunning),
+	).Scan(&active); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	return RuntimeTakeoverMetadata{
+		RuntimeMetadata: metadata,
+		HasActiveTurns:  active != 0,
+	}, nil
+}
+
 type sqliteReadOnlyFileIdentity struct {
 	Exists  bool
 	Size    int64
@@ -1010,9 +1154,13 @@ var sqliteRequiredTables = []string{
 }
 
 func validateSQLiteRequiredTables(db *sql.DB) error {
+	return validateSQLiteRequiredTablesContext(context.Background(), db)
+}
+
+func validateSQLiteRequiredTablesContext(ctx context.Context, db *sql.DB) error {
 	for _, table := range sqliteRequiredTables {
 		var name string
-		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+		err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("sqlite teams store is missing required table %q", table)
 		}

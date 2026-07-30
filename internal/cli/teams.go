@@ -1122,6 +1122,34 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams machine registry heartbeat disabled: Teams write auth is unavailable: %v\n", registryErr)
 					}
 				}
+				legacyStoreSafetyCheck := func(ctx context.Context) error {
+					if !teamsRunShouldRetryInProcess(once) {
+						return fmt.Errorf("automatic Teams runtime store takeover requires the managed service/supervisor")
+					}
+					if teamsServiceIsWSL() {
+						if err := runTeamsServiceWSLReadinessCheck(ctx, nil); err != nil {
+							return err
+						}
+						if err := (teamsServiceWSLWindowsTaskBackend{}).RetireScheduledTasks(ctx); err != nil {
+							return fmt.Errorf("retire WSL Scheduled Tasks before runtime store takeover: %w", err)
+						}
+					}
+					return nil
+				}
+				legacyStoreWriterValidator := func(ctx context.Context, state teamsstore.State) (teams.AutomaticScopeTakeoverFence, error) {
+					spec, err := buildTeamsServiceSpec(registryPath)
+					if err != nil {
+						return teams.AutomaticScopeTakeoverFence{}, err
+					}
+					return teamsServiceValidateLegacyStoreWriters(ctx, state, spec)
+				}
+				legacyStoreWriterFencer := func(ctx context.Context, fence teams.AutomaticScopeTakeoverFence) error {
+					spec, err := buildTeamsServiceSpec(registryPath)
+					if err != nil {
+						return err
+					}
+					return teamsServiceFenceLegacyStoreWriters(ctx, fence, spec)
+				}
 				return bridge.Listen(cmd.Context(), teams.BridgeOptions{
 					RegistryPath:                       *registryPath,
 					HelperVersion:                      buildVersion(),
@@ -1147,25 +1175,13 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					MachineRegistryGraph:               machineRegistryGraph,
 					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
 					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
-					LegacyStoreSafetyCheck: func(ctx context.Context) error {
-						if teamsServiceIsWSL() {
-							return runTeamsServiceWSLReadinessCheck(ctx, nil)
-						}
-						return nil
-					},
-					LegacyStoreWriterValidator: func(ctx context.Context, state teamsstore.State) (teams.AutomaticScopeTakeoverFence, error) {
-						spec, err := buildTeamsServiceSpec(registryPath)
-						if err != nil {
-							return teams.AutomaticScopeTakeoverFence{}, err
-						}
-						return teamsServiceValidateLegacyStoreWriters(ctx, state, spec)
-					},
-					LegacyStoreWriterFencer: func(ctx context.Context, fence teams.AutomaticScopeTakeoverFence) error {
-						spec, err := buildTeamsServiceSpec(registryPath)
-						if err != nil {
-							return err
-						}
-						return teamsServiceFenceLegacyStoreWriters(ctx, fence, spec)
+					LegacyStoreTakeoverCoordinator: func(ctx context.Context, scope teamsstore.ScopeIdentity, legacyPath string) (teams.AutomaticScopeTakeoverResult, error) {
+						return teams.CoordinateAutomaticScopeTakeover(ctx, scope, legacyPath, teams.AutomaticScopeTakeoverOptions{
+							SafetyCheck:         legacyStoreSafetyCheck,
+							ValidateLegacyState: legacyStoreWriterValidator,
+							FenceWriter:         legacyStoreWriterFencer,
+							MigrateSharedState:  teams.MigrateLegacyGlobalLedgersAfterWriterFence,
+						})
 					},
 				})
 			}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -121,17 +122,18 @@ const outboxSendLease = 2 * time.Minute
 const chatPollSuccessHeartbeatWriteInterval = 30 * time.Second
 
 const (
-	HelperUpgradeReason  = "codex-proxy upgrade"
-	HelperReloadReason   = "codex-proxy reload"
-	CodexUpgradeReason   = "codex cli upgrade"
-	chatPollStateHot     = "hot"
-	chatPollStateRunning = "running"
-	chatPollStateWarm    = "warm"
-	chatPollStateCool    = "cool"
-	chatPollStateCold    = "cold"
-	chatPollStateBlocked = "blocked"
-	chatPollStateCatchup = "catchup"
-	chatPollStateParked  = "parked"
+	HelperUpgradeReason        = "codex-proxy upgrade"
+	HelperReloadReason         = "codex-proxy reload"
+	CodexUpgradeReason         = "codex cli upgrade"
+	RuntimeStoreTakeoverReason = "canonical runtime store takeover"
+	chatPollStateHot           = "hot"
+	chatPollStateRunning       = "running"
+	chatPollStateWarm          = "warm"
+	chatPollStateCool          = "cool"
+	chatPollStateCold          = "cold"
+	chatPollStateBlocked       = "blocked"
+	chatPollStateCatchup       = "catchup"
+	chatPollStateParked        = "parked"
 
 	importCheckpointStatusImporting = "importing"
 	importCheckpointStatusComplete  = "complete"
@@ -546,12 +548,17 @@ const (
 type ServiceControl struct {
 	Paused               bool      `json:"paused,omitempty"`
 	Draining             bool      `json:"draining,omitempty"`
+	DrainKind            DrainKind `json:"drain_kind,omitempty"`
 	Reason               string    `json:"reason,omitempty"`
 	DrainOperationID     string    `json:"drain_operation_id,omitempty"`
 	LastDrainOperationID string    `json:"last_drain_operation_id,omitempty"`
 	LastDrainOperationAt time.Time `json:"last_drain_operation_at,omitempty"`
 	UpdatedAt            time.Time `json:"updated_at,omitempty"`
 }
+
+type DrainKind string
+
+const DrainKindRuntimeStoreTakeover DrainKind = "runtime_store_takeover"
 
 var ErrDrainOperationConflict = errors.New("teams drain is owned by another operation")
 
@@ -1382,6 +1389,207 @@ func LoadPathReadOnly(ctx context.Context, path string) (State, error) {
 		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
 	}
 	return loadStateData(data)
+}
+
+// RuntimeMetadata is the bounded subset of a Teams store needed to identify a
+// scope and determine whether a runtime writer may still be authoritative.
+// It deliberately excludes sessions, turns, inbound events, outbox messages,
+// and every other unbounded business-data collection.
+type RuntimeMetadata struct {
+	Scope          ScopeIdentity      `json:"scope"`
+	ControlChat    ControlChatBinding `json:"control_chat"`
+	ServiceOwner   *OwnerMetadata     `json:"service_owner,omitempty"`
+	LockOwner      *OwnerMetadata     `json:"lock_owner,omitempty"`
+	ControlLease   ControlLease       `json:"control_lease"`
+	ServiceControl ServiceControl     `json:"service_control"`
+}
+
+type RuntimeTakeoverMetadata struct {
+	RuntimeMetadata
+	HasActiveTurns bool `json:"-"`
+}
+
+// LoadPathRuntimeMetadataReadOnly reads only the bounded runtime metadata from
+// a JSON or SQLite-backed store. It does not take the writable store flock,
+// create lock files, migrate data, configure WAL, checkpoint, chmod, or load
+// session/outbox tables.
+func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	metadata, err := LoadPathRuntimeTakeoverMetadataReadOnly(ctx, path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	return metadata.RuntimeMetadata, nil
+}
+
+// LoadPathRuntimeTakeoverMetadataReadOnly adds one bounded active-turn
+// predicate for takeover preflight. SQLite stores answer it with LIMIT 1 and
+// never load turn bodies, sessions, inbound rows, or outbox rows.
+func LoadPathRuntimeTakeoverMetadataReadOnly(ctx context.Context, path string) (RuntimeTakeoverMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return RuntimeTakeoverMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return RuntimeTakeoverMetadata{}, err
+			}
+			return loadSQLiteRuntimeTakeoverMetadataFileReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		} else if ok {
+			return RuntimeTakeoverMetadata{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONRuntimeTakeoverMetadataReadOnly(ctx, path)
+}
+
+type runtimeMetadataContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r runtimeMetadataContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+func loadJSONRuntimeTakeoverMetadataReadOnly(ctx context.Context, path string) (RuntimeTakeoverMetadata, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(runtimeMetadataContextReader{ctx: ctx, r: f})
+	token, err := decoder.Token()
+	if err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	if token != json.Delim('{') {
+		return RuntimeTakeoverMetadata{}, fmt.Errorf("teams store root must be a JSON object")
+	}
+	var metadata RuntimeTakeoverMetadata
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return RuntimeTakeoverMetadata{}, fmt.Errorf("teams store metadata key is not a string")
+		}
+		switch key {
+		case "scope":
+			err = decoder.Decode(&metadata.Scope)
+		case "control_chat":
+			err = decoder.Decode(&metadata.ControlChat)
+		case "service_owner":
+			err = decoder.Decode(&metadata.ServiceOwner)
+		case "lock_owner":
+			err = decoder.Decode(&metadata.LockOwner)
+		case "control_lease":
+			err = decoder.Decode(&metadata.ControlLease)
+		case "service_control":
+			err = decoder.Decode(&metadata.ServiceControl)
+		case "turns":
+			err = decodeRuntimeActiveTurnPredicate(decoder, &metadata.HasActiveTurns)
+		default:
+			err = skipRuntimeMetadataJSONValue(decoder)
+		}
+		if err != nil {
+			return RuntimeTakeoverMetadata{}, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return RuntimeTakeoverMetadata{}, err
+	}
+	return metadata, nil
+}
+
+func decodeRuntimeActiveTurnPredicate(decoder *json.Decoder, active *bool) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		return nil
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("teams turns metadata must be a JSON object")
+	}
+	for decoder.More() {
+		if _, err := decoder.Token(); err != nil {
+			return err
+		}
+		var turn struct {
+			Status TurnStatus `json:"status"`
+		}
+		if err := decoder.Decode(&turn); err != nil {
+			return err
+		}
+		if turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning {
+			*active = true
+		}
+	}
+	_, err = decoder.Token()
+	return err
+}
+
+func skipRuntimeMetadataJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipRuntimeMetadataJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := skipRuntimeMetadataJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func (s *Store) LoadLegacyJSONState(ctx context.Context) (State, bool, error) {
@@ -2615,20 +2823,27 @@ func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (Serv
 }
 
 func (s *Store) SetDraining(ctx context.Context, reason string) (ServiceControl, error) {
-	return s.setDrainingOperation(ctx, reason, "")
+	return s.setDrainingOperation(ctx, "", reason, "")
 }
 
 // SetDrainingOperation acquires a persisted maintenance fence. A different
 // operation cannot replace the fence until its owner releases it explicitly.
 func (s *Store) SetDrainingOperation(ctx context.Context, reason string, operationID string) (ServiceControl, error) {
+	return s.SetDrainingOperationKind(ctx, "", reason, operationID)
+}
+
+// SetDrainingOperationKind acquires a persisted maintenance fence with a
+// machine-readable kind. Reason remains user-facing text and must not be used
+// to choose runtime behavior.
+func (s *Store) SetDrainingOperationKind(ctx context.Context, kind DrainKind, reason string, operationID string) (ServiceControl, error) {
 	operationID = strings.TrimSpace(operationID)
 	if operationID == "" {
 		return ServiceControl{}, fmt.Errorf("drain operation id is required")
 	}
-	return s.setDrainingOperation(ctx, reason, operationID)
+	return s.setDrainingOperation(ctx, kind, reason, operationID)
 }
 
-func (s *Store) setDrainingOperation(ctx context.Context, reason string, operationID string) (ServiceControl, error) {
+func (s *Store) setDrainingOperation(ctx context.Context, kind DrainKind, reason string, operationID string) (ServiceControl, error) {
 	var out ServiceControl
 	update := func(state *State) error {
 		next := state.ServiceControl
@@ -2637,12 +2852,13 @@ func (s *Store) setDrainingOperation(ctx context.Context, reason string, operati
 			out = next
 			return fmt.Errorf("%w: current=%q requested=%q", ErrDrainOperationConflict, next.DrainOperationID, operationID)
 		}
-		if next.Draining && next.Reason == reason && next.DrainOperationID == operationID {
+		if next.Draining && next.DrainKind == kind && next.Reason == reason && next.DrainOperationID == operationID {
 			out = next
 			return errStoreNoChange
 		}
 		now := time.Now()
 		next.Draining = true
+		next.DrainKind = kind
 		next.Reason = reason
 		next.DrainOperationID = operationID
 		if operationID != "" {
@@ -2690,6 +2906,7 @@ func (s *Store) clearDrainOperation(ctx context.Context, operationID string, fen
 			return fmt.Errorf("%w: current=%q requested=%q", ErrDrainOperationConflict, next.DrainOperationID, operationID)
 		}
 		next.Draining = false
+		next.DrainKind = ""
 		next.DrainOperationID = ""
 		if !next.Paused {
 			next.Reason = ""
@@ -2982,6 +3199,7 @@ func (s *Store) BeginUpgrade(ctx context.Context, reason string, timeout time.Du
 		}
 		control := previous
 		control.Draining = true
+		control.DrainKind = ""
 		control.Reason = reason
 		control.DrainOperationID = ""
 		control.UpdatedAt = now
@@ -3030,6 +3248,7 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 			}
 			control := previous
 			control.Draining = true
+			control.DrainKind = ""
 			control.Reason = reason
 			control.DrainOperationID = ""
 			control.UpdatedAt = now
@@ -3413,6 +3632,7 @@ func (s *Store) ClearStaleHelperReloadDrain(ctx context.Context, now time.Time, 
 		}
 		next := state.ServiceControl
 		next.Draining = false
+		next.DrainKind = ""
 		next.DrainOperationID = ""
 		if !next.Paused {
 			next.Reason = ""

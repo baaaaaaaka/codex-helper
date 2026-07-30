@@ -448,6 +448,64 @@ func TestTeamsRuntimeSafetyCanonicalFastPathDoesNotLoadSessionOrOutboxTablesCI(t
 	}
 }
 
+func TestTeamsRuntimeSafetyProbeDiscoversRealSQLiteLegacyMetadataCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+	legacy, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, _, err := legacy.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:          "corrupt-business-row",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "legacy-work",
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy session: %v", err)
+	}
+	if _, err := legacy.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("migrate legacy store to SQLite: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(legacyPath), teamstore.SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy SQLite: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{broken-business-row' WHERE id = 'corrupt-business-row'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt unrelated session row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy SQLite: %v", err)
+	}
+
+	before := snapshotRuntimeSafetyFiles(t, tmp)
+	metadata, err := ProbeScopeMetadataReadOnly(context.Background(), legacyPath)
+	if err != nil {
+		t.Fatalf("probe real SQLite legacy metadata: %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("real SQLite metadata probe modified files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+	if metadata.Scope.ID != scope.ID || metadata.ControlChat.TeamsChatID != "legacy-control" {
+		t.Fatalf("real SQLite metadata = %#v, want scope %q/control legacy-control", metadata, scope.ID)
+	}
+}
+
 func TestTeamsRuntimeSafetyCanonicalFastPathIsStrictlyReadOnlyCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
@@ -901,7 +959,7 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverCanonicalWinsAndPreservesLegacyBacku
 	}
 }
 
-func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *testing.T) {
+func TestTeamsRuntimeSafetyAutomaticTakeoverDoesNotInferReplaySuppressionFromStoreRowsCI(t *testing.T) {
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
 	if _, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath); err != nil {
 		t.Fatalf("automatic takeover: %v", err)
@@ -925,8 +983,8 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *te
 	if err != nil {
 		t.Fatalf("claim terminal replay: %v", err)
 	}
-	if claimed {
-		t.Error("terminal legacy inbound message was not added to duplicate-processing suppression")
+	if !claimed {
+		t.Error("scope takeover incorrectly inferred a completed global inbound claim from an ignored store row")
 	}
 	_, claimed, err = claimGlobalInbound(
 		context.Background(),
@@ -951,8 +1009,8 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *te
 	if err != nil {
 		t.Fatalf("lookup sent replay fence: %v", err)
 	}
-	if !hasSent {
-		t.Error("sent legacy outbox idempotency record was not imported")
+	if hasSent {
+		t.Error("scope takeover incorrectly synthesized a shared global outbound record from a legacy store row")
 	}
 
 	canonical, err := teamstore.Open(fixture.CanonicalPath)
@@ -969,6 +1027,119 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *te
 	}
 	if _, ok := state.OutboxMessages["legacy-sent"]; ok {
 		t.Error("sent legacy outbox body was copied into the canonical store")
+	}
+}
+
+func TestTeamsRuntimeSafetyScopeTakeoverDoesNotMoveSharedGlobalLedgersCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacyRegistry, ok := registryPathForStoreMigrationSource(fixture.LegacyPath)
+	if !ok {
+		t.Fatal("legacy registry path unavailable")
+	}
+	inboundPath, ok := globalInboundLedgerPathForRegistry(legacyRegistry)
+	if !ok {
+		t.Fatal("legacy global inbound ledger path unavailable")
+	}
+	outboundPath, ok := globalOutboundLedgerPathForRegistry(legacyRegistry)
+	if !ok {
+		t.Fatal("legacy global outbound ledger path unavailable")
+	}
+	if _, claimed, err := claimGlobalInbound(
+		context.Background(),
+		inboundPath,
+		"shared-chat",
+		"shared-message",
+		"scope-a-owner",
+		time.Now(),
+	); err != nil {
+		t.Fatalf("seed shared inbound ledger: %v", err)
+	} else if !claimed {
+		t.Fatal("shared inbound seed was not claimed")
+	}
+	if err := recordGlobalOutbound(
+		context.Background(),
+		outboundPath,
+		globalOutboundItem{
+			ChatID:     "shared-chat",
+			MessageID:  "shared-sent-message",
+			ScopeID:    "scope-b",
+			MachineID:  "machine-b",
+			OutboxID:   "scope-b-outbox",
+			SessionID:  "scope-b-session",
+			RecordedAt: time.Now(),
+		},
+		time.Now(),
+	); err != nil {
+		t.Fatalf("seed shared outbound ledger: %v", err)
+	}
+	for _, source := range takeoverSourcesForStore(fixture.LegacyPath) {
+		if samePath(source, inboundPath) || samePath(source, outboundPath) {
+			t.Fatalf("scope takeover plan includes shared global ledger %s", source)
+		}
+	}
+	beforeInbound := snapshotRuntimeSafetyFiles(t, filepath.Dir(inboundPath))
+
+	if _, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, takeoverSourcesForStore(fixture.LegacyPath)...); err != nil {
+		t.Fatalf("automatic scope takeover: %v", err)
+	}
+
+	afterInbound := snapshotRuntimeSafetyFiles(t, filepath.Dir(inboundPath))
+	if !reflect.DeepEqual(beforeInbound, afterInbound) {
+		t.Fatalf("scope takeover modified or moved shared global ledgers: %v", runtimeSafetySnapshotChanges(beforeInbound, afterInbound))
+	}
+	if _, claimed, err := claimGlobalInbound(
+		context.Background(),
+		inboundPath,
+		"shared-chat",
+		"shared-message",
+		"scope-b-owner",
+		time.Now(),
+	); err != nil {
+		t.Fatalf("read shared inbound ledger after takeover: %v", err)
+	} else if claimed {
+		t.Fatal("scope takeover lost the shared inbound claim")
+	}
+	if found, err := hasGlobalOutboundLedgerItem(context.Background(), outboundPath, "shared-chat", "shared-sent-message"); err != nil {
+		t.Fatalf("read shared outbound ledger after takeover: %v", err)
+	} else if !found {
+		t.Fatal("scope takeover lost the shared outbound record")
+	}
+}
+
+func TestTeamsRuntimeSafetyGlobalLedgerUnionIsIdempotentWithoutWritesCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacyRegistry, ok := registryPathForStoreMigrationSource(fixture.LegacyPath)
+	if !ok {
+		t.Fatal("legacy registry path unavailable")
+	}
+	inboundPath, ok := globalInboundLedgerPathForRegistry(legacyRegistry)
+	if !ok {
+		t.Fatal("legacy inbound ledger path unavailable")
+	}
+	claim, claimed, err := claimGlobalInbound(
+		context.Background(),
+		inboundPath,
+		"shared-chat",
+		"completed-message",
+		"legacy-listener",
+		time.Now(),
+	)
+	if err != nil || !claimed {
+		t.Fatalf("seed legacy inbound: claimed=%v err=%v", claimed, err)
+	}
+	if err := completeGlobalInbound(context.Background(), claim); err != nil {
+		t.Fatalf("complete legacy inbound: %v", err)
+	}
+	if err := MigrateLegacyGlobalLedgersAfterWriterFence(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("first global ledger union: %v", err)
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if err := MigrateLegacyGlobalLedgersAfterWriterFence(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("idempotent global ledger union: %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("idempotent global ledger union wrote files: %v", runtimeSafetySnapshotChanges(before, after))
 	}
 }
 

@@ -18903,6 +18903,39 @@ func TestBridgeUpgradeDrainingSessionMessageIsDeferred(t *testing.T) {
 	}
 }
 
+func TestBridgeRuntimeStoreTakeoverDrainDoesNotConsumeIncomingMessageCI(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	if _, err := store.SetDrainingOperationKind(
+		context.Background(),
+		teamstore.DrainKindRuntimeStoreTakeover,
+		teamstore.RuntimeStoreTakeoverReason,
+		"runtime-store-takeover:test",
+	); err != nil {
+		t.Fatalf("SetDraining error: %v", err)
+	}
+	executor := &recordingExecutor{result: ExecutionResult{Text: "should not run"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+
+	err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-takeover"), "run after takeover")
+	if !errors.Is(err, ErrRuntimeStoreTakeoverDraining) {
+		t.Fatalf("takeover-drain message error = %v, want ErrRuntimeStoreTakeoverDraining", err)
+	}
+	if got := executor.prompts; len(got) != 0 {
+		t.Fatalf("executor prompts = %#v, want none", got)
+	}
+	if got := len(*sent); got != 0 {
+		t.Fatalf("takeover drain sent legacy-store response messages: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if len(state.InboundEvents) != 0 || len(state.Turns) != 0 || len(state.OutboxMessages) != 0 {
+		t.Fatalf("takeover drain persisted consumptive legacy work: inbound=%#v turns=%#v outbox=%#v", state.InboundEvents, state.Turns, state.OutboxMessages)
+	}
+}
+
 func TestBridgeReloadDrainingSessionMessageIsDeferredAndReplayed(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
