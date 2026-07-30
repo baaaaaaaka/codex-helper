@@ -65,6 +65,10 @@ try {
   New-Item -ItemType Directory -Force -Path (Join-Path $roots.XDG_CONFIG_HOME "go") | Out-Null
   Set-Content -LiteralPath (Join-Path $serviceDir "local-supervisor.json") -Value '{"version":1,"enabled":true,"spec":{"Executable":"C:\\opt\\cxp.exe","WorkingDir":"C:\\opt"}}'
 
+  # NTFS can expose a newly created directory before its LastWriteTime reflects
+  # the immediately following sentinel/subdirectory creation. Let fixture
+  # metadata settle before taking the immutable caller-owned baseline.
+  Start-Sleep -Milliseconds 250
   $before = Get-ProbeSnapshot
   foreach ($entry in $roots.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
