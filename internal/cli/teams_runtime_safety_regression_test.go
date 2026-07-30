@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -306,14 +307,15 @@ func TestTeamsRuntimeSafetyManagedChildCompletesOfflineDualStoreTakeoverCI(t *te
 			if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
 				t.Fatalf("managed offline takeover left legacy store in candidate path: %v", err)
 			}
-			backupPath := filepath.Join(
-				os.Getenv("XDG_CONFIG_HOME"),
-				"codex-helper",
+			backupPath, err := appdirs.LegacyConfigPath(
 				"teams",
 				"migration-backups",
 				scope.ID,
 				"state.json",
 			)
+			if err != nil {
+				t.Fatalf("managed offline takeover backup path: %v", err)
+			}
 			if _, err := os.Stat(backupPath); err != nil {
 				t.Fatalf("managed offline takeover backup missing at %s: %v", backupPath, err)
 			}
@@ -340,14 +342,15 @@ func seedCLIRuntimeSafetyDualStore(t *testing.T, suffix string) (teamsstore.Scop
 	if err != nil {
 		t.Fatalf("canonical store path: %v", err)
 	}
-	legacyPath := filepath.Join(
-		os.Getenv("XDG_CONFIG_HOME"),
-		"codex-helper",
+	legacyPath, err := appdirs.LegacyConfigPath(
 		"teams",
 		"scopes",
 		scope.ID,
 		"state.json",
 	)
+	if err != nil {
+		t.Fatalf("legacy store path: %v", err)
+	}
 	for path, chatID := range map[string]string{
 		canonicalPath: "canonical-" + suffix,
 		legacyPath:    "legacy-" + suffix,
