@@ -1340,7 +1340,7 @@ func (s *Store) Load(ctx context.Context) (State, error) {
 	var state State
 	err := s.withStateLock(ctx, func() error {
 		var err error
-		state, err = s.loadUnlocked()
+		state, err = s.loadUnlocked(ctx)
 		return err
 	})
 	return state, err
@@ -1977,7 +1977,7 @@ func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID s
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2168,7 +2168,7 @@ func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID stri
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2210,7 +2210,7 @@ func (s *Store) SessionWorkflowEventSnapshotForTurn(ctx context.Context, session
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2248,7 +2248,7 @@ func (s *Store) SessionThreadResolutionSnapshot(ctx context.Context, sessionID s
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2290,7 +2290,7 @@ func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) 
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2325,7 +2325,7 @@ func (s *Store) RecentSessionInboundTurnSnapshot(ctx context.Context, sessionID 
 		}
 		if !ok {
 			var loadErr error
-			selected, loadErr = s.loadUnlocked()
+			selected, loadErr = s.loadUnlocked(ctx)
 			if loadErr != nil {
 				return loadErr
 			}
@@ -2364,7 +2364,7 @@ func (s *Store) SessionActiveTurnQueueSnapshot(ctx context.Context, sessionID st
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2496,7 +2496,7 @@ func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[stri
 			return nil
 		}
 		var loadErr error
-		state, loadErr = s.loadUnlocked()
+		state, loadErr = s.loadUnlocked(ctx)
 		return loadErr
 	})
 	return state, err
@@ -2515,7 +2515,7 @@ func (s *Store) loadSelectedStateFieldsUnlocked(wantedFields map[string]struct{}
 
 func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 	return s.withStateLock(ctx, func() error {
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			return err
 		}
@@ -4203,7 +4203,7 @@ func (s *Store) MessageLookup(ctx context.Context, chatID string, teamsMessageID
 			out = lookup
 			return nil
 		}
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			s.invalidateMessageLookupCacheLocked()
 			return err
@@ -6689,9 +6689,18 @@ func (s *Store) updateUpgrade(ctx context.Context, upgradeID string, fn func(Upg
 	return out, err
 }
 
-func (s *Store) loadUnlocked() (State, error) {
+func (s *Store) loadUnlocked(ctx context.Context) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return State{}, err
+	}
 	if loadUnlockedTestHook != nil {
 		loadUnlockedTestHook()
+	}
+	if err := ctx.Err(); err != nil {
+		return State{}, err
 	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -6711,7 +6720,7 @@ func (s *Store) loadUnlocked() (State, error) {
 		} else {
 			s.clearSQLitePointerCacheUnlocked()
 		}
-		return s.loadSQLiteStateUnlocked(pointer)
+		return s.loadSQLiteStateUnlocked(ctx, pointer)
 	}
 	s.clearSQLitePointerCacheUnlocked()
 	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {

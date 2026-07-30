@@ -13481,6 +13481,31 @@ func TestAtomicWriteFileUsesTempAndCleansFailedReplace(t *testing.T) {
 	}
 }
 
+func TestStoreLoadPropagatesContextPastStateLock(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-context-load"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate SQLite store: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	previousHook := loadUnlockedTestHook
+	loadUnlockedTestHook = cancel
+	t.Cleanup(func() { loadUnlockedTestHook = previousHook })
+	if _, err := store.Load(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Load error = %v, want context.Canceled after the state lock was acquired", err)
+	}
+}
+
 func seedLargeMessageLookupState(t testing.TB, store *Store, inboundCount int, provenanceCount int, outboxCount int) {
 	t.Helper()
 	ctx := context.Background()

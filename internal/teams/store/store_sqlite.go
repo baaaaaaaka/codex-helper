@@ -78,7 +78,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if pointer, ok, err := storeSQLitePointerFromData(source); err != nil {
 			return err
 		} else if ok {
-			state, err := s.loadSQLiteStateUnlocked(pointer)
+			state, err := s.loadSQLiteStateUnlocked(ctx, pointer)
 			if err != nil {
 				return err
 			}
@@ -96,7 +96,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if parsed, ok := stateSchemaVersionFromData(source); ok {
 			sourceSchemaVersion = parsed
 		}
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			return err
 		}
@@ -462,12 +462,12 @@ func (s *Store) storeSQLitePath(pointer storeSQLitePointer) (string, error) {
 	return filepath.Join(filepath.Dir(s.path), path), nil
 }
 
-func (s *Store) loadSQLiteStateUnlocked(pointer storeSQLitePointer) (State, error) {
+func (s *Store) loadSQLiteStateUnlocked(ctx context.Context, pointer storeSQLitePointer) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
 		return State{}, err
 	}
-	return loadSQLiteState(context.Background(), db)
+	return loadSQLiteState(ctx, db)
 }
 
 func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State) error {

@@ -906,27 +906,60 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *te
 	if _, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath); err != nil {
 		t.Fatalf("automatic takeover: %v", err)
 	}
+	registryPath, err := DefaultRegistryPathForScope(fixture.Scope.ID)
+	if err != nil {
+		t.Fatalf("canonical registry path: %v", err)
+	}
+	inboundPath, ok := globalInboundLedgerPathForRegistry(registryPath)
+	if !ok {
+		t.Fatal("canonical inbound ledger path unavailable")
+	}
+	_, claimed, err := claimGlobalInbound(
+		context.Background(),
+		inboundPath,
+		"legacy-only-chat",
+		"teams-terminal",
+		"canonical-listener",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("claim terminal replay: %v", err)
+	}
+	if claimed {
+		t.Error("terminal legacy inbound message was not added to duplicate-processing suppression")
+	}
+	_, claimed, err = claimGlobalInbound(
+		context.Background(),
+		inboundPath,
+		"legacy-only-chat",
+		"teams-nonterminal",
+		"canonical-listener",
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("claim nonterminal replay: %v", err)
+	}
+	if !claimed {
+		t.Error("nonterminal legacy inbound message was incorrectly marked processed")
+	}
+
+	outboundPath, ok := globalOutboundLedgerPathForRegistry(registryPath)
+	if !ok {
+		t.Fatal("canonical outbound ledger path unavailable")
+	}
+	hasSent, err := hasGlobalOutboundLedgerItem(context.Background(), outboundPath, "legacy-only-chat", "teams-sent-message")
+	if err != nil {
+		t.Fatalf("lookup sent replay fence: %v", err)
+	}
+	if !hasSent {
+		t.Error("sent legacy outbox idempotency record was not imported")
+	}
+
 	canonical, err := teamstore.Open(fixture.CanonicalPath)
 	if err != nil {
 		t.Fatalf("open canonical after takeover: %v", err)
 	}
 	defer canonical.Close()
-
-	hasTerminal, err := canonical.HasInboundMessage(context.Background(), "legacy-only-chat", "teams-terminal")
-	if err != nil {
-		t.Fatalf("lookup terminal replay fence: %v", err)
-	}
-	if !hasTerminal {
-		t.Error("terminal legacy inbound message was not added to duplicate-processing suppression")
-	}
-	hasNonterminal, err := canonical.HasInboundMessage(context.Background(), "legacy-only-chat", "teams-nonterminal")
-	if err != nil {
-		t.Fatalf("lookup nonterminal replay fence: %v", err)
-	}
-	if hasNonterminal {
-		t.Error("nonterminal legacy inbound message was incorrectly marked processed")
-	}
-
 	state, err := canonical.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load canonical replay state: %v", err)
@@ -934,14 +967,12 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *te
 	if _, ok := state.OutboxMessages["legacy-queued"]; ok {
 		t.Error("queued legacy outbox was imported into the canonical send queue")
 	}
-	if _, ok := state.OutboxMessages["legacy-sent"]; !ok {
-		t.Error("sent legacy outbox idempotency record was not imported")
-	} else if state.OutboxMessages["legacy-sent"].Status != teamstore.OutboxStatusSent {
-		t.Errorf("sent legacy outbox suppression status = %q, want sent", state.OutboxMessages["legacy-sent"].Status)
+	if _, ok := state.OutboxMessages["legacy-sent"]; ok {
+		t.Error("sent legacy outbox body was copied into the canonical store")
 	}
 }
 
-func TestTeamsRuntimeSafetyAutomaticTakeoverDefersActiveTurnWithoutMutationCI(t *testing.T) {
+func TestTeamsRuntimeSafetyAutomaticTakeoverPersistsDrainBeforeDeferringActiveTurnCI(t *testing.T) {
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
 	legacy, err := teamstore.Open(fixture.LegacyPath)
 	if err != nil {
@@ -962,7 +993,7 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverDefersActiveTurnWithoutMutationCI(t 
 	if err := legacy.Close(); err != nil {
 		t.Fatalf("close legacy store: %v", err)
 	}
-	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	before := loadRuntimeSafetyTakeoverState(t, fixture.LegacyPath)
 
 	resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath)
 	if err == nil {
@@ -970,9 +1001,13 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverDefersActiveTurnWithoutMutationCI(t 
 	} else if !stringsContainAnyFold(err.Error(), "active turn", "drain", "deferred") {
 		t.Errorf("active-turn takeover error = %v, want drain/deferred classification", err)
 	}
-	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
-	if !reflect.DeepEqual(before, after) {
-		t.Errorf("deferred active-turn takeover modified files: %v", runtimeSafetySnapshotChanges(before, after))
+	after := loadRuntimeSafetyTakeoverState(t, fixture.LegacyPath)
+	if !reflect.DeepEqual(runtimeSafetyTakeoverBusinessState(before), runtimeSafetyTakeoverBusinessState(after)) {
+		t.Error("entering takeover drain changed legacy business data")
+	}
+	if !after.ServiceControl.Draining ||
+		after.ServiceControl.DrainOperationID != runtimeStoreTakeoverDrainOperationID(fixture.Scope.ID) {
+		t.Fatalf("active-turn deferral did not persist the takeover drain: %#v", after.ServiceControl)
 	}
 }
 

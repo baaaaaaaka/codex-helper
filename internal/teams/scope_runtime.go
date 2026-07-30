@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
@@ -472,19 +474,82 @@ func quarantineRelatedFileFamily(scopeID string, sourceBase string, suffixes ...
 // service layer. File and replay mechanics remain in this package.
 type AutomaticScopeTakeoverOptions struct {
 	SafetyCheck         func(context.Context) error
-	ValidateLegacyState func(context.Context, teamstore.State) error
-	FenceWriter         func(context.Context) error
-	StartCanonical      func(context.Context, teamstore.ScopeIdentity, string) error
+	ValidateLegacyState func(context.Context, teamstore.State) (AutomaticScopeTakeoverFence, error)
+	FenceWriter         func(context.Context, AutomaticScopeTakeoverFence) error
 	OnStage             func(string)
 	FailAfterStage      string
+}
+
+// AutomaticScopeTakeoverWriter is the exact local process identity validated
+// during takeover preflight. ProcessStartTime prevents a recycled PID from
+// being terminated by the later fencing phase.
+type AutomaticScopeTakeoverWriter struct {
+	PID              int
+	ProcessStartTime string
+	ExecutablePath   string
+}
+
+type AutomaticScopeTakeoverFence struct {
+	Writers []AutomaticScopeTakeoverWriter
+}
+
+// AutomaticScopeTakeoverInventory is intentionally count-only. Divergent
+// messages remain in the quarantined legacy store; keeping IDs or bodies in
+// runtime state would create an unbounded second copy of user data.
+type AutomaticScopeTakeoverInventory struct {
+	NonTerminalInbound int `json:"non_terminal_inbound,omitempty"`
+	QueuedOutbox       int `json:"queued_outbox,omitempty"`
+	SendingOutbox      int `json:"sending_outbox,omitempty"`
+	AcceptedOutbox     int `json:"accepted_outbox,omitempty"`
+	SkippedOutbox      int `json:"skipped_outbox,omitempty"`
 }
 
 type AutomaticScopeTakeoverResult struct {
 	CanonicalPath     string
 	Resolved          bool
-	RecoveryInventory []string
+	Draining          bool
+	RecoveryInventory AutomaticScopeTakeoverInventory
 	PreflightCount    int
-	StartedCanonical  bool
+}
+
+const (
+	runtimeStoreTakeoverSummaryVersion = 1
+	runtimeStoreDiscoveryFingerprintV1 = "runtime-store-discovery-v1"
+)
+
+var runtimeStoreTakeoverSummaryCache sync.Map
+
+type RuntimeStoreTakeoverSummary struct {
+	Version              int                             `json:"version"`
+	ScopeID              string                          `json:"scope_id"`
+	Status               string                          `json:"status"`
+	DiscoveryFingerprint string                          `json:"discovery_fingerprint"`
+	LegacyStorePath      string                          `json:"legacy_store_path,omitempty"`
+	LegacyBackupPath     string                          `json:"legacy_backup_path,omitempty"`
+	RecoveryInventory    AutomaticScopeTakeoverInventory `json:"recovery_inventory,omitempty"`
+	UpdatedAt            time.Time                       `json:"updated_at"`
+}
+
+// RuntimeStoreTakeoverDeferredError is safe for the service retry loop. It
+// means takeover made no unsafe selection and should be retried after the
+// existing listener has had time to drain or after a transient fence clears.
+type RuntimeStoreTakeoverDeferredError struct {
+	Reason string
+}
+
+func (e *RuntimeStoreTakeoverDeferredError) Error() string {
+	if e == nil {
+		return "automatic Teams runtime store takeover deferred"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		return "automatic Teams runtime store takeover deferred"
+	}
+	return "automatic Teams runtime store takeover deferred: " + reason
+}
+
+func deferRuntimeStoreTakeover(reason string) error {
+	return &RuntimeStoreTakeoverDeferredError{Reason: strings.TrimSpace(reason)}
 }
 
 func ExecuteAutomaticScopeTakeover(
@@ -504,7 +569,7 @@ func ExecuteAutomaticScopeTakeover(
 	result := AutomaticScopeTakeoverResult{CanonicalPath: canonicalPath}
 	if opts.SafetyCheck != nil {
 		if err := opts.SafetyCheck(ctx); err != nil {
-			return result, fmt.Errorf("automatic takeover deferred: %w", err)
+			return result, deferRuntimeStoreTakeover(err.Error())
 		}
 	}
 	pending, err := validateTakeoverBackupStates(scope.ID, legacySources)
@@ -516,13 +581,15 @@ func ExecuteAutomaticScopeTakeover(
 	if err != nil {
 		return result, err
 	}
+	var writerFence AutomaticScopeTakeoverFence
 	if found {
-		if reason := unsafeLegacyTakeoverReason(scope, legacyState, opts.FenceWriter != nil); reason != "" {
-			return result, fmt.Errorf("automatic takeover deferred: %s", reason)
+		if reason := unsafeLegacyTakeoverAuthorityReason(scope, legacyState, opts.FenceWriter != nil); reason != "" {
+			return result, deferRuntimeStoreTakeover(reason)
 		}
 		if opts.ValidateLegacyState != nil {
-			if err := opts.ValidateLegacyState(ctx, legacyState); err != nil {
-				return result, fmt.Errorf("automatic takeover deferred: %w", err)
+			writerFence, err = opts.ValidateLegacyState(ctx, legacyState)
+			if err != nil {
+				return result, deferRuntimeStoreTakeover(err.Error())
 			}
 		}
 	}
@@ -539,37 +606,76 @@ func ExecuteAutomaticScopeTakeover(
 				return result, err
 			}
 			if found {
-				if reason := unsafeLegacyTakeoverReason(scope, legacyState, opts.FenceWriter != nil); reason != "" {
-					return result, fmt.Errorf("automatic takeover deferred after re-preflight: %s", reason)
+				if reason := unsafeLegacyTakeoverAuthorityReason(scope, legacyState, opts.FenceWriter != nil); reason != "" {
+					return result, deferRuntimeStoreTakeover("after re-preflight: " + reason)
 				}
 				if opts.ValidateLegacyState != nil {
-					if err := opts.ValidateLegacyState(ctx, legacyState); err != nil {
-						return result, fmt.Errorf("automatic takeover deferred after re-preflight: %w", err)
+					writerFence, err = opts.ValidateLegacyState(ctx, legacyState)
+					if err != nil {
+						return result, deferRuntimeStoreTakeover("after re-preflight: " + err.Error())
 					}
 				}
 			}
 		}
 	}
 
+	if found {
+		// Prove every source-family lock is immediately obtainable before the
+		// first persistent drain write. The locks are released before asking
+		// Store to set the drain because Store owns the same state lock.
+		preflightLocks, lockErr := acquireScopeTakeoverLocks(ctx, takeoverLockPaths(pending))
+		if lockErr != nil {
+			return result, deferRuntimeStoreTakeover(lockErr.Error())
+		}
+		releaseScopeTakeoverLocks(preflightLocks)
+
+		drainedState, drainErr := setLegacyTakeoverDrain(ctx, scope, identity.path)
+		if drainErr != nil {
+			return result, deferRuntimeStoreTakeover("set legacy drain: " + drainErr.Error())
+		}
+		result.Draining = true
+		legacyState = drainedState
+		if legacyTakeoverHasActiveWork(legacyState) {
+			return result, deferRuntimeStoreTakeover("legacy work is draining")
+		}
+		// The drain write changes the pointer and SQLite family identity. Take a
+		// new complete snapshot before fencing so the post-fence comparison is
+		// against the frozen generation rather than the pre-drain generation.
+		legacyState, identity, found, err = preflightLegacyTakeoverState(ctx, scope, pending)
+		result.PreflightCount++
+		if err != nil {
+			return result, err
+		}
+		if found {
+			if reason := unsafeLegacyTakeoverAuthorityReason(scope, legacyState, opts.FenceWriter != nil); reason != "" {
+				return result, deferRuntimeStoreTakeover("after drain: " + reason)
+			}
+			if opts.ValidateLegacyState != nil {
+				writerFence, err = opts.ValidateLegacyState(ctx, legacyState)
+				if err != nil {
+					return result, deferRuntimeStoreTakeover("after drain: " + err.Error())
+				}
+			}
+			if legacyTakeoverHasActiveWork(legacyState) {
+				return result, deferRuntimeStoreTakeover("legacy work appeared while entering drain")
+			}
+		}
+	}
 	if err := failTakeoverStage(opts, "after-drain"); err != nil {
 		return result, err
 	}
 	if opts.FenceWriter != nil {
-		if err := opts.FenceWriter(ctx); err != nil {
-			return result, fmt.Errorf("automatic takeover deferred while fencing writer: %w", err)
+		if err := opts.FenceWriter(ctx, writerFence); err != nil {
+			return result, deferRuntimeStoreTakeover("fence legacy writer: " + err.Error())
 		}
 	}
 	if err := failTakeoverStage(opts, "after-writer-exit"); err != nil {
 		return result, err
 	}
 
-	lockPaths := make([]string, 0, len(pending))
-	for _, source := range pending {
-		lockPaths = append(lockPaths, source+".lock")
-	}
-	locks, err := acquireScopeTakeoverLocks(ctx, lockPaths)
+	locks, err := acquireScopeTakeoverLocks(ctx, takeoverLockPaths(pending))
 	if err != nil {
-		return result, fmt.Errorf("automatic takeover deferred: %w", err)
+		return result, deferRuntimeStoreTakeover(err.Error())
 	}
 	defer releaseScopeTakeoverLocks(locks)
 
@@ -579,7 +685,7 @@ func ExecuteAutomaticScopeTakeover(
 			return result, fmt.Errorf("automatic takeover revalidate legacy identity: %w", err)
 		}
 		if currentIdentity != identity {
-			return result, fmt.Errorf("automatic takeover deferred: legacy identity changed after fencing; complete re-preflight required")
+			return result, deferRuntimeStoreTakeover("legacy identity changed after fencing; complete re-preflight required")
 		}
 	}
 
@@ -587,7 +693,7 @@ func ExecuteAutomaticScopeTakeover(
 		return result, err
 	}
 	if found {
-		inventory, err := mergeLegacyReplaySuppression(ctx, canonicalPath, legacyState)
+		inventory, err := mergeLegacyReplaySuppression(ctx, scope, legacyState)
 		if err != nil {
 			return result, err
 		}
@@ -627,14 +733,16 @@ func ExecuteAutomaticScopeTakeover(
 	if err := failTakeoverStage(opts, "before-canonical-listener-start"); err != nil {
 		return result, err
 	}
-	if opts.StartCanonical != nil {
-		if err := opts.StartCanonical(ctx, scope, canonicalPath); err != nil {
-			return result, err
-		}
-		result.StartedCanonical = true
-	}
 	result.Resolved = true
 	return result, nil
+}
+
+func takeoverLockPaths(sources []string) []string {
+	lockPaths := make([]string, 0, len(sources))
+	for _, source := range sources {
+		lockPaths = append(lockPaths, source+".lock")
+	}
+	return lockPaths
 }
 
 func validateTakeoverBackupStates(scopeID string, sources []string) ([]string, error) {
@@ -745,11 +853,12 @@ func preflightLegacyTakeoverState(
 	return teamstore.State{}, takeoverFileIdentity{}, false, nil
 }
 
-func unsafeLegacyTakeoverReason(scope teamstore.ScopeIdentity, state teamstore.State, canFenceLocalWriter bool) string {
-	for _, turn := range state.Turns {
-		if turn.Status == teamstore.TurnStatusQueued || turn.Status == teamstore.TurnStatusRunning {
-			return "active turn must drain before legacy takeover"
-		}
+func unsafeLegacyTakeoverAuthorityReason(scope teamstore.ScopeIdentity, state teamstore.State, canFenceLocalWriter bool) string {
+	operationID := runtimeStoreTakeoverDrainOperationID(scope.ID)
+	if state.ServiceControl.Draining &&
+		strings.TrimSpace(state.ServiceControl.DrainOperationID) != "" &&
+		strings.TrimSpace(state.ServiceControl.DrainOperationID) != operationID {
+		return fmt.Sprintf("legacy drain is owned by operation %q", state.ServiceControl.DrainOperationID)
 	}
 	now := time.Now()
 	for _, owner := range []*teamstore.OwnerMetadata{state.ServiceOwner, state.LockOwner} {
@@ -775,6 +884,40 @@ func unsafeLegacyTakeoverReason(scope teamstore.ScopeIdentity, state teamstore.S
 	return ""
 }
 
+func legacyTakeoverHasActiveWork(state teamstore.State) bool {
+	for _, turn := range state.Turns {
+		if turn.Status == teamstore.TurnStatusQueued || turn.Status == teamstore.TurnStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeStoreTakeoverDrainOperationID(scopeID string) string {
+	return "runtime-store-takeover:" + safeScopePathPart(scopeID)
+}
+
+const automaticScopeTakeoverDrainTimeout = 5 * time.Second
+
+func setLegacyTakeoverDrain(ctx context.Context, scope teamstore.ScopeIdentity, legacyPath string) (teamstore.State, error) {
+	// The preceding lock preflight keeps this path fast in the normal case, but
+	// another writer can still acquire the lock in the hand-off window. Bound
+	// both that race and the small drain transaction so a listener can retry
+	// instead of hanging indefinitely when its parent context has no deadline.
+	drainCtx, cancel := context.WithTimeout(ctx, automaticScopeTakeoverDrainTimeout)
+	defer cancel()
+	st, err := teamstore.Open(legacyPath)
+	if err != nil {
+		return teamstore.State{}, err
+	}
+	defer func() { _ = st.Close() }()
+	operationID := runtimeStoreTakeoverDrainOperationID(scope.ID)
+	if _, err := st.SetDrainingOperation(drainCtx, "canonical runtime store takeover", operationID); err != nil {
+		return teamstore.State{}, err
+	}
+	return st.Load(drainCtx)
+}
+
 // PrepareRuntimeStoreForListener performs the dual-store cold path immediately
 // before a listener opens the canonical store. The canonical-only path checks
 // one exact legacy path and performs no writes.
@@ -794,16 +937,116 @@ func PrepareRuntimeStoreForListener(
 	} else if !exists {
 		return result, nil
 	}
-	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-	if err != nil {
-		return result, err
-	}
-	if exists, err := pathExists(legacyPath); err != nil {
-		return result, err
-	} else if !exists {
+
+	fingerprint := runtimeStoreDiscoveryFingerprintV1
+	summary, summaryOK := readRuntimeStoreTakeoverSummary(canonicalPath)
+	if summaryOK &&
+		summary.Version == runtimeStoreTakeoverSummaryVersion &&
+		summary.ScopeID == scope.ID &&
+		summary.DiscoveryFingerprint == fingerprint &&
+		!runtimeStoreTakeoverSourceReappeared(summary) &&
+		(summary.Status == "checked" || summary.Status == "completed") {
 		result.Resolved = true
 		return result, nil
 	}
+
+	var matches []resolvedScopeStoreCandidate
+	if summaryOK &&
+		summary.Version == runtimeStoreTakeoverSummaryVersion &&
+		summary.ScopeID == scope.ID &&
+		summary.Status == "draining" &&
+		summary.DiscoveryFingerprint == fingerprint {
+		if source := strings.TrimSpace(summary.LegacyStorePath); source != "" {
+			if exists, existsErr := pathExists(source); existsErr != nil {
+				return result, existsErr
+			} else if exists {
+				matches = append(matches, resolvedScopeStoreCandidate{scope: scope, path: source})
+			}
+		}
+	}
+	if len(matches) == 0 {
+		matches, err = discoverRuntimeScopeMigrationMatches(scope, canonicalPath)
+		if err != nil {
+			return result, err
+		}
+	}
+	if len(matches) == 0 {
+		summary := RuntimeStoreTakeoverSummary{
+			Version:              runtimeStoreTakeoverSummaryVersion,
+			ScopeID:              scope.ID,
+			Status:               "checked",
+			DiscoveryFingerprint: fingerprint,
+			UpdatedAt:            time.Now(),
+		}
+		if err := writeRuntimeStoreTakeoverSummary(canonicalPath, summary); err != nil {
+			return result, fmt.Errorf("record Teams runtime store discovery: %w", err)
+		}
+		result.Resolved = true
+		return result, nil
+	}
+	if len(matches) > 1 {
+		paths := make([]string, 0, len(matches))
+		for _, match := range matches {
+			paths = append(paths, match.path)
+		}
+		sort.Strings(paths)
+		return result, deferRuntimeStoreTakeover(
+			fmt.Sprintf("multiple legacy stores match canonical scope %q: %s", scope.ID, strings.Join(paths, ", ")),
+		)
+	}
+	legacyPath := matches[0].path
+	sources := takeoverSourcesForStore(legacyPath)
+	result, err = ExecuteAutomaticScopeTakeover(ctx, scope, sources, opts)
+	if err != nil {
+		if result.Draining {
+			summary := RuntimeStoreTakeoverSummary{
+				Version:              runtimeStoreTakeoverSummaryVersion,
+				ScopeID:              scope.ID,
+				Status:               "draining",
+				DiscoveryFingerprint: fingerprint,
+				LegacyStorePath:      legacyPath,
+				LegacyBackupPath:     migrationBackupPath(legacyPath, scope.ID),
+				UpdatedAt:            time.Now(),
+			}
+			if summaryErr := writeRuntimeStoreTakeoverSummary(canonicalPath, summary); summaryErr != nil {
+				return result, errors.Join(err, fmt.Errorf("record Teams runtime store drain: %w", summaryErr))
+			}
+		}
+		return result, err
+	}
+	if result.Resolved {
+		summary := RuntimeStoreTakeoverSummary{
+			Version:              runtimeStoreTakeoverSummaryVersion,
+			ScopeID:              scope.ID,
+			Status:               "completed",
+			DiscoveryFingerprint: fingerprint,
+			LegacyStorePath:      legacyPath,
+			LegacyBackupPath:     migrationBackupPath(legacyPath, scope.ID),
+			RecoveryInventory:    result.RecoveryInventory,
+			UpdatedAt:            time.Now(),
+		}
+		if err := writeRuntimeStoreTakeoverSummary(canonicalPath, summary); err != nil {
+			return result, fmt.Errorf("record completed Teams runtime store takeover: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func runtimeStoreTakeoverSourceReappeared(summary RuntimeStoreTakeoverSummary) bool {
+	source := strings.TrimSpace(summary.LegacyStorePath)
+	if source != "" {
+		exists, err := pathExists(source)
+		return err != nil || exists
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(summary.ScopeID)
+	if err != nil {
+		return true
+	}
+	exists, err := pathExists(legacyPath)
+	return err != nil || exists
+}
+
+func takeoverSourcesForStore(legacyPath string) []string {
 	sources := []string{legacyPath}
 	if registryPath, ok := registryPathForStoreMigrationSource(legacyPath); ok {
 		if relatedMigrationFamilyExists(registryPath) {
@@ -818,57 +1061,177 @@ func PrepareRuntimeStoreForListener(
 			sources = append(sources, path)
 		}
 	}
-	return ExecuteAutomaticScopeTakeover(ctx, scope, sources, opts)
+	return sources
 }
 
-func mergeLegacyReplaySuppression(ctx context.Context, canonicalPath string, legacy teamstore.State) ([]string, error) {
-	st, err := teamstore.Open(canonicalPath)
+func runtimeStoreTakeoverSummaryPath(canonicalPath string) string {
+	return filepath.Join(filepath.Dir(canonicalPath), "runtime-store-takeover.json")
+}
+
+func readRuntimeStoreTakeoverSummary(canonicalPath string) (RuntimeStoreTakeoverSummary, bool) {
+	cacheKey := filepath.Clean(runtimeStoreTakeoverSummaryPath(canonicalPath))
+	if cached, ok := runtimeStoreTakeoverSummaryCache.Load(cacheKey); ok {
+		return cached.(RuntimeStoreTakeoverSummary), true
+	}
+	summary, ok, err := ReadRuntimeStoreTakeoverSummary(canonicalPath)
 	if err != nil {
-		return nil, err
+		return RuntimeStoreTakeoverSummary{}, false
 	}
-	defer func() { _ = st.Close() }()
-	var inventory []string
-	err = st.Update(ctx, func(state *teamstore.State) error {
-		if state.InboundEvents == nil {
-			state.InboundEvents = make(map[string]teamstore.InboundEvent)
-		}
-		if state.OutboxMessages == nil {
-			state.OutboxMessages = make(map[string]teamstore.OutboxMessage)
-		}
-		for id, event := range legacy.InboundEvents {
-			if event.Status != teamstore.InboundStatusIgnored {
-				continue
-			}
-			if _, exists := state.InboundEvents[id]; exists || inboundMessageAlreadyRecorded(state.InboundEvents, event) {
-				continue
-			}
-			state.InboundEvents[id] = event
-		}
-		for id, message := range legacy.OutboxMessages {
-			if message.Status == teamstore.OutboxStatusSent {
-				if _, exists := state.OutboxMessages[id]; !exists {
-					state.OutboxMessages[id] = message
-				}
-				continue
-			}
-			inventory = append(inventory, id)
-		}
-		return nil
-	})
-	sort.Strings(inventory)
-	return inventory, err
+	if ok {
+		runtimeStoreTakeoverSummaryCache.Store(cacheKey, summary)
+	}
+	return summary, ok
 }
 
-func inboundMessageAlreadyRecorded(events map[string]teamstore.InboundEvent, candidate teamstore.InboundEvent) bool {
-	for _, event := range events {
-		if strings.TrimSpace(candidate.TeamsChatID) != "" &&
-			strings.TrimSpace(candidate.TeamsMessageID) != "" &&
-			strings.TrimSpace(event.TeamsChatID) == strings.TrimSpace(candidate.TeamsChatID) &&
-			strings.TrimSpace(event.TeamsMessageID) == strings.TrimSpace(candidate.TeamsMessageID) {
-			return true
+// ReadRuntimeStoreTakeoverSummary is a read-only diagnostics API. The summary
+// is observability and discovery state only; it is never used to select a
+// non-canonical runtime store.
+func ReadRuntimeStoreTakeoverSummary(canonicalPath string) (RuntimeStoreTakeoverSummary, bool, error) {
+	var summary RuntimeStoreTakeoverSummary
+	path := runtimeStoreTakeoverSummaryPath(canonicalPath)
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return summary, false, nil
+	}
+	if err != nil {
+		return summary, false, err
+	}
+	if info.Size() > 64*1024 {
+		return summary, false, fmt.Errorf("Teams runtime store takeover summary exceeds 64 KiB: %s", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return summary, false, err
+	}
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return RuntimeStoreTakeoverSummary{}, false, err
+	}
+	return summary, true, nil
+}
+
+func writeRuntimeStoreTakeoverSummary(canonicalPath string, summary RuntimeStoreTakeoverSummary) error {
+	summary.Version = runtimeStoreTakeoverSummaryVersion
+	if summary.UpdatedAt.IsZero() {
+		summary.UpdatedAt = time.Now()
+	}
+	raw, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	path := runtimeStoreTakeoverSummaryPath(canonicalPath)
+	if err := durableWriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	runtimeStoreTakeoverSummaryCache.Store(filepath.Clean(path), summary)
+	return nil
+}
+
+func mergeLegacyReplaySuppression(
+	ctx context.Context,
+	scope teamstore.ScopeIdentity,
+	legacy teamstore.State,
+) (AutomaticScopeTakeoverInventory, error) {
+	registryPath, err := DefaultRegistryPathForScope(scope.ID)
+	if err != nil {
+		return AutomaticScopeTakeoverInventory{}, err
+	}
+	inboundPath, inboundOK := globalInboundLedgerPathForRegistry(registryPath)
+	outboundPath, outboundOK := globalOutboundLedgerPathForRegistry(registryPath)
+	now := time.Now()
+	var inventory AutomaticScopeTakeoverInventory
+
+	if inboundOK {
+		err = updateGlobalInboundSQLite(ctx, inboundPath, func(tx *sql.Tx, _ time.Time) error {
+			for _, event := range legacy.InboundEvents {
+				if event.Status != teamstore.InboundStatusIgnored {
+					inventory.NonTerminalInbound++
+					continue
+				}
+				chatID := strings.TrimSpace(event.TeamsChatID)
+				messageID := strings.TrimSpace(event.TeamsMessageID)
+				if chatID == "" || messageID == "" {
+					continue
+				}
+				key := globalInboundKey(chatID, messageID)
+				existing, ok, loadErr := loadGlobalInboundSQLiteItem(ctx, tx, key)
+				if loadErr != nil {
+					return loadErr
+				}
+				if ok && existing.Status == "done" {
+					continue
+				}
+				if err := upsertGlobalInboundSQLiteTx(ctx, tx, key, globalInboundItem{
+					ChatID:    chatID,
+					MessageID: messageID,
+					Owner:     "runtime-store-takeover",
+					Status:    "done",
+					UpdatedAt: now,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return inventory, err
+		}
+	} else {
+		for _, event := range legacy.InboundEvents {
+			if event.Status != teamstore.InboundStatusIgnored {
+				inventory.NonTerminalInbound++
+			}
 		}
 	}
-	return false
+
+	outboundItems := make([]globalOutboundItem, 0)
+	for _, message := range legacy.OutboxMessages {
+		switch message.Status {
+		case teamstore.OutboxStatusSent:
+			if strings.TrimSpace(message.TeamsChatID) != "" && strings.TrimSpace(message.TeamsMessageID) != "" {
+				outboundItems = append(outboundItems, globalOutboundItem{
+					ChatID:     message.TeamsChatID,
+					MessageID:  message.TeamsMessageID,
+					ScopeID:    firstNonEmptyString(message.ScopeID, scope.ID),
+					MachineID:  message.MachineID,
+					OutboxID:   message.ID,
+					SessionID:  message.SessionID,
+					TurnID:     message.TurnID,
+					Kind:       message.Kind,
+					Origin:     teamstore.MessageOriginHelperOutbox,
+					RecordedAt: firstNonZeroTime(message.SentAt, message.UpdatedAt, message.CreatedAt),
+				})
+			}
+		case teamstore.OutboxStatusAccepted:
+			inventory.AcceptedOutbox++
+			if strings.TrimSpace(message.TeamsChatID) != "" && strings.TrimSpace(message.TeamsMessageID) != "" {
+				outboundItems = append(outboundItems, globalOutboundItem{
+					ChatID:     message.TeamsChatID,
+					MessageID:  message.TeamsMessageID,
+					ScopeID:    firstNonEmptyString(message.ScopeID, scope.ID),
+					MachineID:  message.MachineID,
+					OutboxID:   message.ID,
+					SessionID:  message.SessionID,
+					TurnID:     message.TurnID,
+					Kind:       message.Kind,
+					Origin:     teamstore.MessageOriginHelperOutbox,
+					RecordedAt: firstNonZeroTime(message.UpdatedAt, message.CreatedAt),
+				})
+			}
+		case teamstore.OutboxStatusQueued:
+			inventory.QueuedOutbox++
+		case teamstore.OutboxStatusSending:
+			inventory.SendingOutbox++
+		case teamstore.OutboxStatusSkipped:
+			inventory.SkippedOutbox++
+		}
+	}
+	if outboundOK && len(outboundItems) > 0 {
+		if err := recordGlobalOutboundBatch(ctx, outboundPath, outboundItems, now); err != nil {
+			return inventory, err
+		}
+	}
+	return inventory, nil
 }
 
 func quarantineTakeoverSource(scopeID string, source string) error {

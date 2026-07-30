@@ -51,6 +51,37 @@ func TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI(t *testin
 	}
 }
 
+func TestTeamsRuntimeSafetyStatusFormatsBoundedTakeoverRecoverySummaryCI(t *testing.T) {
+	summary := teams.RuntimeStoreTakeoverSummary{
+		Status:           "completed",
+		LegacyStorePath:  "/legacy/scope/state.json",
+		LegacyBackupPath: "/legacy/migration-backups/scope/state.json",
+		RecoveryInventory: teams.AutomaticScopeTakeoverInventory{
+			NonTerminalInbound: 3,
+			QueuedOutbox:       7,
+			SendingOutbox:      2,
+			AcceptedOutbox:     1,
+			SkippedOutbox:      4,
+		},
+		UpdatedAt: time.Date(2026, 7, 30, 1, 2, 3, 0, time.UTC),
+	}
+	got := formatTeamsRuntimeStoreTakeoverSummary(summary)
+	for _, want := range []string{
+		"status=completed",
+		"legacy=/legacy/scope/state.json",
+		"backup=/legacy/migration-backups/scope/state.json",
+		"recovery_counts=inbound:3,queued:7,sending:2,accepted:1,skipped:4",
+		"updated=2026-07-30T01:02:03Z",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("takeover summary missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "message_body") || strings.Contains(got, "outbox-id") {
+		t.Fatalf("takeover status exposed unbounded per-message data: %s", got)
+	}
+}
+
 func TestTeamsRuntimeSafetyServiceSpecDoesNotPersistInvocationWorkingDirCI(t *testing.T) {
 	lockCLITestHooks(t)
 

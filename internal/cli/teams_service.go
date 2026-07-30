@@ -560,6 +560,14 @@ func printTeamsServiceStoreDiagnostics(ctx context.Context, out io.Writer) {
 			continue
 		}
 		_, _ = fmt.Fprintf(out, "Teams store %s: %s (ok)\n", layer, path)
+		if layer != "canonical" {
+			continue
+		}
+		if summary, ok, err := teams.ReadRuntimeStoreTakeoverSummary(path); err != nil {
+			_, _ = fmt.Fprintf(out, "Teams runtime store takeover: unknown (%v)\n", err)
+		} else if ok {
+			_, _ = fmt.Fprintf(out, "Teams runtime store takeover: %s\n", formatTeamsRuntimeStoreTakeoverSummary(summary))
+		}
 	}
 }
 

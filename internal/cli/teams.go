@@ -1153,20 +1153,19 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 						}
 						return nil
 					},
-					LegacyStoreWriterValidator: func(ctx context.Context, state teamsstore.State) error {
+					LegacyStoreWriterValidator: func(ctx context.Context, state teamsstore.State) (teams.AutomaticScopeTakeoverFence, error) {
 						spec, err := buildTeamsServiceSpec(registryPath)
 						if err != nil {
-							return err
+							return teams.AutomaticScopeTakeoverFence{}, err
 						}
 						return teamsServiceValidateLegacyStoreWriters(ctx, state, spec)
 					},
-					LegacyStoreWriterFencer: func(ctx context.Context) error {
+					LegacyStoreWriterFencer: func(ctx context.Context, fence teams.AutomaticScopeTakeoverFence) error {
 						spec, err := buildTeamsServiceSpec(registryPath)
 						if err != nil {
 							return err
 						}
-						_, err = teamsServiceRetireLocalBridgeProcesses(ctx, spec)
-						return err
+						return teamsServiceFenceLegacyStoreWriters(ctx, fence, spec)
 					},
 				})
 			}
@@ -2557,6 +2556,11 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
 	_, _ = fmt.Fprintf(out, "Authoritative store: %s\n", authoritativeStore)
+	if summary, ok, err := teams.ReadRuntimeStoreTakeoverSummary(defaultStatePath); err != nil {
+		_, _ = fmt.Fprintf(out, "Runtime store takeover: unknown (%v)\n", err)
+	} else if ok {
+		_, _ = fmt.Fprintf(out, "Runtime store takeover: %s\n", formatTeamsRuntimeStoreTakeoverSummary(summary))
+	}
 	_, _ = fmt.Fprintf(out, "Store identity: %s\n", storeIdentity)
 	for _, statePath := range statePaths {
 		layer := teamsStatusStoreLayer(statePath)
@@ -2676,6 +2680,38 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		}
 	}
 	return nil
+}
+
+func formatTeamsRuntimeStoreTakeoverSummary(summary teams.RuntimeStoreTakeoverSummary) string {
+	parts := []string{"status=" + firstNonEmptyCLI(summary.Status, "unknown")}
+	if path := strings.TrimSpace(summary.LegacyStorePath); path != "" {
+		parts = append(parts, "legacy="+path)
+	}
+	if path := strings.TrimSpace(summary.LegacyBackupPath); path != "" {
+		parts = append(parts, "backup="+path)
+	}
+	inventory := summary.RecoveryInventory
+	if inventory.NonTerminalInbound > 0 ||
+		inventory.QueuedOutbox > 0 ||
+		inventory.SendingOutbox > 0 ||
+		inventory.AcceptedOutbox > 0 ||
+		inventory.SkippedOutbox > 0 {
+		parts = append(
+			parts,
+			fmt.Sprintf(
+				"recovery_counts=inbound:%d,queued:%d,sending:%d,accepted:%d,skipped:%d",
+				inventory.NonTerminalInbound,
+				inventory.QueuedOutbox,
+				inventory.SendingOutbox,
+				inventory.AcceptedOutbox,
+				inventory.SkippedOutbox,
+			),
+		)
+	}
+	if !summary.UpdatedAt.IsZero() {
+		parts = append(parts, "updated="+summary.UpdatedAt.Format(time.RFC3339))
+	}
+	return strings.Join(parts, " ")
 }
 
 type teamsHelperExecutableStatus struct {

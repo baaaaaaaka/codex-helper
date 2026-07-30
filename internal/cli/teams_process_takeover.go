@@ -11,13 +11,15 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	teamsruntime "github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 type teamsServiceLocalProcess struct {
-	PID  int
-	Args []string
-	Env  map[string]string
+	PID       int
+	StartTime string
+	Args      []string
+	Env       map[string]string
 }
 
 type teamsServiceLocalProcessRetireResult struct {
@@ -96,7 +98,12 @@ func teamsServiceLocalProcessMatchesSpec(proc teamsServiceLocalProcess, spec tea
 	return teamsServiceLocalProcessRegistryMatches(proc.Args, proc.Env, spec.RegistryPath, spec.Environment)
 }
 
-func teamsServiceValidateLegacyStoreWriters(ctx context.Context, state teamsstore.State, spec teamsServiceSpec) error {
+func teamsServiceValidateLegacyStoreWriters(
+	ctx context.Context,
+	state teamsstore.State,
+	spec teamsServiceSpec,
+) (teamsruntime.AutomaticScopeTakeoverFence, error) {
+	var fence teamsruntime.AutomaticScopeTakeoverFence
 	var freshOwners []*teamsstore.OwnerMetadata
 	for _, owner := range []*teamsstore.OwnerMetadata{state.ServiceOwner, state.LockOwner} {
 		if owner != nil && !teamsstore.IsStale(*owner, defaultTeamsOwnerStaleAfter, time.Now()) {
@@ -104,10 +111,86 @@ func teamsServiceValidateLegacyStoreWriters(ctx context.Context, state teamsstor
 		}
 	}
 	if len(freshOwners) == 0 {
+		return fence, nil
+	}
+	if teamsServiceGOOS() != "linux" {
+		return fence, fmt.Errorf("fresh legacy Teams writer validation is not supported on %s", teamsServiceGOOS())
+	}
+	processes, err := teamsServiceListLocalProcesses()
+	if err != nil {
+		return fence, fmt.Errorf("list local Teams writer processes: %w", err)
+	}
+	byPID := make(map[int]teamsServiceLocalProcess, len(processes))
+	for _, process := range processes {
+		byPID[process.PID] = process
+	}
+	seen := map[int]struct{}{}
+	for _, owner := range freshOwners {
+		if err := ctx.Err(); err != nil {
+			return fence, err
+		}
+		if owner.PID <= 0 {
+			return fence, fmt.Errorf("fresh legacy Teams owner has no verifiable PID")
+		}
+		if _, ok := seen[owner.PID]; ok {
+			continue
+		}
+		seen[owner.PID] = struct{}{}
+		process, ok := byPID[owner.PID]
+		if !ok {
+			if teamsServiceStateHasRuntimeStoreTakeoverDrain(state) {
+				// A preceding retry already validated this exact owner before
+				// persisting the deterministic takeover drain. If the process
+				// subsequently exits on its own, there is nothing left to
+				// signal and the coordinator may continue fencing with locks.
+				continue
+			}
+			return fence, fmt.Errorf("legacy Teams owner pid %d is not visible from the current PID namespace", owner.PID)
+		}
+		if !teamsServiceLocalProcessMatchesSpec(process, spec, map[string]bool{"run": true}) {
+			return fence, fmt.Errorf("legacy Teams owner pid %d does not match the managed profile, state root, and registry", owner.PID)
+		}
+		executable := strings.TrimSpace(owner.ExecutablePath)
+		if executable == "" {
+			return fence, fmt.Errorf("legacy Teams owner pid %d has no executable identity", owner.PID)
+		}
+		if err := teamsLocalSupervisorExecutableMatches(owner.PID, executable, process.Args); err != nil {
+			return fence, err
+		}
+		startTime := strings.TrimSpace(process.StartTime)
+		if startTime == "" {
+			startTime, err = teamsLocalSupervisorProcessStartTime(owner.PID)
+			if err != nil {
+				return fence, fmt.Errorf("read legacy Teams owner pid %d start time: %w", owner.PID, err)
+			}
+		}
+		if startTime == "" {
+			return fence, fmt.Errorf("legacy Teams owner pid %d has no verifiable process start time", owner.PID)
+		}
+		fence.Writers = append(fence.Writers, teamsruntime.AutomaticScopeTakeoverWriter{
+			PID:              owner.PID,
+			ProcessStartTime: startTime,
+			ExecutablePath:   executable,
+		})
+	}
+	return fence, nil
+}
+
+func teamsServiceStateHasRuntimeStoreTakeoverDrain(state teamsstore.State) bool {
+	return state.ServiceControl.Draining &&
+		strings.HasPrefix(strings.TrimSpace(state.ServiceControl.DrainOperationID), "runtime-store-takeover:")
+}
+
+func teamsServiceFenceLegacyStoreWriters(
+	ctx context.Context,
+	fence teamsruntime.AutomaticScopeTakeoverFence,
+	spec teamsServiceSpec,
+) error {
+	if len(fence.Writers) == 0 {
 		return nil
 	}
 	if teamsServiceGOOS() != "linux" {
-		return fmt.Errorf("fresh legacy Teams writer validation is not supported on %s", teamsServiceGOOS())
+		return fmt.Errorf("legacy Teams writer fencing is not supported on %s", teamsServiceGOOS())
 	}
 	processes, err := teamsServiceListLocalProcesses()
 	if err != nil {
@@ -117,31 +200,38 @@ func teamsServiceValidateLegacyStoreWriters(ctx context.Context, state teamsstor
 	for _, process := range processes {
 		byPID[process.PID] = process
 	}
-	seen := map[int]struct{}{}
-	for _, owner := range freshOwners {
+	for _, writer := range fence.Writers {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if owner.PID <= 0 {
-			return fmt.Errorf("fresh legacy Teams owner has no verifiable PID")
-		}
-		if _, ok := seen[owner.PID]; ok {
+		process, ok := byPID[writer.PID]
+		if !ok {
+			// The exact process validated during preflight already exited.
 			continue
 		}
-		seen[owner.PID] = struct{}{}
-		process, ok := byPID[owner.PID]
-		if !ok {
-			return fmt.Errorf("legacy Teams owner pid %d is not visible from the current PID namespace", owner.PID)
-		}
 		if !teamsServiceLocalProcessMatchesSpec(process, spec, map[string]bool{"run": true}) {
-			return fmt.Errorf("legacy Teams owner pid %d does not match the managed profile, state root, and registry", owner.PID)
+			return fmt.Errorf("refusing to fence legacy Teams owner pid %d because its managed identity changed", writer.PID)
 		}
-		executable := strings.TrimSpace(owner.ExecutablePath)
-		if executable == "" {
-			return fmt.Errorf("legacy Teams owner pid %d has no executable identity", owner.PID)
+		startTime := strings.TrimSpace(process.StartTime)
+		if startTime == "" {
+			startTime, err = teamsLocalSupervisorProcessStartTime(writer.PID)
+			if err != nil {
+				return fmt.Errorf("recheck legacy Teams owner pid %d start time: %w", writer.PID, err)
+			}
 		}
-		if err := teamsLocalSupervisorExecutableMatches(owner.PID, executable, process.Args); err != nil {
+		if startTime == "" || startTime != strings.TrimSpace(writer.ProcessStartTime) {
+			return fmt.Errorf(
+				"refusing to fence legacy Teams owner pid %d because process start time changed from %s to %s",
+				writer.PID,
+				writer.ProcessStartTime,
+				startTime,
+			)
+		}
+		if err := teamsLocalSupervisorExecutableMatches(writer.PID, writer.ExecutablePath, process.Args); err != nil {
 			return err
+		}
+		if err := teamsServiceTerminateLocalProcess(writer.PID, teamsServiceLocalProcessGraceDelay); err != nil {
+			return fmt.Errorf("stop legacy Teams owner pid %d: %w", writer.PID, err)
 		}
 	}
 	return nil
@@ -334,6 +424,9 @@ func defaultTeamsServiceListLocalProcesses() ([]teamsServiceLocalProcess, error)
 			continue
 		}
 		envFields, _ := readProcNULFileFields(filepath.Join("/proc", entry.Name(), "environ"))
+		// Exact takeover validation reads start time only for the selected owner
+		// PID. Avoid another /proc read for every unrelated process during the
+		// service scans that share this process inventory.
 		out = append(out, teamsServiceLocalProcess{PID: pid, Args: args, Env: envMapFromFields(envFields)})
 	}
 	return out, nil

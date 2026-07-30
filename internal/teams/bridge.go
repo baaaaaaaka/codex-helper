@@ -223,8 +223,8 @@ type BridgeOptions struct {
 	MachineRegistryTTL                 time.Duration
 	MachineRegistryNow                 func() time.Time
 	LegacyStoreSafetyCheck             func(context.Context) error
-	LegacyStoreWriterValidator         func(context.Context, teamstore.State) error
-	LegacyStoreWriterFencer            func(context.Context) error
+	LegacyStoreWriterValidator         func(context.Context, teamstore.State) (AutomaticScopeTakeoverFence, error)
+	LegacyStoreWriterFencer            func(context.Context, AutomaticScopeTakeoverFence) error
 }
 
 type ModelProfileResolver func(context.Context, string) (modelprofile.Snapshot, error)
@@ -2600,6 +2600,10 @@ func (b *Bridge) notePollFailure(err error, now time.Time) error {
 }
 
 func IsRecoverablePollFailure(err error) bool {
+	var takeoverDeferred *RuntimeStoreTakeoverDeferredError
+	if errors.As(err, &takeoverDeferred) {
+		return true
+	}
 	return isPersistentPollFailureCandidate(err)
 }
 

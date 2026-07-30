@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -849,31 +850,110 @@ func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t 
 	}
 	state := teamsstore.State{ServiceOwner: owner}
 	matching := teamsServiceLocalProcess{
-		PID:  ownerPID,
-		Args: []string{executable, "teams", "run", "--auto-service=false"},
-		Env:  env,
+		PID:       ownerPID,
+		StartTime: "100",
+		Args:      []string{executable, "teams", "run", "--auto-service=false"},
+		Env:       env,
 	}
 
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{matching}, nil
 	}
-	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err != nil {
+	fence, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec)
+	if err != nil {
 		t.Fatalf("visible managed writer rejected: %v", err)
+	}
+	if len(fence.Writers) != 1 || fence.Writers[0].PID != ownerPID || fence.Writers[0].ProcessStartTime != "100" {
+		t.Fatalf("validated writer fence = %#v", fence)
 	}
 
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) { return nil, nil }
-	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
+	if _, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
 		!strings.Contains(err.Error(), "not visible from the current PID namespace") {
 		t.Fatalf("invisible writer error = %v", err)
 	}
+	state.ServiceControl = teamsstore.ServiceControl{
+		Draining:         true,
+		DrainOperationID: "runtime-store-takeover:scope_test",
+	}
+	fence, err = teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec)
+	if err != nil {
+		t.Fatalf("writer that exited after persisted takeover drain rejected: %v", err)
+	}
+	if len(fence.Writers) != 0 {
+		t.Fatalf("writer fence after drained process exit = %#v, want empty", fence)
+	}
+	state.ServiceControl = teamsstore.ServiceControl{}
 
 	mismatch := matching
 	mismatch.Env = map[string]string{}
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
 		return []teamsServiceLocalProcess{mismatch}, nil
 	}
-	if err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
+	if _, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
 		!strings.Contains(err.Error(), "does not match the managed profile") {
 		t.Fatalf("writer identity mismatch error = %v", err)
+	}
+}
+
+func TestTeamsServiceFenceLegacyStoreWritersStopsOnlyValidatedProcessGeneration(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "linux"})
+	previousList := teamsServiceListLocalProcesses
+	previousTerminate := teamsServiceTerminateLocalProcess
+	t.Cleanup(func() {
+		teamsServiceListLocalProcesses = previousList
+		teamsServiceTerminateLocalProcess = previousTerminate
+	})
+
+	executable := filepath.Join(tmp, "bin", "cxp")
+	env := teamsServiceCurrentProcessScopeEnvForTest()
+	spec := teamsServiceSpec{Executable: executable, Environment: env}
+	processes := []teamsServiceLocalProcess{
+		{
+			PID:       5101,
+			StartTime: "boot-101",
+			Args:      []string{executable, "teams", "run", "--auto-service=false"},
+			Env:       env,
+		},
+		{
+			PID:       5102,
+			StartTime: "boot-102",
+			Args:      []string{executable, "teams", "run", "--auto-service=false"},
+			Env:       env,
+		},
+	}
+	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
+		return append([]teamsServiceLocalProcess(nil), processes...), nil
+	}
+	var terminated []int
+	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
+		terminated = append(terminated, pid)
+		return nil
+	}
+
+	fence := teams.AutomaticScopeTakeoverFence{Writers: []teams.AutomaticScopeTakeoverWriter{{
+		PID:              5101,
+		ProcessStartTime: "boot-101",
+		ExecutablePath:   executable,
+	}}}
+	if err := teamsServiceFenceLegacyStoreWriters(context.Background(), fence, spec); err != nil {
+		t.Fatalf("fence exact writer: %v", err)
+	}
+	if !reflect.DeepEqual(terminated, []int{5101}) {
+		t.Fatalf("terminated pids = %v, want only validated pid 5101", terminated)
+	}
+
+	terminated = nil
+	fence.Writers[0].ProcessStartTime = "recycled-generation"
+	if err := teamsServiceFenceLegacyStoreWriters(context.Background(), fence, spec); err == nil ||
+		!strings.Contains(err.Error(), "process start time changed") {
+		t.Fatalf("recycled pid fencing error = %v, want start-time refusal", err)
+	}
+	if len(terminated) != 0 {
+		t.Fatalf("recycled pid was terminated: %v", terminated)
 	}
 }
