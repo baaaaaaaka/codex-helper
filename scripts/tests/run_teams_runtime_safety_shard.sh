@@ -5,6 +5,8 @@ case "${1:-}" in
   isolation)
     go test ./internal/cli -count=1 \
       -run '^TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI$' -v
+    go test ./internal/teams -count=1 \
+      -run '^TestTeamsPackageTestMainIsolatesEveryUserDirectoryCI$' -v
     ;;
   store)
     go test ./internal/teams -count=1 \
