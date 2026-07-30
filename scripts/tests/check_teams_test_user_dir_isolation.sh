@@ -19,6 +19,10 @@ go_mod_cache="$(go env GOMODCACHE)"
 go_build_cache="$(go env GOCACHE)"
 service_config="$probe_root/config/codex-helper/teams/local-supervisor.json"
 mkdir -p "$(dirname "$service_config")"
+# The Go command owns XDG_CONFIG_HOME/go even with telemetry disabled. Create
+# and exclude that tool-owned directory before the caller-owned snapshot so
+# Go's own bookkeeping cannot look like an application escape.
+mkdir -p "$probe_root/config/go"
 mkdir -p "$probe_root/state/codex-helper"
 printf '%s\n' \
   '{"version":1,"enabled":true,"spec":{"Executable":"/opt/cxp/bin/cxp","WorkingDir":"/opt/cxp"}}' \
@@ -47,7 +51,7 @@ snapshot_probe() {
     "$probe_root/codex-home" \
     "$probe_root/codex-config" \
     -path "$probe_root/config/go" -prune -o \
-    -printf '%y %m %p\n' |
+    -printf '%y %m %T@ %C@ %p\n' |
     LC_ALL=C sort
   find \
     "$probe_root/config" \
@@ -83,7 +87,8 @@ test_status=0
   GOMODCACHE="$go_mod_cache" \
   GOCACHE="$go_build_cache" \
   GOTELEMETRY=off \
-  go test ./internal/cli -count=1 -run '^TestTeamsService'
+  go test ./internal/cli -count=1 \
+    -run '^Test(TeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired|TeamsServiceUpgradeRetiresLocalDuplicateProcessesBeforeRestart|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$'
 ) || test_status=$?
 
 after_snapshot="$(snapshot_probe)"

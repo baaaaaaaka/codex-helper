@@ -428,27 +428,27 @@ jobs:
       - name: Teams runtime safety test isolation
         if: always() && runner.os == 'Linux'
         shell: bash
-        run: go test ./internal/appdirs ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(PackageTestMain|TestPathGuard)' -v
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
 
       - name: Teams runtime safety scope resolution and migration
         if: always() && runner.os == 'Linux'
         shell: bash
-        run: go test ./internal/teams ./internal/teams/store -count=1 -run '^TestTeamsRuntimeSafety(RuntimeResolver|Legacy|Resolver|SuccessfulMigration|StoreLoad)' -v
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
 
       - name: Teams runtime safety service and update lifecycle
         if: always() && runner.os == 'Linux'
         shell: bash
-        run: go test ./internal/cli ./internal/teams -count=1 -run '^TestTeamsRuntimeSafety(ServiceSpec|AutoUpdate|ServiceConfig|DoesNotRestore|ExplicitStable|ServiceEnvironment|BridgeHelperAutoUpdate|HelperUpdateStatus)' -v
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh service-update
 
       - name: Teams runtime safety WSL and process lifecycle
         if: always() && runner.os == 'Linux'
         shell: bash
-        run: go test ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(WSL|Doctor|StableEntry|ManagedRuntime|Watchdog)' -v
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh wsl-process
 
       - name: Teams runtime safety readiness and diagnostics
         if: always() && runner.os == 'Linux'
         shell: bash
-        run: go test ./internal/cli -count=1 -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|Status|UnavailableModel)' -v
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh diagnostics
 
       - name: Teams read-only diagnostics regressions
         shell: bash

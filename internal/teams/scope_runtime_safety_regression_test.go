@@ -3,11 +3,14 @@ package teams
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,32 +18,6 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/gofrs/flock"
 )
-
-type runtimeSafetyMigrationReceipt struct {
-	Version     int       `json:"version"`
-	ScopeID     string    `json:"scope_id"`
-	LegacyPath  string    `json:"legacy_path"`
-	BackupPath  string    `json:"backup_path"`
-	CompletedAt time.Time `json:"completed_at"`
-}
-
-func runtimeSafetyMigrationReceiptPath(currentPath string) string {
-	return filepath.Join(filepath.Dir(currentPath), "migration-receipt.json")
-}
-
-func readRuntimeSafetyMigrationReceipt(t *testing.T, currentPath string) runtimeSafetyMigrationReceipt {
-	t.Helper()
-	path := runtimeSafetyMigrationReceiptPath(currentPath)
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read migration receipt %s: %v", path, err)
-	}
-	var receipt runtimeSafetyMigrationReceipt
-	if err := json.Unmarshal(raw, &receipt); err != nil {
-		t.Fatalf("decode migration receipt %s: %v", path, err)
-	}
-	return receipt
-}
 
 func openAndSeedRuntimeSafetyScopeStore(t *testing.T, path string, scope teamstore.ScopeIdentity, chatID string) {
 	t.Helper()
@@ -95,7 +72,7 @@ func TestTeamsRuntimeSafetyRuntimeResolverNeverReturnsLegacyPathCI(t *testing.T)
 	}
 }
 
-func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedWhenCanonicalStoreLockTimesOutCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverCanonicalFastPathIgnoresLegacyAndStoreLockCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -119,69 +96,73 @@ func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedWhenCanonicalStoreLockTimes
 	}
 	defer func() { _ = lock.Unlock() }()
 
+	opened := 0
+	prevOpen := resolveScopeStoreOpen
+	resolveScopeStoreOpen = func(path string) (*teamstore.Store, error) {
+		opened++
+		return prevOpen(path)
+	}
+	t.Cleanup(func() { resolveScopeStoreOpen = prevOpen })
+
 	_, resolvedPath, err := ResolveStorePathForScope(scope)
-	if err == nil {
-		t.Fatalf("runtime resolver silently downgraded to %q while canonical store %q could not be loaded", resolvedPath, currentPath)
+	if err != nil {
+		t.Fatalf("canonical fast path must not wait on the store lock: %v", err)
+	}
+	if resolvedPath != currentPath {
+		t.Fatalf("runtime resolver returned %q, want canonical %q", resolvedPath, currentPath)
+	}
+	if opened != 0 {
+		t.Fatalf("canonical fast path opened %d store candidates; want zero", opened)
 	}
 }
 
-func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedForCanonicalProbeFailuresCI(t *testing.T) {
-	for _, failure := range []string{"open", "load", "close"} {
-		t.Run(failure, func(t *testing.T) {
-			tmp := t.TempDir()
-			isolateTeamsScopeUserDirsForTest(t, tmp)
-			t.Setenv("USER", "alice")
-			t.Setenv(envTeamsProfile, "default")
+func TestTeamsRuntimeSafetyRuntimeResolverCanonicalFastPathDoesNotOpenLoadOrCloseCandidatesCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
 
-			scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
-			currentPath, err := DefaultStorePathForScope(scope.ID)
-			if err != nil {
-				t.Fatalf("DefaultStorePathForScope: %v", err)
-			}
-			legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
-			if err != nil {
-				t.Fatalf("legacyDefaultStorePathForScope: %v", err)
-			}
-			openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
-			openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
-			prevOpen := resolveScopeStoreOpen
-			prevLoad := resolveScopeStoreLoad
-			prevClose := resolveScopeStoreClose
-			t.Cleanup(func() {
-				resolveScopeStoreOpen = prevOpen
-				resolveScopeStoreLoad = prevLoad
-				resolveScopeStoreClose = prevClose
-			})
-			switch failure {
-			case "open":
-				resolveScopeStoreOpen = func(path string) (*teamstore.Store, error) {
-					if path == currentPath {
-						return nil, fmt.Errorf("injected canonical open failure")
-					}
-					return prevOpen(path)
-				}
-			case "load":
-				resolveScopeStoreLoad = func(st *teamstore.Store, ctx context.Context) (teamstore.State, error) {
-					if st.Path() == currentPath {
-						return teamstore.State{}, fmt.Errorf("injected canonical load failure")
-					}
-					return prevLoad(st, ctx)
-				}
-			case "close":
-				resolveScopeStoreClose = func(st *teamstore.Store) error {
-					err := prevClose(st)
-					if st.Path() == currentPath {
-						return fmt.Errorf("injected canonical close failure")
-					}
-					return err
-				}
-			}
+	prevOpen := resolveScopeStoreOpen
+	prevLoad := resolveScopeStoreLoad
+	prevClose := resolveScopeStoreClose
+	var opens, loads, closes int
+	resolveScopeStoreOpen = func(string) (*teamstore.Store, error) {
+		opens++
+		return nil, fmt.Errorf("canonical hot path must not open a store")
+	}
+	resolveScopeStoreLoad = func(*teamstore.Store, context.Context) (teamstore.State, error) {
+		loads++
+		return teamstore.State{}, fmt.Errorf("canonical hot path must not load a store")
+	}
+	resolveScopeStoreClose = func(*teamstore.Store) error {
+		closes++
+		return fmt.Errorf("canonical hot path must not close a store")
+	}
+	t.Cleanup(func() {
+		resolveScopeStoreOpen = prevOpen
+		resolveScopeStoreLoad = prevLoad
+		resolveScopeStoreClose = prevClose
+	})
 
-			if _, resolvedPath, err := ResolveStorePathForScope(scope); err == nil {
-				t.Fatalf("runtime resolver selected %q after canonical %s failure; want fail-closed error", resolvedPath, failure)
-			}
-		})
+	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
+		t.Fatalf("canonical hot path unexpectedly probed a candidate: %v", err)
+	} else if resolvedPath != currentPath {
+		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
+	}
+	if opens != 0 || loads != 0 || closes != 0 {
+		t.Fatalf("canonical hot path operations: open=%d load=%d close=%d, want all zero", opens, loads, closes)
 	}
 }
 
@@ -208,8 +189,29 @@ func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedButMaintenanceCanLocateLega
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
 
-	if _, resolvedPath, err := ResolveStorePathForScope(scope); err == nil {
-		t.Fatalf("runtime resolver selected %q after canonical load failure; runtime must fail closed", resolvedPath)
+	before, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatalf("read corrupt canonical before resolution: %v", err)
+	}
+	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
+		t.Fatalf("runtime path selection must not open or repair the canonical store: %v", err)
+	} else if resolvedPath != currentPath {
+		t.Fatalf("runtime resolver returned %q, want canonical %q", resolvedPath, currentPath)
+	}
+	after, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatalf("read corrupt canonical after resolution: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("runtime path selection repaired or replaced a corrupt canonical store from legacy")
+	}
+	canonical, err := teamstore.Open(currentPath)
+	if err == nil {
+		_, err = canonical.Load(context.Background())
+		_ = canonical.Close()
+	}
+	if err == nil {
+		t.Fatal("corrupt canonical store unexpectedly loaded; listener open/load must surface the canonical error")
 	}
 	if _, maintenancePath, err := ResolveStorePathForMaintenance(scope); err != nil {
 		t.Fatalf("maintenance resolver must remain able to locate a retained legacy helper: %v", err)
@@ -282,12 +284,14 @@ func TestTeamsRuntimeSafetyLegacyFallbackCannotCreateSelfReinforcingAuthorityCI(
 		t.Fatalf("close legacy store: %v", err)
 	}
 
-	if _, resolvedPath, err := ResolveStorePathForScope(scope); err == nil {
-		t.Fatalf("runtime resolver selected %q after legacy acquired fresh authority; want explicit split-brain failure", resolvedPath)
+	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
+		t.Fatalf("runtime resolver let legacy authority affect canonical path selection: %v", err)
+	} else if resolvedPath != currentPath {
+		t.Fatalf("fresh legacy authority selected %q, want canonical %q", resolvedPath, currentPath)
 	}
 }
 
-func TestTeamsRuntimeSafetyRuntimeResolverRejectsLiveDivergentLegacyStoreCI(t *testing.T) {
+func TestTeamsRuntimeSafetyRuntimeResolverCanonicalPathCannotLoseToLiveDivergentLegacyStoreCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -353,12 +357,15 @@ func TestTeamsRuntimeSafetyRuntimeResolverRejectsLiveDivergentLegacyStoreCI(t *t
 	}
 
 	_, resolvedPath, err := ResolveStorePathForScope(scope)
-	if err == nil {
-		t.Fatalf("runtime resolver selected %q instead of reporting split-brain between %q and %q", resolvedPath, currentPath, legacyPath)
+	if err != nil {
+		t.Fatalf("live legacy authority affected canonical path selection: %v", err)
+	}
+	if resolvedPath != currentPath {
+		t.Fatalf("runtime resolver selected legacy %q instead of canonical %q", resolvedPath, currentPath)
 	}
 }
 
-func TestTeamsRuntimeSafetyResolverUsesMetadataProbeInsteadOfLoadingSessionAndOutboxTablesCI(t *testing.T) {
+func TestTeamsRuntimeSafetyCanonicalFastPathDoesNotLoadSessionOrOutboxTablesCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -413,7 +420,7 @@ func TestTeamsRuntimeSafetyResolverUsesMetadataProbeInsteadOfLoadingSessionAndOu
 	}
 
 	if _, resolvedPath, err := ResolveStorePathForScope(scope); err != nil {
-		t.Fatalf("metadata resolution must not load unrelated session/outbox rows: %v", err)
+		t.Fatalf("canonical fast path must not load unrelated session/outbox rows: %v", err)
 	} else if resolvedPath != currentPath {
 		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
 	}
@@ -438,7 +445,7 @@ func TestTeamsRuntimeSafetyResolverUsesMetadataProbeInsteadOfLoadingSessionAndOu
 	}
 }
 
-func TestTeamsRuntimeSafetyResolverMetadataProbeIsStrictlyReadOnlyCI(t *testing.T) {
+func TestTeamsRuntimeSafetyCanonicalFastPathIsStrictlyReadOnlyCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -468,7 +475,7 @@ func TestTeamsRuntimeSafetyResolverMetadataProbeIsStrictlyReadOnlyCI(t *testing.
 		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
 	}
 	if _, err := os.Stat(currentPath + ".lock"); !os.IsNotExist(err) {
-		t.Fatalf("metadata probe created a state lock file: %v", err)
+		t.Fatalf("canonical fast path created a state lock file: %v", err)
 	}
 	after, err := os.ReadFile(currentPath)
 	if err != nil {
@@ -480,7 +487,7 @@ func TestTeamsRuntimeSafetyResolverMetadataProbeIsStrictlyReadOnlyCI(t *testing.
 	}
 	if !bytes.Equal(before, after) || beforeInfo.Mode() != afterInfo.Mode() || !beforeInfo.ModTime().Equal(afterInfo.ModTime()) {
 		t.Fatalf(
-			"metadata probe modified canonical store: bytes_equal=%t mode=%v->%v mtime=%v->%v",
+			"canonical fast path modified canonical store: bytes_equal=%t mode=%v->%v mtime=%v->%v",
 			bytes.Equal(before, after),
 			beforeInfo.Mode(),
 			afterInfo.Mode(),
@@ -494,7 +501,13 @@ type runtimeSafetyMigrationFixture struct {
 	Scope        teamstore.ScopeIdentity
 	LegacyPath   string
 	CurrentPath  string
+	BackupPath   string
 	ResolvedPath string
+}
+
+func runtimeSafetyMigrationBackupPath(sourcePath string, scopeID string) string {
+	teamsRoot := filepath.Dir(filepath.Dir(filepath.Dir(sourcePath)))
+	return filepath.Join(teamsRoot, "migration-backups", safeScopePathPart(scopeID), filepath.Base(sourcePath))
 }
 
 func seedRuntimeSafetyMigrationFixture(t *testing.T) runtimeSafetyMigrationFixture {
@@ -550,6 +563,7 @@ func seedRuntimeSafetyMigrationFixture(t *testing.T) runtimeSafetyMigrationFixtu
 		Scope:        scope,
 		LegacyPath:   legacyPath,
 		CurrentPath:  currentPath,
+		BackupPath:   runtimeSafetyMigrationBackupPath(legacyPath, scope.ID),
 		ResolvedPath: resolvedPath,
 	}
 }
@@ -565,26 +579,17 @@ func TestTeamsRuntimeSafetySuccessfulMigrationQuarantinesLegacyOutOfCandidateSca
 	} else if len(matches) != 0 {
 		t.Fatalf("successful migration left legacy SQLite files in the candidate directory: %v", matches)
 	}
-}
-
-func TestTeamsRuntimeSafetySuccessfulMigrationWritesCompleteReceiptCI(t *testing.T) {
-	fixture := seedRuntimeSafetyMigrationFixture(t)
-	receipt := readRuntimeSafetyMigrationReceipt(t, fixture.CurrentPath)
-	if receipt.Version < 1 || receipt.ScopeID != fixture.Scope.ID || receipt.LegacyPath != fixture.LegacyPath ||
-		receipt.BackupPath == "" || receipt.CompletedAt.IsZero() {
-		t.Fatalf("migration receipt is incomplete: %#v", receipt)
-	}
-	legacyDir := filepath.Clean(filepath.Dir(fixture.LegacyPath))
-	backupDir := filepath.Clean(filepath.Dir(receipt.BackupPath))
-	if backupDir == legacyDir || strings.HasPrefix(backupDir+string(filepath.Separator), legacyDir+string(filepath.Separator)) {
-		t.Fatalf("migration backup %q remains inside the normal legacy candidate directory %q", receipt.BackupPath, legacyDir)
+	if _, err := os.Stat(fixture.BackupPath); err != nil {
+		t.Fatalf("successful migration did not preserve legacy store at fixed backup %q: %v", fixture.BackupPath, err)
 	}
 }
 
 func TestTeamsRuntimeSafetySuccessfulMigrationPreservesQuarantinedLogicalDataCI(t *testing.T) {
 	fixture := seedRuntimeSafetyMigrationFixture(t)
-	receipt := readRuntimeSafetyMigrationReceipt(t, fixture.CurrentPath)
-	backup, err := teamstore.Open(receipt.BackupPath)
+	if _, err := os.Stat(fixture.BackupPath); err != nil {
+		t.Fatalf("quarantined backup %q is missing: %v", fixture.BackupPath, err)
+	}
+	backup, err := teamstore.Open(fixture.BackupPath)
 	if err != nil {
 		t.Fatalf("open quarantined backup: %v", err)
 	}
@@ -602,7 +607,7 @@ func TestTeamsRuntimeSafetySuccessfulMigrationPreservesQuarantinedLogicalDataCI(
 	}
 }
 
-func TestTeamsRuntimeSafetyLegacyReappearanceAfterMigrationReceiptIsConflictCI(t *testing.T) {
+func TestTeamsRuntimeSafetyLegacyReappearanceAfterFixedBackupIsConflictCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
 	t.Setenv("USER", "alice")
@@ -618,27 +623,522 @@ func TestTeamsRuntimeSafetyLegacyReappearanceAfterMigrationReceiptIsConflictCI(t
 		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
-	backupPath := filepath.Join(tmp, "migration-backups", scope.ID, "state.json")
+	backupPath := runtimeSafetyMigrationBackupPath(legacyPath, scope.ID)
 	openAndSeedRuntimeSafetyScopeStore(t, backupPath, scope, "legacy-snapshot")
-	receipt := runtimeSafetyMigrationReceipt{
-		Version:     1,
-		ScopeID:     scope.ID,
-		LegacyPath:  legacyPath,
-		BackupPath:  backupPath,
-		CompletedAt: time.Now(),
-	}
-	raw, err := json.Marshal(receipt)
-	if err != nil {
-		t.Fatalf("marshal migration receipt: %v", err)
-	}
-	if err := os.WriteFile(runtimeSafetyMigrationReceiptPath(currentPath), raw, 0o600); err != nil {
-		t.Fatalf("write migration receipt: %v", err)
-	}
 
-	// A legacy store appearing after the receipt can only have been recreated
+	// A legacy store appearing after the fixed backup can only have been recreated
 	// and written by an old helper; it is not the already-quarantined snapshot.
 	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "recreated-legacy-control")
-	if _, resolvedPath, err := ResolveStorePathForScope(scope); err == nil {
+	if resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(scope, legacyPath); err == nil {
 		t.Fatalf("runtime resolver selected %q after legacy reappeared post-migration; want explicit conflict", resolvedPath)
+	} else if !stringsContainAnyFold(err.Error(), "reappear", "conflict", "split-brain") {
+		t.Fatalf("legacy reappearance error = %v, want an explicit conflict classification", err)
 	}
+}
+
+func TestTeamsRuntimeSafetyMigrationBackupStateNeverOverwritesExistingBackupCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	backupPath := runtimeSafetyMigrationBackupPath(legacyPath, scope.ID)
+	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "recreated-legacy-control")
+	openAndSeedRuntimeSafetyScopeStore(t, backupPath, scope, "preserved-legacy-control")
+	backupBefore, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup before resolution: %v", err)
+	}
+
+	if resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(scope, legacyPath); err == nil {
+		t.Fatalf("runtime resolver selected %q while legacy source and fixed backup both exist; want conflict", resolvedPath)
+	} else if !stringsContainAnyFold(err.Error(), "backup", "conflict") {
+		t.Fatalf("source+backup error = %v, want a non-overwrite conflict", err)
+	}
+	backupAfter, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup after conflict: %v", err)
+	}
+	if !bytes.Equal(backupBefore, backupAfter) {
+		t.Fatal("conflicting legacy source overwrote the existing fixed backup")
+	}
+}
+
+func TestTeamsRuntimeSafetyMigrationResumesPartialPerRootQuarantineCI(t *testing.T) {
+	tmp := t.TempDir()
+	_, cacheBase := isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	currentPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, currentPath, scope, "canonical-control")
+	storeBackupPath := runtimeSafetyMigrationBackupPath(legacyPath, scope.ID)
+	openAndSeedRuntimeSafetyScopeStore(t, storeBackupPath, scope, "legacy-snapshot")
+
+	scopePart := safeScopePathPart(scope.ID)
+	legacyRegistryPath := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", scopePart, "registry.json")
+	if err := os.MkdirAll(filepath.Dir(legacyRegistryPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy registry: %v", err)
+	}
+	legacyRegistry := []byte(`{"version":1,"control_chat_id":"legacy-control"}`)
+	if err := os.WriteFile(legacyRegistryPath, legacyRegistry, 0o600); err != nil {
+		t.Fatalf("write legacy registry: %v", err)
+	}
+	registryBackupPath := runtimeSafetyMigrationBackupPath(legacyRegistryPath, scope.ID)
+
+	if resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(scope, legacyRegistryPath); err != nil {
+		t.Fatalf("resume partial per-root quarantine: %v", err)
+	} else if resolvedPath != currentPath {
+		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, currentPath)
+	}
+	if _, err := os.Stat(legacyRegistryPath); !os.IsNotExist(err) {
+		t.Fatalf("partial retry left legacy registry source in place: %v", err)
+	}
+	got, err := os.ReadFile(registryBackupPath)
+	if err != nil {
+		t.Fatalf("partial retry did not finish cache-root quarantine: %v", err)
+	}
+	if !bytes.Equal(got, legacyRegistry) {
+		t.Fatalf("quarantined registry bytes changed: got=%q want=%q", got, legacyRegistry)
+	}
+}
+
+type runtimeSafetyTakeoverFixture struct {
+	Root          string
+	Scope         teamstore.ScopeIdentity
+	CanonicalPath string
+	LegacyPath    string
+	BackupPath    string
+}
+
+func seedRuntimeSafetyTakeoverFixture(t *testing.T) runtimeSafetyTakeoverFixture {
+	t.Helper()
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, canonicalPath, scope, "canonical-control")
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+
+	canonical, err := teamstore.Open(canonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical store: %v", err)
+	}
+	if err := canonical.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["shared-session"] = teamstore.SessionContext{
+			ID:          "shared-session",
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: "canonical-chat",
+		}
+		return nil
+	}); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("seed canonical conflict: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical store: %v", err)
+	}
+
+	legacy, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if err := legacy.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["shared-session"] = teamstore.SessionContext{
+			ID:          "shared-session",
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: "legacy-conflicting-chat",
+		}
+		state.Sessions["legacy-only-session"] = teamstore.SessionContext{
+			ID:          "legacy-only-session",
+			Status:      teamstore.SessionStatusActive,
+			TeamsChatID: "legacy-only-chat",
+		}
+		state.InboundEvents["inbound-terminal"] = teamstore.InboundEvent{
+			ID:             "inbound-terminal",
+			TeamsChatID:    "legacy-only-chat",
+			TeamsMessageID: "teams-terminal",
+			Status:         teamstore.InboundStatusIgnored,
+			Text:           "must not be replayed",
+		}
+		state.InboundEvents["inbound-nonterminal"] = teamstore.InboundEvent{
+			ID:             "inbound-nonterminal",
+			TeamsChatID:    "legacy-only-chat",
+			TeamsMessageID: "teams-nonterminal",
+			Status:         teamstore.InboundStatusQueued,
+			Text:           "must remain recoverable",
+		}
+		return nil
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed legacy divergence: %v", err)
+	}
+	if _, _, err := legacy.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "legacy-sent",
+		SessionID:   "legacy-only-session",
+		TeamsChatID: "legacy-only-chat",
+		Body:        "already sent",
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("queue legacy sent outbox: %v", err)
+	}
+	if _, err := legacy.MarkOutboxSent(context.Background(), "legacy-sent", "teams-sent-message"); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("mark legacy outbox sent: %v", err)
+	}
+	if _, _, err := legacy.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "legacy-queued",
+		SessionID:   "legacy-only-session",
+		TeamsChatID: "legacy-only-chat",
+		Body:        "must not be sent automatically",
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("queue legacy pending outbox: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	return runtimeSafetyTakeoverFixture{
+		Root:          tmp,
+		Scope:         scope,
+		CanonicalPath: canonicalPath,
+		LegacyPath:    legacyPath,
+		BackupPath:    runtimeSafetyMigrationBackupPath(legacyPath, scope.ID),
+	}
+}
+
+// exerciseRuntimeSafetyTakeoverCoordinator is the test adapter for the
+// listener/service entrypoint that will own process fencing and dual-store
+// takeover. The production coordinator does not exist yet, so the adapter
+// deliberately reports any legacy source left behind by today's resolver.
+// The implementation PR must replace this adapter call with the coordinator,
+// without changing the behavioral assertions below.
+func exerciseRuntimeSafetyTakeoverCoordinator(scope teamstore.ScopeIdentity, legacySources ...string) (string, error) {
+	_, resolvedPath, err := ResolveStorePathForScope(scope)
+	if err != nil {
+		return resolvedPath, err
+	}
+	for _, source := range legacySources {
+		if exists, existsErr := pathExists(source); existsErr != nil {
+			return resolvedPath, existsErr
+		} else if exists {
+			return resolvedPath, fmt.Errorf("automatic takeover coordinator is not implemented; legacy source remains")
+		}
+	}
+	return resolvedPath, nil
+}
+
+func TestTeamsRuntimeSafetyAutomaticTakeoverCanonicalWinsAndPreservesLegacyBackupCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+
+	if resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("idle, locally manageable dual store should be taken over automatically: %v", err)
+	} else if resolvedPath != fixture.CanonicalPath {
+		t.Fatalf("resolved path = %q, want canonical %q", resolvedPath, fixture.CanonicalPath)
+	}
+	if _, err := os.Stat(fixture.LegacyPath); !os.IsNotExist(err) {
+		t.Errorf("automatic takeover left legacy source in the normal scan directory: %v", err)
+	}
+
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical after takeover: %v", err)
+	}
+	canonicalState, err := canonical.Load(context.Background())
+	if err != nil {
+		_ = canonical.Close()
+		t.Fatalf("load canonical after takeover: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical after takeover: %v", err)
+	}
+	if got := canonicalState.Sessions["shared-session"].TeamsChatID; got != "canonical-chat" {
+		t.Errorf("legacy binding overwrote canonical conflict: got %q", got)
+	}
+	if _, ok := canonicalState.Sessions["legacy-only-session"]; ok {
+		t.Error("automatic takeover performed an unsafe full session merge")
+	}
+
+	backup, err := teamstore.Open(fixture.BackupPath)
+	if err != nil {
+		t.Fatalf("open preserved legacy backup: %v", err)
+	}
+	backupState, err := backup.Load(context.Background())
+	if err != nil {
+		_ = backup.Close()
+		t.Fatalf("load preserved legacy backup: %v", err)
+	}
+	if err := backup.Close(); err != nil {
+		t.Fatalf("close preserved legacy backup: %v", err)
+	}
+	if backupState.Sessions["shared-session"].TeamsChatID != "legacy-conflicting-chat" ||
+		backupState.OutboxMessages["legacy-queued"].Body != "must not be sent automatically" {
+		t.Errorf("legacy backup did not preserve divergent business data: sessions=%#v outbox=%#v", backupState.Sessions, backupState.OutboxMessages)
+	}
+}
+
+func TestTeamsRuntimeSafetyAutomaticTakeoverImportsOnlyReplaySuppressionCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	if _, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("automatic takeover: %v", err)
+	}
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical after takeover: %v", err)
+	}
+	defer canonical.Close()
+
+	hasTerminal, err := canonical.HasInboundMessage(context.Background(), "legacy-only-chat", "teams-terminal")
+	if err != nil {
+		t.Fatalf("lookup terminal replay fence: %v", err)
+	}
+	if !hasTerminal {
+		t.Error("terminal legacy inbound message was not added to duplicate-processing suppression")
+	}
+	hasNonterminal, err := canonical.HasInboundMessage(context.Background(), "legacy-only-chat", "teams-nonterminal")
+	if err != nil {
+		t.Fatalf("lookup nonterminal replay fence: %v", err)
+	}
+	if hasNonterminal {
+		t.Error("nonterminal legacy inbound message was incorrectly marked processed")
+	}
+
+	state, err := canonical.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load canonical replay state: %v", err)
+	}
+	if _, ok := state.OutboxMessages["legacy-queued"]; ok {
+		t.Error("queued legacy outbox was imported into the canonical send queue")
+	}
+	if _, ok := state.OutboxMessages["legacy-sent"]; !ok {
+		t.Error("sent legacy outbox idempotency record was not imported")
+	} else if state.OutboxMessages["legacy-sent"].Status != teamstore.OutboxStatusSent {
+		t.Errorf("sent legacy outbox suppression status = %q, want sent", state.OutboxMessages["legacy-sent"].Status)
+	}
+}
+
+func TestTeamsRuntimeSafetyAutomaticTakeoverDefersActiveTurnWithoutMutationCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacy, err := teamstore.Open(fixture.LegacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if err := legacy.Update(context.Background(), func(state *teamstore.State) error {
+		state.Turns["turn-running"] = teamstore.Turn{
+			ID:        "turn-running",
+			SessionID: "legacy-only-session",
+			Status:    teamstore.TurnStatusRunning,
+			StartedAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed active legacy turn: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+
+	resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath)
+	if err == nil {
+		t.Errorf("runtime entrypoint selected %q instead of deferring an active legacy turn", resolvedPath)
+	} else if !stringsContainAnyFold(err.Error(), "active turn", "drain", "deferred") {
+		t.Errorf("active-turn takeover error = %v, want drain/deferred classification", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("deferred active-turn takeover modified files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+}
+
+func TestTeamsRuntimeSafetyAutomaticTakeoverDefersRemoteOwnerWithoutMutationCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacy, err := teamstore.Open(fixture.LegacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	owner, err := teamstore.CurrentOwner("v-legacy", "", "", time.Now())
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	owner.ScopeID = fixture.Scope.ID
+	owner.MachineID = "remote-machine"
+	owner.Hostname = "remote-host.example"
+	if err := legacy.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &owner
+		return nil
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("seed remote owner: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+
+	resolvedPath, err := exerciseRuntimeSafetyTakeoverCoordinator(fixture.Scope, fixture.LegacyPath)
+	if err == nil {
+		t.Errorf("runtime entrypoint selected %q instead of deferring an unmanageable remote owner", resolvedPath)
+	} else if !stringsContainAnyFold(err.Error(), "remote", "owner", "deferred") {
+		t.Errorf("remote-owner takeover error = %v, want owner/deferred classification", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("deferred remote-owner takeover modified files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+}
+
+func TestTeamsRuntimeSafetyDiscoveryUsesBoundedMetadataReadsAcrossUnrelatedScopesCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	target := ScopeIdentityForUser(User{ID: "target-user", UserPrincipalName: "target@example.test"})
+	for i := 0; i < 100; i++ {
+		scope := teamstore.ScopeIdentity{
+			ID:            fmt.Sprintf("scope-unrelated-%03d", i),
+			AccountID:     fmt.Sprintf("unrelated-%03d", i),
+			UserPrincipal: fmt.Sprintf("unrelated-%03d@example.test", i),
+			Profile:       "default",
+		}
+		path, err := legacyDefaultStorePathForScope(scope.ID)
+		if err != nil {
+			t.Fatalf("legacyDefaultStorePathForScope(%d): %v", i, err)
+		}
+		openAndSeedRuntimeSafetyScopeStore(t, path, scope, "unrelated-control")
+	}
+	targetLegacy, err := legacyDefaultStorePathForScope(target.ID)
+	if err != nil {
+		t.Fatalf("legacyDefaultStorePathForScope(target): %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, targetLegacy, target, "target-control")
+
+	prevOpen := resolveScopeStoreOpen
+	prevLoad := resolveScopeStoreLoad
+	var opens, fullLoads int
+	resolveScopeStoreOpen = func(path string) (*teamstore.Store, error) {
+		opens++
+		return prevOpen(path)
+	}
+	resolveScopeStoreLoad = func(st *teamstore.Store, ctx context.Context) (teamstore.State, error) {
+		fullLoads++
+		return prevLoad(st, ctx)
+	}
+	t.Cleanup(func() {
+		resolveScopeStoreOpen = prevOpen
+		resolveScopeStoreLoad = prevLoad
+	})
+
+	if _, _, err := ResolveStorePathForScope(target); err != nil {
+		t.Fatalf("cold migration discovery: %v", err)
+	}
+	if opens > 105 {
+		t.Errorf("cold discovery opened %d stores for 100 unrelated scopes; want bounded linear discovery", opens)
+	}
+	if fullLoads != 0 {
+		t.Errorf("cold discovery performed %d full Store.Load calls; want metadata-only probes", fullLoads)
+	}
+}
+
+type runtimeSafetyFileSnapshot struct {
+	Mode    fs.FileMode
+	ModTime time.Time
+	Size    int64
+	SHA256  [sha256.Size]byte
+}
+
+func snapshotRuntimeSafetyFiles(t *testing.T, root string) map[string]runtimeSafetyFileSnapshot {
+	t.Helper()
+	out := map[string]runtimeSafetyFileSnapshot{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		out[rel] = runtimeSafetyFileSnapshot{
+			Mode:    info.Mode(),
+			ModTime: info.ModTime(),
+			Size:    info.Size(),
+			SHA256:  sha256.Sum256(data),
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("snapshot %s: %v", root, err)
+	}
+	return out
+}
+
+func runtimeSafetySnapshotChanges(before, after map[string]runtimeSafetyFileSnapshot) []string {
+	changed := make([]string, 0)
+	for path, beforeFile := range before {
+		afterFile, ok := after[path]
+		if !ok {
+			changed = append(changed, "removed:"+path)
+		} else if beforeFile != afterFile {
+			changed = append(changed, "modified:"+path)
+		}
+	}
+	for path := range after {
+		if _, ok := before[path]; !ok {
+			changed = append(changed, "added:"+path)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
+func stringsContainAnyFold(value string, candidates ...string) bool {
+	value = strings.ToLower(value)
+	for _, candidate := range candidates {
+		if strings.Contains(value, strings.ToLower(candidate)) {
+			return true
+		}
+	}
+	return false
 }

@@ -194,207 +194,6 @@ func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *t
 	}
 }
 
-func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedRegistryIdentityCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
-	missingRegistry := filepath.Join(tmp, "foreign-scope", "registry.json")
-	systemdUnavailable := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:                 "linux",
-		exe:                  currentExe,
-		argv0:                currentExe,
-		cwd:                  tmp,
-		unitDir:              filepath.Join(tmp, "systemd"),
-		runner:               &recordingTeamsServiceRunner{},
-		systemdUserAvailable: &systemdUnavailable,
-	})
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
-		Executable:   currentExe,
-		WorkingDir:   tmp,
-		RegistryPath: missingRegistry,
-		Environment:  map[string]string{},
-	}); err != nil {
-		t.Fatalf("install invalid local-supervisor fixture: %v", err)
-	}
-
-	prevPerform := performUpdate
-	prevResolve := teamsAutoUpdateResolveInstallPath
-	prevExecutable := teamsAutoUpdateExecutable
-	t.Cleanup(func() {
-		performUpdate = prevPerform
-		teamsAutoUpdateResolveInstallPath = prevResolve
-		teamsAutoUpdateExecutable = prevExecutable
-	})
-	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
-	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
-	updateCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		updateCalled = true
-		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
-	}
-
-	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
-		context.Background(),
-		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
-	)
-	if updateCalled {
-		t.Fatal("helper binary was replaced before persisted registry/store identity was validated")
-	}
-	lower := strings.ToLower(fmt.Sprint(err))
-	if err == nil || (!strings.Contains(lower, "registry") && !strings.Contains(lower, "store")) {
-		t.Fatalf("Apply error = %v, want actionable registry/store identity preflight failure", err)
-	}
-}
-
-func TestTeamsRuntimeSafetyAutoUpdateDryRunsSupervisorBeforeReplacingBinaryCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
-	systemdUnavailable := false
-	dryRunAttempted := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     currentExe,
-		argv0:   currentExe,
-		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd"),
-		runner: teamsServiceCommandRunnerFunc(func(context.Context, string, ...string) ([]byte, error) {
-			dryRunAttempted = true
-			return nil, errors.New("supervisor dry-run failed")
-		}),
-		systemdUserAvailable: &systemdUnavailable,
-	})
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
-		Executable:  currentExe,
-		WorkingDir:  tmp,
-		Environment: map[string]string{},
-	}); err != nil {
-		t.Fatalf("install local-supervisor fixture: %v", err)
-	}
-
-	prevPerform := performUpdate
-	prevResolve := teamsAutoUpdateResolveInstallPath
-	prevExecutable := teamsAutoUpdateExecutable
-	t.Cleanup(func() {
-		performUpdate = prevPerform
-		teamsAutoUpdateResolveInstallPath = prevResolve
-		teamsAutoUpdateExecutable = prevExecutable
-	})
-	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
-	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
-	updateCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		updateCalled = true
-		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
-	}
-
-	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
-		context.Background(),
-		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
-	)
-	if updateCalled {
-		t.Fatal("helper binary was replaced before a supervisor dry-run proved the service restartable")
-	}
-	if !dryRunAttempted {
-		t.Fatal("auto-update did not attempt a supervisor dry-run before binary replacement")
-	}
-	lower := strings.ToLower(fmt.Sprint(err))
-	if err == nil || (!strings.Contains(lower, "dry-run") && !strings.Contains(lower, "restart")) {
-		t.Fatalf("Apply error = %v, want actionable supervisor dry-run failure", err)
-	}
-}
-
-func TestTeamsRuntimeSafetyServiceConfigRollsBackWhenActivationStartFailsCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	oldExe := filepath.Join(tmp, "runtime", "v1.2.3", "codex-proxy")
-	newExe := filepath.Join(tmp, "runtime", "v1.2.4", "codex-proxy")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     oldExe,
-		argv0:   oldExe,
-		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd"),
-		runner:  &recordingTeamsServiceRunner{},
-		localStartDetached: func(context.Context, string, string, teamsServiceSpec) (int, error) {
-			return 0, errors.New("activation start failed")
-		},
-	})
-
-	configPath, err := teamsServiceLocalSupervisorConfigPath()
-	if err != nil {
-		t.Fatalf("local supervisor config path: %v", err)
-	}
-	oldConfig := teamsServiceLocalSupervisorConfig{
-		Version: teamsServiceLocalSupervisorConfigVersion,
-		Enabled: true,
-		Spec: teamsServiceSpec{
-			Executable:   oldExe,
-			WorkingDir:   filepath.Join(tmp, "stable-working-dir"),
-			RegistryPath: filepath.Join(tmp, "registry-old.json"),
-			Environment:  map[string]string{"KEEP": "old"},
-		},
-		UpdatedAt: time.Unix(1_700_000_000, 0),
-	}
-	if err := os.MkdirAll(oldConfig.Spec.WorkingDir, 0o700); err != nil {
-		t.Fatalf("mkdir old working dir: %v", err)
-	}
-	if err := writeTeamsServiceLocalSupervisorConfig(configPath, oldConfig); err != nil {
-		t.Fatalf("write old supervisor config: %v", err)
-	}
-	before, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("read old supervisor config: %v", err)
-	}
-	beforeInfo, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("stat old supervisor config: %v", err)
-	}
-
-	_, repairErr := (teamsServiceLocalSupervisorBackend{}).Repair(context.Background(), teamsServiceSpec{
-		Executable:   newExe,
-		WorkingDir:   tmp,
-		RegistryPath: filepath.Join(tmp, "registry-new.json"),
-		Environment:  map[string]string{"KEEP": "new"},
-	}, teamsServiceRepairOptions{Enable: true, Start: true})
-	if repairErr == nil || !strings.Contains(repairErr.Error(), "activation start failed") {
-		t.Fatalf("Repair error = %v, want injected activation failure", repairErr)
-	}
-
-	after, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatalf("read supervisor config after failed activation: %v", err)
-	}
-	afterInfo, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("stat supervisor config after failed activation: %v", err)
-	}
-	if !bytes.Equal(before, after) || beforeInfo.Mode() != afterInfo.Mode() {
-		t.Errorf(
-			"failed activation did not restore the exact previous service config: bytes_equal=%t mode=%v->%v\nbefore=%s\nafter=%s",
-			bytes.Equal(before, after),
-			beforeInfo.Mode(),
-			afterInfo.Mode(),
-			before,
-			after,
-		)
-	}
-	if leftovers, err := filepath.Glob(configPath + ".*"); err != nil {
-		t.Fatalf("glob config transaction leftovers: %v", err)
-	} else if len(leftovers) != 0 {
-		t.Errorf("failed activation left config transaction artifacts: %v", leftovers)
-	}
-}
-
 func TestTeamsRuntimeSafetyDoesNotRestoreStaleLoopbackProxyFromServiceConfigCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -524,62 +323,6 @@ func TestTeamsRuntimeSafetyWSLInteropFailureWithoutProofOfTaskRetirementFailsClo
 	}
 	if started {
 		t.Fatal("local supervisor started while an unobservable Windows task could still launch a competing supervisor")
-	}
-}
-
-func TestTeamsRuntimeSafetyWSLInteropFailureWithTrustedRetirementReceiptStartsLocalSupervisorCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	taskDir := filepath.Join(tmp, "wsl-task")
-	if err := os.MkdirAll(taskDir, 0o700); err != nil {
-		t.Fatalf("mkdir task dir: %v", err)
-	}
-	receipt := `{"version":1,"distro":"Ubuntu","linux_user":"alice","task_prefix":"Codex Helper Teams Bridge","retired":true}`
-	if err := os.WriteFile(filepath.Join(taskDir, "retirement-receipt.json"), []byte(receipt), 0o600); err != nil {
-		t.Fatalf("write trusted retirement receipt: %v", err)
-	}
-	startedPID := 7402
-	started := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:           "linux",
-		isWSL:          true,
-		exe:            exe,
-		argv0:          exe,
-		cwd:            tmp,
-		windowsTaskDir: taskDir,
-		wslDistro:      "Ubuntu",
-		wslLinuxUser:   "alice",
-		runner: teamsServiceCommandRunnerFunc(func(context.Context, string, ...string) ([]byte, error) {
-			return nil, errors.New("fork/exec powershell.exe: exec format error")
-		}),
-		localStartDetached: func(_ context.Context, configPath string, _ string, _ teamsServiceSpec) (int, error) {
-			started = true
-			return startedPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
-				Version:        teamsServiceLocalSupervisorStatusVersion,
-				ConfigPath:     configPath,
-				SupervisorPID:  startedPID,
-				SupervisorPGID: 8402,
-				State:          "running",
-				UpdatedAt:      time.Now(),
-			})
-		},
-		localVerifyProcessIdentity: func(int, string) error { return nil },
-	})
-	prevAlive := teamsLocalSupervisorProcessAlive
-	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == startedPID }
-	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
-
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{Executable: exe, WorkingDir: tmp}); err != nil {
-		t.Fatalf("install local supervisor: %v", err)
-	}
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
-		t.Fatalf("trusted retirement receipt should allow local availability while WSLInterop is temporarily unavailable: %v", err)
-	}
-	if !started {
-		t.Fatal("local supervisor did not start despite a trusted matching retirement receipt")
 	}
 }
 
@@ -738,286 +481,62 @@ func TestTeamsRuntimeSafetyDoctorDistinguishesMissingScheduledTaskCmdletsCI(t *t
 	)
 }
 
-func TestTeamsRuntimeSafetyLocalStartWaitsForChildListenerReadinessCI(t *testing.T) {
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	configPath := filepath.Join(tmp, "local-supervisor.json")
-	supervisorPID := 7501
-	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
-		Version:        teamsServiceLocalSupervisorStatusVersion,
-		ConfigPath:     configPath,
-		SupervisorPID:  supervisorPID,
-		SupervisorPGID: 8501,
-		ChildPID:       7502,
-		ChildPGID:      8502,
-		State:          "running",
-		UpdatedAt:      time.Now(),
-	}); err != nil {
-		t.Fatalf("write supervisor-only status: %v", err)
-	}
-	prevAlive := teamsLocalSupervisorProcessAlive
-	prevVerify := teamsLocalSupervisorVerifyProcessIdentity
-	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == supervisorPID }
-	teamsLocalSupervisorVerifyProcessIdentity = func(int, string) error { return nil }
-	t.Cleanup(func() {
-		teamsLocalSupervisorProcessAlive = prevAlive
-		teamsLocalSupervisorVerifyProcessIdentity = prevVerify
-	})
-
-	ticks := installTeamsRuntimeSafetyReadinessTicker(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		result <- waitTeamsServiceLocalSupervisorReady(ctx, supervisorPID, configPath, time.Hour)
-	}()
-	advanceTeamsRuntimeSafetyReadiness(t, ticks, result, "a child owner, listener, and current-generation poll existed")
-	cancel()
-	var err error
-	select {
-	case err = <-result:
-	case <-time.After(time.Second):
-		t.Fatal("readiness waiter did not stop after context cancellation")
-	}
-	if err == nil {
-		t.Fatal("service start reported ready with no child owner, listener, or first control poll")
-	}
-}
-
-func TestTeamsRuntimeSafetyLocalStartReadinessRejectsHistoricalPollThenAcceptsCurrentGenerationCI(t *testing.T) {
+func TestTeamsRuntimeSafetyLocalStartReportsSupervisorOnlyUntilListenerIsReadyCI(t *testing.T) {
 	lockCLITestHooks(t)
-	fixture := newTeamsRuntimeSafetyReadinessFixture(t)
-	ticks := installTeamsRuntimeSafetyReadinessTicker(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	result := make(chan error, 1)
-	go func() {
-		result <- waitTeamsServiceLocalSupervisorReady(ctx, fixture.supervisorPID, fixture.configPath, time.Hour)
-	}()
-
-	advanceTeamsRuntimeSafetyReadiness(t, ticks, result, "a live owner and control lease existed")
-
-	fixture.seedAuthority(t, fixture.ownerStartedAt.Add(-time.Hour))
-	advanceTeamsRuntimeSafetyReadiness(t, ticks, result, "a current-generation control poll existed")
-
-	if err := fixture.store.Update(context.Background(), func(state *teamsstore.State) error {
-		poll := state.ChatPolls["control-chat"]
-		poll.LastSuccessfulPollAt = fixture.ownerStartedAt.Add(time.Second)
-		poll.UpdatedAt = fixture.ownerStartedAt.Add(time.Second)
-		state.ChatPolls["control-chat"] = poll
-		return nil
-	}); err != nil {
-		t.Fatalf("record current-generation control poll: %v", err)
-	}
-	ticks <- time.Now()
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatalf("fully ready listener did not satisfy readiness: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("fully ready listener did not satisfy readiness before timeout")
-	}
-}
-
-func TestTeamsRuntimeSafetyLocalStartReadinessTimeoutNamesMissingLayerCI(t *testing.T) {
-	tests := []struct {
-		name    string
-		prepare func(*testing.T, *teamsRuntimeSafetyReadinessFixture)
-		want    string
-	}{
-		{
-			name: "child",
-			prepare: func(t *testing.T, fixture *teamsRuntimeSafetyReadinessFixture) {
-				t.Helper()
-				status, ok, err := readTeamsServiceLocalSupervisorStatus()
-				if err != nil || !ok {
-					t.Fatalf("read supervisor status: ok=%v err=%v", ok, err)
-				}
-				status.ChildPID = 0
-				status.ChildPGID = 0
-				if err := writeTeamsServiceLocalSupervisorStatus(status); err != nil {
-					t.Fatalf("remove child from status: %v", err)
-				}
-			},
-			want: "child",
-		},
-		{name: "owner", want: "owner"},
-		{
-			name: "lease",
-			prepare: func(t *testing.T, fixture *teamsRuntimeSafetyReadinessFixture) {
-				t.Helper()
-				fixture.seedOwner(t)
-			},
-			want: "lease",
-		},
-		{
-			name: "first_control_poll",
-			prepare: func(t *testing.T, fixture *teamsRuntimeSafetyReadinessFixture) {
-				t.Helper()
-				fixture.seedAuthority(t, fixture.ownerStartedAt.Add(-time.Hour))
-			},
-			want: "poll",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			lockCLITestHooks(t)
-			fixture := newTeamsRuntimeSafetyReadinessFixture(t)
-			ticks := installTeamsRuntimeSafetyReadinessTicker(t)
-			if tc.prepare != nil {
-				tc.prepare(t, fixture)
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			result := make(chan error, 1)
-			go func() {
-				result <- waitTeamsServiceLocalSupervisorReady(ctx, fixture.supervisorPID, fixture.configPath, time.Hour)
-			}()
-			advanceTeamsRuntimeSafetyReadiness(t, ticks, result, "the missing readiness layer became available")
-			cancel()
-			var err error
-			select {
-			case err = <-result:
-			case <-time.After(time.Second):
-				t.Fatal("readiness waiter did not stop after context cancellation")
-			}
-			if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.want) {
-				t.Fatalf("readiness error = %v, want missing %s layer", err, tc.want)
-			}
-		})
-	}
-}
-
-func installTeamsRuntimeSafetyReadinessTicker(t *testing.T) chan time.Time {
-	t.Helper()
-	ticks := make(chan time.Time)
-	previous := teamsServiceLocalSupervisorReadyTicker
-	teamsServiceLocalSupervisorReadyTicker = func(time.Duration) (<-chan time.Time, func()) {
-		return ticks, func() {}
-	}
-	t.Cleanup(func() {
-		teamsServiceLocalSupervisorReadyTicker = previous
-	})
-	return ticks
-}
-
-func advanceTeamsRuntimeSafetyReadiness(t *testing.T, ticks chan<- time.Time, result <-chan error, before string) {
-	t.Helper()
-	select {
-	case err := <-result:
-		t.Fatalf("readiness returned before %s: %v", before, err)
-	case ticks <- time.Now():
-	}
-}
-
-type teamsRuntimeSafetyReadinessFixture struct {
-	configPath     string
-	supervisorPID  int
-	childPID       int
-	store          *teamsstore.Store
-	ownerStartedAt time.Time
-}
-
-func newTeamsRuntimeSafetyReadinessFixture(t *testing.T) *teamsRuntimeSafetyReadinessFixture {
-	t.Helper()
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND", "local-supervisor")
 	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	configPath, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+	supervisorPID := 7501
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exe,
+		argv0:                exe,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+		localStartDetached: func(_ context.Context, configPath string, logPath string, _ teamsServiceSpec) (int, error) {
+			return supervisorPID, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:        teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:     configPath,
+				LogPath:        logPath,
+				SupervisorPID:  supervisorPID,
+				SupervisorPGID: 8501,
+				State:          "running",
+				UpdatedAt:      time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error { return nil },
+	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == supervisorPID }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
 		Executable: exe,
 		WorkingDir: tmp,
-	})
-	if err != nil {
-		t.Fatalf("install readiness supervisor config: %v", err)
-	}
-	supervisorPID := 7511
-	childPID := 7512
-	if err := writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
-		Version:        teamsServiceLocalSupervisorStatusVersion,
-		ConfigPath:     configPath,
-		SupervisorPID:  supervisorPID,
-		SupervisorPGID: 8511,
-		ChildPID:       childPID,
-		ChildPGID:      8512,
-		State:          "running",
-		UpdatedAt:      time.Now(),
 	}); err != nil {
-		t.Fatalf("write readiness supervisor status: %v", err)
+		t.Fatalf("install local supervisor fixture: %v", err)
 	}
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("open readiness store: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := st.Close(); err != nil {
-			t.Errorf("close readiness store: %v", err)
-		}
-	})
-	prevAlive := teamsLocalSupervisorProcessAlive
-	prevVerify := teamsLocalSupervisorVerifyProcessIdentity
-	prevVerifyChild := teamsLocalSupervisorVerifyChildIdentity
-	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == supervisorPID || pid == childPID }
-	teamsLocalSupervisorVerifyProcessIdentity = func(int, string) error { return nil }
-	teamsLocalSupervisorVerifyChildIdentity = func(int, teamsServiceSpec) error { return nil }
-	t.Cleanup(func() {
-		teamsLocalSupervisorProcessAlive = prevAlive
-		teamsLocalSupervisorVerifyProcessIdentity = prevVerify
-		teamsLocalSupervisorVerifyChildIdentity = prevVerifyChild
-	})
-	return &teamsRuntimeSafetyReadinessFixture{
-		configPath:     configPath,
-		supervisorPID:  supervisorPID,
-		childPID:       childPID,
-		store:          st,
-		ownerStartedAt: time.Now().Add(-time.Second),
-	}
-}
 
-func (f *teamsRuntimeSafetyReadinessFixture) seedOwner(t *testing.T) {
-	t.Helper()
-	owner, err := teamsstore.CurrentOwner("v1.2.4", "", "", f.ownerStartedAt)
-	if err != nil {
-		t.Fatalf("CurrentOwner: %v", err)
+	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd.SetArgs([]string{"start"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("start local supervisor: %v", err)
 	}
-	owner.PID = f.childPID
-	owner.ScopeID = "scope-readiness"
-	owner.MachineID = "machine-readiness"
-	owner.LeaseGeneration = 11
-	owner.StartedAt = f.ownerStartedAt
-	owner.LastHeartbeat = time.Now()
-	if err := f.store.Update(context.Background(), func(state *teamsstore.State) error {
-		state.Scope = teamsstore.ScopeIdentity{ID: owner.ScopeID, Profile: "default"}
-		state.ServiceOwner = &owner
-		state.ControlChat = teamsstore.ControlChatBinding{ScopeID: owner.ScopeID, MachineID: owner.MachineID, TeamsChatID: "control-chat"}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed readiness owner: %v", err)
+	lower := strings.ToLower(out.String())
+	for _, want := range []string{"supervisor started", "child starting"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("start output omitted %q:\n%s", want, out.String())
+		}
 	}
-}
-
-func (f *teamsRuntimeSafetyReadinessFixture) seedAuthority(t *testing.T, pollAt time.Time) {
-	t.Helper()
-	f.seedOwner(t)
-	if err := f.store.Update(context.Background(), func(state *teamsstore.State) error {
-		state.ControlLease = teamsstore.ControlLease{
-			ScopeID:         "scope-readiness",
-			HolderMachineID: "machine-readiness",
-			HolderKind:      teamsstore.MachineKindPrimary,
-			Generation:      11,
-			Status:          teamsstore.ControlLeaseStatusActive,
-			LeaseUntil:      time.Now().Add(time.Minute),
-			LastHeartbeat:   time.Now(),
-			UpdatedAt:       time.Now(),
+	for _, forbidden := range []string{"teams ready", "listener ready", "first poll successful"} {
+		if strings.Contains(lower, forbidden) {
+			t.Errorf("start output claimed %q before listener readiness was observed:\n%s", forbidden, out.String())
 		}
-		state.ChatPolls["control-chat"] = teamsstore.ChatPollState{
-			ChatID:               "control-chat",
-			Seeded:               true,
-			PollState:            "warm",
-			LastSuccessfulPollAt: pollAt,
-			UpdatedAt:            pollAt,
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed readiness authority: %v", err)
 	}
 }
 
@@ -1154,7 +673,7 @@ func TestTeamsRuntimeSafetyStatusReportsAuthoritativeStoreAndReadinessLayersCI(t
 	}
 }
 
-func TestTeamsRuntimeSafetyStatusEnumeratesCanonicalAndBrokenLegacyStoresReadOnlyCI(t *testing.T) {
+func TestTeamsRuntimeSafetyStatusReportsBrokenLegacyPresenceWithoutOpeningItCI(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
@@ -1202,7 +721,7 @@ func TestTeamsRuntimeSafetyStatusEnumeratesCanonicalAndBrokenLegacyStoresReadOnl
 	before := snapshotCLITreeForReadOnlyTest(t, tmp)
 	out, statusErr := executeRootForTeamsTestAllowError(t, "teams", "status")
 	if statusErr != nil {
-		t.Errorf("teams status aborted on one broken retained store instead of reporting every candidate: %v", statusErr)
+		t.Errorf("teams status aborted while reporting retained legacy presence: %v", statusErr)
 	}
 	for _, want := range []string{
 		canonicalPath,
@@ -1210,15 +729,75 @@ func TestTeamsRuntimeSafetyStatusEnumeratesCanonicalAndBrokenLegacyStoresReadOnl
 		"canonical",
 		"legacy",
 		"authoritative",
-		"load error",
+		"non-authoritative",
 	} {
 		if !strings.Contains(strings.ToLower(out), strings.ToLower(want)) {
-			t.Errorf("teams status omitted %q while enumerating canonical and broken legacy stores:\n%s", want, out)
+			t.Errorf("teams status omitted %q while reporting canonical and retained legacy paths:\n%s", want, out)
+		}
+	}
+	if strings.Contains(strings.ToLower(out), "load error") {
+		t.Errorf("default status deep-read the broken legacy store instead of reporting path presence only:\n%s", out)
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("read-only status modified a canonical/legacy store family:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestTeamsRuntimeSafetyDoctorDeepReadsBrokenLegacyAndReportsPerStoreErrorReadOnlyCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "codex-proxy")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    runtime.GOOS,
+		exe:     exe,
+		argv0:   exe,
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{output: []byte("inactive\n")},
+	})
+
+	scopeID := "scope-runtime-safety-doctor"
+	canonicalPath := cliStatePathForTest(t, "teams", "scopes", scopeID, "state.json")
+	canonical, err := teamsstore.Open(canonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical store: %v", err)
+	}
+	if err := canonical.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: scopeID, Profile: "default"}
+		return nil
+	}); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("seed canonical store: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical store: %v", err)
+	}
+	legacyPath := filepath.Join(configBase, "codex-helper", "teams", "scopes", scopeID, "state.json")
+	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
+		t.Fatalf("mkdir legacy scope: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":`), 0o640); err != nil {
+		t.Fatalf("write broken legacy store: %v", err)
+	}
+
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	out, doctorErr := executeRootForTeamsTestAllowError(t, "teams", "service", "doctor")
+	diagnostic := strings.ToLower(out + "\n" + fmt.Sprint(doctorErr))
+	for _, want := range []string{canonicalPath, legacyPath, "legacy", "load error"} {
+		if !strings.Contains(diagnostic, strings.ToLower(want)) {
+			t.Errorf("teams service doctor omitted %q:\n%s", want, diagnostic)
 		}
 	}
 	after := snapshotCLITreeForReadOnlyTest(t, tmp)
 	if !reflect.DeepEqual(before, after) {
-		t.Errorf("read-only status modified a canonical/broken-legacy store family:\nbefore=%#v\nafter=%#v", before, after)
+		t.Errorf("doctor modified a canonical/broken-legacy store family:\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 

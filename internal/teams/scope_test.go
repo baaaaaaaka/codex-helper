@@ -1271,11 +1271,14 @@ func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalFromLegac
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	_, path, err := ResolveStorePathForScope(current)
-	if err == nil {
-		t.Fatalf("runtime resolver selected %q after canonical corruption; want fail-closed error", path)
+	if err != nil {
+		t.Fatalf("runtime path selection opened the corrupt canonical store: %v", err)
+	}
+	if path != newPath {
+		t.Fatalf("runtime path = %q, want canonical %q", path, newPath)
 	}
 	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
-		t.Fatalf("runtime resolver mutated corrupt canonical store while probing: raw=%q err=%v", raw, readErr)
+		t.Fatalf("runtime path selection mutated corrupt canonical store: raw=%q err=%v", raw, readErr)
 	}
 }
 
@@ -1324,11 +1327,14 @@ func TestTeamsRuntimeSafetyRuntimeResolverDoesNotRepairCorruptCanonicalWithoutRe
 
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	_, path, err := ResolveStorePathForScope(current)
-	if err == nil {
-		t.Fatalf("runtime resolver selected %q after canonical corruption; want fail-closed error", path)
+	if err != nil {
+		t.Fatalf("runtime path selection opened the corrupt canonical store: %v", err)
+	}
+	if path != newPath {
+		t.Fatalf("runtime path = %q, want canonical %q", path, newPath)
 	}
 	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"schema_version":` {
-		t.Fatalf("runtime resolver mutated corrupt canonical store while probing: raw=%q err=%v", raw, readErr)
+		t.Fatalf("runtime path selection mutated corrupt canonical store: raw=%q err=%v", raw, readErr)
 	}
 }
 
