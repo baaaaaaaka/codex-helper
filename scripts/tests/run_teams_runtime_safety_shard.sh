@@ -8,7 +8,13 @@ case "${1:-}" in
     ;;
   store)
     go test ./internal/teams -count=1 \
-      -run '^TestTeamsRuntimeSafety(RuntimeResolver|Legacy|CanonicalFastPath|Discovery|SuccessfulMigration|Migration|AutomaticTakeover)' -v
+      -run '^TestTeamsRuntimeSafety(RuntimeResolver|Legacy|Canonical|Discovery|SuccessfulMigration|Migration|AutomaticTakeover)' -v
+    ;;
+  store-io)
+    bash scripts/ci/teams_runtime_resolver_io_smoke.sh
+    ;;
+  store-process)
+    bash scripts/ci/teams_runtime_takeover_process_smoke.sh
     ;;
   service-update)
     go test ./internal/cli ./internal/teams -count=1 \
@@ -22,8 +28,12 @@ case "${1:-}" in
     go test ./internal/cli -count=1 \
       -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|Status|DoctorDeepReads|UnavailableModel)' -v
     ;;
+  windows)
+    go test ./internal/cli -count=1 \
+      -run '^TestTeamsRuntimeSafety(PackageTestMain|ServiceSpec|DoesNotRestore|ExplicitStable|ServiceEnvironment|StableEntry|ManagedRuntime|LocalStatus|StatusReportsAuthoritative)' -v
+    ;;
   *)
-    echo "usage: $0 {isolation|store|service-update|wsl-process|diagnostics}" >&2
+    echo "usage: $0 {isolation|store|store-io|store-process|service-update|wsl-process|diagnostics|windows}" >&2
     exit 2
     ;;
 esac

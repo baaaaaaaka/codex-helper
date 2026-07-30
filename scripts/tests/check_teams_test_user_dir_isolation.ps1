@@ -85,7 +85,7 @@ try {
   [Environment]::SetEnvironmentVariable("GOENV", "off", "Process")
   [Environment]::SetEnvironmentVariable("GOTELEMETRY", "off", "Process")
 
-  & go test ./internal/cli -count=1 -run '^Test(TeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired|TeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI)$'
+  & go test ./internal/cli -count=1 -run '^Test(TeamsServiceBootstrapFailsWhenDuplicateProcessCannotBeRetired|TeamsServiceUpgradeRetiresLocalDuplicateProcessesBeforeRestart|RestartTeamsHelperAfterActivationPendingUsesInstalledPath|TeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI)$'
   $testStatus = $LASTEXITCODE
   $after = Get-ProbeSnapshot
 

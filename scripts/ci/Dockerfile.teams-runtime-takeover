@@ -1,0 +1,5 @@
+FROM scratch
+
+COPY teams-runtime-safety.test /teams-runtime-safety.test
+
+ENTRYPOINT ["/teams-runtime-safety.test"]

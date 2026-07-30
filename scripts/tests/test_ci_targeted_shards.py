@@ -31,9 +31,12 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         for shard in (
             "isolation",
             "store",
+            "store-io",
+            "store-process",
             "service-update",
             "wsl-process",
             "diagnostics",
+            "windows",
         ):
             self.assertIn(f"  {shard})", script)
             call = f"bash scripts/tests/run_teams_runtime_safety_shard.sh {shard}"
@@ -94,6 +97,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Teams SQLite row-level migration regressions": "state-perf",
             "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
             "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
+            "Teams runtime safety resolver syscall budget": "state-perf",
+            "Teams runtime safety real-process takeover": "state-perf",
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
             "Teams SQLite store migration and perf regressions": "state-perf",
             "Teams perf benchmark smoke": "state-perf",
@@ -108,9 +113,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Native managed-node install integration (Windows)": "windows-codex-e2e",
         }
         for name, shard in expected.items():
-            self.assertIn(
-                f"if: matrix.shard == '{shard}'",
+            self.assertRegex(
                 blocks[name],
+                rf"if: (?:always\(\) && )?matrix\.shard == '{re.escape(shard)}'",
                 name,
             )
 

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -717,6 +718,9 @@ func TestTeamsRuntimeSafetyStatusReportsBrokenLegacyPresenceWithoutOpeningItCI(t
 	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":`), 0o640); err != nil {
 		t.Fatalf("write broken legacy store: %v", err)
 	}
+	if runtime.GOOS != "windows" {
+		makeCLITreesReadOnlyForTest(t, filepath.Dir(canonicalPath), filepath.Dir(legacyPath))
+	}
 
 	before := snapshotCLITreeForReadOnlyTest(t, tmp)
 	out, statusErr := executeRootForTeamsTestAllowError(t, "teams", "status")
@@ -785,6 +789,9 @@ func TestTeamsRuntimeSafetyDoctorDeepReadsBrokenLegacyAndReportsPerStoreErrorRea
 	}
 	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":`), 0o640); err != nil {
 		t.Fatalf("write broken legacy store: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		makeCLITreesReadOnlyForTest(t, filepath.Dir(canonicalPath), filepath.Dir(legacyPath))
 	}
 
 	before := snapshotCLITreeForReadOnlyTest(t, tmp)
@@ -896,6 +903,31 @@ func runtimeSafetyRequireStatusLine(t *testing.T, out string, prefix string, wan
 		return
 	}
 	t.Errorf("status output omitted line %q", prefix)
+}
+
+func makeCLITreesReadOnlyForTest(t *testing.T, roots ...string) {
+	t.Helper()
+	var readOnlyPaths []string
+	for _, root := range roots {
+		if err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			readOnlyPaths = append(readOnlyPaths, path)
+			if info.IsDir() {
+				return os.Chmod(path, 0o555)
+			}
+			return os.Chmod(path, 0o444)
+		}); err != nil {
+			t.Fatalf("make diagnostic store family read-only: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		sort.Slice(readOnlyPaths, func(i, j int) bool { return len(readOnlyPaths[i]) > len(readOnlyPaths[j]) })
+		for _, path := range readOnlyPaths {
+			_ = os.Chmod(path, 0o700)
+		}
+	})
 }
 
 func TestTeamsRuntimeSafetyLocalStatusNamesAutostartGuaranteesPreciselyCI(t *testing.T) {

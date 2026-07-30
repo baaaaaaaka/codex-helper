@@ -587,10 +587,25 @@ jobs:
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
 
+      - name: Teams runtime safety Windows paths and service environment
+        if: always() && matrix.shard == 'core' && runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh windows
+
       - name: Teams runtime safety scope resolution and migration
         if: always() && matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
+
+      - name: Teams runtime safety resolver syscall budget
+        if: always() && matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
+
+      - name: Teams runtime safety real-process takeover
+        if: always() && matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
 
       - name: Teams runtime safety service and update lifecycle
         if: always() && matrix.shard == 'core' && runner.os == 'Linux'
@@ -1905,6 +1920,7 @@ jobs:
           $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
           $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
           $env:CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE = "service"
+          $env:CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE = $env:USERPROFILE
           go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: Codex approval, history, and cancellation runtime integration (Linux/macOS)
