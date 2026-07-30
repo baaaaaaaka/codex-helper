@@ -110,6 +110,13 @@ func discoverRuntimeScopeMigrationMatches(scope teamstore.ScopeIdentity, current
 		}
 		metadata, err := ProbeScopeMetadataReadOnly(context.Background(), path)
 		if err != nil {
+			// A concurrent migrator can quarantine the exact legacy path after
+			// Lstat and before the metadata probe. Treat that as a vanished
+			// candidate and let the migration coordinator/canonical path decide;
+			// other read failures remain fail-closed.
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return nil, fmt.Errorf("probe Teams migration candidate %s: %w", path, err)
 		}
 		state := teamstore.State{
