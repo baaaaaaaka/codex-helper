@@ -15,6 +15,8 @@ $roots = @{
   CODEX_DIR = Join-Path $probeRoot "codex-home"
   CODEX_CONFIG_DIR = Join-Path $probeRoot "codex-config"
 }
+$goModCache = (& go env GOMODCACHE).Trim()
+$goBuildCache = (& go env GOCACHE).Trim()
 
 function Get-ProbeSnapshot {
   $goConfigRoot = Join-Path $roots.XDG_CONFIG_HOME "go"
@@ -52,6 +54,12 @@ try {
   foreach ($entry in $roots.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
   }
+  # Keep the Go tool's own caches outside the caller-owned probe roots. Without
+  # these explicit values, changing USERPROFILE and LOCALAPPDATA makes `go
+  # test` populate module and build caches inside the directories this script
+  # is intentionally watching.
+  [Environment]::SetEnvironmentVariable("GOMODCACHE", $goModCache, "Process")
+  [Environment]::SetEnvironmentVariable("GOCACHE", $goBuildCache, "Process")
   [Environment]::SetEnvironmentVariable("GOENV", "off", "Process")
   [Environment]::SetEnvironmentVariable("GOTELEMETRY", "off", "Process")
 
@@ -60,6 +68,11 @@ try {
   $after = Get-ProbeSnapshot
 
   if ($before -ne $after) {
+    Write-Host "Caller-owned directory snapshot differences:"
+    Compare-Object ($before -split "`n") ($after -split "`n") |
+      Format-Table -AutoSize |
+      Out-String |
+      Write-Host
     throw "Teams CLI tests modified caller-owned Windows profile/config/state sentinels."
   }
   if ($testStatus -ne 0) {
