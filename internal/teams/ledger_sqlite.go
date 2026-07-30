@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -60,6 +61,55 @@ func openTeamsLedgerSQLite(path string) (*sql.DB, error) {
 		}
 	}
 	chmodTeamsLedgerSQLiteFiles(path)
+	return db, nil
+}
+
+// openTeamsLedgerSQLiteReadOnly opens an existing ledger without creating its
+// directory, database, WAL/SHM sidecars, schema, or chmod writes. Migration
+// discovery and replay-fence union use this path so inspecting a retained
+// legacy ledger cannot mutate it.
+func openTeamsLedgerSQLiteReadOnly(ctx context.Context, path string) (*sql.DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, fmt.Errorf("ledger sqlite path is required")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("ledger sqlite path is not a regular file: %s", path)
+	}
+	query := url.Values{}
+	query.Set("mode", "ro")
+	// A cleanly closed WAL database has no WAL or a zero-length WAL. Mark that
+	// stable snapshot immutable so SQLite does not create or update WAL/SHM
+	// sidecars for a read. A non-empty WAL must remain a normal read-only open
+	// so its committed frames are visible, but only when an existing SHM lets
+	// SQLite do that without creating a persistent sidecar.
+	if walInfo, walErr := os.Stat(path + "-wal"); os.IsNotExist(walErr) || (walErr == nil && walInfo.Size() == 0) {
+		query.Set("immutable", "1")
+	} else if walErr != nil {
+		return nil, walErr
+	} else if _, shmErr := os.Stat(path + "-shm"); shmErr != nil {
+		if os.IsNotExist(shmErr) {
+			return nil, fmt.Errorf("read live ledger WAL without creating SHM: %w", shmErr)
+		}
+		return nil, shmErr
+	}
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return db, nil
 }
 

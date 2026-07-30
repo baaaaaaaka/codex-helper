@@ -306,7 +306,7 @@ func TestTeamsStorePathsKeepLegacyWhenScopedStoreNeedsRefreshCI(t *testing.T) {
 	assertCLIPathInList(t, storePaths, legacyScopedStore)
 }
 
-func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *testing.T) {
+func TestTeamsRegistryPathsDoNotCoupleScopeMigrationToGlobalLedger(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 
@@ -340,7 +340,8 @@ func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *te
 		t.Fatalf("write new scoped registry: %v", err)
 	}
 	legacyLedger := filepath.Join(cacheBase, "codex-helper", "teams", "global-outbound-ledger.json")
-	if err := os.WriteFile(legacyLedger, []byte(`{"version":1}`), 0o600); err != nil {
+	legacyLedgerData := []byte(`{"version":1}`)
+	if err := os.WriteFile(legacyLedger, legacyLedgerData, 0o600); err != nil {
 		t.Fatalf("write legacy ledger: %v", err)
 	}
 	registryPaths, err := teamsRegistryPaths("")
@@ -348,7 +349,14 @@ func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *te
 		t.Fatalf("teamsRegistryPaths error: %v", err)
 	}
 	assertCLIPathInList(t, registryPaths, newScopedRegistry)
-	assertCLIPathInList(t, registryPaths, legacyScopedRegistry)
+	assertCLIPathNotInList(t, registryPaths, legacyScopedRegistry)
+	gotLegacyLedger, err := os.ReadFile(legacyLedger)
+	if err != nil {
+		t.Fatalf("read retained global ledger: %v", err)
+	}
+	if !bytes.Equal(gotLegacyLedger, legacyLedgerData) {
+		t.Fatalf("global ledger changed during scoped registry enumeration: got %q want %q", gotLegacyLedger, legacyLedgerData)
+	}
 }
 
 func TestRunTeamsServiceRetryLoopRetriesRecoverableErrors(t *testing.T) {

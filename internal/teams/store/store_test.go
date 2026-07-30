@@ -298,13 +298,6 @@ func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(
 	if metadata.ControlLease.HolderMachineID != "machine-1" || metadata.ControlLease.Status != ControlLeaseStatusActive {
 		t.Fatalf("runtime metadata lease = %#v", metadata.ControlLease)
 	}
-	takeover, err := LoadPathRuntimeTakeoverMetadataReadOnly(ctx, store.Path())
-	if err != nil {
-		t.Fatalf("LoadPathRuntimeTakeoverMetadataReadOnly: %v", err)
-	}
-	if !takeover.HasActiveTurns {
-		t.Fatal("bounded takeover metadata missed an active turn")
-	}
 }
 
 func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *testing.T) {
@@ -335,7 +328,7 @@ func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *test
 		t.Fatalf("write large JSON store: %v", err)
 	}
 
-	metadata, err := LoadPathRuntimeTakeoverMetadataReadOnly(context.Background(), path)
+	metadata, err := LoadPathRuntimeMetadataReadOnly(context.Background(), path)
 	if err != nil {
 		t.Fatalf("load large JSON runtime metadata: %v", err)
 	}
@@ -344,9 +337,6 @@ func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *test
 	}
 	if metadata.ServiceOwner == nil || metadata.ServiceOwner.PID != 4321 {
 		t.Fatalf("large JSON owner = %#v", metadata.ServiceOwner)
-	}
-	if !metadata.HasActiveTurns {
-		t.Fatal("large JSON metadata missed active turn")
 	}
 }
 
@@ -15394,7 +15384,6 @@ func testOwner(activeSessionID string, activeTurnID string, startedAt time.Time)
 func sameControl(a ServiceControl, b ServiceControl) bool {
 	return a.Paused == b.Paused &&
 		a.Draining == b.Draining &&
-		a.DrainKind == b.DrainKind &&
 		a.Reason == b.Reason &&
 		a.DrainOperationID == b.DrainOperationID &&
 		a.LastDrainOperationID == b.LastDrainOperationID &&

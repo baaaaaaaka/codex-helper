@@ -311,6 +311,23 @@ func recordGlobalOutbound(ctx context.Context, path string, item globalOutboundI
 }
 
 func recordGlobalOutboundBatch(ctx context.Context, path string, items []globalOutboundItem, now time.Time) error {
+	return recordGlobalOutboundBatchWithWriter(ctx, path, items, now, upsertGlobalOutboundSQLiteTx)
+}
+
+// recordMissingGlobalOutboundBatch records replay fences without enriching or
+// otherwise changing an entry that appeared concurrently in the canonical
+// ledger.
+func recordMissingGlobalOutboundBatch(ctx context.Context, path string, items []globalOutboundItem, now time.Time) error {
+	return recordGlobalOutboundBatchWithWriter(ctx, path, items, now, insertGlobalOutboundSQLiteTxIfMissing)
+}
+
+func recordGlobalOutboundBatchWithWriter(
+	ctx context.Context,
+	path string,
+	items []globalOutboundItem,
+	now time.Time,
+	write func(context.Context, *sql.Tx, globalOutboundItem, time.Time) error,
+) error {
 	if strings.TrimSpace(path) == "" || len(items) == 0 {
 		return nil
 	}
@@ -346,7 +363,7 @@ func recordGlobalOutboundBatch(ctx context.Context, path string, items []globalO
 	}
 	defer tx.Rollback()
 	for _, item := range items {
-		if err := upsertGlobalOutboundSQLiteTx(ctx, tx, item, now); err != nil {
+		if err := write(ctx, tx, item, now); err != nil {
 			return err
 		}
 	}
@@ -645,6 +662,35 @@ VALUES (?, ?, ?, ?, ?, ?, ?)`,
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded.message_id, updated_at = excluded.updated_at, recorded_at = excluded.recorded_at, teams_created_at = excluded.teams_created_at, json = excluded.json`,
 		key, item.ChatID, item.MessageID, item.UpdatedAt.UnixNano(), item.RecordedAt.UnixNano(), item.TeamsCreatedAt.UnixNano(), raw)
+	return err
+}
+
+func insertGlobalOutboundSQLiteTxIfMissing(ctx context.Context, tx *sql.Tx, item globalOutboundItem, now time.Time) error {
+	item.ChatID = strings.TrimSpace(item.ChatID)
+	item.MessageID = strings.TrimSpace(item.MessageID)
+	if item.ChatID == "" || item.MessageID == "" {
+		return nil
+	}
+	if item.RecordedAt.IsZero() {
+		item.RecordedAt = now
+	}
+	if item.UpdatedAt.IsZero() {
+		item.UpdatedAt = now
+	}
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO outbound_ledger(key, chat_id, message_id, updated_at, recorded_at, teams_created_at, json)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		globalOutboundKey(item.ChatID, item.MessageID),
+		item.ChatID,
+		item.MessageID,
+		item.UpdatedAt.UnixNano(),
+		item.RecordedAt.UnixNano(),
+		item.TeamsCreatedAt.UnixNano(),
+		raw,
+	)
 	return err
 }
 

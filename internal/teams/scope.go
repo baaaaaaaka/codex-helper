@@ -82,20 +82,16 @@ func ResolveStorePathForScope(scope teamstore.ScopeIdentity) (teamstore.ScopeIde
 	// path to one metadata lookup: opening the store, scanning legacy roots, or
 	// acquiring a writable lock here can both add startup I/O and allow a
 	// retained migration copy to influence listener selection.
-	if info, err := os.Lstat(currentPath); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return scope, "", fmt.Errorf("canonical Teams store %s is not a regular file", currentPath)
-		}
+	if exists, err := inspectRuntimeStorePath(currentPath); err != nil {
+		return scope, "", err
+	} else if exists {
 		return scope, currentPath, nil
-	} else if !os.IsNotExist(err) {
-		return scope, "", fmt.Errorf("inspect canonical Teams store %s: %w", currentPath, err)
 	}
 	resolved, path, ok, err := discoverRuntimeScopeMigrationSource(scope, currentPath)
 	if err != nil {
 		return scope, "", err
 	}
 	if ok {
-		scope.ID = resolved.ID
 		if !resolved.CreatedAt.IsZero() {
 			scope.CreatedAt = resolved.CreatedAt
 		}
@@ -655,7 +651,7 @@ func migrateResolvedScopeStore(scope teamstore.ScopeIdentity, storePath string) 
 		if err := copyLockedFileFamilyIfPresent(newRegistryPath, oldRegistryPath, oldRegistryPath+".lock"); err != nil {
 			return storePath, nil
 		}
-		if err := migrateScopeLedgerFiles(newRegistryPath, oldRegistryPath); err != nil {
+		if err := UnionLegacyGlobalLedgers(context.Background(), scope, storePath); err != nil {
 			return storePath, nil
 		}
 	}
@@ -701,7 +697,7 @@ func migrateResolvedGlobalStore(scopeID string, newStorePath string, storePath s
 		if err := copyLockedFileFamilyIfPresent(newRegistryPath, oldRegistryPath, oldRegistryPath+".lock"); err != nil {
 			return storePath, nil
 		}
-		if err := migrateScopeLedgerFiles(newRegistryPath, oldRegistryPath); err != nil {
+		if err := UnionLegacyGlobalLedgers(context.Background(), teamstore.ScopeIdentity{ID: scopeID}, storePath); err != nil {
 			return storePath, nil
 		}
 	}
@@ -829,16 +825,6 @@ func cleanupMigratedScopeLegacyFiles(scopeID string, newStorePath string, oldSto
 		if newRegistryPath == "" || !registryMigrationComplete(newRegistryPath, oldRegistryPath) {
 			return
 		}
-		if oldInboundPath, oldOK := globalInboundLedgerPathForRegistry(oldRegistryPath); oldOK {
-			if newInboundPath, newOK := globalInboundLedgerPathForRegistry(newRegistryPath); newOK {
-				registryCleanupOK = cleanupMigratedLedgerLegacyFilesIfSafe(newInboundPath, oldInboundPath) && registryCleanupOK
-			}
-		}
-		if oldOutboundPath, oldOK := globalOutboundLedgerPathForRegistry(oldRegistryPath); oldOK {
-			if newOutboundPath, newOK := globalOutboundLedgerPathForRegistry(newRegistryPath); newOK {
-				registryCleanupOK = cleanupMigratedLedgerLegacyFilesIfSafe(newOutboundPath, oldOutboundPath) && registryCleanupOK
-			}
-		}
 		if legacyRelatedFileFamilyExists(oldRegistryPath) {
 			if !registryCleanupOK {
 				return
@@ -857,23 +843,6 @@ func cleanupMigratedScopeLegacyFiles(scopeID string, newStorePath string, oldSto
 	} else {
 		cleanupMigratedFileFamiliesIfSafe(oldStorePath+".lock", storeFamilies...)
 	}
-}
-
-func cleanupMigratedLedgerLegacyFilesIfSafe(newJSONPath string, oldJSONPath string) bool {
-	if !legacyRelatedFileFamilyExists(oldJSONPath) && !legacyRelatedFileFamilyExists(teamsLedgerSQLitePath(oldJSONPath), "-wal", "-shm") {
-		return true
-	}
-	return cleanupMigratedFileFamiliesIfSafe(oldJSONPath+".lock",
-		migratedCleanupFamily{
-			newBase:  teamsLedgerSQLitePath(newJSONPath),
-			oldBase:  teamsLedgerSQLitePath(oldJSONPath),
-			suffixes: []string{"-wal", "-shm"},
-		},
-		migratedCleanupFamily{
-			newBase: newJSONPath,
-			oldBase: oldJSONPath,
-		},
-	)
 }
 
 func cleanupMigratedFileFamiliesIfSafe(lockPath string, families ...migratedCleanupFamily) bool {
@@ -1106,20 +1075,7 @@ func RegistryMigrationCompleteForPath(newRegistryPath string, oldRegistryPath st
 }
 
 func registryMigrationComplete(newRegistryPath string, oldRegistryPath string) bool {
-	if !relatedFileFamilyCompleteForExistingLegacy(newRegistryPath, oldRegistryPath) {
-		return false
-	}
-	oldInboundPath, oldInboundOK := globalInboundLedgerPathForRegistry(oldRegistryPath)
-	newInboundPath, newInboundOK := globalInboundLedgerPathForRegistry(newRegistryPath)
-	if oldInboundOK && newInboundOK && !ledgerFileFamilyCompleteForExistingLegacy(newInboundPath, oldInboundPath) {
-		return false
-	}
-	oldOutboundPath, oldOutboundOK := globalOutboundLedgerPathForRegistry(oldRegistryPath)
-	newOutboundPath, newOutboundOK := globalOutboundLedgerPathForRegistry(newRegistryPath)
-	if oldOutboundOK && newOutboundOK && !ledgerFileFamilyCompleteForExistingLegacy(newOutboundPath, oldOutboundPath) {
-		return false
-	}
-	return true
+	return relatedFileFamilyCompleteForExistingLegacy(newRegistryPath, oldRegistryPath)
 }
 
 func storeSidecarNames() []string {
@@ -1172,45 +1128,6 @@ func registryLedgerFamilyExists(registryPath string) bool {
 	return false
 }
 
-func migrateScopeLedgerFiles(newRegistryPath string, oldRegistryPath string) error {
-	oldInboundPath, oldInboundOK := globalInboundLedgerPathForRegistry(oldRegistryPath)
-	newInboundPath, newInboundOK := globalInboundLedgerPathForRegistry(newRegistryPath)
-	if oldInboundOK && newInboundOK {
-		if err := copyLockedLedgerFileFamilyIfPresent(newInboundPath, oldInboundPath); err != nil {
-			return err
-		}
-	}
-	oldOutboundPath, oldOutboundOK := globalOutboundLedgerPathForRegistry(oldRegistryPath)
-	newOutboundPath, newOutboundOK := globalOutboundLedgerPathForRegistry(newRegistryPath)
-	if oldOutboundOK && newOutboundOK {
-		if err := copyLockedLedgerFileFamilyIfPresent(newOutboundPath, oldOutboundPath); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func copyLockedLedgerFileFamilyIfPresent(newJSONPath string, oldJSONPath string) error {
-	if !legacyRelatedFileFamilyExists(oldJSONPath) && !legacyRelatedFileFamilyExists(teamsLedgerSQLitePath(oldJSONPath), "-wal", "-shm") {
-		return nil
-	}
-	lock := flock.New(oldJSONPath + ".lock")
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	locked, err := lock.TryLockContext(ctx, 25*time.Millisecond)
-	if err != nil {
-		return err
-	}
-	if !locked {
-		return fmt.Errorf("migration lock was not acquired for %s", oldJSONPath)
-	}
-	defer func() { _ = lock.Unlock() }()
-	if err := copyRelatedFileFamilyIfPresent(newJSONPath, oldJSONPath); err != nil {
-		return err
-	}
-	return copyRelatedFileFamilyIfPresent(teamsLedgerSQLitePath(newJSONPath), teamsLedgerSQLitePath(oldJSONPath), "-wal", "-shm")
-}
-
 func copyLockedFileFamilyIfPresent(newBase string, oldBase string, lockPath string, suffixes ...string) error {
 	if !legacyRelatedFileFamilyExists(oldBase, suffixes...) {
 		return nil
@@ -1259,13 +1176,6 @@ func relatedFileFamilyCompleteForExistingLegacy(newBase string, oldBase string, 
 		}
 	}
 	return true
-}
-
-func ledgerFileFamilyCompleteForExistingLegacy(newJSONPath string, oldJSONPath string) bool {
-	if !relatedFileFamilyCompleteForExistingLegacy(newJSONPath, oldJSONPath) {
-		return false
-	}
-	return relatedFileFamilyCompleteForExistingLegacy(teamsLedgerSQLitePath(newJSONPath), teamsLedgerSQLitePath(oldJSONPath), "-wal", "-shm")
 }
 
 func legacyRelatedFileFamilyExists(base string, suffixes ...string) bool {

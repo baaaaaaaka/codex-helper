@@ -128,22 +128,22 @@ func TestTeamsRuntimeSafetyRuntimeResolverMigratesLegacyScopeOutOfCandidateScanC
 	if err != nil {
 		t.Fatalf("ResolveStorePathForScope error: %v", err)
 	}
-	wantPath, err := DefaultStorePathForScope(oldScope.ID)
+	wantPath, err := DefaultStorePathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope legacy: %v", err)
 	}
-	if resolved.ID != oldScope.ID || path != wantPath {
-		t.Fatalf("resolved scope/path = %#v %q, want migrated legacy scope id %q path %q", resolved, path, oldScope.ID, wantPath)
+	if resolved.ID != current.ID || path != wantPath {
+		t.Fatalf("resolved scope/path = %#v %q, want current canonical scope id %q path %q", resolved, path, current.ID, wantPath)
 	}
 	registryScope, registryPath, err := ResolveRegistryPathForScope(current)
 	if err != nil {
 		t.Fatalf("ResolveRegistryPathForScope error: %v", err)
 	}
-	wantRegistryPath, err := DefaultRegistryPathForScope(oldScope.ID)
+	wantRegistryPath, err := DefaultRegistryPathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultRegistryPathForScope legacy: %v", err)
 	}
-	if registryScope.ID != oldScope.ID || registryPath != wantRegistryPath {
+	if registryScope.ID != current.ID || registryPath != wantRegistryPath {
 		t.Fatalf("resolved registry = %#v %q, want %q", registryScope, registryPath, wantRegistryPath)
 	}
 
@@ -1422,12 +1422,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathConcurrentMigrationCI(t *testin
 	if err != nil {
 		t.Fatalf("final ResolveStorePathForScope error: %v", err)
 	}
-	wantPath, err := DefaultStorePathForScope(scope.ID)
+	wantPath, err := DefaultStorePathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	if resolved.ID != scope.ID || path != wantPath {
-		t.Fatalf("final resolved scope/path = %#v %q, want %q at %q", resolved, path, scope.ID, wantPath)
+	if resolved.ID != current.ID || path != wantPath {
+		t.Fatalf("final resolved scope/path = %#v %q, want %q at %q", resolved, path, current.ID, wantPath)
 	}
 	st, err := teamstore.Open(path)
 	if err != nil {
@@ -1443,7 +1443,7 @@ func TestTeamsBackgroundKeepaliveResolveStorePathConcurrentMigrationCI(t *testin
 	if _, ok := state.OutboxMessages["outbox:stress"]; !ok {
 		t.Fatalf("migrated store lost stress outbox: %#v", state.OutboxMessages)
 	}
-	wantRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
+	wantRegistryPath, err := DefaultRegistryPathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultRegistryPathForScope: %v", err)
 	}
@@ -1531,12 +1531,12 @@ func TestTeamsBackgroundKeepaliveResolveStorePathSubprocessMigrationStressCI(t *
 	if err != nil {
 		t.Fatalf("final ResolveStorePathForScope error: %v", err)
 	}
-	wantPath, err := DefaultStorePathForScope(scope.ID)
+	wantPath, err := DefaultStorePathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	if resolved.ID != scope.ID || path != wantPath {
-		t.Fatalf("final resolved scope/path = %#v %q, want %q at %q", resolved, path, scope.ID, wantPath)
+	if resolved.ID != current.ID || path != wantPath {
+		t.Fatalf("final resolved scope/path = %#v %q, want %q at %q", resolved, path, current.ID, wantPath)
 	}
 	st, err := teamstore.Open(path)
 	if err != nil {
@@ -1552,7 +1552,7 @@ func TestTeamsBackgroundKeepaliveResolveStorePathSubprocessMigrationStressCI(t *
 	if _, ok := state.OutboxMessages["outbox:process-stress"]; !ok {
 		t.Fatalf("migrated store lost process stress outbox: %#v", state.OutboxMessages)
 	}
-	wantRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
+	wantRegistryPath, err := DefaultRegistryPathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultRegistryPathForScope: %v", err)
 	}
@@ -1570,11 +1570,15 @@ func TestTeamsBackgroundKeepaliveResolveStorePathSubprocessMigrationWorkerCI(t *
 	if err != nil {
 		t.Fatalf("ResolveStorePathForScope error: %v", err)
 	}
-	if resolved.ID != "scope:process-stress" {
-		t.Fatalf("resolved scope = %#v, want scope:process-stress", resolved)
+	if resolved.ID != current.ID {
+		t.Fatalf("resolved scope = %#v, want current scope %s", resolved, current.ID)
 	}
-	if !strings.Contains(filepath.ToSlash(path), "scope_process-stress/state.json") {
-		t.Fatalf("resolved path = %q, want migrated process-stress scope path", path)
+	wantPath, err := DefaultStorePathForScope(current.ID)
+	if err != nil {
+		t.Fatalf("DefaultStorePathForScope: %v", err)
+	}
+	if path != wantPath {
+		t.Fatalf("resolved path = %q, want current canonical scope path %q", path, wantPath)
 	}
 }
 
@@ -1637,19 +1641,6 @@ func TestTeamsBackgroundKeepaliveResolveStorePathMigratesLegacyGlobalStoreCI(t *
 	if err := os.WriteFile(oldOutboundPath, []byte(`{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control-chat","message_id":"sent-1"}}}`), 0o600); err != nil {
 		t.Fatalf("write legacy outbound ledger: %v", err)
 	}
-	for suffix, body := range map[string]string{
-		"":     "ledger-db",
-		"-wal": "ledger-wal",
-		"-shm": "ledger-shm",
-	} {
-		if err := os.WriteFile(teamsLedgerSQLitePath(oldInboundPath)+suffix, []byte("inbound-"+body), 0o600); err != nil {
-			t.Fatalf("write legacy inbound sqlite%s: %v", suffix, err)
-		}
-		if err := os.WriteFile(teamsLedgerSQLitePath(oldOutboundPath)+suffix, []byte("outbound-"+body), 0o600); err != nil {
-			t.Fatalf("write legacy outbound sqlite%s: %v", suffix, err)
-		}
-	}
-
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	resolved, path, err := ResolveStorePathForScope(current)
 	if err != nil {
@@ -1704,16 +1695,19 @@ func TestTeamsBackgroundKeepaliveResolveStorePathMigratesLegacyGlobalStoreCI(t *
 	assertTeamsFileContent(t, registryPath, oldRegistry)
 	newInboundPath, _ := globalInboundLedgerPathForRegistry(registryPath)
 	newOutboundPath, _ := globalOutboundLedgerPathForRegistry(registryPath)
-	assertTeamsFileContent(t, newInboundPath, `{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control-chat","message_id":"m1","status":"done"}}}`)
-	assertTeamsFileContent(t, newOutboundPath, `{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control-chat","message_id":"sent-1"}}}`)
-	for suffix, body := range map[string]string{
-		"":     "ledger-db",
-		"-wal": "ledger-wal",
-		"-shm": "ledger-shm",
-	} {
-		assertTeamsFileContent(t, teamsLedgerSQLitePath(newInboundPath)+suffix, "inbound-"+body)
-		assertTeamsFileContent(t, teamsLedgerSQLitePath(newOutboundPath)+suffix, "outbound-"+body)
+	inboundLedger, err := readGlobalInboundLedger(newInboundPath)
+	if err != nil || inboundLedger.Items[globalInboundKey("legacy-control-chat", "m1")].Status != "done" {
+		t.Fatalf("canonical inbound replay fence was not unioned: ledger=%#v err=%v", inboundLedger, err)
 	}
+	outboundLedger, err := readGlobalOutboundLedger(newOutboundPath)
+	if err != nil {
+		t.Fatalf("read canonical outbound ledger: %v", err)
+	}
+	if _, ok := outboundLedger.Items[globalOutboundKey("legacy-control-chat", "sent-1")]; !ok {
+		t.Fatalf("canonical outbound replay fence was not unioned: %#v", outboundLedger)
+	}
+	assertTeamsFileContent(t, oldInboundPath, `{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control-chat","message_id":"m1","status":"done"}}}`)
+	assertTeamsFileContent(t, oldOutboundPath, `{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control-chat","message_id":"sent-1"}}}`)
 }
 
 func TestTeamsBackgroundKeepaliveResolveStorePathCleansEligibleLegacyScopeFilesCI(t *testing.T) {
@@ -1789,36 +1783,23 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCleansEligibleLegacyScopeFilesC
 			t.Fatalf("mkdir legacy ledger parent: %v", err)
 		}
 	}
-	if err := os.WriteFile(oldInboundPath, []byte(`{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control","message_id":"m1"}}}`), 0o600); err != nil {
+	if err := os.WriteFile(oldInboundPath, []byte(`{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control","message_id":"m1","status":"done"}}}`), 0o600); err != nil {
 		t.Fatalf("write legacy inbound ledger: %v", err)
 	}
 	if err := os.WriteFile(oldOutboundPath, []byte(`{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control","message_id":"sent-1"}}}`), 0o600); err != nil {
 		t.Fatalf("write legacy outbound ledger: %v", err)
 	}
-	for suffix, body := range map[string]string{
-		"":     "ledger-db",
-		"-wal": "ledger-wal",
-		"-shm": "ledger-shm",
-	} {
-		if err := os.WriteFile(teamsLedgerSQLitePath(oldInboundPath)+suffix, []byte("inbound-"+body), 0o600); err != nil {
-			t.Fatalf("write legacy inbound sqlite%s: %v", suffix, err)
-		}
-		if err := os.WriteFile(teamsLedgerSQLitePath(oldOutboundPath)+suffix, []byte("outbound-"+body), 0o600); err != nil {
-			t.Fatalf("write legacy outbound sqlite%s: %v", suffix, err)
-		}
-	}
-
 	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
 	resolved, path, err := ResolveStorePathForScope(current)
 	if err != nil {
 		t.Fatalf("ResolveStorePathForScope error: %v", err)
 	}
-	wantPath, err := DefaultStorePathForScope(scope.ID)
+	wantPath, err := DefaultStorePathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultStorePathForScope: %v", err)
 	}
-	if resolved.ID != scope.ID || path != wantPath {
-		t.Fatalf("resolved scope/path = %#v %q, want %q at %q", resolved, path, scope.ID, wantPath)
+	if resolved.ID != current.ID || path != wantPath {
+		t.Fatalf("resolved scope/path = %#v %q, want %q at %q", resolved, path, current.ID, wantPath)
 	}
 	newStore, err := teamstore.Open(path)
 	if err != nil {
@@ -1843,28 +1824,25 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCleansEligibleLegacyScopeFilesC
 		assertTeamsPathMissing(t, filepath.Join(filepath.Dir(oldPath), name))
 	}
 	assertTeamsPathMissing(t, oldRegistryPath)
-	assertTeamsPathMissing(t, oldInboundPath)
-	assertTeamsPathMissing(t, oldOutboundPath)
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		assertTeamsPathMissing(t, teamsLedgerSQLitePath(oldInboundPath)+suffix)
-		assertTeamsPathMissing(t, teamsLedgerSQLitePath(oldOutboundPath)+suffix)
-	}
-	newRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
+	assertTeamsFileContent(t, oldInboundPath, `{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control","message_id":"m1","status":"done"}}}`)
+	assertTeamsFileContent(t, oldOutboundPath, `{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control","message_id":"sent-1"}}}`)
+	newRegistryPath, err := DefaultRegistryPathForScope(current.ID)
 	if err != nil {
 		t.Fatalf("DefaultRegistryPathForScope: %v", err)
 	}
 	assertTeamsFileContent(t, newRegistryPath, oldRegistry)
 	newInboundPath, _ := globalInboundLedgerPathForRegistry(newRegistryPath)
 	newOutboundPath, _ := globalOutboundLedgerPathForRegistry(newRegistryPath)
-	assertTeamsFileContent(t, newInboundPath, `{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control","message_id":"m1"}}}`)
-	assertTeamsFileContent(t, newOutboundPath, `{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control","message_id":"sent-1"}}}`)
-	for suffix, body := range map[string]string{
-		"":     "ledger-db",
-		"-wal": "ledger-wal",
-		"-shm": "ledger-shm",
-	} {
-		assertTeamsFileContent(t, teamsLedgerSQLitePath(newInboundPath)+suffix, "inbound-"+body)
-		assertTeamsFileContent(t, teamsLedgerSQLitePath(newOutboundPath)+suffix, "outbound-"+body)
+	inboundLedger, err := readGlobalInboundLedger(newInboundPath)
+	if err != nil || inboundLedger.Items[globalInboundKey("legacy-control", "m1")].Status != "done" {
+		t.Fatalf("canonical inbound replay fence was not unioned: ledger=%#v err=%v", inboundLedger, err)
+	}
+	outboundLedger, err := readGlobalOutboundLedger(newOutboundPath)
+	if err != nil {
+		t.Fatalf("read canonical outbound ledger: %v", err)
+	}
+	if _, ok := outboundLedger.Items[globalOutboundKey("legacy-control", "sent-1")]; !ok {
+		t.Fatalf("canonical outbound replay fence was not unioned: %#v", outboundLedger)
 	}
 }
 

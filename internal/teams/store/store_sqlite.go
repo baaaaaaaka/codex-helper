@@ -735,61 +735,53 @@ func loadSQLiteStateFileReadOnly(ctx context.Context, path string) (State, error
 }
 
 func loadSQLiteRuntimeMetadataFileReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
-	metadata, err := loadSQLiteRuntimeTakeoverMetadataFileReadOnly(ctx, path)
-	if err != nil {
-		return RuntimeMetadata{}, err
-	}
-	return metadata.RuntimeMetadata, nil
-}
-
-func loadSQLiteRuntimeTakeoverMetadataFileReadOnly(ctx context.Context, path string) (RuntimeTakeoverMetadata, error) {
 	const maxAttempts = 3
 	var changedErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
 		if err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		if !dbBefore.Exists {
-			return RuntimeTakeoverMetadata{}, os.ErrNotExist
+			return RuntimeMetadata{}, os.ErrNotExist
 		}
 		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
 		if err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
 			if _, err := os.Stat(path + "-shm"); err != nil {
 				if errors.Is(err, os.ErrNotExist) {
-					return RuntimeTakeoverMetadata{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
+					return RuntimeMetadata{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
 				}
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		}
-		metadata, err := loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx, path, immutable)
+		metadata, err := loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx, path, immutable)
 		if err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		if !immutable {
 			return metadata, nil
 		}
 		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
 		if err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
 		if err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		if dbBefore == dbAfter && walBefore == walAfter {
 			return metadata, nil
 		}
 		changedErr = fmt.Errorf("database or WAL changed during immutable metadata attempt %d", attempt+1)
 	}
-	return RuntimeTakeoverMetadata{}, fmt.Errorf("read stable sqlite runtime metadata after %d attempts: %w", maxAttempts, changedErr)
+	return RuntimeMetadata{}, fmt.Errorf("read stable sqlite runtime metadata after %d attempts: %w", maxAttempts, changedErr)
 }
 
-func loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (RuntimeTakeoverMetadata, error) {
+func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (RuntimeMetadata, error) {
 	query := url.Values{}
 	query.Set("mode", "ro")
 	if immutable {
@@ -797,16 +789,16 @@ func loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx context.Context, p
 	}
 	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
 	if err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(0)
 	defer db.Close()
 	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 	if err := validateSQLiteRequiredTablesContext(ctx, db); err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 
 	var metadata RuntimeMetadata
@@ -815,10 +807,10 @@ func loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx context.Context, p
 		ctx,
 		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
 	).Scan(&controlChatJSON); err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 	if err := json.Unmarshal([]byte(controlChatJSON), &metadata.ControlChat); err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 
 	rows, err := db.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
@@ -829,53 +821,42 @@ func loadSQLiteRuntimeTakeoverMetadataFileReadOnlyAttempt(ctx context.Context, p
 		sqliteRuntimeKeyServiceControl,
 	)
 	if err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var key string
 		var raw []byte
 		if err := rows.Scan(&key, &raw); err != nil {
-			return RuntimeTakeoverMetadata{}, err
+			return RuntimeMetadata{}, err
 		}
 		switch key {
 		case sqliteRuntimeKeyScope:
 			if err := json.Unmarshal(raw, &metadata.Scope); err != nil {
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		case sqliteRuntimeKeyControlLease:
 			if err := json.Unmarshal(raw, &metadata.ControlLease); err != nil {
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		case sqliteRuntimeKeyServiceOwner:
 			if err := json.Unmarshal(raw, &metadata.ServiceOwner); err != nil {
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		case sqliteRuntimeKeyLockOwner:
 			if err := json.Unmarshal(raw, &metadata.LockOwner); err != nil {
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		case sqliteRuntimeKeyServiceControl:
 			if err := json.Unmarshal(raw, &metadata.ServiceControl); err != nil {
-				return RuntimeTakeoverMetadata{}, err
+				return RuntimeMetadata{}, err
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return RuntimeTakeoverMetadata{}, err
+		return RuntimeMetadata{}, err
 	}
-	var active int
-	if err := db.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM turns WHERE status IN (?, ?) LIMIT 1)`,
-		string(TurnStatusQueued),
-		string(TurnStatusRunning),
-	).Scan(&active); err != nil {
-		return RuntimeTakeoverMetadata{}, err
-	}
-	return RuntimeTakeoverMetadata{
-		RuntimeMetadata: metadata,
-		HasActiveTurns:  active != 0,
-	}, nil
+	return metadata, nil
 }
 
 type sqliteReadOnlyFileIdentity struct {

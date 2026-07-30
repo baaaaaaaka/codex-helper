@@ -1088,6 +1088,23 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				migratedStore, err := prepareManagedTeamsRuntimeStore(
+					cmd.Context(),
+					bridge.RuntimeScopeIdentity(),
+					once,
+				)
+				if err != nil {
+					return err
+				}
+				if migratedStore {
+					// The initial bridge may have loaded the legacy registry
+					// projection before the offline handoff. Recreate it so
+					// every persisted path is resolved from canonical state.
+					bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+					if err != nil {
+						return err
+					}
+				}
 				httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, modelProfile, timeout, cmd.ErrOrStderr())
 				if err != nil {
@@ -1122,34 +1139,6 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams machine registry heartbeat disabled: Teams write auth is unavailable: %v\n", registryErr)
 					}
 				}
-				legacyStoreSafetyCheck := func(ctx context.Context) error {
-					if !teamsRunShouldRetryInProcess(once) {
-						return fmt.Errorf("automatic Teams runtime store takeover requires the managed service/supervisor")
-					}
-					if teamsServiceIsWSL() {
-						if err := runTeamsServiceWSLReadinessCheck(ctx, nil); err != nil {
-							return err
-						}
-						if err := (teamsServiceWSLWindowsTaskBackend{}).RetireScheduledTasks(ctx); err != nil {
-							return fmt.Errorf("retire WSL Scheduled Tasks before runtime store takeover: %w", err)
-						}
-					}
-					return nil
-				}
-				legacyStoreWriterValidator := func(ctx context.Context, state teamsstore.State) (teams.AutomaticScopeTakeoverFence, error) {
-					spec, err := buildTeamsServiceSpec(registryPath)
-					if err != nil {
-						return teams.AutomaticScopeTakeoverFence{}, err
-					}
-					return teamsServiceValidateLegacyStoreWriters(ctx, state, spec)
-				}
-				legacyStoreWriterFencer := func(ctx context.Context, fence teams.AutomaticScopeTakeoverFence) error {
-					spec, err := buildTeamsServiceSpec(registryPath)
-					if err != nil {
-						return err
-					}
-					return teamsServiceFenceLegacyStoreWriters(ctx, fence, spec)
-				}
 				return bridge.Listen(cmd.Context(), teams.BridgeOptions{
 					RegistryPath:                       *registryPath,
 					HelperVersion:                      buildVersion(),
@@ -1175,14 +1164,6 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					MachineRegistryGraph:               machineRegistryGraph,
 					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
 					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
-					LegacyStoreTakeoverCoordinator: func(ctx context.Context, scope teamsstore.ScopeIdentity, legacyPath string) (teams.AutomaticScopeTakeoverResult, error) {
-						return teams.CoordinateAutomaticScopeTakeover(ctx, scope, legacyPath, teams.AutomaticScopeTakeoverOptions{
-							SafetyCheck:         legacyStoreSafetyCheck,
-							ValidateLegacyState: legacyStoreWriterValidator,
-							FenceWriter:         legacyStoreWriterFencer,
-							MigrateSharedState:  teams.MigrateLegacyGlobalLedgersAfterWriterFence,
-						})
-					},
 				})
 			}
 			if teamsRunShouldRetryInProcess(once) {
@@ -1302,6 +1283,33 @@ var (
 	teamsRunServiceRetryDelay = 30 * time.Second
 	teamsRunServiceSleep      = sleepContext
 )
+
+func prepareManagedTeamsRuntimeStore(
+	ctx context.Context,
+	scope teamsstore.ScopeIdentity,
+	once bool,
+) (bool, error) {
+	prepared, err := teams.PrepareRuntimeStoreForListener(ctx, scope)
+	if err != nil {
+		return false, err
+	}
+	if !prepared.TakeoverRequired {
+		return false, nil
+	}
+	if !teamsRunShouldRetryInProcess(once) {
+		return false, fmt.Errorf(
+			"canonical and legacy Teams stores both exist; run the managed Teams service to complete offline takeover",
+		)
+	}
+	// A managed service reaches this point only after its platform backend has
+	// stopped or excluded the previous child. Keep process and Scheduled Task
+	// management in that existing lifecycle boundary; this pre-listener child
+	// step is intentionally limited to deterministic store operations.
+	if err := teams.CompleteOfflineRuntimeStoreTakeover(ctx, scope, prepared.LegacyPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
 
 func teamsRunShouldRetryInProcess(once bool) bool {
 	return !once && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != ""
@@ -2572,11 +2580,6 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
 	_, _ = fmt.Fprintf(out, "Authoritative store: %s\n", authoritativeStore)
-	if summary, ok, err := teams.ReadRuntimeStoreTakeoverSummary(defaultStatePath); err != nil {
-		_, _ = fmt.Fprintf(out, "Runtime store takeover: unknown (%v)\n", err)
-	} else if ok {
-		_, _ = fmt.Fprintf(out, "Runtime store takeover: %s\n", formatTeamsRuntimeStoreTakeoverSummary(summary))
-	}
 	_, _ = fmt.Fprintf(out, "Store identity: %s\n", storeIdentity)
 	for _, statePath := range statePaths {
 		layer := teamsStatusStoreLayer(statePath)
@@ -2696,38 +2699,6 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		}
 	}
 	return nil
-}
-
-func formatTeamsRuntimeStoreTakeoverSummary(summary teams.RuntimeStoreTakeoverSummary) string {
-	parts := []string{"status=" + firstNonEmptyCLI(summary.Status, "unknown")}
-	if path := strings.TrimSpace(summary.LegacyStorePath); path != "" {
-		parts = append(parts, "legacy="+path)
-	}
-	if path := strings.TrimSpace(summary.LegacyBackupPath); path != "" {
-		parts = append(parts, "backup="+path)
-	}
-	inventory := summary.RecoveryInventory
-	if inventory.NonTerminalInbound > 0 ||
-		inventory.QueuedOutbox > 0 ||
-		inventory.SendingOutbox > 0 ||
-		inventory.AcceptedOutbox > 0 ||
-		inventory.SkippedOutbox > 0 {
-		parts = append(
-			parts,
-			fmt.Sprintf(
-				"recovery_counts=inbound:%d,queued:%d,sending:%d,accepted:%d,skipped:%d",
-				inventory.NonTerminalInbound,
-				inventory.QueuedOutbox,
-				inventory.SendingOutbox,
-				inventory.AcceptedOutbox,
-				inventory.SkippedOutbox,
-			),
-		)
-	}
-	if !summary.UpdatedAt.IsZero() {
-		parts = append(parts, "updated="+summary.UpdatedAt.Format(time.RFC3339))
-	}
-	return strings.Join(parts, " ")
 }
 
 type teamsHelperExecutableStatus struct {

@@ -383,6 +383,33 @@ ON CONFLICT(key) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded
 	return err
 }
 
+func insertGlobalInboundSQLiteTxIfMissing(ctx context.Context, tx *sql.Tx, key string, item globalInboundItem) error {
+	item.ChatID = strings.TrimSpace(item.ChatID)
+	item.MessageID = strings.TrimSpace(item.MessageID)
+	if item.ChatID == "" || item.MessageID == "" {
+		return nil
+	}
+	if strings.TrimSpace(key) == "" {
+		key = globalInboundKey(item.ChatID, item.MessageID)
+	}
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbound_ledger(key, chat_id, message_id, owner, status, claimed_at, updated_at, json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		key,
+		item.ChatID,
+		item.MessageID,
+		item.Owner,
+		item.Status,
+		item.ClaimedAt.UnixNano(),
+		item.UpdatedAt.UnixNano(),
+		raw,
+	)
+	return err
+}
+
 func pruneGlobalInboundSQLiteTx(ctx context.Context, tx *sql.Tx) error {
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger`).Scan(&count); err != nil {

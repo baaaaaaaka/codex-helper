@@ -222,7 +222,6 @@ type BridgeOptions struct {
 	MachineRegistryInterval            time.Duration
 	MachineRegistryTTL                 time.Duration
 	MachineRegistryNow                 func() time.Time
-	LegacyStoreTakeoverCoordinator     func(context.Context, teamstore.ScopeIdentity, string) (AutomaticScopeTakeoverResult, error)
 }
 
 type ModelProfileResolver func(context.Context, string) (modelprofile.Snapshot, error)
@@ -668,6 +667,16 @@ func (b *Bridge) readClient() *GraphClient {
 	return b.graph
 }
 
+// RuntimeScopeIdentity exposes the authenticated scope before Listen opens a
+// store. The CLI service boundary uses it for the one-time offline migration;
+// callers must not mutate the returned value and no store is opened here.
+func (b *Bridge) RuntimeScopeIdentity() teamstore.ScopeIdentity {
+	if b == nil {
+		return teamstore.ScopeIdentity{}
+	}
+	return b.scope
+}
+
 func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 	return b.ensureControlChat(ctx, true)
 }
@@ -941,16 +950,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 				return err
 			}
 			if prepared.TakeoverRequired {
-				if opts.LegacyStoreTakeoverCoordinator == nil {
-					return deferRuntimeStoreTakeover("managed service/supervisor coordinator is unavailable")
-				}
-				prepared, err = opts.LegacyStoreTakeoverCoordinator(ctx, b.scope, prepared.LegacyPath)
-				if err != nil {
-					return err
-				}
-				if !prepared.Resolved {
-					return deferRuntimeStoreTakeover("managed service/supervisor coordinator did not complete takeover")
-				}
+				return deferRuntimeStoreTakeover("dual store requires offline service takeover before listener start")
 			}
 			if prepared.Resolved {
 				storePath = prepared.CanonicalPath
@@ -5966,7 +5966,6 @@ func (b *Bridge) beginHelperReloadDrain(ctx context.Context, force bool) (teamst
 		}
 		next := previous
 		next.Draining = true
-		next.DrainKind = ""
 		next.Reason = teamstore.HelperReloadReason
 		next.DrainOperationID = ""
 		next.UpdatedAt = now
@@ -6000,7 +5999,6 @@ func (b *Bridge) clearStaleHelperReloadDrainOnStart(ctx context.Context) error {
 
 func clearStaleHelperReloadControl(control teamstore.ServiceControl, now time.Time) teamstore.ServiceControl {
 	control.Draining = false
-	control.DrainKind = ""
 	control.DrainOperationID = ""
 	if !control.Paused {
 		control.Reason = ""
@@ -7083,11 +7081,11 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
 		return err
 	}
-	completed, err := b.store.CompleteUpgrade(ctx, req.ID, tag)
-	if err != nil {
-		return err
-	}
-	completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(completed, b.reg.ControlChatID)
+	// Installation and activation are distinct. The old helper may schedule a
+	// restart successfully even when the replacement never becomes healthy, so
+	// it must leave the request Ready. The replacement helper completes the
+	// request only after queuePendingHelperRestartNotice verifies its version.
+	completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 	if opts.HelperRestarter == nil {
 		return nil
 	}
@@ -12850,17 +12848,7 @@ func serviceControlDefersInput(control teamstore.ServiceControl) bool {
 	}
 }
 
-var ErrRuntimeStoreTakeoverDraining = errors.New("Teams runtime store takeover is draining")
-
 func (b *Bridge) rejectSessionWork(ctx context.Context, session *Session, msg ChatMessage, control teamstore.ServiceControl) error {
-	if control.Draining && control.DrainKind == teamstore.DrainKindRuntimeStoreTakeover {
-		// Do not persist this message into the legacy scope that is about to be
-		// quarantined, and do not let the caller complete its global inbound
-		// claim. Returning an error makes the poll wrapper release that claim so
-		// the canonical listener can fetch and process the message after the
-		// takeover.
-		return ErrRuntimeStoreTakeoverDraining
-	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
 	}

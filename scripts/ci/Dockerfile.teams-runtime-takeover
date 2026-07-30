@@ -1,6 +1,5 @@
 FROM scratch
 
 COPY teams-runtime-safety.test /teams-runtime-safety.test
-COPY teams-runtime-safety-cli.test /teams-runtime-safety-cli.test
 
 ENTRYPOINT ["/teams-runtime-safety.test"]

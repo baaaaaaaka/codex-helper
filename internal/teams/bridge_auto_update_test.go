@@ -127,11 +127,11 @@ func TestBridgeHelperAutoUpdateAppliesEligibleCandidate(t *testing.T) {
 	if state.AutoUpdate.LastInstalledTag != "v1.2.4" {
 		t.Fatalf("LastInstalledTag = %q, want v1.2.4", state.AutoUpdate.LastInstalledTag)
 	}
-	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade = %#v, want completed", state.Upgrade)
+	if state.Upgrade == nil || state.Upgrade.Phase != teamstore.UpgradePhaseReady {
+		t.Fatalf("upgrade = %#v, want ready until replacement verifies its version", state.Upgrade)
 	}
-	if state.ServiceControl.Draining {
-		t.Fatalf("ServiceControl still draining after completed auto-update: %#v", state.ServiceControl)
+	if !state.ServiceControl.Draining {
+		t.Fatalf("ServiceControl stopped draining before replacement verification: %#v", state.ServiceControl)
 	}
 }
 
@@ -511,6 +511,7 @@ func TestBridgeControlHelperUpdatePrereleaseRunsManualUpdate(t *testing.T) {
 		t.Fatalf("manual helper update notification targets = %#v, want control chat target", state.Upgrade)
 	}
 	restartedBridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedBridge.helperVersion = "v1.2.4-rc.1"
 	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
 		t.Fatalf("queuePendingHelperRestartNotice after helper update error: %v", err)
 	}
@@ -821,6 +822,7 @@ func TestBridgeHelperAutoUpdateQueuesPlainCompletionNotice(t *testing.T) {
 		t.Fatalf("maybeRunHelperAutoUpdate error: %v", err)
 	}
 	restartedBridge := newBridgeTestBridge(graph, st, &recordingExecutor{})
+	restartedBridge.helperVersion = "v1.2.4"
 	if err := restartedBridge.queuePendingHelperRestartNotice(context.Background()); err != nil {
 		t.Fatalf("queuePendingHelperRestartNotice after auto update error: %v", err)
 	}

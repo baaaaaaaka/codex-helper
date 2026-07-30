@@ -17,7 +17,6 @@ docker info >/dev/null 2>&1 || {
 
 cd "$repo_root"
 CGO_ENABLED=0 go test -c -o "$tmp_dir/teams-runtime-safety.test" ./internal/teams
-CGO_ENABLED=0 go test -c -o "$tmp_dir/teams-runtime-safety-cli.test" ./internal/cli
 docker build \
   --file scripts/ci/Dockerfile.teams-runtime-takeover \
   --tag "$image" \
@@ -31,32 +30,6 @@ docker run --rm \
   --tmpfs /tmp:rw,nosuid,nodev,size=64m \
   --env CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER=1 \
   "$image" \
-  -test.run '^TestTeamsRuntimeSafetyAutomaticTakeoverRealWriterProcessDockerCI$' \
-  -test.count=1 \
-  -test.v
-docker run --rm \
-  --network none \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --pids-limit 64 \
-  --read-only \
-  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
-  --env CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER=1 \
-  --entrypoint /teams-runtime-safety-cli.test \
-  "$image" \
-  -test.run '^TestTeamsRuntimeSafetyExactLegacyWriterFenceRealProcessDockerCI$' \
-  -test.count=1 \
-  -test.v
-docker run --rm \
-  --network none \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  --pids-limit 64 \
-  --read-only \
-  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
-  --env CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER=1 \
-  --entrypoint /teams-runtime-safety-cli.test \
-  "$image" \
-  -test.run '^TestTeamsRuntimeSafetySupervisorFencePreventsChildRestartRealProcessDockerCI$' \
+  -test.run '^TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI$' \
   -test.count=1 \
   -test.v

@@ -51,37 +51,6 @@ func TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI(t *testin
 	}
 }
 
-func TestTeamsRuntimeSafetyStatusFormatsBoundedTakeoverRecoverySummaryCI(t *testing.T) {
-	summary := teams.RuntimeStoreTakeoverSummary{
-		Status:           "completed",
-		LegacyStorePath:  "/legacy/scope/state.json",
-		LegacyBackupPath: "/legacy/migration-backups/scope/state.json",
-		RecoveryInventory: teams.AutomaticScopeTakeoverInventory{
-			NonTerminalInbound: 3,
-			QueuedOutbox:       7,
-			SendingOutbox:      2,
-			AcceptedOutbox:     1,
-			SkippedOutbox:      4,
-		},
-		UpdatedAt: time.Date(2026, 7, 30, 1, 2, 3, 0, time.UTC),
-	}
-	got := formatTeamsRuntimeStoreTakeoverSummary(summary)
-	for _, want := range []string{
-		"status=completed",
-		"legacy=/legacy/scope/state.json",
-		"backup=/legacy/migration-backups/scope/state.json",
-		"recovery_counts=inbound:3,queued:7,sending:2,accepted:1,skipped:4",
-		"updated=2026-07-30T01:02:03Z",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("takeover summary missing %q: %s", want, got)
-		}
-	}
-	if strings.Contains(got, "message_body") || strings.Contains(got, "outbox-id") {
-		t.Fatalf("takeover status exposed unbounded per-message data: %s", got)
-	}
-}
-
 func TestTeamsRuntimeSafetyServiceSpecDoesNotPersistInvocationWorkingDirCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -224,6 +193,182 @@ func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *t
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "executable") {
 		t.Fatalf("Apply error = %v, want an actionable executable preflight failure", err)
 	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsUnixExecutableModeWithoutExtraProbeCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix executable mode contract")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
+	serviceExe := filepath.Join(tmp, "service-bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, serviceExe, "1.2.3")
+	if err := os.Chmod(serviceExe, 0o600); err != nil {
+		t.Fatalf("remove service executable bits: %v", err)
+	}
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  currentExe,
+		argv0:                currentExe,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+		Executable:  serviceExe,
+		WorkingDir:  tmp,
+		Environment: map[string]string{},
+	}); err != nil {
+		t.Fatalf("install non-executable local-supervisor fixture: %v", err)
+	}
+
+	prevPerform := performUpdate
+	prevResolve := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolve
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
+	updateCalled := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		updateCalled = true
+		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
+	}
+
+	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
+		context.Background(),
+		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
+	)
+	if updateCalled {
+		t.Fatal("helper binary was replaced before executable mode validation")
+	}
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "not executable") {
+		t.Fatalf("Apply error = %v, want executable-mode preflight failure", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyForegroundDualStoreFailsClosedWithoutMutationCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
+	scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "foreground")
+
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, true)
+	if err == nil || !strings.Contains(err.Error(), "managed Teams service") {
+		t.Fatalf("foreground dual-store error = %v, want managed-service guidance", err)
+	}
+	if migrated {
+		t.Fatal("foreground dual-store path reported a completed migration")
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("foreground dual-store check modified files: before=%v after=%v", before, after)
+	}
+	for _, path := range []string{canonicalPath, legacyPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("foreground dual-store check removed %s: %v", path, err)
+		}
+	}
+}
+
+func TestTeamsRuntimeSafetyManagedChildCompletesOfflineDualStoreTakeoverCI(t *testing.T) {
+	lockCLITestHooks(t)
+	previousGOOS := teamsServiceGOOS
+	t.Cleanup(func() { teamsServiceGOOS = previousGOOS })
+	for _, goos := range []string{"linux", "darwin", "windows"} {
+		t.Run(goos, func(t *testing.T) {
+			teamsServiceGOOS = func() string { return goos }
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "managed-"+goos)
+			scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "managed-"+goos)
+
+			migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false)
+			if err != nil {
+				t.Fatalf("managed offline takeover: %v", err)
+			}
+			if !migrated {
+				t.Fatal("managed dual-store path did not report completed migration")
+			}
+			if _, err := os.Stat(canonicalPath); err != nil {
+				t.Fatalf("managed offline takeover removed canonical store: %v", err)
+			}
+			if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+				t.Fatalf("managed offline takeover left legacy store in candidate path: %v", err)
+			}
+			backupPath := filepath.Join(
+				os.Getenv("XDG_CONFIG_HOME"),
+				"codex-helper",
+				"teams",
+				"migration-backups",
+				scope.ID,
+				"state.json",
+			)
+			if _, err := os.Stat(backupPath); err != nil {
+				t.Fatalf("managed offline takeover backup missing at %s: %v", backupPath, err)
+			}
+			state, err := teamsstore.LoadPathReadOnly(context.Background(), canonicalPath)
+			if err != nil {
+				t.Fatalf("load canonical store after managed takeover: %v", err)
+			}
+			if state.ControlChat.TeamsChatID != "canonical-managed-"+goos {
+				t.Fatalf("managed takeover changed canonical business data: %#v", state.ControlChat)
+			}
+		})
+	}
+}
+
+func seedCLIRuntimeSafetyDualStore(t *testing.T, suffix string) (teamsstore.ScopeIdentity, string, string) {
+	t.Helper()
+	scope := teamsstore.ScopeIdentity{
+		ID:            "scope-cli-offline-" + suffix,
+		AccountID:     "account-" + suffix,
+		UserPrincipal: suffix + "@example.test",
+		Profile:       "default",
+	}
+	canonicalPath, err := teams.DefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("canonical store path: %v", err)
+	}
+	legacyPath := filepath.Join(
+		os.Getenv("XDG_CONFIG_HOME"),
+		"codex-helper",
+		"teams",
+		"scopes",
+		scope.ID,
+		"state.json",
+	)
+	for path, chatID := range map[string]string{
+		canonicalPath: "canonical-" + suffix,
+		legacyPath:    "legacy-" + suffix,
+	} {
+		store, err := teamsstore.Open(path)
+		if err != nil {
+			t.Fatalf("open store %s: %v", path, err)
+		}
+		if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+			state.Scope = scope
+			state.ControlChat.TeamsChatID = chatID
+			return nil
+		}); err != nil {
+			_ = store.Close()
+			t.Fatalf("seed store %s: %v", path, err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close store %s: %v", path, err)
+		}
+	}
+	return scope, canonicalPath, legacyPath
 }
 
 func TestTeamsRuntimeSafetyDoesNotRestoreStaleLoopbackProxyFromServiceConfigCI(t *testing.T) {

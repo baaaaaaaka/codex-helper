@@ -259,6 +259,8 @@ func preflightPersistedTeamsServiceForUpdate() error {
 		return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
 	} else if info.IsDir() {
 		return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
+	} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
 	}
 	if registryPath := strings.TrimSpace(cfg.Spec.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
 		return fmt.Errorf("persisted Teams service registry path must be absolute: %s", registryPath)

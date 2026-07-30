@@ -12,11 +12,14 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const (
 	runtimeSafetyTakeoverWriterHelperEnv  = "CXP_TEAMS_TAKEOVER_WRITER_HELPER"
 	runtimeSafetyTakeoverWriterReadyEnv   = "CXP_TEAMS_TAKEOVER_WRITER_READY"
+	runtimeSafetyTakeoverWriterLockEnv    = "CXP_TEAMS_TAKEOVER_WRITER_LOCK"
 	runtimeSafetyTakeoverRealProcessCIEnv = "CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER"
 )
 
@@ -28,6 +31,15 @@ func TestTeamsRuntimeSafetyTakeoverWriterProcessHelper(t *testing.T) {
 	if readyPath == "" {
 		t.Fatal("writer ready path is required")
 	}
+	lockPath := os.Getenv(runtimeSafetyTakeoverWriterLockEnv)
+	if lockPath == "" {
+		t.Fatal("writer lock path is required")
+	}
+	lock := flock.New(lockPath)
+	if err := lock.Lock(); err != nil {
+		t.Fatalf("hold writer lock: %v", err)
+	}
+	defer func() { _ = lock.Unlock() }()
 	if err := os.WriteFile(readyPath, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		t.Fatalf("write writer readiness: %v", err)
 	}
@@ -36,9 +48,9 @@ func TestTeamsRuntimeSafetyTakeoverWriterProcessHelper(t *testing.T) {
 	<-ctx.Done()
 }
 
-func TestTeamsRuntimeSafetyAutomaticTakeoverRealWriterProcessDockerCI(t *testing.T) {
+func TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI(t *testing.T) {
 	if os.Getenv(runtimeSafetyTakeoverRealProcessCIEnv) != "1" {
-		t.Skip("runs only in the ephemeral Docker process-fencing shard")
+		t.Skip("runs only in the ephemeral Docker offline-takeover shard")
 	}
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
 	readyPath := filepath.Join(t.TempDir(), "writer-ready")
@@ -47,6 +59,7 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverRealWriterProcessDockerCI(t *testing
 		os.Environ(),
 		runtimeSafetyTakeoverWriterHelperEnv+"=1",
 		runtimeSafetyTakeoverWriterReadyEnv+"="+readyPath,
+		runtimeSafetyTakeoverWriterLockEnv+"="+fixture.LegacyPath+".lock",
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start real legacy writer process: %v", err)
@@ -77,38 +90,27 @@ func TestTeamsRuntimeSafetyAutomaticTakeoverRealWriterProcessDockerCI(t *testing
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	result, err := exerciseRuntimeSafetyTakeoverContract(
-		fixture.Scope,
-		runtimeSafetyTakeoverContractOptions{
-			WriterIdentity: "verified-local-managed-writer",
-			WriterPID:      cmd.Process.Pid,
-			PIDVisibility:  "visible",
-			FenceWriter: func(ctx context.Context) error {
-				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-					return err
-				}
-				select {
-				case <-waited:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			},
-		},
-		fixture.LegacyPath,
-	)
-	if err != nil {
-		t.Fatalf("automatic takeover with a real fenced writer: %v", err)
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err == nil {
+		t.Fatal("offline takeover succeeded while the real writer still held the store lock")
 	}
-	if result.CanonicalPath != fixture.CanonicalPath {
-		t.Fatalf("takeover path = %q, want canonical %q", result.CanonicalPath, fixture.CanonicalPath)
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if changes := runtimeSafetySnapshotChanges(before, after); len(changes) != 0 {
+		t.Fatalf("blocked offline takeover modified files: %v", changes)
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("stop real legacy writer process: %v", err)
 	}
 	select {
 	case <-waited:
 	case <-time.After(5 * time.Second):
-		t.Fatal("takeover returned while the real legacy writer process was still alive")
+		t.Fatal("real legacy writer process did not exit")
+	}
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("offline takeover after service writer exit: %v", err)
 	}
 	if _, err := os.Stat(fixture.LegacyPath); !os.IsNotExist(err) {
-		t.Fatalf("takeover left legacy source after fencing the real writer: %v", err)
+		t.Fatalf("offline takeover left legacy source after writer exit: %v", err)
 	}
 }
