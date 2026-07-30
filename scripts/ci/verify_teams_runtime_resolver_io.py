@@ -9,7 +9,7 @@ import sys
 
 
 MUTATING = re.compile(
-    r"\b(?:p?write64|writev|fdatasync|fsync|ftruncate|unlinkat?|"
+    r"\b(?:write|pwrite64|writev|fdatasync|fsync|ftruncate|unlinkat?|"
     r"renameat2?|mkdirat?|chmod|fchmodat|msync)\("
 )
 OPEN = re.compile(r"\bopenat2?\(")
@@ -25,15 +25,30 @@ def fail(message: str, lines: list[str] | None = None) -> None:
     raise SystemExit(1)
 
 
-def trace_phase(lines: list[str], begin_marker: str, end_marker: str) -> list[str]:
-    begin = next((i for i, line in enumerate(lines) if begin_marker in line), -1)
-    end = next(
-        (i for i, line in enumerate(lines[begin + 1 :], begin + 1) if end_marker in line),
-        -1,
-    )
-    if begin < 0 or end <= begin:
-        fail(f"resolver trace is missing phase markers {begin_marker}/{end_marker}")
-    return lines[begin + 1 : end]
+def trace_phases(lines: list[str], begin_marker: str, end_marker: str) -> list[list[str]]:
+    phases: list[list[str]] = []
+    cursor = 0
+    while cursor < len(lines):
+        begin = next(
+            (i for i, line in enumerate(lines[cursor:], cursor) if begin_marker in line),
+            -1,
+        )
+        if begin < 0:
+            break
+        end = next(
+            (i for i, line in enumerate(lines[begin + 1 :], begin + 1) if end_marker in line),
+            -1,
+        )
+        if end <= begin:
+            fail(f"resolver trace is missing phase end marker {end_marker}")
+        phases.append(lines[begin + 1 : end])
+        cursor = end + 1
+    if len(phases) != 2:
+        fail(
+            f"resolver trace contains {len(phases)} {begin_marker}/{end_marker} phases; "
+            "want two independent process startups"
+        )
+    return phases
 
 
 def verify_phase(
@@ -42,6 +57,7 @@ def verify_phase(
     label: str,
     *,
     allow_legacy_metadata: bool,
+    metadata_minimum: int,
     metadata_limit: int,
 ) -> int:
     rooted = [line for line in phase if root in line]
@@ -67,9 +83,10 @@ def verify_phase(
             f"{label} used {len(metadata)} metadata syscalls; want at most {metadata_limit}",
             metadata,
         )
-    if len(metadata) < 2:
+    if len(metadata) < metadata_minimum:
         fail(
-            f"{label} used only {len(metadata)} rooted metadata syscalls; probe may not cover the path",
+            f"{label} used only {len(metadata)} rooted metadata syscalls; "
+            f"want at least {metadata_minimum} so the probe covers the expected paths",
             metadata,
         )
     return len(metadata)
@@ -85,19 +102,37 @@ def main() -> None:
         fail("resolver probe root file is empty")
 
     lines = trace_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    resolver_metadata = verify_phase(
-        trace_phase(lines, "CXP_TEAMS_RESOLVER_IO_BEGIN", "CXP_TEAMS_RESOLVER_IO_END"),
-        root,
-        "two steady canonical resolutions",
-        allow_legacy_metadata=False,
-        metadata_limit=4,
+    resolver_metadata = sum(
+        verify_phase(
+            phase,
+            root,
+            f"canonical resolution process {index}",
+            allow_legacy_metadata=False,
+            metadata_minimum=1,
+            metadata_limit=2,
+        )
+        for index, phase in enumerate(
+            trace_phases(lines, "CXP_TEAMS_RESOLVER_IO_BEGIN", "CXP_TEAMS_RESOLVER_IO_END"),
+            1,
+        )
     )
-    listener_metadata = verify_phase(
-        trace_phase(lines, "CXP_TEAMS_LISTENER_PREP_IO_BEGIN", "CXP_TEAMS_LISTENER_PREP_IO_END"),
-        root,
-        "two steady listener preparations",
-        allow_legacy_metadata=True,
-        metadata_limit=4,
+    listener_metadata = sum(
+        verify_phase(
+            phase,
+            root,
+            f"listener preparation process {index}",
+            allow_legacy_metadata=True,
+            metadata_minimum=2,
+            metadata_limit=3,
+        )
+        for index, phase in enumerate(
+            trace_phases(
+                lines,
+                "CXP_TEAMS_LISTENER_PREP_IO_BEGIN",
+                "CXP_TEAMS_LISTENER_PREP_IO_END",
+            ),
+            1,
+        )
     )
 
     print(

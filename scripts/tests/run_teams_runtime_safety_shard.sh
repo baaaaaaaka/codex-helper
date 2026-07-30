@@ -8,9 +8,9 @@ case "${1:-}" in
     ;;
   store)
     go test ./internal/teams -count=1 \
-      -run '^TestTeamsRuntimeSafety(RuntimeResolver|Legacy|Canonical|Discovery|SuccessfulMigration|Migration|AutomaticTakeover|ListenerPreparation|TakeoverSummary|BridgeListenUsesCanonical)' -v
+      -run '^(TestTeamsRuntimeSafety|TestBridgeRuntimeStoreTakeoverDrain)' -v
     go test ./internal/teams/store -count=1 \
-      -run '^TestStoreLoadPropagatesContextPastStateLock$' -v
+      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly)' -v
     ;;
   store-io)
     bash scripts/ci/teams_runtime_resolver_io_smoke.sh
