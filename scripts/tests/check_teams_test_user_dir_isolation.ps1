@@ -47,7 +47,14 @@ function Get-ProbeSnapshot {
       } else {
         ""
       }
-      "{0}|{1}|{2}|{3}|{4}|{5}" -f $_.FullName, $_.Attributes, $_.Length, $_.CreationTimeUtc.Ticks, $_.LastWriteTimeUtc.Ticks, $hash
+      $lastWriteTicks = if (-not $_.PSIsContainer) {
+        $_.LastWriteTimeUtc.Ticks
+      } else {
+        # NTFS directory LastWriteTime can be committed after the creating
+        # operation returns, so it is not a stable cross-process sentinel.
+        ""
+      }
+      "{0}|{1}|{2}|{3}|{4}|{5}" -f $_.FullName, $_.Attributes, $_.Length, $_.CreationTimeUtc.Ticks, $lastWriteTicks, $hash
     }
   }
   return ($items -join "`n")
@@ -65,10 +72,6 @@ try {
   New-Item -ItemType Directory -Force -Path (Join-Path $roots.XDG_CONFIG_HOME "go") | Out-Null
   Set-Content -LiteralPath (Join-Path $serviceDir "local-supervisor.json") -Value '{"version":1,"enabled":true,"spec":{"Executable":"C:\\opt\\cxp.exe","WorkingDir":"C:\\opt"}}'
 
-  # NTFS can expose a newly created directory before its LastWriteTime reflects
-  # the immediately following sentinel/subdirectory creation. Let fixture
-  # metadata settle before taking the immutable caller-owned baseline.
-  Start-Sleep -Milliseconds 250
   $before = Get-ProbeSnapshot
   foreach ($entry in $roots.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
