@@ -886,6 +886,14 @@ func quarantineTakeoverSource(scopeID string, source string) error {
 
 func takeoverSourceRoot(path string) string {
 	clean := filepath.Clean(path)
+	type sourceRoot struct{ path, name string }
+	roots := make([]sourceRoot, 0, 5)
+	if root, err := appdirs.LegacyConfigPath(); err == nil {
+		roots = append(roots, sourceRoot{path: root, name: "config"})
+	}
+	if root, err := appdirs.LegacyCachePath(); err == nil {
+		roots = append(roots, sourceRoot{path: root, name: "cache"})
+	}
 	for _, item := range []struct {
 		env  string
 		name string
@@ -894,7 +902,10 @@ func takeoverSourceRoot(path string) string {
 		{env: "XDG_CACHE_HOME", name: "cache"},
 		{env: "XDG_DATA_HOME", name: "data"},
 	} {
-		root := filepath.Clean(strings.TrimSpace(os.Getenv(item.env)))
+		roots = append(roots, sourceRoot{path: os.Getenv(item.env), name: item.name})
+	}
+	for _, item := range roots {
+		root := filepath.Clean(strings.TrimSpace(item.path))
 		if root != "" && root != "." && (clean == root || strings.HasPrefix(clean, root+string(filepath.Separator))) {
 			return item.name
 		}

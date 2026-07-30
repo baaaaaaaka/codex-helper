@@ -1084,6 +1084,12 @@ func snapshotRuntimeSafetyFiles(t *testing.T, root string) map[string]runtimeSaf
 		if entry.IsDir() {
 			return nil
 		}
+		if strings.HasSuffix(entry.Name(), ".lock") {
+			// Coordination locks are intentionally allowed during a deferred
+			// takeover and cannot be read while held on Windows. The invariant
+			// here is that durable store/config/ledger data is unchanged.
+			return nil
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err

@@ -4082,7 +4082,10 @@ func buildTeamsServiceWSLTaskLauncherPowerShell(taskName string, args []string, 
 	psName := stem + ".ps1"
 	vbsName := stem + ".vbs"
 	psScript := buildTeamsServiceWSLTaskPowerShellScript(taskName, args)
-	cmd := "$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
+	cmd := "$localAppData = [Environment]::GetFolderPath('LocalApplicationData'); " +
+		"if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = $env:LOCALAPPDATA }; " +
+		"if ([string]::IsNullOrWhiteSpace($localAppData)) { throw 'LocalApplicationData is unavailable for the Teams WSL Scheduled Task launcher' }; " +
+		"$appDir = Join-Path $localAppData 'codex-helper\\teams'; " +
 		"$launcherPowerShellPath = Join-Path $appDir " + powershellSingleQuote(psName) + "; " +
 		"$launcherVbsPath = Join-Path $appDir " + powershellSingleQuote(vbsName) + "; " +
 		"$expectedLauncherPowerShell = " + powershellSingleQuote(psScript) + "; " +

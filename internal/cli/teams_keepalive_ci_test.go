@@ -961,8 +961,9 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 	}
 	config := string(configData)
 	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
+	wantInvocationDir := teamsServiceTestAbsPath(t, "/home/alice/work dir")
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
-	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/teams registry.json")
+	wantRegistry := teamsServiceTestRegistryPath(wantInvocationDir, "/home/alice/teams registry.json")
 	for _, want := range []string{
 		"Command=wsl.exe",
 		"-d Ubuntu/Dev",

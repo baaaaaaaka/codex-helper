@@ -7231,8 +7231,9 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 	}
 	config := string(data)
 	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
+	wantInvocationDir := teamsServiceTestAbsPath(t, "/home/alice/work dir")
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
-	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/registry.json")
+	wantRegistry := teamsServiceTestRegistryPath(wantInvocationDir, "/home/alice/registry.json")
 	for _, want := range []string{
 		"TaskName=Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice default ",
 		"Command=wsl.exe",
