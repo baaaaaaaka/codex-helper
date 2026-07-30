@@ -3868,14 +3868,25 @@ func existingTeamsStorePathsReadOnly() ([]string, error) {
 }
 
 func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
-	paths, err := existingTeamsStorePathsReadOnly()
+	defaultPath, err := teamsstore.DefaultPathReadOnly()
 	if err != nil {
 		return nil, err
 	}
+	paths := []string{defaultPath}
+	paths, err = appendGlobMatches(
+		paths,
+		mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "state.json")),
+	)
+	if err != nil {
+		return nil, err
+	}
+	paths = uniquePaths(paths)
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if teamsStatusStoreLayer(path) == "legacy" {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 			continue
+		} else if err != nil {
+			return nil, err
 		}
 		out = append(out, path)
 	}
