@@ -6,12 +6,30 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_HELPER") == "1" {
+		readyPath := os.Getenv("CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_READY")
+		if readyPath == "" {
+			os.Exit(2)
+		}
+		if err := os.WriteFile(readyPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0o600); err != nil {
+			os.Exit(2)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	if os.Getenv("CXP_TEAMS_TEST_PRESERVE_USER_DIRS") == "1" {
+		code := m.Run()
+		_ = codexhistory.CloseCaches()
+		os.Exit(code)
+	}
 	tmp, err := os.MkdirTemp("", "codex-helper-cli-tests-")
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "create CLI test temp dir: %v\n", err)

@@ -47,3 +47,16 @@ docker run --rm \
   -test.run '^TestTeamsRuntimeSafetyExactLegacyWriterFenceRealProcessDockerCI$' \
   -test.count=1 \
   -test.v
+docker run --rm \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 64 \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  --env CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER=1 \
+  --entrypoint /teams-runtime-safety-cli.test \
+  "$image" \
+  -test.run '^TestTeamsRuntimeSafetySupervisorFencePreventsChildRestartRealProcessDockerCI$' \
+  -test.count=1 \
+  -test.v

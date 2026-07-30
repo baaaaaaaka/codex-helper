@@ -19,6 +19,8 @@ const (
 	teamsTakeoverRealProcessDockerEnv = "CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER"
 	teamsTakeoverWriterHelperEnv      = "CXP_TEAMS_CLI_TAKEOVER_WRITER_HELPER"
 	teamsTakeoverWriterReadyEnv       = "CXP_TEAMS_CLI_TAKEOVER_WRITER_READY"
+	teamsTakeoverSupervisorHelperEnv  = "CXP_TEAMS_TAKEOVER_SUPERVISOR_HELPER"
+	teamsTakeoverSupervisorConfigEnv  = "CXP_TEAMS_TAKEOVER_SUPERVISOR_CONFIG"
 )
 
 func TestTeamsServiceTakeoverWriterProcessHelper(t *testing.T) {
@@ -34,6 +36,19 @@ func TestTeamsServiceTakeoverWriterProcessHelper(t *testing.T) {
 	}
 	for {
 		time.Sleep(time.Second)
+	}
+}
+
+func TestTeamsServiceTakeoverSupervisorProcessHelper(t *testing.T) {
+	if os.Getenv(teamsTakeoverSupervisorHelperEnv) != "1" {
+		t.Skip("real-process supervisor helper")
+	}
+	configPath := os.Getenv(teamsTakeoverSupervisorConfigEnv)
+	if configPath == "" {
+		t.Fatal("supervisor config path is required")
+	}
+	if err := runTeamsServiceLocalSupervisor(context.Background(), configPath); err != nil {
+		t.Fatalf("run takeover supervisor helper: %v", err)
 	}
 }
 
@@ -131,5 +146,115 @@ func TestTeamsRuntimeSafetyExactLegacyWriterFenceRealProcessDockerCI(t *testing.
 	case <-unrelatedDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("unrelated helper did not stop during cleanup")
+	}
+}
+
+func TestTeamsRuntimeSafetySupervisorFencePreventsChildRestartRealProcessDockerCI(t *testing.T) {
+	if os.Getenv(teamsTakeoverRealProcessDockerEnv) != "1" {
+		t.Skip("runs only in the ephemeral Docker process-fencing shard")
+	}
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	cxpPath := filepath.Join(tmp, "cxp")
+	if err := os.Symlink(os.Args[0], cxpPath); err != nil {
+		t.Fatalf("create supervisor stable-entry symlink: %v", err)
+	}
+	childReady := filepath.Join(tmp, "supervisor-child.ready")
+	specEnv := teamsServiceCurrentProcessScopeEnvForTest()
+	specEnv["CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_HELPER"] = "1"
+	specEnv["CXP_TEAMS_TAKEOVER_SUPERVISOR_CHILD_READY"] = childReady
+	spec := teamsServiceSpec{
+		Executable:   cxpPath,
+		WorkingDir:   tmp,
+		RegistryPath: filepath.Join(tmp, "registry.json"),
+		Environment:  specEnv,
+	}
+	configPath, err := teamsServiceLocalSupervisorConfigPath()
+	if err != nil {
+		t.Fatalf("supervisor config path: %v", err)
+	}
+	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Enabled: true,
+		Spec:    spec,
+	}); err != nil {
+		t.Fatalf("write supervisor config: %v", err)
+	}
+
+	supervisor := &exec.Cmd{
+		Path: os.Args[0],
+		Args: []string{
+			cxpPath,
+			"-test.run=^TestTeamsServiceTakeoverSupervisorProcessHelper$",
+			"-test.count=1",
+			"teams", "service", "local-supervisor", "--config", configPath,
+		},
+		Env: append(
+			os.Environ(),
+			"CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1",
+			teamsTakeoverSupervisorHelperEnv+"=1",
+			teamsTakeoverSupervisorConfigEnv+"="+configPath,
+		),
+	}
+	configureTargetProcessGroup(supervisor)
+	if err := supervisor.Start(); err != nil {
+		t.Fatalf("start real supervisor: %v", err)
+	}
+	supervisorDone := make(chan struct{})
+	go func() {
+		_ = supervisor.Wait()
+		close(supervisorDone)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-supervisorDone:
+		default:
+			_ = supervisor.Process.Kill()
+			<-supervisorDone
+		}
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	var status teamsServiceLocalSupervisorStatus
+	for {
+		if _, err := os.Stat(childReady); err == nil {
+			if current, ok, readErr := readTeamsServiceLocalSupervisorStatus(); readErr == nil && ok && current.ChildPID > 0 {
+				status = current
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("real supervisor child did not become ready")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	initialChildPID := status.ChildPID
+	now := time.Now()
+	state := store.State{ServiceOwner: &store.OwnerMetadata{
+		PID:            initialChildPID,
+		ExecutablePath: cxpPath,
+		StartedAt:      now,
+		LastHeartbeat:  now,
+	}}
+	fence, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec)
+	if err != nil {
+		t.Fatalf("validate supervisor-owned writer: %v", err)
+	}
+	if err := teamsServiceFenceLegacyStoreWriters(context.Background(), fence, spec); err != nil {
+		t.Fatalf("fence owning supervisor: %v", err)
+	}
+	select {
+	case <-supervisorDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("owning supervisor remained alive after fencing")
+	}
+	time.Sleep(2 * time.Second)
+	if current, ok, err := readTeamsServiceLocalSupervisorStatus(); err != nil {
+		t.Fatalf("read stopped supervisor status: %v", err)
+	} else if !ok || current.SupervisorPID != 0 || current.ChildPID != 0 || current.State != "stopped" {
+		t.Fatalf("stopped supervisor status = %#v", current)
+	}
+	if err := syscall.Kill(initialChildPID, 0); err == nil {
+		t.Fatalf("legacy child pid %d remained alive or was restarted", initialChildPID)
 	}
 }

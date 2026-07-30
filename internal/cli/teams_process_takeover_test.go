@@ -835,7 +835,11 @@ func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t 
 	isolateTeamsUserDirsForTest(t, tmp)
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "linux"})
 	previousList := teamsServiceListLocalProcesses
-	t.Cleanup(func() { teamsServiceListLocalProcesses = previousList })
+	previousLookup := teamsServiceLookupLocalProcess
+	t.Cleanup(func() {
+		teamsServiceListLocalProcesses = previousList
+		teamsServiceLookupLocalProcess = previousLookup
+	})
 
 	const ownerPID = 424242
 	executable := filepath.Join(tmp, "bin", "cxp")
@@ -857,7 +861,14 @@ func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t 
 	}
 
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
-		return []teamsServiceLocalProcess{matching}, nil
+		t.Fatal("legacy writer validation enumerated all processes")
+		return nil, nil
+	}
+	teamsServiceLookupLocalProcess = func(pid int) (teamsServiceLocalProcess, bool, error) {
+		if pid != ownerPID {
+			return teamsServiceLocalProcess{}, false, nil
+		}
+		return matching, true, nil
 	}
 	fence, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec)
 	if err != nil {
@@ -867,7 +878,9 @@ func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t 
 		t.Fatalf("validated writer fence = %#v", fence)
 	}
 
-	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) { return nil, nil }
+	teamsServiceLookupLocalProcess = func(int) (teamsServiceLocalProcess, bool, error) {
+		return teamsServiceLocalProcess{}, false, nil
+	}
 	if _, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
 		!strings.Contains(err.Error(), "not visible from the current PID namespace") {
 		t.Fatalf("invisible writer error = %v", err)
@@ -876,19 +889,16 @@ func TestTeamsServiceValidateLegacyStoreWritersRequiresVisibleManagedIdentity(t 
 		Draining:         true,
 		DrainOperationID: "runtime-store-takeover:scope_test",
 	}
-	fence, err = teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec)
-	if err != nil {
-		t.Fatalf("writer that exited after persisted takeover drain rejected: %v", err)
-	}
-	if len(fence.Writers) != 0 {
-		t.Fatalf("writer fence after drained process exit = %#v, want empty", fence)
+	if _, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
+		!strings.Contains(err.Error(), "not visible from the current PID namespace") {
+		t.Fatalf("persisted drain bypassed exact writer validation: %v", err)
 	}
 	state.ServiceControl = teamsstore.ServiceControl{}
 
 	mismatch := matching
 	mismatch.Env = map[string]string{}
-	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
-		return []teamsServiceLocalProcess{mismatch}, nil
+	teamsServiceLookupLocalProcess = func(int) (teamsServiceLocalProcess, bool, error) {
+		return mismatch, true, nil
 	}
 	if _, err := teamsServiceValidateLegacyStoreWriters(context.Background(), state, spec); err == nil ||
 		!strings.Contains(err.Error(), "does not match the managed profile") {
@@ -903,9 +913,13 @@ func TestTeamsServiceFenceLegacyStoreWritersStopsOnlyValidatedProcessGeneration(
 	isolateTeamsUserDirsForTest(t, tmp)
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "linux"})
 	previousList := teamsServiceListLocalProcesses
+	previousLookup := teamsServiceLookupLocalProcess
+	previousFenceSupervisor := teamsServiceFenceSupervisorChild
 	previousTerminate := teamsServiceTerminateLocalProcess
 	t.Cleanup(func() {
 		teamsServiceListLocalProcesses = previousList
+		teamsServiceLookupLocalProcess = previousLookup
+		teamsServiceFenceSupervisorChild = previousFenceSupervisor
 		teamsServiceTerminateLocalProcess = previousTerminate
 	})
 
@@ -927,7 +941,19 @@ func TestTeamsServiceFenceLegacyStoreWritersStopsOnlyValidatedProcessGeneration(
 		},
 	}
 	teamsServiceListLocalProcesses = func() ([]teamsServiceLocalProcess, error) {
-		return append([]teamsServiceLocalProcess(nil), processes...), nil
+		t.Fatal("legacy writer fencing enumerated all processes")
+		return nil, nil
+	}
+	teamsServiceLookupLocalProcess = func(pid int) (teamsServiceLocalProcess, bool, error) {
+		for _, process := range processes {
+			if process.PID == pid {
+				return process, true, nil
+			}
+		}
+		return teamsServiceLocalProcess{}, false, nil
+	}
+	teamsServiceFenceSupervisorChild = func(context.Context, int) (bool, error) {
+		return false, nil
 	}
 	var terminated []int
 	teamsServiceTerminateLocalProcess = func(pid int, _ time.Duration) error {
@@ -955,5 +981,60 @@ func TestTeamsServiceFenceLegacyStoreWritersStopsOnlyValidatedProcessGeneration(
 	}
 	if len(terminated) != 0 {
 		t.Fatalf("recycled pid was terminated: %v", terminated)
+	}
+}
+
+func TestTeamsServiceFenceLegacyStoreWriterStopsOwningSupervisorBeforeChildCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{goos: "linux"})
+	previousLookup := teamsServiceLookupLocalProcess
+	previousFenceSupervisor := teamsServiceFenceSupervisorChild
+	previousTerminate := teamsServiceTerminateLocalProcess
+	t.Cleanup(func() {
+		teamsServiceLookupLocalProcess = previousLookup
+		teamsServiceFenceSupervisorChild = previousFenceSupervisor
+		teamsServiceTerminateLocalProcess = previousTerminate
+	})
+
+	const writerPID = 6201
+	executable := filepath.Join(tmp, "bin", "cxp")
+	env := teamsServiceCurrentProcessScopeEnvForTest()
+	spec := teamsServiceSpec{Executable: executable, Environment: env}
+	teamsServiceLookupLocalProcess = func(pid int) (teamsServiceLocalProcess, bool, error) {
+		if pid != writerPID {
+			return teamsServiceLocalProcess{}, false, nil
+		}
+		return teamsServiceLocalProcess{
+			PID:       writerPID,
+			StartTime: "boot-6201",
+			Args:      []string{executable, "teams", "run", "--auto-service=false"},
+			Env:       env,
+		}, true, nil
+	}
+	var fencedSupervisorFor int
+	teamsServiceFenceSupervisorChild = func(_ context.Context, pid int) (bool, error) {
+		fencedSupervisorFor = pid
+		return true, nil
+	}
+	teamsServiceTerminateLocalProcess = func(int, time.Duration) error {
+		t.Fatal("fencer terminated only the child after identifying its owning supervisor")
+		return nil
+	}
+
+	err := teamsServiceFenceLegacyStoreWriters(context.Background(), teams.AutomaticScopeTakeoverFence{
+		Writers: []teams.AutomaticScopeTakeoverWriter{{
+			PID:              writerPID,
+			ProcessStartTime: "boot-6201",
+			ExecutablePath:   executable,
+		}},
+	}, spec)
+	if err != nil {
+		t.Fatalf("fence supervisor-owned legacy writer: %v", err)
+	}
+	if fencedSupervisorFor != writerPID {
+		t.Fatalf("supervisor fencer child pid = %d, want %d", fencedSupervisorFor, writerPID)
 	}
 }
