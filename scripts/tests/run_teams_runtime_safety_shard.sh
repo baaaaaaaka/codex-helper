@@ -10,9 +10,9 @@ case "${1:-}" in
     ;;
   store)
     go test ./internal/teams -count=1 \
-      -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|AutomaticTakeover|BackupConflict|OutboundReplayFence|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
+      -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|LegacyConfig|LegacyOnly|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|Malformed|AutomaticTakeover|BackupConflict|DualStore|OutboundReplayFence|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
     go test ./internal/teams/store -count=1 \
-      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly)' -v
+      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly|TestLoadPathOfflineRecoveryReadOnly)' -v
     ;;
   store-io)
     bash scripts/ci/teams_runtime_resolver_io_smoke.sh

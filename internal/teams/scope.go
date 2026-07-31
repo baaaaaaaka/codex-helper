@@ -1054,21 +1054,84 @@ func storeSidecarNames() []string {
 	}
 }
 
+type migrationSourceKind uint8
+
+const (
+	migrationSourceStateScope migrationSourceKind = iota + 1
+	migrationSourceLegacyConfigScope
+	migrationSourceLegacyGlobal
+)
+
+// migrationSourceLayout is the single description of a store that may seed an
+// offline runtime migration. Keep this narrower than the maintenance resolver:
+// migration code must never infer registry or ledger roots from an arbitrary
+// state.json path.
+type migrationSourceLayout struct {
+	StorePath          string
+	RegistryPath       string
+	RegistryInScopeDir bool
+	Kind               migrationSourceKind
+}
+
+func migrationSourceLayoutForStore(storePath string) (migrationSourceLayout, error) {
+	clean := filepath.Clean(strings.TrimSpace(storePath))
+	if clean == "." || filepath.Base(clean) != "state.json" {
+		return migrationSourceLayout{}, fmt.Errorf("unsupported Teams migration store path %q", storePath)
+	}
+	scopeDir := filepath.Dir(clean)
+	if root, err := appdirs.StatePath("teams", "scopes"); err == nil && directChildPath(root, scopeDir) {
+		return migrationSourceLayout{
+			StorePath:          clean,
+			RegistryPath:       filepath.Join(scopeDir, "registry.json"),
+			RegistryInScopeDir: true,
+			Kind:               migrationSourceStateScope,
+		}, nil
+	}
+	if root, err := appdirs.LegacyConfigPath("teams", "scopes"); err == nil && directChildPath(root, scopeDir) {
+		scopePart := filepath.Base(scopeDir)
+		registryPath, err := appdirs.LegacyCachePath("teams", "scopes", scopePart, "registry.json")
+		if err != nil {
+			return migrationSourceLayout{}, err
+		}
+		return migrationSourceLayout{
+			StorePath:    clean,
+			RegistryPath: registryPath,
+			Kind:         migrationSourceLegacyConfigScope,
+		}, nil
+	}
+	if isDefaultGlobalStorePath(clean) {
+		registryPath, ok := legacyGlobalRegistryPathForMigrationSource()
+		if !ok {
+			var err error
+			registryPath, err = appdirs.StatePath("teams", "registry.json")
+			if err != nil {
+				return migrationSourceLayout{}, err
+			}
+		}
+		return migrationSourceLayout{
+			StorePath:    clean,
+			RegistryPath: registryPath,
+			Kind:         migrationSourceLegacyGlobal,
+		}, nil
+	}
+	return migrationSourceLayout{}, fmt.Errorf("unsupported Teams migration source layout %s", clean)
+}
+
+func directChildPath(root string, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil || rel == "." || filepath.IsAbs(rel) ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !strings.ContainsRune(rel, filepath.Separator)
+}
+
 func registryPathForStoreMigrationSource(storePath string) (string, bool) {
-	if registryPath, ok := legacyRegistryPathForScopeStore(storePath); ok {
-		return registryPath, true
-	}
-	if !isDefaultGlobalStorePath(storePath) {
-		return "", false
-	}
-	if path, ok := legacyGlobalRegistryPathForMigrationSource(); ok {
-		return path, true
-	}
-	path, err := appdirs.StatePath("teams", "registry.json")
+	layout, err := migrationSourceLayoutForStore(storePath)
 	if err != nil {
 		return "", false
 	}
-	return path, true
+	return layout.RegistryPath, strings.TrimSpace(layout.RegistryPath) != ""
 }
 
 func legacyGlobalRegistryPathForMigrationSource() (string, bool) {

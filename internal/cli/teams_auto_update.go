@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -222,14 +223,14 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 func preflightPersistedTeamsServiceForUpdate() error {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
-		return nil
+		return fmt.Errorf("select persisted Teams service backend: %w", err)
 	}
 	path, err := backend.Path()
 	if err != nil {
-		return nil
+		return fmt.Errorf("resolve persisted Teams service configuration path: %w", err)
 	}
 	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return fmt.Errorf("inspect persisted Teams service configuration %s: %w", path, err)
@@ -248,20 +249,15 @@ func preflightPersistedTeamsServiceForUpdate() error {
 		return fmt.Errorf("persisted Teams service WorkingDir %s is not a directory", workingDir)
 	}
 	executable := strings.TrimSpace(contract.Executable)
-	switch backend.ID() {
-	case teamsServiceLocalSupervisorID, "systemd-user", "launchagent":
-		if executable == "" {
-			return fmt.Errorf("persisted Teams service executable is empty")
-		}
+	if executable == "" {
+		return fmt.Errorf("persisted Teams service executable is empty; run `cxp teams service repair` before updating")
 	}
-	if executable != "" {
-		if info, err := os.Stat(executable); err != nil {
-			return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
-		} else if info.IsDir() {
-			return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
-		} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
-			return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
-		}
+	if info, err := os.Stat(executable); err != nil {
+		return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
+	} else if info.IsDir() {
+		return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
+	} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
 	}
 	if registryPath := strings.TrimSpace(contract.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
 		return fmt.Errorf("persisted Teams service registry path must be absolute: %s", registryPath)
@@ -320,9 +316,7 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 			RegistryPath: registryArgumentValue(arguments),
 		}, nil
 	case "windows-task-scheduler":
-		return persistedTeamsServiceLaunchContract{
-			WorkingDir: persistedTeamsServiceXMLValue(text, "WorkingDirectory"),
-		}, nil
+		return readPersistedWindowsTaskLaunchContract(text)
 	case "wsl-windows-task-scheduler":
 		arguments := ""
 		for _, line := range strings.Split(text, "\n") {
@@ -339,13 +333,149 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "--cd" {
 				contract.WorkingDir = args[i+1]
-				break
 			}
 		}
+		executable, err := persistedWSLTeamsExecutable(args)
+		if err != nil {
+			return persistedTeamsServiceLaunchContract{}, err
+		}
+		contract.Executable = executable
 		return contract, nil
 	default:
 		return persistedTeamsServiceLaunchContract{}, fmt.Errorf("unsupported Teams service backend %q", backendID)
 	}
+}
+
+func persistedWSLTeamsExecutable(args []string) (string, error) {
+	execIndex := -1
+	for i, arg := range args {
+		if arg == "--exec" {
+			execIndex = i
+			break
+		}
+	}
+	if execIndex < 0 || execIndex+2 >= len(args) || args[execIndex+1] != "env" {
+		return "", fmt.Errorf("unknown persisted WSL Teams service format; run `cxp teams service repair`")
+	}
+	for i := execIndex + 2; i < len(args); i++ {
+		if strings.Contains(args[i], "=") {
+			continue
+		}
+		if i+2 >= len(args) || args[i+1] != "teams" || args[i+2] != "run" {
+			return "", fmt.Errorf("unknown persisted WSL Teams service command; run `cxp teams service repair`")
+		}
+		return args[i], nil
+	}
+	return "", fmt.Errorf("persisted WSL Teams service executable is missing; run `cxp teams service repair`")
+}
+
+func readPersistedWindowsTaskLaunchContract(text string) (persistedTeamsServiceLaunchContract, error) {
+	command := strings.TrimSpace(persistedTeamsServiceXMLValue(text, "Command"))
+	arguments := strings.TrimSpace(persistedTeamsServiceXMLValue(text, "Arguments"))
+	contract := persistedTeamsServiceLaunchContract{
+		WorkingDir: persistedTeamsServiceXMLValue(text, "WorkingDirectory"),
+	}
+	switch strings.ToLower(filepath.Base(command)) {
+	case "":
+		return persistedTeamsServiceLaunchContract{}, fmt.Errorf("persisted Windows Teams task command is missing; run `cxp teams service repair`")
+	case "wscript.exe", "wscript":
+		args, err := splitWindowsCommandLine(arguments)
+		if err != nil || len(args) != 3 ||
+			!strings.EqualFold(args[0], "//B") ||
+			!strings.EqualFold(args[1], "//Nologo") {
+			return persistedTeamsServiceLaunchContract{}, fmt.Errorf("unknown persisted Windows Teams launcher format; run `cxp teams service repair`")
+		}
+		psPath, err := persistedWindowsPowerShellPathFromVBS(args[2])
+		if err != nil {
+			return persistedTeamsServiceLaunchContract{}, err
+		}
+		return persistedWindowsPowerShellLaunchContract(psPath, contract)
+	case "powershell.exe", "powershell":
+		executable, argumentLine, err := persistedTeamsExecutableFromPowerShell(arguments)
+		if err != nil {
+			return persistedTeamsServiceLaunchContract{}, err
+		}
+		contract.Executable = executable
+		if args, splitErr := splitWindowsCommandLine(argumentLine); splitErr == nil {
+			contract.RegistryPath = registryArgumentValue(args)
+		}
+		return contract, nil
+	default:
+		contract.Executable = command
+		if args, err := splitWindowsCommandLine(arguments); err == nil {
+			contract.RegistryPath = registryArgumentValue(args)
+		}
+		return contract, nil
+	}
+}
+
+func persistedWindowsPowerShellPathFromVBS(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read persisted Windows Teams VBS launcher %s: %w", path, err)
+	}
+	const marker = `-File " & Q("`
+	text := string(data)
+	start := strings.Index(text, marker)
+	if start < 0 {
+		return "", fmt.Errorf("unknown persisted Windows Teams VBS launcher format; run `cxp teams service repair`")
+	}
+	start += len(marker)
+	end := strings.Index(text[start:], `")`)
+	if end < 0 {
+		return "", fmt.Errorf("unknown persisted Windows Teams VBS launcher format; run `cxp teams service repair`")
+	}
+	return strings.ReplaceAll(text[start:start+end], `""`, `"`), nil
+}
+
+func persistedWindowsPowerShellLaunchContract(path string, contract persistedTeamsServiceLaunchContract) (persistedTeamsServiceLaunchContract, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return persistedTeamsServiceLaunchContract{}, fmt.Errorf("read persisted Windows Teams PowerShell launcher %s: %w", path, err)
+	}
+	executable, argumentLine, err := persistedTeamsExecutableFromPowerShell(string(data))
+	if err != nil {
+		return persistedTeamsServiceLaunchContract{}, err
+	}
+	contract.Executable = executable
+	if args, splitErr := splitWindowsCommandLine(argumentLine); splitErr == nil {
+		contract.RegistryPath = registryArgumentValue(args)
+	}
+	return contract, nil
+}
+
+func persistedTeamsExecutableFromPowerShell(text string) (string, string, error) {
+	executable, ok := persistedPowerShellSingleQuotedValue(text, "Start-Process -FilePath ")
+	if !ok {
+		return "", "", fmt.Errorf("unknown persisted Windows Teams PowerShell launcher format; run `cxp teams service repair`")
+	}
+	argumentLine, _ := persistedPowerShellSingleQuotedValue(text, "$argumentLine = ")
+	return executable, argumentLine, nil
+}
+
+func persistedPowerShellSingleQuotedValue(text string, marker string) (string, bool) {
+	start := strings.Index(text, marker)
+	if start < 0 {
+		return "", false
+	}
+	rest := strings.TrimSpace(text[start+len(marker):])
+	if rest == "" || rest[0] != '\'' {
+		return "", false
+	}
+	var value strings.Builder
+	for i := 1; i < len(rest); i++ {
+		if rest[i] != '\'' {
+			value.WriteByte(rest[i])
+			continue
+		}
+		if i+1 < len(rest) && rest[i+1] == '\'' {
+			value.WriteByte('\'')
+			i++
+			continue
+		}
+		return value.String(), true
+	}
+	return "", false
 }
 
 func splitPersistedTeamsServiceSystemdArgs(line string) ([]string, error) {

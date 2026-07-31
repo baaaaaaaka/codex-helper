@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 const (
@@ -820,6 +820,36 @@ func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path stri
 		return RuntimeMetadata{}, err
 	}
 	defer conn.Close()
+	return loadSQLiteRuntimeMetadataConn(ctx, conn)
+}
+
+func loadSQLiteRuntimeMetadataFileOfflineRecoveryReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recoveryNeeded, err := sqliteOfflineRecoveryNeeded(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if !recoveryNeeded {
+		return loadSQLiteRuntimeMetadataFileReadOnly(ctx, path)
+	}
+	reader, err := openSQLiteOfflineRecoveryReader(ctx, path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	metadata, loadErr := loadSQLiteRuntimeMetadataConn(ctx, reader.readConn)
+	closeErr := reader.Close()
+	if loadErr != nil {
+		return RuntimeMetadata{}, loadErr
+	}
+	if closeErr != nil {
+		return RuntimeMetadata{}, closeErr
+	}
+	return metadata, nil
+}
+
+func loadSQLiteRuntimeMetadataConn(ctx context.Context, conn *sql.Conn) (RuntimeMetadata, error) {
 	if sqliteRuntimeMetadataConnectionTestHook != nil {
 		sqliteRuntimeMetadataConnectionTestHook()
 	}
@@ -1159,6 +1189,168 @@ func loadSQLiteStateFileReadOnlyAttempt(ctx context.Context, path string, immuta
 	return loadSQLiteStateRows(ctx, db)
 }
 
+func loadSQLiteStateFileOfflineRecoveryReadOnly(ctx context.Context, path string) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recoveryNeeded, err := sqliteOfflineRecoveryNeeded(path)
+	if err != nil {
+		return State{}, err
+	}
+	if !recoveryNeeded {
+		return loadSQLiteStateFileReadOnly(ctx, path)
+	}
+	reader, err := openSQLiteOfflineRecoveryReader(ctx, path)
+	if err != nil {
+		return State{}, err
+	}
+	if err := validateSQLiteRequiredTablesContext(ctx, reader.readConn); err != nil {
+		_ = reader.Close()
+		return State{}, err
+	}
+	state, loadErr := loadSQLiteStateRows(ctx, reader.readConn)
+	closeErr := reader.Close()
+	if loadErr != nil {
+		return State{}, loadErr
+	}
+	if closeErr != nil {
+		return State{}, closeErr
+	}
+	return state, nil
+}
+
+func sqliteOfflineRecoveryNeeded(path string) (bool, error) {
+	walInfo, err := os.Lstat(path + "-wal")
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if walInfo.Mode()&os.ModeSymlink != 0 || !walInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("sqlite WAL is not a regular file: %s", path+"-wal")
+	}
+	if walInfo.Size() == 0 {
+		return false, nil
+	}
+	shmInfo, err := os.Lstat(path + "-shm")
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if shmInfo.Mode()&os.ModeSymlink != 0 || !shmInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("sqlite SHM is not a regular file: %s", path+"-shm")
+	}
+	return false, nil
+}
+
+func configureSQLiteOfflineRecoveryConnection(ctx context.Context, conn *sql.Conn) error {
+	if err := conn.Raw(func(driverConn any) error {
+		control, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return errors.New("sqlite driver does not support persistent WAL control")
+		}
+		_, err := control.FileControlPersistWAL("main", 1)
+		return err
+	}); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`)
+	return err
+}
+
+type sqliteOfflineRecoveryReader struct {
+	anchorDB   *sql.DB
+	anchorConn *sql.Conn
+	readDB     *sql.DB
+	readConn   *sql.Conn
+}
+
+func openSQLiteOfflineRecoveryReader(ctx context.Context, path string) (*sqliteOfflineRecoveryReader, error) {
+	if err := validateExistingSQLiteStorePath(path); err != nil {
+		return nil, err
+	}
+	reader := &sqliteOfflineRecoveryReader{}
+	var err error
+	reader.anchorDB, err = openSQLiteHandle(path, false)
+	if err != nil {
+		return nil, err
+	}
+	reader.anchorConn, err = reader.anchorDB.Conn(ctx)
+	if err != nil {
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	if err := configureSQLiteOfflineRecoveryConnection(ctx, reader.anchorConn); err != nil {
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+
+	query := url.Values{}
+	query.Set("mode", "ro")
+	reader.readDB, err = sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	reader.readDB.SetMaxOpenConns(1)
+	reader.readDB.SetMaxIdleConns(0)
+	reader.readConn, err = reader.readDB.Conn(ctx)
+	if err != nil {
+		_ = reader.readDB.Close()
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	if _, err := reader.readConn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+	return reader, nil
+}
+
+func (r *sqliteOfflineRecoveryReader) Close() error {
+	if r == nil {
+		return nil
+	}
+	var first error
+	for _, closeFn := range []func() error{
+		func() error {
+			if r.anchorConn == nil {
+				return nil
+			}
+			return r.anchorConn.Close()
+		},
+		func() error {
+			if r.anchorDB == nil {
+				return nil
+			}
+			return r.anchorDB.Close()
+		},
+		func() error {
+			if r.readConn == nil {
+				return nil
+			}
+			return r.readConn.Close()
+		},
+		func() error {
+			if r.readDB == nil {
+				return nil
+			}
+			return r.readDB.Close()
+		},
+	} {
+		if err := closeFn(); first == nil && err != nil {
+			first = err
+		}
+	}
+	return first
+}
+
 func (s *Store) writeSQLiteStateFile(path string, state State) error {
 	db, err := openSQLiteStore(path, true)
 	if err != nil {
@@ -1349,7 +1541,9 @@ func validateSQLiteRequiredTables(db *sql.DB) error {
 	return validateSQLiteRequiredTablesContext(context.Background(), db)
 }
 
-func validateSQLiteRequiredTablesContext(ctx context.Context, db *sql.DB) error {
+func validateSQLiteRequiredTablesContext(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) error {
 	for _, table := range sqliteRequiredTables {
 		var name string
 		err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
@@ -1750,7 +1944,10 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	return loadSQLiteStateRows(ctx, db)
 }
 
-func loadSQLiteStateRows(ctx context.Context, db *sql.DB) (State, error) {
+func loadSQLiteStateRows(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, error) {
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
 		return State{}, err

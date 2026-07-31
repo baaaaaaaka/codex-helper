@@ -265,6 +265,224 @@ func TestTeamsRuntimeSafetyAutoUpdatePreflightsNativeServiceWorkingDirCI(t *test
 	}
 }
 
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsWSLServiceExecutableCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		exe:            exe,
+		argv0:          exe,
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		runner:         &recordingTeamsServiceRunner{},
+	})
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("select WSL backend: %v", err)
+	}
+	path, err := backend.Path()
+	if err != nil {
+		t.Fatalf("WSL backend path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir WSL task dir: %v", err)
+	}
+	spec := teamsServiceSpec{Executable: exe, WorkingDir: tmp, Environment: map[string]string{"HTTPS_PROXY": "https://proxy.example"}}
+	if err := os.WriteFile(path, []byte(buildTeamsServiceWSLTaskConfig(backend.Name(), buildTeamsServiceWSLArguments(spec))), 0o600); err != nil {
+		t.Fatalf("write WSL task config: %v", err)
+	}
+	if err := preflightPersistedTeamsServiceForUpdate(); err != nil {
+		t.Fatalf("valid WSL task preflight: %v", err)
+	}
+	if err := os.Remove(exe); err != nil {
+		t.Fatalf("remove WSL helper executable: %v", err)
+	}
+	if err := preflightPersistedTeamsServiceForUpdate(); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "executable") {
+		t.Fatalf("missing WSL executable preflight error = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(
+		"TaskName="+backend.Name()+"\nCommand=wsl.exe\nArguments=-d Ubuntu -- true\n",
+	), 0o600); err != nil {
+		t.Fatalf("write unknown WSL task format: %v", err)
+	}
+	if err := preflightPersistedTeamsServiceForUpdate(); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "repair") {
+		t.Fatalf("unknown WSL format preflight error = %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsWindowsTaskLaunchChainCI(t *testing.T) {
+	lockCLITestHooks(t)
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, path string, spec teamsServiceSpec)
+	}{
+		{
+			name: "direct",
+			write: func(t *testing.T, path string, spec teamsServiceSpec) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
+					t.Fatalf("write direct Windows task: %v", err)
+				}
+			},
+		},
+		{
+			name: "inline-powershell",
+			write: func(t *testing.T, path string, spec teamsServiceSpec) {
+				t.Helper()
+				spec.Environment = map[string]string{"HTTPS_PROXY": "https://proxy.example"}
+				if err := os.WriteFile(path, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
+					t.Fatalf("write inline PowerShell task: %v", err)
+				}
+			},
+		},
+		{
+			name: "vbs-powershell-chain",
+			write: func(t *testing.T, path string, spec teamsServiceSpec) {
+				t.Helper()
+				spec = teamsServiceSpecWithWindowsTaskLaunchers(spec, path, filepath.Join(filepath.Dir(path), "watchdog.xml"))
+				if err := writeTeamsServiceWindowsTaskLauncherFiles(
+					spec.WindowsTaskLauncherPath,
+					spec,
+					buildTeamsServiceRunArgs(spec),
+				); err != nil {
+					t.Fatalf("write Windows launcher chain: %v", err)
+				}
+				if err := os.WriteFile(path, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
+					t.Fatalf("write launcher Windows task: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			exe := filepath.Join(tmp, "bin", "codex-proxy.exe")
+			writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:           "windows",
+				exe:            exe,
+				argv0:          exe,
+				cwd:            tmp,
+				windowsTaskDir: filepath.Join(tmp, "tasks"),
+				runner:         &recordingTeamsServiceRunner{},
+			})
+			backend, err := teamsServiceBackendForCurrentPlatform()
+			if err != nil {
+				t.Fatalf("select Windows backend: %v", err)
+			}
+			path, err := backend.Path()
+			if err != nil {
+				t.Fatalf("Windows backend path: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir Windows task dir: %v", err)
+			}
+			tc.write(t, path, teamsServiceSpec{Executable: exe, WorkingDir: tmp})
+			if err := preflightPersistedTeamsServiceForUpdate(); err != nil {
+				t.Fatalf("valid Windows task preflight: %v", err)
+			}
+		})
+	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdateRejectsMissingOrUnknownWindowsTaskLauncherCI(t *testing.T) {
+	lockCLITestHooks(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, path string, spec teamsServiceSpec)
+	}{
+		{
+			name: "missing-vbs",
+			mutate: func(t *testing.T, _ string, spec teamsServiceSpec) {
+				t.Helper()
+				if err := os.Remove(spec.WindowsTaskLauncherPath); err != nil {
+					t.Fatalf("remove VBS launcher: %v", err)
+				}
+			},
+		},
+		{
+			name: "unknown-vbs",
+			mutate: func(t *testing.T, _ string, spec teamsServiceSpec) {
+				t.Helper()
+				if err := os.WriteFile(spec.WindowsTaskLauncherPath, []byte(`WScript.Echo "unknown"`), 0o600); err != nil {
+					t.Fatalf("replace VBS launcher: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing-powershell",
+			mutate: func(t *testing.T, _ string, spec teamsServiceSpec) {
+				t.Helper()
+				psPath := strings.TrimSuffix(spec.WindowsTaskLauncherPath, filepath.Ext(spec.WindowsTaskLauncherPath)) + ".ps1"
+				if err := os.Remove(psPath); err != nil {
+					t.Fatalf("remove PowerShell launcher: %v", err)
+				}
+			},
+		},
+		{
+			name: "missing-helper",
+			mutate: func(t *testing.T, _ string, spec teamsServiceSpec) {
+				t.Helper()
+				if err := os.Remove(spec.Executable); err != nil {
+					t.Fatalf("remove helper executable: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			exe := filepath.Join(tmp, "bin", "codex-proxy.exe")
+			writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:           "windows",
+				exe:            exe,
+				argv0:          exe,
+				cwd:            tmp,
+				windowsTaskDir: filepath.Join(tmp, "tasks"),
+				runner:         &recordingTeamsServiceRunner{},
+			})
+			backend, err := teamsServiceBackendForCurrentPlatform()
+			if err != nil {
+				t.Fatalf("select Windows backend: %v", err)
+			}
+			path, err := backend.Path()
+			if err != nil {
+				t.Fatalf("Windows backend path: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir Windows task dir: %v", err)
+			}
+			spec := teamsServiceSpecWithWindowsTaskLaunchers(
+				teamsServiceSpec{Executable: exe, WorkingDir: tmp},
+				path,
+				filepath.Join(filepath.Dir(path), "watchdog.xml"),
+			)
+			if err := writeTeamsServiceWindowsTaskLauncherFiles(spec.WindowsTaskLauncherPath, spec, buildTeamsServiceRunArgs(spec)); err != nil {
+				t.Fatalf("write Windows launcher chain: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(buildTeamsServiceWindowsTaskXML(spec)), 0o600); err != nil {
+				t.Fatalf("write Windows task: %v", err)
+			}
+			tc.mutate(t, path, spec)
+			if err := preflightPersistedTeamsServiceForUpdate(); err == nil ||
+				(!strings.Contains(strings.ToLower(err.Error()), "launcher") &&
+					!strings.Contains(strings.ToLower(err.Error()), "repair") &&
+					!strings.Contains(strings.ToLower(err.Error()), "executable")) {
+				t.Fatalf("invalid Windows launcher preflight error = %v", err)
+			}
+		})
+	}
+}
+
 func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *testing.T) {
 	lockCLITestHooks(t)
 

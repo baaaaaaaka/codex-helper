@@ -1398,6 +1398,47 @@ func LoadPathReadOnly(ctx context.Context, path string) (State, error) {
 	return loadStateData(data)
 }
 
+// LoadPathOfflineRecoveryReadOnly loads a store after the caller has fenced
+// every writer and acquired the store-family locks. Unlike LoadPathReadOnly,
+// its SQLite connection uses mode=rw so SQLite may rebuild a missing SHM index
+// for an existing WAL. Query-only mode is enabled before any state query; this
+// function does not create schemas, checkpoint WAL, or take the Store flock.
+//
+// Runtime resolver, status, and doctor code must use LoadPathReadOnly instead.
+func LoadPathOfflineRecoveryReadOnly(ctx context.Context, path string) (State, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return State{}, err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newState(), nil
+	}
+	if err != nil {
+		return State{}, err
+	}
+	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		store := &Store{path: path}
+		dbPath, err := store.storeSQLitePath(pointer)
+		if err != nil {
+			return State{}, err
+		}
+		return loadSQLiteStateFileOfflineRecoveryReadOnly(ctx, dbPath)
+	}
+	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	return loadStateData(data)
+}
+
 // RuntimeMetadata is the bounded subset of a Teams store needed to identify a
 // scope and determine whether a runtime writer may still be authoritative.
 // It deliberately excludes sessions, turns, inbound events, outbox messages,
@@ -1448,6 +1489,53 @@ func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 				return RuntimeMetadata{}, err
 			}
 			return loadSQLiteRuntimeMetadataFileReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			return RuntimeMetadata{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONRuntimeMetadataReadOnly(ctx, path)
+}
+
+// LoadPathRuntimeMetadataOfflineRecoveryReadOnly is the bounded metadata
+// counterpart of LoadPathOfflineRecoveryReadOnly. The caller must have fenced
+// writers and acquired the store-family locks. SQLite may recreate SHM for an
+// existing WAL, but query-only mode prevents application data changes.
+func LoadPathRuntimeMetadataOfflineRecoveryReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return RuntimeMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return RuntimeMetadata{}, err
+			}
+			return loadSQLiteRuntimeMetadataFileOfflineRecoveryReadOnly(ctx, dbPath)
 		}
 		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
 			return RuntimeMetadata{}, err

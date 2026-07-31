@@ -234,6 +234,112 @@ func TestLoadPathReadOnlySQLiteLiveWALWithoutSHMFailsWithoutCreatingSidecar(t *t
 	}
 }
 
+func TestLoadPathOfflineRecoveryReadOnlySQLiteRecoversWALWithoutPersistentWrites(t *testing.T) {
+	ctx := context.Background()
+	source := newTestStore(t)
+	if err := source.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-offline-recovery", AccountID: "account", Profile: "default"}
+		state.Sessions["s001"] = SessionContext{
+			ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-before",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := source.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate source to SQLite: %v", err)
+	}
+	if err := source.Update(ctx, func(state *State) error {
+		session := state.Sessions["s001"]
+		session.TeamsChatID = "chat-in-wal"
+		state.Sessions["s001"] = session
+		return nil
+	}); err != nil {
+		t.Fatalf("write source WAL: %v", err)
+	}
+	sourceDB := filepath.Join(filepath.Dir(source.Path()), SQLiteFileName)
+	if info, err := os.Stat(sourceDB + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("source WAL fixture is empty: info=%v err=%v", info, err)
+	}
+
+	targetDir := t.TempDir()
+	targetPath := filepath.Join(targetDir, "state.json")
+	for _, pair := range [][2]string{
+		{source.Path(), targetPath},
+		{sourceDB, filepath.Join(targetDir, SQLiteFileName)},
+		{sourceDB + "-wal", filepath.Join(targetDir, SQLiteFileName) + "-wal"},
+	} {
+		data, err := os.ReadFile(pair[0])
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", pair[0], err)
+		}
+		if err := os.WriteFile(pair[1], data, 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", pair[1], err)
+		}
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	if _, ok := before[SQLiteFileName+"-shm"]; ok {
+		t.Fatal("offline recovery fixture unexpectedly contains SHM")
+	}
+	loaded, err := LoadPathOfflineRecoveryReadOnly(ctx, targetPath)
+	if err != nil {
+		t.Fatalf("LoadPathOfflineRecoveryReadOnly: %v", err)
+	}
+	if got := loaded.Sessions["s001"].TeamsChatID; got != "chat-in-wal" {
+		t.Fatalf("offline recovery chat = %q, want WAL value", got)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	delete(before, SQLiteFileName+"-shm")
+	delete(after, SQLiteFileName+"-shm")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("offline recovery changed DB/WAL/pointer files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestLoadPathOfflineRecoveryReadOnlySQLiteWithoutWALWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	source := newTestStore(t)
+	if err := source.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-offline-clean", AccountID: "account", Profile: "default"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := source.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate source to SQLite: %v", err)
+	}
+	if _, err := source.CheckpointSQLiteWAL(ctx, 0); err != nil {
+		t.Fatalf("checkpoint source WAL: %v", err)
+	}
+	sourceDB := filepath.Join(filepath.Dir(source.Path()), SQLiteFileName)
+	targetDir := t.TempDir()
+	targetPath := filepath.Join(targetDir, "state.json")
+	for _, pair := range [][2]string{
+		{source.Path(), targetPath},
+		{sourceDB, filepath.Join(targetDir, SQLiteFileName)},
+	} {
+		data, err := os.ReadFile(pair[0])
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", pair[0], err)
+		}
+		if err := os.WriteFile(pair[1], data, 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", pair[1], err)
+		}
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	loaded, err := LoadPathOfflineRecoveryReadOnly(ctx, targetPath)
+	if err != nil {
+		t.Fatalf("LoadPathOfflineRecoveryReadOnly: %v", err)
+	}
+	if loaded.Scope.ID != "scope-offline-clean" {
+		t.Fatalf("offline clean scope = %#v", loaded.Scope)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("offline clean read created or changed files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
 func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

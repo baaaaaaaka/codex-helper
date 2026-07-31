@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2231,6 +2232,570 @@ func TestTeamsRuntimeSafetyMigrationStagingRecoversCopiedWALWithoutSHMCI(t *test
 	if got := state.Sessions["wal-session"].TeamsChatID; got != "chat-only-in-wal" {
 		t.Fatalf("recovered WAL session chat = %q", got)
 	}
+}
+
+func TestTeamsRuntimeSafetyHistoricalStateScopeUsesColocatedRegistryCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	historical := current
+	historical.ID = "scope-historical-state-layout"
+	historicalPath, err := appdirs.StatePath("teams", "scopes", safeScopePathPart(historical.ID), "state.json")
+	if err != nil {
+		t.Fatalf("historical state path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, historicalPath, historical, "historical-control")
+	colocatedRegistry := filepath.Join(filepath.Dir(historicalPath), "registry.json")
+	colocatedData := []byte(`{"version":1,"control_chat_id":"historical-control"}`)
+	if err := os.WriteFile(colocatedRegistry, colocatedData, 0o600); err != nil {
+		t.Fatalf("write colocated registry: %v", err)
+	}
+	decoyRegistry, err := legacyDefaultRegistryPathForScope(historical.ID)
+	if err != nil {
+		t.Fatalf("legacy cache registry: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(decoyRegistry), 0o700); err != nil {
+		t.Fatalf("mkdir decoy registry: %v", err)
+	}
+	decoyData := []byte(`not-json-and-must-not-be-read`)
+	if err := os.WriteFile(decoyRegistry, decoyData, 0o600); err != nil {
+		t.Fatalf("write decoy registry: %v", err)
+	}
+
+	layout, err := migrationSourceLayoutForStore(historicalPath)
+	if err != nil {
+		t.Fatalf("describe historical state source: %v", err)
+	}
+	if layout.Kind != migrationSourceStateScope || !layout.RegistryInScopeDir || layout.RegistryPath != colocatedRegistry {
+		t.Fatalf("historical state layout = %#v, want colocated state scope", layout)
+	}
+	plan, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil || plan.Action != RuntimeStoreActionMigrateLegacy || plan.LegacyPath != historicalPath {
+		t.Fatalf("historical migration plan = %#v err=%v", plan, err)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete historical state migration: %v", err)
+	}
+	canonicalRegistry, err := DefaultRegistryPathForScope(current.ID)
+	if err != nil {
+		t.Fatalf("canonical registry: %v", err)
+	}
+	if got, err := os.ReadFile(canonicalRegistry); err != nil || !bytes.Equal(got, colocatedData) {
+		t.Fatalf("canonical registry bytes = %q err=%v, want colocated source", got, err)
+	}
+	backupRegistry := filepath.Join(
+		filepath.Dir(runtimeSafetyMigrationBackupPath(historicalPath, current.ID)),
+		"registry.json",
+	)
+	if got, err := os.ReadFile(backupRegistry); err != nil || !bytes.Equal(got, colocatedData) {
+		t.Fatalf("backup registry bytes = %q err=%v, want scope-owned registry", got, err)
+	}
+	if got, err := os.ReadFile(decoyRegistry); err != nil || !bytes.Equal(got, decoyData) {
+		t.Fatalf("legacy-cache decoy changed: bytes=%q err=%v", got, err)
+	}
+	if decoyBackup := runtimeSafetyMigrationBackupPath(decoyRegistry, current.ID); func() bool {
+		_, err := os.Stat(decoyBackup)
+		return !errors.Is(err, os.ErrNotExist)
+	}() {
+		t.Fatalf("colocated registry was also quarantined through legacy-cache path %s", decoyBackup)
+	}
+}
+
+func TestTeamsRuntimeSafetyLegacyConfigScopeUsesLegacyCacheRegistryCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	scope := teamstore.ScopeIdentity{ID: "scope-legacy-layout", AccountID: "account", Profile: "default"}
+	storePath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy store: %v", err)
+	}
+	wantRegistry, err := legacyDefaultRegistryPathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy registry: %v", err)
+	}
+	layout, err := migrationSourceLayoutForStore(storePath)
+	if err != nil {
+		t.Fatalf("describe legacy config source: %v", err)
+	}
+	if layout.Kind != migrationSourceLegacyConfigScope || layout.RegistryInScopeDir || layout.RegistryPath != wantRegistry {
+		t.Fatalf("legacy config layout = %#v, want separate cache registry %q", layout, wantRegistry)
+	}
+}
+
+func TestTeamsRuntimeSafetyMigrationPreflightsSourceMetadataOnceCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	sourcePath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, sourcePath, scope, "legacy-control")
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("inspect migration: %v", err)
+	}
+	previous := loadScopeMetadataOfflineRecoveryReadOnly
+	calls := 0
+	loadScopeMetadataOfflineRecoveryReadOnly = func(ctx context.Context, path string) (teamstore.RuntimeMetadata, error) {
+		calls++
+		return previous(ctx, path)
+	}
+	t.Cleanup(func() { loadScopeMetadataOfflineRecoveryReadOnly = previous })
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete migration: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("offline source metadata reads = %d, want exactly one", calls)
+	}
+}
+
+func TestTeamsRuntimeSafetyHistoricalScopeOutboundReplayFenceUsesVerifiedSourceIDCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	historical := current
+	historical.ID = "scope-historical-outbound"
+	sourcePath, err := appdirs.StatePath("teams", "scopes", safeScopePathPart(historical.ID), "state.json")
+	if err != nil {
+		t.Fatalf("historical path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, sourcePath, historical, "shared-chat")
+	source, err := teamstore.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open historical source: %v", err)
+	}
+	if _, _, err := source.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "historical-outbox",
+		SessionID:   "historical-session",
+		TurnID:      "historical-turn",
+		TeamsChatID: "shared-chat",
+		Kind:        "final",
+		Body:        "already sent",
+	}); err != nil {
+		_ = source.Close()
+		t.Fatalf("queue historical outbox: %v", err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close historical source: %v", err)
+	}
+	layout, err := migrationSourceLayoutForStore(sourcePath)
+	if err != nil {
+		t.Fatalf("source layout: %v", err)
+	}
+	outboundPath, ok := globalOutboundLedgerPathForRegistry(layout.RegistryPath)
+	if !ok {
+		t.Fatal("historical outbound ledger path unavailable")
+	}
+	if err := recordGlobalOutbound(context.Background(), outboundPath, globalOutboundItem{
+		ChatID:     "shared-chat",
+		MessageID:  "teams-historical-sent",
+		ScopeID:    historical.ID,
+		OutboxID:   "historical-outbox",
+		SessionID:  "historical-session",
+		TurnID:     "historical-turn",
+		Kind:       "final",
+		RecordedAt: time.Now(),
+	}, time.Now()); err != nil {
+		t.Fatalf("record historical outbound fence: %v", err)
+	}
+	plan, err := buildLegacyReplayPlanReadOnly(context.Background(), current, historical.ID, layout)
+	if err != nil {
+		t.Fatalf("build replay plan: %v", err)
+	}
+	if len(plan.outboxFences) != 1 || len(plan.outboundDelta) != 0 || plan.canonicalOutboundPath != "" {
+		t.Fatalf("same-ledger replay plan = %#v, want one fence and zero union delta", plan)
+	}
+
+	runtimePlan, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil {
+		t.Fatalf("inspect migration: %v", err)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), runtimePlan); err != nil {
+		t.Fatalf("complete historical migration: %v", err)
+	}
+	canonical, err := teamstore.Open(runtimePlan.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical: %v", err)
+	}
+	state, err := canonical.Load(context.Background())
+	if err != nil {
+		_ = canonical.Close()
+		t.Fatalf("load canonical: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical: %v", err)
+	}
+	outbox := state.OutboxMessages["historical-outbox"]
+	if outbox.Status != teamstore.OutboxStatusSent || outbox.TeamsMessageID != "teams-historical-sent" {
+		t.Fatalf("historical outbox replay fence = %#v, want sent", outbox)
+	}
+}
+
+func TestTeamsRuntimeSafetyOutboundReplayFenceRejectsUnrelatedScopeIDCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	sourcePath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, sourcePath, scope, "shared-chat")
+	source, err := teamstore.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	if _, _, err := source.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID: "shared-outbox", SessionID: "session", TurnID: "turn",
+		TeamsChatID: "shared-chat", Kind: "final", Body: "must remain queued",
+	}); err != nil {
+		_ = source.Close()
+		t.Fatalf("queue source outbox: %v", err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatalf("close source: %v", err)
+	}
+	layout, err := migrationSourceLayoutForStore(sourcePath)
+	if err != nil {
+		t.Fatalf("source layout: %v", err)
+	}
+	outboundPath, _ := globalOutboundLedgerPathForRegistry(layout.RegistryPath)
+	if err := recordGlobalOutbound(context.Background(), outboundPath, globalOutboundItem{
+		ChatID: "shared-chat", MessageID: "teams-unrelated", ScopeID: "scope-unrelated",
+		OutboxID: "shared-outbox", SessionID: "session", TurnID: "turn", Kind: "final",
+	}, time.Now()); err != nil {
+		t.Fatalf("record unrelated fence: %v", err)
+	}
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("inspect migration: %v", err)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete migration: %v", err)
+	}
+	state, err := teamstore.LoadPathReadOnly(context.Background(), plan.CanonicalPath)
+	if err != nil {
+		t.Fatalf("load canonical: %v", err)
+	}
+	if got := state.OutboxMessages["shared-outbox"].Status; got != teamstore.OutboxStatusQueued {
+		t.Fatalf("unrelated scope replay fence changed outbox to %q", got)
+	}
+}
+
+func TestTeamsRuntimeSafetyLegacyOnlyMigrationPreservesKnownScopeSidecarsCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	sourcePath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, sourcePath, scope, "control")
+	sourceHistory := filepath.Join(filepath.Dir(sourcePath), controlChatHistoryFileName)
+	if err := os.WriteFile(sourceHistory, []byte(
+		`{"version":1,"chat_id":"control","message_id":"history-jsonl","direction":"user","kind":"control","text":"jsonl"}`+"\n",
+	), 0o600); err != nil {
+		t.Fatalf("write source history JSONL: %v", err)
+	}
+	if err := appendControlChatHistoryEntry(context.Background(), sourceHistory, controlChatHistoryEntry{
+		ChatID: "control", MessageID: "history-sqlite", Direction: "helper", Kind: "control", Text: "sqlite",
+	}); err != nil {
+		t.Fatalf("append source history SQLite: %v", err)
+	}
+	sourceStore, err := teamstore.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source store: %v", err)
+	}
+	sourceBridge := &Bridge{store: sourceStore}
+	threadPath := sourceBridge.threadLinkJournalPath("sidecar-session")
+	if err := os.MkdirAll(filepath.Dir(threadPath), 0o700); err != nil {
+		_ = sourceStore.Close()
+		t.Fatalf("mkdir thread journal: %v", err)
+	}
+	threadLine := fmt.Sprintf(
+		`{"version":1,"scope_id":%q,"session_id":"sidecar-session","codex_thread_id":"thread-1","unknown_future_field":{"kept":true}}`+"\n",
+		scope.ID,
+	)
+	if err := os.WriteFile(threadPath, []byte(threadLine), 0o600); err != nil {
+		_ = sourceStore.Close()
+		t.Fatalf("write thread journal: %v", err)
+	}
+	if err := sourceStore.Close(); err != nil {
+		t.Fatalf("close source store: %v", err)
+	}
+
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+	if err != nil {
+		t.Fatalf("inspect migration: %v", err)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete migration: %v", err)
+	}
+	targetHistory := filepath.Join(filepath.Dir(plan.CanonicalPath), controlChatHistoryFileName)
+	history, err := readControlChatHistoryEntries(targetHistory)
+	if err != nil {
+		t.Fatalf("read migrated control history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("migrated control history entries = %d, want 2: %#v", len(history), history)
+	}
+	targetStore, err := teamstore.Open(plan.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open target store: %v", err)
+	}
+	targetBridge := &Bridge{store: targetStore}
+	records, err := targetBridge.readThreadLinkJournal(context.Background(), "sidecar-session")
+	if err != nil {
+		_ = targetStore.Close()
+		t.Fatalf("read migrated thread journal: %v", err)
+	}
+	targetThreadPath := targetBridge.threadLinkJournalPath("sidecar-session")
+	if err := targetStore.Close(); err != nil {
+		t.Fatalf("close target store: %v", err)
+	}
+	if len(records) != 1 || records[0].ScopeID != scope.ID || records[0].CodexThreadID != "thread-1" {
+		t.Fatalf("migrated thread records = %#v", records)
+	}
+	raw, err := os.ReadFile(targetThreadPath)
+	if err != nil {
+		t.Fatalf("read raw migrated thread journal: %v", err)
+	}
+	var preserved map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &preserved); err != nil {
+		t.Fatalf("parse raw migrated thread journal: %v", err)
+	}
+	if _, ok := preserved["unknown_future_field"]; !ok {
+		t.Fatal("thread journal migration discarded an unknown future field")
+	}
+}
+
+func TestTeamsRuntimeSafetyMigrationRebindsThreadJournalScopeWithoutDroppingFieldsCI(t *testing.T) {
+	tmp := t.TempDir()
+	sourceDir := filepath.Join(tmp, "source")
+	targetDir := filepath.Join(tmp, "target")
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	sourcePath := filepath.Join(sourceDir, "thread.jsonl")
+	if err := os.WriteFile(sourcePath, []byte(
+		`{"version":1,"scope_id":"scope-old","session_id":"session","codex_thread_id":"thread","future":{"value":1}}`+"\n",
+	), 0o600); err != nil {
+		t.Fatalf("write source journal: %v", err)
+	}
+	if err := copyThreadLinkMigrationJournals(targetDir, sourceDir, "scope-old", "scope-new"); err != nil {
+		t.Fatalf("copy thread journal: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(targetDir, "thread.jsonl"))
+	if err != nil {
+		t.Fatalf("read target journal: %v", err)
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(raw), &record); err != nil {
+		t.Fatalf("parse target journal: %v", err)
+	}
+	var scopeID string
+	if err := json.Unmarshal(record["scope_id"], &scopeID); err != nil {
+		t.Fatalf("parse target scope: %v", err)
+	}
+	if scopeID != "scope-new" {
+		t.Fatalf("target journal scope = %q, want scope-new", scopeID)
+	}
+	if _, ok := record["future"]; !ok {
+		t.Fatal("target journal dropped an unknown field")
+	}
+
+	unrelatedSource := filepath.Join(tmp, "unrelated")
+	if err := os.MkdirAll(unrelatedSource, 0o700); err != nil {
+		t.Fatalf("mkdir unrelated source: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unrelatedSource, "thread.jsonl"), []byte(
+		`{"version":1,"scope_id":"scope-other"}`+"\n",
+	), 0o600); err != nil {
+		t.Fatalf("write unrelated journal: %v", err)
+	}
+	if err := copyThreadLinkMigrationJournals(
+		filepath.Join(tmp, "unrelated-target"),
+		unrelatedSource,
+		"scope-old",
+		"scope-new",
+	); err == nil || !strings.Contains(err.Error(), "unrelated scope_id") {
+		t.Fatalf("unrelated scope migration error = %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyMigrationRejectsThreadJournalSymlinkCI(t *testing.T) {
+	tmp := t.TempDir()
+	sourceDir := filepath.Join(tmp, "source")
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	target := filepath.Join(tmp, "outside.jsonl")
+	if err := os.WriteFile(target, []byte(`{"version":1}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(sourceDir, "thread.jsonl")); err != nil {
+		t.Fatalf("create journal symlink: %v", err)
+	}
+	err := copyThreadLinkMigrationJournals(filepath.Join(tmp, "target"), sourceDir, "scope-old", "scope-new")
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("thread journal symlink migration error = %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyDualStoreTakeoverDoesNotMergeLegacySidecarsCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	legacyHistory := filepath.Join(filepath.Dir(fixture.LegacyPath), controlChatHistoryFileName)
+	if err := os.WriteFile(legacyHistory, []byte(`{"version":1,"text":"legacy-only"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write legacy history: %v", err)
+	}
+	threadDir := filepath.Join(filepath.Dir(fixture.LegacyPath), "thread-links")
+	if err := os.MkdirAll(threadDir, 0o700); err != nil {
+		t.Fatalf("mkdir legacy thread dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(threadDir, "legacy.jsonl"), []byte(`{"version":1}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write legacy thread journal: %v", err)
+	}
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("complete dual-store takeover: %v", err)
+	}
+	canonicalDir := filepath.Dir(fixture.CanonicalPath)
+	for _, path := range []string{
+		filepath.Join(canonicalDir, controlChatHistoryFileName),
+		filepath.Join(canonicalDir, "thread-links"),
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dual-store takeover merged legacy sidecar %s: %v", path, err)
+		}
+	}
+	backupDir := filepath.Dir(runtimeSafetyMigrationBackupPath(fixture.LegacyPath, fixture.Scope.ID))
+	if _, err := os.Stat(filepath.Join(backupDir, controlChatHistoryFileName)); err != nil {
+		t.Fatalf("legacy history missing from backup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(backupDir, "thread-links", "legacy.jsonl")); err != nil {
+		t.Fatalf("legacy thread journal missing from backup: %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyDualStoreTakeoverRecoversCanonicalWALWithoutSHMCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	installRuntimeSafetyCanonicalWALWithoutSHM(t, fixture.CanonicalPath, fixture.Scope)
+	canonicalDir := filepath.Dir(fixture.CanonicalPath)
+	before := snapshotRuntimeSafetyFiles(t, canonicalDir)
+	if _, ok := before[teamstore.SQLiteFileName+"-shm"]; ok {
+		t.Fatal("canonical takeover fixture unexpectedly contains SHM")
+	}
+
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("complete WAL recovery takeover: %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, canonicalDir)
+	delete(before, teamstore.SQLiteFileName+"-shm")
+	delete(after, teamstore.SQLiteFileName+"-shm")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("offline takeover changed canonical DB/WAL/pointer files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+	if _, err := os.Stat(fixture.LegacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("successful WAL recovery did not quarantine legacy source: %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyMalformedCanonicalWALBlocksBeforeQuarantineCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical: %v", err)
+	}
+	if _, err := canonical.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("migrate canonical to SQLite: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(fixture.CanonicalPath), teamstore.SQLiteFileName)
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+	if err := os.Mkdir(dbPath+"-wal", 0o700); err != nil {
+		t.Fatalf("create malformed WAL path: %v", err)
+	}
+	beforeCanonical := snapshotRuntimeSafetyFiles(t, filepath.Dir(fixture.CanonicalPath))
+	beforeLegacy := snapshotRuntimeSafetyFiles(t, filepath.Dir(fixture.LegacyPath))
+
+	err = CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath)
+	if err == nil {
+		t.Fatal("takeover accepted a non-regular canonical WAL path")
+	}
+	afterCanonical := snapshotRuntimeSafetyFiles(t, filepath.Dir(fixture.CanonicalPath))
+	afterLegacy := snapshotRuntimeSafetyFiles(t, filepath.Dir(fixture.LegacyPath))
+	if !reflect.DeepEqual(beforeCanonical, afterCanonical) {
+		t.Fatalf("blocked canonical WAL validation wrote durable files: %v", runtimeSafetySnapshotChanges(beforeCanonical, afterCanonical))
+	}
+	if !reflect.DeepEqual(beforeLegacy, afterLegacy) {
+		t.Fatalf("blocked canonical WAL validation changed legacy source: %v", runtimeSafetySnapshotChanges(beforeLegacy, afterLegacy))
+	}
+	if _, err := os.Stat(fixture.LegacyPath); err != nil {
+		t.Fatalf("blocked canonical WAL validation quarantined legacy source: %v", err)
+	}
+}
+
+func installRuntimeSafetyCanonicalWALWithoutSHM(
+	t *testing.T,
+	canonicalPath string,
+	scope teamstore.ScopeIdentity,
+) {
+	t.Helper()
+	donorPath := filepath.Join(t.TempDir(), "donor", "state.json")
+	openAndSeedRuntimeSafetyScopeStore(t, donorPath, scope, "canonical-control")
+	donor, err := teamstore.Open(donorPath)
+	if err != nil {
+		t.Fatalf("open WAL donor: %v", err)
+	}
+	t.Cleanup(func() { _ = donor.Close() })
+	if _, err := donor.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate WAL donor: %v", err)
+	}
+	if err := donor.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["wal-canonical-session"] = teamstore.SessionContext{
+			ID: "wal-canonical-session", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-in-wal",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write WAL donor: %v", err)
+	}
+	donorDB := filepath.Join(filepath.Dir(donorPath), teamstore.SQLiteFileName)
+	if info, err := os.Stat(donorDB + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("WAL donor has no live WAL: info=%v err=%v", info, err)
+	}
+	targetDir := filepath.Dir(canonicalPath)
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatalf("mkdir canonical WAL target: %v", err)
+	}
+	for _, pair := range [][2]string{
+		{donorPath, canonicalPath},
+		{donorDB, filepath.Join(targetDir, teamstore.SQLiteFileName)},
+		{donorDB + "-wal", filepath.Join(targetDir, teamstore.SQLiteFileName) + "-wal"},
+	} {
+		data, err := os.ReadFile(pair[0])
+		if err != nil {
+			t.Fatalf("read WAL donor %s: %v", pair[0], err)
+		}
+		if err := os.WriteFile(pair[1], data, 0o600); err != nil {
+			t.Fatalf("write canonical WAL fixture %s: %v", pair[1], err)
+		}
+	}
+	_ = os.Remove(filepath.Join(targetDir, teamstore.SQLiteFileName) + "-shm")
 }
 
 func TestTeamsRuntimeSafetyCanonicalResolverSyscallProbeCI(t *testing.T) {
