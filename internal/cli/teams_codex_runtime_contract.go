@@ -57,7 +57,7 @@ func resolveTeamsCodexRuntimeContract(ctx context.Context, root *rootOptions, ra
 
 	command := strings.TrimSpace(rawCommand)
 	if command == "" {
-		if candidate, ok := findManagedTeamsCodexUpgradeCandidate(ctx, environment, paths.ExecIdentity); ok {
+		if candidate, ok := findManagedCodexUpgradeCandidate(ctx, environment, paths.ExecIdentity); ok {
 			command = candidate
 		} else {
 			command, err = ensureManagedTeamsCodexForRuntime(ctx, store, cfg, environment, paths.ExecIdentity, log)
@@ -83,8 +83,8 @@ func resolveTeamsCodexRuntimeContract(ctx context.Context, root *rootOptions, ra
 }
 
 func ensureManagedTeamsCodexRuntime(ctx context.Context, store *config.Store, cfg config.Config, environment []string, identity *execIdentity, log io.Writer) (string, error) {
-	target := teamsCodexUpgradeTarget{environment: append([]string(nil), environment...), identity: identity}
-	opts := teamsCodexUpgradeInstallOptions(target)
+	target := managedCodexUpgradeTarget{environment: append([]string(nil), environment...), identity: identity}
+	opts := managedCodexUpgradeInstallOptions(target)
 	opts.upgradeCodex = false
 	opts.upgradeCodexPath = ""
 	if upgradeUsesProxy(cfg) {
@@ -94,11 +94,11 @@ func ensureManagedTeamsCodexRuntime(ctx context.Context, store *config.Store, cf
 		}
 		opts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
 			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, func(profileEnv []string) error {
-				return runInstall(teamsCodexUpgradeProxyEnvironment(environment, profileEnv))
+				return runInstall(managedCodexUpgradeProxyEnvironment(environment, profileEnv))
 			})
 		}
 	}
-	return ensureCodexInstalledForTeamsRun(ctx, "", log, opts)
+	return ensureCodexInstalledForTargetRun(ctx, "", log, opts)
 }
 
 func teamsCodexRuntimeFingerprint(contract teamsCodexRuntimeContract) string {

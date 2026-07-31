@@ -32,6 +32,9 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	if cmd.Flags().Lookup("upgrade-codex") == nil {
 		t.Fatal("expected --upgrade-codex flag")
 	}
+	if cmd.Flags().Lookup("upgrade-codex-path") == nil {
+		t.Fatal("expected --upgrade-codex-path flag")
+	}
 	appCmd, _, err := cmd.Find([]string{"app"})
 	if err != nil {
 		t.Fatalf("find app command: %v", err)

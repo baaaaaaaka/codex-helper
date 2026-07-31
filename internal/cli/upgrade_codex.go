@@ -3,6 +3,9 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -37,28 +40,73 @@ func runUpgradeCodexFromRoot(cmd *cobra.Command, root *rootOptions) error {
 	if err != nil {
 		return err
 	}
+	explicitPath := ""
+	configPath := ""
+	if root != nil {
+		explicitPath = strings.TrimSpace(root.upgradeCodexPath)
+		configPath = root.configPath
+	}
+	if explicitPath != "" && !filepath.IsAbs(explicitPath) {
+		return fmt.Errorf("--upgrade-codex-path must be an absolute executable path")
+	}
 
-	store, _, err := newRootStore(root, "")
+	paths, err := resolveEffectiveLaunchPaths(configPath, "", "")
 	if err != nil {
 		return err
+	}
+	store, err := config.NewStore(paths.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("open config store: %w", err)
 	}
 	cfg, err := store.Load()
 	if err != nil {
 		return err
 	}
 
-	installOpts := codexInstallOptions{upgradeCodex: true}
+	environment := codexRuntimeEnvironment(os.Environ(), nil, paths.ExecIdentity)
+	target := managedCodexUpgradeTarget{environment: environment, identity: paths.ExecIdentity}
+	managedTarget := explicitPath == ""
+	if managedTarget {
+		target = resolveManagedCodexUpgradeTarget(cmd.Context(), environment, paths.ExecIdentity)
+	} else {
+		target.path = normalizeExecutablePath(explicitPath)
+		if !executableExists(target.path) {
+			return fmt.Errorf("codex not found at %s", explicitPath)
+		}
+		if err := probeManagedCodexUpgradeCandidate(cmd.Context(), target.path, target.environment, target.identity); err != nil {
+			return err
+		}
+	}
+
+	installOpts := codexUpgradeTargetInstallOptions(target, managedTarget)
 	if upgradeUsesProxy(cfg) {
 		profile, err := selectProfile(cfg, profileRef)
 		if err != nil {
 			return err
 		}
 		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
-			return withProfileInstallEnv(ctx, store, profile, cfg.Instances, runInstall)
+			return withProfileInstallEnv(ctx, store, profile, cfg.Instances, func(profileEnv []string) error {
+				return runInstall(managedCodexUpgradeProxyEnvironment(target.environment, profileEnv))
+			})
 		}
 	}
 
-	path, err := upgradeCodexInstalledWithOptions(cmd.Context(), cmd.ErrOrStderr(), installOpts)
+	if target.path != "" {
+		kind := "CXP-managed"
+		if !managedTarget {
+			kind = "explicit external"
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex upgrade target (%s): %s\n", kind, target.path)
+	} else if prefixes := managedCodexPrefixCandidates(target.environment); len(prefixes) > 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex install target (CXP-managed): %s\n", prefixes[0])
+	}
+
+	var path string
+	if managedTarget {
+		path, err = upgradeOrInstallManagedCodex(cmd.Context(), cmd.ErrOrStderr(), target, installOpts)
+	} else {
+		path, err = upgradeCodexInstalledForTargetRun(cmd.Context(), cmd.ErrOrStderr(), installOpts)
+	}
 	if err != nil {
 		return err
 	}

@@ -180,7 +180,8 @@ walk through the normal flows in order.
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
 | `codex-proxy app --model-profile <name>` | Launch the Codex desktop app with a saved model profile through an isolated `CODEX_HOME` |
-| `codex-proxy --upgrade-codex` | Reinstall Codex CLI using detected install source |
+| `codex-proxy --upgrade-codex` | Install or upgrade the CXP-managed Codex CLI |
+| `codex-proxy --upgrade-codex --upgrade-codex-path <absolute-path>` | Upgrade one explicitly selected external Codex installation |
 | `codex-proxy completion <shell>` | Generate shell completion |
 | `codex-proxy init` | Create an SSH profile |
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
@@ -1088,8 +1089,8 @@ now` after a local repair or `helper update now` for a release update. Use
 `helper update prerelease` only when you intentionally want the newest
 pre-release.
 
-Send `codex update now` in the control chat to update the local Codex CLI using
-its detected install source. The helper drains active Codex work first and posts
+Send `codex update now` in the control chat to update the CXP-managed Codex CLI.
+The helper drains active Codex work first and posts
 the result back to the control chat. This command does not update cxp/codex-helper
 and does not automatically retry earlier failed requests.
 
@@ -1466,14 +1467,22 @@ Upgrade Codex CLI itself (reinstall-style):
 codex-proxy --upgrade-codex
 ```
 
+This targets the same CXP-managed Codex installation that normal CXP launches
+use. To upgrade a separate system or user-global Codex installation, select its
+executable explicitly:
+
+```bash
+codex-proxy --upgrade-codex --upgrade-codex-path /absolute/path/to/codex
+```
+
 Behavior:
 
 - Uses current proxy preference: proxy on -> upgrade through proxy; proxy off -> direct.
-- Requires Codex to already be installed; it will not install from scratch in this mode.
-- Keeps install source when recognized:
-  - system npm global install -> `npm install -g @openai/codex`
-  - managed/local npm install (`codex-proxy` prefix) -> managed reinstall path
-- Fails fast when source cannot be determined (to avoid changing install topology unexpectedly).
+- Installs the CXP-managed Codex CLI when it is missing and upgrades it when present.
+- Ignores unrelated `codex` executables earlier in `PATH` for the default managed operation.
+- `--upgrade-codex-path` requires an absolute, functional executable path and keeps
+  that installation's recognized npm source.
+- Explicit external upgrades fail fast when the source cannot be determined.
 
 ### Audit or clean legacy patched binaries (POSIX)
 

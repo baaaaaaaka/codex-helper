@@ -1575,10 +1575,10 @@ func TestRunTeamsUpgradeCodexOnceUsesExistingUpgradePath(t *testing.T) {
 		t.Fatalf("Save config: %v", err)
 	}
 
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
-	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
+	prevUpgrade := upgradeCodexInstalledForTargetRun
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
 	called := false
-	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+	upgradeCodexInstalledForTargetRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
@@ -1625,17 +1625,17 @@ func TestRunTeamsUpgradeCodexOnceSkipsIncompleteProxyPreferenceCI(t *testing.T) 
 	}
 
 	prevEnsureProfile := ensureProfileRunFn
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
+	prevUpgrade := upgradeCodexInstalledForTargetRun
 	t.Cleanup(func() {
 		ensureProfileRunFn = prevEnsureProfile
-		upgradeCodexInstalledForTeamsRun = prevUpgrade
+		upgradeCodexInstalledForTargetRun = prevUpgrade
 	})
 	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
 		t.Fatal("incomplete proxy preference must not start interactive profile setup during Teams upgrade")
 		return config.Profile{}, config.Config{}, nil
 	}
 	called := false
-	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+	upgradeCodexInstalledForTargetRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
@@ -1663,9 +1663,9 @@ func TestRunTeamsUpgradeCodexOnceRejectsLiveTeamsOwnerBeforeUpgrade(t *testing.T
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
-	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
-	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+	prevUpgrade := upgradeCodexInstalledForTargetRun
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
+	upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
 		t.Fatal("upgrade should not run while a Teams bridge owner is live")
 		return "", nil
 	}
@@ -1726,9 +1726,9 @@ func TestRunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			tmp := t.TempDir()
 			isolateTeamsUserDirsForTest(t, tmp)
-			prevUpgrade := upgradeCodexInstalledForTeamsRun
-			t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
-			upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+			prevUpgrade := upgradeCodexInstalledForTargetRun
+			t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
+			upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
 				t.Fatal("upgrade should not run while Teams work is upgrade-blocking")
 				return "", nil
 			}
@@ -1765,9 +1765,9 @@ func TestRunTeamsUpgradeCodexOnceRejectsBeaconTargetWork(t *testing.T) {
 		}
 	})
 
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
-	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
-	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+	prevUpgrade := upgradeCodexInstalledForTargetRun
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
+	upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
 		t.Fatal("upgrade should not run while beacon target work is queued")
 		return "", nil
 	}
@@ -1797,10 +1797,10 @@ func TestRunTeamsCodexUpgradeFromBridgeUsesExistingUpgradePath(t *testing.T) {
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatalf("Save config: %v", err)
 	}
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
-	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = prevUpgrade })
+	prevUpgrade := upgradeCodexInstalledForTargetRun
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
 	called := false
-	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+	upgradeCodexInstalledForTargetRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
@@ -1834,17 +1834,17 @@ func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testi
 	}
 
 	prevEnsureProfile := ensureProfileRunFn
-	prevUpgrade := upgradeCodexInstalledForTeamsRun
+	prevUpgrade := upgradeCodexInstalledForTargetRun
 	t.Cleanup(func() {
 		ensureProfileRunFn = prevEnsureProfile
-		upgradeCodexInstalledForTeamsRun = prevUpgrade
+		upgradeCodexInstalledForTargetRun = prevUpgrade
 	})
 	ensureProfileRunFn = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
 		t.Fatal("incomplete proxy preference must not start interactive profile setup during bridge upgrade")
 		return config.Profile{}, config.Config{}, nil
 	}
 	called := false
-	upgradeCodexInstalledForTeamsRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+	upgradeCodexInstalledForTargetRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
 		called = true
 		if !opts.upgradeCodex {
 			t.Fatal("expected upgradeCodex install option")
@@ -1867,17 +1867,18 @@ func TestRunTeamsCodexUpgradeFromBridgeSkipsIncompleteProxyPreferenceCI(t *testi
 func stubTeamsCodexUpgradePath(t *testing.T, path string) {
 	t.Helper()
 	previous := resolveTeamsCodexUpgradeTargetForRun
-	resolveTeamsCodexUpgradeTargetForRun = func(context.Context, config.Config, effectivePaths) (teamsCodexUpgradeTarget, error) {
-		return teamsCodexUpgradeTarget{path: path, environment: []string{"PATH=/target-account/bin:/usr/bin"}}, nil
+	resolveTeamsCodexUpgradeTargetForRun = func(context.Context, config.Config, effectivePaths) (managedCodexUpgradeTarget, error) {
+		return managedCodexUpgradeTarget{path: path, environment: []string{"PATH=/target-account/bin:/usr/bin"}}, nil
 	}
 	t.Cleanup(func() { resolveTeamsCodexUpgradeTargetForRun = previous })
 }
 
 func TestTeamsCodexUpgradeProxyEnvironmentPreservesTargetPATH(t *testing.T) {
-	got := teamsCodexUpgradeProxyEnvironment(
+	got := managedCodexUpgradeProxyEnvironment(
 		[]string{
 			"PATH=/target/bin:/usr/bin",
 			"HOME=/home/target",
+			"CODEX_NPM_PREFIX=/home/target/.local/share/codex-proxy/npm-global",
 			"HTTP_PROXY=http://stale",
 			"ALL_PROXY=socks5://127.0.0.1:11080",
 			"all_proxy=socks5://127.0.0.1:11080",
@@ -1890,6 +1891,9 @@ func TestTeamsCodexUpgradeProxyEnvironmentPreservesTargetPATH(t *testing.T) {
 	}
 	if home := envValue(got, "HOME"); home != "/home/target" {
 		t.Fatalf("HOME = %q", home)
+	}
+	if prefix := envValue(got, "CODEX_NPM_PREFIX"); prefix != "/home/target/.local/share/codex-proxy/npm-global" {
+		t.Fatalf("CODEX_NPM_PREFIX = %q", prefix)
 	}
 	if proxy := envValue(got, "HTTP_PROXY"); proxy != "http://127.0.0.1:18080" {
 		t.Fatalf("HTTP_PROXY = %q", proxy)
@@ -1915,24 +1919,24 @@ func TestTeamsCodexUpgraderForRunRejectsCustomCodexPathBeforeDrain(t *testing.T)
 }
 
 func TestUpgradeOrInstallManagedTeamsCodexMigratesWhenManagedInstallIsMissing(t *testing.T) {
-	previousEnsure := ensureCodexInstalledForTeamsRun
-	previousUpgrade := upgradeCodexInstalledForTeamsRun
+	previousEnsure := ensureCodexInstalledForTargetRun
+	previousUpgrade := upgradeCodexInstalledForTargetRun
 	t.Cleanup(func() {
-		ensureCodexInstalledForTeamsRun = previousEnsure
-		upgradeCodexInstalledForTeamsRun = previousUpgrade
+		ensureCodexInstalledForTargetRun = previousEnsure
+		upgradeCodexInstalledForTargetRun = previousUpgrade
 	})
-	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+	upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
 		t.Fatal("missing managed install must not upgrade a PATH or cached Codex")
 		return "", nil
 	}
-	ensureCodexInstalledForTeamsRun = func(_ context.Context, path string, _ io.Writer, opts codexInstallOptions) (string, error) {
+	ensureCodexInstalledForTargetRun = func(_ context.Context, path string, _ io.Writer, opts codexInstallOptions) (string, error) {
 		if path != "" || opts.upgradeCodex || !opts.requireManaged || envValue(opts.installerEnv, "PATH") != "/service/bin" {
 			t.Fatalf("managed migration path=%q opts=%#v", path, opts)
 		}
 		return "/managed/bin/codex", nil
 	}
 
-	got, err := upgradeOrInstallManagedTeamsCodex(context.Background(), io.Discard, teamsCodexUpgradeTarget{
+	got, err := upgradeOrInstallManagedCodex(context.Background(), io.Discard, managedCodexUpgradeTarget{
 		environment: []string{"PATH=/service/bin"},
 	}, codexInstallOptions{upgradeCodex: true, installerEnv: []string{"PATH=/service/bin"}, requireManaged: true})
 	if err != nil {
@@ -1967,11 +1971,11 @@ func TestTeamsCodexUpgraderForRunRestartsCachedRunnersAfterSuccess(t *testing.T)
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
-	previousUpgrade := upgradeCodexInstalledForTeamsRun
-	upgradeCodexInstalledForTeamsRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
+	previousUpgrade := upgradeCodexInstalledForTargetRun
+	upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
 		return "/target-account/bin/codex", nil
 	}
-	t.Cleanup(func() { upgradeCodexInstalledForTeamsRun = previousUpgrade })
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = previousUpgrade })
 
 	executor := &restartTrackingTeamsExecutor{}
 	upgrader := teamsCodexUpgraderForRun(&rootOptions{configPath: cfgPath}, io.Discard, "", executor)

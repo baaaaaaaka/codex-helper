@@ -1134,7 +1134,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run "$pattern"
 
       - name: Root/home/identity regressions (Windows)
@@ -1143,7 +1143,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run $pattern
 
       - name: Config and standard runtime resilience regressions (Linux/macOS)
@@ -1766,8 +1766,9 @@ jobs:
           }
           bash scripts/ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
           system_prefix="$(npm prefix -g)"
+          system_codex_path="$(command -v codex)"
           seed_stale_codex_backup "$system_prefix"
-          go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-system.json" --upgrade-codex
+          go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-system.json" --upgrade-codex --upgrade-codex-path "$system_codex_path"
           codex --version >/dev/null
           upgraded_path="$(command -v codex)"
           case "$upgraded_path" in
@@ -1778,7 +1779,7 @@ jobs:
               ;;
           esac
 
-      - name: Codex upgrade integration (local npm, Linux/macOS)
+      - name: Codex upgrade integration (managed npm with unrelated PATH Codex, Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
@@ -1800,19 +1801,16 @@ jobs:
           }
           local_prefix="$RUNNER_TEMP/codex-local-prefix"
           bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
+          path_codex_before="$(command -v codex)"
           export CODEX_NPM_PREFIX="$local_prefix"
-          export PATH="$local_prefix/bin:$local_prefix:$PATH"
           seed_stale_codex_backup "$local_prefix"
           go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-upgrade-local.json" --upgrade-codex
-          codex --version >/dev/null
-          upgraded_path="$(command -v codex)"
-          case "$upgraded_path" in
-            "$local_prefix"/*) ;;
-            *)
-              echo "expected local npm codex under $local_prefix, got $upgraded_path"
-              exit 1
-              ;;
-          esac
+          "$local_prefix/bin/codex" --version >/dev/null
+          path_codex_after="$(command -v codex)"
+          if [ "$path_codex_after" != "$path_codex_before" ]; then
+            echo "default managed upgrade changed PATH-selected Codex from $path_codex_before to $path_codex_after"
+            exit 1
+          fi
 
       - name: Codex upgrade integration (system npm, Windows)
         if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
@@ -1844,15 +1842,19 @@ jobs:
           }
           & .\scripts\ci\retry.ps1 5 5 npm install -g --include=optional '@openai/codex'
           $systemPrefix = (npm prefix -g).Trim()
+          $systemCodexPath = Join-Path $systemPrefix "codex.cmd"
+          if (-not (Test-Path -LiteralPath $systemCodexPath)) {
+            throw "expected npm Codex command shim at $systemCodexPath"
+          }
           New-StaleCodexBackup $systemPrefix
-          go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex
+          go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-system.json" --upgrade-codex --upgrade-codex-path $systemCodexPath
           & codex --version | Out-Null
           $upgradedPath = (Get-Command codex).Source
           if (-not $upgradedPath.ToLower().StartsWith($systemPrefix.ToLower())) {
             throw "expected system npm codex under $systemPrefix, got $upgradedPath"
           }
 
-      - name: Codex upgrade integration (local npm, Windows)
+      - name: Codex upgrade integration (managed npm with unrelated PATH Codex, Windows)
         if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -1882,15 +1884,15 @@ jobs:
           }
           $localPrefix = Join-Path $env:RUNNER_TEMP "codex-local-prefix"
           & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $localPrefix --include=optional '@openai/codex'
-          $localBin = Join-Path $localPrefix "bin"
+          $pathCodexBefore = (Get-Command codex).Source
           $env:CODEX_NPM_PREFIX = $localPrefix
-          $env:PATH = "$localPrefix;$localBin;$env:PATH"
           New-StaleCodexBackup $localPrefix
           go run ./cmd/codex-proxy --config "$env:RUNNER_TEMP\codex-upgrade-local.json" --upgrade-codex
-          & codex --version | Out-Null
-          $upgradedPath = (Get-Command codex).Source
-          if (-not $upgradedPath.ToLower().StartsWith($localPrefix.ToLower())) {
-            throw "expected local npm codex under $localPrefix, got $upgradedPath"
+          $managedCodexPath = Join-Path $localPrefix "codex.cmd"
+          & $managedCodexPath --version | Out-Null
+          $pathCodexAfter = (Get-Command codex).Source
+          if ($pathCodexAfter -ne $pathCodexBefore) {
+            throw "default managed upgrade changed PATH-selected Codex from $pathCodexBefore to $pathCodexAfter"
           }
 
       - name: Teams target-account PATH Codex upgrade (Linux/macOS)
@@ -2682,7 +2684,8 @@ jobs:
 
               bash /ci/retry.sh 5 5 npm install -g --include=optional @openai/codex
               system_prefix="$(npm prefix -g)"
-              /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex
+              system_codex_path="$(command -v codex)"
+              /dist/codex-proxy --config /tmp/codex-upgrade-system.json --upgrade-codex --upgrade-codex-path "$system_codex_path"
               codex --version >/dev/null
               system_path="$(command -v codex)"
               case "$system_path" in
@@ -2695,18 +2698,15 @@ jobs:
 
               local_prefix="/tmp/codex-local-prefix"
               bash /ci/retry.sh 5 5 npm install -g --prefix "$local_prefix" --include=optional @openai/codex
+              path_codex_before="$(command -v codex)"
               export CODEX_NPM_PREFIX="$local_prefix"
-              export PATH="$local_prefix/bin:$local_prefix:$PATH"
               /dist/codex-proxy --config /tmp/codex-upgrade-local.json --upgrade-codex
-              codex --version >/dev/null
-              local_path="$(command -v codex)"
-              case "$local_path" in
-                "$local_prefix"/*) ;;
-                *)
-                  echo "expected local codex under $local_prefix, got $local_path"
-                  exit 1
-                  ;;
-              esac
+              "$local_prefix/bin/codex" --version >/dev/null
+              path_codex_after="$(command -v codex)"
+              if [ "$path_codex_after" != "$path_codex_before" ]; then
+                echo "default managed upgrade changed PATH-selected Codex from $path_codex_before to $path_codex_after"
+                exit 1
+              fi
             '
 
   test:

@@ -74,9 +74,9 @@ func TestResolveTeamsCodexUserPathCarriesPolicyAndTargetIdentity(t *testing.T) {
 }
 
 func TestResolveTeamsCodexUpgradePathUsesManagedPrefixNotTargetAccountPATH(t *testing.T) {
-	previousProbe := probeTeamsCodexUpgradeCandidateForRun
-	probeTeamsCodexUpgradeCandidateForRun = func(context.Context, string, []string, *execIdentity) error { return nil }
-	t.Cleanup(func() { probeTeamsCodexUpgradeCandidateForRun = previousProbe })
+	previousProbe := probeManagedCodexUpgradeCandidateForRun
+	probeManagedCodexUpgradeCandidateForRun = func(context.Context, string, []string, *execIdentity) error { return nil }
+	t.Cleanup(func() { probeManagedCodexUpgradeCandidateForRun = previousProbe })
 	previous := teamsUserPathResolver
 	targetBin := t.TempDir()
 	managedPrefix := t.TempDir()

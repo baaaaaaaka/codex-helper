@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -14,8 +15,9 @@ var (
 )
 
 type rootOptions struct {
-	configPath   string
-	upgradeCodex bool
+	configPath       string
+	upgradeCodex     bool
+	upgradeCodexPath string
 }
 
 func Execute() int {
@@ -48,6 +50,9 @@ func newRootCmd() *cobra.Command {
 		Version:       buildVersion(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = args
+			if strings.TrimSpace(opts.upgradeCodexPath) != "" && !opts.upgradeCodex {
+				return fmt.Errorf("--upgrade-codex-path requires --upgrade-codex")
+			}
 			if opts.upgradeCodex {
 				return runUpgradeCodexFromRoot(cmd, opts)
 			}
@@ -56,7 +61,8 @@ func newRootCmd() *cobra.Command {
 	}
 
 	cmd.PersistentFlags().StringVar(&opts.configPath, "config", "", "Override config file path (default: OS user config dir)")
-	cmd.Flags().BoolVar(&opts.upgradeCodex, "upgrade-codex", false, "Reinstall Codex CLI using its detected install source")
+	cmd.Flags().BoolVar(&opts.upgradeCodex, "upgrade-codex", false, "Install or upgrade the CXP-managed Codex CLI")
+	cmd.Flags().StringVar(&opts.upgradeCodexPath, "upgrade-codex-path", "", "Upgrade an explicit external Codex executable instead (requires --upgrade-codex)")
 
 	cmd.AddCommand(
 		newInternalNpmWrapperCmd(),

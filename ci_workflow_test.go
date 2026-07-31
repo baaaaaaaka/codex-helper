@@ -63,7 +63,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"Install Codex for integration (Windows)",
 		"Teams app-server probe (Windows)",
 		"Codex upgrade integration (system npm, Windows)",
-		"Codex upgrade integration (local npm, Windows)",
+		"Codex upgrade integration (managed npm with unrelated PATH Codex, Windows)",
 		"Teams target-account PATH Codex upgrade (Windows)",
 		"Codex approval, history, and cancellation runtime integration (Windows)",
 		"Native managed-node install integration (Windows)",

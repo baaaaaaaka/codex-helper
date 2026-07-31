@@ -47,6 +47,7 @@ type codexInstallOptions struct {
 	installerEnv              []string
 	withInstallerEnv          func(context.Context, func([]string) error) error
 	configureInstallerCommand func(*exec.Cmd) error
+	probeManagedCodex         func(context.Context, string, []string) error
 	upgradeCodex              bool
 	upgradeCodexPath          string
 	requireManaged            bool
@@ -1476,7 +1477,7 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 	}
 
 	if opts.requireManaged {
-		if path, err := findManagedCodexForEnvironment(ctx, opts.installerEnv); err == nil {
+		if path, err := findManagedCodexForEnvironmentWithProbe(ctx, opts.installerEnv, opts.probeManagedCodex); err == nil {
 			writeCachedCodexPath(path)
 			return path, nil
 		}
@@ -1554,12 +1555,26 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 }
 
 func findManagedCodexForEnvironment(ctx context.Context, environment []string) (string, error) {
+	return findManagedCodexForEnvironmentWithProbe(ctx, environment, nil)
+}
+
+func findManagedCodexForEnvironmentWithProbe(
+	ctx context.Context,
+	environment []string,
+	probe func(context.Context, string, []string) error,
+) (string, error) {
 	for _, prefix := range managedCodexPrefixCandidates(environment) {
 		for _, candidate := range codexBinCandidatesForPrefixForOS(runtime.GOOS, prefix) {
 			if !executableExists(candidate) {
 				continue
 			}
 			candidate = normalizeExecutablePath(candidate)
+			if probe != nil {
+				if err := probe(ctx, candidate, environment); err == nil {
+					return candidate, nil
+				}
+				continue
+			}
 			probeCtx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
 			command := exec.CommandContext(probeCtx, candidate, "--version")
 			if len(environment) > 0 {
@@ -1581,7 +1596,7 @@ func installManagedCodexWithOptions(ctx context.Context, out io.Writer, opts cod
 	}
 	var installedPath string
 	if err := withCodexInstallLock(ctx, out, func() error {
-		if path, err := findManagedCodexForEnvironment(ctx, opts.installerEnv); err == nil {
+		if path, err := findManagedCodexForEnvironmentWithProbe(ctx, opts.installerEnv, opts.probeManagedCodex); err == nil {
 			installedPath = path
 			return nil
 		}
@@ -1589,7 +1604,7 @@ func installManagedCodexWithOptions(ctx context.Context, out io.Writer, opts cod
 			if err := runCodexInstallerWithOptions(ctx, out, installerEnv, opts.configureInstallerCommand); err != nil {
 				return err
 			}
-			path, err := findManagedCodexForEnvironment(ctx, installerEnv)
+			path, err := findManagedCodexForEnvironmentWithProbe(ctx, installerEnv, opts.probeManagedCodex)
 			if err != nil {
 				return codexPostInstallError("installation", err)
 			}

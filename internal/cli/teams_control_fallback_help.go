@@ -114,7 +114,7 @@ func teamsControlFallbackHelpContext() string {
 		"- `helper webhook setup`: show Teams Workflow webhook setup.",
 		"- `helper update now`: update to the latest stable helper release.",
 		"- `helper update prerelease`: update to the newest eligible release or prerelease.",
-		"- `codex update now`: wait for active work, then update the local Codex CLI using its detected install source.",
+		"- `codex update now`: wait for active work, then update the CXP-managed Codex CLI.",
 		"- `helper restart now`: restart the installed Teams helper, including after a release update.",
 		"- `helper reload now`: development/source-checkout only; rebuild and reload from a local codex-helper checkout.",
 		"",
