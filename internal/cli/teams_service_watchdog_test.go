@@ -877,12 +877,40 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 	if err != nil {
 		t.Fatalf("collect watchdog snapshot: %v", err)
 	}
-	if !snapshot.OwnerFresh || snapshot.PollActivityFound {
-		t.Fatalf("snapshot combined cross-store health evidence: %+v", snapshot)
+	if !snapshot.AmbiguousCanonicalStores || snapshot.OwnerFresh || snapshot.PollActivityFound {
+		t.Fatalf("snapshot selected cross-store health evidence without a managed child identity: %+v", snapshot)
 	}
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "ambiguous") {
+		t.Fatalf("decision = %+v, want ambiguous multi-store noop", decision)
+	}
+
+	prevManagedChild := teamsServiceWatchdogManagedChild
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{PID: os.Getpid(), StartedAt: now.Add(-10 * time.Minute)}, true
+	}
+	t.Cleanup(func() { teamsServiceWatchdogManagedChild = prevManagedChild })
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect managed-child watchdog snapshot: %v", err)
+	}
+	if snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != ownerPath || !snapshot.OwnerFresh || snapshot.PollActivityFound {
+		t.Fatalf("managed-child selection mixed or selected the wrong store: %+v", snapshot)
+	}
+	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
 	if decision.Action != teamsServiceWatchdogActionRestart || !strings.Contains(decision.Reason, "never became active") {
-		t.Fatalf("decision = %+v, want stale owner-store poll restart", decision)
+		t.Fatalf("managed-child decision = %+v, want stale owner-store poll restart", decision)
+	}
+
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{PID: os.Getpid(), StartedAt: now}, true
+	}
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect reused-pid watchdog snapshot: %v", err)
+	}
+	if !snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != "" {
+		t.Fatalf("historical owner with reused managed PID was selected: %+v", snapshot)
 	}
 }
 
@@ -891,12 +919,13 @@ func TestTeamsRuntimeSafetyWatchdogRefusesLifecycleChangesWithMultipleFreshOwner
 		Installed:                true,
 		Active:                   true,
 		StateFiles:               2,
+		AmbiguousCanonicalStores: true,
 		MultipleFreshOwnerStores: true,
 	}
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, teamsServiceWatchdogOptions{
 		Now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
 	})
-	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "multiple canonical") {
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "ambiguous") {
 		t.Fatalf("decision = %+v, want fail-closed multiple-owner noop", decision)
 	}
 }
@@ -961,6 +990,40 @@ func TestTeamsRuntimeSafetyWatchdogIgnoresLegacyAndPerformsZeroStoreWritesCI(t *
 	after := snapshotCLITreeForReadOnlyTest(t, tmp)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("watchdog modified canonical or legacy store files: before=%v after=%v", before, after)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogRejectsCanonicalStoreSymlinkWithoutReadingTargetCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on many Windows runners")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	canonicalPath, err := appdirs.StatePath("teams", "scopes", "scope-symlink", "state.json")
+	if err != nil {
+		t.Fatalf("canonical path: %v", err)
+	}
+	target := filepath.Join(tmp, "outside-store.json")
+	targetData := []byte(`{"schema_version":1}`)
+	if err := os.WriteFile(target, targetData, 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(canonicalPath), 0o700); err != nil {
+		t.Fatalf("mkdir canonical parent: %v", err)
+	}
+	if err := os.Symlink(target, canonicalPath); err != nil {
+		t.Fatalf("create canonical symlink: %v", err)
+	}
+	if _, err := existingCanonicalTeamsStorePathsReadOnly(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("canonical symlink enumeration error = %v, want fail-closed regular-file error", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target after watchdog enumeration: %v", err)
+	}
+	if !bytes.Equal(got, targetData) {
+		t.Fatalf("watchdog enumeration modified symlink target: got %q want %q", got, targetData)
 	}
 }
 
@@ -1319,6 +1382,7 @@ func TestRunTeamsServiceWatchdogOnceDoesNotClearFreshRemoteStoreDuringLocalDrain
 			Installed:                         true,
 			Active:                            true,
 			StateFiles:                        2,
+			AuthoritativeStorePath:            localStorePath,
 			ServiceDraining:                   true,
 			HelperReloadDrainStale:            true,
 			HelperReloadDrainLocalOwnerFresh:  true,

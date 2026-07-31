@@ -3045,6 +3045,9 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 	}
 	delete(env, update.EnvInstallDir)
 	env[update.EnvInstallPath] = exe
+	if err := normalizeTeamsServicePathEnvironment(env, invocationDir); err != nil {
+		return teamsServiceSpec{}, err
+	}
 	return teamsServiceSpec{
 		Executable:   exe,
 		WorkingDir:   workingDir,
@@ -3151,6 +3154,91 @@ func normalizeTeamsServiceCodexHomeEnv(value string, workingDir string) string {
 		value = abs
 	}
 	return value
+}
+
+func normalizeTeamsServicePathEnvironment(env map[string]string, invocationDir string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	pathNames := []string{
+		envCodexHome,
+		"CODEX_DIR",
+		appdirs.EnvStateDir,
+		"XDG_STATE_HOME",
+		"CODEX_HELPER_CONFIG",
+		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_BEACON_STORE",
+		envTeamsASRLlamaModel,
+		envTeamsASRLlamaMMProj,
+		update.EnvInstallPath,
+	}
+	for _, name := range pathNames {
+		value := strings.TrimSpace(env[name])
+		if value == "" {
+			continue
+		}
+		normalized, err := normalizeTeamsServicePersistedPath(value, invocationDir)
+		if err != nil {
+			return fmt.Errorf("resolve Teams service environment %s: %w", name, err)
+		}
+		env[name] = normalized
+	}
+	for _, name := range []string{
+		envTeamsASRCommand,
+		envTeamsASRLlamaBinary,
+		envTeamsASRFFmpeg,
+	} {
+		value := strings.TrimSpace(env[name])
+		if value == "" || !teamsServiceEnvironmentValueLooksLikePath(value) {
+			continue
+		}
+		normalized, err := normalizeTeamsServicePersistedPath(value, invocationDir)
+		if err != nil {
+			return fmt.Errorf("resolve Teams service environment %s: %w", name, err)
+		}
+		env[name] = normalized
+	}
+	return nil
+}
+
+func normalizeTeamsServicePersistedPath(value string, invocationDir string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if value == "~" || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, `~\`) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		suffix := strings.TrimLeft(value[1:], `/\`)
+		value = filepath.Join(home, filepath.FromSlash(strings.ReplaceAll(suffix, `\`, `/`)))
+	}
+	if !filepath.IsAbs(value) {
+		invocationDir = strings.TrimSpace(invocationDir)
+		if invocationDir == "" {
+			return "", fmt.Errorf("relative path %q has no invocation directory", value)
+		}
+		value = filepath.Join(invocationDir, value)
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func teamsServiceEnvironmentValueLooksLikePath(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "~" ||
+		strings.HasPrefix(value, "~/") ||
+		strings.HasPrefix(value, `~\`) ||
+		strings.HasPrefix(value, ".") ||
+		strings.ContainsAny(value, `/\`)
 }
 
 func teamsServiceExistingEnvironment() map[string]string {
@@ -3478,6 +3566,7 @@ func buildTeamsServiceRunArgs(spec teamsServiceSpec) []string {
 		"--owner-stale-after",
 		teamsServiceRunOwnerStaleAfter.String(),
 		"--auto-service=false",
+		"--managed-service-child",
 	}
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
@@ -3788,7 +3877,7 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		args = append(args, key+"="+spec.Environment[key])
 	}
-	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false")
+	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false", "--managed-service-child")
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
 	}

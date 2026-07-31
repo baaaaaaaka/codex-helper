@@ -25,11 +25,6 @@ func TestMain(m *testing.M) {
 			time.Sleep(time.Hour)
 		}
 	}
-	if os.Getenv("CXP_TEAMS_TEST_PRESERVE_USER_DIRS") == "1" {
-		code := m.Run()
-		_ = codexhistory.CloseCaches()
-		os.Exit(code)
-	}
 	tmp, err := os.MkdirTemp("", "codex-helper-cli-tests-")
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "create CLI test temp dir: %v\n", err)
@@ -44,6 +39,8 @@ func TestMain(m *testing.M) {
 		"XDG_CACHE_HOME":  filepath.Join(tmp, "cache"),
 		"XDG_DATA_HOME":   filepath.Join(tmp, "data"),
 		"XDG_STATE_HOME":  filepath.Join(tmp, "state"),
+		"CODEX_HOME":      filepath.Join(tmp, "home", ".codex"),
+		"CODEX_DIR":       filepath.Join(tmp, "home", ".codex"),
 	}
 	for name, value := range isolatedEnv {
 		if err := os.MkdirAll(value, 0o700); err != nil {
@@ -57,7 +54,7 @@ func TestMain(m *testing.M) {
 			os.Exit(2)
 		}
 	}
-	for _, name := range []string{"CODEX_HOME", "CODEX_DIR", "CODEX_CONFIG_DIR"} {
+	for _, name := range []string{"CODEX_CONFIG_DIR", "CODEX_HELPER_STATE_DIR"} {
 		if err := os.Unsetenv(name); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "clear ambient %s: %v\n", name, err)
 			_ = os.RemoveAll(tmp)

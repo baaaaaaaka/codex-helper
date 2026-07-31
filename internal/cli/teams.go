@@ -1031,6 +1031,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var autoService bool
 	var modelProfile string
 	var machineRegistry bool
+	var managedServiceChild bool
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -1090,7 +1091,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					if !actionRequired {
 						return err
 					}
-					if !teamsRunShouldRetryInProcess(once) {
+					if !teamsRunShouldRetryInProcess(once, managedServiceChild) {
 						return fmt.Errorf(
 							"%w; run the managed Teams service to complete offline migration",
 							err,
@@ -1165,7 +1166,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
 				})
 			}
-			if teamsRunShouldRetryInProcess(once) {
+			if teamsRunShouldRetryInProcess(once, managedServiceChild) {
 				return runTeamsServiceRetryLoop(cmd.Context(), cmd.ErrOrStderr(), runOnce)
 			}
 			return runOnce()
@@ -1195,6 +1196,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	cmd.Flags().BoolVar(&machineRegistry, "machine-registry", true, "Enable cross-machine Teams registry heartbeat and delegation worker")
+	cmd.Flags().BoolVar(&managedServiceChild, "managed-service-child", false, "Internal marker for a Teams service-managed listener")
+	_ = cmd.Flags().MarkHidden("managed-service-child")
 	return cmd
 }
 
@@ -1279,14 +1282,16 @@ func teamsASREnvTruthy(value string) bool {
 }
 
 var (
-	teamsRunServiceRetryDelay = 30 * time.Second
-	teamsRunServiceSleep      = sleepContext
+	teamsRunServiceRetryDelay    = 30 * time.Second
+	teamsRunServiceMaxRetryDelay = 5 * time.Minute
+	teamsRunServiceSleep         = sleepContext
 )
 
 func prepareManagedTeamsRuntimeStore(
 	ctx context.Context,
 	scope teamsstore.ScopeIdentity,
 	once bool,
+	managedServiceChild bool,
 ) (bool, error) {
 	plan, err := teams.InspectRuntimeStoreForScope(ctx, scope)
 	if err != nil {
@@ -1295,7 +1300,7 @@ func prepareManagedTeamsRuntimeStore(
 	if plan.Action == teams.RuntimeStoreActionReady || plan.Action == teams.RuntimeStoreActionCreate {
 		return false, nil
 	}
-	if !teamsRunShouldRetryInProcess(once) {
+	if !teamsRunShouldRetryInProcess(once, managedServiceChild) {
 		return false, fmt.Errorf(
 			"canonical and legacy Teams stores both exist; run the managed Teams service to complete offline takeover",
 		)
@@ -1310,8 +1315,12 @@ func prepareManagedTeamsRuntimeStore(
 	return true, nil
 }
 
-func teamsRunShouldRetryInProcess(once bool) bool {
-	return !once && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != ""
+func teamsRunShouldRetryInProcess(once bool, managedServiceChild bool) bool {
+	return !once &&
+		managedServiceChild &&
+		!runningInsideTeamsCodexChild() &&
+		strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == "1" &&
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE_MODE")), "background")
 }
 
 func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
@@ -1322,10 +1331,7 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 		if err == nil || !isRecoverableTeamsRunError(err) {
 			return err
 		}
-		delay := teamsRunServiceRetryDelay
-		if delay <= 0 {
-			delay = 30 * time.Second
-		}
+		delay := teamsRunRetryDelay(err, attempt)
 		if errOut != nil {
 			deadline := "unknown"
 			if value, ok := ctx.Deadline(); ok {
@@ -1344,6 +1350,31 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 			return sleepErr
 		}
 	}
+}
+
+func teamsRunRetryDelay(err error, attempt int) time.Duration {
+	delay := teamsRunServiceRetryDelay
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
+	var migrationBlocked *teams.RuntimeStoreMigrationBlockedError
+	if !errors.As(err, &migrationBlocked) || attempt <= 1 {
+		return delay
+	}
+	maxDelay := teamsRunServiceMaxRetryDelay
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	for i := 1; i < attempt && delay < maxDelay; i++ {
+		if delay > maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
 }
 
 func isRecoverableTeamsRunError(err error) bool {
@@ -2495,7 +2526,10 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	var controlLeases []string
 	var canonicalLoadErrors []string
 	authoritativeStore := ""
+	authoritativeStorePath := ""
+	authoritativeStoreAmbiguous := false
 	storeIdentity := "unavailable"
+	canonicalStoreCandidates := 0
 	activeSessions := 0
 	parkedSessions := 0
 	historicalSessions := 0
@@ -2504,19 +2538,11 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 		if teamsStatusStoreLayer(statePath) == "legacy" {
 			continue
 		}
+		canonicalStoreCandidates++
 		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
 		if err != nil {
 			canonicalLoadErrors = append(canonicalLoadErrors, fmt.Sprintf("%s: %v", statePath, err))
 			continue
-		}
-		if authoritativeStore == "" || statePath == defaultStatePath {
-			authoritativeStore = statePath
-			storeIdentity = fmt.Sprintf(
-				"scope=%s account=%s profile=%s",
-				firstNonEmptyCLI(state.Scope.ID, "unknown"),
-				firstNonEmptyCLI(state.Scope.AccountID, "unknown"),
-				firstNonEmptyCLI(state.Scope.Profile, "default"),
-			)
 		}
 		owner, ownerKind := teamsStatusOwner(state, now)
 		statusStores = append(statusStores, teamsStatusStoreSnapshot{
@@ -2571,7 +2597,47 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			controlChatSource = statePath
 		}
 	}
-	if authoritativeStore == "" {
+	if canonicalStoreCandidates == 1 && len(statusStores) == 1 {
+		authoritativeStorePath = statusStores[0].Path
+	} else if canonicalStoreCandidates > 1 {
+		if len(canonicalLoadErrors) == 0 {
+			managedChild, managed := teamsServiceWatchdogManagedChild()
+			for _, snapshot := range statusStores {
+				if snapshot.OwnerKind != teamsStatusOwnerLive ||
+					!managed ||
+					!teamsServiceWatchdogOwnerMatchesManagedChild(snapshot.Owner, managedChild) {
+					continue
+				}
+				if authoritativeStorePath != "" {
+					authoritativeStorePath = ""
+					break
+				}
+				authoritativeStorePath = snapshot.Path
+			}
+		}
+		if authoritativeStorePath == "" {
+			authoritativeStoreAmbiguous = true
+		}
+	}
+	if authoritativeStorePath != "" {
+		authoritativeStore = authoritativeStorePath
+		for _, snapshot := range statusStores {
+			if filepath.Clean(snapshot.Path) != filepath.Clean(authoritativeStorePath) {
+				continue
+			}
+			storeIdentity = fmt.Sprintf(
+				"scope=%s account=%s profile=%s",
+				firstNonEmptyCLI(snapshot.State.Scope.ID, "unknown"),
+				firstNonEmptyCLI(snapshot.State.Scope.AccountID, "unknown"),
+				firstNonEmptyCLI(snapshot.State.Scope.Profile, "default"),
+			)
+			break
+		}
+	} else if authoritativeStoreAmbiguous {
+		authoritativeStore = "unknown (multiple canonical stores are ambiguous)"
+	} else if canonicalStoreCandidates > 0 {
+		authoritativeStore = "unknown (canonical store could not be loaded)"
+	} else {
 		authoritativeStore = defaultStatePath + " (not present)"
 	}
 	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
@@ -2583,7 +2649,9 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	for _, statePath := range statePaths {
 		layer := teamsStatusStoreLayer(statePath)
 		authority := "non-authoritative"
-		if layer == "canonical" && filepath.Clean(statePath) == filepath.Clean(strings.TrimSuffix(authoritativeStore, " (not present)")) {
+		if layer == "canonical" && authoritativeStoreAmbiguous {
+			authority = "unknown"
+		} else if layer == "canonical" && filepath.Clean(statePath) == filepath.Clean(authoritativeStorePath) {
 			authority = "authoritative"
 		}
 		_, _ = fmt.Fprintf(out, "Store candidate: %s %s %s\n", layer, authority, statePath)
@@ -3883,10 +3951,14 @@ func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
 	paths = uniquePaths(paths)
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
 			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("canonical Teams store %s is not a regular file", path)
 		}
 		out = append(out, path)
 	}

@@ -346,6 +346,26 @@ func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *test
 	}
 }
 
+func TestLoadPathRuntimeMetadataReadOnlyRejectsOversizedJSONBeforeOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("create oversized JSON fixture: %v", err)
+	}
+	if err := f.Truncate(maxRuntimeMetadataJSONBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatalf("truncate oversized JSON fixture: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close oversized JSON fixture: %v", err)
+	}
+
+	_, err = LoadPathRuntimeMetadataReadOnly(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "discovery limit") {
+		t.Fatalf("oversized metadata error = %v, want discovery limit", err)
+	}
+}
+
 type readOnlyFileSnapshot struct {
 	Mode    os.FileMode
 	Size    int64

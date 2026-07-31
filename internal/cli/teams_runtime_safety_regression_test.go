@@ -35,6 +35,8 @@ func TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI(t *testin
 		"XDG_CACHE_HOME",
 		"XDG_DATA_HOME",
 		"XDG_STATE_HOME",
+		"CODEX_HOME",
+		"CODEX_DIR",
 	} {
 		value := strings.TrimSpace(os.Getenv(name))
 		if value == "" {
@@ -45,9 +47,9 @@ func TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI(t *testin
 			t.Fatalf("TestMain left %s outside the package test root: %q (root %q)", name, value, testRoot)
 		}
 	}
-	for _, name := range []string{"CODEX_HOME", "CODEX_DIR", "CODEX_CONFIG_DIR"} {
+	for _, name := range []string{"CODEX_CONFIG_DIR", "CODEX_HELPER_STATE_DIR"} {
 		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			t.Fatalf("TestMain retained ambient %s=%q instead of using the isolated HOME fallback", name, value)
+			t.Fatalf("TestMain retained ambient %s=%q", name, value)
 		}
 	}
 }
@@ -85,6 +87,74 @@ func TestTeamsRuntimeSafetyServiceSpecDoesNotPersistInvocationWorkingDirCI(t *te
 	}
 	if info, err := os.Stat(spec.WorkingDir); err != nil || !info.IsDir() {
 		t.Fatalf("service WorkingDir must be an existing directory: path=%q info=%v err=%v", spec.WorkingDir, info, err)
+	}
+}
+
+func TestTeamsRuntimeSafetyServiceSpecNormalizesAllPersistedPathOverridesCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	invocationDir := filepath.Join(tmp, "invocation")
+	if err := os.MkdirAll(invocationDir, 0o700); err != nil {
+		t.Fatalf("mkdir invocation dir: %v", err)
+	}
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exe,
+		argv0:   exe,
+		cwd:     invocationDir,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	spec, err := buildTeamsServiceSpec(
+		stringPtr("registry.json"),
+		teamsServiceSpecEnvironmentOverrides(map[string]string{
+			"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
+			"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
+			"CODEX_HELPER_BEACON_STORE":      "beacon/state.json",
+			envTeamsASRLlamaModel:            "models/qwen.gguf",
+			envTeamsASRCommand:               "bin/asr",
+			envTeamsASRFFmpeg:                "ffmpeg",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec: %v", err)
+	}
+	for name, relative := range map[string]string{
+		"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
+		"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
+		"CODEX_HELPER_BEACON_STORE":      "beacon/state.json",
+		envTeamsASRLlamaModel:            "models/qwen.gguf",
+		envTeamsASRCommand:               "bin/asr",
+	} {
+		want := filepath.Join(invocationDir, filepath.FromSlash(relative))
+		if got := spec.Environment[name]; got != want || !filepath.IsAbs(got) {
+			t.Fatalf("%s = %q, want invocation-time absolute path %q", name, got, want)
+		}
+	}
+	if got := spec.Environment[envTeamsASRFFmpeg]; got != "ffmpeg" {
+		t.Fatalf("bare ffmpeg command was incorrectly treated as a path: %q", got)
+	}
+	if spec.RegistryPath != filepath.Join(invocationDir, "registry.json") {
+		t.Fatalf("registry path = %q, want invocation-time absolute path", spec.RegistryPath)
+	}
+}
+
+func TestTeamsRuntimeSafetyManagedServiceArgsAlwaysCarryMigrationAuthorityMarkerCI(t *testing.T) {
+	args := buildTeamsServiceRunArgs(teamsServiceSpec{})
+	found := false
+	for _, arg := range args {
+		if arg == "--managed-service-child" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("managed service args omitted hidden migration authority marker: %v", args)
 	}
 }
 
@@ -264,7 +334,7 @@ func TestTeamsRuntimeSafetyForegroundDualStoreFailsClosedWithoutMutationCI(t *te
 	scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "foreground")
 
 	before := snapshotCLITreeForReadOnlyTest(t, tmp)
-	migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, true)
+	migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, true, false)
 	if err == nil || !strings.Contains(err.Error(), "managed Teams service") {
 		t.Fatalf("foreground dual-store error = %v, want managed-service guidance", err)
 	}
@@ -291,10 +361,12 @@ func TestTeamsRuntimeSafetyManagedChildCompletesOfflineDualStoreTakeoverCI(t *te
 			teamsServiceGOOS = func() string { return goos }
 			tmp := t.TempDir()
 			isolateTeamsUserDirsForTest(t, tmp)
-			t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "managed-"+goos)
+			t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+			t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
+			t.Setenv(envTeamsCodexChild, "")
 			scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "managed-"+goos)
 
-			migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false)
+			migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false, true)
 			if err != nil {
 				t.Fatalf("managed offline takeover: %v", err)
 			}
@@ -812,6 +884,33 @@ func TestTeamsRuntimeSafetyRecoverableErrorIncludesOperationContextCI(t *testing
 	}
 }
 
+func TestTeamsRuntimeSafetyBlockedMigrationUsesBoundedExponentialRetryCI(t *testing.T) {
+	lockCLITestHooks(t)
+	previousBase := teamsRunServiceRetryDelay
+	previousMax := teamsRunServiceMaxRetryDelay
+	t.Cleanup(func() {
+		teamsRunServiceRetryDelay = previousBase
+		teamsRunServiceMaxRetryDelay = previousMax
+	})
+	teamsRunServiceRetryDelay = time.Second
+	teamsRunServiceMaxRetryDelay = 5 * time.Second
+	err := &teams.RuntimeStoreMigrationBlockedError{Err: errors.New("staging validation failed")}
+	for attempt, want := range map[int]time.Duration{
+		1: time.Second,
+		2: 2 * time.Second,
+		3: 4 * time.Second,
+		4: 5 * time.Second,
+		8: 5 * time.Second,
+	} {
+		if got := teamsRunRetryDelay(err, attempt); got != want {
+			t.Fatalf("attempt %d delay = %s, want %s", attempt, got, want)
+		}
+	}
+	if got := teamsRunRetryDelay(&teams.GraphStatusError{StatusCode: 502}, 8); got != time.Second {
+		t.Fatalf("ordinary Graph retry delay = %s, want fixed base delay", got)
+	}
+}
+
 func TestTeamsRuntimeSafetyStatusReportsAuthoritativeStoreAndReadinessLayersCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -850,6 +949,52 @@ func TestTeamsRuntimeSafetyStatusReportsAuthoritativeStoreAndReadinessLayersCI(t
 		if !strings.Contains(out, want) {
 			t.Fatalf("teams status omitted %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestTeamsRuntimeSafetyStatusReportsAmbiguousCanonicalStoresWithoutManagedOwnerCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "codex-proxy")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    runtime.GOOS,
+		exe:     exe,
+		argv0:   exe,
+		cwd:     tmp,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{output: []byte("inactive\n")},
+	})
+
+	for _, scopeID := range []string{"scope-status-a", "scope-status-b"} {
+		path := cliStatePathForTest(t, "teams", "scopes", scopeID, "state.json")
+		store, err := teamsstore.Open(path)
+		if err != nil {
+			t.Fatalf("open %s: %v", scopeID, err)
+		}
+		if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+			state.Scope = teamsstore.ScopeIdentity{ID: scopeID, Profile: "default"}
+			return nil
+		}); err != nil {
+			_ = store.Close()
+			t.Fatalf("seed %s: %v", scopeID, err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("close %s: %v", scopeID, err)
+		}
+	}
+
+	out := executeRootForTeamsTest(t, "teams", "status")
+	if !strings.Contains(out, "Authoritative store: unknown (multiple canonical stores are ambiguous)") {
+		t.Fatalf("status guessed an authoritative canonical store:\n%s", out)
+	}
+	if got := strings.Count(out, "Store candidate: canonical unknown "); got != 2 {
+		t.Fatalf("canonical unknown candidates = %d, want 2:\n%s", got, out)
 	}
 }
 

@@ -72,6 +72,8 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	t.Setenv("CODEX_HOME", filepath.Join(tmp, ".codex"))
+	t.Setenv("CODEX_DIR", filepath.Join(tmp, ".codex"))
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv(update.EnvInstallPath, "")
 	t.Setenv(update.EnvInstallDir, "")
@@ -285,7 +287,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"[Unit]",
 		"Description=Codex Helper Teams bridge",
 		"WorkingDirectory=" + systemdQuoteArg(stableHome),
-		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(registryPath),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + strconv.Quote(registryPath),
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
@@ -4691,7 +4693,7 @@ func TestTeamsServiceInstallRendersModelProfileProviderKeysForBackgroundService(
 	}
 	unit := string(data)
 	for _, want := range []string{
-		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + systemdQuoteArg(registryPath),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + systemdQuoteArg(registryPath),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_CONFIG="+filepath.Join(tmp, "cxp-config.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=thirdparty-service"),
 		"Environment=" + systemdQuoteArg("QWEN_API_KEY=sk-qwen-background-test"),
@@ -5145,6 +5147,7 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 		"<string>--owner-stale-after</string>",
 		"<string>1m30s</string>",
 		"<string>--auto-service=false</string>",
+		"<string>--managed-service-child</string>",
 		"<string>--registry</string>",
 		"<string>" + registryPath + "</string>",
 		"<key>KeepAlive</key>",
@@ -5293,7 +5296,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"Start-Process -FilePath",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
-		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '1m30s' '--auto-service=false' '--registry' '" + registryPath + "'",
+		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '1m30s' '--auto-service=false' '--managed-service-child' '--registry' '" + registryPath + "'",
 		"$code = $LASTEXITCODE",
 		"exit $code",
 		"$env:CODEX_HELPER_TEAMS_SERVICE = '1'",
@@ -7243,7 +7246,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {

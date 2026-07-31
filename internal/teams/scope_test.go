@@ -2167,6 +2167,7 @@ func assertTeamsPathMissing(t *testing.T, path string) {
 
 func isolateTeamsScopeUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Helper()
+	authorizeTeamsPackageSubprocessRoot(t, tmp)
 	home := filepath.Join(tmp, "home")
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -2176,6 +2177,8 @@ func isolateTeamsScopeUserDirsForTest(t *testing.T, tmp string) (string, string)
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(tmp, "data"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
+	t.Setenv("CODEX_DIR", filepath.Join(home, ".codex"))
 	t.Setenv("CODEX_HELPER_STATE_DIR", "")
 	configBase, err := os.UserConfigDir()
 	if err != nil {

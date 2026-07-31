@@ -84,6 +84,7 @@ test_status=0
   CODEX_HOME="$probe_root/codex-home" \
   CODEX_DIR="$probe_root/codex-home" \
   CODEX_CONFIG_DIR="$probe_root/codex-config" \
+  CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1 \
   GOMODCACHE="$go_mod_cache" \
   GOCACHE="$go_build_cache" \
   GOTELEMETRY=off \

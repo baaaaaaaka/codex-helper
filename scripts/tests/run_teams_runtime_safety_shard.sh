@@ -3,14 +3,14 @@ set -euo pipefail
 
 case "${1:-}" in
   isolation)
-    go test ./internal/cli -count=1 \
+    CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1 go test ./internal/cli -count=1 \
       -run '^TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI$' -v
-    go test ./internal/teams -count=1 \
-      -run '^TestTeamsPackageTestMainIsolatesEveryUserDirectoryCI$' -v
+    CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1 go test ./internal/teams -count=1 \
+      -run '^TestTeamsPackageTestMain(IsolatesEveryUserDirectory|RejectsUnmarkedInheritedRoot)CI$' -v
     ;;
   store)
     go test ./internal/teams -count=1 \
-      -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|AutomaticTakeover|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
+      -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|AutomaticTakeover|BackupConflict|OutboundReplayFence|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
     go test ./internal/teams/store -count=1 \
       -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly)' -v
     ;;
@@ -30,7 +30,7 @@ case "${1:-}" in
     ;;
   diagnostics)
     go test ./internal/cli -count=1 \
-      -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|Status|DoctorDeepReads|UnavailableModel)' -v
+      -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|BlockedMigration|Status|DoctorDeepReads|UnavailableModel)' -v
     ;;
   windows)
     go test ./internal/cli -count=1 \

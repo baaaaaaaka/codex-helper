@@ -37,6 +37,7 @@ const (
 	maxRetainedMessageProvenance       = 8192
 	maxRetainedHelperDeliveries        = 32768
 	maxStatePointerSize                = 4096
+	maxRuntimeMetadataJSONBytes        = 64 << 20
 )
 
 type SessionStatus string
@@ -851,6 +852,19 @@ type OutboxMessage struct {
 	LastSendError          string           `json:"last_send_error,omitempty"`
 }
 
+// OutboxReplayFence is a cold-path proof that an outbox message was already
+// accepted by Teams before a legacy store was quarantined. Every populated
+// identity field must match the canonical outbox row before it can be promoted
+// to sent.
+type OutboxReplayFence struct {
+	OutboxID       string
+	TeamsChatID    string
+	TeamsMessageID string
+	SessionID      string
+	TurnID         string
+	Kind           string
+}
+
 type SessionQuarantineRequest struct {
 	SessionID         string
 	Reason            string
@@ -1420,6 +1434,13 @@ func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return RuntimeMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
+	}
+	if info.Size() > maxRuntimeMetadataJSONBytes {
+		return RuntimeMetadata{}, fmt.Errorf(
+			"teams runtime metadata JSON exceeds %d-byte discovery limit: %s",
+			maxRuntimeMetadataJSONBytes,
+			path,
+		)
 	}
 	if info.Size() <= maxStatePointerSize {
 		data, err := os.ReadFile(path)
@@ -5569,6 +5590,92 @@ func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessag
 
 func (s *Store) MarkOutboxSentForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
 	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true)
+}
+
+// ApplyOutboxReplayFences promotes already-delivered canonical outbox rows in
+// one transaction. It is intentionally separate from the normal send path so
+// regular delivery does not gain a global-ledger lookup.
+func (s *Store) ApplyOutboxReplayFences(ctx context.Context, fences []OutboxReplayFence) (int, error) {
+	fences, err := normalizeOutboxReplayFences(fences)
+	if err != nil || len(fences) == 0 {
+		return 0, err
+	}
+	if changed, handled, err := s.applyOutboxReplayFencesSQLite(ctx, fences); handled || err != nil {
+		return changed, err
+	}
+	changed := 0
+	err = s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		for _, fence := range fences {
+			current, ok := state.OutboxMessages[fence.OutboxID]
+			if !ok {
+				continue
+			}
+			if err := validateOutboxReplayFence(current, fence); err != nil {
+				return false, err
+			}
+		}
+		now := time.Now()
+		for _, fence := range fences {
+			current, ok := state.OutboxMessages[fence.OutboxID]
+			if !ok || current.Status == OutboxStatusSent {
+				continue
+			}
+			current.Status = OutboxStatusSent
+			current.TeamsMessageID = fence.TeamsMessageID
+			if current.SentAt.IsZero() {
+				current.SentAt = now
+			}
+			current.UpdatedAt = now
+			current.LastSendError = ""
+			current.SendAttemptToken = ""
+			state.OutboxMessages[current.ID] = current
+			changed++
+		}
+		return changed > 0, nil
+	})
+	return changed, err
+}
+
+func normalizeOutboxReplayFences(fences []OutboxReplayFence) ([]OutboxReplayFence, error) {
+	normalized := make([]OutboxReplayFence, 0, len(fences))
+	byID := make(map[string]OutboxReplayFence, len(fences))
+	for _, fence := range fences {
+		fence.OutboxID = strings.TrimSpace(fence.OutboxID)
+		fence.TeamsChatID = strings.TrimSpace(fence.TeamsChatID)
+		fence.TeamsMessageID = strings.TrimSpace(fence.TeamsMessageID)
+		fence.SessionID = strings.TrimSpace(fence.SessionID)
+		fence.TurnID = strings.TrimSpace(fence.TurnID)
+		fence.Kind = strings.TrimSpace(fence.Kind)
+		if fence.OutboxID == "" || fence.TeamsMessageID == "" {
+			continue
+		}
+		if existing, ok := byID[fence.OutboxID]; ok {
+			if existing != fence {
+				return nil, fmt.Errorf("conflicting replay fences for outbox %q", fence.OutboxID)
+			}
+			continue
+		}
+		byID[fence.OutboxID] = fence
+		normalized = append(normalized, fence)
+	}
+	sort.Slice(normalized, func(i, j int) bool {
+		return normalized[i].OutboxID < normalized[j].OutboxID
+	})
+	return normalized, nil
+}
+
+func validateOutboxReplayFence(current OutboxMessage, fence OutboxReplayFence) error {
+	if current.ID != fence.OutboxID ||
+		strings.TrimSpace(current.TeamsChatID) != fence.TeamsChatID ||
+		strings.TrimSpace(current.SessionID) != fence.SessionID ||
+		strings.TrimSpace(current.TurnID) != fence.TurnID ||
+		strings.TrimSpace(current.Kind) != fence.Kind {
+		return fmt.Errorf("legacy delivery identity conflicts with canonical outbox %q", fence.OutboxID)
+	}
+	if existing := strings.TrimSpace(current.TeamsMessageID); existing != "" && existing != fence.TeamsMessageID {
+		return fmt.Errorf("legacy Teams message id conflicts with canonical outbox %q", fence.OutboxID)
+	}
+	return nil
 }
 
 func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {

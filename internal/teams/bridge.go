@@ -2620,6 +2620,10 @@ func IsRecoverablePollFailure(err error) bool {
 	if errors.As(err, &takeoverDeferred) {
 		return true
 	}
+	var migrationBlocked *RuntimeStoreMigrationBlockedError
+	if errors.As(err, &migrationBlocked) {
+		return true
+	}
 	return isPersistentPollFailureCandidate(err)
 }
 

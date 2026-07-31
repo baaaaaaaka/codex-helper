@@ -425,16 +425,27 @@ func TestRunTeamsServiceRetryLoopDoesNotRetryPermanentErrors(t *testing.T) {
 func TestTeamsRunShouldRetryInProcessOnlyForServiceMode(t *testing.T) {
 	lockCLITestHooks(t)
 
+	t.Setenv(envTeamsCodexChild, "")
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
-	if teamsRunShouldRetryInProcess(false) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "")
+	if teamsRunShouldRetryInProcess(false, false) {
 		t.Fatal("foreground teams run should not retry internally")
 	}
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	if !teamsRunShouldRetryInProcess(false) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
+	if !teamsRunShouldRetryInProcess(false, true) {
 		t.Fatal("background service teams run should retry recoverable errors internally")
 	}
-	if teamsRunShouldRetryInProcess(true) {
+	if teamsRunShouldRetryInProcess(true, true) {
 		t.Fatal("teams run --once should not enter service retry loop")
+	}
+	t.Setenv(envTeamsCodexChild, "1")
+	if teamsRunShouldRetryInProcess(false, true) {
+		t.Fatal("Teams Codex child must not receive managed-service migration authority")
+	}
+	t.Setenv(envTeamsCodexChild, "")
+	if teamsRunShouldRetryInProcess(false, false) {
+		t.Fatal("service environment without the hidden managed-child argument must fail closed")
 	}
 }
 

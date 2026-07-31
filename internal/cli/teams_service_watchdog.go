@@ -45,6 +45,8 @@ type teamsServiceWatchdogSnapshot struct {
 	Installed                          bool
 	Active                             bool
 	StateFiles                         int
+	AuthoritativeStorePath             string
+	AmbiguousCanonicalStores           bool
 	MultipleFreshOwnerStores           bool
 	ServicePaused                      bool
 	ServiceDraining                    bool
@@ -86,6 +88,11 @@ type teamsServiceWatchdogResult struct {
 	DryRun   bool
 }
 
+type teamsServiceWatchdogManagedChildIdentity struct {
+	PID       int
+	StartedAt time.Time
+}
+
 var (
 	teamsServiceWatchdogNow             = time.Now
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
@@ -94,6 +101,7 @@ var (
 	teamsServiceWatchdogInstalled       = teamsServiceInstalled
 	teamsServiceWatchdogActive          = teamsServiceActive
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
+	teamsServiceWatchdogManagedChild    = defaultTeamsServiceWatchdogManagedChild
 )
 
 func newTeamsServiceWatchdogCmd() *cobra.Command {
@@ -165,7 +173,17 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 		return result, nil
 	}
 	if decision.Action == teamsServiceWatchdogActionClear {
-		if err := reconcileTeamsServiceWatchdogLifecycleDrains(ctx, opts); err != nil {
+		path := snapshot.AuthoritativeStorePath
+		if strings.TrimSpace(path) == "" && snapshot.StateFiles == 1 {
+			paths, pathErr := teamsServiceWatchdogStorePaths()
+			if pathErr != nil {
+				return result, pathErr
+			}
+			if len(paths) == 1 {
+				path = paths[0]
+			}
+		}
+		if err := reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx, opts, path); err != nil {
 			return result, err
 		}
 		if err := saveTeamsServiceWatchdogState(next); err != nil {
@@ -231,10 +249,18 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	if err != nil {
 		return snapshot, err
 	}
-	var selected teamsServiceWatchdogSnapshot
-	selectedFound := false
+	type candidateSnapshot struct {
+		path     string
+		snapshot teamsServiceWatchdogSnapshot
+		owner    teamsstore.OwnerMetadata
+		hasOwner bool
+	}
+	candidates := make([]candidateSnapshot, 0, len(paths))
 	freshOwnerStores := 0
 	for _, path := range paths {
+		if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
+			return snapshot, err
+		}
 		state, err := teamsstore.LoadPathReadOnly(ctx, path)
 		if err != nil {
 			return snapshot, err
@@ -242,43 +268,75 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.StateFiles++
 		var candidate teamsServiceWatchdogSnapshot
 		mergeTeamsServiceWatchdogState(&candidate, state, opts)
+		owner, hasOwner := rawTeamsStateOwner(state)
 		if candidate.OwnerFresh {
 			freshOwnerStores++
 		}
-		if !selectedFound || teamsServiceWatchdogSnapshotPreferred(candidate, selected) {
-			selected = candidate
-			selectedFound = true
+		candidates = append(candidates, candidateSnapshot{path: path, snapshot: candidate, owner: owner, hasOwner: hasOwner})
+	}
+	var selected candidateSnapshot
+	selectedFound := false
+	if len(candidates) == 1 {
+		selected = candidates[0]
+		selectedFound = true
+	} else if len(candidates) > 1 {
+		managedChild, ok := teamsServiceWatchdogManagedChild()
+		if ok && managedChild.PID > 0 && !managedChild.StartedAt.IsZero() {
+			for _, candidate := range candidates {
+				if !candidate.hasOwner ||
+					!candidate.snapshot.OwnerFresh ||
+					!teamsServiceWatchdogOwnerMatchesManagedChild(candidate.owner, managedChild) {
+					continue
+				}
+				if selectedFound {
+					selectedFound = false
+					break
+				}
+				selected = candidate
+				selectedFound = true
+			}
+		}
+		if !selectedFound {
+			snapshot.AmbiguousCanonicalStores = true
 		}
 	}
 	if selectedFound {
 		installed := snapshot.Installed
 		active := snapshot.Active
 		stateFiles := snapshot.StateFiles
-		snapshot = selected
+		snapshot = selected.snapshot
 		snapshot.Installed = installed
 		snapshot.Active = active
 		snapshot.StateFiles = stateFiles
+		snapshot.AuthoritativeStorePath = selected.path
+		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
+	} else {
 		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
 	}
 	return snapshot, nil
 }
 
-func teamsServiceWatchdogSnapshotPreferred(candidate, current teamsServiceWatchdogSnapshot) bool {
-	if candidate.OwnerFresh != current.OwnerFresh {
-		return candidate.OwnerFresh
+func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChildIdentity, bool) {
+	status, ok, err := readTeamsServiceLocalSupervisorStatus()
+	if err != nil || !ok || status.ChildPID <= 0 || status.ChildIdentity == nil || status.LastChildStartAt.IsZero() {
+		return teamsServiceWatchdogManagedChildIdentity{}, false
 	}
-	if candidate.OwnerFound != current.OwnerFound {
-		return candidate.OwnerFound
+	if !teamsLocalSupervisorProcessAlive(status.ChildPID) {
+		return teamsServiceWatchdogManagedChildIdentity{}, false
 	}
-	candidateActivity := candidate.LastOwnerHeartbeat
-	if candidate.PollActivityAt.After(candidateActivity) {
-		candidateActivity = candidate.PollActivityAt
+	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(status.ChildPID, status.ChildIdentity, "local supervisor child"); err != nil {
+		return teamsServiceWatchdogManagedChildIdentity{}, false
 	}
-	currentActivity := current.LastOwnerHeartbeat
-	if current.PollActivityAt.After(currentActivity) {
-		currentActivity = current.PollActivityAt
-	}
-	return candidateActivity.After(currentActivity)
+	return teamsServiceWatchdogManagedChildIdentity{PID: status.ChildPID, StartedAt: status.LastChildStartAt}, true
+}
+
+func teamsServiceWatchdogOwnerMatchesManagedChild(owner teamsstore.OwnerMetadata, child teamsServiceWatchdogManagedChildIdentity) bool {
+	return child.PID > 0 &&
+		!child.StartedAt.IsZero() &&
+		teamsstore.OwnerAppearsLocal(owner) &&
+		owner.PID == child.PID &&
+		!owner.StartedAt.IsZero() &&
+		!owner.StartedAt.Before(child.StartedAt.Add(-time.Second))
 }
 
 func mergeTeamsServiceWatchdogState(snapshot *teamsServiceWatchdogSnapshot, state teamsstore.State, opts teamsServiceWatchdogOptions) {
@@ -396,6 +454,9 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
 	}
+	if snapshot.AmbiguousCanonicalStores {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores are ambiguous; refusing automatic lifecycle changes"}
+	}
 	if snapshot.MultipleFreshOwnerStores {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores have fresh owners; refusing automatic lifecycle changes"}
 	}
@@ -457,49 +518,75 @@ func evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot teamsServiceWat
 }
 
 func reconcileTeamsServiceWatchdogLifecycleDrains(ctx context.Context, opts teamsServiceWatchdogOptions) error {
-	opts = normalizeTeamsServiceWatchdogOptions(opts)
-	paths, err := teamsServiceWatchdogStorePaths()
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(ctx, opts)
 	if err != nil {
 		return err
 	}
-	for _, path := range paths {
-		state, err := teamsstore.LoadPathReadOnly(ctx, path)
-		if err != nil {
-			return err
-		}
-		upgradeExpired := teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != ""
-		reloadStale := teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter)
-		if !upgradeExpired && !reloadStale {
-			continue
-		}
-		st, err := teamsstore.Open(path)
-		if err != nil {
-			return err
-		}
-		state, err = st.Load(ctx)
-		if err != nil {
+	if snapshot.AmbiguousCanonicalStores {
+		return fmt.Errorf("multiple canonical Teams stores are ambiguous; refusing lifecycle reconciliation")
+	}
+	return reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx, opts, snapshot.AuthoritativeStorePath)
+}
+
+func reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx context.Context, opts teamsServiceWatchdogOptions, path string) error {
+	opts = normalizeTeamsServiceWatchdogOptions(opts)
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
+		return err
+	}
+	state, err := teamsstore.LoadPathReadOnly(ctx, path)
+	if err != nil {
+		return err
+	}
+	upgradeExpired := teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != ""
+	reloadStale := teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter)
+	if !upgradeExpired && !reloadStale {
+		return nil
+	}
+	if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
+		return err
+	}
+	st, err := teamsstore.Open(path)
+	if err != nil {
+		return err
+	}
+	state, err = st.Load(ctx)
+	if err != nil {
+		_ = st.Close()
+		return err
+	}
+	if teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
+		if _, _, err := st.AbortExpiredHelperUpgradeDrain(ctx, state.Upgrade.ID, opts.Now, opts.OwnerStaleAfter, "helper upgrade drain expired; reconciled by watchdog"); err != nil {
 			_ = st.Close()
 			return err
-		}
-		if teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
-			if _, _, err := st.AbortExpiredHelperUpgradeDrain(ctx, state.Upgrade.ID, opts.Now, opts.OwnerStaleAfter, "helper upgrade drain expired; reconciled by watchdog"); err != nil {
-				_ = st.Close()
-				return err
-			}
-			if err := st.Close(); err != nil {
-				return err
-			}
-			continue
-		}
-		if teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter) {
-			if _, _, err := st.ClearStaleHelperReloadDrain(ctx, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter, opts.OwnerStaleAfter); err != nil {
-				_ = st.Close()
-				return err
-			}
 		}
 		if err := st.Close(); err != nil {
 			return err
 		}
+		return nil
+	}
+	if teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter) {
+		if _, _, err := st.ClearStaleHelperReloadDrain(ctx, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter, opts.OwnerStaleAfter); err != nil {
+			_ = st.Close()
+			return err
+		}
+	}
+	if err := st.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTeamsServiceWatchdogStorePath(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("canonical Teams watchdog store %s is not a regular file", path)
 	}
 	return nil
 }

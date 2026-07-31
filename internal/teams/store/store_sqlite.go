@@ -5007,6 +5007,67 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 	return out, handled, err
 }
 
+func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []OutboxReplayFence) (int, bool, error) {
+	changed := 0
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		current := make(map[string]OutboxMessage, len(fences))
+		for _, fence := range fences {
+			msg, found, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, fence.OutboxID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				continue
+			}
+			if err := validateOutboxReplayFence(msg, fence); err != nil {
+				return err
+			}
+			current[fence.OutboxID] = msg
+		}
+
+		now := time.Now()
+		for _, fence := range fences {
+			msg, ok := current[fence.OutboxID]
+			if !ok || msg.Status == OutboxStatusSent {
+				continue
+			}
+			msg.Status = OutboxStatusSent
+			msg.TeamsMessageID = fence.TeamsMessageID
+			if msg.SentAt.IsZero() {
+				msg.SentAt = now
+			}
+			msg.UpdatedAt = now
+			msg.LastSendError = ""
+			msg.SendAttemptToken = ""
+			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+				return err
+			}
+			changed++
+		}
+		if changed == 0 {
+			return nil
+		}
+		return tx.Commit()
+	})
+	return changed, handled, err
+}
+
 func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, bool, error) {
 	var out PendingOutboxPage
 	handled := false

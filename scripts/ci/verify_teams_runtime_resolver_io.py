@@ -134,10 +134,29 @@ def main() -> None:
             1,
         )
     )
+    bridge_prestore_metadata = sum(
+        verify_phase(
+            phase,
+            root,
+            f"Bridge pre-store inspection process {index}",
+            allow_legacy_metadata=True,
+            metadata_minimum=2,
+            metadata_limit=2,
+        )
+        for index, phase in enumerate(
+            trace_phases(
+                lines,
+                "CXP_TEAMS_BRIDGE_PRESTORE_IO_BEGIN",
+                "CXP_TEAMS_BRIDGE_PRESTORE_IO_END",
+            ),
+            1,
+        )
+    )
 
     print(
         "Teams resolver syscall budget passed: "
         f"resolver_metadata={resolver_metadata} listener_metadata={listener_metadata} "
+        f"bridge_prestore_metadata={bridge_prestore_metadata} "
         "open=0 scan=0 sqlite=0 mutate=0"
     )
 
