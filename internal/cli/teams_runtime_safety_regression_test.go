@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -357,48 +358,55 @@ func TestTeamsRuntimeSafetyManagedChildCompletesOfflineDualStoreTakeoverCI(t *te
 	previousGOOS := teamsServiceGOOS
 	t.Cleanup(func() { teamsServiceGOOS = previousGOOS })
 	for _, goos := range []string{"linux", "darwin", "windows"} {
-		t.Run(goos, func(t *testing.T) {
-			teamsServiceGOOS = func() string { return goos }
-			tmp := t.TempDir()
-			isolateTeamsUserDirsForTest(t, tmp)
-			t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-			t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
-			t.Setenv(envTeamsCodexChild, "")
-			scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "managed-"+goos)
+		for _, managedServiceChild := range []bool{true, false} {
+			spec := "new-spec"
+			if !managedServiceChild {
+				spec = "persisted-old-spec"
+			}
+			t.Run(goos+"/"+spec, func(t *testing.T) {
+				teamsServiceGOOS = func() string { return goos }
+				tmp := t.TempDir()
+				isolateTeamsUserDirsForTest(t, tmp)
+				t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
+				t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
+				t.Setenv(envTeamsCodexChild, "")
+				suffix := "managed-" + goos + "-" + spec
+				scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, suffix)
 
-			migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false, true)
-			if err != nil {
-				t.Fatalf("managed offline takeover: %v", err)
-			}
-			if !migrated {
-				t.Fatal("managed dual-store path did not report completed migration")
-			}
-			if _, err := os.Stat(canonicalPath); err != nil {
-				t.Fatalf("managed offline takeover removed canonical store: %v", err)
-			}
-			if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-				t.Fatalf("managed offline takeover left legacy store in candidate path: %v", err)
-			}
-			backupPath, err := appdirs.LegacyConfigPath(
-				"teams",
-				"migration-backups",
-				scope.ID,
-				"state.json",
-			)
-			if err != nil {
-				t.Fatalf("managed offline takeover backup path: %v", err)
-			}
-			if _, err := os.Stat(backupPath); err != nil {
-				t.Fatalf("managed offline takeover backup missing at %s: %v", backupPath, err)
-			}
-			state, err := teamsstore.LoadPathReadOnly(context.Background(), canonicalPath)
-			if err != nil {
-				t.Fatalf("load canonical store after managed takeover: %v", err)
-			}
-			if state.ControlChat.TeamsChatID != "canonical-managed-"+goos {
-				t.Fatalf("managed takeover changed canonical business data: %#v", state.ControlChat)
-			}
-		})
+				migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false, managedServiceChild)
+				if err != nil {
+					t.Fatalf("managed offline takeover: %v", err)
+				}
+				if !migrated {
+					t.Fatal("managed dual-store path did not report completed migration")
+				}
+				if _, err := os.Stat(canonicalPath); err != nil {
+					t.Fatalf("managed offline takeover removed canonical store: %v", err)
+				}
+				if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+					t.Fatalf("managed offline takeover left legacy store in candidate path: %v", err)
+				}
+				backupPath, err := appdirs.LegacyConfigPath(
+					"teams",
+					"migration-backups",
+					scope.ID,
+					"state.json",
+				)
+				if err != nil {
+					t.Fatalf("managed offline takeover backup path: %v", err)
+				}
+				if _, err := os.Stat(backupPath); err != nil {
+					t.Fatalf("managed offline takeover backup missing at %s: %v", backupPath, err)
+				}
+				state, err := teamsstore.LoadPathReadOnly(context.Background(), canonicalPath)
+				if err != nil {
+					t.Fatalf("load canonical store after managed takeover: %v", err)
+				}
+				if state.ControlChat.TeamsChatID != "canonical-"+suffix {
+					t.Fatalf("managed takeover changed canonical business data: %#v", state.ControlChat)
+				}
+			})
+		}
 	}
 }
 
@@ -884,7 +892,7 @@ func TestTeamsRuntimeSafetyRecoverableErrorIncludesOperationContextCI(t *testing
 	}
 }
 
-func TestTeamsRuntimeSafetyBlockedMigrationUsesBoundedExponentialRetryCI(t *testing.T) {
+func TestTeamsRuntimeSafetyDeferredMigrationUsesBoundedExponentialRetryCI(t *testing.T) {
 	lockCLITestHooks(t)
 	previousBase := teamsRunServiceRetryDelay
 	previousMax := teamsRunServiceMaxRetryDelay
@@ -894,7 +902,7 @@ func TestTeamsRuntimeSafetyBlockedMigrationUsesBoundedExponentialRetryCI(t *test
 	})
 	teamsRunServiceRetryDelay = time.Second
 	teamsRunServiceMaxRetryDelay = 5 * time.Second
-	err := &teams.RuntimeStoreMigrationBlockedError{Err: errors.New("staging validation failed")}
+	err := &teams.RuntimeStoreTakeoverDeferredError{Reason: "writer lock is still held"}
 	for attempt, want := range map[int]time.Duration{
 		1: time.Second,
 		2: 2 * time.Second,
@@ -908,6 +916,39 @@ func TestTeamsRuntimeSafetyBlockedMigrationUsesBoundedExponentialRetryCI(t *test
 	}
 	if got := teamsRunRetryDelay(&teams.GraphStatusError{StatusCode: 502}, 8); got != time.Second {
 		t.Fatalf("ordinary Graph retry delay = %s, want fixed base delay", got)
+	}
+}
+
+func TestTeamsRuntimeSafetyBlockedMigrationWaitsWithoutRetryingCI(t *testing.T) {
+	lockCLITestHooks(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var attempts atomic.Int32
+	firstAttempt := make(chan struct{})
+	var out bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runTeamsServiceRetryLoop(ctx, &out, func() error {
+			if attempts.Add(1) == 1 {
+				close(firstAttempt)
+			}
+			return &teams.RuntimeStoreMigrationBlockedError{Err: errors.New("staging validation failed")}
+		})
+	}()
+	select {
+	case <-firstAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("blocked migration was not attempted")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("blocked migration attempts = %d, want exactly one", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked migration wait error = %v, want context cancellation", err)
+	}
+	if !strings.Contains(out.String(), "waiting for service restart") {
+		t.Fatalf("blocked migration output = %q, want restart guidance", out.String())
 	}
 }
 

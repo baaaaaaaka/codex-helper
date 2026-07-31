@@ -1038,6 +1038,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		return err
 	}
+	b.writeManagedActiveStoreBinding()
 	defer func() {
 		b.clearOwnerIfSame(context.Background())
 		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())

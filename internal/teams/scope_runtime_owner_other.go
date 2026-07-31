@@ -1,12 +1,20 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package teams
 
-import teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+import (
+	"errors"
+	"syscall"
 
-func runtimeStoreOwnerExitConfirmed(teamstore.OwnerMetadata) bool {
-	// Other platforms do not expose a cheap process-identity primitive that is
-	// uniform across service and sandbox boundaries. The managed stop path is
-	// expected to clear owner metadata; otherwise migration remains deferred.
-	return false
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+)
+
+func runtimeStoreOwnerExitConfirmed(owner teamstore.OwnerMetadata) bool {
+	if owner.PID <= 0 || !teamstore.OwnerAppearsLocal(owner) {
+		return false
+	}
+	err := syscall.Kill(owner.PID, 0)
+	// ESRCH is positive evidence that the PID is absent. EPERM and every other
+	// result remain unknown so migration stays fail-closed.
+	return errors.Is(err, syscall.ESRCH)
 }

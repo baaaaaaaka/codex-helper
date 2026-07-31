@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -206,6 +207,10 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 		}
 		return result, nil
 	}
+	if teamsServiceWatchdogStateSemanticallyEqual(state, next) {
+		result.State = state
+		return result, nil
+	}
 	if err := saveTeamsServiceWatchdogState(next); err != nil {
 		return teamsServiceWatchdogResult{}, err
 	}
@@ -253,6 +258,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		path     string
 		snapshot teamsServiceWatchdogSnapshot
 		owner    teamsstore.OwnerMetadata
+		scope    teamsstore.ScopeIdentity
 		hasOwner bool
 	}
 	candidates := make([]candidateSnapshot, 0, len(paths))
@@ -261,7 +267,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
 			return snapshot, err
 		}
-		state, err := teamsstore.LoadPathReadOnly(ctx, path)
+		state, err := teamsstore.LoadPathWatchdogStateReadOnly(ctx, path)
 		if err != nil {
 			return snapshot, err
 		}
@@ -272,7 +278,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		if candidate.OwnerFresh {
 			freshOwnerStores++
 		}
-		candidates = append(candidates, candidateSnapshot{path: path, snapshot: candidate, owner: owner, hasOwner: hasOwner})
+		candidates = append(candidates, candidateSnapshot{path: path, snapshot: candidate, owner: owner, scope: state.Scope, hasOwner: hasOwner})
 	}
 	var selected candidateSnapshot
 	selectedFound := false
@@ -297,6 +303,24 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 			}
 		}
 		if !selectedFound {
+			binding, ok, _ := teams.LoadActiveStoreBindingReadOnly()
+			if ok {
+				for _, candidate := range candidates {
+					if !candidate.hasOwner ||
+						!candidate.snapshot.OwnerFresh ||
+						!teamsServiceWatchdogBindingMatchesCandidate(binding, candidate.path, candidate.owner, candidate.scope) {
+						continue
+					}
+					if selectedFound {
+						selectedFound = false
+						break
+					}
+					selected = candidate
+					selectedFound = true
+				}
+			}
+		}
+		if !selectedFound {
 			snapshot.AmbiguousCanonicalStores = true
 		}
 	}
@@ -314,6 +338,14 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
 	}
 	return snapshot, nil
+}
+
+func teamsServiceWatchdogBindingMatchesCandidate(binding teams.ActiveStoreBinding, path string, owner teamsstore.OwnerMetadata, scope teamsstore.ScopeIdentity) bool {
+	return samePath(binding.CanonicalPath, path) &&
+		binding.ScopeID == strings.TrimSpace(scope.ID) &&
+		binding.PID == owner.PID &&
+		binding.StartedAt.Equal(owner.StartedAt) &&
+		binding.LeaseGeneration == owner.LeaseGeneration
 }
 
 func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChildIdentity, bool) {
@@ -658,6 +690,12 @@ func teamsServiceWatchdogPendingActionState(state teamsServiceWatchdogState) tea
 	state.LastAction = ""
 	state.LastActionAt = time.Time{}
 	return state
+}
+
+func teamsServiceWatchdogStateSemanticallyEqual(left, right teamsServiceWatchdogState) bool {
+	left.UpdatedAt = time.Time{}
+	right.UpdatedAt = time.Time{}
+	return left == right
 }
 
 func loadTeamsServiceWatchdogState() (teamsServiceWatchdogState, error) {

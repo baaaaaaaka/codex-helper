@@ -444,8 +444,8 @@ func TestTeamsRunShouldRetryInProcessOnlyForServiceMode(t *testing.T) {
 		t.Fatal("Teams Codex child must not receive managed-service migration authority")
 	}
 	t.Setenv(envTeamsCodexChild, "")
-	if teamsRunShouldRetryInProcess(false, false) {
-		t.Fatal("service environment without the hidden managed-child argument must fail closed")
+	if !teamsRunShouldRetryInProcess(false, false) {
+		t.Fatal("persisted background service specs created before the hidden managed-child argument must remain compatible")
 	}
 }
 

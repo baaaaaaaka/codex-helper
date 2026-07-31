@@ -37,7 +37,6 @@ const (
 	maxRetainedMessageProvenance       = 8192
 	maxRetainedHelperDeliveries        = 32768
 	maxStatePointerSize                = 4096
-	maxRuntimeMetadataJSONBytes        = 64 << 20
 )
 
 type SessionStatus string
@@ -1435,13 +1434,6 @@ func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return RuntimeMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
 	}
-	if info.Size() > maxRuntimeMetadataJSONBytes {
-		return RuntimeMetadata{}, fmt.Errorf(
-			"teams runtime metadata JSON exceeds %d-byte discovery limit: %s",
-			maxRuntimeMetadataJSONBytes,
-			path,
-		)
-	}
 	if info.Size() <= maxStatePointerSize {
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -1464,6 +1456,54 @@ func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 		}
 	}
 	return loadJSONRuntimeMetadataReadOnly(ctx, path)
+}
+
+// LoadPathWatchdogStateReadOnly reads only the bounded state needed by the
+// service watchdog. The returned State is a partial projection containing the
+// control chat, owners, service control, upgrade request, and relevant chat
+// poll state. It never loads sessions, turns, inbound events, outbox messages,
+// or delivery records, and it performs no store writes.
+func LoadPathWatchdogStateReadOnly(ctx context.Context, path string) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return State{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return State{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return State{}, fmt.Errorf("teams watchdog state path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return State{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return State{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return State{}, err
+			}
+			return loadSQLiteWatchdogStateFileReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return State{}, err
+		} else if ok {
+			return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONWatchdogStateReadOnly(ctx, path)
 }
 
 type runtimeMetadataContextReader struct {
@@ -1526,6 +1566,58 @@ func loadJSONRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 		return RuntimeMetadata{}, err
 	}
 	return metadata, nil
+}
+
+func loadJSONWatchdogStateReadOnly(ctx context.Context, path string) (State, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return State{}, err
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(runtimeMetadataContextReader{ctx: ctx, r: f})
+	token, err := decoder.Token()
+	if err != nil {
+		return State{}, err
+	}
+	if token != json.Delim('{') {
+		return State{}, fmt.Errorf("teams store root must be a JSON object")
+	}
+	state := State{ChatPolls: make(map[string]ChatPollState)}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return State{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return State{}, fmt.Errorf("teams watchdog state key is not a string")
+		}
+		switch key {
+		case "scope":
+			err = decoder.Decode(&state.Scope)
+		case "control_chat":
+			err = decoder.Decode(&state.ControlChat)
+		case "service_owner":
+			err = decoder.Decode(&state.ServiceOwner)
+		case "lock_owner":
+			err = decoder.Decode(&state.LockOwner)
+		case "service_control":
+			err = decoder.Decode(&state.ServiceControl)
+		case "upgrade":
+			err = decoder.Decode(&state.Upgrade)
+		case "chat_polls":
+			err = decoder.Decode(&state.ChatPolls)
+		default:
+			err = skipRuntimeMetadataJSONValue(decoder)
+		}
+		if err != nil {
+			return State{}, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return State{}, err
+	}
+	return state, nil
 }
 
 func skipRuntimeMetadataJSONValue(decoder *json.Decoder) error {
@@ -5620,14 +5712,7 @@ func (s *Store) ApplyOutboxReplayFences(ctx context.Context, fences []OutboxRepl
 			if !ok || current.Status == OutboxStatusSent {
 				continue
 			}
-			current.Status = OutboxStatusSent
-			current.TeamsMessageID = fence.TeamsMessageID
-			if current.SentAt.IsZero() {
-				current.SentAt = now
-			}
-			current.UpdatedAt = now
-			current.LastSendError = ""
-			current.SendAttemptToken = ""
+			current = applyOutboxSentProjectionLocked(state, current, fence.TeamsMessageID, now)
 			state.OutboxMessages[current.ID] = current
 			changed++
 		}
@@ -5686,19 +5771,26 @@ func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToke
 		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, true, requireClaim); err != nil {
 			return msg, err
 		}
-		msg.Status = OutboxStatusSent
-		if msg.SentAt.IsZero() {
-			msg.SentAt = now
-		}
-		if teamsMessageID != "" {
-			msg.TeamsMessageID = teamsMessageID
-		}
-		recordOutboxProvenanceLocked(state, msg, now)
-		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
-		updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
-		return msg, nil
+		return applyOutboxSentProjectionLocked(state, msg, teamsMessageID, now), nil
 	})
+}
+
+func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time) OutboxMessage {
+	msg.Status = OutboxStatusSent
+	if msg.SentAt.IsZero() {
+		msg.SentAt = now
+	}
+	if teamsMessageID = strings.TrimSpace(teamsMessageID); teamsMessageID != "" {
+		msg.TeamsMessageID = teamsMessageID
+	}
+	msg.UpdatedAt = now
+	msg.LastSendError = ""
+	msg.SendAttemptToken = ""
+	recordOutboxProvenanceLocked(state, msg, now)
+	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
+	updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
+	return msg
 }
 
 func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) error {
@@ -5744,6 +5836,23 @@ func markTranscriptDeliveryForOutboxLocked(state *State, msg OutboxMessage, stat
 
 func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time) {
 	if state == nil {
+		return
+	}
+	updatedExisting := false
+	for id, existing := range state.HelperDeliveries {
+		if strings.TrimSpace(existing.OutboxID) != strings.TrimSpace(msg.ID) {
+			continue
+		}
+		existing.Status = status
+		existing.TeamsMessageID = firstStoreNonEmptyString(msg.TeamsMessageID, existing.TeamsMessageID)
+		if status == HelperDeliveryStatusSent && existing.SentAt.IsZero() {
+			existing.SentAt = firstStoreNonZeroTime(msg.SentAt, now)
+		}
+		existing.UpdatedAt = now
+		state.HelperDeliveries[id] = existing
+		updatedExisting = true
+	}
+	if updatedExisting {
 		return
 	}
 	record, ok := helperDeliveryRecordFromOutboxLocked(state, msg, status, now)

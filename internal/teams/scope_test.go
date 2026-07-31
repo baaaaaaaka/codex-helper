@@ -158,8 +158,9 @@ func TestTeamsRuntimeSafetyRuntimeResolverMigratesLegacyScopeOutOfCandidateScanC
 		t.Fatalf("resolved registry = %#v %q, want %q", registryScope, registryPath, wantRegistryPath)
 	}
 
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("historical migration source should be retained outside the canonical hot path: %v", err)
+	assertTeamsPathMissing(t, oldPath)
+	if _, err := os.Stat(migrationBackupPath(oldPath, current.ID)); err != nil {
+		t.Fatalf("historical migration source backup: %v", err)
 	}
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("migrated state should exist: %v", err)
@@ -900,8 +901,9 @@ func TestTeamsRuntimeSafetyRuntimeResolverMigratesLegacyControlBindingOutOfCandi
 	if resolved.ID != current.ID {
 		t.Fatalf("resolved scope = %#v, want current canonical scope id %q for legacy state without recorded scope", resolved, current.ID)
 	}
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("historical control-binding source should be retained: %v", err)
+	assertTeamsPathMissing(t, oldPath)
+	if _, err := os.Stat(migrationBackupPath(oldPath, current.ID)); err != nil {
+		t.Fatalf("historical control-binding source backup: %v", err)
 	}
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Fatalf("migrated state should exist: %v", err)
@@ -1825,11 +1827,15 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCleansEligibleLegacyScopeFilesC
 	if _, ok := state.OutboxMessages["outbox:cleanup"]; !ok {
 		t.Fatalf("migrated store lost cleanup outbox: %#v", state.OutboxMessages)
 	}
-	if _, err := os.Stat(oldPath); err != nil {
-		t.Fatalf("historical scope state should be retained: %v", err)
+	assertTeamsPathMissing(t, oldPath)
+	backupPath := migrationBackupPath(oldPath, current.ID)
+	if _, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("historical scope state backup: %v", err)
 	}
+	backupSQLite := filepath.Join(filepath.Dir(backupPath), teamstore.SQLiteFileName)
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		assertTeamsFileContent(t, oldSQLite+suffix, map[string]string{"": "db", "-wal": "wal", "-shm": "shm"}[suffix])
+		assertTeamsPathMissing(t, oldSQLite+suffix)
+		assertTeamsFileContent(t, backupSQLite+suffix, map[string]string{"": "db", "-wal": "wal", "-shm": "shm"}[suffix])
 		if suffix != "-shm" {
 			assertTeamsFileContent(t, filepath.Join(filepath.Dir(path), teamstore.SQLiteFileName)+suffix, map[string]string{"": "db", "-wal": "wal"}[suffix])
 		} else {
@@ -1837,11 +1843,13 @@ func TestTeamsBackgroundKeepaliveResolveStorePathCleansEligibleLegacyScopeFilesC
 		}
 	}
 	for _, name := range storeSidecarNames() {
-		if _, err := os.Stat(filepath.Join(filepath.Dir(oldPath), name)); err != nil {
-			t.Fatalf("historical sidecar %s should be retained: %v", name, err)
+		assertTeamsPathMissing(t, filepath.Join(filepath.Dir(oldPath), name))
+		if _, err := os.Stat(filepath.Join(filepath.Dir(backupPath), name)); err != nil {
+			t.Fatalf("historical sidecar %s backup: %v", name, err)
 		}
 	}
-	assertTeamsFileContent(t, oldRegistryPath, oldRegistry)
+	assertTeamsPathMissing(t, oldRegistryPath)
+	assertTeamsFileContent(t, migrationBackupPath(oldRegistryPath, current.ID), oldRegistry)
 	assertTeamsFileContent(t, oldInboundPath, `{"version":1,"items":{"inbound-1":{"chat_id":"legacy-control","message_id":"m1","status":"done"}}}`)
 	assertTeamsFileContent(t, oldOutboundPath, `{"version":1,"items":{"outbound-1":{"chat_id":"legacy-control","message_id":"sent-1"}}}`)
 	newRegistryPath, err := DefaultRegistryPathForScope(current.ID)

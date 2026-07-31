@@ -802,6 +802,93 @@ func TestTeamsRuntimeSafetySuccessfulMigrationPreservesQuarantinedLogicalDataCI(
 	}
 }
 
+func TestTeamsRuntimeSafetyLegacyOnlyMigrationAppliesDeliveredOutboxFenceToStagingCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	scope := ScopeIdentityForUser(User{ID: "teams-user-replay-fence", UserPrincipalName: "replay@example.test"})
+	legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy store path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+	legacy, err := teamstore.Open(legacyPath)
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	if _, _, err := legacy.CreateSession(context.Background(), teamstore.SessionContext{
+		ID:          "legacy-session",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "legacy-chat",
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy session: %v", err)
+	}
+	if _, _, err := legacy.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "legacy-outbox",
+		SessionID:   "legacy-session",
+		TeamsChatID: "legacy-chat",
+		Kind:        "final",
+		Body:        "Graph accepted this before the old helper crashed",
+	}); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("queue legacy outbox: %v", err)
+	}
+	if _, err := legacy.MarkOutboxSendAttempt(context.Background(), "legacy-outbox"); err != nil {
+		_ = legacy.Close()
+		t.Fatalf("claim legacy outbox send: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy store: %v", err)
+	}
+	legacyRegistry, ok := registryPathForStoreMigrationSource(legacyPath)
+	if !ok {
+		t.Fatal("legacy registry path unavailable")
+	}
+	legacyOutbound, ok := globalOutboundLedgerPathForRegistry(legacyRegistry)
+	if !ok {
+		t.Fatal("legacy outbound ledger path unavailable")
+	}
+	if err := recordGlobalOutbound(context.Background(), legacyOutbound, globalOutboundItem{
+		ChatID:    "legacy-chat",
+		MessageID: "teams-delivered-before-crash",
+		ScopeID:   scope.ID,
+		OutboxID:  "legacy-outbox",
+		SessionID: "legacy-session",
+		Kind:      "final",
+	}, time.Now()); err != nil {
+		t.Fatalf("record delivered legacy outbox: %v", err)
+	}
+
+	plan, err := InspectRuntimeStoreForScope(context.Background(), scope)
+	if err != nil || plan.Action != RuntimeStoreActionMigrateLegacy {
+		t.Fatalf("migration plan = %#v err=%v, want legacy migration", plan, err)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete legacy migration: %v", err)
+	}
+	state, err := teamstore.LoadPathReadOnly(context.Background(), plan.CanonicalPath)
+	if err != nil {
+		t.Fatalf("load migrated canonical store: %v", err)
+	}
+	outbox := state.OutboxMessages["legacy-outbox"]
+	if outbox.Status != teamstore.OutboxStatusSent || outbox.TeamsMessageID != "teams-delivered-before-crash" {
+		t.Fatalf("migrated outbox replay fence = %#v, want sent delivery", outbox)
+	}
+	var provenance teamstore.MessageProvenanceRecord
+	for _, candidate := range state.MessageProvenance {
+		if candidate.TeamsChatID == "legacy-chat" && candidate.TeamsMessageID == "teams-delivered-before-crash" {
+			provenance = candidate
+			break
+		}
+	}
+	if provenance.OutboxID != outbox.ID {
+		t.Fatalf("migrated outbox provenance = %#v, want outbox %q", provenance, outbox.ID)
+	}
+}
+
 func TestTeamsRuntimeSafetyStagedLegacyMigrationRetriesEveryDurableBoundaryCI(t *testing.T) {
 	stages := []string{
 		runtimeStoreMigrationStageStagingReady,
@@ -1678,11 +1765,11 @@ func TestTeamsRuntimeSafetyGlobalLedgerUnionIsIdempotentWithoutWritesCI(t *testi
 	if err := completeGlobalInbound(context.Background(), claim); err != nil {
 		t.Fatalf("complete legacy inbound: %v", err)
 	}
-	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath, fixture.CanonicalPath); err != nil {
 		t.Fatalf("first global ledger union: %v", err)
 	}
 	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
-	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath, fixture.CanonicalPath); err != nil {
 		t.Fatalf("idempotent global ledger union: %v", err)
 	}
 	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
@@ -1731,7 +1818,7 @@ func TestTeamsRuntimeSafetyGlobalLedgerUnionPromotesCanonicalInboundClaimMonoton
 		t.Fatalf("seed canonical outbound: %v", err)
 	}
 
-	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath, fixture.CanonicalPath); err != nil {
 		t.Fatalf("global ledger union: %v", err)
 	}
 	inboundLedger, err := readGlobalInboundLedger(canonicalInbound)
@@ -1765,7 +1852,7 @@ func TestTeamsRuntimeSafetyGlobalLedgerUnionPromotesCanonicalInboundClaimMonoton
 	}
 
 	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
-	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+	if err := UnionLegacyGlobalLedgers(context.Background(), fixture.Scope, fixture.LegacyPath, fixture.CanonicalPath); err != nil {
 		t.Fatalf("idempotent global ledger union: %v", err)
 	}
 	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
@@ -1902,6 +1989,13 @@ func TestTeamsRuntimeSafetyHistoricalScopeMigrationSecondStartupUsesCanonicalOnl
 	}
 	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
 		t.Fatalf("complete historical migration: %v", err)
+	}
+	if _, err := os.Stat(historicalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("historical scoped source remained writable after migration: %v", err)
+	}
+	historicalBackup := runtimeSafetyMigrationBackupPath(historicalPath, current.ID)
+	if _, err := os.Stat(historicalBackup); err != nil {
+		t.Fatalf("historical scoped backup missing at %q: %v", historicalBackup, err)
 	}
 	resolved, canonicalPath, err := ResolveStorePathForScope(current)
 	if err != nil {

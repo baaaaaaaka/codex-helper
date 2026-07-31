@@ -615,12 +615,14 @@ func migrateResolvedScopeStore(scope teamstore.ScopeIdentity, storePath string) 
 		if err := copyLockedFileFamilyIfPresent(newRegistryPath, oldRegistryPath, oldRegistryPath+".lock"); err != nil {
 			return storePath, nil
 		}
-		if err := UnionLegacyGlobalLedgers(context.Background(), scope, storePath); err != nil {
-			return storePath, nil
-		}
 	}
 	if err := appdirs.CopyFileReplacing(newStorePath, storePath); err != nil {
 		return storePath, nil
+	}
+	if hasOldRegistryPath {
+		if err := UnionLegacyGlobalLedgers(context.Background(), scope, storePath, newStorePath); err != nil {
+			return storePath, nil
+		}
 	}
 	if !scopeMigrationComplete(scope.ID, newStorePath, storePath) {
 		return storePath, nil
@@ -661,12 +663,14 @@ func migrateResolvedGlobalStore(scopeID string, newStorePath string, storePath s
 		if err := copyLockedFileFamilyIfPresent(newRegistryPath, oldRegistryPath, oldRegistryPath+".lock"); err != nil {
 			return storePath, nil
 		}
-		if err := UnionLegacyGlobalLedgers(context.Background(), teamstore.ScopeIdentity{ID: scopeID}, storePath); err != nil {
-			return storePath, nil
-		}
 	}
 	if err := appdirs.CopyFileReplacing(newStorePath, storePath); err != nil {
 		return storePath, nil
+	}
+	if hasOldRegistryPath {
+		if err := UnionLegacyGlobalLedgers(context.Background(), teamstore.ScopeIdentity{ID: scopeID}, storePath, newStorePath); err != nil {
+			return storePath, nil
+		}
 	}
 	if !scopeMigrationComplete(scopeID, newStorePath, storePath) {
 		return storePath, nil

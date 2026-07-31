@@ -870,6 +870,163 @@ func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path stri
 	return metadata, nil
 }
 
+func loadSQLiteWatchdogStateFileReadOnly(ctx context.Context, path string) (State, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		if !dbBefore.Exists {
+			return State{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if _, err := os.Stat(path + "-shm"); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return State{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
+				}
+				return State{}, err
+			}
+		}
+		state, err := loadSQLiteWatchdogStateFileReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return State{}, err
+		}
+		if !immutable {
+			return state, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return state, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable watchdog attempt %d", attempt+1)
+	}
+	return State{}, fmt.Errorf("read stable sqlite watchdog state after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteWatchdogStateFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (State, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return State{}, err
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	defer conn.Close()
+	if sqliteRuntimeMetadataConnectionTestHook != nil {
+		sqliteRuntimeMetadataConnectionTestHook()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return State{}, err
+	}
+	if err := validateSQLiteWatchdogTablesContext(ctx, conn); err != nil {
+		return State{}, err
+	}
+
+	state := State{ChatPolls: make(map[string]ChatPollState)}
+	var controlChatJSON string
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
+	).Scan(&controlChatJSON); err != nil {
+		return State{}, err
+	}
+	if err := json.Unmarshal([]byte(controlChatJSON), &state.ControlChat); err != nil {
+		return State{}, err
+	}
+
+	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+		sqliteRuntimeKeyScope,
+		sqliteRuntimeKeyServiceOwner,
+		sqliteRuntimeKeyLockOwner,
+		sqliteRuntimeKeyServiceControl,
+		sqliteRuntimeKeyUpgrade,
+	)
+	if err != nil {
+		return State{}, err
+	}
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			_ = rows.Close()
+			return State{}, err
+		}
+		switch key {
+		case sqliteRuntimeKeyScope:
+			err = json.Unmarshal(raw, &state.Scope)
+		case sqliteRuntimeKeyServiceOwner:
+			err = json.Unmarshal(raw, &state.ServiceOwner)
+		case sqliteRuntimeKeyLockOwner:
+			err = json.Unmarshal(raw, &state.LockOwner)
+		case sqliteRuntimeKeyServiceControl:
+			err = json.Unmarshal(raw, &state.ServiceControl)
+		case sqliteRuntimeKeyUpgrade:
+			err = json.Unmarshal(raw, &state.Upgrade)
+		}
+		if err != nil {
+			_ = rows.Close()
+			return State{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return State{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return State{}, err
+	}
+
+	controlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
+	pollQuery := `SELECT json FROM chat_polls`
+	var pollArgs []any
+	if controlChatID != "" {
+		pollQuery += ` WHERE chat_id = ?`
+		pollArgs = append(pollArgs, controlChatID)
+	}
+	pollRows, err := conn.QueryContext(ctx, pollQuery, pollArgs...)
+	if err != nil {
+		return State{}, err
+	}
+	defer pollRows.Close()
+	for pollRows.Next() {
+		var raw []byte
+		if err := pollRows.Scan(&raw); err != nil {
+			return State{}, err
+		}
+		var poll ChatPollState
+		if err := json.Unmarshal(raw, &poll); err != nil {
+			return State{}, err
+		}
+		state.ChatPolls[poll.ChatID] = poll
+	}
+	if err := pollRows.Err(); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
 func validateSQLiteRuntimeMetadataTablesContext(ctx context.Context, conn *sql.Conn) error {
 	var count int
 	if err := conn.QueryRowContext(
@@ -880,6 +1037,20 @@ func validateSQLiteRuntimeMetadataTablesContext(ctx context.Context, conn *sql.C
 	}
 	if count != 2 {
 		return fmt.Errorf("sqlite teams store is missing runtime metadata tables")
+	}
+	return nil
+}
+
+func validateSQLiteWatchdogTablesContext(ctx context.Context, conn *sql.Conn) error {
+	var count int
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('state_meta', 'runtime_state', 'chat_polls')`,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count != 3 {
+		return fmt.Errorf("sqlite teams store is missing watchdog state tables")
 	}
 	return nil
 }
@@ -5020,48 +5191,135 @@ func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []Outb
 		if err != nil {
 			return err
 		}
+		fencesByID := make(map[string]OutboxReplayFence, len(fences))
+		for _, fence := range fences {
+			fencesByID[fence.OutboxID] = fence
+		}
+		current := make(map[string]OutboxMessage, len(fences))
+		const replayFenceReadBatch = 400
+		for start := 0; start < len(fences); start += replayFenceReadBatch {
+			end := min(start+replayFenceReadBatch, len(fences))
+			placeholders := make([]string, 0, end-start)
+			args := make([]any, 0, end-start)
+			for _, fence := range fences[start:end] {
+				placeholders = append(placeholders, "?")
+				args = append(args, fence.OutboxID)
+			}
+			rows, err := db.QueryContext(ctx, `SELECT json FROM outbox_messages WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var raw []byte
+				if err := rows.Scan(&raw); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				var msg OutboxMessage
+				if err := json.Unmarshal(raw, &msg); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				fence := fencesByID[msg.ID]
+				if err := validateOutboxReplayFence(msg, fence); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				current[msg.ID] = msg
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+		}
+		pending := 0
+		for _, msg := range current {
+			if msg.Status != OutboxStatusSent {
+				pending++
+			}
+		}
+		if pending == 0 {
+			return nil
+		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer tx.Rollback()
 
-		current := make(map[string]OutboxMessage, len(fences))
-		for _, fence := range fences {
-			msg, found, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, fence.OutboxID)
-			if err != nil {
-				return err
-			}
-			if !found {
-				continue
-			}
-			if err := validateOutboxReplayFence(msg, fence); err != nil {
-				return err
-			}
-			current[fence.OutboxID] = msg
-		}
-
+		state := newState()
+		state.OutboxMessages = make(map[string]OutboxMessage, pending)
+		state.MessageProvenance = map[string]MessageProvenanceRecord{}
+		state.InboundEvents = map[string]InboundEvent{}
+		state.Turns = map[string]Turn{}
 		now := time.Now()
 		for _, fence := range fences {
 			msg, ok := current[fence.OutboxID]
 			if !ok || msg.Status == OutboxStatusSent {
 				continue
 			}
-			msg.Status = OutboxStatusSent
-			msg.TeamsMessageID = fence.TeamsMessageID
-			if msg.SentAt.IsZero() {
-				msg.SentAt = now
+			provenanceID := messageProvenanceID(msg.TeamsChatID, fence.TeamsMessageID)
+			if existing, ok, err := loadSQLiteJSONRow[MessageProvenanceRecord](ctx, tx, `SELECT json FROM message_provenance WHERE id = ?`, provenanceID); err != nil {
+				return err
+			} else if ok {
+				state.MessageProvenance[provenanceID] = existing
+				if strings.TrimSpace(existing.Origin) == MessageOriginUserInbound {
+					inboundEventID := strings.TrimSpace(existing.InboundID)
+					if inboundEventID == "" {
+						inboundEventID = inboundID(existing.TeamsChatID, existing.TeamsMessageID)
+					}
+					if inbound, found, err := loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundEventID); err != nil {
+						return err
+					} else if found {
+						state.InboundEvents[inbound.ID] = inbound
+					}
+					if turnID := strings.TrimSpace(existing.TurnID); turnID != "" {
+						if turn, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
+							return err
+						} else if found {
+							state.Turns[turn.ID] = turn
+						}
+					}
+				}
 			}
-			msg.UpdatedAt = now
-			msg.LastSendError = ""
-			msg.SendAttemptToken = ""
-			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, msg.ID); err != nil {
 				return err
 			}
+			if err := loadSQLiteArtifactRecordsByIDTx(ctx, tx, &state, msg.ArtifactIDs); err != nil {
+				return err
+			}
+			msg = applyOutboxSentProjectionLocked(&state, msg, fence.TeamsMessageID, now)
+			state.OutboxMessages[msg.ID] = msg
 			changed++
 		}
 		if changed == 0 {
 			return nil
+		}
+		for _, msg := range state.OutboxMessages {
+			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+				return err
+			}
+		}
+		for _, record := range state.MessageProvenance {
+			if err := upsertSQLiteProvenanceTx(ctx, tx, record); err != nil {
+				return err
+			}
+		}
+		if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+			return err
+		}
+		for _, inbound := range state.InboundEvents {
+			if err := upsertSQLiteInboundTx(ctx, tx, inbound); err != nil {
+				return err
+			}
+		}
+		for _, turn := range state.Turns {
+			if err := upsertSQLiteTurnTx(ctx, tx, turn); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	})

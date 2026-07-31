@@ -419,13 +419,8 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 	if err := preflightLegacyQuarantineTargets(scope.ID, sourcePath); err != nil {
 		return "", err
 	}
-	if err := preflightLegacyGlobalLedgersReadOnly(ctx, scope, sourcePath); err != nil {
-		return "", err
-	}
-	if err := UnionLegacyGlobalLedgers(ctx, scope, sourcePath); err != nil {
-		return "", fmt.Errorf("merge legacy Teams replay fences: %w", err)
-	}
-	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageReplayFencesMerged); err != nil {
+	replayPlan, err := buildLegacyReplayPlanReadOnly(ctx, scope, sourcePath)
+	if err != nil {
 		return "", err
 	}
 	stagingDir := canonicalDir + ".migrating"
@@ -439,7 +434,16 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 	if err := copyLegacyStoreToTarget(scope.ID, stagingPath, sourcePath); err != nil {
 		return "", fmt.Errorf("copy legacy Teams store to canonical path: %w", err)
 	}
+	if err := clearConfirmedStoppedOwnerFromMigrationTarget(ctx, sourcePath, stagingPath); err != nil {
+		return "", fmt.Errorf("clear stopped Teams owner from migration staging: %w", err)
+	}
 	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageStagingCopied); err != nil {
+		return "", err
+	}
+	if err := applyLegacyReplayPlan(ctx, stagingPath, replayPlan); err != nil {
+		return "", fmt.Errorf("merge legacy Teams replay fences: %w", err)
+	}
+	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageReplayFencesMerged); err != nil {
 		return "", err
 	}
 	if err := validateRuntimeStoreMigrationStaging(ctx, scope, stagingPath, sourcePath); err != nil {
@@ -458,8 +462,7 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 		return "", err
 	}
 
-	expectedLegacyPath, expectedErr := legacyDefaultStorePathForScope(scope.ID)
-	if expectedErr == nil && samePath(sourcePath, expectedLegacyPath) {
+	if scopedStoreMigrationSource(sourcePath) {
 		if registryPath, ok := registryPathForStoreMigrationSource(sourcePath); ok {
 			if err := quarantineRelatedFileFamily(scope.ID, registryPath); err != nil {
 				return "", fmt.Errorf("quarantine migrated legacy Teams registry: %w", err)
@@ -672,9 +675,8 @@ func migrationBackupPath(sourcePath string, scopeID string) string {
 }
 
 func preflightLegacyQuarantineTargets(scopeID string, sourcePath string) error {
-	expectedLegacyPath, err := legacyDefaultStorePathForScope(scopeID)
-	if err != nil || !samePath(sourcePath, expectedLegacyPath) {
-		return err
+	if !scopedStoreMigrationSource(sourcePath) {
+		return nil
 	}
 	sourceDir := filepath.Dir(filepath.Clean(sourcePath))
 	backupDir := filepath.Dir(migrationBackupPath(sourcePath, scopeID))
@@ -687,6 +689,15 @@ func preflightLegacyQuarantineTargets(scopeID string, sourcePath string) error {
 		}
 	}
 	return nil
+}
+
+func scopedStoreMigrationSource(sourcePath string) bool {
+	sourcePath = filepath.Clean(strings.TrimSpace(sourcePath))
+	if filepath.Base(sourcePath) != "state.json" {
+		return false
+	}
+	sourceDir := filepath.Dir(sourcePath)
+	return filepath.Base(filepath.Dir(sourceDir)) == "scopes"
 }
 
 func preflightMigrationPathPair(source string, backup string, directory bool) error {
@@ -771,6 +782,33 @@ func validateOfflineRuntimeStoreWriterStopped(ctx context.Context, scope teamsto
 		))
 	}
 	return nil
+}
+
+func clearConfirmedStoppedOwnerFromMigrationTarget(ctx context.Context, sourcePath string, targetPath string) error {
+	metadata, err := ProbeScopeMetadataReadOnly(ctx, sourcePath)
+	if err != nil {
+		return err
+	}
+	var owner *teamstore.OwnerMetadata
+	switch {
+	case metadata.ServiceOwner != nil && !ownerMetadataEmpty(*metadata.ServiceOwner):
+		owner = metadata.ServiceOwner
+	case metadata.LockOwner != nil && !ownerMetadataEmpty(*metadata.LockOwner):
+		owner = metadata.LockOwner
+	}
+	if owner == nil || !runtimeStoreOwnerExitConfirmed(*owner) {
+		return nil
+	}
+	store, err := teamstore.Open(targetPath)
+	if err != nil {
+		return err
+	}
+	_, clearErr := store.ClearOwnerIfSame(ctx, *owner)
+	closeErr := store.Close()
+	if clearErr != nil {
+		return clearErr
+	}
+	return closeErr
 }
 
 func ownerMetadataEmpty(owner teamstore.OwnerMetadata) bool {
@@ -1052,10 +1090,11 @@ func CompleteOfflineRuntimeStoreTakeover(
 	if err := preflightLegacyQuarantineTargets(scope.ID, legacyPath); err != nil {
 		return err
 	}
-	if err := preflightLegacyGlobalLedgersReadOnly(ctx, scope, legacyPath); err != nil {
+	replayPlan, err := buildLegacyReplayPlanReadOnly(ctx, scope, legacyPath)
+	if err != nil {
 		return err
 	}
-	if err := UnionLegacyGlobalLedgers(ctx, scope, legacyPath); err != nil {
+	if err := applyLegacyReplayPlan(ctx, canonicalPath, replayPlan); err != nil {
 		return err
 	}
 
@@ -1239,54 +1278,26 @@ func readGlobalOutboundForUnion(ctx context.Context, path string) (map[string]gl
 	return items, nil
 }
 
-func preflightLegacyGlobalLedgersReadOnly(ctx context.Context, scope teamstore.ScopeIdentity, legacyStorePath string) error {
-	legacyRegistryPath, ok := registryPathForStoreMigrationSource(legacyStorePath)
-	if !ok {
-		return nil
-	}
-	canonicalRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
-	if err != nil {
-		return err
-	}
-	if legacyPath, ok := globalInboundLedgerPathForRegistry(legacyRegistryPath); ok {
-		if _, err := readCompletedGlobalInboundForUnion(ctx, legacyPath); err != nil {
-			return fmt.Errorf("preflight legacy global inbound ledger: %w", err)
-		}
-	}
-	if canonicalPath, ok := globalInboundLedgerPathForRegistry(canonicalRegistryPath); ok {
-		if _, err := readGlobalInboundForUnion(ctx, canonicalPath); err != nil {
-			return fmt.Errorf("preflight canonical global inbound ledger: %w", err)
-		}
-	}
-	if legacyPath, ok := globalOutboundLedgerPathForRegistry(legacyRegistryPath); ok {
-		if _, err := readGlobalOutboundForUnion(ctx, legacyPath); err != nil {
-			return fmt.Errorf("preflight legacy global outbound ledger: %w", err)
-		}
-	}
-	if canonicalPath, ok := globalOutboundLedgerPathForRegistry(canonicalRegistryPath); ok {
-		if _, err := readGlobalOutboundForUnion(ctx, canonicalPath); err != nil {
-			return fmt.Errorf("preflight canonical global outbound ledger: %w", err)
-		}
-	}
-	return nil
+type legacyReplayPlan struct {
+	canonicalInboundPath  string
+	canonicalOutboundPath string
+	inboundDelta          []globalInboundItem
+	outboundDelta         []globalOutboundItem
+	outboxFences          []teamstore.OutboxReplayFence
 }
 
-// UnionLegacyGlobalLedgers copies only monotonic replay fences into the
-// canonical ledgers. The legacy ledgers are shared by every legacy scope, so
-// this function never moves, truncates, or deletes them. Holding their normal
-// writer locks gives this migration a consistent snapshot while allowing a
-// later scope migration to union any subsequently added rows.
-func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity, legacyStorePath string) error {
+func buildLegacyReplayPlanReadOnly(ctx context.Context, scope teamstore.ScopeIdentity, legacyStorePath string) (legacyReplayPlan, error) {
+	var plan legacyReplayPlan
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	legacyRegistryPath, ok := registryPathForStoreMigrationSource(legacyStorePath)
 	if !ok {
-		return nil
+		return plan, nil
 	}
 	canonicalRegistryPath, err := DefaultRegistryPathForScope(scope.ID)
 	if err != nil {
-		return err
+		return plan, err
 	}
 
 	legacyInboundPath, legacyInboundOK := globalInboundLedgerPathForRegistry(legacyRegistryPath)
@@ -1296,45 +1307,25 @@ func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity
 		if relatedMigrationFamilyExists(legacyInboundPath, teamsLedgerSQLitePath(legacyInboundPath)) {
 			locks, err = acquireScopeTakeoverLocks(ctx, []string{legacyInboundPath + ".lock"})
 			if err != nil {
-				return fmt.Errorf("lock legacy global Teams inbound ledger: %w", err)
+				return plan, fmt.Errorf("lock legacy global Teams inbound ledger: %w", err)
 			}
 		}
-		legacyItems, err := readCompletedGlobalInboundForUnion(ctx, legacyInboundPath)
+		legacyItems, readErr := readCompletedGlobalInboundForUnion(ctx, legacyInboundPath)
 		releaseScopeTakeoverLocks(locks)
-		if err != nil {
-			return fmt.Errorf("read legacy global inbound ledger: %w", err)
+		if readErr != nil {
+			return plan, fmt.Errorf("read legacy global inbound ledger: %w", readErr)
 		}
 		canonicalItems, err := readGlobalInboundForUnion(ctx, canonicalInboundPath)
 		if err != nil {
-			return fmt.Errorf("read canonical global inbound ledger: %w", err)
+			return plan, fmt.Errorf("read canonical global inbound ledger: %w", err)
 		}
-		var delta []globalInboundItem
+		plan.canonicalInboundPath = canonicalInboundPath
 		for key, item := range legacyItems {
 			if canonical, ok := canonicalItems[key]; ok && canonical.Status == "done" {
 				continue
 			}
-			delta = append(delta, item)
-		}
-		if len(delta) > 0 {
-			if err := updateGlobalInboundSQLite(ctx, canonicalInboundPath, func(tx *sql.Tx, _ time.Time) error {
-				for _, item := range delta {
-					key := globalInboundKey(item.ChatID, item.MessageID)
-					current, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, key)
-					if err != nil {
-						return err
-					}
-					if ok && current.Status == "done" {
-						continue
-					}
-					item.Status = "done"
-					if err := upsertGlobalInboundSQLiteTx(ctx, tx, key, item); err != nil {
-						return err
-					}
-				}
-				return nil
-			}); err != nil {
-				return fmt.Errorf("merge legacy global inbound ledger: %w", err)
-			}
+			item.Status = "done"
+			plan.inboundDelta = append(plan.inboundDelta, item)
 		}
 	}
 
@@ -1345,74 +1336,98 @@ func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity
 		if relatedMigrationFamilyExists(legacyOutboundPath, teamsLedgerSQLitePath(legacyOutboundPath)) {
 			locks, err = acquireScopeTakeoverLocks(ctx, []string{legacyOutboundPath + ".lock"})
 			if err != nil {
-				return fmt.Errorf("lock legacy global Teams outbound ledger: %w", err)
+				return plan, fmt.Errorf("lock legacy global Teams outbound ledger: %w", err)
 			}
 		}
-		legacyItems, err := readGlobalOutboundForUnion(ctx, legacyOutboundPath)
+		legacyItems, readErr := readGlobalOutboundForUnion(ctx, legacyOutboundPath)
 		releaseScopeTakeoverLocks(locks)
-		if err != nil {
-			return fmt.Errorf("read legacy global outbound ledger: %w", err)
+		if readErr != nil {
+			return plan, fmt.Errorf("read legacy global outbound ledger: %w", readErr)
 		}
 		canonicalItems, err := readGlobalOutboundForUnion(ctx, canonicalOutboundPath)
 		if err != nil {
-			return fmt.Errorf("read canonical global outbound ledger: %w", err)
+			return plan, fmt.Errorf("read canonical global outbound ledger: %w", err)
 		}
-		if err := applyLegacyOutboxReplayFences(ctx, scope, legacyItems); err != nil {
-			return err
-		}
-		delta := make([]globalOutboundItem, 0)
+		plan.canonicalOutboundPath = canonicalOutboundPath
 		for key, item := range legacyItems {
-			if _, ok := canonicalItems[key]; ok {
-				continue
+			if item.ScopeID == "" || item.ScopeID == scope.ID {
+				plan.outboxFences = append(plan.outboxFences, teamstore.OutboxReplayFence{
+					OutboxID:       item.OutboxID,
+					TeamsChatID:    item.ChatID,
+					TeamsMessageID: item.MessageID,
+					SessionID:      item.SessionID,
+					TurnID:         item.TurnID,
+					Kind:           item.Kind,
+				})
 			}
-			delta = append(delta, item)
+			if _, ok := canonicalItems[key]; !ok {
+				plan.outboundDelta = append(plan.outboundDelta, item)
+			}
 		}
-		if len(delta) > 0 {
-			if err := recordMissingGlobalOutboundBatch(ctx, canonicalOutboundPath, delta, time.Now()); err != nil {
-				return fmt.Errorf("merge legacy global outbound ledger: %w", err)
+	}
+	sort.Slice(plan.inboundDelta, func(i, j int) bool {
+		return globalInboundKey(plan.inboundDelta[i].ChatID, plan.inboundDelta[i].MessageID) <
+			globalInboundKey(plan.inboundDelta[j].ChatID, plan.inboundDelta[j].MessageID)
+	})
+	sort.Slice(plan.outboundDelta, func(i, j int) bool {
+		return globalOutboundKey(plan.outboundDelta[i].ChatID, plan.outboundDelta[i].MessageID) <
+			globalOutboundKey(plan.outboundDelta[j].ChatID, plan.outboundDelta[j].MessageID)
+	})
+	sort.Slice(plan.outboxFences, func(i, j int) bool { return plan.outboxFences[i].OutboxID < plan.outboxFences[j].OutboxID })
+	return plan, nil
+}
+
+func applyLegacyReplayPlan(ctx context.Context, targetStorePath string, plan legacyReplayPlan) error {
+	if len(plan.outboxFences) > 0 {
+		store, err := teamstore.Open(targetStorePath)
+		if err != nil {
+			return fmt.Errorf("open target Teams store for outbound replay fence: %w", err)
+		}
+		_, applyErr := store.ApplyOutboxReplayFences(ctx, plan.outboxFences)
+		closeErr := store.Close()
+		if applyErr != nil {
+			return fmt.Errorf("apply legacy outbound replay fence: %w", applyErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close target Teams store after outbound replay fence: %w", closeErr)
+		}
+	}
+	if len(plan.inboundDelta) > 0 {
+		if err := updateGlobalInboundSQLite(ctx, plan.canonicalInboundPath, func(tx *sql.Tx, _ time.Time) error {
+			for _, item := range plan.inboundDelta {
+				key := globalInboundKey(item.ChatID, item.MessageID)
+				current, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, key)
+				if err != nil {
+					return err
+				}
+				if ok && current.Status == "done" {
+					continue
+				}
+				item.Status = "done"
+				if err := upsertGlobalInboundSQLiteTx(ctx, tx, key, item); err != nil {
+					return err
+				}
 			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("merge legacy global inbound ledger: %w", err)
+		}
+	}
+	if len(plan.outboundDelta) > 0 {
+		if err := recordMissingGlobalOutboundBatch(ctx, plan.canonicalOutboundPath, plan.outboundDelta, time.Now()); err != nil {
+			return fmt.Errorf("merge legacy global outbound ledger: %w", err)
 		}
 	}
 	return nil
 }
 
-func applyLegacyOutboxReplayFences(ctx context.Context, scope teamstore.ScopeIdentity, items map[string]globalOutboundItem) error {
-	if len(items) == 0 {
-		return nil
-	}
-	canonicalPath, err := DefaultStorePathForScope(scope.ID)
+// UnionLegacyGlobalLedgers copies only monotonic replay fences into the
+// canonical ledgers. The legacy ledgers are shared by every legacy scope, so
+// this function never moves, truncates, or deletes them.
+func UnionLegacyGlobalLedgers(ctx context.Context, scope teamstore.ScopeIdentity, legacyStorePath string, targetStorePath string) error {
+	plan, err := buildLegacyReplayPlanReadOnly(ctx, scope, legacyStorePath)
 	if err != nil {
 		return err
 	}
-	exists, err := inspectRuntimeStorePath(canonicalPath)
-	if err != nil || !exists {
-		return err
-	}
-	fences := make([]teamstore.OutboxReplayFence, 0, len(items))
-	for _, item := range items {
-		if item.ScopeID != "" && item.ScopeID != scope.ID {
-			continue
-		}
-		fences = append(fences, teamstore.OutboxReplayFence{
-			OutboxID:       item.OutboxID,
-			TeamsChatID:    item.ChatID,
-			TeamsMessageID: item.MessageID,
-			SessionID:      item.SessionID,
-			TurnID:         item.TurnID,
-			Kind:           item.Kind,
-		})
-	}
-	store, err := teamstore.Open(canonicalPath)
-	if err != nil {
-		return fmt.Errorf("open canonical Teams store for outbound replay fence: %w", err)
-	}
-	_, applyErr := store.ApplyOutboxReplayFences(ctx, fences)
-	closeErr := store.Close()
-	if applyErr != nil {
-		return fmt.Errorf("apply legacy outbound replay fence: %w", applyErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close canonical Teams store after outbound replay fence: %w", closeErr)
-	}
-	return nil
+	return applyLegacyReplayPlan(ctx, targetStorePath, plan)
 }

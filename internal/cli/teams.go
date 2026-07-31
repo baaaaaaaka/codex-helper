@@ -1316,8 +1316,13 @@ func prepareManagedTeamsRuntimeStore(
 }
 
 func teamsRunShouldRetryInProcess(once bool, managedServiceChild bool) bool {
+	// CODEX_HELPER_TEAMS_SERVICE and CODEX_HELPER_TEAMS_SERVICE_MODE predate the
+	// hidden managed-child flag. Treat the flag as an additional marker instead
+	// of an upgrade boundary so persisted service specs created by an older
+	// helper can still complete a one-time offline store migration after the
+	// runtime is updated. Teams Codex children inherit the service environment,
+	// so the explicit child check remains the authority boundary.
 	return !once &&
-		managedServiceChild &&
 		!runningInsideTeamsCodexChild() &&
 		strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == "1" &&
 		strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE_MODE")), "background")
@@ -1330,6 +1335,18 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 		err := runOnce()
 		if err == nil || !isRecoverableTeamsRunError(err) {
 			return err
+		}
+		var migrationBlocked *teams.RuntimeStoreMigrationBlockedError
+		if errors.As(err, &migrationBlocked) {
+			if errOut != nil {
+				_, _ = fmt.Fprintf(
+					errOut,
+					"Teams service migration blocked: operation=teams-store-migration error=%v; waiting for service restart\n",
+					err,
+				)
+			}
+			<-ctx.Done()
+			return ctx.Err()
 		}
 		delay := teamsRunRetryDelay(err, attempt)
 		if errOut != nil {
@@ -1357,8 +1374,8 @@ func teamsRunRetryDelay(err error, attempt int) time.Duration {
 	if delay <= 0 {
 		delay = 30 * time.Second
 	}
-	var migrationBlocked *teams.RuntimeStoreMigrationBlockedError
-	if !errors.As(err, &migrationBlocked) || attempt <= 1 {
+	var takeoverDeferred *teams.RuntimeStoreTakeoverDeferredError
+	if !errors.As(err, &takeoverDeferred) || attempt <= 1 {
 		return delay
 	}
 	maxDelay := teamsRunServiceMaxRetryDelay

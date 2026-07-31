@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -836,11 +837,14 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 	}
 	if err := ownerStore.Update(context.Background(), func(state *teamsstore.State) error {
 		owner := teamsstore.OwnerMetadata{
-			PID:           os.Getpid(),
-			Hostname:      hostname,
-			StartedAt:     now.Add(-5 * time.Minute),
-			LastHeartbeat: now.Add(-5 * time.Second),
+			PID:             os.Getpid(),
+			Hostname:        hostname,
+			ScopeID:         "scope-owner",
+			LeaseGeneration: 7,
+			StartedAt:       now.Add(-5 * time.Minute),
+			LastHeartbeat:   now.Add(-5 * time.Second),
 		}
+		state.Scope = teamsstore.ScopeIdentity{ID: owner.ScopeID}
 		state.ServiceOwner = &owner
 		state.LockOwner = &owner
 		state.ControlChat = teamsstore.ControlChatBinding{TeamsChatID: "owner-control"}
@@ -911,6 +915,39 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 	}
 	if !snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != "" {
 		t.Fatalf("historical owner with reused managed PID was selected: %+v", snapshot)
+	}
+
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{}, false
+	}
+	exactBinding := teams.ActiveStoreBinding{
+		CanonicalPath:   ownerPath,
+		ScopeID:         "scope-owner",
+		PID:             os.Getpid(),
+		StartedAt:       now.Add(-5 * time.Minute),
+		LeaseGeneration: 7,
+	}
+	if err := teams.WriteActiveStoreBinding(exactBinding); err != nil {
+		t.Fatalf("write exact active-store binding: %v", err)
+	}
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect bound watchdog snapshot: %v", err)
+	}
+	if snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != ownerPath {
+		t.Fatalf("exact active-store binding was not selected: %+v", snapshot)
+	}
+
+	exactBinding.LeaseGeneration++
+	if err := teams.WriteActiveStoreBinding(exactBinding); err != nil {
+		t.Fatalf("write mismatched active-store binding: %v", err)
+	}
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect mismatched binding watchdog snapshot: %v", err)
+	}
+	if !snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != "" {
+		t.Fatalf("mismatched active-store binding was trusted: %+v", snapshot)
 	}
 }
 
@@ -1057,6 +1094,58 @@ func TestTeamsServiceWatchdogStateRoundTripAndCorruptReset(t *testing.T) {
 	}
 	if got != (teamsServiceWatchdogState{}) {
 		t.Fatalf("corrupt state = %+v, want zero", got)
+	}
+}
+
+func TestRunTeamsServiceWatchdogOnceStableNoopDoesNotRewriteState(t *testing.T) {
+	lockCLITestHooks(t)
+
+	firstNow := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{Installed: false}, nil
+	}
+
+	first, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: firstNow})
+	if err != nil {
+		t.Fatalf("first watchdog run: %v", err)
+	}
+	if first.Decision.Action != teamsServiceWatchdogActionNoop {
+		t.Fatalf("first watchdog action = %q, want noop", first.Decision.Action)
+	}
+	fixedModTime := firstNow.Add(-time.Hour)
+	if err := os.Chtimes(path, fixedModTime, fixedModTime); err != nil {
+		t.Fatalf("set watchdog sentinel mtime: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read watchdog state before stable run: %v", err)
+	}
+
+	second, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: firstNow.Add(5 * time.Second)})
+	if err != nil {
+		t.Fatalf("second watchdog run: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read watchdog state after stable run: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat watchdog state after stable run: %v", err)
+	}
+	if !bytes.Equal(before, after) || !info.ModTime().Equal(fixedModTime) {
+		t.Fatalf("stable watchdog rewrote state: bytes_equal=%t mtime=%s want=%s", bytes.Equal(before, after), info.ModTime(), fixedModTime)
+	}
+	if !second.State.UpdatedAt.Equal(first.State.UpdatedAt) {
+		t.Fatalf("stable watchdog advanced persisted timestamp: first=%s second=%s", first.State.UpdatedAt, second.State.UpdatedAt)
 	}
 }
 

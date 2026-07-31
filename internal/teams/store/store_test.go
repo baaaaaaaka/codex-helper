@@ -306,6 +306,70 @@ func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(
 	}
 }
 
+func TestLoadPathWatchdogStateReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat"}
+		state.ServiceOwner = &OwnerMetadata{PID: 1234, LastHeartbeat: now, StartedAt: now.Add(-time.Minute)}
+		state.ServiceControl = ServiceControl{Draining: true, Reason: "upgrade", UpdatedAt: now}
+		state.Upgrade = &UpgradeRequest{ID: "upgrade-1", Phase: UpgradePhaseDraining, DeadlineAt: now.Add(time.Minute)}
+		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", LastSuccessfulPollAt: now}
+		state.ChatPolls["unrelated-chat"] = ChatPollState{ChatID: "unrelated-chat", LastSuccessfulPollAt: now.Add(-time.Hour)}
+		state.Sessions["corrupt-session"] = SessionContext{ID: "corrupt-session", TeamsChatID: "work-chat", Status: SessionStatusActive}
+		state.OutboxMessages["corrupt-outbox"] = OutboxMessage{ID: "corrupt-outbox", TeamsChatID: "work-chat", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{broken-session' WHERE id = 'corrupt-session'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt session sentinel: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = 'corrupt-outbox'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	state, err := LoadPathWatchdogStateReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathWatchdogStateReadOnly: %v", err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("watchdog probe modified the SQLite family:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.PID != 1234 {
+		t.Fatalf("watchdog owner = %#v", state.ServiceOwner)
+	}
+	if !state.ServiceControl.Draining || state.Upgrade == nil || state.Upgrade.ID != "upgrade-1" {
+		t.Fatalf("watchdog lifecycle projection = control %#v upgrade %#v", state.ServiceControl, state.Upgrade)
+	}
+	if len(state.ChatPolls) != 1 || state.ChatPolls["control-chat"].ChatID != "control-chat" {
+		t.Fatalf("watchdog polls = %#v, want only control chat", state.ChatPolls)
+	}
+	if state.Sessions != nil || state.OutboxMessages != nil {
+		t.Fatalf("watchdog loaded business collections: sessions=%#v outbox=%#v", state.Sessions, state.OutboxMessages)
+	}
+}
+
 func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	scope := ScopeIdentity{ID: "scope-large-json", AccountID: "account-large", Profile: "default"}
@@ -346,23 +410,170 @@ func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *test
 	}
 }
 
-func TestLoadPathRuntimeMetadataReadOnlyRejectsOversizedJSONBeforeOpen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatalf("create oversized JSON fixture: %v", err)
-	}
-	if err := f.Truncate(maxRuntimeMetadataJSONBytes + 1); err != nil {
-		_ = f.Close()
-		t.Fatalf("truncate oversized JSON fixture: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close oversized JSON fixture: %v", err)
-	}
+func TestApplyOutboxReplayFencesUsesCompleteSentProjection(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
+			message := OutboxMessage{
+				ID:          "outbox-1",
+				SessionID:   "session-1",
+				TurnID:      "turn-1",
+				TeamsChatID: "chat-1",
+				Kind:        "codex-progress-001",
+				Status:      OutboxStatusQueued,
+				ArtifactIDs: []string{"artifact-1"},
+				DriveItemID: "drive-item-1",
+				CreatedAt:   now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[message.ID] = message
+				state.TranscriptDeliveries["transcript-1"] = TranscriptDeliveryRecord{
+					ID:        "transcript-1",
+					SessionID: message.SessionID,
+					OutboxID:  message.ID,
+					Status:    TranscriptDeliveryStatusQueued,
+					CreatedAt: now,
+				}
+				updateHelperDeliveryForOutboxLocked(state, message, HelperDeliveryStatusQueued, now)
+				state.ArtifactRecords["artifact-1"] = ArtifactRecord{
+					ID:          "artifact-1",
+					SessionID:   message.SessionID,
+					TurnID:      message.TurnID,
+					OutboxID:    message.ID,
+					DriveItemID: message.DriveItemID,
+					Status:      "queued",
+					CreatedAt:   now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed replay projection: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate replay projection to SQLite: %v", err)
+				}
+			}
 
-	_, err = LoadPathRuntimeMetadataReadOnly(context.Background(), path)
-	if err == nil || !strings.Contains(err.Error(), "discovery limit") {
-		t.Fatalf("oversized metadata error = %v, want discovery limit", err)
+			fence := OutboxReplayFence{
+				OutboxID:       message.ID,
+				TeamsChatID:    message.TeamsChatID,
+				TeamsMessageID: "teams-message-1",
+				SessionID:      message.SessionID,
+				TurnID:         message.TurnID,
+				Kind:           message.Kind,
+			}
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 1 {
+				t.Fatalf("ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load replay projection: %v", err)
+			}
+			outbox := state.OutboxMessages[message.ID]
+			if outbox.Status != OutboxStatusSent || outbox.TeamsMessageID != fence.TeamsMessageID || outbox.SentAt.IsZero() {
+				t.Fatalf("outbox sent projection = %#v", outbox)
+			}
+			provenance := state.MessageProvenance[messageProvenanceID(message.TeamsChatID, fence.TeamsMessageID)]
+			if provenance.Origin != MessageOriginHelperOutbox || provenance.OutboxID != message.ID {
+				t.Fatalf("outbox provenance = %#v", provenance)
+			}
+			transcript := state.TranscriptDeliveries["transcript-1"]
+			if transcript.Status != TranscriptDeliveryStatusSent || transcript.TeamsMessageID != fence.TeamsMessageID || transcript.SentAt.IsZero() {
+				t.Fatalf("transcript sent projection = %#v", transcript)
+			}
+			helperSent := false
+			for _, delivery := range state.HelperDeliveries {
+				if delivery.OutboxID == message.ID && delivery.Status == HelperDeliveryStatusSent && delivery.TeamsMessageID == fence.TeamsMessageID {
+					helperSent = true
+				}
+			}
+			if !helperSent {
+				t.Fatalf("helper delivery sent projection = %#v", state.HelperDeliveries)
+			}
+			artifact := state.ArtifactRecords["artifact-1"]
+			if artifact.Status != "uploaded" || artifact.TeamsMessageID != fence.TeamsMessageID || artifact.SentAt.IsZero() {
+				t.Fatalf("artifact sent projection = %#v", artifact)
+			}
+
+			before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			changed, err = store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 0 {
+				t.Fatalf("repeat ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("already-applied replay fence wrote store files:\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
+	}
+}
+
+func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	target := OutboxMessage{ID: "target", SessionID: "session-1", TurnID: "turn-1", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued}
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages[target.ID] = target
+		state.OutboxMessages["unrelated"] = OutboxMessage{ID: "unrelated", TeamsChatID: "chat-2", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed outbox rows: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-unrelated' WHERE id = 'unrelated'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt unrelated outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+	fence := OutboxReplayFence{
+		OutboxID:       target.ID,
+		TeamsChatID:    target.TeamsChatID,
+		TeamsMessageID: "teams-target",
+		SessionID:      target.SessionID,
+		TurnID:         target.TurnID,
+		Kind:           target.Kind,
+	}
+	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 1 {
+		t.Fatalf("ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen SQLite store: %v", err)
+	}
+	var raw []byte
+	if err := db.QueryRow(`SELECT json FROM outbox_messages WHERE id = ?`, target.ID).Scan(&raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("read fenced outbox: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite reader: %v", err)
+	}
+	var got OutboxMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode fenced outbox: %v", err)
+	}
+	if got.Status != OutboxStatusSent || got.TeamsMessageID != fence.TeamsMessageID {
+		t.Fatalf("fenced outbox = %#v", got)
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 0 {
+		t.Fatalf("repeat ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("zero-delta targeted replay fence wrote files:\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 
