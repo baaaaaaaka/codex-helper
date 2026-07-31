@@ -536,11 +536,12 @@ func writeRuntimeStoreMigrationCleanup(storePath string, sourcePath string) erro
 		return err
 	}
 	path := runtimeStoreMigrationCleanupPath(storePath)
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	file, err := os.Open(path)
-	if err != nil {
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
 		return err
 	}
 	syncErr := file.Sync()
