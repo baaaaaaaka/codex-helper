@@ -104,6 +104,20 @@ func (s *Store) Load() (Config, error) {
 	return s.loadUnlocked()
 }
 
+// LoadPathReadOnly parses a config file without creating its parent directory
+// or lock file. Diagnostic commands should use this instead of NewStore.Load.
+func LoadPathReadOnly(path string) (Config, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPath()
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	return (&Store{path: path}).loadUnlocked()
+}
+
 func (s *Store) Save(cfg Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

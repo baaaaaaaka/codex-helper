@@ -255,6 +255,7 @@ jobs:
           $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
           $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
           $env:CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE = "service"
+          $env:CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE = $env:USERPROFILE
           go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: CXP TUI preview, navigation, refresh, and thread-name regressions
@@ -419,6 +420,51 @@ jobs:
           go test ./internal/teams -count=1 -run "$durable_routing_pattern" -v
           go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
           go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
+
+      - name: Teams test user-directory isolation guard
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
+
+      - name: Teams runtime safety test isolation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
+
+      - name: Teams runtime safety Windows paths and service environment
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh windows
+
+      - name: Teams runtime safety scope resolution and migration
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
+
+      - name: Teams runtime safety resolver syscall budget
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
+
+      - name: Teams runtime safety real-process takeover
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
+
+      - name: Teams runtime safety service and update lifecycle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh service-update
+
+      - name: Teams runtime safety WSL and process lifecycle
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh wsl-process
+
+      - name: Teams runtime safety readiness and diagnostics
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh diagnostics
 
       - name: Teams read-only diagnostics regressions
         shell: bash

@@ -5,6 +5,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
 
 
 def targeted_job() -> str:
@@ -24,6 +26,31 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    def test_teams_runtime_safety_uses_one_shared_shard_definition(self):
+        script = TEAMS_RUNTIME_SHARD.read_text(encoding="utf-8")
+        for shard in (
+            "isolation",
+            "store",
+            "store-io",
+            "store-process",
+            "service-update",
+            "wsl-process",
+            "diagnostics",
+            "windows",
+        ):
+            self.assertIn(f"  {shard})", script)
+            call = f"bash scripts/tests/run_teams_runtime_safety_shard.sh {shard}"
+            self.assertIn(call, WORKFLOW.read_text(encoding="utf-8"))
+            self.assertIn(call, RELEASE_WORKFLOW.read_text(encoding="utf-8"))
+
+        for workflow in (WORKFLOW, RELEASE_WORKFLOW):
+            text = workflow.read_text(encoding="utf-8")
+            self.assertNotRegex(
+                text,
+                r"go test .*TestTeamsRuntimeSafety",
+                f"{workflow.name} duplicated a Teams runtime-safety regex",
+            )
+
     def test_declares_parallel_shards_and_limits_platform_only_shards(self):
         job = targeted_job()
         self.assertIn(
@@ -52,7 +79,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             if name in {"Checkout", "Setup Go"}:
                 continue
             matches = re.findall(
-                r"^        if: matrix\.shard == '("
+                r"^        if: (?:always\(\) && )?matrix\.shard == '("
                 r"core|platform-integration|state-perf|ubuntu-stress|"
                 r"windows-skills-desktop|windows-codex-e2e"
                 r")'(?: && .+)?$",
@@ -70,6 +97,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Teams SQLite row-level migration regressions": "state-perf",
             "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
             "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
+            "Teams runtime safety resolver syscall budget": "state-perf",
+            "Teams runtime safety real-process takeover": "state-perf",
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
             "Teams SQLite store migration and perf regressions": "state-perf",
             "Teams perf benchmark smoke": "state-perf",
@@ -84,9 +113,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Native managed-node install integration (Windows)": "windows-codex-e2e",
         }
         for name, shard in expected.items():
-            self.assertIn(
-                f"if: matrix.shard == '{shard}'",
+            self.assertRegex(
                 blocks[name],
+                rf"if: (?:always\(\) && )?matrix\.shard == '{re.escape(shard)}'",
                 name,
             )
 

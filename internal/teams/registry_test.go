@@ -115,7 +115,7 @@ func TestDefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI(t *testing.T)
 	}
 }
 
-func TestDefaultRegistryPathForScopeRefreshesCorruptNewRegistryCI(t *testing.T) {
+func TestDefaultRegistryPathForScopeDoesNotOverwriteCorruptCanonicalFromLegacyCI(t *testing.T) {
 	tmp := t.TempDir()
 	_, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 	scopeID := "scope:registry-corrupt"
@@ -146,11 +146,11 @@ func TestDefaultRegistryPathForScopeRefreshesCorruptNewRegistryCI(t *testing.T) 
 		t.Fatalf("DefaultRegistryPathForScope = %q, want %q", got, newPath)
 	}
 	reg, err := LoadRegistry(got)
-	if err != nil {
-		t.Fatalf("LoadRegistry after scoped refresh: %v", err)
+	if err == nil {
+		t.Fatalf("LoadRegistry unexpectedly repaired corrupt canonical registry: %#v", reg)
 	}
-	if reg.ControlChatID != "legacy-control" {
-		t.Fatalf("registry control chat = %q, want legacy-control", reg.ControlChatID)
+	if raw, readErr := os.ReadFile(newPath); readErr != nil || string(raw) != `{"version":` {
+		t.Fatalf("canonical registry changed: raw=%q err=%v", raw, readErr)
 	}
 }
 

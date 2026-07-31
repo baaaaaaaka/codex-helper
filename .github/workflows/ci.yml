@@ -572,6 +572,56 @@ jobs:
           go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
+      - name: Teams test user-directory isolation guard
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/check_teams_test_user_dir_isolation.sh
+
+      - name: Teams test user-directory isolation guard (Windows)
+        if: matrix.shard == 'core' && runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\tests\check_teams_test_user_dir_isolation.ps1
+
+      - name: Teams runtime safety test isolation
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
+
+      - name: Teams runtime safety Windows paths and service environment
+        if: matrix.shard == 'core' && runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh windows
+
+      - name: Teams runtime safety scope resolution and migration
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
+
+      - name: Teams runtime safety resolver syscall budget
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
+
+      - name: Teams runtime safety real-process takeover
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
+
+      - name: Teams runtime safety service and update lifecycle
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh service-update
+
+      - name: Teams runtime safety WSL and process lifecycle
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh wsl-process
+
+      - name: Teams runtime safety readiness and diagnostics
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/tests/run_teams_runtime_safety_shard.sh diagnostics
+
       - name: Teams read-only diagnostics regressions
         if: matrix.shard == 'core'
         shell: bash
@@ -1870,6 +1920,7 @@ jobs:
           $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
           $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
           $env:CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE = "service"
+          $env:CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE = $env:USERPROFILE
           go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
 
       - name: Codex approval, history, and cancellation runtime integration (Linux/macOS)

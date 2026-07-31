@@ -14,9 +14,10 @@ import (
 )
 
 type teamsServiceLocalProcess struct {
-	PID  int
-	Args []string
-	Env  map[string]string
+	PID       int
+	StartTime string
+	Args      []string
+	Env       map[string]string
 }
 
 type teamsServiceLocalProcessRetireResult struct {
@@ -75,6 +76,10 @@ func teamsServiceShouldRetireLocalProcess(proc teamsServiceLocalProcess, spec te
 	if proc.PID <= 0 || proc.PID == os.Getpid() {
 		return false
 	}
+	return teamsServiceLocalProcessMatchesSpec(proc, spec, kinds)
+}
+
+func teamsServiceLocalProcessMatchesSpec(proc teamsServiceLocalProcess, spec teamsServiceSpec, kinds map[string]bool) bool {
 	kind := teamsServiceLocalProcessKind(proc.Args)
 	if kind == "" || !kinds[kind] {
 		return false
@@ -262,7 +267,7 @@ func teamsServiceCleanRegistryPath(path string) string {
 func defaultTeamsServiceListLocalProcesses() ([]teamsServiceLocalProcess, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	out := make([]teamsServiceLocalProcess, 0)
 	for _, entry := range entries {
@@ -278,6 +283,9 @@ func defaultTeamsServiceListLocalProcesses() ([]teamsServiceLocalProcess, error)
 			continue
 		}
 		envFields, _ := readProcNULFileFields(filepath.Join("/proc", entry.Name(), "environ"))
+		// Exact takeover validation reads start time only for the selected owner
+		// PID. Avoid another /proc read for every unrelated process during the
+		// service scans that share this process inventory.
 		out = append(out, teamsServiceLocalProcess{PID: pid, Args: args, Env: envMapFromFields(envFields)})
 	}
 	return out, nil

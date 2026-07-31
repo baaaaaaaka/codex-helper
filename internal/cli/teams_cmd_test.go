@@ -306,7 +306,7 @@ func TestTeamsStorePathsKeepLegacyWhenScopedStoreNeedsRefreshCI(t *testing.T) {
 	assertCLIPathInList(t, storePaths, legacyScopedStore)
 }
 
-func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *testing.T) {
+func TestTeamsRegistryPathsDoNotCoupleScopeMigrationToGlobalLedger(t *testing.T) {
 	tmp := t.TempDir()
 	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
 
@@ -340,7 +340,8 @@ func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *te
 		t.Fatalf("write new scoped registry: %v", err)
 	}
 	legacyLedger := filepath.Join(cacheBase, "codex-helper", "teams", "global-outbound-ledger.json")
-	if err := os.WriteFile(legacyLedger, []byte(`{"version":1}`), 0o600); err != nil {
+	legacyLedgerData := []byte(`{"version":1}`)
+	if err := os.WriteFile(legacyLedger, legacyLedgerData, 0o600); err != nil {
 		t.Fatalf("write legacy ledger: %v", err)
 	}
 	registryPaths, err := teamsRegistryPaths("")
@@ -348,7 +349,14 @@ func TestTeamsStoreAndRegistryPathsKeepLegacyWhenScopedMigrationIncomplete(t *te
 		t.Fatalf("teamsRegistryPaths error: %v", err)
 	}
 	assertCLIPathInList(t, registryPaths, newScopedRegistry)
-	assertCLIPathInList(t, registryPaths, legacyScopedRegistry)
+	assertCLIPathNotInList(t, registryPaths, legacyScopedRegistry)
+	gotLegacyLedger, err := os.ReadFile(legacyLedger)
+	if err != nil {
+		t.Fatalf("read retained global ledger: %v", err)
+	}
+	if !bytes.Equal(gotLegacyLedger, legacyLedgerData) {
+		t.Fatalf("global ledger changed during scoped registry enumeration: got %q want %q", gotLegacyLedger, legacyLedgerData)
+	}
 }
 
 func TestRunTeamsServiceRetryLoopRetriesRecoverableErrors(t *testing.T) {
@@ -417,16 +425,27 @@ func TestRunTeamsServiceRetryLoopDoesNotRetryPermanentErrors(t *testing.T) {
 func TestTeamsRunShouldRetryInProcessOnlyForServiceMode(t *testing.T) {
 	lockCLITestHooks(t)
 
+	t.Setenv(envTeamsCodexChild, "")
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
-	if teamsRunShouldRetryInProcess(false) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "")
+	if teamsRunShouldRetryInProcess(false, false) {
 		t.Fatal("foreground teams run should not retry internally")
 	}
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	if !teamsRunShouldRetryInProcess(false) {
+	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
+	if !teamsRunShouldRetryInProcess(false, true) {
 		t.Fatal("background service teams run should retry recoverable errors internally")
 	}
-	if teamsRunShouldRetryInProcess(true) {
+	if teamsRunShouldRetryInProcess(true, true) {
 		t.Fatal("teams run --once should not enter service retry loop")
+	}
+	t.Setenv(envTeamsCodexChild, "1")
+	if teamsRunShouldRetryInProcess(false, true) {
+		t.Fatal("Teams Codex child must not receive managed-service migration authority")
+	}
+	t.Setenv(envTeamsCodexChild, "")
+	if !teamsRunShouldRetryInProcess(false, false) {
+		t.Fatal("persisted background service specs created before the hidden managed-child argument must remain compatible")
 	}
 }
 
@@ -434,8 +453,8 @@ func TestTeamsStatusFindsScopedControlChatState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	isolateTeamsUserDirsForTest(t, tmp)
+	scopedStatePath := cliStatePathForTest(t, "teams", "scopes", "scope-a", "state.json")
 	st, err := teamsstore.Open(scopedStatePath)
 	if err != nil {
 		t.Fatalf("Open scoped store: %v", err)
@@ -671,17 +690,20 @@ func TestTeamsStatusPrefersScopedDrainingServiceControl(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	legacyStatePath := filepath.Join(configBase, "codex-helper", "teams", "state.json")
-	legacyStore, err := teamsstore.Open(legacyStatePath)
+	isolateTeamsUserDirsForTest(t, tmp)
+	defaultStatePath, err := teamsStorePathReadOnly()
 	if err != nil {
-		t.Fatalf("Open legacy store: %v", err)
+		t.Fatalf("resolve default state path: %v", err)
 	}
-	if _, err := legacyStore.ClearDrain(context.Background()); err != nil {
-		t.Fatalf("ClearDrain legacy: %v", err)
+	defaultStore, err := teamsstore.Open(defaultStatePath)
+	if err != nil {
+		t.Fatalf("Open default store: %v", err)
+	}
+	if _, err := defaultStore.ClearDrain(context.Background()); err != nil {
+		t.Fatalf("ClearDrain default: %v", err)
 	}
 
-	scopedStatePath := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope-a", "state.json")
+	scopedStatePath := cliStatePathForTest(t, "teams", "scopes", "scope-a", "state.json")
 	scopedStore, err := teamsstore.Open(scopedStatePath)
 	if err != nil {
 		t.Fatalf("Open scoped store: %v", err)
@@ -1088,11 +1110,11 @@ func TestTeamsStatusSeparatesCatchupBacklogAndInactiveRows(t *testing.T) {
 	out := executeRootForTeamsTest(t, "teams", "status")
 	for _, want := range []string{
 		"Active summary: 2 pollable chats, 1 active catchup, 1 pollable backlog",
-		"Poll summary: 6 chats",
+		"Poll summary: 4 chats",
 		"1 active catchup",
-		"5 backlog continuations",
-		"Work row layers: pollable=2 parked=1 closed=1 archived=1 stale_scope=2 closed_legacy=1 test_e2e_stale=1",
-		"Scope layers: live=1 stale_owner=2 dead_owner=0 stopped=0",
+		"3 backlog continuations",
+		"Work row layers: pollable=2 parked=1 closed=1 archived=1 stale_scope=0 closed_legacy=1 test_e2e_stale=0",
+		"Scope layers: live=1 stale_owner=0 dead_owner=0 stopped=0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("teams status output missing %q:\n%s", want, out)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -850,6 +851,19 @@ type OutboxMessage struct {
 	LastSendError          string           `json:"last_send_error,omitempty"`
 }
 
+// OutboxReplayFence is a cold-path proof that an outbox message was already
+// accepted by Teams before a legacy store was quarantined. Every populated
+// identity field must match the canonical outbox row before it can be promoted
+// to sent.
+type OutboxReplayFence struct {
+	OutboxID       string
+	TeamsChatID    string
+	TeamsMessageID string
+	SessionID      string
+	TurnID         string
+	Kind           string
+}
+
 type SessionQuarantineRequest struct {
 	SessionID         string
 	Reason            string
@@ -1340,7 +1354,7 @@ func (s *Store) Load(ctx context.Context) (State, error) {
 	var state State
 	err := s.withStateLock(ctx, func() error {
 		var err error
-		state, err = s.loadUnlocked()
+		state, err = s.loadUnlocked(ctx)
 		return err
 	})
 	return state, err
@@ -1382,6 +1396,348 @@ func LoadPathReadOnly(ctx context.Context, path string) (State, error) {
 		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
 	}
 	return loadStateData(data)
+}
+
+// LoadPathOfflineRecoveryReadOnly loads a store after the caller has fenced
+// every writer and acquired the store-family locks. Unlike LoadPathReadOnly,
+// its SQLite connection uses mode=rw so SQLite may rebuild a missing SHM index
+// for an existing WAL. Query-only mode is enabled before any state query; this
+// function does not create schemas, checkpoint WAL, or take the Store flock.
+//
+// Runtime resolver, status, and doctor code must use LoadPathReadOnly instead.
+func LoadPathOfflineRecoveryReadOnly(ctx context.Context, path string) (State, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return State{}, err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newState(), nil
+	}
+	if err != nil {
+		return State{}, err
+	}
+	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		store := &Store{path: path}
+		dbPath, err := store.storeSQLitePath(pointer)
+		if err != nil {
+			return State{}, err
+		}
+		return loadSQLiteStateFileOfflineRecoveryReadOnly(ctx, dbPath)
+	}
+	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+		return State{}, err
+	} else if ok {
+		return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	return loadStateData(data)
+}
+
+// RuntimeMetadata is the bounded subset of a Teams store needed to identify a
+// scope and determine whether a runtime writer may still be authoritative.
+// It deliberately excludes sessions, turns, inbound events, outbox messages,
+// and every other unbounded business-data collection.
+type RuntimeMetadata struct {
+	Scope          ScopeIdentity      `json:"scope"`
+	ControlChat    ControlChatBinding `json:"control_chat"`
+	ServiceOwner   *OwnerMetadata     `json:"service_owner,omitempty"`
+	LockOwner      *OwnerMetadata     `json:"lock_owner,omitempty"`
+	ControlLease   ControlLease       `json:"control_lease"`
+	ServiceControl ServiceControl     `json:"service_control"`
+}
+
+// LoadPathRuntimeMetadataReadOnly reads only the bounded runtime metadata from
+// a JSON or SQLite-backed store. It does not take the writable store flock,
+// create lock files, migrate data, configure WAL, checkpoint, chmod, or load
+// session/outbox tables.
+func LoadPathRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return RuntimeMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return RuntimeMetadata{}, err
+			}
+			return loadSQLiteRuntimeMetadataFileReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			return RuntimeMetadata{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONRuntimeMetadataReadOnly(ctx, path)
+}
+
+// LoadPathRuntimeMetadataOfflineRecoveryReadOnly is the bounded metadata
+// counterpart of LoadPathOfflineRecoveryReadOnly. The caller must have fenced
+// writers and acquired the store-family locks. SQLite may recreate SHM for an
+// existing WAL, but query-only mode prevents application data changes.
+func LoadPathRuntimeMetadataOfflineRecoveryReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return RuntimeMetadata{}, fmt.Errorf("teams runtime metadata path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return RuntimeMetadata{}, err
+			}
+			return loadSQLiteRuntimeMetadataFileOfflineRecoveryReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return RuntimeMetadata{}, err
+		} else if ok {
+			return RuntimeMetadata{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONRuntimeMetadataReadOnly(ctx, path)
+}
+
+// LoadPathWatchdogStateReadOnly reads only the bounded state needed by the
+// service watchdog. The returned State is a partial projection containing the
+// control chat, owners, service control, upgrade request, and relevant chat
+// poll state. It never loads sessions, turns, inbound events, outbox messages,
+// or delivery records, and it performs no store writes.
+func LoadPathWatchdogStateReadOnly(ctx context.Context, path string) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return State{}, err
+		}
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return State{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return State{}, fmt.Errorf("teams watchdog state path is not a regular file: %s", path)
+	}
+	if info.Size() <= maxStatePointerSize {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return State{}, err
+		}
+		if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+			return State{}, err
+		} else if ok {
+			store := &Store{path: path}
+			dbPath, err := store.storeSQLitePath(pointer)
+			if err != nil {
+				return State{}, err
+			}
+			return loadSQLiteWatchdogStateFileReadOnly(ctx, dbPath)
+		}
+		if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+			return State{}, err
+		} else if ok {
+			return State{}, fmt.Errorf("unsupported teams store backend %q", backend)
+		}
+	}
+	return loadJSONWatchdogStateReadOnly(ctx, path)
+}
+
+type runtimeMetadataContextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r runtimeMetadataContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+func loadJSONRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(runtimeMetadataContextReader{ctx: ctx, r: f})
+	token, err := decoder.Token()
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if token != json.Delim('{') {
+		return RuntimeMetadata{}, fmt.Errorf("teams store root must be a JSON object")
+	}
+	var metadata RuntimeMetadata
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return RuntimeMetadata{}, fmt.Errorf("teams store metadata key is not a string")
+		}
+		switch key {
+		case "scope":
+			err = decoder.Decode(&metadata.Scope)
+		case "control_chat":
+			err = decoder.Decode(&metadata.ControlChat)
+		case "service_owner":
+			err = decoder.Decode(&metadata.ServiceOwner)
+		case "lock_owner":
+			err = decoder.Decode(&metadata.LockOwner)
+		case "control_lease":
+			err = decoder.Decode(&metadata.ControlLease)
+		case "service_control":
+			err = decoder.Decode(&metadata.ServiceControl)
+		default:
+			err = skipRuntimeMetadataJSONValue(decoder)
+		}
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return RuntimeMetadata{}, err
+	}
+	return metadata, nil
+}
+
+func loadJSONWatchdogStateReadOnly(ctx context.Context, path string) (State, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return State{}, err
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(runtimeMetadataContextReader{ctx: ctx, r: f})
+	token, err := decoder.Token()
+	if err != nil {
+		return State{}, err
+	}
+	if token != json.Delim('{') {
+		return State{}, fmt.Errorf("teams store root must be a JSON object")
+	}
+	state := State{ChatPolls: make(map[string]ChatPollState)}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return State{}, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return State{}, fmt.Errorf("teams watchdog state key is not a string")
+		}
+		switch key {
+		case "scope":
+			err = decoder.Decode(&state.Scope)
+		case "control_chat":
+			err = decoder.Decode(&state.ControlChat)
+		case "service_owner":
+			err = decoder.Decode(&state.ServiceOwner)
+		case "lock_owner":
+			err = decoder.Decode(&state.LockOwner)
+		case "service_control":
+			err = decoder.Decode(&state.ServiceControl)
+		case "upgrade":
+			err = decoder.Decode(&state.Upgrade)
+		case "chat_polls":
+			err = decoder.Decode(&state.ChatPolls)
+		default:
+			err = skipRuntimeMetadataJSONValue(decoder)
+		}
+		if err != nil {
+			return State{}, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func skipRuntimeMetadataJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		for decoder.More() {
+			if _, err := decoder.Token(); err != nil {
+				return err
+			}
+			if err := skipRuntimeMetadataJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := skipRuntimeMetadataJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 func (s *Store) LoadLegacyJSONState(ctx context.Context) (State, bool, error) {
@@ -1977,7 +2333,7 @@ func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID s
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2168,7 +2524,7 @@ func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID stri
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2210,7 +2566,7 @@ func (s *Store) SessionWorkflowEventSnapshotForTurn(ctx context.Context, session
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2248,7 +2604,7 @@ func (s *Store) SessionThreadResolutionSnapshot(ctx context.Context, sessionID s
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2290,7 +2646,7 @@ func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) 
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2325,7 +2681,7 @@ func (s *Store) RecentSessionInboundTurnSnapshot(ctx context.Context, sessionID 
 		}
 		if !ok {
 			var loadErr error
-			selected, loadErr = s.loadUnlocked()
+			selected, loadErr = s.loadUnlocked(ctx)
 			if loadErr != nil {
 				return loadErr
 			}
@@ -2364,7 +2720,7 @@ func (s *Store) SessionActiveTurnQueueSnapshot(ctx context.Context, sessionID st
 			return nil
 		}
 		var loadErr error
-		selected, loadErr = s.loadUnlocked()
+		selected, loadErr = s.loadUnlocked(ctx)
 		if loadErr != nil {
 			return loadErr
 		}
@@ -2496,7 +2852,7 @@ func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[stri
 			return nil
 		}
 		var loadErr error
-		state, loadErr = s.loadUnlocked()
+		state, loadErr = s.loadUnlocked(ctx)
 		return loadErr
 	})
 	return state, err
@@ -2515,7 +2871,7 @@ func (s *Store) loadSelectedStateFieldsUnlocked(wantedFields map[string]struct{}
 
 func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 	return s.withStateLock(ctx, func() error {
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			return err
 		}
@@ -2742,6 +3098,88 @@ func (s *Store) RecordScope(ctx context.Context, scope ScopeIdentity) (ScopeIden
 		return nil
 	})
 	return out, err
+}
+
+// RebindScopeForMigration changes only persisted scope identity fields after an
+// old scope-ID store has been copied into an unpublished migration target.
+// Callers must hold the migration writer fence. Cross-account/profile changes
+// are rejected.
+func (s *Store) RebindScopeForMigration(ctx context.Context, scope ScopeIdentity) error {
+	scope = normalizeScope(scope)
+	if scope.ID == "" {
+		return fmt.Errorf("scope id is required")
+	}
+	update := func(state *State) error {
+		current := normalizeScope(state.Scope)
+		compatible := func(accountID string, principal string, profile string) bool {
+			profile = strings.TrimSpace(profile)
+			if profile != "" && profile != scope.Profile {
+				return false
+			}
+			sameAccount := strings.TrimSpace(accountID) != "" && scope.AccountID != "" &&
+				strings.TrimSpace(accountID) == scope.AccountID
+			samePrincipal := strings.TrimSpace(principal) != "" && scope.UserPrincipal != "" &&
+				strings.EqualFold(strings.TrimSpace(principal), scope.UserPrincipal)
+			return sameAccount || samePrincipal
+		}
+		if current.ID != "" && current.ID != scope.ID {
+			if !compatible(current.AccountID, current.UserPrincipal, current.Profile) {
+				return fmt.Errorf("Teams state belongs to scope %q, not migration target %q", current.ID, scope.ID)
+			}
+		}
+		oldScopeIDs := map[string]bool{scope.ID: true}
+		if current.ID != "" {
+			oldScopeIDs[current.ID] = true
+		}
+		if scope.CreatedAt.IsZero() {
+			scope.CreatedAt = current.CreatedAt
+		}
+		if scope.CreatedAt.IsZero() {
+			scope.CreatedAt = time.Now()
+		}
+		scope.UpdatedAt = time.Now()
+		state.Scope = scope
+		if state.ControlChat.ScopeID != "" && !oldScopeIDs[state.ControlChat.ScopeID] {
+			if !compatible(state.ControlChat.AccountID, "", state.ControlChat.Profile) {
+				return fmt.Errorf("Teams control binding belongs to scope %q, not migration target %q", state.ControlChat.ScopeID, scope.ID)
+			}
+			oldScopeIDs[state.ControlChat.ScopeID] = true
+		}
+		if state.ControlChat.ScopeID == "" || oldScopeIDs[state.ControlChat.ScopeID] {
+			state.ControlChat.ScopeID = scope.ID
+		}
+		if state.MachineIdentity.ScopeID != "" && !oldScopeIDs[state.MachineIdentity.ScopeID] {
+			if !compatible(state.MachineIdentity.AccountID, state.MachineIdentity.UserPrincipal, state.MachineIdentity.Profile) {
+				return fmt.Errorf("Teams machine identity belongs to scope %q, not migration target %q", state.MachineIdentity.ScopeID, scope.ID)
+			}
+			oldScopeIDs[state.MachineIdentity.ScopeID] = true
+		}
+		if state.MachineIdentity.ScopeID == "" || oldScopeIDs[state.MachineIdentity.ScopeID] {
+			state.MachineIdentity.ScopeID = scope.ID
+		}
+		for id, machine := range state.Machines {
+			if machine.ScopeID != "" && !oldScopeIDs[machine.ScopeID] {
+				if !compatible(machine.AccountID, machine.UserPrincipal, machine.Profile) {
+					return fmt.Errorf("Teams machine %q belongs to scope %q, not migration target %q", id, machine.ScopeID, scope.ID)
+				}
+				oldScopeIDs[machine.ScopeID] = true
+			}
+			if machine.ScopeID == "" || oldScopeIDs[machine.ScopeID] {
+				machine.ScopeID = scope.ID
+				state.Machines[id] = machine
+			}
+		}
+		if state.ControlLease.ScopeID == "" || oldScopeIDs[state.ControlLease.ScopeID] {
+			state.ControlLease.ScopeID = scope.ID
+		} else if state.ControlLease.ScopeID != scope.ID {
+			return fmt.Errorf("Teams control lease belongs to scope %q, not migration target %q", state.ControlLease.ScopeID, scope.ID)
+		}
+		return nil
+	}
+	if handled, err := s.rebindSQLiteScopeForMigration(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
 }
 
 func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, error) {
@@ -3328,6 +3766,7 @@ func (s *Store) MarkUpgradeCompletionNoticeQueued(ctx context.Context, upgradeID
 func (s *Store) AbortUpgrade(ctx context.Context, upgradeID string, reason string) (UpgradeRequest, error) {
 	return s.updateUpgrade(ctx, upgradeID, func(req UpgradeRequest, now time.Time) (UpgradeRequest, error) {
 		req.Phase = UpgradePhaseAborted
+		req.CompletedAt = time.Time{}
 		req.AbortReason = trimDiagnostic(reason, 240)
 		if req.AbortedAt.IsZero() {
 			req.AbortedAt = now
@@ -3562,16 +4001,20 @@ func (s *Store) ClearOwner(ctx context.Context) error {
 
 func (s *Store) ClearOwnerIfSame(ctx context.Context, owner OwnerMetadata) (bool, error) {
 	cleared := false
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		existing, ok := state.readOwner()
 		if !ok || !sameOwnerInstance(existing, owner) {
-			return nil
+			return errStoreNoChange
 		}
 		state.ServiceOwner = nil
 		state.LockOwner = nil
 		cleared = true
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return cleared, err
+	}
+	err := s.Update(ctx, update)
 	return cleared, err
 }
 
@@ -4202,7 +4645,7 @@ func (s *Store) MessageLookup(ctx context.Context, chatID string, teamsMessageID
 			out = lookup
 			return nil
 		}
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			s.invalidateMessageLookupCacheLocked()
 			return err
@@ -5415,6 +5858,85 @@ func (s *Store) MarkOutboxSentForAttempt(ctx context.Context, outboxID string, a
 	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true)
 }
 
+// ApplyOutboxReplayFences promotes already-delivered canonical outbox rows in
+// one transaction. It is intentionally separate from the normal send path so
+// regular delivery does not gain a global-ledger lookup.
+func (s *Store) ApplyOutboxReplayFences(ctx context.Context, fences []OutboxReplayFence) (int, error) {
+	fences, err := normalizeOutboxReplayFences(fences)
+	if err != nil || len(fences) == 0 {
+		return 0, err
+	}
+	if changed, handled, err := s.applyOutboxReplayFencesSQLite(ctx, fences); handled || err != nil {
+		return changed, err
+	}
+	changed := 0
+	err = s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		for _, fence := range fences {
+			current, ok := state.OutboxMessages[fence.OutboxID]
+			if !ok {
+				continue
+			}
+			if err := validateOutboxReplayFence(current, fence); err != nil {
+				return false, err
+			}
+		}
+		now := time.Now()
+		for _, fence := range fences {
+			current, ok := state.OutboxMessages[fence.OutboxID]
+			if !ok || current.Status == OutboxStatusSent {
+				continue
+			}
+			current = applyOutboxSentProjectionLocked(state, current, fence.TeamsMessageID, now)
+			state.OutboxMessages[current.ID] = current
+			changed++
+		}
+		return changed > 0, nil
+	})
+	return changed, err
+}
+
+func normalizeOutboxReplayFences(fences []OutboxReplayFence) ([]OutboxReplayFence, error) {
+	normalized := make([]OutboxReplayFence, 0, len(fences))
+	byID := make(map[string]OutboxReplayFence, len(fences))
+	for _, fence := range fences {
+		fence.OutboxID = strings.TrimSpace(fence.OutboxID)
+		fence.TeamsChatID = strings.TrimSpace(fence.TeamsChatID)
+		fence.TeamsMessageID = strings.TrimSpace(fence.TeamsMessageID)
+		fence.SessionID = strings.TrimSpace(fence.SessionID)
+		fence.TurnID = strings.TrimSpace(fence.TurnID)
+		fence.Kind = strings.TrimSpace(fence.Kind)
+		if fence.OutboxID == "" || fence.TeamsMessageID == "" {
+			continue
+		}
+		if existing, ok := byID[fence.OutboxID]; ok {
+			if existing != fence {
+				return nil, fmt.Errorf("conflicting replay fences for outbox %q", fence.OutboxID)
+			}
+			continue
+		}
+		byID[fence.OutboxID] = fence
+		normalized = append(normalized, fence)
+	}
+	sort.Slice(normalized, func(i, j int) bool {
+		return normalized[i].OutboxID < normalized[j].OutboxID
+	})
+	return normalized, nil
+}
+
+func validateOutboxReplayFence(current OutboxMessage, fence OutboxReplayFence) error {
+	if current.ID != fence.OutboxID ||
+		strings.TrimSpace(current.TeamsChatID) != fence.TeamsChatID ||
+		strings.TrimSpace(current.SessionID) != fence.SessionID ||
+		strings.TrimSpace(current.TurnID) != fence.TurnID ||
+		strings.TrimSpace(current.Kind) != fence.Kind {
+		return fmt.Errorf("legacy delivery identity conflicts with canonical outbox %q", fence.OutboxID)
+	}
+	if existing := strings.TrimSpace(current.TeamsMessageID); existing != "" && existing != fence.TeamsMessageID {
+		return fmt.Errorf("legacy Teams message id conflicts with canonical outbox %q", fence.OutboxID)
+	}
+	return nil
+}
+
 func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
 	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim); handled || err != nil {
 		return out, err
@@ -5423,19 +5945,26 @@ func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToke
 		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, true, requireClaim); err != nil {
 			return msg, err
 		}
-		msg.Status = OutboxStatusSent
-		if msg.SentAt.IsZero() {
-			msg.SentAt = now
-		}
-		if teamsMessageID != "" {
-			msg.TeamsMessageID = teamsMessageID
-		}
-		recordOutboxProvenanceLocked(state, msg, now)
-		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
-		updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
-		return msg, nil
+		return applyOutboxSentProjectionLocked(state, msg, teamsMessageID, now), nil
 	})
+}
+
+func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time) OutboxMessage {
+	msg.Status = OutboxStatusSent
+	if msg.SentAt.IsZero() {
+		msg.SentAt = now
+	}
+	if teamsMessageID = strings.TrimSpace(teamsMessageID); teamsMessageID != "" {
+		msg.TeamsMessageID = teamsMessageID
+	}
+	msg.UpdatedAt = now
+	msg.LastSendError = ""
+	msg.SendAttemptToken = ""
+	recordOutboxProvenanceLocked(state, msg, now)
+	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
+	updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
+	return msg
 }
 
 func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) error {
@@ -5481,6 +6010,23 @@ func markTranscriptDeliveryForOutboxLocked(state *State, msg OutboxMessage, stat
 
 func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time) {
 	if state == nil {
+		return
+	}
+	updatedExisting := false
+	for id, existing := range state.HelperDeliveries {
+		if strings.TrimSpace(existing.OutboxID) != strings.TrimSpace(msg.ID) {
+			continue
+		}
+		existing.Status = status
+		existing.TeamsMessageID = firstStoreNonEmptyString(msg.TeamsMessageID, existing.TeamsMessageID)
+		if status == HelperDeliveryStatusSent && existing.SentAt.IsZero() {
+			existing.SentAt = firstStoreNonZeroTime(msg.SentAt, now)
+		}
+		existing.UpdatedAt = now
+		state.HelperDeliveries[id] = existing
+		updatedExisting = true
+	}
+	if updatedExisting {
 		return
 	}
 	record, ok := helperDeliveryRecordFromOutboxLocked(state, msg, status, now)
@@ -6688,9 +7234,18 @@ func (s *Store) updateUpgrade(ctx context.Context, upgradeID string, fn func(Upg
 	return out, err
 }
 
-func (s *Store) loadUnlocked() (State, error) {
+func (s *Store) loadUnlocked(ctx context.Context) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return State{}, err
+	}
 	if loadUnlockedTestHook != nil {
 		loadUnlockedTestHook()
+	}
+	if err := ctx.Err(); err != nil {
+		return State{}, err
 	}
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -6710,7 +7265,7 @@ func (s *Store) loadUnlocked() (State, error) {
 		} else {
 			s.clearSQLitePointerCacheUnlocked()
 		}
-		return s.loadSQLiteStateUnlocked(pointer)
+		return s.loadSQLiteStateUnlocked(ctx, pointer)
 	}
 	s.clearSQLitePointerCacheUnlocked()
 	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {

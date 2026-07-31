@@ -72,6 +72,8 @@ func isolateTeamsUserDirsForTest(t *testing.T, tmp string) (string, string) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(tmp, "cache"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
+	t.Setenv("CODEX_HOME", filepath.Join(tmp, ".codex"))
+	t.Setenv("CODEX_DIR", filepath.Join(tmp, ".codex"))
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv(update.EnvInstallPath, "")
 	t.Setenv(update.EnvInstallDir, "")
@@ -280,11 +282,12 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		t.Fatalf("read unit file: %v", err)
 	}
 	unit := string(data)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
 	for _, want := range []string{
 		"[Unit]",
 		"Description=Codex Helper Teams bridge",
-		"WorkingDirectory=" + strconv.Quote(cwd),
-		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(registryPath),
+		"WorkingDirectory=" + systemdQuoteArg(stableHome),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + strconv.Quote(registryPath),
 		"Restart=on-failure",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
@@ -855,8 +858,9 @@ func TestTeamsServiceInstallWritesLocalSupervisorConfigWhenSystemdUserUnavailabl
 	if cfg.Spec.Executable != exePath {
 		t.Fatalf("config executable = %q, want %q", cfg.Spec.Executable, exePath)
 	}
-	if cfg.Spec.WorkingDir != cwd {
-		t.Fatalf("config working dir = %q, want %q", cfg.Spec.WorkingDir, cwd)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
+	if cfg.Spec.WorkingDir != stableHome {
+		t.Fatalf("config working dir = %q, want stable home %q", cfg.Spec.WorkingDir, stableHome)
 	}
 	if cfg.Spec.RegistryPath != registryPath {
 		t.Fatalf("config registry path = %q, want %q", cfg.Spec.RegistryPath, registryPath)
@@ -4517,6 +4521,9 @@ func TestTeamsServiceInstallDefaultsCodexHomeForScope(t *testing.T) {
 
 	tmp := t.TempDir()
 	home := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir effective home: %v", err)
+	}
 	prevUserHome := effectivePathsUserHomeDir
 	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
@@ -4554,7 +4561,7 @@ func TestTeamsServiceInstallDefaultsCodexHomeForScope(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *testing.T) {
+func TestTeamsServiceInstallFailsClosedWhenStableHomeCannotBeDerived(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
@@ -4575,23 +4582,30 @@ func TestTeamsServiceInstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived(t *te
 
 	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
 	cmd.SetArgs([]string{"install"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("service install should not fail only because default Codex home cannot be derived: %v", err)
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "resolve stable Teams service home") {
+		t.Fatalf("service install error = %v, want stable-home resolution failure", err)
 	}
-	data, err := os.ReadFile(filepath.Join(unitDir, teamsServiceUnitName))
-	if err != nil {
-		t.Fatalf("read unit file: %v", err)
-	}
-	unit := string(data)
-	if strings.Contains(unit, "CODEX_HOME=") || strings.Contains(unit, "CODEX_DIR=") {
-		t.Fatalf("unit should omit default Codex home env when it cannot be derived:\n%s", unit)
-	}
-	if !strings.Contains(unit, "CODEX_HELPER_TEAMS_SERVICE=1") {
-		t.Fatalf("unit missing required helper service env:\n%s", unit)
+	if _, err := os.Stat(filepath.Join(unitDir, teamsServiceUnitName)); !os.IsNotExist(err) {
+		t.Fatalf("failed service install should not write a unit, stat error = %v", err)
 	}
 }
 
-func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
+func TestTeamsRuntimeSafetyServiceEnvironmentDoesNotPersistWSLDynamicLoopbackProxyByDefaultCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		exe:            filepath.Join(tmp, "bin", "codex-proxy"),
+		argv0:          filepath.Join(tmp, "bin", "codex-proxy"),
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{},
+	})
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:38471")
 	t.Setenv("HTTPS_PROXY", "http://localhost:38471")
 	t.Setenv("ALL_PROXY", "socks5://[::1]:38471")
@@ -4603,8 +4617,8 @@ func TestTeamsServiceEnvironmentPreservesLoopbackProxyByDefault(t *testing.T) {
 
 	env := teamsServiceEnvironment()
 	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
-		if value := env[name]; value == "" {
-			t.Fatalf("%s should be preserved for the background service, got %#v", name, env)
+		if value := env[name]; value != "" {
+			t.Fatalf("%s persisted dynamic WSL loopback proxy %q in the background service: %#v", name, value, env)
 		}
 	}
 	if env["NO_PROXY"] == "" || env["no_proxy"] == "" {
@@ -4679,7 +4693,7 @@ func TestTeamsServiceInstallRendersModelProfileProviderKeysForBackgroundService(
 	}
 	unit := string(data)
 	for _, want := range []string{
-		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + systemdQuoteArg(registryPath),
+		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + systemdQuoteArg(registryPath),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_CONFIG="+filepath.Join(tmp, "cxp-config.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=thirdparty-service"),
 		"Environment=" + systemdQuoteArg("QWEN_API_KEY=sk-qwen-background-test"),
@@ -5133,6 +5147,7 @@ func TestTeamsServiceInstallWritesMacOSLaunchAgentPlist(t *testing.T) {
 		"<string>--owner-stale-after</string>",
 		"<string>1m30s</string>",
 		"<string>--auto-service=false</string>",
+		"<string>--managed-service-child</string>",
 		"<string>--registry</string>",
 		"<string>" + registryPath + "</string>",
 		"<key>KeepAlive</key>",
@@ -5218,6 +5233,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		t.Fatalf("read task xml: %v", err)
 	}
 	taskXML := string(data)
+	stableHome := filepath.Clean(os.Getenv("HOME"))
 	for _, want := range []string{
 		"<LogonType>InteractiveToken</LogonType>",
 		"<RunLevel>LeastPrivilege</RunLevel>",
@@ -5227,7 +5243,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"<Command>wscript.exe</Command>",
 		"//B //Nologo",
 		"codex-helper-teams-task.vbs",
-		"<WorkingDirectory>" + cwd + "</WorkingDirectory>",
+		"<WorkingDirectory>" + stableHome + "</WorkingDirectory>",
 		"<RestartOnFailure>",
 		"<Count>999</Count>",
 	} {
@@ -5280,7 +5296,7 @@ func TestTeamsServiceInstallWritesWindowsTaskXMLAndRegistersTask(t *testing.T) {
 		"Start-Process -FilePath",
 		"-RedirectStandardOutput $stdoutLog",
 		"-RedirectStandardError $stderrLog",
-		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '1m30s' '--auto-service=false' '--registry' '" + registryPath + "'",
+		"& '" + exePath + "' 'teams' 'run' '--owner-stale-after' '1m30s' '--auto-service=false' '--managed-service-child' '--registry' '" + registryPath + "'",
 		"$code = $LASTEXITCODE",
 		"exit $code",
 		"$env:CODEX_HELPER_TEAMS_SERVICE = '1'",
@@ -5544,6 +5560,9 @@ func TestTeamsServiceBootstrapPreparesControlChatWithServiceCodexHomeEnv(t *test
 
 	tmp := t.TempDir()
 	home := filepath.Join(tmp, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatalf("mkdir effective home: %v", err)
+	}
 	prevUserHome := effectivePathsUserHomeDir
 	effectivePathsUserHomeDir = func() (string, error) { return home, nil }
 	t.Cleanup(func() { effectivePathsUserHomeDir = prevUserHome })
@@ -7214,9 +7233,10 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(data)
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
+	wantInvocationDir := teamsServiceTestAbsPath(t, "/home/alice/work dir")
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
-	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/registry.json")
+	wantRegistry := teamsServiceTestRegistryPath(wantInvocationDir, "/home/alice/registry.json")
 	for _, want := range []string{
 		"TaskName=Codex Helper Teams Bridge (WSL Ubuntu-22.04 alice default ",
 		"Command=wsl.exe",
@@ -7226,7 +7246,7 @@ func TestTeamsServiceInstallWritesWSLWindowsTask(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex-home"),
-		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
@@ -7395,6 +7415,7 @@ type teamsServiceTestHooks struct {
 	windowsTaskDir             string
 	userID                     string
 	isWSL                      bool
+	wslInteropAvailable        *bool
 	wslDistro                  string
 	wslLinuxUser               string
 	powerShellExecutable       string
@@ -7430,6 +7451,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	prevWindowsTaskXMLDir := teamsServiceWindowsTaskXMLDir
 	prevUserID := teamsServiceUserID
 	prevIsWSL := teamsServiceIsWSL
+	prevWSLInteropAvailable := teamsServiceWSLInteropAvailable
 	prevWSLDistroName := teamsServiceWSLDistroName
 	prevWSLLinuxUserName := teamsServiceWSLLinuxUserName
 	prevPowerShellExecutable := teamsServicePowerShellExecutable
@@ -7467,6 +7489,14 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	teamsServiceWindowsTaskXMLDir = func() (string, error) { return hooks.windowsTaskDir, nil }
 	teamsServiceUserID = func() string { return hooks.userID }
 	teamsServiceIsWSL = func() bool { return hooks.isWSL }
+	if hooks.wslInteropAvailable != nil {
+		teamsServiceWSLInteropAvailable = func() bool { return *hooks.wslInteropAvailable }
+	} else if hooks.isWSL {
+		// Unit tests that explicitly simulate WSL should not inherit the host
+		// runner's binfmt state. Tests for unavailable interop opt out via the
+		// explicit hook above.
+		teamsServiceWSLInteropAvailable = func() bool { return true }
+	}
 	teamsServiceWSLDistroName = func() string { return hooks.wslDistro }
 	teamsServiceWSLLinuxUserName = func() string { return hooks.wslLinuxUser }
 	teamsServicePowerShellExecutable = func() string {
@@ -7557,6 +7587,7 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceWindowsTaskXMLDir = prevWindowsTaskXMLDir
 		teamsServiceUserID = prevUserID
 		teamsServiceIsWSL = prevIsWSL
+		teamsServiceWSLInteropAvailable = prevWSLInteropAvailable
 		teamsServiceWSLDistroName = prevWSLDistroName
 		teamsServiceWSLLinuxUserName = prevWSLLinuxUserName
 		teamsServicePowerShellExecutable = prevPowerShellExecutable

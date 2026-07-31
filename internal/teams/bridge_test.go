@@ -23640,6 +23640,7 @@ func TestBridgeRecoverablePollFailureClassification(t *testing.T) {
 		{name: "graph 403", err: &GraphStatusError{StatusCode: http.StatusForbidden}, want: false},
 		{name: "deadline exceeded", err: context.DeadlineExceeded, want: true},
 		{name: "context canceled", err: context.Canceled, want: false},
+		{name: "runtime store takeover draining", err: &RuntimeStoreTakeoverDeferredError{Reason: "legacy work is draining"}, want: true},
 		{name: "net dns timeout", err: &net.DNSError{IsTimeout: true, Err: "lookup timed out"}, want: true},
 		{name: "proxyconnect timeout", err: fmt.Errorf("proxyconnect tcp: dial tcp: i/o timeout"), want: true},
 		{name: "bad gateway text", err: fmt.Errorf("Graph GET failed: HTTP 502 Bad Gateway: dial upstream failed"), want: true},

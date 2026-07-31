@@ -139,11 +139,15 @@ func loadTeamsGraphProxyLocalStatus(ctx context.Context, root *rootOptions) (tea
 		checkCtx, cancel = context.WithTimeout(checkCtx, teamsGraphProxyLocalStatusOverallTimeout)
 		defer cancel()
 	}
-	store, _, err := newRootStore(root, "")
+	configPathOverride := ""
+	if root != nil {
+		configPathOverride = root.configPath
+	}
+	paths, err := resolveEffectivePaths(configPathOverride, "", "")
 	if err != nil {
 		return teamsGraphProxyLocalStatus{}, err
 	}
-	cfg, err := store.Load()
+	cfg, err := config.LoadPathReadOnly(paths.ConfigPath)
 	if err != nil {
 		return teamsGraphProxyLocalStatus{}, err
 	}

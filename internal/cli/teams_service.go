@@ -31,6 +31,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -91,6 +92,7 @@ var (
 	teamsServiceWindowsTaskXMLDir                                     = defaultTeamsServiceWindowsTaskXMLDir
 	teamsServiceUserID                                                = defaultTeamsServiceUserID
 	teamsServiceIsWSL                                                 = defaultTeamsServiceIsWSL
+	teamsServiceWSLInteropAvailable                                   = defaultTeamsServiceWSLInteropAvailable
 	teamsServiceWSLDistroName                                         = defaultTeamsServiceWSLDistroName
 	teamsServiceWSLLinuxUserName                                      = defaultTeamsServiceWSLLinuxUserName
 	teamsServiceCurrentUser                                           = user.Current
@@ -332,6 +334,10 @@ func newTeamsServiceStartCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Started Teams service: %s\n", backend.Name())
+			if backend.ID() == teamsServiceLocalSupervisorID {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Supervisor started.")
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Child starting; listener readiness has not been observed yet.")
+			}
 			return nil
 		},
 	}
@@ -500,6 +506,7 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams service auth: ok")
 			}
 			printTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
+			printTeamsServiceStoreDiagnostics(cmd.Context(), cmd.OutOrStdout())
 			if teamsServiceGOOS() == "linux" && teamsServiceIsWSL() {
 				if backend.ID() == "wsl-windows-task-scheduler" {
 					if wslStartupFallback {
@@ -534,6 +541,25 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 			}
 			return nil
 		},
+	}
+}
+
+func printTeamsServiceStoreDiagnostics(ctx context.Context, out io.Writer) {
+	if out == nil {
+		return
+	}
+	paths, err := existingTeamsStorePathsReadOnly()
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "Teams store diagnostics: unavailable (%v)\n", err)
+		return
+	}
+	for _, path := range paths {
+		layer := teamsStatusStoreLayer(path)
+		if _, err := teamsstore.LoadPathReadOnly(ctx, path); err != nil {
+			_, _ = fmt.Fprintf(out, "Teams store %s load error: %s: %v\n", layer, path, err)
+			continue
+		}
+		_, _ = fmt.Fprintf(out, "Teams store %s: %s (ok)\n", layer, path)
 	}
 }
 
@@ -1190,8 +1216,21 @@ func runTeamsServiceCommand(ctx context.Context, out io.Writer, backend teamsSer
 }
 
 func runTeamsServiceWSLReadinessCheck(ctx context.Context, out io.Writer) error {
+	if !teamsServiceWSLInteropAvailable() {
+		return fmt.Errorf("WSLInterop binfmt entry is unavailable; /proc/sys/fs/binfmt_misc/WSLInterop must be active before Windows Scheduled Tasks can be inspected")
+	}
 	command := "Get-Command wsl.exe -ErrorAction Stop | Out-Null; Get-Command Get-ScheduledTask -ErrorAction Stop | Out-Null"
 	if _, err := teamsServiceRunPowerShell(ctx, command); err != nil {
+		detail := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(detail, "exec format"):
+			return fmt.Errorf("WSLInterop is broken (PowerShell returned exec format error): %w", err)
+		case strings.Contains(detail, "executable file not found"), strings.Contains(detail, "no such file"):
+			return fmt.Errorf("PowerShell executable is unavailable: %w", err)
+		case strings.Contains(detail, "get-scheduledtask") &&
+			(strings.Contains(detail, "not recognized") || strings.Contains(detail, "not found")):
+			return fmt.Errorf("Windows ScheduledTask cmdlet is unavailable: %w", err)
+		}
 		return fmt.Errorf("WSL Windows Scheduled Task readiness check failed: %w", err)
 	}
 	if out != nil {
@@ -2941,22 +2980,38 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	cwd, err := teamsServiceGetwd()
+	invocationDir, err := teamsServiceGetwd()
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
-	cwd, err = filepath.Abs(cwd)
+	invocationDir, err = filepath.Abs(invocationDir)
 	if err != nil {
 		return teamsServiceSpec{}, err
+	}
+	paths, err := resolveEffectivePaths("", "", invocationDir)
+	if err != nil {
+		return teamsServiceSpec{}, fmt.Errorf("resolve stable Teams service home: %w", err)
+	}
+	workingDir := filepath.Clean(strings.TrimSpace(paths.Home))
+	if workingDir == "" || workingDir == "." {
+		return teamsServiceSpec{}, fmt.Errorf("resolve stable Teams service home: empty home directory")
+	}
+	if info, statErr := os.Stat(workingDir); statErr != nil {
+		return teamsServiceSpec{}, fmt.Errorf("validate stable Teams service home %s: %w", workingDir, statErr)
+	} else if !info.IsDir() {
+		return teamsServiceSpec{}, fmt.Errorf("validate stable Teams service home %s: not a directory", workingDir)
 	}
 	var resolvedRegistryPath string
 	if registryPath != nil && strings.TrimSpace(*registryPath) != "" {
 		resolvedRegistryPath = strings.TrimSpace(*registryPath)
 		if !filepath.IsAbs(resolvedRegistryPath) {
-			resolvedRegistryPath = filepath.Join(cwd, resolvedRegistryPath)
+			resolvedRegistryPath = filepath.Join(invocationDir, resolvedRegistryPath)
 		}
 	}
-	env, err := teamsServiceEnvironmentForWorkingDir(cwd)
+	// Relative environment inputs are invocation-time inputs. Resolve them once
+	// against the caller's directory, then persist only absolute values while
+	// using the stable target home as the child working directory.
+	env, err := teamsServiceEnvironmentForWorkingDir(invocationDir)
 	if err != nil {
 		return teamsServiceSpec{}, err
 	}
@@ -2990,9 +3045,12 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 	}
 	delete(env, update.EnvInstallDir)
 	env[update.EnvInstallPath] = exe
+	if err := normalizeTeamsServicePathEnvironment(env, invocationDir); err != nil {
+		return teamsServiceSpec{}, err
+	}
 	return teamsServiceSpec{
 		Executable:   exe,
-		WorkingDir:   cwd,
+		WorkingDir:   workingDir,
 		RegistryPath: resolvedRegistryPath,
 		Environment:  env,
 	}, nil
@@ -3096,6 +3154,91 @@ func normalizeTeamsServiceCodexHomeEnv(value string, workingDir string) string {
 		value = abs
 	}
 	return value
+}
+
+func normalizeTeamsServicePathEnvironment(env map[string]string, invocationDir string) error {
+	if len(env) == 0 {
+		return nil
+	}
+	pathNames := []string{
+		envCodexHome,
+		"CODEX_DIR",
+		appdirs.EnvStateDir,
+		"XDG_STATE_HOME",
+		"CODEX_HELPER_CONFIG",
+		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_BEACON_STORE",
+		envTeamsASRLlamaModel,
+		envTeamsASRLlamaMMProj,
+		update.EnvInstallPath,
+	}
+	for _, name := range pathNames {
+		value := strings.TrimSpace(env[name])
+		if value == "" {
+			continue
+		}
+		normalized, err := normalizeTeamsServicePersistedPath(value, invocationDir)
+		if err != nil {
+			return fmt.Errorf("resolve Teams service environment %s: %w", name, err)
+		}
+		env[name] = normalized
+	}
+	for _, name := range []string{
+		envTeamsASRCommand,
+		envTeamsASRLlamaBinary,
+		envTeamsASRFFmpeg,
+	} {
+		value := strings.TrimSpace(env[name])
+		if value == "" || !teamsServiceEnvironmentValueLooksLikePath(value) {
+			continue
+		}
+		normalized, err := normalizeTeamsServicePersistedPath(value, invocationDir)
+		if err != nil {
+			return fmt.Errorf("resolve Teams service environment %s: %w", name, err)
+		}
+		env[name] = normalized
+	}
+	return nil
+}
+
+func normalizeTeamsServicePersistedPath(value string, invocationDir string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if value == "~" || strings.HasPrefix(value, "~/") || strings.HasPrefix(value, `~\`) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		suffix := strings.TrimLeft(value[1:], `/\`)
+		value = filepath.Join(home, filepath.FromSlash(strings.ReplaceAll(suffix, `\`, `/`)))
+	}
+	if !filepath.IsAbs(value) {
+		invocationDir = strings.TrimSpace(invocationDir)
+		if invocationDir == "" {
+			return "", fmt.Errorf("relative path %q has no invocation directory", value)
+		}
+		value = filepath.Join(invocationDir, value)
+	}
+	absolute, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func teamsServiceEnvironmentValueLooksLikePath(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "~" ||
+		strings.HasPrefix(value, "~/") ||
+		strings.HasPrefix(value, `~\`) ||
+		strings.HasPrefix(value, ".") ||
+		strings.ContainsAny(value, `/\`)
 }
 
 func teamsServiceExistingEnvironment() map[string]string {
@@ -3227,7 +3370,12 @@ func teamsServiceDropLocalProxyEnv() bool {
 	case "1", "true", "yes", "on":
 		return true
 	default:
-		return false
+		// WSL commonly injects localhost proxy ports that are regenerated after
+		// a WSL restart. Persisting those values makes a background helper keep
+		// dialing a dead port indefinitely. Preserve the historical behavior on
+		// native Linux, macOS, and Windows; WSL users can explicitly opt in when
+		// their loopback proxy is intentionally stable.
+		return teamsServiceGOOS() == "linux" && teamsServiceIsWSL()
 	}
 }
 
@@ -3418,6 +3566,7 @@ func buildTeamsServiceRunArgs(spec teamsServiceSpec) []string {
 		"--owner-stale-after",
 		teamsServiceRunOwnerStaleAfter.String(),
 		"--auto-service=false",
+		"--managed-service-child",
 	}
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
@@ -3728,7 +3877,7 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		args = append(args, key+"="+spec.Environment[key])
 	}
-	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false")
+	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false", "--managed-service-child")
 	if spec.RegistryPath != "" {
 		args = append(args, "--registry", spec.RegistryPath)
 	}
@@ -3925,8 +4074,11 @@ func buildTeamsServiceWSLRetireTaskCommand(taskName string, includeCurrent bool)
 		"$tasks = @(Get-ScheduledTask | Where-Object { $_.TaskName -like ($legacyPrefix + '*') }); " +
 		"foreach ($t in $tasks) { " +
 		skipCurrent +
+		"if ($t.State -eq 'Disabled') { continue }; " +
 		"Stop-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction SilentlyContinue; " +
-		"Disable-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop | Out-Null " +
+		"Disable-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop | Out-Null; " +
+		"$retired = Get-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName -ErrorAction Stop; " +
+		"if ($retired.State -ne 'Disabled') { throw ('Scheduled Task remains enabled: ' + $t.TaskPath + $t.TaskName) } " +
 		"}"
 }
 
@@ -4019,7 +4171,10 @@ func buildTeamsServiceWSLTaskLauncherPowerShell(taskName string, args []string, 
 	psName := stem + ".ps1"
 	vbsName := stem + ".vbs"
 	psScript := buildTeamsServiceWSLTaskPowerShellScript(taskName, args)
-	cmd := "$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
+	cmd := "$localAppData = [Environment]::GetFolderPath('LocalApplicationData'); " +
+		"if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = $env:LOCALAPPDATA }; " +
+		"if ([string]::IsNullOrWhiteSpace($localAppData)) { throw 'LocalApplicationData is unavailable for the Teams WSL Scheduled Task launcher' }; " +
+		"$appDir = Join-Path $localAppData 'codex-helper\\teams'; " +
 		"$launcherPowerShellPath = Join-Path $appDir " + powershellSingleQuote(psName) + "; " +
 		"$launcherVbsPath = Join-Path $appDir " + powershellSingleQuote(vbsName) + "; " +
 		"$expectedLauncherPowerShell = " + powershellSingleQuote(psScript) + "; " +
@@ -4600,7 +4755,7 @@ func teamsServiceIsWSLFromSignals(goos string, procVersion string, interopAvaila
 	return interopAvailable
 }
 
-func teamsServiceWSLInteropAvailable() bool {
+func defaultTeamsServiceWSLInteropAvailable() bool {
 	info, err := os.Stat("/proc/sys/fs/binfmt_misc/WSLInterop")
 	return err == nil && !info.IsDir()
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -388,6 +389,29 @@ func TestResolveRoutableConfiguredModelsIsolatesUnavailableCredential(t *testing
 	got, keys := resolveRoutableConfiguredModels(cfg, store, io.Discard)
 	if len(got) != 1 || got[0].Name != "good" || keys["good"] != "usable" {
 		t.Fatalf("resolved=%#v keys=%#v", got, keys)
+	}
+}
+
+func TestTeamsRuntimeSafetyUnavailableModelProfileWarningIsEmittedOncePerProcessCI(t *testing.T) {
+	store, err := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{Version: config.CurrentVersion, ModelProfiles: map[string]config.ModelProfile{
+		"missing-credential": {
+			Provider:  "mimo",
+			Model:     "mimo/mimo-v2.5",
+			APIKeyRef: "env:CXP_TEST_MISSING_MODEL_CREDENTIAL",
+			Revision:  1,
+		},
+	}}
+	t.Setenv("CXP_TEST_MISSING_MODEL_CREDENTIAL", "")
+	var log bytes.Buffer
+	for i := 0; i < 2; i++ {
+		_, _ = resolveRoutableConfiguredModels(cfg, store, &log)
+	}
+	if got := strings.Count(log.String(), `warning: third-party model profile "missing-credential"`); got != 1 {
+		t.Fatalf("model availability warning count = %d, want one per helper process:\n%s", got, log.String())
 	}
 }
 

@@ -187,6 +187,16 @@ func TestTeamsCodexUpgradeLiveTargetPATH(t *testing.T) {
 	}
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	if runtime.GOOS == "windows" {
+		callerProfile := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE"))
+		if callerProfile == "" {
+			t.Fatal("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE is required on Windows; TestMain must not recover the ambient profile implicitly")
+		}
+		if !filepath.IsAbs(callerProfile) {
+			t.Fatalf("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE must be absolute, got %q", callerProfile)
+		}
+		if samePath(callerProfile, os.Getenv("USERPROFILE")) {
+			t.Fatalf("live shard restored caller profile globally instead of passing it through the explicit test-only channel: %q", callerProfile)
+		}
 		t.Setenv("LOCALAPPDATA", t.TempDir())
 	}
 	servicePath := os.Getenv("PATH")

@@ -1031,6 +1031,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var autoService bool
 	var modelProfile string
 	var machineRegistry bool
+	var managedServiceChild bool
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
@@ -1086,7 +1087,23 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				}
 				bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
 				if err != nil {
-					return err
+					plan, actionRequired := teams.RuntimeStorePlanFromError(err)
+					if !actionRequired {
+						return err
+					}
+					if !teamsRunShouldRetryInProcess(once, managedServiceChild) {
+						return fmt.Errorf(
+							"%w; run the managed Teams service to complete offline migration",
+							err,
+						)
+					}
+					if err := teams.CompleteOfflineRuntimeStorePlan(cmd.Context(), plan); err != nil {
+						return err
+					}
+					bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
+					if err != nil {
+						return err
+					}
 				}
 				httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, modelProfile, timeout, cmd.ErrOrStderr())
@@ -1149,7 +1166,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
 				})
 			}
-			if teamsRunShouldRetryInProcess(once) {
+			if teamsRunShouldRetryInProcess(once, managedServiceChild) {
 				return runTeamsServiceRetryLoop(cmd.Context(), cmd.ErrOrStderr(), runOnce)
 			}
 			return runOnce()
@@ -1179,6 +1196,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	cmd.Flags().BoolVar(&machineRegistry, "machine-registry", true, "Enable cross-machine Teams registry heartbeat and delegation worker")
+	cmd.Flags().BoolVar(&managedServiceChild, "managed-service-child", false, "Internal marker for a Teams service-managed listener")
+	_ = cmd.Flags().MarkHidden("managed-service-child")
 	return cmd
 }
 
@@ -1263,31 +1282,195 @@ func teamsASREnvTruthy(value string) bool {
 }
 
 var (
-	teamsRunServiceRetryDelay = 30 * time.Second
-	teamsRunServiceSleep      = sleepContext
+	teamsRunServiceRetryDelay        = 30 * time.Second
+	teamsRunServiceMaxRetryDelay     = 5 * time.Minute
+	teamsRunServiceSleep             = sleepContext
+	teamsServiceMigrationBlockedPath = defaultTeamsServiceMigrationBlockedPath
 )
 
-func teamsRunShouldRetryInProcess(once bool) bool {
-	return !once && strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != ""
+type teamsServiceMigrationBlockedState struct {
+	PID          int       `json:"pid"`
+	ProcessStart string    `json:"process_start,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func defaultTeamsServiceMigrationBlockedPath() (string, error) {
+	return appdirs.StatePath("teams", "service", "migration-blocked.json")
+}
+
+func writeTeamsServiceMigrationBlockedState(reason string) error {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	start, _ := teamsLocalSupervisorProcessStartTime(os.Getpid())
+	data, err := json.Marshal(teamsServiceMigrationBlockedState{
+		PID:          os.Getpid(),
+		ProcessStart: strings.TrimSpace(start),
+		Reason:       strings.TrimSpace(reason),
+		UpdatedAt:    time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func clearTeamsServiceMigrationBlockedState() error {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func liveTeamsServiceMigrationBlockedState() (teamsServiceMigrationBlockedState, bool) {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	var state teamsServiceMigrationBlockedState
+	if json.Unmarshal(data, &state) != nil || state.PID <= 0 || !teamsLocalSupervisorProcessAlive(state.PID) {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	if state.ProcessStart != "" {
+		current, err := teamsLocalSupervisorProcessStartTime(state.PID)
+		if err != nil || strings.TrimSpace(current) != state.ProcessStart {
+			return teamsServiceMigrationBlockedState{}, false
+		}
+	}
+	return state, true
+}
+
+func prepareManagedTeamsRuntimeStore(
+	ctx context.Context,
+	scope teamsstore.ScopeIdentity,
+	once bool,
+	managedServiceChild bool,
+) (bool, error) {
+	plan, err := teams.InspectRuntimeStoreForScope(ctx, scope)
+	if err != nil {
+		return false, err
+	}
+	if plan.Action == teams.RuntimeStoreActionReady || plan.Action == teams.RuntimeStoreActionCreate {
+		return false, nil
+	}
+	if !teamsRunShouldRetryInProcess(once, managedServiceChild) {
+		return false, fmt.Errorf(
+			"canonical and legacy Teams stores both exist; run the managed Teams service to complete offline takeover",
+		)
+	}
+	// A managed service reaches this point only after its platform backend has
+	// stopped or excluded the previous child. Keep process and Scheduled Task
+	// management in that existing lifecycle boundary; this pre-listener child
+	// step is intentionally limited to deterministic store operations.
+	if err := teams.CompleteOfflineRuntimeStorePlan(ctx, plan); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func teamsRunShouldRetryInProcess(once bool, managedServiceChild bool) bool {
+	// CODEX_HELPER_TEAMS_SERVICE and CODEX_HELPER_TEAMS_SERVICE_MODE predate the
+	// hidden managed-child flag. Treat the flag as an additional marker instead
+	// of an upgrade boundary so persisted service specs created by an older
+	// helper can still complete a one-time offline store migration after the
+	// runtime is updated. Teams Codex children inherit the service environment,
+	// so the explicit child check remains the authority boundary.
+	return !once &&
+		!runningInsideTeamsCodexChild() &&
+		strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == "1" &&
+		strings.EqualFold(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE_MODE")), "background")
 }
 
 func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
+	attempt := 0
+	_ = clearTeamsServiceMigrationBlockedState()
 	for {
+		attempt++
 		err := runOnce()
 		if err == nil || !isRecoverableTeamsRunError(err) {
 			return err
 		}
-		delay := teamsRunServiceRetryDelay
-		if delay <= 0 {
-			delay = 30 * time.Second
+		var migrationBlocked *teams.RuntimeStoreMigrationBlockedError
+		if errors.As(err, &migrationBlocked) {
+			if errOut != nil {
+				_, _ = fmt.Fprintf(
+					errOut,
+					"Teams service migration blocked: operation=teams-store-migration error=%v; waiting for service restart\n",
+					err,
+				)
+			}
+			if markerErr := writeTeamsServiceMigrationBlockedState(err.Error()); markerErr != nil {
+				return fmt.Errorf("record blocked Teams migration state: %w", markerErr)
+			}
+			defer clearTeamsServiceMigrationBlockedState()
+			<-ctx.Done()
+			return ctx.Err()
 		}
+		delay := teamsRunRetryDelay(err, attempt)
 		if errOut != nil {
-			_, _ = fmt.Fprintf(errOut, "Teams service recoverable error: %v; retrying in %s\n", err, delay)
+			deadline := "unknown"
+			if value, ok := ctx.Deadline(); ok {
+				deadline = value.Format(time.RFC3339Nano)
+			}
+			_, _ = fmt.Fprintf(
+				errOut,
+				"Teams service recoverable error: operation=teams-listener scope=unknown attempt=%d deadline=%s error=%v; retrying in %s\n",
+				attempt,
+				deadline,
+				err,
+				delay,
+			)
 		}
 		if sleepErr := teamsRunServiceSleep(ctx, delay); sleepErr != nil {
 			return sleepErr
 		}
 	}
+}
+
+func teamsRunRetryDelay(err error, attempt int) time.Duration {
+	delay := teamsRunServiceRetryDelay
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
+	var takeoverDeferred *teams.RuntimeStoreTakeoverDeferredError
+	if !errors.As(err, &takeoverDeferred) || attempt <= 1 {
+		return delay
+	}
+	maxDelay := teamsRunServiceMaxRetryDelay
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	for i := 1; i < attempt && delay < maxDelay; i++ {
+		if delay > maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
 }
 
 func isRecoverableTeamsRunError(err error) bool {
@@ -2437,10 +2620,25 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 	var owners []teamsstore.OwnerMetadata
 	var serviceControls []teamsstore.ServiceControl
 	var controlLeases []string
+	var canonicalLoadErrors []string
+	authoritativeStore := ""
+	authoritativeStorePath := ""
+	authoritativeStoreAmbiguous := false
+	storeIdentity := "unavailable"
+	canonicalStoreCandidates := 0
+	activeSessions := 0
+	parkedSessions := 0
+	historicalSessions := 0
+	pollableSessions := 0
 	for _, statePath := range statePaths {
+		if teamsStatusStoreLayer(statePath) == "legacy" {
+			continue
+		}
+		canonicalStoreCandidates++
 		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
 		if err != nil {
-			return err
+			canonicalLoadErrors = append(canonicalLoadErrors, fmt.Sprintf("%s: %v", statePath, err))
+			continue
 		}
 		owner, ownerKind := teamsStatusOwner(state, now)
 		statusStores = append(statusStores, teamsStatusStoreSnapshot{
@@ -2456,6 +2654,17 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			}
 			stateSessions++
 			addStatusSession(statusSessions, session.ID, session.TeamsChatID, string(session.Status))
+			if session.Status == teamsstore.SessionStatusActive {
+				activeSessions++
+				poll := state.ChatPolls[session.TeamsChatID]
+				if strings.EqualFold(strings.TrimSpace(poll.PollState), "parked") {
+					parkedSessions++
+				} else if strings.TrimSpace(session.TeamsChatID) != "" {
+					pollableSessions++
+				}
+			} else {
+				historicalSessions++
+			}
 		}
 		for _, msg := range state.OutboxMessages {
 			if msg.Status == teamsstore.OutboxStatusQueued {
@@ -2484,10 +2693,92 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			controlChatSource = statePath
 		}
 	}
+	if canonicalStoreCandidates == 1 && len(statusStores) == 1 {
+		authoritativeStorePath = statusStores[0].Path
+	} else if canonicalStoreCandidates > 1 {
+		if len(canonicalLoadErrors) == 0 {
+			managedChild, managed := teamsServiceWatchdogManagedChild()
+			for _, snapshot := range statusStores {
+				if snapshot.OwnerKind != teamsStatusOwnerLive ||
+					!managed ||
+					!teamsServiceWatchdogOwnerMatchesManagedChild(snapshot.Owner, managedChild) {
+					continue
+				}
+				if authoritativeStorePath != "" {
+					authoritativeStorePath = ""
+					break
+				}
+				authoritativeStorePath = snapshot.Path
+			}
+		}
+		if authoritativeStorePath == "" {
+			authoritativeStoreAmbiguous = true
+		}
+	}
+	if authoritativeStorePath != "" {
+		authoritativeStore = authoritativeStorePath
+		for _, snapshot := range statusStores {
+			if filepath.Clean(snapshot.Path) != filepath.Clean(authoritativeStorePath) {
+				continue
+			}
+			storeIdentity = fmt.Sprintf(
+				"scope=%s account=%s profile=%s",
+				firstNonEmptyCLI(snapshot.State.Scope.ID, "unknown"),
+				firstNonEmptyCLI(snapshot.State.Scope.AccountID, "unknown"),
+				firstNonEmptyCLI(snapshot.State.Scope.Profile, "default"),
+			)
+			break
+		}
+	} else if authoritativeStoreAmbiguous {
+		authoritativeStore = "unknown (multiple canonical stores are ambiguous)"
+	} else if canonicalStoreCandidates > 0 {
+		authoritativeStore = "unknown (canonical store could not be loaded)"
+	} else {
+		authoritativeStore = defaultStatePath + " (not present)"
+	}
 	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
 	authorityDiagnostics := buildTeamsAuthorityDiagnostics(statusStores, reg, controlChatID)
 	_, _ = fmt.Fprintln(out, "Teams status")
 	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
+	_, _ = fmt.Fprintf(out, "Authoritative store: %s\n", authoritativeStore)
+	_, _ = fmt.Fprintf(out, "Store identity: %s\n", storeIdentity)
+	for _, statePath := range statePaths {
+		layer := teamsStatusStoreLayer(statePath)
+		authority := "non-authoritative"
+		if layer == "canonical" && authoritativeStoreAmbiguous {
+			authority = "unknown"
+		} else if layer == "canonical" && filepath.Clean(statePath) == filepath.Clean(authoritativeStorePath) {
+			authority = "authoritative"
+		}
+		_, _ = fmt.Fprintf(out, "Store candidate: %s %s %s\n", layer, authority, statePath)
+	}
+	for _, loadErr := range canonicalLoadErrors {
+		_, _ = fmt.Fprintf(out, "Canonical load error: %s\n", loadErr)
+	}
+	_, _ = fmt.Fprintln(out, "Desired service state: configured")
+	_, _ = fmt.Fprintln(out, "Supervisor state: see OS service")
+	_, _ = fmt.Fprintln(out, "Child state: see OS service")
+	listenerState := "stopped"
+	if len(owners) > 0 {
+		listenerState = "running"
+	}
+	_, _ = fmt.Fprintf(out, "Listener state: %s\n", listenerState)
+	if len(owners) == 0 {
+		_, _ = fmt.Fprintln(out, "Live owner: none")
+	} else {
+		owner := owners[0]
+		_, _ = fmt.Fprintf(out, "Live owner: machine=%s pid=%d generation=%d heartbeat=%s\n", owner.MachineID, owner.PID, owner.LeaseGeneration, owner.LastHeartbeat.Format(time.RFC3339))
+	}
+	if len(controlLeases) == 0 {
+		_, _ = fmt.Fprintln(out, "Control lease: none")
+	} else {
+		_, _ = fmt.Fprintln(out, controlLeases[0])
+	}
+	_, _ = fmt.Fprintf(out, "Active sessions: %d\n", activeSessions)
+	_, _ = fmt.Fprintf(out, "Parked sessions: %d\n", parkedSessions)
+	_, _ = fmt.Fprintf(out, "Historical sessions: %d\n", historicalSessions)
+	_, _ = fmt.Fprintf(out, "Pollable sessions: %d\n", pollableSessions)
+	_, _ = fmt.Fprintln(out, "Remediation: run `cxp teams service doctor` for actionable checks.")
 	if controlChatID == "" {
 		_, _ = fmt.Fprintln(out, "Control chat: unavailable")
 	} else if len(owners) == 0 {
@@ -3576,7 +3867,11 @@ func teamsStorePathsWithMode(readOnly bool) ([]string, error) {
 	}
 	paths := []string{defaultPath}
 	if legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "state.json"); legacyErr == nil {
-		paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
+		if readOnly {
+			paths = append(paths, legacyPath)
+		} else {
+			paths = appendLegacyPathIfMirrorMissing(paths, legacyPath, defaultPath)
+		}
 	}
 	for _, globPath := range []string{mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "state.json"))} {
 		paths, err = appendGlobMatches(paths, globPath)
@@ -3591,6 +3886,10 @@ func teamsStorePathsWithMode(readOnly bool) ([]string, error) {
 		}
 		sort.Strings(matches)
 		for _, match := range matches {
+			if readOnly {
+				paths = append(paths, match)
+				continue
+			}
 			mirrorPath, ok := stateScopedStorePathForLegacyStore(match)
 			if !ok {
 				paths = append(paths, match)
@@ -3713,12 +4012,127 @@ func uniquePaths(paths []string) []string {
 	return out
 }
 
+func teamsStatusStoreLayer(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if legacyRoot, err := appdirs.LegacyConfigPath("teams"); err == nil {
+		legacyRoot = filepath.Clean(legacyRoot)
+		if path == legacyRoot || strings.HasPrefix(path, legacyRoot+string(filepath.Separator)) {
+			return "legacy"
+		}
+	}
+	return "canonical"
+}
+
 func existingTeamsStorePaths() ([]string, error) {
 	return existingTeamsStorePathsWithMode(false)
 }
 
 func existingTeamsStorePathsReadOnly() ([]string, error) {
 	return existingTeamsStorePathsWithMode(true)
+}
+
+func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
+	defaultPath, err := teamsstore.DefaultPathReadOnly()
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{defaultPath}
+	scopedPaths, err := existingCanonicalTeamsScopedStorePathsReadOnly()
+	if err != nil {
+		return nil, err
+	}
+	paths = append(paths, scopedPaths...)
+	paths = uniquePaths(paths)
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		if err := validateCanonicalTeamsStoreFileReadOnly(path, info); err != nil {
+			return nil, err
+		}
+		out = append(out, path)
+	}
+	return out, nil
+}
+
+func existingCanonicalTeamsScopedStorePathsReadOnly() ([]string, error) {
+	teamsRoot, err := appdirs.StatePath("teams")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCanonicalTeamsDirectoryReadOnly(teamsRoot); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	scopesRoot := filepath.Join(teamsRoot, "scopes")
+	if err := validateCanonicalTeamsDirectoryReadOnly(scopesRoot); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	entries, err := os.ReadDir(scopesRoot)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		scopeDir := filepath.Join(scopesRoot, entry.Name())
+		info, err := os.Lstat(scopeDir)
+		if err != nil {
+			return nil, err
+		}
+		reparse, err := codexWindowsManagedPathIsReparsePoint(scopeDir, info)
+		if err != nil {
+			return nil, fmt.Errorf("inspect canonical Teams path component %s: %w", scopeDir, err)
+		}
+		if reparse {
+			return nil, fmt.Errorf("canonical Teams path component %s is a symlink or reparse point", scopeDir)
+		}
+		if !info.IsDir() {
+			continue
+		}
+		paths = append(paths, filepath.Join(scopeDir, "state.json"))
+	}
+	return paths, nil
+}
+
+func validateCanonicalTeamsDirectoryReadOnly(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	reparse, err := codexWindowsManagedPathIsReparsePoint(path, info)
+	if err != nil {
+		return fmt.Errorf("inspect canonical Teams path component %s: %w", path, err)
+	}
+	if reparse {
+		return fmt.Errorf("canonical Teams path component %s is a symlink or reparse point", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("canonical Teams path component %s is not a directory", path)
+	}
+	return nil
+}
+
+func validateCanonicalTeamsStoreFileReadOnly(path string, info os.FileInfo) error {
+	if info == nil {
+		return fmt.Errorf("canonical Teams store %s is not a regular file", path)
+	}
+	reparse, err := codexWindowsManagedPathIsReparsePoint(path, info)
+	if err != nil {
+		return fmt.Errorf("inspect canonical Teams store %s: %w", path, err)
+	}
+	if reparse || !info.Mode().IsRegular() {
+		return fmt.Errorf("canonical Teams store %s is not a regular file", path)
+	}
+	return nil
 }
 
 func existingTeamsStorePathsWithMode(readOnly bool) ([]string, error) {

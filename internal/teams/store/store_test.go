@@ -234,6 +234,619 @@ func TestLoadPathReadOnlySQLiteLiveWALWithoutSHMFailsWithoutCreatingSidecar(t *t
 	}
 }
 
+func TestLoadPathOfflineRecoveryReadOnlySQLiteRecoversWALWithoutPersistentWrites(t *testing.T) {
+	ctx := context.Background()
+	source := newTestStore(t)
+	if err := source.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-offline-recovery", AccountID: "account", Profile: "default"}
+		state.Sessions["s001"] = SessionContext{
+			ID: "s001", Status: SessionStatusActive, TeamsChatID: "chat-before",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := source.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate source to SQLite: %v", err)
+	}
+	if err := source.Update(ctx, func(state *State) error {
+		session := state.Sessions["s001"]
+		session.TeamsChatID = "chat-in-wal"
+		state.Sessions["s001"] = session
+		return nil
+	}); err != nil {
+		t.Fatalf("write source WAL: %v", err)
+	}
+	sourceDB := filepath.Join(filepath.Dir(source.Path()), SQLiteFileName)
+	if info, err := os.Stat(sourceDB + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("source WAL fixture is empty: info=%v err=%v", info, err)
+	}
+
+	targetDir := t.TempDir()
+	targetPath := filepath.Join(targetDir, "state.json")
+	for _, pair := range [][2]string{
+		{source.Path(), targetPath},
+		{sourceDB, filepath.Join(targetDir, SQLiteFileName)},
+		{sourceDB + "-wal", filepath.Join(targetDir, SQLiteFileName) + "-wal"},
+	} {
+		data, err := os.ReadFile(pair[0])
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", pair[0], err)
+		}
+		if err := os.WriteFile(pair[1], data, 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", pair[1], err)
+		}
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	if _, ok := before[SQLiteFileName+"-shm"]; ok {
+		t.Fatal("offline recovery fixture unexpectedly contains SHM")
+	}
+	loaded, err := LoadPathOfflineRecoveryReadOnly(ctx, targetPath)
+	if err != nil {
+		t.Fatalf("LoadPathOfflineRecoveryReadOnly: %v", err)
+	}
+	if got := loaded.Sessions["s001"].TeamsChatID; got != "chat-in-wal" {
+		t.Fatalf("offline recovery chat = %q, want WAL value", got)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	delete(before, SQLiteFileName+"-shm")
+	delete(after, SQLiteFileName+"-shm")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("offline recovery changed DB/WAL/pointer files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestLoadPathOfflineRecoveryReadOnlySQLiteWithoutWALWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	source := newTestStore(t)
+	if err := source.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-offline-clean", AccountID: "account", Profile: "default"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	if _, err := source.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate source to SQLite: %v", err)
+	}
+	if _, err := source.CheckpointSQLiteWAL(ctx, 0); err != nil {
+		t.Fatalf("checkpoint source WAL: %v", err)
+	}
+	sourceDB := filepath.Join(filepath.Dir(source.Path()), SQLiteFileName)
+	targetDir := t.TempDir()
+	targetPath := filepath.Join(targetDir, "state.json")
+	for _, pair := range [][2]string{
+		{source.Path(), targetPath},
+		{sourceDB, filepath.Join(targetDir, SQLiteFileName)},
+	} {
+		data, err := os.ReadFile(pair[0])
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", pair[0], err)
+		}
+		if err := os.WriteFile(pair[1], data, 0o600); err != nil {
+			t.Fatalf("write fixture %s: %v", pair[1], err)
+		}
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	loaded, err := LoadPathOfflineRecoveryReadOnly(ctx, targetPath)
+	if err != nil {
+		t.Fatalf("LoadPathOfflineRecoveryReadOnly: %v", err)
+	}
+	if loaded.Scope.ID != "scope-offline-clean" {
+		t.Fatalf("offline clean scope = %#v", loaded.Scope)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, targetDir)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("offline clean read created or changed files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+}
+
+func TestLoadPathRuntimeMetadataReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	scope := ScopeIdentity{ID: "scope-runtime-metadata", AccountID: "account-1", Profile: "default"}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = scope
+		state.ControlChat = ControlChatBinding{ScopeID: scope.ID, AccountID: scope.AccountID, Profile: scope.Profile, TeamsChatID: "control-chat"}
+		state.ServiceOwner = &OwnerMetadata{PID: 1234, ScopeID: scope.ID, LastHeartbeat: now}
+		state.ControlLease = ControlLease{
+			ScopeID:         scope.ID,
+			HolderMachineID: "machine-1",
+			Status:          ControlLeaseStatusActive,
+			LeaseUntil:      now.Add(time.Minute),
+		}
+		state.Sessions["corrupt-session"] = SessionContext{ID: "corrupt-session", TeamsChatID: "work-chat", Status: SessionStatusActive}
+		state.Turns["active-turn"] = Turn{ID: "active-turn", SessionID: "corrupt-session", Status: TurnStatusRunning}
+		state.OutboxMessages["corrupt-outbox"] = OutboxMessage{ID: "corrupt-outbox", TeamsChatID: "work-chat", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{broken-session' WHERE id = 'corrupt-session'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt session sentinel: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = 'corrupt-outbox'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	connections := 0
+	sqliteRuntimeMetadataConnectionTestHook = func() { connections++ }
+	t.Cleanup(func() { sqliteRuntimeMetadataConnectionTestHook = nil })
+	metadata, err := LoadPathRuntimeMetadataReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathRuntimeMetadataReadOnly: %v", err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("runtime metadata probe modified the SQLite family:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if metadata.Scope != scope || metadata.ControlChat.TeamsChatID != "control-chat" {
+		t.Fatalf("runtime metadata identity = %#v", metadata)
+	}
+	if metadata.ServiceOwner == nil || metadata.ServiceOwner.PID != 1234 {
+		t.Fatalf("runtime metadata owner = %#v", metadata.ServiceOwner)
+	}
+	if metadata.ControlLease.HolderMachineID != "machine-1" || metadata.ControlLease.Status != ControlLeaseStatusActive {
+		t.Fatalf("runtime metadata lease = %#v", metadata.ControlLease)
+	}
+	if connections != 1 {
+		t.Fatalf("runtime metadata probe acquired %d SQLite connections, want exactly one", connections)
+	}
+}
+
+func TestLoadPathWatchdogStateReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat"}
+		state.ServiceOwner = &OwnerMetadata{PID: 1234, LastHeartbeat: now, StartedAt: now.Add(-time.Minute)}
+		state.ServiceControl = ServiceControl{Draining: true, Reason: "upgrade", UpdatedAt: now}
+		state.Upgrade = &UpgradeRequest{ID: "upgrade-1", Phase: UpgradePhaseDraining, DeadlineAt: now.Add(time.Minute)}
+		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", LastSuccessfulPollAt: now}
+		state.ChatPolls["unrelated-chat"] = ChatPollState{ChatID: "unrelated-chat", LastSuccessfulPollAt: now.Add(-time.Hour)}
+		state.Sessions["corrupt-session"] = SessionContext{ID: "corrupt-session", TeamsChatID: "work-chat", Status: SessionStatusActive}
+		state.OutboxMessages["corrupt-outbox"] = OutboxMessage{ID: "corrupt-outbox", TeamsChatID: "work-chat", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{broken-session' WHERE id = 'corrupt-session'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt session sentinel: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = 'corrupt-outbox'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	state, err := LoadPathWatchdogStateReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathWatchdogStateReadOnly: %v", err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("watchdog probe modified the SQLite family:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.PID != 1234 {
+		t.Fatalf("watchdog owner = %#v", state.ServiceOwner)
+	}
+	if !state.ServiceControl.Draining || state.Upgrade == nil || state.Upgrade.ID != "upgrade-1" {
+		t.Fatalf("watchdog lifecycle projection = control %#v upgrade %#v", state.ServiceControl, state.Upgrade)
+	}
+	if len(state.ChatPolls) != 1 || state.ChatPolls["control-chat"].ChatID != "control-chat" {
+		t.Fatalf("watchdog polls = %#v, want only control chat", state.ChatPolls)
+	}
+	if state.Sessions != nil || state.OutboxMessages != nil {
+		t.Fatalf("watchdog loaded business collections: sessions=%#v outbox=%#v", state.Sessions, state.OutboxMessages)
+	}
+}
+
+func TestLoadPathWatchdogStateReadOnlyRejectsSQLiteFamilySymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on many Windows runners")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		suffix := suffix
+		name := suffix
+		if name == "" {
+			name = "db"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = ScopeIdentity{ID: "scope-sqlite-family-link"}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed store: %v", err)
+			}
+			if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+				t.Fatalf("migrate store: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("close migrated store: %v", err)
+			}
+
+			dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+			familyPath := dbPath + suffix
+			target := filepath.Join(t.TempDir(), "outside"+suffix)
+			var targetData []byte
+			if suffix == "" {
+				var err error
+				targetData, err = os.ReadFile(dbPath)
+				if err != nil {
+					t.Fatalf("read sqlite target: %v", err)
+				}
+				if err := os.Rename(dbPath, target); err != nil {
+					t.Fatalf("move sqlite target: %v", err)
+				}
+			} else {
+				targetData = []byte("outside-sidecar")
+				if err := os.WriteFile(target, targetData, 0o600); err != nil {
+					t.Fatalf("write outside sidecar: %v", err)
+				}
+				if suffix == "-shm" {
+					if err := os.WriteFile(dbPath+"-wal", []byte("non-empty-wal"), 0o600); err != nil {
+						t.Fatalf("write WAL sentinel: %v", err)
+					}
+				}
+			}
+			if err := os.Symlink(target, familyPath); err != nil {
+				t.Fatalf("create sqlite family symlink: %v", err)
+			}
+
+			if _, err := LoadPathWatchdogStateReadOnly(ctx, store.Path()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("watchdog sqlite family symlink error = %v, want regular-file error", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("read outside target: %v", err)
+			}
+			if !bytes.Equal(got, targetData) {
+				t.Fatalf("watchdog modified outside target: got %d bytes want %d", len(got), len(targetData))
+			}
+		})
+	}
+}
+
+func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	scope := ScopeIdentity{ID: "scope-large-json", AccountID: "account-large", Profile: "default"}
+	raw, err := json.Marshal(map[string]any{
+		"schema_version": SchemaVersion,
+		"scope":          scope,
+		"control_chat":   ControlChatBinding{ScopeID: scope.ID, TeamsChatID: "control-large"},
+		"service_owner":  OwnerMetadata{PID: 4321, ScopeID: scope.ID},
+		"sessions": map[string]any{
+			"large-session": map[string]any{"ignored_blob": strings.Repeat("session-data-", 8192)},
+		},
+		"turns": map[string]any{
+			"active-turn": map[string]any{"status": TurnStatusRunning, "ignored_blob": strings.Repeat("turn-data-", 4096)},
+		},
+		"outbox_messages": map[string]any{
+			"large-outbox": map[string]any{"body": strings.Repeat("outbox-data-", 8192)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal large JSON store: %v", err)
+	}
+	if len(raw) <= maxStatePointerSize {
+		t.Fatalf("large JSON fixture size = %d, want larger than pointer threshold", len(raw))
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write large JSON store: %v", err)
+	}
+
+	metadata, err := LoadPathRuntimeMetadataReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("load large JSON runtime metadata: %v", err)
+	}
+	if metadata.Scope != scope || metadata.ControlChat.TeamsChatID != "control-large" {
+		t.Fatalf("large JSON metadata = %#v", metadata)
+	}
+	if metadata.ServiceOwner == nil || metadata.ServiceOwner.PID != 4321 {
+		t.Fatalf("large JSON owner = %#v", metadata.ServiceOwner)
+	}
+}
+
+func TestApplyOutboxReplayFencesUsesCompleteSentProjection(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
+			message := OutboxMessage{
+				ID:          "outbox-1",
+				SessionID:   "session-1",
+				TurnID:      "turn-1",
+				TeamsChatID: "chat-1",
+				Kind:        "codex-progress-001",
+				Status:      OutboxStatusQueued,
+				ArtifactIDs: []string{"artifact-1"},
+				DriveItemID: "drive-item-1",
+				CreatedAt:   now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[message.ID] = message
+				state.TranscriptDeliveries["transcript-1"] = TranscriptDeliveryRecord{
+					ID:        "transcript-1",
+					SessionID: message.SessionID,
+					OutboxID:  message.ID,
+					Status:    TranscriptDeliveryStatusQueued,
+					CreatedAt: now,
+				}
+				updateHelperDeliveryForOutboxLocked(state, message, HelperDeliveryStatusQueued, now)
+				state.ArtifactRecords["artifact-1"] = ArtifactRecord{
+					ID:          "artifact-1",
+					SessionID:   message.SessionID,
+					TurnID:      message.TurnID,
+					OutboxID:    message.ID,
+					DriveItemID: message.DriveItemID,
+					Status:      "queued",
+					CreatedAt:   now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed replay projection: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate replay projection to SQLite: %v", err)
+				}
+			}
+
+			fence := OutboxReplayFence{
+				OutboxID:       message.ID,
+				TeamsChatID:    message.TeamsChatID,
+				TeamsMessageID: "teams-message-1",
+				SessionID:      message.SessionID,
+				TurnID:         message.TurnID,
+				Kind:           message.Kind,
+			}
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 1 {
+				t.Fatalf("ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load replay projection: %v", err)
+			}
+			outbox := state.OutboxMessages[message.ID]
+			if outbox.Status != OutboxStatusSent || outbox.TeamsMessageID != fence.TeamsMessageID || outbox.SentAt.IsZero() {
+				t.Fatalf("outbox sent projection = %#v", outbox)
+			}
+			provenance := state.MessageProvenance[messageProvenanceID(message.TeamsChatID, fence.TeamsMessageID)]
+			if provenance.Origin != MessageOriginHelperOutbox || provenance.OutboxID != message.ID {
+				t.Fatalf("outbox provenance = %#v", provenance)
+			}
+			transcript := state.TranscriptDeliveries["transcript-1"]
+			if transcript.Status != TranscriptDeliveryStatusSent || transcript.TeamsMessageID != fence.TeamsMessageID || transcript.SentAt.IsZero() {
+				t.Fatalf("transcript sent projection = %#v", transcript)
+			}
+			helperSent := false
+			for _, delivery := range state.HelperDeliveries {
+				if delivery.OutboxID == message.ID && delivery.Status == HelperDeliveryStatusSent && delivery.TeamsMessageID == fence.TeamsMessageID {
+					helperSent = true
+				}
+			}
+			if !helperSent {
+				t.Fatalf("helper delivery sent projection = %#v", state.HelperDeliveries)
+			}
+			artifact := state.ArtifactRecords["artifact-1"]
+			if artifact.Status != "uploaded" || artifact.TeamsMessageID != fence.TeamsMessageID || artifact.SentAt.IsZero() {
+				t.Fatalf("artifact sent projection = %#v", artifact)
+			}
+
+			if sqliteMode {
+				store = settleSQLiteStoreForReadOnlyAssertion(t, ctx, store)
+			}
+			before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			changed, err = store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 0 {
+				t.Fatalf("repeat ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("already-applied replay fence wrote store files:\nbefore=%#v\nafter=%#v", before, after)
+			}
+		})
+	}
+}
+
+func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	target := OutboxMessage{ID: "target", SessionID: "session-1", TurnID: "turn-1", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued}
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages[target.ID] = target
+		state.OutboxMessages["unrelated"] = OutboxMessage{ID: "unrelated", TeamsChatID: "chat-2", Status: OutboxStatusQueued}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed outbox rows: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to SQLite: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite store: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE outbox_messages SET json = '{broken-unrelated' WHERE id = 'unrelated'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt unrelated outbox sentinel: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+	fence := OutboxReplayFence{
+		OutboxID:       target.ID,
+		TeamsChatID:    target.TeamsChatID,
+		TeamsMessageID: "teams-target",
+		SessionID:      target.SessionID,
+		TurnID:         target.TurnID,
+		Kind:           target.Kind,
+	}
+	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 1 {
+		t.Fatalf("ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen SQLite store: %v", err)
+	}
+	var raw []byte
+	if err := db.QueryRow(`SELECT json FROM outbox_messages WHERE id = ?`, target.ID).Scan(&raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("read fenced outbox: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite reader: %v", err)
+	}
+	var got OutboxMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode fenced outbox: %v", err)
+	}
+	if got.Status != OutboxStatusSent || got.TeamsMessageID != fence.TeamsMessageID {
+		t.Fatalf("fenced outbox = %#v", got)
+	}
+	store = settleSQLiteStoreForReadOnlyAssertion(t, ctx, store)
+	if err := os.Remove(store.Path() + ".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remove replay lock before zero-write assertion: %v", err)
+	}
+	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 0 {
+		t.Fatalf("repeat ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
+	}
+	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("zero-delta targeted replay fence wrote files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if _, err := os.Lstat(store.Path() + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("zero-delta targeted replay fence created a lock file: %v", err)
+	}
+}
+
+func TestSQLiteClearOwnerIfSameDoesNotRewriteBusinessTables(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	owner := OwnerMetadata{
+		PID:           4321,
+		Hostname:      "migration-host",
+		ScopeID:       "scope-1",
+		StartedAt:     time.Date(2026, 7, 31, 3, 0, 0, 0, time.UTC),
+		LastHeartbeat: time.Date(2026, 7, 31, 3, 1, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		state.Sessions["unrelated"] = SessionContext{ID: "unrelated", TeamsChatID: "chat-1", Status: SessionStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate owner fixture: %v", err)
+	}
+	pointer, ok, err := store.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		t.Fatalf("SQLite pointer: ok=%v err=%v", ok, err)
+	}
+	dbPath, err := store.storeSQLitePath(pointer)
+	if err != nil {
+		t.Fatalf("SQLite path: %v", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite fixture: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{corrupt-business-row' WHERE id = 'unrelated'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt unrelated session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite fixture: %v", err)
+	}
+
+	cleared, err := store.ClearOwnerIfSame(ctx, owner)
+	if err != nil || !cleared {
+		t.Fatalf("ClearOwnerIfSame: cleared=%v err=%v", cleared, err)
+	}
+	if _, found, err := store.ReadOwner(ctx); err != nil || found {
+		t.Fatalf("ReadOwner after clear: found=%v err=%v", found, err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen SQLite fixture: %v", err)
+	}
+	var raw string
+	if err := db.QueryRow(`SELECT json FROM sessions WHERE id = 'unrelated'`).Scan(&raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("read unrelated session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite reader: %v", err)
+	}
+	if raw != "{corrupt-business-row" {
+		t.Fatalf("unrelated business row was rewritten: %q", raw)
+	}
+}
+
+func settleSQLiteStoreForReadOnlyAssertion(t *testing.T, ctx context.Context, store *Store) *Store {
+	t.Helper()
+	path := store.Path()
+	checkpoint, err := store.CheckpointSQLiteWAL(ctx, 0)
+	if err != nil {
+		t.Fatalf("checkpoint SQLite store before read-only assertion: %v", err)
+	}
+	if !checkpoint.SQLite || !checkpoint.Attempted || checkpoint.Busy != 0 {
+		t.Fatalf("SQLite checkpoint before read-only assertion = %#v", checkpoint)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close SQLite writer before read-only assertion: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen SQLite store for read-only assertion: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	return reopened
+}
+
 type readOnlyFileSnapshot struct {
 	Mode    os.FileMode
 	Size    int64
@@ -1631,6 +2244,7 @@ func officialReleaseUpgradeFixtureCasesForTest() []officialReleaseFixtureCase {
 		{tag: "v0.1.17", kind: officialReleaseFixtureSQLiteV5},
 		{tag: "v0.1.18", kind: officialReleaseFixtureSQLiteV5},
 		{tag: "v0.1.19", kind: officialReleaseFixtureSQLiteV5},
+		{tag: "v0.1.20", kind: officialReleaseFixtureSQLiteV5},
 	}
 }
 
@@ -13477,6 +14091,31 @@ func TestAtomicWriteFileUsesTempAndCleansFailedReplace(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("target should not exist after failed replace: stat err=%v", err)
+	}
+}
+
+func TestStoreLoadPropagatesContextPastStateLock(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-context-load"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate SQLite store: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	previousHook := loadUnlockedTestHook
+	loadUnlockedTestHook = cancel
+	t.Cleanup(func() { loadUnlockedTestHook = previousHook })
+	if _, err := store.Load(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Load error = %v, want context.Canceled after the state lock was acquired", err)
 	}
 }
 

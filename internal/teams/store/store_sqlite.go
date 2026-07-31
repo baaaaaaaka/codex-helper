@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 const (
@@ -41,6 +41,10 @@ const (
 // sqliteMigrationTestHook is nil in production; tests use it to inject failures
 // at durable migration boundaries.
 var sqliteMigrationTestHook func(stage string) error
+
+// sqliteRuntimeMetadataConnectionTestHook is nil in production. It lets tests
+// verify that one metadata attempt acquires exactly one physical connection.
+var sqliteRuntimeMetadataConnectionTestHook func()
 
 type storeSQLitePointer struct {
 	SchemaVersion       int       `json:"schema_version"`
@@ -78,7 +82,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if pointer, ok, err := storeSQLitePointerFromData(source); err != nil {
 			return err
 		} else if ok {
-			state, err := s.loadSQLiteStateUnlocked(pointer)
+			state, err := s.loadSQLiteStateUnlocked(ctx, pointer)
 			if err != nil {
 				return err
 			}
@@ -96,7 +100,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if parsed, ok := stateSchemaVersionFromData(source); ok {
 			sourceSchemaVersion = parsed
 		}
-		state, err := s.loadUnlocked()
+		state, err := s.loadUnlocked(ctx)
 		if err != nil {
 			return err
 		}
@@ -310,6 +314,24 @@ func (s *Store) currentSQLitePointerUnlocked() (storeSQLitePointer, bool, error)
 	return s.sqlitePointerFromDataUnlocked(data, info)
 }
 
+func (s *Store) currentSQLitePointerReadOnly() (storeSQLitePointer, bool, error) {
+	info, err := os.Lstat(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return storeSQLitePointer{}, false, nil
+	}
+	if err != nil {
+		return storeSQLitePointer{}, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maxStatePointerSize {
+		return storeSQLitePointer{}, false, nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return storeSQLitePointer{}, false, err
+	}
+	return storeSQLitePointerFromData(data)
+}
+
 func (s *Store) writeSQLitePointerUnlocked(pointer storeSQLitePointer) error {
 	if strings.TrimSpace(pointer.Path) == "" {
 		pointer.Path = storeSQLiteFileName
@@ -462,12 +484,12 @@ func (s *Store) storeSQLitePath(pointer storeSQLitePointer) (string, error) {
 	return filepath.Join(filepath.Dir(s.path), path), nil
 }
 
-func (s *Store) loadSQLiteStateUnlocked(pointer storeSQLitePointer) (State, error) {
+func (s *Store) loadSQLiteStateUnlocked(ctx context.Context, pointer storeSQLitePointer) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
 		return State{}, err
 	}
-	return loadSQLiteState(context.Background(), db)
+	return loadSQLiteState(ctx, db)
 }
 
 func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State) error {
@@ -734,6 +756,344 @@ func loadSQLiteStateFileReadOnly(ctx context.Context, path string) (State, error
 	return loadSQLiteStateFileReadOnlyWithHook(ctx, path, nil)
 }
 
+func loadSQLiteRuntimeMetadataFileReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if !dbBefore.Exists {
+			return RuntimeMetadata{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		}
+		metadata, err := loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if !immutable {
+			return metadata, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return RuntimeMetadata{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return metadata, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable metadata attempt %d", attempt+1)
+	}
+	return RuntimeMetadata{}, fmt.Errorf("read stable sqlite runtime metadata after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteRuntimeMetadataFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (RuntimeMetadata, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	defer conn.Close()
+	return loadSQLiteRuntimeMetadataConn(ctx, conn)
+}
+
+func loadSQLiteRuntimeMetadataFileOfflineRecoveryReadOnly(ctx context.Context, path string) (RuntimeMetadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recoveryNeeded, err := sqliteOfflineRecoveryNeeded(path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if !recoveryNeeded {
+		return loadSQLiteRuntimeMetadataFileReadOnly(ctx, path)
+	}
+	reader, err := openSQLiteOfflineRecoveryReader(ctx, path)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	metadata, loadErr := loadSQLiteRuntimeMetadataConn(ctx, reader.readConn)
+	closeErr := reader.Close()
+	if loadErr != nil {
+		return RuntimeMetadata{}, loadErr
+	}
+	if closeErr != nil {
+		return RuntimeMetadata{}, closeErr
+	}
+	return metadata, nil
+}
+
+func loadSQLiteRuntimeMetadataConn(ctx context.Context, conn *sql.Conn) (RuntimeMetadata, error) {
+	if sqliteRuntimeMetadataConnectionTestHook != nil {
+		sqliteRuntimeMetadataConnectionTestHook()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if err := validateSQLiteRuntimeMetadataTablesContext(ctx, conn); err != nil {
+		return RuntimeMetadata{}, err
+	}
+
+	var metadata RuntimeMetadata
+	var controlChatJSON string
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
+	).Scan(&controlChatJSON); err != nil {
+		return RuntimeMetadata{}, err
+	}
+	if err := json.Unmarshal([]byte(controlChatJSON), &metadata.ControlChat); err != nil {
+		return RuntimeMetadata{}, err
+	}
+
+	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+		sqliteRuntimeKeyScope,
+		sqliteRuntimeKeyControlLease,
+		sqliteRuntimeKeyServiceOwner,
+		sqliteRuntimeKeyLockOwner,
+		sqliteRuntimeKeyServiceControl,
+	)
+	if err != nil {
+		return RuntimeMetadata{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			return RuntimeMetadata{}, err
+		}
+		switch key {
+		case sqliteRuntimeKeyScope:
+			if err := json.Unmarshal(raw, &metadata.Scope); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyControlLease:
+			if err := json.Unmarshal(raw, &metadata.ControlLease); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyServiceOwner:
+			if err := json.Unmarshal(raw, &metadata.ServiceOwner); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyLockOwner:
+			if err := json.Unmarshal(raw, &metadata.LockOwner); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyServiceControl:
+			if err := json.Unmarshal(raw, &metadata.ServiceControl); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return RuntimeMetadata{}, err
+	}
+	return metadata, nil
+}
+
+func loadSQLiteWatchdogStateFileReadOnly(ctx context.Context, path string) (State, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		if !dbBefore.Exists {
+			return State{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
+				return State{}, err
+			}
+		}
+		state, err := loadSQLiteWatchdogStateFileReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return State{}, err
+		}
+		if !immutable {
+			return state, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return State{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return State{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return state, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable watchdog attempt %d", attempt+1)
+	}
+	return State{}, fmt.Errorf("read stable sqlite watchdog state after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteWatchdogStateFileReadOnlyAttempt(ctx context.Context, path string, immutable bool) (State, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return State{}, err
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	defer conn.Close()
+	if sqliteRuntimeMetadataConnectionTestHook != nil {
+		sqliteRuntimeMetadataConnectionTestHook()
+	}
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return State{}, err
+	}
+	if err := validateSQLiteWatchdogTablesContext(ctx, conn); err != nil {
+		return State{}, err
+	}
+
+	state := State{ChatPolls: make(map[string]ChatPollState)}
+	var controlChatJSON string
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COALESCE(json_extract(value, '$.control_chat'), '{}') FROM state_meta WHERE key = 'state_json'`,
+	).Scan(&controlChatJSON); err != nil {
+		return State{}, err
+	}
+	if err := json.Unmarshal([]byte(controlChatJSON), &state.ControlChat); err != nil {
+		return State{}, err
+	}
+
+	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+		sqliteRuntimeKeyScope,
+		sqliteRuntimeKeyServiceOwner,
+		sqliteRuntimeKeyLockOwner,
+		sqliteRuntimeKeyServiceControl,
+		sqliteRuntimeKeyUpgrade,
+	)
+	if err != nil {
+		return State{}, err
+	}
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			_ = rows.Close()
+			return State{}, err
+		}
+		switch key {
+		case sqliteRuntimeKeyScope:
+			err = json.Unmarshal(raw, &state.Scope)
+		case sqliteRuntimeKeyServiceOwner:
+			err = json.Unmarshal(raw, &state.ServiceOwner)
+		case sqliteRuntimeKeyLockOwner:
+			err = json.Unmarshal(raw, &state.LockOwner)
+		case sqliteRuntimeKeyServiceControl:
+			err = json.Unmarshal(raw, &state.ServiceControl)
+		case sqliteRuntimeKeyUpgrade:
+			err = json.Unmarshal(raw, &state.Upgrade)
+		}
+		if err != nil {
+			_ = rows.Close()
+			return State{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return State{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return State{}, err
+	}
+
+	controlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
+	if controlChatID == "" {
+		return state, nil
+	}
+	pollRows, err := conn.QueryContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, controlChatID)
+	if err != nil {
+		return State{}, err
+	}
+	defer pollRows.Close()
+	for pollRows.Next() {
+		var raw []byte
+		if err := pollRows.Scan(&raw); err != nil {
+			return State{}, err
+		}
+		var poll ChatPollState
+		if err := json.Unmarshal(raw, &poll); err != nil {
+			return State{}, err
+		}
+		state.ChatPolls[poll.ChatID] = poll
+	}
+	if err := pollRows.Err(); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+func validateSQLiteRuntimeMetadataTablesContext(ctx context.Context, conn *sql.Conn) error {
+	var count int
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('state_meta', 'runtime_state')`,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count != 2 {
+		return fmt.Errorf("sqlite teams store is missing runtime metadata tables")
+	}
+	return nil
+}
+
+func validateSQLiteWatchdogTablesContext(ctx context.Context, conn *sql.Conn) error {
+	var count int
+	if err := conn.QueryRowContext(
+		ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('state_meta', 'runtime_state', 'chat_polls')`,
+	).Scan(&count); err != nil {
+		return err
+	}
+	if count != 3 {
+		return fmt.Errorf("sqlite teams store is missing watchdog state tables")
+	}
+	return nil
+}
+
 type sqliteReadOnlyFileIdentity struct {
 	Exists  bool
 	Size    int64
@@ -741,14 +1101,32 @@ type sqliteReadOnlyFileIdentity struct {
 }
 
 func sqliteReadOnlyFileIdentityForPath(path string) (sqliteReadOnlyFileIdentity, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return sqliteReadOnlyFileIdentity{}, nil
 	}
 	if err != nil {
 		return sqliteReadOnlyFileIdentity{}, err
 	}
+	reparse, err := sqliteStorePathIsReparsePoint(path, info)
+	if err != nil {
+		return sqliteReadOnlyFileIdentity{}, err
+	}
+	if reparse || !info.Mode().IsRegular() {
+		return sqliteReadOnlyFileIdentity{}, fmt.Errorf("sqlite store path is not a regular file: %s", path)
+	}
 	return sqliteReadOnlyFileIdentity{Exists: true, Size: info.Size(), ModTime: info.ModTime().UnixNano()}, nil
+}
+
+func requireSQLiteReadOnlySHM(path string) error {
+	identity, err := sqliteReadOnlyFileIdentityForPath(path + "-shm")
+	if err != nil {
+		return err
+	}
+	if !identity.Exists {
+		return fmt.Errorf("read live sqlite WAL without creating SHM: %w", os.ErrNotExist)
+	}
+	return nil
 }
 
 func loadSQLiteStateFileReadOnlyWithHook(ctx context.Context, path string, afterSnapshot func(attempt int, immutable bool)) (State, error) {
@@ -768,10 +1146,7 @@ func loadSQLiteStateFileReadOnlyWithHook(ctx context.Context, path string, after
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
-			if _, err := os.Stat(path + "-shm"); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return State{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
-				}
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
 				return State{}, err
 			}
 		}
@@ -821,6 +1196,165 @@ func loadSQLiteStateFileReadOnlyAttempt(ctx context.Context, path string, immuta
 		return State{}, err
 	}
 	return loadSQLiteStateRows(ctx, db)
+}
+
+func loadSQLiteStateFileOfflineRecoveryReadOnly(ctx context.Context, path string) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recoveryNeeded, err := sqliteOfflineRecoveryNeeded(path)
+	if err != nil {
+		return State{}, err
+	}
+	if !recoveryNeeded {
+		return loadSQLiteStateFileReadOnly(ctx, path)
+	}
+	reader, err := openSQLiteOfflineRecoveryReader(ctx, path)
+	if err != nil {
+		return State{}, err
+	}
+	if err := validateSQLiteRequiredTablesContext(ctx, reader.readConn); err != nil {
+		_ = reader.Close()
+		return State{}, err
+	}
+	state, loadErr := loadSQLiteStateRows(ctx, reader.readConn)
+	closeErr := reader.Close()
+	if loadErr != nil {
+		return State{}, loadErr
+	}
+	if closeErr != nil {
+		return State{}, closeErr
+	}
+	return state, nil
+}
+
+func sqliteOfflineRecoveryNeeded(path string) (bool, error) {
+	if err := validateExistingSQLiteStorePath(path); err != nil {
+		return false, err
+	}
+	walInfo, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+	if err != nil {
+		return false, err
+	}
+	if !walInfo.Exists {
+		return false, nil
+	}
+	if walInfo.Size == 0 {
+		return false, nil
+	}
+	shmInfo, err := sqliteReadOnlyFileIdentityForPath(path + "-shm")
+	if err != nil {
+		return false, err
+	}
+	if !shmInfo.Exists {
+		return true, nil
+	}
+	return false, nil
+}
+
+func configureSQLiteOfflineRecoveryConnection(ctx context.Context, conn *sql.Conn) error {
+	if err := conn.Raw(func(driverConn any) error {
+		control, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return errors.New("sqlite driver does not support persistent WAL control")
+		}
+		_, err := control.FileControlPersistWAL("main", 1)
+		return err
+	}); err != nil {
+		return err
+	}
+	_, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`)
+	return err
+}
+
+type sqliteOfflineRecoveryReader struct {
+	anchorDB   *sql.DB
+	anchorConn *sql.Conn
+	readDB     *sql.DB
+	readConn   *sql.Conn
+}
+
+func openSQLiteOfflineRecoveryReader(ctx context.Context, path string) (*sqliteOfflineRecoveryReader, error) {
+	if err := validateExistingSQLiteStorePath(path); err != nil {
+		return nil, err
+	}
+	reader := &sqliteOfflineRecoveryReader{}
+	var err error
+	reader.anchorDB, err = openSQLiteHandle(path, false)
+	if err != nil {
+		return nil, err
+	}
+	reader.anchorConn, err = reader.anchorDB.Conn(ctx)
+	if err != nil {
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	if err := configureSQLiteOfflineRecoveryConnection(ctx, reader.anchorConn); err != nil {
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+
+	query := url.Values{}
+	query.Set("mode", "ro")
+	reader.readDB, err = sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	reader.readDB.SetMaxOpenConns(1)
+	reader.readDB.SetMaxIdleConns(0)
+	reader.readConn, err = reader.readDB.Conn(ctx)
+	if err != nil {
+		_ = reader.readDB.Close()
+		_ = reader.anchorConn.Close()
+		_ = reader.anchorDB.Close()
+		return nil, err
+	}
+	if _, err := reader.readConn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+	return reader, nil
+}
+
+func (r *sqliteOfflineRecoveryReader) Close() error {
+	if r == nil {
+		return nil
+	}
+	var first error
+	for _, closeFn := range []func() error{
+		func() error {
+			if r.anchorConn == nil {
+				return nil
+			}
+			return r.anchorConn.Close()
+		},
+		func() error {
+			if r.anchorDB == nil {
+				return nil
+			}
+			return r.anchorDB.Close()
+		},
+		func() error {
+			if r.readConn == nil {
+				return nil
+			}
+			return r.readConn.Close()
+		},
+		func() error {
+			if r.readDB == nil {
+				return nil
+			}
+			return r.readDB.Close()
+		},
+	} {
+		if err := closeFn(); first == nil && err != nil {
+			first = err
+		}
+	}
+	return first
 }
 
 func (s *Store) writeSQLiteStateFile(path string, state State) error {
@@ -887,15 +1421,17 @@ func openExistingSQLiteStore(path string) (*sql.DB, error) {
 }
 
 func validateExistingSQLiteStorePath(path string) error {
-	info, err := os.Stat(path)
+	identity, err := sqliteReadOnlyFileIdentityForPath(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("sqlite store %q does not exist", path)
-		}
 		return err
 	}
-	if info.IsDir() {
-		return fmt.Errorf("sqlite store %q is a directory", path)
+	if !identity.Exists {
+		return fmt.Errorf("sqlite store %q does not exist", path)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := sqliteReadOnlyFileIdentityForPath(path + suffix); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1010,9 +1546,15 @@ var sqliteRequiredTables = []string{
 }
 
 func validateSQLiteRequiredTables(db *sql.DB) error {
+	return validateSQLiteRequiredTablesContext(context.Background(), db)
+}
+
+func validateSQLiteRequiredTablesContext(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) error {
 	for _, table := range sqliteRequiredTables {
 		var name string
-		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
+		err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("sqlite teams store is missing required table %q", table)
 		}
@@ -1410,7 +1952,10 @@ func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
 	return loadSQLiteStateRows(ctx, db)
 }
 
-func loadSQLiteStateRows(ctx context.Context, db *sql.DB) (State, error) {
+func loadSQLiteStateRows(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, error) {
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
 		return State{}, err
@@ -2041,6 +2586,58 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 	if errors.Is(err, errStoreNoChange) {
 		return handled, nil
 	}
+	return handled, err
+}
+
+// rebindSQLiteScopeForMigration updates only the bounded runtime projection and
+// the small state_meta document. It deliberately leaves all business-data
+// tables untouched.
+func (s *Store) rebindSQLiteScopeForMigration(ctx context.Context, fn func(*State) error) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		runtimeState, seen, err := loadSQLiteRuntimeState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			return errors.New("sqlite teams store is missing required runtime state")
+		}
+		coldState, err := loadSQLiteColdStateWithoutChatSequences(ctx, tx)
+		if err != nil {
+			return err
+		}
+		runtimeState.ControlChat = coldState.ControlChat
+		if err := fn(&runtimeState); err != nil {
+			return err
+		}
+		coldState.ControlChat = runtimeState.ControlChat
+		if err := saveSQLiteRuntimeStateTx(ctx, tx, runtimeState); err != nil {
+			return err
+		}
+		cold, err := json.Marshal(coldSQLiteState(coldState))
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 	return handled, err
 }
 
@@ -4851,6 +5448,260 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 		err = run()
 	}
 	return out, handled, err
+}
+
+func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []OutboxReplayFence) (int, bool, error) {
+	changed := 0
+	pointer, handled, err := s.currentSQLitePointerReadOnly()
+	if err != nil || !handled {
+		return 0, handled, err
+	}
+	dbPath, err := s.storeSQLitePath(pointer)
+	if err != nil {
+		return 0, true, err
+	}
+	current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx, dbPath, fences)
+	if err != nil {
+		return 0, true, err
+	}
+	pending := 0
+	for _, msg := range current {
+		if msg.Status != OutboxStatusSent {
+			pending++
+		}
+	}
+	if pending == 0 {
+		return 0, true, nil
+	}
+	err = s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		dbPath, err := s.storeSQLitePath(pointer)
+		if err != nil {
+			return err
+		}
+		current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx, dbPath, fences)
+		if err != nil {
+			return err
+		}
+		pending := 0
+		for _, msg := range current {
+			if msg.Status != OutboxStatusSent {
+				pending++
+			}
+		}
+		if pending == 0 {
+			return nil
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		state := newState()
+		state.OutboxMessages = make(map[string]OutboxMessage, pending)
+		state.MessageProvenance = map[string]MessageProvenanceRecord{}
+		state.InboundEvents = map[string]InboundEvent{}
+		state.Turns = map[string]Turn{}
+		now := time.Now()
+		for _, fence := range fences {
+			msg, ok := current[fence.OutboxID]
+			if !ok || msg.Status == OutboxStatusSent {
+				continue
+			}
+			provenanceID := messageProvenanceID(msg.TeamsChatID, fence.TeamsMessageID)
+			if existing, ok, err := loadSQLiteJSONRow[MessageProvenanceRecord](ctx, tx, `SELECT json FROM message_provenance WHERE id = ?`, provenanceID); err != nil {
+				return err
+			} else if ok {
+				state.MessageProvenance[provenanceID] = existing
+				if strings.TrimSpace(existing.Origin) == MessageOriginUserInbound {
+					inboundEventID := strings.TrimSpace(existing.InboundID)
+					if inboundEventID == "" {
+						inboundEventID = inboundID(existing.TeamsChatID, existing.TeamsMessageID)
+					}
+					if inbound, found, err := loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundEventID); err != nil {
+						return err
+					} else if found {
+						state.InboundEvents[inbound.ID] = inbound
+					}
+					if turnID := strings.TrimSpace(existing.TurnID); turnID != "" {
+						if turn, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
+							return err
+						} else if found {
+							state.Turns[turn.ID] = turn
+						}
+					}
+				}
+			}
+			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, msg.ID); err != nil {
+				return err
+			}
+			if err := loadSQLiteArtifactRecordsByIDTx(ctx, tx, &state, msg.ArtifactIDs); err != nil {
+				return err
+			}
+			msg = applyOutboxSentProjectionLocked(&state, msg, fence.TeamsMessageID, now)
+			state.OutboxMessages[msg.ID] = msg
+			changed++
+		}
+		if changed == 0 {
+			return nil
+		}
+		for _, msg := range state.OutboxMessages {
+			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+				return err
+			}
+		}
+		for _, record := range state.MessageProvenance {
+			if err := upsertSQLiteProvenanceTx(ctx, tx, record); err != nil {
+				return err
+			}
+		}
+		if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+			return err
+		}
+		for _, inbound := range state.InboundEvents {
+			if err := upsertSQLiteInboundTx(ctx, tx, inbound); err != nil {
+				return err
+			}
+		}
+		for _, turn := range state.Turns {
+			if err := upsertSQLiteTurnTx(ctx, tx, turn); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+	return changed, handled, err
+}
+
+func loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx context.Context, path string, fences []OutboxReplayFence) (map[string]OutboxMessage, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return nil, err
+		}
+		if !dbBefore.Exists {
+			return nil, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
+				return nil, err
+			}
+		}
+		current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnlyAttempt(ctx, path, immutable, fences)
+		if err != nil {
+			return nil, err
+		}
+		if !immutable {
+			return current, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return nil, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return current, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable replay fence attempt %d", attempt+1)
+	}
+	return nil, fmt.Errorf("read stable sqlite replay fences after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteOutboxReplayFenceMessagesFileReadOnlyAttempt(
+	ctx context.Context,
+	path string,
+	immutable bool,
+	fences []OutboxReplayFence,
+) (map[string]OutboxMessage, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return nil, err
+	}
+	return querySQLiteOutboxReplayFenceMessages(ctx, conn, fences)
+}
+
+func querySQLiteOutboxReplayFenceMessages(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, fences []OutboxReplayFence) (map[string]OutboxMessage, error) {
+	fencesByID := make(map[string]OutboxReplayFence, len(fences))
+	for _, fence := range fences {
+		fencesByID[fence.OutboxID] = fence
+	}
+	current := make(map[string]OutboxMessage, len(fences))
+	const replayFenceReadBatch = 400
+	for start := 0; start < len(fences); start += replayFenceReadBatch {
+		end := min(start+replayFenceReadBatch, len(fences))
+		placeholders := make([]string, 0, end-start)
+		args := make([]any, 0, end-start)
+		for _, fence := range fences[start:end] {
+			placeholders = append(placeholders, "?")
+			args = append(args, fence.OutboxID)
+		}
+		rows, err := q.QueryContext(ctx, `SELECT json FROM outbox_messages WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			var msg OutboxMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			fence := fencesByID[msg.ID]
+			if err := validateOutboxReplayFence(msg, fence); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			current[msg.ID] = msg
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return current, nil
 }
 
 func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, bool, error) {

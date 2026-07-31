@@ -102,7 +102,7 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 	for _, want := range []string{
 		"Type=simple",
 		"WorkingDirectory=" + strconv.Quote(spec.WorkingDir),
-		"ExecStart=" + spec.Executable + " teams run --owner-stale-after 1m30s --auto-service=false --registry " + strconv.Quote(spec.RegistryPath),
+		"ExecStart=" + spec.Executable + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + strconv.Quote(spec.RegistryPath),
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
 		"Environment=HTTP_PROXY=http://127.0.0.1:38471",
@@ -960,9 +960,10 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		t.Fatalf("read WSL task config: %v", err)
 	}
 	config := string(configData)
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
+	wantInvocationDir := teamsServiceTestAbsPath(t, "/home/alice/work dir")
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
-	wantRegistry := teamsServiceTestRegistryPath(wantCWD, "/home/alice/teams registry.json")
+	wantRegistry := teamsServiceTestRegistryPath(wantInvocationDir, "/home/alice/teams registry.json")
 	for _, want := range []string{
 		"Command=wsl.exe",
 		"-d Ubuntu/Dev",
@@ -971,7 +972,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskConfigCI(t *testing.T) {
 		"--exec env",
 		wantCWD,
 		"CODEX_HOME=" + filepath.Join(tmp, "codex home"),
-		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --registry",
+		wantExe + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry",
 		wantRegistry,
 	} {
 		if !strings.Contains(config, want) {
@@ -1481,7 +1482,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 		t.Fatalf("bootstrap should not print raw access-denied repair errors before UAC:\n%s", gotOut)
 	}
 	elevated := strings.Join(runner.calls[2].args, " ")
-	wantCWD := teamsServiceTestAbsPath(t, "/home/alice/work dir")
+	wantCWD := teamsServiceTestAbsPath(t, os.Getenv("HOME"))
 	wantExe := teamsServiceTestAbsPath(t, "/home/alice/bin/codex-proxy")
 	for _, want := range []string{
 		"Start-Process",

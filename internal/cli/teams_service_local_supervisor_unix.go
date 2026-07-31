@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 func configureTeamsLocalSupervisorDetachedCommand(cmd *exec.Cmd) {
@@ -266,7 +268,41 @@ func teamsLocalSupervisorExecutableMatches(pid int, executable string, args []st
 	if teamsLocalSupervisorSameExecutable(got, want) {
 		return nil
 	}
+	if teamsLocalSupervisorManagedRuntimeMatches(got, want) {
+		return nil
+	}
 	return fmt.Errorf("refusing to manage pid %d because executable %s does not match expected %s", pid, got, want)
+}
+
+func teamsLocalSupervisorManagedRuntimeMatches(runtimePath string, stableEntry string) bool {
+	runtimePath = filepath.Clean(strings.TrimSuffix(strings.TrimSpace(runtimePath), " (deleted)"))
+	stableEntry = filepath.Clean(strings.TrimSuffix(strings.TrimSpace(stableEntry), " (deleted)"))
+	if runtimePath == "" || runtimePath == "." || stableEntry == "" || stableEntry == "." {
+		return false
+	}
+	if filepath.Base(stableEntry) != helperruntime.BinaryName(runtime.GOOS) {
+		return false
+	}
+	root := filepath.Join(filepath.Dir(stableEntry), ".cxp-runtime")
+	rel, err := filepath.Rel(root, runtimePath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 3 || parts[0] != "versions" || parts[2] != helperruntime.BinaryName(runtime.GOOS) {
+		return false
+	}
+	version, ok := helperruntime.NormalizeVersion(parts[1])
+	if !ok || helperruntime.VersionPath(root, version, runtime.GOOS) != runtimePath {
+		return false
+	}
+	for _, path := range []string{stableEntry, runtimePath} {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func teamsLocalSupervisorSameExecutable(a string, b string) bool {

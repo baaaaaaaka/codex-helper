@@ -640,13 +640,23 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 		return nil, err
 	}
 	scope := ScopeIdentityForUser(user)
+	plan, err := InspectRuntimeStoreForScopeWithRegistry(ctx, scope, registryPath)
+	if err != nil {
+		return nil, err
+	}
+	switch plan.Action {
+	case RuntimeStoreActionReady, RuntimeStoreActionCreate:
+		scope = plan.Scope
+	case RuntimeStoreActionMigrateLegacy, RuntimeStoreActionQuarantineLegacy:
+		return nil, &RuntimeStoreActionRequiredError{Plan: plan}
+	default:
+		return nil, fmt.Errorf("unsupported Teams runtime store action %q", plan.Action)
+	}
 	if strings.TrimSpace(registryPath) == "" {
-		var resolvedScope teamstore.ScopeIdentity
-		resolvedScope, registryPath, err = ResolveRegistryPathForScope(scope)
+		registryPath, err = DefaultRegistryPathForScope(scope.ID)
 		if err != nil {
 			return nil, err
 		}
-		scope = resolvedScope
 	}
 	reg, err := LoadRegistry(registryPath)
 	if err != nil {
@@ -665,6 +675,16 @@ func (b *Bridge) readClient() *GraphClient {
 		return b.readGraph
 	}
 	return b.graph
+}
+
+// RuntimeScopeIdentity exposes the authenticated scope before Listen opens a
+// store. The CLI service boundary uses it for the one-time offline migration;
+// callers must not mutate the returned value and no store is opened here.
+func (b *Bridge) RuntimeScopeIdentity() teamstore.ScopeIdentity {
+	if b == nil {
+		return teamstore.ScopeIdentity{}
+	}
+	return b.scope
 }
 
 func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
@@ -935,16 +955,26 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if b.store == nil {
 		storePath := opts.StorePath
 		if strings.TrimSpace(storePath) == "" {
-			var err error
-			var resolvedScope teamstore.ScopeIdentity
-			resolvedScope, storePath, err = ResolveStorePathForScope(b.scope)
+			prepared, err := PrepareRuntimeStoreForListener(ctx, b.scope)
 			if err != nil {
 				return err
 			}
-			if resolvedScope.ID != b.scope.ID {
-				b.scope = resolvedScope
-				b.machine = MachineRecordForUser(b.user, b.scope)
-				b.applyRegistryMachineHostnameOverride()
+			if prepared.TakeoverRequired {
+				return deferRuntimeStoreTakeover("runtime store action requires offline service migration before listener start")
+			}
+			if prepared.Resolved {
+				storePath = prepared.CanonicalPath
+			} else {
+				var resolvedScope teamstore.ScopeIdentity
+				resolvedScope, storePath, err = ResolveStorePathForScope(b.scope)
+				if err != nil {
+					return err
+				}
+				if resolvedScope.ID != b.scope.ID {
+					b.scope = resolvedScope
+					b.machine = MachineRecordForUser(b.user, b.scope)
+					b.applyRegistryMachineHostnameOverride()
+				}
 			}
 		}
 		store, err := teamstore.Open(storePath)
@@ -1008,6 +1038,7 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 		return err
 	}
+	b.writeManagedActiveStoreBinding()
 	defer func() {
 		b.clearOwnerIfSame(context.Background())
 		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())
@@ -2586,6 +2617,14 @@ func (b *Bridge) notePollFailure(err error, now time.Time) error {
 }
 
 func IsRecoverablePollFailure(err error) bool {
+	var takeoverDeferred *RuntimeStoreTakeoverDeferredError
+	if errors.As(err, &takeoverDeferred) {
+		return true
+	}
+	var migrationBlocked *RuntimeStoreMigrationBlockedError
+	if errors.As(err, &migrationBlocked) {
+		return true
+	}
 	return isPersistentPollFailureCandidate(err)
 }
 
@@ -5401,6 +5440,16 @@ func (b *Bridge) updateHelperFromControl(ctx context.Context, msg ChatMessage, a
 	if !ok {
 		return b.sendControl(ctx, helperUpdateHelpText(b.helperAutoUpdatePrerelease))
 	}
+	if req.Status {
+		if err := b.ensureStore(); err != nil {
+			return err
+		}
+		state, err := b.store.Load(ctx)
+		if err != nil {
+			return err
+		}
+		return b.sendControl(ctx, helperUpdateStatusText(state))
+	}
 	if b.helperAutoUpdater == nil {
 		return b.sendControl(ctx, "⚠️ Helper update is not available in this helper process. Start it with the normal Teams service command, then try again.")
 	}
@@ -5720,6 +5769,7 @@ func (b *Bridge) workflowWebhookControlStatus(ctx context.Context) string {
 
 type helperUpdateRequest struct {
 	IncludePrerelease bool
+	Status            bool
 }
 
 func parseHelperUpdateRequest(arg string) (helperUpdateRequest, bool) {
@@ -5743,6 +5793,12 @@ func parseHelperUpdateRequest(arg string) (helperUpdateRequest, bool) {
 	recognized := false
 	for _, token := range filtered {
 		switch token {
+		case "status":
+			if len(filtered) != 1 {
+				return helperUpdateRequest{}, false
+			}
+			req.Status = true
+			recognized = true
 		case "now", "--now", "latest", "release", "stable":
 			recognized = true
 		case "prerelease", "pre-release", "pre", "rc", "--pre", "--prerelease", "--include-prerelease":
@@ -5753,6 +5809,84 @@ func parseHelperUpdateRequest(arg string) (helperUpdateRequest, bool) {
 		}
 	}
 	return req, recognized
+}
+
+func helperUpdateStatusText(state teamstore.State) string {
+	upgrade := state.Upgrade
+	auto := state.AutoUpdate
+	target := firstNonEmptyString(auto.CandidateTag, auto.LastAttemptTag, auto.LastInstalledTag)
+	if upgrade != nil {
+		target = firstNonEmptyString(upgrade.InstalledTag, target)
+	}
+	if target == "" {
+		target = "none"
+	}
+	phase := "idle"
+	blocker := "none"
+	install := "not started"
+	activation := "not started"
+	restart := "not started"
+	if upgrade != nil {
+		switch upgrade.Phase {
+		case teamstore.UpgradePhaseDraining:
+			phase = "scheduled"
+			blocker = "drain"
+			if state.ServiceOwner != nil && strings.TrimSpace(state.ServiceOwner.ActiveTurnID) != "" {
+				blocker = "active Codex work"
+			}
+		case teamstore.UpgradePhaseReady:
+			if strings.TrimSpace(auto.LastInstalledTag) != "" || strings.TrimSpace(upgrade.InstalledTag) != "" {
+				phase = "activation"
+				install = "installed"
+				activation = "pending"
+				restart = "pending"
+			} else {
+				phase = "install"
+				install = "in progress"
+			}
+		case teamstore.UpgradePhaseAborted:
+			phase = "failed"
+			if strings.TrimSpace(auto.LastInstalledTag) != "" || strings.TrimSpace(upgrade.InstalledTag) != "" {
+				install = "installed"
+			}
+			activation = "failed"
+			restart = "failed"
+		case teamstore.UpgradePhaseCompleted:
+			phase = "completed"
+			install = "installed"
+			activation = "verified"
+			restart = "successful"
+		}
+	}
+	lines := []string{
+		"## ⬇️ Helper update status",
+		"",
+		"Phase: " + phase,
+		"Target: `" + target + "`",
+		"Blocker: " + blocker,
+		"Install: " + install,
+		"Activation: " + activation,
+		"Restart: " + restart,
+	}
+	if upgrade != nil && upgrade.Phase == teamstore.UpgradePhaseDraining {
+		lines = append(lines, "Drain: waiting for `"+target+"`")
+	}
+	if state.ServiceOwner != nil && strings.TrimSpace(state.ServiceOwner.ActiveTurnID) != "" {
+		lines = append(lines, "Blocking turn: `"+strings.TrimSpace(state.ServiceOwner.ActiveTurnID)+"`")
+	}
+	failure := firstNonEmptyString(auto.LastError, func() string {
+		if upgrade != nil {
+			return upgrade.AbortReason
+		}
+		return ""
+	}())
+	if failure != "" {
+		lines = append(lines, "Last error: "+failure)
+	}
+	if !auto.BackoffUntil.IsZero() {
+		lines = append(lines, "Next retry: "+auto.BackoffUntil.Format(time.RFC3339))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func helperUpdateHelpText(autoPrerelease bool) string {
@@ -6904,9 +7038,12 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 	if strings.TrimSpace(tag) == "" && strings.TrimSpace(res.Version) != "" {
 		tag = "v" + strings.TrimPrefix(strings.TrimSpace(res.Version), "v")
 	}
+	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
+		return err
+	}
 	if res.RestartRequired || strings.TrimSpace(res.PendingReplacePath) != "" {
 		pendingReason := "helper update replacement is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		if completionChatID != "" {
 			if err := b.writePendingHelperUpgradeNoticeWithReplacement(completionChatID, completionCommandID, tag, manualNotice, res.PendingReplacePath, res.InstallPath); err != nil {
@@ -6918,6 +7055,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 				if completionChatID != "" {
 					_ = b.clearPendingHelperRestartNotice()
 				}
+				_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 				return err
 			}
 			return nil
@@ -6929,6 +7067,7 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 			if completionChatID != "" {
 				_ = b.clearPendingHelperRestartNotice()
 			}
+			_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 			return err
 		}
 		return nil
@@ -6938,7 +7077,6 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		if pendingReason == "" {
 			pendingReason = "helper update activation is pending; waiting for the restarted helper to verify " + strings.TrimSpace(tag)
 		}
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, pendingReason)
 		completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 		canRecoverAutomatically := opts.HelperPendingRestarter != nil && strings.TrimSpace(res.InstallPath) != ""
 		if completionChatID != "" {
@@ -6953,20 +7091,17 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		}
 		if canRecoverAutomatically {
 			if err := opts.HelperPendingRestarter(ctx, "", res.InstallPath); err != nil {
+				_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 				return err
 			}
 		}
 		return nil
 	}
-	if _, err := b.store.RecordAutoUpdateInstalled(ctx, tag, time.Now()); err != nil {
-		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, err.Error())
-		return err
-	}
-	completed, err := b.store.CompleteUpgrade(ctx, req.ID, tag)
-	if err != nil {
-		return err
-	}
-	completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(completed, b.reg.ControlChatID)
+	// Installation and activation are distinct. The old helper may schedule a
+	// restart successfully even when the replacement never becomes healthy, so
+	// it must leave the request Ready. The replacement helper completes the
+	// request only after queuePendingHelperRestartNotice verifies its version.
+	completionChatID, completionCommandID, manualNotice := helperUpgradeCompletionTarget(req, b.reg.ControlChatID)
 	if opts.HelperRestarter == nil {
 		return nil
 	}
@@ -6979,6 +7114,20 @@ func (b *Bridge) applyHelperAutoUpdateWhenDrainedWithOptions(ctx context.Context
 		if completionChatID != "" {
 			_ = b.clearPendingHelperRestartNotice()
 		}
+		now := time.Now()
+		_, _ = b.store.RecordAutoUpdateCheck(context.Background(), teamstore.AutoUpdateRecord{
+			Now:                  now,
+			NextCheckAt:          now.Add(30 * time.Minute),
+			BackoffUntil:         now.Add(30 * time.Minute),
+			LastError:            "helper restart failed: " + err.Error(),
+			CandidateTag:         candidate.TagName,
+			CandidateVersion:     candidate.Version,
+			CandidatePriority:    candidate.Priority,
+			CandidateAsset:       candidate.Asset,
+			CandidatePublishedAt: candidate.PublishedAt,
+			CandidateEligibleAt:  candidate.EligibleAt,
+		})
+		_, _ = b.store.AbortUpgrade(context.Background(), req.ID, "helper restart failed: "+err.Error())
 		return err
 	}
 	return nil
