@@ -476,6 +476,74 @@ func TestLoadPathWatchdogStateReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t 
 	}
 }
 
+func TestLoadPathWatchdogStateReadOnlyRejectsSQLiteFamilySymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on many Windows runners")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		suffix := suffix
+		name := suffix
+		if name == "" {
+			name = "db"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = ScopeIdentity{ID: "scope-sqlite-family-link"}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed store: %v", err)
+			}
+			if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+				t.Fatalf("migrate store: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatalf("close migrated store: %v", err)
+			}
+
+			dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+			familyPath := dbPath + suffix
+			target := filepath.Join(t.TempDir(), "outside"+suffix)
+			var targetData []byte
+			if suffix == "" {
+				var err error
+				targetData, err = os.ReadFile(dbPath)
+				if err != nil {
+					t.Fatalf("read sqlite target: %v", err)
+				}
+				if err := os.Rename(dbPath, target); err != nil {
+					t.Fatalf("move sqlite target: %v", err)
+				}
+			} else {
+				targetData = []byte("outside-sidecar")
+				if err := os.WriteFile(target, targetData, 0o600); err != nil {
+					t.Fatalf("write outside sidecar: %v", err)
+				}
+				if suffix == "-shm" {
+					if err := os.WriteFile(dbPath+"-wal", []byte("non-empty-wal"), 0o600); err != nil {
+						t.Fatalf("write WAL sentinel: %v", err)
+					}
+				}
+			}
+			if err := os.Symlink(target, familyPath); err != nil {
+				t.Fatalf("create sqlite family symlink: %v", err)
+			}
+
+			if _, err := LoadPathWatchdogStateReadOnly(ctx, store.Path()); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("watchdog sqlite family symlink error = %v, want regular-file error", err)
+			}
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("read outside target: %v", err)
+			}
+			if !bytes.Equal(got, targetData) {
+				t.Fatalf("watchdog modified outside target: got %d bytes want %d", len(got), len(targetData))
+			}
+		})
+	}
+}
+
 func TestLoadPathRuntimeMetadataReadOnlyLargeJSONSkipsBusinessProjection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	scope := ScopeIdentity{ID: "scope-large-json", AccountID: "account-large", Profile: "default"}

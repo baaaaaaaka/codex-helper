@@ -100,6 +100,7 @@ var (
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
 	teamsServiceWatchdogCollectSnapshot = collectTeamsServiceWatchdogSnapshot
 	teamsServiceWatchdogStorePaths      = existingCanonicalTeamsStorePathsReadOnly
+	teamsServiceWatchdogLoadState       = teamsstore.LoadPathWatchdogStateReadOnly
 	teamsServiceWatchdogInstalled       = teamsServiceInstalled
 	teamsServiceWatchdogActive          = teamsServiceActive
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
@@ -266,13 +267,46 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		scope    teamsstore.ScopeIdentity
 		hasOwner bool
 	}
+	var managedChild teamsServiceWatchdogManagedChildIdentity
+	managedChildFound := false
+	if len(paths) > 1 {
+		managedChild, managedChildFound = teamsServiceWatchdogManagedChild()
+		managedChildFound = managedChildFound && managedChild.PID > 0 && !managedChild.StartedAt.IsZero()
+		binding, bindingFound, _ := teams.LoadActiveStoreBindingReadOnly()
+		if bindingFound && (!managedChildFound || teamsServiceWatchdogBindingMatchesManagedChildGeneration(binding, managedChild)) {
+			for _, path := range paths {
+				if !samePath(path, binding.CanonicalPath) {
+					continue
+				}
+				if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
+					break
+				}
+				state, err := teamsServiceWatchdogLoadState(ctx, path)
+				if err != nil {
+					break
+				}
+				owner, hasOwner := rawTeamsStateOwner(state)
+				if !hasOwner || !teamsServiceWatchdogBindingMatchesCandidate(binding, path, owner, state.Scope) {
+					break
+				}
+				installed := snapshot.Installed
+				active := snapshot.Active
+				mergeTeamsServiceWatchdogState(&snapshot, state, opts)
+				snapshot.Installed = installed
+				snapshot.Active = active
+				snapshot.StateFiles = len(paths)
+				snapshot.AuthoritativeStorePath = path
+				return snapshot, nil
+			}
+		}
+	}
 	candidates := make([]candidateSnapshot, 0, len(paths))
 	freshOwnerStores := 0
 	for _, path := range paths {
 		if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
 			return snapshot, err
 		}
-		state, err := teamsstore.LoadPathWatchdogStateReadOnly(ctx, path)
+		state, err := teamsServiceWatchdogLoadState(ctx, path)
 		if err != nil {
 			return snapshot, err
 		}
@@ -291,8 +325,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		selected = candidates[0]
 		selectedFound = true
 	} else if len(candidates) > 1 {
-		managedChild, ok := teamsServiceWatchdogManagedChild()
-		if ok && managedChild.PID > 0 && !managedChild.StartedAt.IsZero() {
+		if managedChildFound {
 			for _, candidate := range candidates {
 				if !candidate.hasOwner ||
 					!candidate.snapshot.OwnerFresh ||
@@ -342,6 +375,12 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
 	}
 	return snapshot, nil
+}
+
+func teamsServiceWatchdogBindingMatchesManagedChildGeneration(binding teams.ActiveStoreBinding, child teamsServiceWatchdogManagedChildIdentity) bool {
+	return binding.PID == child.PID &&
+		!binding.StartedAt.IsZero() &&
+		!binding.StartedAt.Before(child.StartedAt.Add(-time.Second))
 }
 
 func teamsServiceWatchdogBindingMatchesCandidate(binding teams.ActiveStoreBinding, path string, owner teamsstore.OwnerMetadata, scope teamsstore.ScopeIdentity) bool {

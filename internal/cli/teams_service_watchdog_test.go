@@ -981,6 +981,101 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 	}
 }
 
+func TestTeamsRuntimeSafetyWatchdogReadsOnlyVerifiedBoundStoreCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	now := time.Date(2026, 7, 31, 9, 0, 0, 0, time.UTC)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	boundPath := filepath.Join(tmp, "canonical", "state.json")
+	store, err := teamsstore.Open(boundPath)
+	if err != nil {
+		t.Fatalf("open bound store: %v", err)
+	}
+	owner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		ScopeID:         "scope-bound-fast-path",
+		LeaseGeneration: 41,
+		StartedAt:       now.Add(-time.Minute),
+		LastHeartbeat:   now.Add(-time.Second),
+	}
+	if err := store.Update(context.Background(), func(state *teamsstore.State) error {
+		state.Scope = teamsstore.ScopeIdentity{ID: owner.ScopeID}
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		return nil
+	}); err != nil {
+		_ = store.Close()
+		t.Fatalf("seed bound store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		_ = store.Close()
+		t.Fatalf("migrate bound store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close bound store: %v", err)
+	}
+	badPath := filepath.Join(tmp, "unrelated", "state.json")
+	if err := os.MkdirAll(filepath.Dir(badPath), 0o700); err != nil {
+		t.Fatalf("mkdir unrelated store: %v", err)
+	}
+	if err := os.WriteFile(badPath, []byte("{broken"), 0o600); err != nil {
+		t.Fatalf("write unrelated corrupt store: %v", err)
+	}
+	if err := teams.WriteActiveStoreBinding(teams.ActiveStoreBinding{
+		CanonicalPath:   boundPath,
+		ScopeID:         owner.ScopeID,
+		PID:             owner.PID,
+		StartedAt:       owner.StartedAt,
+		LeaseGeneration: owner.LeaseGeneration,
+	}); err != nil {
+		t.Fatalf("write active store binding: %v", err)
+	}
+
+	prevPaths := teamsServiceWatchdogStorePaths
+	prevInstalled := teamsServiceWatchdogInstalled
+	prevManagedChild := teamsServiceWatchdogManagedChild
+	prevLoadState := teamsServiceWatchdogLoadState
+	t.Cleanup(func() {
+		teamsServiceWatchdogStorePaths = prevPaths
+		teamsServiceWatchdogInstalled = prevInstalled
+		teamsServiceWatchdogManagedChild = prevManagedChild
+		teamsServiceWatchdogLoadState = prevLoadState
+	})
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		return []string{badPath, boundPath}, nil
+	}
+	teamsServiceWatchdogInstalled = func() (bool, error) { return false, nil }
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{}, false
+	}
+	loads := 0
+	teamsServiceWatchdogLoadState = func(ctx context.Context, path string) (teamsstore.State, error) {
+		loads++
+		return teamsstore.LoadPathWatchdogStateReadOnly(ctx, path)
+	}
+
+	before := snapshotCLITreeForReadOnlyTest(t, tmp)
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now}))
+	if err != nil {
+		t.Fatalf("collect bound watchdog snapshot: %v", err)
+	}
+	after := snapshotCLITreeForReadOnlyTest(t, tmp)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("bound watchdog fast path modified files: before=%v after=%v", before, after)
+	}
+	if loads != 1 {
+		t.Fatalf("watchdog loaded %d stores, want only the verified active-store binding", loads)
+	}
+	if snapshot.StateFiles != 2 || snapshot.AuthoritativeStorePath != boundPath || snapshot.AmbiguousCanonicalStores || !snapshot.OwnerFresh {
+		t.Fatalf("bound watchdog snapshot = %+v", snapshot)
+	}
+}
+
 func TestTeamsRuntimeSafetyWatchdogRefusesLifecycleChangesWithMultipleFreshOwnerStoresCI(t *testing.T) {
 	snapshot := teamsServiceWatchdogSnapshot{
 		Installed:                true,
@@ -1091,6 +1186,45 @@ func TestTeamsRuntimeSafetyWatchdogRejectsCanonicalStoreSymlinkWithoutReadingTar
 	}
 	if !bytes.Equal(got, targetData) {
 		t.Fatalf("watchdog enumeration modified symlink target: got %q want %q", got, targetData)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogRejectsCanonicalScopeSymlinkWithoutReadingTargetCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires privileges on many Windows runners")
+	}
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	canonicalPath, err := appdirs.StatePath("teams", "scopes", "scope-parent-symlink", "state.json")
+	if err != nil {
+		t.Fatalf("canonical path: %v", err)
+	}
+	targetDir := filepath.Join(tmp, "outside-scope")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatalf("mkdir outside scope: %v", err)
+	}
+	target := filepath.Join(targetDir, "state.json")
+	targetData := []byte(`{"schema_version":1}`)
+	if err := os.WriteFile(target, targetData, 0o600); err != nil {
+		t.Fatalf("write outside store: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(filepath.Dir(canonicalPath)), 0o700); err != nil {
+		t.Fatalf("mkdir scopes root: %v", err)
+	}
+	if err := os.Symlink(targetDir, filepath.Dir(canonicalPath)); err != nil {
+		t.Fatalf("create canonical scope symlink: %v", err)
+	}
+
+	if _, err := existingCanonicalTeamsStorePathsReadOnly(); err == nil || !strings.Contains(err.Error(), "symlink or reparse point") {
+		t.Fatalf("canonical scope symlink enumeration error = %v, want fail-closed path-component error", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read outside target after watchdog enumeration: %v", err)
+	}
+	if !bytes.Equal(got, targetData) {
+		t.Fatalf("watchdog enumeration modified outside target: got %q want %q", got, targetData)
 	}
 }
 

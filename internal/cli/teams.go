@@ -4037,13 +4037,11 @@ func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
 		return nil, err
 	}
 	paths := []string{defaultPath}
-	paths, err = appendGlobMatches(
-		paths,
-		mustPathForGlob(appdirs.StatePath("teams", "scopes", "*", "state.json")),
-	)
+	scopedPaths, err := existingCanonicalTeamsScopedStorePathsReadOnly()
 	if err != nil {
 		return nil, err
 	}
+	paths = append(paths, scopedPaths...)
 	paths = uniquePaths(paths)
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
@@ -4053,12 +4051,88 @@ func existingCanonicalTeamsStorePathsReadOnly() ([]string, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return nil, fmt.Errorf("canonical Teams store %s is not a regular file", path)
+		if err := validateCanonicalTeamsStoreFileReadOnly(path, info); err != nil {
+			return nil, err
 		}
 		out = append(out, path)
 	}
 	return out, nil
+}
+
+func existingCanonicalTeamsScopedStorePathsReadOnly() ([]string, error) {
+	teamsRoot, err := appdirs.StatePath("teams")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateCanonicalTeamsDirectoryReadOnly(teamsRoot); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	scopesRoot := filepath.Join(teamsRoot, "scopes")
+	if err := validateCanonicalTeamsDirectoryReadOnly(scopesRoot); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	entries, err := os.ReadDir(scopesRoot)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		scopeDir := filepath.Join(scopesRoot, entry.Name())
+		info, err := os.Lstat(scopeDir)
+		if err != nil {
+			return nil, err
+		}
+		reparse, err := codexWindowsManagedPathIsReparsePoint(scopeDir, info)
+		if err != nil {
+			return nil, fmt.Errorf("inspect canonical Teams path component %s: %w", scopeDir, err)
+		}
+		if reparse {
+			return nil, fmt.Errorf("canonical Teams path component %s is a symlink or reparse point", scopeDir)
+		}
+		if !info.IsDir() {
+			continue
+		}
+		paths = append(paths, filepath.Join(scopeDir, "state.json"))
+	}
+	return paths, nil
+}
+
+func validateCanonicalTeamsDirectoryReadOnly(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	reparse, err := codexWindowsManagedPathIsReparsePoint(path, info)
+	if err != nil {
+		return fmt.Errorf("inspect canonical Teams path component %s: %w", path, err)
+	}
+	if reparse {
+		return fmt.Errorf("canonical Teams path component %s is a symlink or reparse point", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("canonical Teams path component %s is not a directory", path)
+	}
+	return nil
+}
+
+func validateCanonicalTeamsStoreFileReadOnly(path string, info os.FileInfo) error {
+	if info == nil {
+		return fmt.Errorf("canonical Teams store %s is not a regular file", path)
+	}
+	reparse, err := codexWindowsManagedPathIsReparsePoint(path, info)
+	if err != nil {
+		return fmt.Errorf("inspect canonical Teams store %s: %w", path, err)
+	}
+	if reparse || !info.Mode().IsRegular() {
+		return fmt.Errorf("canonical Teams store %s is not a regular file", path)
+	}
+	return nil
 }
 
 func existingTeamsStorePathsWithMode(readOnly bool) ([]string, error) {

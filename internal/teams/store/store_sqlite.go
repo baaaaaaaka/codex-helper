@@ -773,10 +773,7 @@ func loadSQLiteRuntimeMetadataFileReadOnly(ctx context.Context, path string) (Ru
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
-			if _, err := os.Stat(path + "-shm"); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return RuntimeMetadata{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
-				}
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
 				return RuntimeMetadata{}, err
 			}
 		}
@@ -935,10 +932,7 @@ func loadSQLiteWatchdogStateFileReadOnly(ctx context.Context, path string) (Stat
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
-			if _, err := os.Stat(path + "-shm"); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return State{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
-				}
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
 				return State{}, err
 			}
 		}
@@ -1107,14 +1101,32 @@ type sqliteReadOnlyFileIdentity struct {
 }
 
 func sqliteReadOnlyFileIdentityForPath(path string) (sqliteReadOnlyFileIdentity, error) {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return sqliteReadOnlyFileIdentity{}, nil
 	}
 	if err != nil {
 		return sqliteReadOnlyFileIdentity{}, err
 	}
+	reparse, err := sqliteStorePathIsReparsePoint(path, info)
+	if err != nil {
+		return sqliteReadOnlyFileIdentity{}, err
+	}
+	if reparse || !info.Mode().IsRegular() {
+		return sqliteReadOnlyFileIdentity{}, fmt.Errorf("sqlite store path is not a regular file: %s", path)
+	}
 	return sqliteReadOnlyFileIdentity{Exists: true, Size: info.Size(), ModTime: info.ModTime().UnixNano()}, nil
+}
+
+func requireSQLiteReadOnlySHM(path string) error {
+	identity, err := sqliteReadOnlyFileIdentityForPath(path + "-shm")
+	if err != nil {
+		return err
+	}
+	if !identity.Exists {
+		return fmt.Errorf("read live sqlite WAL without creating SHM: %w", os.ErrNotExist)
+	}
+	return nil
 }
 
 func loadSQLiteStateFileReadOnlyWithHook(ctx context.Context, path string, afterSnapshot func(attempt int, immutable bool)) (State, error) {
@@ -1134,10 +1146,7 @@ func loadSQLiteStateFileReadOnlyWithHook(ctx context.Context, path string, after
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
-			if _, err := os.Stat(path + "-shm"); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return State{}, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
-				}
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
 				return State{}, err
 			}
 		}
@@ -1220,28 +1229,25 @@ func loadSQLiteStateFileOfflineRecoveryReadOnly(ctx context.Context, path string
 }
 
 func sqliteOfflineRecoveryNeeded(path string) (bool, error) {
-	walInfo, err := os.Lstat(path + "-wal")
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+	if err := validateExistingSQLiteStorePath(path); err != nil {
+		return false, err
 	}
+	walInfo, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
 	if err != nil {
 		return false, err
 	}
-	if walInfo.Mode()&os.ModeSymlink != 0 || !walInfo.Mode().IsRegular() {
-		return false, fmt.Errorf("sqlite WAL is not a regular file: %s", path+"-wal")
-	}
-	if walInfo.Size() == 0 {
+	if !walInfo.Exists {
 		return false, nil
 	}
-	shmInfo, err := os.Lstat(path + "-shm")
-	if errors.Is(err, os.ErrNotExist) {
+	if walInfo.Size == 0 {
+		return false, nil
+	}
+	shmInfo, err := sqliteReadOnlyFileIdentityForPath(path + "-shm")
+	if err != nil {
+		return false, err
+	}
+	if !shmInfo.Exists {
 		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if shmInfo.Mode()&os.ModeSymlink != 0 || !shmInfo.Mode().IsRegular() {
-		return false, fmt.Errorf("sqlite SHM is not a regular file: %s", path+"-shm")
 	}
 	return false, nil
 }
@@ -1415,15 +1421,17 @@ func openExistingSQLiteStore(path string) (*sql.DB, error) {
 }
 
 func validateExistingSQLiteStorePath(path string) error {
-	info, err := os.Stat(path)
+	identity, err := sqliteReadOnlyFileIdentityForPath(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("sqlite store %q does not exist", path)
-		}
 		return err
 	}
-	if info.IsDir() {
-		return fmt.Errorf("sqlite store %q is a directory", path)
+	if !identity.Exists {
+		return fmt.Errorf("sqlite store %q does not exist", path)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := sqliteReadOnlyFileIdentityForPath(path + suffix); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -5590,10 +5598,7 @@ func loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx context.Context, path s
 		}
 		immutable := !walBefore.Exists || walBefore.Size == 0
 		if !immutable {
-			if _, err := os.Stat(path + "-shm"); err != nil {
-				if errors.Is(err, os.ErrNotExist) {
-					return nil, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
-				}
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
 				return nil, err
 			}
 		}

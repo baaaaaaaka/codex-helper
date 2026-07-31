@@ -12,7 +12,7 @@ case "${1:-}" in
     go test ./internal/teams -count=1 \
       -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|LegacyConfig|LegacyOnly|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|Malformed|AutomaticTakeover|BackupConflict|DualStore|OutboundReplayFence|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
     go test ./internal/teams/store -count=1 \
-      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly|TestLoadPathOfflineRecoveryReadOnly)' -v
+      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly|TestLoadPathOfflineRecoveryReadOnly|TestLoadPathWatchdogStateReadOnlyRejectsSQLiteFamilySymlinks)' -v
     ;;
   store-io)
     bash scripts/ci/teams_runtime_resolver_io_smoke.sh
