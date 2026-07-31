@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -256,7 +257,10 @@ func preflightPersistedTeamsServiceForUpdate() error {
 		return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
 	} else if info.IsDir() {
 		return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
-	} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
+	} else if teamsServiceGOOS() != "windows" && runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		// A Windows test host can simulate a WSL backend, but its filesystem
+		// does not expose meaningful Unix execute bits. Real WSL runs on a
+		// Linux Go runtime and still takes this check.
 		return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
 	}
 	if registryPath := strings.TrimSpace(contract.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
