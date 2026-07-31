@@ -318,6 +318,62 @@ func TestTeamsRuntimeSafetyAutoUpdatePreflightsWSLServiceExecutableCI(t *testing
 	}
 }
 
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsWSLStartupFallbackCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:           "linux",
+		isWSL:          true,
+		wslDistro:      "Ubuntu",
+		wslLinuxUser:   "alice",
+		exe:            exe,
+		argv0:          exe,
+		cwd:            tmp,
+		windowsTaskDir: filepath.Join(tmp, "wsl-task"),
+		runner:         &recordingTeamsServiceRunner{},
+	})
+	backend, err := teamsServiceBackendForCurrentPlatform()
+	if err != nil {
+		t.Fatalf("select WSL backend: %v", err)
+	}
+	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
+	if !ok {
+		t.Fatalf("backend = %T, want WSL Windows Task backend", backend)
+	}
+	fallbackPath, err := wslBackend.startupFallbackMarkerPath()
+	if err != nil {
+		t.Fatalf("fallback marker path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(fallbackPath), 0o700); err != nil {
+		t.Fatalf("mkdir fallback marker directory: %v", err)
+	}
+	taskPath, err := backend.Path()
+	if err != nil {
+		t.Fatalf("task marker path: %v", err)
+	}
+	validTaskSpec := teamsServiceSpec{Executable: exe, WorkingDir: tmp}
+	if err := os.WriteFile(
+		taskPath,
+		[]byte(buildTeamsServiceWSLTaskConfig(backend.Name(), buildTeamsServiceWSLArguments(validTaskSpec))),
+		0o600,
+	); err != nil {
+		t.Fatalf("write stale valid WSL task marker: %v", err)
+	}
+	missingWorkingDir := filepath.Join(tmp, "deleted-working-directory")
+	spec := teamsServiceSpec{Executable: exe, WorkingDir: missingWorkingDir}
+	config := buildTeamsServiceWSLStartupFallbackConfig(backend.Name(), buildTeamsServiceWSLArguments(spec))
+	if err := os.WriteFile(fallbackPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write WSL fallback marker: %v", err)
+	}
+	if err := preflightPersistedTeamsServiceForUpdate(); err == nil ||
+		!strings.Contains(strings.ToLower(err.Error()), "working") {
+		t.Fatalf("WSL fallback preflight error = %v, want WorkingDir failure", err)
+	}
+}
+
 func TestTeamsRuntimeSafetyAutoUpdatePreflightsWindowsTaskLaunchChainCI(t *testing.T) {
 	lockCLITestHooks(t)
 	for _, tc := range []struct {

@@ -1233,6 +1233,10 @@ func isDefaultGlobalStorePath(path string) bool {
 }
 
 func defaultGlobalStoreCanSeedScope(scope teamstore.ScopeIdentity, path string, state teamstore.State) bool {
+	return defaultGlobalStoreCanSeedScopeWithRegistry(scope, path, state, "")
+}
+
+func defaultGlobalStoreCanSeedScopeWithRegistry(scope teamstore.ScopeIdentity, path string, state teamstore.State, registryPath string) bool {
 	if !isDefaultGlobalStorePath(path) {
 		return false
 	}
@@ -1242,10 +1246,14 @@ func defaultGlobalStoreCanSeedScope(scope teamstore.ScopeIdentity, path string, 
 	if strings.TrimSpace(state.ControlChat.ScopeID) != "" || strings.TrimSpace(state.ControlChat.AccountID) != "" || strings.TrimSpace(state.ControlChat.Profile) != "" {
 		return false
 	}
-	registryPath, ok := legacyGlobalRegistryPathForMigrationSource()
-	if !ok {
-		if path, err := appdirs.StatePath("teams", "registry.json"); err == nil {
-			registryPath = path
+	registryPath = strings.TrimSpace(registryPath)
+	if registryPath == "" {
+		var ok bool
+		registryPath, ok = legacyGlobalRegistryPathForMigrationSource()
+		if !ok {
+			if path, err := appdirs.StatePath("teams", "registry.json"); err == nil {
+				registryPath = path
+			}
 		}
 	}
 	if strings.TrimSpace(registryPath) == "" {

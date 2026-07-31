@@ -121,14 +121,18 @@ func TestTeamsRuntimeSafetyBridgeConstructionReturnsPlanBeforeRegistryMutationCI
 	}
 	openAndSeedRuntimeSafetyScopeStore(t, canonicalPath, scope, "canonical-control")
 	openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+	explicitRegistry := filepath.Join(tmp, "custom-registry", "registry.json")
 
 	before := snapshotRuntimeSafetyFiles(t, tmp)
 	var out bytes.Buffer
-	bridge, err := newBridgeWithGraphClients(context.Background(), graph, graph, "", &out)
+	bridge, err := newBridgeWithGraphClients(context.Background(), graph, graph, explicitRegistry, &out)
 	if bridge != nil {
 		t.Fatal("Bridge construction returned a bridge while offline quarantine is required")
 	}
-	requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, canonicalPath, legacyPath)
+	plan := requireRuntimeStoreActionPlan(t, err, RuntimeStoreActionQuarantineLegacy, canonicalPath, legacyPath)
+	if plan.RegistryPath != explicitRegistry {
+		t.Fatalf("runtime store plan registry = %q, want explicit registry %q", plan.RegistryPath, explicitRegistry)
+	}
 	after := snapshotRuntimeSafetyFiles(t, tmp)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("Bridge construction modified files before returning its plan: %v", runtimeSafetySnapshotChanges(before, after))
@@ -1491,6 +1495,51 @@ func TestTeamsRuntimeSafetyOfflineTakeoverDefersUnfencedRemoteWriterBeforeStagin
 	}
 }
 
+func TestTeamsRuntimeSafetyOfflineTakeoverDefersUnfencedCanonicalWriterCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	now := time.Now()
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical store: %v", err)
+	}
+	if err := canonical.Update(context.Background(), func(state *teamstore.State) error {
+		state.ServiceOwner = &teamstore.OwnerMetadata{
+			PID:            4242,
+			Hostname:       "remote-host.example",
+			ExecutablePath: "/opt/cxp",
+			ScopeID:        fixture.Scope.ID,
+			MachineID:      "remote-machine",
+			StartedAt:      now.Add(-time.Minute),
+			LastHeartbeat:  now,
+		}
+		state.ControlLease = teamstore.ControlLease{
+			Status:     teamstore.ControlLeaseStatusActive,
+			LeaseUntil: now.Add(time.Minute),
+		}
+		return nil
+	}); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("seed canonical writer: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical store: %v", err)
+	}
+
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	err = CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath)
+	var deferred *RuntimeStoreTakeoverDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("canonical writer takeover error = %v, want deferred", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("canonical writer deferral modified durable files: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+	if _, err := os.Stat(fixture.LegacyPath); err != nil {
+		t.Fatalf("canonical writer deferral moved legacy store: %v", err)
+	}
+}
+
 func TestTeamsRuntimeSafetyOfflineTakeoverDefersReusedLivePIDCI(t *testing.T) {
 	fixture := seedRuntimeSafetyTakeoverFixture(t)
 	hostname, err := os.Hostname()
@@ -1600,6 +1649,166 @@ func TestTeamsRuntimeSafetyOutboundReplayFenceMarksMatchingCanonicalOutboxSentCI
 	outbox := state.OutboxMessages["shared-outbox"]
 	if outbox.Status != teamstore.OutboxStatusSent || outbox.TeamsMessageID != "teams-already-sent" {
 		t.Fatalf("canonical outbox was not replay-fenced as sent: %#v", outbox)
+	}
+}
+
+func TestTeamsRuntimeSafetyOutboundReplayFenceUsesExplicitRegistryWithoutMovingItCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open canonical store: %v", err)
+	}
+	if _, _, err := canonical.QueueOutbox(context.Background(), teamstore.OutboxMessage{
+		ID:          "explicit-registry-outbox",
+		SessionID:   "shared-session",
+		TeamsChatID: "canonical-chat",
+		Kind:        "final",
+		Body:        "already delivered through explicit registry",
+	}); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("queue canonical outbox: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical store: %v", err)
+	}
+
+	explicitRegistry := filepath.Join(fixture.Root, "explicit", "registry.json")
+	if err := os.MkdirAll(filepath.Dir(explicitRegistry), 0o700); err != nil {
+		t.Fatalf("create explicit registry directory: %v", err)
+	}
+	registryData := []byte(`{"version":1,"control_chat_id":"explicit-control"}`)
+	if err := os.WriteFile(explicitRegistry, registryData, 0o600); err != nil {
+		t.Fatalf("write explicit registry: %v", err)
+	}
+	explicitOutbound, ok := globalOutboundLedgerPathForRegistry(explicitRegistry)
+	if !ok {
+		t.Fatal("explicit outbound ledger path unavailable")
+	}
+	if err := recordGlobalOutbound(context.Background(), explicitOutbound, globalOutboundItem{
+		ChatID:    "canonical-chat",
+		MessageID: "teams-explicitly-sent",
+		ScopeID:   fixture.Scope.ID,
+		OutboxID:  "explicit-registry-outbox",
+		SessionID: "shared-session",
+		Kind:      "final",
+	}, time.Now()); err != nil {
+		t.Fatalf("record explicit outbound fence: %v", err)
+	}
+
+	plan := RuntimeStorePlan{
+		Action:        RuntimeStoreActionQuarantineLegacy,
+		Scope:         fixture.Scope,
+		CanonicalPath: fixture.CanonicalPath,
+		LegacyPath:    fixture.LegacyPath,
+		RegistryPath:  explicitRegistry,
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("complete explicit-registry takeover: %v", err)
+	}
+	if got, err := os.ReadFile(explicitRegistry); err != nil || !bytes.Equal(got, registryData) {
+		t.Fatalf("explicit registry changed or moved: data=%q err=%v", got, err)
+	}
+	canonical, err = teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("reopen canonical store: %v", err)
+	}
+	state, err := canonical.Load(context.Background())
+	if err != nil {
+		_ = canonical.Close()
+		t.Fatalf("load canonical store: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close canonical store: %v", err)
+	}
+	outbox := state.OutboxMessages["explicit-registry-outbox"]
+	if outbox.Status != teamstore.OutboxStatusSent || outbox.TeamsMessageID != "teams-explicitly-sent" {
+		t.Fatalf("explicit-registry replay fence was not applied: %#v", outbox)
+	}
+}
+
+func TestTeamsRuntimeSafetyLegacyOnlyMigrationUsesExplicitRegistryReplayFenceCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	if err := os.RemoveAll(filepath.Dir(fixture.CanonicalPath)); err != nil {
+		t.Fatalf("remove canonical fixture: %v", err)
+	}
+	explicitRegistry := filepath.Join(fixture.Root, "explicit", "registry.json")
+	if err := os.MkdirAll(filepath.Dir(explicitRegistry), 0o700); err != nil {
+		t.Fatalf("create explicit registry directory: %v", err)
+	}
+	registryData := []byte(`{"version":1,"control_chat_id":"explicit-control"}`)
+	if err := os.WriteFile(explicitRegistry, registryData, 0o600); err != nil {
+		t.Fatalf("write explicit registry: %v", err)
+	}
+	explicitOutbound, ok := globalOutboundLedgerPathForRegistry(explicitRegistry)
+	if !ok {
+		t.Fatal("explicit outbound ledger path unavailable")
+	}
+	if err := recordGlobalOutbound(context.Background(), explicitOutbound, globalOutboundItem{
+		ChatID:    "legacy-only-chat",
+		MessageID: "teams-explicit-legacy-send",
+		ScopeID:   fixture.Scope.ID,
+		OutboxID:  "legacy-queued",
+		SessionID: "legacy-only-session",
+	}, time.Now()); err != nil {
+		t.Fatalf("record explicit legacy outbound fence: %v", err)
+	}
+
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), RuntimeStorePlan{
+		Action:        RuntimeStoreActionMigrateLegacy,
+		Scope:         fixture.Scope,
+		CanonicalPath: fixture.CanonicalPath,
+		LegacyPath:    fixture.LegacyPath,
+		RegistryPath:  explicitRegistry,
+	}); err != nil {
+		t.Fatalf("complete explicit-registry legacy migration: %v", err)
+	}
+	if got, err := os.ReadFile(explicitRegistry); err != nil || !bytes.Equal(got, registryData) {
+		t.Fatalf("explicit registry changed or moved: data=%q err=%v", got, err)
+	}
+	canonical, err := teamstore.Open(fixture.CanonicalPath)
+	if err != nil {
+		t.Fatalf("open migrated canonical store: %v", err)
+	}
+	state, err := canonical.Load(context.Background())
+	if err != nil {
+		_ = canonical.Close()
+		t.Fatalf("load migrated canonical store: %v", err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close migrated canonical store: %v", err)
+	}
+	outbox := state.OutboxMessages["legacy-queued"]
+	if outbox.Status != teamstore.OutboxStatusSent || outbox.TeamsMessageID != "teams-explicit-legacy-send" {
+		t.Fatalf("legacy-only explicit-registry replay fence was not applied: %#v", outbox)
+	}
+}
+
+func TestTeamsRuntimeSafetyOutboundReplayFenceRejectsCorruptExplicitRegistryBeforeWritesCI(t *testing.T) {
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	explicitRegistry := filepath.Join(fixture.Root, "explicit", "registry.json")
+	if err := os.MkdirAll(filepath.Dir(explicitRegistry), 0o700); err != nil {
+		t.Fatalf("create explicit registry directory: %v", err)
+	}
+	if err := os.WriteFile(explicitRegistry, []byte("{"), 0o600); err != nil {
+		t.Fatalf("write corrupt explicit registry: %v", err)
+	}
+	before := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	err := CompleteOfflineRuntimeStorePlan(context.Background(), RuntimeStorePlan{
+		Action:        RuntimeStoreActionQuarantineLegacy,
+		Scope:         fixture.Scope,
+		CanonicalPath: fixture.CanonicalPath,
+		LegacyPath:    fixture.LegacyPath,
+		RegistryPath:  explicitRegistry,
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate explicit Teams registry") {
+		t.Fatalf("corrupt explicit-registry takeover error = %v, want preflight validation failure", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, fixture.Root)
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("corrupt explicit registry caused migration writes: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+	if _, err := os.Stat(fixture.LegacyPath); err != nil {
+		t.Fatalf("corrupt explicit registry moved legacy store: %v", err)
 	}
 }
 

@@ -230,6 +230,24 @@ func preflightPersistedTeamsServiceForUpdate() error {
 	if err != nil {
 		return fmt.Errorf("resolve persisted Teams service configuration path: %w", err)
 	}
+	if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
+		fallbackPath, fallbackErr := wslBackend.startupFallbackMarkerPath()
+		if fallbackErr != nil {
+			return fmt.Errorf("resolve persisted Teams WSL Startup fallback configuration path: %w", fallbackErr)
+		}
+		if _, fallbackErr := os.Stat(fallbackPath); fallbackErr == nil {
+			// The WSL backend routes lifecycle actions through the Startup
+			// fallback whenever its marker exists, even if a stale main Task
+			// marker is also present. Preflight the effective contract.
+			path = fallbackPath
+		} else if !errors.Is(fallbackErr, os.ErrNotExist) {
+			return fmt.Errorf(
+				"inspect persisted Teams WSL Startup fallback configuration %s: %w",
+				fallbackPath,
+				fallbackErr,
+			)
+		}
+	}
 	if _, err := os.Stat(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil

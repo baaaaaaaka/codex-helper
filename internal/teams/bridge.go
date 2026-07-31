@@ -640,7 +640,7 @@ func newBridgeWithGraphClients(ctx context.Context, graph *GraphClient, readGrap
 		return nil, err
 	}
 	scope := ScopeIdentityForUser(user)
-	plan, err := InspectRuntimeStoreForScope(ctx, scope)
+	plan, err := InspectRuntimeStoreForScopeWithRegistry(ctx, scope, registryPath)
 	if err != nil {
 		return nil, err
 	}
