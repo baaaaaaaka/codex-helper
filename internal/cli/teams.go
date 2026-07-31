@@ -1282,10 +1282,84 @@ func teamsASREnvTruthy(value string) bool {
 }
 
 var (
-	teamsRunServiceRetryDelay    = 30 * time.Second
-	teamsRunServiceMaxRetryDelay = 5 * time.Minute
-	teamsRunServiceSleep         = sleepContext
+	teamsRunServiceRetryDelay        = 30 * time.Second
+	teamsRunServiceMaxRetryDelay     = 5 * time.Minute
+	teamsRunServiceSleep             = sleepContext
+	teamsServiceMigrationBlockedPath = defaultTeamsServiceMigrationBlockedPath
 )
+
+type teamsServiceMigrationBlockedState struct {
+	PID          int       `json:"pid"`
+	ProcessStart string    `json:"process_start,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+func defaultTeamsServiceMigrationBlockedPath() (string, error) {
+	return appdirs.StatePath("teams", "service", "migration-blocked.json")
+}
+
+func writeTeamsServiceMigrationBlockedState(reason string) error {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	start, _ := teamsLocalSupervisorProcessStartTime(os.Getpid())
+	data, err := json.Marshal(teamsServiceMigrationBlockedState{
+		PID:          os.Getpid(),
+		ProcessStart: strings.TrimSpace(start),
+		Reason:       strings.TrimSpace(reason),
+		UpdatedAt:    time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", path, os.Getpid())
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func clearTeamsServiceMigrationBlockedState() error {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func liveTeamsServiceMigrationBlockedState() (teamsServiceMigrationBlockedState, bool) {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	var state teamsServiceMigrationBlockedState
+	if json.Unmarshal(data, &state) != nil || state.PID <= 0 || !teamsLocalSupervisorProcessAlive(state.PID) {
+		return teamsServiceMigrationBlockedState{}, false
+	}
+	if state.ProcessStart != "" {
+		current, err := teamsLocalSupervisorProcessStartTime(state.PID)
+		if err != nil || strings.TrimSpace(current) != state.ProcessStart {
+			return teamsServiceMigrationBlockedState{}, false
+		}
+	}
+	return state, true
+}
 
 func prepareManagedTeamsRuntimeStore(
 	ctx context.Context,
@@ -1330,6 +1404,7 @@ func teamsRunShouldRetryInProcess(once bool, managedServiceChild bool) bool {
 
 func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
 	attempt := 0
+	_ = clearTeamsServiceMigrationBlockedState()
 	for {
 		attempt++
 		err := runOnce()
@@ -1345,6 +1420,10 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 					err,
 				)
 			}
+			if markerErr := writeTeamsServiceMigrationBlockedState(err.Error()); markerErr != nil {
+				return fmt.Errorf("record blocked Teams migration state: %w", markerErr)
+			}
+			defer clearTeamsServiceMigrationBlockedState()
 			<-ctx.Done()
 			return ctx.Err()
 		}

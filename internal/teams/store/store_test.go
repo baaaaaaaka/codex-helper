@@ -571,6 +571,9 @@ func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T)
 		t.Fatalf("fenced outbox = %#v", got)
 	}
 	store = settleSQLiteStoreForReadOnlyAssertion(t, ctx, store)
+	if err := os.Remove(store.Path() + ".lock"); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("remove replay lock before zero-write assertion: %v", err)
+	}
 	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
 	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 0 {
 		t.Fatalf("repeat ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
@@ -578,6 +581,74 @@ func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T)
 	after := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("zero-delta targeted replay fence wrote files:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if _, err := os.Lstat(store.Path() + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("zero-delta targeted replay fence created a lock file: %v", err)
+	}
+}
+
+func TestSQLiteClearOwnerIfSameDoesNotRewriteBusinessTables(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	owner := OwnerMetadata{
+		PID:           4321,
+		Hostname:      "migration-host",
+		ScopeID:       "scope-1",
+		StartedAt:     time.Date(2026, 7, 31, 3, 0, 0, 0, time.UTC),
+		LastHeartbeat: time.Date(2026, 7, 31, 3, 1, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		state.Sessions["unrelated"] = SessionContext{ID: "unrelated", TeamsChatID: "chat-1", Status: SessionStatusActive}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate owner fixture: %v", err)
+	}
+	pointer, ok, err := store.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		t.Fatalf("SQLite pointer: ok=%v err=%v", ok, err)
+	}
+	dbPath, err := store.storeSQLitePath(pointer)
+	if err != nil {
+		t.Fatalf("SQLite path: %v", err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open SQLite fixture: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET json = '{corrupt-business-row' WHERE id = 'unrelated'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt unrelated session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite fixture: %v", err)
+	}
+
+	cleared, err := store.ClearOwnerIfSame(ctx, owner)
+	if err != nil || !cleared {
+		t.Fatalf("ClearOwnerIfSame: cleared=%v err=%v", cleared, err)
+	}
+	if _, found, err := store.ReadOwner(ctx); err != nil || found {
+		t.Fatalf("ReadOwner after clear: found=%v err=%v", found, err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen SQLite fixture: %v", err)
+	}
+	var raw string
+	if err := db.QueryRow(`SELECT json FROM sessions WHERE id = 'unrelated'`).Scan(&raw); err != nil {
+		_ = db.Close()
+		t.Fatalf("read unrelated session: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite reader: %v", err)
+	}
+	if raw != "{corrupt-business-row" {
+		t.Fatalf("unrelated business row was rewritten: %q", raw)
 	}
 }
 

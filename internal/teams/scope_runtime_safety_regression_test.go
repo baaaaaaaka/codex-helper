@@ -272,6 +272,68 @@ func TestTeamsRuntimeSafetyRuntimeResolverFailsClosedButMaintenanceCanLocateLega
 	}
 }
 
+func TestTeamsRuntimeSafetyOfflineTakeoverValidatesCanonicalBeforeWritesCI(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		seedCanonical func(t *testing.T, path string, scope teamstore.ScopeIdentity)
+	}{
+		{
+			name: "corrupt",
+			seedCanonical: func(t *testing.T, path string, _ teamstore.ScopeIdentity) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatalf("mkdir canonical: %v", err)
+				}
+				if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+					t.Fatalf("write corrupt canonical: %v", err)
+				}
+			},
+		},
+		{
+			name: "wrong-scope",
+			seedCanonical: func(t *testing.T, path string, scope teamstore.ScopeIdentity) {
+				t.Helper()
+				wrong := scope
+				wrong.ID = "scope-other"
+				wrong.AccountID = "other-account"
+				wrong.UserPrincipal = "other@example.test"
+				openAndSeedRuntimeSafetyScopeStore(t, path, wrong, "wrong-control")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsScopeUserDirsForTest(t, tmp)
+			t.Setenv("USER", "alice")
+			t.Setenv(envTeamsProfile, "default")
+			scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+			canonicalPath, err := DefaultStorePathForScope(scope.ID)
+			if err != nil {
+				t.Fatalf("canonical path: %v", err)
+			}
+			legacyPath, err := legacyDefaultStorePathForScope(scope.ID)
+			if err != nil {
+				t.Fatalf("legacy path: %v", err)
+			}
+			tc.seedCanonical(t, canonicalPath, scope)
+			openAndSeedRuntimeSafetyScopeStore(t, legacyPath, scope, "legacy-control")
+
+			before := snapshotRuntimeSafetyFiles(t, tmp)
+			err = CompleteOfflineRuntimeStoreTakeover(context.Background(), scope, legacyPath)
+			if err == nil || !strings.Contains(err.Error(), "canonical Teams store") {
+				t.Fatalf("takeover error = %v, want canonical validation failure", err)
+			}
+			after := snapshotRuntimeSafetyFiles(t, tmp)
+			if !reflect.DeepEqual(before, after) {
+				t.Fatalf("failed canonical validation wrote files: %v", runtimeSafetySnapshotChanges(before, after))
+			}
+			if _, err := os.Stat(legacyPath); err != nil {
+				t.Fatalf("legacy source was not preserved: %v", err)
+			}
+		})
+	}
+}
+
 func TestTeamsRuntimeSafetyLegacyFallbackCannotCreateSelfReinforcingAuthorityCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)
@@ -2008,6 +2070,20 @@ func TestTeamsRuntimeSafetyHistoricalScopeMigrationSecondStartupUsesCanonicalOnl
 	if resolved.ID != current.ID || canonicalPath != wantCanonical {
 		t.Fatalf("first migration resolved %#v at %q, want current canonical %q", resolved, canonicalPath, wantCanonical)
 	}
+	canonical, err := teamstore.Open(wantCanonical)
+	if err != nil {
+		t.Fatalf("open migrated canonical store: %v", err)
+	}
+	if recorded, err := canonical.RecordScope(context.Background(), current); err != nil {
+		_ = canonical.Close()
+		t.Fatalf("listener RecordScope after historical migration: %v", err)
+	} else if recorded.ID != current.ID {
+		_ = canonical.Close()
+		t.Fatalf("listener RecordScope returned %#v, want current scope", recorded)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatalf("close migrated canonical store: %v", err)
+	}
 
 	before := snapshotRuntimeSafetyFiles(t, tmp)
 	resolved, secondPath, err := ResolveStorePathForScope(current)
@@ -2027,6 +2103,133 @@ func TestTeamsRuntimeSafetyHistoricalScopeMigrationSecondStartupUsesCanonicalOnl
 	after := snapshotRuntimeSafetyFiles(t, tmp)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("second canonical startup performed migration I/O: %v", runtimeSafetySnapshotChanges(before, after))
+	}
+}
+
+func TestTeamsRuntimeSafetyHistoricalScopeMigrationRecoversAfterCanonicalPublishCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+
+	current := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	historical := current
+	historical.ID = "scope-historical-crash"
+	historicalPath, err := legacyDefaultStorePathForScope(historical.ID)
+	if err != nil {
+		t.Fatalf("historical legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, historicalPath, historical, "legacy-control")
+	plan, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil || plan.Action != RuntimeStoreActionMigrateLegacy {
+		t.Fatalf("historical plan = %#v err=%v", plan, err)
+	}
+	runtimeStoreMigrationTestHook = func(stage string) error {
+		if stage == runtimeStoreMigrationStageCanonicalPublished {
+			return errors.New("injected post-publish crash")
+		}
+		return nil
+	}
+	t.Cleanup(func() { runtimeStoreMigrationTestHook = nil })
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), plan); err == nil {
+		t.Fatal("historical migration unexpectedly survived injected crash")
+	}
+	runtimeStoreMigrationTestHook = nil
+
+	exactLegacyPath, err := legacyDefaultStorePathForScope(current.ID)
+	if err != nil {
+		t.Fatalf("exact legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, exactLegacyPath, current, "exact-legacy-control")
+	beforeConflict := snapshotRuntimeSafetyFiles(t, tmp)
+	if _, err := InspectRuntimeStoreForScope(context.Background(), current); err == nil ||
+		!strings.Contains(err.Error(), "multiple legacy Teams stores") {
+		t.Fatalf("cleanup conflict error = %v, want both legacy sources reported", err)
+	}
+	afterConflict := snapshotRuntimeSafetyFiles(t, tmp)
+	if !reflect.DeepEqual(beforeConflict, afterConflict) {
+		t.Fatalf("cleanup conflict inspection wrote files: %v", runtimeSafetySnapshotChanges(beforeConflict, afterConflict))
+	}
+	if err := os.RemoveAll(filepath.Dir(exactLegacyPath)); err != nil {
+		t.Fatalf("remove exact legacy conflict fixture: %v", err)
+	}
+
+	retry, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil {
+		t.Fatalf("inspect historical cleanup retry: %v", err)
+	}
+	if retry.Action != RuntimeStoreActionQuarantineLegacy || retry.LegacyPath != historicalPath {
+		t.Fatalf("historical cleanup retry = %#v, want exact historical source", retry)
+	}
+	if err := CompleteOfflineRuntimeStorePlan(context.Background(), retry); err != nil {
+		t.Fatalf("complete historical cleanup retry: %v", err)
+	}
+	final, err := InspectRuntimeStoreForScope(context.Background(), current)
+	if err != nil || final.Action != RuntimeStoreActionReady {
+		t.Fatalf("final plan = %#v err=%v, want ready", final, err)
+	}
+	if _, err := os.Stat(historicalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("historical source remains after retry: %v", err)
+	}
+	if _, err := os.Stat(runtimeStoreMigrationCleanupPath(final.CanonicalPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("migration cleanup marker remains after retry: %v", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyMigrationStagingRecoversCopiedWALWithoutSHMCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+	t.Setenv("USER", "alice")
+	t.Setenv(envTeamsProfile, "default")
+	scope := ScopeIdentityForUser(User{ID: "teams-user-1", UserPrincipalName: "same@example.test"})
+	sourcePath, err := legacyDefaultStorePathForScope(scope.ID)
+	if err != nil {
+		t.Fatalf("legacy path: %v", err)
+	}
+	openAndSeedRuntimeSafetyScopeStore(t, sourcePath, scope, "legacy-control")
+	source, err := teamstore.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer source.Close()
+	if _, err := source.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate source to SQLite: %v", err)
+	}
+	if err := source.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions["wal-session"] = teamstore.SessionContext{
+			ID:          "wal-session",
+			TeamsChatID: "chat-only-in-wal",
+			Status:      teamstore.SessionStatusActive,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("write source WAL: %v", err)
+	}
+	sourceDB := filepath.Join(filepath.Dir(sourcePath), teamstore.SQLiteFileName)
+	if info, err := os.Stat(sourceDB + "-wal"); err != nil || info.Size() == 0 {
+		t.Fatalf("source WAL fixture is empty: info=%v err=%v", info, err)
+	}
+
+	targetPath := filepath.Join(tmp, "staging", "state.json")
+	if err := copyLegacyStoreToTarget(scope.ID, targetPath, sourcePath); err != nil {
+		t.Fatalf("copy migration target: %v", err)
+	}
+	targetDB := filepath.Join(filepath.Dir(targetPath), teamstore.SQLiteFileName)
+	if _, err := os.Stat(targetDB + "-wal"); err != nil {
+		t.Fatalf("copied WAL missing: %v", err)
+	}
+	if _, err := os.Stat(targetDB + "-shm"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging copy unexpectedly included SHM: %v", err)
+	}
+	if err := rebindRuntimeStoreMigrationScope(context.Background(), targetPath, scope); err != nil {
+		t.Fatalf("recover copied WAL during staging rebind: %v", err)
+	}
+	state, err := teamstore.LoadPathReadOnly(context.Background(), targetPath)
+	if err != nil {
+		t.Fatalf("load recovered staging store: %v", err)
+	}
+	if got := state.Sessions["wal-session"].TeamsChatID; got != "chat-only-in-wal" {
+		t.Fatalf("recovered WAL session chat = %q", got)
 	}
 }
 

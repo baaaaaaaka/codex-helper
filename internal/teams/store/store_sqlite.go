@@ -314,6 +314,24 @@ func (s *Store) currentSQLitePointerUnlocked() (storeSQLitePointer, bool, error)
 	return s.sqlitePointerFromDataUnlocked(data, info)
 }
 
+func (s *Store) currentSQLitePointerReadOnly() (storeSQLitePointer, bool, error) {
+	info, err := os.Lstat(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return storeSQLitePointer{}, false, nil
+	}
+	if err != nil {
+		return storeSQLitePointer{}, false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maxStatePointerSize {
+		return storeSQLitePointer{}, false, nil
+	}
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		return storeSQLitePointer{}, false, err
+	}
+	return storeSQLitePointerFromData(data)
+}
+
 func (s *Store) writeSQLitePointerUnlocked(pointer storeSQLitePointer) error {
 	if strings.TrimSpace(pointer.Path) == "" {
 		pointer.Path = storeSQLiteFileName
@@ -999,13 +1017,10 @@ func loadSQLiteWatchdogStateFileReadOnlyAttempt(ctx context.Context, path string
 	}
 
 	controlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
-	pollQuery := `SELECT json FROM chat_polls`
-	var pollArgs []any
-	if controlChatID != "" {
-		pollQuery += ` WHERE chat_id = ?`
-		pollArgs = append(pollArgs, controlChatID)
+	if controlChatID == "" {
+		return state, nil
 	}
-	pollRows, err := conn.QueryContext(ctx, pollQuery, pollArgs...)
+	pollRows, err := conn.QueryContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, controlChatID)
 	if err != nil {
 		return State{}, err
 	}
@@ -2366,6 +2381,58 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 	if errors.Is(err, errStoreNoChange) {
 		return handled, nil
 	}
+	return handled, err
+}
+
+// rebindSQLiteScopeForMigration updates only the bounded runtime projection and
+// the small state_meta document. It deliberately leaves all business-data
+// tables untouched.
+func (s *Store) rebindSQLiteScopeForMigration(ctx context.Context, fn func(*State) error) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		runtimeState, seen, err := loadSQLiteRuntimeState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			return errors.New("sqlite teams store is missing required runtime state")
+		}
+		coldState, err := loadSQLiteColdStateWithoutChatSequences(ctx, tx)
+		if err != nil {
+			return err
+		}
+		runtimeState.ControlChat = coldState.ControlChat
+		if err := fn(&runtimeState); err != nil {
+			return err
+		}
+		coldState.ControlChat = runtimeState.ControlChat
+		if err := saveSQLiteRuntimeStateTx(ctx, tx, runtimeState); err != nil {
+			return err
+		}
+		cold, err := json.Marshal(coldSQLiteState(coldState))
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 	return handled, err
 }
 
@@ -5180,13 +5247,32 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 
 func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []OutboxReplayFence) (int, bool, error) {
 	changed := 0
-	handled := false
-	err := s.withStateLock(ctx, func() error {
+	pointer, handled, err := s.currentSQLitePointerReadOnly()
+	if err != nil || !handled {
+		return 0, handled, err
+	}
+	dbPath, err := s.storeSQLitePath(pointer)
+	if err != nil {
+		return 0, true, err
+	}
+	current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx, dbPath, fences)
+	if err != nil {
+		return 0, true, err
+	}
+	pending := 0
+	for _, msg := range current {
+		if msg.Status != OutboxStatusSent {
+			pending++
+		}
+	}
+	if pending == 0 {
+		return 0, true, nil
+	}
+	err = s.withStateLock(ctx, func() error {
 		pointer, ok, err := s.currentSQLitePointerUnlocked()
 		if err != nil || !ok {
 			return err
 		}
-		handled = true
 		dbPath, err := s.storeSQLitePath(pointer)
 		if err != nil {
 			return err

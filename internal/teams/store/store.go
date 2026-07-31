@@ -3012,6 +3012,88 @@ func (s *Store) RecordScope(ctx context.Context, scope ScopeIdentity) (ScopeIden
 	return out, err
 }
 
+// RebindScopeForMigration changes only persisted scope identity fields after an
+// old scope-ID store has been copied into an unpublished migration target.
+// Callers must hold the migration writer fence. Cross-account/profile changes
+// are rejected.
+func (s *Store) RebindScopeForMigration(ctx context.Context, scope ScopeIdentity) error {
+	scope = normalizeScope(scope)
+	if scope.ID == "" {
+		return fmt.Errorf("scope id is required")
+	}
+	update := func(state *State) error {
+		current := normalizeScope(state.Scope)
+		compatible := func(accountID string, principal string, profile string) bool {
+			profile = strings.TrimSpace(profile)
+			if profile != "" && profile != scope.Profile {
+				return false
+			}
+			sameAccount := strings.TrimSpace(accountID) != "" && scope.AccountID != "" &&
+				strings.TrimSpace(accountID) == scope.AccountID
+			samePrincipal := strings.TrimSpace(principal) != "" && scope.UserPrincipal != "" &&
+				strings.EqualFold(strings.TrimSpace(principal), scope.UserPrincipal)
+			return sameAccount || samePrincipal
+		}
+		if current.ID != "" && current.ID != scope.ID {
+			if !compatible(current.AccountID, current.UserPrincipal, current.Profile) {
+				return fmt.Errorf("Teams state belongs to scope %q, not migration target %q", current.ID, scope.ID)
+			}
+		}
+		oldScopeIDs := map[string]bool{scope.ID: true}
+		if current.ID != "" {
+			oldScopeIDs[current.ID] = true
+		}
+		if scope.CreatedAt.IsZero() {
+			scope.CreatedAt = current.CreatedAt
+		}
+		if scope.CreatedAt.IsZero() {
+			scope.CreatedAt = time.Now()
+		}
+		scope.UpdatedAt = time.Now()
+		state.Scope = scope
+		if state.ControlChat.ScopeID != "" && !oldScopeIDs[state.ControlChat.ScopeID] {
+			if !compatible(state.ControlChat.AccountID, "", state.ControlChat.Profile) {
+				return fmt.Errorf("Teams control binding belongs to scope %q, not migration target %q", state.ControlChat.ScopeID, scope.ID)
+			}
+			oldScopeIDs[state.ControlChat.ScopeID] = true
+		}
+		if state.ControlChat.ScopeID == "" || oldScopeIDs[state.ControlChat.ScopeID] {
+			state.ControlChat.ScopeID = scope.ID
+		}
+		if state.MachineIdentity.ScopeID != "" && !oldScopeIDs[state.MachineIdentity.ScopeID] {
+			if !compatible(state.MachineIdentity.AccountID, state.MachineIdentity.UserPrincipal, state.MachineIdentity.Profile) {
+				return fmt.Errorf("Teams machine identity belongs to scope %q, not migration target %q", state.MachineIdentity.ScopeID, scope.ID)
+			}
+			oldScopeIDs[state.MachineIdentity.ScopeID] = true
+		}
+		if state.MachineIdentity.ScopeID == "" || oldScopeIDs[state.MachineIdentity.ScopeID] {
+			state.MachineIdentity.ScopeID = scope.ID
+		}
+		for id, machine := range state.Machines {
+			if machine.ScopeID != "" && !oldScopeIDs[machine.ScopeID] {
+				if !compatible(machine.AccountID, machine.UserPrincipal, machine.Profile) {
+					return fmt.Errorf("Teams machine %q belongs to scope %q, not migration target %q", id, machine.ScopeID, scope.ID)
+				}
+				oldScopeIDs[machine.ScopeID] = true
+			}
+			if machine.ScopeID == "" || oldScopeIDs[machine.ScopeID] {
+				machine.ScopeID = scope.ID
+				state.Machines[id] = machine
+			}
+		}
+		if state.ControlLease.ScopeID == "" || oldScopeIDs[state.ControlLease.ScopeID] {
+			state.ControlLease.ScopeID = scope.ID
+		} else if state.ControlLease.ScopeID != scope.ID {
+			return fmt.Errorf("Teams control lease belongs to scope %q, not migration target %q", state.ControlLease.ScopeID, scope.ID)
+		}
+		return nil
+	}
+	if handled, err := s.rebindSQLiteScopeForMigration(ctx, update); handled || err != nil {
+		return err
+	}
+	return s.Update(ctx, update)
+}
+
 func (s *Store) ClaimControlLease(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, error) {
 	claim.Scope = normalizeScope(claim.Scope)
 	claim.Machine = normalizeMachine(claim.Machine)
@@ -3831,16 +3913,20 @@ func (s *Store) ClearOwner(ctx context.Context) error {
 
 func (s *Store) ClearOwnerIfSame(ctx context.Context, owner OwnerMetadata) (bool, error) {
 	cleared := false
-	err := s.Update(ctx, func(state *State) error {
+	update := func(state *State) error {
 		existing, ok := state.readOwner()
 		if !ok || !sameOwnerInstance(existing, owner) {
-			return nil
+			return errStoreNoChange
 		}
 		state.ServiceOwner = nil
 		state.LockOwner = nil
 		cleared = true
 		return nil
-	})
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return cleared, err
+	}
+	err := s.Update(ctx, update)
 	return cleared, err
 }
 

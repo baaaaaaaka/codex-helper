@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -232,17 +234,11 @@ func preflightPersistedTeamsServiceForUpdate() error {
 		}
 		return fmt.Errorf("inspect persisted Teams service configuration %s: %w", path, err)
 	}
-	if backend.ID() != teamsServiceLocalSupervisorID {
-		// Native system service formats are validated when installed/repaired.
-		// The local-supervisor JSON is the format that can outlive a temporary
-		// invocation directory and is therefore checked at this boundary.
-		return nil
-	}
-	cfg, err := readTeamsServiceLocalSupervisorConfig(path)
+	contract, err := readPersistedTeamsServiceLaunchContract(backend.ID(), path)
 	if err != nil {
 		return fmt.Errorf("read persisted Teams service configuration %s: %w", path, err)
 	}
-	workingDir := strings.TrimSpace(cfg.Spec.WorkingDir)
+	workingDir := strings.TrimSpace(contract.WorkingDir)
 	if workingDir == "" {
 		return fmt.Errorf("persisted Teams service WorkingDir is empty")
 	}
@@ -251,21 +247,201 @@ func preflightPersistedTeamsServiceForUpdate() error {
 	} else if !info.IsDir() {
 		return fmt.Errorf("persisted Teams service WorkingDir %s is not a directory", workingDir)
 	}
-	executable := strings.TrimSpace(cfg.Spec.Executable)
-	if executable == "" {
-		return fmt.Errorf("persisted Teams service executable is empty")
+	executable := strings.TrimSpace(contract.Executable)
+	switch backend.ID() {
+	case teamsServiceLocalSupervisorID, "systemd-user", "launchagent":
+		if executable == "" {
+			return fmt.Errorf("persisted Teams service executable is empty")
+		}
 	}
-	if info, err := os.Stat(executable); err != nil {
-		return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
-	} else if info.IsDir() {
-		return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
-	} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
+	if executable != "" {
+		if info, err := os.Stat(executable); err != nil {
+			return fmt.Errorf("persisted Teams service executable %s is unavailable: %w", executable, err)
+		} else if info.IsDir() {
+			return fmt.Errorf("persisted Teams service executable %s is a directory", executable)
+		} else if teamsServiceGOOS() != "windows" && info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
+		}
 	}
-	if registryPath := strings.TrimSpace(cfg.Spec.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
+	if registryPath := strings.TrimSpace(contract.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
 		return fmt.Errorf("persisted Teams service registry path must be absolute: %s", registryPath)
 	}
 	return nil
+}
+
+type persistedTeamsServiceLaunchContract struct {
+	Executable   string
+	WorkingDir   string
+	RegistryPath string
+}
+
+func readPersistedTeamsServiceLaunchContract(backendID string, path string) (persistedTeamsServiceLaunchContract, error) {
+	if backendID == teamsServiceLocalSupervisorID {
+		cfg, err := readTeamsServiceLocalSupervisorConfig(path)
+		if err != nil {
+			return persistedTeamsServiceLaunchContract{}, err
+		}
+		return persistedTeamsServiceLaunchContract{
+			Executable:   cfg.Spec.Executable,
+			WorkingDir:   cfg.Spec.WorkingDir,
+			RegistryPath: cfg.Spec.RegistryPath,
+		}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return persistedTeamsServiceLaunchContract{}, err
+	}
+	text := string(data)
+	switch backendID {
+	case "systemd-user":
+		var contract persistedTeamsServiceLaunchContract
+		for _, line := range strings.Split(text, "\n") {
+			switch {
+			case strings.HasPrefix(strings.TrimSpace(line), "WorkingDirectory="):
+				contract.WorkingDir = unquotePersistedTeamsServiceValue(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "WorkingDirectory=")))
+			case strings.HasPrefix(strings.TrimSpace(line), "ExecStart="):
+				fields, err := splitPersistedTeamsServiceSystemdArgs(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "ExecStart=")))
+				if err != nil {
+					return persistedTeamsServiceLaunchContract{}, err
+				}
+				if len(fields) > 0 {
+					contract.Executable = fields[0]
+				}
+				contract.RegistryPath = registryArgumentValue(fields)
+			}
+		}
+		return contract, nil
+	case "launchagent":
+		values := parsePersistedTeamsServicePlistStrings(text)
+		arguments := values["ProgramArguments"]
+		return persistedTeamsServiceLaunchContract{
+			Executable:   firstString(arguments),
+			WorkingDir:   firstString(values["WorkingDirectory"]),
+			RegistryPath: registryArgumentValue(arguments),
+		}, nil
+	case "windows-task-scheduler":
+		return persistedTeamsServiceLaunchContract{
+			WorkingDir: persistedTeamsServiceXMLValue(text, "WorkingDirectory"),
+		}, nil
+	case "wsl-windows-task-scheduler":
+		arguments := ""
+		for _, line := range strings.Split(text, "\n") {
+			if value, ok := strings.CutPrefix(strings.TrimSpace(line), "Arguments="); ok {
+				arguments = value
+				break
+			}
+		}
+		args, err := splitWindowsCommandLine(arguments)
+		if err != nil {
+			return persistedTeamsServiceLaunchContract{}, err
+		}
+		contract := persistedTeamsServiceLaunchContract{RegistryPath: registryArgumentValue(args)}
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "--cd" {
+				contract.WorkingDir = args[i+1]
+				break
+			}
+		}
+		return contract, nil
+	default:
+		return persistedTeamsServiceLaunchContract{}, fmt.Errorf("unsupported Teams service backend %q", backendID)
+	}
+}
+
+func splitPersistedTeamsServiceSystemdArgs(line string) ([]string, error) {
+	var out []string
+	for line = strings.TrimSpace(line); line != ""; line = strings.TrimSpace(line) {
+		if line[0] == '"' {
+			quoted, err := strconv.QuotedPrefix(line)
+			if err != nil {
+				return nil, fmt.Errorf("parse systemd ExecStart: %w", err)
+			}
+			value, err := strconv.Unquote(quoted)
+			if err != nil {
+				return nil, fmt.Errorf("parse systemd ExecStart: %w", err)
+			}
+			out = append(out, value)
+			line = line[len(quoted):]
+			continue
+		}
+		end := strings.IndexAny(line, " \t")
+		if end < 0 {
+			out = append(out, line)
+			break
+		}
+		out = append(out, line[:end])
+		line = line[end:]
+	}
+	return out, nil
+}
+
+func unquotePersistedTeamsServiceValue(value string) string {
+	if unquoted, err := strconv.Unquote(value); err == nil {
+		return unquoted
+	}
+	return value
+}
+
+func parsePersistedTeamsServicePlistStrings(text string) map[string][]string {
+	out := make(map[string][]string)
+	var key string
+	inArray := false
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "<key>") && strings.HasSuffix(line, "</key>") {
+			key = html.UnescapeString(strings.TrimSuffix(strings.TrimPrefix(line, "<key>"), "</key>"))
+			inArray = false
+			continue
+		}
+		if line == "<array>" {
+			inArray = true
+			continue
+		}
+		if line == "</array>" {
+			inArray = false
+			key = ""
+			continue
+		}
+		if key != "" && strings.HasPrefix(line, "<string>") && strings.HasSuffix(line, "</string>") {
+			value := html.UnescapeString(strings.TrimSuffix(strings.TrimPrefix(line, "<string>"), "</string>"))
+			out[key] = append(out[key], value)
+			if !inArray {
+				key = ""
+			}
+		}
+	}
+	return out
+}
+
+func persistedTeamsServiceXMLValue(text string, tag string) string {
+	open := "<" + tag + ">"
+	close := "</" + tag + ">"
+	start := strings.Index(text, open)
+	if start < 0 {
+		return ""
+	}
+	start += len(open)
+	end := strings.Index(text[start:], close)
+	if end < 0 {
+		return ""
+	}
+	return html.UnescapeString(strings.TrimSpace(text[start : start+end]))
+}
+
+func registryArgumentValue(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--registry" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func teamsAutoUpdateActivationAfterApply(preUpdatePending bool, preUpdateReason string, res update.ApplyResult) (bool, string, error) {

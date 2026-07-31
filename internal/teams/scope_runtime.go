@@ -48,6 +48,7 @@ const (
 	runtimeStoreMigrationStageReplayFencesMerged  = "replay-fences-merged"
 	runtimeStoreMigrationStageCanonicalPublished  = "canonical-published"
 	runtimeStoreMigrationStageRegistryQuarantined = "registry-quarantined"
+	runtimeStoreMigrationCleanupFileName          = ".migration-cleanup.json"
 )
 
 // runtimeStoreMigrationTestHook is nil in production. Tests use it to inject
@@ -59,6 +60,10 @@ type RuntimeStorePlan struct {
 	Scope         teamstore.ScopeIdentity
 	CanonicalPath string
 	LegacyPath    string
+}
+
+type runtimeStoreMigrationCleanup struct {
+	SourcePath string `json:"source_path"`
 }
 
 type RuntimeStoreActionRequiredError struct {
@@ -311,11 +316,27 @@ func InspectRuntimeStoreForScope(ctx context.Context, scope teamstore.ScopeIdent
 		return plan, err
 	}
 	if canonicalExists {
-		if legacyExists {
-			plan.Action = RuntimeStoreActionQuarantineLegacy
-		} else {
-			plan.Action = RuntimeStoreActionReady
+		cleanupSource, cleanupPending, err := readRuntimeStoreMigrationCleanup(canonicalPath)
+		if err != nil {
+			return plan, err
 		}
+		if legacyExists {
+			if cleanupPending && !samePath(cleanupSource, legacyPath) {
+				return plan, fmt.Errorf(
+					"multiple legacy Teams stores require cleanup: %s and %s",
+					cleanupSource,
+					legacyPath,
+				)
+			}
+			plan.Action = RuntimeStoreActionQuarantineLegacy
+			return plan, nil
+		}
+		if cleanupPending {
+			plan.Action = RuntimeStoreActionQuarantineLegacy
+			plan.LegacyPath = cleanupSource
+			return plan, nil
+		}
+		plan.Action = RuntimeStoreActionReady
 		return plan, nil
 	}
 	if legacyExists {
@@ -434,6 +455,9 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 	if err := copyLegacyStoreToTarget(scope.ID, stagingPath, sourcePath); err != nil {
 		return "", fmt.Errorf("copy legacy Teams store to canonical path: %w", err)
 	}
+	if err := rebindRuntimeStoreMigrationScope(ctx, stagingPath, scope); err != nil {
+		return "", fmt.Errorf("rebind migrated Teams scope identity: %w", err)
+	}
 	if err := clearConfirmedStoppedOwnerFromMigrationTarget(ctx, sourcePath, stagingPath); err != nil {
 		return "", fmt.Errorf("clear stopped Teams owner from migration staging: %w", err)
 	}
@@ -448,6 +472,11 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 	}
 	if err := validateRuntimeStoreMigrationStaging(ctx, scope, stagingPath, sourcePath); err != nil {
 		return "", fmt.Errorf("validate Teams migration staging directory: %w", err)
+	}
+	if scopedStoreMigrationSource(sourcePath) {
+		if err := writeRuntimeStoreMigrationCleanup(stagingPath, sourcePath); err != nil {
+			return "", fmt.Errorf("record Teams migration cleanup source: %w", err)
+		}
 	}
 	if err := runRuntimeStoreMigrationTestHook(runtimeStoreMigrationStageStagingValidated); err != nil {
 		return "", err
@@ -478,7 +507,99 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 			return "", fmt.Errorf("legacy Teams scope is not a scoped store: %s", sourcePath)
 		}
 	}
+	if err := removeRuntimeStoreMigrationCleanup(canonicalPath); err != nil {
+		return "", err
+	}
 	return canonicalPath, nil
+}
+
+func rebindRuntimeStoreMigrationScope(ctx context.Context, path string, scope teamstore.ScopeIdentity) error {
+	store, err := teamstore.Open(path)
+	if err != nil {
+		return err
+	}
+	rebindErr := store.RebindScopeForMigration(ctx, scope)
+	closeErr := store.Close()
+	if rebindErr != nil {
+		return rebindErr
+	}
+	return closeErr
+}
+
+func runtimeStoreMigrationCleanupPath(storePath string) string {
+	return filepath.Join(filepath.Dir(storePath), runtimeStoreMigrationCleanupFileName)
+}
+
+func writeRuntimeStoreMigrationCleanup(storePath string, sourcePath string) error {
+	data, err := json.Marshal(runtimeStoreMigrationCleanup{SourcePath: filepath.Clean(sourcePath)})
+	if err != nil {
+		return err
+	}
+	path := runtimeStoreMigrationCleanupPath(storePath)
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return syncRuntimeStoreRenameParents(path, path)
+}
+
+func readRuntimeStoreMigrationCleanup(storePath string) (string, bool, error) {
+	path := runtimeStoreMigrationCleanupPath(storePath)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > 4096 {
+		return "", false, fmt.Errorf("invalid Teams migration cleanup marker %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	var marker runtimeStoreMigrationCleanup
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return "", false, fmt.Errorf("parse Teams migration cleanup marker %s: %w", path, err)
+	}
+	sourcePath := filepath.Clean(strings.TrimSpace(marker.SourcePath))
+	if sourcePath == "." || !scopedStoreMigrationSource(sourcePath) || !runtimeStoreMigrationSourceAllowed(sourcePath) {
+		return "", false, fmt.Errorf("invalid Teams migration cleanup source %q", marker.SourcePath)
+	}
+	return sourcePath, true, nil
+}
+
+func runtimeStoreMigrationSourceAllowed(sourcePath string) bool {
+	sourceRoot := filepath.Clean(filepath.Dir(filepath.Dir(sourcePath)))
+	for _, root := range runtimeStoreMigrationScopeRoots() {
+		if samePath(sourceRoot, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeRuntimeStoreMigrationCleanup(storePath string) error {
+	path := runtimeStoreMigrationCleanupPath(storePath)
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("remove Teams migration cleanup marker: %w", err)
+	}
+	return syncRuntimeStoreRenameParents(path, path)
 }
 
 func runRuntimeStoreMigrationTestHook(stage string) error {
@@ -1037,12 +1158,16 @@ func CompleteOfflineRuntimeStoreTakeover(
 	if !canonicalExists {
 		return fmt.Errorf("offline Teams store takeover requires canonical store %s", canonicalPath)
 	}
+	if err := validateCanonicalRuntimeStoreForScope(ctx, scope, canonicalPath); err != nil {
+		return err
+	}
 	legacyPath = filepath.Clean(strings.TrimSpace(legacyPath))
 	expectedLegacyPath, err := legacyDefaultStorePathForScope(scope.ID)
 	if err != nil {
 		return err
 	}
-	if !samePath(legacyPath, expectedLegacyPath) {
+	if !samePath(legacyPath, expectedLegacyPath) &&
+		(!scopedStoreMigrationSource(legacyPath) || !runtimeStoreMigrationSourceAllowed(legacyPath)) {
 		return fmt.Errorf("offline Teams store takeover expected legacy path %s, got %s", expectedLegacyPath, legacyPath)
 	}
 	if err := preflightLegacyQuarantineTargets(scope.ID, legacyPath); err != nil {
@@ -1113,6 +1238,20 @@ func CompleteOfflineRuntimeStoreTakeover(
 		} else if !handled {
 			return fmt.Errorf("legacy Teams scope is not a scoped store: %s", legacyPath)
 		}
+	}
+	if err := removeRuntimeStoreMigrationCleanup(canonicalPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCanonicalRuntimeStoreForScope(ctx context.Context, scope teamstore.ScopeIdentity, path string) error {
+	state, err := teamstore.LoadPathReadOnly(ctx, path)
+	if err != nil {
+		return fmt.Errorf("validate canonical Teams store %s: %w", path, err)
+	}
+	if strings.TrimSpace(state.Scope.ID) != strings.TrimSpace(scope.ID) || !scopeStateMatches(scope, state) {
+		return fmt.Errorf("canonical Teams store %s identity does not match scope %q", path, scope.ID)
 	}
 	return nil
 }

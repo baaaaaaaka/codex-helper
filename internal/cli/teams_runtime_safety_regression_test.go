@@ -213,6 +213,58 @@ func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceWorkingDirCI(t *t
 	}
 }
 
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsNativeServiceWorkingDirCI(t *testing.T) {
+	lockCLITestHooks(t)
+	for _, tc := range []struct {
+		name  string
+		goos  string
+		write func(teamsServiceSpec) string
+	}{
+		{name: "systemd", goos: "linux", write: buildTeamsServiceUnit},
+		{name: "launchagent", goos: "darwin", write: buildTeamsServiceLaunchAgentPlist},
+		{name: "windows-task", goos: "windows", write: buildTeamsServiceWindowsTaskXML},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			isolateTeamsUserDirsForTest(t, tmp)
+			exe := filepath.Join(tmp, "bin", "codex-proxy")
+			writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+			available := true
+			withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+				goos:                 tc.goos,
+				exe:                  exe,
+				argv0:                exe,
+				cwd:                  tmp,
+				unitDir:              filepath.Join(tmp, "systemd"),
+				launchAgentDir:       filepath.Join(tmp, "launchagents"),
+				windowsTaskDir:       filepath.Join(tmp, "windows-task"),
+				runner:               &recordingTeamsServiceRunner{},
+				systemdUserAvailable: &available,
+			})
+			backend, err := teamsServiceBackendForCurrentPlatform()
+			if err != nil {
+				t.Fatalf("select backend: %v", err)
+			}
+			path, err := backend.Path()
+			if err != nil {
+				t.Fatalf("backend path: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatalf("mkdir backend config: %v", err)
+			}
+			missing := filepath.Join(tmp, "deleted-working-directory")
+			spec := teamsServiceSpec{Executable: exe, WorkingDir: missing}
+			if err := os.WriteFile(path, []byte(tc.write(spec)), 0o600); err != nil {
+				t.Fatalf("write backend config: %v", err)
+			}
+			if err := preflightPersistedTeamsServiceForUpdate(); err == nil ||
+				!strings.Contains(strings.ToLower(err.Error()), "working") {
+				t.Fatalf("native preflight error = %v, want WorkingDir failure", err)
+			}
+		})
+	}
+}
+
 func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -939,13 +991,33 @@ func TestTeamsRuntimeSafetyBlockedMigrationWaitsWithoutRetryingCI(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("blocked migration was not attempted")
 	}
-	time.Sleep(10 * time.Millisecond)
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, ok := liveTeamsServiceMigrationBlockedState(); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("blocked migration did not publish watchdog coordination state")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("blocked migration attempts = %d, want exactly one", got)
+	}
+	decision := evaluateTeamsServiceWatchdog(
+		teamsServiceWatchdogSnapshot{Installed: true, Active: true, MigrationBlocked: true},
+		teamsServiceWatchdogState{ConsecutiveStale: 2},
+		teamsServiceWatchdogOptions{Now: time.Now()},
+	)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "blocked store migration") {
+		t.Fatalf("blocked migration watchdog decision = %+v, want noop", decision)
 	}
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("blocked migration wait error = %v, want context cancellation", err)
+	}
+	if _, ok := liveTeamsServiceMigrationBlockedState(); ok {
+		t.Fatal("blocked migration marker remained after child exit")
 	}
 	if !strings.Contains(out.String(), "waiting for service restart") {
 		t.Fatalf("blocked migration output = %q, want restart guidance", out.String())

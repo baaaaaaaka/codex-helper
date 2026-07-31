@@ -49,6 +49,7 @@ type teamsServiceWatchdogSnapshot struct {
 	AuthoritativeStorePath             string
 	AmbiguousCanonicalStores           bool
 	MultipleFreshOwnerStores           bool
+	MigrationBlocked                   bool
 	ServicePaused                      bool
 	ServiceDraining                    bool
 	HelperUpgradeDrainExpired          bool
@@ -250,6 +251,10 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		}
 		snapshot.Active = active
 	}
+	if _, blocked := liveTeamsServiceMigrationBlockedState(); blocked {
+		snapshot.MigrationBlocked = true
+		return snapshot, nil
+	}
 	paths, err := teamsServiceWatchdogStorePaths()
 	if err != nil {
 		return snapshot, err
@@ -307,7 +312,6 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 			if ok {
 				for _, candidate := range candidates {
 					if !candidate.hasOwner ||
-						!candidate.snapshot.OwnerFresh ||
 						!teamsServiceWatchdogBindingMatchesCandidate(binding, candidate.path, candidate.owner, candidate.scope) {
 						continue
 					}
@@ -485,6 +489,9 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
+	}
+	if snapshot.MigrationBlocked {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service child is waiting on a blocked store migration"}
 	}
 	if snapshot.AmbiguousCanonicalStores {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores are ambiguous; refusing automatic lifecycle changes"}

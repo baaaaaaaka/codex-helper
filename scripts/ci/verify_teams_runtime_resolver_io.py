@@ -108,8 +108,10 @@ def main() -> None:
             root,
             f"canonical resolution process {index}",
             allow_legacy_metadata=True,
-            metadata_minimum=2,
-            metadata_limit=2,
+            # canonical, exact legacy, and the fixed crash-cleanup marker.
+            # The third Lstat replaces unbounded historical-scope discovery.
+            metadata_minimum=3,
+            metadata_limit=3,
         )
         for index, phase in enumerate(
             trace_phases(lines, "CXP_TEAMS_RESOLVER_IO_BEGIN", "CXP_TEAMS_RESOLVER_IO_END"),
@@ -122,7 +124,7 @@ def main() -> None:
             root,
             f"listener preparation process {index}",
             allow_legacy_metadata=True,
-            metadata_minimum=2,
+            metadata_minimum=3,
             metadata_limit=3,
         )
         for index, phase in enumerate(
@@ -140,8 +142,10 @@ def main() -> None:
             root,
             f"Bridge pre-store inspection process {index}",
             allow_legacy_metadata=True,
+            # A dual-store Bridge stops after canonical + exact legacy; a
+            # canonical-only Bridge also checks the fixed cleanup marker.
             metadata_minimum=2,
-            metadata_limit=2,
+            metadata_limit=3,
         )
         for index, phase in enumerate(
             trace_phases(

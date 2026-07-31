@@ -938,6 +938,36 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 		t.Fatalf("exact active-store binding was not selected: %+v", snapshot)
 	}
 
+	ownerStore, err = teamsstore.Open(ownerPath)
+	if err != nil {
+		t.Fatalf("reopen owner store: %v", err)
+	}
+	if err := ownerStore.Update(context.Background(), func(state *teamsstore.State) error {
+		if state.ServiceOwner == nil || state.LockOwner == nil {
+			return errors.New("seeded owner is missing")
+		}
+		state.ServiceOwner.LastHeartbeat = now.Add(-30 * time.Minute)
+		state.LockOwner.LastHeartbeat = now.Add(-30 * time.Minute)
+		return nil
+	}); err != nil {
+		_ = ownerStore.Close()
+		t.Fatalf("make bound owner stale: %v", err)
+	}
+	if err := ownerStore.Close(); err != nil {
+		t.Fatalf("close stale owner store: %v", err)
+	}
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect stale bound watchdog snapshot: %v", err)
+	}
+	if snapshot.AmbiguousCanonicalStores || snapshot.AuthoritativeStorePath != ownerPath || snapshot.OwnerFresh {
+		t.Fatalf("exact binding did not select stale authoritative store: %+v", snapshot)
+	}
+	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionRestart || !strings.Contains(decision.Reason, "heartbeat is stale") {
+		t.Fatalf("stale bound decision = %+v, want restart", decision)
+	}
+
 	exactBinding.LeaseGeneration++
 	if err := teams.WriteActiveStoreBinding(exactBinding); err != nil {
 		t.Fatalf("write mismatched active-store binding: %v", err)
