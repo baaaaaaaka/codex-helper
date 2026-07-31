@@ -5187,53 +5187,13 @@ func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []Outb
 			return err
 		}
 		handled = true
-		db, err := s.sqliteDBUnlocked(pointer)
+		dbPath, err := s.storeSQLitePath(pointer)
 		if err != nil {
 			return err
 		}
-		fencesByID := make(map[string]OutboxReplayFence, len(fences))
-		for _, fence := range fences {
-			fencesByID[fence.OutboxID] = fence
-		}
-		current := make(map[string]OutboxMessage, len(fences))
-		const replayFenceReadBatch = 400
-		for start := 0; start < len(fences); start += replayFenceReadBatch {
-			end := min(start+replayFenceReadBatch, len(fences))
-			placeholders := make([]string, 0, end-start)
-			args := make([]any, 0, end-start)
-			for _, fence := range fences[start:end] {
-				placeholders = append(placeholders, "?")
-				args = append(args, fence.OutboxID)
-			}
-			rows, err := db.QueryContext(ctx, `SELECT json FROM outbox_messages WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
-			if err != nil {
-				return err
-			}
-			for rows.Next() {
-				var raw []byte
-				if err := rows.Scan(&raw); err != nil {
-					_ = rows.Close()
-					return err
-				}
-				var msg OutboxMessage
-				if err := json.Unmarshal(raw, &msg); err != nil {
-					_ = rows.Close()
-					return err
-				}
-				fence := fencesByID[msg.ID]
-				if err := validateOutboxReplayFence(msg, fence); err != nil {
-					_ = rows.Close()
-					return err
-				}
-				current[msg.ID] = msg
-			}
-			if err := rows.Err(); err != nil {
-				_ = rows.Close()
-				return err
-			}
-			if err := rows.Close(); err != nil {
-				return err
-			}
+		current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx, dbPath, fences)
+		if err != nil {
+			return err
 		}
 		pending := 0
 		for _, msg := range current {
@@ -5243,6 +5203,10 @@ func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []Outb
 		}
 		if pending == 0 {
 			return nil
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
 		}
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
@@ -5324,6 +5288,132 @@ func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []Outb
 		return tx.Commit()
 	})
 	return changed, handled, err
+}
+
+func loadSQLiteOutboxReplayFenceMessagesFileReadOnly(ctx context.Context, path string, fences []OutboxReplayFence) (map[string]OutboxMessage, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return nil, err
+		}
+		if !dbBefore.Exists {
+			return nil, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if _, err := os.Stat(path + "-shm"); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil, fmt.Errorf("read live sqlite WAL without creating SHM: %w", err)
+				}
+				return nil, err
+			}
+		}
+		current, err := loadSQLiteOutboxReplayFenceMessagesFileReadOnlyAttempt(ctx, path, immutable, fences)
+		if err != nil {
+			return nil, err
+		}
+		if !immutable {
+			return current, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return nil, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return nil, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return current, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during immutable replay fence attempt %d", attempt+1)
+	}
+	return nil, fmt.Errorf("read stable sqlite replay fences after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteOutboxReplayFenceMessagesFileReadOnlyAttempt(
+	ctx context.Context,
+	path string,
+	immutable bool,
+	fences []OutboxReplayFence,
+) (map[string]OutboxMessage, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	defer db.Close()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return nil, err
+	}
+	return querySQLiteOutboxReplayFenceMessages(ctx, conn, fences)
+}
+
+func querySQLiteOutboxReplayFenceMessages(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, fences []OutboxReplayFence) (map[string]OutboxMessage, error) {
+	fencesByID := make(map[string]OutboxReplayFence, len(fences))
+	for _, fence := range fences {
+		fencesByID[fence.OutboxID] = fence
+	}
+	current := make(map[string]OutboxMessage, len(fences))
+	const replayFenceReadBatch = 400
+	for start := 0; start < len(fences); start += replayFenceReadBatch {
+		end := min(start+replayFenceReadBatch, len(fences))
+		placeholders := make([]string, 0, end-start)
+		args := make([]any, 0, end-start)
+		for _, fence := range fences[start:end] {
+			placeholders = append(placeholders, "?")
+			args = append(args, fence.OutboxID)
+		}
+		rows, err := q.QueryContext(ctx, `SELECT json FROM outbox_messages WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			var msg OutboxMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			fence := fencesByID[msg.ID]
+			if err := validateOutboxReplayFence(msg, fence); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			current[msg.ID] = msg
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return current, nil
 }
 
 func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, bool, error) {

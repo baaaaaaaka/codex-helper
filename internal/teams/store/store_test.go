@@ -498,6 +498,9 @@ func TestApplyOutboxReplayFencesUsesCompleteSentProjection(t *testing.T) {
 				t.Fatalf("artifact sent projection = %#v", artifact)
 			}
 
+			if sqliteMode {
+				store = settleSQLiteStoreForReadOnlyAssertion(t, ctx, store)
+			}
 			before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
 			changed, err = store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
 			if err != nil || changed != 0 {
@@ -567,6 +570,7 @@ func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T)
 	if got.Status != OutboxStatusSent || got.TeamsMessageID != fence.TeamsMessageID {
 		t.Fatalf("fenced outbox = %#v", got)
 	}
+	store = settleSQLiteStoreForReadOnlyAssertion(t, ctx, store)
 	before := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
 	if changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence}); err != nil || changed != 0 {
 		t.Fatalf("repeat ApplyOutboxReplayFences with corrupt unrelated row: changed=%d err=%v", changed, err)
@@ -575,6 +579,27 @@ func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T)
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("zero-delta targeted replay fence wrote files:\nbefore=%#v\nafter=%#v", before, after)
 	}
+}
+
+func settleSQLiteStoreForReadOnlyAssertion(t *testing.T, ctx context.Context, store *Store) *Store {
+	t.Helper()
+	path := store.Path()
+	checkpoint, err := store.CheckpointSQLiteWAL(ctx, 0)
+	if err != nil {
+		t.Fatalf("checkpoint SQLite store before read-only assertion: %v", err)
+	}
+	if !checkpoint.SQLite || !checkpoint.Attempted || checkpoint.Busy != 0 {
+		t.Fatalf("SQLite checkpoint before read-only assertion = %#v", checkpoint)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close SQLite writer before read-only assertion: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen SQLite store for read-only assertion: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	return reopened
 }
 
 type readOnlyFileSnapshot struct {
