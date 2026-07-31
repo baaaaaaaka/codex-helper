@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -388,7 +389,9 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 	if err != nil {
 		return "", deferRuntimeStoreTakeover("lock legacy Teams migration source: " + err.Error())
 	}
-	defer releaseScopeTakeoverLocks(locks)
+	defer func() {
+		releaseScopeTakeoverLocks(locks)
+	}()
 
 	// Another process can finish the migration between discovery and the
 	// coordinator handoff. Recheck after all source-family locks are held so a
@@ -465,6 +468,7 @@ func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.Scop
 				return "", err
 			}
 		}
+		releaseScopeTakeoverLocksBeforeDirectoryRename(&locks)
 		if handled, err := quarantineScopedStoreDirectory(scope.ID, sourcePath); err != nil {
 			return "", fmt.Errorf("quarantine migrated legacy Teams scope: %w", err)
 		} else if !handled {
@@ -643,6 +647,18 @@ func releaseScopeTakeoverLocks(locks []heldScopeTakeoverLock) {
 	for i := len(locks) - 1; i >= 0; i-- {
 		_ = locks[i].lock.Unlock()
 	}
+}
+
+func releaseScopeTakeoverLocksBeforeDirectoryRename(locks *[]heldScopeTakeoverLock) {
+	if runtime.GOOS != "windows" || locks == nil || len(*locks) == 0 {
+		return
+	}
+	// Windows does not allow a directory rename while flock keeps the
+	// state.json.lock handle open inside that directory. The managed-service
+	// coordinator and writer-exit checks still fence the cold-path handoff, and
+	// Rename itself fails closed if another process opens the source meanwhile.
+	releaseScopeTakeoverLocks(*locks)
+	*locks = nil
 }
 
 func migrationBackupPath(sourcePath string, scopeID string) string {
@@ -1025,7 +1041,9 @@ func CompleteOfflineRuntimeStoreTakeover(
 		return deferRuntimeStoreTakeover(err.Error())
 	}
 	defer releaseScopeTakeoverLocks([]heldScopeTakeoverLock{coordinator})
-	defer releaseScopeTakeoverLocks(locks)
+	defer func() {
+		releaseScopeTakeoverLocks(locks)
+	}()
 	if !storeAlreadyQuarantined {
 		if err := validateOfflineRuntimeStoreWriterStopped(ctx, scope, legacyPath); err != nil {
 			return err
@@ -1050,6 +1068,7 @@ func CompleteOfflineRuntimeStoreTakeover(
 		}
 	}
 	if !storeAlreadyQuarantined {
+		releaseScopeTakeoverLocksBeforeDirectoryRename(&locks)
 		if handled, err := quarantineScopedStoreDirectory(scope.ID, legacyPath); err != nil {
 			return fmt.Errorf("quarantine legacy Teams scope: %w", err)
 		} else if !handled {
