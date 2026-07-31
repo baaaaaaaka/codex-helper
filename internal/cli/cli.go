@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	version = "v0.1.20"
+	version = "v0.1.21"
 	commit  = ""
 	date    = ""
 )
