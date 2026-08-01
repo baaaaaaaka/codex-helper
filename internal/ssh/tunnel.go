@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,96 @@ type TunnelConfig struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+}
+
+// EffectiveEndpoint is the host and port OpenSSH selected after applying a
+// config file and command-line options. It is used for bounded wake/network
+// admission checks; an interface becoming UP is not sufficient evidence that
+// this endpoint is reachable.
+type EffectiveEndpoint struct {
+	Host         string
+	Port         int
+	ProxyJump    string
+	ProxyCommand string
+}
+
+// ResolveEffectiveEndpoint asks OpenSSH to resolve its own configuration. It
+// intentionally does not make a network connection. Callers decide whether
+// to probe the final endpoint or the first hop of a proxy route.
+func ResolveEffectiveEndpoint(ctx context.Context, host string, args []string) (EffectiveEndpoint, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return EffectiveEndpoint{}, errors.New("ssh config target is required")
+	}
+	cmdArgs := []string{"-G"}
+	cmdArgs = append(cmdArgs, args...)
+	cmdArgs = append(cmdArgs, host)
+	cmd := exec.CommandContext(ctx, "ssh", cmdArgs...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return EffectiveEndpoint{}, ctx.Err()
+		}
+		return EffectiveEndpoint{}, fmt.Errorf("ssh -G %s: %w", host, err)
+	}
+	endpoint := EffectiveEndpoint{Host: host, Port: 22}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		switch strings.ToLower(fields[0]) {
+		case "hostname":
+			if strings.TrimSpace(fields[1]) != "" {
+				endpoint.Host = strings.Trim(strings.TrimSpace(fields[1]), "[]")
+			}
+		case "port":
+			port, parseErr := strconv.Atoi(fields[1])
+			if parseErr == nil && port > 0 && port <= 65535 {
+				endpoint.Port = port
+			}
+		case "proxyjump":
+			endpoint.ProxyJump = strings.TrimSpace(strings.Join(fields[1:], " "))
+		case "proxycommand":
+			endpoint.ProxyCommand = strings.TrimSpace(strings.Join(fields[1:], " "))
+		}
+	}
+	if endpoint.Host == "" || endpoint.Port <= 0 {
+		return EffectiveEndpoint{}, fmt.Errorf("ssh -G %s returned no usable host/port", host)
+	}
+	return endpoint, nil
+}
+
+// FirstProxyHop returns the first host and port in a ProxyJump value. It is a
+// local-only admission probe; the complete route is still validated by the
+// real SSH tunnel before the backend is marked ready.
+func FirstProxyHop(value string) (string, int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "none") {
+		return "", 0, false
+	}
+	hop := strings.TrimSpace(strings.Split(value, ",")[0])
+	if at := strings.LastIndexByte(hop, '@'); at >= 0 {
+		hop = hop[at+1:]
+	}
+	port := 22
+	if host, rawPort, err := net.SplitHostPort(hop); err == nil {
+		hop = strings.Trim(host, "[]")
+		if parsed, parseErr := strconv.Atoi(rawPort); parseErr == nil && parsed > 0 && parsed <= 65535 {
+			port = parsed
+		}
+	} else if strings.Count(hop, ":") == 1 {
+		parts := strings.SplitN(hop, ":", 2)
+		if parsed, parseErr := strconv.Atoi(parts[1]); parseErr == nil && parsed > 0 && parsed <= 65535 {
+			hop = parts[0]
+			port = parsed
+		}
+	}
+	hop = strings.TrimSpace(strings.Trim(hop, "[]"))
+	return hop, port, hop != ""
 }
 
 // DefaultHostKeyArgs accepts first-seen SSH host keys without prompting while

@@ -1313,6 +1313,7 @@ func TestCodexAppAuthWindowsProxyReachabilityScriptChecksHealthEndpoint(t *testi
 		"http://127.0.0.1:23123/_codex_proxy/health",
 		"Invoke-RestMethod",
 		"$response.ok",
+		"$response.instanceId",
 		"System.Net.Sockets.TcpClient",
 		"[Environment]::NewLine",
 		"CONNECT ",

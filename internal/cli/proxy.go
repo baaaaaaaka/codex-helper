@@ -78,6 +78,7 @@ func newProxyCmd(root *rootOptions) *cobra.Command {
 	cmd.AddCommand(
 		newProxyStartCmd(root),
 		newProxyDaemonCmd(root),
+		newProxyAppGatewayCmd(root),
 		newProxySupervisorCmd(root),
 		newProxyListCmd(root),
 		newProxyStopCmd(root),

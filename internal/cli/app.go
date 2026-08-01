@@ -41,11 +41,14 @@ const (
 )
 
 var (
-	codexAppGOOS                  = func() string { return runtime.GOOS }
-	codexAppGOARCH                = func() string { return runtime.GOARCH }
-	codexAppIsWSL                 = func() bool { return teamsServiceIsWSL() }
-	codexAppLaunchDesktopFn       = launchCodexDesktopApp
-	codexAppEnsureProxyURLFn      = ensureCodexAppProxyURL
+	codexAppGOOS            = func() string { return runtime.GOOS }
+	codexAppGOARCH          = func() string { return runtime.GOARCH }
+	codexAppIsWSL           = func() bool { return teamsServiceIsWSL() }
+	codexAppLaunchDesktopFn = launchCodexDesktopApp
+	// Desktop app launches use the stable App Gateway. The legacy helper is
+	// retained for explicit proxy-start compatibility and older tests/tools;
+	// it is no longer the default application path.
+	codexAppEnsureProxyURLFn      = ensureCodexAppGatewayURL
 	codexAppCommandContext        = exec.CommandContext
 	codexAppRunCommand            = runCodexAppLoggedCommand
 	codexAppCommandOutput         = runCodexAppCommandOutput

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -61,6 +62,20 @@ func TestParseCodexAppArgs(t *testing.T) {
 				t.Fatalf("profile = %q, want %q", gotProfile, tc.wantProfile)
 			}
 		})
+	}
+}
+
+func TestCodexAppDefaultProxyEnsurerUsesStableGateway(t *testing.T) {
+	if codexAppEnsureProxyURLFn == nil {
+		t.Fatal("desktop app proxy ensurer is nil")
+	}
+	fn := runtime.FuncForPC(reflect.ValueOf(codexAppEnsureProxyURLFn).Pointer())
+	if fn == nil || !strings.Contains(fn.Name(), "ensureCodexAppGatewayURL") {
+		name := "<nil>"
+		if fn != nil {
+			name = fn.Name()
+		}
+		t.Fatalf("desktop app default proxy ensurer = %q, want stable App Gateway", name)
 	}
 }
 

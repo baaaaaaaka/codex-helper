@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -115,6 +116,40 @@ func TestArgsUseProxyRoute(t *testing.T) {
 				t.Fatalf("ArgsUseProxyRoute(%#v) = %v, want %v", test.args, got, test.want)
 			}
 		})
+	}
+}
+
+func TestFirstProxyHop(t *testing.T) {
+	cases := []struct {
+		value       string
+		wantHost    string
+		wantPort    int
+		wantPresent bool
+	}{
+		{value: "jump.example", wantHost: "jump.example", wantPort: 22, wantPresent: true},
+		{value: "alice@jump.example:2200,second.example", wantHost: "jump.example", wantPort: 2200, wantPresent: true},
+		{value: "[2001:db8::1]:2222", wantHost: "2001:db8::1", wantPort: 2222, wantPresent: true},
+		{value: "none"},
+	}
+	for _, tc := range cases {
+		host, port, present := FirstProxyHop(tc.value)
+		if host != tc.wantHost || port != tc.wantPort || present != tc.wantPresent {
+			t.Errorf("FirstProxyHop(%q) = %q/%d/%v, want %q/%d/%v", tc.value, host, port, present, tc.wantHost, tc.wantPort, tc.wantPresent)
+		}
+	}
+}
+
+func TestResolveEffectiveEndpointUsesSSHConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	if err := os.WriteFile(path, []byte("Host corp-alias\n  HostName ssh.corp.example\n  Port 2207\n  ProxyJump alice@jump.corp.example:2208\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := ResolveEffectiveEndpoint(context.Background(), "corp-alias", []string{"-F", path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint.Host != "ssh.corp.example" || endpoint.Port != 2207 || endpoint.ProxyJump != "alice@jump.corp.example:2208" {
+		t.Fatalf("effective endpoint = %#v", endpoint)
 	}
 }
 

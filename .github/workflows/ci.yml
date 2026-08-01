@@ -196,6 +196,37 @@ jobs:
           go test -p=1 ./internal/hoststate -count=5 -v
           go test -p=1 ./internal/stack -count=5 -run 'Test(Monitor|SuspendDoesNotConsumeRecoveryBudgetAfterTunnelExit|WakeWaitsForHostBeforeCreatingCandidate|ProbeGapDetectedStripsMonotonicClock|TunnelExitAfterWallClockGapWaitsForHostBeforeRecovery|RequestFailureGate|ClassifyRequestFailure|NotifyNetworkResume|SetupHTTPProxyBackendFailureStormCountsRawRequestsAndOneSignal)' -v
 
+  app-gateway-lifecycle:
+    name: App Gateway lifecycle contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Stable port, wake admission, migration, and service contracts
+        shell: bash
+        env:
+          HTTP_PROXY: ""
+          HTTPS_PROXY: ""
+          ALL_PROXY: ""
+          NO_PROXY: "127.0.0.1,localhost"
+        run: |
+          set -euo pipefail
+          go test -p=1 ./internal/appgateway -count=1 -run 'Test(Registry|Frontend|Probe|Service)' -v
+          go test -p=1 ./internal/stack -count=1 -run '^TestProbeHostNetwork' -v
+          go test -p=1 ./internal/cli -count=1 -run '^Test(CodexAppDefaultProxyEnsurer|EnsureAppGateway|RunAppGateway|DesktopProxy|ParseWindows|ParseDarwin|DiscoverDesktop|ParseProxy|AppendUnique)' -v -timeout=3m
+
   targeted-test:
     name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
@@ -2718,6 +2749,7 @@ jobs:
       - windows-proxy-lifecycle
       - proxy-recovery-docker
       - proxy-recovery-soak
+      - app-gateway-lifecycle
       - full-go-test
       - race-test
       - runtime-env-contract
@@ -2748,6 +2780,7 @@ jobs:
           check windows-proxy-lifecycle "${{ needs.windows-proxy-lifecycle.result }}"
           check proxy-recovery-docker "${{ needs.proxy-recovery-docker.result }}"
           check proxy-recovery-soak "${{ needs.proxy-recovery-soak.result }}"
+          check app-gateway-lifecycle "${{ needs.app-gateway-lifecycle.result }}"
           check full-go-test "${{ needs.full-go-test.result }}"
           check race-test "${{ needs.race-test.result }}"
           check runtime-env-contract "${{ needs.runtime-env-contract.result }}"

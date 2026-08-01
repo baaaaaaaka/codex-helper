@@ -928,26 +928,103 @@ func (s *Stack) waitForHostResume() error {
 }
 
 func hostProbeTarget(profile config.Profile) (host string, port int, direct bool) {
+	host, port, direct, _ = resolveHostProbeTargetContext(context.Background(), profile)
+	return host, port, direct
+}
+
+func resolveHostProbeTarget(profile config.Profile) (host string, port int, direct bool, err error) {
+	return resolveHostProbeTargetContext(context.Background(), profile)
+}
+
+func resolveHostProbeTargetContext(ctx context.Context, profile config.Profile) (host string, port int, direct bool, err error) {
+	return resolveHostProbeTargetContextWith(ctx, profile, defaultHostProbeDependencies())
+}
+
+// hostProbeDependencies keeps the production admission path deterministic in
+// tests without weakening the real checks. In particular, tests can model a
+// wake window in which interfaces are already UP while the SSH endpoint still
+// fails DNS/TCP, instead of replacing the entire host probe with an idealized
+// callback.
+type hostProbeDependencies struct {
+	listInterfaces  func() ([]net.Interface, error)
+	resolveEndpoint func(context.Context, string, []string) (ssh.EffectiveEndpoint, error)
+	dialContext     func(context.Context, string, string) (net.Conn, error)
+}
+
+// hostProbeDependenciesFn is a narrow test seam around the exported
+// ProbeHostNetwork entrypoint. Production always returns the real OS, OpenSSH
+// and TCP implementations; tests can exercise that exact entrypoint while
+// controlling the staged wake/DNS outcome.
+var hostProbeDependenciesFn = defaultHostProbeDependencies
+
+func defaultHostProbeDependencies() hostProbeDependencies {
+	return hostProbeDependencies{
+		listInterfaces:  net.Interfaces,
+		resolveEndpoint: ssh.ResolveEffectiveEndpoint,
+		dialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		},
+	}
+}
+
+func resolveHostProbeTargetContextWith(ctx context.Context, profile config.Profile, deps hostProbeDependencies) (host string, port int, direct bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if deps.resolveEndpoint == nil {
+		deps.resolveEndpoint = ssh.ResolveEffectiveEndpoint
+	}
+	if ssh.ArgsUseConfigFile(profile.SSHArgs) {
+		// RouteTargetHost/Port remain authoritative when the caller supplied a
+		// concrete destination. Otherwise ask OpenSSH to resolve the -F alias;
+		// merely seeing a non-loopback interface after wake is not enough.
+		if strings.TrimSpace(profile.RouteTargetHost) != "" && profile.RouteTargetPort > 0 {
+			host = profile.RouteTargetHost
+			port = profile.RouteTargetPort
+		} else {
+			resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			effective, resolveErr := deps.resolveEndpoint(resolveCtx, profile.Host, profile.SSHArgs)
+			cancel()
+			if resolveErr != nil {
+				return "", 0, false, resolveErr
+			}
+			host = effective.Host
+			port = effective.Port
+			if jumpHost, jumpPort, ok := ssh.FirstProxyHop(effective.ProxyJump); ok {
+				host = jumpHost
+				port = jumpPort
+			} else if strings.TrimSpace(effective.ProxyCommand) != "" && !strings.EqualFold(strings.TrimSpace(effective.ProxyCommand), "none") {
+				// ProxyCommand can encode an arbitrary local program, so a direct
+				// TCP probe would be misleading. The actual bounded SSH candidate
+				// connection remains authoritative.
+				return "", 0, false, nil
+			}
+		}
+		return host, port, true, nil
+	}
 	if ssh.ArgsUseProxyRoute(profile.SSHArgs) {
 		// The final destination may only be reachable through the SSH jump
 		// route. The local interface gate remains useful; the candidate SSH
 		// connection is the authoritative endpoint probe.
-		return "", 0, false
+		return "", 0, false, nil
 	}
-	host = profile.Host
-	port = profile.Port
-	if ssh.ArgsUseConfigFile(profile.SSHArgs) {
-		if profile.RouteTargetHost == "" || profile.RouteTargetPort <= 0 {
-			return "", 0, false
-		}
-		host = profile.RouteTargetHost
-		port = profile.RouteTargetPort
-	}
-	return host, port, true
+	return profile.Host, profile.Port, true, nil
 }
 
 func probeHostNetwork(ctx context.Context, profile config.Profile) error {
-	interfaces, err := net.Interfaces()
+	return probeHostNetworkWith(ctx, profile, hostProbeDependenciesFn())
+}
+
+func probeHostNetworkWith(ctx context.Context, profile config.Profile, deps hostProbeDependencies) error {
+	if deps.listInterfaces == nil {
+		deps.listInterfaces = net.Interfaces
+	}
+	if deps.dialContext == nil {
+		deps.dialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, address)
+		}
+	}
+	interfaces, err := deps.listInterfaces()
 	if err != nil {
 		return fmt.Errorf("list network interfaces: %w", err)
 	}
@@ -961,18 +1038,27 @@ func probeHostNetwork(ctx context.Context, profile config.Profile) error {
 	if !hasUsableInterface {
 		return errors.New("no usable network interface")
 	}
-	host, port, direct := hostProbeTarget(profile)
+	host, port, direct, resolveErr := resolveHostProbeTargetContextWith(ctx, profile, deps)
+	if resolveErr != nil {
+		return fmt.Errorf("resolve SSH endpoint: %w", resolveErr)
+	}
 	if !direct {
 		return nil
 	}
 	address := net.JoinHostPort(host, strconv.Itoa(port))
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	conn, err := deps.dialContext(ctx, "tcp", address)
 	if err != nil {
 		return fmt.Errorf("ssh endpoint %s unavailable: %w", address, err)
 	}
 	_ = conn.Close()
 	return nil
+}
+
+// ProbeHostNetwork is the bounded wake/network admission check used by the
+// App Gateway controller. It intentionally does not consume a proxy recovery
+// budget; the caller decides whether a backend attempt is admissible.
+func ProbeHostNetwork(ctx context.Context, profile config.Profile) error {
+	return probeHostNetwork(ctx, profile)
 }
 
 // NotifyNetworkResume asks the stack to re-establish the tunnel. Calls are
