@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -2227,13 +2228,118 @@ func TestTeamsRuntimeSafetyDiscoveryFailsClosedAtCandidateLimitCI(t *testing.T) 
 		t.Fatalf("legacy scope root: %v", err)
 	}
 	for _, name := range []string{"scope-a", "scope-b", "scope-c"} {
-		if err := os.MkdirAll(filepath.Join(root, name), 0o700); err != nil {
+		dir := filepath.Join(root, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatalf("create candidate %s: %v", name, err)
 		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write candidate %s: %v", name, err)
+		}
 	}
-	paths, err := runtimeStoreMigrationCandidatePaths(filepath.Join(tmp, "canonical", "state.json"), 2)
+	paths, err := runtimeStoreMigrationCandidatePaths(context.Background(), filepath.Join(tmp, "canonical", "state.json"), 2)
 	if err == nil || !strings.Contains(err.Error(), "exceeded 2 scope candidates") {
 		t.Fatalf("candidate limit result paths=%v err=%v, want fail-closed limit error", paths, err)
+	}
+}
+
+func TestTeamsRuntimeSafetyDiscoveryIgnoresSidecarOnlyDirectoriesCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+
+	root, err := appdirs.LegacyConfigPath("teams", "scopes")
+	if err != nil {
+		t.Fatalf("legacy scope root: %v", err)
+	}
+	for i := 0; i < 1024; i++ {
+		dir := filepath.Join(root, fmt.Sprintf("scope-sidecar-%04d", i))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("create sidecar directory %d: %v", i, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "workflow-notifications.json"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("write sidecar %d: %v", i, err)
+		}
+	}
+	realDir := filepath.Join(root, "scope-real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatalf("create real candidate: %v", err)
+	}
+	realPath := filepath.Join(realDir, "state.json")
+	if err := os.WriteFile(realPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write real candidate: %v", err)
+	}
+
+	current := filepath.Join(tmp, "canonical", "state.json")
+	before := snapshotRuntimeSafetyFiles(t, tmp)
+	paths, err := runtimeStoreMigrationCandidatePaths(context.Background(), current, 2)
+	if err != nil {
+		t.Fatalf("discover with sidecar-only directories: %v", err)
+	}
+	after := snapshotRuntimeSafetyFiles(t, tmp)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("candidate discovery modified files\nbefore=%#v\nafter=%#v", before, after)
+	}
+	if !containsString(paths, current) || !containsString(paths, realPath) {
+		t.Fatalf("candidate paths = %#v, want current and real store", paths)
+	}
+	for _, path := range paths {
+		if strings.Contains(path, "scope-sidecar-") {
+			t.Fatalf("sidecar-only directory leaked into candidate paths: %s", path)
+		}
+	}
+}
+
+func TestTeamsRuntimeSafetyDiscoveryBoundsRawDirectoryEntriesCI(t *testing.T) {
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+
+	root, err := appdirs.LegacyConfigPath("teams", "scopes")
+	if err != nil {
+		t.Fatalf("legacy scope root: %v", err)
+	}
+	for _, name := range []string{"scope-a", "scope-b", "scope-c"} {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o700); err != nil {
+			t.Fatalf("create directory %s: %v", name, err)
+		}
+	}
+	paths, err := runtimeStoreMigrationCandidatePathsWithLimits(
+		context.Background(),
+		filepath.Join(tmp, "canonical", "state.json"),
+		2,
+		2,
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeded 2 scope directory entries") {
+		t.Fatalf("entry limit result paths=%v err=%v, want bounded-scan error", paths, err)
+	}
+}
+
+func TestTeamsRuntimeSafetyDiscoveryRejectsLinkedScopeDirectoryCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation is not reliably available to unprivileged Windows tests")
+	}
+	tmp := t.TempDir()
+	isolateTeamsScopeUserDirsForTest(t, tmp)
+
+	root, err := appdirs.LegacyConfigPath("teams", "scopes")
+	if err != nil {
+		t.Fatalf("legacy scope root: %v", err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("create legacy root: %v", err)
+	}
+	target := filepath.Join(tmp, "outside")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatalf("create symlink target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "state.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "scope-linked")); err != nil {
+		t.Fatalf("create linked scope directory: %v", err)
+	}
+
+	paths, err := runtimeStoreMigrationCandidatePaths(context.Background(), filepath.Join(tmp, "canonical", "state.json"), 2)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "must not be a symlink") {
+		t.Fatalf("linked scope result paths=%v err=%v, want fail-closed symlink error", paths, err)
 	}
 }
 

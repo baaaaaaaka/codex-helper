@@ -31,6 +31,7 @@ const (
 	defaultTeamsServiceWatchdogConsecutiveStale   = 3
 	defaultTeamsServiceWatchdogMissingStateReason = "no Teams state evidence yet"
 	defaultTeamsServiceWatchdogReloadStaleAfter   = 6 * time.Minute
+	defaultTeamsServiceWatchdogMigrationActiveFor = 15 * time.Minute
 )
 
 type teamsServiceWatchdogOptions struct {
@@ -38,6 +39,7 @@ type teamsServiceWatchdogOptions struct {
 	OwnerStaleAfter     time.Duration
 	PollStaleAfter      time.Duration
 	Cooldown            time.Duration
+	MigrationActiveFor  time.Duration
 	MinConsecutiveStale int
 	DryRun              bool
 }
@@ -50,6 +52,8 @@ type teamsServiceWatchdogSnapshot struct {
 	AmbiguousCanonicalStores           bool
 	MultipleFreshOwnerStores           bool
 	MigrationBlocked                   bool
+	MigrationActive                    bool
+	MigrationStateUnknown              bool
 	ServicePaused                      bool
 	ServiceDraining                    bool
 	HelperUpgradeDrainExpired          bool
@@ -232,6 +236,9 @@ func normalizeTeamsServiceWatchdogOptions(opts teamsServiceWatchdogOptions) team
 	if opts.Cooldown <= 0 {
 		opts.Cooldown = defaultTeamsServiceWatchdogCooldown
 	}
+	if opts.MigrationActiveFor <= 0 {
+		opts.MigrationActiveFor = defaultTeamsServiceWatchdogMigrationActiveFor
+	}
 	if opts.MinConsecutiveStale <= 0 {
 		opts.MinConsecutiveStale = defaultTeamsServiceWatchdogConsecutiveStale
 	}
@@ -252,9 +259,33 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		}
 		snapshot.Active = active
 	}
-	if _, blocked := liveTeamsServiceMigrationBlockedState(); blocked {
-		snapshot.MigrationBlocked = true
-		return snapshot, nil
+	migrationState, migrationStateExists, migrationStateErr := readTeamsServiceMigrationState()
+	if migrationStateErr != nil {
+		// An unreadable marker is ambiguous only while the managed backend is
+		// still active. Once the backend is confirmed stopped, no managed child
+		// can be performing the offline migration, so let the normal watchdog
+		// start path recover instead of making a corrupt marker permanently
+		// suppress service startup.
+		if snapshot.Active {
+			snapshot.MigrationStateUnknown = true
+			return snapshot, nil
+		}
+	}
+	if migrationStateExists && teamsServiceMigrationStateAppearsLive(migrationState) {
+		switch normalizedTeamsServiceMigrationPhase(migrationState.Phase) {
+		case teamsServiceMigrationPhaseBlocked:
+			snapshot.MigrationBlocked = true
+			return snapshot, nil
+		case teamsServiceMigrationPhaseActive:
+			if migrationState.StartedAt.After(opts.Now.Add(time.Minute)) {
+				snapshot.MigrationStateUnknown = true
+				return snapshot, nil
+			}
+			if snapshot.Active && opts.Now.Sub(migrationState.StartedAt) < opts.MigrationActiveFor {
+				snapshot.MigrationActive = true
+				return snapshot, nil
+			}
+		}
 	}
 	paths, err := teamsServiceWatchdogStorePaths()
 	if err != nil {
@@ -531,6 +562,12 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	}
 	if snapshot.MigrationBlocked {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service child is waiting on a blocked store migration"}
+	}
+	if snapshot.MigrationStateUnknown {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service migration state is invalid; refusing automatic lifecycle changes"}
+	}
+	if snapshot.MigrationActive {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service child is performing offline store migration"}
 	}
 	if snapshot.AmbiguousCanonicalStores {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores are ambiguous; refusing automatic lifecycle changes"}

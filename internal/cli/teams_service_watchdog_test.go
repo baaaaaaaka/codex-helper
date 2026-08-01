@@ -34,6 +34,9 @@ func TestTeamsServiceWatchdogDefaultsAvoidTransientRestartLoops(t *testing.T) {
 	if defaultTeamsServiceWatchdogCooldown != 2*time.Minute {
 		t.Fatalf("restart cooldown = %s, want 2m", defaultTeamsServiceWatchdogCooldown)
 	}
+	if defaultTeamsServiceWatchdogMigrationActiveFor != 15*time.Minute {
+		t.Fatalf("migration active lease = %s, want 15m", defaultTeamsServiceWatchdogMigrationActiveFor)
+	}
 	if teamsServiceExternalWatchdogInterval != 10*time.Second {
 		t.Fatalf("watchdog interval = %s, want 10s", teamsServiceExternalWatchdogInterval)
 	}

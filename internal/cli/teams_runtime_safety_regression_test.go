@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1242,6 +1243,268 @@ func TestTeamsRuntimeSafetyDeferredMigrationUsesBoundedExponentialRetryCI(t *tes
 	}
 	if got := teamsRunRetryDelay(&teams.GraphStatusError{StatusCode: 502}, 8); got != time.Second {
 		t.Fatalf("ordinary Graph retry delay = %s, want fixed base delay", got)
+	}
+}
+
+func TestTeamsRuntimeSafetyActiveMigrationLeaseIsSingleWriteAndClearsOnSuccessCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	previousComplete := teamsCompleteOfflineStorePlan
+	previousNow := teamsServiceMigrationNow
+	previousStart := teamsLocalSupervisorProcessStartTime
+	previousAlive := teamsLocalSupervisorProcessAlive
+	t.Cleanup(func() {
+		teamsCompleteOfflineStorePlan = previousComplete
+		teamsServiceMigrationNow = previousNow
+		teamsLocalSupervisorProcessStartTime = previousStart
+		teamsLocalSupervisorProcessAlive = previousAlive
+		_ = clearTeamsServiceMigrationBlockedState()
+	})
+
+	now := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
+	teamsServiceMigrationNow = func() time.Time { return now }
+	teamsLocalSupervisorProcessStartTime = func(pid int) (string, error) {
+		if pid != os.Getpid() {
+			return "", fmt.Errorf("unexpected pid %d", pid)
+		}
+		return "self-start", nil
+	}
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == os.Getpid() }
+
+	var attempts int
+	teamsCompleteOfflineStorePlan = func(context.Context, teams.RuntimeStorePlan) error {
+		attempts++
+		state, exists, err := readTeamsServiceMigrationState()
+		if err != nil || !exists || state.Phase != teamsServiceMigrationPhaseActive {
+			t.Fatalf("migration attempt %d state=(%+v,%t,%v), want active lease", attempts, state, exists, err)
+		}
+		if attempts < 3 {
+			return &teams.RuntimeStoreTakeoverDeferredError{Reason: "writer lock is still held"}
+		}
+		return nil
+	}
+
+	plan := teams.RuntimeStorePlan{Action: teams.RuntimeStoreActionMigrateLegacy}
+	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err == nil {
+		t.Fatal("first migration attempt succeeded, want deferred")
+	}
+	first, exists, err := readTeamsServiceMigrationState()
+	if err != nil || !exists {
+		t.Fatalf("read first active lease: state=%+v exists=%t err=%v", first, exists, err)
+	}
+
+	now = now.Add(time.Minute)
+	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err == nil {
+		t.Fatal("second migration attempt succeeded, want deferred")
+	}
+	second, exists, err := readTeamsServiceMigrationState()
+	if err != nil || !exists {
+		t.Fatalf("read second active lease: state=%+v exists=%t err=%v", second, exists, err)
+	}
+	if !second.StartedAt.Equal(first.StartedAt) || !second.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("deferred retry rewrote active lease: first=%+v second=%+v", first, second)
+	}
+
+	now = now.Add(time.Minute)
+	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err != nil {
+		t.Fatalf("successful migration attempt: %v", err)
+	}
+	if _, exists, err := readTeamsServiceMigrationState(); err != nil || exists {
+		t.Fatalf("active lease remained after success: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogHonorsOnlyLiveBoundedMigrationLeaseCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	previousNow := teamsServiceMigrationNow
+	previousStart := teamsLocalSupervisorProcessStartTime
+	previousAlive := teamsLocalSupervisorProcessAlive
+	previousInstalled := teamsServiceWatchdogInstalled
+	previousActive := teamsServiceWatchdogActive
+	previousPaths := teamsServiceWatchdogStorePaths
+	t.Cleanup(func() {
+		teamsServiceMigrationNow = previousNow
+		teamsLocalSupervisorProcessStartTime = previousStart
+		teamsLocalSupervisorProcessAlive = previousAlive
+		teamsServiceWatchdogInstalled = previousInstalled
+		teamsServiceWatchdogActive = previousActive
+		teamsServiceWatchdogStorePaths = previousPaths
+		_ = clearTeamsServiceMigrationBlockedState()
+	})
+
+	startedAt := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	teamsServiceMigrationNow = func() time.Time { return startedAt }
+	teamsLocalSupervisorProcessStartTime = func(pid int) (string, error) {
+		if pid == os.Getpid() {
+			return "self-start", nil
+		}
+		return "other-start", nil
+	}
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == os.Getpid() }
+	teamsServiceWatchdogInstalled = func() (bool, error) { return true, nil }
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return true, nil }
+	pathCalls := 0
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		pathCalls++
+		return nil, nil
+	}
+
+	if err := ensureTeamsServiceMigrationActiveState(); err != nil {
+		t.Fatalf("write active migration lease: %v", err)
+	}
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: startedAt.Add(time.Minute)})
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect active migration snapshot: %v", err)
+	}
+	if !snapshot.MigrationActive || pathCalls != 0 {
+		t.Fatalf("active snapshot=%+v pathCalls=%d, want protected lease without store scan", snapshot, pathCalls)
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale || !strings.Contains(decision.Reason, "offline store migration") {
+		t.Fatalf("active migration decision=%+v, want non-stale noop", decision)
+	}
+
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return false, nil }
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect inactive-service migration snapshot: %v", err)
+	}
+	if snapshot.MigrationActive || pathCalls != 1 {
+		t.Fatalf("inactive-service snapshot=%+v pathCalls=%d, want normal inspection", snapshot, pathCalls)
+	}
+	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionStart {
+		t.Fatalf("inactive-service decision=%+v, want start despite stale active marker", decision)
+	}
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return true, nil }
+
+	opts.Now = startedAt.Add(defaultTeamsServiceWatchdogMigrationActiveFor + time.Second)
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect expired migration snapshot: %v", err)
+	}
+	if snapshot.MigrationActive || pathCalls != 2 {
+		t.Fatalf("expired snapshot=%+v pathCalls=%d, want normal store inspection", snapshot, pathCalls)
+	}
+
+	teamsLocalSupervisorProcessStartTime = func(int) (string, error) { return "reused-pid", nil }
+	opts.Now = startedAt.Add(time.Minute)
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect reused-pid migration snapshot: %v", err)
+	}
+	if snapshot.MigrationActive || pathCalls != 3 {
+		t.Fatalf("reused-pid snapshot=%+v pathCalls=%d, want no migration protection", snapshot, pathCalls)
+	}
+}
+
+func TestTeamsRuntimeSafetyWatchdogFailsClosedForInvalidMigrationStateCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		t.Fatalf("migration state path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create migration state directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("{not-json\n"), 0o600); err != nil {
+		t.Fatalf("write invalid migration state: %v", err)
+	}
+
+	previousInstalled := teamsServiceWatchdogInstalled
+	previousActive := teamsServiceWatchdogActive
+	previousPaths := teamsServiceWatchdogStorePaths
+	t.Cleanup(func() {
+		teamsServiceWatchdogInstalled = previousInstalled
+		teamsServiceWatchdogActive = previousActive
+		teamsServiceWatchdogStorePaths = previousPaths
+		_ = os.Remove(path)
+	})
+	active := true
+	pathCalls := 0
+	teamsServiceWatchdogInstalled = func() (bool, error) { return true, nil }
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return active, nil }
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		pathCalls++
+		return nil, nil
+	}
+
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: time.Now()})
+	snapshot, err := collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect invalid migration snapshot: %v", err)
+	}
+	if !snapshot.MigrationStateUnknown {
+		t.Fatalf("invalid migration snapshot=%+v, want unknown state", snapshot)
+	}
+	if pathCalls != 0 {
+		t.Fatalf("active service inspected stores %d times with invalid migration state, want 0", pathCalls)
+	}
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || !strings.Contains(decision.Reason, "invalid") {
+		t.Fatalf("invalid migration decision=%+v, want fail-closed noop", decision)
+	}
+
+	active = false
+	snapshot, err = collectTeamsServiceWatchdogSnapshot(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("collect stopped-service migration snapshot: %v", err)
+	}
+	if snapshot.MigrationStateUnknown || pathCalls != 1 {
+		t.Fatalf("stopped-service migration snapshot=%+v pathCalls=%d, want normal inspection", snapshot, pathCalls)
+	}
+	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{}, opts)
+	if decision.Action != teamsServiceWatchdogActionStart {
+		t.Fatalf("stopped-service migration decision=%+v, want start", decision)
+	}
+}
+
+func TestTeamsRuntimeSafetyLegacyMigrationMarkerDefaultsToBlockedCI(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	previousStart := teamsLocalSupervisorProcessStartTime
+	previousAlive := teamsLocalSupervisorProcessAlive
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessStartTime = previousStart
+		teamsLocalSupervisorProcessAlive = previousAlive
+		_ = clearTeamsServiceMigrationBlockedState()
+	})
+	teamsLocalSupervisorProcessStartTime = func(int) (string, error) { return "self-start", nil }
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == os.Getpid() }
+
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		t.Fatalf("migration state path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create migration state directory: %v", err)
+	}
+	legacy, err := json.Marshal(teamsServiceMigrationBlockedState{
+		PID:          os.Getpid(),
+		ProcessStart: "self-start",
+		Reason:       "legacy blocked marker",
+		UpdatedAt:    time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("marshal legacy migration marker: %v", err)
+	}
+	if err := os.WriteFile(path, append(legacy, '\n'), 0o600); err != nil {
+		t.Fatalf("write legacy migration marker: %v", err)
+	}
+	state, ok := liveTeamsServiceMigrationBlockedState()
+	if !ok || state.Phase != teamsServiceMigrationPhaseBlocked {
+		t.Fatalf("legacy migration marker state=%+v ok=%t, want blocked compatibility", state, ok)
 	}
 }
 
