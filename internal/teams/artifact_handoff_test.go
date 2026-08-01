@@ -123,6 +123,7 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 		"`helper restart now`",
 		"`helper update now`",
 		"`helper reload now` only for source-checkout development reloads",
+		"Subagent requests use native Codex subagents.",
 		"cross-machine agent delegation",
 		"`cxp delegate`",
 		TeamsMathPromptContract,
