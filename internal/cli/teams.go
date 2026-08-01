@@ -1097,7 +1097,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 							err,
 						)
 					}
-					if err := teams.CompleteOfflineRuntimeStorePlan(cmd.Context(), plan); err != nil {
+					if err := completeManagedTeamsRuntimeStorePlan(cmd.Context(), plan); err != nil {
 						return err
 					}
 					bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
@@ -1286,20 +1286,41 @@ var (
 	teamsRunServiceMaxRetryDelay     = 5 * time.Minute
 	teamsRunServiceSleep             = sleepContext
 	teamsServiceMigrationBlockedPath = defaultTeamsServiceMigrationBlockedPath
+	teamsCompleteOfflineStorePlan    = teams.CompleteOfflineRuntimeStorePlan
+	teamsServiceMigrationNow         = time.Now
 )
 
 type teamsServiceMigrationBlockedState struct {
 	PID          int       `json:"pid"`
 	ProcessStart string    `json:"process_start,omitempty"`
+	Phase        string    `json:"phase,omitempty"`
+	StartedAt    time.Time `json:"started_at,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
+
+const (
+	teamsServiceMigrationPhaseActive  = "active"
+	teamsServiceMigrationPhaseBlocked = "blocked"
+)
 
 func defaultTeamsServiceMigrationBlockedPath() (string, error) {
 	return appdirs.StatePath("teams", "service", "migration-blocked.json")
 }
 
 func writeTeamsServiceMigrationBlockedState(reason string) error {
+	return writeTeamsServiceMigrationState(teamsServiceMigrationPhaseBlocked, reason)
+}
+
+func ensureTeamsServiceMigrationActiveState() error {
+	return writeTeamsServiceMigrationState(teamsServiceMigrationPhaseActive, "offline store migration is in progress")
+}
+
+func writeTeamsServiceMigrationState(phase string, reason string) error {
+	phase = strings.TrimSpace(phase)
+	if phase != teamsServiceMigrationPhaseActive && phase != teamsServiceMigrationPhaseBlocked {
+		return fmt.Errorf("unsupported Teams service migration phase %q", phase)
+	}
 	path, err := teamsServiceMigrationBlockedPath()
 	if err != nil {
 		return err
@@ -1307,12 +1328,27 @@ func writeTeamsServiceMigrationBlockedState(reason string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	now := teamsServiceMigrationNow()
 	start, _ := teamsLocalSupervisorProcessStartTime(os.Getpid())
+	start = strings.TrimSpace(start)
+	startedAt := now
+	if existing, exists, readErr := readTeamsServiceMigrationState(); readErr == nil && exists &&
+		teamsServiceMigrationStateMatchesProcess(existing, os.Getpid(), start) {
+		if !existing.StartedAt.IsZero() {
+			startedAt = existing.StartedAt
+		}
+		if normalizedTeamsServiceMigrationPhase(existing.Phase) == phase &&
+			strings.TrimSpace(existing.Reason) == strings.TrimSpace(reason) {
+			return nil
+		}
+	}
 	data, err := json.Marshal(teamsServiceMigrationBlockedState{
 		PID:          os.Getpid(),
-		ProcessStart: strings.TrimSpace(start),
+		ProcessStart: start,
+		Phase:        phase,
+		StartedAt:    startedAt,
 		Reason:       strings.TrimSpace(reason),
-		UpdatedAt:    time.Now(),
+		UpdatedAt:    now,
 	})
 	if err != nil {
 		return err
@@ -1333,6 +1369,14 @@ func clearTeamsServiceMigrationBlockedState() error {
 	if err != nil {
 		return err
 	}
+	state, exists, readErr := readTeamsServiceMigrationState()
+	if readErr == nil && exists {
+		start, _ := teamsLocalSupervisorProcessStartTime(os.Getpid())
+		start = strings.TrimSpace(start)
+		if !teamsServiceMigrationStateMatchesProcess(state, os.Getpid(), start) && teamsServiceMigrationStateAppearsLive(state) {
+			return nil
+		}
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -1340,25 +1384,88 @@ func clearTeamsServiceMigrationBlockedState() error {
 }
 
 func liveTeamsServiceMigrationBlockedState() (teamsServiceMigrationBlockedState, bool) {
-	path, err := teamsServiceMigrationBlockedPath()
-	if err != nil {
+	state, exists, err := readTeamsServiceMigrationState()
+	if err != nil || !exists || normalizedTeamsServiceMigrationPhase(state.Phase) != teamsServiceMigrationPhaseBlocked ||
+		!teamsServiceMigrationStateAppearsLive(state) {
 		return teamsServiceMigrationBlockedState{}, false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return teamsServiceMigrationBlockedState{}, false
-	}
-	var state teamsServiceMigrationBlockedState
-	if json.Unmarshal(data, &state) != nil || state.PID <= 0 || !teamsLocalSupervisorProcessAlive(state.PID) {
-		return teamsServiceMigrationBlockedState{}, false
-	}
-	if state.ProcessStart != "" {
-		current, err := teamsLocalSupervisorProcessStartTime(state.PID)
-		if err != nil || strings.TrimSpace(current) != state.ProcessStart {
-			return teamsServiceMigrationBlockedState{}, false
-		}
 	}
 	return state, true
+}
+
+func readTeamsServiceMigrationState() (teamsServiceMigrationBlockedState, bool, error) {
+	path, err := teamsServiceMigrationBlockedPath()
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, false, err
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return teamsServiceMigrationBlockedState{}, false, nil
+	}
+	if err != nil {
+		return teamsServiceMigrationBlockedState{}, true, err
+	}
+	var state teamsServiceMigrationBlockedState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return teamsServiceMigrationBlockedState{}, true, fmt.Errorf("decode Teams service migration state: %w", err)
+	}
+	state.Phase = normalizedTeamsServiceMigrationPhase(state.Phase)
+	if state.Phase != teamsServiceMigrationPhaseActive && state.Phase != teamsServiceMigrationPhaseBlocked {
+		return teamsServiceMigrationBlockedState{}, true, fmt.Errorf("invalid Teams service migration phase %q", state.Phase)
+	}
+	if state.PID <= 0 {
+		return teamsServiceMigrationBlockedState{}, true, fmt.Errorf("invalid Teams service migration pid %d", state.PID)
+	}
+	if state.Phase == teamsServiceMigrationPhaseActive && state.StartedAt.IsZero() {
+		return teamsServiceMigrationBlockedState{}, true, errors.New("active Teams service migration state is missing started_at")
+	}
+	return state, true, nil
+}
+
+func normalizedTeamsServiceMigrationPhase(phase string) string {
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		return teamsServiceMigrationPhaseBlocked
+	}
+	return phase
+}
+
+func teamsServiceMigrationStateMatchesProcess(state teamsServiceMigrationBlockedState, pid int, processStart string) bool {
+	if state.PID != pid || pid <= 0 {
+		return false
+	}
+	left := strings.TrimSpace(state.ProcessStart)
+	right := strings.TrimSpace(processStart)
+	if left == "" {
+		return true
+	}
+	if right == "" {
+		return false
+	}
+	return left == right
+}
+
+func teamsServiceMigrationStateAppearsLive(state teamsServiceMigrationBlockedState) bool {
+	if state.PID <= 0 || !teamsLocalSupervisorProcessAlive(state.PID) {
+		return false
+	}
+	if strings.TrimSpace(state.ProcessStart) == "" {
+		return true
+	}
+	current, err := teamsLocalSupervisorProcessStartTime(state.PID)
+	return err == nil && strings.TrimSpace(current) == strings.TrimSpace(state.ProcessStart)
+}
+
+func completeManagedTeamsRuntimeStorePlan(ctx context.Context, plan teams.RuntimeStorePlan) error {
+	if err := ensureTeamsServiceMigrationActiveState(); err != nil {
+		return fmt.Errorf("record active Teams migration state: %w", err)
+	}
+	if err := teamsCompleteOfflineStorePlan(ctx, plan); err != nil {
+		return err
+	}
+	if err := clearTeamsServiceMigrationBlockedState(); err != nil {
+		return fmt.Errorf("clear active Teams migration state: %w", err)
+	}
+	return nil
 }
 
 func prepareManagedTeamsRuntimeStore(
@@ -1383,7 +1490,7 @@ func prepareManagedTeamsRuntimeStore(
 	// stopped or excluded the previous child. Keep process and Scheduled Task
 	// management in that existing lifecycle boundary; this pre-listener child
 	// step is intentionally limited to deterministic store operations.
-	if err := teams.CompleteOfflineRuntimeStorePlan(ctx, plan); err != nil {
+	if err := completeManagedTeamsRuntimeStorePlan(ctx, plan); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -1405,6 +1512,7 @@ func teamsRunShouldRetryInProcess(once bool, managedServiceChild bool) bool {
 func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce func() error) error {
 	attempt := 0
 	_ = clearTeamsServiceMigrationBlockedState()
+	defer clearTeamsServiceMigrationBlockedState()
 	for {
 		attempt++
 		err := runOnce()
@@ -1423,7 +1531,6 @@ func runTeamsServiceRetryLoop(ctx context.Context, errOut io.Writer, runOnce fun
 			if markerErr := writeTeamsServiceMigrationBlockedState(err.Error()); markerErr != nil {
 				return fmt.Errorf("record blocked Teams migration state: %w", markerErr)
 			}
-			defer clearTeamsServiceMigrationBlockedState()
 			<-ctx.Done()
 			return ctx.Err()
 		}

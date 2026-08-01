@@ -42,6 +42,8 @@ const (
 
 	runtimeStoreDiscoveryTimeout        = 5 * time.Second
 	runtimeStoreDiscoveryCandidateLimit = 512
+	runtimeStoreDiscoveryEntryLimit     = 100_000
+	runtimeStoreDiscoveryBatchSize      = 256
 
 	runtimeStoreMigrationStageStagingReady        = "staging-ready"
 	runtimeStoreMigrationStageStagingCopied       = "staging-copied"
@@ -267,7 +269,7 @@ func discoverRuntimeScopeMigrationMatches(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	paths, err := runtimeStoreMigrationCandidatePaths(currentPath, runtimeStoreDiscoveryCandidateLimit)
+	paths, err := runtimeStoreMigrationCandidatePaths(ctx, currentPath, runtimeStoreDiscoveryCandidateLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -319,12 +321,31 @@ func discoverRuntimeScopeMigrationMatches(
 }
 
 // runtimeStoreMigrationCandidatePaths bounds the historical discovery cold
-// path without changing the maintenance resolver. It reads at most limit+1
-// directory entries across the state and legacy scope roots, then fails
-// closed instead of truncating the candidate set and guessing.
-func runtimeStoreMigrationCandidatePaths(currentPath string, limit int) ([]string, error) {
-	if limit <= 0 {
+// path without changing the maintenance resolver. Only regular state.json
+// files count as candidates; retained sidecar-only directories do not consume
+// the candidate budget. A separate, much larger entry budget keeps a damaged
+// directory from turning cold discovery into an unbounded scan.
+func runtimeStoreMigrationCandidatePaths(ctx context.Context, currentPath string, limit int) ([]string, error) {
+	return runtimeStoreMigrationCandidatePathsWithLimits(ctx, currentPath, limit, runtimeStoreDiscoveryEntryLimit)
+}
+
+func runtimeStoreMigrationCandidatePathsWithLimits(
+	ctx context.Context,
+	currentPath string,
+	candidateLimit int,
+	entryLimit int,
+) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if candidateLimit <= 0 {
 		return nil, fmt.Errorf("Teams runtime migration candidate limit must be positive")
+	}
+	if entryLimit <= 0 {
+		return nil, fmt.Errorf("Teams runtime migration entry limit must be positive")
 	}
 	seen := map[string]bool{}
 	paths := make([]string, 0, 8)
@@ -338,22 +359,22 @@ func runtimeStoreMigrationCandidatePaths(currentPath string, limit int) ([]strin
 	}
 	add(currentPath)
 
-	remaining := limit
+	remainingCandidates := candidateLimit
+	remainingEntries := entryLimit
 	for _, rootPath := range runtimeStoreMigrationScopeRoots() {
-		names, err := readRuntimeStoreMigrationScopeNames(rootPath, remaining+1)
+		candidates, visited, err := readRuntimeStoreMigrationCandidates(
+			ctx,
+			rootPath,
+			remainingCandidates,
+			remainingEntries,
+		)
 		if err != nil {
 			return nil, err
 		}
-		if len(names) > remaining {
-			return nil, fmt.Errorf(
-				"Teams runtime migration discovery exceeded %d scope candidates; refusing unbounded scan",
-				limit,
-			)
-		}
-		remaining -= len(names)
-		sort.Strings(names)
-		for _, name := range names {
-			add(filepath.Join(rootPath, name, "state.json"))
+		remainingEntries -= visited
+		remainingCandidates -= len(candidates)
+		for _, path := range candidates {
+			add(path)
 		}
 	}
 	if stateGlobalPath, err := appdirs.StatePath("teams", "state.json"); err == nil {
@@ -376,20 +397,86 @@ func runtimeStoreMigrationScopeRoots() []string {
 	return roots
 }
 
-func readRuntimeStoreMigrationScopeNames(rootPath string, limit int) ([]string, error) {
-	dir, err := os.Open(rootPath)
+func readRuntimeStoreMigrationCandidates(
+	ctx context.Context,
+	rootPath string,
+	candidateLimit int,
+	entryLimit int,
+) ([]string, int, error) {
+	root, err := os.OpenRoot(rootPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("open Teams runtime migration scope root %s: %w", rootPath, err)
+		return nil, 0, fmt.Errorf("open Teams runtime migration scope root %s: %w", rootPath, err)
+	}
+	defer root.Close()
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, 0, fmt.Errorf("read Teams runtime migration scope root %s: %w", rootPath, err)
 	}
 	defer dir.Close()
-	names, err := dir.Readdirnames(limit)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("read Teams runtime migration scope root %s: %w", rootPath, err)
+
+	visited := 0
+	candidates := make([]string, 0, 8)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, visited, err
+		}
+		entries, readErr := dir.ReadDir(runtimeStoreDiscoveryBatchSize)
+		for _, entry := range entries {
+			visited++
+			if visited > entryLimit {
+				return nil, visited, fmt.Errorf(
+					"Teams runtime migration discovery exceeded %d scope directory entries; refusing unbounded scan",
+					entryLimit,
+				)
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, visited, err
+			}
+			name := entry.Name()
+			info, err := root.Lstat(name)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, visited, fmt.Errorf("inspect Teams migration scope directory %s: %w", filepath.Join(rootPath, name), err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, visited, fmt.Errorf("Teams migration scope directory %s must not be a symlink", filepath.Join(rootPath, name))
+			}
+			if !info.IsDir() {
+				continue
+			}
+			stateRel := filepath.Join(name, "state.json")
+			stateInfo, err := root.Lstat(stateRel)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, visited, fmt.Errorf("inspect Teams migration candidate %s: %w", filepath.Join(rootPath, stateRel), err)
+			}
+			if stateInfo.Mode()&os.ModeSymlink != 0 || !stateInfo.Mode().IsRegular() {
+				return nil, visited, fmt.Errorf("Teams migration candidate %s is not a regular file", filepath.Join(rootPath, stateRel))
+			}
+			if len(candidates) >= candidateLimit {
+				return nil, visited, fmt.Errorf(
+					"Teams runtime migration discovery exceeded %d scope candidates; refusing unbounded scan",
+					candidateLimit,
+				)
+			}
+			candidates = append(candidates, filepath.Join(rootPath, stateRel))
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, visited, fmt.Errorf("read Teams runtime migration scope root %s: %w", rootPath, readErr)
+		}
 	}
-	return names, nil
+	sort.Strings(candidates)
+	return candidates, visited, nil
 }
 
 func InspectRuntimeStoreForScope(ctx context.Context, scope teamstore.ScopeIdentity) (RuntimeStorePlan, error) {

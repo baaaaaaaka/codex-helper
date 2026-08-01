@@ -30,11 +30,11 @@ case "${1:-}" in
     ;;
   diagnostics)
     go test ./internal/cli -count=1 \
-      -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|BlockedMigration|Status|DoctorDeepReads|UnavailableModel)' -v
+      -run '^TestTeamsRuntimeSafety(LocalStart|LocalStatus|SupervisorLogs|Recoverable|ActiveMigrationLease|LegacyMigrationMarker|BlockedMigration|Status|DoctorDeepReads|UnavailableModel)' -v
     ;;
   windows)
     go test ./internal/cli -count=1 \
-      -run '^TestTeamsRuntimeSafety(PackageTestMain|ServiceSpec|DoesNotRestore|ExplicitStable|ServiceEnvironment|StableEntry|ManagedRuntime|LocalStatus|StatusReportsAuthoritative)' -v
+      -run '^TestTeamsRuntimeSafety(PackageTestMain|ServiceSpec|DoesNotRestore|ExplicitStable|ServiceEnvironment|StableEntry|ManagedRuntime|ActiveMigrationLease|LegacyMigrationMarker|LocalStatus|StatusReportsAuthoritative)' -v
     ;;
   *)
     echo "usage: $0 {isolation|store|store-io|store-process|service-update|wsl-process|diagnostics|windows}" >&2
