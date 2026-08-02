@@ -348,6 +348,68 @@ func TestRunHistoryTuiOpensExistingSessionSelection(t *testing.T) {
 	}
 }
 
+func TestRunHistoryTuiForksOnlyValidatedMainSelection(t *testing.T) {
+	lockCLITestHooks(t)
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevSelect := selectSession
+	prevRunFork := runCodexForkSessionFn
+	prevRunSession := runCodexSessionFunc
+	t.Cleanup(func() {
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		selectSession = prevSelect
+		runCodexForkSessionFn = prevRunFork
+		runCodexSessionFunc = prevRunSession
+	})
+
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		return false, config.Config{Version: config.CurrentVersion}, nil
+	}
+	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
+		return &tui.Selection{
+			Action:         tui.SelectionActionFork,
+			RowKind:        tui.SelectionRowKindMain,
+			SourceThreadID: "fork-source",
+			Session:        codexhistory.Session{SessionID: "fork-source"},
+			Project:        codexhistory.Project{Path: "/repo"},
+		}, nil
+	}
+	runCodexSessionFunc = func(context.Context, *rootOptions, *config.Store, *config.Profile, []config.Instance, codexhistory.Session, codexhistory.Project, string, string, bool, io.Writer) error {
+		t.Fatal("expected fork path, not normal session path")
+		return nil
+	}
+
+	called := false
+	runCodexForkSessionFn = func(
+		_ context.Context,
+		_ *rootOptions,
+		_ *config.Store,
+		_ *config.Profile,
+		_ []config.Instance,
+		session codexhistory.Session,
+		project codexhistory.Project,
+		codexPath string,
+		codexDir string,
+		useProxy bool,
+		_ io.Writer,
+	) error {
+		called = true
+		if session.SessionID != "fork-source" || project.Path != "/repo" || codexPath != "codex-bin" || codexDir != "codex-home" || useProxy {
+			t.Fatalf("unexpected fork args: session=%+v project=%+v codex=%q dir=%q proxy=%v", session, project, codexPath, codexDir, useProxy)
+		}
+		return nil
+	}
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	if err := runHistoryTui(cmd, &rootOptions{configPath: cfgPath}, "", "codex-home", "codex-bin", 0); err != nil {
+		t.Fatalf("runHistoryTui error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected runCodexForkSessionFn to be called")
+	}
+}
+
 func TestHistoryOpenReturnsSessionNotFound(t *testing.T) {
 	lockCLITestHooks(t)
 	cfgPath := filepath.Join(t.TempDir(), "config.json")

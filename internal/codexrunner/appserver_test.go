@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
@@ -57,6 +58,34 @@ func TestEmitAppServerStreamEventRecognizesCompletedContextCompactionOnly(t *tes
 	}
 }
 
+func TestAppServerLaunchContextSharesExactRequestAndRunnerContract(t *testing.T) {
+	configure := func(cmd *exec.Cmd) error {
+		cmd.Env = append(cmd.Env, "TEST_LAUNCH_CONTEXT=1")
+		return nil
+	}
+	launch := AppServerLaunchContext{
+		Command:          "/managed/codex",
+		Args:             []string{"app-server", "--config", "profile"},
+		WorkingDir:       "/work",
+		ExtraEnv:         []string{"CODEX_HOME=/codex"},
+		Timeout:          time.Minute,
+		ConfigureCommand: configure,
+	}
+	req := launch.StartRequest()
+	req.Args[1] = "mutated"
+	req.ExtraEnv[0] = "mutated"
+	if launch.Args[1] != "--config" || launch.ExtraEnv[0] != "CODEX_HOME=/codex" {
+		t.Fatalf("StartRequest did not copy launch slices: launch=%#v", launch)
+	}
+	runner := launch.NewRunner(nil, ApprovalModeAutomatic)
+	if runner.Command != launch.Command || runner.WorkingDir != launch.WorkingDir || runner.Timeout != launch.Timeout || runner.ApprovalMode != ApprovalModeAutomatic {
+		t.Fatalf("runner launch fields = %#v", runner)
+	}
+	if !reflect.DeepEqual(runner.AppServerArgs, []string{"--config", "profile"}) || !reflect.DeepEqual(runner.ExtraEnv, launch.ExtraEnv) || runner.ConfigureCommand == nil {
+		t.Fatalf("runner launch context = %#v", runner)
+	}
+}
+
 func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{"userAgent":"codex-helper-test/0","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}`,
@@ -92,6 +121,90 @@ func TestAppServerRunnerInitializeHandshakeAndThreadListProbe(t *testing.T) {
 	assertParamNumber(t, writes[3], "limit", 2)
 	for _, write := range writes {
 		assertJSONRPC(t, write)
+	}
+}
+
+func TestAppServerRunnerForkThreadEncodesBoundedForkRequest(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"child-thread","forkedFromId":"parent-thread","createdAt":1785542400,"updatedAt":1785542401,"turns":[{"id":"turn-7","status":"completed"}]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	got, err := runner.ForkThread(context.Background(), ThreadForkParams{
+		ThreadID:              "parent-thread",
+		LastTurnID:            "turn-7",
+		ExcludeTurns:          true,
+		DeferGoalContinuation: true,
+		WorkingDir:            "/work",
+		RuntimeWorkspaceRoots: []string{"/extra"},
+	})
+	if err != nil {
+		t.Fatalf("ForkThread error: %v", err)
+	}
+	if got.ID != "child-thread" || got.ForkedFromID != "parent-thread" || got.LatestTurnID != "turn-7" {
+		t.Fatalf("forked thread = %#v", got)
+	}
+	if got.CreatedAt.Unix() != 1785542400 || got.UpdatedAt.Unix() != 1785542401 {
+		t.Fatalf("forked thread timestamps = %#v", got)
+	}
+
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[3], "thread/fork")
+	assertParamString(t, writes[3], "threadId", "parent-thread")
+	assertParamString(t, writes[3], "lastTurnId", "turn-7")
+	assertParamBool(t, writes[3], "excludeTurns", true)
+	assertParamBool(t, writes[3], "deferGoalContinuation", true)
+	assertParamBool(t, writes[3], "ephemeral", false)
+	assertParamString(t, writes[3], "cwd", "/work")
+	params := writes[3]["params"].(map[string]any)
+	roots, ok := params["runtimeWorkspaceRoots"].([]any)
+	if !ok || len(roots) != 1 || roots[0] != "/extra" {
+		t.Fatalf("runtimeWorkspaceRoots = %#v", params["runtimeWorkspaceRoots"])
+	}
+	assertParamAbsent(t, writes[3], "beforeTurnId")
+}
+
+func TestAppServerRunnerForkThreadMapsLostResponseToAmbiguous(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+	)
+	transport.eofWhenDrained = true
+	runner := NewAppServerRunner(transport)
+
+	_, err := runner.ForkThread(context.Background(), ThreadForkParams{
+		ThreadID:   "parent-thread",
+		LastTurnID: "turn-7",
+	})
+	if !IsKind(err, ErrorAmbiguous) {
+		t.Fatalf("ForkThread error = %v, want ambiguous response-loss error", err)
+	}
+}
+
+func TestAppServerRunnerForkThreadRejectsConflictingBoundaries(t *testing.T) {
+	runner := &AppServerRunner{}
+	_, err := runner.ForkThread(context.Background(), ThreadForkParams{
+		ThreadID:     "parent-thread",
+		LastTurnID:   "turn-1",
+		BeforeTurnID: "turn-2",
+	})
+	if !IsKind(err, ErrorInvalidRequest) {
+		t.Fatalf("ForkThread error = %v, want invalid request", err)
+	}
+}
+
+func TestAppServerRunnerForkThreadMapsUnsupportedMethod(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"error":{"code":-32601,"message":"Method not found"}}`,
+	)
+	runner := NewAppServerRunner(transport)
+	_, err := runner.ForkThread(context.Background(), ThreadForkParams{ThreadID: "parent-thread"})
+	if !IsKind(err, ErrorUnsupported) {
+		t.Fatalf("ForkThread error = %v, want unsupported", err)
 	}
 }
 
@@ -698,7 +811,7 @@ func TestAppServerRunnerReadThreadUsesIncludeTurns(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,
 		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
-		`{"id":3,"result":{"thread":{"id":"thread-read","name":"Read thread title","turns":[{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"done"}]}]}}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-read","name":"Read thread title","turns":[{"id":"turn-1","status":"completed","items":[{"id":"item-1","type":"agentMessage","text":"done"}]},{"id":"turn-failed","status":"failed","items":[]}]}}}`,
 	)
 	runner := NewAppServerRunner(transport)
 
@@ -711,6 +824,9 @@ func TestAppServerRunnerReadThreadUsesIncludeTurns(t *testing.T) {
 	}
 	if got.Name != "Read thread title" {
 		t.Fatalf("thread name = %q", got.Name)
+	}
+	if got.LatestTurnID != "turn-1" {
+		t.Fatalf("latest completed turn = %q, want turn-1", got.LatestTurnID)
 	}
 
 	writes := transport.decodedWrites(t)

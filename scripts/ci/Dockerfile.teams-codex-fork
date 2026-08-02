@@ -1,0 +1,6 @@
+FROM scratch
+
+COPY teams-fork.test /teams-fork.test
+COPY store-fork.test /store-fork.test
+COPY codexrunner-fork.test /codexrunner-fork.test
+COPY cli-fork.test /cli-fork.test

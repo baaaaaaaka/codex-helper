@@ -211,11 +211,45 @@ func TestHandleKeyEnterSelectsSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleKey error: %v", err)
 	}
-	if selection == nil || selection.Session.SessionID != "sess-1" {
+	if selection == nil || selection.Action != SelectionActionOpen || selection.RowKind != SelectionRowKindMain || selection.SourceThreadID != "sess-1" || selection.Session.SessionID != "sess-1" {
 		t.Fatalf("expected session sess-1, got %#v", selection)
 	}
 	if selection.UseProxy {
 		t.Fatalf("expected proxy to be disabled by default")
+	}
+}
+
+func TestHandleKeyForksOnlyMainSession(t *testing.T) {
+	screen := newTestScreen(t, 120, 40)
+	now := time.Now()
+	project := codexhistory.Project{
+		Key:  "one",
+		Path: "/tmp/one",
+		Sessions: []codexhistory.Session{
+			{SessionID: "sess-1", Summary: "hello", ModifiedAt: now, Subagents: []codexhistory.SubagentSession{{AgentID: "agent-1", ParentSessionID: "sess-1", ModifiedAt: now}}},
+		},
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.focus = "sessions"
+	state.lastListFocus = "sessions"
+	state.sessionState.selected = 1
+
+	selection, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyRune, 'f', 0))
+	if err != nil {
+		t.Fatalf("handleKey error: %v", err)
+	}
+	if selection == nil || selection.Action != SelectionActionFork || selection.RowKind != SelectionRowKindMain || selection.SourceThreadID != "sess-1" || selection.Session.SessionID != "sess-1" {
+		t.Fatalf("fork selection = %#v", selection)
+	}
+
+	state.expandedSessions["sess-1"] = true
+	state.sessionState.selected = 2
+	selection, err = handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyRune, 'f', 0))
+	if err != nil {
+		t.Fatalf("subagent handleKey error: %v", err)
+	}
+	if selection != nil {
+		t.Fatalf("subagent fork selection = %#v, want nil", selection)
 	}
 }
 

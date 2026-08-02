@@ -187,6 +187,56 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorReconcileForkThreadRequiresUniqueBoundedChild(t *testing.T) {
+	windowStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	windowEnd := windowStart.Add(15 * time.Minute)
+	runner := &fakeTeamsRunner{threads: []codexrunner.Thread{
+		{ID: "parent-thread", CreatedAt: windowStart},
+		{ID: "wrong-parent", ForkedFromID: "other-parent", CreatedAt: windowStart.Add(time.Minute)},
+		{ID: "wrong-turn", ForkedFromID: "parent-thread", CreatedAt: windowStart.Add(time.Minute)},
+		{ID: "too-old", ForkedFromID: "parent-thread", CreatedAt: windowStart.Add(-time.Minute)},
+		{ID: "child-thread", Name: "fork child", ForkedFromID: "parent-thread", CreatedAt: windowStart.Add(2 * time.Minute)},
+	}, threadReads: map[string]codexrunner.Thread{
+		"wrong-turn":   {ID: "wrong-turn", ForkedFromID: "parent-thread", LatestTurnID: "turn-8", CreatedAt: windowStart.Add(time.Minute)},
+		"child-thread": {ID: "child-thread", Name: "fork child", ForkedFromID: "parent-thread", LatestTurnID: "turn-7", CreatedAt: windowStart.Add(2 * time.Minute)},
+	}}
+	executor := teamsCodexExecutor{runner: runner, workDir: "/default"}
+
+	got, err := executor.ReconcileForkThread(context.Background(), &teams.Session{
+		CodexThreadID: "parent-thread",
+		Cwd:           "/session",
+	}, "turn-7", windowStart, windowEnd)
+	if err != nil {
+		t.Fatalf("ReconcileForkThread: %v", err)
+	}
+	if got.MatchCount != 1 || got.Result.CodexThreadID != "child-thread" || got.Result.CodexThreadTitle != "fork child" {
+		t.Fatalf("reconciliation result = %#v, want one bounded child", got)
+	}
+	if runner.listOptions.WorkingDir != "/session" || runner.listOptions.Limit != 100 {
+		t.Fatalf("ListThreads options = %#v", runner.listOptions)
+	}
+}
+
+func TestTeamsCodexExecutorReconcileForkThreadRefusesMultipleChildren(t *testing.T) {
+	windowStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	runner := &fakeTeamsRunner{threads: []codexrunner.Thread{
+		{ID: "child-a", ForkedFromID: "parent-thread", CreatedAt: windowStart.Add(time.Minute)},
+		{ID: "child-b", ForkedFromID: "parent-thread", CreatedAt: windowStart.Add(2 * time.Minute)},
+	}, threadReads: map[string]codexrunner.Thread{
+		"child-a": {ID: "child-a", ForkedFromID: "parent-thread", LatestTurnID: "turn-7", CreatedAt: windowStart.Add(time.Minute)},
+		"child-b": {ID: "child-b", ForkedFromID: "parent-thread", LatestTurnID: "turn-7", CreatedAt: windowStart.Add(2 * time.Minute)},
+	}}
+	executor := teamsCodexExecutor{runner: runner}
+
+	got, err := executor.ReconcileForkThread(context.Background(), &teams.Session{CodexThreadID: "parent-thread"}, "turn-7", windowStart, windowStart.Add(15*time.Minute))
+	if err != nil {
+		t.Fatalf("ReconcileForkThread: %v", err)
+	}
+	if got.MatchCount != 2 || got.Result.CodexThreadID != "" {
+		t.Fatalf("reconciliation result = %#v, want two matches and no adoption", got)
+	}
+}
+
 func TestTeamsCodexExecutorUsesSessionCwdForNewThread(t *testing.T) {
 	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
 		ThreadID:          "thread-new",
@@ -1989,12 +2039,16 @@ func TestTeamsCodexUpgraderForRunRestartsCachedRunnersAfterSuccess(t *testing.T)
 }
 
 type fakeTeamsRunner struct {
-	result   codexrunner.TurnResult
-	err      error
-	resumed  bool
-	threadID string
-	input    codexrunner.TurnInput
-	models   []codexrunner.ModelInfo
+	result      codexrunner.TurnResult
+	err         error
+	resumed     bool
+	threadID    string
+	input       codexrunner.TurnInput
+	models      []codexrunner.ModelInfo
+	threads     []codexrunner.Thread
+	threadReads map[string]codexrunner.Thread
+	listErr     error
+	listOptions codexrunner.ListThreadsOptions
 }
 
 func (r *fakeTeamsRunner) StartThread(_ context.Context, input codexrunner.TurnInput) (codexrunner.TurnResult, error) {
@@ -2017,12 +2071,16 @@ func (r *fakeTeamsRunner) InterruptTurn(context.Context, codexrunner.TurnRef) er
 	return nil
 }
 
-func (r *fakeTeamsRunner) ReadThread(context.Context, string) (codexrunner.Thread, error) {
-	return codexrunner.Thread{}, nil
+func (r *fakeTeamsRunner) ReadThread(_ context.Context, threadID string) (codexrunner.Thread, error) {
+	if thread, ok := r.threadReads[threadID]; ok {
+		return thread, nil
+	}
+	return codexrunner.Thread{}, fmt.Errorf("thread %q was not configured", threadID)
 }
 
-func (r *fakeTeamsRunner) ListThreads(context.Context, codexrunner.ListThreadsOptions) ([]codexrunner.Thread, error) {
-	return nil, nil
+func (r *fakeTeamsRunner) ListThreads(_ context.Context, opts codexrunner.ListThreadsOptions) ([]codexrunner.Thread, error) {
+	r.listOptions = opts
+	return append([]codexrunner.Thread(nil), r.threads...), r.listErr
 }
 
 func (r *fakeTeamsRunner) ListModels(context.Context) ([]codexrunner.ModelInfo, error) {

@@ -22,6 +22,8 @@ import (
 
 const codexRemoteTUIFeatureConfig = "features.tui_app_server=true"
 
+type codexTUIBeforeBroker func(context.Context, codexrunner.AppServerTransportStarter, codexrunner.AppServerLaunchContext) ([]string, error)
+
 func normalizeWorkingDir(cwd string) (string, error) {
 	cwd = strings.TrimSpace(cwd)
 	if cwd == "" {
@@ -85,6 +87,80 @@ func runCodexNewSession(
 	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, "", codexPath, codexDir, useProxy, agentAutoApprove, "", log)
 }
 
+func runCodexForkSession(
+	ctx context.Context,
+	root *rootOptions,
+	store *config.Store,
+	profile *config.Profile,
+	instances []config.Instance,
+	session codexhistory.Session,
+	project codexhistory.Project,
+	codexPath string,
+	codexDir string,
+	useProxy bool,
+	log io.Writer,
+) error {
+	cwd := codexhistory.SessionWorkingDir(session)
+	if cwd == "" {
+		cwd = project.Path
+	}
+	if strings.TrimSpace(session.SessionID) == "" {
+		return fmt.Errorf("missing session id")
+	}
+	agentAutoApprove, err := aaaPreference(store)
+	if err != nil {
+		return err
+	}
+	return runCodexTUIInvocationViaBrokerWithHook(
+		ctx,
+		root,
+		store,
+		profile,
+		instances,
+		cwd,
+		codexPath,
+		codexDir,
+		useProxy,
+		agentAutoApprove,
+		"",
+		nil,
+		nil,
+		nil,
+		func(ctx context.Context, starter codexrunner.AppServerTransportStarter, launch codexrunner.AppServerLaunchContext) ([]string, error) {
+			runner := launch.NewRunner(starter, approvalModeForAAA(agentAutoApprove))
+			parentThread, readErr := runner.ReadThread(ctx, session.SessionID)
+			if readErr != nil {
+				_ = runner.Close()
+				return nil, fmt.Errorf("read parent thread before fork: %w", readErr)
+			}
+			lastTurnID := strings.TrimSpace(parentThread.LatestTurnID)
+			if lastTurnID == "" {
+				_ = runner.Close()
+				return nil, fmt.Errorf("parent thread %q has no completed turn to use as the fork cutoff", session.SessionID)
+			}
+			child, forkErr := runner.ForkThread(ctx, codexrunner.ThreadForkParams{
+				ThreadID:              session.SessionID,
+				LastTurnID:            lastTurnID,
+				ExcludeTurns:          true,
+				DeferGoalContinuation: true,
+				WorkingDir:            cwd,
+			})
+			closeErr := runner.Close()
+			if forkErr != nil {
+				return nil, errors.Join(forkErr, closeErr)
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close temporary fork app-server: %w", closeErr)
+			}
+			if strings.TrimSpace(child.ID) == "" {
+				return nil, fmt.Errorf("fork returned an empty child thread id")
+			}
+			return []string{"resume", child.ID}, nil
+		},
+		log,
+	)
+}
+
 func aaaPreference(store *config.Store) (bool, error) {
 	if store == nil {
 		return false, nil
@@ -140,6 +216,27 @@ func runCodexTUIInvocationViaBroker(
 	tuiGlobalArgs []string,
 	tuiTail []string,
 	appServerExtraArgs []string,
+	log io.Writer,
+) error {
+	return runCodexTUIInvocationViaBrokerWithHook(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, log)
+}
+
+func runCodexTUIInvocationViaBrokerWithHook(
+	ctx context.Context,
+	root *rootOptions,
+	store *config.Store,
+	profile *config.Profile,
+	instances []config.Instance,
+	cwd string,
+	codexPath string,
+	codexDir string,
+	useProxy bool,
+	agentAutoApprove bool,
+	modelProfileRef string,
+	tuiGlobalArgs []string,
+	tuiTail []string,
+	appServerExtraArgs []string,
+	beforeBroker codexTUIBeforeBroker,
 	log io.Writer,
 ) error {
 	cwd, err := normalizeWorkingDir(cwd)
@@ -254,18 +351,26 @@ func runCodexTUIInvocationViaBroker(
 		ServerOptions: responsespolicy.ServerOptions{ProxyURL: proxyURL},
 		ReadyHook:     runtimeMigrationReadyHook(store, paths, codexPath, log),
 	}
+	launchContext := codexrunner.AppServerLaunchContext{
+		Command:          codexPath,
+		Args:             appServerArgs,
+		WorkingDir:       cwd,
+		ExtraEnv:         extraEnv,
+		Timeout:          30 * time.Second,
+		ConfigureCommand: configureIdentity,
+	}
+	if beforeBroker != nil {
+		updatedTail, err := beforeBroker(ctx, starter, launchContext)
+		if err != nil {
+			return err
+		}
+		tuiTail = updatedTail
+	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
 		Starter:      starter,
 		Log:          log,
 		ApprovalMode: approvalModeForAAA(agentAutoApprove),
-		StartRequest: codexrunner.AppServerStartRequest{
-			Command:          codexPath,
-			Args:             appServerArgs,
-			WorkingDir:       cwd,
-			ExtraEnv:         extraEnv,
-			Timeout:          30 * time.Second,
-			ConfigureCommand: configureIdentity,
-		},
+		StartRequest: launchContext.StartRequest(),
 	})
 	if err != nil {
 		return err

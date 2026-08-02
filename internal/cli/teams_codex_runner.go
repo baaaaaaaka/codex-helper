@@ -282,6 +282,112 @@ func (e teamsCodexExecutor) Run(ctx context.Context, session *teams.Session, pro
 	return e.RunWithEventHandler(ctx, session, prompt, nil)
 }
 
+func (e teamsCodexExecutor) ForkThread(ctx context.Context, session *teams.Session, cutoffCodexTurnID string) (teams.ForkResult, error) {
+	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return teams.ForkResult{}, fmt.Errorf("Codex parent thread is required for fork")
+	}
+	cutoffCodexTurnID = strings.TrimSpace(cutoffCodexTurnID)
+	if cutoffCodexTurnID == "" {
+		return teams.ForkResult{}, fmt.Errorf("last completed Codex turn is required for fork")
+	}
+	runner, err := e.runnerForSessionProfile(ctx, session)
+	if err != nil {
+		return teams.ForkResult{}, err
+	}
+	forger, ok := runner.(codexrunner.ThreadForker)
+	if !ok {
+		return teams.ForkResult{}, codexrunner.UnsupportedError("thread/fork")
+	}
+	child, err := forger.ForkThread(ctx, codexrunner.ThreadForkParams{
+		ThreadID:              strings.TrimSpace(session.CodexThreadID),
+		LastTurnID:            cutoffCodexTurnID,
+		ExcludeTurns:          true,
+		DeferGoalContinuation: true,
+		Ephemeral:             false,
+		WorkingDir:            teamsCodexEffectiveWorkDir(session, e.workDir),
+	})
+	if err != nil {
+		return teams.ForkResult{}, err
+	}
+	return teams.ForkResult{CodexThreadID: child.ID, CodexThreadTitle: child.Name}, nil
+}
+
+func (e teamsCodexExecutor) ReconcileForkThread(ctx context.Context, session *teams.Session, cutoffCodexTurnID string, windowStart time.Time, windowEnd time.Time) (teams.ForkReconcileResult, error) {
+	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return teams.ForkReconcileResult{}, fmt.Errorf("Codex parent thread is required for fork reconciliation")
+	}
+	if windowStart.IsZero() || windowEnd.IsZero() || !windowEnd.After(windowStart) {
+		return teams.ForkReconcileResult{}, fmt.Errorf("fork reconciliation window is invalid")
+	}
+	runner, err := e.runnerForSessionProfile(ctx, session)
+	if err != nil {
+		return teams.ForkReconcileResult{}, err
+	}
+	const reconciliationThreadLimit = 100
+	threads, err := runner.ListThreads(ctx, codexrunner.ListThreadsOptions{
+		WorkingDir: teamsCodexEffectiveWorkDir(session, e.workDir),
+		Limit:      reconciliationThreadLimit,
+	})
+	if err != nil {
+		return teams.ForkReconcileResult{}, err
+	}
+	if len(threads) >= reconciliationThreadLimit {
+		return teams.ForkReconcileResult{}, fmt.Errorf("thread list reached reconciliation limit; refusing to infer a unique child")
+	}
+	parentThreadID := strings.TrimSpace(session.CodexThreadID)
+	cutoffCodexTurnID = strings.TrimSpace(cutoffCodexTurnID)
+	potentialMatches := 0
+	verifiedMatches := make([]codexrunner.Thread, 0, len(threads))
+	readUnresolved := false
+	for _, thread := range threads {
+		if strings.TrimSpace(thread.ID) == "" || strings.TrimSpace(thread.ID) == parentThreadID {
+			continue
+		}
+		if strings.TrimSpace(thread.ForkedFromID) != parentThreadID {
+			continue
+		}
+		if !thread.CreatedAt.IsZero() && (thread.CreatedAt.Before(windowStart) || thread.CreatedAt.After(windowEnd)) {
+			continue
+		}
+		potentialMatches++
+		read, readErr := runner.ReadThread(ctx, thread.ID)
+		if readErr != nil {
+			readUnresolved = true
+			continue
+		}
+		if strings.TrimSpace(read.ID) == "" {
+			read.ID = thread.ID
+		}
+		if !read.CreatedAt.IsZero() && (read.CreatedAt.Before(windowStart) || read.CreatedAt.After(windowEnd)) {
+			continue
+		}
+		if read.ForkedFromID != "" && strings.TrimSpace(read.ForkedFromID) != parentThreadID {
+			continue
+		}
+		// The current app-server Thread schema exposes the parent thread but not
+		// the fork cutoff. Reading the child with turns included lets us prove
+		// that the selected cutoff is its last completed historical turn instead
+		// of trusting a non-protocol forkedFromTurnId field.
+		if strings.TrimSpace(read.LatestTurnID) != cutoffCodexTurnID {
+			continue
+		}
+		verifiedMatches = append(verifiedMatches, read)
+	}
+	result := teams.ForkReconcileResult{MatchCount: len(verifiedMatches)}
+	if readUnresolved && potentialMatches > result.MatchCount {
+		// An unreadable candidate is still a possible duplicate. Do not adopt a
+		// different candidate merely because its read happened to succeed first.
+		result.MatchCount = potentialMatches
+	}
+	if len(verifiedMatches) == 1 && !readUnresolved {
+		result.Result = teams.ForkResult{
+			CodexThreadID:    verifiedMatches[0].ID,
+			CodexThreadTitle: firstNonEmptyCLI(verifiedMatches[0].Name),
+		}
+	}
+	return result, nil
+}
+
 func (e teamsCodexExecutor) RunWithEventHandler(ctx context.Context, session *teams.Session, prompt string, handler codexrunner.EventHandler) (teams.ExecutionResult, error) {
 	return e.RunInputWithEventHandler(ctx, session, teams.ExecutionInput{Prompt: prompt}, handler)
 }

@@ -23,6 +23,7 @@ var (
 	selectSession              = tui.SelectSession
 	runCodexSessionFunc        = runCodexSession
 	runCodexNewSessionFn       = runCodexNewSession
+	runCodexForkSessionFn      = runCodexForkSession
 	findSessionWithProjectFunc = codexhistory.FindSessionWithProject
 	ensureProxyPreferenceFunc  = ensureProxyPreference
 	ensureProfileFunc          = ensureProfile
@@ -346,6 +347,24 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		}
 		if selection == nil {
 			return nil
+		}
+		if selection.Action == tui.SelectionActionFork {
+			if selection.RowKind != tui.SelectionRowKindMain || strings.TrimSpace(selection.SourceThreadID) == "" || selection.SourceThreadID != strings.TrimSpace(selection.Session.SessionID) {
+				return fmt.Errorf("fork selection is not bound to a main Codex thread")
+			}
+			return runCodexForkSessionFn(
+				ctx,
+				root,
+				store,
+				profile,
+				cfg.Instances,
+				selection.Session,
+				selection.Project,
+				codexPath,
+				codexDir,
+				selection.UseProxy,
+				cmd.ErrOrStderr(),
+			)
 		}
 		if selection.Cwd != "" {
 			return runCodexNewSessionFn(

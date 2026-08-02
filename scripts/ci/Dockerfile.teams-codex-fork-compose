@@ -1,0 +1,7 @@
+FROM scratch
+
+COPY teams-fork.test /teams-fork.test
+COPY fake-codex /fake-codex
+COPY fake-graph /fake-graph
+COPY controller /controller
+COPY observer /observer

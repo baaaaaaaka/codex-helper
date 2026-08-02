@@ -29,6 +29,24 @@ type ModelCatalogReader interface {
 	ListModels(context.Context) ([]ModelInfo, error)
 }
 
+// ThreadForker is an optional app-server capability. It is deliberately kept
+// separate from Runner so lightweight runners and older integrations do not
+// need to implement native thread forking.
+type ThreadForker interface {
+	ForkThread(context.Context, ThreadForkParams) (Thread, error)
+}
+
+type ThreadForkParams struct {
+	ThreadID              string
+	LastTurnID            string
+	BeforeTurnID          string
+	ExcludeTurns          bool
+	DeferGoalContinuation bool
+	Ephemeral             bool
+	WorkingDir            string
+	RuntimeWorkspaceRoots []string
+}
+
 type ModelInfo struct {
 	ID                     string
 	Model                  string
@@ -73,8 +91,16 @@ type TurnRef struct {
 }
 
 type Thread struct {
-	ID   string
-	Name string
+	ID           string
+	Name         string
+	ForkedFromID string
+	// ForkedFromTurnID is retained for source compatibility with older test
+	// runners, but current app-server Thread responses do not expose this
+	// field. Reconciliation must prove the cutoff from the child history.
+	ForkedFromTurnID string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	LatestTurnID     string
 }
 
 type ListThreadsOptions struct {
@@ -153,6 +179,7 @@ const (
 	ErrorCanceled       ErrorKind = "canceled"
 	ErrorParse          ErrorKind = "parse_failure"
 	ErrorUnsupported    ErrorKind = "unsupported"
+	ErrorAmbiguous      ErrorKind = "ambiguous"
 )
 
 type Error struct {
@@ -202,4 +229,10 @@ func IsKind(err error, kind ErrorKind) bool {
 
 func unsupported(operation string) error {
 	return &Error{Kind: ErrorUnsupported, Message: operation + " is not supported by this runner"}
+}
+
+// UnsupportedError exposes the same typed error used by built-in runners to
+// optional integrations such as the Teams native fork workflow.
+func UnsupportedError(operation string) error {
+	return unsupported(operation)
 }

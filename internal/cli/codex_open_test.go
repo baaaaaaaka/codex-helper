@@ -57,6 +57,38 @@ func TestRunCodexSessionPreservesResumeExperience(t *testing.T) {
 	assertBrokerCapabilityToken(t, fixture)
 }
 
+func TestRunCodexForkSessionForksBeforeResumingChildThroughRemoteTUI(t *testing.T) {
+	fixture := writeCodexTUIBrokerFixture(t)
+	store := newCodexOpenTestStore(t)
+	session := codexhistory.Session{SessionID: "parent-thread", ProjectPath: fixture.workDir}
+	if err := runCodexForkSession(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil, session, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", false, io.Discard); err != nil {
+		t.Fatalf("runCodexForkSession: %v", err)
+	}
+	tuiArgs := readArgLines(t, fixture.tuiArgs)
+	if len(tuiArgs) != 8 || tuiArgs[6] != "resume" || tuiArgs[7] != "child-thread" {
+		t.Fatalf("TUI args = %#v, want resume child-thread", tuiArgs)
+	}
+	rawEvents, err := os.ReadFile(fixture.events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := strings.Fields(string(rawEvents))
+	forkIndex := indexOfString(events, "fork")
+	tuiIndex := indexOfString(events, "tui-start")
+	if forkIndex < 0 || tuiIndex < 0 || forkIndex >= tuiIndex {
+		t.Fatalf("fork lifecycle events = %#v, want fork before remote TUI", events)
+	}
+}
+
+func indexOfString(values []string, want string) int {
+	for i, value := range values {
+		if value == want {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestNormalizeWorkingDirRejectsMissingDirectory(t *testing.T) {
 	if _, err := normalizeWorkingDir(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("normalizeWorkingDir accepted a missing directory")
@@ -108,6 +140,7 @@ type codexTUIBrokerFixture struct {
 	tuiSQLiteHome string
 	appServerArgs string
 	appSQLiteHome string
+	events        string
 }
 
 func writeCodexTUIBrokerFixture(t *testing.T) codexTUIBrokerFixture {
@@ -130,6 +163,7 @@ func writeCodexTUIBrokerFixture(t *testing.T) codexTUIBrokerFixture {
 	tuiSQLiteHome := filepath.Join(dir, "tui.sqlite-home")
 	appServerArgs := filepath.Join(dir, "app-server.args")
 	appSQLiteHome := filepath.Join(dir, "app-server.sqlite-home")
+	events := filepath.Join(dir, "events")
 	t.Setenv(codexrunner.RemoteBrokerAuthTokenEnv, "poisoned-inherited-token")
 	script := fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -142,20 +176,24 @@ case "${1:-}" in
     echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'
     exit 0
     ;;
-  app-server)
-    printf '%%s\n' "$@" > %s
+	  app-server)
+	    printf 'app-server-start\n' >> %s
+	    printf '%%s\n' "$@" > %s
     printf '%%s\n' "${%s:-}" > %s
     while IFS= read -r line; do
       id=$(printf %%s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
       case "$line" in
         *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{}}\n' "$id" ;;
-        *'"method":"thread/list"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"data":[]}}\n' "$id" ;;
+	        *'"method":"thread/list"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"data":[]}}\n' "$id" ;;
+	        *'"method":"thread/read"'*) printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"parent-thread","latestTurnId":"turn-7","turns":[{"id":"turn-7","status":"completed"}]}}}\n' "$id" ;;
+	        *'"method":"thread/fork"'*) printf 'fork\n' >> %s; printf '{"jsonrpc":"2.0","id":%%s,"result":{"thread":{"id":"child-thread","forkedFromId":"parent-thread","forkedFromTurnId":"turn-7"}}}\n' "$id" ;;
       esac
     done
     exit 0
     ;;
-  *)
-    printf '%%s\n' "$@" > %s
+	  *)
+	    printf 'tui-start\n' >> %s
+	    printf '%%s\n' "$@" > %s
     printf '%%s\n' "${%s:-}" > %s
     printf '%%s\n' "${%s:-}" > %s
     attempt=0
@@ -170,11 +208,11 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-`, shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
+	`, shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return codexTUIBrokerFixture{path: path, workDir: workDir, tuiArgs: tuiArgs, tuiAuthToken: tuiAuthToken, tuiSQLiteHome: tuiSQLiteHome, appServerArgs: appServerArgs, appSQLiteHome: appSQLiteHome}
+	return codexTUIBrokerFixture{path: path, workDir: workDir, tuiArgs: tuiArgs, tuiAuthToken: tuiAuthToken, tuiSQLiteHome: tuiSQLiteHome, appServerArgs: appServerArgs, appSQLiteHome: appSQLiteHome, events: events}
 }
 
 func newCodexOpenTestStore(t *testing.T) *config.Store {

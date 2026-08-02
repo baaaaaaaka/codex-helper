@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	SchemaVersion = 5
+	SchemaVersion = 6
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -42,10 +42,12 @@ const (
 type SessionStatus string
 
 const (
-	SessionStatusActive      SessionStatus = "active"
-	SessionStatusArchived    SessionStatus = "archived"
-	SessionStatusClosed      SessionStatus = "closed"
-	SessionStatusQuarantined SessionStatus = "quarantined"
+	SessionStatusActive          SessionStatus = "active"
+	SessionStatusArchived        SessionStatus = "archived"
+	SessionStatusClosed          SessionStatus = "closed"
+	SessionStatusQuarantined     SessionStatus = "quarantined"
+	SessionStatusStaging         SessionStatus = "staging"
+	SessionStatusAwaitingHistory SessionStatus = "awaiting_history"
 )
 
 type TurnStatus string
@@ -171,6 +173,8 @@ type State struct {
 	ChatRateLimits         map[string]ChatRateLimitState       `json:"chat_rate_limits,omitempty"`
 	ArtifactRecords        map[string]ArtifactRecord           `json:"artifact_records,omitempty"`
 	Notifications          map[string]NotificationRecord       `json:"notifications,omitempty"`
+	ForkOperations         map[string]ForkOperation            `json:"fork_operations,omitempty"`
+	ForkHistoryItems       map[string]ForkHistoryItem          `json:"fork_history_items,omitempty"`
 	ModelProfileKeyIntakes map[string]ModelProfileKeyIntake    `json:"model_profile_key_intakes,omitempty"`
 	SkillPushReviews       map[string]SkillPushReview          `json:"skill_push_reviews,omitempty"`
 	Workflow               WorkflowNotificationConfig          `json:"workflow,omitempty"`
@@ -832,6 +836,11 @@ type OutboxMessage struct {
 	AckKind                string           `json:"ack_kind,omitempty"`
 	QuoteReplyToMessageID  string           `json:"quote_reply_to_message_id,omitempty"`
 	NotificationKind       string           `json:"notification_kind,omitempty"`
+	ForkOperationID        string           `json:"fork_operation_id,omitempty"`
+	ForkHistoryNamespace   string           `json:"fork_history_namespace,omitempty"`
+	ForkOrdinal            int              `json:"fork_ordinal,omitempty"`
+	ForkBodyHash           string           `json:"fork_body_hash,omitempty"`
+	ForkRole               string           `json:"fork_role,omitempty"`
 	MentionOwner           bool             `json:"mention_owner,omitempty"`
 	MentionUserID          string           `json:"mention_user_id,omitempty"`
 	MentionUserName        string           `json:"mention_user_name,omitempty"`
@@ -1861,6 +1870,18 @@ var (
 	chatRateLimitStateFields = stateFieldSet(
 		"chat_rate_limits",
 	)
+	forkOperationStateFields = stateFieldSet(
+		"fork_operations",
+	)
+	forkCutoffStateFields = stateFieldSet(
+		"fork_operations",
+		"turns",
+	)
+	forkPollingStateFields = stateFieldSet(
+		"fork_operations",
+		"sessions",
+		"chat_polls",
+	)
 )
 
 func stateFieldSet(fields ...string) map[string]struct{} {
@@ -2838,6 +2859,30 @@ func (s *Store) SentOutboxMessagesForChat(ctx context.Context, chatID string) ([
 		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
 	})
 	return messages, nil
+}
+
+func (s *Store) OutboxMessageByID(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" {
+		return OutboxMessage{}, fmt.Errorf("outbox id is required")
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	msg, ok := state.OutboxMessages[outboxID]
+	if !ok {
+		return OutboxMessage{}, fmt.Errorf("outbox message %q not found", outboxID)
+	}
+	return msg, nil
+}
+
+// ForkPollingSnapshot returns only the durable fields needed to recover fork
+// operations and poll staged child chats. SQLite callers avoid materializing
+// unrelated outbox and cold history tables; legacy JSON stores fall back to
+// the normal loader.
+func (s *Store) ForkPollingSnapshot(ctx context.Context) (State, error) {
+	return s.loadStateFieldsOrFull(ctx, forkPollingStateFields)
 }
 
 func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
@@ -4509,6 +4554,9 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 		if helperOutboxMessageLocked(state, event.TeamsChatID, event.TeamsMessageID) {
 			return ErrInboundMessageFromHelperOutbox
 		}
+		if _, fenced := activeForkForSessionLocked(state, event.SessionID); fenced && event.Status != InboundStatusDeferred {
+			return ErrForkParentFenced
+		}
 		now := time.Now()
 		if event.Status == "" {
 			event.Status = InboundStatusPersisted
@@ -4862,6 +4910,12 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		if session.Status == SessionStatusQuarantined {
 			return fmt.Errorf("session %q is quarantined", turn.SessionID)
 		}
+		if !sessionStatusIsActive(session.Status) {
+			return fmt.Errorf("session %q is not active", turn.SessionID)
+		}
+		if _, fenced := activeForkForSessionLocked(state, turn.SessionID); fenced {
+			return ErrForkParentFenced
+		}
 		now := time.Now()
 		if turn.Status == "" {
 			turn.Status = TurnStatusQueued
@@ -4947,6 +5001,9 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 	claimed := false
 	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
 		if session, ok := state.Sessions[sessionID]; !ok || !sessionStatusIsActive(session.Status) {
+			return nil
+		}
+		if _, fenced := activeForkForSessionLocked(state, sessionID); fenced {
 			return nil
 		}
 		for _, turn := range state.Turns {
@@ -5541,7 +5598,7 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
 		session, ok := state.Sessions[sessionID]
-		if ok && !sessionStatusIsActive(session.Status) {
+		if ok && !sessionStatusIsActive(session.Status) && !forkHistoryOutboxMaySend(state, msg) {
 			return msg, ErrOutboxSendNotClaimed
 		}
 	}
@@ -7636,6 +7693,8 @@ func newState() State {
 		ChatRateLimits:         make(map[string]ChatRateLimitState),
 		ArtifactRecords:        make(map[string]ArtifactRecord),
 		Notifications:          make(map[string]NotificationRecord),
+		ForkOperations:         make(map[string]ForkOperation),
+		ForkHistoryItems:       make(map[string]ForkHistoryItem),
 		ModelProfileKeyIntakes: make(map[string]ModelProfileKeyIntake),
 		SkillPushReviews:       make(map[string]SkillPushReview),
 	}
@@ -7711,6 +7770,12 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.Notifications == nil {
 		s.Notifications = make(map[string]NotificationRecord)
+	}
+	if s.ForkOperations == nil {
+		s.ForkOperations = make(map[string]ForkOperation)
+	}
+	if s.ForkHistoryItems == nil {
+		s.ForkHistoryItems = make(map[string]ForkHistoryItem)
 	}
 	if s.ModelProfileKeyIntakes == nil {
 		s.ModelProfileKeyIntakes = make(map[string]ModelProfileKeyIntake)

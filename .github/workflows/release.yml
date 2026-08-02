@@ -273,6 +273,30 @@ jobs:
           go test ./internal/cli -count=1 -run '^TestHistoryListCmdTracksCodexThreadNameIndex$' -v
           go test ./internal/codexhistory -run '^$' -bench '^BenchmarkLoadThreadNameIndexCached$' -benchtime=100x -count=1 -benchmem
 
+      - name: Native Codex fork contract regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/codexrunner -count=1 -run '^Test(AppServerLaunchContext|AppServerRunnerForkThread)' -v
+          go test ./internal/cli -count=1 -run '^Test(Run(CodexForkSession|HistoryTuiForksOnlyValidatedMainSelection)|TeamsCodexExecutorReconcileForkThread)' -v
+          go test ./internal/tui -count=1 -run '^TestHandleKeyForksOnlyMainSession$' -v
+          go test ./internal/teams/store -count=1 -run '^Test(BeginFork|ClaimForkOperation|Fork|BlockedAmbiguousFork)' -v
+          go test ./internal/teams -count=1 -run '^TestFork' -v
+
+      - name: Teams Codex fork Docker smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/teams_codex_fork_docker_smoke.sh
+
+      - name: Teams Codex fork Compose fault matrix (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/teams_codex_fork_compose_smoke.sh
+
       - name: CXP preview SQLite correctness, concurrency, and write budgets
         shell: bash
         run: |

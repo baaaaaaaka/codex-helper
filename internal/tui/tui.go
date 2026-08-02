@@ -43,12 +43,30 @@ var newScreen = tcell.NewScreen
 var loadingFrames = []string{"-", "\\", "|", "/"}
 
 type Selection struct {
-	Project  codexhistory.Project
-	Session  codexhistory.Session
-	Cwd      string
-	UseProxy bool
-	UseAAA   bool
+	Action         SelectionAction
+	RowKind        SelectionRowKind
+	SourceThreadID string
+	Project        codexhistory.Project
+	Session        codexhistory.Session
+	Cwd            string
+	UseProxy       bool
+	UseAAA         bool
 }
+
+type SelectionAction string
+
+const (
+	SelectionActionOpen SelectionAction = "open"
+	SelectionActionFork SelectionAction = "fork"
+)
+
+type SelectionRowKind string
+
+const (
+	SelectionRowKindNew      SelectionRowKind = "new"
+	SelectionRowKindMain     SelectionRowKind = "main"
+	SelectionRowKindSubagent SelectionRowKind = "subagent"
+)
 
 type Options struct {
 	LoadProjects    func(context.Context) ([]codexhistory.Project, error)
@@ -702,9 +720,36 @@ func handleKey(
 		return nil, nil
 	}
 
+	if ev.Key() == tcell.KeyRune && (ev.Rune() == 'f' || ev.Rune() == 'F') {
+		if listFocus != "sessions" || !selectedOk || selectedItem.kind != sessionItemMain || selectedSession == nil {
+			return nil, nil
+		}
+		return &Selection{
+			Action:         SelectionActionFork,
+			RowKind:        SelectionRowKindMain,
+			SourceThreadID: strings.TrimSpace(selectedSession.SessionID),
+			Project:        selectedProject,
+			Session:        *selectedSession,
+			UseProxy:       state.proxyEnabled,
+			UseAAA:         state.aaaEnabled,
+		}, nil
+	}
+
 	if enterPressed {
 		if selectedSession != nil {
-			return &Selection{Project: selectedProject, Session: *selectedSession, UseProxy: state.proxyEnabled, UseAAA: state.aaaEnabled}, nil
+			rowKind := SelectionRowKindMain
+			if selectedItem.kind == sessionItemSubagent {
+				rowKind = SelectionRowKindSubagent
+			}
+			return &Selection{
+				Action:         SelectionActionOpen,
+				RowKind:        rowKind,
+				SourceThreadID: strings.TrimSpace(selectedSession.SessionID),
+				Project:        selectedProject,
+				Session:        *selectedSession,
+				UseProxy:       state.proxyEnabled,
+				UseAAA:         state.aaaEnabled,
+			}, nil
 		}
 		if selectedIsNew {
 			if cwd := newSessionCwd(selectedProject, opts.DefaultCwd); cwd != "" {
@@ -869,7 +914,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		}
 	}
 	statusSegments := []statusSegment{
-		{text: "Tab/Left/Right: switch  /: search  Ctrl+O: subagents  " + openLabel + "  r: refresh" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+		{text: "Tab/Left/Right: switch  /: search  Ctrl+O: subagents  " + openLabel + "  f: fork  r: refresh" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 		{text: aaaLabel + "  ", style: aaaStyle},
 		{text: "  q: quit", style: baseStatusStyle},
 	}
@@ -886,7 +931,7 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		}
 	} else if state.focus == "preview" {
 		statusSegments = []statusSegment{
-			{text: "Up/Down PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
+			{text: "Up/Down PgUp/PgDn Home/End: scroll  /: search  Ctrl+O: subagents  " + openLabel + "  f: fork  Tab/Left/Right: switch" + newHint + "  " + proxyLabel + "  ", style: baseStatusStyle},
 			{text: aaaLabel + "  ", style: aaaStyle},
 			{text: "  q: quit", style: baseStatusStyle},
 		}

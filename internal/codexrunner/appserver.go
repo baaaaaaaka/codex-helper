@@ -20,6 +20,7 @@ const (
 	appServerMethodThreadResume               = "thread/resume"
 	appServerMethodThreadRead                 = "thread/read"
 	appServerMethodThreadList                 = "thread/list"
+	appServerMethodThreadFork                 = "thread/fork"
 	appServerMethodThreadTurnsList            = "thread/turns/list"
 	appServerMethodModelList                  = "model/list"
 	appServerMethodTurnStart                  = "turn/start"
@@ -64,6 +65,50 @@ type AppServerStartRequest struct {
 	ConfigureCommand func(*exec.Cmd) error
 }
 
+// AppServerLaunchContext is the immutable launch contract shared by a
+// short-lived native operation (for example thread/fork) and the subsequent
+// remote broker. Keeping the process command, environment, cwd, and command
+// configuration together prevents the two lifecycles from silently drifting.
+type AppServerLaunchContext struct {
+	Command          string
+	Args             []string
+	WorkingDir       string
+	ExtraEnv         []string
+	Timeout          time.Duration
+	ConfigureCommand func(*exec.Cmd) error
+}
+
+func (c AppServerLaunchContext) StartRequest() AppServerStartRequest {
+	return AppServerStartRequest{
+		Command:          c.Command,
+		Args:             append([]string(nil), c.Args...),
+		WorkingDir:       c.WorkingDir,
+		ExtraEnv:         append([]string(nil), c.ExtraEnv...),
+		Timeout:          c.Timeout,
+		ConfigureCommand: c.ConfigureCommand,
+	}
+}
+
+// NewRunner creates a runner for the same launch context. AppServerRunner
+// stores app-server arguments without the leading subcommand, while the
+// starter request retains the complete command line.
+func (c AppServerLaunchContext) NewRunner(starter AppServerTransportStarter, approval ApprovalMode) *AppServerRunner {
+	args := append([]string(nil), c.Args...)
+	if len(args) > 0 && args[0] == "app-server" {
+		args = args[1:]
+	}
+	return &AppServerRunner{
+		Starter:          starter,
+		Command:          c.Command,
+		AppServerArgs:    args,
+		ExtraEnv:         append([]string(nil), c.ExtraEnv...),
+		WorkingDir:       c.WorkingDir,
+		Timeout:          c.Timeout,
+		ConfigureCommand: c.ConfigureCommand,
+		ApprovalMode:     approval,
+	}
+}
+
 type AppServerRunner struct {
 	Transport AppServerLineTransport
 	Starter   AppServerTransportStarter
@@ -73,12 +118,13 @@ type AppServerRunner struct {
 	// ServerRequestHandler overrides the handler selected by ApprovalMode.
 	ServerRequestHandler AppServerServerRequestHandler
 
-	Command       string
-	AppServerArgs []string
-	ExtraArgs     []string
-	ExtraEnv      []string
-	WorkingDir    string
-	Timeout       time.Duration
+	Command          string
+	AppServerArgs    []string
+	ExtraArgs        []string
+	ExtraEnv         []string
+	WorkingDir       string
+	Timeout          time.Duration
+	ConfigureCommand func(*exec.Cmd) error
 	// BackfillThreadName reads thread metadata after completed turns when the
 	// completion stream did not carry a thread/name/updated notification.
 	BackfillThreadName bool
@@ -473,6 +519,75 @@ func (r *AppServerRunner) ListThreads(ctx context.Context, opts ListThreadsOptio
 	return threads, nil
 }
 
+// ForkThread creates a child thread without changing the source thread. The
+// capability is intentionally not probed during initialize: older Codex
+// versions remain usable for normal history and turn operations.
+func (r *AppServerRunner) ForkThread(ctx context.Context, opts ThreadForkParams) (Thread, error) {
+	threadID := strings.TrimSpace(opts.ThreadID)
+	if threadID == "" {
+		return Thread{}, &Error{Kind: ErrorInvalidRequest, Message: "thread id is required"}
+	}
+	if strings.TrimSpace(opts.LastTurnID) != "" && strings.TrimSpace(opts.BeforeTurnID) != "" {
+		return Thread{}, &Error{Kind: ErrorInvalidRequest, Message: "last turn id and before turn id cannot both be set"}
+	}
+	ctx, cancel := withOptionalTimeout(ctx, r.Timeout)
+	defer cancel()
+	if err := r.ensureReady(ctx); err != nil {
+		return Thread{}, err
+	}
+	params := map[string]any{"threadId": threadID}
+	if lastTurnID := strings.TrimSpace(opts.LastTurnID); lastTurnID != "" {
+		params["lastTurnId"] = lastTurnID
+	}
+	if beforeTurnID := strings.TrimSpace(opts.BeforeTurnID); beforeTurnID != "" {
+		params["beforeTurnId"] = beforeTurnID
+	}
+	if opts.ExcludeTurns {
+		params["excludeTurns"] = true
+	}
+	if opts.DeferGoalContinuation {
+		params["deferGoalContinuation"] = true
+	}
+	// Send the value explicitly. A fork must never silently inherit a future
+	// server default that turns the child into an ephemeral thread.
+	params["ephemeral"] = opts.Ephemeral
+	if workingDir := firstNonEmpty(opts.WorkingDir, r.WorkingDir); workingDir != "" {
+		params["cwd"] = workingDir
+	}
+	if len(opts.RuntimeWorkspaceRoots) > 0 {
+		params["runtimeWorkspaceRoots"] = append([]string(nil), opts.RuntimeWorkspaceRoots...)
+	}
+	raw, err := r.request(ctx, appServerMethodThreadFork, params)
+	if err != nil {
+		if isUnsupportedThreadForkError(err) {
+			return Thread{}, &Error{Kind: ErrorUnsupported, Message: "Codex app-server does not support thread/fork", Err: err}
+		}
+		// The request has already crossed the transport boundary. A timeout,
+		// process exit, or lost response must never be retried blindly: the
+		// server may have created the child even though the caller saw an error.
+		if !IsKind(err, ErrorCodex) {
+			return Thread{}, &Error{Kind: ErrorAmbiguous, Message: "thread/fork response was not confirmed", Err: err}
+		}
+		return Thread{}, err
+	}
+	thread, ok := decodeThread(raw)
+	if !ok || strings.TrimSpace(thread.ID) == "" {
+		return Thread{}, &Error{Kind: ErrorParse, Message: "thread/fork response did not include a child thread id"}
+	}
+	return thread, nil
+}
+
+func isUnsupportedThreadForkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "-32601") ||
+		strings.Contains(text, "method not found") ||
+		strings.Contains(text, "thread/fork is not supported") ||
+		strings.Contains(text, "thread/fork not supported")
+}
+
 func (r *AppServerRunner) Close() error {
 	r.mu.Lock()
 	err := r.closeTransportLocked()
@@ -534,11 +649,12 @@ func (r *AppServerRunner) startAndInitializeLocked(ctx context.Context) error {
 			return &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
 		}
 		transport, err := r.Starter.StartAppServer(ctx, AppServerStartRequest{
-			Command:    firstNonEmpty(r.Command, defaultCodexCommand),
-			Args:       append([]string{"app-server"}, r.AppServerArgs...),
-			WorkingDir: r.WorkingDir,
-			ExtraEnv:   append([]string{}, r.ExtraEnv...),
-			Timeout:    r.Timeout,
+			Command:          firstNonEmpty(r.Command, defaultCodexCommand),
+			Args:             append([]string{"app-server"}, r.AppServerArgs...),
+			WorkingDir:       r.WorkingDir,
+			ExtraEnv:         append([]string{}, r.ExtraEnv...),
+			Timeout:          r.Timeout,
+			ConfigureCommand: r.ConfigureCommand,
 		})
 		if err != nil {
 			return classifyLaunchError(err)
@@ -1714,37 +1830,123 @@ func decodeThreadID(raw json.RawMessage) string {
 	return ""
 }
 
+type rawThreadEnvelope struct {
+	ID            string             `json:"id"`
+	ThreadID      string             `json:"thread_id"`
+	ThreadIDCamel string             `json:"threadId"`
+	Name          string             `json:"name"`
+	ThreadName    string             `json:"thread_name"`
+	ThreadName2   string             `json:"threadName"`
+	Title         string             `json:"title"`
+	ForkedFromID  string             `json:"forkedFromId"`
+	ForkedFromID2 string             `json:"forked_from_id"`
+	CreatedAt     json.RawMessage    `json:"createdAt"`
+	CreatedAt2    json.RawMessage    `json:"created_at"`
+	UpdatedAt     json.RawMessage    `json:"updatedAt"`
+	UpdatedAt2    json.RawMessage    `json:"updated_at"`
+	LatestTurnID  string             `json:"latestTurnId"`
+	LatestTurnID2 string             `json:"latest_turn_id"`
+	Turns         []json.RawMessage  `json:"turns"`
+	Thread        *rawThreadEnvelope `json:"thread"`
+}
+
 func decodeThread(raw json.RawMessage) (Thread, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return Thread{}, false
 	}
-	var envelope struct {
-		ID            string `json:"id"`
-		ThreadID      string `json:"thread_id"`
-		ThreadIDCamel string `json:"threadId"`
-		Name          string `json:"name"`
-		ThreadName    string `json:"thread_name"`
-		ThreadName2   string `json:"threadName"`
-		Title         string `json:"title"`
-		Thread        struct {
-			ID            string `json:"id"`
-			ThreadID      string `json:"thread_id"`
-			ThreadIDCamel string `json:"threadId"`
-			Name          string `json:"name"`
-			ThreadName    string `json:"thread_name"`
-			ThreadName2   string `json:"threadName"`
-			Title         string `json:"title"`
-		} `json:"thread"`
-	}
+	var envelope rawThreadEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return Thread{}, false
 	}
-	id := firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID, envelope.ID, envelope.Thread.ThreadIDCamel, envelope.Thread.ThreadID, envelope.Thread.ID)
+	nested := envelope.Thread
+	if nested == nil {
+		nested = &rawThreadEnvelope{}
+	}
+	id := firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID, envelope.ID, nested.ThreadIDCamel, nested.ThreadID, nested.ID)
 	if id == "" {
 		return Thread{}, false
 	}
-	name := firstNonEmpty(envelope.Thread.Name, envelope.Thread.ThreadName2, envelope.Thread.ThreadName, envelope.Thread.Title, envelope.Name, envelope.ThreadName2, envelope.ThreadName, envelope.Title)
-	return Thread{ID: id, Name: strings.TrimSpace(name)}, true
+	createdAt, createdOK := firstUnixTimestamp(envelope.CreatedAt, envelope.CreatedAt2, nested.CreatedAt, nested.CreatedAt2)
+	updatedAt, updatedOK := firstUnixTimestamp(envelope.UpdatedAt, envelope.UpdatedAt2, nested.UpdatedAt, nested.UpdatedAt2)
+	if !createdOK || !updatedOK {
+		return Thread{}, false
+	}
+	name := firstNonEmpty(nested.Name, nested.ThreadName2, nested.ThreadName, nested.Title, envelope.Name, envelope.ThreadName2, envelope.ThreadName, envelope.Title)
+	latestTurnID := firstNonEmpty(envelope.LatestTurnID, envelope.LatestTurnID2, nested.LatestTurnID, nested.LatestTurnID2)
+	if latestTurnID == "" {
+		latestTurnID = latestCompletedTurnID(envelope.Turns)
+	}
+	if latestTurnID == "" {
+		latestTurnID = latestCompletedTurnID(nested.Turns)
+	}
+	return Thread{
+		ID:           id,
+		Name:         strings.TrimSpace(name),
+		ForkedFromID: firstNonEmpty(envelope.ForkedFromID, envelope.ForkedFromID2, nested.ForkedFromID, nested.ForkedFromID2),
+		CreatedAt:    createdAt,
+		UpdatedAt:    updatedAt,
+		LatestTurnID: latestTurnID,
+	}, true
+}
+
+func latestCompletedTurnID(rawTurns []json.RawMessage) string {
+	var latest string
+	for _, raw := range rawTurns {
+		var turn struct {
+			ID     string `json:"id"`
+			ID2    string `json:"turnId"`
+			ID3    string `json:"turn_id"`
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(raw, &turn); err != nil || TurnStatus(strings.TrimSpace(turn.Status)) != TurnStatusCompleted {
+			continue
+		}
+		if id := firstNonEmpty(turn.ID, turn.ID2, turn.ID3); id != "" {
+			latest = id
+		}
+	}
+	return latest
+}
+
+func firstUnixTimestamp(values ...json.RawMessage) (time.Time, bool) {
+	for _, raw := range values {
+		if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			continue
+		}
+		value, ok := decodeUnixTimestamp(raw)
+		if !ok {
+			return time.Time{}, false
+		}
+		return value, true
+	}
+	return time.Time{}, true
+}
+
+func decodeUnixTimestamp(raw json.RawMessage) (time.Time, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return time.Time{}, true
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err == nil {
+		seconds, err := strconv.ParseInt(number.String(), 10, 64)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return time.Unix(seconds, 0).UTC(), true
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(text)); err == nil {
+		return parsed, true
+	}
+	seconds, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(seconds, 0).UTC(), true
 }
 
 func decodeThreadIdle(raw json.RawMessage) (bool, bool) {

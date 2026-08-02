@@ -1101,6 +1101,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			b.clearOwnerIfSame(context.Background())
 			return b.runStandbyLoop(ctx, opts)
 		}
+		if err := b.reconcileForkOperations(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams fork recovery error: %v\n", err)
+		}
 		if err := b.flushPendingOutboxMainLoop(ctx); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
@@ -1398,6 +1401,9 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		if controlHandled {
 			return nil
 		}
+	}
+	if err := b.pollStagedForkChildren(ctx, top); err != nil && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams staged fork child poll error: %v\n", err)
 	}
 
 	var candidateSessions []Session
@@ -4789,6 +4795,31 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 				return b.sendControl(ctx, controlCommandErrorMessage(err))
 			}
 			return b.sendControl(ctx, message)
+		case DashboardCommandFork:
+			if strings.TrimSpace(parsed.Argument) == "" {
+				return b.sendControl(ctx, "usage: `fork <session-number-or-session-id>`")
+			}
+			sessionID, err := b.resolvePublishTargetSessionID(ctx, parsed.Target)
+			if err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			session := b.reg.SessionByID(sessionID)
+			if session == nil {
+				state, stateErr := b.store.Load(ctx)
+				if stateErr != nil {
+					return b.sendControl(ctx, controlCommandErrorMessage(stateErr))
+				}
+				durable, found := state.Sessions[sessionID]
+				if !found {
+					return b.sendControl(ctx, fmt.Sprintf("session %q was not found", sessionID))
+				}
+				converted := registrySessionFromDurable(durable)
+				session = &converted
+			}
+			if err := b.forkWorkSession(ctx, session, msg); err != nil {
+				return b.sendControl(ctx, controlCommandErrorMessage(err))
+			}
+			return nil
 		case DashboardCommandMkdir:
 			return b.createWorkspaceDirectory(ctx, parsed.Argument)
 		case DashboardCommandRename:
@@ -5173,6 +5204,7 @@ func controlHelpText() string {
 		"- `default status` / `default model ...` / `default effort ...` - manage global defaults for future launches and chats",
 		"- `s` / `sessions` - show sessions in the selected workspace",
 		"- `c <number>` / `continue <number>` - continue an old local Codex session in Teams",
+		"- `fork <number-or-session-id>` - fork an existing Work chat after its last completed turn",
 		"- `st` / `status` - show active Work chats",
 		"- `helper rename <title>` - rename this Control chat",
 		"- `helper rename hostname <name>` - rename this machine in all related chat titles",
@@ -5199,6 +5231,7 @@ func controlAdvancedHelpText() string {
 		"History flow:",
 		"- `s` / `sessions` / `history` - list local sessions in the selected workspace",
 		"- `c 1` / `continue 1` / `1` on a sessions page - create/open a Work chat and import that session history",
+		"- `fork <id>` - native child; publish history before link",
 		"",
 		"Other control commands:",
 		"- `st` / `status` - list active Teams work chats",
@@ -5263,6 +5296,7 @@ func sessionHelpText() string {
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper restore-thread <thread-id>` - restore a missing Codex thread binding before retrying an interrupted turn",
 		"`helper close` or `!close` - close this Codex session in Teams",
+		"`fork` - create a native Codex child from this Work chat; the new chat link is sent only after history publishing is verified",
 		"`helper details` or `!details` - show debug IDs and links",
 		"`beacon status` - show this Work chat execution target",
 		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
@@ -5288,6 +5322,7 @@ func sessionAdvancedHelpText() string {
 		"`helper rename hostname <name>` - rename this machine in all related chat titles",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 		"`helper close` or `!close` - close this Codex session in Teams",
+		"`fork` - create a native Codex child from the last completed turn; messages received during the operation are deferred and replayed afterward",
 		"`helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 		"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 		"`helper publish-history full` - publish the complete local Codex history once to this chat",
@@ -7482,7 +7517,7 @@ func isWorkOnlyHelperCommand(text string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "rename", "publish-history", "sync-history", "import-history", "stats", "usage", "tokens":
+	case "file", "image", "send-file", "send-image", "retry", "restore-thread", "restore", "cancel", "close", "rename", "publish-history", "sync-history", "import-history", "fork", "stats", "usage", "tokens":
 		return true
 	default:
 		return false
@@ -8151,6 +8186,15 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 		if !messageAuthoredByCurrentUser(msg, b.user) {
 			return b.rejectExternalWorkCommand(ctx, session, msg)
 		}
+		if b.store != nil && forkWorkCommandMutatesParent(parsed.Name) {
+			operation, fenced, err := b.store.ParentFork(ctx, session.ID)
+			if err != nil {
+				return err
+			}
+			if fenced {
+				return b.sendToChat(ctx, chatID, fmt.Sprintf("A fork operation (%s) is still preparing this session. Only `helper status`, `helper details`, and `helper help` are available until the new chat link is durably sent.", operation.Phase))
+			}
+		}
 		switch parsed.Name {
 		case DashboardCommandClose:
 			session.Status = "closed"
@@ -8214,6 +8258,14 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 			default:
 				return b.sendToChat(ctx, chatID, "Usage: `helper publish-history` imports the pending backlog; `helper publish-history full` imports the complete local Codex history into this chat.")
 			}
+		case DashboardCommandFork:
+			if strings.TrimSpace(parsed.Argument) != "" {
+				return b.sendToChat(ctx, chatID, "usage: `fork` forks this Work chat; use `fork <session>` in the Control chat for another session.")
+			}
+			if err := b.forkWorkSession(ctx, session, msg); err != nil {
+				return b.sendToChat(ctx, chatID, controlCommandErrorMessage(err))
+			}
+			return nil
 		case DashboardCommandSkills:
 			return b.handleSkillsCommandFromMessage(ctx, chatID, msg, parsed.Argument)
 		case DashboardCommandBeacon:
@@ -8244,6 +8296,13 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 
 	if msg.Body.Content == "" && strings.TrimSpace(text) != "" {
 		msg.Body.Content = text
+	}
+	if b.store != nil {
+		if _, fenced, err := b.store.ParentFork(ctx, session.ID); err != nil {
+			return err
+		} else if fenced {
+			return b.deferSessionMessageDuringFork(ctx, session, msg)
+		}
 	}
 	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
 		return err
@@ -8362,6 +8421,15 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 		return nil
 	}
 	return b.runPreparedQueuedTurnFromMessage(ctx, session, turn, chatID, msg, text, b.executor)
+}
+
+func forkWorkCommandMutatesParent(command DashboardCommandName) bool {
+	switch command {
+	case DashboardCommandStatus, DashboardCommandStats, DashboardCommandDetails, DashboardCommandHelp, DashboardCommandDefault:
+		return false
+	default:
+		return true
+	}
 }
 
 func (b *Bridge) rejectExternalWorkCommand(ctx context.Context, session *Session, msg ChatMessage) error {
@@ -8948,6 +9016,15 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 				return err
 			}
 			continue
+		case "teams_session_fork_deferred":
+			// The parent fence is the durable ordering barrier. Leave the
+			// inbound row deferred until activation clears it, then replay it
+			// through the ordinary turn path below.
+			if _, fenced, err := b.store.ParentFork(ctx, inbound.SessionID); err != nil {
+				return err
+			} else if fenced {
+				continue
+			}
 		}
 		session, err := b.sessionForInboundEvent(ctx, inbound)
 		if err != nil {
@@ -8957,6 +9034,17 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			if err := b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred input session is no longer available"); err != nil {
 				return err
 			}
+			continue
+		}
+		if !isActiveSessionStatus(session.Status) {
+			// Staged fork children are polled through the dedicated preactivation
+			// path. Keep their input durable, but do not create a Codex turn until
+			// the history proof atomically activates the child.
+			continue
+		}
+		if _, fenced, err := b.store.ParentFork(ctx, session.ID); err != nil {
+			return err
+		} else if fenced {
 			continue
 		}
 		if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
@@ -14254,6 +14342,11 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			return err
 		}
 	}
+	if isForkDeliveryOutbox(outbox) {
+		if err := b.validateForkOwner(ctx, outbox.ForkOperationID); err != nil {
+			return err
+		}
+	}
 	if shouldSuppressCodexCommandOutbox(outbox.Kind) {
 		_, err := b.store.MarkOutboxSent(ctx, outbox.ID, "")
 		return err
@@ -14277,7 +14370,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 		return err
 	}
-	if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(outbox) && !teamstore.OutboxDeliveryProtected(outbox) {
+	if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(outbox) && !teamstore.OutboxDeliveryProtected(outbox) && !isForkDeliveryOutbox(outbox) {
 		if teamstore.OutboxDeliveryTransient(outbox) {
 			if _, err := b.store.MarkOutboxSkippedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "ambiguous transient output superseded by explicit progress"); err != nil {
 				return err
@@ -14297,6 +14390,9 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 		return err
 	}
+	if teamstore.OutboxSendIsAmbiguous(outbox) && isForkDeliveryOutbox(outbox) {
+		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(outbox.LastSendAttempt, outbox.CreatedAt)}
+	}
 	if opts.RespectRateLimitBlock {
 		if blockedUntil, ok := b.chatBlockedUntil(ctx, outbox.TeamsChatID); ok {
 			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: blockedUntil}
@@ -14306,6 +14402,16 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	} else if ok {
 		if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(earlier) && isTranscriptImportBatchOutboxKind(earlier.Kind) {
+			if err := b.sendQueuedOutboxWithOptions(ctx, earlier, opts); err != nil {
+				return err
+			}
+		} else if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(earlier) && isForkDeliveryOutbox(earlier) {
+			// Fork history/link outboxes carry an explicit provenance marker. A
+			// transport error may mean Graph accepted the message, so never let a
+			// later fork outbox make this predecessor skipped before its marker can
+			// be reconciled. Re-enter the recovery path for the earlier item; if
+			// its Graph message is found it will be settled as duplicate-settled,
+			// otherwise the ambiguity remains durable and blocks the later item.
 			if err := b.sendQueuedOutboxWithOptions(ctx, earlier, opts); err != nil {
 				return err
 			}
@@ -14532,6 +14638,12 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 		if strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
 			continue
 		}
+		if isForkDeliveryOutbox(outbox) && helperOutboxProvenanceMarkerID(msg.Body.Content) != strings.TrimSpace(outbox.ID) {
+			// Fork history must never be settled by a coincidentally identical
+			// user message in the staged chat. Only the durable outbox marker can
+			// prove that an ambiguous Graph POST actually produced this message.
+			continue
+		}
 		activity := chatMessageActivityTime(msg)
 		if !activity.IsZero() && activity.Before(minActivity) {
 			continue
@@ -14546,6 +14658,11 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 		}
 		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, msg.ID)
 		if err == nil {
+			if isForkHistoryOutbox(outbox) {
+				if duplicateErr := b.markForkHistoryDuplicateSettled(ctx, outbox.ForkOperationID, outbox.ID, msg.ID); duplicateErr != nil {
+					return true, duplicateErr
+				}
+			}
 			b.forgetAcceptedOutbox(outbox.ID)
 			b.recordSentOutboxSideEffect(ctx, sent, msg, opts)
 		}

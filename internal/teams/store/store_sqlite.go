@@ -1631,6 +1631,11 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, status TEXT, created_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS notifications_session_idx ON notifications(session_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS notifications_status_idx ON notifications(status, created_at, id)`,
+		`CREATE TABLE IF NOT EXISTS fork_operations (id TEXT PRIMARY KEY, parent_session_id TEXT, child_session_id TEXT, phase TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS fork_operations_parent_idx ON fork_operations(parent_session_id, phase, updated_at, id)`,
+		`CREATE INDEX IF NOT EXISTS fork_operations_phase_idx ON fork_operations(phase, updated_at, id)`,
+		`CREATE TABLE IF NOT EXISTS fork_history_items (id TEXT PRIMARY KEY, operation_id TEXT, ordinal INTEGER, delivery_status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS fork_history_operation_idx ON fork_history_items(operation_id, ordinal, id)`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
@@ -1708,6 +1713,8 @@ func coldSQLiteState(state State) State {
 	cold.ImportCheckpoints = nil
 	cold.ArtifactRecords = nil
 	cold.Notifications = nil
+	cold.ForkOperations = nil
+	cold.ForkHistoryItems = nil
 	return cold
 }
 
@@ -1718,7 +1725,7 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_sequences", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications"} {
+	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_sequences", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications", "fork_operations", "fork_history_items"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return err
 		}
@@ -1800,6 +1807,16 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}
 	if err := writeSQLiteMap(ctx, tx, `INSERT INTO notifications(id, session_id, turn_id, status, created_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.Notifications, func(v NotificationRecord) []any {
 		return []any{v.ID, v.SessionID, v.TurnID, string(v.Status), sqliteTime(v.CreatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO fork_operations(id, parent_session_id, child_session_id, phase, updated_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.ForkOperations, func(v ForkOperation) []any {
+		return []any{v.ID, v.ParentSessionID, v.ChildSessionID, string(v.Phase), sqliteTime(v.UpdatedAt)}
+	}); err != nil {
+		return err
+	}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO fork_history_items(id, operation_id, ordinal, delivery_status, updated_at, json) VALUES (?, ?, ?, ?, ?, ?)`, state.ForkHistoryItems, func(v ForkHistoryItem) []any {
+		return []any{v.ID, v.OperationID, v.Ordinal, string(v.DeliveryStatus), sqliteTime(v.UpdatedAt)}
 	}); err != nil {
 		return err
 	}
@@ -2002,6 +2019,12 @@ func loadSQLiteStateRows(ctx context.Context, db interface {
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM notifications`, state.Notifications, func(v NotificationRecord) string { return v.ID }); err != nil {
 		return State{}, err
 	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM fork_operations`, state.ForkOperations, func(v ForkOperation) string { return v.ID }); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM fork_history_items`, state.ForkHistoryItems, func(v ForkHistoryItem) string { return v.ID }); err != nil {
+		return State{}, err
+	}
 	normalizeLoadedState(&state)
 	return state, nil
 }
@@ -2083,6 +2106,16 @@ func loadSQLiteSelectedStateWithChatPollQuery(ctx context.Context, db *sql.DB, w
 	}
 	if _, ok := wanted["notifications"]; ok {
 		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM notifications`, state.Notifications, func(v NotificationRecord) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["fork_operations"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM fork_operations`, state.ForkOperations, func(v ForkOperation) string { return v.ID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["fork_history_items"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM fork_history_items`, state.ForkHistoryItems, func(v ForkHistoryItem) string { return v.ID }); err != nil {
 			return State{}, err
 		}
 	}
@@ -4008,6 +4041,12 @@ func (s *Store) persistInboundSQLite(ctx context.Context, event InboundEvent) (I
 				handled = true
 				return ErrInboundMessageFromHelperOutbox
 			}
+			if fenced, err := sqliteForkParentFencedTx(ctx, tx, event.SessionID); err != nil {
+				return err
+			} else if fenced && event.Status != InboundStatusDeferred {
+				handled = true
+				return ErrForkParentFenced
+			}
 			now := time.Now()
 			if event.Status == "" {
 				event.Status = InboundStatusPersisted
@@ -4065,6 +4104,26 @@ func (s *Store) persistInboundSQLite(ctx context.Context, event InboundEvent) (I
 	}
 	err := run()
 	return out, created, handled, err
+}
+
+func sqliteForkParentFencedTx(ctx context.Context, tx *sql.Tx, sessionID string) (bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return false, nil
+	}
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM fork_operations
+	WHERE parent_session_id = ?
+	  AND phase NOT IN (?, ?, ?, ?)
+	LIMIT 1`, sessionID,
+		string(ForkPhaseActivated), string(ForkPhaseLinkSent), string(ForkPhaseFailed), string(ForkPhaseAbandoned)).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return one == 1, nil
 }
 
 func (s *Store) updateInboundEventSQLite(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, bool, error) {
@@ -4179,6 +4238,15 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 			}
 			if session.Status == SessionStatusQuarantined {
 				return fmt.Errorf("session %q is quarantined", turn.SessionID)
+			}
+			if !sessionStatusIsActive(session.Status) {
+				return fmt.Errorf("session %q is not active", turn.SessionID)
+			}
+			if fenced, err := sqliteForkParentFencedTx(ctx, tx, turn.SessionID); err != nil {
+				return err
+			} else if fenced {
+				handled = true
+				return ErrForkParentFenced
 			}
 			now := time.Now()
 			if turn.Status == "" {
@@ -4776,6 +4844,11 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 			if !ok || !sessionStatusIsActive(session.Status) {
 				return tx.Commit()
 			}
+			if fenced, err := sqliteForkParentFencedTx(ctx, tx, sessionID); err != nil {
+				return err
+			} else if fenced {
+				return tx.Commit()
+			}
 			var running int
 			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE session_id = ? AND status = ? LIMIT 1`, sessionID, string(TurnStatusRunning)).Scan(&running); err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
@@ -5257,6 +5330,13 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					return err
 				} else if ok {
 					state.Sessions[sessionID] = session
+				}
+			}
+			if operationID := strings.TrimSpace(current.ForkOperationID); operationID != "" {
+				if operation, ok, err := loadSQLiteJSONRow[ForkOperation](ctx, tx, `SELECT json FROM fork_operations WHERE id = ?`, operationID); err != nil {
+					return err
+				} else if ok {
+					state.ForkOperations[operationID] = operation
 				}
 			}
 			if loadCold || loadLinked {

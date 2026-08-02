@@ -1,0 +1,118 @@
+services:
+  fake-codex:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/fake-codex"]
+    environment:
+      STATE_DIR: /state
+      SCENARIO: ${CXP_FORK_COMPOSE_SCENARIO}
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+  fake-graph:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/fake-graph"]
+    environment:
+      STATE_DIR: /state
+      SCENARIO: ${CXP_FORK_COMPOSE_SCENARIO}
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+  sut-a:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/teams-fork.test", "-test.run", "^TestForkComposeSUT$", "-test.v"]
+    environment:
+      CXP_RUNTIME_DISABLE: "1"
+      CXP_FORK_COMPOSE_SUT: "1"
+      CXP_FORK_COMPOSE_ROLE: sut-a
+      CXP_FORK_COMPOSE_SCENARIO: ${CXP_FORK_COMPOSE_SCENARIO}
+      CXP_FORK_COMPOSE_STORE_KIND: ${CXP_FORK_COMPOSE_STORE_KIND}
+      CXP_FORK_COMPOSE_STATE_DIR: /state
+      CXP_FORK_COMPOSE_CODEX_URL: http://fake-codex:8080
+      CXP_FORK_COMPOSE_GRAPH_URL: http://fake-graph:8081
+      HOME: /state/home
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    depends_on: [fake-codex, fake-graph]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+  sut-b:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/teams-fork.test", "-test.run", "^TestForkComposeSUT$", "-test.v"]
+    environment:
+      CXP_RUNTIME_DISABLE: "1"
+      CXP_FORK_COMPOSE_SUT: "1"
+      CXP_FORK_COMPOSE_ROLE: sut-b
+      CXP_FORK_COMPOSE_SCENARIO: ${CXP_FORK_COMPOSE_SCENARIO}
+      CXP_FORK_COMPOSE_STORE_KIND: ${CXP_FORK_COMPOSE_STORE_KIND}
+      CXP_FORK_COMPOSE_STATE_DIR: /state
+      CXP_FORK_COMPOSE_CODEX_URL: http://fake-codex:8080
+      CXP_FORK_COMPOSE_GRAPH_URL: http://fake-graph:8081
+      HOME: /state/home
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    depends_on: [fake-codex, fake-graph]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+  controller:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/controller"]
+    environment:
+      STATE_DIR: /state
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+  observer:
+    image: ${CXP_FORK_COMPOSE_IMAGE:?CXP_FORK_COMPOSE_IMAGE is required}
+    command: ["/observer"]
+    environment:
+      STATE_DIR: /state
+    volumes:
+      - fork-state:/state
+    networks: [fork]
+    depends_on: [controller]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+
+volumes:
+  fork-state:
+
+networks:
+  fork:
+    internal: true

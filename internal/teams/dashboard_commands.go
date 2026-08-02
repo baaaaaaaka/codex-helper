@@ -40,6 +40,7 @@ const (
 	DashboardCommandCodexUpdate    DashboardCommandName = "codex-update"
 	DashboardCommandWebhook        DashboardCommandName = "webhook"
 	DashboardCommandPublishHistory DashboardCommandName = "publish-history"
+	DashboardCommandFork           DashboardCommandName = "fork"
 	DashboardCommandClose          DashboardCommandName = "close"
 	DashboardCommandRetry          DashboardCommandName = "retry"
 	DashboardCommandRestoreThread  DashboardCommandName = "restore-thread"
@@ -153,7 +154,7 @@ func helperPrefixedControlCancelName(name string) bool {
 
 func helperPrefixedControlNameIsWorkOnly(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "close", "retry", "restore-thread", "restore", "cancel", "stop", "send-file", "send-image", "file", "image", "publish-history", "sync-history", "import-history", "stats", "usage", "tokens":
+	case "close", "retry", "restore-thread", "restore", "cancel", "stop", "send-file", "send-image", "file", "image", "publish-history", "sync-history", "import-history", "fork", "stats", "usage", "tokens":
 		return true
 	default:
 		return false
@@ -247,6 +248,8 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 		return DashboardCommandEffort, arg, true
 	case "default", "defaults":
 		return DashboardCommandDefault, arg, true
+	case "fork":
+		return DashboardCommandFork, arg, true
 	default:
 	}
 	return DashboardCommandNone, "", false
@@ -411,6 +414,8 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == ""
 	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault:
 		return true
+	case DashboardCommandFork:
+		return true
 	case DashboardCommandWorkspace, DashboardCommandOpen, DashboardCommandPark, DashboardCommandResume, DashboardCommandPublish, DashboardCommandNew, DashboardCommandAsk, DashboardCommandMkdir, DashboardCommandRename, DashboardCommandDetails:
 		return true
 	default:
@@ -437,6 +442,8 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandResume, true
 	case "c", "continue", "publish", "import":
 		return DashboardCommandPublish, true
+	case "fork":
+		return DashboardCommandFork, true
 	case "n", "new", "create":
 		return DashboardCommandNew, true
 	case "q", "ask", "question":
@@ -553,6 +560,8 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandDetails, true
 	case "publish-history", "sync-history", "import-history":
 		return DashboardCommandPublishHistory, true
+	case "fork":
+		return DashboardCommandFork, true
 	case "skills", "skill":
 		return DashboardCommandSkills, true
 	case "beacon":

@@ -43,6 +43,8 @@ func TestParseControlDashboardCommandsDoNotRequireCodex(t *testing.T) {
 		{text: "history", name: DashboardCommandSessions},
 		{text: "c 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
 		{text: "continue 3", name: DashboardCommandPublish, raw: "3", number: 3, isNumber: true},
+		{text: "fork 3", name: DashboardCommandFork, raw: "3", number: 3, isNumber: true},
+		{text: "helper fork session-abc", name: DashboardCommandFork, raw: "session-abc"},
 		{text: "open 3", name: DashboardCommandOpen, raw: "3", number: 3, isNumber: true},
 		{text: "d 3", name: DashboardCommandDetails, raw: "3", number: 3, isNumber: true},
 		{text: "details 3", name: DashboardCommandDetails, raw: "3", number: 3, isNumber: true},
@@ -254,7 +256,7 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 		})
 	}
 
-	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/park s001", "/resume s001", "/unpark s001", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper park s001", "helper resume s001", "helper unpark s001", "helper file report.txt", "helper publish-history", "helper skills push", "model status", "models", "helper model switch mimo25", "effort list", "effort set xhigh", "helper effort reset", "default status", "helper default model set mimo25", "/default effort reset", "codex status", "codex stats", "codex send-file report.txt"} {
+	for _, text := range []string{"help", "help advanced", "h advanced", "/status", "/stats", "/close", "/park s001", "/resume s001", "/unpark s001", "/help", "/details", "!status", "!stats", "!file report.txt", "!ph", "helper status", "helper stats", "helper usage", "helper retry turn-1", "helper park s001", "helper resume s001", "helper unpark s001", "helper file report.txt", "helper publish-history", "helper fork", "helper skills push", "model status", "models", "helper model switch mimo25", "effort list", "effort set xhigh", "helper effort reset", "default status", "helper default model set mimo25", "/default effort reset", "codex status", "codex stats", "codex send-file report.txt"} {
 		t.Run(text, func(t *testing.T) {
 			cmd := ParseDashboardCommand(ChatScopeWork, text)
 			if !cmd.HelperCommand {
@@ -264,6 +266,12 @@ func TestParseWorkChatPlainTextIsCodexInput(t *testing.T) {
 				t.Fatalf("work slash command %q should not require Codex: %#v", text, cmd)
 			}
 		})
+	}
+	for _, text := range []string{"fork", "helper fork", "/fork"} {
+		cmd := ParseDashboardCommand(ChatScopeWork, text)
+		if !cmd.HelperCommand || cmd.Name != DashboardCommandFork || cmd.ForwardToCodex || cmd.RequiresCodex {
+			t.Fatalf("work fork command %q parsed as %#v", text, cmd)
+		}
 	}
 	for _, text := range []string{"default status", "helper default model set mimo25", "/default effort reset"} {
 		cmd := ParseDashboardCommand(ChatScopeWork, text)

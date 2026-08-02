@@ -14,6 +14,31 @@ type Executor interface {
 	Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error)
 }
 
+// ForkExecutor is optional so existing custom Executors remain source
+// compatible. The Teams native fork path is only enabled when the configured
+// Codex runner implements this capability; it never degrades to a prompt.
+type ForkExecutor interface {
+	ForkThread(ctx context.Context, session *Session, cutoffCodexTurnID string) (ForkResult, error)
+}
+
+// ForkReconciler is the read-only recovery capability for a fork request whose
+// native response was lost. Implementations must never issue another fork
+// request; they may only inspect the runtime and return a uniquely identified
+// child.
+type ForkReconciler interface {
+	ReconcileForkThread(ctx context.Context, session *Session, cutoffCodexTurnID string, windowStart time.Time, windowEnd time.Time) (ForkReconcileResult, error)
+}
+
+type ForkReconcileResult struct {
+	MatchCount int
+	Result     ForkResult
+}
+
+type ForkResult struct {
+	CodexThreadID    string
+	CodexThreadTitle string
+}
+
 // ReasoningEffortCatalogProvider is implemented by executors that can ask
 // their actual Codex runtime for the current model's effort choices.
 type ReasoningEffortCatalogProvider interface {
@@ -109,6 +134,32 @@ type RunnerExecutor struct {
 
 func (e RunnerExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
 	return e.RunWithEventHandler(ctx, session, prompt, nil)
+}
+
+func (e RunnerExecutor) ForkThread(ctx context.Context, session *Session, cutoffCodexTurnID string) (ForkResult, error) {
+	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return ForkResult{}, fmt.Errorf("Codex parent thread is required for fork")
+	}
+	cutoffCodexTurnID = strings.TrimSpace(cutoffCodexTurnID)
+	if cutoffCodexTurnID == "" {
+		return ForkResult{}, fmt.Errorf("last completed Codex turn is required for fork")
+	}
+	forger, ok := e.Runner.(codexrunner.ThreadForker)
+	if !ok {
+		return ForkResult{}, codexrunner.UnsupportedError("thread/fork")
+	}
+	child, err := forger.ForkThread(ctx, codexrunner.ThreadForkParams{
+		ThreadID:              strings.TrimSpace(session.CodexThreadID),
+		LastTurnID:            cutoffCodexTurnID,
+		ExcludeTurns:          true,
+		DeferGoalContinuation: true,
+		Ephemeral:             false,
+		WorkingDir:            strings.TrimSpace(session.Cwd),
+	})
+	if err != nil {
+		return ForkResult{}, err
+	}
+	return ForkResult{CodexThreadID: child.ID, CodexThreadTitle: child.Name}, nil
 }
 
 func (e RunnerExecutor) RunWithEventHandler(ctx context.Context, session *Session, prompt string, handler codexrunner.EventHandler) (ExecutionResult, error) {
@@ -238,6 +289,10 @@ type CodexExecutor struct {
 	WorkDir   string
 	ExtraArgs []string
 	Timeout   time.Duration
+}
+
+func (CodexExecutor) ForkThread(context.Context, *Session, string) (ForkResult, error) {
+	return ForkResult{}, codexrunner.UnsupportedError("thread/fork")
 }
 
 func (e CodexExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {
