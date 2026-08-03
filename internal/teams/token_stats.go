@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -27,6 +28,7 @@ type CodexTokenStats struct {
 	Source                   string
 	Info                     CodexTokenUsageInfo
 	ModelTierUsages          []CodexModelTierUsage
+	ModelUsages              []CodexModelUsage
 	NativeLatestTotal        CodexTokenUsage
 	UsageEventCount          int
 	NonAdvancingUsageEvents  int
@@ -47,6 +49,22 @@ type CodexModelTierUsage struct {
 	Usage CodexTokenUsage
 }
 
+// CodexModelUsage is the usage attributed to one model. Overall is the sum of
+// all observed service tiers and effort levels for the model, while
+// EffortUsages preserves the per-effort breakdown. The legacy
+// ModelTierUsages view keeps service-tier details separately.
+type CodexModelUsage struct {
+	Model        string
+	Overall      CodexTokenUsage
+	EffortUsages []CodexEffortUsage
+}
+
+// CodexEffortUsage is the usage attributed to one reasoning-effort setting.
+type CodexEffortUsage struct {
+	Effort string
+	Usage  CodexTokenUsage
+}
+
 type CodexTokenUsageInfo struct {
 	Total              CodexTokenUsage
 	Last               CodexTokenUsage
@@ -59,6 +77,70 @@ type CodexTokenUsage struct {
 	OutputTokens          int64
 	ReasoningOutputTokens int64
 	TotalTokens           int64
+}
+
+type codexTokenUsageSummary struct {
+	Total       CodexTokenUsage
+	ModelUsages []CodexModelUsage
+}
+
+func summarizeCodexTokenStats(stats []CodexTokenStats) codexTokenUsageSummary {
+	var summary codexTokenUsageSummary
+	modelGroups := make(map[string]*CodexModelUsage)
+	for _, stat := range stats {
+		total := stat.Info.Total
+		if !total.hasTokens() {
+			total = stat.Info.Last
+		}
+		summary.Total, _ = addCodexTokenUsage(summary.Total, total)
+		for _, modelUsage := range stat.ModelUsages {
+			model := normalizedCodexModelName(modelUsage.Model)
+			group := modelGroups[model]
+			if group == nil {
+				group = &CodexModelUsage{Model: model}
+				modelGroups[model] = group
+			}
+			group.Overall, _ = addCodexTokenUsage(group.Overall, modelUsage.Overall)
+			for _, effortUsage := range modelUsage.EffortUsages {
+				effort := normalizedCodexEffortName(effortUsage.Effort)
+				found := false
+				for index := range group.EffortUsages {
+					if group.EffortUsages[index].Effort != effort {
+						continue
+					}
+					group.EffortUsages[index].Usage, _ = addCodexTokenUsage(group.EffortUsages[index].Usage, effortUsage.Usage)
+					found = true
+					break
+				}
+				if !found {
+					group.EffortUsages = append(group.EffortUsages, CodexEffortUsage{Effort: effort, Usage: effortUsage.Usage})
+				}
+			}
+		}
+	}
+	models := make([]string, 0, len(modelGroups))
+	for model, group := range modelGroups {
+		if group.Overall.hasTokens() {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		group := *modelGroups[model]
+		sort.Slice(group.EffortUsages, func(i, j int) bool {
+			return lessCodexEffortName(group.EffortUsages[i].Effort, group.EffortUsages[j].Effort)
+		})
+		summary.ModelUsages = append(summary.ModelUsages, group)
+	}
+	return summary
+}
+
+func codexModelUsagesTotal(usages []CodexModelUsage) CodexTokenUsage {
+	var total CodexTokenUsage
+	for _, usage := range usages {
+		total, _ = addCodexTokenUsage(total, usage.Overall)
+	}
+	return total
 }
 
 type codexTokenUsageAccumulator struct {
@@ -372,7 +454,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 		if readErr != nil && readErr != io.EOF {
-			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot()), fmt.Errorf("read Codex token stats: %w", readErr)
+			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot()), fmt.Errorf("read Codex token stats: %w", readErr)
 		}
 		lineNo++
 		line = bytes.TrimSpace(line)
@@ -440,7 +522,7 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			break
 		}
 	}
-	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot()), nil
+	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot()), nil
 }
 
 func finishCodexTokenStats(
@@ -451,13 +533,25 @@ func finishCodexTokenStats(
 	tokenSourceLine int,
 	lastTokenCountLine int,
 	modelTierUsages []CodexModelTierUsage,
+	modelUsages []CodexModelUsage,
 ) CodexTokenStats {
 	if usage.seen {
+		info := usage.info()
+		// A transcript can contain a native token_count stream plus a later
+		// turn.completed usage fallback for a turn that never emitted token_count.
+		// The model/effort accumulator retains that fallback-only turn, so use its
+		// sum as the conversation total to keep overall and detailed tables
+		// internally consistent. NativeLatestTotal remains available to explain
+		// the reconciliation in the analysis section.
+		if modelTotal := codexModelUsagesTotal(modelUsages); modelTotal.hasTokens() && modelTotal != info.Total {
+			info.Total = modelTotal
+		}
 		return CodexTokenStats{
 			SourceLine:               tokenSourceLine,
 			Source:                   "token_count",
-			Info:                     usage.info(),
+			Info:                     info,
 			ModelTierUsages:          modelTierUsages,
+			ModelUsages:              modelUsages,
 			NativeLatestTotal:        usage.nativeLatestTotal,
 			UsageEventCount:          usage.usageEventCount,
 			NonAdvancingUsageEvents:  usage.nonAdvancingUsageEvents,
@@ -470,9 +564,13 @@ func finishCodexTokenStats(
 		}
 	}
 	if fallback.HasUsage() {
+		if total := codexModelUsagesTotal(modelUsages); total.hasTokens() {
+			fallback.Info.Total = total
+		}
 		fallback.RateLimits = rateLimits
 		fallback.Diagnostics = diagnostics
 		fallback.ModelTierUsages = modelTierUsages
+		fallback.ModelUsages = modelUsages
 		return fallback
 	}
 	if rateLimits.Present {
@@ -480,12 +578,14 @@ func finishCodexTokenStats(
 			SourceLine:      lastTokenCountLine,
 			Source:          "token_count",
 			ModelTierUsages: modelTierUsages,
+			ModelUsages:     modelUsages,
 			RateLimits:      rateLimits,
 			Diagnostics:     diagnostics,
 		}
 	}
 	fallback.Diagnostics = append(fallback.Diagnostics, diagnostics...)
 	fallback.ModelTierUsages = modelTierUsages
+	fallback.ModelUsages = modelUsages
 	return fallback
 }
 
@@ -535,12 +635,19 @@ type codexTokenUsage struct {
 type codexModelTierContext struct {
 	Model  string
 	Tier   string
+	Effort string
 	TurnID string
 }
 
 type codexModelTierUsageKey struct {
 	Model string
 	Tier  string
+}
+
+type codexModelTierEffortUsageKey struct {
+	Model  string
+	Tier   string
+	Effort string
 }
 
 type codexModelTierUsageAccumulator struct {
@@ -550,12 +657,12 @@ type codexModelTierUsageAccumulator struct {
 	awaitingTurnContext bool
 	turnHasTokenUsage   bool
 	fallbackUsage       CodexTokenUsage
-	groups              map[codexModelTierUsageKey]CodexTokenUsage
+	groups              map[codexModelTierEffortUsageKey]CodexTokenUsage
 }
 
 func newCodexModelTierUsageAccumulator() codexModelTierUsageAccumulator {
 	return codexModelTierUsageAccumulator{
-		groups: make(map[codexModelTierUsageKey]CodexTokenUsage),
+		groups: make(map[codexModelTierEffortUsageKey]CodexTokenUsage),
 	}
 }
 
@@ -597,6 +704,9 @@ func (a *codexModelTierUsageAccumulator) applyTurnContext(context codexModelTier
 		if context.Tier != "" {
 			a.current.Tier = context.Tier
 		}
+		if context.Effort != "" {
+			a.current.Effort = context.Effort
+		}
 		if context.TurnID != "" {
 			a.currentTurnID = context.TurnID
 		}
@@ -610,9 +720,10 @@ func (a *codexModelTierUsageAccumulator) observeTokenUsage(delta CodexTokenUsage
 	}
 	a.turnHasTokenUsage = true
 	a.fallbackUsage = CodexTokenUsage{}
-	key := codexModelTierUsageKey{
-		Model: normalizedCodexModelName(a.current.Model),
-		Tier:  normalizedCodexTierName(a.current.Tier),
+	key := codexModelTierEffortUsageKey{
+		Model:  normalizedCodexModelName(a.current.Model),
+		Tier:   normalizedCodexTierName(a.current.Tier),
+		Effort: normalizedCodexEffortName(a.current.Effort),
 	}
 	previous := a.groups[key]
 	a.groups[key], _ = addCodexTokenUsage(previous, delta)
@@ -630,9 +741,10 @@ func (a *codexModelTierUsageAccumulator) finishTurn() {
 		a.resetTurn()
 		return
 	}
-	key := codexModelTierUsageKey{
-		Model: normalizedCodexModelName(a.current.Model),
-		Tier:  normalizedCodexTierName(a.current.Tier),
+	key := codexModelTierEffortUsageKey{
+		Model:  normalizedCodexModelName(a.current.Model),
+		Tier:   normalizedCodexTierName(a.current.Tier),
+		Effort: normalizedCodexEffortName(a.current.Effort),
 	}
 	previous := a.groups[key]
 	a.groups[key], _ = addCodexTokenUsage(previous, a.fallbackUsage)
@@ -646,8 +758,16 @@ func (a *codexModelTierUsageAccumulator) resetTurn() {
 
 func (a *codexModelTierUsageAccumulator) snapshot() []CodexModelTierUsage {
 	a.finishTurn()
-	keys := make([]codexModelTierUsageKey, 0, len(a.groups))
+	grouped := make(map[codexModelTierUsageKey]CodexTokenUsage)
 	for key, usage := range a.groups {
+		if usage.hasTokens() {
+			legacyKey := codexModelTierUsageKey{Model: key.Model, Tier: key.Tier}
+			previous := grouped[legacyKey]
+			grouped[legacyKey], _ = addCodexTokenUsage(previous, usage)
+		}
+	}
+	keys := make([]codexModelTierUsageKey, 0, len(grouped))
+	for key, usage := range grouped {
 		if usage.hasTokens() {
 			keys = append(keys, key)
 		}
@@ -663,8 +783,62 @@ func (a *codexModelTierUsageAccumulator) snapshot() []CodexModelTierUsage {
 		result = append(result, CodexModelTierUsage{
 			Model: key.Model,
 			Tier:  key.Tier,
-			Usage: a.groups[key],
+			Usage: grouped[key],
 		})
+	}
+	return result
+}
+
+func (a *codexModelTierUsageAccumulator) modelSnapshot() []CodexModelUsage {
+	a.finishTurn()
+	type effortGroup struct {
+		usage CodexTokenUsage
+	}
+	type modelGroup struct {
+		overall CodexTokenUsage
+		efforts map[string]effortGroup
+	}
+	grouped := make(map[string]*modelGroup)
+	for key, usage := range a.groups {
+		if !usage.hasTokens() {
+			continue
+		}
+		model := normalizedCodexModelName(key.Model)
+		group := grouped[model]
+		if group == nil {
+			group = &modelGroup{efforts: make(map[string]effortGroup)}
+			grouped[model] = group
+		}
+		group.overall, _ = addCodexTokenUsage(group.overall, usage)
+		effort := normalizedCodexEffortName(key.Effort)
+		perEffort := group.efforts[effort]
+		perEffort.usage, _ = addCodexTokenUsage(perEffort.usage, usage)
+		group.efforts[effort] = perEffort
+	}
+	models := make([]string, 0, len(grouped))
+	for model, group := range grouped {
+		if group.overall.hasTokens() {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	result := make([]CodexModelUsage, 0, len(models))
+	for _, model := range models {
+		group := grouped[model]
+		efforts := make([]string, 0, len(group.efforts))
+		for effort, perEffort := range group.efforts {
+			if perEffort.usage.hasTokens() {
+				efforts = append(efforts, effort)
+			}
+		}
+		sort.Slice(efforts, func(i, j int) bool {
+			return lessCodexEffortName(efforts[i], efforts[j])
+		})
+		usage := CodexModelUsage{Model: model, Overall: group.overall, EffortUsages: make([]CodexEffortUsage, 0, len(efforts))}
+		for _, effort := range efforts {
+			usage.EffortUsages = append(usage.EffortUsages, CodexEffortUsage{Effort: effort, Usage: group.efforts[effort].usage})
+		}
+		result = append(result, usage)
 	}
 	return result
 }
@@ -672,6 +846,7 @@ func (a *codexModelTierUsageAccumulator) snapshot() []CodexModelTierUsage {
 func normalizedCodexModelTierContext(context codexModelTierContext) codexModelTierContext {
 	context.Model = strings.TrimSpace(context.Model)
 	context.Tier = strings.TrimSpace(context.Tier)
+	context.Effort = strings.TrimSpace(context.Effort)
 	context.TurnID = strings.TrimSpace(context.TurnID)
 	return context
 }
@@ -692,12 +867,53 @@ func normalizedCodexTierName(tier string) string {
 	return tier
 }
 
+func normalizedCodexEffortName(effort string) string {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return "unknown"
+	}
+	return effort
+}
+
+func lessCodexEffortName(left string, right string) bool {
+	left = normalizedCodexEffortName(left)
+	right = normalizedCodexEffortName(right)
+	leftOrder := codexEffortOrder(left)
+	rightOrder := codexEffortOrder(right)
+	if leftOrder != rightOrder {
+		return leftOrder < rightOrder
+	}
+	return left < right
+}
+
+func codexEffortOrder(effort string) int {
+	switch strings.ToLower(normalizedCodexEffortName(effort)) {
+	case "low":
+		return 0
+	case "medium":
+		return 1
+	case "high":
+		return 2
+	case "xhigh":
+		return 3
+	case "max":
+		return 4
+	case "unknown":
+		return 100
+	default:
+		return 50
+	}
+}
+
 type codexContextSettings struct {
-	Model        string `json:"model"`
-	ModelSlug    string `json:"model_slug"`
-	ModelSlug2   string `json:"modelSlug"`
-	ServiceTier  string `json:"service_tier"`
-	ServiceTier2 string `json:"serviceTier"`
+	Model            string `json:"model"`
+	ModelSlug        string `json:"model_slug"`
+	ModelSlug2       string `json:"modelSlug"`
+	ServiceTier      string `json:"service_tier"`
+	ServiceTier2     string `json:"serviceTier"`
+	Effort           string `json:"effort"`
+	ReasoningEffort  string `json:"reasoning_effort"`
+	ReasoningEffort2 string `json:"reasoningEffort"`
 }
 
 type codexContextPayload struct {
@@ -709,6 +925,9 @@ type codexContextPayload struct {
 	ModelSlug2        string               `json:"modelSlug"`
 	ServiceTier       string               `json:"service_tier"`
 	ServiceTier2      string               `json:"serviceTier"`
+	Effort            string               `json:"effort"`
+	ReasoningEffort   string               `json:"reasoning_effort"`
+	ReasoningEffort2  string               `json:"reasoningEffort"`
 	ThreadSettings    codexContextSettings `json:"thread_settings"`
 	ThreadSettings2   codexContextSettings `json:"threadSettings"`
 	CollaborationMode struct {
@@ -757,11 +976,25 @@ func parseCodexModelTierContext(event codexTokenStatsEvent) (codexModelTierConte
 		payload.CollaborationMode.Settings.ServiceTier,
 		payload.CollaborationMode.Settings.ServiceTier2,
 	)
+	effort := firstNonEmptyCodexString(
+		payload.Effort,
+		payload.ReasoningEffort,
+		payload.ReasoningEffort2,
+		payload.ThreadSettings.Effort,
+		payload.ThreadSettings.ReasoningEffort,
+		payload.ThreadSettings.ReasoningEffort2,
+		payload.ThreadSettings2.Effort,
+		payload.ThreadSettings2.ReasoningEffort,
+		payload.ThreadSettings2.ReasoningEffort2,
+		payload.CollaborationMode.Settings.Effort,
+		payload.CollaborationMode.Settings.ReasoningEffort,
+		payload.CollaborationMode.Settings.ReasoningEffort2,
+	)
 	turnID := firstNonEmptyCodexString(payload.TurnID, payload.TurnID2)
-	if model == "" && tier == "" && turnID == "" {
+	if model == "" && tier == "" && effort == "" && turnID == "" {
 		return codexModelTierContext{}, false
 	}
-	return codexModelTierContext{Model: model, Tier: tier, TurnID: turnID}, true
+	return codexModelTierContext{Model: model, Tier: tier, Effort: effort, TurnID: turnID}, true
 }
 
 func firstNonEmptyCodexString(values ...string) string {
@@ -1049,8 +1282,236 @@ func (b *Bridge) formatWorkSessionStats(ctx context.Context, session *Session) s
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines, "")
-	lines = append(lines, formatCodexTokenStatsLines(stats)...)
+	lines = append(lines, formatCodexMainAgentStatsLines(stats)...)
+	subagentSummary, subagentCount, subagentProblems, discoveryErr := b.readSubagentTokenStatsForWorkSession(ctx, session.CodexThreadID)
+	lines = append(lines, "")
+	if discoveryErr != nil {
+		lines = append(lines, formatCodexSubagentUnavailableLines(discoveryErr)...)
+		return strings.Join(lines, "\n")
+	}
+	if subagentCount == 0 {
+		lines = append(lines, formatCodexNoSubagentLines(subagentProblems)...)
+	} else {
+		lines = append(lines, formatCodexSubagentStatsLines(subagentSummary, subagentCount, subagentProblems)...)
+	}
 	return strings.Join(lines, "\n")
+}
+
+func formatCodexTokenStatsMetadataLines(stats CodexTokenStats) []string {
+	source := strings.TrimSpace(stats.Source)
+	if source == "" {
+		source = "unknown"
+	}
+	sourceLine := "Source: " + source
+	if stats.SourceLine > 0 {
+		sourceLine += " at transcript line " + strconv.Itoa(stats.SourceLine)
+	}
+	if strings.TrimSpace(stats.SourcePath) != "" {
+		sourceLine += " (" + stats.SourcePath + ")"
+	}
+	lines := []string{sourceLine}
+	if stats.UsedFallbackOnly {
+		lines = append(lines, "", "Reliability: using runner usage fallback because no `token_count` event was found; conversation totals and context-window analysis may be incomplete.")
+	} else if stats.HasUsage() {
+		lines = append(lines, "", fmt.Sprintf(
+			"Reliability: reconstructed conversation usage from %d unique Codex `token_count` update(s) in local history; malformed trailing JSONL lines are ignored and reported below.",
+			stats.UsageEventCount,
+		))
+		if stats.NonAdvancingUsageEvents > 0 || stats.NativeCounterResets > 0 || stats.NativeCounterRecoveries > 0 {
+			lines = append(lines, "", fmt.Sprintf(
+				"Aggregation: ignored %d non-advancing usage snapshot(s); observed %d native cumulative counter reset(s) and %d recovery event(s).",
+				stats.NonAdvancingUsageEvents,
+				stats.NativeCounterResets,
+				stats.NativeCounterRecoveries,
+			))
+		}
+	} else {
+		lines = append(lines, "", "Reliability: Codex `token_count` metadata was found, but it did not contain a usage snapshot.")
+		lines = append(lines, "", "Token usage unavailable: no Codex usage event was found in the linked transcript.")
+	}
+	return lines
+}
+
+func formatCodexMainAgentStatsLines(stats CodexTokenStats) []string {
+	lines := []string{"🧠 MAIN AGENT · metadata:"}
+	lines = append(lines, formatCodexTokenStatsMetadataLines(stats)...)
+	if !stats.HasUsage() {
+		lines = append(lines, "", "🧠 MAIN AGENT · UNAVAILABLE:")
+		lines = append(lines,
+			"Status: no Codex usage event was found",
+			"Token usage: not reported",
+			"Cache hit rate: N/A",
+			"Model/effort breakdown: not reported",
+		)
+	} else {
+		overall := stats.Info.Total
+		if !overall.hasTokens() {
+			overall = stats.Info.Last
+		}
+		lines = append(lines, "", "🧠 MAIN AGENT · snapshots:")
+		if stats.Info.Last.hasTokens() {
+			lines = append(lines, "Last recorded model usage:")
+			lines = append(lines, formatTokenUsageLines(stats.Info.Last)...)
+		}
+		if stats.Info.Total.hasTokens() {
+			lines = append(lines, "Conversation total:")
+			lines = append(lines, formatTokenUsageLines(stats.Info.Total)...)
+		}
+		lines = append(lines, "", "🧠 MAIN AGENT · overall:")
+		lines = append(lines, formatTokenUsageLines(overall)...)
+		lines = append(lines, "", "🧠 MAIN AGENT · model/effort detail:")
+		if modelLines := formatCodexModelUsageLines(stats.ModelUsages); len(modelLines) > 0 {
+			lines = append(lines, modelLines...)
+		} else {
+			lines = append(lines, "Model/effort breakdown: unavailable")
+		}
+		analysisInfo := stats.Info
+		analysisInfo.Total = overall
+		analysis := formatTokenUsageAnalysis(analysisInfo)
+		analysis = append(analysis, formatCodexModelUsageAnalysis(stats.ModelUsages)...)
+		analysis = append(analysis, formatTokenAggregationAnalysis(stats)...)
+		if len(analysis) > 0 {
+			lines = append(lines, "", "🧠 MAIN AGENT · analysis:")
+			lines = append(lines, analysis...)
+		}
+	}
+	if rateLines := formatCodexRateLimitLines(stats.RateLimits); len(rateLines) > 0 {
+		lines = append(lines, "", "🧠 MAIN AGENT · rate limits:")
+		lines = append(lines, rateLines...)
+	}
+	if diagnostics := formatTokenStatsDiagnostics(stats.Diagnostics); len(diagnostics) > 0 {
+		lines = append(lines, "", "🧠 MAIN AGENT · diagnostics:")
+		lines = append(lines, diagnostics...)
+	}
+	return lines
+}
+
+func formatCodexSubagentStatsLines(summary codexTokenUsageSummary, count int, problems []string) []string {
+	title := fmt.Sprintf("🧩 SUBAGENTS (%d) ·", count)
+	lines := []string{title + " overall:"}
+	if summary.Total.hasTokens() {
+		lines = append(lines, formatTokenUsageLines(summary.Total)...)
+	} else {
+		lines = append(lines, "Token usage unavailable: no readable subagent usage event was found.")
+	}
+	lines = append(lines, "", title+" model/effort detail:")
+	if modelLines := formatCodexModelUsageLines(summary.ModelUsages); len(modelLines) > 0 {
+		lines = append(lines, modelLines...)
+	} else {
+		lines = append(lines, "Model/effort breakdown: unavailable")
+	}
+	if len(problems) > 0 {
+		lines = append(lines, "", title+" diagnostics:")
+		for _, problem := range problems {
+			lines = append(lines, "- "+problem)
+		}
+	}
+	return lines
+}
+
+func formatCodexNoSubagentLines(problems []string) []string {
+	lines := []string{
+		"🧩 SUBAGENTS · NOT USED:",
+		"Status: no user-visible subagent transcript was found",
+		"Transcript count: 0",
+		"Token usage: 0",
+		"Cache hit rate: N/A",
+		"Model/effort breakdown: not applicable",
+	}
+	if len(problems) > 0 {
+		lines = append(lines, "", "🧩 SUBAGENTS · diagnostics:")
+		for _, problem := range problems {
+			lines = append(lines, "- "+problem)
+		}
+	}
+	return lines
+}
+
+func formatCodexSubagentUnavailableLines(err error) []string {
+	return []string{
+		"🧩 SUBAGENTS · UNAVAILABLE:",
+		"Status: history discovery failed",
+		"Reason: " + err.Error(),
+		"Token usage: not reported",
+		"Cache hit rate: N/A",
+		"Model/effort breakdown: not reported",
+	}
+}
+
+// discoverSubagentProjects bounds the expensive history catalog scan that a
+// stats request needs in order to connect a Work-chat thread to its child
+// transcripts. The short cache keeps repeated helper-stats commands from
+// rescanning every session file while still refreshing promptly as history
+// changes. Partial projects and the discovery error are cached together so
+// callers keep the existing fail-closed diagnostics behavior.
+func (b *Bridge) discoverSubagentProjects(ctx context.Context) ([]codexhistory.Project, error) {
+	if b == nil {
+		return discoverCodexProjectsForTeams(ctx, "")
+	}
+	root := strings.TrimSpace(b.scope.CodexHome)
+	now := time.Now()
+	b.subagentProjectsMu.Lock()
+	if !b.subagentProjectsCachedAt.IsZero() && b.subagentProjectsCacheRoot == root && now.Sub(b.subagentProjectsCachedAt) < subagentProjectsCacheTTL {
+		projects := cloneCodexProjects(b.subagentProjectsCache)
+		err := b.subagentProjectsCacheErr
+		b.subagentProjectsMu.Unlock()
+		return projects, err
+	}
+	b.subagentProjectsMu.Unlock()
+
+	projects, err := discoverCodexProjectsForTeams(ctx, root)
+	cached := cloneCodexProjects(projects)
+	b.subagentProjectsMu.Lock()
+	b.subagentProjectsCache = cached
+	b.subagentProjectsCacheRoot = root
+	b.subagentProjectsCacheErr = err
+	b.subagentProjectsCachedAt = now
+	b.subagentProjectsMu.Unlock()
+	return cloneCodexProjects(cached), err
+}
+
+func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, threadID string) (codexTokenUsageSummary, int, []string, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return codexTokenUsageSummary{}, 0, nil, nil
+	}
+	projects, discoveryErr := b.discoverSubagentProjects(ctx)
+	if discoveryErr != nil && len(projects) == 0 {
+		return codexTokenUsageSummary{}, 0, nil, discoveryErr
+	}
+	parent, _, ok := findCodexSession(projects, threadID)
+	if !ok {
+		if discoveryErr != nil {
+			return codexTokenUsageSummary{}, 0, nil, discoveryErr
+		}
+		return codexTokenUsageSummary{}, 0, nil, nil
+	}
+	subagents := codexhistory.FilterUserVisibleSubagentSessions(parent.Subagents)
+	if len(subagents) == 0 {
+		if discoveryErr != nil {
+			return codexTokenUsageSummary{}, 0, nil, discoveryErr
+		}
+		return codexTokenUsageSummary{}, 0, nil, nil
+	}
+	stats := make([]CodexTokenStats, 0, len(subagents))
+	problems := make([]string, 0)
+	if discoveryErr != nil {
+		problems = append(problems, "history discovery: "+discoveryErr.Error())
+	}
+	for _, subagent := range subagents {
+		path := strings.TrimSpace(subagent.FilePath)
+		if path == "" {
+			problems = append(problems, subagent.DisplayTitle()+" has no linked transcript")
+			continue
+		}
+		stat, readErr := ReadCodexTokenStats(path)
+		if readErr != nil {
+			problems = append(problems, subagent.DisplayTitle()+": "+readErr.Error())
+			continue
+		}
+		stats = append(stats, stat)
+	}
+	return summarizeCodexTokenStats(stats), len(subagents), problems, nil
 }
 
 func (b *Bridge) latestTurnForStats(ctx context.Context, sessionID string) (teamstore.Turn, bool) {
@@ -1143,8 +1604,15 @@ func formatCodexTokenStatsLines(stats CodexTokenStats) []string {
 		lines = append(lines, "")
 		lines = append(lines, modelTierLines...)
 	}
+	if modelLines := formatCodexModelUsageLines(stats.ModelUsages); len(modelLines) > 0 {
+		lines = append(lines, "")
+		lines = append(lines, "Model/effort usage:")
+		lines = append(lines, "")
+		lines = append(lines, modelLines...)
+	}
 	analysis := formatTokenUsageAnalysis(stats.Info)
 	analysis = append(analysis, formatCodexModelTierUsageAnalysis(stats.ModelTierUsages)...)
+	analysis = append(analysis, formatCodexModelUsageAnalysis(stats.ModelUsages)...)
 	analysis = append(analysis, formatTokenAggregationAnalysis(stats)...)
 	if len(analysis) > 0 {
 		lines = append(lines, "")
@@ -1194,6 +1662,56 @@ func formatCodexModelTierUsageAnalysis(usages []CodexModelTierUsage) []string {
 	if unknownGroups > 0 {
 		lines = append(lines, fmt.Sprintf(
 			"%d combination(s), %s total, have missing model or service-tier metadata; they remain `unknown` instead of being guessed or merged",
+			unknownGroups,
+			formatTokenCount(effectiveCodexTokenUsageTotal(unknownUsage)),
+		))
+	}
+	return lines
+}
+
+func formatCodexModelUsageLines(usages []CodexModelUsage) []string {
+	var lines []string
+	for index, usage := range usages {
+		if index > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "Model: "+normalizedCodexModelName(usage.Model))
+		lines = append(lines, "Overall:")
+		lines = append(lines, formatTokenUsageLines(usage.Overall)...)
+		for _, effort := range usage.EffortUsages {
+			lines = append(lines, "")
+			lines = append(lines, "Effort: "+normalizedCodexEffortName(effort.Effort))
+			lines = append(lines, formatTokenUsageLines(effort.Usage)...)
+		}
+	}
+	return lines
+}
+
+func formatCodexModelUsageAnalysis(usages []CodexModelUsage) []string {
+	if len(usages) == 0 {
+		return nil
+	}
+	effortGroups := 0
+	unknownGroups := 0
+	unknownUsage := CodexTokenUsage{}
+	for _, usage := range usages {
+		modelUnknown := normalizedCodexModelName(usage.Model) == "unknown"
+		if modelUnknown {
+			unknownGroups++
+			unknownUsage, _ = addCodexTokenUsage(unknownUsage, usage.Overall)
+		}
+		for _, effort := range usage.EffortUsages {
+			effortGroups++
+			if !modelUnknown && normalizedCodexEffortName(effort.Effort) == "unknown" {
+				unknownGroups++
+				unknownUsage, _ = addCodexTokenUsage(unknownUsage, effort.Usage)
+			}
+		}
+	}
+	lines := []string{fmt.Sprintf("model/effort attribution: %d model(s), %d per-effort group(s)", len(usages), effortGroups)}
+	if unknownGroups > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"%d model or effort group(s), %s total, have missing metadata; they remain `unknown` instead of being guessed or merged",
 			unknownGroups,
 			formatTokenCount(effectiveCodexTokenUsageTotal(unknownUsage)),
 		))
@@ -1257,14 +1775,49 @@ func renderCodexTokenStatsHTML(text string) string {
 		header := lines[idx]
 		idx++
 		var block []string
+		scopedKind, scoped := parseStatsScopedSectionHeader(header)
 		for idx < len(lines) && !isStatsSectionHeader(lines[idx]) {
 			block = append(block, lines[idx])
 			idx++
+		}
+		// Snapshot labels are nested inside the scoped snapshots section. They
+		// must stay in one block so the renderer can build the comparison table;
+		// they are top-level sections only for the legacy, unscoped format.
+		if scoped && scopedKind == "snapshots" {
+			for idx < len(lines) {
+				line := lines[idx]
+				if _, ok := parseStatsScopedSectionHeader(line); ok {
+					break
+				}
+				block = append(block, line)
+				idx++
+			}
 		}
 		sections = append(sections, statsRenderSection{Header: header, Lines: block})
 	}
 	for idx := 0; idx < len(sections); idx++ {
 		section := sections[idx]
+		if scopedKind, ok := parseStatsScopedSectionHeader(section.Header); ok {
+			out.WriteString("<p>&nbsp;</p>")
+			out.WriteString("<p><strong>")
+			out.WriteString(html.EscapeString(section.Header))
+			out.WriteString("</strong></p>")
+			switch scopedKind {
+			case "overall":
+				out.WriteString(renderStatsSingleUsageTableHTML(section.Lines))
+			case "snapshots":
+				out.WriteString(renderStatsUsageSnapshotsHTML(section.Lines))
+			case "model/effort detail":
+				out.WriteString(renderStatsModelEffortUsageHTML(section.Lines))
+			case "analysis", "rate limits", "diagnostics":
+				out.WriteString(renderStatsListHTML(section.Lines))
+			case "not used", "unavailable":
+				out.WriteString(renderStatsStatusTableHTML(section.Lines))
+			default:
+				out.WriteString(renderStatsParagraphLinesHTML(section.Lines))
+			}
+			continue
+		}
 		if section.Header == "Last recorded model usage:" || section.Header == "Conversation total:" {
 			last := statsRenderSection{}
 			conversation := statsRenderSection{}
@@ -1298,11 +1851,214 @@ func renderCodexTokenStatsHTML(text string) string {
 			out.WriteString(renderStatsListHTML(section.Lines))
 		case "Model/tier usage:":
 			out.WriteString(renderStatsModelTierUsageHTML(section.Lines))
+		case "Model/effort usage:":
+			out.WriteString(renderStatsModelEffortUsageHTML(section.Lines))
 		default:
 			out.WriteString(renderStatsParagraphLinesHTML(section.Lines))
 		}
 	}
 	return out.String()
+}
+
+// renderCodexTokenStatsHTMLChunks keeps helper stats as trusted HTML while
+// respecting the same Graph payload budget used by the normal outbox renderer.
+// Stats are rendered as tables, so chunking the source markdown would either
+// lose the table structure or turn the HTML into escaped text. We therefore
+// split the rendered document at section boundaries and, when necessary, at
+// table rows (repeating the table header in each continuation part).
+func renderCodexTokenStatsHTMLChunks(text string) []string {
+	body := renderCodexTokenStatsHTML(text)
+	if len(body) <= safeTeamsHTMLContentBytes {
+		return []string{body}
+	}
+	return splitCodexTokenStatsHTML(body, teamsChunkHTMLContentBytes)
+}
+
+func splitCodexTokenStatsHTML(body string, targetBytes int) []string {
+	if strings.TrimSpace(body) == "" {
+		return []string{""}
+	}
+	if targetBytes <= 0 {
+		targetBytes = teamsChunkHTMLContentBytes
+	}
+	prefix := renderCodexTokenStatsHTMLPrefix()
+	if !strings.HasPrefix(body, prefix) {
+		return []string{body}
+	}
+	remainder := strings.TrimPrefix(body, prefix)
+	sections := strings.Split(remainder, "<p>&nbsp;</p>")
+	chunks := make([]string, 0, len(sections))
+	current := prefix
+	flushCurrent := func() {
+		if current != prefix {
+			chunks = append(chunks, current)
+			current = prefix
+		}
+	}
+	appendSection := func(section string) {
+		if section == "" {
+			return
+		}
+		separator := "<p>&nbsp;</p>"
+		candidate := current + separator + section
+		if current == prefix {
+			candidate = current + section
+		}
+		if len(candidate) <= targetBytes {
+			current = candidate
+			return
+		}
+		flushCurrent()
+		if len(prefix+section) <= targetBytes {
+			current += section
+			return
+		}
+		for _, part := range splitOversizedCodexStatsHTMLSection(section, targetBytes-len(prefix)) {
+			if part == "" {
+				continue
+			}
+			if len(prefix+part) > targetBytes {
+				// A single HTML row/value can be larger than the target. Keep it
+				// intact rather than emitting malformed HTML; the hard limit is
+				// still enforced by the caller's normal Graph failure handling.
+				flushCurrent()
+				chunks = append(chunks, prefix+part)
+				continue
+			}
+			chunks = append(chunks, prefix+part)
+		}
+	}
+	for _, section := range sections {
+		appendSection(section)
+	}
+	flushCurrent()
+	if len(chunks) == 0 {
+		return []string{body}
+	}
+	return chunks
+}
+
+func renderCodexTokenStatsHTMLPrefix() string {
+	label := teamsRenderLabel(TeamsRenderHelper, 1, 1)
+	return "<p><strong>" + html.EscapeString(label) + ":</strong></p>"
+}
+
+func splitOversizedCodexStatsHTMLSection(section string, targetBytes int) []string {
+	if targetBytes <= 0 {
+		return []string{section}
+	}
+	if tableStart := strings.Index(section, "<table>"); tableStart >= 0 {
+		if tableEndRel := strings.Index(section[tableStart+len("<table>"):], "</table>"); tableEndRel >= 0 {
+			tableEnd := tableStart + len("<table>") + tableEndRel
+			return splitCodexStatsHTMLTableSection(
+				section[:tableStart],
+				section[tableStart+len("<table>"):tableEnd],
+				section[tableEnd+len("</table>"):],
+				targetBytes,
+			)
+		}
+	}
+	return splitCodexStatsHTMLParagraphSection(section, targetBytes)
+}
+
+func splitCodexStatsHTMLTableSection(before string, tableBody string, after string, targetBytes int) []string {
+	rows := splitCodexStatsHTMLTableRows(tableBody)
+	if len(rows) <= 1 {
+		return []string{before + "<table>" + tableBody + "</table>" + after}
+	}
+	header := rows[0]
+	parts := make([]string, 0, (len(rows)+7)/8)
+	currentRows := []string{header}
+	flush := func(suffix string) {
+		if len(currentRows) == 0 {
+			return
+		}
+		var body strings.Builder
+		body.WriteString(before)
+		body.WriteString("<table>")
+		body.WriteString(strings.Join(currentRows, ""))
+		body.WriteString("</table>")
+		body.WriteString(suffix)
+		parts = append(parts, body.String())
+		currentRows = []string{header}
+	}
+	for _, row := range rows[1:] {
+		candidateRows := append(append([]string{}, currentRows...), row)
+		candidate := before + "<table>" + strings.Join(candidateRows, "") + "</table>" + after
+		if len(candidate) <= targetBytes {
+			currentRows = candidateRows
+			continue
+		}
+		flush("")
+		candidate = before + "<table>" + header + row + "</table>" + after
+		if len(candidate) <= targetBytes {
+			currentRows = []string{header, row}
+			continue
+		}
+		// Preserve one oversized row as a valid table rather than cutting
+		// through tags or escaped values.
+		flush("")
+		parts = append(parts, before+"<table>"+header+row+"</table>"+after)
+		currentRows = []string{header}
+	}
+	if len(currentRows) > 1 {
+		flush(after)
+	} else if len(parts) == 0 {
+		flush(after)
+	}
+	return parts
+}
+
+func splitCodexStatsHTMLTableRows(tableBody string) []string {
+	var rows []string
+	for rest := tableBody; ; {
+		start := strings.Index(rest, "<tr>")
+		if start < 0 {
+			break
+		}
+		endRel := strings.Index(rest[start:], "</tr>")
+		if endRel < 0 {
+			break
+		}
+		end := start + endRel + len("</tr>")
+		rows = append(rows, rest[start:end])
+		rest = rest[end:]
+	}
+	return rows
+}
+
+func splitCodexStatsHTMLParagraphSection(section string, targetBytes int) []string {
+	start := strings.Index(section, "<p>")
+	end := strings.LastIndex(section, "</p>")
+	if start < 0 || end < start {
+		return []string{section}
+	}
+	open := section[:start+len("<p>")]
+	inner := section[start+len("<p>") : end]
+	close := section[end:]
+	lines := strings.Split(inner, "<br>")
+	parts := make([]string, 0, len(lines))
+	current := ""
+	for _, line := range lines {
+		candidateInner := line
+		if current != "" {
+			candidateInner = current + "<br>" + line
+		}
+		candidate := open + candidateInner + close
+		if current == "" || len(candidate) <= targetBytes {
+			current = candidateInner
+			continue
+		}
+		parts = append(parts, open+current+close)
+		current = line
+	}
+	if current != "" {
+		parts = append(parts, open+current+close)
+	}
+	if len(parts) == 0 {
+		return []string{section}
+	}
+	return parts
 }
 
 type statsRenderSection struct {
@@ -1323,12 +2079,34 @@ func compactStatsRenderLines(lines []string) []string {
 }
 
 func isStatsSectionHeader(line string) bool {
-	switch strings.TrimSpace(line) {
-	case "Last recorded model usage:", "Conversation total:", "Model/tier usage:", "Analysis:", "Rate limits:":
+	line = strings.TrimSpace(line)
+	if _, ok := parseStatsScopedSectionHeader(line); ok {
+		return true
+	}
+	switch line {
+	case "Last recorded model usage:", "Conversation total:", "Model/tier usage:", "Model/effort usage:", "Analysis:", "Rate limits:":
 		return true
 	default:
-		return false
+		return line == "Main agent token usage:" || strings.HasPrefix(line, "Subagent token usage")
 	}
+}
+
+func parseStatsScopedSectionHeader(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	const mainPrefix = "🧠 MAIN AGENT · "
+	if strings.HasPrefix(line, mainPrefix) {
+		kind := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, mainPrefix)), ":")
+		return strings.ToLower(kind), true
+	}
+	if !strings.HasPrefix(line, "🧩 SUBAGENTS") {
+		return "", false
+	}
+	separator := strings.LastIndex(line, " · ")
+	if separator < 0 {
+		return "", false
+	}
+	kind := strings.TrimSuffix(strings.TrimSpace(line[separator+len(" · "):]), ":")
+	return strings.ToLower(kind), true
 }
 
 type statsModelTierRenderGroup struct {
@@ -1381,6 +2159,166 @@ func renderStatsModelTierUsageHTML(lines []string) string {
 		}
 		out.WriteString("</p>")
 	}
+	return out.String()
+}
+
+type statsModelEffortRenderRow struct {
+	Model  string
+	Effort string
+	Lines  []string
+}
+
+func renderStatsModelEffortUsageHTML(lines []string) string {
+	var rows []statsModelEffortRenderRow
+	var current *statsModelEffortRenderRow
+	currentModel := ""
+	flush := func() {
+		if current == nil {
+			return
+		}
+		rows = append(rows, *current)
+		current = nil
+	}
+	for _, line := range compactStatsRenderLines(lines) {
+		label, value := splitStatsLineLabelValue(line)
+		switch strings.ToLower(label) {
+		case "model":
+			flush()
+			currentModel = value
+		case "overall":
+			flush()
+			current = &statsModelEffortRenderRow{Model: currentModel, Effort: "overall"}
+		case "effort":
+			flush()
+			current = &statsModelEffortRenderRow{Model: currentModel, Effort: value}
+		default:
+			if current == nil {
+				current = &statsModelEffortRenderRow{Model: currentModel}
+			}
+			current.Lines = append(current.Lines, line)
+		}
+	}
+	flush()
+	if len(rows) == 0 {
+		return renderStatsParagraphLinesHTML(lines)
+	}
+	meaningful := false
+	for _, row := range rows {
+		if strings.TrimSpace(row.Model) != "" || strings.TrimSpace(row.Effort) != "" {
+			meaningful = true
+			break
+		}
+		values := parseStatsUsageValues(row.Lines)
+		if values.Input != "" || values.CacheHitRate != "" || values.Output != "" || values.Total != "" {
+			meaningful = true
+			break
+		}
+	}
+	if !meaningful {
+		return renderStatsParagraphLinesHTML(lines)
+	}
+	var out strings.Builder
+	out.WriteString("<table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>")
+	for _, row := range rows {
+		values := parseStatsUsageValues(row.Lines)
+		out.WriteString("<tr><td>")
+		out.WriteString(html.EscapeString(row.Model))
+		out.WriteString("</td><td>")
+		out.WriteString(html.EscapeString(row.Effort))
+		out.WriteString("</td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(values.Input))
+		out.WriteString("</td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(values.CacheHitRate))
+		out.WriteString("</td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(values.Output))
+		out.WriteString("</td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(values.Total))
+		out.WriteString("</td></tr>")
+	}
+	out.WriteString("</table>")
+	return out.String()
+}
+
+// renderStatsSingleUsageTableHTML renders a scope's conversation-wide usage
+// without putting it next to another scope. Keeping this as a table makes the
+// main-agent and subagent sections visually comparable while their headings
+// remain unambiguous.
+func renderStatsSingleUsageTableHTML(lines []string) string {
+	values := parseStatsUsageValues(lines)
+	if values.Input == "" && values.CacheHitRate == "" && values.Output == "" && values.Total == "" {
+		return renderStatsParagraphLinesHTML(lines)
+	}
+	rows := []struct {
+		Label string
+		Value string
+	}{
+		{Label: "input", Value: values.Input},
+		{Label: "Cache hit rate", Value: values.CacheHitRate},
+		{Label: "output", Value: values.Output},
+		{Label: "total", Value: values.Total},
+	}
+	var out strings.Builder
+	out.WriteString("<table><tr><th>Metric</th><th>Overall</th></tr>")
+	for _, row := range rows {
+		if strings.TrimSpace(row.Value) == "" {
+			continue
+		}
+		out.WriteString("<tr><td><strong>")
+		out.WriteString(html.EscapeString(row.Label))
+		out.WriteString("</strong></td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(row.Value))
+		out.WriteString("</td></tr>")
+	}
+	out.WriteString("</table>")
+	return out.String()
+}
+
+// renderStatsUsageSnapshotsHTML keeps the last snapshot and reconstructed
+// conversation total together. The markers are intentionally parsed here,
+// rather than being treated as independent sections, so the old useful
+// snapshot comparison survives inside the new explicit main-agent scope.
+func renderStatsUsageSnapshotsHTML(lines []string) string {
+	var lastLines, conversationLines []string
+	var target *[]string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		switch line {
+		case "Last recorded model usage:":
+			target = &lastLines
+		case "Conversation total:":
+			target = &conversationLines
+		default:
+			if target != nil {
+				*target = append(*target, line)
+			}
+		}
+	}
+	return renderStatsUsageComparisonTableHTML(lastLines, conversationLines)
+}
+
+// renderStatsStatusTableHTML is used for the explicit no-subagent and
+// unavailable states. It deliberately does not render an empty token table:
+// the status itself is the useful information when there is no child history.
+func renderStatsStatusTableHTML(lines []string) string {
+	compact := compactStatsRenderLines(lines)
+	if len(compact) == 0 {
+		return ""
+	}
+	var out strings.Builder
+	out.WriteString("<table><tr><th>Status</th><th>Value</th></tr>")
+	for _, line := range compact {
+		line = strings.TrimPrefix(line, "- ")
+		label, value := splitStatsLineLabelValue(line)
+		if label == "" {
+			label = "Detail"
+		}
+		out.WriteString("<tr><td><strong>")
+		out.WriteString(html.EscapeString(label))
+		out.WriteString("</strong></td><td>")
+		out.WriteString(renderTeamsInlineMarkdownWithLineBreaks(value))
+		out.WriteString("</td></tr>")
+	}
+	out.WriteString("</table>")
 	return out.String()
 }
 
@@ -1542,6 +2480,9 @@ func formatTokenUsageLines(usage CodexTokenUsage) []string {
 	if pct, ok := usage.cachePercent(); ok {
 		lines = append(lines, "")
 		lines = append(lines, fmt.Sprintf("Cache hit rate: %.1f%%", pct))
+	} else {
+		lines = append(lines, "")
+		lines = append(lines, "Cache hit rate: N/A")
 	}
 	output := "output: " + formatTokenCount(usage.OutputTokens)
 	if usage.ReasoningOutputTokens > 0 {

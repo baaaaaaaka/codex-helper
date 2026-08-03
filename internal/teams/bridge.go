@@ -50,6 +50,7 @@ const (
 	pendingUpgradeBlockedRetryInterval      = 5 * time.Second
 	registryProjectionSaveMinInterval       = time.Minute
 	dashboardProjectsCacheTTL               = 30 * time.Second
+	subagentProjectsCacheTTL                = 30 * time.Second
 	persistentPollFailureRestartAfter       = 10 * time.Minute
 	persistentPollFailureRestartMinCount    = 3
 	recentDuplicateSessionPromptWindow      = 3 * time.Minute
@@ -456,6 +457,11 @@ type Bridge struct {
 	dashboardProjectsMu               sync.Mutex
 	dashboardProjectsCache            []codexhistory.Project
 	dashboardProjectsCachedAt         time.Time
+	subagentProjectsMu                sync.Mutex
+	subagentProjectsCache             []codexhistory.Project
+	subagentProjectsCacheRoot         string
+	subagentProjectsCacheErr          error
+	subagentProjectsCachedAt          time.Time
 	annotateUserMessages              bool
 	annotationWarned                  bool
 	markAnswerChatsUnread             bool
@@ -14989,22 +14995,31 @@ func (b *Bridge) sendToChat(ctx context.Context, chatID string, text string) err
 }
 
 func (b *Bridge) sendStatsToChat(ctx context.Context, chatID string, text string) error {
-	body := renderCodexTokenStatsHTML(text)
-	msg := teamstore.OutboxMessage{
-		ID:             directOutboxID(chatID, "helper-stats", body),
-		TeamsChatID:    chatID,
-		Kind:           "helper-stats",
-		Body:           body,
-		PartIndex:      1,
-		PartCount:      1,
-		SourceTextHash: normalizedTextHash(text),
-		RenderedBytes:  len(body),
+	chunks := renderCodexTokenStatsHTMLChunks(text)
+	queued := make([]teamstore.OutboxMessage, 0, len(chunks))
+	sourceHash := normalizedTextHash(text)
+	for index, body := range chunks {
+		kind := "helper-stats"
+		if len(chunks) > 1 {
+			kind = fmt.Sprintf("helper-stats-%03d", index+1)
+		}
+		msg := teamstore.OutboxMessage{
+			ID:             directOutboxID(chatID, kind, body),
+			TeamsChatID:    chatID,
+			Kind:           kind,
+			Body:           body,
+			PartIndex:      index + 1,
+			PartCount:      len(chunks),
+			SourceTextHash: sourceHash,
+			RenderedBytes:  len(body),
+		}
+		queuedMsg, err := b.queueOutbox(ctx, msg)
+		if err != nil {
+			return err
+		}
+		queued = append(queued, queuedMsg)
 	}
-	queued, err := b.queueOutbox(ctx, msg)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(queued.ID) == "" {
+	if len(queued) == 0 || strings.TrimSpace(queued[len(queued)-1].ID) == "" {
 		return nil
 	}
 	return b.flushPendingOutboxForChat(ctx, chatID)
@@ -15156,7 +15171,20 @@ func isWorkflowFallbackOutboxKind(kind string) bool {
 }
 
 func isHelperStatsOutboxKind(kind string) bool {
-	return strings.EqualFold(strings.TrimSpace(kind), "helper-stats")
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind == "helper-stats" {
+		return true
+	}
+	const prefix = "helper-stats-"
+	if !strings.HasPrefix(kind, prefix) || len(kind) != len(prefix)+3 {
+		return false
+	}
+	for _, r := range kind[len(prefix):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func renderWorkflowFallbackOutboxHTML(outbox teamstore.OutboxMessage, firstPrefixHTML string) string {

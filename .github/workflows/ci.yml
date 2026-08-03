@@ -586,6 +586,14 @@ jobs:
           go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
           go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
 
+      - name: Teams helper token stats regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery))'
+          go test ./internal/teams -count=1 -run "$token_stats_pattern" -v
+
       - name: Teams chat-local model and global default regressions
         if: matrix.shard == 'core'
         shell: bash
