@@ -138,9 +138,12 @@ func TestPolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway(t *t
 		t.Fatalf("openai_base_url values = %#v, want one loopback Responses gateway", openAIValues)
 	}
 	joined := strings.Join(base.request.Args, " ")
-	for _, want := range []string{`approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
+	for _, want := range []string{`approval_policy="on-request"`, `approvals_reviewer="user"`} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("policy args missing %q: %s", want, joined)
 		}
+	}
+	if strings.Contains(joined, "sandbox_mode=") {
+		t.Fatalf("policy starter must leave sandbox_mode to Codex configuration: %s", joined)
 	}
 }

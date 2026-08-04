@@ -151,7 +151,6 @@ func (s *Server) CodexConfigArgs() []string {
 		"-c", `openai_base_url="` + tomlEscape(s.OpenAIBaseURL()) + `"`,
 		"-c", `approval_policy="on-request"`,
 		"-c", `approvals_reviewer="user"`,
-		"-c", `sandbox_mode="read-only"`,
 	}
 }
 

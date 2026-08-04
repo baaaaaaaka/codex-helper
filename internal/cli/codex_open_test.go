@@ -238,10 +238,13 @@ func assertStandardBrokerLaunch(t *testing.T, fixture codexTUIBrokerFixture) {
 	assertBrokerCapabilityToken(t, fixture)
 	assertRemoteTUISQLiteIsolation(t, fixture)
 	appArgs := strings.Join(readArgLines(t, fixture.appServerArgs), "\n")
-	for _, want := range []string{"app-server", "--analytics-default-enabled", `approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
+	for _, want := range []string{"app-server", "--analytics-default-enabled", `approval_policy="on-request"`, `approvals_reviewer="user"`} {
 		if !strings.Contains(appArgs, want) {
 			t.Fatalf("app-server args missing %q:\n%s", want, appArgs)
 		}
+	}
+	if strings.Contains(appArgs, "sandbox_mode=") {
+		t.Fatalf("app-server args must leave sandbox_mode to Codex configuration:\n%s", appArgs)
 	}
 	for _, forbidden := range []string{"--aaa", "agent_auto_approve", "auto_approve", "--yolo", "dangerously-bypass", "danger-full-access", "approval_policy=\"never\""} {
 		if strings.Contains(appArgs, forbidden) || strings.Contains(strings.Join(tuiArgs, "\n"), forbidden) {

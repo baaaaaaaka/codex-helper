@@ -76,10 +76,13 @@ func TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged(t *testing.T
 	}
 
 	args := strings.Join(server.CodexConfigArgs(), " ")
-	for _, want := range []string{"openai_base_url", `approval_policy="on-request"`, `approvals_reviewer="user"`, `sandbox_mode="read-only"`} {
+	for _, want := range []string{"openai_base_url", `approval_policy="on-request"`, `approvals_reviewer="user"`} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("config args missing %q: %s", want, args)
 		}
+	}
+	if strings.Contains(args, "sandbox_mode=") {
+		t.Fatalf("config args must leave sandbox_mode to Codex configuration: %s", args)
 	}
 	if strings.Contains(args, "chatgpt_base_url") {
 		t.Fatalf("config args must preserve the official ChatGPT HTTPS origin: %s", args)
