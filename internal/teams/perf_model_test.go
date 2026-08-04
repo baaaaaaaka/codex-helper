@@ -489,7 +489,7 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 					cxpPerfSeedLinkedTranscriptFiles(t, store, bridge, profile)
 					_, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(t, store)
 					now := time.Date(2026, 5, 23, 9, 45, 0, 0, time.UTC)
-					cxpPerfAppendHistoryCommentary(t, checkpoint.Path, 0, now)
+					cxpPerfAppendHistoryUserPrompt(t, checkpoint.Path, checkpoint.ThreadID, 0, now)
 					bridge.lastHistoryWatchSync = time.Time{}
 					bridge.lastHistoryWatchReconcile = now
 					if err := bridge.syncCodexHistoryFinalsIfDue(context.Background(), now); err != nil {
@@ -3487,6 +3487,32 @@ func BenchmarkCXPPerfModelSQLiteHistoryWatchCheckpointUpdateProfiles(b *testing.
 	}
 }
 
+func TestCXPPerfModelSQLiteHistoryWatchActiveAppendExercisesTeamsOriginLookup(t *testing.T) {
+	profile := cxpPerfProfileByNameForTest(t, "light-user")
+	profile.MessagesPerPoll = 0
+	store := newCXPPerfStore(t, profile)
+	cxpPerfSeedColdRuntimeMetadata(t, store, profile)
+	cxpPerfMigrateStoreToSQLite(t, store)
+	bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
+	cxpPerfSeedLinkedTranscriptFiles(t, store, bridge, profile)
+	checkpointID, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(t, store)
+	now := time.Date(2026, 8, 4, 23, 10, 0, 0, time.UTC)
+	cxpPerfAppendHistoryUserPrompt(t, checkpoint.Path, checkpoint.ThreadID, 0, now)
+	bridge.lastHistoryWatchSync = time.Time{}
+	bridge.lastHistoryWatchReconcile = now
+	if err := bridge.syncCodexHistoryFinalsIfDue(context.Background(), now); err != nil {
+		t.Fatalf("history watch active append: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load history watch checkpoint: %v", err)
+	}
+	updated := state.HistoryWatch[checkpointID]
+	if updated.TeamsOriginThreadID != checkpoint.ThreadID || updated.TeamsOriginTurnID != "perf-origin-turn-000000" {
+		t.Fatalf("active append did not exercise Teams-origin lookup: %#v", updated)
+	}
+}
+
 func BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles(b *testing.B) {
 	for _, profile := range cxpPerfProfiles {
 		profile := profile
@@ -3505,7 +3531,7 @@ func BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				callNow := now.Add(time.Duration(i) * 11 * time.Second)
 				b.StopTimer()
-				cxpPerfAppendHistoryCommentary(b, checkpoint.Path, i, callNow)
+				cxpPerfAppendHistoryUserPrompt(b, checkpoint.Path, checkpoint.ThreadID, i, callNow)
 				b.StartTimer()
 				bridge.lastHistoryWatchSync = time.Time{}
 				bridge.lastHistoryWatchReconcile = callNow
@@ -4041,6 +4067,31 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 				session.CodexHome = root
 				state.Sessions[sessionID] = session
 			}
+			originInboundID := fmt.Sprintf("perf-watch-inbound-%03d", chat)
+			originTurnID := fmt.Sprintf("perf-watch-origin-turn-%03d", chat)
+			originPrompt := cxpPerfHistoryWatchPrompt(threadID)
+			state.InboundEvents[originInboundID] = teamstore.InboundEvent{
+				ID:             originInboundID,
+				SessionID:      sessionID,
+				TeamsChatID:    cxpPerfChatID(chat),
+				TeamsMessageID: fmt.Sprintf("perf-watch-message-%03d", chat),
+				Text:           originPrompt,
+				TextHash:       normalizedTextHash(originPrompt),
+				Source:         "teams",
+				Status:         teamstore.InboundStatusPersisted,
+				TurnID:         originTurnID,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
+			state.Turns[originTurnID] = teamstore.Turn{
+				ID:             originTurnID,
+				SessionID:      sessionID,
+				InboundEventID: originInboundID,
+				Status:         teamstore.TurnStatusCompleted,
+				CodexThreadID:  threadID,
+				CreatedAt:      now,
+				UpdatedAt:      now,
+			}
 			if bridge != nil {
 				for i := range bridge.reg.Sessions {
 					if bridge.reg.Sessions[i].ID == sessionID {
@@ -4198,9 +4249,17 @@ func cxpPerfFirstHistoryWatchCheckpoint(tb testing.TB, store *teamstore.Store) (
 	return "", teamstore.HistoryWatchCheckpoint{}
 }
 
-func cxpPerfAppendHistoryCommentary(tb testing.TB, path string, index int, when time.Time) {
+func cxpPerfAppendHistoryUserPrompt(tb testing.TB, path string, threadID string, index int, when time.Time) {
 	tb.Helper()
-	line := fmt.Sprintf(
+	promptLine := fmt.Sprintf(
+		`{"timestamp":%q,"thread_id":%q,"turn_id":%q,"id":%q,"role":"user","text":%q}`+"\n",
+		when.Format(time.RFC3339Nano),
+		threadID,
+		fmt.Sprintf("perf-origin-turn-%06d", index),
+		fmt.Sprintf("perf-user-%06d", index),
+		cxpPerfHistoryWatchPrompt(threadID),
+	)
+	commentaryLine := fmt.Sprintf(
 		`{"timestamp":%q,"type":"event_msg","payload":{"type":"agent_message","id":%q,"turn_id":%q,"phase":"commentary","message":%q}}`+"\n",
 		when.Format(time.RFC3339Nano),
 		fmt.Sprintf("perf-status-%06d", index),
@@ -4211,13 +4270,17 @@ func cxpPerfAppendHistoryCommentary(tb testing.TB, path string, index int, when 
 	if err != nil {
 		tb.Fatalf("open history file for append: %v", err)
 	}
-	if _, err := f.WriteString(line); err != nil {
+	if _, err := f.WriteString(promptLine + commentaryLine); err != nil {
 		_ = f.Close()
 		tb.Fatalf("append history commentary: %v", err)
 	}
 	if err := f.Close(); err != nil {
 		tb.Fatalf("close history commentary file: %v", err)
 	}
+}
+
+func cxpPerfHistoryWatchPrompt(threadID string) string {
+	return "Teams-origin performance prompt for " + strings.TrimSpace(threadID)
 }
 
 func cxpPerfTranscriptContent(threadID string, lines int, messageBytes int) string {

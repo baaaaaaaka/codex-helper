@@ -24,8 +24,13 @@ const (
 	storeSQLiteVersion              = 1
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
-	sqliteImportCheckpointImporting = "importing"
-	sqliteWALAutocheckpointPages    = 0
+	// Pointer schema 6 was emitted while the JSON state schema was 5. The
+	// pointer envelope and SQLite storage version have not changed since then,
+	// so keep that durable format readable until the backend storage version is
+	// intentionally retired.
+	storeSQLiteMinPointerSchemaVersion = 6
+	sqliteImportCheckpointImporting    = "importing"
+	sqliteWALAutocheckpointPages       = 0
 
 	DefaultSQLiteStateMigrationMinSize int64 = 1 << 20
 )
@@ -262,7 +267,7 @@ func storeSQLitePointerFromData(data []byte) (storeSQLitePointer, bool, error) {
 	if err := json.Unmarshal(data, &pointer); err != nil {
 		return storeSQLitePointer{}, false, err
 	}
-	if pointer.SchemaVersion != storeSQLitePointerSchemaVersion {
+	if pointer.SchemaVersion < storeSQLiteMinPointerSchemaVersion || pointer.SchemaVersion > storeSQLitePointerSchemaVersion {
 		return storeSQLitePointer{}, false, &UnsupportedSchemaVersionError{Version: pointer.SchemaVersion}
 	}
 	if pointer.StorageVersion != storeSQLiteVersion {
@@ -2883,6 +2888,86 @@ func (s *Store) historyWatchStateSQLite(ctx context.Context) (State, bool, error
 		return err
 	})
 	return state, handled, err
+}
+
+func (s *Store) historyWatchOriginStateSQLite(ctx context.Context, threadID string) (State, bool, error) {
+	state := State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      make(map[string]SessionContext),
+		Turns:         make(map[string]Turn),
+		InboundEvents: make(map[string]InboundEvent),
+	}
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM sessions`, state.Sessions, func(v SessionContext) string { return v.ID }); err != nil {
+			return err
+		}
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns`, state.Turns, func(v Turn) string { return v.ID }); err != nil {
+			return err
+		}
+
+		threadID = strings.TrimSpace(threadID)
+		sessionIDs := make(map[string]struct{})
+		inboundIDs := make(map[string]struct{})
+		for _, session := range state.Sessions {
+			if strings.TrimSpace(session.CodexThreadID) == threadID {
+				if sessionID := strings.TrimSpace(session.ID); sessionID != "" {
+					sessionIDs[sessionID] = struct{}{}
+				}
+			}
+		}
+		for _, turn := range state.Turns {
+			if strings.TrimSpace(turn.CodexThreadID) != threadID {
+				continue
+			}
+			if sessionID := strings.TrimSpace(turn.SessionID); sessionID != "" {
+				sessionIDs[sessionID] = struct{}{}
+			}
+			if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+				inboundIDs[inboundID] = struct{}{}
+			}
+		}
+		if err := loadSQLiteHistoryWatchInboundRows(ctx, db, "session_id", sortedMapKeys(sessionIDs), state.InboundEvents); err != nil {
+			return err
+		}
+		return loadSQLiteHistoryWatchInboundRows(ctx, db, "id", sortedMapKeys(inboundIDs), state.InboundEvents)
+	})
+	return state, handled, err
+}
+
+func loadSQLiteHistoryWatchInboundRows(ctx context.Context, db *sql.DB, column string, values []string, out map[string]InboundEvent) error {
+	if len(values) == 0 {
+		return nil
+	}
+	switch column {
+	case "id", "session_id":
+	default:
+		return fmt.Errorf("unsupported history-watch inbound lookup column %q", column)
+	}
+	const batchSize = 400
+	for start := 0; start < len(values); start += batchSize {
+		end := min(start+batchSize, len(values))
+		placeholders := make([]string, 0, end-start)
+		args := make([]any, 0, end-start)
+		for _, value := range values[start:end] {
+			placeholders = append(placeholders, "?")
+			args = append(args, value)
+		}
+		query := `SELECT json FROM inbound_events WHERE ` + column + ` IN (` + strings.Join(placeholders, ",") + `)`
+		if err := loadSQLiteJSONMap(ctx, db, query, out, func(v InboundEvent) string { return v.ID }, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) claimControlLeaseSQLite(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, bool, error) {

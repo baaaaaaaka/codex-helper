@@ -31227,6 +31227,81 @@ func TestBridgeHistoryWatchSkipsTeamsOriginPromptByInboundHash(t *testing.T) {
 	}
 }
 
+func TestBridgeHistoryWatchSQLiteNarrowOriginLookupSkipsCorruptExcludedRows(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 5, 2, 0, 0, 0, time.UTC)
+	codexRoot := newBridgeTestCodexRoot(t)
+	threadID := "thread-teams-origin-sqlite-narrow"
+	turnID := "turn-teams-origin-sqlite-narrow"
+	prompt := "Teams prompt that must use the narrow SQLite lookup"
+	transcriptPath := filepath.Join(codexRoot, "sessions", "2026", "08", "05", "rollout-2026-08-05T02-00-00-"+threadID+".jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatalf("mkdir transcript dir: %v", err)
+	}
+	body := `{"type":"session_meta","payload":{"id":` + strconv.Quote(threadID) + `}}` + "\n" +
+		`{"thread_id":` + strconv.Quote(threadID) + `,"turn_id":` + strconv.Quote(turnID) + `,"id":"u1","role":"user","text":` + strconv.Quote(prompt) + `}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeCreateChatGraph(t, nil)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.scope.CodexHome = codexRoot
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.HistoryWatchReady = now.Add(-time.Minute)
+		state.Sessions["session-origin"] = teamstore.SessionContext{ID: "session-origin", TeamsChatID: "chat-origin", CodexThreadID: threadID, Status: teamstore.SessionStatusActive}
+		state.InboundEvents["inbound-origin"] = teamstore.InboundEvent{ID: "inbound-origin", SessionID: "session-origin", TeamsChatID: "chat-origin", Text: prompt, TextHash: normalizedTextHash(prompt), Source: "teams", Status: teamstore.InboundStatusPersisted, TurnID: turnID, CreatedAt: now, UpdatedAt: now}
+		state.Turns[turnID] = teamstore.Turn{ID: turnID, SessionID: "session-origin", InboundEventID: "inbound-origin", CodexThreadID: threadID, Status: teamstore.TurnStatusRunning, CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages["outbox-sentinel"] = teamstore.OutboxMessage{ID: "outbox-sentinel", SessionID: "session-unrelated", TeamsChatID: "chat-unrelated", Kind: "final", Status: teamstore.OutboxStatusSent, CreatedAt: now, UpdatedAt: now, SentAt: now}
+		state.HelperDeliveries["helper-sentinel"] = teamstore.HelperDeliveryRecord{ID: "helper-sentinel", SessionID: "session-unrelated", TeamsChatID: "chat-unrelated", OutboxID: "outbox-sentinel", Kind: "final", Status: teamstore.HelperDeliveryStatusSent, CreatedAt: now, UpdatedAt: now, SentAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed SQLite history origin state: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate history origin store to SQLite: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName))
+	if err != nil {
+		t.Fatalf("open SQLite sentinel writer: %v", err)
+	}
+	for _, update := range []struct {
+		table string
+		id    string
+	}{
+		{table: "outbox_messages", id: "outbox-sentinel"},
+		{table: "helper_deliveries", id: "helper-sentinel"},
+	} {
+		if _, err := db.Exec(`UPDATE `+update.table+` SET json = '{broken-sentinel' WHERE id = ?`, update.id); err != nil {
+			_ = db.Close()
+			t.Fatalf("corrupt %s sentinel: %v", update.table, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite sentinel writer: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryFinals(ctx, now, false); err != nil {
+		t.Fatalf("history watch sync with corrupt excluded rows: %v", err)
+	}
+	state, err := store.HistoryWatchState(ctx)
+	if err != nil {
+		t.Fatalf("load history watch checkpoint: %v", err)
+	}
+	checkpoint := state.HistoryWatch[historyWatchCheckpointID(transcriptPath)]
+	if checkpoint.TeamsOriginThreadID != threadID || checkpoint.TeamsOriginTurnID != turnID {
+		t.Fatalf("history watch checkpoint = %#v, want Teams-origin thread and turn", checkpoint)
+	}
+	if bridge.reg.SessionByCodexThreadID(threadID) != nil || len(*sent) != 0 {
+		t.Fatalf("Teams-origin prompt was published as local: session=%#v sent=%#v", bridge.reg.SessionByCodexThreadID(threadID), *sent)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Store.Load unexpectedly accepted corrupt sentinels; bridge narrow-read assertion is ineffective")
+	}
+}
+
 func TestBridgeHistoryWatchDoesNotSkipLocalPromptWithSameTextAsTeamsInboundDifferentThread(t *testing.T) {
 	now := time.Date(2026, 5, 11, 9, 0, 0, 0, time.UTC)
 	codexRoot := newBridgeTestCodexRoot(t)

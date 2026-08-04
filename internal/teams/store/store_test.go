@@ -688,6 +688,155 @@ func TestApplyOutboxReplayFencesUsesCompleteSentProjection(t *testing.T) {
 	}
 }
 
+func TestBackfillHelperDeliveriesUpdatesEveryLegacyRecordForOutbox(t *testing.T) {
+	now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
+	sentAt := now.Add(time.Minute)
+	state := newState()
+	state.OutboxMessages["outbox-1"] = OutboxMessage{
+		ID:             "outbox-1",
+		SessionID:      "session-1",
+		TurnID:         "turn-1",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "teams-message-1",
+		Kind:           "final",
+		Status:         OutboxStatusSent,
+		CreatedAt:      now,
+		UpdatedAt:      sentAt,
+		SentAt:         sentAt,
+	}
+	state.HelperDeliveries["legacy-a"] = HelperDeliveryRecord{ID: "legacy-a", OutboxID: "outbox-1", Status: HelperDeliveryStatusQueued, CreatedAt: now.Add(-time.Hour)}
+	state.HelperDeliveries["legacy-b"] = HelperDeliveryRecord{ID: "legacy-b", OutboxID: " outbox-1 ", Status: HelperDeliveryStatusAccepted, CreatedAt: now.Add(-2 * time.Hour)}
+	state.HelperDeliveries["unrelated"] = HelperDeliveryRecord{ID: "unrelated", OutboxID: "outbox-2", Status: HelperDeliveryStatusQueued, CreatedAt: now}
+
+	backfillHelperDeliveries(&state)
+
+	if len(state.HelperDeliveries) != 3 {
+		t.Fatalf("helper delivery count = %d, want existing legacy records only", len(state.HelperDeliveries))
+	}
+	for _, id := range []string{"legacy-a", "legacy-b"} {
+		delivery := state.HelperDeliveries[id]
+		if delivery.Status != HelperDeliveryStatusSent || delivery.TeamsMessageID != "teams-message-1" || !delivery.SentAt.Equal(sentAt) || !delivery.UpdatedAt.Equal(sentAt) {
+			t.Fatalf("legacy helper delivery %s = %#v", id, delivery)
+		}
+	}
+	if unrelated := state.HelperDeliveries["unrelated"]; unrelated.Status != HelperDeliveryStatusQueued || unrelated.TeamsMessageID != "" {
+		t.Fatalf("unrelated helper delivery changed: %#v", unrelated)
+	}
+}
+
+func TestBackfillHelperDeliveriesCreatesEligibleRecord(t *testing.T) {
+	now := time.Date(2026, 8, 5, 1, 0, 0, 0, time.UTC)
+	state := newState()
+	state.Sessions["session-1"] = SessionContext{ID: "session-1", TeamsChatID: "chat-1", CodexThreadID: "thread-1"}
+	state.Turns["turn-1"] = Turn{ID: "turn-1", SessionID: "session-1", CodexThreadID: "thread-1"}
+	state.OutboxMessages["outbox-1"] = OutboxMessage{
+		ID:          "outbox-1",
+		SessionID:   "session-1",
+		TurnID:      "turn-1",
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-001",
+		Body:        "still working",
+		Status:      OutboxStatusQueued,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	backfillHelperDeliveries(&state)
+
+	if len(state.HelperDeliveries) != 1 {
+		t.Fatalf("helper delivery count = %d, want 1", len(state.HelperDeliveries))
+	}
+	var created HelperDeliveryRecord
+	for _, delivery := range state.HelperDeliveries {
+		created = delivery
+	}
+	if created.ID == "" || created.OutboxID != "outbox-1" || created.KindFamily != "status" || created.Status != HelperDeliveryStatusQueued {
+		t.Fatalf("created helper delivery = %#v", created)
+	}
+	before := created
+	backfillHelperDeliveries(&state)
+	if got := state.HelperDeliveries[created.ID]; !reflect.DeepEqual(got, before) {
+		t.Fatalf("eligible helper delivery changed after stable backfill:\nbefore=%#v\nafter=%#v", before, got)
+	}
+}
+
+const (
+	productionScaleOutboxCount         = 6103
+	productionScaleHelperDeliveryCount = 32793
+)
+
+func helperDeliveryProductionScaleState() State {
+	now := time.Date(2026, 8, 4, 23, 0, 0, 0, time.UTC)
+	state := newState()
+	for i := 0; i < productionScaleOutboxCount; i++ {
+		id := fmt.Sprintf("outbox-%05d", i)
+		state.OutboxMessages[id] = OutboxMessage{
+			ID:             id,
+			SessionID:      fmt.Sprintf("session-%03d", i%80),
+			TurnID:         fmt.Sprintf("turn-%05d", i),
+			TeamsChatID:    fmt.Sprintf("chat-%03d", i%80),
+			TeamsMessageID: fmt.Sprintf("teams-%05d", i),
+			Kind:           "final",
+			Status:         OutboxStatusSent,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			SentAt:         now,
+		}
+	}
+	for i := 0; i < productionScaleHelperDeliveryCount; i++ {
+		outboxID := fmt.Sprintf("outbox-%05d", i%productionScaleOutboxCount)
+		id := fmt.Sprintf("helper-%05d", i)
+		state.HelperDeliveries[id] = HelperDeliveryRecord{
+			ID:        id,
+			OutboxID:  outboxID,
+			Status:    HelperDeliveryStatusQueued,
+			CreatedAt: now,
+		}
+	}
+	return state
+}
+
+func BenchmarkBackfillHelperDeliveriesProductionScale(b *testing.B) {
+	state := helperDeliveryProductionScaleState()
+	b.ReportMetric(productionScaleOutboxCount, "outbox_records")
+	b.ReportMetric(productionScaleHelperDeliveryCount, "helper_delivery_records")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		backfillHelperDeliveries(&state)
+	}
+}
+
+func BenchmarkNormalizeLoadedStateProductionScaleHelperDeliveries(b *testing.B) {
+	state := helperDeliveryProductionScaleState()
+	b.ReportMetric(productionScaleOutboxCount, "outbox_records")
+	b.ReportMetric(productionScaleHelperDeliveryCount, "helper_delivery_records")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		normalizeLoadedState(&state)
+	}
+}
+
+func TestBackfillHelperDeliveriesProductionScaleCompletesWithinBudget(t *testing.T) {
+	state := helperDeliveryProductionScaleState()
+	started := time.Now()
+	backfillHelperDeliveries(&state)
+	elapsed := time.Since(started)
+	// The indexed implementation normally completes in tens of milliseconds on
+	// CI. Keep a broad one-second budget so normal host variance is harmless,
+	// while the former hundreds-of-millions-of-comparisons scan fails closed.
+	if elapsed > time.Second {
+		t.Fatalf("production-scale helper delivery backfill took %s, want <= 1s", elapsed)
+	}
+	if len(state.HelperDeliveries) != productionScaleHelperDeliveryCount {
+		t.Fatalf("helper delivery count = %d, want %d", len(state.HelperDeliveries), productionScaleHelperDeliveryCount)
+	}
+	if got := state.HelperDeliveries["helper-00000"].Status; got != HelperDeliveryStatusSent {
+		t.Fatalf("helper-00000 status = %q, want sent", got)
+	}
+}
+
 func TestSQLiteApplyOutboxReplayFencesReadsOnlyRequestedOutboxRows(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -2000,8 +2149,163 @@ func TestSQLitePointerSchemaRejectsLegacyV5Loaders(t *testing.T) {
 	}
 }
 
+func TestSQLitePointerLegacySchemaLoadsAllEntryPoints(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 8, 4, 22, 39, 3, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "scope-legacy-pointer", AccountID: "account-1", Profile: "default"}
+		state.ControlChat = ControlChatBinding{ScopeID: state.Scope.ID, TeamsChatID: "control-1"}
+		state.ServiceControl = ServiceControl{Paused: true, Reason: "legacy pointer compatibility", UpdatedAt: now}
+		state.Sessions["session-1"] = SessionContext{ID: "session-1", Status: SessionStatusActive, TeamsChatID: "chat-1"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy pointer state: %v", err)
+	}
+	result := migrateStoreToSQLiteForTest(t, store)
+	if result.Path == "" {
+		t.Fatal("sqlite migration returned an empty database path")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	pointerData, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read current sqlite pointer: %v", err)
+	}
+	var pointer storeSQLitePointer
+	if err := json.Unmarshal(pointerData, &pointer); err != nil {
+		t.Fatalf("unmarshal current sqlite pointer: %v", err)
+	}
+	pointer.SchemaVersion = storeSQLiteMinPointerSchemaVersion
+	pointer.SourceSchemaVersion = 5
+	pointerData, err = json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal legacy sqlite pointer: %v", err)
+	}
+	pointerData = append(pointerData, '\n')
+	if err := os.WriteFile(store.Path(), pointerData, 0o600); err != nil {
+		t.Fatalf("write legacy sqlite pointer: %v", err)
+	}
+	offline, err := LoadPathOfflineRecoveryReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathOfflineRecoveryReadOnly legacy sqlite pointer: %v", err)
+	}
+	if offline.Scope.ID != "scope-legacy-pointer" || offline.Sessions["session-1"].TeamsChatID != "chat-1" {
+		t.Fatalf("legacy pointer offline state = %#v", offline)
+	}
+	offlineMetadata, err := LoadPathRuntimeMetadataOfflineRecoveryReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathRuntimeMetadataOfflineRecoveryReadOnly legacy sqlite pointer: %v", err)
+	}
+	if offlineMetadata.Scope.ID != "scope-legacy-pointer" || offlineMetadata.ControlChat.TeamsChatID != "control-1" {
+		t.Fatalf("legacy pointer offline runtime metadata = %#v", offlineMetadata)
+	}
+
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("open legacy sqlite pointer: %v", err)
+	}
+	defer reopened.Close()
+	loaded, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load legacy sqlite pointer: %v", err)
+	}
+	if loaded.Scope.ID != "scope-legacy-pointer" || loaded.Sessions["session-1"].TeamsChatID != "chat-1" {
+		t.Fatalf("Load legacy sqlite pointer state = %#v", loaded)
+	}
+	if _, err := LoadPathReadOnly(ctx, store.Path()); err != nil {
+		t.Fatalf("LoadPathReadOnly legacy sqlite pointer: %v", err)
+	}
+	metadata, err := LoadPathRuntimeMetadataReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathRuntimeMetadataReadOnly legacy sqlite pointer: %v", err)
+	}
+	if metadata.Scope.ID != "scope-legacy-pointer" || metadata.ControlChat.TeamsChatID != "control-1" {
+		t.Fatalf("legacy pointer runtime metadata = %#v", metadata)
+	}
+	watchdog, err := LoadPathWatchdogStateReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathWatchdogStateReadOnly legacy sqlite pointer: %v", err)
+	}
+	if !watchdog.ServiceControl.Paused || watchdog.ServiceControl.Reason != "legacy pointer compatibility" {
+		t.Fatalf("legacy pointer watchdog state = %#v", watchdog.ServiceControl)
+	}
+	migration, err := reopened.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite legacy sqlite pointer: %v", err)
+	}
+	if !migration.AlreadyDB || migration.Migrated {
+		t.Fatalf("legacy sqlite pointer migration result = %#v", migration)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read legacy sqlite pointer after entry points: %v", err)
+	}
+	if !bytes.Equal(after, pointerData) {
+		t.Fatal("reading a supported legacy sqlite pointer rewrote the pointer file")
+	}
+}
+
+func TestSQLitePointerLegacySchemaUnsupportedStorageVersionFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	seedLegacyStateFileForSQLiteMigrationTest(t, store)
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read sqlite pointer: %v", err)
+	}
+	var pointer map[string]any
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		t.Fatalf("unmarshal sqlite pointer: %v", err)
+	}
+	pointer["schema_version"] = storeSQLiteMinPointerSchemaVersion
+	pointer["source_schema_version"] = 5
+	pointer["storage_version"] = storeSQLiteVersion + 1
+	data, err = json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal incompatible sqlite pointer: %v", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(store.Path(), data, 0o600); err != nil {
+		t.Fatalf("write incompatible sqlite pointer: %v", err)
+	}
+
+	for name, load := range map[string]func() error{
+		"state read": func() error {
+			_, err := LoadPathReadOnly(ctx, store.Path())
+			return err
+		},
+		"runtime metadata read": func() error {
+			_, err := LoadPathRuntimeMetadataReadOnly(ctx, store.Path())
+			return err
+		},
+		"offline state read": func() error {
+			_, err := LoadPathOfflineRecoveryReadOnly(ctx, store.Path())
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := load(); err == nil || !strings.Contains(err.Error(), "unsupported sqlite store version 2") {
+				t.Fatalf("error = %v, want unsupported sqlite store version 2", err)
+			}
+		})
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read incompatible sqlite pointer after failed reads: %v", err)
+	}
+	if !bytes.Equal(after, data) {
+		t.Fatal("failed reads modified incompatible sqlite pointer")
+	}
+}
+
 func TestSQLitePointerUnsupportedSchemaFailsClosed(t *testing.T) {
-	for _, schemaVersion := range []int{0, storeSQLitePointerSchemaVersion - 1, storeSQLitePointerSchemaVersion + 1} {
+	for _, schemaVersion := range []int{0, storeSQLiteMinPointerSchemaVersion - 1, storeSQLitePointerSchemaVersion + 1} {
 		t.Run(fmt.Sprintf("schema=%d", schemaVersion), func(t *testing.T) {
 			store := newTestStore(t)
 			ctx := context.Background()
@@ -13393,6 +13697,100 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	}
 	if state.TranscriptDeliveries["delivery-1"].ID == "" || state.HelperDeliveries["helper-1"].ID == "" || state.Notifications["notification-1"].ID == "" {
 		t.Fatalf("split side tables were lost: transcript=%#v helper=%#v notifications=%#v", state.TranscriptDeliveries, state.HelperDeliveries, state.Notifications)
+	}
+}
+
+func TestSQLiteHistoryWatchOriginStateSkipsOutboxDeliveryAndUnrelatedInboundRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 8, 4, 23, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-target"] = SessionContext{ID: "session-target", TeamsChatID: "chat-target", CodexThreadID: "thread-target", Status: SessionStatusActive}
+		state.Sessions["session-unrelated"] = SessionContext{ID: "session-unrelated", TeamsChatID: "chat-unrelated", CodexThreadID: "thread-unrelated", Status: SessionStatusActive}
+		state.InboundEvents["inbound-target"] = InboundEvent{ID: "inbound-target", SessionID: "session-target", TeamsChatID: "chat-target", TeamsMessageID: "message-target", Text: "target prompt", Source: "teams", Status: InboundStatusPersisted, TurnID: "turn-target", CreatedAt: now, UpdatedAt: now}
+		state.InboundEvents["inbound-unrelated"] = InboundEvent{ID: "inbound-unrelated", SessionID: "session-unrelated", TeamsChatID: "chat-unrelated", TeamsMessageID: "message-unrelated", Text: "unrelated prompt", Source: "teams", Status: InboundStatusPersisted, TurnID: "turn-unrelated", CreatedAt: now, UpdatedAt: now}
+		state.Turns["turn-target"] = Turn{ID: "turn-target", SessionID: "session-target", InboundEventID: "inbound-target", CodexThreadID: "thread-target", Status: TurnStatusRunning}
+		state.Turns["turn-unrelated"] = Turn{ID: "turn-unrelated", SessionID: "session-unrelated", InboundEventID: "inbound-unrelated", CodexThreadID: "thread-unrelated", Status: TurnStatusCompleted}
+		state.OutboxMessages["outbox-sentinel"] = OutboxMessage{ID: "outbox-sentinel", SessionID: "session-unrelated", TeamsChatID: "chat-unrelated", Kind: "final", Body: "must not decode", Status: OutboxStatusSent, CreatedAt: now, UpdatedAt: now, SentAt: now}
+		state.HelperDeliveries["helper-sentinel"] = HelperDeliveryRecord{ID: "helper-sentinel", SessionID: "session-unrelated", TeamsChatID: "chat-unrelated", OutboxID: "outbox-sentinel", Kind: "final", Status: HelperDeliveryStatusSent, CreatedAt: now, UpdatedAt: now, SentAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed history origin state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	dbPath := filepath.Join(filepath.Dir(store.Path()), SQLiteFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite sentinel writer: %v", err)
+	}
+	for _, update := range []struct {
+		table string
+		id    string
+	}{
+		{table: "inbound_events", id: "inbound-unrelated"},
+		{table: "outbox_messages", id: "outbox-sentinel"},
+		{table: "helper_deliveries", id: "helper-sentinel"},
+	} {
+		if _, err := db.Exec(`UPDATE `+update.table+` SET json = '{broken-sentinel' WHERE id = ?`, update.id); err != nil {
+			_ = db.Close()
+			t.Fatalf("corrupt %s sentinel: %v", update.table, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite sentinel writer: %v", err)
+	}
+
+	state, err := store.HistoryWatchOriginState(ctx, "thread-target")
+	if err != nil {
+		t.Fatalf("HistoryWatchOriginState with corrupt unrelated rows: %v", err)
+	}
+	if _, ok := state.InboundEvents["inbound-target"]; !ok || len(state.InboundEvents) != 1 {
+		t.Fatalf("history origin inbound projection = %#v", state.InboundEvents)
+	}
+	if len(state.OutboxMessages) != 0 || len(state.HelperDeliveries) != 0 {
+		t.Fatalf("history origin loaded excluded tables: outbox=%d helper=%d", len(state.OutboxMessages), len(state.HelperDeliveries))
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly accepted corrupt sentinels; narrow-read assertion is not effective")
+	}
+}
+
+func TestSQLiteHistoryWatchOriginStateCoversSessionAndTurnMatches(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 8, 5, 1, 30, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-match"] = SessionContext{ID: "session-match", CodexThreadID: "thread-by-session", Status: SessionStatusActive}
+		state.Sessions["turn-match"] = SessionContext{ID: "turn-match", CodexThreadID: "thread-other", Status: SessionStatusActive}
+		state.Sessions["unrelated"] = SessionContext{ID: "unrelated", CodexThreadID: "thread-unrelated", Status: SessionStatusActive}
+		state.InboundEvents["inbound-session"] = InboundEvent{ID: "inbound-session", SessionID: "session-match", Source: "teams", TurnID: "turn-session", CreatedAt: now}
+		state.InboundEvents["inbound-turn"] = InboundEvent{ID: "inbound-turn", SessionID: "turn-match", Source: "teams", TurnID: "turn-match", CreatedAt: now}
+		state.InboundEvents["inbound-unrelated"] = InboundEvent{ID: "inbound-unrelated", SessionID: "unrelated", Source: "teams", TurnID: "turn-unrelated", CreatedAt: now}
+		state.Turns["turn-session"] = Turn{ID: "turn-session", SessionID: "session-match", InboundEventID: "inbound-session", Status: TurnStatusRunning}
+		state.Turns["turn-match"] = Turn{ID: "turn-match", SessionID: "turn-match", InboundEventID: "inbound-turn", CodexThreadID: "thread-by-turn", Status: TurnStatusRunning}
+		state.Turns["turn-unrelated"] = Turn{ID: "turn-unrelated", SessionID: "unrelated", InboundEventID: "inbound-unrelated", CodexThreadID: "thread-unrelated", Status: TurnStatusRunning}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed history origin match modes: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	for _, tt := range []struct {
+		threadID  string
+		inboundID string
+	}{
+		{threadID: "thread-by-session", inboundID: "inbound-session"},
+		{threadID: "thread-by-turn", inboundID: "inbound-turn"},
+	} {
+		t.Run(tt.threadID, func(t *testing.T) {
+			state, err := store.HistoryWatchOriginState(ctx, tt.threadID)
+			if err != nil {
+				t.Fatalf("HistoryWatchOriginState: %v", err)
+			}
+			if _, ok := state.InboundEvents[tt.inboundID]; !ok || len(state.InboundEvents) != 1 {
+				t.Fatalf("inbound projection = %#v, want only %s", state.InboundEvents, tt.inboundID)
+			}
+		})
 	}
 }
 

@@ -446,15 +446,18 @@ func (b *Bridge) historyWatchRecordLooksTeamsOrigin(ctx context.Context, record 
 	if b == nil || b.store == nil || record.Kind != TranscriptKindUser {
 		return false
 	}
-	state, err := b.store.Load(ctx)
-	if err != nil {
-		return false
-	}
 	body := formatTranscriptRecordForTeams(record)
 	if strings.TrimSpace(body) == "" {
 		return false
 	}
 	threadID := strings.TrimSpace(record.ThreadID)
+	if threadID == "" {
+		return false
+	}
+	state, err := b.store.HistoryWatchOriginState(ctx, threadID)
+	if err != nil {
+		return false
+	}
 	return shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTextHashesForHistoryWatch(state, threadID))
 }
 

@@ -2983,6 +2983,36 @@ func (s *Store) HistoryWatchState(ctx context.Context) (State, error) {
 	}, nil
 }
 
+// HistoryWatchOriginState returns only the session, turn, and inbound records
+// needed to decide whether a Codex history prompt originated in Teams. SQLite
+// stores avoid materializing outbox and delivery tables, and load inbound rows
+// only for sessions associated with threadID. Legacy JSON stores still require
+// one full JSON decode, but return the same narrow projection to callers.
+func (s *Store) HistoryWatchOriginState(ctx context.Context, threadID string) (State, error) {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return State{
+			SchemaVersion: SchemaVersion,
+			Sessions:      map[string]SessionContext{},
+			Turns:         map[string]Turn{},
+			InboundEvents: map[string]InboundEvent{},
+		}, nil
+	}
+	if state, handled, err := s.historyWatchOriginStateSQLite(ctx, threadID); handled || err != nil {
+		return state, err
+	}
+	state, err := s.Load(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	return State{
+		SchemaVersion: SchemaVersion,
+		Sessions:      state.Sessions,
+		Turns:         state.Turns,
+		InboundEvents: state.InboundEvents,
+	}, nil
+}
+
 func (s *Store) SetPaused(ctx context.Context, paused bool, reason string) (ServiceControl, error) {
 	var out ServiceControl
 	update := func(state *State) error {
@@ -6069,9 +6099,23 @@ func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status
 	if state == nil {
 		return
 	}
-	updatedExisting := false
+	deliveryIDs := make([]string, 0)
 	for id, existing := range state.HelperDeliveries {
-		if strings.TrimSpace(existing.OutboxID) != strings.TrimSpace(msg.ID) {
+		if strings.TrimSpace(existing.OutboxID) == strings.TrimSpace(msg.ID) {
+			deliveryIDs = append(deliveryIDs, id)
+		}
+	}
+	updateHelperDeliveryForOutboxIDsLocked(state, msg, status, now, deliveryIDs)
+}
+
+func updateHelperDeliveryForOutboxIDsLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time, deliveryIDs []string) string {
+	if state == nil {
+		return ""
+	}
+	updatedExisting := false
+	for _, id := range deliveryIDs {
+		existing, ok := state.HelperDeliveries[id]
+		if !ok || strings.TrimSpace(existing.OutboxID) != strings.TrimSpace(msg.ID) {
 			continue
 		}
 		existing.Status = status
@@ -6084,11 +6128,11 @@ func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status
 		updatedExisting = true
 	}
 	if updatedExisting {
-		return
+		return ""
 	}
 	record, ok := helperDeliveryRecordFromOutboxLocked(state, msg, status, now)
 	if !ok {
-		return
+		return ""
 	}
 	if existing, ok := state.HelperDeliveries[record.ID]; ok {
 		if !existing.CreatedAt.IsZero() {
@@ -6105,6 +6149,7 @@ func updateHelperDeliveryForOutboxLocked(state *State, msg OutboxMessage, status
 		}
 	}
 	state.HelperDeliveries[record.ID] = record
+	return record.ID
 }
 
 func helperDeliveryRecordFromOutboxLocked(state *State, msg OutboxMessage, status HelperDeliveryStatus, now time.Time) (HelperDeliveryRecord, bool) {
@@ -7949,10 +7994,25 @@ func backfillHelperDeliveries(state *State) {
 		return
 	}
 	state.ensure(time.Time{})
+	deliveryIDsByOutboxID := make(map[string][]string)
+	for deliveryID, delivery := range state.HelperDeliveries {
+		outboxID := strings.TrimSpace(delivery.OutboxID)
+		deliveryIDsByOutboxID[outboxID] = append(deliveryIDsByOutboxID[outboxID], deliveryID)
+	}
 	outboxIDs := sortedMapKeys(state.OutboxMessages)
 	for _, outboxID := range outboxIDs {
 		msg := state.OutboxMessages[outboxID]
-		updateHelperDeliveryForOutboxLocked(state, msg, helperDeliveryStatusFromOutboxStatus(msg.Status), firstStoreNonZeroTime(msg.UpdatedAt, msg.CreatedAt))
+		messageOutboxID := strings.TrimSpace(msg.ID)
+		createdID := updateHelperDeliveryForOutboxIDsLocked(
+			state,
+			msg,
+			helperDeliveryStatusFromOutboxStatus(msg.Status),
+			firstStoreNonZeroTime(msg.UpdatedAt, msg.CreatedAt),
+			deliveryIDsByOutboxID[messageOutboxID],
+		)
+		if createdID != "" {
+			deliveryIDsByOutboxID[messageOutboxID] = append(deliveryIDsByOutboxID[messageOutboxID], createdID)
+		}
 	}
 	transcriptDeliveryIDs := sortedMapKeys(state.TranscriptDeliveries)
 	for _, deliveryID := range transcriptDeliveryIDs {

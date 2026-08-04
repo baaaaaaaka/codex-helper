@@ -3,6 +3,7 @@ package teams
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,57 @@ import (
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestProbeScopeMetadataReadOnlyAcceptsLegacySQLitePointerSchema(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.json")
+	store, err := teamstore.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	scope := teamstore.ScopeIdentity{ID: "scope:legacy-pointer", AccountID: "account-1", Profile: "default"}
+	if _, err := store.RecordScope(ctx, scope); err != nil {
+		t.Fatalf("record scope: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{ScopeID: scope.ID, AccountID: scope.AccountID, Profile: scope.Profile, TeamsChatID: "control-1"}
+		return nil
+	}); err != nil {
+		t.Fatalf("record control chat: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store to sqlite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sqlite pointer: %v", err)
+	}
+	var pointer map[string]any
+	if err := json.Unmarshal(raw, &pointer); err != nil {
+		t.Fatalf("unmarshal sqlite pointer: %v", err)
+	}
+	// Version 6 is the durable pointer emitted before v0.1.21-rc.7.
+	pointer["schema_version"] = 6
+	pointer["source_schema_version"] = 5
+	raw, err = json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal legacy sqlite pointer: %v", err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write legacy sqlite pointer: %v", err)
+	}
+
+	metadata, err := ProbeScopeMetadataReadOnly(ctx, path)
+	if err != nil {
+		t.Fatalf("probe legacy sqlite migration candidate: %v", err)
+	}
+	if metadata.Scope.ID != scope.ID || metadata.ControlChat.TeamsChatID != "control-1" {
+		t.Fatalf("legacy sqlite migration candidate metadata = %#v", metadata)
+	}
+}
 
 func completeRuntimeStorePlanForTest(ctx context.Context, scope teamstore.ScopeIdentity) (teamstore.ScopeIdentity, string, error) {
 	plan, err := InspectRuntimeStoreForScope(ctx, scope)
