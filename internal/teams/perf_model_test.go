@@ -489,7 +489,7 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 					cxpPerfSeedLinkedTranscriptFiles(t, store, bridge, profile)
 					_, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(t, store)
 					now := time.Date(2026, 5, 23, 9, 45, 0, 0, time.UTC)
-					cxpPerfAppendHistoryUserPrompt(t, checkpoint.Path, checkpoint.ThreadID, 0, now)
+					cxpPerfAppendHistoryCommentary(t, checkpoint.Path, 0, now)
 					bridge.lastHistoryWatchSync = time.Time{}
 					bridge.lastHistoryWatchReconcile = now
 					if err := bridge.syncCodexHistoryFinalsIfDue(context.Background(), now); err != nil {
@@ -3495,6 +3495,7 @@ func TestCXPPerfModelSQLiteHistoryWatchActiveAppendExercisesTeamsOriginLookup(t 
 	cxpPerfMigrateStoreToSQLite(t, store)
 	bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
 	cxpPerfSeedLinkedTranscriptFiles(t, store, bridge, profile)
+	cxpPerfRegisterCodexHistoryCacheCleanup(t)
 	checkpointID, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(t, store)
 	now := time.Date(2026, 8, 4, 23, 10, 0, 0, time.UTC)
 	cxpPerfAppendHistoryUserPrompt(t, checkpoint.Path, checkpoint.ThreadID, 0, now)
@@ -3523,6 +3524,7 @@ func BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles(b *testing.B) {
 			cxpPerfMigrateStoreToSQLite(b, store)
 			bridge := newCXPPerfBridge(store, newCXPPerfGraph(profile), profile)
 			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
+			cxpPerfRegisterCodexHistoryCacheCleanup(b)
 			_, checkpoint := cxpPerfFirstHistoryWatchCheckpoint(b, store)
 			ctx := context.Background()
 			now := time.Date(2026, 5, 23, 10, 25, 0, 0, time.UTC)
@@ -4247,6 +4249,40 @@ func cxpPerfFirstHistoryWatchCheckpoint(tb testing.TB, store *teamstore.Store) (
 	}
 	tb.Fatal("perf store has no history watch checkpoint")
 	return "", teamstore.HistoryWatchCheckpoint{}
+}
+
+func cxpPerfRegisterCodexHistoryCacheCleanup(tb testing.TB) {
+	tb.Helper()
+	if err := codexhistory.CloseCaches(); err != nil {
+		tb.Fatalf("close Codex history caches before active history watch: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := codexhistory.CloseCaches(); err != nil {
+			tb.Errorf("close Codex history caches after active history watch: %v", err)
+		}
+	})
+}
+
+func cxpPerfAppendHistoryCommentary(tb testing.TB, path string, index int, when time.Time) {
+	tb.Helper()
+	line := fmt.Sprintf(
+		`{"timestamp":%q,"type":"event_msg","payload":{"type":"agent_message","id":%q,"turn_id":%q,"phase":"commentary","message":%q}}`+"\n",
+		when.Format(time.RFC3339Nano),
+		fmt.Sprintf("perf-status-%06d", index),
+		fmt.Sprintf("perf-turn-%06d", index),
+		"working",
+	)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		tb.Fatalf("open history file for append: %v", err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		_ = f.Close()
+		tb.Fatalf("append history commentary: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		tb.Fatalf("close history commentary file: %v", err)
+	}
 }
 
 func cxpPerfAppendHistoryUserPrompt(tb testing.TB, path string, threadID string, index int, when time.Time) {
