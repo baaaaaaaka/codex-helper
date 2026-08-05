@@ -591,7 +591,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery))'
+          # Keep parser, aggregation, rendering, stale-checkpoint/model-switch,
+          # and subagent discovery regressions in the core CI shard.
+          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|AggregateCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery))'
           go test ./internal/teams -count=1 -run "$token_stats_pattern" -v
 
       - name: Teams chat-local model and global default regressions

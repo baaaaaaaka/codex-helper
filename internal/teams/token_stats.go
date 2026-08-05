@@ -24,6 +24,7 @@ const codexContextBaselineTokens int64 = 12000
 
 type CodexTokenStats struct {
 	SourcePath               string
+	SourcePaths              []string
 	SourceLine               int
 	Source                   string
 	Info                     CodexTokenUsageInfo
@@ -82,6 +83,187 @@ type CodexTokenUsage struct {
 type codexTokenUsageSummary struct {
 	Total       CodexTokenUsage
 	ModelUsages []CodexModelUsage
+}
+
+// codexStatsParentSource identifies one parent transcript that contributes to
+// a Work-chat stats report. The import checkpoint intentionally remains a
+// separate concern: it tracks transcript delivery progress for one source,
+// while stats may need to read several historical Codex threads after a model
+// switch.
+type codexStatsParentSource struct {
+	ThreadID   string
+	FilePath   string
+	ModifiedAt time.Time
+	Subagents  []codexhistory.SubagentSession
+}
+
+func canonicalCodexStatsPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	return filepath.Clean(path)
+}
+
+func codexStatsParentSourceModifiedAt(source codexStatsParentSource) time.Time {
+	if !source.ModifiedAt.IsZero() {
+		return source.ModifiedAt
+	}
+	if info, err := os.Stat(source.FilePath); err == nil {
+		return info.ModTime()
+	}
+	return time.Time{}
+}
+
+func appendCodexStatsParentSource(sources []codexStatsParentSource, source codexStatsParentSource) []codexStatsParentSource {
+	source.FilePath = canonicalCodexStatsPath(source.FilePath)
+	if source.FilePath == "" {
+		return sources
+	}
+	source.ModifiedAt = codexStatsParentSourceModifiedAt(source)
+	for index := range sources {
+		if canonicalCodexStatsPath(sources[index].FilePath) != source.FilePath {
+			continue
+		}
+		if sources[index].ThreadID == "" {
+			sources[index].ThreadID = strings.TrimSpace(source.ThreadID)
+		}
+		if !source.ModifiedAt.IsZero() {
+			sources[index].ModifiedAt = source.ModifiedAt
+		}
+		if len(source.Subagents) > 0 {
+			sources[index].Subagents = append(sources[index].Subagents, source.Subagents...)
+		}
+		return sources
+	}
+	sources = append(sources, source)
+	sort.SliceStable(sources, func(i, j int) bool {
+		left := sources[i].ModifiedAt
+		right := sources[j].ModifiedAt
+		if !left.Equal(right) {
+			if left.IsZero() {
+				return false
+			}
+			if right.IsZero() {
+				return true
+			}
+			return left.Before(right)
+		}
+		return sources[i].FilePath < sources[j].FilePath
+	})
+	return sources
+}
+
+func summarizeCodexModelTierUsages(stats []CodexTokenStats) []CodexModelTierUsage {
+	type key struct {
+		model string
+		tier  string
+	}
+	groups := make(map[key]CodexTokenUsage)
+	for _, stat := range stats {
+		for _, usage := range stat.ModelTierUsages {
+			groupKey := key{model: normalizedCodexModelName(usage.Model), tier: normalizedCodexTierName(usage.Tier)}
+			groups[groupKey], _ = addCodexTokenUsage(groups[groupKey], usage.Usage)
+		}
+	}
+	keys := make([]key, 0, len(groups))
+	for groupKey, usage := range groups {
+		if usage.hasTokens() {
+			keys = append(keys, groupKey)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].model != keys[j].model {
+			return keys[i].model < keys[j].model
+		}
+		return keys[i].tier < keys[j].tier
+	})
+	result := make([]CodexModelTierUsage, 0, len(keys))
+	for _, groupKey := range keys {
+		result = append(result, CodexModelTierUsage{
+			Model: groupKey.model,
+			Tier:  groupKey.tier,
+			Usage: groups[groupKey],
+		})
+	}
+	return result
+}
+
+func aggregateCodexTokenStats(stats []CodexTokenStats, sources []codexStatsParentSource) CodexTokenStats {
+	if len(stats) == 0 {
+		return CodexTokenStats{}
+	}
+	if len(stats) == 1 {
+		return stats[0]
+	}
+
+	summary := summarizeCodexTokenStats(stats)
+	newestIndex := len(stats) - 1
+	latestUsage := stats[newestIndex]
+	for index := len(stats) - 1; index >= 0; index-- {
+		if stats[index].Info.Last.hasTokens() || stats[index].Info.Total.hasTokens() {
+			latestUsage = stats[index]
+			break
+		}
+	}
+
+	out := stats[newestIndex]
+	out.Source = fmt.Sprintf("aggregated across %d linked parent transcripts", len(stats))
+	out.SourceLine = latestUsage.SourceLine
+	out.SourcePath = ""
+	out.SourcePaths = make([]string, 0, len(stats))
+	out.Diagnostics = nil
+	out.UsedFallbackOnly = true
+	out.UsageEventCount = 0
+	out.NonAdvancingUsageEvents = 0
+	out.NativeCounterResets = 0
+	out.NativeCounterRecoveries = 0
+	out.MissingLastUsageEvents = 0
+	out.UsageAggregationOverflow = false
+	for index, stat := range stats {
+		path := canonicalCodexStatsPath(stat.SourcePath)
+		if path == "" && index < len(sources) {
+			path = canonicalCodexStatsPath(sources[index].FilePath)
+		}
+		if path != "" {
+			seenPath := false
+			for _, existing := range out.SourcePaths {
+				if existing == path {
+					seenPath = true
+					break
+				}
+			}
+			if !seenPath {
+				out.SourcePaths = append(out.SourcePaths, path)
+			}
+		}
+		out.UsageEventCount += stat.UsageEventCount
+		out.NonAdvancingUsageEvents += stat.NonAdvancingUsageEvents
+		out.NativeCounterResets += stat.NativeCounterResets
+		out.NativeCounterRecoveries += stat.NativeCounterRecoveries
+		out.MissingLastUsageEvents += stat.MissingLastUsageEvents
+		out.UsageAggregationOverflow = out.UsageAggregationOverflow || stat.UsageAggregationOverflow
+		out.UsedFallbackOnly = out.UsedFallbackOnly && stat.UsedFallbackOnly
+		for _, diagnostic := range stat.Diagnostics {
+			if path != "" {
+				diagnostic.Message = path + ": " + diagnostic.Message
+			}
+			out.Diagnostics = append(out.Diagnostics, diagnostic)
+		}
+	}
+	out.Info.ModelContextWindow = stats[newestIndex].Info.ModelContextWindow
+	out.RateLimits = stats[newestIndex].RateLimits
+	out.NativeLatestTotal = CodexTokenUsage{}
+	out.Info.Total = summary.Total
+	if latestUsage.Info.Last.hasTokens() {
+		out.Info.Last = latestUsage.Info.Last
+	}
+	out.ModelUsages = summary.ModelUsages
+	out.ModelTierUsages = summarizeCodexModelTierUsages(stats)
+	return out
 }
 
 func summarizeCodexTokenStats(stats []CodexTokenStats) codexTokenUsageSummary {
@@ -1243,6 +1425,132 @@ func firstJSONMapFloat(fields map[string]json.RawMessage, keys ...string) (float
 	return 0, false
 }
 
+// statsParentSourcesForWorkSession resolves every transcript that has been
+// linked to a Work chat's parent conversation. Import checkpoints deliberately
+// point at one transcript, but a model switch can create a new Codex thread;
+// stats must therefore use durable turns and the thread-link journal as an
+// additional, read-only history index.
+func (b *Bridge) statsParentSourcesForWorkSession(ctx context.Context, session Session, projects []codexhistory.Project, discoveryErr error) ([]codexStatsParentSource, []string) {
+	var sources []codexStatsParentSource
+	var problems []string
+	if discoveryErr != nil {
+		problems = append(problems, "history discovery: "+discoveryErr.Error())
+	}
+	if b == nil || b.store == nil {
+		if strings.TrimSpace(session.CodexThreadID) != "" {
+			problems = append(problems, "durable Teams state is unavailable")
+		}
+		return sources, problems
+	}
+
+	threadIDs := appendUniqueString(nil, session.CodexThreadID)
+	state, err := b.store.SessionThreadResolutionSnapshot(ctx, session.ID)
+	if err != nil {
+		problems = append(problems, "durable thread history: "+err.Error())
+	} else {
+		if durable, ok := state.Sessions[strings.TrimSpace(session.ID)]; ok {
+			threadIDs = appendUniqueString(threadIDs, durable.CodexThreadID)
+		}
+		for _, turn := range state.Turns {
+			if strings.TrimSpace(turn.SessionID) != strings.TrimSpace(session.ID) {
+				continue
+			}
+			threadIDs = appendUniqueString(threadIDs, turn.CodexThreadID)
+		}
+	}
+
+	journal, err := b.readThreadLinkJournal(ctx, session.ID)
+	if err != nil {
+		problems = append(problems, "thread-link history: "+err.Error())
+	} else {
+		for _, record := range journal {
+			if threadLinkJournalRecordMatchesSession(b, &session, record) {
+				threadIDs = appendUniqueString(threadIDs, record.CodexThreadID)
+			}
+		}
+	}
+	resolvedProjects := projects
+	missingThread := false
+	for _, threadID := range threadIDs {
+		if _, _, ok := findCodexSession(resolvedProjects, threadID); !ok {
+			missingThread = true
+			break
+		}
+	}
+	if missingThread && discoveryErr == nil {
+		// The short-lived subagent catalog cache can race a just-created thread.
+		// Refresh only when a durable thread has no catalog entry, so normal stats
+		// requests retain the cache's bounded scan cost.
+		freshProjects, refreshErr := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+		if refreshErr != nil {
+			problems = append(problems, "history refresh: "+refreshErr.Error())
+		} else {
+			resolvedProjects = freshProjects
+		}
+	}
+	for _, threadID := range threadIDs {
+		local, _, ok := findCodexSession(resolvedProjects, threadID)
+		if !ok {
+			problems = append(problems, "parent transcript for Codex thread "+strings.TrimSpace(threadID)+" was not found in local history")
+		} else if strings.TrimSpace(local.FilePath) == "" {
+			problems = append(problems, "parent transcript for Codex thread "+strings.TrimSpace(threadID)+" has no local file path")
+		}
+	}
+
+	checkpoint, _, err := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(session.ID))
+	if err != nil {
+		problems = append(problems, "transcript checkpoint: "+err.Error())
+	} else if path := canonicalCodexStatsPath(checkpoint.SourcePath); path != "" {
+		sources = appendCodexStatsParentSource(sources, codexStatsParentSource{
+			ThreadID: session.CodexThreadID,
+			FilePath: path,
+		})
+	}
+
+	for _, threadID := range threadIDs {
+		local, project, ok := findCodexSession(resolvedProjects, threadID)
+		if !ok || strings.TrimSpace(local.FilePath) == "" {
+			continue
+		}
+		if strings.TrimSpace(local.ProjectPath) == "" {
+			local.ProjectPath = project.Path
+		}
+		sources = appendCodexStatsParentSource(sources, codexStatsParentSource{
+			ThreadID:   local.SessionID,
+			FilePath:   local.FilePath,
+			ModifiedAt: local.ModifiedAt,
+			Subagents:  local.Subagents,
+		})
+	}
+	return sources, problems
+}
+
+func readAggregatedCodexTokenStats(sources []codexStatsParentSource) (CodexTokenStats, []string) {
+	if len(sources) == 0 {
+		return CodexTokenStats{}, nil
+	}
+	stats := make([]CodexTokenStats, 0, len(sources))
+	readSources := make([]codexStatsParentSource, 0, len(sources))
+	problems := make([]string, 0)
+	for _, source := range sources {
+		path := canonicalCodexStatsPath(source.FilePath)
+		if path == "" {
+			continue
+		}
+		stat, err := ReadCodexTokenStats(path)
+		if err != nil {
+			problems = append(problems, path+": "+err.Error())
+			continue
+		}
+		stats = append(stats, stat)
+		readSources = append(readSources, source)
+	}
+	if len(stats) == 0 {
+		return CodexTokenStats{}, problems
+	}
+	return aggregateCodexTokenStats(stats, readSources), problems
+}
+
 func (b *Bridge) formatWorkSessionStats(ctx context.Context, session *Session) string {
 	if session == nil {
 		return "STATS: Codex tokens\nSession: not found"
@@ -1267,23 +1575,29 @@ func (b *Bridge) formatWorkSessionStats(ctx context.Context, session *Session) s
 		lines = append(lines, "", "Token stats unavailable: this Work chat does not have a linked Codex thread yet.")
 		return strings.Join(lines, "\n")
 	}
-	local, ok, err := b.localCodexSessionForTeamsSession(ctx, *session)
-	if err != nil {
+	if err := b.ensureStore(); err != nil {
 		lines = append(lines, "", "Token stats unavailable: "+err.Error())
 		return strings.Join(lines, "\n")
 	}
-	if !ok || strings.TrimSpace(local.FilePath) == "" {
+	projects, discoveryErr := b.discoverSubagentProjects(ctx)
+	sources, sourceProblems := b.statsParentSourcesForWorkSession(ctx, *session, projects, discoveryErr)
+	if len(sources) == 0 {
+		if len(sourceProblems) > 0 {
+			lines = append(lines, "", "Token stats unavailable: "+sourceProblems[0])
+			return strings.Join(lines, "\n")
+		}
 		lines = append(lines, "", "Token stats unavailable: no local Codex transcript is linked to this Work chat.")
 		return strings.Join(lines, "\n")
 	}
-	stats, err := ReadCodexTokenStats(local.FilePath)
-	if err != nil {
-		lines = append(lines, "", "Token stats unavailable: read local Codex transcript failed: "+err.Error())
+	stats, readProblems := readAggregatedCodexTokenStats(sources)
+	if !stats.HasUsage() && len(readProblems) > 0 {
+		lines = append(lines, "", "Token stats unavailable: read local Codex transcript failed: "+readProblems[0])
 		return strings.Join(lines, "\n")
 	}
 	lines = append(lines, "")
-	lines = append(lines, formatCodexMainAgentStatsLines(stats)...)
-	subagentSummary, subagentCount, subagentProblems, discoveryErr := b.readSubagentTokenStatsForWorkSession(ctx, session.CodexThreadID)
+	allProblems := append(append([]string{}, sourceProblems...), readProblems...)
+	lines = append(lines, formatCodexMainAgentStatsLines(stats, allProblems)...)
+	subagentSummary, subagentCount, subagentProblems, discoveryErr := b.readSubagentTokenStatsForWorkSession(ctx, sources, discoveryErr)
 	lines = append(lines, "")
 	if discoveryErr != nil {
 		lines = append(lines, formatCodexSubagentUnavailableLines(discoveryErr)...)
@@ -1310,6 +1624,17 @@ func formatCodexTokenStatsMetadataLines(stats CodexTokenStats) []string {
 		sourceLine += " (" + stats.SourcePath + ")"
 	}
 	lines := []string{sourceLine}
+	if len(stats.SourcePaths) > 0 {
+		lines = append(lines, "", fmt.Sprintf("Sources: %d linked parent transcripts", len(stats.SourcePaths)))
+		for _, path := range stats.SourcePaths {
+			if strings.TrimSpace(path) != "" {
+				lines = append(lines, "- "+path)
+			}
+		}
+	}
+	if len(stats.SourcePaths) > 1 {
+		lines = append(lines, "", "Source aggregation: usage and model/effort details are combined across the linked parent transcripts; latest context and rate-limit metadata comes from the newest transcript.")
+	}
 	if stats.UsedFallbackOnly {
 		lines = append(lines, "", "Reliability: using runner usage fallback because no `token_count` event was found; conversation totals and context-window analysis may be incomplete.")
 	} else if stats.HasUsage() {
@@ -1332,7 +1657,7 @@ func formatCodexTokenStatsMetadataLines(stats CodexTokenStats) []string {
 	return lines
 }
 
-func formatCodexMainAgentStatsLines(stats CodexTokenStats) []string {
+func formatCodexMainAgentStatsLines(stats CodexTokenStats, extraProblems ...[]string) []string {
 	lines := []string{"🧠 MAIN AGENT · metadata:"}
 	lines = append(lines, formatCodexTokenStatsMetadataLines(stats)...)
 	if !stats.HasUsage() {
@@ -1382,6 +1707,17 @@ func formatCodexMainAgentStatsLines(stats CodexTokenStats) []string {
 	if diagnostics := formatTokenStatsDiagnostics(stats.Diagnostics); len(diagnostics) > 0 {
 		lines = append(lines, "", "🧠 MAIN AGENT · diagnostics:")
 		lines = append(lines, diagnostics...)
+	}
+	for _, problems := range extraProblems {
+		if len(problems) == 0 {
+			continue
+		}
+		lines = append(lines, "", "🧠 MAIN AGENT · source diagnostics:")
+		for _, problem := range problems {
+			if strings.TrimSpace(problem) != "" {
+				lines = append(lines, "- "+problem)
+			}
+		}
 	}
 	return lines
 }
@@ -1470,35 +1806,46 @@ func (b *Bridge) discoverSubagentProjects(ctx context.Context) ([]codexhistory.P
 	return cloneCodexProjects(cached), err
 }
 
-func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, threadID string) (codexTokenUsageSummary, int, []string, error) {
-	threadID = strings.TrimSpace(threadID)
-	if threadID == "" {
-		return codexTokenUsageSummary{}, 0, nil, nil
-	}
-	projects, discoveryErr := b.discoverSubagentProjects(ctx)
-	if discoveryErr != nil && len(projects) == 0 {
-		return codexTokenUsageSummary{}, 0, nil, discoveryErr
-	}
-	parent, _, ok := findCodexSession(projects, threadID)
-	if !ok {
+func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, parents []codexStatsParentSource, discoveryErr error) (codexTokenUsageSummary, int, []string, error) {
+	if len(parents) == 0 {
 		if discoveryErr != nil {
 			return codexTokenUsageSummary{}, 0, nil, discoveryErr
 		}
 		return codexTokenUsageSummary{}, 0, nil, nil
 	}
-	subagents := codexhistory.FilterUserVisibleSubagentSessions(parent.Subagents)
-	if len(subagents) == 0 {
+	children := make([]codexhistory.SubagentSession, 0)
+	seen := make(map[string]struct{})
+	for _, parent := range parents {
+		for _, subagent := range codexhistory.FilterUserVisibleSubagentSessions(parent.Subagents) {
+			key := "session:" + strings.TrimSpace(subagent.SessionID)
+			if key == "session:" {
+				key = canonicalCodexStatsPath(subagent.FilePath)
+			}
+			if key == "" {
+				key = "agent:" + strings.TrimSpace(subagent.AgentID)
+			}
+			if key == "agent:" {
+				key = "title:" + subagent.DisplayTitle()
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			children = append(children, subagent)
+		}
+	}
+	if len(children) == 0 {
 		if discoveryErr != nil {
 			return codexTokenUsageSummary{}, 0, nil, discoveryErr
 		}
 		return codexTokenUsageSummary{}, 0, nil, nil
 	}
-	stats := make([]CodexTokenStats, 0, len(subagents))
+	stats := make([]CodexTokenStats, 0, len(children))
 	problems := make([]string, 0)
 	if discoveryErr != nil {
 		problems = append(problems, "history discovery: "+discoveryErr.Error())
 	}
-	for _, subagent := range subagents {
+	for _, subagent := range children {
 		path := strings.TrimSpace(subagent.FilePath)
 		if path == "" {
 			problems = append(problems, subagent.DisplayTitle()+" has no linked transcript")
@@ -1511,7 +1858,7 @@ func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, threa
 		}
 		stats = append(stats, stat)
 	}
-	return summarizeCodexTokenStats(stats), len(subagents), problems, nil
+	return summarizeCodexTokenStats(stats), len(children), problems, nil
 }
 
 func (b *Bridge) latestTurnForStats(ctx context.Context, sessionID string) (teamstore.Turn, bool) {

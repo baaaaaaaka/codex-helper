@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
@@ -629,6 +630,54 @@ func TestSummarizeCodexTokenStatsCombinesSubagentsByModelAndEffort(t *testing.T)
 	}
 }
 
+func TestAggregateCodexTokenStatsCombinesSourcesAndResetsNativeLatest(t *testing.T) {
+	old := CodexTokenStats{
+		SourcePath:        "/tmp/old-parent.jsonl",
+		Source:            "token_count",
+		SourceLine:        4,
+		Info:              CodexTokenUsageInfo{Last: CodexTokenUsage{InputTokens: 80, CachedInputTokens: 40, OutputTokens: 10, ReasoningOutputTokens: 5, TotalTokens: 90}, Total: CodexTokenUsage{InputTokens: 80, CachedInputTokens: 40, OutputTokens: 10, ReasoningOutputTokens: 5, TotalTokens: 90}, ModelContextWindow: 1000},
+		NativeLatestTotal: CodexTokenUsage{TotalTokens: 90},
+		UsageEventCount:   1,
+		ModelUsages: []CodexModelUsage{{
+			Model:        "gpt-5.5",
+			Overall:      CodexTokenUsage{InputTokens: 80, CachedInputTokens: 40, OutputTokens: 10, ReasoningOutputTokens: 5, TotalTokens: 90},
+			EffortUsages: []CodexEffortUsage{{Effort: "xhigh", Usage: CodexTokenUsage{InputTokens: 80, CachedInputTokens: 40, OutputTokens: 10, ReasoningOutputTokens: 5, TotalTokens: 90}}},
+		}},
+		ModelTierUsages: []CodexModelTierUsage{{Model: "gpt-5.5", Tier: "default", Usage: CodexTokenUsage{InputTokens: 80, CachedInputTokens: 40, OutputTokens: 10, TotalTokens: 90}}},
+	}
+	newer := CodexTokenStats{
+		SourcePath:        "/tmp/new-parent.jsonl",
+		Source:            "token_count",
+		SourceLine:        7,
+		Info:              CodexTokenUsageInfo{Last: CodexTokenUsage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 20, ReasoningOutputTokens: 10, TotalTokens: 120}, Total: CodexTokenUsage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 20, ReasoningOutputTokens: 10, TotalTokens: 120}, ModelContextWindow: 2000},
+		NativeLatestTotal: CodexTokenUsage{TotalTokens: 120},
+		UsageEventCount:   2,
+		ModelUsages: []CodexModelUsage{{
+			Model:        "gpt-5.6-luna",
+			Overall:      CodexTokenUsage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 20, ReasoningOutputTokens: 10, TotalTokens: 120},
+			EffortUsages: []CodexEffortUsage{{Effort: "max", Usage: CodexTokenUsage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 20, ReasoningOutputTokens: 10, TotalTokens: 120}}},
+		}},
+		ModelTierUsages: []CodexModelTierUsage{{Model: "gpt-5.6-luna", Tier: "priority", Usage: CodexTokenUsage{InputTokens: 100, CachedInputTokens: 80, OutputTokens: 20, TotalTokens: 120}}},
+	}
+
+	got := aggregateCodexTokenStats([]CodexTokenStats{old, newer}, []codexStatsParentSource{{FilePath: old.SourcePath}, {FilePath: newer.SourcePath}})
+	if got.Source != "aggregated across 2 linked parent transcripts" || got.SourcePath != "" || len(got.SourcePaths) != 2 {
+		t.Fatalf("aggregate metadata = %#v", got)
+	}
+	if got.Info.Total.InputTokens != 180 || got.Info.Total.CachedInputTokens != 120 || got.Info.Total.OutputTokens != 30 || got.Info.Total.TotalTokens != 210 {
+		t.Fatalf("aggregate total = %#v", got.Info.Total)
+	}
+	if got.Info.Last != newer.Info.Last || got.Info.ModelContextWindow != 2000 || got.NativeLatestTotal.hasTokens() {
+		t.Fatalf("aggregate latest metadata = %#v", got)
+	}
+	if got.UsageEventCount != 3 || got.UsedFallbackOnly {
+		t.Fatalf("aggregate counters = %#v", got)
+	}
+	if len(got.ModelUsages) != 2 || len(got.ModelTierUsages) != 2 {
+		t.Fatalf("aggregate model details = %#v tiers=%#v", got.ModelUsages, got.ModelTierUsages)
+	}
+}
+
 func TestBridgeSubagentProjectDiscoveryCachesShortHistoryScan(t *testing.T) {
 	previousDiscover := discoverCodexProjectsForTeams
 	defer func() { discoverCodexProjectsForTeams = previousDiscover }()
@@ -1131,6 +1180,135 @@ func TestBridgeWorkHelperStatsCombinesUserVisibleSubagentsByModelAndEffort(t *te
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("combined helper stats HTML missing %q:\n%s", want, html)
+		}
+	}
+}
+
+func TestBridgeWorkHelperStatsAggregatesLinkedParentTranscriptsAfterModelSwitch(t *testing.T) {
+	tempDir := t.TempDir()
+	oldParentPath := filepath.Join(tempDir, "old-parent.jsonl")
+	newParentPath := filepath.Join(tempDir, "new-parent.jsonl")
+	childAPath := filepath.Join(tempDir, "child-a.jsonl")
+	childBPath := filepath.Join(tempDir, "child-b.jsonl")
+	writeTranscript := func(path string, threadID string, model string, effort string, input int, cached int, output int) {
+		t.Helper()
+		total := input + output
+		transcript := fmt.Sprintf(`{"type":"session_meta","payload":{"id":%q}}`, threadID) + "\n" +
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":%q,"reasoning_effort":%q}}}`, model, effort) + "\n" +
+			fmt.Sprintf(`{"type":"turn_context","payload":{"turn_id":%q,"model":%q,"effort":%q}}`, threadID+"-turn", model, effort) + "\n" +
+			fmt.Sprintf(`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d},"last_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d,"reasoning_output_tokens":%d,"total_tokens":%d}}}}`, input, cached, output, output/2, total, input, cached, output, output/2, total)
+		if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+			t.Fatalf("write transcript %s: %v", path, err)
+		}
+	}
+	writeTranscript(oldParentPath, "thread-old", "gpt-5.5", "xhigh", 80, 40, 10)
+	writeTranscript(newParentPath, "thread-new", "gpt-5.6-luna", "max", 100, 80, 20)
+	writeTranscript(childAPath, "child-a", "gpt-5.6-sol", "high", 10, 5, 3)
+	writeTranscript(childBPath, "child-b", "gpt-5.6-sol", "max", 12, 6, 5)
+
+	previousDiscover := discoverCodexProjectsForTeams
+	var discoveryCalls int
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		discoveryCalls++
+		now := time.Now()
+		sessions := []codexhistory.Session{
+			{
+				SessionID:  "thread-old",
+				FilePath:   oldParentPath,
+				ModifiedAt: now.Add(-time.Hour),
+				Subagents: []codexhistory.SubagentSession{
+					{SessionID: "child-a", FilePath: childAPath, Summary: "child-a"},
+				},
+			},
+			{
+				SessionID:  "thread-new",
+				FilePath:   newParentPath,
+				ModifiedAt: now,
+				Subagents: []codexhistory.SubagentSession{
+					// The same child is visible from both parent transcripts after
+					// discovery; stats must count it only once.
+					{SessionID: "child-a", FilePath: childAPath, Summary: "child-a"},
+					{SessionID: "child-b", FilePath: childBPath, Summary: "child-b"},
+				},
+			},
+		}
+		if discoveryCalls == 1 {
+			// Simulate the 30-second catalog cache racing the latest model-switch
+			// thread; the stats resolver must perform one targeted refresh.
+			sessions = sessions[:1]
+		}
+		return []codexhistory.Project{{Path: tempDir, Sessions: sessions}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = previousDiscover })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{result: ExecutionResult{Text: "should not run"}})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-new"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	now := time.Now()
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:         transcriptCheckpointID(session.ID),
+			SessionID:  session.ID,
+			SourcePath: oldParentPath,
+			Status:     importCheckpointStatusComplete,
+		}
+		state.Turns["turn-old"] = teamstore.Turn{
+			ID: "turn-old", SessionID: session.ID, CodexThreadID: "thread-old",
+			Status: teamstore.TurnStatusCompleted, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+		}
+		state.Turns["turn-new"] = teamstore.Turn{
+			ID: "turn-new", SessionID: session.ID, CodexThreadID: "thread-new",
+			Status: teamstore.TurnStatusCompleted, CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint and prior turns: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("helper-stats", "helper stats"), "helper stats"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(*sent))
+	}
+	if discoveryCalls != 2 {
+		t.Fatalf("history discovery calls = %d, want cached scan plus one refresh", discoveryCalls)
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	for _, want := range []string{
+		"Source: aggregated across 2 linked parent transcripts",
+		"Sources: 2 linked parent transcripts",
+		"gpt-5.5",
+		"gpt-5.6-luna",
+		"xhigh",
+		"max",
+		"180 (cached 120, non-cached 60)",
+		"66.7%",
+		"total\t210",
+		"🧩 SUBAGENTS (2) · overall:",
+		"gpt-5.6-sol",
+		"total\t30",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("model-switch helper stats missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "child-a.jsonl") != 0 || strings.Count(got, "child-b.jsonl") != 0 {
+		t.Fatalf("helper stats exposed individual subagent transcript paths:\n%s", got)
+	}
+	html := (*sent)[0].Content
+	for _, want := range []string{
+		"<strong>Source aggregation:</strong> usage and model/effort details are combined across the linked parent transcripts; latest context and rate-limit metadata comes from the newest transcript.",
+		"<p><strong>🧩 SUBAGENTS (2) · model/effort detail:</strong></p>",
+		"<table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("model-switch helper stats HTML missing %q:\n%s", want, html)
 		}
 	}
 }
