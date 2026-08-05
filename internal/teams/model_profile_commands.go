@@ -468,7 +468,7 @@ func (b *Bridge) activatePendingSessionModelProfileLocked(ctx context.Context, s
 	}
 	effort := session.PendingReasoningEffort
 	source := session.PendingReasoningSource
-	if strings.TrimSpace(effort) == "" {
+	if strings.TrimSpace(source) == "" {
 		effort, source, _ = b.reasoningEffortForModelSwitch(ctx, session, snapshot)
 	}
 	if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
@@ -628,7 +628,7 @@ func (b *Bridge) reasoningEffortForModelSwitch(ctx context.Context, session *Ses
 		if current != "" && (len(options) == 0 || supported(current)) {
 			return current, source, ""
 		}
-		return "", reasoningEffortSourceModelDefault, "Reasoning effort will use the target model default."
+		return "", reasoningEffortSourceRuntimeDefault, "Reasoning effort will use the Codex runtime fallback because the target model did not advertise a default."
 	}
 	notice := ""
 	if wasExplicit && !strings.EqualFold(current, defaultEffort) {

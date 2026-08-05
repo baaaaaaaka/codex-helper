@@ -125,7 +125,7 @@ func TestTeamsDefaultManagerLegacyConfigKeepsRuntimeEffortFallback(t *testing.T)
 		defaultResolver: func(context.Context, string) (modelprofile.Snapshot, error) { return snapshot, nil },
 	}
 	effort, source, err := manager.ResolveDefaultReasoningEffort(context.Background(), snapshot)
-	if err != nil || effort != "" || source != "" {
+	if err != nil || effort != "" || source != teams.ReasoningEffortSourceRuntimeDefault {
 		t.Fatalf("legacy effort/source = %q/%q err=%v", effort, source, err)
 	}
 	status, err := manager.HandleDefaultCommand(context.Background(), teams.DefaultCommand{Setting: "effort", Action: teams.DefaultCommandStatus})

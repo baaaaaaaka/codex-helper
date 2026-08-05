@@ -187,6 +187,26 @@ func TestTeamsCodexExecutorResumesExistingSession(t *testing.T) {
 	}
 }
 
+func TestTeamsCodexExecutorRuntimeFallbackLeavesTurnEffortUnset(t *testing.T) {
+	runner := &fakeTeamsRunner{result: codexrunner.TurnResult{
+		ThreadID:          "thread-runtime-default",
+		TurnID:            "turn-runtime-default",
+		FinalAgentMessage: "final",
+	}}
+	executor := teamsCodexExecutor{runner: runner}
+	_, err := executor.Run(context.Background(), &teams.Session{
+		CodexThreadID:         "thread-runtime-default",
+		ModelProfile:          modelprofile.Snapshot{Provider: modelprofile.DefaultProvider, Model: "gpt-default"},
+		ReasoningEffortSource: teams.ReasoningEffortSourceRuntimeDefault,
+	}, "continue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.input.ReasoningEffort != "" {
+		t.Fatalf("runtime fallback turn effort = %q, want omitted", runner.input.ReasoningEffort)
+	}
+}
+
 func TestTeamsCodexExecutorReconcileForkThreadRequiresUniqueBoundedChild(t *testing.T) {
 	windowStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	windowEnd := windowStart.Add(15 * time.Minute)
@@ -1465,21 +1485,23 @@ func TestTeamsExecutorUsesStandardAppServerPolicyArgs(t *testing.T) {
 		args       []string
 		model      string
 		want       []string
+		forbid     []string
 	}{
-		{name: "legacy runner alias", runnerName: "exec", args: []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, want: []string{`model="gpt-5"`, teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}},
-		{name: "native runner name", runnerName: "appserver", want: []string{teams.CodexReasoningEffortConfigArg(teams.DefaultSessionReasoningEffort)}},
+		{name: "legacy runner alias", runnerName: "exec", args: []string{"--model", "gpt-5", "--sandbox", "workspace-write"}, want: []string{`model="gpt-5"`}, forbid: []string{teams.CodexReasoningEffortConfigKey}},
+		{name: "native runner name", runnerName: "appserver", forbid: []string{teams.CodexReasoningEffortConfigKey}},
 		{name: "explicit effort", runnerName: "exec", args: []string{"-c", `model_reasoning_effort="medium"`}, want: []string{`model_reasoning_effort="medium"`}},
 		{name: "control defaults", runnerName: "exec", control: true, args: []string{"--model", "gpt-5", "--sandbox", "workspace-write", "-c", `model_reasoning_effort="xhigh"`}, want: []string{teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}},
 		{name: "control model", runnerName: "appserver", control: true, model: "gpt-control", want: []string{`model="gpt-control"`, teams.CodexReasoningEffortConfigArg(teams.DefaultControlFallbackReasoningEffort)}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			root := &rootOptions{configPath: filepath.Join(t.TempDir(), "config.json")}
 			var executor teams.Executor
 			var err error
 			if test.control {
-				executor, err = newTeamsControlFallbackExecutor(&rootOptions{}, test.runnerName, "/tmp/codex", "/work", test.args, "", test.model, time.Minute, io.Discard)
+				executor, err = newTeamsControlFallbackExecutor(root, test.runnerName, "/tmp/codex", "/work", test.args, "", test.model, time.Minute, io.Discard)
 			} else {
-				executor, err = newTeamsExecutor(&rootOptions{}, "codex", test.runnerName, "/tmp/codex", "/work", test.args, "", time.Minute, io.Discard)
+				executor, err = newTeamsExecutor(root, "codex", test.runnerName, "/tmp/codex", "/work", test.args, "", time.Minute, io.Discard)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -1495,6 +1517,11 @@ func TestTeamsExecutorUsesStandardAppServerPolicyArgs(t *testing.T) {
 			for _, want := range test.want {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("app-server args missing %q: %#v", want, runner.AppServerArgs)
+				}
+			}
+			for _, forbidden := range test.forbid {
+				if strings.Contains(joined, forbidden) {
+					t.Fatalf("app-server args unexpectedly contain %q: %#v", forbidden, runner.AppServerArgs)
 				}
 			}
 			for _, forbidden := range []string{"workspace-write", "danger-full-access", "approval_policy=never"} {

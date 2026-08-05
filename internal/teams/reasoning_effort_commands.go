@@ -15,6 +15,8 @@ const (
 	reasoningEffortSourceExecutorDefault = "executor_default"
 	reasoningEffortSourceHelperDefault   = "helper_default"
 	reasoningEffortSourceGlobalDefault   = "global_default"
+	reasoningEffortSourceRuntimeDefault  = ReasoningEffortSourceRuntimeDefault
+	reasoningEffortSourceLegacy          = "legacy"
 )
 
 func (b *Bridge) handleReasoningEffortControlCommand(ctx context.Context, arg string) (string, error) {
@@ -61,8 +63,12 @@ func (b *Bridge) handleReasoningEffortCommand(ctx context.Context, session *Sess
 			if err != nil {
 				return "", err
 			}
+			source = normalizedReasoningEffortSource(effort, source)
 			if strings.TrimSpace(effort) != "" {
 				return b.setReasoningEffortFromCatalog(ctx, session, executor, effort, firstNonEmptyString(source, reasoningEffortSourceGlobalDefault))
+			}
+			if source == reasoningEffortSourceRuntimeDefault && !isControlFallbackSessionID(session.ID) {
+				return b.setSessionReasoningEffort(ctx, session, "", source, ReasoningEffortCatalog{})
 			}
 		}
 		catalog, err := reasoningEffortCatalog(ctx, executor, session)
@@ -114,12 +120,12 @@ func (b *Bridge) setReasoningEffortFromCatalog(ctx context.Context, session *Ses
 
 func (b *Bridge) setSessionReasoningEffort(ctx context.Context, session *Session, effort string, source string, catalog ReasoningEffortCatalog) (string, error) {
 	effort = strings.TrimSpace(effort)
-	if effort == "" {
-		return "", fmt.Errorf("reasoning effort is required")
-	}
 	source = strings.TrimSpace(source)
 	if source == "" {
 		source = reasoningEffortSourceExplicit
+	}
+	if effort == "" && source != reasoningEffortSourceRuntimeDefault {
+		return "", fmt.Errorf("reasoning effort is required")
 	}
 	b.reasoningEffortMu.Lock()
 	defer b.reasoningEffortMu.Unlock()
@@ -171,22 +177,15 @@ func (b *Bridge) setSessionReasoningEffort(ctx context.Context, session *Session
 	if model == "" {
 		model = "current model"
 	}
-	return fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: `%s`\nEffective for next turn: `%s`\nModel: `%s`\nSource: %s\nApplies to new turns in this chat; running or already queued turns keep their captured effort.", reasoningEffortChatKind(session), firstNonEmptyString(previous, "unset"), effort, model, reasoningEffortSourceLabel(source)), nil
+	previousLabel := "`" + firstNonEmptyString(previous, "unset") + "`"
+	return fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: %s\nEffective for next turn: %s\nModel: `%s`\nSource: %s\nApplies to new turns in this chat; running or already queued turns keep their captured effort.", reasoningEffortChatKind(session), previousLabel, reasoningEffortDisplayValue(effort), model, reasoningEffortSourceLabel(source)), nil
 }
 
 func formatReasoningEffortStatus(session *Session, executor Executor, catalog ReasoningEffortCatalog, catalogErr error) string {
-	effort := effectiveSessionReasoningEffortWithExecutor(session, executor)
-	source := strings.TrimSpace(session.ReasoningEffortSource)
-	if source == "" {
-		if provider, ok := executor.(ReasoningEffortDefaultProvider); ok && strings.TrimSpace(provider.DefaultReasoningEffort()) != "" {
-			source = reasoningEffortSourceExecutorDefault
-		} else {
-			source = reasoningEffortSourceHelperDefault
-		}
-	}
+	effort, source := effectiveSessionReasoningEffortResolution(session, executor)
 	lines := []string{
 		"Current chat effort (" + reasoningEffortChatKind(session) + ")",
-		"Effective for next turn: `" + effort + "`",
+		"Effective for next turn: " + reasoningEffortDisplayValue(effort),
 		"Source: " + reasoningEffortSourceLabel(source),
 		"Applies to: new turns in this chat; running and already queued turns keep their captured effort.",
 	}
@@ -208,7 +207,7 @@ func formatReasoningEffortStatus(session *Session, executor Executor, catalog Re
 func formatReasoningEffortCatalog(session *Session, executor Executor, catalog ReasoningEffortCatalog) string {
 	model := firstNonEmptyString(catalog.DisplayName, catalog.Model, "current model")
 	lines := []string{"Current chat effort choices for " + model + ":"}
-	current := effectiveSessionReasoningEffortWithExecutor(session, executor)
+	current, _ := effectiveSessionReasoningEffortResolution(session, executor)
 	for _, option := range catalog.Options {
 		markers := []string{}
 		if strings.EqualFold(option.Effort, current) {
@@ -228,6 +227,25 @@ func formatReasoningEffortCatalog(session *Session, executor Executor, catalog R
 	}
 	lines = append(lines, "", "Use `effort set <value>` to switch this chat.")
 	return strings.Join(lines, "\n")
+}
+
+func normalizedReasoningEffortSource(effort string, source string) string {
+	source = strings.TrimSpace(source)
+	if source != "" {
+		return source
+	}
+	if strings.TrimSpace(effort) == "" {
+		return reasoningEffortSourceRuntimeDefault
+	}
+	return reasoningEffortSourceLegacy
+}
+
+func reasoningEffortDisplayValue(effort string) string {
+	effort = strings.TrimSpace(effort)
+	if effort == "" {
+		return "Codex runtime fallback"
+	}
+	return "`" + effort + "`"
 }
 
 func reasoningEffortOptionNames(options []ReasoningEffortOption) string {

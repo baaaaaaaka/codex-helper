@@ -790,15 +790,18 @@ type Turn struct {
 	CodexTurnID     string                `json:"codex_turn_id,omitempty"`
 	ModelProfile    modelprofile.Snapshot `json:"model_profile,omitempty"`
 	ReasoningEffort string                `json:"reasoning_effort,omitempty"`
-	FailureMessage  string                `json:"failure_message,omitempty"`
-	RecoveryReason  string                `json:"recovery_reason,omitempty"`
-	QueuedAt        time.Time             `json:"queued_at,omitempty"`
-	StartedAt       time.Time             `json:"started_at,omitempty"`
-	CompletedAt     time.Time             `json:"completed_at,omitempty"`
-	FailedAt        time.Time             `json:"failed_at,omitempty"`
-	InterruptedAt   time.Time             `json:"interrupted_at,omitempty"`
-	CreatedAt       time.Time             `json:"created_at,omitempty"`
-	UpdatedAt       time.Time             `json:"updated_at,omitempty"`
+	// ReasoningEffortSource makes an intentionally empty runtime fallback a
+	// captured turn value rather than indistinguishable legacy missing data.
+	ReasoningEffortSource string    `json:"reasoning_effort_source,omitempty"`
+	FailureMessage        string    `json:"failure_message,omitempty"`
+	RecoveryReason        string    `json:"recovery_reason,omitempty"`
+	QueuedAt              time.Time `json:"queued_at,omitempty"`
+	StartedAt             time.Time `json:"started_at,omitempty"`
+	CompletedAt           time.Time `json:"completed_at,omitempty"`
+	FailedAt              time.Time `json:"failed_at,omitempty"`
+	InterruptedAt         time.Time `json:"interrupted_at,omitempty"`
+	CreatedAt             time.Time `json:"created_at,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at,omitempty"`
 }
 
 type OutboxMessage struct {
@@ -4977,8 +4980,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		if turn.ModelGeneration == 0 {
 			turn.ModelGeneration = session.ModelGeneration
 		}
-		if strings.TrimSpace(turn.ReasoningEffort) == "" {
+		if strings.TrimSpace(turn.ReasoningEffort) == "" && strings.TrimSpace(turn.ReasoningEffortSource) == "" {
 			turn.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
+			turn.ReasoningEffortSource = strings.TrimSpace(session.ReasoningEffortSource)
 		}
 		if turn.QueuedAt.IsZero() {
 			turn.QueuedAt = now

@@ -4376,8 +4376,9 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 			if turn.ModelGeneration == 0 {
 				turn.ModelGeneration = session.ModelGeneration
 			}
-			if strings.TrimSpace(turn.ReasoningEffort) == "" {
+			if strings.TrimSpace(turn.ReasoningEffort) == "" && strings.TrimSpace(turn.ReasoningEffortSource) == "" {
 				turn.ReasoningEffort = strings.TrimSpace(session.ReasoningEffort)
+				turn.ReasoningEffortSource = strings.TrimSpace(session.ReasoningEffortSource)
 			}
 			if turn.QueuedAt.IsZero() {
 				turn.QueuedAt = now

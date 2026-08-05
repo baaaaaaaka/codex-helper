@@ -106,3 +106,26 @@ func TestGlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated(t *testing.
 		t.Fatalf("existing work chat was mutated = %#v", source)
 	}
 }
+
+func TestRuntimeDefaultSourceIsCapturedOnlyForNewSessions(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeCreateChatGraph(t, nil)
+	bridge := newBridgeTestBridge(graph, store, testEffortCatalogExecutor())
+	bridge.defaultManager = &testGlobalDefaultManager{}
+	bridge.modelProfileResolver = func(context.Context, string) (modelprofile.Snapshot, error) {
+		return modelprofile.Snapshot{Name: "default", Provider: modelprofile.DefaultProvider, Model: "gpt-default", Revision: 1}, nil
+	}
+
+	source := bridge.reg.SessionByID("s001")
+	if _, err := bridge.forkWorkChatWithModelProfile(ctx, source, ""); err != nil {
+		t.Fatal(err)
+	}
+	created := bridge.reg.SessionByID("s002")
+	if created == nil || created.ReasoningEffort != "" || created.ReasoningEffortSource != reasoningEffortSourceRuntimeDefault {
+		t.Fatalf("new runtime-default work chat = %#v", created)
+	}
+	if source.ReasoningEffort != "" || source.ReasoningEffortSource != "" {
+		t.Fatalf("existing legacy chat was mutated = %#v", source)
+	}
+}

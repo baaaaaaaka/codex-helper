@@ -8499,14 +8499,16 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	if err != nil {
 		return b.sendToChat(ctx, session.ChatID, "retry failed while reading the original Teams message: "+err.Error())
 	}
+	retryEffort, retryEffortSource := retryTurnReasoningEffortResolution(turn, session, b.executor)
 	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
-		ID:              retryTurnID(turn.ID),
-		SessionID:       session.ID,
-		CodexThreadID:   session.CodexThreadID,
-		ModelGeneration: session.ModelGeneration,
-		ModelProfile:    retryTurnModelProfile(turn, session.ModelProfile),
-		ReasoningEffort: retryTurnReasoningEffort(turn, session, b.executor),
-		RecoveryReason:  "retry of " + turn.ID,
+		ID:                    retryTurnID(turn.ID),
+		SessionID:             session.ID,
+		CodexThreadID:         session.CodexThreadID,
+		ModelGeneration:       session.ModelGeneration,
+		ModelProfile:          retryTurnModelProfile(turn, session.ModelProfile),
+		ReasoningEffort:       retryEffort,
+		ReasoningEffortSource: retryEffortSource,
+		RecoveryReason:        "retry of " + turn.ID,
 	})
 	if err != nil {
 		return err
@@ -13788,24 +13790,26 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 	modelSnapshot := session.ModelProfile
 	modelGeneration := session.ModelGeneration
 	threadID := session.CodexThreadID
-	reasoningEffort := effectiveSessionReasoningEffortWithExecutor(session, executor)
+	reasoningEffort, reasoningEffortSource := effectiveSessionReasoningEffortResolution(session, executor)
 	if !session.PendingModelProfile.IsZero() {
 		modelSnapshot = session.PendingModelProfile
 		modelGeneration++
-		if effort := strings.TrimSpace(session.PendingReasoningEffort); effort != "" {
-			reasoningEffort = effort
+		if effortSource := strings.TrimSpace(session.PendingReasoningSource); effortSource != "" || strings.TrimSpace(session.PendingReasoningEffort) != "" {
+			reasoningEffort = strings.TrimSpace(session.PendingReasoningEffort)
+			reasoningEffortSource = normalizedReasoningEffortSource(reasoningEffort, effortSource)
 		}
 	}
 	return b.store.QueueTurn(ctx, teamstore.Turn{
-		SessionID:       session.ID,
-		InboundEventID:  inbound.ID,
-		ScopeID:         b.scope.ID,
-		MachineID:       b.machine.ID,
-		LeaseGeneration: leaseGeneration,
-		CodexThreadID:   threadID,
-		ModelGeneration: modelGeneration,
-		ModelProfile:    modelSnapshot,
-		ReasoningEffort: reasoningEffort,
+		SessionID:             session.ID,
+		InboundEventID:        inbound.ID,
+		ScopeID:               b.scope.ID,
+		MachineID:             b.machine.ID,
+		LeaseGeneration:       leaseGeneration,
+		CodexThreadID:         threadID,
+		ModelGeneration:       modelGeneration,
+		ModelProfile:          modelSnapshot,
+		ReasoningEffort:       reasoningEffort,
+		ReasoningEffortSource: reasoningEffortSource,
 	})
 }
 
@@ -13817,8 +13821,12 @@ func sessionWithTurnExecutionConfig(session *Session, turn teamstore.Turn) *Sess
 	if !turn.ModelProfile.IsZero() {
 		clone.ModelProfile = turn.ModelProfile
 	}
-	if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
+	if source := strings.TrimSpace(turn.ReasoningEffortSource); source != "" {
+		clone.ReasoningEffort = strings.TrimSpace(turn.ReasoningEffort)
+		clone.ReasoningEffortSource = source
+	} else if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
 		clone.ReasoningEffort = effort
+		clone.ReasoningEffortSource = reasoningEffortSourceLegacy
 	}
 	return &clone
 }
@@ -13828,20 +13836,28 @@ func effectiveSessionReasoningEffort(session *Session) string {
 }
 
 func effectiveSessionReasoningEffortWithExecutor(session *Session, executor Executor) string {
+	effort, _ := effectiveSessionReasoningEffortResolution(session, executor)
+	return effort
+}
+
+func effectiveSessionReasoningEffortResolution(session *Session, executor Executor) (string, string) {
 	if session != nil {
 		if effort := strings.TrimSpace(session.ReasoningEffort); effort != "" {
-			return effort
+			return effort, normalizedReasoningEffortSource(effort, session.ReasoningEffortSource)
 		}
 		if provider, ok := executor.(ReasoningEffortDefaultProvider); ok {
 			if effort := strings.TrimSpace(provider.DefaultReasoningEffort()); effort != "" {
-				return effort
+				return effort, reasoningEffortSourceExecutorDefault
 			}
 		}
 		if isControlFallbackSessionID(session.ID) {
-			return DefaultControlFallbackReasoningEffort
+			return DefaultControlFallbackReasoningEffort, reasoningEffortSourceHelperDefault
+		}
+		if source := strings.TrimSpace(session.ReasoningEffortSource); source != "" {
+			return "", source
 		}
 	}
-	return DefaultSessionReasoningEffort
+	return "", reasoningEffortSourceRuntimeDefault
 }
 
 func retryTurnModelProfile(turn teamstore.Turn, fallback modelprofile.Snapshot) modelprofile.Snapshot {
@@ -13852,10 +13868,18 @@ func retryTurnModelProfile(turn teamstore.Turn, fallback modelprofile.Snapshot) 
 }
 
 func retryTurnReasoningEffort(turn teamstore.Turn, session *Session, executor Executor) string {
-	if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
-		return effort
+	effort, _ := retryTurnReasoningEffortResolution(turn, session, executor)
+	return effort
+}
+
+func retryTurnReasoningEffortResolution(turn teamstore.Turn, session *Session, executor Executor) (string, string) {
+	if source := strings.TrimSpace(turn.ReasoningEffortSource); source != "" {
+		return strings.TrimSpace(turn.ReasoningEffort), source
 	}
-	return effectiveSessionReasoningEffortWithExecutor(session, executor)
+	if effort := strings.TrimSpace(turn.ReasoningEffort); effort != "" {
+		return effort, reasoningEffortSourceLegacy
+	}
+	return effectiveSessionReasoningEffortResolution(session, executor)
 }
 
 func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string) error {

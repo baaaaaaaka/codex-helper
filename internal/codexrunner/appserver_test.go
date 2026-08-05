@@ -412,6 +412,25 @@ func TestAppServerRunnerBeforeFirstTurnHookIsSkippedForEphemeralThread(t *testin
 	}
 }
 
+func TestAppServerRunnerRuntimeFallbackOmitsTurnStartEffort(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[]}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-runtime-default"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-runtime-default","status":"inProgress","items":[]}}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-runtime-default","turnId":"turn-runtime-default","item":{"id":"item-1","type":"agentMessage","text":"done"}}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-runtime-default","turn":{"id":"turn-runtime-default","status":"completed","items":[]}}}`,
+	)
+	runner := NewAppServerRunner(transport)
+
+	if _, err := runner.StartThread(context.Background(), TurnInput{Prompt: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[4], "turn/start")
+	assertParamAbsent(t, writes[4], "effort")
+}
+
 func TestAppServerRunnerListModelsPreservesEffortOrderAndPaginates(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,

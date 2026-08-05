@@ -2326,8 +2326,7 @@ func newTeamsAuthFileWriteLogoutCmd() *cobra.Command {
 func newTeamsExecutor(root *rootOptions, name string, runnerName string, codexPath string, workDir string, codexArgs []string, modelProfile string, timeout time.Duration, log io.Writer) (teams.Executor, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "codex":
-		args := codexArgsWithDefaultReasoningEffort(codexArgs, teams.DefaultSessionReasoningEffort)
-		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, modelProfile, timeout, log)
+		return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, append([]string{}, codexArgs...), modelProfile, timeout, log)
 	case "echo":
 		return teams.EchoExecutor{}, nil
 	default:
@@ -2342,13 +2341,6 @@ func newTeamsControlFallbackExecutor(root *rootOptions, runnerName string, codex
 	return newManagedTeamsCodexExecutor(root, runnerName, codexPath, workDir, args, modelProfile, timeout, log)
 }
 
-func codexArgsWithDefaultReasoningEffort(args []string, effort string) []string {
-	if codexArgsHasConfigOverride(args, teams.CodexReasoningEffortConfigKey) {
-		return append([]string{}, args...)
-	}
-	return codexArgsWithReasoningEffort(args, effort)
-}
-
 func codexArgsWithReasoningEffort(args []string, effort string) []string {
 	return codexArgsWithConfigOverride(args, teams.CodexReasoningEffortConfigKey, strings.TrimSpace(effort))
 }
@@ -2361,29 +2353,6 @@ func codexArgsWithConfigOverride(args []string, key string, value string) []stri
 		out = append(out, "-c", teams.CodexReasoningEffortConfigArg(value))
 	}
 	return out
-}
-
-func codexArgsHasConfigOverride(args []string, key string) bool {
-	key = strings.TrimSpace(key)
-	for i := 0; i < len(args); i++ {
-		trimmed := strings.TrimSpace(args[i])
-		switch {
-		case trimmed == "-c" || trimmed == "--config":
-			if i+1 < len(args) && codexConfigOverrideMatchesKey(args[i+1], key) {
-				return true
-			}
-			i++
-		case strings.HasPrefix(trimmed, "-c="):
-			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "-c="), key) {
-				return true
-			}
-		case strings.HasPrefix(trimmed, "--config="):
-			if codexConfigOverrideMatchesKey(strings.TrimPrefix(trimmed, "--config="), key) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func codexReasoningEffortFromArgs(args []string) string {

@@ -580,11 +580,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/codexrunner -count=1 -run '^TestAppServerRunner(StartThreadEncodesThreadStartAndTurnStart|ListModels.*)$' -v
+          go test ./internal/codexrunner -count=1 -run '^TestAppServerRunner(StartThreadEncodesThreadStartAndTurnStart|RuntimeFallbackOmitsTurnStartEffort|ListModels.*)$' -v
           go test ./internal/modelprofile -count=1 -run '^TestCodexModelCatalogJSONUsesPublicModelIDs$' -v
-          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|ReasoningEffortCatalog.*)|CodexReasoningEffortFromArgsPreservesExplicitLastOverride|RunBeaconWorkerJobUsesStandardAppServer)$' -v
+          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|RuntimeFallbackLeavesTurnEffortUnset|ReasoningEffortCatalog.*)|TeamsExecutorUsesStandardAppServerPolicyArgs|CodexReasoningEffortFromArgsPreservesExplicitLastOverride|RunBeaconWorkerJobUsesStandardAppServer)$' -v
           go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
-          go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
+          go test ./internal/teams/store -count=1 -run '^TestQueueTurn(PinsSessionExecutionConfigSnapshot|PreservesCapturedRuntimeReasoningFallback)$' -v
 
       - name: Teams helper token stats regressions
         if: matrix.shard == 'core'
@@ -601,8 +601,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(TeamsDefault|PinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults|TeamsCodexExecutor(SwitchesProfileRunnerWithoutChangingThread|ReturnToBaseProfileUsesFreshGenerationRunner|ReclaimsPreviousSessionGenerationRunner)|Sanitize(Official|ThirdParty)ResponsesHistory)' -v
-          go test ./internal/teams -count=1 -run 'Test(ParseDefaultCommand|DefaultCommandWorkChatMessageIsExplicitlyControlOnly|GlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated|BridgeModelProfileSwitch|BridgePendingModelSwitch|BridgeModelSwitchSerializesWithQueueTurn)' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsDefault|GlobalOfficialModelAndEffortDefaultsUseNativeLaunch|PinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults|TeamsCodexExecutor(SwitchesProfileRunnerWithoutChangingThread|ReturnToBaseProfileUsesFreshGenerationRunner|ReclaimsPreviousSessionGenerationRunner)|Sanitize(Official|ThirdParty)ResponsesHistory)' -v
+          go test ./internal/teams -count=1 -run 'Test(ParseDefaultCommand|DefaultCommandWorkChatMessageIsExplicitlyControlOnly|GlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated|RuntimeDefaultSourceIsCapturedOnlyForNewSessions|BridgeModelProfileSwitch|BridgePendingModelSwitch|BridgeModelSwitchSerializesWithQueueTurn)' -v
 
       - name: Teams model/default/effort presentation and persistence contracts
         if: matrix.shard == 'core'

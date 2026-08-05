@@ -32,6 +32,10 @@ type GlobalDefaultManager interface {
 	ResolveDefaultReasoningEffort(context.Context, modelprofile.Snapshot) (string, string, error)
 }
 
+// ReasoningEffortSourceRuntimeDefault marks an intentionally empty effort that
+// delegates resolution to the Codex launch configuration and runtime.
+const ReasoningEffortSourceRuntimeDefault = "runtime_default"
+
 func (b *Bridge) handleDefaultControlCommand(ctx context.Context, arg string) (string, error) {
 	if b == nil || b.defaultManager == nil {
 		return "Global default management is not configured for this Teams service.", nil
@@ -87,7 +91,11 @@ func defaultCommandWorkChatMessage() string {
 
 func (b *Bridge) reasoningEffortFromGlobalDefault(ctx context.Context, snapshot modelprofile.Snapshot) (string, string, error) {
 	if b == nil || b.defaultManager == nil {
-		return "", "", nil
+		return "", reasoningEffortSourceRuntimeDefault, nil
 	}
-	return b.defaultManager.ResolveDefaultReasoningEffort(ctx, snapshot)
+	effort, source, err := b.defaultManager.ResolveDefaultReasoningEffort(ctx, snapshot)
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimSpace(effort), normalizedReasoningEffortSource(effort, source), nil
 }

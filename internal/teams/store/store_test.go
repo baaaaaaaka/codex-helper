@@ -1150,6 +1150,7 @@ func TestQueueTurnPinsSessionExecutionConfigSnapshot(t *testing.T) {
 			session := testSession()
 			session.ModelProfile = snapshot
 			session.ReasoningEffort = "xhigh"
+			session.ReasoningEffortSource = "explicit"
 			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
 				t.Fatalf("CreateSession created=%v err=%v", created, err)
 			}
@@ -1170,6 +1171,9 @@ func TestQueueTurnPinsSessionExecutionConfigSnapshot(t *testing.T) {
 			if turn.ReasoningEffort != "xhigh" {
 				t.Fatalf("queued turn reasoning effort = %q, want xhigh", turn.ReasoningEffort)
 			}
+			if turn.ReasoningEffortSource != "explicit" {
+				t.Fatalf("queued turn reasoning effort source = %q, want explicit", turn.ReasoningEffortSource)
+			}
 			state, err := store.Load(ctx)
 			if err != nil {
 				t.Fatalf("Load: %v", err)
@@ -1179,6 +1183,50 @@ func TestQueueTurnPinsSessionExecutionConfigSnapshot(t *testing.T) {
 			}
 			if got := state.Turns[turn.ID].ReasoningEffort; got != "xhigh" {
 				t.Fatalf("stored turn reasoning effort = %q, want xhigh", got)
+			}
+			if got := state.Turns[turn.ID].ReasoningEffortSource; got != "explicit" {
+				t.Fatalf("stored turn reasoning effort source = %q, want explicit", got)
+			}
+		})
+	}
+}
+
+func TestQueueTurnPreservesCapturedRuntimeReasoningFallback(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			session := testSession()
+			session.ReasoningEffort = "xhigh"
+			session.ReasoningEffortSource = "explicit"
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			inbound, created, err := store.PersistInbound(ctx, testInbound())
+			if err != nil || !created {
+				t.Fatalf("PersistInbound created=%v err=%v", created, err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			turn, created, err := store.QueueTurn(ctx, Turn{
+				SessionID:             session.ID,
+				InboundEventID:        inbound.ID,
+				ReasoningEffortSource: "runtime_default",
+			})
+			if err != nil || !created {
+				t.Fatalf("QueueTurn created=%v err=%v", created, err)
+			}
+			if turn.ReasoningEffort != "" || turn.ReasoningEffortSource != "runtime_default" {
+				t.Fatalf("queued runtime fallback = %#v", turn)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored := state.Turns[turn.ID]
+			if stored.ReasoningEffort != "" || stored.ReasoningEffortSource != "runtime_default" {
+				t.Fatalf("stored runtime fallback = %#v", stored)
 			}
 		})
 	}

@@ -36421,6 +36421,22 @@ func TestReasoningEffortForModelSwitchResetsUnsupportedExplicitEffort(t *testing
 	}
 }
 
+func TestReasoningEffortForModelSwitchUsesRuntimeFallbackWithoutAdvertisedDefault(t *testing.T) {
+	executor := testEffortCatalogExecutor()
+	executor.catalog.DefaultEffort = ""
+	executor.catalog.Options = nil
+	bridge := newBridgeTestBridge(nil, newBridgeTestStore(t), executor)
+	session := bridge.reg.SessionByID("s001")
+	session.ReasoningEffort = "xhigh"
+	session.ReasoningEffortSource = reasoningEffortSourceExplicit
+	snapshot := modelprofile.Snapshot{Provider: modelprofile.DefaultProvider, Model: "gpt-future", SupportedReasoningEffortsJSON: `["low"]`, Revision: 1}
+
+	effort, source, notice := bridge.reasoningEffortForModelSwitch(context.Background(), session, snapshot)
+	if effort != "" || source != reasoningEffortSourceRuntimeDefault || !strings.Contains(notice, "runtime fallback") {
+		t.Fatalf("model switch fallback = %q/%q notice=%q", effort, source, notice)
+	}
+}
+
 func TestBridgeModelSwitchSerializesWithQueueTurn(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)

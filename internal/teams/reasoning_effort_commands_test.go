@@ -65,6 +65,9 @@ func TestReasoningEffortWorkCommandPersistsAndQueuedTurnSnapshots(t *testing.T) 
 	if turn.ReasoningEffort != "xhigh" {
 		t.Fatalf("queued effort = %q, want xhigh", turn.ReasoningEffort)
 	}
+	if turn.ReasoningEffortSource != reasoningEffortSourceExplicit {
+		t.Fatalf("queued effort source = %q, want explicit", turn.ReasoningEffortSource)
+	}
 
 	if _, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "low"); err != nil {
 		t.Fatalf("switch work effort: %v", err)
@@ -150,11 +153,14 @@ func TestReasoningEffortUsesExecutorDefaultUntilChatOverridesIt(t *testing.T) {
 	if turn.ReasoningEffort != "medium" {
 		t.Fatalf("queued effort = %q, want configured executor default medium", turn.ReasoningEffort)
 	}
+	if turn.ReasoningEffortSource != reasoningEffortSourceExecutorDefault {
+		t.Fatalf("queued effort source = %q, want executor default", turn.ReasoningEffortSource)
+	}
 	status, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "status")
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if !strings.Contains(status, "Effective for next turn: `medium`") || !strings.Contains(status, "Source: Codex runtime default") {
+	if !strings.Contains(status, "Effective for next turn: `medium`") || !strings.Contains(status, "Source: Codex launch option") {
 		t.Fatalf("status did not report executor default:\n%s", status)
 	}
 }
@@ -179,6 +185,69 @@ func TestReasoningEffortResetUsesExplicitGlobalDefaultForCurrentChat(t *testing.
 	}
 	if session.ReasoningEffort != "xhigh" || session.ReasoningEffortSource != reasoningEffortSourceGlobalDefault || !strings.Contains(message, "`xhigh`") {
 		t.Fatalf("reset result = session=%#v message=%q", session, message)
+	}
+}
+
+func TestReasoningEffortWorkResetRestoresRuntimeFallback(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	executor := testEffortCatalogExecutor()
+	bridge := newBridgeTestBridge(nil, store, executor)
+	bridge.defaultManager = &testGlobalDefaultManager{source: reasoningEffortSourceRuntimeDefault}
+	session := bridge.reg.SessionByID("s001")
+	session.ModelProfile = modelprofile.Snapshot{Name: "gpt-test", Provider: modelprofile.DefaultProvider, Model: "gpt-test", Revision: 1}
+	session.ReasoningEffort = "low"
+	session.ReasoningEffortSource = reasoningEffortSourceExplicit
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+
+	message, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "reset")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ReasoningEffort != "" || session.ReasoningEffortSource != reasoningEffortSourceRuntimeDefault || !strings.Contains(message, "Codex runtime fallback") {
+		t.Fatalf("reset result = session=%#v message=%q", session, message)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := state.Sessions[session.ID]
+	if durable.ReasoningEffort != "" || durable.ReasoningEffortSource != reasoningEffortSourceRuntimeDefault {
+		t.Fatalf("durable runtime fallback = %#v", durable)
+	}
+}
+
+func TestReasoningEffortRuntimeFallbackTurnSnapshotSurvivesChatOverride(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	executor := testEffortCatalogExecutor()
+	bridge := newBridgeTestBridge(nil, store, executor)
+	session := bridge.reg.SessionByID("s001")
+	session.ReasoningEffort = ""
+	session.ReasoningEffortSource = reasoningEffortSourceRuntimeDefault
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatal(err)
+	}
+
+	turn, created, err := bridge.queueTurn(ctx, session, teamstore.InboundEvent{ID: "inbound-runtime-default"})
+	if err != nil || !created {
+		t.Fatalf("queueTurn created=%v err=%v", created, err)
+	}
+	if turn.ReasoningEffort != "" || turn.ReasoningEffortSource != reasoningEffortSourceRuntimeDefault {
+		t.Fatalf("queued runtime fallback = %#v", turn)
+	}
+
+	session.ReasoningEffort = "xhigh"
+	session.ReasoningEffortSource = reasoningEffortSourceExplicit
+	executionSession := sessionWithTurnExecutionConfig(session, turn)
+	if executionSession.ReasoningEffort != "" || executionSession.ReasoningEffortSource != reasoningEffortSourceRuntimeDefault {
+		t.Fatalf("execution session did not restore queued runtime fallback: %#v", executionSession)
+	}
+	retryEffort, retrySource := retryTurnReasoningEffortResolution(turn, session, executor)
+	if retryEffort != "" || retrySource != reasoningEffortSourceRuntimeDefault {
+		t.Fatalf("retry runtime fallback = %q/%q", retryEffort, retrySource)
 	}
 }
 

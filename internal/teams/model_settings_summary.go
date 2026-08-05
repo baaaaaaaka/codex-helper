@@ -96,7 +96,7 @@ func (b *Bridge) currentChatModelSummaryLines(ctx context.Context, session *Sess
 		"Effective: " + modelSnapshotExactLabel(session.ModelProfile),
 		"Selector: `" + modelSnapshotSelectorLabel(session.ModelProfile) + "`",
 		"Selection: " + modelSelectionSourceLabel(source),
-		"Effective effort: `" + effort + "` (" + reasoningEffortSourceLabel(effortSource) + ")",
+		"Effective effort: " + reasoningEffortDisplayValue(effort) + " (" + reasoningEffortSourceLabel(effortSource) + ")",
 		"Applies to: new turns in this chat",
 	}
 	if global, err := b.resolveNewSessionModelProfile(ctx, ""); err == nil && !global.IsZero() {
@@ -117,7 +117,7 @@ func (b *Bridge) currentChatModelSummaryLines(ctx context.Context, session *Sess
 
 func (b *Bridge) chatReasoningEffortSummary(session *Session) (string, string) {
 	if session == nil {
-		return DefaultSessionReasoningEffort, reasoningEffortSourceHelperDefault
+		return "", reasoningEffortSourceRuntimeDefault
 	}
 	executor := Executor(nil)
 	if b != nil {
@@ -126,18 +126,7 @@ func (b *Bridge) chatReasoningEffortSummary(session *Session) (string, string) {
 			executor = b.effectiveControlFallbackExecutor()
 		}
 	}
-	effort := effectiveSessionReasoningEffortWithExecutor(session, executor)
-	source := strings.TrimSpace(session.ReasoningEffortSource)
-	if source == "" {
-		if provider, ok := executor.(ReasoningEffortDefaultProvider); ok && strings.TrimSpace(provider.DefaultReasoningEffort()) != "" {
-			source = reasoningEffortSourceExecutorDefault
-		} else if isControlFallbackSessionID(session.ID) {
-			source = reasoningEffortSourceHelperDefault
-		} else {
-			source = reasoningEffortSourceHelperDefault
-		}
-	}
-	return effort, source
+	return effectiveSessionReasoningEffortResolution(session, executor)
 }
 
 func (b *Bridge) currentTurnModelSummaryLines(ctx context.Context, sessionID string) []string {
@@ -181,7 +170,8 @@ func (b *Bridge) currentTurnModelSummaryLines(ctx context.Context, sessionID str
 		if effort == "" {
 			effort = "runtime fallback"
 		}
-		lines = append(lines, fmt.Sprintf("%s: %s; effort `%s` (captured when queued)", kind, modelSnapshotExactLabel(turn.ModelProfile), effort))
+		effortSource := normalizedReasoningEffortSource(turn.ReasoningEffort, turn.ReasoningEffortSource)
+		lines = append(lines, fmt.Sprintf("%s: %s; effort `%s` (%s, captured when queued)", kind, modelSnapshotExactLabel(turn.ModelProfile), effort, reasoningEffortSourceLabel(effortSource)))
 		if len(lines) == 2 {
 			break
 		}
@@ -198,9 +188,13 @@ func reasoningEffortSourceLabel(source string) string {
 	case reasoningEffortSourceModelDefault:
 		return "model-advertised default"
 	case reasoningEffortSourceExecutorDefault:
-		return "Codex runtime default"
+		return "Codex launch option"
 	case reasoningEffortSourceHelperDefault:
-		return "helper fallback"
+		return "Control helper fallback"
+	case reasoningEffortSourceRuntimeDefault:
+		return "Codex runtime fallback"
+	case reasoningEffortSourceLegacy:
+		return "legacy snapshot"
 	default:
 		return "runtime fallback"
 	}

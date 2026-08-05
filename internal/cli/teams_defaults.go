@@ -544,7 +544,7 @@ func (m teamsModelProfileManager) ResolveDefaultReasoningEffort(ctx context.Cont
 				return modelDefault, "model_default", nil
 			}
 		}
-		return "", "", nil
+		return "", teams.ReasoningEffortSourceRuntimeDefault, nil
 	}
 	options, modelDefault := snapshotReasoningEfforts(snapshot)
 	if effortSupported(options, effort) {
@@ -553,5 +553,5 @@ func (m teamsModelProfileManager) ResolveDefaultReasoningEffort(ctx context.Cont
 	if modelDefault != "" && effortSupported(options, modelDefault) {
 		return modelDefault, "model_default", nil
 	}
-	return "", "", nil
+	return "", teams.ReasoningEffortSourceRuntimeDefault, nil
 }
