@@ -3653,14 +3653,35 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 }
 
 func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
-	state, err := s.loadStateFieldsOrFull(ctx, upgradeStateFields)
-	if err != nil {
-		return UpgradeRequest{}, false, err
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if state.Upgrade == nil || state.Upgrade.ID == "" {
-		return UpgradeRequest{}, false, nil
-	}
-	return *state.Upgrade, true, nil
+	var out UpgradeRequest
+	found := false
+	err := s.withStateLock(ctx, func() error {
+		if upgrade, foundRuntime, handled, err := s.readUpgradeSQLiteUnlocked(ctx); handled || err != nil {
+			out = upgrade
+			found = foundRuntime
+			return err
+		}
+		state, ok, err := s.loadSelectedStateFieldsUnlocked(upgradeStateFields)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			state, err = s.loadUnlocked(ctx)
+			if err != nil {
+				return err
+			}
+		}
+		if state.Upgrade == nil || state.Upgrade.ID == "" {
+			return nil
+		}
+		out = *state.Upgrade
+		found = true
+		return nil
+	})
+	return out, found, err
 }
 
 func (s *Store) UpgradeBlockingStateSnapshot(ctx context.Context) (State, error) {

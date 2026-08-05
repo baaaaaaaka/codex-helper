@@ -2157,6 +2157,7 @@ func TestSQLitePointerLegacySchemaLoadsAllEntryPoints(t *testing.T) {
 		state.Scope = ScopeIdentity{ID: "scope-legacy-pointer", AccountID: "account-1", Profile: "default"}
 		state.ControlChat = ControlChatBinding{ScopeID: state.Scope.ID, TeamsChatID: "control-1"}
 		state.ServiceControl = ServiceControl{Paused: true, Reason: "legacy pointer compatibility", UpdatedAt: now}
+		state.Upgrade = &UpgradeRequest{ID: "legacy-pointer-upgrade", Phase: UpgradePhaseDraining, Reason: HelperUpgradeReason, StartedAt: now, UpdatedAt: now}
 		state.Sessions["session-1"] = SessionContext{ID: "session-1", Status: SessionStatusActive, TeamsChatID: "chat-1"}
 		return nil
 	}); err != nil {
@@ -2213,6 +2214,13 @@ func TestSQLitePointerLegacySchemaLoadsAllEntryPoints(t *testing.T) {
 	}
 	if loaded.Scope.ID != "scope-legacy-pointer" || loaded.Sessions["session-1"].TeamsChatID != "chat-1" {
 		t.Fatalf("Load legacy sqlite pointer state = %#v", loaded)
+	}
+	readUpgrade, ok, err := reopened.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade legacy sqlite pointer: %v", err)
+	}
+	if !ok || readUpgrade.ID != "legacy-pointer-upgrade" || readUpgrade.Phase != UpgradePhaseDraining {
+		t.Fatalf("ReadUpgrade legacy sqlite pointer = %#v ok=%v", readUpgrade, ok)
 	}
 	if _, err := LoadPathReadOnly(ctx, store.Path()); err != nil {
 		t.Fatalf("LoadPathReadOnly legacy sqlite pointer: %v", err)
@@ -7573,6 +7581,393 @@ func TestSQLiteServiceControlAndUpgradeUseRuntimeRows(t *testing.T) {
 	if _, err := store.Load(ctx); err == nil {
 		t.Fatal("full Load unexpectedly succeeded with corrupt hot inbound row")
 	}
+}
+
+const (
+	readUpgradePerfHistoryWatchCount = 1099
+	readUpgradePerfDashboardCount    = 710
+	readUpgradePerfChatSequenceCount = 435
+)
+
+func seedReadUpgradeLargeColdState(tb testing.TB, store *Store, upgrade *UpgradeRequest) {
+	tb.Helper()
+	now := time.Date(2026, 8, 5, 9, 9, 22, 0, time.UTC)
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Upgrade = upgrade
+		for i := 0; i < readUpgradePerfHistoryWatchCount; i++ {
+			id := fmt.Sprintf("history-%04d", i)
+			state.HistoryWatch[id] = HistoryWatchCheckpoint{
+				ID:                         id,
+				Path:                       fmt.Sprintf("/workspace/project-%04d/%s.jsonl", i, strings.Repeat("session-path-", 32)),
+				Size:                       int64(1<<20 + i),
+				Offset:                     int64(1<<19 + i),
+				Line:                       i + 1,
+				SessionID:                  fmt.Sprintf("session-%04d", i),
+				ThreadID:                   fmt.Sprintf("thread-%04d", i),
+				PendingAssistantSourceID:   fmt.Sprintf("source-%04d", i),
+				PendingAssistantThreadID:   fmt.Sprintf("thread-%04d", i),
+				PendingAssistantTurnID:     fmt.Sprintf("turn-%04d", i),
+				PendingAssistantText:       strings.Repeat("pending assistant text ", 8),
+				PendingAssistantSourceLine: i + 1,
+				UpdatedAt:                  now,
+			}
+		}
+		for i := 0; i < readUpgradePerfDashboardCount; i++ {
+			id := fmt.Sprintf("dashboard-%04d", i)
+			state.DashboardNumbers[id] = DashboardNumberRecord{
+				ID:          id,
+				ChatID:      fmt.Sprintf("chat-%04d", i%100),
+				Kind:        "session",
+				Number:      i + 1,
+				WorkspaceID: fmt.Sprintf("workspace-%03d", i%119),
+				SessionID:   fmt.Sprintf("session-%04d", i),
+				Label:       strings.Repeat("production dashboard label ", 4),
+				UpdatedAt:   now,
+			}
+		}
+		for i := 0; i < readUpgradePerfChatSequenceCount; i++ {
+			chatID := fmt.Sprintf("chat-%04d", i)
+			state.ChatSequences[chatID] = ChatSequenceState{ChatID: chatID, Next: int64(i + 1), UpdatedAt: now}
+		}
+		return nil
+	}); err != nil {
+		tb.Fatalf("seed large read-upgrade state: %v", err)
+	}
+}
+
+func TestSQLiteReadUpgradeSkipsLargeColdState(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	upgrade := &UpgradeRequest{
+		ID:     "upgrade:narrow-read",
+		Phase:  UpgradePhaseReady,
+		Reason: CodexUpgradeReason,
+		PreviousControl: ServiceControl{
+			Paused:   true,
+			Draining: true,
+			Reason:   "codex upgrade",
+		},
+		NotificationTargets: []UpgradeNotificationTarget{{
+			SessionID:   "session-target",
+			TurnID:      "turn-target",
+			TeamsChatID: "chat-target",
+			CreatedAt:   time.Date(2026, 8, 5, 9, 8, 0, 0, time.UTC),
+		}},
+		InstalledTag:       "v0.1.21-rc.10",
+		CompletionNoticeID: "notice:narrow-read",
+		CompletionNoticeAt: time.Date(2026, 8, 5, 9, 8, 30, 0, time.UTC),
+		DeadlineAt:         time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC),
+		StartedAt:          time.Date(2026, 8, 5, 9, 9, 5, 0, time.UTC),
+		RescueStartedAt:    time.Date(2026, 8, 5, 9, 7, 0, 0, time.UTC),
+		RescueCompletedAt:  time.Date(2026, 8, 5, 9, 7, 30, 0, time.UTC),
+		RescueActions: []UpgradeRescueAction{{
+			Kind:      "preserve-queued-turn",
+			ID:        "turn-target",
+			SessionID: "session-target",
+			Status:    string(TurnStatusQueued),
+			Detail:    "protected",
+			CreatedAt: time.Date(2026, 8, 5, 9, 7, 15, 0, time.UTC),
+		}},
+		ReadyAt:   time.Date(2026, 8, 5, 9, 9, 22, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 8, 5, 9, 9, 22, 0, time.UTC),
+	}
+	seedReadUpgradeLargeColdState(t, store, upgrade)
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = '{broken-cold-state' WHERE key = 'state_json'`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE chat_sequences SET json = '{broken-chat-sequence' WHERE chat_id = (SELECT chat_id FROM chat_sequences LIMIT 1)`)
+		return err
+	})
+
+	read, ok, err := store.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade loaded excluded cold state: %v", err)
+	}
+	if !ok || !reflect.DeepEqual(read, *upgrade) {
+		t.Fatalf("ReadUpgrade = %#v ok=%v, want %#v", read, ok, *upgrade)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = 'null' WHERE key = ?`, sqliteRuntimeKeyUpgrade)
+		return err
+	})
+	if read, ok, err := store.ReadUpgrade(ctx); err != nil || ok || read.ID != "" {
+		t.Fatalf("ReadUpgrade null runtime row = %#v ok=%v err=%v", read, ok, err)
+	}
+	if _, err := store.Load(ctx); err == nil {
+		t.Fatal("full Load unexpectedly accepted corrupt cold state; narrow-read assertion is ineffective")
+	}
+}
+
+func TestSQLiteReadUpgradeFallsBackWhenRuntimeUpgradeRowIsMissing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	upgrade := &UpgradeRequest{
+		ID:        "upgrade:legacy-runtime-row",
+		Phase:     UpgradePhaseDraining,
+		Reason:    HelperUpgradeReason,
+		StartedAt: time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 8, 5, 9, 0, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = upgrade
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy upgrade state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyUpgrade)
+		return err
+	})
+
+	read, ok, err := store.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade legacy fallback: %v", err)
+	}
+	if !ok || !reflect.DeepEqual(read, *upgrade) {
+		t.Fatalf("ReadUpgrade legacy fallback = %#v ok=%v, want %#v", read, ok, *upgrade)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyUpgrade).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return fmt.Errorf("ReadUpgrade wrote missing runtime row: count=%d", count)
+		}
+		return nil
+	})
+}
+
+func TestSQLiteReadUpgradeFallsBackWhenRuntimeProjectionIsIncomplete(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	coldUpgrade := &UpgradeRequest{
+		ID:        "upgrade:cold-fallback",
+		Phase:     UpgradePhaseDraining,
+		Reason:    HelperUpgradeReason,
+		StartedAt: time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = coldUpgrade
+		return nil
+	}); err != nil {
+		t.Fatalf("seed incomplete-projection upgrade state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	runtimeUpgrade := *coldUpgrade
+	runtimeUpgrade.ID = "upgrade:must-not-win"
+	runtimeUpgrade.Phase = UpgradePhaseCompleted
+	runtimeRaw, err := json.Marshal(runtimeUpgrade)
+	if err != nil {
+		t.Fatalf("marshal incomplete runtime upgrade: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyScope); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, runtimeRaw, sqliteRuntimeKeyUpgrade)
+		return err
+	})
+
+	read, ok, err := store.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade incomplete projection fallback: %v", err)
+	}
+	if !ok || !reflect.DeepEqual(read, *coldUpgrade) {
+		t.Fatalf("ReadUpgrade incomplete projection = %#v ok=%v, want cold %#v", read, ok, *coldUpgrade)
+	}
+}
+
+func TestSQLiteReadUpgradeMalformedRuntimeRowFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = &UpgradeRequest{ID: "upgrade:valid-cold", Phase: UpgradePhaseReady, Reason: CodexUpgradeReason}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed malformed-runtime upgrade state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = '{broken-runtime-upgrade' WHERE key = ?`, sqliteRuntimeKeyUpgrade)
+		return err
+	})
+
+	if _, _, err := store.ReadUpgrade(ctx); err == nil {
+		t.Fatal("ReadUpgrade unexpectedly ignored malformed authoritative runtime row")
+	}
+}
+
+func TestReadUpgradeJSONBackendPreservesSemantics(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	want := UpgradeRequest{ID: "json-upgrade", Phase: UpgradePhaseAborted, Reason: HelperUpgradeReason, AbortReason: "test abort"}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = &want
+		return nil
+	}); err != nil {
+		t.Fatalf("seed JSON upgrade: %v", err)
+	}
+	got, ok, err := store.ReadUpgrade(ctx)
+	if err != nil {
+		t.Fatalf("ReadUpgrade JSON: %v", err)
+	}
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Fatalf("ReadUpgrade JSON = %#v ok=%v, want %#v", got, ok, want)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("clear JSON upgrade: %v", err)
+	}
+	if got, ok, err := store.ReadUpgrade(ctx); err != nil || ok || got.ID != "" {
+		t.Fatalf("ReadUpgrade JSON without upgrade = %#v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestSQLiteReadUpgradeAcceptsNilContextAndWhitespaceID(t *testing.T) {
+	store := newTestStore(t)
+	want := UpgradeRequest{ID: "  ", Phase: UpgradePhaseDraining, Reason: HelperUpgradeReason}
+	if err := store.Update(context.Background(), func(state *State) error {
+		state.Upgrade = &want
+		return nil
+	}); err != nil {
+		t.Fatalf("seed whitespace upgrade: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	type result struct {
+		upgrade UpgradeRequest
+		ok      bool
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		upgrade, ok, err := store.ReadUpgrade(nil)
+		done <- result{upgrade: upgrade, ok: ok, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadUpgrade nil context: %v", got.err)
+		}
+		if !got.ok || !reflect.DeepEqual(got.upgrade, want) {
+			t.Fatalf("ReadUpgrade nil context = %#v ok=%v, want %#v", got.upgrade, got.ok, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadUpgrade nil context did not return")
+	}
+}
+
+func TestSQLiteReadUpgradeConcurrentRuntimeUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Upgrade = &UpgradeRequest{ID: "concurrent-upgrade", Phase: UpgradePhaseDraining, Reason: CodexUpgradeReason}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed concurrent upgrade: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	readerStore, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("open concurrent reader store: %v", err)
+	}
+	defer readerStore.Close()
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 40; i++ {
+			upgrade, ok, err := readerStore.ReadUpgrade(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("read %d: %w", i, err)
+				return
+			}
+			if !ok || upgrade.ID != "concurrent-upgrade" {
+				errCh <- fmt.Errorf("read %d = %#v ok=%v", i, upgrade, ok)
+				return
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, err := store.MarkUpgradeReady(ctx, "concurrent-upgrade"); err != nil {
+			errCh <- fmt.Errorf("mark ready: %w", err)
+			return
+		}
+		if _, err := store.CompleteUpgrade(ctx, "concurrent-upgrade", "v-test"); err != nil {
+			errCh <- fmt.Errorf("complete: %w", err)
+		}
+	}()
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+}
+
+func BenchmarkSQLiteReadUpgradeLargeColdState(b *testing.B) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(b.TempDir(), "state.json"))
+	if err != nil {
+		b.Fatalf("open benchmark store: %v", err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+	upgrade := &UpgradeRequest{
+		ID:        "upgrade:perf-ready",
+		Phase:     UpgradePhaseReady,
+		Reason:    CodexUpgradeReason,
+		StartedAt: time.Date(2026, 8, 5, 9, 9, 5, 0, time.UTC),
+		ReadyAt:   time.Date(2026, 8, 5, 9, 9, 22, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 8, 5, 9, 9, 22, 0, time.UTC),
+	}
+	seedReadUpgradeLargeColdState(b, store, upgrade)
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		b.Fatalf("migrate benchmark store: %v", err)
+	}
+	var coldStateBytes int64
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return db.QueryRowContext(ctx, `SELECT length(value) FROM state_meta WHERE key = 'state_json'`).Scan(&coldStateBytes)
+	}); err != nil {
+		b.Fatalf("measure benchmark cold state: %v", err)
+	}
+	if _, ok, err := store.ReadUpgrade(ctx); err != nil || !ok {
+		b.Fatalf("warm ReadUpgrade = ok=%v err=%v", ok, err)
+	}
+	b.ReportAllocs()
+	beforeIO, beforeIOOK := readSQLiteTestProcSelfIO()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		read, ok, err := store.ReadUpgrade(ctx)
+		if err != nil || !ok || read.ID != upgrade.ID || read.Phase != upgrade.Phase {
+			b.Fatalf("ReadUpgrade iteration %d = %#v ok=%v err=%v", i, read, ok, err)
+		}
+	}
+	b.StopTimer()
+	afterIO, afterIOOK := readSQLiteTestProcSelfIO()
+	if beforeIOOK && afterIOOK {
+		reportSQLiteTestProcIO(b, beforeIO.delta(afterIO), b.N)
+	}
+	b.ReportMetric(float64(coldStateBytes), "cold_state_bytes")
+	b.ReportMetric(readUpgradePerfHistoryWatchCount, "history_checkpoints")
+	b.ReportMetric(readUpgradePerfDashboardCount, "dashboard_numbers")
+	b.ReportMetric(readUpgradePerfChatSequenceCount, "chat_sequences")
 }
 
 func TestUpgradeBlockingStateSnapshotSQLiteDoesNotLoadUnneededHotTables(t *testing.T) {

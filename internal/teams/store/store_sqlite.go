@@ -2551,6 +2551,39 @@ func overlaySQLiteRuntimeState(ctx context.Context, q interface {
 	return nil
 }
 
+// readUpgradeSQLite reads the bounded runtime projection used by the main-loop
+// upgrade notice check. A complete runtime projection is authoritative for
+// SQLite stores and avoids decoding the growing cold state document and chat
+// sequences on every poll. Older stores with an incomplete projection fall
+// back to the compatibility loader in ReadUpgrade.
+func (s *Store) readUpgradeSQLiteUnlocked(ctx context.Context) (UpgradeRequest, bool, bool, error) {
+	var out UpgradeRequest
+	found := false
+	handled := false
+	pointer, ok, err := s.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		return out, found, handled, err
+	}
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return out, found, handled, err
+	}
+	runtimeState, seen, err := loadSQLiteRuntimeState(ctx, db)
+	if err != nil {
+		return out, found, handled, err
+	}
+	if !sqliteRuntimeStateUsable(seen) || !seen[sqliteRuntimeKeyUpgrade] {
+		return out, found, handled, nil
+	}
+	handled = true
+	if runtimeState.Upgrade == nil || runtimeState.Upgrade.ID == "" {
+		return out, found, handled, nil
+	}
+	out = *runtimeState.Upgrade
+	found = true
+	return out, found, handled, nil
+}
+
 func seedMissingSQLiteRuntimeOptionalState(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
