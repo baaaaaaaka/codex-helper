@@ -467,14 +467,15 @@ func (e teamsCodexExecutor) RunInputWithEventHandler(ctx context.Context, sessio
 		return teams.ExecutionResult{}, err
 	}
 	turnInput := codexrunner.TurnInput{
-		Prompt:         input.Prompt,
-		ImagePaths:     append(append([]string{}, e.staticImages...), input.ImagePaths...),
-		AdditionalDirs: append([]string{}, e.additionalDirs...),
-		OutputSchema:   append(json.RawMessage(nil), e.outputSchema...),
-		WorkingDir:     workDir,
-		Timeout:        e.timeout,
-		EventHandler:   handler,
-		Ephemeral:      e.ephemeral,
+		Prompt:          input.Prompt,
+		ImagePaths:      append(append([]string{}, e.staticImages...), input.ImagePaths...),
+		AdditionalDirs:  append([]string{}, e.additionalDirs...),
+		OutputSchema:    append(json.RawMessage(nil), e.outputSchema...),
+		WorkingDir:      workDir,
+		Timeout:         e.timeout,
+		EventHandler:    handler,
+		Ephemeral:       e.ephemeral,
+		BeforeFirstTurn: input.BeforeFirstTurn,
 	}
 	if session != nil {
 		turnInput.Model = teamsSessionModel(session)

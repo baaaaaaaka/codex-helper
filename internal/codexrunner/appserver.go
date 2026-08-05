@@ -213,6 +213,17 @@ func (r *AppServerRunner) StartThread(ctx context.Context, input TurnInput) (Tur
 	if err != nil {
 		return TurnResult{}, err
 	}
+	if input.BeforeFirstTurn != nil && !input.Ephemeral {
+		if hookErr := input.BeforeFirstTurn(ctx, ThreadStartInfo{ThreadID: threadID, Ephemeral: input.Ephemeral}); hookErr != nil {
+			return TurnResult{ThreadID: threadID, Status: TurnStatusUnknown}, &BeforeFirstTurnError{ThreadID: threadID, Err: hookErr}
+		}
+		// A detached persistence context may outlive the caller long enough to
+		// make the thread durable, but it must never turn a canceled request into
+		// a model turn.
+		if err := ctx.Err(); err != nil {
+			return TurnResult{ThreadID: threadID, Status: TurnStatusUnknown}, err
+		}
+	}
 	result, err := r.startTurn(ctx, StartTurnInput{ThreadID: threadID, TurnInput: input})
 	if result.ThreadID == "" {
 		result.ThreadID = threadID

@@ -290,6 +290,128 @@ func TestAppServerRunnerStartThreadEncodesThreadStartAndTurnStart(t *testing.T) 
 	assertJSONRPC(t, writes[4])
 }
 
+func TestAppServerRunnerBeforeFirstTurnHookRunsBeforeTurnStart(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-barrier"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-barrier","status":"completed","items":[{"type":"agentMessage","text":"done"}]}}}`,
+	)
+	runner := &AppServerRunner{Transport: transport, Timeout: time.Second}
+	defer runner.Close()
+	var hookCalls int
+	got, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt: "hello",
+		BeforeFirstTurn: func(_ context.Context, info ThreadStartInfo) error {
+			hookCalls++
+			if info.ThreadID != "thread-barrier" || info.Ephemeral {
+				t.Fatalf("hook info = %#v", info)
+			}
+			writes := transport.decodedWrites(t)
+			if len(writes) != 4 {
+				t.Fatalf("writes at barrier = %d, want initialize/initialized/probe/thread-start", len(writes))
+			}
+			assertMethod(t, writes[3], "thread/start")
+			for _, write := range writes {
+				if method, _ := write["method"].(string); method == "turn/start" {
+					t.Fatal("turn/start was sent before the first-turn hook returned")
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartThread error: %v", err)
+	}
+	if hookCalls != 1 || got.ThreadID != "thread-barrier" || got.TurnID != "turn-barrier" {
+		t.Fatalf("hook calls/result = %d/%#v", hookCalls, got)
+	}
+	writes := transport.decodedWrites(t)
+	assertMethod(t, writes[4], "turn/start")
+}
+
+func TestAppServerRunnerBeforeFirstTurnHookFailureDoesNotDispatch(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-rejected"}}}`,
+	)
+	runner := &AppServerRunner{Transport: transport, Timeout: time.Second}
+	defer runner.Close()
+	wantErr := errors.New("durable bind rejected")
+	result, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:          "hello",
+		BeforeFirstTurn: func(context.Context, ThreadStartInfo) error { return wantErr },
+	})
+	var hookErr *BeforeFirstTurnError
+	if !errors.As(err, &hookErr) || !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want BeforeFirstTurnError wrapping hook failure", err)
+	}
+	if result.ThreadID != "thread-rejected" || result.Status != TurnStatusUnknown {
+		t.Fatalf("result = %#v, want thread id with unknown status", result)
+	}
+	for _, write := range transport.decodedWrites(t) {
+		if method, _ := write["method"].(string); method == "turn/start" {
+			t.Fatal("turn/start was dispatched after the pre-dispatch hook failed")
+		}
+	}
+}
+
+func TestAppServerRunnerBeforeFirstTurnCancellationDoesNotDispatch(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-canceled"}}}`,
+	)
+	runner := &AppServerRunner{Transport: transport, Timeout: time.Second}
+	defer runner.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	result, err := runner.StartThread(ctx, TurnInput{
+		Prompt: "hello",
+		BeforeFirstTurn: func(context.Context, ThreadStartInfo) error {
+			cancel()
+			return nil
+		},
+	})
+	if !errors.Is(err, context.Canceled) || result.ThreadID != "thread-canceled" {
+		t.Fatalf("result/error = %#v/%v, want canceled after thread creation", result, err)
+	}
+	for _, write := range transport.decodedWrites(t) {
+		if method, _ := write["method"].(string); method == "turn/start" {
+			t.Fatal("turn/start was dispatched after the caller canceled")
+		}
+	}
+}
+
+func TestAppServerRunnerBeforeFirstTurnHookIsSkippedForEphemeralThread(t *testing.T) {
+	transport := newFakeAppServerTransport(
+		`{"id":1,"result":{}}`,
+		`{"id":2,"result":{"data":[],"nextCursor":null,"backwardsCursor":null}}`,
+		`{"id":3,"result":{"thread":{"id":"thread-ephemeral"}}}`,
+		`{"id":4,"result":{"turn":{"id":"turn-ephemeral","status":"inProgress","items":[]}}}`,
+		`{"method":"turn/started","params":{"threadId":"thread-ephemeral","turn":{"id":"turn-ephemeral"}}}`,
+		`{"method":"item/agentMessage/delta","params":{"threadId":"thread-ephemeral","turnId":"turn-ephemeral","itemId":"item-ephemeral","delta":"done"}}`,
+		`{"method":"turn/completed","params":{"threadId":"thread-ephemeral","turn":{"id":"turn-ephemeral","status":"completed","items":[]}}}`,
+	)
+	runner := &AppServerRunner{Transport: transport, Timeout: time.Second}
+	defer runner.Close()
+	called := false
+	result, err := runner.StartThread(context.Background(), TurnInput{
+		Prompt:    "hello",
+		Ephemeral: true,
+		BeforeFirstTurn: func(context.Context, ThreadStartInfo) error {
+			called = true
+			return errors.New("ephemeral barrier must not run")
+		},
+	})
+	if err != nil {
+		t.Fatalf("ephemeral StartThread error: %v", err)
+	}
+	if called || result.ThreadID != "thread-ephemeral" || result.TurnID != "turn-ephemeral" {
+		t.Fatalf("called/result = %v/%#v", called, result)
+	}
+}
+
 func TestAppServerRunnerListModelsPreservesEffortOrderAndPaginates(t *testing.T) {
 	transport := newFakeAppServerTransport(
 		`{"id":1,"result":{}}`,

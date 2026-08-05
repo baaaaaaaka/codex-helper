@@ -69,8 +69,9 @@ type StreamingExecutor interface {
 }
 
 type ExecutionInput struct {
-	Prompt     string
-	ImagePaths []string
+	Prompt          string
+	ImagePaths      []string
+	BeforeFirstTurn codexrunner.BeforeFirstTurnHook `json:"-"`
 }
 
 type InputExecutor interface {
@@ -191,12 +192,13 @@ func (e RunnerExecutor) RunInputWithEventHandler(ctx context.Context, session *S
 	result, err := runner.StartTurn(ctx, codexrunner.StartTurnInput{
 		ThreadID: threadID,
 		TurnInput: codexrunner.TurnInput{
-			Prompt:       input.Prompt,
-			ImagePaths:   append([]string{}, input.ImagePaths...),
-			WorkingDir:   workDir,
-			ExtraArgs:    e.ExtraArgs,
-			Timeout:      e.Timeout,
-			EventHandler: handler,
+			Prompt:          input.Prompt,
+			ImagePaths:      append([]string{}, input.ImagePaths...),
+			WorkingDir:      workDir,
+			ExtraArgs:       e.ExtraArgs,
+			Timeout:         e.Timeout,
+			EventHandler:    handler,
+			BeforeFirstTurn: input.BeforeFirstTurn,
 			ReasoningEffort: func() string {
 				if session == nil {
 					return ""

@@ -12,6 +12,39 @@ import (
 // active Codex turn from a caller lifecycle context that merely went away.
 var ErrTurnInterruptRequested = errors.New("codex turn interrupt requested")
 
+// ThreadStartInfo identifies the Codex thread returned by thread/start before
+// the first turn is dispatched. The hook is intentionally supplied on a
+// single TurnInput rather than stored on a shared Runner: Teams reuses
+// AppServerRunner instances across sessions.
+type ThreadStartInfo struct {
+	ThreadID  string
+	Ephemeral bool
+}
+
+type BeforeFirstTurnHook func(context.Context, ThreadStartInfo) error
+
+// BeforeFirstTurnError means thread/start succeeded, but the caller's
+// durable pre-dispatch barrier rejected the request. Callers must not fall
+// through to ordinary terminal thread binding in this case.
+type BeforeFirstTurnError struct {
+	ThreadID string
+	Err      error
+}
+
+func (e *BeforeFirstTurnError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Codex thread was created but the first turn was not dispatched"
+	}
+	return "Codex thread was created but the first turn was not dispatched: " + e.Err.Error()
+}
+
+func (e *BeforeFirstTurnError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 type Runner interface {
 	StartThread(ctx context.Context, input TurnInput) (TurnResult, error)
 	ResumeThread(ctx context.Context, threadID string, input TurnInput) (TurnResult, error)
@@ -78,6 +111,10 @@ type TurnInput struct {
 	ReasoningEffort string
 	// Ephemeral creates a pathless thread that is not persisted by Codex.
 	Ephemeral bool
+	// BeforeFirstTurn runs after thread/start and before the first turn/start.
+	// ResumeThread never invokes this hook. AppServerRunner also skips it for
+	// ephemeral threads because those threads are intentionally not durable.
+	BeforeFirstTurn BeforeFirstTurnHook `json:"-"`
 }
 
 type StartTurnInput struct {

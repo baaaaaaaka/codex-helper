@@ -7385,6 +7385,10 @@ func infraLaunchFailureNotice(err error) (string, bool) {
 }
 
 func codexConfigurationFailureNotice(err error) (string, bool) {
+	return codexConfigurationFailureNoticeWithThreadState(err, false)
+}
+
+func codexConfigurationFailureNoticeWithThreadState(err error, threadCreated bool) (string, bool) {
 	var failure *codexrunner.Error
 	if !errors.As(err, &failure) || failure == nil || failure.Kind != codexrunner.ErrorCodex || failure.Details == nil {
 		return "", false
@@ -7418,11 +7422,15 @@ func codexConfigurationFailureNotice(err error) (string, bool) {
 	if len(structured) > 0 {
 		diagnostic += "\n" + strings.Join(structured, ", ")
 	}
+	workState := "No Codex thread or user work was started, so retrying later will not duplicate work."
+	if threadCreated {
+		workState = "A Codex conversation container was created, but no user turn was accepted. Retrying later will resume that empty thread rather than create another one."
+	}
 	return strings.Join([]string{
 		"⚠️ Codex could not load the workspace-managed configuration through the selected network route.",
 		"",
 		"The ChatGPT configuration request returned " + status + "." + classification,
-		"No Codex thread or user work was started, so retrying later will not duplicate work.",
+		workState,
 		"Once the network/proxy path is corrected, send `helper retry last` here.",
 		"",
 		"Diagnostic for the admin:",
@@ -11397,6 +11405,42 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	unregisterCancel()
 	cancelExec(nil)
 	if err != nil {
+		var beforeFirstTurnErr *codexrunner.BeforeFirstTurnError
+		if errors.As(err, &beforeFirstTurnErr) {
+			// A stale owner must not mutate the turn or send a notification after
+			// the fencing transaction rejected its thread/start result. The next
+			// owner can recover the running turn using the normal takeover path.
+			if errors.Is(err, teamstore.ErrCodexThreadStartBindingOwnerFence) {
+				return err
+			}
+			var threadConflict codexThreadConflictError
+			if errors.As(err, &threadConflict) {
+				recoveryCtx := ctx
+				if recoveryCtx == nil || recoveryCtx.Err() != nil {
+					recoveryCtx = context.Background()
+				}
+				return b.interruptTurnForThreadRecovery(recoveryCtx, session, turn, codexThreadConflictKind, threadConflict.Error())
+			}
+			notifyCtx := ctx
+			if notifyCtx == nil || notifyCtx.Err() != nil {
+				notifyCtx = context.Background()
+			}
+			reason := "Codex created a conversation container, but the helper could not durably bind it before the first turn: " + err.Error()
+			if _, markErr := b.store.MarkTurnInterrupted(notifyCtx, turn.ID, reason); markErr != nil {
+				return markErr
+			}
+			body := "Codex created a conversation container, but your request was not sent to Codex because the helper could not safely persist that thread. No automatic retry was attempted, so an empty thread will not be duplicated. Fix the durable-state issue and then send `helper retry last`."
+			if detail := strings.TrimSpace(trimTeamsCommandOutput(beforeFirstTurnErr.Error(), 600)); detail != "" {
+				body += "\n\nDiagnostic for the admin:\n" + detail
+			}
+			if queueErr := b.queueAndSendOutboxChunksWithOptions(notifyCtx, session.ID, turn.ID, chatID, "interrupted", body, outboxQueueOptions{
+				MentionOwner:     true,
+				NotificationKind: "needs_attention",
+			}); queueErr != nil {
+				return queueErr
+			}
+			return nil
+		}
 		if cancelRequested && isCanceledExecutionError(err) {
 			if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
 				if beaconErr := b.cancelBeaconTurn(ctx, session, turn, firstNonEmptyString(cancelReason, "canceled by user")); beaconErr != nil && b.out != nil {
@@ -11480,7 +11524,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			}
 			return nil
 		}
-		if configBody, ok := codexConfigurationFailureNotice(err); ok {
+		if configBody, ok := codexConfigurationFailureNoticeWithThreadState(err, strings.TrimSpace(result.CodexThreadID) != ""); ok {
 			if b.out != nil {
 				_, _ = fmt.Fprintf(b.out, "codex configuration failure (network/proxy path): %v\n", err)
 			}
@@ -11989,6 +12033,9 @@ func (b *Bridge) handleClaimedQueuedTurnError(ctx context.Context, session *Sess
 	if err == nil || b == nil || b.store == nil {
 		return
 	}
+	if errors.Is(err, teamstore.ErrCodexThreadStartBindingOwnerFence) || errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+		return
+	}
 	if current, ok, loadErr := b.store.TurnByID(ctx, turn.ID); loadErr == nil && ok {
 		switch current.Status {
 		case teamstore.TurnStatusCompleted, teamstore.TurnStatusFailed, teamstore.TurnStatusInterrupted:
@@ -12038,6 +12085,9 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 	if err := b.recordOwnerHeartbeat(ctx, session.ID, turn.ID); err != nil {
 		return ExecutionResult{}, err
 	}
+	if input.BeforeFirstTurn == nil && session != nil && strings.TrimSpace(session.CodexThreadID) == "" {
+		input.BeforeFirstTurn = b.beforeFirstCodexTurnHook(session, &turn)
+	}
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := b.startActiveOwnerHeartbeat(heartbeatCtx, session.ID, turn.ID)
 	var result ExecutionResult
@@ -12081,6 +12131,76 @@ func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor
 		return result, clearErr
 	default:
 		return result, nil
+	}
+}
+
+const codexThreadStartBindingTimeout = 2 * time.Second
+
+func (b *Bridge) beforeFirstCodexTurnHook(session *Session, turn *teamstore.Turn) codexrunner.BeforeFirstTurnHook {
+	return func(hookCtx context.Context, info codexrunner.ThreadStartInfo) error {
+		if info.Ephemeral || b == nil || b.store == nil || session == nil || turn == nil {
+			return nil
+		}
+		bindCtx := hookCtx
+		if bindCtx == nil {
+			bindCtx = context.Background()
+		}
+		bindCtx = context.WithoutCancel(bindCtx)
+		bindCtx, cancel := context.WithTimeout(bindCtx, codexThreadStartBindingTimeout)
+		defer cancel()
+
+		owner, lease := b.currentOwnerAndLease()
+		machineID := ""
+		leaseGeneration := lease.Generation
+		if leaseGeneration > 0 {
+			machineID = strings.TrimSpace(b.machine.ID)
+		}
+		result, err := b.store.BindCodexThreadForRunningTurn(bindCtx, teamstore.CodexThreadStartBindingRequest{
+			SessionID:       session.ID,
+			TurnID:          turn.ID,
+			ThreadID:        info.ThreadID,
+			ModelGeneration: turn.ModelGeneration,
+			MachineID:       machineID,
+			LeaseGeneration: leaseGeneration,
+			Owner:           owner,
+		})
+		if err != nil {
+			var conflict teamstore.CodexThreadBindingConflictError
+			if errors.As(err, &conflict) {
+				observed := strings.TrimSpace(conflict.Observed)
+				if observed == "" {
+					observed = strings.TrimSpace(info.ThreadID)
+				}
+				return codexThreadConflictError{SessionID: session.ID, Existing: conflict.Existing, Observed: observed, Source: "pre_dispatch"}
+			}
+			return err
+		}
+		if result.Session.CodexThreadID != "" {
+			session.CodexThreadID = result.Session.CodexThreadID
+		}
+		if result.Turn.CodexThreadID != "" {
+			turn.CodexThreadID = result.Turn.CodexThreadID
+		}
+		if b.updateSessionCodexThreadProjection(session, session.ID, info.ThreadID) && strings.TrimSpace(b.registryPath) != "" {
+			if err := b.Save(); err != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams registry thread projection save skipped for %s: %v\n", session.ID, err)
+			}
+		}
+		if result.Changed {
+			_ = b.appendThreadLinkJournal(bindCtx, threadLinkJournalRecord{
+				Source:          "pre_dispatch",
+				ScopeID:         b.scope.ID,
+				MachineID:       b.machine.ID,
+				SessionID:       session.ID,
+				ChatID:          session.ChatID,
+				TeamsTurnID:     turn.ID,
+				CodexThreadID:   info.ThreadID,
+				ModelGeneration: turn.ModelGeneration,
+				ModelProfile:    session.ModelProfile,
+				Cwd:             session.Cwd,
+			})
+		}
+		return nil
 	}
 }
 
@@ -12563,6 +12683,12 @@ func (b *Bridge) currentLease() teamstore.ControlLease {
 	b.ownerMu.Lock()
 	defer b.ownerMu.Unlock()
 	return b.lease
+}
+
+func (b *Bridge) currentOwnerAndLease() (teamstore.OwnerMetadata, teamstore.ControlLease) {
+	b.ownerMu.Lock()
+	defer b.ownerMu.Unlock()
+	return b.owner, b.lease
 }
 
 func (b *Bridge) currentLeaseGeneration() int64 {
