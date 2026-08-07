@@ -117,6 +117,88 @@ func TestWindowsManagedAppInstallPublishesAndReusesCache(t *testing.T) {
 	}
 }
 
+func TestWindowsManagedAppExplicitUpgradePublishesSideBySide(t *testing.T) {
+	lockCLITestHooks(t)
+	root := t.TempDir()
+	packageV1 := filepath.Join(t.TempDir(), "ChatGPT-v1.msix")
+	packageV2 := filepath.Join(t.TempDir(), "ChatGPT-v2.msix")
+	writeTestCodexWindowsManagedMSIX(t, packageV1, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt-v1"))
+	writeTestCodexWindowsManagedMSIX(t, packageV2, "CN=TestPublisher", "app/ChatGPT.exe", []byte("chatgpt-v2"))
+
+	prevDownload := codexAppDownloadPackageFn
+	prevOutput := codexAppCommandOutput
+	t.Cleanup(func() {
+		codexAppDownloadPackageFn = prevDownload
+		codexAppCommandOutput = prevOutput
+	})
+	downloads := 0
+	signer := "CN=TestPublisher"
+	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
+		downloads++
+		path := packageV1
+		if downloads > 1 {
+			path = packageV2
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(opts.Path, data, 0o600)
+	}
+	codexAppCommandOutput = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "Get-AuthenticodeSignature") {
+			return []byte(signer + "\n"), nil
+		}
+		return nil, errors.New("unexpected PowerShell command")
+	}
+
+	first, err := ensureCodexWindowsManagedInstall(context.Background(), root, codexDesktopAppOptions{Log: io.Discard})
+	if err != nil {
+		t.Fatalf("initial managed install: %v", err)
+	}
+	oldExe := filepath.Join(root, filepath.FromSlash(first.RuntimeRelative), "app", codexDesktopWindowsCurrentExecutable)
+	signer = "CN=UnexpectedPublisher"
+	failed, changed, err := upgradeCodexWindowsManagedInstall(context.Background(), root, codexDesktopAppOptions{Log: io.Discard})
+	if err == nil || changed || failed.PackageVersion != "" {
+		t.Fatalf("failed explicit upgrade changed=%v state=%#v err=%v", changed, failed, err)
+	}
+	current, ok, err := readValidCodexWindowsManagedState(root)
+	if err != nil || !ok || current.RuntimeRelative != first.RuntimeRelative || current.PackageSHA256 != first.PackageSHA256 {
+		t.Fatalf("failed upgrade changed current state: %#v valid=%v err=%v first=%#v", current, ok, err, first)
+	}
+	if data, err := os.ReadFile(oldExe); err != nil || string(data) != "chatgpt-v1" {
+		t.Fatalf("failed upgrade damaged old managed runtime: data=%q err=%v", string(data), err)
+	}
+
+	signer = "CN=TestPublisher"
+	refreshed, changed, err := upgradeCodexWindowsManagedInstall(context.Background(), root, codexDesktopAppOptions{Log: io.Discard})
+	if err != nil {
+		t.Fatalf("explicit managed app upgrade: %v", err)
+	}
+	if !changed || refreshed.PackageSHA256 == first.PackageSHA256 || refreshed.RuntimeRelative == first.RuntimeRelative {
+		t.Fatalf("upgrade changed=%v first=%#v refreshed=%#v", changed, first, refreshed)
+	}
+	if data, err := os.ReadFile(oldExe); err != nil || string(data) != "chatgpt-v1" {
+		t.Fatalf("old managed runtime was not preserved: data=%q err=%v", string(data), err)
+	}
+	newExe := filepath.Join(root, filepath.FromSlash(refreshed.RuntimeRelative), "app", codexDesktopWindowsCurrentExecutable)
+	if data, err := os.ReadFile(newExe); err != nil || string(data) != "chatgpt-v2" {
+		t.Fatalf("new managed runtime = %q err=%v", string(data), err)
+	}
+	current, ok, err = readValidCodexWindowsManagedState(root)
+	if err != nil || !ok || current.RuntimeRelative != refreshed.RuntimeRelative {
+		t.Fatalf("current state after upgrade = %#v valid=%v err=%v", current, ok, err)
+	}
+
+	same, changed, err := upgradeCodexWindowsManagedInstall(context.Background(), root, codexDesktopAppOptions{Log: io.Discard})
+	if err != nil {
+		t.Fatalf("repeat managed app upgrade: %v", err)
+	}
+	if changed || same.RuntimeRelative != refreshed.RuntimeRelative || downloads != 4 {
+		t.Fatalf("repeat upgrade changed=%v state=%#v downloads=%d", changed, same, downloads)
+	}
+}
+
 func TestWindowsManagedAppVerifyPackageRejectsSignerPublisherMismatch(t *testing.T) {
 	lockCLITestHooks(t)
 	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")

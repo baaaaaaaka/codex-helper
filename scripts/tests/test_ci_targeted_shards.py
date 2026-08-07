@@ -145,6 +145,28 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         positions = [job.index(f"- name: {name}") for name in ordered_steps]
         self.assertEqual(positions, sorted(positions))
 
+    def test_desktop_app_update_contracts_are_selected_by_ci(self):
+        job = targeted_job()
+        blocks = step_blocks(job)
+        self.assertIn(
+            "RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp",
+            job,
+        )
+        unsupported = blocks["Codex desktop app unsupported smoke (Linux/macOS)"]
+        self.assertIn("--upgrade-codex-app", unsupported)
+        self.assertIn("only supported on native Windows or WSL", unsupported)
+
+        managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
+        self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)
+        self.assertIn("codex_app_managed_install_smoke.ps1", managed)
+        managed_smoke = (ROOT / "scripts" / "ci" / "codex_app_managed_install_smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("--upgrade-codex-app", managed_smoke)
+
+    def test_release_install_smoke_checks_root_desktop_update_help(self):
+        workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn('grep -q -- "--upgrade-codex-app"', workflow)
+        self.assertIn('& $cxp --help | Select-String "--upgrade-codex-app"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

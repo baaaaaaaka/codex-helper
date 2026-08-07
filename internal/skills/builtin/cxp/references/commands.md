@@ -16,6 +16,7 @@
 - `cxp app [profile]`: install the Codex desktop app if needed, use or configure proxy mode, and launch the desktop app on macOS, Windows, or WSL. Linux outside WSL has no official Codex desktop app. If a proxy profile is literally named `app` or `auth`, use `cxp tui app`, `cxp app --profile auth`, or `cxp app auth --profile auth` to avoid command-name ambiguity.
 - `cxp app auth [profile]`: complete ChatGPT auth for the Codex desktop app through a temporary Codex app-server using the same CODEX_HOME and proxy setup as `cxp app`.
 - `cxp app --model-profile <name>`: launch the desktop app with a saved model profile through an isolated CODEX_HOME; quit an already-running app first so the setting takes effect.
+- `cxp --upgrade-codex-app [profile]`: on native Windows or WSL, download and verify the official signed x64 ChatGPT MSIX, publish it beside the current CXP-managed runtime, and select it for future `cxp app` launches without modifying the Microsoft Store/AppX installation.
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
 - `cxp run -- codex`: launch the original Codex TUI through CXP's standard approval broker with manual approvals.
 - `cxp run --aaa -- codex`: enable Agent Auto Approve for this run without changing the saved TUI preference.

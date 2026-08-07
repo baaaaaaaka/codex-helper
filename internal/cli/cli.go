@@ -17,6 +17,7 @@ var (
 type rootOptions struct {
 	configPath       string
 	upgradeCodex     bool
+	upgradeCodexApp  bool
 	upgradeCodexPath string
 }
 
@@ -50,8 +51,17 @@ func newRootCmd() *cobra.Command {
 		Version:       buildVersion(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = args
+			if opts.upgradeCodex && opts.upgradeCodexApp {
+				return fmt.Errorf("--upgrade-codex and --upgrade-codex-app cannot be used together")
+			}
 			if strings.TrimSpace(opts.upgradeCodexPath) != "" && !opts.upgradeCodex {
 				return fmt.Errorf("--upgrade-codex-path requires --upgrade-codex")
+			}
+			if opts.upgradeCodexApp && strings.TrimSpace(opts.upgradeCodexPath) != "" {
+				return fmt.Errorf("--upgrade-codex-app cannot be used with --upgrade-codex-path")
+			}
+			if opts.upgradeCodexApp {
+				return runUpgradeCodexAppFromRoot(cmd, opts)
 			}
 			if opts.upgradeCodex {
 				return runUpgradeCodexFromRoot(cmd, opts)
@@ -62,6 +72,7 @@ func newRootCmd() *cobra.Command {
 
 	cmd.PersistentFlags().StringVar(&opts.configPath, "config", "", "Override config file path (default: OS user config dir)")
 	cmd.Flags().BoolVar(&opts.upgradeCodex, "upgrade-codex", false, "Install or upgrade the CXP-managed Codex CLI")
+	cmd.Flags().BoolVar(&opts.upgradeCodexApp, "upgrade-codex-app", false, "Install or upgrade the CXP-managed Codex desktop app")
 	cmd.Flags().StringVar(&opts.upgradeCodexPath, "upgrade-codex-path", "", "Upgrade an explicit external Codex executable instead (requires --upgrade-codex)")
 
 	cmd.AddCommand(

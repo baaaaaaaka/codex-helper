@@ -136,6 +136,46 @@ try {
   if (!(Test-Path -LiteralPath $managedExe -PathType Leaf)) { throw "managed runtime has no ChatGPT.exe: $managedExe" }
   if ($managedExe -like "*\WindowsApps\*") { throw "managed ChatGPT executable unexpectedly resides below WindowsApps: $managedExe" }
 
+  $rootHelp = (& $Helper --help | Out-String)
+  if ($rootHelp -notmatch "--upgrade-codex-app") { throw "built helper root help does not expose --upgrade-codex-app" }
+  $stateBeforeUpgrade = Get-Content -Raw -LiteralPath $statePath
+  $oldRuntime = $runtime
+  $oldManagedExe = $managedExe
+  $proxyLogBeforeUpgrade = if (Test-Path -LiteralPath $proxyLog -PathType Leaf) { Get-Content -Raw -LiteralPath $proxyLog } else { "" }
+  $upgradeOut = Join-Path $base "app-upgrade.out"
+  try {
+    & $Helper --config $config --upgrade-codex-app "CI recording proxy" *> $upgradeOut
+  } catch {
+    $upgradeText = if (Test-Path -LiteralPath $upgradeOut) { Get-Content -Raw -LiteralPath $upgradeOut } else { "" }
+    throw "managed app update command failed`nupdate output:`n$upgradeText`nerror:`n$($_.Exception.Message)"
+  }
+  $upgradeText = Get-Content -Raw -LiteralPath $upgradeOut
+  $updatePublished = $upgradeText -match "Codex desktop app upgraded:"
+  if (-not $updatePublished -and $upgradeText -notmatch "Codex desktop app is already up to date") {
+    throw "managed app update did not report a verified package result`n$upgradeText"
+  }
+  $stateAfterUpgrade = Get-Content -Raw -LiteralPath $statePath
+  if (-not $updatePublished -and $stateAfterUpgrade -ne $stateBeforeUpgrade) {
+    throw "unchanged managed app update rewrote current.json"
+  }
+  if ($updatePublished -and $stateAfterUpgrade -eq $stateBeforeUpgrade) {
+    throw "managed app update reported a publish without changing current.json"
+  }
+  if ($updatePublished -and !(Test-Path -LiteralPath $oldManagedExe -PathType Leaf)) {
+    throw "managed app update removed the old runtime: $oldRuntime"
+  }
+  $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
+  $runtime = Join-Path $managedRoot ([string]$state.runtime)
+  $managedExe = Join-Path $runtime "app\ChatGPT.exe"
+  if (!(Test-Path -LiteralPath $managedExe -PathType Leaf)) { throw "managed app update left no current ChatGPT.exe: $managedExe" }
+  $proxyLogAfterUpgrade = Get-Content -Raw -LiteralPath $proxyLog
+  $proxyLogDelta = if ($proxyLogAfterUpgrade.Length -gt $proxyLogBeforeUpgrade.Length) {
+    $proxyLogAfterUpgrade.Substring($proxyLogBeforeUpgrade.Length)
+  } else { "" }
+  if ($proxyLogDelta -notmatch "CONNECT target=") {
+    throw "managed app update did not download the official MSIX through the selected proxy"
+  }
+
   $env:CXP_TEST_CHILD_LOG = $fakeLog
   & go build -o $fakeExe .\scripts\ci\windows_managed_fake_chatgpt
   if ($LASTEXITCODE -ne 0) { throw "building fake ChatGPT child failed" }

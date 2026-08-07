@@ -169,6 +169,7 @@ codex-proxy proxy doctor
 | `codex-proxy app [profile]` | 需要时安装、使用或配置代理模式，并在 macOS、Windows 或 WSL 上启动 Codex 桌面 App |
 | `codex-proxy app auth [profile]` | 使用相同的 `CODEX_HOME` 和代理设置完成 Codex 桌面 App 的 ChatGPT auth |
 | `codex-proxy app --model-profile <name>` | 通过隔离的 `CODEX_HOME` 使用保存的模型 profile 启动 Codex 桌面 App |
+| `codex-proxy --upgrade-codex-app [profile]` | 下载并安装 CXP-managed 的最新版 Windows/WSL 桌面 App 副本 |
 | `codex-proxy --upgrade-codex` | 使用检测到的安装来源重新安装 Codex CLI |
 | `codex-proxy completion <shell>` | 生成 shell completion |
 | `codex-proxy init` | 创建 SSH profile |
@@ -690,6 +691,20 @@ page 会在该代理下的隔离 per-run profile 中打开。在代理模式下�
 打印 URL 和 one-time code，并要求你在为所选代理配置的浏览器中手动打开。在 WSL
 上，自动打开前会检查 Windows browser 是否能访问 WSL loopback proxy，因为这取决
 于环境。
+
+在 Windows 上，proxy/model-profile 启动会使用官方签名 x64 ChatGPT MSIX 的
+CXP-managed 解包副本，默认位于 `%LOCALAPPDATA%\cxp\apps\chatgpt`。这个副本不注册为
+AppX，也不会接管 ChatGPT 自带的 updater；如果需要手动刷新它，使用：
+
+```bash
+codex-proxy --upgrade-codex-app
+```
+
+该命令只支持原生 Windows 和 WSL，可选地接受 proxy profile
+（`codex-proxy --upgrade-codex-app <profile>`），在副本缺失时安装，并把通过校验的
+新 runtime 原子切换为后续 `codex-proxy app` 使用的版本。它会把新 runtime 放在旧版本旁边，
+不会覆盖正在运行的 App；退出并重新启动桌面 App 后新版本才会生效，也不会修改 Microsoft
+Store/AppX 安装。
 
 `app` 是 root command，`auth` 是 `app` subcommand。如果你的代理 profiles 字面上
 叫 `app` 或 `auth`，使用 `codex-proxy tui app`、`codex-proxy app --profile auth`
@@ -1236,6 +1251,17 @@ codex-proxy --upgrade-codex
   - system npm global install -> `npm install -g @openai/codex`
   - managed/local npm install（`codex-proxy` prefix）-> managed reinstall path
 - 无法确定来源时 fail fast（避免意外改变 install topology）。
+
+在原生 Windows 或 WSL 上手动刷新 CXP-managed 的 Codex 桌面 App 副本：
+
+```bash
+codex-proxy --upgrade-codex-app
+```
+
+可选的 positional argument 用来选择已配置的 proxy profile。该命令会下载并校验官方签名
+x64 ChatGPT MSIX，把它安装到当前 managed runtime 旁边，并原子选择它供后续
+`codex-proxy app` 使用。已经运行的桌面进程会继续使用旧 runtime，退出并重新启动后才会
+使用新版本；Microsoft Store/AppX 安装不会被修改。
 
 ### 审计或清理旧版 patched binaries（POSIX）
 

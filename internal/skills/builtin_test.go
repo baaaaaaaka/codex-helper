@@ -120,6 +120,7 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp app [profile]",
 		"cxp app auth [profile]",
 		"cxp app --model-profile <name>",
+		"cxp --upgrade-codex-app [profile]",
 		"cxp run [profile] -- <cmd args...>",
 		"cxp run -- codex",
 		"cxp run --model-profile <name> -- codex",

@@ -236,17 +236,31 @@ func checkWindowsManagedProcessConflict(ctx context.Context) error {
 }
 
 func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts codexDesktopAppOptions) (codexWindowsManagedInstallState, error) {
+	state, _, err := ensureCodexWindowsManagedInstallWithRefresh(ctx, root, opts, false)
+	return state, err
+}
+
+// upgradeCodexWindowsManagedInstall fetches and verifies the current official
+// MSIX even when current.json is valid. A refresh publishes a new immutable
+// runtime directory and switches current.json only after extraction succeeds,
+// so a running process can finish on the old runtime without being replaced.
+func upgradeCodexWindowsManagedInstall(ctx context.Context, root string, opts codexDesktopAppOptions) (codexWindowsManagedInstallState, bool, error) {
+	return ensureCodexWindowsManagedInstallWithRefresh(ctx, root, opts, true)
+}
+
+func ensureCodexWindowsManagedInstallWithRefresh(ctx context.Context, root string, opts codexDesktopAppOptions, refresh bool) (codexWindowsManagedInstallState, bool, error) {
 	root = filepath.Clean(strings.TrimSpace(root))
 	if root == "." || root == "" {
-		return codexWindowsManagedInstallState{}, errors.New("managed Windows ChatGPT root is empty")
+		return codexWindowsManagedInstallState{}, false, errors.New("managed Windows ChatGPT root is empty")
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("create managed Windows ChatGPT root: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed Windows ChatGPT root: %w", err)
 	}
-	if state, ok, err := readValidCodexWindowsManagedState(root); err != nil {
-		return codexWindowsManagedInstallState{}, err
-	} else if ok {
-		return state, nil
+	currentState, currentOK, err := readValidCodexWindowsManagedState(root)
+	if err != nil {
+		return codexWindowsManagedInstallState{}, false, err
+	} else if currentOK && !refresh {
+		return currentState, false, nil
 	}
 
 	lockPath := filepath.Join(root, codexWindowsManagedLockDir)
@@ -257,19 +271,19 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 			data, marshalErr := json.Marshal(owner)
 			if marshalErr != nil {
 				_ = os.RemoveAll(lockPath)
-				return codexWindowsManagedInstallState{}, fmt.Errorf("encode managed ChatGPT install lock: %w", marshalErr)
+				return codexWindowsManagedInstallState{}, false, fmt.Errorf("encode managed ChatGPT install lock: %w", marshalErr)
 			}
 			if writeErr := os.WriteFile(filepath.Join(lockPath, codexWindowsManagedLockOwner), append(data, '\n'), 0o600); writeErr != nil {
 				_ = os.RemoveAll(lockPath)
-				return codexWindowsManagedInstallState{}, fmt.Errorf("write managed ChatGPT install lock: %w", writeErr)
+				return codexWindowsManagedInstallState{}, false, fmt.Errorf("write managed ChatGPT install lock: %w", writeErr)
 			}
 			break
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return codexWindowsManagedInstallState{}, fmt.Errorf("acquire managed ChatGPT install lock: %w", err)
+			return codexWindowsManagedInstallState{}, false, fmt.Errorf("acquire managed ChatGPT install lock: %w", err)
 		}
 		if reclaimed, reclaimErr := reclaimStaleCodexWindowsManagedLock(lockPath); reclaimErr != nil {
-			return codexWindowsManagedInstallState{}, reclaimErr
+			return codexWindowsManagedInstallState{}, false, reclaimErr
 		} else if reclaimed {
 			continue
 		}
@@ -277,7 +291,7 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return codexWindowsManagedInstallState{}, ctx.Err()
+			return codexWindowsManagedInstallState{}, false, ctx.Err()
 		case <-timer.C:
 		}
 	}
@@ -285,20 +299,21 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 		_ = os.Remove(filepath.Join(lockPath, codexWindowsManagedLockOwner))
 		_ = os.Remove(lockPath)
 	}()
-	if state, ok, err := readValidCodexWindowsManagedState(root); err != nil {
-		return codexWindowsManagedInstallState{}, err
-	} else if ok {
-		return state, nil
+	currentState, currentOK, err = readValidCodexWindowsManagedState(root)
+	if err != nil {
+		return codexWindowsManagedInstallState{}, false, err
+	} else if currentOK && !refresh {
+		return currentState, false, nil
 	}
 
 	installID := fmt.Sprintf("%d", codexWindowsManagedNow().UnixNano())
 	stagingRoot := filepath.Join(root, codexWindowsManagedStagingDir, installID)
 	packagePath := filepath.Join(root, codexWindowsManagedDownloadsDir, installID+".msix")
 	if err := os.MkdirAll(stagingRoot, 0o700); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("create managed ChatGPT staging directory: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed ChatGPT staging directory: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(packagePath), 0o700); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("create managed ChatGPT download directory: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed ChatGPT download directory: %w", err)
 	}
 	defer os.RemoveAll(stagingRoot)
 	defer os.Remove(packagePath)
@@ -309,45 +324,66 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 		ProxyURL: opts.ProxyURL,
 		Log:      opts.Log,
 	}); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("download official ChatGPT MSIX: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("download official ChatGPT MSIX: %w", err)
 	}
 	manifest, packageHash, err := verifyCodexWindowsManagedPackage(ctx, packagePath)
 	if err != nil {
-		return codexWindowsManagedInstallState{}, err
+		return codexWindowsManagedInstallState{}, false, err
 	}
 	if !strings.EqualFold(manifest.Architecture, codexWindowsManagedArch) {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("official ChatGPT MSIX architecture is %q, want %s", manifest.Architecture, codexWindowsManagedArch)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("official ChatGPT MSIX architecture is %q, want %s", manifest.Architecture, codexWindowsManagedArch)
 	}
 	if !strings.EqualFold(manifest.PackageName, codexDesktopWindowsPackageName) {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("official ChatGPT MSIX package name is %q, want %s", manifest.PackageName, codexDesktopWindowsPackageName)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("official ChatGPT MSIX package name is %q, want %s", manifest.PackageName, codexDesktopWindowsPackageName)
+	}
+	if refresh && currentOK && strings.EqualFold(currentState.PackageSHA256, packageHash) {
+		return currentState, false, nil
 	}
 	if err := extractCodexWindowsManagedPackage(packagePath, stagingRoot); err != nil {
-		return codexWindowsManagedInstallState{}, err
+		return codexWindowsManagedInstallState{}, false, err
 	}
 	exePath := filepath.Join(stagingRoot, "app", codexDesktopWindowsCurrentExecutable)
 	exeHash, err := sha256File(exePath)
 	if err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("hash extracted ChatGPT executable: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("hash extracted ChatGPT executable: %w", err)
 	}
 	version := strings.TrimSpace(manifest.PackageVersion)
 	if version == "" {
-		return codexWindowsManagedInstallState{}, errors.New("official ChatGPT MSIX has no package version")
+		return codexWindowsManagedInstallState{}, false, errors.New("official ChatGPT MSIX has no package version")
 	}
-	versionDir := filepath.Join(root, codexWindowsManagedVersionsDir, version+"-"+packageHash[:16])
-	if err := os.MkdirAll(filepath.Dir(versionDir), 0o755); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("create managed ChatGPT versions directory: %w", err)
-	}
-	if _, err := os.Stat(versionDir); err == nil {
-		// A previous interrupted publish can leave the same immutable version
-		// directory behind. Replace only this exact generated destination.
-		if err := os.RemoveAll(versionDir); err != nil {
-			return codexWindowsManagedInstallState{}, fmt.Errorf("replace stale managed ChatGPT runtime: %w", err)
+	versionDirBase := filepath.Join(root, codexWindowsManagedVersionsDir, version+"-"+packageHash[:16])
+	versionDir := versionDirBase
+	if refresh {
+		// Never replace an existing runtime during an explicit refresh: it may
+		// still be mapped by a running ChatGPT process. The content hash check
+		// above avoids duplicate directories when the CDN has not changed.
+		for attempt := 0; ; attempt++ {
+			if attempt > 0 {
+				versionDir = fmt.Sprintf("%s-%d", versionDirBase, attempt)
+			}
+			if _, err := os.Stat(versionDir); os.IsNotExist(err) {
+				break
+			} else if err != nil {
+				return codexWindowsManagedInstallState{}, false, fmt.Errorf("inspect managed ChatGPT runtime destination: %w", err)
+			}
 		}
-	} else if !os.IsNotExist(err) {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("inspect managed ChatGPT runtime destination: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(versionDir), 0o755); err != nil {
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed ChatGPT versions directory: %w", err)
+	}
+	if !refresh {
+		if _, err := os.Stat(versionDir); err == nil {
+			// A previous interrupted publish can leave the same immutable version
+			// directory behind. Replace only this exact generated destination.
+			if err := os.RemoveAll(versionDir); err != nil {
+				return codexWindowsManagedInstallState{}, false, fmt.Errorf("replace stale managed ChatGPT runtime: %w", err)
+			}
+		} else if !os.IsNotExist(err) {
+			return codexWindowsManagedInstallState{}, false, fmt.Errorf("inspect managed ChatGPT runtime destination: %w", err)
+		}
 	}
 	if err := os.Rename(stagingRoot, versionDir); err != nil {
-		return codexWindowsManagedInstallState{}, fmt.Errorf("publish managed ChatGPT runtime: %w", err)
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("publish managed ChatGPT runtime: %w", err)
 	}
 	state := codexWindowsManagedInstallState{
 		PackageName:      manifest.PackageName,
@@ -360,9 +396,9 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 		InstalledAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := writeCodexWindowsManagedState(root, state); err != nil {
-		return codexWindowsManagedInstallState{}, err
+		return codexWindowsManagedInstallState{}, false, err
 	}
-	return state, nil
+	return state, true, nil
 }
 
 func readValidCodexWindowsManagedState(root string) (codexWindowsManagedInstallState, bool, error) {

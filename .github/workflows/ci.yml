@@ -554,7 +554,7 @@ jobs:
           go test ./internal/teams/delegation -count=1 -v
           go test ./internal/teams/machineregistry -count=1 -v
           go test ./cmd/teams-registry-probe -count=1 -v
-          go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags)' -v
+          go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp)' -v
           go test ./internal/teams -count=1 -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
 
       - name: Responses adapter provider compatibility regressions
@@ -1667,8 +1667,8 @@ jobs:
           .\scripts\ci\skills_migration_smoke.ps1
           Remove-Item Env:\CODEX_HELPER_BIN
 
-      - name: Codex desktop app unsupported smoke (Linux)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
+      - name: Codex desktop app unsupported smoke (Linux/macOS)
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -1678,6 +1678,12 @@ jobs:
             exit 1
           fi
           grep -q "only available for macOS and Windows" "$RUNNER_TEMP/codex-desktop-unsupported.out"
+          if go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-desktop-upgrade-unsupported.json" --upgrade-codex-app >"$RUNNER_TEMP/codex-desktop-upgrade-unsupported.out" 2>&1; then
+            echo "cxp --upgrade-codex-app unexpectedly succeeded outside Windows/WSL" >&2
+            cat "$RUNNER_TEMP/codex-desktop-upgrade-unsupported.out" >&2
+            exit 1
+          fi
+          grep -q "only supported on native Windows or WSL" "$RUNNER_TEMP/codex-desktop-upgrade-unsupported.out"
 
       - name: Codex desktop app network install smoke (macOS)
         if: matrix.shard == 'platform-integration' && runner.os == 'macOS'
@@ -1734,11 +1740,12 @@ jobs:
           }
           $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
-          $listed = @(go test ./internal/cli -list '^TestWindowsManagedApp' | Select-String '^TestWindowsManagedApp')
+          $pattern = '^Test(RootUpgradeCodexApp|WindowsManagedApp)'
+          $listed = @(go test ./internal/cli -list $pattern | Select-String $pattern)
           if ($listed.Count -lt 1) {
-            throw "Windows managed app test selector matched no tests; refusing a silent fake pass"
+            throw "Windows managed app/update test selector matched no tests; refusing a silent fake pass"
           }
-          go test ./internal/cli -run '^TestWindowsManagedApp' -count=1 -v
+          go test ./internal/cli -run $pattern -count=1 -v
           for ($attempt = 1; $attempt -le 2; $attempt++) {
             try {
               .\scripts\ci\codex_app_managed_install_smoke.ps1 -Helper $helper

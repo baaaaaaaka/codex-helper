@@ -180,6 +180,7 @@ walk through the normal flows in order.
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
 | `codex-proxy app --model-profile <name>` | Launch the Codex desktop app with a saved model profile through an isolated `CODEX_HOME` |
+| `codex-proxy --upgrade-codex-app [profile]` | Download and install the latest CXP-managed Windows/WSL desktop app copy |
 | `codex-proxy --upgrade-codex` | Install or upgrade the CXP-managed Codex CLI |
 | `codex-proxy --upgrade-codex --upgrade-codex-path <absolute-path>` | Upgrade one explicitly selected external Codex installation |
 | `codex-proxy completion <shell>` | Generate shell completion |
@@ -814,6 +815,21 @@ Windows Store path keeps the Codex product/package identity for update
 compatibility. The managed
 Windows copy is deliberately not registered as an AppX package and does not
 take over ChatGPT's updater; a later `cxp app` run reuses the verified cache.
+
+To manually refresh that CXP-managed Windows copy from the current official
+signed x64 ChatGPT MSIX, run:
+
+```bash
+codex-proxy --upgrade-codex-app
+```
+
+This command is supported on native Windows and WSL, optionally accepts a
+proxy profile (`codex-proxy --upgrade-codex-app <profile>`), installs the
+package if the managed copy is missing, and switches new `cxp app` launches to
+the newly verified runtime. It stages the new runtime beside the old one, so a
+currently running app is not overwritten; quit and relaunch the app to use the
+new version. It does not register the unpacked copy as an AppX package or
+change the Microsoft Store installation.
 On macOS the
 launcher also requires bundle identifier `com.openai.codex`, so a separately
 installed classic `ChatGPT.app` is never mistaken for Codex or overwritten; a
@@ -1483,6 +1499,20 @@ Behavior:
 - `--upgrade-codex-path` requires an absolute, functional executable path and keeps
   that installation's recognized npm source.
 - Explicit external upgrades fail fast when the source cannot be determined.
+
+Manually refresh the CXP-managed Codex desktop app copy on native Windows or
+WSL:
+
+```bash
+codex-proxy --upgrade-codex-app
+```
+
+The optional positional argument selects a configured proxy profile. The
+command downloads and verifies the official signed x64 ChatGPT MSIX, installs
+it beside the current managed runtime, and atomically selects it for future
+`codex-proxy app` launches. An already-running desktop process continues on
+its old runtime until it is quit and relaunched; the Microsoft Store/AppX
+installation is not modified.
 
 ### Audit or clean legacy patched binaries (POSIX)
 

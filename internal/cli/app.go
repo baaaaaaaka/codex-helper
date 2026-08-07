@@ -48,20 +48,21 @@ var (
 	// Desktop app launches use the stable App Gateway. The legacy helper is
 	// retained for explicit proxy-start compatibility and older tests/tools;
 	// it is no longer the default application path.
-	codexAppEnsureProxyURLFn      = ensureCodexAppGatewayURL
-	codexAppCommandContext        = exec.CommandContext
-	codexAppRunCommand            = runCodexAppLoggedCommand
-	codexAppCommandOutput         = runCodexAppCommandOutput
-	codexAppDownloadPackageFn     = downloadCodexAppPackage
-	codexAppLookPath              = exec.LookPath
-	codexAppUserHomeDir           = os.UserHomeDir
-	codexAppMacSystemAppsDir      = "/Applications"
-	codexAppWSLPathFn             = defaultCodexAppWSLPath
-	codexAppWindowsManagedRootFn  = defaultCodexAppWindowsManagedRoot
-	codexAppProxyPollInterval     = 200 * time.Millisecond
-	codexAppProxyReadyTimeout     = 15 * time.Second
-	codexAppMacInstallURL         = func() string { return codexDesktopMacDownloadURLForArch(codexAppGOARCH()) }
-	errCodexDesktopAppUnsupported = errors.New("codex desktop app is only available for macOS and Windows")
+	codexAppEnsureProxyURLFn        = ensureCodexAppGatewayURL
+	codexAppCommandContext          = exec.CommandContext
+	codexAppRunCommand              = runCodexAppLoggedCommand
+	codexAppCommandOutput           = runCodexAppCommandOutput
+	codexAppDownloadPackageFn       = downloadCodexAppPackage
+	codexAppLookPath                = exec.LookPath
+	codexAppUserHomeDir             = os.UserHomeDir
+	codexAppMacSystemAppsDir        = "/Applications"
+	codexAppWSLPathFn               = defaultCodexAppWSLPath
+	codexAppWindowsManagedRootFn    = defaultCodexAppWindowsManagedRoot
+	codexAppProxyPollInterval       = 200 * time.Millisecond
+	codexAppProxyReadyTimeout       = 15 * time.Second
+	codexAppMacInstallURL           = func() string { return codexDesktopMacDownloadURLForArch(codexAppGOARCH()) }
+	codexAppUpgradeManagedInstallFn = upgradeCodexWindowsManagedInstall
+	errCodexDesktopAppUnsupported   = errors.New("codex desktop app is only available for macOS and Windows")
 )
 
 type codexAppOptions struct {

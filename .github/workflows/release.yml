@@ -716,6 +716,8 @@ jobs:
           grep -q 'Next launch will ask whether to configure proxy mode.' <<<"$reset_out"
           app_help="$("$HOME/.local/bin/cxp" app --help)"
           grep -q 'Install and launch the Codex desktop app' <<<"$app_help"
+          root_help="$("$HOME/.local/bin/cxp" --help)"
+          grep -q -- "--upgrade-codex-app" <<<"$root_help"
           app_auth_help="$("$HOME/.local/bin/cxp" app auth --help)"
           grep -q 'Authenticate Codex for the desktop app' <<<"$app_auth_help"
           if [[ "$RUNNER_OS" == "Linux" ]]; then
@@ -792,6 +794,7 @@ jobs:
           $resetOut | Out-Default
           if ($resetOut -notmatch "profiles=0 instances=0 stopped=0 failed=0") { throw "proxy reset smoke did not report empty reset counts" }
           if ($resetOut -notmatch "Next launch will ask whether to configure proxy mode.") { throw "proxy reset smoke did not mention next prompt" }
+          & $cxp --help | Select-String "--upgrade-codex-app" | Out-Null
           & $cxp app --help | Select-String "Install and launch the Codex desktop app" | Out-Null
           & $cxp app auth --help | Select-String "Authenticate Codex for the desktop app" | Out-Null
           $env:CODEX_HELPER_BIN = $exe
