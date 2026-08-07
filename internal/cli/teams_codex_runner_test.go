@@ -1147,6 +1147,44 @@ func TestTeamsCodexExecutorSwitchesProfileRunnerWithoutChangingThread(t *testing
 	}
 }
 
+func TestTeamsCodexExecutorTracksBaseRunnerBeforeModelSwitch(t *testing.T) {
+	baseSnapshot := modelprofile.Snapshot{Name: "gpt-origin", Provider: modelprofile.DefaultProvider, Model: "gpt-origin", Revision: 1}
+	targetSnapshot := modelprofile.Snapshot{Name: "ih-target", Provider: "chat-compatible", Model: "nvidia/nvidia/eccn-nemotron-3-ultra", Revision: 2}
+	baseRunner := &fakeTeamsRunner{}
+	targetRunner := &fakeTeamsRunner{}
+	sessionID := "session-base-switch"
+	baseSession := &teams.Session{ID: sessionID, ModelProfile: baseSnapshot}
+	targetSession := &teams.Session{ID: sessionID, ModelProfile: targetSnapshot, ModelGeneration: 1}
+	baseKey := modelProfileRunnerSessionCacheKey(baseSession)
+	targetKey := modelProfileRunnerSessionCacheKey(targetSession)
+	executor := teamsCodexExecutor{
+		runner:               baseRunner,
+		modelProfileSnapshot: baseSnapshot,
+		runnerCacheMu:        &sync.Mutex{},
+		runnersByProfile:     map[string]codexrunner.Runner{targetKey: targetRunner},
+		runnerKeyBySession:   map[string]string{},
+	}
+
+	got, err := executor.runnerForSessionProfile(context.Background(), baseSession)
+	if err != nil || got != baseRunner {
+		t.Fatalf("base runner = %p err=%v, want %p", got, err, baseRunner)
+	}
+	if executor.runnerKeyBySession[sessionID] != baseKey || executor.runnersByProfile[baseKey] != baseRunner {
+		t.Fatalf("base runner cache = key:%q runners:%#v, want key:%q and base runner", executor.runnerKeyBySession[sessionID], executor.runnersByProfile, baseKey)
+	}
+
+	got, err = executor.runnerForSessionProfile(context.Background(), targetSession)
+	if err != nil || got != targetRunner {
+		t.Fatalf("target runner = %p err=%v, want %p", got, err, targetRunner)
+	}
+	if _, exists := executor.runnersByProfile[baseKey]; exists {
+		t.Fatal("base runner remains cached after model switch")
+	}
+	if executor.runnerKeyBySession[sessionID] != targetKey {
+		t.Fatalf("session runner key = %q, want %q", executor.runnerKeyBySession[sessionID], targetKey)
+	}
+}
+
 func TestTeamsCodexExecutorReturnToBaseProfileUsesFreshGenerationRunner(t *testing.T) {
 	baseSnapshot := modelprofile.Snapshot{Name: "gpt-origin", Provider: modelprofile.DefaultProvider, Model: "gpt-origin", Revision: 1}
 	baseRunner := &fakeTeamsRunner{}

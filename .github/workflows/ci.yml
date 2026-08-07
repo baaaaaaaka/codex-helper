@@ -1667,8 +1667,8 @@ jobs:
           .\scripts\ci\skills_migration_smoke.ps1
           Remove-Item Env:\CODEX_HELPER_BIN
 
-      - name: Codex desktop app unsupported smoke (Linux/macOS)
-        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
+      - name: Codex desktop app unsupported smoke (Linux)
+        if: matrix.shard == 'platform-integration' && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1678,6 +1678,12 @@ jobs:
             exit 1
           fi
           grep -q "only available for macOS and Windows" "$RUNNER_TEMP/codex-desktop-unsupported.out"
+
+      - name: Codex desktop app updater unsupported smoke (Linux/macOS)
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
           if go run ./cmd/codex-proxy --config "$RUNNER_TEMP/codex-desktop-upgrade-unsupported.json" --upgrade-codex-app >"$RUNNER_TEMP/codex-desktop-upgrade-unsupported.out" 2>&1; then
             echo "cxp --upgrade-codex-app unexpectedly succeeded outside Windows/WSL" >&2
             cat "$RUNNER_TEMP/codex-desktop-upgrade-unsupported.out" >&2

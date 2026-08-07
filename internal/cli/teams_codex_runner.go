@@ -562,6 +562,17 @@ func (e teamsCodexExecutor) runnerForSessionProfile(ctx context.Context, session
 		return e.runner, nil
 	}
 	if session.ModelGeneration == 0 && modelProfileSnapshotKey(session.ModelProfile) == modelProfileSnapshotKey(e.modelProfileSnapshot) {
+		// The base runner is selected before a profile-specific cache entry is
+		// needed. Remember it for this session so the first model-generation
+		// switch can close the process before another runner resumes the same
+		// Codex thread.
+		if sessionID := strings.TrimSpace(session.ID); sessionID != "" && e.runnerCacheMu != nil && e.runnersByProfile != nil && e.runnerKeyBySession != nil {
+			key := modelProfileRunnerSessionCacheKey(session)
+			e.runnerCacheMu.Lock()
+			e.runnersByProfile[key] = e.runner
+			e.runnerKeyBySession[sessionID] = key
+			e.runnerCacheMu.Unlock()
+		}
 		return e.runner, nil
 	}
 	key := modelProfileRunnerSessionCacheKey(session)

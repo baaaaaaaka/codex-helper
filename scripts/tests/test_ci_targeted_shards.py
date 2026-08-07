@@ -152,9 +152,13 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp",
             job,
         )
-        unsupported = blocks["Codex desktop app unsupported smoke (Linux/macOS)"]
-        self.assertIn("--upgrade-codex-app", unsupported)
-        self.assertIn("only supported on native Windows or WSL", unsupported)
+        unsupported = blocks["Codex desktop app unsupported smoke (Linux)"]
+        self.assertIn("app --cwd", unsupported)
+        self.assertIn("only available for macOS and Windows", unsupported)
+
+        updater_unsupported = blocks["Codex desktop app updater unsupported smoke (Linux/macOS)"]
+        self.assertIn("--upgrade-codex-app", updater_unsupported)
+        self.assertIn("only supported on native Windows or WSL", updater_unsupported)
 
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
         self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)

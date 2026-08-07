@@ -49,6 +49,7 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: false,
 		SilenceUsage:  true,
 		Version:       buildVersion(),
+		Args:          cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_ = args
 			if opts.upgradeCodex && opts.upgradeCodexApp {
