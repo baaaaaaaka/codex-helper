@@ -61,7 +61,7 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"parent-codex-thread"}`,
 		`{"type":"turn.started","turn_id":"cutoff-codex-turn"}`,
-		`{"type":"event_msg","payload":{"type":"agent_message","id":"history-final","turn_id":"cutoff-codex-turn","phase":"final_answer","message":"history before fork"}}`,
+		`{"type":"response_item","payload":{"id":"history-final","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"cutoff-codex-turn"},"content":[{"type":"output_text","text":"history before fork"}]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)

@@ -658,7 +658,13 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 	itemType := jsonStringField(payload, "type")
 	sourceID := jsonStringField(payload, "id", "item_id", "itemId", "call_id", "callId")
 	threadID = firstNonEmptyString(jsonStringField(payload, "thread_id", "threadId"), threadID)
-	turnID = firstNonEmptyString(jsonStringField(payload, "turn_id", "turnId"), nestedJSONID(payload, "turn"), turnID)
+	metadata, _ := jsonObjectField(payload, "internal_chat_message_metadata_passthrough")
+	turnID = firstNonEmptyString(
+		jsonStringField(payload, "turn_id", "turnId"),
+		nestedJSONID(payload, "turn"),
+		jsonStringField(metadata, "turn_id", "turnId"),
+		turnID,
+	)
 	phase := jsonStringField(payload, "phase")
 	if responseItemIsInternalAgentMessage(payload) {
 		// Keep only the source identity and position.  The collaboration

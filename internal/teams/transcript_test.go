@@ -104,6 +104,32 @@ func TestParseCodexTranscriptHidesInternalResponseItemAgentMessages(t *testing.T
 	assertTranscriptRecord(t, got.Records[4], "visible-final", "source:visible-final", TranscriptKindAssistant, "real final answer", 5)
 }
 
+func TestParseCodexTranscriptReadsResponseItemTurnFromMetadata(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"user-1","type":"message","role":"user","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"content":[{"type":"input_text","text":"prompt"}]}}`,
+		`{"type":"response_item","payload":{"id":"assistant-1","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"content":[{"type":"output_text","text":"answer"}]}}`,
+		`{"type":"response_item","payload":{"id":"assistant-direct","type":"message","role":"assistant","phase":"final_answer","turn_id":"turn-direct","internal_chat_message_metadata_passthrough":{"turn_id":"turn-ignored"},"content":[{"type":"output_text","text":"direct answer"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 3 {
+		t.Fatalf("records = %#v, want 3", got.Records)
+	}
+	wantTurns := map[string]string{
+		"user-1":           "turn-1",
+		"assistant-1":      "turn-1",
+		"assistant-direct": "turn-direct",
+	}
+	for _, record := range got.Records {
+		if want, ok := wantTurns[record.ItemID]; !ok || record.TurnID != want {
+			t.Fatalf("record %q TurnID = %q, want %q", record.ItemID, record.TurnID, want)
+		}
+	}
+}
+
 func TestParseCodexTranscriptClassifiesResponseItemCommentaryAsStatus(t *testing.T) {
 	input := strings.Join([]string{
 		`{"type":"response_item","payload":{"id":"commentary-1","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}`,
