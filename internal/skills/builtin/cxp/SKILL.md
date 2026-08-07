@@ -1,13 +1,19 @@
 ---
 name: cxp
-description: "CXP/codex-proxy/codex-helper operations: proxy/SSH profiles, model profiles/Responses adapter/standard approvals, Teams helper/control/work chats, cross-machine delegation/remote agents, Codex history or skills, upgrades, beacon/execution target/profile switching, Slurm/LSF/GPU/local execution, and safe handoffs that can interrupt Codex."
+description: "Operate installed CXP/codex-proxy/codex-helper: model and SSH/proxy profiles, Responses adapter, approvals, Teams, beacon targets, delegation, upgrades, operational Codex history, and CXP-managed skills. Exclude conceptual history, skill authoring, source changes, and unrelated scheduler/GPU work."
 ---
 
 # cxp
 
 Use `cxp` (or `codex-proxy`); in Teams turns prefer `$CODEX_HELPER_CLI_PATH` because service PATH may differ.
 
-Trigger on related requests even when the user does not say `cxp`: model profiles, third-party model JSON subscriptions, Responses adapter, standard approval runtime, beacon mode, execution target/profile switching, GPU/Slurm/LSF/local execution, Teams helper/control/work chats, cross-machine delegation/remote agents/asking another signed-in machine, proxy/SSH profiles, history, skills, and upgrades.
+Trigger for installed CXP operations, even if they do not name CXP:
+model/profile routing, Responses adapter, standard approvals, beacon
+targets, Teams helper/control/work chats, cross-machine delegation, SSH/proxy
+profiles, upgrades, operational Codex history through the CXP CLI/store, or
+CXP-managed skill operations (install-builtin, list, add, sync,
+doctor, push, or remove). Do not trigger for conceptual history, generic skill
+authoring, source changes, or unrelated GPU/scheduler work.
 
 Read live help: `cxp --help`, `cxp <command> --help`, and `cxp <command> <subcommand> --help`. For the command map and workflows, load `references/commands.md`.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CXP Operations"
+  short_description: "Operate an installed CXP instance safely"
+  default_prompt: "Use $cxp to operate the installed CXP capability requested by the user."

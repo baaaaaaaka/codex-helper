@@ -32,6 +32,9 @@ func TestInstallBuiltinsPublishesCxpSkill(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(installed.TargetPath, "references", "delegation.md")); err != nil {
 		t.Fatalf("installed delegation reference missing: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(installed.TargetPath, "agents", "openai.yaml")); err != nil {
+		t.Fatalf("installed OpenAI metadata missing: %v", err)
+	}
 	manifest, ok, err := readExportManifest(filepath.Join(installed.TargetPath, manifestFilename))
 	if err != nil {
 		t.Fatalf("read manifest: %v", err)
@@ -188,29 +191,40 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 	skill := files["SKILL.md"]
 	description := builtinSkillDescriptionForTest(t, skill)
 	for _, want := range []string{
-		"codex-helper",
-		"proxy/SSH profiles",
-		"model profiles/Responses adapter/standard approvals",
-		"Teams helper/control/work chats",
-		"cross-machine delegation/remote agents",
-		"Codex history or skills",
+		"installed CXP/codex-proxy/codex-helper",
+		"model and SSH/proxy profiles",
+		"Responses adapter",
+		"approvals",
+		"Teams",
+		"beacon targets",
+		"delegation",
 		"upgrades",
-		"beacon/execution target/profile switching",
-		"Slurm/LSF/GPU/local execution",
-		"interrupt Codex",
+		"operational Codex history",
+		"CXP-managed skills",
+		"Exclude conceptual history",
+		"skill authoring",
+		"source changes",
+		"unrelated scheduler/GPU work",
 	} {
 		if !strings.Contains(description, want) {
 			t.Fatalf("frontmatter description missing trigger %q:\n%s", want, description)
 		}
 	}
 	for _, want := range []string{
-		"even when the user does not say `cxp`",
-		"model profiles",
+		"even if they do not",
+		"name CXP",
+		"model/profile routing",
 		"Responses adapter",
-		"standard approval runtime",
-		"execution target/profile switching",
-		"GPU/Slurm/LSF/local execution",
-		"cross-machine delegation/remote agents/asking another signed-in machine",
+		"standard approvals",
+		"beacon targets",
+		"cross-machine delegation",
+		"operational Codex history through the CXP CLI/store",
+		"CXP-managed skill operations",
+		"install-builtin, list, add, sync",
+		"doctor, push, or remove",
+		"Do not trigger for conceptual history",
+		"source changes",
+		"unrelated GPU/scheduler work",
 		"For the command map and workflows, load `references/commands.md`",
 		"For natural-language cross-machine requests, load `references/delegation.md`",
 	} {
@@ -220,6 +234,20 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 	}
 	if got, max := len([]rune(skill)), 2800; got > max {
 		t.Fatalf("SKILL.md length = %d runes, want <= %d so the trigger stays token-efficient", got, max)
+	}
+}
+
+func TestBuiltinCxpSkillPublishesOpenAIInterfaceMetadata(t *testing.T) {
+	files := builtinCxpSkillTestFiles(t)
+	metadata := files["agents/openai.yaml"]
+	for _, want := range []string{
+		"display_name: \"CXP Operations\"",
+		"short_description: \"Operate an installed CXP instance safely\"",
+		"default_prompt: \"Use $cxp to operate the installed CXP capability requested by the user.\"",
+	} {
+		if !strings.Contains(metadata, want) {
+			t.Fatalf("agents/openai.yaml missing %q:\n%s", want, metadata)
+		}
 	}
 }
 
@@ -305,7 +333,7 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 		{
 			name: "natural language cross machine delegation",
 			required: []string{
-				"cross-machine delegation/remote agents/asking another signed-in machine",
+				"cross-machine delegation",
 				"cxp delegate resolve --query <text> --json",
 				"cxp delegate start --candidate-token <token> --task-file <path> --json",
 				"cxp delegate result --id <delegation-id> --claim-id <claim>",
@@ -391,8 +419,8 @@ func builtinCxpSkillTestFiles(t *testing.T) map[string]string {
 	for _, file := range tree.Files {
 		files[file.RelPath] = string(file.Data)
 	}
-	if files["SKILL.md"] == "" || files["references/commands.md"] == "" || files["references/delegation.md"] == "" {
-		t.Fatalf("builtin cxp skill files = %v, want SKILL.md and references", sortedBuiltinTestKeys(files))
+	if files["SKILL.md"] == "" || files["agents/openai.yaml"] == "" || files["references/commands.md"] == "" || files["references/delegation.md"] == "" {
+		t.Fatalf("builtin cxp skill files = %v, want SKILL.md, interface metadata, and references", sortedBuiltinTestKeys(files))
 	}
 	return files
 }

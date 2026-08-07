@@ -59,6 +59,9 @@ if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "bui
 $builtinReference = Join-Path $builtinSkill "references\commands.md"
 if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
 if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
+$builtinMetadata = Join-Path $builtinSkill "agents\openai.yaml"
+if (!(Test-Path -LiteralPath $builtinMetadata)) { throw "builtin cxp OpenAI metadata missing" }
+if ((Get-Content -Raw -LiteralPath $builtinMetadata) -notmatch [regex]::Escape('Use $cxp')) { throw "builtin cxp OpenAI metadata missing default prompt" }
 $listBeforeAdd = & $helperExe @helperArgs --config $config skills --codex-dir $codexDir list
 if (($listBeforeAdd -join "`n") -notmatch "No skill subscriptions.") { throw "builtin skill should not appear as a git subscription: $listBeforeAdd" }
 
