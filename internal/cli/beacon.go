@@ -1300,6 +1300,7 @@ func runBeaconWorkerJob(ctx context.Context, job beacon.JobAttempt, codexPath st
 		Command:            command,
 		AppServerArgs:      []string{"--analytics-default-enabled"},
 		ExtraEnv:           runtimeContract.Environment,
+		CodexHome:          paths.CodexDir,
 		WorkingDir:         job.Payload.WorkingDir,
 		BackfillThreadName: true,
 	}

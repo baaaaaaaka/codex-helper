@@ -182,6 +182,7 @@ func newManagedTeamsCodexExecutorWithContext(
 			Command:              command,
 			AppServerArgs:        append(append([]string{"--analytics-default-enabled"}, appServerExtraArgs...), appServerModelArgs...),
 			ExtraEnv:             extraEnv,
+			CodexHome:            paths.CodexDir,
 			WorkingDir:           strings.TrimSpace(workDir),
 			Timeout:              timeout,
 			MetadataOnlyResume:   true,

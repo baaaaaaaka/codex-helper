@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -563,6 +564,8 @@ func runAppServerProcessHelper(args []string) int {
 			return 3
 		}
 		return 0
+	case "mcp-jsonl":
+		return runMCPJSONLProcessHelper(args[1:])
 	case "ready-block":
 		fmt.Fprintln(os.Stdout, `{"ready":true}`)
 		time.Sleep(24 * time.Hour)
@@ -591,4 +594,82 @@ func runAppServerProcessHelper(args []string) int {
 		fmt.Fprintf(os.Stderr, "unknown helper mode %q\n", args[0])
 		return 2
 	}
+}
+
+// runMCPJSONLProcessHelper is a real child-process JSONL harness for the
+// runner/coordinator tests. It deliberately models only the app-server
+// methods needed by the test; it does not require a model, network, or MCP
+// credentials. Each request is handled independently so a blocked reload
+// cannot prevent a turn/start response from being emitted.
+func runMCPJSONLProcessHelper(args []string) int {
+	if len(args) < 3 {
+		fmt.Fprintln(os.Stderr, "mcp-jsonl requires reload-count, reload-complete, and release paths")
+		return 2
+	}
+	reloadCountPath := args[0]
+	reloadCompletePath := args[1]
+	releasePath := args[2]
+	var outputMu sync.Mutex
+	var reloadMu sync.Mutex
+	var workers sync.WaitGroup
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		var request appServerRequest
+		if err := json.Unmarshal(scanner.Bytes(), &request); err != nil {
+			fmt.Fprintf(os.Stderr, "decode mcp-jsonl request: %v\n", err)
+			return 3
+		}
+		if request.Method == appServerMethodInitialized {
+			continue
+		}
+		requestCopy := request
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			switch requestCopy.Method {
+			case appServerMethodInitialize, appServerMethodThreadList:
+				writeMCPJSONLResult(&outputMu, requestCopy.ID, map[string]any{"data": []any{}})
+			case appServerMethodTurnStart:
+				writeMCPJSONLResult(&outputMu, requestCopy.ID, map[string]any{
+					"turn": map[string]any{
+						"id":     fmt.Sprintf("turn-%d", requestCopy.ID),
+						"status": "completed",
+						"items":  []any{map[string]any{"type": "agentMessage", "text": "done"}},
+					},
+				})
+			case appServerMethodMCPServerReload:
+				reloadMu.Lock()
+				count := 0
+				if raw, err := os.ReadFile(reloadCountPath); err == nil {
+					count, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
+				}
+				_ = os.WriteFile(reloadCountPath, []byte(strconv.Itoa(count+1)), 0o600)
+				reloadMu.Unlock()
+				for {
+					if _, err := os.Stat(releasePath); err == nil {
+						break
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				writeMCPJSONLResult(&outputMu, requestCopy.ID, map[string]any{})
+				_ = os.WriteFile(reloadCompletePath, []byte(strconv.Itoa(count+1)), 0o600)
+			}
+		}()
+	}
+	workers.Wait()
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "scan mcp-jsonl stdin: %v\n", err)
+		return 4
+	}
+	return 0
+}
+
+func writeMCPJSONLResult(outputMu *sync.Mutex, id int64, result any) {
+	outputMu.Lock()
+	defer outputMu.Unlock()
+	_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"result":  result,
+	})
 }
