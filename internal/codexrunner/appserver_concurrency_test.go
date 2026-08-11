@@ -538,6 +538,8 @@ func TestAppServerRunnerUnconfirmedExplicitInterruptRetriesBeforeNextTurn(t *tes
 	}
 	if err := <-firstDone; !IsKind(err, ErrorCodex) {
 		t.Fatalf("first turn error = %v, want unconfirmed Codex error", err)
+	} else if !errors.Is(err, ErrTurnCancelFenceUnconfirmed) {
+		t.Fatalf("first turn error = %v, want cancellation-fence sentinel", err)
 	}
 
 	secondDone := make(chan error, 1)
@@ -612,6 +614,12 @@ func TestAppServerRunnerPersistentCancelFenceDoesNotStartSameThread(t *testing.T
 	})
 	if !IsKind(err, ErrorCodex) {
 		t.Fatalf("next same-thread turn error = %v, want recoverable cancel-fence error", err)
+	}
+	if !errors.Is(err, ErrTurnCancelFenceUnconfirmed) {
+		t.Fatalf("next same-thread turn error = %v, want cancellation-fence sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "Previous Codex turn cancellation is still unconfirmed; no new turn was started") {
+		t.Fatalf("next same-thread turn error = %v, want explicit cancellation-fence diagnostic", err)
 	}
 	select {
 	case sequence := <-transport.started:

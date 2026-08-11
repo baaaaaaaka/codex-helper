@@ -157,6 +157,9 @@ type AppServerRunner struct {
 	completedServerRequests map[string][]byte
 	completedServerOrder    []string
 	closeHookOnce           sync.Once
+	modelCatalogMu          sync.RWMutex
+	modelCatalog            []ModelInfo
+	modelCatalogReady       bool
 }
 
 type appServerResponseDelivery struct {
@@ -191,6 +194,11 @@ type appServerTurnCancelFence struct {
 	// and Codex did not return the exact id within the confirmation window.
 	turnID string
 }
+
+// ErrTurnCancelFenceUnconfirmed identifies a same-thread cancellation whose
+// terminal state is not proven. Callers must preserve a durable ownership
+// barrier instead of treating this as an ordinary failed user request.
+var ErrTurnCancelFenceUnconfirmed = errors.New("codex turn cancellation fence is unconfirmed")
 
 func NewAppServerRunner(transport AppServerLineTransport) *AppServerRunner {
 	return &AppServerRunner{Transport: transport, Command: defaultCodexCommand}
@@ -336,13 +344,30 @@ func (r *AppServerRunner) threadStateConfirmationContext() (context.Context, con
 }
 
 func (r *AppServerRunner) confirmTurnStopped(threadID string, turnID string, subscription *appServerTurnSubscriber) error {
+	return r.confirmTurnStoppedWithContext(context.Background(), threadID, turnID, subscription)
+}
+
+// confirmTurnStoppedWithContext is the bounded variant used by callers that
+// probe a persisted cancellation fence from a hot path.  The legacy wrapper
+// above intentionally keeps the original independent confirmation timeout for
+// an in-flight explicit cancellation, whose parent context is commonly
+// canceled by the interrupt itself.
+func (r *AppServerRunner) confirmTurnStoppedWithContext(parent context.Context, threadID string, turnID string, subscription *appServerTurnSubscriber) error {
 	threadID = strings.TrimSpace(threadID)
 	turnID = strings.TrimSpace(turnID)
 	if threadID == "" || turnID == "" {
 		return &Error{Kind: ErrorInvalidRequest, Message: "thread id and turn id are required to confirm cancellation"}
 	}
 
-	confirmationCtx, cancelConfirmation := r.turnInterruptConfirmationContext()
+	if parent == nil {
+		parent = context.Background()
+	}
+	// When the caller supplies a bounded reconciliation context, split the
+	// remaining budget between the interrupt and thread-state probes.  Deriving
+	// both probes from the same parent with the full timeout let the interrupt
+	// consume the entire parent deadline, making the idle-state fallback
+	// deterministically expire without being attempted.
+	confirmationCtx, cancelConfirmation := withConfirmationProbeTimeout(parent, appServerTurnInterruptConfirmationTimeout)
 	interruptErr := r.requestTurnInterrupt(confirmationCtx, TurnRef{ThreadID: threadID, TurnID: turnID})
 	if interruptErr == nil && subscription != nil {
 		interruptErr = r.waitForTurnTerminal(confirmationCtx, subscription, threadID, turnID)
@@ -355,7 +380,7 @@ func (r *AppServerRunner) confirmTurnStopped(threadID string, turnID string, sub
 		return nil
 	}
 
-	stateCtx, cancelState := r.threadStateConfirmationContext()
+	stateCtx, cancelState := withConfirmationProbeTimeout(parent, appServerThreadStateConfirmationTimeout)
 	idle, stateErr := r.threadIdle(stateCtx, threadID)
 	cancelState()
 	if stateErr == nil && idle {
@@ -365,14 +390,35 @@ func (r *AppServerRunner) confirmTurnStopped(threadID string, turnID string, sub
 		return &Error{
 			Kind:    ErrorCodex,
 			Message: "Codex turn cancellation could not be confirmed and thread state could not be read",
-			Err:     errors.Join(interruptErr, stateErr),
+			Err:     errors.Join(ErrTurnCancelFenceUnconfirmed, interruptErr, stateErr),
 		}
 	}
 	return &Error{
 		Kind:    ErrorCodex,
 		Message: "Codex turn cancellation was not confirmed and the thread remains active",
-		Err:     interruptErr,
+		Err:     errors.Join(ErrTurnCancelFenceUnconfirmed, interruptErr),
 	}
+}
+
+func withConfirmationProbeTimeout(parent context.Context, preferred time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return context.WithTimeout(parent, 0)
+		}
+		remaining /= 2
+		if remaining <= 0 {
+			remaining = time.Nanosecond
+		}
+		if preferred > 0 && remaining > preferred {
+			remaining = preferred
+		}
+		return context.WithTimeout(parent, remaining)
+	}
+	return withOptionalTimeout(parent, preferred)
 }
 
 func (r *AppServerRunner) waitForTurnTerminal(ctx context.Context, subscription *appServerTurnSubscriber, threadID string, turnID string) error {
@@ -440,14 +486,14 @@ func (r *AppServerRunner) interruptStartedTurn(threadID string, turnID string, g
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
 		gate.cancelFence = &appServerTurnCancelFence{}
-		return &Error{Kind: ErrorCodex, Message: "Codex turn cancel could not be confirmed because turn/start did not return an exact turn id"}
+		return &Error{Kind: ErrorCodex, Message: "Codex turn cancel could not be confirmed because turn/start did not return an exact turn id", Err: ErrTurnCancelFenceUnconfirmed}
 	}
 	if err := r.confirmTurnStopped(threadID, turnID, subscription); err != nil {
 		gate.cancelFence = &appServerTurnCancelFence{turnID: turnID}
 		return &Error{
 			Kind:    ErrorCodex,
 			Message: "Codex turn cancel was not confirmed; cleanup will be retried before the next same-thread turn",
-			Err:     err,
+			Err:     errors.Join(ErrTurnCancelFenceUnconfirmed, err),
 		}
 	}
 	gate.cancelFence = nil
@@ -455,12 +501,19 @@ func (r *AppServerRunner) interruptStartedTurn(threadID string, turnID string, g
 }
 
 func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appServerThreadTurnGate) error {
+	return r.reconcileTurnCancelFenceWithContext(context.Background(), threadID, gate)
+}
+
+func (r *AppServerRunner) reconcileTurnCancelFenceWithContext(ctx context.Context, threadID string, gate *appServerThreadTurnGate) error {
 	if gate == nil || gate.cancelFence == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	turnID := strings.TrimSpace(gate.cancelFence.turnID)
 	if turnID == "" {
-		stateCtx, cancelState := r.threadStateConfirmationContext()
+		stateCtx, cancelState := withOptionalTimeout(ctx, appServerThreadStateConfirmationTimeout)
 		idle, err := r.threadIdle(stateCtx, threadID)
 		cancelState()
 		if err != nil || !idle {
@@ -470,21 +523,41 @@ func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appSer
 			return &Error{
 				Kind:    ErrorCodex,
 				Message: "Previous Codex turn cancellation is still unconfirmed; no new turn was started. Retry this request later",
-				Err:     err,
+				Err:     errors.Join(ErrTurnCancelFenceUnconfirmed, err),
 			}
 		}
 		gate.cancelFence = nil
 		return nil
 	}
-	if err := r.confirmTurnStopped(threadID, turnID, nil); err != nil {
+	if err := r.confirmTurnStoppedWithContext(ctx, threadID, turnID, nil); err != nil {
 		return &Error{
 			Kind:    ErrorCodex,
 			Message: "Previous Codex turn cancellation is still unconfirmed; no new turn was started. Retry this request later",
-			Err:     err,
+			Err:     errors.Join(ErrTurnCancelFenceUnconfirmed, err),
 		}
 	}
 	gate.cancelFence = nil
 	return nil
+}
+
+// ReconcileTurnCancelFence exposes the same-thread cancellation fence without
+// starting a new turn. Teams uses this while an unresolved execution anchor
+// is blocking dispatch: a confirmed fence is explicit app-server ownership
+// evidence, while an unconfirmed fence remains fail-closed.
+func (r *AppServerRunner) ReconcileTurnCancelFence(ctx context.Context, threadID string) (bool, error) {
+	threadID = strings.TrimSpace(threadID)
+	if r == nil || threadID == "" {
+		return false, nil
+	}
+	gate, unlock := r.lockThreadTurn(threadID)
+	defer unlock()
+	if gate == nil || gate.cancelFence == nil {
+		return false, nil
+	}
+	if err := r.reconcileTurnCancelFenceWithContext(ctx, threadID, gate); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func (r *AppServerRunner) ReadThread(ctx context.Context, threadID string) (Thread, error) {
@@ -883,6 +956,10 @@ func (r *AppServerRunner) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		}
 		next := strings.TrimSpace(page.NextCursor)
 		if next == "" {
+			r.modelCatalogMu.Lock()
+			r.modelCatalog = cloneModelInfos(out)
+			r.modelCatalogReady = true
+			r.modelCatalogMu.Unlock()
 			return out, nil
 		}
 		if seen[next] {
@@ -891,6 +968,33 @@ func (r *AppServerRunner) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		seen[next] = true
 		cursor = next
 	}
+}
+
+// CachedModels returns only a catalog populated by an earlier successful
+// model/list request. It deliberately does not call ensureReady or touch the
+// transport, so a status/list command cannot start a new app-server.
+func (r *AppServerRunner) CachedModels() ([]ModelInfo, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.modelCatalogMu.RLock()
+	defer r.modelCatalogMu.RUnlock()
+	if !r.modelCatalogReady {
+		return nil, false
+	}
+	return cloneModelInfos(r.modelCatalog), true
+}
+
+func cloneModelInfos(models []ModelInfo) []ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	out := make([]ModelInfo, len(models))
+	for i, model := range models {
+		out[i] = model
+		out[i].ReasoningEfforts = append([]ReasoningEffortOption(nil), model.ReasoningEfforts...)
+	}
+	return out
 }
 
 func appServerTurnInput(input TurnInput) []map[string]string {
@@ -1603,6 +1707,10 @@ func (r *AppServerRunner) closeTransportLocked() error {
 	r.completedServerOrder = nil
 	r.protocolMu.Unlock()
 	r.ready = false
+	r.modelCatalogMu.Lock()
+	r.modelCatalog = nil
+	r.modelCatalogReady = false
+	r.modelCatalogMu.Unlock()
 	return err
 }
 

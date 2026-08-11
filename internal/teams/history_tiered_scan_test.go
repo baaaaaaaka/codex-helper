@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 func TestHistoryTieredStatDetectsOnlyChangedFiles(t *testing.T) {
@@ -36,6 +38,41 @@ func TestHistoryTieredStatDetectsOnlyChangedFiles(t *testing.T) {
 	}
 	if len(changes) != 1 || changes[0].Path != paths[2] {
 		t.Fatalf("changes = %#v, want only %s", changes, paths[2])
+	}
+}
+
+func TestHistoryTieredStatReconcileDetectsSameSizeSameMtimeRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	original := []byte("abcdef\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("write original: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+	state := historyTieredFileState{
+		Path:              path,
+		Size:              info.Size(),
+		ModTime:           info.ModTime(),
+		Offset:            info.Size(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, info.Size()),
+	}
+	if state.SourceFingerprint == "" {
+		t.Fatal("missing original source fingerprint")
+	}
+	if err := os.WriteFile(path, []byte("uvwxyz\n"), 0o600); err != nil {
+		t.Fatalf("rewrite same-size file: %v", err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore mtime: %v", err)
+	}
+	changes, err := historyTieredDetectStatChanges([]string{path}, map[string]historyTieredFileState{path: state}, true)
+	if err != nil {
+		t.Fatalf("historyTieredDetectStatChanges: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Path != path {
+		t.Fatalf("changes = %#v, want rewritten path", changes)
 	}
 }
 
@@ -143,11 +180,8 @@ func TestHistoryTieredScanTailMultipleFinalAnswersInOneTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if len(result.Finals) != 2 {
-		t.Fatalf("finals = %#v, want two final_answer completions", result.Finals)
-	}
-	if result.Finals[0].Record.Text != "first final" || result.Finals[1].Record.Text != "second final" {
-		t.Fatalf("final texts = %#v", []string{result.Finals[0].Record.Text, result.Finals[1].Record.Text})
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("anonymous final pair = state=%#v finals=%#v, want unresolved with no publishable finals", result.State, result.Finals)
 	}
 }
 
@@ -463,6 +497,790 @@ func TestHistoryTieredScanTailTruncateDoesNotSkipRewrittenContent(t *testing.T) 
 	}
 	if len(recovered.Finals) != 1 || recovered.Finals[0].Record.Text != "new" {
 		t.Fatalf("recovered finals = %#v, want rewritten final", recovered.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDoesNotMarkOrdinaryNextTurnAsContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"ordinary next request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"next-turn","started_at":"2026-08-08T08:00:00Z","model_context_window":128000,"collaboration_mode_kind":"default"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"next-turn","phase":"final_answer","message":"ordinary next answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:        path,
+		Offset:      0,
+		LastFinalID: "previous-final-is-only-a-dedupe-key",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("ordinary next turn was marked unresolved continuation: %#v", result.State)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "ordinary next answer" {
+		t.Fatalf("ordinary next turn finals = %#v, want one final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDoesNotMarkLegacyOrdinaryNextTurnAsContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"legacy ordinary next request"}]}}`,
+		// Older Codex history emits normal root task_started events without
+		// started_at; model_context_window + collaboration_mode_kind are still
+		// the root-turn markers and must not be confused with a child continuation.
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"next-turn","model_context_window":128000,"collaboration_mode_kind":"plan"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"next-turn","phase":"final_answer","message":"legacy ordinary next answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:        path,
+		Offset:      0,
+		LastFinalID: "previous-final-is-only-a-dedupe-key",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("legacy ordinary next turn was marked unresolved continuation: %#v", result.State)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "legacy ordinary next answer" {
+		t.Fatalf("legacy ordinary next turn finals = %#v, want one final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDoesNotMarkLegacyCursorOrdinaryNextTurnAsContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"old-turn","phase":"final_answer","message":"old final"}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"next-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"ordinary request after legacy cursor"}]}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"next-turn","model_context_window":128000,"collaboration_mode_kind":"plan"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"next-turn","phase":"final_answer","message":"ordinary root after legacy cursor"}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:   path,
+		Size:   info.Size(),
+		Offset: info.Size(),
+		Line:   1,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("ordinary root after legacy cursor was marked unresolved: %#v", result.State)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "ordinary root after legacy cursor" {
+		t.Fatalf("ordinary root after legacy cursor finals = %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailMarksContinuationAcrossIncrementalScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer final"}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("initial scan: %v", err)
+	}
+	if first.State.LastFinalID == "" || first.State.Offset <= 0 {
+		t.Fatalf("initial scan state = %#v, want final and offset", first.State)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	_, writeErr := f.WriteString(
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"outer-turn"}}` + "\n" +
+			`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"continuation final"}}` + "\n",
+	)
+	closeErr := f.Close()
+	if writeErr != nil {
+		t.Fatalf("append continuation: %v", writeErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("close append: %v", closeErr)
+	}
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("incremental scan: %v", err)
+	}
+	if !second.State.UnresolvedContinuation {
+		t.Fatalf("incremental continuation was not marked: %#v finals=%#v", second.State, second.Finals)
+	}
+}
+
+func TestHistoryTieredLineSignalsRecognizesTaskTerminalVariants(t *testing.T) {
+	cases := []string{"task_complete", "task.completed", "task_failed", "task.failed"}
+	for _, terminal := range cases {
+		t.Run(terminal, func(t *testing.T) {
+			line := []byte(`{"type":"event_msg","payload":{"type":"` + terminal + `","task_id":"task-1"}}`)
+			signal := historyTieredLineSignals(line)
+			wantCompleted := strings.Contains(terminal, "complete")
+			if signal.TurnCompleted != wantCompleted || signal.TerminalFailed != !wantCompleted || signal.TurnID != "task-1" {
+				t.Fatalf("signal = %#v, want completed=%t failed=%t task-1", signal, wantCompleted, !wantCompleted)
+			}
+		})
+	}
+	method := historyTieredLineSignals([]byte(`{"method":"turn/completed","params":{"turn_id":"method-turn"}}`))
+	if !method.TurnCompleted || method.TurnID != "method-turn" || method.TerminalKind != "turn/completed" {
+		t.Fatalf("method terminal signal = %#v, want completed method-turn", method)
+	}
+}
+
+func TestHistoryTieredLineHintsCoverProtocolMarkerFamilies(t *testing.T) {
+	for _, marker := range historyTieredContinuationMarkers {
+		name := strings.Trim(string(marker), `"`)
+		t.Run("continuation/"+name, func(t *testing.T) {
+			hint := historyTieredLineHints([]byte(`{"type":"` + name + `"}`))
+			if !hint.MayContinuation {
+				t.Fatalf("hint = %#v, want continuation for %q", hint, name)
+			}
+		})
+	}
+	for _, marker := range historyTieredTerminalMarkers {
+		name := strings.Trim(string(marker), `"`)
+		t.Run("terminal/"+name, func(t *testing.T) {
+			line := `{"type":"` + name + `"}`
+			if name == "final_answer" {
+				line = `{"phase":"final_answer"}`
+			}
+			hint := historyTieredLineHints([]byte(line))
+			if !hint.MayTerminal {
+				t.Fatalf("hint = %#v, want terminal for %q", hint, name)
+			}
+		})
+	}
+
+	for _, line := range []string{
+		`{"turn_id":"turn-1"}`,
+		`{"turnId":"turn-2"}`,
+		`{"turn":{"id":"turn-3"}}`,
+	} {
+		hint := historyTieredLineHints([]byte(line))
+		if !hint.MayTurnField || hint.MayContinuation || hint.MayTerminal {
+			t.Fatalf("hint = %#v for provenance-only line %s, want turn field only", hint, line)
+		}
+	}
+}
+
+func TestHistoryTieredLineHintsDoNotChangeTextMarkerSemantics(t *testing.T) {
+	line := []byte(`{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"literal \"task_started\" and \"final_answer\" text"}}`)
+	hint := historyTieredLineHints(line)
+	if !hint.MayContinuation || !hint.MayTerminal {
+		t.Fatalf("hint = %#v, want conservative marker candidates", hint)
+	}
+	signal := historyTieredLineSignals(line)
+	if signal.FinalAnswer || signal.TurnCompleted || signal.TerminalFailed {
+		t.Fatalf("signal = %#v, text-only markers changed semantics", signal)
+	}
+	continuationType, _, continuation, _ := historyTieredContinuationSignal(line)
+	if continuation || continuationType != "" {
+		t.Fatalf("continuation signal = (%q, %t), text-only marker changed semantics", continuationType, continuation)
+	}
+}
+
+func TestHistoryTieredScanTailLegacyCheckpointWithoutFinalBoundaryDoesNotAcceptContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-legacy-watch"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"old-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	// This models a pre-anchor HistoryWatchCheckpoint: it resumes after a
+	// completed final but has no LastFinalID/continuation metadata yet.
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"child continuation must not be accepted"}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:   path,
+		Size:   info.Size(),
+		Offset: info.Size(),
+		Line:   3,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("legacy checkpoint accepted continuation: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 0 {
+		t.Fatalf("legacy checkpoint emitted continuation finals: %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailResponseItemOnlyChildFinalIsQuarantined(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"session_meta","payload":{"id":"thread-response-child"}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"old-final","type":"message","role":"assistant","turn_id":"outer-turn","phase":"final_answer","content":[{"type":"output_text","text":"old final"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-turn","phase":"final_answer","content":[{"type":"output_text","text":"child response-only final must not be accepted"}]}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:        path,
+		Size:        info.Size(),
+		Offset:      info.Size(),
+		Line:        2,
+		TurnID:      "outer-turn",
+		LastFinalID: "old-final",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("response_item-only child was not marked unresolved: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 0 {
+		t.Fatalf("response_item-only child emitted finals: %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailResponseItemWithoutTurnIDAfterTerminalIsQuarantined(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"thread-response-no-id"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"orphan-no-turn","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"response-only answer without turn provenance"}]}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:        path,
+		Size:        info.Size(),
+		Offset:      info.Size(),
+		Line:        1,
+		TurnID:      "outer-turn",
+		LastFinalID: "old-final",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("response_item without turn provenance was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 0 {
+		t.Fatalf("response_item without turn provenance emitted finals: %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailLegacyFinalAndTurnIdentityStillQuarantinesRootShapedContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer final"}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"legacy root-shaped child must not publish"}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:        path,
+		Size:        info.Size(),
+		Offset:      info.Size(),
+		Line:        1,
+		TurnID:      "outer-turn",
+		LastFinalID: "outer-final",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("legacy root-shaped continuation was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailLegacyTurnIDRootMarkerIsQuarantined(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer final"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"legacy turn-id child answer must not publish"}}`)
+	// This is the direct/completion-recovery legacy shape: the old checkpoint
+	// has a final dedupe key and inherited Codex turn ID, but no explicit
+	// TerminalBoundarySeen bit. A root-shaped S462 continuation must still be
+	// fail-closed until a visible external prompt proves a new owner.
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:                 path,
+		Size:                 info.Size(),
+		Offset:               info.Size(),
+		Line:                 2,
+		TurnID:               "outer-turn",
+		LastFinalID:          "outer-final",
+		TerminalBoundarySeen: false,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("legacy turn-id root marker accepted child continuation: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 0 {
+		t.Fatalf("legacy turn-id root marker emitted child final: %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailFailedTerminalQuarantinesChildResponse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"commentary","message":"work"}}`,
+		`{"type":"event_msg","payload":{"type":"task_failed","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-turn","phase":"final_answer","content":[{"type":"output_text","text":"child after failed task must not publish"}]}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:   path,
+		Size:   info.Size(),
+		Offset: info.Size(),
+		Line:   2,
+		TurnID: "outer-turn",
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("failed terminal child was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailEventMessageChildFinalIsQuarantined(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer final"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"event child final must not publish"}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path: path, Size: info.Size(), Offset: info.Size(), Line: 2,
+		TurnID: "outer-turn", LastFinalID: "outer-final", TerminalBoundarySeen: true,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("event child final was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailNormalizedTaskStartedMarksContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer final"}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil || len(first.Finals) != 1 {
+		t.Fatalf("initial scan = state=%#v finals=%#v err=%v", first.State, first.Finals, err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task.started","turn_id":"child-turn"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"normalized child final must not publish"}}`)
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("incremental scan: %v", err)
+	}
+	if !second.State.UnresolvedContinuation || len(second.Finals) != 0 {
+		t.Fatalf("normalized child continuation was accepted: state=%#v finals=%#v", second.State, second.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailS462GoalContinuationUsesRootShapedTaskStarted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		// The real s462 continuation has the same fields as a normal root
+		// task_started.  Those fields are not proof of a new Teams owner.
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-task","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+		`{"type":"response_item","payload":{"id":"goal-context","type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">Continue working toward the active thread goal.</codex_internal_context>"}]}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-task","phase":"final_answer","content":[{"type":"output_text","text":"child goal answer must remain quarantined"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("root-shaped goal continuation was not quarantined: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer answer" {
+		t.Fatalf("finals=%#v, want only the outer answer", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailTurnContextContinuationIsQuarantined(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		// Some app-server revisions use turn_context instead of task_started
+		// for the child execution boundary.
+		`{"type":"event_msg","payload":{"type":"turn_context","turn_id":"child-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"turn_context child answer must remain quarantined"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer answer" {
+		t.Fatalf("turn_context continuation was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailTurnContextAfterPromptStartsFreshRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"new explicit request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"turn_context","turn_id":"new-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"new-turn","phase":"final_answer","message":"new root answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation || len(result.Finals) != 2 || result.Finals[1].Record.Text != "new root answer" {
+		t.Fatalf("turn_context root was not released by prompt: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailAcceptsRootShapedTaskStartedAfterExternalPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"new explicit Teams request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"new-root","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"new-root","phase":"final_answer","message":"new root answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("explicit new prompt was not accepted as a new root: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 2 || result.Finals[1].Record.Text != "new root answer" {
+		t.Fatalf("finals=%#v, want outer and new-root finals", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailAcceptsRootShapedTaskStartedBeforeExternalPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	// app-server normally writes task_started before the user response_item for
+	// a fresh root turn.  The ownership hint therefore arrives after the marker
+	// that resembles an S462 goal continuation.
+	lines := []string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"new-root","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+		`{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"new explicit Teams request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"new-root","phase":"final_answer","message":"new root answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("external prompt after root marker was not accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 2 || result.Finals[1].Record.Text != "new root answer" {
+		t.Fatalf("finals=%#v, want outer and new-root finals", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDoesNotReuseOuterPromptForLaterContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		// The prompt belongs to the outer Teams turn and must not prove a
+		// root-shaped task_started emitted after that turn completed.
+		`{"type":"response_item","payload":{"id":"outer-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"outer Teams request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":128000,"collaboration_mode_kind":"default"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"child continuation must remain quarantined"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("outer prompt was reused to accept continuation: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer answer" {
+		t.Fatalf("finals=%#v, want only outer answer", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailReleasesRootMarkerWhenPromptArrivesNextScan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"new-root","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if first.State.UnresolvedContinuation || !first.State.PendingRootTaskStarted {
+		t.Fatalf("first scan state=%#v, want pending root without unresolved anchor", first.State)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"new explicit Teams request"}]}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"new-root","phase":"final_answer","message":"new root answer"}}`)
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if second.State.UnresolvedContinuation || second.State.PendingRootTaskStarted {
+		t.Fatalf("second scan state=%#v, want released root", second.State)
+	}
+	if len(second.Finals) != 1 || second.Finals[0].Record.Text != "new root answer" {
+		t.Fatalf("second scan finals=%#v, want new root final", second.Finals)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaBlocksPendingRootContinuationRecords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-linked-s462"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial transcript: %v", err)
+	}
+	checkpoint := teamstore.ImportCheckpoint{
+		SourcePath:     path,
+		LastRecordID:   "outer-final",
+		LastSourceLine: 3,
+		LastOffset:     info.Size(),
+		SourceSize:     info.Size(),
+		SourceModTime:  info.ModTime(),
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-task","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`)
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"goal-context","type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">Continue.</codex_internal_context>"}]}}`)
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-task","phase":"final_answer","content":[{"type":"output_text","text":"orphan S462 answer"}]}}`)
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, checkpoint, "thread-linked-s462", "thread-linked-s462")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcript.UnresolvedContinuation && !transcript.PendingContinuation {
+		t.Fatalf("pending S462 continuation was not blocked: records=%#v", transcript.Records)
+	}
+	if transcript.PendingContinuation {
+		for _, record := range transcript.Records {
+			if strings.Contains(record.Text, "orphan S462 answer") {
+				t.Fatalf("pending S462 answer leaked in linked records: %#v", transcript.Records)
+			}
+		}
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyCheckpointUsesFailClosedScanner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-linked-legacy"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"outer-final","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+		`{"type":"response_item","payload":{"id":"goal-context","type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">Continue.</codex_internal_context>"}]}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-turn","phase":"final_answer","content":[{"type":"output_text","text":"legacy checkpoint child answer"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath:   path,
+		LastRecordID: "outer-final",
+	}, "thread-linked-legacy", "thread-linked-legacy")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcript.UnresolvedContinuation && !transcript.PendingContinuation {
+		t.Fatalf("legacy checkpoint child was not blocked: %#v", transcript)
+	}
+	for _, record := range transcript.Records {
+		if strings.Contains(record.Text, "legacy checkpoint child answer") {
+			t.Fatalf("legacy checkpoint child leaked through linked delta: %#v", transcript.Records)
+		}
+	}
+}
+
+func TestHistoryTieredScanTailLegacyCursorAcceptsFirstExplicitResponseItem(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := `{"type":"session_meta","payload":{"id":"thread-baseline"}}` + "\n" +
+		`{"type":"response_item","payload":{"id":"old-user","type":"message","role":"user","content":[{"type":"input_text","text":"old prompt"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(prefix), 0o600); err != nil {
+		t.Fatalf("write prefix: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat prefix: %v", err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"new-final","type":"message","role":"assistant","turn_id":"new-root-turn","phase":"final_answer","content":[{"type":"output_text","text":"first final after baseline"}]}}`)
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:   path,
+		Size:   info.Size(),
+		Offset: info.Size(),
+		Line:   2,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("first explicit response_item after baseline was blocked: %#v", result.State)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "first final after baseline" {
+		t.Fatalf("first explicit response_item finals = %#v", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDedupesSameTurnFinalMirrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":"same final mirrored by two transcript surfaces"}}`,
+		`{"type":"response_item","payload":{"id":"response-final","type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":"same final mirrored by two transcript surfaces"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(lines), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if len(result.Finals) != 1 {
+		t.Fatalf("same-turn mirrored finals = %#v, want one final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailDedupesIncrementalSameTurnFinalMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	eventFinal := `{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","turn_id":"turn-1","phase":"final_answer","message":"same final mirrored in a later response item"}}` + "\n"
+	if err := os.WriteFile(path, []byte(eventFinal), 0o600); err != nil {
+		t.Fatalf("write event final: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil || len(first.Finals) != 1 {
+		t.Fatalf("initial scan = state=%#v finals=%#v err=%v", first.State, first.Finals, err)
+	}
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"response-final","type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":"same final mirrored in a later response item"}]}}`)
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("incremental scan: %v", err)
+	}
+	if len(second.Finals) != 0 {
+		t.Fatalf("incremental same-turn mirror emitted duplicate final: %#v", second.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailTruncateClearsOldContinuationMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"thread-new"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:                   path,
+		Size:                   100,
+		Offset:                 100,
+		Line:                   3,
+		LastFinalID:            "old-final",
+		UnresolvedContinuation: true,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.Truncated || result.State.Offset != 0 || result.State.UnresolvedContinuation || result.State.LastFinalID != "" {
+		t.Fatalf("truncated state retained old boundary: %#v", result.State)
+	}
+}
+
+func TestHistoryTieredScanTailMarksNestedTurnIDExplicit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := `{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"nested-turn"},"content":[{"type":"output_text","text":"nested turn final"}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if len(result.Finals) != 1 {
+		t.Fatalf("finals = %#v, want one final", result.Finals)
+	}
+	if !result.Finals[0].Record.TurnIDExplicit || result.Finals[0].Record.TurnID != "nested-turn" {
+		t.Fatalf("nested turn provenance = explicit=%t id=%q, want explicit nested-turn", result.Finals[0].Record.TurnIDExplicit, result.Finals[0].Record.TurnID)
 	}
 }
 

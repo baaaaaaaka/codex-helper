@@ -453,11 +453,22 @@ func TestAppServerRunnerListModelsPreservesEffortOrderAndPaginates(t *testing.T)
 	if models[1].ReasoningEfforts[0].Effort != "custom-future" {
 		t.Fatalf("custom effort was not preserved: %#v", models[1])
 	}
+	cached, ok := runner.CachedModels()
+	if !ok || !reflect.DeepEqual(cached, models) {
+		t.Fatalf("cached models = %#v/%v, want the successful model/list result", cached, ok)
+	}
 
 	writes := transport.decodedWrites(t)
 	assertMethod(t, writes[3], "model/list")
 	assertMethod(t, writes[4], "model/list")
 	assertParamString(t, writes[4], "cursor", "page-2")
+}
+
+func TestAppServerRunnerCachedModelsDoesNotStartTransport(t *testing.T) {
+	runner := NewAppServerRunner(nil)
+	if cached, ok := runner.CachedModels(); ok || cached != nil {
+		t.Fatalf("empty runner cached models = %#v/%v, want no cached catalog", cached, ok)
+	}
 }
 
 func TestAppServerRunnerListModelsRejectsRepeatedCursor(t *testing.T) {
@@ -945,6 +956,30 @@ func TestAppServerRunnerApprovesInterleavedServerRequestAndKeepsWaiting(t *testi
 	result, ok := response["result"].(map[string]any)
 	if !ok || result["decision"] != "accept" {
 		t.Fatalf("server request response = %#v, want one-time accept", response)
+	}
+}
+
+func TestConfirmationProbeTimeoutSplitsBoundedParentBudget(t *testing.T) {
+	parent, cancelParent := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
+	defer cancelParent()
+	first, cancelFirst := withConfirmationProbeTimeout(parent, 30*time.Second)
+	defer cancelFirst()
+	second, cancelSecond := withConfirmationProbeTimeout(parent, 5*time.Second)
+	defer cancelSecond()
+	parentDeadline, ok := parent.Deadline()
+	if !ok {
+		t.Fatal("parent deadline missing")
+	}
+	firstDeadline, ok := first.Deadline()
+	if !ok || !firstDeadline.Before(parentDeadline) {
+		t.Fatalf("first probe deadline = %v, want before parent %v", firstDeadline, parentDeadline)
+	}
+	secondDeadline, ok := second.Deadline()
+	if !ok || !secondDeadline.Before(parentDeadline) {
+		t.Fatalf("second probe deadline = %v, want before parent %v", secondDeadline, parentDeadline)
+	}
+	if !secondDeadline.After(time.Now()) {
+		t.Fatalf("second probe deadline = %v, already expired", secondDeadline)
 	}
 }
 

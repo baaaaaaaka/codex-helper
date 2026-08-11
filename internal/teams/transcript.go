@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 type TranscriptKind string
@@ -30,6 +32,8 @@ const (
 
 const transcriptContextCompactMessage = "Context compacted. Earlier turns were summarized so Codex can continue the thread."
 
+const transcriptCheckpointFingerprintBytes int64 = 8 * 1024
+
 type TranscriptParseOptions struct {
 	SourceName       string
 	InitialSessionID string
@@ -43,16 +47,36 @@ type Transcript struct {
 	SourceName      string
 	FileFingerprint string
 	ThreadID        string
+	// UnresolvedContinuation is set by the bounded incremental scanner when
+	// execution-bearing work appears after a prior terminal boundary. Callers
+	// performing automatic delivery must fail closed rather than treating the
+	// returned records as an ordinary backlog.
+	UnresolvedContinuation bool
+	// PendingContinuation means a root-shaped task_started followed a terminal
+	// without enough evidence yet to classify it as either a new outer request
+	// or an internal continuation. Automatic linked sync must leave its
+	// checkpoint unchanged and rescan when the next record supplies ownership.
+	PendingContinuation bool
+	// AmbiguousFinals carries the anonymous final candidates that caused the
+	// scanner's pair quarantine. They are kept separate from Records so normal
+	// automatic callers cannot accidentally publish them; a very narrow bridge
+	// dedupe path may inspect them when one is already proven to be a live-status
+	// mirror.
+	AmbiguousFinals []TranscriptRecord
 	Records         []TranscriptRecord
 	Diagnostics     []TranscriptDiagnostic
 }
 
 type TranscriptRecord struct {
-	ItemID            string
-	SourceItemID      string
-	DedupeKey         string
-	ThreadID          string
-	TurnID            string
+	ItemID       string
+	SourceItemID string
+	DedupeKey    string
+	ThreadID     string
+	TurnID       string
+	// TurnIDExplicit distinguishes a protocol turn_id on this record from an
+	// ID inherited from parser context. Recovery must not treat an inherited
+	// ID as proof that a final belongs to the requested Codex turn.
+	TurnIDExplicit    bool
 	Kind              TranscriptKind
 	Text              string
 	CreatedAt         time.Time
@@ -1105,6 +1129,93 @@ func transcriptFileFingerprint(sourceName string, sessionID string, contentDiges
 		return "stream:" + hex.EncodeToString(contentDigest[:min(len(contentDigest), 8)])
 	}
 	return "stream:empty"
+}
+
+// transcriptCheckpointSourceFingerprint hashes a bounded window ending at a
+// trusted JSONL cursor and binds it to the stable source-file identity.  The
+// identity is intentionally part of the existing fingerprint field so old
+// JSON/SQLite rows remain readable without a schema migration while an atomic
+// replacement cannot reuse a prefix proof from the previous inode. Size/mtime
+// are only change hints; an in-place rewrite can preserve both. Keeping the
+// content window small avoids turning every unchanged-file poll into a full
+// transcript read.
+func transcriptCheckpointSourceFingerprint(sourcePath string, offset int64) string {
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" {
+		return ""
+	}
+	f, err := os.Open(sourcePath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() || info.Size() < 0 {
+		return ""
+	}
+	identity, err := teamstore.SourceFileIdentityFromFileInfo(sourcePath, info)
+	if err != nil || strings.TrimSpace(identity) == "" {
+		return ""
+	}
+	return transcriptCheckpointSourceFingerprintFromReaderWithIdentity(f, sourcePath, identity, info.Size(), offset)
+}
+
+func transcriptCheckpointSourceFingerprintFromReader(reader io.ReaderAt, sourcePath string, sourceSize int64, offset int64) string {
+	var identity string
+	var err error
+	if file, ok := reader.(*os.File); ok {
+		if info, statErr := file.Stat(); statErr == nil {
+			identity, err = teamstore.SourceFileIdentityFromFileInfo(sourcePath, info)
+		} else {
+			err = statErr
+		}
+	} else {
+		identity, err = teamstore.SourceFileIdentity(sourcePath)
+	}
+	if err != nil || strings.TrimSpace(identity) == "" {
+		return ""
+	}
+	return transcriptCheckpointSourceFingerprintFromReaderWithIdentity(reader, sourcePath, identity, sourceSize, offset)
+}
+
+func transcriptCheckpointSourceFingerprintFromReaderWithIdentity(reader io.ReaderAt, sourcePath string, identity string, sourceSize int64, offset int64) string {
+	sourcePath = strings.TrimSpace(sourcePath)
+	identity = strings.TrimSpace(identity)
+	if reader == nil || sourcePath == "" || identity == "" || sourceSize < 0 {
+		return ""
+	}
+	// A negative offset is the explicit sentinel for the end of the source.
+	// Zero is a valid, known empty-prefix cursor and must not silently become
+	// EOF: doing so lets legacy/unknown checkpoints appear trusted.
+	if offset < 0 {
+		offset = sourceSize
+	}
+	if offset > sourceSize {
+		return ""
+	}
+	start := offset - transcriptCheckpointFingerprintBytes
+	if start < 0 {
+		start = 0
+	}
+	length := offset - start
+	if length < 0 {
+		return ""
+	}
+	window := make([]byte, length)
+	if length > 0 {
+		if n, err := reader.ReadAt(window, start); err != nil || n != len(window) {
+			return ""
+		}
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(identity))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(filepath.Clean(sourcePath)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.FormatInt(start, 10)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(window)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func kindFromRole(role string) TranscriptKind {

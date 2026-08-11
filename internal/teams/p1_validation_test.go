@@ -242,7 +242,7 @@ func TestP1ArtifactManifestRejectedAfterFinalWhenAuthExists(t *testing.T) {
 	}
 }
 
-func TestP1SyncLinkedTranscriptIgnoresHalfWrittenTailAndCheckpointsCompleteRecord(t *testing.T) {
+func TestP1SyncLinkedTranscriptPausesBeforeHalfWrittenTail(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -297,20 +297,16 @@ func TestP1SyncLinkedTranscriptIgnoresHalfWrittenTailAndCheckpointsCompleteRecor
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("second sync error: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("sent messages = %#v, want only the complete appended record", *sent)
-	}
-	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(plain, "complete local answer") || strings.Contains(plain, "half-written") {
-		t.Fatalf("synced transcript text = %q, want complete record without bad tail", plain)
+	if len(*sent) != 0 {
+		t.Fatalf("sent messages = %#v, want no output while the tail is incomplete", *sent)
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "new" || checkpoint.LastSourceLine != 2 {
-		t.Fatalf("checkpoint = %#v, want new at line 2", checkpoint)
+	if checkpoint.LastRecordID != "source:old" || checkpoint.LastSourceLine != 1 {
+		t.Fatalf("checkpoint = %#v, want unchanged trusted cursor", checkpoint)
 	}
 }
 

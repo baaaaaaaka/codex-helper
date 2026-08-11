@@ -400,10 +400,69 @@ func (e teamsCodexExecutor) DefaultReasoningEffort() string {
 	return strings.TrimSpace(firstNonEmptyCLI(e.defaultReasoningEffort, codexReasoningEffortFromArgs(e.codexArgs)))
 }
 
+func (e teamsCodexExecutor) ReconcileExecutionFence(ctx context.Context, session *teams.Session) (bool, error) {
+	if session == nil || strings.TrimSpace(session.CodexThreadID) == "" {
+		return false, nil
+	}
+	// Fence reconciliation must remain a read-only probe. Do not construct a
+	// new profile runner (which can perform login/model preparation and spawn an
+	// app-server) merely because an unresolved anchor is being polled. A runner
+	// that was not already used by this session provides no in-memory fence to
+	// reconcile, so fail closed and let the durable anchor remain.
+	runner := e.cachedRunnerForSessionProfile(session)
+	if runner == nil {
+		return false, nil
+	}
+	reconciler, ok := runner.(codexrunner.TurnCancelFenceReconciler)
+	if !ok {
+		return false, nil
+	}
+	return reconciler.ReconcileTurnCancelFence(ctx, strings.TrimSpace(session.CodexThreadID))
+}
+
+func (e teamsCodexExecutor) cachedRunnerForSessionProfile(session *teams.Session) codexrunner.Runner {
+	if session == nil {
+		return e.runner
+	}
+	if session.ModelProfile.IsZero() || (session.ModelGeneration == 0 && modelProfileSnapshotKey(session.ModelProfile) == modelProfileSnapshotKey(e.modelProfileSnapshot)) {
+		return e.runner
+	}
+	if e.runnerCacheMu == nil || e.runnersByProfile == nil {
+		return nil
+	}
+	key := modelProfileRunnerSessionCacheKey(session)
+	e.runnerCacheMu.Lock()
+	defer e.runnerCacheMu.Unlock()
+	return e.runnersByProfile[key]
+}
+
 func (e teamsCodexExecutor) ReasoningEffortCatalog(ctx context.Context, session *teams.Session) (teams.ReasoningEffortCatalog, error) {
 	runner, err := e.runnerForSessionProfile(ctx, session)
 	if err != nil {
 		return teams.ReasoningEffortCatalog{}, err
+	}
+	return e.reasoningEffortCatalogFromRunner(ctx, session, runner)
+}
+
+func (e teamsCodexExecutor) CachedReasoningEffortCatalog(ctx context.Context, session *teams.Session) (teams.ReasoningEffortCatalog, error) {
+	runner := e.cachedRunnerForSessionProfile(session)
+	if runner == nil {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("no cached Codex runner is available for this chat")
+	}
+	reader, ok := runner.(codexrunner.CachedModelCatalogReader)
+	if !ok {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("cached Codex runner does not expose a read-only model/list catalog")
+	}
+	models, ok := reader.CachedModels()
+	if !ok {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("no cached Codex model/list catalog is available for this chat")
+	}
+	return e.reasoningEffortCatalogFromModels(session, models)
+}
+
+func (e teamsCodexExecutor) reasoningEffortCatalogFromRunner(ctx context.Context, session *teams.Session, runner codexrunner.Runner) (teams.ReasoningEffortCatalog, error) {
+	if runner == nil {
+		return teams.ReasoningEffortCatalog{}, fmt.Errorf("Codex runner is unavailable")
 	}
 	reader, ok := runner.(codexrunner.ModelCatalogReader)
 	if !ok {
@@ -413,6 +472,10 @@ func (e teamsCodexExecutor) ReasoningEffortCatalog(ctx context.Context, session 
 	if err != nil {
 		return teams.ReasoningEffortCatalog{}, err
 	}
+	return e.reasoningEffortCatalogFromModels(session, models)
+}
+
+func (e teamsCodexExecutor) reasoningEffortCatalogFromModels(session *teams.Session, models []codexrunner.ModelInfo) (teams.ReasoningEffortCatalog, error) {
 	target := ""
 	if session != nil {
 		target = strings.TrimSpace(session.ModelProfile.Model)

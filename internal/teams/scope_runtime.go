@@ -2217,7 +2217,55 @@ func applyLegacyReplayPlan(ctx context.Context, targetStorePath string, plan leg
 		if err != nil {
 			return fmt.Errorf("open target Teams store for outbound replay fence: %w", err)
 		}
-		_, applyErr := store.ApplyOutboxReplayFences(ctx, plan.outboxFences)
+		// A legacy global ledger proves only that Graph accepted a message; it
+		// does not prove that the linked transcript source is still the one that
+		// produced the outbox row.  Reconcile changed transcript sources behind a
+		// durable fence before applying the generic replay projection.  Rows that
+		// cannot be loaded remain in the normal replay set so existing missing-row
+		// handling is unchanged.
+		safeFences := make([]teamstore.OutboxReplayFence, 0, len(plan.outboxFences))
+		for _, fence := range plan.outboxFences {
+			// Older global ledgers can contain a marker without a local outbox
+			// identity.  It cannot be reconciled to a source proof, but it is also
+			// not a lookup request; preserve the old replay behavior by leaving the
+			// marker out of the scoped replay set rather than failing the whole
+			// migration on OutboxMessageByID("").
+			if strings.TrimSpace(fence.OutboxID) == "" {
+				continue
+			}
+			msg, lookupErr := store.OutboxMessageByID(ctx, fence.OutboxID)
+			if lookupErr != nil {
+				if errors.Is(lookupErr, teamstore.ErrOutboxNotFound) {
+					// The canonical store may have pruned a sent row after the
+					// legacy ledger was written. Keep the fence in the normal
+					// replay batch; ApplyOutboxReplayFences treats the missing
+					// canonical row as an idempotent no-op.
+					safeFences = append(safeFences, fence)
+					continue
+				}
+				closeErr := store.Close()
+				if closeErr != nil {
+					return fmt.Errorf("lookup replay outbox %q: %v (close: %v)", fence.OutboxID, lookupErr, closeErr)
+				}
+				return fmt.Errorf("lookup replay outbox %q: %w", fence.OutboxID, lookupErr)
+			}
+			// Legacy automatic transcript rows may predate the bounded source
+			// proof.  They are not safe replay evidence after a source rewrite;
+			// keep them behind the same durable fence as newer rows.  Explicit
+			// publish-history rows intentionally remain replayable.
+			if transcriptOutboxRequiresSourceProof(msg) && !transcriptOutboxSourceProofMatches(msg) {
+				if _, fenceErr := store.MarkOutboxSourceRewriteFence(ctx, fence.OutboxID, fence.TeamsMessageID); fenceErr != nil {
+					closeErr := store.Close()
+					if closeErr != nil {
+						return fmt.Errorf("fence replay source rewrite for %q: %v (close: %v)", fence.OutboxID, fenceErr, closeErr)
+					}
+					return fmt.Errorf("fence replay source rewrite for %q: %w", fence.OutboxID, fenceErr)
+				}
+				continue
+			}
+			safeFences = append(safeFences, fence)
+		}
+		_, applyErr := store.ApplyOutboxReplayFences(ctx, safeFences)
 		closeErr := store.Close()
 		if applyErr != nil {
 			return fmt.Errorf("apply legacy outbound replay fence: %w", applyErr)

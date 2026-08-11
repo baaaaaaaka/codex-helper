@@ -688,6 +688,216 @@ func TestApplyOutboxReplayFencesUsesCompleteSentProjection(t *testing.T) {
 	}
 }
 
+func TestApplyOutboxReplayFencesPreservesTerminalFailureFence(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 8, 10, 14, 0, 0, 0, time.UTC)
+			turnID := "turn:replay-failed"
+			message := OutboxMessage{
+				ID: "outbox:replay-failed", SessionID: "session:replay-failed", TurnID: turnID,
+				TeamsChatID: "chat:replay-failed", Kind: "final", Status: OutboxStatusSending,
+				CreatedAt: now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Turns[turnID] = Turn{ID: turnID, SessionID: message.SessionID, Status: TurnStatusFailed, FailedAt: now, UpdatedAt: now}
+				state.OutboxMessages[message.ID] = message
+				return nil
+			}); err != nil {
+				t.Fatalf("seed failed replay state: %v", err)
+			}
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			fence := OutboxReplayFence{OutboxID: message.ID, TeamsChatID: message.TeamsChatID, TeamsMessageID: "teams:stale-final", SessionID: message.SessionID, TurnID: turnID, Kind: message.Kind}
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 1 {
+				t.Fatalf("ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load replay state: %v", err)
+			}
+			got := state.OutboxMessages[message.ID]
+			if got.Status != OutboxStatusAccepted || got.TeamsMessageID != fence.TeamsMessageID || !got.BlockedByTerminalFailure {
+				t.Fatalf("failed replay promoted stale final: %#v", got)
+			}
+		})
+	}
+}
+
+func TestApplyOutboxReplayFencesSourceRewriteKeepsAcceptedFenceAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqliteMode), func(t *testing.T) {
+			store := newTestStore(t)
+			sourcePath := filepath.Join(t.TempDir(), "session.jsonl")
+			old := []byte(`{"id":"old","role":"assistant","text":"old"}` + "\n")
+			if err := os.WriteFile(sourcePath, old, 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			offset := int64(len(old))
+			proof := sourceCheckpointFingerprintAtOffsetForTest(t, sourcePath, offset)
+			message := OutboxMessage{
+				ID: "outbox:replay-source", SessionID: "session:replay-source", TurnID: "sync:session:replay-source",
+				TeamsChatID: "chat:replay-source", Kind: "sync-assistant", Status: OutboxStatusQueued,
+				TranscriptCheckpointID: "transcript:session:replay-source", TranscriptSourcePath: sourcePath,
+				TranscriptSourceProofFingerprint: proof, TranscriptSourceProofOffset: offset,
+				TranscriptSourceProofOffsetKnown: true, CreatedAt: time.Now(),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[message.ID] = message
+				return nil
+			}); err != nil {
+				t.Fatalf("seed replay source row: %v", err)
+			}
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			replacement := filepath.Join(t.TempDir(), "replacement.jsonl")
+			if err := os.WriteFile(replacement, append(append([]byte{}, old...), []byte(`{"id":"new","role":"assistant","text":"stale"}`+"\n")...), 0o600); err != nil {
+				t.Fatalf("write replacement: %v", err)
+			}
+			moved := sourcePath + ".old"
+			if err := os.Rename(sourcePath, moved); err != nil {
+				t.Fatalf("move source: %v", err)
+			}
+			if err := os.Rename(replacement, sourcePath); err != nil {
+				t.Fatalf("install replacement: %v", err)
+			}
+			fence := OutboxReplayFence{OutboxID: message.ID, TeamsChatID: message.TeamsChatID, TeamsMessageID: "teams:replay-source", SessionID: message.SessionID, TurnID: message.TurnID, Kind: message.Kind}
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{fence})
+			if err != nil || changed != 1 {
+				t.Fatalf("ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load replay source state: %v", err)
+			}
+			got := state.OutboxMessages[message.ID]
+			if got.Status != OutboxStatusAccepted || !got.BlockedBySourceRewrite || got.TeamsMessageID != fence.TeamsMessageID {
+				t.Fatalf("source-rewritten replay promoted stale row: %#v", got)
+			}
+		})
+	}
+}
+
+func TestApplyOutboxReplayFencesLegacySourceLessRewriteAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqliteMode), func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "legacy-replay-source-less"
+			message := OutboxMessage{
+				ID: "outbox:legacy-replay-source-less", SessionID: sessionID, TurnID: "sync:" + sessionID,
+				TeamsChatID: "chat:legacy-replay-source-less", Kind: "codex-status-001", Status: OutboxStatusQueued,
+				CreatedAt: time.Now(),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive}
+				state.ImportCheckpoints[transcriptCheckpointIDForSession(sessionID)] = ImportCheckpoint{
+					ID: transcriptCheckpointIDForSession(sessionID), SessionID: sessionID, Status: "blocked", SourceRewriteBlocked: true,
+				}
+				state.OutboxMessages[message.ID] = message
+				return nil
+			}); err != nil {
+				t.Fatalf("seed legacy replay row: %v", err)
+			}
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{{
+				OutboxID: message.ID, TeamsChatID: message.TeamsChatID, TeamsMessageID: "teams:legacy-replay-source-less",
+				SessionID: sessionID, TurnID: message.TurnID, Kind: message.Kind,
+			}})
+			if err != nil || changed != 1 {
+				t.Fatalf("ApplyOutboxReplayFences: changed=%d err=%v", changed, err)
+			}
+			got, err := store.OutboxMessageByID(ctx, message.ID)
+			if err != nil || got.Status != OutboxStatusAccepted || !got.BlockedBySourceRewrite || got.TeamsMessageID == "" {
+				t.Fatalf("legacy source-less replay row = %#v err=%v, want Accepted + source fence", got, err)
+			}
+		})
+	}
+}
+
+func TestApplyOutboxReplayFencesRejectsForeignCanonicalCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	const sessionID = "replay-foreign-checkpoint"
+	const checkpointID = "transcript:replay-foreign-checkpoint"
+	for _, backend := range []struct {
+		name      string
+		useSQLite bool
+	}{
+		{name: "json"},
+		{name: "sqlite", useSQLite: true},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := newTestStore(t)
+			message := OutboxMessage{
+				ID: "outbox:replay-foreign-checkpoint", SessionID: sessionID, TurnID: "sync:" + sessionID,
+				TeamsChatID: "chat:replay-foreign-checkpoint", Kind: "sync-assistant", Status: OutboxStatusQueued,
+				CreatedAt: time.Now(),
+			}
+			valid := ImportCheckpoint{ID: checkpointID, SessionID: sessionID, Status: "complete"}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive}
+				state.ImportCheckpoints[checkpointID] = valid
+				state.OutboxMessages[message.ID] = message
+				return nil
+			}); err != nil {
+				t.Fatalf("seed replay state: %v", err)
+			}
+			if backend.useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+				foreign := valid
+				foreign.ID = "transcript:foreign-owner"
+				foreign.SessionID = "foreign-owner"
+				raw, err := json.Marshal(foreign)
+				if err != nil {
+					t.Fatalf("marshal foreign checkpoint: %v", err)
+				}
+				withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+					_, err := tx.ExecContext(ctx, `UPDATE import_checkpoints SET session_id = ?, json = ? WHERE id = ?`, foreign.SessionID, raw, checkpointID)
+					return err
+				})
+			} else if err := store.Update(ctx, func(state *State) error {
+				foreign := valid
+				foreign.ID = "transcript:foreign-owner"
+				foreign.SessionID = "foreign-owner"
+				state.ImportCheckpoints[checkpointID] = foreign
+				return nil
+			}); err != nil {
+				t.Fatalf("corrupt replay checkpoint: %v", err)
+			}
+
+			changed, err := store.ApplyOutboxReplayFences(ctx, []OutboxReplayFence{
+				{OutboxID: message.ID, TeamsChatID: message.TeamsChatID, TeamsMessageID: "teams:foreign-checkpoint", SessionID: sessionID, TurnID: message.TurnID, Kind: message.Kind},
+			})
+			if !errors.Is(err, ErrSessionStateProvenanceMismatch) {
+				t.Fatalf("ApplyOutboxReplayFences error = %v, want provenance mismatch", err)
+			}
+			if changed != 0 {
+				t.Fatalf("ApplyOutboxReplayFences changed=%d after malformed row", changed)
+			}
+			got, loadErr := store.OutboxMessageByID(ctx, message.ID)
+			if loadErr != nil || got.Status != OutboxStatusQueued || got.TeamsMessageID != "" || got.BlockedBySourceRewrite {
+				t.Fatalf("malformed replay row = %#v err=%v, want unchanged queued row", got, loadErr)
+			}
+		})
+	}
+}
+
+func sourceCheckpointFingerprintAtOffsetForTest(t *testing.T, path string, offset int64) string {
+	t.Helper()
+	proof, err := sourceCheckpointFingerprintAtOffset(path, offset)
+	if err != nil || proof == "" {
+		t.Fatalf("source checkpoint proof: %q err=%v", proof, err)
+	}
+	return proof
+}
+
 func TestBackfillHelperDeliveriesUpdatesEveryLegacyRecordForOutbox(t *testing.T) {
 	now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
 	sentAt := now.Add(time.Minute)
@@ -2172,7 +2382,7 @@ func TestSQLitePointerPathValidationFailsClosed(t *testing.T) {
 	}
 }
 
-func TestSQLitePointerSchemaRejectsLegacyV5Loaders(t *testing.T) {
+func TestSQLitePointerSchemaRejectsLegacyLoaders(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	seedLegacyStateFileForSQLiteMigrationTest(t, store)
@@ -2189,11 +2399,58 @@ func TestSQLitePointerSchemaRejectsLegacyV5Loaders(t *testing.T) {
 	if pointer.SchemaVersion <= SchemaVersion {
 		t.Fatalf("sqlite pointer schema_version = %d, want greater than legacy schema %d", pointer.SchemaVersion, SchemaVersion)
 	}
-	if _, err := legacyV5LoadStateDataForTest(data); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(pointer.SchemaVersion)) {
-		t.Fatalf("legacy v5 loader error = %v, want unsupported pointer schema %d", err, pointer.SchemaVersion)
+	if _, err := legacyV6LoadStateDataForTest(data); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(pointer.SchemaVersion)) {
+		t.Fatalf("legacy v6 loader error = %v, want unsupported pointer schema %d", err, pointer.SchemaVersion)
 	}
 	if _, err := store.Load(ctx); err != nil {
 		t.Fatalf("current loader should still read sqlite pointer: %v", err)
+	}
+}
+
+func TestSchemaSevenStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
+	ctx := context.Background()
+	seedSafetyState := func(t *testing.T, store *Store) {
+		t.Helper()
+		if err := store.Update(ctx, func(state *State) error {
+			state.Sessions["schema7-session"] = SessionContext{ID: "schema7-session", Status: SessionStatusActive, TeamsChatID: "schema7-chat"}
+			state.ImportCheckpoints["transcript:schema7-session"] = ImportCheckpoint{
+				ID: "transcript:schema7-session", SessionID: "schema7-session",
+				UnresolvedExecution: &ExecutionAnchor{
+					SessionID: "schema7-session", ThreadID: "schema7-thread", OuterTurnID: "schema7-turn", CodexTurnID: "schema7-codex",
+					Generation: 4, State: "unresolved", SourcePath: "/tmp/schema7.jsonl", SourceFingerprint: "prefix-proof",
+				},
+			}
+			state.OutboxMessages["schema7-final"] = OutboxMessage{
+				ID: "schema7-final", SessionID: "schema7-session", TurnID: "schema7-turn", Kind: "final",
+				TerminalGroupID: "schema7-group", BlockedByTerminalFailure: true,
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed schema-7 safety state: %v", err)
+		}
+	}
+
+	jsonStore := newTestStore(t)
+	seedSafetyState(t, jsonStore)
+	jsonData, err := os.ReadFile(jsonStore.Path())
+	if err != nil {
+		t.Fatalf("read schema-7 JSON store: %v", err)
+	}
+	if _, err := legacyV6LoadStateDataForTest(jsonData); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(SchemaVersion)) {
+		t.Fatalf("legacy JSON writer result = %v, want schema-%d rejection", err, SchemaVersion)
+	}
+
+	sqliteStore := newTestStore(t)
+	seedSafetyState(t, sqliteStore)
+	if _, err := sqliteStore.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate schema-7 safety state to SQLite: %v", err)
+	}
+	pointerData, err := os.ReadFile(sqliteStore.Path())
+	if err != nil {
+		t.Fatalf("read schema-8 SQLite pointer: %v", err)
+	}
+	if _, err := legacyV6LoadStateDataForTest(pointerData); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(storeSQLitePointerSchemaVersion)) {
+		t.Fatalf("legacy SQLite writer result = %v, want pointer schema-%d rejection", err, storeSQLitePointerSchemaVersion)
 	}
 }
 
@@ -2298,8 +2555,18 @@ func TestSQLitePointerLegacySchemaLoadsAllEntryPoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read legacy sqlite pointer after entry points: %v", err)
 	}
-	if !bytes.Equal(after, pointerData) {
-		t.Fatal("reading a supported legacy sqlite pointer rewrote the pointer file")
+	if bytes.Equal(after, pointerData) {
+		t.Fatal("MigrateLargeStateToSQLite did not publish the current pointer schema")
+	}
+	var upgraded storeSQLitePointer
+	if err := json.Unmarshal(after, &upgraded); err != nil {
+		t.Fatalf("unmarshal upgraded sqlite pointer: %v", err)
+	}
+	if upgraded.SchemaVersion != storeSQLitePointerSchemaVersion {
+		t.Fatalf("upgraded sqlite pointer schema = %d, want %d", upgraded.SchemaVersion, storeSQLitePointerSchemaVersion)
+	}
+	if upgraded.Path != pointer.Path || upgraded.MigrationID != pointer.MigrationID {
+		t.Fatalf("upgraded sqlite pointer identity changed: %#v (before %#v)", upgraded, pointer)
 	}
 }
 
@@ -4153,7 +4420,7 @@ func TestUpdateImportCheckpointSQLiteCreatesMissingRow(t *testing.T) {
 	}
 	migrateStoreToSQLiteForTest(t, store)
 
-	created, changed, err := store.UpdateImportCheckpoint(ctx, "transcript:created", func(current ImportCheckpoint, found bool, updateTime time.Time) (ImportCheckpoint, bool, error) {
+	created, changed, err := store.UpdateImportCheckpoint(ctx, "transcript:session-created", func(current ImportCheckpoint, found bool, updateTime time.Time) (ImportCheckpoint, bool, error) {
 		if found || current.ID != "" {
 			t.Fatalf("current checkpoint = %#v found=%v, want missing", current, found)
 		}
@@ -4170,10 +4437,10 @@ func TestUpdateImportCheckpointSQLiteCreatesMissingRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateImportCheckpoint create error: %v", err)
 	}
-	if !changed || created.ID != "transcript:created" || created.LastRecordID != "record-created" {
+	if !changed || created.ID != "transcript:session-created" || created.LastRecordID != "record-created" {
 		t.Fatalf("created checkpoint = %#v changed=%v", created, changed)
 	}
-	got, found, err := store.ImportCheckpoint(ctx, "transcript:created")
+	got, found, err := store.ImportCheckpoint(ctx, "transcript:session-created")
 	if err != nil {
 		t.Fatalf("ImportCheckpoint created row error: %v", err)
 	}
@@ -8681,6 +8948,20 @@ func TestMarkTurnInterruptedSkipsPendingTransientOutbox(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("QueueOutbox final error: %v", err)
 	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:status-sending",
+		SessionID:   "s1",
+		TurnID:      turn.ID,
+		TeamsChatID: "chat-1",
+		Kind:        "codex-status-002",
+		Body:        "in-flight status",
+	}); err != nil {
+		t.Fatalf("QueueOutbox sending status error: %v", err)
+	}
+	claimed, err := store.MarkOutboxSendAttempt(ctx, "outbox:status-sending")
+	if err != nil || claimed.Status != OutboxStatusSending || claimed.SendAttemptToken == "" {
+		t.Fatalf("MarkOutboxSendAttempt = %#v err=%v, want sending claim", claimed, err)
+	}
 
 	if _, err := store.MarkTurnInterrupted(ctx, turn.ID, "canceled by user"); err != nil {
 		t.Fatalf("MarkTurnInterrupted error: %v", err)
@@ -8694,6 +8975,9 @@ func TestMarkTurnInterruptedSkipsPendingTransientOutbox(t *testing.T) {
 	}
 	if got := state.OutboxMessages["outbox:final"].Status; got != OutboxStatusQueued {
 		t.Fatalf("final outbox status = %q, want queued", got)
+	}
+	if got := state.OutboxMessages["outbox:status-sending"].Status; got != OutboxStatusSending || state.OutboxMessages["outbox:status-sending"].SendAttemptToken == "" {
+		t.Fatalf("in-flight status outbox = %#v, want sending claim preserved", state.OutboxMessages["outbox:status-sending"])
 	}
 }
 
@@ -8726,6 +9010,63 @@ func TestRecordTranscriptDeliveryAdvancesCheckpointPosition(t *testing.T) {
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	if checkpoint.LastRecordID != "r1" || checkpoint.LastSourceLine != 42 || checkpoint.LastOffset != 2048 {
 		t.Fatalf("checkpoint = %#v, want full source position for skipped delivery", checkpoint)
+	}
+}
+
+func TestRecordTranscriptProvenanceRejectsForeignCheckpointAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []struct {
+		name      string
+		useSQLite bool
+	}{
+		{name: "json"},
+		{name: "sqlite", useSQLite: true},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			store := newTestStore(t)
+			if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			const checkpointID = "checkpoint:s1"
+			valid := ImportCheckpoint{ID: checkpointID, SessionID: "s1", LastRecordID: "old", Status: "complete"}
+			if err := store.Update(ctx, func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = valid
+				return nil
+			}); err != nil {
+				t.Fatalf("seed checkpoint: %v", err)
+			}
+			if backend.useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+				foreign := valid
+				foreign.ID = "checkpoint:s2"
+				foreign.SessionID = "s2"
+				raw, err := json.Marshal(foreign)
+				if err != nil {
+					t.Fatalf("marshal foreign checkpoint: %v", err)
+				}
+				withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+					_, err := tx.ExecContext(ctx, `UPDATE import_checkpoints SET session_id = ?, json = ? WHERE id = ?`, "s2", raw, checkpointID)
+					return err
+				})
+			} else if err := store.Update(ctx, func(state *State) error {
+				foreign := valid
+				foreign.ID = "checkpoint:s2"
+				foreign.SessionID = "s2"
+				state.ImportCheckpoints[checkpointID] = foreign
+				return nil
+			}); err != nil {
+				t.Fatalf("corrupt checkpoint: %v", err)
+			}
+
+			checkpoint := ImportCheckpoint{ID: checkpointID, SessionID: "s1", LastRecordID: "new", Status: "complete"}
+			err := store.RecordTranscriptCheckpoint(ctx, checkpoint, TranscriptLedgerRecord{ID: "ledger:foreign", SessionID: "s1"})
+			if !errors.Is(err, ErrSessionStateProvenanceMismatch) {
+				t.Fatalf("RecordTranscriptCheckpoint error = %v, want provenance mismatch", err)
+			}
+			if _, _, err := store.RecordTranscriptDelivery(ctx, TranscriptDeliveryRecord{ID: "delivery:foreign", SessionID: "s1", Status: TranscriptDeliveryStatusSkipped}, checkpoint); !errors.Is(err, ErrSessionStateProvenanceMismatch) {
+				t.Fatalf("RecordTranscriptDelivery error = %v, want provenance mismatch", err)
+			}
+		})
 	}
 }
 
@@ -14107,6 +14448,7 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	if len(watchState.Sessions) != 0 || len(watchState.InboundEvents) != 0 || len(watchState.Turns) != 0 || len(watchState.OutboxMessages) != 0 {
 		t.Fatalf("HistoryWatchState should not load hot tables: sessions=%d inbound=%d turns=%d outbox=%d", len(watchState.Sessions), len(watchState.InboundEvents), len(watchState.Turns), len(watchState.OutboxMessages))
 	}
+	coldBefore := sqliteRawStateJSONForTest(t, store)
 
 	updatedAt := now.Add(2 * time.Minute)
 	if err := store.UpdateHistoryWatch(ctx, func(historyWatch map[string]HistoryWatchCheckpoint, ready *time.Time) error {
@@ -14124,6 +14466,9 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpdateHistoryWatch sqlite error: %v", err)
 	}
+	if coldAfter := sqliteRawStateJSONForTest(t, store); !bytes.Equal(coldBefore, coldAfter) {
+		t.Fatal("history-watch update rewrote the large state_json document")
+	}
 	afterCounts := sqliteTableCountsForTest(t, store, tables...)
 	if !reflect.DeepEqual(afterCounts, beforeCounts) {
 		t.Fatalf("split table counts changed after history watch update: before=%#v after=%#v", beforeCounts, afterCounts)
@@ -14140,6 +14485,251 @@ func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	}
 	if state.TranscriptDeliveries["delivery-1"].ID == "" || state.HelperDeliveries["helper-1"].ID == "" || state.Notifications["notification-1"].ID == "" {
 		t.Fatalf("split side tables were lost: transcript=%#v helper=%#v notifications=%#v", state.TranscriptDeliveries, state.HelperDeliveries, state.Notifications)
+	}
+}
+
+func TestSQLiteHistoryWatchProjectionDoesNotOverrideMixedVersionStateJSON(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	checkpointID := "history-watch:mixed-version"
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{ID: checkpointID, Path: "/tmp/mixed-version.jsonl", Size: 100, Offset: 100, Line: 5, SessionID: "mixed-session", UpdatedAt: now}
+		state.HistoryWatchReady = now
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, ready *time.Time) error {
+		checkpoint := history[checkpointID]
+		checkpoint.Offset = 128
+		checkpoint.Size = 128
+		checkpoint.UpdatedAt = now.Add(time.Minute)
+		history[checkpointID] = checkpoint
+		*ready = now.Add(time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("projection update: %v", err)
+	}
+
+	// Simulate an older helper that knows only state_json. The persistent SQLite
+	// trigger advances state_json_revision, so the projection is no longer
+	// allowed to mask this full-state write.
+	raw := sqliteRawStateJSONForTest(t, store)
+	var legacy State
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatalf("decode cold state: %v", err)
+	}
+	legacy.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{
+		ID: checkpointID, Path: "/tmp/mixed-version.jsonl", Size: 160, Offset: 160, Line: 8,
+		SessionID: "mixed-session", LastFinalID: "legacy-final", UpdatedAt: now.Add(2 * time.Minute),
+	}
+	legacy.HistoryWatchReady = now.Add(2 * time.Minute)
+	legacyRaw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("encode legacy state: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, legacyRaw)
+		return err
+	})
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after mixed-version write: %v", err)
+	}
+	if got := state.HistoryWatch[checkpointID]; got.Offset != 160 || got.LastFinalID != "legacy-final" {
+		t.Fatalf("projection masked mixed-version state_json: %#v", got)
+	}
+
+	// A current writer reconciles from the authoritative JSON and rematerializes
+	// the projection at the new revision. Subsequent reads may use the narrow
+	// projection again without losing the legacy writer's boundary.
+	if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, _ *time.Time) error {
+		checkpoint := history[checkpointID]
+		checkpoint.Offset = 192
+		history[checkpointID] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("reconcile projection update: %v", err)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after projection rematerialization: %v", err)
+	}
+	if got := state.HistoryWatch[checkpointID]; got.Offset != 192 || got.LastFinalID != "legacy-final" {
+		t.Fatalf("rematerialized projection mismatch: %#v", got)
+	}
+}
+
+func TestSQLiteHistoryWatchMissingProjectionMaterializesCurrentRevision(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	checkpointID := "history-watch:legacy-projection"
+	now := time.Date(2026, 8, 10, 13, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{
+			ID: checkpointID, Path: "/tmp/legacy-projection.jsonl", Size: 64, Offset: 64,
+			Line: 4, SessionID: "legacy-projection-session", UpdatedAt: now,
+		}
+		state.HistoryWatchReady = now
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	// Simulate a pre-projection SQLite pointer. The first changed update must
+	// read state_json once and record its current revision, otherwise every
+	// subsequent update would be forced through the cold JSON1 fallback.
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM state_meta WHERE key = ?`, sqliteHistoryWatchProjectionKey)
+		return err
+	})
+	if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, ready *time.Time) error {
+		checkpoint := history[checkpointID]
+		checkpoint.Offset = 96
+		checkpoint.Size = 96
+		checkpoint.UpdatedAt = now.Add(time.Minute)
+		history[checkpointID] = checkpoint
+		*ready = now.Add(time.Minute)
+		return nil
+	}); err != nil {
+		t.Fatalf("materialize legacy projection: %v", err)
+	}
+	var projection sqliteHistoryWatchProjection
+	var revision int64
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteHistoryWatchProjectionKey).Scan(&raw); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &projection); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?`, sqliteStateJSONRevisionKey).Scan(&revision)
+	})
+	if projection.StateJSONRevision <= 0 || projection.StateJSONRevision != revision {
+		t.Fatalf("materialized projection revision = %d, state_json revision = %d; want equal positive revisions", projection.StateJSONRevision, revision)
+	}
+	if got := projection.HistoryWatch[checkpointID].Offset; got != 96 {
+		t.Fatalf("materialized projection offset = %d, want 96", got)
+	}
+}
+
+func TestHistoryWatchUnchangedCheckpointIsNoopAcrossBackends(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			checkpointID := "history-watch:unchanged"
+			now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.HistoryWatch[checkpointID] = HistoryWatchCheckpoint{
+					ID: checkpointID, Path: "/tmp/unchanged-session.jsonl", Size: 128, Offset: 96, Line: 4,
+					SessionID: "session-unchanged", ThreadID: "thread-unchanged", UpdatedAt: now,
+				}
+				state.HistoryWatchReady = now
+				return nil
+			}); err != nil {
+				t.Fatalf("seed history-watch state: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			var before []byte
+			if backend == "sqlite" {
+				before = sqliteRawStateJSONForTest(t, store)
+			} else {
+				var err error
+				before, err = os.ReadFile(store.Path())
+				if err != nil {
+					t.Fatalf("read JSON state before no-op: %v", err)
+				}
+			}
+			if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, _ *time.Time) error {
+				checkpoint := history[checkpointID]
+				// The watcher refreshes this audit field on every observation. It
+				// must not turn an unchanged source into a durable write.
+				checkpoint.UpdatedAt = now.Add(time.Hour)
+				history[checkpointID] = checkpoint
+				return nil
+			}); err != nil {
+				t.Fatalf("unchanged history-watch update: %v", err)
+			}
+			var after []byte
+			if backend == "sqlite" {
+				after = sqliteRawStateJSONForTest(t, store)
+			} else {
+				var err error
+				after, err = os.ReadFile(store.Path())
+				if err != nil {
+					t.Fatalf("read JSON state after no-op: %v", err)
+				}
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("unchanged history-watch update rewrote durable state for %s backend", backend)
+			}
+		})
+	}
+}
+
+func TestUpdateHistoryWatchCheckpointIfCurrentRejectsStaleWriterAcrossBackends(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			checkpointID := "history-watch:cas"
+			now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+			initial := HistoryWatchCheckpoint{ID: checkpointID, Path: "/tmp/cas.jsonl", Size: 64, Offset: 64, Line: 4, SessionID: "cas-session", UpdatedAt: now}
+			if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, _ *time.Time) error {
+				history[checkpointID] = initial
+				return nil
+			}); err != nil {
+				t.Fatalf("seed history-watch checkpoint: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			state, err := store.HistoryWatchState(ctx)
+			if err != nil {
+				t.Fatalf("load initial history-watch state: %v", err)
+			}
+			expected := state.HistoryWatch[checkpointID]
+			first := expected
+			first.Offset = 96
+			first.Size = 96
+			first.UpdatedAt = now.Add(time.Minute)
+			if err := store.UpdateHistoryWatchCheckpointIfCurrent(ctx, checkpointID, &expected, first); err != nil {
+				t.Fatalf("first history-watch CAS: %v", err)
+			}
+			stale := expected
+			stale.Offset = 128
+			stale.Size = 128
+			stale.UpdatedAt = now.Add(2 * time.Minute)
+			if err := store.UpdateHistoryWatchCheckpointIfCurrent(ctx, checkpointID, &expected, stale); !errors.Is(err, ErrHistoryWatchCheckpointConflict) {
+				t.Fatalf("stale history-watch CAS error = %v, want %v", err, ErrHistoryWatchCheckpointConflict)
+			}
+			state, err = store.HistoryWatchState(ctx)
+			if err != nil {
+				t.Fatalf("load history-watch state after stale CAS: %v", err)
+			}
+			if got := state.HistoryWatch[checkpointID]; got.Offset != first.Offset || got.Size != first.Size {
+				t.Fatalf("stale writer overwrote history-watch cursor: %#v", got)
+			}
+			if err := store.DeleteHistoryWatchCheckpointIfCurrent(ctx, checkpointID, &expected); !errors.Is(err, ErrHistoryWatchCheckpointConflict) {
+				t.Fatalf("stale history-watch delete error = %v, want %v", err, ErrHistoryWatchCheckpointConflict)
+			}
+			if err := store.DeleteHistoryWatchCheckpointIfCurrent(ctx, checkpointID, &first); err != nil {
+				t.Fatalf("current history-watch delete: %v", err)
+			}
+			state, err = store.HistoryWatchState(ctx)
+			if err != nil {
+				t.Fatalf("load history-watch state after delete: %v", err)
+			}
+			if _, ok := state.HistoryWatch[checkpointID]; ok {
+				t.Fatalf("history-watch checkpoint survived current delete: %#v", state.HistoryWatch[checkpointID])
+			}
+		})
 	}
 }
 
@@ -16624,19 +17214,36 @@ func writeSQLitePointerForTest(t *testing.T, store *Store, path string) {
 	}
 }
 
-func legacyV5LoadStateDataForTest(data []byte) (State, error) {
+func legacyV6LoadStateDataForTest(data []byte) (State, error) {
+	// Model the last released writer rather than reusing the current schema
+	// constant.  This test helper intentionally understands neither the
+	// unresolved-execution anchor nor terminal outbox fences.
+	const legacySchemaVersion = SchemaVersion - 1
+	const legacySQLitePointerSchemaVersion = legacySchemaVersion + 1
+	var envelope struct {
+		SchemaVersion  int    `json:"schema_version"`
+		StorageBackend string `json:"storage_backend"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return State{}, err
+	}
+	if envelope.StorageBackend == storeSQLiteBackend {
+		var pointer storeSQLitePointer
+		if err := json.Unmarshal(data, &pointer); err != nil {
+			return State{}, err
+		}
+		if pointer.SchemaVersion < storeSQLiteMinPointerSchemaVersion || pointer.SchemaVersion > legacySQLitePointerSchemaVersion {
+			return State{}, &UnsupportedSchemaVersionError{Version: pointer.SchemaVersion}
+		}
+		return State{}, nil
+	}
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {
 		return State{}, err
 	}
-	if state.SchemaVersion >= 0 && state.SchemaVersion < SchemaVersion {
-		state = migrateStateToCurrent(state)
-		return state, nil
-	}
-	if state.SchemaVersion != SchemaVersion {
+	if state.SchemaVersion > legacySchemaVersion {
 		return State{}, &UnsupportedSchemaVersionError{Version: state.SchemaVersion}
 	}
-	normalizeLoadedState(&state)
 	return state, nil
 }
 

@@ -4103,28 +4103,31 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 				}
 			}
 			state.ImportCheckpoints[transcriptCheckpointID(sessionID)] = teamstore.ImportCheckpoint{
-				ID:             transcriptCheckpointID(sessionID),
-				SessionID:      sessionID,
-				SourcePath:     path,
-				LastRecordID:   fmt.Sprintf("record-%s-%04d", threadID, lineCount-1),
-				LastSourceLine: lineCount + 1,
-				LastOffset:     int64(len(data)),
-				SourceSize:     info.Size(),
-				SourceModTime:  info.ModTime(),
-				Status:         importCheckpointStatusComplete,
-				UpdatedAt:      now,
+				ID:                transcriptCheckpointID(sessionID),
+				SessionID:         sessionID,
+				SourcePath:        path,
+				LastRecordID:      fmt.Sprintf("record-%s-%04d", threadID, lineCount-1),
+				LastSourceLine:    lineCount + 1,
+				LastOffset:        int64(len(data)),
+				LastOffsetKnown:   true,
+				SourceSize:        info.Size(),
+				SourceModTime:     info.ModTime(),
+				SourceFingerprint: transcriptCheckpointSourceFingerprint(path, int64(len(data))),
+				Status:            importCheckpointStatusComplete,
+				UpdatedAt:         now,
 			}
 			state.HistoryWatch[historyWatchCheckpointID(path)] = teamstore.HistoryWatchCheckpoint{
-				ID:        historyWatchCheckpointID(path),
-				Path:      path,
-				Size:      info.Size(),
-				ModTime:   info.ModTime(),
-				Offset:    int64(len(data)),
-				Line:      lineCount + 1,
-				SessionID: sessionID,
-				ThreadID:  threadID,
-				TurnID:    fmt.Sprintf("perf-watch-turn-%03d", chat),
-				UpdatedAt: now,
+				ID:                historyWatchCheckpointID(path),
+				Path:              path,
+				Size:              info.Size(),
+				ModTime:           info.ModTime(),
+				SourceFingerprint: transcriptCheckpointSourceFingerprint(path, int64(len(data))),
+				Offset:            int64(len(data)),
+				Line:              lineCount + 1,
+				SessionID:         sessionID,
+				ThreadID:          threadID,
+				TurnID:            fmt.Sprintf("perf-watch-turn-%03d", chat),
+				UpdatedAt:         now,
 			}
 		}
 		state.HistoryWatchReady = now
@@ -4738,16 +4741,18 @@ func newCXPPerfLongTranscriptFinalArrivalFixture(tb testing.TB, index int) (*tea
 		state.Sessions[session.ID] = stored
 		state.Turns[turn.ID] = turn
 		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
-			ID:             transcriptCheckpointID(session.ID),
-			SessionID:      session.ID,
-			SourcePath:     transcriptPath,
-			LastRecordID:   "perf-long-final-checkpoint",
-			LastSourceLine: checkpointLine,
-			LastOffset:     checkpointOffset,
-			SourceSize:     checkpointOffset,
-			SourceModTime:  info.ModTime(),
-			Status:         importCheckpointStatusComplete,
-			UpdatedAt:      now.Add(-30 * time.Second),
+			ID:                transcriptCheckpointID(session.ID),
+			SessionID:         session.ID,
+			SourcePath:        transcriptPath,
+			SourceFingerprint: transcriptCheckpointSourceFingerprint(transcriptPath, checkpointOffset),
+			LastRecordID:      "perf-long-final-checkpoint",
+			LastSourceLine:    checkpointLine,
+			LastOffset:        checkpointOffset,
+			LastOffsetKnown:   true,
+			SourceSize:        checkpointOffset,
+			SourceModTime:     info.ModTime(),
+			Status:            importCheckpointStatusComplete,
+			UpdatedAt:         now.Add(-30 * time.Second),
 		}
 		for i := 0; i < cxpPerfLongFinalStatusRecords; i++ {
 			body := cxpPerfLongFinalStatusBody(i)
@@ -4876,16 +4881,18 @@ func newCXPPerfStatusOnlyFinalArrivalFixture(tb testing.TB, index int) (*teamsto
 		state.Sessions[session.ID] = stored
 		state.Turns[turn.ID] = turn
 		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
-			ID:             transcriptCheckpointID(session.ID),
-			SessionID:      session.ID,
-			SourcePath:     transcriptPath,
-			LastRecordID:   "perf-status-only-checkpoint",
-			LastSourceLine: checkpointLine,
-			LastOffset:     checkpointOffset,
-			SourceSize:     checkpointOffset,
-			SourceModTime:  info.ModTime(),
-			Status:         importCheckpointStatusComplete,
-			UpdatedAt:      fixtureNow.Add(-30 * time.Second),
+			ID:                transcriptCheckpointID(session.ID),
+			SessionID:         session.ID,
+			SourcePath:        transcriptPath,
+			SourceFingerprint: transcriptCheckpointSourceFingerprint(transcriptPath, checkpointOffset),
+			LastRecordID:      "perf-status-only-checkpoint",
+			LastSourceLine:    checkpointLine,
+			LastOffset:        checkpointOffset,
+			LastOffsetKnown:   true,
+			SourceSize:        checkpointOffset,
+			SourceModTime:     info.ModTime(),
+			Status:            importCheckpointStatusComplete,
+			UpdatedAt:         fixtureNow.Add(-30 * time.Second),
 		}
 		return nil
 	}); err != nil {

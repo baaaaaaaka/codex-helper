@@ -514,6 +514,36 @@ func (s *Store) UpdateForkOperationOwned(ctx context.Context, operationID string
 	return s.updateForkOperationState(ctx, operationID, &owner, fnStateForkOperation(fn))
 }
 
+// MarkForkNativeIntentIfParentExecutionClear records the durable happens-before
+// marker immediately before the external app-server fork request. The
+// unresolved-execution check and the intent write share one store transaction:
+// a bridge-side probe can become stale before the native request is issued,
+// which would otherwise let a fork consume an ambiguous parent transcript.
+// ErrForkParentFenced leaves the operation staged so reconciliation can retry
+// after an explicit ownership proof.
+func (s *Store) MarkForkNativeIntentIfParentExecutionClear(ctx context.Context, operationID string) (ForkOperation, error) {
+	return s.markForkNativeIntentIfParentExecutionClear(ctx, operationID, nil)
+}
+
+// MarkForkNativeIntentIfParentExecutionClearOwned is the owner-checked form
+// used by the bridge owner loop. Lease validation and the parent execution
+// fence are evaluated against the same durable snapshot as the intent write.
+func (s *Store) MarkForkNativeIntentIfParentExecutionClearOwned(ctx context.Context, operationID string, owner ForkOwnerLease) (ForkOperation, error) {
+	return s.markForkNativeIntentIfParentExecutionClear(ctx, operationID, &owner)
+}
+
+func (s *Store) markForkNativeIntentIfParentExecutionClear(ctx context.Context, operationID string, owner *ForkOwnerLease) (ForkOperation, error) {
+	return s.updateForkOperationState(ctx, operationID, owner, func(state *State, op *ForkOperation) error {
+		if stateHasUnresolvedExecution(state, op.ParentSessionID) {
+			return ErrForkParentFenced
+		}
+		if op.NativeForkIntentAt.IsZero() {
+			op.NativeForkIntentAt = time.Now()
+		}
+		return nil
+	})
+}
+
 // ValidateForkOperationOwner performs the same lease and operation-owner
 // check without changing durable state. It is used immediately before an
 // external Codex or Graph call; the corresponding owned mutation is still

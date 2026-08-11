@@ -82,6 +82,91 @@ func (e *forkReconcileTestExecutor) ReconcileForkThread(context.Context, *Sessio
 	return e.result, nil
 }
 
+type forkCountingExecutor struct {
+	forkCalls int
+}
+
+func (e *forkCountingExecutor) Run(context.Context, *Session, string) (ExecutionResult, error) {
+	return ExecutionResult{}, fmt.Errorf("not used by fork staging test")
+}
+
+func (e *forkCountingExecutor) ForkThread(context.Context, *Session, string) (ForkResult, error) {
+	e.forkCalls++
+	return ForkResult{CodexThreadID: "unexpected-child-thread"}, nil
+}
+
+func TestForkWorkSessionDoesNotCallNativeForkWhenParentExecutionIsUnresolved(t *testing.T) {
+	ctx := context.Background()
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			const (
+				parentID      = "fork-staged-parent"
+				parentChatID  = "fork-staged-chat"
+				parentThread  = "fork-staged-thread"
+				cutoffTurnID  = "fork-staged-cutoff"
+				cutoffCodexID = "fork-staged-codex"
+			)
+			now := time.Now()
+			machine := MachineRecordForUser(User{ID: "user-1", UserPrincipalName: "user@example.test"}, ScopeIdentityForUser(User{ID: "user-1", UserPrincipalName: "user@example.test"}))
+			lease := teamstore.ControlLease{HolderMachineID: machine.ID, Generation: 1, LeaseUntil: now.Add(time.Hour), Status: teamstore.ControlLeaseStatusActive}
+			if _, created, err := store.CreateSession(ctx, teamstore.SessionContext{
+				ID: parentID, Status: teamstore.SessionStatusActive, TeamsChatID: parentChatID, CodexThreadID: parentThread,
+				CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+			}); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = lease
+				state.Turns[cutoffTurnID] = teamstore.Turn{
+					ID: cutoffTurnID, SessionID: parentID, CodexTurnID: cutoffCodexID,
+					Status: teamstore.TurnStatusCompleted, CompletedAt: now.Add(-time.Minute),
+				}
+				checkpointID := "transcript:" + parentID
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: parentID, Status: "blocked",
+					UnresolvedExecution: &teamstore.ExecutionAnchor{
+						SessionID: parentID, ThreadID: parentThread, OuterTurnID: "fork-staged-old-turn", CodexTurnID: "fork-staged-old-codex",
+						State: "unresolved", Generation: 3,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed parent fence: %v", err)
+			}
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			executor := &forkCountingExecutor{}
+			bridge := newBridgeTestBridge(graph, store, executor)
+			bridge.machine = machine
+			bridge.setControlLease(lease)
+			parent := &Session{ID: parentID, ChatID: parentChatID, Status: "active", CodexThreadID: parentThread}
+			command := ChatMessage{ID: "fork-staged-command", ChatID: parentChatID}
+			command.Body.Content = "fork"
+			if err := bridge.forkWorkSession(ctx, parent, command); err != nil {
+				t.Fatalf("forkWorkSession: %v", err)
+			}
+			if executor.forkCalls != 0 {
+				t.Fatalf("ForkThread calls = %d, want zero while parent execution is unresolved", executor.forkCalls)
+			}
+			op, ok, err := store.ParentFork(ctx, parentID)
+			if err != nil || !ok {
+				t.Fatalf("ParentFork = %#v ok=%v err=%v", op, ok, err)
+			}
+			if op.NativeForkIntentAt.IsZero() == false {
+				t.Fatalf("staged operation recorded native intent: %#v", op)
+			}
+			if len(*sent) == 0 {
+				t.Fatal("fork staging notice was not sent")
+			}
+		})
+	}
+}
+
 func TestForkParentAndCutoffLoadsDurableSessionAndTurn(t *testing.T) {
 	for _, sqliteMode := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sqlite"}[sqliteMode], func(t *testing.T) {

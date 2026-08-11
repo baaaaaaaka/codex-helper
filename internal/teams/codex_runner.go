@@ -14,11 +14,24 @@ type Executor interface {
 	Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error)
 }
 
+// errExecutorNotDispatched distinguishes cancellation before the executor was
+// called from cancellation of an already-started Codex request. The former
+// must return the durable turn to queued without creating an interrupted
+// execution anchor or a retry-looking answer.
+var errExecutorNotDispatched = errors.New("Codex executor was not dispatched")
+
 // ForkExecutor is optional so existing custom Executors remain source
 // compatible. The Teams native fork path is only enabled when the configured
 // Codex runner implements this capability; it never degrades to a prompt.
 type ForkExecutor interface {
 	ForkThread(ctx context.Context, session *Session, cutoffCodexTurnID string) (ForkResult, error)
+}
+
+// ExecutionFenceReconciler is an optional executor capability. It never
+// starts Codex work; it only reports whether the runner had an existing
+// same-thread cancellation fence and confirmed it clear.
+type ExecutionFenceReconciler interface {
+	ReconcileExecutionFence(context.Context, *Session) (bool, error)
 }
 
 // ForkReconciler is the read-only recovery capability for a fork request whose
@@ -43,6 +56,14 @@ type ForkResult struct {
 // their actual Codex runtime for the current model's effort choices.
 type ReasoningEffortCatalogProvider interface {
 	ReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error)
+}
+
+// ReadOnlyReasoningEffortCatalogProvider is the non-allocating variant used by
+// status/list commands. Implementations must inspect only an already-cached
+// runner; they must not start a new app-server or evict a runner that owns an
+// unresolved same-thread execution.
+type ReadOnlyReasoningEffortCatalogProvider interface {
+	CachedReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error)
 }
 
 // ReasoningEffortDefaultProvider exposes the launch-level default already
@@ -120,6 +141,24 @@ func isCanceledExecutionError(err error) bool {
 	return errors.Is(err, context.Canceled) || codexrunner.IsKind(err, codexrunner.ErrorCanceled)
 }
 
+func isUnresolvedExecutionFenceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, codexrunner.ErrTurnCancelFenceUnconfirmed) {
+		return true
+	}
+	// Keep compatibility with older app-server adapters that predate the
+	// exported sentinel but already emitted the stable fence message.
+	if !codexrunner.IsKind(err, codexrunner.ErrorCodex) {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "previous codex turn cancellation is still unconfirmed") ||
+		strings.Contains(text, "codex turn cancel was not confirmed") ||
+		strings.Contains(text, "turn cancel could not be confirmed")
+}
+
 type EchoExecutor struct{}
 
 func (EchoExecutor) Run(_ context.Context, _ *Session, prompt string) (ExecutionResult, error) {
@@ -131,6 +170,17 @@ type RunnerExecutor struct {
 	WorkDir   string
 	ExtraArgs []string
 	Timeout   time.Duration
+}
+
+func (e RunnerExecutor) ReconcileExecutionFence(ctx context.Context, session *Session) (bool, error) {
+	if session == nil {
+		return false, nil
+	}
+	reconciler, ok := e.Runner.(codexrunner.TurnCancelFenceReconciler)
+	if !ok {
+		return false, nil
+	}
+	return reconciler.ReconcileTurnCancelFence(ctx, strings.TrimSpace(session.CodexThreadID))
 }
 
 func (e RunnerExecutor) Run(ctx context.Context, session *Session, prompt string) (ExecutionResult, error) {

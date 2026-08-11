@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,16 +25,35 @@ const (
 	storeSQLiteVersion              = 1
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
-	// Pointer schema 6 was emitted while the JSON state schema was 5. The
-	// pointer envelope and SQLite storage version have not changed since then,
-	// so keep that durable format readable until the backend storage version is
-	// intentionally retired.
+	// Pointer schema 6 was emitted while the JSON state schema was 5. Pointer
+	// schemas 6 and 7 remain readable for migration, but the current pointer
+	// schema (8) is an upgrade-only boundary because schema-6 helpers cannot
+	// preserve unresolved-execution and terminal-outbox safety fields.
 	storeSQLiteMinPointerSchemaVersion = 6
 	sqliteImportCheckpointImporting    = "importing"
 	sqliteWALAutocheckpointPages       = 0
 
 	DefaultSQLiteStateMigrationMinSize int64 = 1 << 20
 )
+
+// History-watch is kept in the existing cold state document for backwards
+// compatibility.  This projection is an additional state_meta value, not a
+// schema/table change, and lets the high-frequency watcher update only its own
+// JSON without repeatedly rewriting the large cold document.
+const (
+	sqliteHistoryWatchProjectionKey = "history_watch_projection"
+	// stateJSONRevisionKey is incremented by a durable SQLite trigger whenever
+	// any writer (including an older helper) replaces state_json.  The history
+	// watch projection records the revision it was based on, so a mixed-version
+	// full-state write cannot silently get overwritten by a stale projection.
+	sqliteStateJSONRevisionKey = "state_json_revision"
+)
+
+type sqliteHistoryWatchProjection struct {
+	HistoryWatch      map[string]HistoryWatchCheckpoint `json:"history_watch,omitempty"`
+	HistoryWatchReady time.Time                         `json:"history_watch_ready,omitempty"`
+	StateJSONRevision int64                             `json:"state_json_revision,omitempty"`
+}
 
 const SQLiteFileName = storeSQLiteFileName
 
@@ -50,6 +70,11 @@ var sqliteMigrationTestHook func(stage string) error
 // sqliteRuntimeMetadataConnectionTestHook is nil in production. It lets tests
 // verify that one metadata attempt acquires exactly one physical connection.
 var sqliteRuntimeMetadataConnectionTestHook func()
+
+// SQLite defaults to 999 host parameters. Keep headroom for fixed query
+// arguments (for example a status predicate) and avoid making a large linked
+// transcript poll fail just because many sessions are registered.
+const sqliteQueryParameterBatchSize = 400
 
 type storeSQLitePointer struct {
 	SchemaVersion       int       `json:"schema_version"`
@@ -90,6 +115,17 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 			state, err := s.loadSQLiteStateUnlocked(ctx, pointer)
 			if err != nil {
 				return err
+			}
+			// A pointer emitted by the previous helper is readable for the
+			// migration step, but it must not remain writable under the old
+			// format.  Publish the current pointer schema before returning the
+			// already-migrated database so an older helper rejects the store
+			// instead of overwriting safety fields it does not understand.
+			if pointer.SchemaVersion < storeSQLitePointerSchemaVersion {
+				if err := s.writeSQLitePointerUnlocked(pointer); err != nil {
+					return err
+				}
+				pointer.SchemaVersion = storeSQLitePointerSchemaVersion
 			}
 			dbPath, err := s.storeSQLitePath(pointer)
 			if err != nil {
@@ -354,6 +390,7 @@ func (s *Store) writeSQLitePointerUnlocked(pointer storeSQLitePointer) error {
 	}
 	if info, err := os.Stat(s.path); err == nil {
 		s.cacheSQLitePointerUnlocked(pointer, info, false)
+		s.sqlitePointerFingerprint = sha256Bytes(data)
 	} else {
 		s.clearSQLitePointerCacheUnlocked()
 	}
@@ -393,6 +430,7 @@ func (s *Store) sqlitePointerFromDataUnlocked(data []byte, info os.FileInfo) (st
 		return pointer, ok, err
 	}
 	s.cacheSQLitePointerUnlocked(pointer, info, true)
+	s.sqlitePointerFingerprint = sha256Bytes(data)
 	return pointer, true, nil
 }
 
@@ -403,6 +441,7 @@ func (s *Store) clearSQLitePointerCacheUnlocked() {
 	s.sqlitePointerSize = 0
 	s.sqlitePointerMod = time.Time{}
 	s.sqlitePointerChange = 0
+	s.sqlitePointerFingerprint = ""
 }
 
 func fileInfoChangeTimeUnixNano(info os.FileInfo) int64 {
@@ -1646,6 +1685,31 @@ func ensureSQLiteSchema(db *sql.DB) error {
 			return err
 		}
 	}
+	// Keep a tiny durable epoch for the cold state row. The trigger is part of
+	// the SQLite file, so an older helper that only knows state_json still bumps
+	// the epoch and cannot silently leave a newer history-watch projection in
+	// front of its write.
+	for _, stmt := range []string{
+		`CREATE TRIGGER IF NOT EXISTS state_json_revision_insert
+AFTER INSERT ON state_meta
+WHEN NEW.key = 'state_json'
+BEGIN
+  INSERT INTO state_meta(key, value) VALUES ('state_json_revision', '1')
+  ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(COALESCE(value, '0') AS INTEGER) + 1 AS TEXT);
+END`,
+		`CREATE TRIGGER IF NOT EXISTS state_json_revision_update
+AFTER UPDATE OF value ON state_meta
+WHEN NEW.key = 'state_json'
+BEGIN
+  INSERT INTO state_meta(key, value) VALUES ('state_json_revision', '1')
+  ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(COALESCE(value, '0') AS INTEGER) + 1 AS TEXT);
+END`,
+		`INSERT OR IGNORE INTO state_meta(key, value) VALUES ('state_json_revision', '1')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
 	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN teams_message_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
@@ -1725,6 +1789,13 @@ func coldSQLiteState(state State) State {
 
 func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	state.ensure(time.Time{})
+	for key, checkpoint := range state.ImportCheckpoints {
+		checkpointKey := strings.TrimSpace(key)
+		checkpointID := strings.TrimSpace(checkpoint.ID)
+		if checkpointKey != "" && checkpointID != "" && checkpointKey != checkpointID {
+			return fmt.Errorf("%w: checkpoint row id %q is keyed as %q", ErrSessionStateProvenanceMismatch, checkpointID, checkpointKey)
+		}
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1740,6 +1811,13 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
+		return err
+	}
+	stateJSONRevision, err := sqliteStateJSONRevision(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := upsertSQLiteHistoryWatchProjectionTx(ctx, tx, state.HistoryWatch, state.HistoryWatchReady, stateJSONRevision); err != nil {
 		return err
 	}
 	if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
@@ -2286,6 +2364,9 @@ func loadSQLiteColdStateWithChatSequences(ctx context.Context, q interface {
 		return State{}, err
 	}
 	state.ensure(time.Time{})
+	if err := overlaySQLiteHistoryWatchProjection(ctx, q, &state); err != nil {
+		return State{}, err
+	}
 	state.ChatSequences = map[string]ChatSequenceState{}
 	if includeChatSequences {
 		if err := loadSQLiteJSONMap(ctx, q, `SELECT json FROM chat_sequences`, state.ChatSequences, func(v ChatSequenceState) string { return v.ChatID }); err != nil {
@@ -2293,6 +2374,73 @@ func loadSQLiteColdStateWithChatSequences(ctx context.Context, q interface {
 		}
 	}
 	return state, nil
+}
+
+func loadSQLiteHistoryWatchProjection(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (map[string]HistoryWatchCheckpoint, time.Time, int64, int64, bool, error) {
+	var raw []byte
+	var stateJSONRevision int64
+	// Read the projection and the epoch in one scoped query.  The epoch is
+	// required for mixed-version safety, but a second state_meta round trip on
+	// every HistoryWatch poll was a measurable cost in the SQLite hot path.
+	if err := q.QueryRowContext(ctx, `
+SELECT value,
+       COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?), 0)
+FROM state_meta WHERE key = ?`, sqliteStateJSONRevisionKey, sqliteHistoryWatchProjectionKey).Scan(&raw, &stateJSONRevision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, time.Time{}, 0, 0, false, nil
+		}
+		return nil, time.Time{}, 0, 0, false, err
+	}
+	var projection sqliteHistoryWatchProjection
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &projection); err != nil {
+			return nil, time.Time{}, 0, 0, false, err
+		}
+	}
+	if projection.HistoryWatch == nil {
+		projection.HistoryWatch = make(map[string]HistoryWatchCheckpoint)
+	}
+	return projection.HistoryWatch, projection.HistoryWatchReady, projection.StateJSONRevision, stateJSONRevision, true, nil
+}
+
+func sqliteStateJSONRevision(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (int64, error) {
+	var revision int64
+	if err := q.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?`, sqliteStateJSONRevisionKey).Scan(&revision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if revision < 0 {
+		return 0, fmt.Errorf("invalid sqlite state_json revision %d", revision)
+	}
+	return revision, nil
+}
+
+func overlaySQLiteHistoryWatchProjection(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, state *State) error {
+	history, ready, projectionRevision, stateJSONRevision, found, err := loadSQLiteHistoryWatchProjection(ctx, q)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	// A projection written before the epoch existed is treated as legacy. If a
+	// full-state writer has since touched state_json, the revision differs and
+	// the cold JSON is authoritative until the current helper rematerializes the
+	// projection. This is deliberately fail-closed for mixed-version stores.
+	if projectionRevision <= 0 || stateJSONRevision <= 0 || projectionRevision != stateJSONRevision {
+		return nil
+	}
+	state.HistoryWatch = history
+	state.HistoryWatchReady = ready
+	return nil
 }
 
 func loadSQLiteJSONMap[T any](ctx context.Context, q interface {
@@ -2384,6 +2532,28 @@ func saveSQLiteColdStateTx(ctx context.Context, tx *sql.Tx, state State) error {
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold)
+	if err != nil {
+		return err
+	}
+	// HistoryWatch has a dedicated projection update path.  Do not rewrite that
+	// projection on every unrelated cold-state/outbox update: it adds a JSON
+	// marshal and state_meta write to the hot queue path and can overwrite a
+	// newer watcher projection when a legacy full-state writer races with it.
+	// The state_json revision trigger invalidates a stale projection; the next
+	// HistoryWatch read/update will rebuild it from the canonical cold state.
+	return nil
+}
+
+func upsertSQLiteHistoryWatchProjectionTx(ctx context.Context, tx *sql.Tx, history map[string]HistoryWatchCheckpoint, ready time.Time, stateJSONRevision int64) error {
+	if history == nil {
+		history = make(map[string]HistoryWatchCheckpoint)
+	}
+	raw, err := json.Marshal(sqliteHistoryWatchProjection{HistoryWatch: history, HistoryWatchReady: ready, StateJSONRevision: stateJSONRevision})
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteHistoryWatchProjectionKey, raw)
 	return err
 }
 
@@ -2732,6 +2902,66 @@ func (s *Store) importCheckpointSQLite(ctx context.Context, id string) (ImportCh
 	return out, found, handled, err
 }
 
+func (s *Store) loadSQLiteImportCheckpointsByIDsUnlocked(ctx context.Context, pointer storeSQLitePointer, requested map[string]string) (map[string]ImportCheckpoint, error) {
+	out := make(map[string]ImportCheckpoint, len(requested))
+	if len(requested) == 0 {
+		return out, nil
+	}
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(requested))
+	for id := range requested {
+		ids = append(ids, id)
+	}
+	for start := 0; start < len(ids); start += sqliteQueryParameterBatchSize {
+		end := start + sqliteQueryParameterBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		args := make([]any, 0, len(batch))
+		for _, id := range batch {
+			args = append(args, id)
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		rows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			var raw []byte
+			if err := rows.Scan(&id, &raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			var checkpoint ImportCheckpoint
+			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if strings.TrimSpace(checkpoint.ID) == "" {
+				checkpoint.ID = id
+			}
+			if err := validateImportCheckpointProvenance(checkpoint, requested[id], id); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[id] = checkpoint
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, bool, error) {
 	var out ImportCheckpoint
 	changed := false
@@ -2757,6 +2987,9 @@ func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn 
 		now := time.Now()
 		next, updateChanged, err := fn(current, found, now)
 		if err != nil {
+			return err
+		}
+		if err := validateImportCheckpointUpdateProvenance(id, current, found, next); err != nil {
 			return err
 		}
 		out = next
@@ -2793,14 +3026,32 @@ func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, checkpoint
 			}
 			defer tx.Rollback()
 			state := State{
-				SchemaVersion:     SchemaVersion,
-				ImportCheckpoints: map[string]ImportCheckpoint{},
-				TranscriptLedger:  map[string]TranscriptLedgerRecord{},
+				SchemaVersion:            SchemaVersion,
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				TranscriptLedger:         map[string]TranscriptLedgerRecord{},
+				legacyUnresolvedSessions: map[string]bool{},
 			}
 			if existing, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpoint.ID); err != nil {
 				return err
 			} else if ok {
+				if err := validateLoadedTranscriptCheckpointRow(existing, checkpoint.ID, checkpoint.SessionID); err != nil {
+					return err
+				}
 				state.ImportCheckpoints[existing.ID] = existing
+			}
+			if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, &state, checkpoint.SessionID); err != nil {
+				return err
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, checkpoint.SessionID); err != nil {
+				return err
+			}
+			if err := validateTranscriptCheckpointRecordProvenance(&state, checkpoint); err != nil {
+				return err
+			}
+			previous, _ := state.ImportCheckpoints[checkpoint.ID]
+			if stateHasUnresolvedExecution(&state, checkpoint.SessionID) &&
+				!importCheckpointIsExplicitHistoryRun(previous) {
+				return ErrUnresolvedExecution
 			}
 			nextCheckpoint, nextLedger := applyRecordTranscriptCheckpointLocked(&state, checkpoint, ledger, time.Now())
 			if err := upsertSQLiteImportCheckpointTx(ctx, tx, nextCheckpoint); err != nil {
@@ -2828,6 +3079,19 @@ func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, checkpoint
 }
 
 func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error) (bool, error) {
+	return s.updateSQLiteColdStateIfChanged(ctx, func(state *State) (bool, error) {
+		if err := fn(state); err != nil {
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+// updateSQLiteColdStateIfChanged keeps the transaction and cold-state lock
+// narrow while allowing callers that can prove a no-op to avoid rewriting the
+// state_json row and all split metadata. In particular, history-watch polls
+// must not rewrite SQLite for an unchanged incomplete tail.
+func (s *Store) updateSQLiteColdStateIfChanged(ctx context.Context, fn func(*State) (bool, error)) (bool, error) {
 	handled := false
 	err := s.withStateLock(ctx, func() error {
 		pointer, ok, err := s.currentSQLitePointerUnlocked()
@@ -2848,12 +3112,107 @@ func (s *Store) updateSQLiteColdState(ctx context.Context, fn func(*State) error
 		if err != nil {
 			return err
 		}
-		if err := fn(&state); err != nil {
+		changed, err := fn(&state)
+		if err != nil {
 			return err
+		}
+		if !changed {
+			return tx.Commit()
 		}
 		state.ensure(time.Now())
 		if err := saveSQLiteColdStateTx(ctx, tx, state); err != nil {
 			return err
+		}
+		return tx.Commit()
+	})
+	if errors.Is(err, errStoreNoChange) {
+		return handled, nil
+	}
+	return handled, err
+}
+
+// updateSQLiteHistoryWatchIfChanged updates only the history-watch projection.
+// Older pointers that lack the projection are read through JSON1 once and are
+// materialized lazily on the first changed update. The projection lives in the
+// existing state_meta table, so no schema migration is required; each update
+// remains atomic under the same store lock and SQLite transaction.
+func (s *Store) updateSQLiteHistoryWatchIfChanged(ctx context.Context, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) (bool, error) {
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		history, ready, projectionRevision, stateJSONRevision, found, err := loadSQLiteHistoryWatchProjection(ctx, tx)
+		if err != nil {
+			return err
+		}
+		// A missing/legacy projection or a revision mismatch means an older
+		// full-state writer may have changed state_json. Start from that JSON and
+		// rematerialize a current projection after applying this update.
+		if found && (projectionRevision <= 0 || stateJSONRevision <= 0 || projectionRevision != stateJSONRevision) {
+			found = false
+		}
+		if !found {
+			// Old SQLite pointers have only state_json.  Read just the two
+			// history-watch members once, then materialize the projection on
+			// the first changed update below.
+			var raw []byte
+			var readyRaw sql.NullString
+			if err := tx.QueryRowContext(ctx, `
+SELECT COALESCE(json_extract(value, '$.history_watch'), '{}'),
+       json_extract(value, '$.history_watch_ready')
+FROM state_meta WHERE key = 'state_json'`).Scan(&raw, &readyRaw); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return errors.New("sqlite teams store is missing state metadata")
+				}
+				return err
+			}
+			history = make(map[string]HistoryWatchCheckpoint)
+			if len(raw) > 0 && string(raw) != "null" {
+				if err := json.Unmarshal(raw, &history); err != nil {
+					return err
+				}
+				if history == nil {
+					history = make(map[string]HistoryWatchCheckpoint)
+				}
+			}
+			if readyRaw.Valid && strings.TrimSpace(readyRaw.String) != "" {
+				ready, err = time.Parse(time.RFC3339Nano, readyRaw.String)
+				if err != nil {
+					return fmt.Errorf("invalid history_watch_ready: %w", err)
+				}
+			}
+			// A legacy SQLite pointer has no projection row, so the loader
+			// cannot supply the state_json revision.  Fetch it before
+			// materializing the projection; revision zero is intentionally
+			// rejected by the overlay path and would otherwise force every
+			// subsequent update back through JSON1.
+			stateJSONRevision, err = sqliteStateJSONRevision(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		before := cloneHistoryWatchCheckpoints(history)
+		beforeReady := ready
+		if err := fn(history, &ready); err != nil {
+			return err
+		}
+		if !historyWatchCheckpointsEqual(before, history) || !beforeReady.Equal(ready) {
+			if err := upsertSQLiteHistoryWatchProjectionTx(ctx, tx, history, ready, stateJSONRevision); err != nil {
+				return err
+			}
 		}
 		return tx.Commit()
 	})
@@ -3749,9 +4108,10 @@ func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, delivery Tra
 			}
 			defer tx.Rollback()
 			state := State{
-				SchemaVersion:        SchemaVersion,
-				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
-				ImportCheckpoints:    map[string]ImportCheckpoint{},
+				SchemaVersion:            SchemaVersion,
+				TranscriptDeliveries:     map[string]TranscriptDeliveryRecord{},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				legacyUnresolvedSessions: map[string]bool{},
 			}
 			if existing, ok, err := loadSQLiteJSONRow[TranscriptDeliveryRecord](ctx, tx, `SELECT json FROM transcript_deliveries WHERE id = ?`, strings.TrimSpace(delivery.ID)); err != nil {
 				return err
@@ -3759,14 +4119,36 @@ func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, delivery Tra
 				state.TranscriptDeliveries[existing.ID] = existing
 			}
 			checkpointID := strings.TrimSpace(checkpoint.ID)
-			if checkpointID != "" && strings.TrimSpace(checkpoint.LastRecordID) != "" {
+			if checkpointID == "" {
+				checkpointID = sessionTranscriptCheckpointID(delivery.SessionID)
+			}
+			if checkpointID != "" {
 				if existing, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
 					return err
 				} else if ok {
+					if err := validateLoadedTranscriptCheckpointRow(existing, checkpointID, delivery.SessionID); err != nil {
+						return err
+					}
 					state.ImportCheckpoints[existing.ID] = existing
 				}
 			}
+			if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, &state, delivery.SessionID); err != nil {
+				return err
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, delivery.SessionID); err != nil {
+				return err
+			}
+			if err := validateTranscriptDeliveryCheckpointProvenance(delivery, checkpoint); err != nil {
+				return err
+			}
+			if err := validateTranscriptCheckpointRecordProvenance(&state, checkpoint); err != nil {
+				return err
+			}
 			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[checkpointID]
+			if stateHasUnresolvedExecution(&state, delivery.SessionID) &&
+				!importCheckpointIsExplicitHistoryRun(beforeCheckpoint) {
+				return ErrUnresolvedExecution
+			}
 			out, created = applyRecordTranscriptDeliveryLocked(&state, delivery, checkpoint, time.Now())
 			if created {
 				if err := upsertSQLiteTranscriptDeliveryTx(ctx, tx, out); err != nil {
@@ -4613,6 +4995,9 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
 			return State{}, err
 		} else if ok {
+			if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
+				return State{}, err
+			}
 			state.ImportCheckpoints[checkpoint.ID] = checkpoint
 		}
 	}
@@ -4648,12 +5033,367 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 	return state, nil
 }
 
-func (s *Store) loadSQLiteSessionActiveTurnQueueStateUnlocked(pointer storeSQLitePointer, sessionID string) (State, error) {
+func (s *Store) loadSQLiteSessionExecutionStateUnlocked(ctx context.Context, pointer storeSQLitePointer, sessionID string, checkpointID string) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
 		return State{}, err
 	}
-	ctx := context.Background()
+	state := State{
+		SchemaVersion:     SchemaVersion,
+		Turns:             map[string]Turn{},
+		ImportCheckpoints: map[string]ImportCheckpoint{},
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM turns WHERE session_id = ?`, state.Turns, func(v Turn) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM import_checkpoints WHERE session_id = ?`, state.ImportCheckpoints, func(v ImportCheckpoint) string { return v.ID }, sessionID); err != nil {
+		return State{}, err
+	}
+	if checkpointID != "" {
+		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+			return State{}, err
+		} else if ok {
+			if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
+				return State{}, err
+			}
+			state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		}
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) loadSQLiteSessionExecutionOwnershipProbeUnlocked(ctx context.Context, pointer storeSQLitePointer, sessionID string, checkpointID string) (bool, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return false, err
+	}
+	if checkpointID != "" {
+		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+			return false, err
+		} else if ok {
+			if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
+				return false, err
+			}
+			if importCheckpointHasUnresolvedExecution(checkpoint) {
+				return true, nil
+			}
+		}
+	}
+	rows, err := db.QueryContext(ctx, `SELECT json FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return false, err
+		}
+		var meta struct {
+			Status         TurnStatus `json:"status"`
+			RecoveryReason string     `json:"recovery_reason"`
+		}
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return false, err
+		}
+		if isLegacyUnresolvedTurn(Turn{Status: meta.Status, RecoveryReason: meta.RecoveryReason}) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *Store) loadSQLiteSessionExecutionOwnershipProbesUnlocked(ctx context.Context, pointer storeSQLitePointer, requested map[string]struct{}) (map[string]bool, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(requested))
+	for sessionID := range requested {
+		out[sessionID] = false
+	}
+	ids := make([]string, 0, len(requested))
+	checkpointIDToSession := make(map[string]string, len(requested))
+	for sessionID := range requested {
+		ids = append(ids, sessionID)
+		checkpointIDToSession[sessionTranscriptCheckpointID(sessionID)] = sessionID
+	}
+	for start := 0; start < len(ids); start += sqliteQueryParameterBatchSize {
+		end := start + sqliteQueryParameterBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		args := make([]any, 0, len(batch))
+		for _, sessionID := range batch {
+			args = append(args, sessionTranscriptCheckpointID(sessionID))
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		checkpointRows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for checkpointRows.Next() {
+			var id string
+			var raw []byte
+			if err := checkpointRows.Scan(&id, &raw); err != nil {
+				_ = checkpointRows.Close()
+				return nil, err
+			}
+			var checkpoint ImportCheckpoint
+			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+				_ = checkpointRows.Close()
+				return nil, err
+			}
+			sessionID, wanted := checkpointIDToSession[id]
+			if !wanted {
+				continue
+			}
+			if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+				_ = checkpointRows.Close()
+				return nil, err
+			}
+			if importCheckpointHasUnresolvedExecution(checkpoint) {
+				out[sessionID] = true
+			}
+		}
+		if err := checkpointRows.Err(); err != nil {
+			_ = checkpointRows.Close()
+			return nil, err
+		}
+		if err := checkpointRows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	for start := 0; start < len(ids); start += sqliteQueryParameterBatchSize {
+		end := start + sqliteQueryParameterBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		turnArgs := make([]any, 0, len(batch)+1)
+		turnArgs = append(turnArgs, string(TurnStatusInterrupted))
+		for _, id := range batch {
+			turnArgs = append(turnArgs, id)
+		}
+		turnPlaceholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		rows, err := db.QueryContext(ctx, `SELECT session_id, json FROM turns WHERE status = ? AND session_id IN (`+turnPlaceholders+`)`, turnArgs...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var sessionID string
+			var raw []byte
+			if err := rows.Scan(&sessionID, &raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if out[sessionID] {
+				continue
+			}
+			var meta struct {
+				Status         TurnStatus `json:"status"`
+				RecoveryReason string     `json:"recovery_reason"`
+			}
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if isLegacyUnresolvedTurn(Turn{Status: meta.Status, RecoveryReason: meta.RecoveryReason}) {
+				out[sessionID] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// loadSQLiteLinkedTranscriptExecutionSnapshotUnlocked loads only the
+// active/interrupted turn rows used by the linked-transcript bridge. The
+// caller already holds the state lock; keeping this query separate lets the
+// idle path avoid it entirely when every checkpoint is a trusted no-op.
+func (s *Store) loadSQLiteLinkedTranscriptExecutionSnapshotUnlocked(ctx context.Context, pointer storeSQLitePointer, requested map[string]struct{}) (LinkedTranscriptExecutionSnapshot, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return LinkedTranscriptExecutionSnapshot{}, err
+	}
+	out := LinkedTranscriptExecutionSnapshot{
+		Running:   make(map[string]bool, len(requested)),
+		Ownership: make(map[string]bool, len(requested)),
+	}
+	for sessionID := range requested {
+		out.Running[sessionID] = false
+		out.Ownership[sessionID] = false
+	}
+	if len(requested) == 0 {
+		return out, nil
+	}
+	sessionIDs := make([]string, 0, len(requested))
+	for sessionID := range requested {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	// Two arguments are reserved for the status predicates.
+	for start := 0; start < len(sessionIDs); start += sqliteQueryParameterBatchSize - 2 {
+		end := start + sqliteQueryParameterBatchSize - 2
+		if end > len(sessionIDs) {
+			end = len(sessionIDs)
+		}
+		batch := sessionIDs[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, string(TurnStatusRunning), string(TurnStatusInterrupted))
+		for _, sessionID := range batch {
+			args = append(args, sessionID)
+		}
+		rows, err := db.QueryContext(ctx, `SELECT session_id, json FROM turns WHERE status IN (?, ?) AND session_id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return LinkedTranscriptExecutionSnapshot{}, err
+		}
+		for rows.Next() {
+			var sessionID string
+			var raw []byte
+			if err := rows.Scan(&sessionID, &raw); err != nil {
+				_ = rows.Close()
+				return LinkedTranscriptExecutionSnapshot{}, err
+			}
+			sessionID = strings.TrimSpace(sessionID)
+			if _, wanted := requested[sessionID]; !wanted {
+				continue
+			}
+			var meta struct {
+				SessionID      string     `json:"session_id"`
+				Status         TurnStatus `json:"status"`
+				RecoveryReason string     `json:"recovery_reason"`
+			}
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				_ = rows.Close()
+				return LinkedTranscriptExecutionSnapshot{}, err
+			}
+			if strings.TrimSpace(meta.SessionID) != "" && strings.TrimSpace(meta.SessionID) != sessionID {
+				_ = rows.Close()
+				return LinkedTranscriptExecutionSnapshot{}, fmt.Errorf("%w: turn row session %q differs from indexed session %q", ErrSessionStateProvenanceMismatch, meta.SessionID, sessionID)
+			}
+			switch meta.Status {
+			case TurnStatusRunning:
+				out.Running[sessionID] = true
+			case TurnStatusInterrupted:
+				if isLegacyUnresolvedTurn(Turn{Status: meta.Status, RecoveryReason: meta.RecoveryReason}) {
+					out.Ownership[sessionID] = true
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return LinkedTranscriptExecutionSnapshot{}, err
+		}
+		if err := rows.Close(); err != nil {
+			return LinkedTranscriptExecutionSnapshot{}, err
+		}
+	}
+	return out, nil
+}
+
+// loadSQLiteLinkedTranscriptSessionSnapshotUnlocked combines the checkpoint
+// and active/interrupted-turn probes used by the linked-transcript bridge.
+// The caller already holds the state lock, so this avoids both repeated lock
+// acquisition and decoding the same checkpoint JSON once for the checkpoint
+// map and again for the ownership probe.
+func (s *Store) loadSQLiteLinkedTranscriptSessionSnapshotUnlocked(ctx context.Context, pointer storeSQLitePointer, requested map[string]struct{}) (LinkedTranscriptSessionSnapshot, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return LinkedTranscriptSessionSnapshot{}, err
+	}
+	out := LinkedTranscriptSessionSnapshot{
+		Running:     make(map[string]bool, len(requested)),
+		Checkpoints: make(map[string]ImportCheckpoint, len(requested)),
+		Ownership:   make(map[string]bool, len(requested)),
+	}
+	checkpointIDToSession := make(map[string]string, len(requested))
+	ids := make([]string, 0, len(requested))
+	for sessionID := range requested {
+		out.Running[sessionID] = false
+		out.Ownership[sessionID] = false
+		checkpointID := sessionTranscriptCheckpointID(sessionID)
+		checkpointIDToSession[checkpointID] = sessionID
+		ids = append(ids, checkpointID)
+	}
+	for start := 0; start < len(ids); start += sqliteQueryParameterBatchSize {
+		end := start + sqliteQueryParameterBatchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			args[i] = id
+		}
+		rows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return LinkedTranscriptSessionSnapshot{}, err
+		}
+		for rows.Next() {
+			var id string
+			var raw []byte
+			if err := rows.Scan(&id, &raw); err != nil {
+				_ = rows.Close()
+				return LinkedTranscriptSessionSnapshot{}, err
+			}
+			sessionID, wanted := checkpointIDToSession[id]
+			if !wanted {
+				continue
+			}
+			var checkpoint ImportCheckpoint
+			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+				_ = rows.Close()
+				return LinkedTranscriptSessionSnapshot{}, err
+			}
+			if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+				_ = rows.Close()
+				return LinkedTranscriptSessionSnapshot{}, err
+			}
+			out.Checkpoints[id] = checkpoint
+			out.Ownership[sessionID] = importCheckpointHasUnresolvedExecution(checkpoint)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return LinkedTranscriptSessionSnapshot{}, err
+		}
+		if err := rows.Close(); err != nil {
+			return LinkedTranscriptSessionSnapshot{}, err
+		}
+	}
+	// One query per bounded session batch covers both active execution and the
+	// legacy interrupted-turn fallback. This preserves the old fail-closed
+	// behavior without a second pass over checkpoint rows.
+	execution, err := s.loadSQLiteLinkedTranscriptExecutionSnapshotUnlocked(ctx, pointer, requested)
+	if err != nil {
+		return LinkedTranscriptSessionSnapshot{}, err
+	}
+	out.Running = execution.Running
+	for sessionID, owned := range execution.Ownership {
+		if owned {
+			out.Ownership[sessionID] = true
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) loadSQLiteSessionActiveTurnQueueStateUnlocked(ctx context.Context, pointer storeSQLitePointer, sessionID string) (State, error) {
+	db, err := s.sqliteDBUnlocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
 	state := State{
 		SchemaVersion: SchemaVersion,
 		Turns:         map[string]Turn{},
@@ -4936,6 +5676,200 @@ func (s *Store) recordMessageProvenanceSQLite(ctx context.Context, record Messag
 	return out, handled, err
 }
 
+func markSQLiteLegacyUnresolvedSessionTx(ctx context.Context, tx *sql.Tx, state *State, sessionID string) error {
+	if tx == nil || state == nil {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	if state.legacyUnresolvedSessions == nil {
+		state.legacyUnresolvedSessions = map[string]bool{}
+	}
+	if _, probed := state.legacyUnresolvedSessions[sessionID]; probed {
+		// Multiple operations can share one SQLite transaction. A negative probe
+		// is authoritative for that transaction just like a materialized anchor.
+		return nil
+	}
+	if state.ImportCheckpoints == nil {
+		state.ImportCheckpoints = map[string]ImportCheckpoint{}
+	}
+	checkpointID := sessionTranscriptCheckpointID(sessionID)
+	if _, loaded := state.ImportCheckpoints[checkpointID]; !loaded {
+		if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, state, sessionID); err != nil {
+			return err
+		}
+	}
+	if checkpoint, ok := state.ImportCheckpoints[checkpointID]; ok && importCheckpointHasUnresolvedExecution(checkpoint) {
+		// Once the compatibility probe has materialized the canonical anchor,
+		// every subsequent transaction can use this single indexed checkpoint
+		// row instead of decoding all interrupted turns again.
+		state.legacyUnresolvedSessions[sessionID] = true
+		return nil
+	}
+	legacyRevision, err := sqliteLegacyInterruptedRevisionTx(ctx, tx, sessionID)
+	if err != nil {
+		return err
+	}
+	if checkpoint, ok := state.ImportCheckpoints[checkpointID]; ok && strings.TrimSpace(legacyRevision) != "" && checkpoint.LegacyProbeRevision == legacyRevision {
+		// A persisted negative probe is valid until the indexed interrupted set
+		// changes. Do not scan/decode the same candidate rows again in every
+		// transaction.
+		state.legacyUnresolvedSessions[sessionID] = false
+		return nil
+	}
+	// This is a compatibility probe for pre-anchor state. It intentionally
+	// checks only the interrupted record itself: a later durable terminal is
+	// not app-server ownership proof and must never discharge the fence. Keep
+	// the SQL predicate limited to the indexed session/status columns, then
+	// decode the small candidate rows in Go. SQLite's json_extract on every
+	// candidate was a measurable polling regression and could not use the
+	// existing turns indexes.
+	rows, err := tx.QueryContext(ctx, `SELECT json FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted))
+	if err != nil {
+		return err
+	}
+	legacyCandidates := make([]Turn, 0)
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		var turn Turn
+		if err := json.Unmarshal(raw, &turn); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if isLegacyUnresolvedTurn(turn) {
+			legacyCandidates = append(legacyCandidates, turn)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	sort.SliceStable(legacyCandidates, func(i, j int) bool {
+		leftTime := firstStoreNonZeroTime(legacyCandidates[i].InterruptedAt, legacyCandidates[i].UpdatedAt, legacyCandidates[i].CreatedAt)
+		rightTime := firstStoreNonZeroTime(legacyCandidates[j].InterruptedAt, legacyCandidates[j].UpdatedAt, legacyCandidates[j].CreatedAt)
+		if !leftTime.Equal(rightTime) {
+			return leftTime.After(rightTime)
+		}
+		return strings.TrimSpace(legacyCandidates[i].ID) > strings.TrimSpace(legacyCandidates[j].ID)
+	})
+	if len(legacyCandidates) > 0 {
+		legacyTurn := legacyCandidates[0]
+		state.legacyUnresolvedSessions[sessionID] = true
+		checkpoint := state.ImportCheckpoints[checkpointID]
+		checkpoint.ID = checkpointID
+		checkpoint.SessionID = sessionID
+		checkpoint.LegacyProbeRevision = legacyRevision
+		state.ImportCheckpoints[checkpointID] = checkpoint
+		if err := materializeSQLiteLegacyExecutionAnchorTx(ctx, tx, state, sessionID, legacyTurn); err != nil {
+			return err
+		}
+		return nil
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	checkpoint.ID = checkpointID
+	checkpoint.SessionID = sessionID
+	checkpoint.LegacyProbeRevision = legacyRevision
+	state.ImportCheckpoints[checkpointID] = checkpoint
+	if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+		return err
+	}
+	state.legacyUnresolvedSessions[sessionID] = false
+	return nil
+}
+
+func sqliteLegacyInterruptedRevisionTx(ctx context.Context, tx *sql.Tx, sessionID string) (string, error) {
+	if tx == nil || strings.TrimSpace(sessionID) == "" {
+		return "", nil
+	}
+	var maxUpdated int64
+	var count int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at), 0), COUNT(*) FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted)).Scan(&maxUpdated, &count); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d", maxUpdated, count), nil
+}
+
+func materializeSQLiteLegacyExecutionAnchorTx(ctx context.Context, tx *sql.Tx, state *State, sessionID string, turn Turn) error {
+	if tx == nil || state == nil || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	checkpointID := sessionTranscriptCheckpointID(sessionID)
+	checkpoint, ok := state.ImportCheckpoints[checkpointID]
+	if !ok {
+		checkpoint = ImportCheckpoint{ID: checkpointID, SessionID: sessionID}
+		state.ImportCheckpoints[checkpointID] = checkpoint
+	}
+	if importCheckpointHasUnresolvedExecution(checkpoint) {
+		return nil
+	}
+	generation := checkpoint.ExecutionAnchorGeneration + 1
+	if generation <= 0 {
+		generation = 1
+	}
+	anchor := ExecutionAnchor{
+		SessionID:         sessionID,
+		ThreadID:          strings.TrimSpace(firstStoreNonEmptyString(turn.CodexThreadID, state.Sessions[sessionID].CodexThreadID)),
+		OuterTurnID:       strings.TrimSpace(turn.ID),
+		CodexTurnID:       strings.TrimSpace(turn.CodexTurnID),
+		SourcePath:        strings.TrimSpace(checkpoint.SourcePath),
+		SourceFingerprint: strings.TrimSpace(checkpoint.SourceFingerprint),
+		Reason:            strings.TrimSpace(turn.RecoveryReason),
+		State:             "unresolved",
+		Generation:        generation,
+		CreatedAt:         firstStoreNonZeroTime(turn.InterruptedAt, turn.UpdatedAt, turn.CreatedAt, time.Now()),
+		UpdatedAt:         time.Now(),
+	}
+	// If the checkpoint was written after the interruption, it is not a safe
+	// cutoff: use the conservative beginning-of-source boundary instead.
+	if turn.InterruptedAt.IsZero() || checkpoint.UpdatedAt.IsZero() || !checkpoint.UpdatedAt.After(turn.InterruptedAt) {
+		anchor.CutoffRecordID = strings.TrimSpace(checkpoint.LastRecordID)
+		anchor.CutoffLine = checkpoint.LastSourceLine
+		anchor.CutoffOffset = checkpoint.LastOffset
+	}
+	checkpoint.ExecutionAnchorGeneration = generation
+	checkpoint.UnresolvedExecution = &anchor
+	state.ImportCheckpoints[checkpointID] = checkpoint
+	return upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint)
+}
+
+// loadSQLiteSessionTranscriptCheckpointTx loads the canonical per-session
+// transcript checkpoint in addition to any operation-specific checkpoint the
+// caller requested.  An explicit/full-history operation may use a different
+// checkpoint ID, but the session anchor remains the authoritative execution
+// fence for every automatic delivery path.
+func loadSQLiteSessionTranscriptCheckpointTx(ctx context.Context, tx *sql.Tx, state *State, sessionID string) error {
+	if tx == nil || state == nil {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	id := sessionTranscriptCheckpointID(sessionID)
+	if checkpoint, alreadyLoaded := state.ImportCheckpoints[id]; alreadyLoaded {
+		// Callers may have loaded an operation-specific row into the same
+		// transaction before asking for the canonical session row.  Never trust
+		// the map key alone: an embedded foreign ID/session must fail closed.
+		return validateImportCheckpointProvenance(checkpoint, sessionID, id)
+	}
+	checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+			return err
+		}
+		state.ImportCheckpoints[checkpoint.ID] = checkpoint
+	}
+	return nil
+}
+
 func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string) (Turn, bool, bool, error) {
 	var out Turn
 	claimed := false
@@ -4966,6 +5900,31 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 			if fenced, err := sqliteForkParentFencedTx(ctx, tx, sessionID); err != nil {
 				return err
 			} else if fenced {
+				return tx.Commit()
+			}
+			checkpoint, checkpointFound, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, sessionTranscriptCheckpointID(sessionID))
+			if err != nil {
+				return err
+			}
+			if checkpointFound && importCheckpointHasUnresolvedExecution(checkpoint) {
+				// Keep the ownership fence in the same SQLite transaction as the
+				// claim so a stale bridge snapshot cannot start a same-session turn.
+				return tx.Commit()
+			}
+			legacyState := State{
+				legacyUnresolvedSessions: map[string]bool{},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+			}
+			if checkpointFound {
+				// The canonical row was already loaded for the fast unresolved
+				// check above.  Seed the compatibility probe with it so a queued
+				// turn claim does not issue the same indexed JSON query again.
+				legacyState.ImportCheckpoints[checkpoint.ID] = checkpoint
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &legacyState, sessionID); err != nil {
+				return err
+			}
+			if legacyState.legacyUnresolvedSessions[sessionID] {
 				return tx.Commit()
 			}
 			var running int
@@ -5060,14 +6019,16 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 			}
 			defer tx.Rollback()
 			state := State{
-				SchemaVersion:        SchemaVersion,
-				Sessions:             map[string]SessionContext{},
-				Turns:                map[string]Turn{turnID: current},
-				InboundEvents:        map[string]InboundEvent{},
-				OutboxMessages:       map[string]OutboxMessage{},
-				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
-				HelperDeliveries:     map[string]HelperDeliveryRecord{},
-				ArtifactRecords:      map[string]ArtifactRecord{},
+				SchemaVersion:            SchemaVersion,
+				Sessions:                 map[string]SessionContext{},
+				Turns:                    map[string]Turn{turnID: current},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				InboundEvents:            map[string]InboundEvent{},
+				OutboxMessages:           map[string]OutboxMessage{},
+				TranscriptDeliveries:     map[string]TranscriptDeliveryRecord{},
+				HelperDeliveries:         map[string]HelperDeliveryRecord{},
+				ArtifactRecords:          map[string]ArtifactRecord{},
+				legacyUnresolvedSessions: map[string]bool{},
 			}
 			if current.SessionID != "" {
 				if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, current.SessionID); err != nil {
@@ -5075,6 +6036,19 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 				} else if ok {
 					state.Sessions[current.SessionID] = session
 				}
+			}
+			if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, sessionTranscriptCheckpointID(current.SessionID)); err != nil {
+				return err
+			} else if ok {
+				if err := validateImportCheckpointProvenance(checkpoint, current.SessionID, sessionTranscriptCheckpointID(current.SessionID)); err != nil {
+					return err
+				}
+				state.ImportCheckpoints[checkpoint.ID] = checkpoint
+			}
+			checkpointID := sessionTranscriptCheckpointID(current.SessionID)
+			beforeCheckpoint, beforeCheckpointFound := state.ImportCheckpoints[checkpointID]
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, current.SessionID); err != nil {
+				return err
 			}
 			if inboundID := strings.TrimSpace(current.InboundEventID); inboundID != "" {
 				if inbound, ok, err := loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundID); err != nil {
@@ -5129,6 +6103,11 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 					return err
 				}
 			}
+			if checkpoint, found := state.ImportCheckpoints[checkpointID]; found && (!beforeCheckpointFound || !importCheckpointEqualExceptUpdatedAt(beforeCheckpoint, checkpoint)) {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+					return err
+				}
+			}
 			if err := tx.Commit(); err != nil {
 				return err
 			}
@@ -5142,6 +6121,391 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 		err = run()
 	}
 	return out, handled, err
+}
+
+// markTurnCompletedWithTranscriptCheckpointSQLite is the SQLite half of the
+// terminal-owner/checkpoint CAS. It deliberately loads only the turn,
+// session, legacy ownership probe, and one checkpoint row; unlike the old
+// bridge sequence it cannot commit a cursor after a competing anchor has
+// become visible.
+func (s *Store) markTurnCompletedWithTranscriptCheckpointSQLite(ctx context.Context, turnID string, codexThreadID string, codexTurnID string, progress TranscriptCheckpointProgress) (Turn, bool, error) {
+	var out Turn
+	handled := false
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return out, false, fmt.Errorf("turn id is required")
+	}
+	if strings.TrimSpace(progress.ID) == "" {
+		return out, false, fmt.Errorf("transcript checkpoint id is required")
+	}
+	sessionID := ""
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		turn, found, err := loadSQLiteJSONRow[Turn](ctx, db, `SELECT json FROM turns WHERE id = ?`, turnID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("turn %q not found", turnID)
+		}
+		sessionID = strings.TrimSpace(turn.SessionID)
+		if strings.TrimSpace(progress.SessionID) != "" && strings.TrimSpace(progress.SessionID) != sessionID {
+			return fmt.Errorf("%w: turn %q belongs to session %q, not %q", ErrSessionStateProvenanceMismatch, turnID, sessionID, progress.SessionID)
+		}
+		return nil
+	})
+	if err != nil || !handled {
+		return out, handled, err
+	}
+	if strings.TrimSpace(progress.SessionID) == "" {
+		progress.SessionID = sessionID
+	}
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			current, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return fmt.Errorf("turn %q not found", turnID)
+			}
+			state := State{
+				SchemaVersion:            SchemaVersion,
+				Sessions:                 map[string]SessionContext{},
+				Turns:                    map[string]Turn{turnID: current},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				legacyUnresolvedSessions: map[string]bool{},
+			}
+			if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, sessionID); err != nil {
+				return err
+			} else if ok {
+				state.Sessions[sessionID] = session
+			}
+			checkpoint, checkpointFound, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, strings.TrimSpace(progress.ID))
+			if err != nil {
+				return err
+			}
+			if checkpointFound {
+				if err := validateImportCheckpointProvenance(checkpoint, sessionID, progress.ID); err != nil {
+					return err
+				}
+				state.ImportCheckpoints[strings.TrimSpace(progress.ID)] = checkpoint
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
+				return err
+			}
+			if checkpointFound && importCheckpointHasUnresolvedExecution(checkpoint) && checkpoint.UnresolvedExecution != nil && checkpoint.UnresolvedExecution.Generation <= 0 {
+				if _, ok := migrateLegacyExecutionAnchorGenerationLocked(&state, progress.ID, sessionID, codexThreadID, turnID, codexTurnID, 0); !ok {
+					return ErrUnresolvedExecution
+				}
+				checkpoint = state.ImportCheckpoints[strings.TrimSpace(progress.ID)]
+			}
+			now := time.Now()
+			completed, completeErr := markTurnCompletedLocked(&state, current, codexThreadID, codexTurnID, now)
+			completedChanged := true
+			if errors.Is(completeErr, errStoreNoChange) {
+				completedChanged = false
+				if current.Status != TurnStatusCompleted || !completionIdentityMatches(current, codexThreadID, codexTurnID) {
+					out = current
+					return tx.Commit()
+				}
+				completed = current
+			} else if completeErr != nil {
+				return completeErr
+			}
+			if completed.Status != TurnStatusCompleted {
+				out = completed
+				return tx.Commit()
+			}
+			checkpoint, checkpointFound = state.ImportCheckpoints[strings.TrimSpace(progress.ID)]
+			anchorCleared := false
+			if checkpointFound && importCheckpointHasUnresolvedExecution(checkpoint) && checkpoint.UnresolvedExecution != nil {
+				anchor := checkpoint.UnresolvedExecution
+				if strings.TrimSpace(anchor.OuterTurnID) != turnID || strings.TrimSpace(anchor.ThreadID) != strings.TrimSpace(codexThreadID) || strings.TrimSpace(anchor.CodexTurnID) != strings.TrimSpace(codexTurnID) || strings.TrimSpace(codexTurnID) == "" {
+					return ErrUnresolvedExecution
+				}
+				if !completionSourceProofVerified(*anchor, progress) {
+					return ErrUnresolvedExecution
+				}
+				checkpoint.UnresolvedExecution = nil
+				anchorCleared = true
+				if checkpoint.ExecutionAnchorGeneration < anchor.Generation {
+					checkpoint.ExecutionAnchorGeneration = anchor.Generation
+				}
+			}
+			next, checkpointChanged, err := applyTranscriptCheckpointProgress(checkpoint, checkpointFound, progress, now)
+			if err != nil {
+				return err
+			}
+			if completedChanged {
+				if err := upsertSQLiteTurnTx(ctx, tx, completed); err != nil {
+					return err
+				}
+				if session := state.Sessions[sessionID]; session.ID != "" {
+					if err := upsertSQLiteSessionTx(ctx, tx, session); err != nil {
+						return err
+					}
+				}
+			}
+			if checkpointChanged || anchorCleared {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, next); err != nil {
+					return err
+				}
+			}
+			out = completed
+			return tx.Commit()
+		})
+	}
+	err = s.withSessionLock(ctx, sessionID, run)
+	return out, handled, err
+}
+
+// completeTurnWithFinalSQLite is the SQLite implementation of
+// Store.CompleteTurnWithFinal.  It deliberately loads only the current turn,
+// session, checkpoint, its outbox rows, and the linked delivery records.  No
+// Graph or transcript I/O is performed while the transaction is open.
+func (s *Store) completeTurnWithFinalSQLite(ctx context.Context, req CompleteTurnWithFinalRequest) (Turn, bool, error) {
+	var out Turn
+	handled := false
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			handled = true
+			current, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, req.TurnID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return fmt.Errorf("turn %q not found", req.TurnID)
+			}
+			if strings.TrimSpace(current.SessionID) != req.SessionID {
+				return fmt.Errorf("%w: turn %q belongs to session %q, not %q", ErrSessionStateProvenanceMismatch, req.TurnID, current.SessionID, req.SessionID)
+			}
+			state := State{
+				SchemaVersion:            SchemaVersion,
+				Sessions:                 map[string]SessionContext{},
+				Turns:                    map[string]Turn{req.TurnID: current},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				OutboxMessages:           map[string]OutboxMessage{},
+				TranscriptDeliveries:     map[string]TranscriptDeliveryRecord{},
+				HelperDeliveries:         map[string]HelperDeliveryRecord{},
+				ArtifactRecords:          map[string]ArtifactRecord{},
+				ChatSequences:            map[string]ChatSequenceState{},
+				legacyUnresolvedSessions: map[string]bool{},
+			}
+			if session, ok, err := loadSQLiteJSONRow[SessionContext](ctx, tx, `SELECT json FROM sessions WHERE id = ?`, req.SessionID); err != nil {
+				return err
+			} else if ok {
+				state.Sessions[req.SessionID] = session
+			}
+			checkpointID := sessionTranscriptCheckpointID(req.SessionID)
+			checkpoint, checkpointFound, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID)
+			if err != nil {
+				return err
+			}
+			if checkpointFound {
+				if err := validateImportCheckpointProvenance(checkpoint, req.SessionID, checkpointID); err != nil {
+					return err
+				}
+				state.ImportCheckpoints[checkpointID] = checkpoint
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, req.SessionID); err != nil {
+				return err
+			}
+			if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM outbox_messages WHERE turn_id = ?`, []any{req.TurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+				return err
+			}
+			// The planned IDs are part of the ownership CAS.  Loading only rows
+			// selected by TurnID would let a collision with another Turn reach
+			// the upsert and overwrite that row, unlike the JSON backend which
+			// rejects the conflict.  Load every intended ID before validation.
+			for _, planned := range req.FinalOutbox {
+				id := strings.TrimSpace(planned.ID)
+				if id == "" {
+					continue
+				}
+				if _, exists := state.OutboxMessages[id]; exists {
+					continue
+				}
+				existing, exists, loadErr := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, id)
+				if loadErr != nil {
+					return loadErr
+				}
+				if exists {
+					state.OutboxMessages[id] = existing
+					if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, id); err != nil {
+						return err
+					}
+				}
+			}
+			for outboxID := range state.OutboxMessages {
+				if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, outboxID); err != nil {
+					return err
+				}
+			}
+			for i, msg := range req.FinalOutbox {
+				if _, exists := state.OutboxMessages[msg.ID]; exists || msg.Sequence > 0 {
+					continue
+				}
+				sequence, err := allocateSQLiteChatSequenceTx(ctx, tx, &state, msg.TeamsChatID, time.Now())
+				if err != nil {
+					return err
+				}
+				msg.Sequence = sequence
+				req.FinalOutbox[i] = msg
+			}
+			beforeCheckpoint, beforeCheckpointFound := state.ImportCheckpoints[checkpointID]
+			completed, completeErr := completeTurnWithFinalLocked(&state, req, time.Now())
+			if errors.Is(completeErr, errStoreNoChange) {
+				out = completed
+				return tx.Commit()
+			}
+			if completeErr != nil {
+				return completeErr
+			}
+			if err := upsertSQLiteTurnTx(ctx, tx, completed); err != nil {
+				return err
+			}
+			if session := state.Sessions[req.SessionID]; session.ID != "" {
+				if err := upsertSQLiteSessionTx(ctx, tx, session); err != nil {
+					return err
+				}
+			}
+			for _, msg := range state.OutboxMessages {
+				if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+					return err
+				}
+			}
+			if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+				return err
+			}
+			if checkpoint, found := state.ImportCheckpoints[checkpointID]; found && (!beforeCheckpointFound || !importCheckpointEqualExceptUpdatedAt(beforeCheckpoint, checkpoint)) {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+					return err
+				}
+			}
+			out = completed
+			return tx.Commit()
+		})
+	}
+	err := s.withSessionLock(ctx, req.SessionID, run)
+	return out, handled, err
+}
+
+func (s *Store) clearExecutionAnchorAndConfirmTurnSQLite(ctx context.Context, req ExecutionAnchorClearRequest) (bool, error) {
+	handled := false
+	if strings.TrimSpace(req.CheckpointID) == "" || strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.OuterTurnID) == "" {
+		return false, nil
+	}
+	err := s.withStateLock(ctx, func() error {
+		_, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	if err != nil || !handled {
+		return handled, err
+	}
+	run := func() error {
+		return s.withStateLock(ctx, func() error {
+			pointer, ok, err := s.currentSQLitePointerUnlocked()
+			if err != nil || !ok {
+				return err
+			}
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			checkpoint, checkpointFound, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, req.CheckpointID)
+			if err != nil {
+				return err
+			}
+			turn, turnFound, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, req.OuterTurnID)
+			if err != nil {
+				return err
+			}
+			if !checkpointFound || !turnFound {
+				return tx.Commit()
+			}
+			state := State{
+				SchemaVersion:            SchemaVersion,
+				Turns:                    map[string]Turn{turn.ID: turn},
+				ImportCheckpoints:        map[string]ImportCheckpoint{checkpoint.ID: checkpoint},
+				OutboxMessages:           map[string]OutboxMessage{},
+				legacyUnresolvedSessions: map[string]bool{},
+			}
+			if strings.TrimSpace(turn.SessionID) != strings.TrimSpace(req.SessionID) {
+				return tx.Commit()
+			}
+			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, req.SessionID); err != nil {
+				return err
+			}
+			if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM outbox_messages WHERE turn_id = ?`, []any{req.OuterTurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+				return err
+			}
+			if !clearExecutionAnchorLocked(&state, req) {
+				return tx.Commit()
+			}
+			updatedTurn := state.Turns[turn.ID]
+			if updatedTurn.RecoveryReason != turn.RecoveryReason {
+				if err := upsertSQLiteTurnTx(ctx, tx, updatedTurn); err != nil {
+					return err
+				}
+			}
+			for _, msg := range state.OutboxMessages {
+				if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+					return err
+				}
+			}
+			updatedCheckpoint := state.ImportCheckpoints[checkpoint.ID]
+			if err := upsertSQLiteImportCheckpointTx(ctx, tx, updatedCheckpoint); err != nil {
+				return err
+			}
+			return tx.Commit()
+		})
+	}
+	err = s.withSessionLock(ctx, req.SessionID, run)
+	return handled, err
 }
 
 func (s *Store) queueOutboxSQLite(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, bool, error) {
@@ -5248,15 +6612,16 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 			}
 			defer tx.Rollback()
 			state := State{
-				SchemaVersion:        SchemaVersion,
-				Sessions:             map[string]SessionContext{},
-				Turns:                map[string]Turn{},
-				OutboxMessages:       map[string]OutboxMessage{},
-				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
-				HelperDeliveries:     map[string]HelperDeliveryRecord{},
-				ArtifactRecords:      map[string]ArtifactRecord{},
-				ImportCheckpoints:    map[string]ImportCheckpoint{},
-				ChatSequences:        map[string]ChatSequenceState{},
+				SchemaVersion:            SchemaVersion,
+				Sessions:                 map[string]SessionContext{},
+				Turns:                    map[string]Turn{},
+				OutboxMessages:           map[string]OutboxMessage{},
+				TranscriptDeliveries:     map[string]TranscriptDeliveryRecord{},
+				HelperDeliveries:         map[string]HelperDeliveryRecord{},
+				ArtifactRecords:          map[string]ArtifactRecord{},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				ChatSequences:            map[string]ChatSequenceState{},
+				legacyUnresolvedSessions: map[string]bool{},
 			}
 			msg := req.Message
 			delivery := req.Delivery
@@ -5272,6 +6637,9 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 					return err
 				} else if ok {
 					state.Sessions[sessionID] = session
+				}
+				if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
+					return err
 				}
 			}
 			deliveryID := strings.TrimSpace(delivery.ID)
@@ -5302,12 +6670,22 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 					return err
 				}
 			}
-			if checkpointID := strings.TrimSpace(req.Checkpoint.ID); checkpointID != "" {
+			checkpointID := strings.TrimSpace(req.Checkpoint.ID)
+			if checkpointID == "" {
+				checkpointID = sessionTranscriptCheckpointID(firstStoreNonEmptyString(msg.SessionID, delivery.SessionID))
+			}
+			if checkpointID != "" {
 				if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
 					return err
 				} else if ok {
+					if err := validateLoadedTranscriptCheckpointRow(checkpoint, checkpointID, firstStoreNonEmptyString(msg.SessionID, delivery.SessionID)); err != nil {
+						return err
+					}
 					state.ImportCheckpoints[checkpoint.ID] = checkpoint
 				}
+			}
+			if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, &state, firstStoreNonEmptyString(msg.SessionID, delivery.SessionID)); err != nil {
+				return err
 			}
 
 			needCreateOutbox := false
@@ -5334,7 +6712,7 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 			}
 
 			beforeDelivery, hadDelivery := state.TranscriptDeliveries[deliveryID]
-			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[strings.TrimSpace(req.Checkpoint.ID)]
+			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[checkpointID]
 			beforeHelpers := make(map[string]HelperDeliveryRecord, len(state.HelperDeliveries))
 			for id, record := range state.HelperDeliveries {
 				beforeHelpers[id] = record
@@ -5354,7 +6732,7 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 					return err
 				}
 			}
-			if checkpointID := strings.TrimSpace(req.Checkpoint.ID); checkpointID != "" {
+			if checkpointID != "" {
 				if after, ok := state.ImportCheckpoints[checkpointID]; ok && (!hadCheckpoint || !reflect.DeepEqual(beforeCheckpoint, after)) {
 					if err := upsertSQLiteImportCheckpointTx(ctx, tx, after); err != nil {
 						return err
@@ -5434,6 +6812,9 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					return err
 				}
 			}
+			if state.legacyUnresolvedSessions == nil {
+				state.legacyUnresolvedSessions = map[string]bool{}
+			}
 			state.OutboxMessages = map[string]OutboxMessage{outboxID: current}
 			state.Sessions = map[string]SessionContext{}
 			state.Turns = map[string]Turn{}
@@ -5449,6 +6830,15 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					return err
 				} else if ok {
 					state.Sessions[sessionID] = session
+				}
+				if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
+					return err
+				}
+				checkpointID := sessionTranscriptCheckpointID(sessionID)
+				if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+					return err
+				} else if ok {
+					state.ImportCheckpoints[checkpoint.ID] = checkpoint
 				}
 			}
 			if operationID := strings.TrimSpace(current.ForkOperationID); operationID != "" {
@@ -5580,6 +6970,17 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				} else if ok {
 					state.Sessions[sessionID] = session
 				}
+				// The canonical session checkpoint (including a materialized
+				// pre-anchor compatibility anchor) is part of the same transaction
+				// as the final delivery projection.  This closes the race where an
+				// execution becomes unresolved after the pre-send check but before
+				// Graph's accepted/sent callback.
+				if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, &state, sessionID); err != nil {
+					return err
+				}
+				if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
+					return err
+				}
 			}
 			if nextMessageID != "" {
 				id := messageProvenanceID(current.TeamsChatID, nextMessageID)
@@ -5597,29 +6998,31 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 			}
 			now := time.Now()
 			msg := current
+			if err := markOutboxDeliveryBlockedIfUnresolvedExecution(&state, &msg, teamsMessageID); err != nil {
+				out = current
+				return err
+			}
 			if sent {
-				msg.Status = OutboxStatusSent
-				if msg.SentAt.IsZero() {
-					msg.SentAt = now
-				}
-			} else if msg.Status != OutboxStatusSent {
-				msg.Status = OutboxStatusAccepted
-			}
-			if teamsMessageID != "" {
-				msg.TeamsMessageID = teamsMessageID
-			}
-			msg.LastSendError = ""
-			if msg.Status == OutboxStatusSent {
-				recordOutboxProvenanceLocked(&state, msg, now)
-				markTranscriptDeliveryForOutboxLocked(&state, msg, TranscriptDeliveryStatusSent, now)
-				updateHelperDeliveryForOutboxLocked(&state, msg, HelperDeliveryStatusSent, now)
-				updateArtifactRecordsForOutboxLocked(&state, msg, now, "uploaded", "", "")
+				msg = applyOutboxSentProjectionLocked(&state, msg, teamsMessageID, now)
 			} else {
+				if msg.Status != OutboxStatusSent {
+					msg.Status = OutboxStatusAccepted
+				}
+				if teamsMessageID != "" {
+					msg.TeamsMessageID = teamsMessageID
+				}
+				msg.LastSendError = ""
 				recordOutboxProvenanceLocked(&state, msg, now)
-				markTranscriptDeliveryForOutboxLocked(&state, msg, TranscriptDeliveryStatusAccepted, now)
-				updateHelperDeliveryForOutboxLocked(&state, msg, HelperDeliveryStatusAccepted, now)
+				if msg.Status == OutboxStatusSent {
+					markTranscriptDeliveryForOutboxLocked(&state, msg, TranscriptDeliveryStatusSent, now)
+					updateHelperDeliveryForOutboxLocked(&state, msg, HelperDeliveryStatusSent, now)
+					updateArtifactRecordsForOutboxLocked(&state, msg, now, "uploaded", "", "")
+				} else {
+					markTranscriptDeliveryForOutboxLocked(&state, msg, TranscriptDeliveryStatusAccepted, now)
+					updateHelperDeliveryForOutboxLocked(&state, msg, HelperDeliveryStatusAccepted, now)
+				}
+				msg.UpdatedAt = now
 			}
-			msg.UpdatedAt = now
 			state.OutboxMessages[outboxID] = msg
 			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
 				return err
@@ -5730,14 +7133,34 @@ func (s *Store) applyOutboxReplayFencesSQLite(ctx context.Context, fences []Outb
 					} else if found {
 						state.InboundEvents[inbound.ID] = inbound
 					}
-					if turnID := strings.TrimSpace(existing.TurnID); turnID != "" {
-						if turn, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
-							return err
-						} else if found {
-							state.Turns[turn.ID] = turn
-						}
-					}
 				}
+			}
+			// The replay fence must see the canonical owner even when the global
+			// provenance row is absent or originated from a non-inbound send.  A
+			// failed Turn is a durable terminal fence and must not be promoted.
+			if turnID := strings.TrimSpace(msg.TurnID); turnID != "" {
+				if turn, found, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
+					return err
+				} else if found {
+					state.Turns[turn.ID] = turn
+				}
+			}
+			if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" {
+				if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
+					return err
+				}
+				checkpointID := sessionTranscriptCheckpointID(sessionID)
+				if checkpoint, found, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+					return err
+				} else if found {
+					if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
+						return err
+					}
+					state.ImportCheckpoints[checkpoint.ID] = checkpoint
+				}
+			}
+			if err := validateOutboxReplayCheckpointProvenance(&state, msg); err != nil {
+				return err
 			}
 			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, msg.ID); err != nil {
 				return err

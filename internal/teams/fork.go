@@ -50,6 +50,10 @@ func (b *Bridge) forkWorkSession(ctx context.Context, parent *Session, command C
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
+	unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, *parent)
+	if err != nil {
+		return err
+	}
 	operationID := forkOperationID(parent.ID, command.ID, command.Body.Content)
 	childID := "fork-session:" + shortStableID(operationID)
 	now := time.Now()
@@ -90,12 +94,23 @@ func (b *Bridge) forkWorkSession(ctx context.Context, parent *Session, command C
 		return err
 	}
 	if !created {
+		if unresolved {
+			// The durable operation is already staged; reconciliation will resume
+			// only after the parent execution fence is resolved.
+			return nil
+		}
 		return b.resumeForkOperation(ctx, parent, op)
 	}
 	if claimed, err := b.claimForkOperation(ctx, op); err != nil {
 		return err
 	} else {
 		op = claimed
+	}
+	if unresolved {
+		if err := b.sendToChat(ctx, parent.ChatID, "⏳ Fork staged. The parent Codex execution is still unconfirmed; I will continue the fork only after that ownership fence is resolved."); err != nil {
+			return err
+		}
+		return nil
 	}
 	cutoff, ok, err := b.store.ForkCutoff(ctx, op.ID)
 	if err != nil {
@@ -125,12 +140,13 @@ func (b *Bridge) forkWorkSession(ctx context.Context, parent *Session, command C
 		err := codexrunner.UnsupportedError("thread/fork")
 		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
 	}
-	if _, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
-		if current.NativeForkIntentAt.IsZero() {
-			current.NativeForkIntentAt = time.Now()
+	if _, err := b.markForkNativeIntentIfParentExecutionClear(ctx, op.ID); err != nil {
+		if errors.Is(err, teamstore.ErrForkParentFenced) {
+			if sendErr := b.sendToChat(ctx, parent.ChatID, "⏳ Fork staged. The parent Codex execution became unconfirmed before the native fork request; I will continue only after that ownership fence is resolved."); sendErr != nil {
+				return sendErr
+			}
+			return nil
 		}
-		return nil
-	}); err != nil {
 		// The intent is written before the external request. If this durable
 		// boundary cannot be recorded, do not issue the native fork call.
 		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
@@ -304,6 +320,17 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 	if err != nil {
 		return err
 	}
+	if op.Phase == teamstore.ForkPhaseParentFenced || (op.Phase == teamstore.ForkPhaseSnapshotMaterialized && op.NativeForkIntentAt.IsZero()) {
+		unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, *parent)
+		if err != nil {
+			return err
+		}
+		if unresolved {
+			// Fork staging is durable, but history materialization and native fork
+			// execution must not consume an ambiguous parent transcript.
+			return teamstore.ErrUnresolvedExecution
+		}
+	}
 	if op.Phase == teamstore.ForkPhaseSnapshotMaterialized {
 		if op.NativeForkIntentAt.IsZero() {
 			// The intent is the durable happens-before marker for the external
@@ -362,12 +389,10 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 		if !ok {
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, codexrunner.UnsupportedError("thread/fork"))
 		}
-		if _, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
-			if current.NativeForkIntentAt.IsZero() {
-				current.NativeForkIntentAt = time.Now()
+		if _, err := b.markForkNativeIntentIfParentExecutionClear(ctx, op.ID); err != nil {
+			if errors.Is(err, teamstore.ErrForkParentFenced) || errors.Is(err, teamstore.ErrUnresolvedExecution) {
+				return err
 			}
-			return nil
-		}); err != nil {
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
 		}
 		if err := b.validateForkOwner(ctx, op.ID); err != nil {
@@ -609,6 +634,13 @@ func (b *Bridge) updateForkOperation(ctx context.Context, operationID string, fn
 		return b.store.UpdateForkOperationOwned(ctx, operationID, owner, fn)
 	}
 	return b.store.UpdateForkOperation(ctx, operationID, fn)
+}
+
+func (b *Bridge) markForkNativeIntentIfParentExecutionClear(ctx context.Context, operationID string) (teamstore.ForkOperation, error) {
+	if owner, ok := b.forkOwnerLease(); ok {
+		return b.store.MarkForkNativeIntentIfParentExecutionClearOwned(ctx, operationID, owner)
+	}
+	return b.store.MarkForkNativeIntentIfParentExecutionClear(ctx, operationID)
 }
 
 func (b *Bridge) saveForkManifest(ctx context.Context, operationID string, items []teamstore.ForkHistoryItem, metadata teamstore.ForkManifestMetadata) (teamstore.ForkOperation, error) {
