@@ -210,12 +210,26 @@ func activeForkForSessionLocked(state *State, sessionID string) (ForkOperation, 
 	return ForkOperation{}, false
 }
 
+// ensureParentUnfencedLocked is used by transcript publication writes. The
+// caller must already hold the store's state transaction lock; checking the
+// fork map and applying the write in that same critical section closes the
+// check-then-write window around BeginFork.
+func ensureParentUnfencedLocked(state *State, sessionID string) error {
+	if _, fenced := activeForkForSessionLocked(state, sessionID); fenced {
+		return ErrForkParentFenced
+	}
+	return nil
+}
+
 func (s *Store) ParentFork(ctx context.Context, sessionID string) (ForkOperation, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return ForkOperation{}, false, nil
 	}
-	state, err := s.Load(ctx)
+	// ParentFork is called from transcript and inbound hot paths. The fence
+	// decision depends only on fork_operations; keep SQLite callers on the
+	// bounded projection while preserving the legacy JSON fallback.
+	state, err := s.loadStateFieldsOrFull(ctx, forkOperationStateFields)
 	if err != nil {
 		return ForkOperation{}, false, err
 	}
@@ -507,7 +521,7 @@ func (s *Store) ForkOperation(ctx context.Context, operationID string) (ForkOper
 	if operationID == "" {
 		return ForkOperation{}, false, nil
 	}
-	state, err := s.Load(ctx)
+	state, err := s.loadStateFieldsOrFull(ctx, forkOperationStateFields)
 	if err != nil {
 		return ForkOperation{}, false, err
 	}

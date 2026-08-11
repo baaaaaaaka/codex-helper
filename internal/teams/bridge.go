@@ -186,8 +186,9 @@ const (
 )
 
 type outboxQueueOptions struct {
-	MentionOwner     bool
-	NotificationKind string
+	MentionOwner         bool
+	NotificationKind     string
+	ParentFenceSessionID string
 }
 
 type BridgeOptions struct {
@@ -14127,8 +14128,9 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithNamespace(ctx context.Context,
 		}
 		msg = b.prepareOutboxForQueue(ctx, msg)
 		queuedMsg, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
-			Message:  msg,
-			Delivery: delivery,
+			Message:              msg,
+			Delivery:             delivery,
+			ParentFenceSessionID: strings.TrimSpace(opts.ParentFenceSessionID),
 		})
 		if err != nil {
 			return nil, err
@@ -17511,6 +17513,10 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 }
 
 func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+	return b.advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx, session, local, "")
+}
+
+func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx context.Context, session Session, local codexhistory.Session, parentFenceSessionID string) (bool, error) {
 	if b == nil || strings.TrimSpace(local.FilePath) == "" {
 		return false, nil
 	}
@@ -17587,7 +17593,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, 
 	if !sawRecentTeamsTurnRecord {
 		return false, nil
 	}
-	if err := b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, lastKey, lastLine, lastOffset); err != nil {
+	if err := b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), parentFenceSessionID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -17923,6 +17929,10 @@ func (b *Bridge) recordSkippedTranscriptDeliveryWithoutCheckpoint(ctx context.Co
 }
 
 func (b *Bridge) recordSkippedTranscriptDeliveryWithCheckpoint(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, checkpoint teamstore.ImportCheckpoint) error {
+	return b.recordSkippedTranscriptDeliveryWithParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, checkpoint, "")
+}
+
+func (b *Bridge) recordSkippedTranscriptDeliveryWithParentFence(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, checkpoint teamstore.ImportCheckpoint, parentFenceSessionID string) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -17930,7 +17940,12 @@ func (b *Bridge) recordSkippedTranscriptDeliveryWithCheckpoint(ctx context.Conte
 	record.SourceOffset = checkpointOffset
 	delivery := transcriptDeliveryRecord(session, local, record, kind, body)
 	delivery.Status = teamstore.TranscriptDeliveryStatusSkipped
-	_, _, err := b.store.RecordTranscriptDelivery(ctx, delivery, checkpoint)
+	var err error
+	if strings.TrimSpace(parentFenceSessionID) != "" {
+		_, _, err = b.store.RecordTranscriptDeliveryIfParentUnfenced(ctx, parentFenceSessionID, delivery, checkpoint)
+	} else {
+		_, _, err = b.store.RecordTranscriptDelivery(ctx, delivery, checkpoint)
+	}
 	return err
 }
 
@@ -18512,7 +18527,15 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	return b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint)
 }
 
-func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session Session, local codexhistory.Session, state teamstore.State, checkpoint teamstore.ImportCheckpoint, hasCheckpoint bool) error {
+func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session Session, local codexhistory.Session, state teamstore.State, checkpoint teamstore.ImportCheckpoint, hasCheckpoint bool) (err error) {
+	defer func() {
+		// A fork can begin after the initial read-only ParentFork check. The
+		// guarded publication writes below report that transition explicitly;
+		// treat it as a normal retry point for the next background scan.
+		if errors.Is(err, teamstore.ErrForkParentFenced) {
+			err = nil
+		}
+	}()
 	if _, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
 		return err
 	} else if blocked {
@@ -18560,10 +18583,10 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			return nil
 		}
 		last := transcript.Records[len(transcript.Records)-1]
-		return b.recordTranscriptCheckpointDetailed(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset)
+		return b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset, checkpointID, session.ID)
 	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint, local.FilePath) {
-		updated, ok, err := b.backfillLinkedTranscriptCheckpointPosition(ctx, session, local, checkpoint)
+		updated, ok, err := b.backfillLinkedTranscriptCheckpointPositionWithParentFence(ctx, session, local, checkpoint, session.ID)
 		if err != nil {
 			return err
 		}
@@ -18579,12 +18602,12 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		return err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-		return b.markTranscriptImportFailed(ctx, session, local.FilePath)
+		return b.markTranscriptImportFailedWithParentFence(ctx, session, local.FilePath, checkpointID, session.ID)
 	}
 	if len(transcript.Records) == 0 {
 		return nil
 	}
-	if advanced, err := b.advanceRecentCompletedTeamsTranscriptTail(ctx, session, local); err != nil {
+	if advanced, err := b.advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx, session, local, session.ID); err != nil {
 		return err
 	} else if advanced {
 		return nil
@@ -18633,7 +18656,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		}
 		checkpoint := pendingCheckpoint
 		hasPendingCheckpoint = false
-		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+		return b.recordTranscriptCheckpointProgressDetailedWithParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, session.ID)
 	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
@@ -18661,13 +18684,14 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
 			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
-			if err := b.recordSkippedTranscriptDelivery(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body); err != nil {
+			if err := b.recordSkippedTranscriptDeliveryWithParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, transcriptDeliveryCheckpoint(session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset), session.ID); err != nil {
 				return err
 			}
 			hasPendingCheckpoint = false
 			continue
 		}
 		opts := transcriptSyncOutboxOptions(record)
+		opts.ParentFenceSessionID = session.ID
 		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
@@ -18780,6 +18804,10 @@ func linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint teamstore.Import
 }
 
 func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) (teamstore.ImportCheckpoint, bool, error) {
+	return b.backfillLinkedTranscriptCheckpointPositionWithParentFence(ctx, session, local, checkpoint, "")
+}
+
+func (b *Bridge) backfillLinkedTranscriptCheckpointPositionWithParentFence(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint, parentFenceSessionID string) (teamstore.ImportCheckpoint, bool, error) {
 	sourcePath := strings.TrimSpace(firstNonEmptyString(local.FilePath, checkpoint.SourcePath))
 	if sourcePath == "" {
 		return checkpoint, false, nil
@@ -18804,7 +18832,13 @@ func (b *Bridge) backfillLinkedTranscriptCheckpointPosition(ctx context.Context,
 		updated.Status = importCheckpointStatusComplete
 	}
 	applied := false
-	next, _, err := b.store.UpdateImportCheckpoint(ctx, updated.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	updateCheckpoint := func(id string, fn func(teamstore.ImportCheckpoint, bool, time.Time) (teamstore.ImportCheckpoint, bool, error)) (teamstore.ImportCheckpoint, bool, error) {
+		if strings.TrimSpace(parentFenceSessionID) != "" {
+			return b.store.UpdateImportCheckpointIfParentUnfenced(ctx, parentFenceSessionID, id, fn)
+		}
+		return b.store.UpdateImportCheckpoint(ctx, id, fn)
+	}
+	next, _, err := updateCheckpoint(updated.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if strings.TrimSpace(current.LastRecordID) != "" && strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) {
 			updated = current
 			return current, false, nil
@@ -19916,6 +19950,10 @@ func (b *Bridge) recordTranscriptCheckpointDetailed(ctx context.Context, session
 }
 
 func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
+	return b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, "")
+}
+
+func (b *Bridge) recordTranscriptCheckpointDetailedWithParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, parentFenceSessionID string) error {
 	if strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
@@ -19924,7 +19962,7 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, s
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	ledgerID := transcriptLedgerID(session.ID, checkpointID, lastRecordID)
-	return b.store.RecordTranscriptCheckpoint(ctx, teamstore.ImportCheckpoint{
+	checkpoint := teamstore.ImportCheckpoint{
 		ID:             checkpointID,
 		SessionID:      session.ID,
 		SourcePath:     sourcePath,
@@ -19933,17 +19971,26 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, s
 		LastOffset:     lastOffset,
 		SourceSize:     sourceSize,
 		SourceModTime:  sourceModTime,
-	}, teamstore.TranscriptLedgerRecord{
+	}
+	ledger := teamstore.TranscriptLedgerRecord{
 		ID:             ledgerID,
 		SessionID:      session.ID,
 		CodexThreadID:  session.CodexThreadID,
 		SourcePath:     sourcePath,
 		SourceLine:     lastLine,
 		SourceRecordID: lastRecordID,
-	})
+	}
+	if strings.TrimSpace(parentFenceSessionID) != "" {
+		return b.store.RecordTranscriptCheckpointIfParentUnfenced(ctx, parentFenceSessionID, checkpoint, ledger)
+	}
+	return b.store.RecordTranscriptCheckpoint(ctx, checkpoint, ledger)
 }
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
+	return b.recordTranscriptCheckpointProgressDetailedWithParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, "")
+}
+
+func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, parentFenceSessionID string) error {
 	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
@@ -19951,7 +19998,13 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Co
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	updateCheckpoint := func(id string, fn func(teamstore.ImportCheckpoint, bool, time.Time) (teamstore.ImportCheckpoint, bool, error)) (teamstore.ImportCheckpoint, bool, error) {
+		if strings.TrimSpace(parentFenceSessionID) != "" {
+			return b.store.UpdateImportCheckpointIfParentUnfenced(ctx, parentFenceSessionID, id, fn)
+		}
+		return b.store.UpdateImportCheckpoint(ctx, id, fn)
+	}
+	_, _, err := updateCheckpoint(checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if transcriptCheckpointProgressAlreadyAhead(previous, sourcePath, lastLine, lastOffset) {
 			return previous, false, nil
 		}
@@ -20142,10 +20195,20 @@ func (b *Bridge) markTranscriptImportFailed(ctx context.Context, session Session
 }
 
 func (b *Bridge) markTranscriptImportFailedWithID(ctx context.Context, session Session, sourcePath string, checkpointID string) error {
+	return b.markTranscriptImportFailedWithParentFence(ctx, session, sourcePath, checkpointID, "")
+}
+
+func (b *Bridge) markTranscriptImportFailedWithParentFence(ctx context.Context, session Session, sourcePath string, checkpointID string, parentFenceSessionID string) error {
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
-	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	updateCheckpoint := func(id string, fn func(teamstore.ImportCheckpoint, bool, time.Time) (teamstore.ImportCheckpoint, bool, error)) (teamstore.ImportCheckpoint, bool, error) {
+		if strings.TrimSpace(parentFenceSessionID) != "" {
+			return b.store.UpdateImportCheckpointIfParentUnfenced(ctx, parentFenceSessionID, id, fn)
+		}
+		return b.store.UpdateImportCheckpoint(ctx, id, fn)
+	}
+	_, _, err := updateCheckpoint(checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
 		checkpoint.SourcePath = sourcePath

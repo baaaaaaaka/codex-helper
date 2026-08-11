@@ -508,12 +508,12 @@ func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State)
 	return writeSQLiteState(context.Background(), db, state)
 }
 
-func (s *Store) loadSQLiteSelectedStateFieldsUnlocked(pointer storeSQLitePointer, wanted map[string]struct{}) (State, error) {
+func (s *Store) loadSQLiteSelectedStateFieldsUnlocked(ctx context.Context, pointer storeSQLitePointer, wanted map[string]struct{}) (State, error) {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
 		return State{}, err
 	}
-	return loadSQLiteSelectedState(context.Background(), db, wanted)
+	return loadSQLiteSelectedState(ctx, db, wanted)
 }
 
 func (s *Store) hotPollScheduleStateSQLite(ctx context.Context) (State, bool, error) {
@@ -2732,7 +2732,7 @@ func (s *Store) importCheckpointSQLite(ctx context.Context, id string) (ImportCh
 	return out, found, handled, err
 }
 
-func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, bool, error) {
+func (s *Store) updateImportCheckpointSQLite(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, bool, error) {
 	var out ImportCheckpoint
 	changed := false
 	handled := false
@@ -2750,6 +2750,9 @@ func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn 
 			return err
 		}
 		defer tx.Rollback()
+		if err := ensureSQLiteParentUnfencedTx(ctx, tx, parentSessionID); err != nil {
+			return err
+		}
 		current, found, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
 		if err != nil {
 			return err
@@ -2775,7 +2778,7 @@ func (s *Store) updateImportCheckpointSQLite(ctx context.Context, id string, fn 
 	return out, changed, handled, err
 }
 
-func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) (bool, error) {
+func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) (bool, error) {
 	handled := false
 	run := func() error {
 		return s.withStateLock(ctx, func() error {
@@ -2792,6 +2795,9 @@ func (s *Store) recordTranscriptCheckpointSQLite(ctx context.Context, checkpoint
 				return err
 			}
 			defer tx.Rollback()
+			if err := ensureSQLiteParentUnfencedTx(ctx, tx, parentSessionID); err != nil {
+				return err
+			}
 			state := State{
 				SchemaVersion:     SchemaVersion,
 				ImportCheckpoints: map[string]ImportCheckpoint{},
@@ -3729,7 +3735,7 @@ func (s *Store) upsertArtifactRecordSQLite(ctx context.Context, record ArtifactR
 	return out, handled, err
 }
 
-func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, bool, error) {
+func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, bool, error) {
 	var out TranscriptDeliveryRecord
 	created := false
 	handled := false
@@ -3748,6 +3754,9 @@ func (s *Store) recordTranscriptDeliverySQLite(ctx context.Context, delivery Tra
 				return err
 			}
 			defer tx.Rollback()
+			if err := ensureSQLiteParentUnfencedTx(ctx, tx, parentSessionID); err != nil {
+				return err
+			}
 			state := State{
 				SchemaVersion:        SchemaVersion,
 				TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
@@ -4232,9 +4241,9 @@ func sqliteForkParentFencedTx(ctx context.Context, tx *sql.Tx, sessionID string)
 	var one int
 	err := tx.QueryRowContext(ctx, `SELECT 1 FROM fork_operations
 	WHERE parent_session_id = ?
-	  AND phase NOT IN (?, ?, ?, ?)
+	  AND phase NOT IN (?, ?, ?)
 	LIMIT 1`, sessionID,
-		string(ForkPhaseActivated), string(ForkPhaseLinkSent), string(ForkPhaseFailed), string(ForkPhaseAbandoned)).Scan(&one)
+		string(ForkPhaseLinkSent), string(ForkPhaseFailed), string(ForkPhaseAbandoned)).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -4242,6 +4251,17 @@ func sqliteForkParentFencedTx(ctx context.Context, tx *sql.Tx, sessionID string)
 		return false, err
 	}
 	return one == 1, nil
+}
+
+func ensureSQLiteParentUnfencedTx(ctx context.Context, tx *sql.Tx, sessionID string) error {
+	fenced, err := sqliteForkParentFencedTx(ctx, tx, sessionID)
+	if err != nil {
+		return err
+	}
+	if fenced {
+		return ErrForkParentFenced
+	}
+	return nil
 }
 
 func (s *Store) updateInboundEventSQLite(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, bool, error) {
@@ -5247,6 +5267,9 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 				return err
 			}
 			defer tx.Rollback()
+			if err := ensureSQLiteParentUnfencedTx(ctx, tx, req.ParentFenceSessionID); err != nil {
+				return err
+			}
 			state := State{
 				SchemaVersion:        SchemaVersion,
 				Sessions:             map[string]SessionContext{},
@@ -5463,6 +5486,11 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 					return err
 				}
 				if err := loadSQLiteArtifactRecordsByIDTx(ctx, tx, &state, current.ArtifactIDs); err != nil {
+					return err
+				}
+			}
+			if parentSessionID := transcriptDeliveryParentFenceSessionID(current); parentSessionID != "" {
+				if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM fork_operations WHERE parent_session_id = ?`, []any{parentSessionID}, state.ForkOperations, func(v ForkOperation) string { return v.ID }); err != nil {
 					return err
 				}
 			}

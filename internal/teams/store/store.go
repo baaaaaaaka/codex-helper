@@ -807,6 +807,7 @@ type Turn struct {
 type OutboxMessage struct {
 	ID                     string           `json:"id"`
 	SessionID              string           `json:"session_id,omitempty"`
+	ParentFenceSessionID   string           `json:"parent_fence_session_id,omitempty"`
 	TurnID                 string           `json:"turn_id,omitempty"`
 	CodexThreadID          string           `json:"codex_thread_id,omitempty"`
 	TeamsChatID            string           `json:"teams_chat_id"`
@@ -2348,7 +2349,7 @@ func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID s
 			state, loadErr = s.loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer, sessionID, checkpointID)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(transcriptDedupeSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, transcriptDedupeSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2391,6 +2392,19 @@ func (s *Store) ImportCheckpoint(ctx context.Context, id string) (ImportCheckpoi
 }
 
 func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	return s.updateImportCheckpoint(ctx, "", id, fn)
+}
+
+// UpdateImportCheckpointIfParentUnfenced applies a checkpoint update only if
+// the parent fork fence is still open in the same store transaction. It is
+// intended for the background linked-transcript synchronizer; ordinary
+// checkpoint callers retain the legacy behavior through UpdateImportCheckpoint.
+func (s *Store) UpdateImportCheckpointIfParentUnfenced(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	return s.updateImportCheckpoint(ctx, parentSessionID, id, fn)
+}
+
+func (s *Store) updateImportCheckpoint(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	parentSessionID = strings.TrimSpace(parentSessionID)
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return ImportCheckpoint{}, false, fmt.Errorf("import checkpoint id is required")
@@ -2398,12 +2412,15 @@ func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(I
 	if fn == nil {
 		return ImportCheckpoint{}, false, fmt.Errorf("import checkpoint update function is required")
 	}
-	if out, changed, handled, err := s.updateImportCheckpointSQLite(ctx, id, fn); handled || err != nil {
+	if out, changed, handled, err := s.updateImportCheckpointSQLite(ctx, parentSessionID, id, fn); handled || err != nil {
 		return out, changed, err
 	}
 	var out ImportCheckpoint
 	changed := false
 	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
+			return false, err
+		}
 		now := time.Now()
 		if state.ImportCheckpoints == nil {
 			state.ImportCheckpoints = make(map[string]ImportCheckpoint)
@@ -2427,6 +2444,19 @@ func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(I
 }
 
 func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
+	return s.recordTranscriptCheckpoint(ctx, "", checkpoint, ledger)
+}
+
+// RecordTranscriptCheckpointIfParentUnfenced atomically records the
+// checkpoint and ledger only while the parent session is not fenced by an
+// active fork. The fork fence is checked inside the same SQLite/JSON write
+// critical section as the publication state.
+func (s *Store) RecordTranscriptCheckpointIfParentUnfenced(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
+	return s.recordTranscriptCheckpoint(ctx, parentSessionID, checkpoint, ledger)
+}
+
+func (s *Store) recordTranscriptCheckpoint(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
+	parentSessionID = strings.TrimSpace(parentSessionID)
 	checkpoint.ID = strings.TrimSpace(checkpoint.ID)
 	checkpoint.SessionID = strings.TrimSpace(checkpoint.SessionID)
 	checkpoint.LastRecordID = strings.TrimSpace(checkpoint.LastRecordID)
@@ -2440,7 +2470,7 @@ func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint Impor
 	if ledger.ID == "" {
 		return fmt.Errorf("transcript ledger id is required")
 	}
-	if handled, err := s.recordTranscriptCheckpointSQLite(ctx, checkpoint, ledger); handled || err != nil {
+	if handled, err := s.recordTranscriptCheckpointSQLite(ctx, parentSessionID, checkpoint, ledger); handled || err != nil {
 		return err
 	}
 	update := s.Update
@@ -2450,6 +2480,9 @@ func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint Impor
 		}
 	}
 	return update(ctx, func(state *State) error {
+		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
+			return err
+		}
 		applyRecordTranscriptCheckpointLocked(state, checkpoint, ledger, time.Now())
 		return nil
 	})
@@ -2539,7 +2572,7 @@ func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID stri
 			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, true)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2581,7 +2614,7 @@ func (s *Store) SessionWorkflowEventSnapshotForTurn(ctx context.Context, session
 			state, loadErr = s.loadSQLiteSessionWorkflowEventForTurnUnlocked(pointer, sessionID, turnID)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2619,7 +2652,7 @@ func (s *Store) SessionThreadResolutionSnapshot(ctx context.Context, sessionID s
 			state, loadErr = s.loadSQLiteSessionThreadResolutionStateUnlocked(pointer, sessionID)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(workflowEventStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2661,7 +2694,7 @@ func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) 
 			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, false)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, turnQueueStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2699,7 +2732,7 @@ func (s *Store) RecentSessionInboundTurnSnapshot(ctx context.Context, sessionID 
 			state, loadErr = s.loadSQLiteRecentSessionInboundTurnStateUnlocked(pointer, sessionID, since)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, turnQueueStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2735,7 +2768,7 @@ func (s *Store) SessionActiveTurnQueueSnapshot(ctx context.Context, sessionID st
 			state, loadErr = s.loadSQLiteSessionActiveTurnQueueStateUnlocked(pointer, sessionID)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(turnQueueStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, turnQueueStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -2891,7 +2924,7 @@ func (s *Store) ForkPollingSnapshot(ctx context.Context) (State, error) {
 func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
 	var state State
 	err := s.withStateLock(ctx, func() error {
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(wantedFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, wantedFields)
 		if err != nil {
 			return err
 		}
@@ -2906,12 +2939,15 @@ func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[stri
 	return state, err
 }
 
-func (s *Store) loadSelectedStateFieldsUnlocked(wantedFields map[string]struct{}) (State, bool, error) {
+func (s *Store) loadSelectedStateFieldsUnlocked(ctx context.Context, wantedFields map[string]struct{}) (State, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
 		if err != nil {
 			return State{}, false, err
 		}
-		state, err := s.loadSQLiteSelectedStateFieldsUnlocked(pointer, wantedFields)
+		state, err := s.loadSQLiteSelectedStateFieldsUnlocked(ctx, pointer, wantedFields)
 		return state, true, err
 	}
 	return State{}, false, nil
@@ -3667,7 +3703,7 @@ func (s *Store) ReadUpgrade(ctx context.Context) (UpgradeRequest, bool, error) {
 			found = foundRuntime
 			return err
 		}
-		state, ok, err := s.loadSelectedStateFieldsUnlocked(upgradeStateFields)
+		state, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, upgradeStateFields)
 		if err != nil {
 			return err
 		}
@@ -5336,12 +5372,14 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 }
 
 type TranscriptDeliveryQueueRequest struct {
-	Message    OutboxMessage
-	Delivery   TranscriptDeliveryRecord
-	Checkpoint ImportCheckpoint
+	Message              OutboxMessage
+	Delivery             TranscriptDeliveryRecord
+	Checkpoint           ImportCheckpoint
+	ParentFenceSessionID string
 }
 
 func (s *Store) QueueTranscriptDeliveryOutbox(ctx context.Context, req TranscriptDeliveryQueueRequest) (OutboxMessage, bool, bool, error) {
+	req.ParentFenceSessionID = strings.TrimSpace(req.ParentFenceSessionID)
 	msg := req.Message
 	if strings.TrimSpace(msg.ID) == "" {
 		msg.ID = outboxID(msg)
@@ -5364,6 +5402,9 @@ func (s *Store) QueueTranscriptDeliveryOutbox(ctx context.Context, req Transcrip
 	if req.Delivery.Status == "" {
 		req.Delivery.Status = TranscriptDeliveryStatusQueued
 	}
+	if req.ParentFenceSessionID != "" {
+		msg.ParentFenceSessionID = req.ParentFenceSessionID
+	}
 	req.Message = msg
 	if out, created, alreadyDelivered, handled, err := s.queueTranscriptDeliveryOutboxSQLite(ctx, req); handled || err != nil {
 		return out, created, alreadyDelivered, err
@@ -5378,6 +5419,9 @@ func (s *Store) QueueTranscriptDeliveryOutbox(ctx context.Context, req Transcrip
 	created := false
 	alreadyDelivered := false
 	err := update(ctx, func(state *State) error {
+		if err := ensureParentUnfencedLocked(state, req.ParentFenceSessionID); err != nil {
+			return err
+		}
 		now := time.Now()
 		var err error
 		out, created, alreadyDelivered, err = applyQueueTranscriptDeliveryOutboxLocked(state, req.Message, req.Delivery, req.Checkpoint, now)
@@ -5457,13 +5501,24 @@ func transcriptDeliverySuppressesQueue(record TranscriptDeliveryRecord) bool {
 }
 
 func (s *Store) RecordTranscriptDelivery(ctx context.Context, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
+	return s.recordTranscriptDelivery(ctx, "", delivery, checkpoint)
+}
+
+// RecordTranscriptDeliveryIfParentUnfenced atomically records a transcript
+// delivery and its checkpoint only while the parent fork fence is open.
+func (s *Store) RecordTranscriptDeliveryIfParentUnfenced(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
+	return s.recordTranscriptDelivery(ctx, parentSessionID, delivery, checkpoint)
+}
+
+func (s *Store) recordTranscriptDelivery(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
+	parentSessionID = strings.TrimSpace(parentSessionID)
 	if strings.TrimSpace(delivery.ID) == "" {
 		return TranscriptDeliveryRecord{}, false, fmt.Errorf("transcript delivery id is required")
 	}
 	if delivery.Status == "" {
 		delivery.Status = TranscriptDeliveryStatusSkipped
 	}
-	if out, created, handled, err := s.recordTranscriptDeliverySQLite(ctx, delivery, checkpoint); handled || err != nil {
+	if out, created, handled, err := s.recordTranscriptDeliverySQLite(ctx, parentSessionID, delivery, checkpoint); handled || err != nil {
 		return out, created, err
 	}
 	update := s.Update
@@ -5475,6 +5530,9 @@ func (s *Store) RecordTranscriptDelivery(ctx context.Context, delivery Transcrip
 	var out TranscriptDeliveryRecord
 	created := false
 	err := update(ctx, func(state *State) error {
+		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
+			return err
+		}
 		now := time.Now()
 		out, created = applyRecordTranscriptDeliveryLocked(state, delivery, checkpoint, now)
 		return nil
@@ -5657,6 +5715,11 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 			return msg, ErrOutboxSendNotClaimed
 		}
 	}
+	if parentSessionID := transcriptDeliveryParentFenceSessionID(msg); parentSessionID != "" {
+		if _, fenced := activeForkForSessionLocked(state, parentSessionID); fenced {
+			return msg, ErrOutboxSendNotClaimed
+		}
+	}
 	switch msg.Status {
 	case OutboxStatusQueued:
 	case OutboxStatusSending:
@@ -5672,6 +5735,16 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	msg.LastSendError = ""
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
 	return msg, nil
+}
+
+func transcriptDeliveryParentFenceSessionID(msg OutboxMessage) string {
+	if parentSessionID := strings.TrimSpace(msg.ParentFenceSessionID); parentSessionID != "" {
+		return parentSessionID
+	}
+	if strings.HasPrefix(strings.TrimSpace(msg.ID), "outbox:transcript-delivery:") {
+		return strings.TrimSpace(msg.SessionID)
+	}
+	return ""
 }
 
 func outboxSendAttemptToken(outboxID string, now time.Time, previousToken string) string {
