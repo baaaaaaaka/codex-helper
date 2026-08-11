@@ -431,6 +431,8 @@ type Bridge struct {
 	ownerStaleAfter                   time.Duration
 	ownerHeartbeatInterval            time.Duration
 	outboxFlushMu                     sync.Mutex
+	forkReconcileMu                   sync.Mutex
+	forkReconcileAfterID              string
 	outboxSendPaceMu                  sync.Mutex
 	outboxSendPaceLast                map[string]time.Time
 	pollMu                            sync.Mutex
@@ -1107,9 +1109,6 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			b.clearOwnerIfSame(context.Background())
 			return b.runStandbyLoop(ctx, opts)
 		}
-		if err := b.reconcileForkOperations(ctx); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams fork recovery error: %v\n", err)
-		}
 		if err := b.flushPendingOutboxMainLoop(ctx); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
@@ -1125,6 +1124,9 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			if restartErr := b.notePollFailure(err, time.Now()); restartErr != nil {
 				return restartErr
 			}
+		}
+		if err := b.reconcileForkOperations(ctx); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams fork recovery error: %v\n", err)
 		}
 		if err := b.maybeRunIdleWorkChatAutoPark(ctx, time.Now()); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams idle auto-park error: %v\n", err)
@@ -15253,7 +15255,7 @@ func renderOutboxHTMLWithMathAssets(outbox teamstore.OutboxMessage, assets []tea
 	if strings.EqualFold(strings.TrimSpace(outbox.Kind), "freeze-notice") {
 		return outbox.Body
 	}
-	if isTranscriptImportBatchOutboxKind(outbox.Kind) {
+	if isTranscriptImportBatchOutboxKind(outbox.Kind) || isForkHistoryBatchOutboxKind(outbox.Kind) {
 		return outbox.Body
 	}
 	if isCompletionNotificationOutbox(outbox) && renderKindForOutbox(outbox.Kind) == TeamsRenderAssistant {
@@ -15586,6 +15588,10 @@ func isTranscriptImportBatchOutboxKind(kind string) bool {
 		strings.HasPrefix(kind, "import-bg-batch-") ||
 		strings.HasPrefix(kind, "sync-batch-") ||
 		strings.HasPrefix(kind, "publish-full-batch-")
+}
+
+func isForkHistoryBatchOutboxKind(kind string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(kind)), "fork-history-batch")
 }
 
 func shouldSuppressCodexCommandOutbox(kind string) bool {
@@ -16449,6 +16455,11 @@ func (b *Bridge) importCodexTranscriptToTeamsWithTarget(ctx context.Context, ses
 	checkpointID = strings.TrimSpace(firstNonEmptyString(checkpointID, transcriptCheckpointID(session.ID)))
 	importTurnID = strings.TrimSpace(firstNonEmptyString(importTurnID, "import:"+session.ID))
 	kindPrefix = strings.TrimSpace(firstNonEmptyString(kindPrefix, "import"))
+	if op, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
+		return err
+	} else if blocked {
+		return fmt.Errorf("fork operation %q is still preparing this session; transcript publication is temporarily gated", op.ID)
+	}
 	if strings.TrimSpace(opts.SubagentCheckpointRoot) == "" {
 		opts.SubagentCheckpointRoot = checkpointID
 	}
@@ -16489,6 +16500,11 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
+	}
+	if op, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
+		return err
+	} else if blocked {
+		return fmt.Errorf("fork operation %q is still preparing this session; publish-history will resume after the fork completes", op.ID)
 	}
 	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *session)
 	if err != nil {
@@ -16533,6 +16549,11 @@ func (b *Bridge) publishWorkSessionFullHistory(ctx context.Context, session *Ses
 	}
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return err
+	}
+	if op, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
+		return err
+	} else if blocked {
+		return fmt.Errorf("fork operation %q is still preparing this session; full history publish is temporarily gated", op.ID)
 	}
 	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *session)
 	if err != nil {
@@ -16585,6 +16606,11 @@ func (b *Bridge) PublishSessionFullHistory(ctx context.Context, selector string,
 	session := b.sessionForRecreateSelector(selector)
 	if session == nil {
 		return false, fmt.Errorf("Teams session not found for %q", selector)
+	}
+	if op, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
+		return false, err
+	} else if blocked {
+		return false, fmt.Errorf("fork operation %q is still preparing this session; full history publish is temporarily gated", op.ID)
 	}
 	status := teamstore.SessionStatus(strings.TrimSpace(session.Status))
 	if status != "" && status != teamstore.SessionStatusActive {
@@ -16698,8 +16724,8 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	var lastOffset int64
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
-		checkpointKey := transcriptRecordCheckpointKey(record)
 		if record.Internal {
+			checkpointKey := transcriptRecordCheckpointKey(record)
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
 				return transcriptImportResult{}, err
 			}
@@ -16718,38 +16744,18 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 				Complete:     false,
 			}, nil
 		}
-		if shouldSkipImportedTranscriptRecord(record) {
-			stats.SkippedBackground++
+		planned, checkpointKey, skippedBackground, included := planTranscriptImportRecord(record, checkpointLine, checkpointOffset, kindPrefix, i+1, dedupe, transcriptPlanOptions{})
+		if !included {
+			if skippedBackground {
+				stats.SkippedBackground++
+			}
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
 				return transcriptImportResult{}, err
 			}
 			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 			continue
 		}
-		body := formatTranscriptRecordForTeams(record)
-		if strings.TrimSpace(body) == "" {
-			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
-				return transcriptImportResult{}, err
-			}
-			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
-			continue
-		}
-		if dedupe.shouldSkip(record, body) {
-			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
-				return transcriptImportResult{}, err
-			}
-			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
-			continue
-		}
-		record.SourceLine = checkpointLine
-		record.SourceOffset = checkpointOffset
-		kind := transcriptRecordOutboxKind(kindPrefix, record, i+1)
-		if err := batcher.add(ctx, transcriptImportBatchRecord{
-			Record:        record,
-			Kind:          kind,
-			Body:          body,
-			CheckpointKey: checkpointKey,
-		}); errors.Is(err, errTranscriptImportBudgetExhausted) {
+		if err := batcher.add(ctx, planned); errors.Is(err, errTranscriptImportBudgetExhausted) {
 			return transcriptImportResult{
 				LastRecordID: lastRecordID,
 				LastLine:     lastLine,
@@ -16867,11 +16873,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 		b.queuedBatches++
 		return nil
 	}
-	html := renderTeamsHTMLPart(TeamsRenderInput{
-		Surface: TeamsRenderSurfaceOutbox,
-		Kind:    renderKindForOutbox(record.Kind),
-		Text:    record.Body,
-	}, 1, 1)
+	html := renderTranscriptImportRecordHTML(record)
 	if len(html) > teamsChunkHTMLContentBytes {
 		if err := b.flush(ctx); err != nil {
 			return err
@@ -16942,7 +16944,7 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 		return errTranscriptImportBudgetExhausted
 	}
 	b.batchIndex++
-	html := strings.Join(b.htmlParts, transcriptImportBatchSeparatorHTML)
+	html := renderTranscriptImportBatchHTMLParts(b.htmlParts)
 	first := b.records[0]
 	last := b.records[len(b.records)-1]
 	kind := transcriptImportBatchOutboxKind(b.kindPrefix, first.Record, last.Record, b.batchIndex)
@@ -18494,6 +18496,14 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 }
 
 func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session Session, local codexhistory.Session, state teamstore.State, checkpoint teamstore.ImportCheckpoint, hasCheckpoint bool) error {
+	if _, blocked, err := b.store.ParentFork(ctx, session.ID); err != nil {
+		return err
+	} else if blocked {
+		// The fork owns the parent cutoff and its visible history ordering until
+		// the parent link is durably sent. Leave the checkpoint untouched so the
+		// normal sync can resume from the same boundary after the fence releases.
+		return nil
+	}
 	checkpointID := transcriptCheckpointID(session.ID)
 	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
 		return err

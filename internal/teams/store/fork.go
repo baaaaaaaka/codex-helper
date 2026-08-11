@@ -75,6 +75,7 @@ type ForkOperation struct {
 	ChatStart               time.Time          `json:"chat_start,omitempty"`
 	ChatEnd                 time.Time          `json:"chat_end,omitempty"`
 	HistoryNamespace        string             `json:"history_namespace,omitempty"`
+	HistoryPlanVersion      int                `json:"history_plan_version,omitempty"`
 	HistoryCompleteOutboxID string             `json:"history_complete_outbox_id,omitempty"`
 	LinkOutboxID            string             `json:"link_outbox_id,omitempty"`
 	LastError               string             `json:"last_error,omitempty"`
@@ -89,6 +90,7 @@ type ForkHistoryItem struct {
 	OperationID       string                    `json:"operation_id"`
 	Ordinal           int                       `json:"ordinal"`
 	SourceRecordID    string                    `json:"source_record_id,omitempty"`
+	SourceEndRecordID string                    `json:"source_end_record_id,omitempty"`
 	SourceLine        int                       `json:"source_line,omitempty"`
 	SourceStartOffset int64                     `json:"source_start_offset,omitempty"`
 	SourceOffset      int64                     `json:"source_offset,omitempty"`
@@ -117,6 +119,7 @@ type ForkBeginRequest struct {
 	CutoffCodexTurnID    string
 	OwnerMachineID       string
 	OwnerLeaseGeneration int64
+	HistoryPlanVersion   int
 	ForkWindowStart      time.Time
 	ForkWindowEnd        time.Time
 	Now                  time.Time
@@ -134,6 +137,7 @@ type ForkOwnerLease struct {
 type ForkManifestMetadata struct {
 	SourcePath              string
 	SourceFingerprint       string
+	HistoryPlanVersion      int
 	CutoffSourceRecordID    string
 	CutoffSourceLine        int
 	CutoffSourceStartOffset int64
@@ -224,10 +228,39 @@ func ForkHistoryItemID(operationID string, ordinal int) string {
 }
 
 func ForkHistoryManifestHash(items []ForkHistoryItem) string {
+	return forkHistoryManifestHash(items, false)
+}
+
+// ForkHistoryManifestHashForPlanVersion preserves the legacy v1 manifest hash
+// while binding the v2 source range metadata into the immutable manifest. The
+// plan version is part of the durable operation, so changing this format for
+// v2 must not invalidate an in-flight v1 operation after an upgrade.
+func ForkHistoryManifestHashForPlanVersion(items []ForkHistoryItem, planVersion int) string {
+	return forkHistoryManifestHash(items, planVersion >= 2)
+}
+
+func forkHistoryManifestHash(items []ForkHistoryItem, includeSourceEnd bool) string {
 	ordered := append([]ForkHistoryItem(nil), items...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Ordinal < ordered[j].Ordinal })
 	h := sha256.New()
 	for _, item := range ordered {
+		if includeSourceEnd {
+			fmt.Fprintf(h, "%d\x00%s\x00%s\x00%d\x00%d\x00%d\x00%s\x00%d\x00%d\x00%d\x00%s\x00%s\n",
+				item.Ordinal,
+				item.SourceRecordID,
+				item.SourceEndRecordID,
+				item.SourceLine,
+				item.SourceStartOffset,
+				item.SourceOffset,
+				item.SourceTurnID,
+				item.PartIndex,
+				item.PartCount,
+				item.RenderedBytes,
+				item.BodyHash,
+				item.RenderedBody,
+			)
+			continue
+		}
 		fmt.Fprintf(h, "%d\x00%s\x00%d\x00%d\x00%d\x00%s\x00%d\x00%d\x00%d\x00%s\x00%s\n",
 			item.Ordinal,
 			item.SourceRecordID,
@@ -249,6 +282,7 @@ func normalizeForkHistoryItem(item ForkHistoryItem, now time.Time) ForkHistoryIt
 	item.ID = strings.TrimSpace(item.ID)
 	item.OperationID = strings.TrimSpace(item.OperationID)
 	item.SourceRecordID = strings.TrimSpace(item.SourceRecordID)
+	item.SourceEndRecordID = strings.TrimSpace(item.SourceEndRecordID)
 	item.SourceTurnID = strings.TrimSpace(item.SourceTurnID)
 	item.Kind = strings.TrimSpace(item.Kind)
 	item.RenderedBody = strings.TrimSpace(item.RenderedBody)
@@ -378,8 +412,12 @@ func (s *Store) BeginFork(ctx context.Context, req ForkBeginRequest) (ForkOperat
 			NativeForkWindowStart: forkWindowStart,
 			NativeForkWindowEnd:   forkWindowEnd,
 			HistoryNamespace:      "fork-history:" + req.OperationID,
+			HistoryPlanVersion:    req.HistoryPlanVersion,
 			CreatedAt:             now,
 			UpdatedAt:             now,
+		}
+		if op.HistoryPlanVersion <= 0 {
+			op.HistoryPlanVersion = 1
 		}
 		state.Sessions[child.ID] = child
 		state.ForkOperations[op.ID] = op
@@ -636,9 +674,24 @@ func (s *Store) SaveForkManifestWithMetadataOwned(ctx context.Context, operation
 
 func (s *Store) saveForkManifestWithMetadata(ctx context.Context, operationID string, items []ForkHistoryItem, metadata ForkManifestMetadata, owner *ForkOwnerLease) (ForkOperation, error) {
 	operationID = strings.TrimSpace(operationID)
+	requestedPlanVersion := metadata.HistoryPlanVersion
 	var out ForkOperation
 	_, err := s.updateForkOperationState(ctx, operationID, owner, func(state *State, op *ForkOperation) error {
+		operationPlanVersion := op.HistoryPlanVersion
+		if operationPlanVersion <= 0 {
+			operationPlanVersion = 1
+		}
+		planVersion := requestedPlanVersion
+		if planVersion <= 0 {
+			// The operation is authoritative once BeginFork has durably selected
+			// a plan. This keeps legacy store callers from silently downgrading a
+			// new v2 operation merely because they use the old metadata shape.
+			planVersion = operationPlanVersion
+		}
 		if strings.TrimSpace(op.ManifestID) != "" {
+			if operationPlanVersion != planVersion {
+				return fmt.Errorf("fork history plan version is immutable")
+			}
 			normalized := make([]ForkHistoryItem, 0, len(items))
 			for ordinal, item := range items {
 				item.OperationID = operationID
@@ -650,7 +703,7 @@ func (s *Store) saveForkManifestWithMetadata(ctx context.Context, operationID st
 					normalized = append(normalized, item)
 				}
 			}
-			if len(normalized) != op.ManifestCount || ForkHistoryManifestHash(normalized) != op.ManifestHash {
+			if len(normalized) != op.ManifestCount || ForkHistoryManifestHashForPlanVersion(normalized, operationPlanVersion) != op.ManifestHash {
 				return fmt.Errorf("fork history manifest is immutable")
 			}
 			out = *op
@@ -675,6 +728,7 @@ func (s *Store) saveForkManifestWithMetadata(ctx context.Context, operationID st
 		}
 		op.SourceTranscriptPath = strings.TrimSpace(metadata.SourcePath)
 		op.SourceFingerprint = strings.TrimSpace(metadata.SourceFingerprint)
+		op.HistoryPlanVersion = planVersion
 		op.CutoffSourceRecordID = strings.TrimSpace(metadata.CutoffSourceRecordID)
 		op.CutoffSourceLine = metadata.CutoffSourceLine
 		op.CutoffSourceStartOffset = metadata.CutoffSourceStartOffset
@@ -682,7 +736,7 @@ func (s *Store) saveForkManifestWithMetadata(ctx context.Context, operationID st
 		op.SourcePrefixHash = strings.TrimSpace(metadata.SourcePrefixHash)
 		op.ManifestID = "fork-manifest:" + operationID
 		op.ManifestCount = len(normalized)
-		op.ManifestHash = ForkHistoryManifestHash(normalized)
+		op.ManifestHash = ForkHistoryManifestHashForPlanVersion(normalized, planVersion)
 		op.Phase = ForkPhaseSnapshotMaterialized
 		op.UpdatedAt = now
 		out = *op
@@ -908,6 +962,15 @@ func (s *Store) refreshForkHistory(ctx context.Context, operationID string, owne
 	var out ForkOperation
 	verified := false
 	_, err := s.updateForkOperationState(ctx, operationID, owner, func(state *State, op *ForkOperation) error {
+		changed := false
+		now := time.Now()
+		finish := func() error {
+			out = *op
+			if !changed {
+				return errStoreNoChange
+			}
+			return nil
+		}
 		items := make([]ForkHistoryItem, 0)
 		for id, item := range state.ForkHistoryItems {
 			if item.OperationID != operationID {
@@ -915,56 +978,61 @@ func (s *Store) refreshForkHistory(ctx context.Context, operationID string, owne
 			}
 			if item.OutboxID != "" {
 				if msg, ok := state.OutboxMessages[item.OutboxID]; ok {
-					item.TeamsMessageID = strings.TrimSpace(msg.TeamsMessageID)
+					teamsMessageID := strings.TrimSpace(msg.TeamsMessageID)
+					deliveryStatus := forkHistoryDeliveryFromOutbox(msg)
+					itemChanged := item.TeamsMessageID != teamsMessageID
 					if item.DeliveryStatus != ForkHistoryDeliveryDuplicateSettled {
-						item.DeliveryStatus = forkHistoryDeliveryFromOutbox(msg)
+						itemChanged = itemChanged || item.DeliveryStatus != deliveryStatus
 					}
-					item.UpdatedAt = time.Now()
-					state.ForkHistoryItems[id] = item
+					if itemChanged {
+						item.TeamsMessageID = teamsMessageID
+						if item.DeliveryStatus != ForkHistoryDeliveryDuplicateSettled {
+							item.DeliveryStatus = deliveryStatus
+						}
+						item.UpdatedAt = now
+						state.ForkHistoryItems[id] = item
+						changed = true
+					}
 				}
 			}
 			items = append(items, item)
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i].Ordinal < items[j].Ordinal })
 		if strings.TrimSpace(op.HistoryNamespace) == "" || strings.TrimSpace(op.ManifestID) == "" || strings.TrimSpace(op.SourceTranscriptPath) == "" || strings.TrimSpace(op.SourceFingerprint) == "" || strings.TrimSpace(op.CutoffSourceRecordID) == "" || op.CutoffSourceLine <= 0 || op.CutoffSourceOffset <= 0 || strings.TrimSpace(op.SourcePrefixHash) == "" {
-			out = *op
-			return nil
+			return finish()
 		}
-		if len(items) != op.ManifestCount || ForkHistoryManifestHash(items) != op.ManifestHash {
-			out = *op
-			return nil
+		planVersion := op.HistoryPlanVersion
+		if planVersion <= 0 {
+			planVersion = 1
+		}
+		if len(items) != op.ManifestCount || ForkHistoryManifestHashForPlanVersion(items, planVersion) != op.ManifestHash {
+			return finish()
 		}
 		for _, item := range items {
 			if item.DeliveryStatus != ForkHistoryDeliverySent && item.DeliveryStatus != ForkHistoryDeliveryDuplicateSettled {
-				out = *op
-				return nil
+				return finish()
 			}
 		}
 		marker, ok := state.OutboxMessages[op.HistoryCompleteOutboxID]
 		if !ok || marker.ForkOperationID != operationID || marker.ForkHistoryNamespace != op.HistoryNamespace || marker.ForkRole != "complete-marker" || marker.Kind != "fork-history-complete" || marker.Status != OutboxStatusSent || strings.TrimSpace(marker.TeamsMessageID) == "" {
-			out = *op
-			return nil
+			return finish()
 		}
 		for _, item := range items {
 			if item.OutboxID == "" {
-				out = *op
-				return nil
+				return finish()
 			}
 			history, ok := state.OutboxMessages[item.OutboxID]
 			if !ok || history.ForkOperationID != operationID || history.ForkHistoryNamespace != op.HistoryNamespace || history.ForkRole == "link" {
-				out = *op
-				return nil
+				return finish()
 			}
 			if marker.Sequence <= 0 || history.Sequence <= 0 || marker.Sequence <= history.Sequence {
-				out = *op
-				return nil
+				return finish()
 			}
 			if item.DeliveryStatus == ForkHistoryDeliveryDuplicateSettled && item.TeamsMessageID != "" {
 				continue
 			}
 			if history.Status != OutboxStatusSent || strings.TrimSpace(history.TeamsMessageID) == "" {
-				out = *op
-				return nil
+				return finish()
 			}
 		}
 		duplicateSettled := make(map[string]bool)
@@ -978,25 +1046,27 @@ func (s *Store) refreshForkHistory(ctx context.Context, operationID string, owne
 				continue
 			}
 			if message.ForkHistoryNamespace != op.HistoryNamespace {
-				out = *op
-				return nil
+				return finish()
 			}
 			if message.ID != marker.ID && (marker.Sequence <= 0 || message.Sequence <= 0 || marker.Sequence <= message.Sequence) {
-				out = *op
-				return nil
+				return finish()
 			}
 			if duplicateSettled[message.ID] {
 				continue
 			}
 			if message.Status != OutboxStatusSent || strings.TrimSpace(message.TeamsMessageID) == "" {
-				out = *op
-				return nil
+				return finish()
 			}
 		}
-		op.Phase = ForkPhaseHistoryVerified
-		op.UpdatedAt = time.Now()
+		if op.Phase != ForkPhaseHistoryVerified {
+			op.Phase = ForkPhaseHistoryVerified
+			changed = true
+		}
 		out = *op
 		verified = true
+		if !changed {
+			return errStoreNoChange
+		}
 		return nil
 	})
 	return out, verified, err

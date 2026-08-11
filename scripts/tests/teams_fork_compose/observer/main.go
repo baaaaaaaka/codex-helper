@@ -86,8 +86,8 @@ func checkCodex(path string, parentID string, cutoffID string) error {
 	if err := readJSON(path, &state); err != nil {
 		return fmt.Errorf("read fake Codex state: %w", err)
 	}
-	if state.ForkRequests < 1 {
-		return fmt.Errorf("fake Codex did not receive thread/fork")
+	if state.ForkRequests != 1 {
+		return fmt.Errorf("fake Codex thread/fork requests = %d, want exactly one", state.ForkRequests)
 	}
 	children := 0
 	for _, thread := range state.Threads {
@@ -111,6 +111,7 @@ func checkGraph(path string, parentChatID string, childChatID string) error {
 	}
 	seen := make(map[string]bool)
 	historyLast := -1
+	historyCount := 0
 	markerIndex := -1
 	linkIndex := -1
 	for index, message := range state.Messages {
@@ -129,13 +130,17 @@ func checkGraph(path string, parentChatID string, childChatID string) error {
 			if markerIndex >= 0 {
 				return fmt.Errorf("history chunk appeared after completion marker")
 			}
+			historyCount++
+			if !strings.Contains(message.Body, "history before compose fork") || strings.Contains(message.Body, "must not appear after fork") {
+				return fmt.Errorf("unexpected fork history body: %q", message.Body)
+			}
 			historyLast = index
 		case strings.HasPrefix(marker, "fork-link:") && message.ChatID == parentChatID && strings.Contains(message.Body, "Fork complete"):
 			linkIndex = index
 		}
 	}
-	if historyLast < 0 || markerIndex < 0 || linkIndex < 0 || historyLast >= markerIndex || markerIndex >= linkIndex {
-		return fmt.Errorf("Graph ordering history=%d marker=%d link=%d", historyLast, markerIndex, linkIndex)
+	if historyCount != 1 || historyLast < 0 || markerIndex < 0 || linkIndex < 0 || historyLast >= markerIndex || markerIndex >= linkIndex {
+		return fmt.Errorf("Graph ordering/count history=%d/%d marker=%d link=%d", historyCount, historyLast, markerIndex, linkIndex)
 	}
 	return nil
 }

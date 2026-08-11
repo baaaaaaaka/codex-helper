@@ -104,6 +104,13 @@ func (b *Bridge) RecreateSessionChat(ctx context.Context, selector string, opts 
 	default:
 		return RecreatedChat{}, fmt.Errorf("Teams session %s has unsupported status %q", session.ID, session.Status)
 	}
+	if b.store != nil {
+		if operation, fenced, err := b.store.ParentFork(ctx, session.ID); err != nil {
+			return RecreatedChat{}, err
+		} else if fenced {
+			return RecreatedChat{}, fmt.Errorf("fork operation %q is still preparing this session; recreate is temporarily gated", operation.ID)
+		}
+	}
 	old := Chat{ID: session.ChatID, Topic: session.Topic, WebURL: session.ChatURL, ChatType: "meeting"}
 	topic := strings.TrimSpace(session.Topic)
 	if topic == "" {
