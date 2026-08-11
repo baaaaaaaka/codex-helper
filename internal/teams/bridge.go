@@ -14672,7 +14672,24 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
 		} else {
 			b.retainAmbiguousOutboxEchoAttempt(outbox.ID)
-			_, _ = b.store.MarkOutboxAmbiguousSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
+			ambiguous, markErr := b.store.MarkOutboxAmbiguousSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, err.Error())
+			if markErr == nil && isForkDeliveryOutbox(ambiguous) {
+				// The POST may have committed before its response was lost. Fork
+				// messages carry an exact provenance marker, so reconcile that
+				// boundary immediately instead of returning a raw transport error
+				// and waiting for the send lease to expire. A failed or inconclusive
+				// read remains deferred; it must never turn into a duplicate POST.
+				if recovered, recoveryErr := b.recoverAcceptedOutboxFromGraph(ctx, ambiguous, opts); recovered || recoveryErr != nil {
+					if recoveryErr != nil && opts.RecordRateLimit {
+						b.recordGraphReadRateLimit(context.Background(), ambiguous.TeamsChatID, recoveryErr)
+					}
+					if recoveryErr != nil {
+						return recoveryErr
+					}
+					return nil
+				}
+				return outboxDeliveryDeferredError{ChatID: ambiguous.TeamsChatID, Until: firstNonZeroTime(ambiguous.LastSendAttempt, ambiguous.CreatedAt)}
+			}
 		}
 		if opts.RecordRateLimit {
 			b.recordGraphRateLimit(context.Background(), outbox.TeamsChatID, outbox.ID, err)
