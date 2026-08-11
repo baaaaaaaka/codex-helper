@@ -12457,6 +12457,9 @@ func formatCodexStreamRetryStatus(event codexrunner.StreamEvent) string {
 	if message == "" {
 		message = "Reconnecting..."
 	}
+	if codexrunner.IsModelCapacityFailure(codexrunner.TurnResult{Failure: event.Failure}, nil) {
+		return "Codex is waiting for model capacity and will retry this turn."
+	}
 	lines := []string{"Connection dropped. Codex is reconnecting."}
 	if !strings.EqualFold(strings.TrimSpace(message), strings.TrimSpace(lines[0])) {
 		lines = append(lines, "", message)

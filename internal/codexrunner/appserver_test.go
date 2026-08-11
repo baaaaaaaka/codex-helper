@@ -1175,7 +1175,9 @@ func BenchmarkAppServerProtocolFinalNotifications(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		var result TurnResult
-		if !applyAppServerProtocolNotification(&result, item) || !applyAppServerProtocolNotification(&result, completed) {
+		itemHandled, _ := applyAppServerProtocolNotification(&result, item)
+		completedHandled, _ := applyAppServerProtocolNotification(&result, completed)
+		if !itemHandled || !completedHandled {
 			b.Fatal("notification parse failed")
 		}
 		if result.FinalAgentMessage != "complete final" || !result.FinalAgentMessageComplete || result.Status != TurnStatusCompleted {

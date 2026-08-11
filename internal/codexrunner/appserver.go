@@ -139,6 +139,9 @@ type AppServerRunner struct {
 	// RequireCompleteFinal fails closed when a completed turn has no final
 	// agent item, allowing callers to recover from the canonical transcript.
 	RequireCompleteFinal bool
+	// capacityRetry is kept private because retry timing and test seams are an
+	// implementation detail of the managed app-server path.
+	capacityRetry capacityRetryPolicy
 	// CloseHook releases resources that must live exactly as long as this
 	// runner (for example a local third-party Responses adapter).
 	CloseHook func()
@@ -185,8 +188,10 @@ type appServerServerRequestState struct {
 }
 
 type appServerThreadTurnGate struct {
-	mu   sync.Mutex
-	refs int
+	// token is a context-aware, one-slot mutex. A same-thread caller waiting
+	// behind a long retry lease must still be able to honor its own timeout.
+	token chan struct{}
+	refs  int
 	// cancelFence prevents a new same-thread turn until an earlier explicit
 	// cancellation is confirmed. It belongs to this app-server transport only
 	// and is retried lazily by the next same-thread turn.
@@ -231,7 +236,7 @@ func (r *AppServerRunner) StartThread(ctx context.Context, input TurnInput) (Tur
 			return TurnResult{ThreadID: threadID, Status: TurnStatusUnknown}, err
 		}
 	}
-	result, err := r.startTurn(ctx, StartTurnInput{ThreadID: threadID, TurnInput: input})
+	result, err := r.startTurnWithCapacityRetry(ctx, StartTurnInput{ThreadID: threadID, TurnInput: input})
 	if result.ThreadID == "" {
 		result.ThreadID = threadID
 	}
@@ -259,7 +264,7 @@ func (r *AppServerRunner) ResumeThread(ctx context.Context, threadID string, inp
 	if err != nil {
 		return TurnResult{}, err
 	}
-	result, err := r.startTurn(ctx, StartTurnInput{ThreadID: resumedThreadID, TurnInput: input})
+	result, err := r.startTurnWithCapacityRetry(ctx, StartTurnInput{ThreadID: resumedThreadID, TurnInput: input})
 	if result.ThreadID == "" {
 		result.ThreadID = resumedThreadID
 	}
@@ -282,7 +287,7 @@ func (r *AppServerRunner) StartTurn(ctx context.Context, input StartTurnInput) (
 	if err := r.ensureReady(ctx); err != nil {
 		return TurnResult{}, err
 	}
-	result, err := r.startTurn(ctx, input)
+	result, err := r.startTurnWithCapacityRetry(ctx, input)
 	if result.ThreadID == "" {
 		result.ThreadID = strings.TrimSpace(input.ThreadID)
 	}
@@ -325,6 +330,21 @@ func (r *AppServerRunner) requestTurnInterrupt(ctx context.Context, ref TurnRef)
 
 func explicitTurnInterruptRequested(ctx context.Context) bool {
 	return ctx != nil && errors.Is(context.Cause(ctx), ErrTurnInterruptRequested)
+}
+
+func capacityRetryDeadlineRequested(ctx context.Context) bool {
+	return ctx != nil && errors.Is(context.Cause(ctx), errCapacityRetryDeadline)
+}
+
+func turnStopRequested(ctx context.Context) bool {
+	return explicitTurnInterruptRequested(ctx) || capacityRetryDeadlineRequested(ctx)
+}
+
+func turnStopError(ctx context.Context) error {
+	if capacityRetryDeadlineRequested(ctx) {
+		return &Error{Kind: ErrorTimeout, Message: "Codex capacity retry deadline exceeded", Err: errCapacityRetryDeadline}
+	}
+	return explicitTurnCanceledError(context.Cause(ctx))
 }
 
 func explicitTurnCanceledError(cause error) error {
@@ -423,7 +443,7 @@ func appServerTerminalNotificationForTurn(line []byte, threadID string, turnID s
 		return false
 	}
 	result := TurnResult{}
-	if applyAppServerNotification(&result, line) != nil {
+	if _, err := applyAppServerNotification(&result, line); err != nil {
 		return false
 	}
 	return strings.TrimSpace(result.TurnID) == strings.TrimSpace(turnID) && isTerminalTurnStatus(result.Status)
@@ -446,26 +466,32 @@ func (r *AppServerRunner) threadIdle(ctx context.Context, threadID string) (bool
 func (r *AppServerRunner) interruptStartedTurn(threadID string, turnID string, gate *appServerThreadTurnGate, subscription *appServerTurnSubscriber) error {
 	turnID = strings.TrimSpace(turnID)
 	if turnID == "" {
-		gate.cancelFence = &appServerTurnCancelFence{}
+		r.setTurnCancelFence(gate, &appServerTurnCancelFence{})
 		return &Error{Kind: ErrorCodex, Message: "Codex turn cancel could not be confirmed because turn/start did not return an exact turn id"}
 	}
 	if err := r.confirmTurnStopped(threadID, turnID, subscription); err != nil {
-		gate.cancelFence = &appServerTurnCancelFence{turnID: turnID}
+		r.setTurnCancelFence(gate, &appServerTurnCancelFence{turnID: turnID})
 		return &Error{
 			Kind:    ErrorCodex,
 			Message: "Codex turn cancel was not confirmed; cleanup will be retried before the next same-thread turn",
 			Err:     err,
 		}
 	}
-	gate.cancelFence = nil
+	r.setTurnCancelFence(gate, nil)
 	return explicitTurnCanceledError(ErrTurnInterruptRequested)
 }
 
 func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appServerThreadTurnGate) error {
-	if gate == nil || gate.cancelFence == nil {
+	if gate == nil {
 		return nil
 	}
-	turnID := strings.TrimSpace(gate.cancelFence.turnID)
+	r.protocolMu.Lock()
+	fence := gate.cancelFence
+	r.protocolMu.Unlock()
+	if fence == nil {
+		return nil
+	}
+	turnID := strings.TrimSpace(fence.turnID)
 	if turnID == "" {
 		stateCtx, cancelState := r.threadStateConfirmationContext()
 		idle, err := r.threadIdle(stateCtx, threadID)
@@ -480,7 +506,7 @@ func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appSer
 				Err:     err,
 			}
 		}
-		gate.cancelFence = nil
+		r.setTurnCancelFence(gate, nil)
 		return nil
 	}
 	if err := r.confirmTurnStopped(threadID, turnID, nil); err != nil {
@@ -490,8 +516,17 @@ func (r *AppServerRunner) reconcileTurnCancelFence(threadID string, gate *appSer
 			Err:     err,
 		}
 	}
-	gate.cancelFence = nil
+	r.setTurnCancelFence(gate, nil)
 	return nil
+}
+
+func (r *AppServerRunner) setTurnCancelFence(gate *appServerThreadTurnGate, fence *appServerTurnCancelFence) {
+	if gate == nil {
+		return
+	}
+	r.protocolMu.Lock()
+	gate.cancelFence = fence
+	r.protocolMu.Unlock()
 }
 
 func (r *AppServerRunner) ReadThread(ctx context.Context, threadID string) (Thread, error) {
@@ -794,13 +829,166 @@ func (r *AppServerRunner) resumeThread(ctx context.Context, threadID string) (st
 	return threadID, nil
 }
 
-func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (TurnResult, error) {
+func (r *AppServerRunner) startTurnWithCapacityRetry(ctx context.Context, input StartTurnInput) (TurnResult, error) {
 	threadID := strings.TrimSpace(input.ThreadID)
 	if threadID == "" {
 		return TurnResult{}, &Error{Kind: ErrorInvalidRequest, Message: "thread id is required"}
 	}
-	gate, unlockThread := r.lockThreadTurn(threadID)
+	gate, unlockThread, lockErr := r.lockThreadTurnContext(ctx, threadID)
+	if lockErr != nil {
+		return TurnResult{ThreadID: threadID}, classifyTransportError(lockErr)
+	}
 	defer unlockThread()
+
+	policy := r.capacityRetry.normalized()
+	if policy.MaxRetries < 0 {
+		return r.startTurnOnceLocked(ctx, input, gate, nil, nil)
+	}
+
+	retryCount := 0
+	totalRetries := 0
+	useContinuation := false
+	retryDeadline := time.Now().Add(policy.MaxElapsed)
+	for {
+		attempt := input
+		if useContinuation {
+			// A terminal capacity failure belongs to an accepted turn. A new
+			// app-server turn still requires non-empty input, so continue the
+			// existing task without duplicating the original user prompt.
+			attempt.Prompt = capacityRetryContinuationPrompt
+			attempt.ImagePaths = nil
+		}
+
+		var capacityFailureEvent *StreamEvent
+		substantiveUpdate := false
+		sideEffectUpdate := false
+		var observe EventHandler
+		var observeSideEffect func()
+		if input.EventHandler != nil {
+			// The observer below handles the internal retry decision. Keep
+			// capacity failures out of the caller's stream until the retry
+			// budget is exhausted.
+			attempt.EventHandler = func(event StreamEvent) {
+				if !isModelCapacityFailureEvent(event) {
+					input.EventHandler(event)
+				}
+			}
+			observe = func(event StreamEvent) {
+				if isModelCapacityFailureEvent(event) {
+					copied := event
+					if event.Failure != nil {
+						failure := *event.Failure
+						copied.Failure = &failure
+					}
+					capacityFailureEvent = &copied
+					return
+				}
+				if isSubstantiveStreamEvent(event) {
+					substantiveUpdate = true
+				}
+				if event.Kind == StreamEventCommandStarted || event.Kind == StreamEventCommandCompleted {
+					sideEffectUpdate = true
+				}
+			}
+			observeSideEffect = func() {
+				sideEffectUpdate = true
+			}
+		} else {
+			// Without a caller stream, keep the normal path lightweight. The
+			// app-server decoder reports side-effect item types while it is
+			// already parsing each result/notification; do not unmarshal the
+			// same payload a second time just for retry classification.
+			observeSideEffect = func() {
+				sideEffectUpdate = true
+			}
+		}
+
+		attemptCtx := ctx
+		var cancelAttempt context.CancelCauseFunc
+		var attemptDeadlineTimer *time.Timer
+		if totalRetries > 0 {
+			attemptCtx, cancelAttempt = context.WithCancelCause(ctx)
+			attemptDeadlineTimer = time.AfterFunc(time.Until(retryDeadline), func() {
+				cancelAttempt(errCapacityRetryDeadline)
+			})
+		}
+		result, err := r.startTurnOnceLocked(attemptCtx, attempt, gate, observe, observeSideEffect)
+		if attemptDeadlineTimer != nil {
+			attemptDeadlineTimer.Stop()
+			cancelAttempt(nil)
+		}
+		// Some app-server versions expose assistant progress as deltas that are
+		// folded into TurnResult without a corresponding StreamEvent. Treat
+		// that accumulated content as substantive for the retry budget too.
+		if strings.TrimSpace(result.FinalAgentMessage) != "" {
+			substantiveUpdate = true
+		}
+		retryable := canRetryModelCapacityFailure(result, err)
+		if retryable && result.Status == TurnStatusFailed && sideEffectUpdate {
+			// A new turn is the only app-server continuation available after a
+			// terminal failure. Do not risk replaying a command that may already
+			// have changed the workspace.
+			retryable = false
+		}
+		if !retryable {
+			// A suppressed terminal capacity event must be restored to the
+			// caller. For ordinary completions/errors there is no suppressed
+			// event and synthesizing one would misreport the turn as failed.
+			if capacityFailureEvent != nil || shouldFlushModelCapacityFailure(result, err) {
+				flushModelCapacityFailureEvent(input.EventHandler, capacityFailureEvent, result, err, threadID)
+			}
+			return result, err
+		}
+		if substantiveUpdate {
+			retryCount = 0
+		}
+		if retryCount >= policy.MaxRetries || totalRetries >= policy.MaxTotalRetries {
+			flushModelCapacityFailureEvent(input.EventHandler, capacityFailureEvent, result, err, threadID)
+			return result, err
+		}
+		if !time.Now().Before(retryDeadline) {
+			flushModelCapacityFailureEvent(input.EventHandler, capacityFailureEvent, result, err, threadID)
+			return result, err
+		}
+
+		retryCount++
+		totalRetries++
+		retryEvent := modelCapacityRetryEvent(result, err, capacityFailureEvent, threadID)
+		waitCtx, cancelWait := context.WithDeadline(ctx, retryDeadline)
+		waitErr := policy.wait(waitCtx, retryCount)
+		cancelWait()
+		if waitErr != nil {
+			if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+				if ctx.Err() == nil && time.Now().After(retryDeadline) {
+					flushModelCapacityFailureEvent(input.EventHandler, capacityFailureEvent, result, err, threadID)
+					return result, err
+				}
+				return result, classifyTransportError(waitErr)
+			}
+			return result, waitErr
+		}
+		if !time.Now().Before(retryDeadline) {
+			flushModelCapacityFailureEvent(input.EventHandler, capacityFailureEvent, result, err, threadID)
+			return result, err
+		}
+		if err := ctx.Err(); err != nil {
+			return result, classifyTransportError(err)
+		}
+		if input.EventHandler != nil {
+			// Publish the retry status only once the cancellable backoff has
+			// completed. A canceled wait must not leave a stale "will retry"
+			// status in stream consumers.
+			input.EventHandler(retryEvent)
+		}
+		useContinuation = result.Status == TurnStatusFailed && strings.TrimSpace(result.TurnID) != ""
+	}
+}
+
+func (r *AppServerRunner) startTurnOnceLocked(ctx context.Context, input StartTurnInput, gate *appServerThreadTurnGate, observer EventHandler, sideEffectObserver func()) (TurnResult, error) {
+	threadID := strings.TrimSpace(input.ThreadID)
+	if threadID == "" {
+		return TurnResult{}, &Error{Kind: ErrorInvalidRequest, Message: "thread id is required"}
+	}
 	if err := r.reconcileTurnCancelFence(threadID, gate); err != nil {
 		return TurnResult{ThreadID: threadID}, err
 	}
@@ -831,14 +1019,23 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 	if err != nil {
 		if errors.Is(err, errAppServerTurnStartUnconfirmed) {
 			result.Status = TurnStatusStarted
-			gate.cancelFence = &appServerTurnCancelFence{}
+			r.setTurnCancelFence(gate, &appServerTurnCancelFence{})
+		} else if capacityRetryDeadlineRequested(ctx) {
+			return result, turnStopError(ctx)
 		}
 		return result, err
 	}
-	if err := applyAppServerResult(&result, raw); err != nil {
-		if explicitTurnInterruptRequested(ctx) {
+	sideEffect, err := applyAppServerResult(&result, raw)
+	if sideEffect && sideEffectObserver != nil {
+		sideEffectObserver()
+	}
+	if err != nil {
+		if turnStopRequested(ctx) {
 			result.Status = TurnStatusStarted
-			gate.cancelFence = &appServerTurnCancelFence{turnID: strings.TrimSpace(result.TurnID)}
+			r.setTurnCancelFence(gate, &appServerTurnCancelFence{turnID: strings.TrimSpace(result.TurnID)})
+			if capacityRetryDeadlineRequested(ctx) {
+				return result, turnStopError(ctx)
+			}
 		}
 		return result, err
 	}
@@ -846,16 +1043,42 @@ func (r *AppServerRunner) startTurn(ctx context.Context, input StartTurnInput) (
 		result.ThreadID = threadID
 	}
 	r.setTurnSubscriptionID(subscription, result.TurnID)
-	if explicitTurnInterruptRequested(ctx) {
+	if turnStopRequested(ctx) {
 		if isTerminalTurnStatus(result.Status) {
-			return result, explicitTurnCanceledError(context.Cause(ctx))
+			return result, turnStopError(ctx)
 		}
-		return result, r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+		interruptErr := r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+		if capacityRetryDeadlineRequested(ctx) {
+			if interruptErr != nil && !IsKind(interruptErr, ErrorCanceled) {
+				return result, interruptErr
+			}
+			return result, turnStopError(ctx)
+		}
+		return result, interruptErr
 	}
 	if !isTerminalTurnStatus(result.Status) {
-		if err := r.readTurnNotificationsUntilTerminal(ctx, subscription, &result, input.EventHandler); err != nil {
-			if explicitTurnInterruptRequested(ctx) {
-				return result, r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+		handler := input.EventHandler
+		if observer != nil {
+			if handler == nil {
+				handler = observer
+			} else {
+				downstream := handler
+				handler = func(event StreamEvent) {
+					observer(event)
+					downstream(event)
+				}
+			}
+		}
+		if err := r.readTurnNotificationsUntilTerminal(ctx, subscription, &result, handler, sideEffectObserver); err != nil {
+			if turnStopRequested(ctx) {
+				interruptErr := r.interruptStartedTurn(threadID, result.TurnID, gate, subscription)
+				if capacityRetryDeadlineRequested(ctx) {
+					if interruptErr != nil && !IsKind(interruptErr, ErrorCanceled) {
+						return result, interruptErr
+					}
+					return result, turnStopError(ctx)
+				}
+				return result, interruptErr
 			}
 			return result, err
 		}
@@ -1025,14 +1248,18 @@ func (r *AppServerRunner) backfillTurnResult(ctx context.Context, result *TurnRe
 	return nil
 }
 
-func (r *AppServerRunner) readTurnNotificationsUntilTerminal(ctx context.Context, subscription *appServerTurnSubscriber, result *TurnResult, handler EventHandler) error {
+func (r *AppServerRunner) readTurnNotificationsUntilTerminal(ctx context.Context, subscription *appServerTurnSubscriber, result *TurnResult, handler EventHandler, sideEffectObserver func()) error {
 	seenCompletedItems := map[string]struct{}{}
 	for !isTerminalTurnStatus(result.Status) {
 		line, err := r.readTurnNotification(ctx, subscription)
 		if err != nil {
 			return err
 		}
-		if err := applyAppServerNotification(result, line); err != nil {
+		sideEffect, err := applyAppServerNotification(result, line)
+		if sideEffect && sideEffectObserver != nil {
+			sideEffectObserver()
+		}
+		if err != nil {
 			return err
 		}
 		if subscription.turnID == "" && result.TurnID != "" {
@@ -1075,7 +1302,7 @@ func (r *AppServerRunner) requestTurnStart(ctx context.Context, params any) (jso
 		return nil, err
 	}
 	raw, err := r.awaitRequest(ctx, id, delivery, false)
-	if err == nil || !explicitTurnInterruptRequested(ctx) {
+	if err == nil || !turnStopRequested(ctx) {
 		if err != nil {
 			r.unregisterPendingRequest(id, delivery)
 		}
@@ -1352,6 +1579,11 @@ func (r *AppServerRunner) subscribeTurn(ctx context.Context, threadID string) *a
 }
 
 func (r *AppServerRunner) lockThreadTurn(threadID string) (*appServerThreadTurnGate, func()) {
+	gate, release, _ := r.lockThreadTurnContext(context.Background(), threadID)
+	return gate, release
+}
+
+func (r *AppServerRunner) lockThreadTurnContext(ctx context.Context, threadID string) (*appServerThreadTurnGate, func(), error) {
 	threadID = strings.TrimSpace(threadID)
 	r.protocolMu.Lock()
 	if r.threadTurnGates == nil {
@@ -1359,27 +1591,45 @@ func (r *AppServerRunner) lockThreadTurn(threadID string) (*appServerThreadTurnG
 	}
 	gate := r.threadTurnGates[threadID]
 	if gate == nil {
-		gate = &appServerThreadTurnGate{}
+		gate = &appServerThreadTurnGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
 		r.threadTurnGates[threadID] = gate
 	}
 	gate.refs++
 	r.protocolMu.Unlock()
 
-	gate.mu.Lock()
-	release := func() {
-		// Keep the fence observation and reference-count update in one critical
-		// section. Otherwise a queued same-thread caller can clear cancelFence
-		// after this goroutine snapshots it but before refs reaches zero, leaving
-		// an empty gate retained until that thread happens to run again.
-		r.protocolMu.Lock()
-		gate.refs--
-		if gate.refs == 0 && gate.cancelFence == nil && r.threadTurnGates[threadID] == gate {
-			delete(r.threadTurnGates, threadID)
-		}
-		r.protocolMu.Unlock()
-		gate.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return gate, release
+	if err := ctx.Err(); err != nil {
+		r.releaseThreadTurnGateRef(threadID, gate)
+		return nil, nil, err
+	}
+	select {
+	case <-gate.token:
+		return gate, func() {
+			// Return the token before dropping the reference. This keeps the
+			// map entry valid while a queued caller can acquire the same gate.
+			gate.token <- struct{}{}
+			r.releaseThreadTurnGateRef(threadID, gate)
+		}, nil
+	case <-ctx.Done():
+		r.releaseThreadTurnGateRef(threadID, gate)
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (r *AppServerRunner) releaseThreadTurnGateRef(threadID string, gate *appServerThreadTurnGate) {
+	// Keep the fence observation and reference-count update in one critical
+	// section. Otherwise a queued same-thread caller can clear cancelFence
+	// after this goroutine snapshots it but before refs reaches zero, leaving
+	// an empty gate retained until that thread happens to run again.
+	r.protocolMu.Lock()
+	gate.refs--
+	if gate.refs == 0 && gate.cancelFence == nil && r.threadTurnGates[threadID] == gate {
+		delete(r.threadTurnGates, threadID)
+	}
+	r.protocolMu.Unlock()
 }
 
 func (r *AppServerRunner) unsubscribeTurn(subscriber *appServerTurnSubscriber) {
@@ -1727,13 +1977,18 @@ func decodeAppServerErrorDetails(raw json.RawMessage) *CodexErrorDetails {
 		RequestIDSnake string          `json:"request_id"`
 		CloudflareRay  string          `json:"cfRay"`
 		CloudflareRay2 string          `json:"cf-ray"`
+		CodexErrorInfo json.RawMessage `json:"codexErrorInfo"`
 	}
 	if json.Unmarshal(raw, &payload) != nil {
 		return nil
 	}
+	errorCode := strings.TrimSpace(payload.ErrorCode)
+	if errorCode == "" {
+		errorCode = codexErrorInfoCode(payload.CodexErrorInfo)
+	}
 	details := &CodexErrorDetails{
 		Reason:    sanitizeCodexErrorText(payload.Reason, 128),
-		ErrorCode: sanitizeCodexErrorText(payload.ErrorCode, 128),
+		ErrorCode: sanitizeCodexErrorText(errorCode, 128),
 		Detail:    sanitizeCodexErrorText(payload.Detail, 512),
 		RequestID: sanitizeCodexErrorText(firstNonEmpty(payload.RequestID, payload.RequestIDSnake), 128),
 	}
@@ -1744,7 +1999,7 @@ func decodeAppServerErrorDetails(raw json.RawMessage) *CodexErrorDetails {
 	}
 	combined := strings.ToLower(strings.Join([]string{
 		payload.Detail,
-		payload.ErrorCode,
+		errorCode,
 		payload.Reason,
 		payload.CloudflareRay,
 		payload.CloudflareRay2,
@@ -2090,29 +2345,29 @@ func decodeThreadList(rawThreads []json.RawMessage) ([]Thread, error) {
 	return threads, nil
 }
 
-func applyAppServerNotification(result *TurnResult, line []byte) error {
+func applyAppServerNotification(result *TurnResult, line []byte) (bool, error) {
 	var msg appServerMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
-		return &Error{Kind: ErrorParse, Message: "invalid app-server notification", Err: err}
+		return false, &Error{Kind: ErrorParse, Message: "invalid app-server notification", Err: err}
 	}
-	if applyAppServerProtocolNotification(result, msg) {
-		return nil
+	if handled, sideEffect := applyAppServerProtocolNotification(result, msg); handled {
+		return sideEffect, nil
 	}
 	if len(msg.Params) > 0 {
-		if applyAppServerEventPayload(result, msg.Params) {
-			return nil
+		if handled, sideEffect := applyAppServerEventPayload(result, msg.Params); handled {
+			return sideEffect, nil
 		}
 	}
 	if appServerMethodLooksLikeEvent(msg.Method) {
 		payload := appServerMethodEventPayload(msg.Method, msg.Params)
-		if applyAppServerEventPayload(result, payload) {
-			return nil
+		if handled, sideEffect := applyAppServerEventPayload(result, payload); handled {
+			return sideEffect, nil
 		}
 	}
-	if applyAppServerEventPayload(result, line) {
-		return nil
+	if handled, sideEffect := applyAppServerEventPayload(result, line); handled {
+		return sideEffect, nil
 	}
-	return nil
+	return false, nil
 }
 
 func emitAppServerStreamEvent(handler EventHandler, line []byte) {
@@ -2361,12 +2616,12 @@ func appServerParamsStreamEvent(msg appServerMessage, line []byte) (StreamEvent,
 	return event, true
 }
 
-func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
+func applyAppServerResult(result *TurnResult, raw json.RawMessage) (bool, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil
+		return false, nil
 	}
-	if applyAppServerEventPayload(result, raw) {
-		return nil
+	if handled, sideEffect := applyAppServerEventPayload(result, raw); handled {
+		return sideEffect, nil
 	}
 	var envelope struct {
 		ThreadID      string `json:"thread_id"`
@@ -2390,13 +2645,14 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 			Items  []codexItem  `json:"items"`
 			Error  *TurnFailure `json:"error"`
 		} `json:"turn"`
+		Items             []codexItem  `json:"items"`
 		Status            TurnStatus   `json:"status"`
 		FinalAgentMessage string       `json:"final_agent_message"`
 		Failure           *TurnFailure `json:"failure"`
 		Usage             Usage        `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return &Error{Kind: ErrorParse, Message: "invalid turn/start result", Err: err}
+		return false, &Error{Kind: ErrorParse, Message: "invalid turn/start result", Err: err}
 	}
 	if firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID) != "" {
 		result.ThreadID = firstNonEmpty(envelope.ThreadIDCamel, envelope.ThreadID)
@@ -2439,19 +2695,60 @@ func applyAppServerResult(result *TurnResult, raw json.RawMessage) error {
 	if envelope.Usage != (Usage{}) {
 		result.Usage = envelope.Usage
 	}
-	return nil
+	return codexItemsHaveSideEffect(envelope.Items) || codexItemsHaveSideEffect(envelope.Turn.Items), nil
 }
 
-func applyAppServerEventPayload(result *TurnResult, raw json.RawMessage) bool {
+func applyAppServerEventPayload(result *TurnResult, raw json.RawMessage) (bool, bool) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return false
+		return false, false
 	}
 	var event codexEvent
 	if err := json.Unmarshal(raw, &event); err != nil || event.Type == "" {
-		return false
+		return false, false
 	}
 	applyEvent(result, event, bytes.TrimSpace(raw))
-	return true
+	return true, codexItemHasSideEffect(event.Item)
+}
+
+func codexItemsHaveSideEffect(items []codexItem) bool {
+	for _, item := range items {
+		if codexItemHasSideEffect(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexItemHasSideEffect(item codexItem) bool {
+	if strings.TrimSpace(item.Command) != "" {
+		return true
+	}
+	typeName := normalizeAppServerItemType(item.Type)
+	return strings.Contains(typeName, "command") ||
+		strings.Contains(typeName, "shell") ||
+		strings.Contains(typeName, "function") ||
+		strings.Contains(typeName, "toolcall") ||
+		strings.Contains(typeName, "mcptool") ||
+		strings.Contains(typeName, "dynamictool") ||
+		strings.Contains(typeName, "customtool") ||
+		strings.Contains(typeName, "filechange") ||
+		strings.Contains(typeName, "computer") ||
+		strings.Contains(typeName, "patch") ||
+		strings.Contains(typeName, "websearch") ||
+		strings.Contains(typeName, "imagegeneration") ||
+		strings.Contains(typeName, "browser")
+}
+
+func normalizeAppServerItemType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '_', '-', '/', '.', ' ', ':':
+			return -1
+		default:
+			return r
+		}
+	}, value)
 }
 
 func appServerMethodLooksLikeEvent(method string) bool {
@@ -2463,9 +2760,9 @@ func appServerMethodLooksLikeEvent(method string) bool {
 		strings.HasPrefix(method, "item/")
 }
 
-func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage) bool {
+func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage) (bool, bool) {
 	if len(msg.Params) == 0 {
-		return false
+		return false, false
 	}
 	switch msg.Method {
 	case "thread/started":
@@ -2486,7 +2783,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			if name := firstNonEmpty(params.Thread.Name, params.Thread.ThreadName2, params.Thread.ThreadName, params.Thread.Title); name != "" {
 				result.ThreadName = strings.TrimSpace(name)
 			}
-			return result.ThreadID != "" || result.ThreadName != ""
+			return result.ThreadID != "" || result.ThreadName != "", false
 		}
 	case "thread/name/updated":
 		var params struct {
@@ -2513,7 +2810,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			if name := firstNonEmpty(params.ThreadName, params.ThreadName2, params.Name, params.Title, params.Thread.Name, params.Thread.ThreadName2, params.Thread.ThreadName, params.Thread.Title); name != "" {
 				result.ThreadName = strings.TrimSpace(name)
 			}
-			return result.ThreadID != "" || result.ThreadName != ""
+			return result.ThreadID != "" || result.ThreadName != "", false
 		}
 	case "turn/started":
 		var params struct {
@@ -2531,7 +2828,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 				result.TurnID = id
 			}
 			result.Status = TurnStatusStarted
-			return true
+			return true, false
 		}
 	case "item/agentMessage/delta":
 		var params struct {
@@ -2548,7 +2845,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			}
 			result.FinalAgentMessage += params.Delta
 			result.FinalAgentMessageComplete = false
-			return true
+			return true, false
 		}
 	case "turn/completed":
 		var params struct {
@@ -2578,7 +2875,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 				result.Failure = sanitizeTurnFailure(params.Turn.Error)
 			}
 			mergeUsage(&result.Usage, params.Usage)
-			return true
+			return true, codexItemsHaveSideEffect(params.Turn.Items)
 		}
 	case "item/completed":
 		var params struct {
@@ -2599,7 +2896,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 					result.FinalAgentMessageComplete = true
 				}
 			}
-			return true
+			return true, codexItemHasSideEffect(params.Item)
 		}
 	case "thread/tokenUsage/updated":
 		var params struct {
@@ -2620,7 +2917,7 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 				usage = params.TokenUsage2
 			}
 			mergeAppServerUsage(&result.Usage, usage)
-			return true
+			return true, false
 		}
 	case "error":
 		var params struct {
@@ -2638,17 +2935,17 @@ func applyAppServerProtocolNotification(result *TurnResult, msg appServerMessage
 			result.ThreadID = params.ThreadID
 			result.TurnID = params.TurnID
 			if params.WillRetry {
-				return true
+				return true, false
 			}
 			result.Status = TurnStatusFailed
 			result.Failure = &TurnFailure{
 				Code:    sanitizeCodexErrorText(firstNonEmpty(params.Error.Code, params.Code), 128),
 				Message: sanitizeCodexErrorText(firstNonEmpty(params.Error.Message, params.Message, "Codex turn failed"), 2048),
 			}
-			return true
+			return true, false
 		}
 	}
-	return false
+	return false, false
 }
 
 func appServerMethodEventPayload(method string, params json.RawMessage) json.RawMessage {
