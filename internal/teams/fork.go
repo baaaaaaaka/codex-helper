@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -82,81 +83,55 @@ func (b *Bridge) forkWorkSession(ctx context.Context, parent *Session, command C
 		ChildSession:         child,
 		OwnerMachineID:       b.machine.ID,
 		OwnerLeaseGeneration: b.currentLeaseGeneration(),
+		HistoryPlanVersion:   2,
 		ForkWindowStart:      now,
 		ForkWindowEnd:        now.Add(forkNativeReconcileWindow),
 		Now:                  now,
 	})
 	if err != nil {
+		if errors.Is(err, teamstore.ErrForkAlreadyInProgress) {
+			existing, fenced, lookupErr := b.store.ParentFork(ctx, parent.ID)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if fenced && strings.TrimSpace(existing.ID) != "" {
+				return b.queueForkNotice(ctx, parent.ID, existing.ID, parent.ChatID, "fork-pending", "⏳ A fork is already in progress for this chat. I will keep the existing operation and send its link when the history is confirmed; no duplicate fork was started.")
+			}
+		}
 		return err
 	}
 	if !created {
-		return b.resumeForkOperation(ctx, parent, op)
+		if teamstore.ForkPhaseTerminal(op.Phase) {
+			return b.resumeForkOperation(ctx, parent, op)
+		}
+		return b.queueForkNotice(ctx, parent.ID, op.ID, parent.ChatID, "fork-pending", "⏳ A fork is already in progress for this chat. I will keep the existing operation and send its link when the history is confirmed; no duplicate fork was started.")
 	}
 	if claimed, err := b.claimForkOperation(ctx, op); err != nil {
 		return err
 	} else {
 		op = claimed
 	}
-	cutoff, ok, err := b.store.ForkCutoff(ctx, op.ID)
+	_, ok, err := b.store.ForkCutoff(ctx, op.ID)
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, fmt.Errorf("fork cutoff for operation %q is not durable", op.ID))
 	}
-	if err := b.sendToChat(ctx, parent.ChatID, "⏳ Fork requested. I fixed the parent cutoff and am preparing the new chat; I will send its link only after the visible history is confirmed."); err != nil {
-		return err
-	}
+	return b.queueForkNotice(ctx, parent.ID, op.ID, parent.ChatID, "fork-progress", "⏳ Fork requested. I fixed the parent cutoff and am preparing the new chat; I will send its link only after the visible history is confirmed.")
+}
 
-	snapshot, err := b.materializeForkHistory(ctx, parent, cutoff)
-	if err != nil {
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
+// queueForkNotice is deliberately queue-only. Fork commands are handled by
+// the Teams polling path; doing a synchronous Graph flush here would make a
+// large parent-chat backlog (or a slow Graph request) block all subsequent
+// polling. The owner loop sends the notice under the normal bounded outbox
+// budget.
+func (b *Bridge) queueForkNotice(ctx context.Context, sessionID string, operationID string, chatID string, kind string, body string) error {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		return fmt.Errorf("fork notice operation id is required")
 	}
-	manifest, err := b.saveForkManifest(ctx, op.ID, snapshot.Items, snapshot.Metadata)
-	if err != nil {
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
-	}
-	if err := b.validateForkBoundary(ctx, parent, cutoff, manifest); err != nil {
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
-	}
-
-	forger, ok := b.executor.(ForkExecutor)
-	if !ok {
-		err := codexrunner.UnsupportedError("thread/fork")
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
-	}
-	if _, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
-		if current.NativeForkIntentAt.IsZero() {
-			current.NativeForkIntentAt = time.Now()
-		}
-		return nil
-	}); err != nil {
-		// The intent is written before the external request. If this durable
-		// boundary cannot be recorded, do not issue the native fork call.
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
-	}
-	if err := b.validateForkOwner(ctx, op.ID); err != nil {
-		return err
-	}
-	childResult, err := forger.ForkThread(ctx, parent, cutoff.CodexTurnID)
-	if err != nil {
-		phase := teamstore.ForkPhaseFailed
-		if codexrunner.IsKind(err, codexrunner.ErrorAmbiguous) || codexrunner.IsKind(err, codexrunner.ErrorParse) {
-			phase = teamstore.ForkPhaseBlockedAmbiguous
-		}
-		return b.failFork(ctx, op.ID, phase, err)
-	}
-	if _, err := b.recordForkCodexChild(ctx, op.ID, childResult.CodexThreadID); err != nil {
-		return b.failFork(ctx, op.ID, teamstore.ForkPhaseBlockedAmbiguous, err)
-	}
-	current, ok, err := b.store.ForkOperation(ctx, op.ID)
-	if err != nil || !ok {
-		if err != nil {
-			return err
-		}
-		return teamstore.ErrForkNotFound
-	}
-	return b.resumeForkAfterCodexChild(ctx, parent, current)
+	return b.queueOrSendOutboxChunks(ctx, sessionID, "fork:"+operationID, chatID, kind, body, outboxQueueOptions{}, true)
 }
 
 func (b *Bridge) deferSessionMessageDuringFork(ctx context.Context, session *Session, msg ChatMessage) error {
@@ -262,8 +237,21 @@ func (b *Bridge) resumeForkOperation(ctx context.Context, parent *Session, op te
 	if err != nil {
 		return err
 	}
-	if !ok || updated.Phase != teamstore.ForkPhaseLinkSent {
-		return fmt.Errorf("fork operation %q remains in %s", op.ID, updated.Phase)
+	if !ok {
+		return teamstore.ErrForkNotFound
+	}
+	if teamstore.ForkPhaseTerminal(updated.Phase) && updated.Phase != teamstore.ForkPhaseLinkSent {
+		if strings.TrimSpace(updated.LastError) != "" {
+			return fmt.Errorf("fork operation %q is already %s: %s", updated.ID, updated.Phase, strings.TrimSpace(updated.LastError))
+		}
+		return fmt.Errorf("fork operation %q is already %s", updated.ID, updated.Phase)
+	}
+	// Recovery is driven by the owner loop. A fork may legitimately remain
+	// pending while its history or link outbox is waiting for the next bounded
+	// flush cycle; that is not a command failure and must not trigger a retry
+	// that creates another operation.
+	if updated.Phase != teamstore.ForkPhaseLinkSent {
+		return nil
 	}
 	return nil
 }
@@ -280,15 +268,59 @@ func (b *Bridge) reconcileForkOperations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, op := range ops {
-		if teamstore.ForkPhaseTerminal(op.Phase) {
-			continue
-		}
-		if err := b.reconcileForkOperation(ctx, op); err != nil && b.out != nil {
+	op, ok := b.nextForkOperation(ops)
+	if !ok {
+		return nil
+	}
+	if err := b.reconcileForkOperation(ctx, op); err != nil {
+		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams fork recovery %s: %v\n", op.ID, err)
+		}
+		latest, found, loadErr := b.store.ForkOperation(ctx, op.ID)
+		if loadErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams fork recovery state %s: %v\n", op.ID, loadErr)
+			}
+			return nil
+		}
+		if found {
+			if latest.Phase == teamstore.ForkPhaseFailed {
+				_ = b.queueForkNotice(ctx, latest.ParentSessionID, latest.ID, latest.ParentChatID, "fork-failure", "❌ Fork failed: "+firstNonEmptyString(strings.TrimSpace(latest.LastError), "the operation could not be completed")+". The parent chat remains available.")
+			} else if latest.Phase == teamstore.ForkPhaseBlockedAmbiguous && strings.TrimSpace(latest.ChildThreadID) == "" {
+				_ = b.queueForkNotice(ctx, latest.ParentSessionID, latest.ID, latest.ParentChatID, "fork-blocked", "⚠️ Fork is blocked because the native child response was ambiguous. I did not retry `thread/fork`; inspect the operation before continuing.")
+			}
 		}
 	}
 	return nil
+}
+
+// nextForkOperation keeps the owner loop bounded and fair. A single fork may
+// still need several durable phases, but one loop pass must not walk every
+// unfinished operation and issue an unbounded sequence of Graph calls.
+func (b *Bridge) nextForkOperation(ops []teamstore.ForkOperation) (teamstore.ForkOperation, bool) {
+	candidates := make([]teamstore.ForkOperation, 0, len(ops))
+	for _, op := range ops {
+		if !teamstore.ForkPhaseTerminal(op.Phase) {
+			candidates = append(candidates, op)
+		}
+	}
+	if len(candidates) == 0 {
+		return teamstore.ForkOperation{}, false
+	}
+	b.forkReconcileMu.Lock()
+	defer b.forkReconcileMu.Unlock()
+	start := 0
+	if after := strings.TrimSpace(b.forkReconcileAfterID); after != "" {
+		for i, op := range candidates {
+			if op.ID == after {
+				start = (i + 1) % len(candidates)
+				break
+			}
+		}
+	}
+	op := candidates[start]
+	b.forkReconcileAfterID = op.ID
+	return op, true
 }
 
 func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOperation) error {
@@ -306,17 +338,9 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 	}
 	if op.Phase == teamstore.ForkPhaseSnapshotMaterialized {
 		if op.NativeForkIntentAt.IsZero() {
-			// The intent is the durable happens-before marker for the external
-			// request. Without it, the previous process could not have reached
-			// the request call, so recovery may safely resume the fork.
-			updated, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
-				current.Phase = teamstore.ForkPhaseParentFenced
-				return nil
-			})
-			if err != nil {
-				return err
-			}
-			op = updated
+			// The manifest is already durable. The next phase can safely resume
+			// from it; re-materializing the full transcript would add latency and
+			// could create a different snapshot after a restart.
 		} else {
 			op.Phase = teamstore.ForkPhaseBlockedAmbiguous
 			if _, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
@@ -328,6 +352,21 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 				return err
 			}
 		}
+	}
+	if op.Phase == teamstore.ForkPhaseParentFenced && !op.NativeForkIntentAt.IsZero() && strings.TrimSpace(op.ChildThreadID) == "" {
+		// A crash can occur after the durable native-fork intent and before the
+		// child ID is persisted. Treat that boundary exactly like an ambiguous
+		// response; retrying thread/fork could create a second child.
+		updated, err := b.updateForkOperation(ctx, op.ID, func(current *teamstore.ForkOperation) error {
+			current.Phase = teamstore.ForkPhaseBlockedAmbiguous
+			current.LastError = "native fork intent was durably recorded before the child ID; automatic retry is disabled"
+			current.LastErrorAt = time.Now()
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		op = updated
 	}
 	if op.Phase == teamstore.ForkPhaseBlockedAmbiguous && strings.TrimSpace(op.ChildThreadID) == "" {
 		return b.reconcileAmbiguousNativeFork(ctx, parent, op)
@@ -347,7 +386,7 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 		op = updated
 	}
 	if op.Phase == teamstore.ForkPhaseParentFenced {
-		snapshot, err := b.materializeForkHistory(ctx, parent, cutoff)
+		snapshot, err := b.materializeForkHistoryForVersion(ctx, parent, cutoff, op.HistoryPlanVersion)
 		if err != nil {
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
 		}
@@ -356,6 +395,16 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
 		}
 		if err := b.validateForkBoundary(ctx, parent, cutoff, manifest); err != nil {
+			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
+		}
+		// Keep transcript planning and the native side effect in separate owner
+		// loop passes. The command path is already queue-only, and this durable
+		// boundary prevents one reconcile pass from doing both a large local
+		// render and an external Codex request.
+		return nil
+	}
+	if op.Phase == teamstore.ForkPhaseSnapshotMaterialized {
+		if err := b.validateForkBoundary(ctx, parent, cutoff, op); err != nil {
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseFailed, err)
 		}
 		forger, ok := b.executor.(ForkExecutor)
@@ -384,10 +433,8 @@ func (b *Bridge) reconcileForkOperation(ctx context.Context, op teamstore.ForkOp
 		if _, err := b.recordForkCodexChild(ctx, op.ID, child.CodexThreadID); err != nil {
 			return b.failFork(ctx, op.ID, teamstore.ForkPhaseBlockedAmbiguous, err)
 		}
-		op, _, err = b.store.ForkOperation(ctx, op.ID)
-		if err != nil {
-			return err
-		}
+		// Leave Graph chat creation to the next bounded owner-loop pass.
+		return nil
 	}
 	return b.resumeForkAfterCodexChild(ctx, parent, op)
 }
@@ -499,6 +546,9 @@ func (b *Bridge) resumeForkAfterCodexChild(ctx context.Context, parent *Session,
 		if err != nil {
 			return err
 		}
+		// The next owner-loop pass queues the immutable history. Keep Graph chat
+		// creation as the only external action in this pass.
+		return nil
 	}
 	if op.Phase == teamstore.ForkPhaseChildChatStaged {
 		if _, err := b.queueForkHistory(ctx, op.ID, forkHistoryCompleteMarker); err != nil {
@@ -508,19 +558,18 @@ func (b *Bridge) resumeForkAfterCodexChild(ctx context.Context, parent *Session,
 		if err != nil {
 			return err
 		}
+		return nil
 	}
 	if op.Phase == teamstore.ForkPhaseHistoryPublishing {
-		if err := b.flushPendingOutboxForChat(ctx, op.ChildChatID); err != nil {
-			return err
-		}
 		current, verified, err := b.refreshForkHistory(ctx, op.ID)
 		if err != nil {
 			return err
 		}
 		if !verified {
-			return fmt.Errorf("fork history for %q is not durably verified; link remains gated", op.ID)
+			return nil
 		}
 		op = current
+		return nil
 	}
 	if op.Phase == teamstore.ForkPhaseHistoryVerified {
 		linkBody := fmt.Sprintf("✅ Fork complete. Open the new Codex chat:\n%s", strings.TrimSpace(op.ChildChatURL))
@@ -539,21 +588,18 @@ func (b *Bridge) resumeForkAfterCodexChild(ctx context.Context, parent *Session,
 		if err != nil {
 			return err
 		}
+		return nil
 	}
 	if op.Phase == teamstore.ForkPhaseActivated {
-		if err := b.flushPendingOutboxForChat(ctx, parent.ChatID); err != nil {
-			return err
-		}
 		link, err := b.store.OutboxMessageByID(ctx, op.LinkOutboxID)
 		if err != nil {
 			return err
 		}
 		if link.Status != teamstore.OutboxStatusSent || strings.TrimSpace(link.TeamsMessageID) == "" {
 			// A fresh sending lease can survive a process crash and is normally
-			// excluded from PendingOutboxPageAt until its lease expires. Fork
-			// release cannot wait for that timeout: the new owner must immediately
-			// reconcile the provenance-marked link against Graph before deciding
-			// that the URL is still withheld.
+			// excluded from PendingOutboxPageAt until it expires. Fork release
+			// cannot wait for that timeout: reconcile the provenance-marked link
+			// immediately, while keeping the large history delivery queue-only.
 			if err := b.sendQueuedOutboxWithOptions(ctx, link, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil {
 				return err
 			}
@@ -563,7 +609,7 @@ func (b *Bridge) resumeForkAfterCodexChild(ctx context.Context, parent *Session,
 			}
 		}
 		if link.Status != teamstore.OutboxStatusSent || strings.TrimSpace(link.TeamsMessageID) == "" {
-			return fmt.Errorf("fork link for %q is not durably sent; URL remains withheld", op.ID)
+			return nil
 		}
 		_, err = b.markForkLinkSent(ctx, op.ID)
 		return err
@@ -689,6 +735,13 @@ func (b *Bridge) failFork(ctx context.Context, operationID string, phase teamsto
 }
 
 func (b *Bridge) materializeForkHistory(ctx context.Context, parent *Session, cutoff teamstore.Turn) (forkHistorySnapshot, error) {
+	return b.materializeForkHistoryForVersion(ctx, parent, cutoff, 2)
+}
+
+func (b *Bridge) materializeForkHistoryForVersion(ctx context.Context, parent *Session, cutoff teamstore.Turn, planVersion int) (forkHistorySnapshot, error) {
+	if planVersion <= 0 {
+		planVersion = 1
+	}
 	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *parent)
 	if err != nil {
 		return forkHistorySnapshot{}, err
@@ -743,29 +796,72 @@ func (b *Bridge) materializeForkHistory(ctx context.Context, parent *Session, cu
 			})
 		}
 	}
-	for _, record := range records {
-		if err := ctx.Err(); err != nil {
-			return forkHistorySnapshot{}, err
+	if planVersion <= 1 {
+		for _, record := range records {
+			if err := ctx.Err(); err != nil {
+				return forkHistorySnapshot{}, err
+			}
+			if record.Internal || record.Kind == TranscriptKindTool || record.Kind == TranscriptKindArtifact {
+				continue
+			}
+			body := strings.TrimSpace(formatTranscriptRecordForTeams(record))
+			if body == "" {
+				continue
+			}
+			if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus && record.Kind != TranscriptKindCompact {
+				continue
+			}
+			appendHistoryBody(
+				firstNonEmptyString(record.ItemID, record.DedupeKey),
+				record.SourceLine,
+				record.SourceStartOffset,
+				record.SourceOffset,
+				record.TurnID,
+				string(record.Kind),
+				body,
+			)
 		}
-		if record.Internal || record.Kind == TranscriptKindTool || record.Kind == TranscriptKindArtifact {
-			continue
+	} else {
+		dedupe := newTranscriptDedupeState()
+		plannedRecords := make([]transcriptImportBatchRecord, 0, len(records))
+		for i, record := range records {
+			if err := ctx.Err(); err != nil {
+				return forkHistorySnapshot{}, err
+			}
+			line, offset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+			planned, _, _, included := planTranscriptImportRecord(record, line, offset, "fork", i+1, dedupe, transcriptPlanOptions{ForkVisibleOnly: true})
+			if !included {
+				continue
+			}
+			plannedRecords = append(plannedRecords, planned)
 		}
-		body := strings.TrimSpace(formatTranscriptRecordForTeams(record))
-		if body == "" {
-			continue
+		for _, batch := range planTranscriptHistoryBatches(plannedRecords) {
+			firstID := transcriptRecordCheckpointKey(batch.First)
+			lastID := transcriptRecordCheckpointKey(batch.Last)
+			sourceRecordID := firstNonEmptyString(firstID, lastID, "record")
+			if lastID != "" && lastID != firstID {
+				sourceRecordID += ".." + lastID
+			}
+			if batch.PartCount > 1 {
+				sourceRecordID = fmt.Sprintf("%s:part:%d", sourceRecordID, batch.PartIndex)
+			}
+			items = append(items, teamstore.ForkHistoryItem{
+				Ordinal:           len(items),
+				SourceRecordID:    sourceRecordID,
+				SourceEndRecordID: lastID,
+				SourceLine:        batch.First.SourceLine,
+				SourceStartOffset: batch.First.SourceStartOffset,
+				SourceOffset:      batch.Last.SourceOffset,
+				SourceTurnID:      firstNonEmptyString(batch.Last.TurnID, batch.First.TurnID),
+				Kind:              "batch",
+				RenderedBody:      batch.HTML,
+				PartIndex:         batch.PartIndex,
+				PartCount:         batch.PartCount,
+				RenderedBytes:     len(batch.HTML),
+				BodyHash:          forkBodyHash(batch.HTML),
+				DeliveryStatus:    teamstore.ForkHistoryDeliveryQueued,
+			})
 		}
-		if record.Kind != TranscriptKindUser && record.Kind != TranscriptKindAssistant && record.Kind != TranscriptKindStatus && record.Kind != TranscriptKindCompact {
-			continue
-		}
-		appendHistoryBody(
-			firstNonEmptyString(record.ItemID, record.DedupeKey),
-			record.SourceLine,
-			record.SourceStartOffset,
-			record.SourceOffset,
-			record.TurnID,
-			string(record.Kind),
-			body,
-		)
 	}
 	for _, subagent := range local.Subagents {
 		if !forkSubagentIsBeforeCutoff(subagent, cutoff.CompletedAt) {
@@ -786,6 +882,7 @@ func (b *Bridge) materializeForkHistory(ctx context.Context, parent *Session, cu
 		Metadata: teamstore.ForkManifestMetadata{
 			SourcePath:              local.FilePath,
 			SourceFingerprint:       transcript.FileFingerprint,
+			HistoryPlanVersion:      planVersion,
 			CutoffSourceRecordID:    firstNonEmptyString(cutoffRecord.ItemID, cutoffRecord.DedupeKey),
 			CutoffSourceLine:        cutoffRecord.SourceLine,
 			CutoffSourceStartOffset: cutoffRecord.SourceStartOffset,
@@ -795,10 +892,13 @@ func (b *Bridge) materializeForkHistory(ctx context.Context, parent *Session, cu
 	}, nil
 }
 
-// validateForkBoundary re-reads the authoritative parent/cutoff and transcript
-// immediately before the native fork intent is recorded. The parent is fenced
-// by this point, but this check still closes races with a stale registry
-// projection or a transcript writer that advanced the source unexpectedly.
+// validateForkBoundary re-reads the authoritative parent/cutoff and the
+// immutable transcript prefix immediately before the native fork intent is
+// recorded. The parent is fenced by this point, but this check still closes
+// races with a stale registry projection or a transcript writer that advanced
+// the source unexpectedly. The manifest already contains the rendered item
+// hash, so re-rendering the entire transcript here would only add latency and
+// memory pressure; the byte prefix hash is the source-of-truth check.
 func (b *Bridge) validateForkBoundary(ctx context.Context, parent *Session, cutoff teamstore.Turn, manifest teamstore.ForkOperation) error {
 	if parent == nil {
 		return fmt.Errorf("fork parent is required for boundary validation")
@@ -813,21 +913,25 @@ func (b *Bridge) validateForkBoundary(ctx context.Context, parent *Session, cuto
 	if !ok || authoritativeCutoff.ID != cutoff.ID || authoritativeCutoff.CodexTurnID != cutoff.CodexTurnID {
 		return fmt.Errorf("fork cutoff changed before native fork")
 	}
-	snapshot, err := b.materializeForkHistory(ctx, parent, cutoff)
+	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *parent)
+	if err != nil {
+		return err
+	}
+	if !ok || strings.TrimSpace(local.FilePath) == "" {
+		return fmt.Errorf("fork transcript is no longer available before native fork")
+	}
+	if filepath.Clean(local.FilePath) != filepath.Clean(manifest.SourceTranscriptPath) {
+		return fmt.Errorf("fork transcript path changed before native fork")
+	}
+	if manifest.CutoffSourceOffset <= 0 || strings.TrimSpace(manifest.SourcePrefixHash) == "" {
+		return fmt.Errorf("fork cutoff prefix proof is incomplete before native fork")
+	}
+	prefixHash, err := hashForkTranscriptPrefix(local.FilePath, manifest.CutoffSourceOffset)
 	if err != nil {
 		return fmt.Errorf("fork transcript changed before native fork: %w", err)
 	}
-	metadata := snapshot.Metadata
-	if metadata.SourcePath != manifest.SourceTranscriptPath ||
-		metadata.SourceFingerprint != manifest.SourceFingerprint ||
-		metadata.CutoffSourceRecordID != manifest.CutoffSourceRecordID ||
-		metadata.CutoffSourceLine != manifest.CutoffSourceLine ||
-		metadata.CutoffSourceStartOffset != manifest.CutoffSourceStartOffset ||
-		metadata.CutoffSourceOffset != manifest.CutoffSourceOffset ||
-		metadata.SourcePrefixHash != manifest.SourcePrefixHash ||
-		len(snapshot.Items) != manifest.ManifestCount ||
-		teamstore.ForkHistoryManifestHash(snapshot.Items) != manifest.ManifestHash {
-		return fmt.Errorf("fork transcript fingerprint or cutoff manifest changed before native fork")
+	if prefixHash != manifest.SourcePrefixHash {
+		return fmt.Errorf("fork transcript prefix changed before native fork")
 	}
 	return nil
 }

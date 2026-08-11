@@ -133,9 +133,33 @@ func TestForkComposeSUT(t *testing.T) {
 		return
 	}
 
-	if err := bridge.reconcileForkOperations(ctx); err != nil {
-		_ = os.WriteFile(filepath.Join(stateDir, "sut-b.failed"), []byte(err.Error()+"\n"), 0o600)
-		t.Fatalf("reconcile fork operations after takeover: %v", err)
+	complete := false
+	for attempt := 0; attempt < 16; attempt++ {
+		if err := bridge.reconcileForkOperations(ctx); err != nil {
+			_ = os.WriteFile(filepath.Join(stateDir, "sut-b.failed"), []byte(err.Error()+"\n"), 0o600)
+			t.Fatalf("reconcile fork operations after takeover: %v", err)
+		}
+		if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+			_ = os.WriteFile(filepath.Join(stateDir, "sut-b.failed"), []byte(err.Error()+"\n"), 0o600)
+			t.Fatalf("flush fork outbox after takeover: %v", err)
+		}
+		state, err := store.Load(ctx)
+		if err != nil {
+			t.Fatalf("load fork state after takeover attempt %d: %v", attempt, err)
+		}
+		complete = false
+		for _, op := range state.ForkOperations {
+			if op.ParentSessionID == parent.ID && op.Phase == teamstore.ForkPhaseLinkSent {
+				complete = true
+				break
+			}
+		}
+		if complete {
+			break
+		}
+	}
+	if !complete {
+		t.Fatalf("fork recovery did not reach link_sent within bounded reconcile/flush attempts")
 	}
 	_ = os.WriteFile(filepath.Join(stateDir, "sut-b.done"), []byte("recovered\n"), 0o600)
 }
@@ -233,6 +257,7 @@ func seedComposeForkParent(ctx context.Context, t *testing.T, store *teamstore.S
 	transcriptPath := filepath.Join(stateDir, "parent.jsonl")
 	transcript := "{" + `"type":"thread.started","thread_id":"compose-parent-thread"` + "}\n" +
 		"{" + `"type":"turn.started","turn_id":"compose-cutoff-turn"` + "}\n" +
+		"{" + `"type":"event_msg","payload":{"type":"agent_message","id":"compose-history-status","turn_id":"compose-cutoff-turn","phase":"commentary","message":"compose history status"}}` + "\n" +
 		"{" + `"type":"event_msg","payload":{"type":"agent_message","id":"compose-history-final","turn_id":"compose-cutoff-turn","phase":"final_answer","message":"history before compose fork"}}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
 		return nil, err

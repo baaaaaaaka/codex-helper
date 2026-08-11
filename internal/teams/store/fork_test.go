@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -488,6 +490,190 @@ func TestForkHistoryRequiresSentProofBeforeActivation(t *testing.T) {
 			}
 			if state.ForkOperations[op.ID].ManifestHash == "" || state.ForkOperations[op.ID].CutoffSourceOffset != 42 || state.ForkHistoryItems[ForkHistoryItemID(op.ID, 0)].DeliveryStatus != ForkHistoryDeliveryDuplicateSettled {
 				t.Fatalf("fork proof state was not persisted: op=%#v item=%#v", state.ForkOperations[op.ID], state.ForkHistoryItems[ForkHistoryItemID(op.ID, 0)])
+			}
+		})
+	}
+}
+
+func TestForkHistoryPlanV2PersistsSourceRangeAndProtectsIt(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			parent := testSession()
+			parent.ID = "parent-v2-range"
+			parent.Status = SessionStatusActive
+			parent.TeamsChatID = "parent-v2-range-chat"
+			parent.CodexThreadID = "parent-v2-range-thread"
+			if _, _, err := store.CreateSession(ctx, parent); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			seedCompletedForkCutoff(t, store, parent.ID, "cutoff-v2-range", "codex-cutoff-v2-range", time.Now().Add(-time.Minute))
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			op, created, err := store.BeginFork(ctx, ForkBeginRequest{
+				OperationID:        "fork-v2-range",
+				ParentSessionID:    parent.ID,
+				ParentChatID:       parent.TeamsChatID,
+				ParentThreadID:     parent.CodexThreadID,
+				ChildSession:       SessionContext{ID: "child-v2-range", Status: SessionStatusStaging},
+				CutoffTurnID:       "cutoff-v2-range",
+				CutoffCodexTurnID:  "codex-cutoff-v2-range",
+				HistoryPlanVersion: 2,
+			})
+			if err != nil || !created {
+				t.Fatalf("BeginFork = %#v, created=%v, err=%v", op, created, err)
+			}
+			item := ForkHistoryItem{
+				Ordinal:           0,
+				SourceRecordID:    "first..last",
+				SourceEndRecordID: "last",
+				SourceLine:        4,
+				SourceStartOffset: 20,
+				SourceOffset:      80,
+				SourceTurnID:      "codex-cutoff-v2-range",
+				Kind:              "batch",
+				RenderedBody:      "<p>batch</p>",
+			}
+			metadata := ForkManifestMetadata{
+				SourcePath:           "transcript.jsonl",
+				SourceFingerprint:    "fingerprint-v2",
+				HistoryPlanVersion:   2,
+				CutoffSourceRecordID: "last",
+				CutoffSourceLine:     4,
+				CutoffSourceOffset:   80,
+				SourcePrefixHash:     "prefix-v2",
+			}
+			saved, err := store.SaveForkManifestWithMetadata(ctx, op.ID, []ForkHistoryItem{item}, metadata)
+			if err != nil {
+				t.Fatalf("SaveForkManifestWithMetadata: %v", err)
+			}
+			if saved.HistoryPlanVersion != 2 {
+				t.Fatalf("saved plan version = %d, want 2", saved.HistoryPlanVersion)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after v2 manifest: %v", err)
+			}
+			persisted := state.ForkHistoryItems[ForkHistoryItemID(op.ID, 0)]
+			if persisted.SourceEndRecordID != "last" {
+				t.Fatalf("persisted source end = %q, want last", persisted.SourceEndRecordID)
+			}
+
+			// Omitting the new metadata field must preserve the operation's
+			// durable plan version for legacy store callers.
+			if _, err := store.SaveForkManifestWithMetadata(ctx, op.ID, []ForkHistoryItem{item}, ForkManifestMetadata{}); err != nil {
+				t.Fatalf("idempotent v2 save without metadata version: %v", err)
+			}
+			mutated := item
+			mutated.SourceEndRecordID = "different-end"
+			if _, err := store.SaveForkManifestWithMetadata(ctx, op.ID, []ForkHistoryItem{mutated}, ForkManifestMetadata{}); err == nil || !strings.Contains(err.Error(), "manifest is immutable") {
+				t.Fatalf("mutated source range error = %v, want immutable rejection", err)
+			}
+		})
+	}
+}
+
+func TestRefreshForkHistoryNoopDoesNotRewriteState(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			parent := testSession()
+			parent.ID = "refresh-noop-parent"
+			parent.Status = SessionStatusActive
+			parent.TeamsChatID = "refresh-noop-parent-chat"
+			parent.CodexThreadID = "refresh-noop-parent-thread"
+			if _, _, err := store.CreateSession(ctx, parent); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			seedCompletedForkCutoff(t, store, parent.ID, "refresh-noop-cutoff", "refresh-noop-codex-cutoff", time.Now().Add(-time.Minute))
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			op, created, err := store.BeginFork(ctx, ForkBeginRequest{
+				OperationID:        "refresh-noop-operation",
+				ParentSessionID:    parent.ID,
+				ParentChatID:       parent.TeamsChatID,
+				ParentThreadID:     parent.CodexThreadID,
+				ChildSession:       SessionContext{ID: "refresh-noop-child", Status: SessionStatusStaging},
+				CutoffTurnID:       "refresh-noop-cutoff",
+				CutoffCodexTurnID:  "refresh-noop-codex-cutoff",
+				HistoryPlanVersion: 2,
+			})
+			if err != nil || !created {
+				t.Fatalf("BeginFork = %#v, created=%v, err=%v", op, created, err)
+			}
+			item := ForkHistoryItem{
+				Ordinal:           0,
+				SourceRecordID:    "refresh-record",
+				SourceEndRecordID: "refresh-record",
+				SourceLine:        3,
+				SourceStartOffset: 10,
+				SourceOffset:      42,
+				SourceTurnID:      "refresh-noop-codex-cutoff",
+				Kind:              "batch",
+				RenderedBody:      "<p>refresh me</p>",
+			}
+			metadata := ForkManifestMetadata{
+				SourcePath:              "refresh-noop-transcript.jsonl",
+				SourceFingerprint:       "refresh-noop-fingerprint",
+				HistoryPlanVersion:      2,
+				CutoffSourceRecordID:    "refresh-record",
+				CutoffSourceLine:        3,
+				CutoffSourceStartOffset: 10,
+				CutoffSourceOffset:      42,
+				SourcePrefixHash:        "refresh-noop-prefix",
+			}
+			if _, err := store.SaveForkManifestWithMetadata(ctx, op.ID, []ForkHistoryItem{item}, metadata); err != nil {
+				t.Fatalf("SaveForkManifestWithMetadata: %v", err)
+			}
+			if _, err := store.RecordForkCodexChild(ctx, op.ID, "refresh-noop-child-thread"); err != nil {
+				t.Fatalf("RecordForkCodexChild: %v", err)
+			}
+			if _, err := store.StageForkChat(ctx, op.ID, "refresh-noop-child-chat", "https://teams.example/refresh-noop", "refresh noop", "refresh-noop-graph", time.Now(), time.Now().Add(time.Hour)); err != nil {
+				t.Fatalf("StageForkChat: %v", err)
+			}
+			queued, err := store.QueueForkHistory(ctx, op.ID, "History import complete")
+			if err != nil || len(queued) != 2 {
+				t.Fatalf("QueueForkHistory = %#v, err=%v", queued, err)
+			}
+			for _, message := range queued {
+				if _, err := store.MarkOutboxSendAttempt(ctx, message.ID); err != nil {
+					t.Fatalf("MarkOutboxSendAttempt(%s): %v", message.ID, err)
+				}
+				if _, err := store.MarkOutboxSent(ctx, message.ID, message.ID+":teams"); err != nil {
+					t.Fatalf("MarkOutboxSent(%s): %v", message.ID, err)
+				}
+			}
+			if _, verified, err := store.RefreshForkHistory(ctx, op.ID); err != nil || !verified {
+				t.Fatalf("initial RefreshForkHistory verified=%v err=%v", verified, err)
+			}
+			beforeFiles := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			var beforeSQLite []byte
+			if sqliteMode {
+				// SQLite may update its shared-memory bookkeeping while a read
+				// transaction is opened. The durable state JSON is the write
+				// amplification signal for this no-op assertion.
+				delete(beforeFiles, "store.sqlite-shm")
+				delete(beforeFiles, "store.sqlite-wal")
+				beforeSQLite = sqliteRawStateJSONForTest(t, store)
+			}
+			refreshed, verified, err := store.RefreshForkHistory(ctx, op.ID)
+			if err != nil || !verified || refreshed.Phase != ForkPhaseHistoryVerified {
+				t.Fatalf("noop RefreshForkHistory = %#v verified=%v err=%v", refreshed, verified, err)
+			}
+			afterFiles := snapshotRegularFilesForReadOnlyTest(t, filepath.Dir(store.Path()))
+			if sqliteMode {
+				delete(afterFiles, "store.sqlite-shm")
+				delete(afterFiles, "store.sqlite-wal")
+			}
+			if !reflect.DeepEqual(beforeFiles, afterFiles) {
+				t.Fatalf("noop refresh rewrote store files:\nbefore=%#v\nafter=%#v", beforeFiles, afterFiles)
+			}
+			if sqliteMode && !reflect.DeepEqual(beforeSQLite, sqliteRawStateJSONForTest(t, store)) {
+				t.Fatal("noop refresh rewrote SQLite state JSON")
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	stdhtml "html"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17681,6 +17682,97 @@ func TestBridgeAmbiguousGraphPostKeepsOutboxUnderSendLease(t *testing.T) {
 	rendered, _, _ := bridge.renderOutboxHTMLForSend(context.Background(), outbox)
 	if _, ok := bridge.matchOutboxEchoAttempt("chat-1", PlainTextFromTeamsHTML(rendered), "teams-recovered", time.Now()); !ok {
 		t.Fatal("ambiguous Graph send did not retain its bounded in-memory echo fingerprint")
+	}
+}
+
+func TestBridgeForkAmbiguousGraphPostRecoversWithoutDuplicate(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:              "fork-link:ambiguous-recovery",
+		TeamsChatID:     "chat-1",
+		Kind:            "fork-link",
+		Body:            "open the recovered child chat",
+		ForkOperationID: "fork-operation-ambiguous-recovery",
+		ForkRole:        "link",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	var posts, lists int
+	var postedContent string
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("unexpected Graph POST: %s", r.URL.Path)
+			}
+			posts++
+			var body struct {
+				Body struct {
+					Content string `json:"content"`
+				} `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			postedContent = body.Body.Content
+			return nil, errors.New("connection reset after Graph accepted fork link")
+		case http.MethodGet:
+			if r.URL.Path != "/chats/chat-1/messages" {
+				t.Fatalf("unexpected Graph GET: %s", r.URL.Path)
+			}
+			lists++
+			payload, err := json.Marshal(map[string]any{"value": []any{map[string]any{
+				"id":                   "teams-fork-link-recovered",
+				"messageType":          "message",
+				"createdDateTime":      time.Now().UTC().Format(time.RFC3339Nano),
+				"lastModifiedDateTime": time.Now().UTC().Format(time.RFC3339Nano),
+				"from": map[string]any{"user": map[string]any{
+					"id":          "user-1",
+					"displayName": "User",
+				}},
+				"body": map[string]any{
+					"contentType": "html",
+					"content":     postedContent,
+				},
+			}}})
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(string(payload))),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
+			return nil, nil
+		}
+	})
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     &http.Client{Transport: transport},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	if err := bridge.sendQueuedOutbox(ctx, queued); err != nil {
+		t.Fatalf("fork send should recover the accepted Graph message: %v", err)
+	}
+	if posts != 1 || lists != 1 {
+		t.Fatalf("Graph POST/list counts = %d/%d, want exactly one POST and one recovery read", posts, lists)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	got := state.OutboxMessages[queued.ID]
+	if got.Status != teamstore.OutboxStatusSent || got.TeamsMessageID != "teams-fork-link-recovered" {
+		t.Fatalf("recovered fork outbox = %#v, want sent with the original Graph message id", got)
 	}
 }
 

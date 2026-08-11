@@ -61,7 +61,11 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"type":"thread.started","thread_id":"parent-codex-thread"}`,
 		`{"type":"turn.started","turn_id":"cutoff-codex-turn"}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"history-status-event","message":"duplicate visible status","phase":"commentary"}}`,
+		`{"type":"response_item","payload":{"id":"history-status-response","type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"duplicate visible status"}]}}`,
 		`{"type":"response_item","payload":{"id":"history-final","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"cutoff-codex-turn"},"content":[{"type":"output_text","text":"history before fork"}]}}`,
+		`{"type":"turn.started","turn_id":"after-fork-codex-turn"}`,
+		`{"type":"response_item","payload":{"id":"after-fork-final","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"after-fork-codex-turn"},"content":[{"type":"output_text","text":"must not appear after fork"}]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -109,6 +113,7 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 		ChatID string
 		Body   string
 	}
+	postCounts := make(map[string]int)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -116,6 +121,8 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 			_, _ = w.Write([]byte(`{"id":"docker-user","displayName":"Docker User","userPrincipalName":"docker@example.test"}`))
 		case req.Method == http.MethodPost && req.URL.Path == "/me/onlineMeetings/createOrGet":
 			_, _ = w.Write([]byte(`{"id":"docker-meeting","subject":"Docker fork parent (fork)","joinWebUrl":"https://teams.example/child","chatInfo":{"threadId":"docker-child-chat"}}`))
+		case req.Method == http.MethodGet && strings.HasPrefix(req.URL.Path, "/chats/") && strings.HasSuffix(req.URL.Path, "/messages"):
+			_, _ = w.Write([]byte(`{"value":[]}`))
 		case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/chats/") && strings.HasSuffix(req.URL.Path, "/messages"):
 			var payload struct {
 				Body struct {
@@ -129,6 +136,7 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/chats/"), "/messages")
 			mu.Lock()
+			postCounts[chatID]++
 			sent = append(sent, struct {
 				ChatID string
 				Body   string
@@ -158,13 +166,87 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 	if err := bridge.forkWorkSession(ctx, parent, command); err != nil {
 		t.Fatalf("forkWorkSession: %v", err)
 	}
-
-	state, err := store.Load(ctx)
-	if err != nil {
-		t.Fatalf("load final state: %v", err)
+	mu.Lock()
+	if len(sent) != 0 {
+		got := append([]struct {
+			ChatID string
+			Body   string
+		}(nil), sent...)
+		mu.Unlock()
+		t.Fatalf("forkWorkSession synchronously called Graph: %#v", got)
+	}
+	mu.Unlock()
+	if err := bridge.forkWorkSession(ctx, parent, command); err != nil {
+		t.Fatalf("duplicate forkWorkSession: %v", err)
 	}
 	operationID := forkOperationID(parent.ID, command.ID, command.Body.Content)
-	op, ok := state.ForkOperations[operationID]
+	var stateBeforeFlush teamstore.State
+	historyQueued := false
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := bridge.reconcileForkOperations(ctx); err != nil {
+			t.Fatalf("prepare fork history attempt %d: %v", attempt, err)
+		}
+		var err error
+		stateBeforeFlush, err = store.Load(ctx)
+		if err != nil {
+			t.Fatalf("load queued fork state attempt %d: %v", attempt, err)
+		}
+		for _, message := range stateBeforeFlush.OutboxMessages {
+			if message.ForkOperationID == operationID && isForkHistoryOutbox(message) {
+				historyQueued = true
+				break
+			}
+		}
+		if historyQueued {
+			break
+		}
+	}
+	if !historyQueued {
+		t.Fatal("fork history did not reach the durable outbox")
+	}
+	markedSending := false
+	for _, message := range stateBeforeFlush.OutboxMessages {
+		if message.ForkOperationID != operationID || !isForkHistoryOutbox(message) {
+			continue
+		}
+		if _, err := store.MarkOutboxSendAttempt(ctx, message.ID); err != nil {
+			t.Fatalf("mark history sending: %v", err)
+		}
+		if err := store.Update(ctx, func(state *teamstore.State) error {
+			current := state.OutboxMessages[message.ID]
+			current.LastSendAttempt = time.Now().Add(-3 * time.Minute)
+			state.OutboxMessages[message.ID] = current
+			return nil
+		}); err != nil {
+			t.Fatalf("age history sending lease: %v", err)
+		}
+		markedSending = true
+		break
+	}
+	if !markedSending {
+		t.Fatal("fork history did not create a recoverable outbox item")
+	}
+
+	var state teamstore.State
+	var op teamstore.ForkOperation
+	ok := false
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := bridge.reconcileForkOperations(ctx); err != nil {
+			t.Fatalf("reconcile fork operations attempt %d: %v", attempt, err)
+		}
+		if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+			t.Fatalf("flush fork outbox attempt %d: %v", attempt, err)
+		}
+		var err error
+		state, err = store.Load(ctx)
+		if err != nil {
+			t.Fatalf("load fork state attempt %d: %v", attempt, err)
+		}
+		op, ok = state.ForkOperations[operationID]
+		if ok && op.Phase == teamstore.ForkPhaseLinkSent {
+			break
+		}
+	}
 	if !ok || op.Phase != teamstore.ForkPhaseLinkSent {
 		t.Fatalf("fork operation = %#v ok=%v, want link_sent", op, ok)
 	}
@@ -185,8 +267,44 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 		Body   string
 	}(nil), sent...)
 	mu.Unlock()
-	if len(gotSent) < 4 {
-		t.Fatalf("sent messages = %#v, want progress, history, marker, and link", gotSent)
+	if len(gotSent) != 5 {
+		t.Fatalf("sent messages = %#v, want progress, pending notice, one history batch, marker, and link", gotSent)
+	}
+	childHistory := make([]string, 0, len(gotSent))
+	parentBodies := make([]string, 0, len(gotSent))
+	for _, item := range gotSent {
+		if item.ChatID == op.ChildChatID {
+			childHistory = append(childHistory, item.Body)
+		} else if item.ChatID == parent.ChatID {
+			parentBodies = append(parentBodies, item.Body)
+		}
+	}
+	if postCounts[op.ChildChatID] != 2 || len(childHistory) != 2 {
+		t.Fatalf("child history POSTs/messages = %d/%d, want exactly one batch plus one marker: %#v", postCounts[op.ChildChatID], len(childHistory), childHistory)
+	}
+	if len(parentBodies) != 3 || strings.Count(strings.Join(parentBodies, "\n"), "Fork requested") != 1 || strings.Count(strings.Join(parentBodies, "\n"), "already in progress") != 1 || strings.Count(strings.Join(parentBodies, "\n"), "Fork complete") != 1 {
+		t.Fatalf("parent fork notices = %#v, want one progress, one pending, and one link", parentBodies)
+	}
+	if strings.Count(strings.Join(childHistory, "\n"), "duplicate visible status") != 1 {
+		t.Fatalf("fork status duplicate was not deduped: %#v", childHistory)
+	}
+	batchMessages := 0
+	for _, body := range childHistory {
+		if strings.Contains(body, "history before fork") {
+			batchMessages++
+			if strings.Count(body, "duplicate visible status") != 1 || strings.Count(body, "history before fork") != 1 {
+				t.Fatalf("combined history batch did not contain each visible source record exactly once: %#v", body)
+			}
+		}
+		if strings.Contains(body, "must not appear after fork") {
+			t.Fatalf("post-cutoff history was imported: %#v", childHistory)
+		}
+	}
+	if batchMessages != 1 {
+		t.Fatalf("history batch messages = %d, want one combined batch: %#v", batchMessages, childHistory)
+	}
+	if op.HistoryPlanVersion != 2 {
+		t.Fatalf("fork history plan version = %d, want v2", op.HistoryPlanVersion)
 	}
 	linkIndex := -1
 	markerIndex := -1
@@ -200,6 +318,15 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 	}
 	if linkIndex < 0 || markerIndex < 0 || linkIndex <= markerIndex {
 		t.Fatalf("history/link ordering = marker %d link %d messages=%#v", markerIndex, linkIndex, gotSent)
+	}
+	if err := bridge.forkWorkSession(ctx, parent, command); err != nil {
+		t.Fatalf("terminal duplicate forkWorkSession: %v", err)
+	}
+	mu.Lock()
+	terminalCount := len(sent)
+	mu.Unlock()
+	if terminalCount != len(gotSent) {
+		t.Fatalf("terminal duplicate fork sent %d new messages, want none", terminalCount-len(gotSent))
 	}
 }
 

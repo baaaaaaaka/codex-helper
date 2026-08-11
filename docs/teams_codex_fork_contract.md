@@ -66,6 +66,26 @@ history chunks -> history-complete marker -> child activation -> parent link
 ```
 
 Each chunk has a stable outbox ID, ordinal, part count, and rendered body hash.
+
+New fork operations use history plan version 2. Version 2 reuses the
+publish-history transcript visibility, dedupe, HTML chunking, and batch
+planning rules, but writes only fork-owned manifest and outbox state. The
+normal publish-history checkpoint and delivery namespace are never used by a
+fork. A version 2 batch records its first and last logical source record so a
+cutoff cannot be inferred from a byte offset alone; one JSONL source line may
+produce multiple logical transcript records. Operations without an explicit
+plan version remain version 1 and are recovered from their existing immutable
+manifest without re-materialization.
+
+The fork command itself only records the durable operation and queues a
+deterministic progress notice. It does not materialize the transcript, call
+native `thread/fork`, create the child chat, or flush the parent-chat backlog
+on the polling command path. The owner loop advances at most one unfinished
+fork per cycle, with the local snapshot, native fork, child-chat creation,
+history queue, verification, activation, and link delivery separated by
+durable phase boundaries. History materialization only queues durable outbox
+rows; the normal bounded outbox loop performs delivery on later cycles.
+
 The helper sends the parent progress message without a child URL. It releases
 the URL only after the marker and every history item are durably proven sent.
 While the parent is fenced, only read-only `status`, `stats`, `details`,
@@ -81,7 +101,7 @@ is merely similar, or is not yet visible through the read path, is not proof.
 
 | Boundary | Required recovery |
 | --- | --- |
-| before `NativeForkIntentAt` | return to `parent_fenced`; native fork was not allowed to start |
+| before `NativeForkIntentAt` | resume from the durable snapshot without retrying an unrecorded native request |
 | after intent, before child record | block ambiguous; reconcile native child by the proof above |
 | after child/chat creation, before local checkpoint | keep the parent fenced and reconcile by operation ID/external ID |
 | during history outbox send | recover the existing outbox row; do not create a second visible item without provenance proof |
