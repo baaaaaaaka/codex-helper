@@ -118,10 +118,15 @@ type AppServerRunner struct {
 	// ServerRequestHandler overrides the handler selected by ApprovalMode.
 	ServerRequestHandler AppServerServerRequestHandler
 
-	Command          string
-	AppServerArgs    []string
-	ExtraArgs        []string
-	ExtraEnv         []string
+	Command       string
+	AppServerArgs []string
+	ExtraArgs     []string
+	ExtraEnv      []string
+	// CodexHome identifies the Codex home whose global config should be
+	// watched for MCP changes. It is intentionally explicit so a runner never
+	// accidentally watches the helper process's home instead of the app-server
+	// process's home.
+	CodexHome        string
 	WorkingDir       string
 	Timeout          time.Duration
 	ConfigureCommand func(*exec.Cmd) error
@@ -157,6 +162,8 @@ type AppServerRunner struct {
 	completedServerRequests map[string][]byte
 	completedServerOrder    []string
 	closeHookOnce           sync.Once
+	mcpRefreshLifecycleMu   sync.Mutex
+	mcpRefresh              *mcpRefreshCoordinator
 }
 
 type appServerResponseDelivery struct {
@@ -600,9 +607,12 @@ func isUnsupportedThreadForkError(err error) bool {
 }
 
 func (r *AppServerRunner) Close() error {
+	r.mcpRefreshLifecycleMu.Lock()
+	r.detachMCPRefreshAndWait()
 	r.mu.Lock()
 	err := r.closeTransportLocked()
 	r.mu.Unlock()
+	r.mcpRefreshLifecycleMu.Unlock()
 	r.closeHookOnce.Do(func() {
 		if r.CloseHook != nil {
 			r.CloseHook()
@@ -615,12 +625,48 @@ func (r *AppServerRunner) Close() error {
 // cold start. Unlike Close it preserves the runner-scoped CloseHook because
 // the runner remains usable after a runtime upgrade.
 func (r *AppServerRunner) Restart() error {
+	r.mcpRefreshLifecycleMu.Lock()
+	defer r.mcpRefreshLifecycleMu.Unlock()
+	r.detachMCPRefreshAndWait()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.closeTransportLocked()
 }
 
 func (r *AppServerRunner) ensureReady(ctx context.Context) error {
+	r.mu.Lock()
+	ready := r.ready
+	failed := false
+	if ready {
+		r.protocolMu.Lock()
+		failed = r.protocolErr != nil
+		r.protocolMu.Unlock()
+	}
+	r.mu.Unlock()
+	if ready && !failed {
+		return nil
+	}
+
+	// Recovery and initial startup are serialized separately from the healthy
+	// hot path. This ensures that an old refresh worker is gone before a new
+	// transport can be installed.
+	r.mcpRefreshLifecycleMu.Lock()
+	defer r.mcpRefreshLifecycleMu.Unlock()
+	r.mu.Lock()
+	ready = r.ready
+	failed = false
+	if ready {
+		r.protocolMu.Lock()
+		failed = r.protocolErr != nil
+		r.protocolMu.Unlock()
+	}
+	if ready && !failed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	r.detachMCPRefreshAndWait()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ensureReadyLocked(ctx)
@@ -655,6 +701,13 @@ func (r *AppServerRunner) ensureReadyLocked(ctx context.Context) error {
 }
 
 func (r *AppServerRunner) startAndInitializeLocked(ctx context.Context) error {
+	initialMCPConfigState := mcpConfigFileState{}
+	if path := mcpConfigFilePath(r.CodexHome); path != "" {
+		// Capture the baseline before app-server initialization. A config change
+		// during the handshake must not be mistaken for the watcher's initial
+		// state and silently skipped.
+		initialMCPConfigState = readMCPConfigFileState(path)
+	}
 	if r.Transport == nil {
 		if r.Starter == nil {
 			return &Error{Kind: ErrorLaunch, Message: "codex app-server transport is not configured"}
@@ -678,6 +731,7 @@ func (r *AppServerRunner) startAndInitializeLocked(ctx context.Context) error {
 		return err
 	}
 	r.ready = true
+	r.startMCPRefreshLocked(initialMCPConfigState)
 	return nil
 }
 

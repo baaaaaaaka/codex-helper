@@ -601,6 +601,7 @@ func runCodexExecFacade(
 		Command:       codexPath,
 		AppServerArgs: append([]string{"--analytics-default-enabled"}, options.AppServerArgs...),
 		ExtraEnv:      extraEnv,
+		CodexHome:     paths.CodexDir,
 		WorkingDir:    options.WorkingDir,
 		Timeout:       0,
 	}
