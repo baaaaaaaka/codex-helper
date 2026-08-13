@@ -227,14 +227,16 @@ func attachSubagents(sessions []Session, sessionIndex map[string]int, pending []
 			summary = "[subagent]"
 		}
 		sess := Session{
-			SessionID:    orphan.SessionID,
-			ThreadName:   orphan.ThreadName,
-			Summary:      summary,
-			FirstPrompt:  orphan.FirstPrompt,
-			MessageCount: orphan.MessageCount,
-			CreatedAt:    orphan.CreatedAt,
-			ModifiedAt:   orphan.ModifiedAt,
-			FilePath:     orphan.FilePath,
+			SessionID:       orphan.SessionID,
+			ThreadName:      orphan.ThreadName,
+			Summary:         summary,
+			FirstPrompt:     orphan.FirstPrompt,
+			MessageCount:    orphan.MessageCount,
+			CreatedAt:       orphan.CreatedAt,
+			ModifiedAt:      orphan.ModifiedAt,
+			FilePath:        orphan.FilePath,
+			ParentSessionID: orphan.ParentSessionID,
+			AgentID:         orphan.AgentID,
 		}
 		sessionIndex[orphan.SessionID] = len(sessions)
 		sessions = append(sessions, sess)
@@ -277,6 +279,12 @@ func groupByProject(sessions []Session) []Project {
 }
 
 func mergeSessionMetadata(base Session, other Session) Session {
+	if base.ParentSessionID == "" && other.ParentSessionID != "" {
+		base.ParentSessionID = other.ParentSessionID
+	}
+	if base.AgentID == "" && other.AgentID != "" {
+		base.AgentID = other.AgentID
+	}
 	if base.ThreadName == "" && other.ThreadName != "" {
 		base.ThreadName = other.ThreadName
 	}
@@ -354,14 +362,16 @@ func FindSessionByID(codexDir, sessionID string) (*Session, error) {
 				return nil, err
 			}
 			sess := &Session{
-				SessionID:    sessionID,
-				ThreadName:   threadNames[sessionID],
-				FirstPrompt:  meta.FirstPrompt,
-				MessageCount: meta.MessageCount,
-				CreatedAt:    meta.CreatedAt,
-				ModifiedAt:   meta.ModifiedAt,
-				ProjectPath:  strings.TrimSpace(meta.ProjectPath),
-				FilePath:     filePath,
+				SessionID:       sessionID,
+				ThreadName:      threadNames[sessionID],
+				FirstPrompt:     meta.FirstPrompt,
+				MessageCount:    meta.MessageCount,
+				CreatedAt:       meta.CreatedAt,
+				ModifiedAt:      meta.ModifiedAt,
+				ProjectPath:     strings.TrimSpace(meta.ProjectPath),
+				FilePath:        filePath,
+				ParentSessionID: meta.ParentThreadID,
+				AgentID:         meta.SubagentType,
 			}
 			return sess, nil
 		}

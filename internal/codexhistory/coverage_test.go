@@ -306,12 +306,12 @@ func TestSessionDisplayTitle(t *testing.T) {
 }
 
 func TestSessionThreadNameJSONIsBackwardCompatibleWhenEmpty(t *testing.T) {
-	raw, err := json.Marshal(Session{SessionID: "session-1", FirstPrompt: "prompt"})
+	raw, err := json.Marshal(Session{SessionID: "session-1", FirstPrompt: "prompt", ParentSessionID: "parent", AgentID: "thread_spawn"})
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	if strings.Contains(string(raw), "ThreadName") {
-		t.Fatalf("empty ThreadName should be omitted from history JSON: %s", raw)
+	if strings.Contains(string(raw), "ThreadName") || strings.Contains(string(raw), "ParentSessionID") || strings.Contains(string(raw), "AgentID") {
+		t.Fatalf("graph-only metadata should be omitted from history JSON: %s", raw)
 	}
 
 	raw, err = json.Marshal(Session{SessionID: "session-1", ThreadName: "renamed"})

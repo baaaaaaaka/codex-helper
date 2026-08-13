@@ -40,6 +40,24 @@ type CodexTokenStats struct {
 	RateLimits               CodexRateLimits
 	Diagnostics              []TokenStatsDiagnostic
 	UsedFallbackOnly         bool
+	usageTimeline            []codexUsageObservation
+	nativeTotalPresent       bool
+}
+
+// codexUsageObservation is the internal, per-transcript usage ledger. Native
+// token_count snapshots are cumulative, so retaining both the raw native
+// counter and the reconstructed delta lets a child transcript discard the
+// exact prefix inherited from its immediate parent before aggregation.
+type codexUsageObservation struct {
+	Timestamp          time.Time
+	SourceLine         int
+	NativeTotal        CodexTokenUsage
+	ReconstructedTotal CodexTokenUsage
+	Delta              CodexTokenUsage
+	Model              string
+	Tier               string
+	Effort             string
+	Cumulative         bool
 }
 
 // CodexModelTierUsage is the token usage attributed to one model/service-tier
@@ -257,6 +275,7 @@ func aggregateCodexTokenStats(stats []CodexTokenStats, sources []codexStatsParen
 	out.Info.ModelContextWindow = stats[newestIndex].Info.ModelContextWindow
 	out.RateLimits = stats[newestIndex].RateLimits
 	out.NativeLatestTotal = CodexTokenUsage{}
+	out.usageTimeline = nil
 	out.Info.Total = summary.Total
 	if latestUsage.Info.Last.hasTokens() {
 		out.Info.Last = latestUsage.Info.Last
@@ -270,10 +289,7 @@ func summarizeCodexTokenStats(stats []CodexTokenStats) codexTokenUsageSummary {
 	var summary codexTokenUsageSummary
 	modelGroups := make(map[string]*CodexModelUsage)
 	for _, stat := range stats {
-		total := stat.Info.Total
-		if !total.hasTokens() {
-			total = stat.Info.Last
-		}
+		total := codexTokenStatsOverallUsage(stat)
 		summary.Total, _ = addCodexTokenUsage(summary.Total, total)
 		for _, modelUsage := range stat.ModelUsages {
 			model := normalizedCodexModelName(modelUsage.Model)
@@ -315,6 +331,188 @@ func summarizeCodexTokenStats(stats []CodexTokenStats) codexTokenUsageSummary {
 		summary.ModelUsages = append(summary.ModelUsages, group)
 	}
 	return summary
+}
+
+func codexTokenStatsOverallUsage(stats CodexTokenStats) CodexTokenUsage {
+	total := stats.Info.Total
+	if !total.hasTokens() {
+		total = stats.Info.Last
+	}
+	return total
+}
+
+func combineCodexTokenUsageSummaries(summaries ...codexTokenUsageSummary) codexTokenUsageSummary {
+	stats := make([]CodexTokenStats, 0, len(summaries))
+	for _, summary := range summaries {
+		stats = append(stats, CodexTokenStats{
+			Info:        CodexTokenUsageInfo{Total: summary.Total},
+			ModelUsages: summary.ModelUsages,
+		})
+	}
+	return summarizeCodexTokenStats(stats)
+}
+
+// codexUsageTimelinePrefix returns the number of child cumulative snapshots
+// that are exactly equivalent at the token-vector level to the
+// immediate parent's snapshots. A zero-length result is meaningful: native
+// children created without inherited context start their own local counter,
+// so their complete child ledger is attributable to the child.
+func codexUsageTimelinePrefix(parent, child []codexUsageObservation) int {
+	parent = cumulativeCodexUsageTimeline(parent)
+	child = cumulativeCodexUsageTimeline(child)
+	matched := 0
+	for matched < len(parent) && matched < len(child) {
+		if parent[matched].NativeTotal != child[matched].NativeTotal {
+			break
+		}
+		matched++
+	}
+	return matched
+}
+
+func cumulativeCodexUsageTimeline(timeline []codexUsageObservation) []codexUsageObservation {
+	if len(timeline) == 0 {
+		return nil
+	}
+	result := make([]codexUsageObservation, 0, len(timeline))
+	for _, observation := range timeline {
+		if observation.Cumulative {
+			result = append(result, observation)
+		}
+	}
+	return result
+}
+
+func attributeCodexChildTokenStats(parent, child CodexTokenStats) (CodexTokenStats, error) {
+	if !child.HasUsage() {
+		return child, nil
+	}
+	if len(child.usageTimeline) == 0 {
+		return CodexTokenStats{}, fmt.Errorf("child transcript has usage but no cumulative token ledger")
+	}
+	if len(cumulativeCodexUsageTimeline(child.usageTimeline)) != len(child.usageTimeline) {
+		return CodexTokenStats{}, fmt.Errorf("child transcript mixes cumulative and non-cumulative usage events")
+	}
+	parentTimeline := cumulativeCodexUsageTimeline(parent.usageTimeline)
+	if len(parentTimeline) == 0 {
+		return CodexTokenStats{}, fmt.Errorf("immediate parent transcript has no cumulative token ledger")
+	}
+	if len(parentTimeline) != len(parent.usageTimeline) {
+		return CodexTokenStats{}, fmt.Errorf("immediate parent transcript has an incomplete cumulative token ledger")
+	}
+	prefixLength := codexUsageTimelinePrefix(parent.usageTimeline, child.usageTimeline)
+	if prefixLength == 0 && !codexChildHasIndependentCounter(parentTimeline, child.usageTimeline) {
+		return CodexTokenStats{}, fmt.Errorf("child cumulative token ledger has no provable inherited prefix or independent counter start")
+	}
+	childTimeline := cumulativeCodexUsageTimeline(child.usageTimeline)
+	return rebuildCodexTokenStatsFromTimeline(child, childTimeline[prefixLength:]), nil
+}
+
+func codexChildHasIndependentCounter(parent, child []codexUsageObservation) bool {
+	child = cumulativeCodexUsageTimeline(child)
+	if len(parent) == 0 || len(child) == 0 || child[0].Timestamp.IsZero() {
+		return false
+	}
+	var parentAtChildStart CodexTokenUsage
+	foundParentSnapshot := false
+	for _, observation := range parent {
+		if !observation.Timestamp.IsZero() && observation.Timestamp.After(child[0].Timestamp) {
+			break
+		}
+		parentAtChildStart = observation.NativeTotal
+		foundParentSnapshot = true
+	}
+	if !foundParentSnapshot {
+		return false
+	}
+	return effectiveCodexTokenUsageTotal(child[0].NativeTotal) < effectiveCodexTokenUsageTotal(parentAtChildStart)
+}
+
+func rebuildCodexTokenStatsFromTimeline(base CodexTokenStats, timeline []codexUsageObservation) CodexTokenStats {
+	out := base
+	out.Info.Total = CodexTokenUsage{}
+	out.Info.Last = CodexTokenUsage{}
+	out.NativeLatestTotal = CodexTokenUsage{}
+	out.ModelTierUsages = nil
+	out.ModelUsages = nil
+	out.UsedFallbackOnly = false
+	out.UsageEventCount = len(timeline)
+	out.usageTimeline = append([]codexUsageObservation(nil), timeline...)
+
+	type tierKey struct {
+		model string
+		tier  string
+	}
+	tierGroups := make(map[tierKey]CodexTokenUsage)
+	modelGroups := make(map[string]*CodexModelUsage)
+	for _, observation := range timeline {
+		out.Info.Total, _ = addCodexTokenUsage(out.Info.Total, observation.Delta)
+		out.Info.Last = observation.Delta
+
+		model := normalizedCodexModelName(observation.Model)
+		tier := normalizedCodexTierName(observation.Tier)
+		tierGroup := tierKey{model: model, tier: tier}
+		tierGroups[tierGroup], _ = addCodexTokenUsage(tierGroups[tierGroup], observation.Delta)
+
+		modelGroup := modelGroups[model]
+		if modelGroup == nil {
+			modelGroup = &CodexModelUsage{Model: model}
+			modelGroups[model] = modelGroup
+		}
+		modelGroup.Overall, _ = addCodexTokenUsage(modelGroup.Overall, observation.Delta)
+		effort := normalizedCodexEffortName(observation.Effort)
+		foundEffort := false
+		for index := range modelGroup.EffortUsages {
+			if modelGroup.EffortUsages[index].Effort != effort {
+				continue
+			}
+			modelGroup.EffortUsages[index].Usage, _ = addCodexTokenUsage(modelGroup.EffortUsages[index].Usage, observation.Delta)
+			foundEffort = true
+			break
+		}
+		if !foundEffort {
+			modelGroup.EffortUsages = append(modelGroup.EffortUsages, CodexEffortUsage{Effort: effort, Usage: observation.Delta})
+		}
+	}
+
+	models := make([]string, 0, len(modelGroups))
+	for model, group := range modelGroups {
+		if group.Overall.hasTokens() {
+			models = append(models, model)
+		}
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		group := *modelGroups[model]
+		sort.Slice(group.EffortUsages, func(i, j int) bool {
+			return lessCodexEffortName(group.EffortUsages[i].Effort, group.EffortUsages[j].Effort)
+		})
+		out.ModelUsages = append(out.ModelUsages, group)
+	}
+
+	tierKeys := make([]tierKey, 0, len(tierGroups))
+	for key, usage := range tierGroups {
+		if usage.hasTokens() {
+			tierKeys = append(tierKeys, key)
+		}
+	}
+	sort.Slice(tierKeys, func(i, j int) bool {
+		if tierKeys[i].model != tierKeys[j].model {
+			return tierKeys[i].model < tierKeys[j].model
+		}
+		return tierKeys[i].tier < tierKeys[j].tier
+	})
+	for _, key := range tierKeys {
+		out.ModelTierUsages = append(out.ModelTierUsages, CodexModelTierUsage{
+			Model: key.model,
+			Tier:  key.tier,
+			Usage: tierGroups[key],
+		})
+	}
+	if out.Info.Total.hasTokens() {
+		out.NativeLatestTotal = out.Info.Total
+	}
+	return out
 }
 
 func codexModelUsagesTotal(usages []CodexModelUsage) CodexTokenUsage {
@@ -627,16 +825,22 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 	var diagnostics []TokenStatsDiagnostic
 	var tokenSourceLine int
 	var lastTokenCountLine int
+	var usageTimeline []codexUsageObservation
 	atTurnStart := false
 	reader := bufio.NewReader(r)
 	lineNo := 0
+	finish := func() CodexTokenStats {
+		stats := finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot())
+		stats.usageTimeline = append([]codexUsageObservation(nil), usageTimeline...)
+		return stats
+	}
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) == 0 && readErr == io.EOF {
 			break
 		}
 		if readErr != nil && readErr != io.EOF {
-			return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot()), fmt.Errorf("read Codex token stats: %w", readErr)
+			return finish(), fmt.Errorf("read Codex token stats: %w", readErr)
 		}
 		lineNo++
 		line = bytes.TrimSpace(line)
@@ -680,6 +884,24 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			if tokenCountHasUsage {
 				usageDelta, advanced := usage.observe(tokenCount.Info, atTurnStart)
 				modelTierUsage.observeTokenUsage(usageDelta, advanced)
+				if advanced && usageDelta.hasTokens() {
+					nativeTotal := tokenCount.Info.Total
+					if !tokenCount.nativeTotalPresent {
+						nativeTotal = tokenCount.Info.Last
+					}
+					context := modelTierUsage.current
+					usageTimeline = append(usageTimeline, codexUsageObservation{
+						Timestamp:          parseCodexEventTimestamp(event.Timestamp),
+						SourceLine:         lineNo,
+						NativeTotal:        nativeTotal,
+						ReconstructedTotal: usage.info().Total,
+						Delta:              usageDelta,
+						Model:              context.Model,
+						Tier:               context.Tier,
+						Effort:             context.Effort,
+						Cumulative:         tokenCount.nativeTotalPresent,
+					})
+				}
 				if advanced {
 					atTurnStart = false
 				}
@@ -699,12 +921,22 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 				Info:             CodexTokenUsageInfo{Total: usage, Last: usage},
 				UsedFallbackOnly: true,
 			}
+			context := modelTierUsage.current
+			usageTimeline = append(usageTimeline, codexUsageObservation{
+				Timestamp:  parseCodexEventTimestamp(event.Timestamp),
+				SourceLine: lineNo,
+				Delta:      usage,
+				Model:      context.Model,
+				Tier:       context.Tier,
+				Effort:     context.Effort,
+				Cumulative: false,
+			})
 		}
 		if readErr == io.EOF {
 			break
 		}
 	}
-	return finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot()), nil
+	return finish(), nil
 }
 
 func finishCodexTokenStats(
@@ -772,9 +1004,22 @@ func finishCodexTokenStats(
 }
 
 type codexTokenStatsEvent struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-	Usage   codexTokenUsage `json:"usage"`
+	Type      string          `json:"type"`
+	Timestamp string          `json:"timestamp"`
+	Payload   json.RawMessage `json:"payload"`
+	Usage     codexTokenUsage `json:"usage"`
+}
+
+func parseCodexEventTimestamp(value string) time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return timestamp
 }
 
 type codexTokenCountPayload struct {
@@ -1205,11 +1450,14 @@ func parseCodexTokenCountEvent(event codexTokenStatsEvent, raw []byte) (CodexTok
 	if payload.Type != "token_count" {
 		return CodexTokenStats{}, false
 	}
+	total := normalizeCodexUsage(firstNonZeroCodexTokenUsage(payload.Info.Total, payload.Info.Total2))
+	last := normalizeCodexUsage(firstNonZeroCodexTokenUsage(payload.Info.Last, payload.Info.Last2))
 	info := CodexTokenUsageInfo{
-		Total:              normalizeCodexUsage(firstNonZeroCodexTokenUsage(payload.Info.Total, payload.Info.Total2)),
-		Last:               normalizeCodexUsage(firstNonZeroCodexTokenUsage(payload.Info.Last, payload.Info.Last2)),
+		Total:              total,
+		Last:               last,
 		ModelContextWindow: firstNonZeroInt64Teams(payload.Info.ModelContextWindow, payload.Info.ModelContextWindow2),
 	}
+	nativeTotalPresent := total.hasTokens()
 	if !info.Total.hasTokens() && !info.Last.hasTokens() {
 		usage := normalizeCodexUsage(payload.Usage)
 		info.Total = usage
@@ -1220,9 +1468,10 @@ func parseCodexTokenCountEvent(event codexTokenStatsEvent, raw []byte) (CodexTok
 		rawRateLimits = payload.RateLimits2
 	}
 	return CodexTokenStats{
-		Source:     "token_count",
-		Info:       info,
-		RateLimits: parseCodexRateLimits(rawRateLimits),
+		Source:             "token_count",
+		Info:               info,
+		nativeTotalPresent: nativeTotalPresent,
+		RateLimits:         parseCodexRateLimits(rawRateLimits),
 	}, true
 }
 
@@ -1594,13 +1843,28 @@ func (b *Bridge) formatWorkSessionStats(ctx context.Context, session *Session) s
 		lines = append(lines, "", "Token stats unavailable: read local Codex transcript failed: "+readProblems[0])
 		return strings.Join(lines, "\n")
 	}
+	subagentSummary, subagentCount, subagentProblems, subagentDiscoveryErr := b.readSubagentTokenStatsForWorkSession(ctx, sources, projects, discoveryErr)
+	totalAvailable := stats.HasUsage() &&
+		len(sourceProblems) == 0 &&
+		len(readProblems) == 0 &&
+		subagentDiscoveryErr == nil &&
+		len(subagentProblems) == 0 &&
+		(subagentCount == 0 || subagentSummary.Total.hasTokens())
+	totalSummary := combineCodexTokenUsageSummaries(
+		codexTokenUsageSummary{
+			Total:       codexTokenStatsOverallUsage(stats),
+			ModelUsages: stats.ModelUsages,
+		},
+		subagentSummary,
+	)
+	lines = append(lines, "")
+	lines = append(lines, formatCodexTotalStatsLines(totalSummary, totalAvailable)...)
 	lines = append(lines, "")
 	allProblems := append(append([]string{}, sourceProblems...), readProblems...)
 	lines = append(lines, formatCodexMainAgentStatsLines(stats, allProblems)...)
-	subagentSummary, subagentCount, subagentProblems, discoveryErr := b.readSubagentTokenStatsForWorkSession(ctx, sources, discoveryErr)
 	lines = append(lines, "")
-	if discoveryErr != nil {
-		lines = append(lines, formatCodexSubagentUnavailableLines(discoveryErr)...)
+	if subagentDiscoveryErr != nil {
+		lines = append(lines, formatCodexSubagentUnavailableLines(subagentDiscoveryErr)...)
 		return strings.Join(lines, "\n")
 	}
 	if subagentCount == 0 {
@@ -1669,10 +1933,7 @@ func formatCodexMainAgentStatsLines(stats CodexTokenStats, extraProblems ...[]st
 			"Model/effort breakdown: not reported",
 		)
 	} else {
-		overall := stats.Info.Total
-		if !overall.hasTokens() {
-			overall = stats.Info.Last
-		}
+		overall := codexTokenStatsOverallUsage(stats)
 		lines = append(lines, "", "🧠 MAIN AGENT · snapshots:")
 		if stats.Info.Last.hasTokens() {
 			lines = append(lines, "Last recorded model usage:")
@@ -1718,6 +1979,23 @@ func formatCodexMainAgentStatsLines(stats CodexTokenStats, extraProblems ...[]st
 				lines = append(lines, "- "+problem)
 			}
 		}
+	}
+	return lines
+}
+
+func formatCodexTotalStatsLines(summary codexTokenUsageSummary, available bool) []string {
+	const title = "🧮 TOTAL (MAIN + SUBAGENTS)"
+	lines := []string{title + " · overall:"}
+	if !available || !summary.Total.hasTokens() {
+		lines = append(lines, "Token usage unavailable: complete main and subagent usage could not be established.")
+		return lines
+	}
+	lines = append(lines, formatTokenUsageLines(summary.Total)...)
+	lines = append(lines, "", title+" · model/effort detail:")
+	if modelLines := formatCodexModelUsageLines(summary.ModelUsages); len(modelLines) > 0 {
+		lines = append(lines, modelLines...)
+	} else {
+		lines = append(lines, "Model/effort breakdown: unavailable")
 	}
 	return lines
 }
@@ -1806,59 +2084,211 @@ func (b *Bridge) discoverSubagentProjects(ctx context.Context) ([]codexhistory.P
 	return cloneCodexProjects(cached), err
 }
 
-func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, parents []codexStatsParentSource, discoveryErr error) (codexTokenUsageSummary, int, []string, error) {
+type codexSubagentUsageCandidate struct {
+	session codexhistory.SubagentSession
+	native  bool
+}
+
+func codexSubagentCandidateKey(session codexhistory.SubagentSession) string {
+	if id := strings.TrimSpace(session.SessionID); id != "" {
+		return "session:" + id
+	}
+	if path := canonicalCodexStatsPath(session.FilePath); path != "" {
+		return "path:" + path
+	}
+	return "title:" + session.DisplayTitle()
+}
+
+func collectCodexSubagentUsageCandidates(nodes []codexhistory.SessionGraphNode, parents []codexStatsParentSource) []codexSubagentUsageCandidate {
+	rootIDs := make(map[string]struct{})
+	for _, parent := range parents {
+		if id := strings.TrimSpace(parent.ThreadID); id != "" {
+			rootIDs[id] = struct{}{}
+		}
+	}
+
+	nodesByID := make(map[string]codexhistory.SessionGraphNode, len(nodes))
+	for _, node := range nodes {
+		if id := strings.TrimSpace(node.SessionID); id != "" {
+			nodesByID[id] = node
+		}
+	}
+	reachableMemo := make(map[string]bool)
+	reachableKnown := make(map[string]bool)
+	var reachable func(string) bool
+	reachable = func(id string) bool {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return false
+		}
+		if reachableKnown[id] {
+			return reachableMemo[id]
+		}
+		reachableKnown[id] = true
+		if _, ok := rootIDs[id]; ok {
+			reachableMemo[id] = true
+			return true
+		}
+		node, ok := nodesByID[id]
+		if !ok || strings.TrimSpace(node.ParentSessionID) == id {
+			reachableMemo[id] = false
+			return false
+		}
+		reachableMemo[id] = reachable(node.ParentSessionID)
+		return reachableMemo[id]
+	}
+
+	candidatesByKey := make(map[string]codexSubagentUsageCandidate)
+	add := func(candidate codexSubagentUsageCandidate) {
+		key := codexSubagentCandidateKey(candidate.session)
+		if existing, ok := candidatesByKey[key]; ok {
+			if candidate.native && !existing.native {
+				candidatesByKey[key] = candidate
+			}
+			return
+		}
+		candidatesByKey[key] = candidate
+	}
+	for _, node := range nodes {
+		parentID := strings.TrimSpace(node.ParentSessionID)
+		if !node.IsSubagent || parentID == "" || !reachable(node.SessionID) {
+			continue
+		}
+		session := node.AsSubagentSession()
+		if len(codexhistory.FilterUserVisibleSubagentSessions([]codexhistory.SubagentSession{session})) == 0 {
+			continue
+		}
+		add(codexSubagentUsageCandidate{session: session, native: true})
+	}
+	for _, parent := range parents {
+		for _, session := range codexhistory.FilterUserVisibleSubagentSessions(parent.Subagents) {
+			session.ParentSessionID = strings.TrimSpace(session.ParentSessionID)
+			native := session.ParentSessionID != "" || strings.EqualFold(strings.TrimSpace(session.AgentID), "thread_spawn")
+			add(codexSubagentUsageCandidate{session: session, native: native})
+		}
+	}
+
+	result := make([]codexSubagentUsageCandidate, 0, len(candidatesByKey))
+	for _, candidate := range candidatesByKey {
+		result = append(result, candidate)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		leftID := strings.TrimSpace(result[i].session.SessionID)
+		rightID := strings.TrimSpace(result[j].session.SessionID)
+		if leftID != rightID {
+			return leftID < rightID
+		}
+		return canonicalCodexStatsPath(result[i].session.FilePath) < canonicalCodexStatsPath(result[j].session.FilePath)
+	})
+	return result
+}
+
+func (b *Bridge) readSubagentTokenStatsForWorkSession(ctx context.Context, parents []codexStatsParentSource, projects []codexhistory.Project, discoveryErr error) (codexTokenUsageSummary, int, []string, error) {
 	if len(parents) == 0 {
 		if discoveryErr != nil {
 			return codexTokenUsageSummary{}, 0, nil, discoveryErr
 		}
 		return codexTokenUsageSummary{}, 0, nil, nil
 	}
-	children := make([]codexhistory.SubagentSession, 0)
-	seen := make(map[string]struct{})
-	for _, parent := range parents {
-		for _, subagent := range codexhistory.FilterUserVisibleSubagentSessions(parent.Subagents) {
-			key := "session:" + strings.TrimSpace(subagent.SessionID)
-			if key == "session:" {
-				key = canonicalCodexStatsPath(subagent.FilePath)
-			}
-			if key == "" {
-				key = "agent:" + strings.TrimSpace(subagent.AgentID)
-			}
-			if key == "agent:" {
-				key = "title:" + subagent.DisplayTitle()
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			children = append(children, subagent)
-		}
+	if discoveryErr != nil {
+		return codexTokenUsageSummary{}, 0, nil, discoveryErr
 	}
-	if len(children) == 0 {
-		if discoveryErr != nil {
-			return codexTokenUsageSummary{}, 0, nil, discoveryErr
-		}
+	nodes := codexhistory.FlattenSessionGraph(projects)
+	candidates := collectCodexSubagentUsageCandidates(nodes, parents)
+	if len(candidates) == 0 {
 		return codexTokenUsageSummary{}, 0, nil, nil
 	}
-	stats := make([]CodexTokenStats, 0, len(children))
-	problems := make([]string, 0)
-	if discoveryErr != nil {
-		problems = append(problems, "history discovery: "+discoveryErr.Error())
+
+	rootPaths := make(map[string]string)
+	for _, parent := range parents {
+		if id := strings.TrimSpace(parent.ThreadID); id != "" {
+			rootPaths[id] = canonicalCodexStatsPath(parent.FilePath)
+		}
 	}
-	for _, subagent := range children {
-		path := strings.TrimSpace(subagent.FilePath)
+	nodePaths := make(map[string]string)
+	for _, node := range nodes {
+		if id := strings.TrimSpace(node.SessionID); id != "" {
+			nodePaths[id] = canonicalCodexStatsPath(node.FilePath)
+		}
+	}
+	statsCache := make(map[string]CodexTokenStats)
+	statsErrors := make(map[string]error)
+	readCached := func(id, path string) (CodexTokenStats, error) {
+		id = strings.TrimSpace(id)
+		path = canonicalCodexStatsPath(path)
+		key := "path:" + path
+		if id != "" {
+			key = "session:" + id
+		}
+		if stat, ok := statsCache[key]; ok {
+			return stat, nil
+		}
+		if readErr, ok := statsErrors[key]; ok {
+			return CodexTokenStats{}, readErr
+		}
+		if path == "" {
+			readErr := fmt.Errorf("no linked transcript")
+			statsErrors[key] = readErr
+			return CodexTokenStats{}, readErr
+		}
+		stat, readErr := ReadCodexTokenStats(path)
+		if readErr != nil {
+			statsErrors[key] = readErr
+			return CodexTokenStats{}, readErr
+		}
+		statsCache[key] = stat
+		return stat, nil
+	}
+
+	stats := make([]CodexTokenStats, 0, len(candidates))
+	problems := make([]string, 0)
+	for _, candidate := range candidates {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return codexTokenUsageSummary{}, len(candidates), problems, err
+			}
+		}
+		subagent := candidate.session
+		path := canonicalCodexStatsPath(subagent.FilePath)
 		if path == "" {
 			problems = append(problems, subagent.DisplayTitle()+" has no linked transcript")
 			continue
 		}
-		stat, readErr := ReadCodexTokenStats(path)
+		stat, readErr := readCached(subagent.SessionID, path)
 		if readErr != nil {
 			problems = append(problems, subagent.DisplayTitle()+": "+readErr.Error())
 			continue
 		}
+		if candidate.native {
+			parentID := strings.TrimSpace(subagent.ParentSessionID)
+			parentPath := rootPaths[parentID]
+			if parentPath == "" {
+				parentPath = nodePaths[parentID]
+			}
+			if parentPath == "" {
+				problems = append(problems, subagent.DisplayTitle()+": immediate parent transcript is unavailable for token attribution")
+				continue
+			}
+			parentStat, parentErr := readCached(parentID, parentPath)
+			if parentErr != nil {
+				problems = append(problems, subagent.DisplayTitle()+": immediate parent transcript could not be read: "+parentErr.Error())
+				continue
+			}
+			adjusted, attributionErr := attributeCodexChildTokenStats(parentStat, stat)
+			if attributionErr != nil {
+				problems = append(problems, subagent.DisplayTitle()+": token usage could not be attributed to child requests")
+				continue
+			}
+			stat = adjusted
+		}
 		stats = append(stats, stat)
 	}
-	return summarizeCodexTokenStats(stats), len(children), problems, nil
+	if len(problems) > 0 {
+		// A partial child sum would be a plausible-looking but incomplete token
+		// number. Keep the existing report shape, but fail closed on the number.
+		return codexTokenUsageSummary{}, len(candidates), problems, nil
+	}
+	return summarizeCodexTokenStats(stats), len(candidates), nil, nil
 }
 
 func (b *Bridge) latestTurnForStats(ctx context.Context, sessionID string) (teamstore.Turn, bool) {
@@ -2443,6 +2873,11 @@ func parseStatsScopedSectionHeader(line string) (string, bool) {
 	const mainPrefix = "🧠 MAIN AGENT · "
 	if strings.HasPrefix(line, mainPrefix) {
 		kind := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, mainPrefix)), ":")
+		return strings.ToLower(kind), true
+	}
+	const totalPrefix = "🧮 TOTAL (MAIN + SUBAGENTS) · "
+	if strings.HasPrefix(line, totalPrefix) {
+		kind := strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, totalPrefix)), ":")
 		return strings.ToLower(kind), true
 	}
 	if !strings.HasPrefix(line, "🧩 SUBAGENTS") {
