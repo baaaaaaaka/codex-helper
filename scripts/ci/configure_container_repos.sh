@@ -33,7 +33,8 @@ configure_centos_vault() {
   repo_file="$(root_path /etc/yum.repos.d/CentOS-Base.repo)"
   if [[ -f "$repo_file" ]]; then
     sed_in_place 's/^mirrorlist=/#mirrorlist=/g' "$repo_file"
-    sed_in_place 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' "$repo_file"
+    sed_in_place_ext 's|^#?baseurl=https?://mirror\.centos\.org/centos/\$releasever/|baseurl=https://vault.centos.org/7.9.2009/|g' "$repo_file"
+    sed_in_place_ext 's|^#?baseurl=https?://vault\.centos\.org/centos/\$releasever/|baseurl=https://vault.centos.org/7.9.2009/|g' "$repo_file"
   fi
 }
 
