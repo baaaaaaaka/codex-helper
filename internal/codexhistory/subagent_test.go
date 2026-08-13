@@ -246,6 +246,22 @@ func TestProcessMetaLine_SubagentFields(t *testing.T) {
 			wantProjectPath: "/x",
 		},
 		{
+			name:             "parent thread fallback in session metadata",
+			line:             `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-parent-fallback","cwd":"/x","source":"cli","parent_thread_id":"parent-uuid"}}`,
+			wantIsSub:        true,
+			wantSubType:      "thread_spawn",
+			wantParentThread: "parent-uuid",
+			wantSessionID:    "sess-parent-fallback",
+		},
+		{
+			name:             "forked-from fallback in session metadata",
+			line:             `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-fork-fallback","cwd":"/x","forked_from_id":"parent-uuid"}}`,
+			wantIsSub:        true,
+			wantSubType:      "thread_spawn",
+			wantParentThread: "parent-uuid",
+			wantSessionID:    "sess-fork-fallback",
+		},
+		{
 			name:          "source is null",
 			line:          `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-5","cwd":"/y","source":null}}`,
 			wantIsSub:     false,

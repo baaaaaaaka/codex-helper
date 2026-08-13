@@ -1023,6 +1023,8 @@ func TestBridgeWorkHelperStatsReadsLinkedTranscript(t *testing.T) {
 	for _, want := range []string{
 		"STATS: Codex tokens",
 		"Codex thread: thread-1",
+		"🧮 TOTAL (MAIN + SUBAGENTS) · overall:",
+		"total: 530",
 		"🧠 MAIN AGENT · metadata:",
 		"🧠 MAIN AGENT · snapshots:",
 		"Last recorded model usage",
@@ -1046,6 +1048,8 @@ func TestBridgeWorkHelperStatsReadsLinkedTranscript(t *testing.T) {
 		"<p><strong>🔧 Helper:</strong></p>",
 		"<p><strong>STATS: Codex tokens</strong></p>",
 		"<strong>Session:</strong> s001<br><strong>Codex thread:</strong> thread-1",
+		"<p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>",
+		"<table><tr><th>Metric</th><th>Overall</th></tr>",
 		"<p><strong>🧠 MAIN AGENT · metadata:</strong></p>",
 		"<p><strong>🧠 MAIN AGENT · snapshots:</strong></p>",
 		"<table><tr><th>Metric</th><th>Last recorded model usage</th><th>Conversation total</th></tr>",
@@ -1154,6 +1158,8 @@ func TestBridgeWorkHelperStatsCombinesUserVisibleSubagentsByModelAndEffort(t *te
 	got := PlainTextFromTeamsHTML((*sent)[0].Content)
 	for _, want := range []string{
 		"🧠 MAIN AGENT · overall:",
+		"🧮 TOTAL (MAIN + SUBAGENTS) · overall:",
+		"total\t69",
 		"🧩 SUBAGENTS (2) · overall:",
 		"🧩 SUBAGENTS (2) · model/effort detail:",
 		"model-a",
@@ -1165,6 +1171,11 @@ func TestBridgeWorkHelperStatsCombinesUserVisibleSubagentsByModelAndEffort(t *te
 			t.Fatalf("combined helper stats missing %q:\n%s", want, got)
 		}
 	}
+	totalIndex := strings.Index(got, "🧮 TOTAL (MAIN + SUBAGENTS) · overall:")
+	mainIndex := strings.Index(got, "🧠 MAIN AGENT · metadata:")
+	if totalIndex < 0 || mainIndex < 0 || totalIndex > mainIndex {
+		t.Fatalf("combined total section was not placed before main agent section:\n%s", got)
+	}
 	if strings.Contains(got, "child-max") || strings.Contains(got, "child-high") {
 		t.Fatalf("helper stats exposed individual subagent details instead of combined usage:\n%s", got)
 	}
@@ -1173,6 +1184,9 @@ func TestBridgeWorkHelperStatsCombinesUserVisibleSubagentsByModelAndEffort(t *te
 	}
 	html := (*sent)[0].Content
 	for _, want := range []string{
+		"<p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>",
+		"<p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · model/effort detail:</strong></p>",
+		"<tr><td><strong>total</strong></td><td>69</td></tr>",
 		"<p><strong>🧠 MAIN AGENT · overall:</strong></p>",
 		"<p><strong>🧩 SUBAGENTS (2) · overall:</strong></p>",
 		"<p><strong>🧩 SUBAGENTS (2) · model/effort detail:</strong></p>",
@@ -1181,6 +1195,72 @@ func TestBridgeWorkHelperStatsCombinesUserVisibleSubagentsByModelAndEffort(t *te
 		if !strings.Contains(html, want) {
 			t.Fatalf("combined helper stats HTML missing %q:\n%s", want, html)
 		}
+	}
+	totalHTMLIndex := strings.Index(html, "<p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>")
+	mainHTMLIndex := strings.Index(html, "<p><strong>🧠 MAIN AGENT · metadata:</strong></p>")
+	if totalHTMLIndex < 0 || mainHTMLIndex < 0 || totalHTMLIndex > mainHTMLIndex {
+		t.Fatalf("combined total HTML section was not placed before main agent section:\n%s", html)
+	}
+}
+
+func TestBridgeWorkHelperStatsHidesCombinedTotalWhenSubagentAttributionFails(t *testing.T) {
+	tempDir := t.TempDir()
+	parentPath := filepath.Join(tempDir, "parent.jsonl")
+	childPath := filepath.Join(tempDir, "child.jsonl")
+	writeCumulativeTokenTranscript(t, parentPath, 10, 20)
+	writeCumulativeTokenTranscript(t, childPath, 99, 120)
+
+	previousDiscover := discoverCodexProjectsForTeams
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		return []codexhistory.Project{{Path: tempDir, Sessions: []codexhistory.Session{{
+			SessionID: "root",
+			FilePath:  parentPath,
+			Subagents: []codexhistory.SubagentSession{{
+				AgentID:         "thread_spawn",
+				ParentSessionID: "root",
+				SessionID:       "child",
+				Summary:         "child",
+				FilePath:        childPath,
+			}},
+		}}}}, nil
+	}
+	t.Cleanup(func() { discoverCodexProjectsForTeams = previousDiscover })
+
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{result: ExecutionResult{Text: "should not run"}})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "root"
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession error: %v", err)
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.ImportCheckpoints[transcriptCheckpointID(session.ID)] = teamstore.ImportCheckpoint{
+			ID:         transcriptCheckpointID(session.ID),
+			SessionID:  session.ID,
+			SourcePath: parentPath,
+			Status:     importCheckpointStatusComplete,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessageWithText("helper-stats", "helper stats"), "helper stats"); err != nil {
+		t.Fatalf("handleSessionMessage error: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent = %d, want 1", len(*sent))
+	}
+	got := PlainTextFromTeamsHTML((*sent)[0].Content)
+	totalStart := strings.Index(got, "🧮 TOTAL (MAIN + SUBAGENTS) · overall:")
+	mainStart := strings.Index(got, "🧠 MAIN AGENT · metadata:")
+	if totalStart < 0 || mainStart <= totalStart {
+		t.Fatalf("combined total/main sections missing or out of order:\n%s", got)
+	}
+	totalSection := got[totalStart:mainStart]
+	if !strings.Contains(totalSection, "Token usage unavailable") || strings.Contains(totalSection, "total\t20") {
+		t.Fatalf("incomplete combined total exposed a number:\n%s", totalSection)
 	}
 }
 

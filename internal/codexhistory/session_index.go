@@ -36,9 +36,11 @@ type codexEnvelope struct {
 }
 
 type codexSessionMetaPayload struct {
-	ID     string          `json:"id"`
-	Cwd    string          `json:"cwd"`
-	Source json.RawMessage `json:"source"`
+	ID             string          `json:"id"`
+	Cwd            string          `json:"cwd"`
+	Source         json.RawMessage `json:"source"`
+	ParentThreadID string          `json:"parent_thread_id"`
+	ForkedFromID   string          `json:"forked_from_id"`
 }
 
 // codexResponsePayload is a unified struct for response_item payloads.
@@ -247,9 +249,19 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 				meta.ProjectPath = payload.Cwd
 			}
 			isSub, subType, parentID := parseSessionSource(payload.Source)
+			if parentID == "" {
+				parentID = strings.TrimSpace(payload.ParentThreadID)
+			}
+			if parentID == "" {
+				parentID = strings.TrimSpace(payload.ForkedFromID)
+			}
 			if isSub {
 				meta.IsSubagent = true
 				meta.SubagentType = subType
+				meta.ParentThreadID = parentID
+			} else if parentID != "" {
+				meta.IsSubagent = true
+				meta.SubagentType = "thread_spawn"
 				meta.ParentThreadID = parentID
 			}
 		}

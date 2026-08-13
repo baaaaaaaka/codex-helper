@@ -2328,7 +2328,7 @@ jobs:
       matrix:
         include:
           - label: CentOS7
-            image: centos:7
+            image: centos:7.9.2009
             package_args: ca-certificates curl xz tar procps-ng util-linux python36 binutils
             path_activation_package_args: zsh tcsh
             path_activation_cases: sh bash zsh csh tcsh
@@ -2593,10 +2593,12 @@ jobs:
           set -euo pipefail
           img="$DISTRO_IMAGE"
           echo "==> $img"
-          if [ "$img" = "centos:7" ]; then
-            docker run --rm -v "$PWD/dist:/dist:ro" "$img" bash -c '
-              sed -i "s/^mirrorlist=/#mirrorlist=/g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
-              sed -i "s|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g" /etc/yum.repos.d/CentOS-Base.repo 2>/dev/null || true
+          if [ "$img" = "centos:7.9.2009" ]; then
+            docker run --rm \
+              -v "$PWD/dist:/dist:ro" \
+              -v "$PWD/scripts/ci:/ci:ro" \
+              "$img" bash -c '
+              bash /ci/configure_container_repos.sh centos-vault
               /dist/codex-proxy proxy doctor'
           else
             docker run --rm -v "$PWD/dist:/dist:ro" "$img" /dist/codex-proxy proxy doctor

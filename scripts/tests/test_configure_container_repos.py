@@ -39,6 +39,8 @@ class ConfigureContainerReposTests(unittest.TestCase):
                     [
                         "mirrorlist=http://mirrorlist.centos.org/?release=7&arch=$basearch",
                         "#baseurl=http://mirror.centos.org/centos/$releasever/os/$basearch/",
+                        "#baseurl=https://vault.centos.org/centos/$releasever/updates/$basearch/",
+                        "#baseurl=https://vault.centos.org/7.9.2009/extras/$basearch/",
                     ]
                 )
                 + "\n",
@@ -50,7 +52,9 @@ class ConfigureContainerReposTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             text = repo.read_text(encoding="utf-8")
             self.assertIn("#mirrorlist=http://mirrorlist.centos.org/", text)
-            self.assertIn("baseurl=http://vault.centos.org/centos/$releasever/os/$basearch/", text)
+            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/os/$basearch/", text)
+            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/updates/$basearch/", text)
+            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/extras/$basearch/", text)
 
     def test_rocky_official_rewrites_repo_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
