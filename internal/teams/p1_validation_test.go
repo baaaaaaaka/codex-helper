@@ -16,7 +16,7 @@ func TestP1TranscriptToolStatusArtifactAndHalfWrittenTail(t *testing.T) {
 	input := strings.Join([]string{
 		`{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"session-p1"}}`,
 		`{"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"id":"tool-1","type":"function_call","name":"shell","arguments":"{\"cmd\":\"go test ./internal/teams\"}"}}`,
-		`{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"id":"status-1","type":"reasoning","summary":[{"text":"visible summary"}]}}`,
+		`{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"id":"status-1","type":"reasoning","summary":[{"text":"private summary"}]}}`,
 		`{"timestamp":"2026-01-01T00:03:00Z","type":"response_item","payload":{"id":"artifact-1","type":"artifact","path":"reports/final.txt","text":"reports/final.txt"}}`,
 		`{"timestamp":"2026-01-01T00:04:00Z","type":"response_item","payload":{"id":"tail","type":"artifact","text":"half"}`,
 	}, "\n")
@@ -26,18 +26,31 @@ func TestP1TranscriptToolStatusArtifactAndHalfWrittenTail(t *testing.T) {
 		t.Fatalf("ParseCodexTranscript error: %v", err)
 	}
 	if len(got.Records) != 3 {
-		t.Fatalf("records = %#v, want complete tool/status/artifact records only", got.Records)
+		t.Fatalf("records = %#v, want complete tool/internal/artifact records only", got.Records)
 	}
 	want := []struct {
-		kind TranscriptKind
-		text string
+		kind     TranscriptKind
+		text     string
+		internal bool
 	}{
 		{kind: TranscriptKindTool, text: "go test ./internal/teams"},
-		{kind: TranscriptKindStatus, text: "visible summary"},
+		{kind: TranscriptKindUnknown, internal: true},
 		{kind: TranscriptKindArtifact, text: "reports/final.txt"},
 	}
 	for i, item := range want {
 		record := got.Records[i]
+		if record.Internal != item.internal {
+			t.Fatalf("record[%d] Internal = %v, want %v: %#v", i, record.Internal, item.internal, record)
+		}
+		if item.internal {
+			if record.Kind != item.kind || strings.TrimSpace(record.Text) != "" {
+				t.Fatalf("internal record[%d] = %#v, want empty unknown record", i, record)
+			}
+			if formatTranscriptRecordForTeams(record) != "" {
+				t.Fatalf("internal record[%d] rendered visible text", i)
+			}
+			continue
+		}
 		if record.Kind != item.kind || !strings.Contains(record.Text, item.text) {
 			t.Fatalf("record[%d] = %#v, want kind %q containing %q", i, record, item.kind, item.text)
 		}

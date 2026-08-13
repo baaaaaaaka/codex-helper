@@ -14,7 +14,7 @@ type transcriptPlanOptions struct {
 // perform any persistence or delivery side effect.
 func planTranscriptImportRecord(record TranscriptRecord, sourceLine int, sourceOffset int64, kindPrefix string, fallback int, dedupe *transcriptDedupeState, opts transcriptPlanOptions) (transcriptImportBatchRecord, string, bool, bool) {
 	checkpointKey := transcriptRecordCheckpointKey(record)
-	if record.Internal || strings.TrimSpace(record.Text) == "" {
+	if record.Internal || record.Kind == TranscriptKindUnknown || strings.TrimSpace(record.Text) == "" {
 		return transcriptImportBatchRecord{}, checkpointKey, false, false
 	}
 	if shouldSkipImportedTranscriptRecord(record) {

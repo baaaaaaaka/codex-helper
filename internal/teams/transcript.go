@@ -521,6 +521,32 @@ type pendingTranscriptRecord struct {
 	internal     bool
 }
 
+func newInternalTranscriptRecord(sourceItemID string, threadID string, turnID string, kind TranscriptKind, createdAt time.Time, lineNo int, sourceType string, phase string) pendingTranscriptRecord {
+	if kind == "" {
+		kind = TranscriptKindUnknown
+	}
+	return pendingTranscriptRecord{
+		sourceItemID: sourceItemID,
+		threadID:     threadID,
+		turnID:       turnID,
+		kind:         kind,
+		createdAt:    createdAt,
+		sourceLine:   lineNo,
+		sourceType:   sourceType,
+		phase:        phase,
+		internal:     true,
+	}
+}
+
+func isInternalTranscriptType(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return normalized == "reasoning" ||
+		strings.HasPrefix(normalized, "reasoning_") ||
+		strings.HasPrefix(normalized, "agent_reasoning") ||
+		strings.HasPrefix(normalized, "token_count") ||
+		strings.HasPrefix(normalized, "patch_apply")
+}
+
 func parseTranscriptLine(line []byte, lineNo int, state *transcriptParseState) ([]TranscriptRecord, []TranscriptDiagnostic) {
 	if len(line) == 0 || line[0] != '{' {
 		return nil, nil
@@ -587,6 +613,31 @@ func parseTranscriptLine(line []byte, lineNo int, state *transcriptParseState) (
 			state.threadID = id
 		}
 		return nil, nil
+	case "turn_context":
+		// token_stats.go consumes this independently, but the JSONL line still
+		// needs a durable transcript position so linked sync does not rescan it
+		// on every poll. The finalizer supplies a stable line-based ID when the
+		// event has no explicit source ID.
+		payload, _ := jsonObjectField(obj, "payload")
+		turnID = firstNonEmptyString(
+			jsonStringField(obj, "turn_id", "turnId"),
+			jsonStringField(payload, "turn_id", "turnId"),
+			nestedJSONID(payload, "turn"),
+			turnID,
+		)
+		if turnID != "" {
+			state.turnID = turnID
+		}
+		return []TranscriptRecord{newInternalTranscriptRecord(
+			firstNonEmptyString(jsonStringField(obj, "id", "context_id", "contextId"), nestedJSONID(obj, "payload")),
+			threadID,
+			turnID,
+			TranscriptKindUnknown,
+			createdAt,
+			lineNo,
+			lineType,
+			jsonStringField(obj, "phase"),
+		).toRecord()}, nil
 	case "turn.started":
 		if id := firstNonEmptyString(jsonStringField(obj, "turn_id", "turnId"), nestedJSONID(obj, "turn")); id != "" {
 			state.turnID = id
@@ -666,7 +717,7 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 		turnID,
 	)
 	phase := jsonStringField(payload, "phase")
-	if responseItemIsInternalAgentMessage(payload) {
+	if transcriptEnvelopeIsInternalAgentMessage(payload) {
 		// Keep only the source identity and position.  The collaboration
 		// envelope can contain encrypted content or a plaintext FINAL_ANSWER;
 		// neither belongs in the in-memory visible transcript or history-watch
@@ -683,9 +734,24 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 			internal:     true,
 		}, true
 	}
+	if isInternalTranscriptType(itemType) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, itemType, phase), true
+	}
+	if strings.TrimSpace(itemType) != "" && kindFromType(itemType) == TranscriptKindUnknown {
+		// Do not decode content from an explicitly unknown response item. It is
+		// not a public transcript surface, and fail-closed classification also
+		// avoids allocating its potentially large payload.
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, itemType, phase), true
+	}
 	kind, text, ok := responseItemKindText(payload)
 	if !ok {
 		return pendingTranscriptRecord{}, false
+	}
+	if kind == TranscriptKindUnknown {
+		kind = transcriptKindFromTypeOrRole(itemType, jsonStringField(payload, "role"))
+		if kind == TranscriptKindUnknown {
+			return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, itemType, phase), true
+		}
 	}
 	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
@@ -703,8 +769,9 @@ func responseItemTranscriptRecord(payload map[string]json.RawMessage, lineNo int
 	}, true
 }
 
-func responseItemIsInternalAgentMessage(payload map[string]json.RawMessage) bool {
-	if !strings.EqualFold(strings.TrimSpace(jsonStringField(payload, "type")), "agent_message") {
+func transcriptEnvelopeIsInternalAgentMessage(payload map[string]json.RawMessage) bool {
+	itemType := strings.ToLower(strings.TrimSpace(jsonStringField(payload, "type")))
+	if itemType != "agent_message" && itemType != "agentmessage" {
 		return false
 	}
 	if _, ok := payload["internal_chat_message_metadata_passthrough"]; ok {
@@ -720,10 +787,16 @@ func eventMsgTranscriptRecord(payload map[string]json.RawMessage, lineNo int, cr
 	threadID = firstNonEmptyString(jsonStringField(payload, "thread_id", "threadId"), threadID)
 	turnID = firstNonEmptyString(jsonStringField(payload, "turn_id", "turnId"), turnID)
 	phase := jsonStringField(payload, "phase")
+	if transcriptEnvelopeIsInternalAgentMessage(payload) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindAssistant, createdAt, lineNo, eventType, phase), true
+	}
+	if isInternalTranscriptType(eventType) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, eventType, phase), true
+	}
 
-	kind := kindFromType(eventType)
-	if kind == TranscriptKindUnknown && eventType == "user_message" {
-		kind = TranscriptKindUser
+	kind := transcriptKindFromTypeOrRole(eventType, jsonStringField(payload, "role"))
+	if kind == TranscriptKindUnknown {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, eventType, phase), true
 	}
 	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
@@ -765,13 +838,19 @@ func completedItemTranscriptRecord(obj map[string]json.RawMessage, lineNo int, c
 	sourceID := jsonStringField(item, "id", "item_id", "itemId", "call_id", "callId")
 	itemType := jsonStringField(item, "type")
 	phase := firstNonEmptyString(jsonStringField(item, "phase"), jsonStringField(obj, "phase"))
+	if transcriptEnvelopeIsInternalAgentMessage(item) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindAssistant, createdAt, lineNo, itemType, phase), true
+	}
+	if isInternalTranscriptType(itemType) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, itemType, phase), true
+	}
 	role := strings.ToLower(strings.TrimSpace(jsonStringField(item, "role")))
 	if role == "system" || role == "developer" {
 		return pendingTranscriptRecord{}, false
 	}
-	kind := kindFromRole(role)
+	kind := transcriptKindFromTypeOrRole(itemType, role)
 	if kind == TranscriptKindUnknown {
-		kind = kindFromType(itemType)
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, itemType, phase), true
 	}
 	if kind == TranscriptKindAssistant && strings.EqualFold(phase, "commentary") {
 		kind = TranscriptKindStatus
@@ -874,9 +953,15 @@ func turnCompletedMethodTranscriptRecords(params map[string]json.RawMessage, lin
 func genericTranscriptRecord(obj map[string]json.RawMessage, lineNo int, createdAt time.Time, threadID string, turnID string) (pendingTranscriptRecord, bool) {
 	sourceID := jsonStringField(obj, "id", "item_id", "itemId", "record_id", "recordId", "message_id", "messageId")
 	sourceType := jsonStringField(obj, "type", "kind")
-	kind := kindFromRole(jsonStringField(obj, "role"))
+	if transcriptEnvelopeIsInternalAgentMessage(obj) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindAssistant, createdAt, lineNo, sourceType, jsonStringField(obj, "phase")), true
+	}
+	if isInternalTranscriptType(sourceType) {
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, sourceType, jsonStringField(obj, "phase")), true
+	}
+	kind := transcriptKindFromTypeOrRole(sourceType, jsonStringField(obj, "role"))
 	if kind == TranscriptKindUnknown {
-		kind = kindFromType(sourceType)
+		return newInternalTranscriptRecord(sourceID, threadID, turnID, TranscriptKindUnknown, createdAt, lineNo, sourceType, jsonStringField(obj, "phase")), true
 	}
 	text := firstNonEmptyString(
 		jsonStringField(obj, "text", "message", "output", "delta"),
@@ -903,8 +988,24 @@ func genericTranscriptRecord(obj map[string]json.RawMessage, lineNo int, created
 	}, true
 }
 
+func transcriptKindFromTypeOrRole(typeValue string, role string) TranscriptKind {
+	typeValue = strings.TrimSpace(typeValue)
+	if typeValue == "" {
+		return kindFromRole(role)
+	}
+	// Legacy message envelopes use role to distinguish user and assistant,
+	// while an explicit future/unknown type must fail closed rather than
+	// inheriting a visible assistant role.
+	if strings.EqualFold(typeValue, "message") {
+		if roleKind := kindFromRole(role); roleKind != TranscriptKindUnknown {
+			return roleKind
+		}
+	}
+	return kindFromType(typeValue)
+}
+
 func responseItemKindText(payload map[string]json.RawMessage) (TranscriptKind, string, bool) {
-	itemType := jsonStringField(payload, "type")
+	itemType := strings.ToLower(strings.TrimSpace(jsonStringField(payload, "type")))
 	switch itemType {
 	case "message":
 		role := strings.ToLower(jsonStringField(payload, "role"))

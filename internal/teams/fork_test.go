@@ -359,6 +359,9 @@ func TestForkHistoryPlanV1RetainsLegacyManifestShape(t *testing.T) {
 		`{"type":"thread.started","thread_id":"v1-parent-thread"}`,
 		`{"type":"turn.started","turn_id":"v1-cutoff-turn"}`,
 		`{"type":"event_msg","payload":{"type":"agent_message","id":"v1-status","message":"v1 status","phase":"commentary"}}`,
+		`{"type":"item.completed","item":{"id":"v1-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","text":"private v1 agent"}}`,
+		`{"type":"response_item","payload":{"id":"v1-unknown","type":"future_event","role":"assistant","text":"private v1 unknown"}}`,
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}`,
 		`{"type":"response_item","payload":{"id":"v1-final","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"v1-cutoff-turn"},"content":[{"type":"output_text","text":"v1 final"}]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
@@ -382,6 +385,9 @@ func TestForkHistoryPlanV1RetainsLegacyManifestShape(t *testing.T) {
 		t.Fatalf("v1 snapshot metadata/items = %#v/%d", v1.Metadata, len(v1.Items))
 	}
 	for _, item := range v1.Items {
+		if strings.Contains(item.RenderedBody, "private v1") || strings.Contains(item.RenderedBody, "gpt-test") {
+			t.Fatalf("v1 snapshot leaked internal transcript event: %#v", item)
+		}
 		if item.SourceEndRecordID != "" {
 			t.Fatalf("legacy v1 item unexpectedly has source end id: %#v", item)
 		}
@@ -395,9 +401,11 @@ func TestForkHistoryPlanV1RetainsLegacyManifestShape(t *testing.T) {
 	}
 	foundRange := false
 	for _, item := range v2.Items {
+		if strings.Contains(item.RenderedBody, "private v1") || strings.Contains(item.RenderedBody, "gpt-test") {
+			t.Fatalf("v2 snapshot leaked internal transcript event: %#v", item)
+		}
 		if item.SourceEndRecordID != "" {
 			foundRange = true
-			break
 		}
 	}
 	if !foundRange {

@@ -12372,6 +12372,61 @@ func TestBridgeImportTranscriptDedupesNonAdjacentAssistantStatusEcho(t *testing.
 	}
 }
 
+func TestBridgeImportTranscriptSkipsInternalEventsAndAdvancesCheckpoint(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-import-internal"}}`,
+		`{"id":"u1","role":"user","text":"visible prompt"}`,
+		`{"type":"item.completed","item":{"id":"internal-item","type":"agent_message","author":"/root/child","recipient":"/root","text":"private completed agent"}}`,
+		`{"id":"internal-generic","type":"agent_message","author":"/root/child","recipient":"/root","message":"private generic agent"}`,
+		`{"type":"response_item","payload":{"id":"unknown-assistant","type":"future_event","role":"assistant","text":"private future event"}}`,
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}`,
+		`{"id":"a1","role":"assistant","text":"visible answer"}`,
+		``,
+	}, "\n")
+	if err := os.WriteFile(transcriptPath, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.Sessions[0]
+	session.CodexThreadID = "thread-import-internal"
+	bridge.reg.Sessions[0] = session
+	if err := bridge.ensureDurableSession(context.Background(), &session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+
+	result, err := bridge.importTranscriptRecordsToTeams(context.Background(), session, transcriptPath, "import:"+session.ID, "import", transcriptCheckpointID(session.ID), transcriptImportRunOptions{})
+	if err != nil {
+		t.Fatalf("import transcript records: %v", err)
+	}
+	if !result.Complete || result.LastRecordID != "a1" || result.Stats.Total != 6 || result.Stats.Imported != 2 {
+		t.Fatalf("import result = %#v, want complete with only prompt and answer imported", result)
+	}
+	joined := sentPlainJoined(*sent)
+	if !strings.Contains(joined, "visible prompt") || !strings.Contains(joined, "visible answer") {
+		t.Fatalf("visible import output = %q, want prompt and answer", joined)
+	}
+	for _, secret := range []string{"private completed agent", "private generic agent", "private future event", "gpt-test"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("internal import text leaked into Teams output: %q", joined)
+		}
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after import: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastRecordID != "a1" || checkpoint.LastOffset != int64(len(transcript)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("import checkpoint = %#v, want a1 at EOF", checkpoint)
+	}
+	if len(state.TranscriptDeliveries) != 1 {
+		t.Fatalf("transcript deliveries = %#v, want one delivery containing only visible prompt and answer", state.TranscriptDeliveries)
+	}
+	assertFileDoesNotContain(t, store.Path(), "private completed agent")
+}
+
 func TestBridgeImportTranscriptBatchesVisibleHistoryRecords(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	var lines []string
@@ -25589,6 +25644,124 @@ func TestBridgeSyncLinkedTranscriptSkipsInternalAgentMessagesAndAdvancesCheckpoi
 	}
 }
 
+func TestBridgeSyncLinkedTranscriptSkipsChatGPTAppInternalEventsAndAdvancesCheckpoint(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-chatgpt-app"}}` + "\n" +
+		`{"id":"old","thread_id":"thread-chatgpt-app","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-chatgpt-app", transcriptPath)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-chatgpt-app")
+	checkpointID := transcriptCheckpointID(session.ID)
+
+	internalTail := strings.Join([]string{
+		`{"type":"event_msg","payload":{"type":"agent_reasoning","id":"event-reasoning","message":"Planning macOS IP logging script"}}`,
+		`{"type":"response_item","payload":{"id":"response-reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"Designing macOS launchd IP logging script"}]}}`,
+		`{"type":"response_item","payload":{"id":"response-reasoning-raw","type":"reasoning","encrypted_content":"private reasoning","summary":[]}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","id":"event-token-empty","info":{"total_token_usage":{"input_tokens":12,"output_tokens":3}}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","id":"event-token-text","message":"private token accounting","info":{"total_token_usage":{"input_tokens":12,"output_tokens":3}}}}`,
+		`{"type":"agent_reasoning","id":"generic-reasoning","text":"Planning the next internal step"}`,
+		`{"type":"patch_apply_end","id":"generic-patch","message":"Applied private patch details"}`,
+		`{"type":"item.completed","item":{"id":"completed-patch","type":"patch_apply_end","text":"Completed private patch details"}}`,
+		`{"type":"item.completed","item":{"id":"completed-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","text":"Private completed agent message"}}`,
+		`{"id":"generic-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","message":"Private generic agent message"}`,
+		`{"type":"response_item","payload":{"id":"unknown-response-assistant","type":"future_event","role":"assistant","text":"Private unknown response"}}`,
+		`{"type":"item.completed","item":{"id":"unknown-completed-assistant","type":"future_event","role":"assistant","text":"Private unknown completed"}}`,
+		`{"type":"event_msg","payload":{"id":"unknown-event-assistant","type":"future_event","role":"assistant","message":"Private unknown event"}}`,
+		`{"id":"unknown-generic-assistant","type":"future_event","role":"assistant","message":"Private unknown generic"}`,
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}`,
+		``,
+	}, "\n")
+	internalBody := initial + internalTail
+	if err := os.WriteFile(transcriptPath, []byte(internalBody), 0o600); err != nil {
+		t.Fatalf("append ChatGPT app internal transcript records: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync internal-only ChatGPT app tail: %v", err)
+	}
+	if len(*sent) != 0 {
+		t.Fatalf("ChatGPT app internal transcript records sent to Teams: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after ChatGPT app internal tail: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID == "" || !strings.Contains(checkpoint.LastRecordID, ":line:") || checkpoint.LastOffset != int64(len(internalBody)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after ChatGPT app internal tail = %#v, want line-based turn_context checkpoint at EOF", checkpoint)
+	}
+	if len(state.TranscriptDeliveries) != 0 {
+		t.Fatalf("ChatGPT app internal records created transcript deliveries: %#v", state.TranscriptDeliveries)
+	}
+	for _, secret := range []string{
+		"Planning macOS IP logging script",
+		"Designing macOS launchd IP logging script",
+		"private token accounting",
+		"Planning the next internal step",
+		"Applied private patch details",
+		"Completed private patch details",
+		"Private completed agent message",
+		"Private generic agent message",
+		"Private unknown response",
+		"Private unknown completed",
+		"Private unknown event",
+		"Private unknown generic",
+	} {
+		assertFileDoesNotContain(t, store.Path(), secret)
+	}
+
+	visibleTail := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"visible-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"real final answer"}]}}`,
+		`{"type":"response_item","payload":{"id":"post-final-reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"post-final private reasoning"}]}}`,
+		``,
+	}, "\n")
+	wantBody := internalBody + visibleTail
+	if err := os.WriteFile(transcriptPath, []byte(wantBody), 0o600); err != nil {
+		t.Fatalf("append visible final after ChatGPT app internal records: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync visible final after ChatGPT app internal tail: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if len(*sent) != 1 || !strings.Contains(joined, "real final answer") {
+		t.Fatalf("visible final sync = %#v, want one visible final", *sent)
+	}
+	for _, secret := range []string{
+		"Planning macOS IP logging script",
+		"Designing macOS launchd IP logging script",
+		"private token accounting",
+		"Planning the next internal step",
+		"Applied private patch details",
+		"Completed private patch details",
+		"post-final private reasoning",
+	} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("ChatGPT app internal transcript text leaked into Teams output: %s", joined)
+		}
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load final ChatGPT app sync state: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastRecordID != "post-final-reasoning" || checkpoint.LastOffset != int64(len(wantBody)) {
+		t.Fatalf("checkpoint after visible final = %#v, want post-final hidden tail at EOF", checkpoint)
+	}
+
+	sentBeforeRepeat := len(*sent)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("repeat sync after ChatGPT app internal tail: %v", err)
+	}
+	if len(*sent) != sentBeforeRepeat {
+		t.Fatalf("repeat sync replayed ChatGPT app transcript output: %#v", *sent)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptRefreshesAutoWorkTitleFromCodexHistory(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"fix alpha bug"}`+"\n"), 0o600); err != nil {
@@ -26202,6 +26375,7 @@ func TestBridgeRunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheck
 	}
 	beforeCheckpoint := beforeState.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	activeTranscript := initial +
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}` + "\n" +
 		`{"type":"event_msg","thread_id":"thread-1","payload":{"type":"agent_message","id":"progress-1","message":"watchdog progress","phase":"commentary","thread_id":"thread-1","turn_id":"codex-turn-1"}}` + "\n" +
 		`{"type":"event_msg","thread_id":"thread-1","payload":{"type":"agent_message","id":"final-1","message":"final must wait for completion","phase":"final_answer","thread_id":"thread-1","turn_id":"codex-turn-1"}}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(activeTranscript), 0o600); err != nil {
@@ -30857,6 +31031,10 @@ func TestBridgeHistoryWatchSkipsInternalAgentMessagesAndAdvancesCheckpoint(t *te
 		`{"type":"session_meta","payload":{"id":"thread-internal-watch"}}`,
 		`{"type":"response_item","payload":{"id":"child-message","type":"agent_message","author":"/root/child","recipient":"/root","content":[{"type":"input_text","text":"Message Type: MESSAGE\nPayload: encrypted"}],"encrypted_content":"sealed","internal_chat_message_metadata_passthrough":{"turn_id":"child-turn"}}}`,
 		`{"type":"response_item","payload":{"id":"child-final","type":"agent_message","content":[{"type":"input_text","text":"Message Type: FINAL_ANSWER\nPayload: private answer"}],"internal_chat_message_metadata_passthrough":{}}}`,
+		`{"type":"item.completed","item":{"id":"completed-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","text":"private completed agent"}}`,
+		`{"id":"generic-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","message":"private generic agent"}`,
+		`{"type":"response_item","payload":{"id":"unknown-assistant","type":"future_event","role":"assistant","text":"private unknown assistant"}}`,
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}`,
 		`{"type":"turn.completed","thread_id":"thread-internal-watch","turn_id":"turn-child"}`,
 		``,
 	}, "\n")
@@ -30897,7 +31075,9 @@ func TestBridgeHistoryWatchSkipsInternalAgentMessagesAndAdvancesCheckpoint(t *te
 			t.Fatalf("internal agent message became pending assistant text: %#v", checkpoint)
 		}
 	}
-	assertFileDoesNotContain(t, store.Path(), "private answer")
+	for _, secret := range []string{"private answer", "private completed agent", "private generic agent", "private unknown assistant", "gpt-test"} {
+		assertFileDoesNotContain(t, store.Path(), secret)
+	}
 
 	if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(time.Minute), true); err != nil {
 		t.Fatalf("repeat history watch sync error: %v", err)

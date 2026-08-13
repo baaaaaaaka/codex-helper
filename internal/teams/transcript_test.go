@@ -104,6 +104,250 @@ func TestParseCodexTranscriptHidesInternalResponseItemAgentMessages(t *testing.T
 	assertTranscriptRecord(t, got.Records[4], "visible-final", "source:visible-final", TranscriptKindAssistant, "real final answer", 5)
 }
 
+func TestParseCodexTranscriptHidesChatGPTAppInternalEvents(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"user-1","type":"message","role":"user","content":[{"type":"input_text","text":"collect the local IP"}]}}`,
+		`{"type":"event_msg","payload":{"type":"agent_reasoning","id":"event-reasoning","message":"Planning macOS IP logging script"}}`,
+		`{"type":"response_item","payload":{"id":"response-reasoning","type":"reasoning","summary":[{"type":"summary_text","text":"Designing macOS launchd IP logging script"}]}}`,
+		`{"type":"response_item","payload":{"id":"response-reasoning-raw","type":"reasoning","encrypted_content":"private reasoning","summary":[]}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","id":"event-token-empty","info":{"total_token_usage":{"input_tokens":12,"output_tokens":3}}}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","id":"event-token-text","message":"private token accounting","info":{"total_token_usage":{"input_tokens":12,"output_tokens":3}}}}`,
+		`{"type":"agent_reasoning","id":"generic-reasoning","text":"Planning the next internal step"}`,
+		`{"type":"patch_apply_end","id":"generic-patch","message":"Applied private patch details"}`,
+		`{"type":"future_internal_event","id":"generic-unknown","message":"Private future event details"}`,
+		`{"type":"item.completed","item":{"id":"completed-patch","type":"patch_apply_end","text":"Completed private patch details"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"visible-status","phase":"commentary","message":"working"}}`,
+		`{"type":"response_item","payload":{"id":"visible-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"IP logging is configured."}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "chatgpt-app-session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+
+	type expectedRecord struct {
+		internal   bool
+		kind       TranscriptKind
+		text       string
+		sourceType string
+	}
+	want := map[string]expectedRecord{
+		"user-1": {
+			kind:       TranscriptKindUser,
+			text:       "collect the local IP",
+			sourceType: "message",
+		},
+		"event-reasoning": {
+			internal:   true,
+			sourceType: "agent_reasoning",
+		},
+		"response-reasoning": {
+			internal:   true,
+			sourceType: "reasoning",
+		},
+		"response-reasoning-raw": {
+			internal:   true,
+			sourceType: "reasoning",
+		},
+		"event-token-empty": {
+			internal:   true,
+			sourceType: "token_count",
+		},
+		"event-token-text": {
+			internal:   true,
+			sourceType: "token_count",
+		},
+		"generic-reasoning": {
+			internal:   true,
+			sourceType: "agent_reasoning",
+		},
+		"generic-patch": {
+			internal:   true,
+			sourceType: "patch_apply_end",
+		},
+		"generic-unknown": {
+			internal:   true,
+			sourceType: "future_internal_event",
+		},
+		"completed-patch": {
+			internal:   true,
+			sourceType: "patch_apply_end",
+		},
+		"visible-status": {
+			kind:       TranscriptKindStatus,
+			text:       "working",
+			sourceType: "agent_message",
+		},
+		"visible-final": {
+			kind:       TranscriptKindAssistant,
+			text:       "IP logging is configured.",
+			sourceType: "message",
+		},
+	}
+
+	if len(got.Records) != len(want) {
+		t.Errorf("records = %d, want %d; got %#v", len(got.Records), len(want), got.Records)
+	}
+	byID := make(map[string]TranscriptRecord, len(got.Records))
+	for _, record := range got.Records {
+		byID[record.ItemID] = record
+	}
+	for id, expected := range want {
+		record, ok := byID[id]
+		if !ok {
+			t.Errorf("record %q is missing; parsed records = %#v", id, got.Records)
+			continue
+		}
+		if record.Internal != expected.internal {
+			t.Errorf("record %q Internal = %v, want %v: %#v", id, record.Internal, expected.internal, record)
+		}
+		if expected.internal && strings.TrimSpace(record.Text) != "" {
+			t.Errorf("internal record %q exposed text %q", id, record.Text)
+		}
+		if !expected.internal && (record.Kind != expected.kind || record.Text != expected.text) {
+			t.Errorf("visible record %q = %#v, want kind=%q text=%q", id, record, expected.kind, expected.text)
+		}
+		if record.SourceType != expected.sourceType {
+			t.Errorf("record %q SourceType = %q, want %q", id, record.SourceType, expected.sourceType)
+		}
+	}
+	for id, record := range byID {
+		if _, ok := want[id]; !ok {
+			t.Errorf("unexpected parsed record %q: %#v", id, record)
+		}
+	}
+}
+
+func TestParseCodexTranscriptFailsClosedAcrossInternalAgentEnvelopes(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"response-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","content":[{"type":"input_text","text":"private response item"}]}}`,
+		`{"type":"item.completed","item":{"id":"completed-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","text":"private completed item"}}`,
+		`{"type":"event_msg","payload":{"id":"event-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","message":"private event message"}}`,
+		`{"id":"generic-internal-agent","type":"agent_message","author":"/root/child","recipient":"/root","message":"private generic message"}`,
+		`{"type":"response_item","payload":{"id":"response-unknown-assistant","type":"future_event","role":"assistant","text":"private future response"}}`,
+		`{"type":"item.completed","item":{"id":"completed-unknown-assistant","type":"future_event","role":"assistant","text":"private future completed"}}`,
+		`{"type":"event_msg","payload":{"id":"event-unknown-assistant","type":"future_event","role":"assistant","message":"private future event"}}`,
+		`{"id":"generic-unknown-assistant","type":"future_event","role":"assistant","message":"private future generic"}`,
+		`{"type":"turn_context","payload":{"model":"gpt-test"}}`,
+		`{"id":"legacy-assistant","role":"assistant","text":"legacy visible assistant"}`,
+		`{"type":"item.completed","item":{"id":"visible-completed-agent","type":"agent_message","text":"visible completed message"}}`,
+		`{"type":"response_item","payload":{"id":"visible-final","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"visible final answer"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 12 {
+		t.Fatalf("records = %#v, want all source lines represented", got.Records)
+	}
+
+	internalIDs := map[string]bool{
+		"response-internal-agent":     true,
+		"completed-internal-agent":    true,
+		"event-internal-agent":        true,
+		"generic-internal-agent":      true,
+		"response-unknown-assistant":  true,
+		"completed-unknown-assistant": true,
+		"event-unknown-assistant":     true,
+		"generic-unknown-assistant":   true,
+	}
+	seenInternal := make(map[string]bool)
+	for _, record := range got.Records {
+		if internalIDs[record.ItemID] {
+			seenInternal[record.ItemID] = true
+			if !record.Internal || strings.TrimSpace(record.Text) != "" {
+				t.Errorf("internal record %q = %#v, want hidden empty record", record.ItemID, record)
+			}
+		}
+		if record.SourceType == "turn_context" {
+			if !record.Internal || strings.TrimSpace(record.Text) != "" || strings.TrimSpace(transcriptRecordCheckpointKey(record)) == "" {
+				t.Errorf("turn_context record = %#v, want hidden record with checkpoint identity", record)
+			}
+		}
+	}
+	if len(seenInternal) != len(internalIDs) {
+		t.Errorf("hidden internal records = %#v, want %#v", seenInternal, internalIDs)
+	}
+
+	for _, want := range []struct {
+		id   string
+		kind TranscriptKind
+		text string
+	}{
+		{id: "legacy-assistant", kind: TranscriptKindAssistant, text: "legacy visible assistant"},
+		{id: "visible-completed-agent", kind: TranscriptKindAssistant, text: "visible completed message"},
+		{id: "visible-final", kind: TranscriptKindAssistant, text: "visible final answer"},
+	} {
+		var found TranscriptRecord
+		for _, record := range got.Records {
+			if record.ItemID == want.id {
+				found = record
+				break
+			}
+		}
+		if found.ItemID != want.id || found.Internal || found.Kind != want.kind || found.Text != want.text {
+			t.Errorf("visible record %q = %#v, want kind=%q text=%q", want.id, found, want.kind, want.text)
+		}
+	}
+}
+
+func TestParseCodexTranscriptTurnContextCheckpointKeySurvivesTailRead(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"turn-context-session"}}`,
+		`{"type":"turn_context","payload":{"turn_id":"turn-context-1","model":"gpt-test"}}`,
+		`{"type":"response_item","payload":{"id":"final","type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+	}, "\n") + "\n"
+
+	first, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "session.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(first.Records) != 2 {
+		t.Fatalf("records = %#v, want turn_context and final", first.Records)
+	}
+	turnContext := first.Records[0]
+	if turnContext.SourceType != "turn_context" || turnContext.TurnID != "turn-context-1" || !turnContext.Internal || transcriptRecordCheckpointKey(turnContext) == "" {
+		t.Fatalf("turn_context = %#v, want checkpointable internal record", turnContext)
+	}
+	if first.Records[1].TurnID != "turn-context-1" {
+		t.Fatalf("record after turn_context has TurnID %q, want turn-context-1", first.Records[1].TurnID)
+	}
+
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	tail, err := ReadSessionTranscriptSince(path, transcriptRecordCheckpointKey(turnContext))
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSinceWithOptions error: %v", err)
+	}
+	if len(tail.Records) != 1 || tail.Records[0].ItemID != "final" {
+		t.Fatalf("tail records = %#v, want final after turn_context checkpoint", tail.Records)
+	}
+}
+
+func TestParseCodexTranscriptAcceptsCaseInsensitiveKnownResponseItemTypes(t *testing.T) {
+	input := strings.Join([]string{
+		`{"type":"response_item","payload":{"id":"user-upper","type":"MESSAGE","role":"user","content":[{"type":"input_text","text":"prompt"}]}}`,
+		`{"type":"response_item","payload":{"id":"assistant-mixed","type":"Message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}`,
+	}, "\n")
+
+	got, err := ParseCodexTranscript(strings.NewReader(input), TranscriptParseOptions{SourceName: "case-insensitive.jsonl"})
+	if err != nil {
+		t.Fatalf("ParseCodexTranscript error: %v", err)
+	}
+	if len(got.Records) != 2 {
+		t.Fatalf("records = %#v, want both known message records", got.Records)
+	}
+	if got.Records[0].Kind != TranscriptKindUser || got.Records[0].Text != "prompt" {
+		t.Fatalf("user record = %#v, want visible user prompt", got.Records[0])
+	}
+	if got.Records[1].Kind != TranscriptKindAssistant || got.Records[1].Text != "answer" {
+		t.Fatalf("assistant record = %#v, want visible assistant answer", got.Records[1])
+	}
+}
+
 func TestParseCodexTranscriptReadsResponseItemTurnFromMetadata(t *testing.T) {
 	input := strings.Join([]string{
 		`{"type":"response_item","payload":{"id":"user-1","type":"message","role":"user","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"},"content":[{"type":"input_text","text":"prompt"}]}}`,
@@ -163,10 +407,14 @@ func TestParseCodexTranscriptSkipsRawReasoningWithoutVisibleSummary(t *testing.T
 	if err != nil {
 		t.Fatalf("ParseCodexTranscript error: %v", err)
 	}
-	if len(got.Records) != 1 {
-		t.Fatalf("records = %#v, want only visible reasoning summary", got.Records)
+	if len(got.Records) != 2 {
+		t.Fatalf("records = %#v, want both reasoning records as internal checkpoints", got.Records)
 	}
-	assertTranscriptRecord(t, got.Records[0], "reasoning-summary", "source:reasoning-summary", TranscriptKindStatus, "visible summary", 2)
+	for _, record := range got.Records {
+		if !record.Internal || strings.TrimSpace(record.Text) != "" || record.Kind != TranscriptKindUnknown {
+			t.Fatalf("reasoning record leaked or lost internal classification: %#v", record)
+		}
+	}
 }
 
 func TestParseCodexTranscriptKeepsResponseItemAssistantPrefixRecords(t *testing.T) {
@@ -221,13 +469,21 @@ func TestParseCodexTranscriptRecordsContextCompactEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseCodexTranscript error: %v", err)
 	}
-	if len(got.Records) != 1 {
-		t.Fatalf("records = %#v, want one visible context compact record", got.Records)
+	if len(got.Records) != 3 {
+		t.Fatalf("records = %#v, want visible context compact records plus an internal turn_context checkpoint", got.Records)
 	}
-	wantID := "fallback:session:thread-compact:line:4:kind:compact"
-	assertTranscriptRecord(t, got.Records[0], wantID, wantID, TranscriptKindCompact, transcriptContextCompactMessage, 4)
-	if got.Records[0].SourceType != "context_compacted" {
-		t.Fatalf("SourceType = %q, want context_compacted", got.Records[0].SourceType)
+	firstID := "fallback:session:thread-compact:line:2:kind:compact"
+	assertTranscriptRecord(t, got.Records[0], firstID, firstID, TranscriptKindCompact, transcriptContextCompactMessage, 2)
+	if got.Records[0].SourceType != "compacted" {
+		t.Fatalf("first SourceType = %q, want compacted", got.Records[0].SourceType)
+	}
+	if got.Records[1].SourceType != "turn_context" || !got.Records[1].Internal || got.Records[1].Kind != TranscriptKindUnknown || strings.TrimSpace(got.Records[1].Text) != "" {
+		t.Fatalf("turn_context record = %#v, want empty internal checkpoint record", got.Records[1])
+	}
+	lastID := "fallback:session:thread-compact:line:4:kind:compact"
+	assertTranscriptRecord(t, got.Records[2], lastID, lastID, TranscriptKindCompact, transcriptContextCompactMessage, 4)
+	if got.Records[2].SourceType != "context_compacted" {
+		t.Fatalf("last SourceType = %q, want context_compacted", got.Records[2].SourceType)
 	}
 }
 

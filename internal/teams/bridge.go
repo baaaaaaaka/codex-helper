@@ -16752,6 +16752,11 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 			continue
 		}
 		if strings.TrimSpace(record.Text) == "" {
+			checkpointKey := transcriptRecordCheckpointKey(record)
+			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
+				return transcriptImportResult{}, err
+			}
+			lastRecordID, lastLine, lastOffset = checkpointKey, checkpointLine, checkpointOffset
 			continue
 		}
 		if batcher.budgetExhausted() {
@@ -17748,7 +17753,7 @@ func transcriptHasDiagnostic(transcript Transcript, kind string) bool {
 }
 
 func formatTranscriptRecordForTeams(record TranscriptRecord) string {
-	if record.Internal {
+	if record.Internal || record.Kind == TranscriptKindUnknown {
 		return ""
 	}
 	text := strings.TrimSpace(StripHelperPromptEchoes(StripArtifactManifestBlocks(record.Text)))
@@ -17765,7 +17770,7 @@ func formatTranscriptRecordForTeams(record TranscriptRecord) string {
 }
 
 func shouldSkipImportedTranscriptRecord(record TranscriptRecord) bool {
-	return record.Internal || record.Kind == TranscriptKindTool
+	return record.Internal || record.Kind == TranscriptKindTool || record.Kind == TranscriptKindUnknown
 }
 
 func transcriptRecordOutboxKind(prefix string, record TranscriptRecord, fallback int) string {
@@ -18441,9 +18446,13 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 		body := formatTranscriptRecordForTeams(record)
 		body = teamsOriginTranscriptUserDisplayBody(record, body, teamsOriginDisplays)
 		if strings.TrimSpace(body) == "" || shouldSkipBackgroundTranscriptRecord(record) {
+			rememberInternal(record, checkpointLine, checkpointOffset)
 			continue
 		}
 		if shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginHashes) || dedupe.shouldSkip(record, body) || known.shouldSkip(record, body) {
+			if err := flushInternal(); err != nil {
+				return queued, err
+			}
 			continue
 		}
 		switch record.Kind {
@@ -18452,6 +18461,10 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 			if err := b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, sessionCopy, local, record, checkpointLine, checkpointOffset, kind, body, outboxQueueOptions{}, turn.ID, checkpointID, true, true, ""); err != nil {
 				return queued, err
 			}
+			// The visible delivery advanced the cursor past any hidden records
+			// immediately before it. Do not flush that older pending position
+			// after the delivery and regress the live checkpoint.
+			pendingInternal = transcriptImportCheckpointRecord{}
 			queued++
 			if queued >= maxRecords {
 				break
@@ -18667,6 +18680,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			continue
 		}
 		if strings.TrimSpace(record.Text) == "" {
+			rememberCheckpoint(transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset)
 			continue
 		}
 		if shouldSkipBackgroundTranscriptRecord(record) {
@@ -19783,7 +19797,7 @@ func shouldSkipKnownTranscriptOutboxRecord(record TranscriptRecord, body string,
 }
 
 func shouldSkipBackgroundTranscriptRecord(record TranscriptRecord) bool {
-	return record.Kind == TranscriptKindTool
+	return record.Internal || record.Kind == TranscriptKindTool || record.Kind == TranscriptKindUnknown
 }
 
 func transcriptRecordIsLiveAgentMirrorCandidate(record TranscriptRecord) bool {

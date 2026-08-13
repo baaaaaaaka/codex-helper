@@ -62,6 +62,33 @@ func TestPlanTranscriptImportRecordPreservesParserLineForAdjacentDedupe(t *testi
 	}
 }
 
+func TestPlanTranscriptImportRecordSkipsUnknownTranscriptEvents(t *testing.T) {
+	record := TranscriptRecord{
+		ItemID:     "future-internal-event",
+		Kind:       TranscriptKindUnknown,
+		Text:       "private future event text",
+		SourceLine: 7,
+	}
+	_, checkpointKey, skippedBackground, included := planTranscriptImportRecord(
+		record,
+		record.SourceLine,
+		int64(record.SourceLine),
+		"sync",
+		1,
+		newTranscriptDedupeState(),
+		transcriptPlanOptions{},
+	)
+	if included {
+		t.Fatal("unknown transcript event was planned for Teams delivery")
+	}
+	if skippedBackground {
+		t.Fatal("unknown transcript event was classified as a visible background record")
+	}
+	if checkpointKey != record.ItemID {
+		t.Fatalf("checkpoint key = %q, want %q", checkpointKey, record.ItemID)
+	}
+}
+
 func TestPlanTranscriptHistoryBatchesIsDeterministicAndCombinesRecords(t *testing.T) {
 	records := make([]transcriptImportBatchRecord, 0, 8)
 	for i := 0; i < 8; i++ {
