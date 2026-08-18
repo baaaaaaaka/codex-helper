@@ -1,4 +1,4 @@
-//go:build linux
+//go:build darwin
 
 package store
 
@@ -7,6 +7,9 @@ import (
 	"syscall"
 )
 
+// Darwin does not expose the Linux statx fields used by the other identity
+// implementation, but (device, inode) is a stable identity for the open
+// source file and is sufficient to reject an atomic path replacement.
 func stateFileStampRevision(path string, info os.FileInfo) (stateFileRevision, error) {
 	var stat syscall.Stat_t
 	if native, ok := info.Sys().(*syscall.Stat_t); ok {
@@ -17,11 +20,9 @@ func stateFileStampRevision(path string, info os.FileInfo) (stateFileRevision, e
 	dev := uint64(stat.Dev)
 	ino := uint64(stat.Ino)
 	return stateFileRevision{
-		Valid:             true,
-		VolumeSerial:      uint32(dev),
-		FileIndexHigh:     uint32(ino >> 32),
-		FileIndexLow:      uint32(ino),
-		CreationTimeNanos: int64(dev >> 32),
-		ChangeTimeNanos:   stat.Ctim.Sec*1_000_000_000 + stat.Ctim.Nsec,
+		Valid:         true,
+		VolumeSerial:  uint32(dev),
+		FileIndexHigh: uint32(ino >> 32),
+		FileIndexLow:  uint32(ino),
 	}, nil
 }

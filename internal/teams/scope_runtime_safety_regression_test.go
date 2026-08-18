@@ -2755,6 +2755,42 @@ func TestTeamsRuntimeSafetyHistoricalScopeOutboundReplayFenceUsesVerifiedSourceI
 	}
 }
 
+func TestTeamsRuntimeSafetyApplyLegacyReplayPlanIgnoresPrunedOutboxCI(t *testing.T) {
+	targetPath := filepath.Join(t.TempDir(), "state.json")
+	store, err := teamstore.Open(targetPath)
+	if err != nil {
+		t.Fatalf("open target store: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close target store: %v", err)
+	}
+
+	// Global ledgers can outlive a sent outbox row after retention pruning.  A
+	// replay fence for that row is already satisfied by the ledger and must be
+	// an idempotent no-op, rather than aborting the entire scope migration.
+	if err := applyLegacyReplayPlan(context.Background(), targetPath, legacyReplayPlan{
+		outboxFences: []teamstore.OutboxReplayFence{{
+			OutboxID:       "pruned-outbox",
+			TeamsChatID:    "chat-pruned",
+			TeamsMessageID: "teams-pruned",
+		}},
+	}); err != nil {
+		t.Fatalf("apply replay plan with pruned outbox: %v", err)
+	}
+	check, err := teamstore.Open(targetPath)
+	if err != nil {
+		t.Fatalf("reopen target store: %v", err)
+	}
+	defer check.Close()
+	state, err := check.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load target store after pruned replay: %v", err)
+	}
+	if len(state.OutboxMessages) != 0 {
+		t.Fatalf("pruned replay unexpectedly created outbox rows: %#v", state.OutboxMessages)
+	}
+}
+
 func TestTeamsRuntimeSafetyOutboundReplayFenceRejectsUnrelatedScopeIDCI(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsScopeUserDirsForTest(t, tmp)

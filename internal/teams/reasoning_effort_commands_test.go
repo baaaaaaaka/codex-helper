@@ -16,11 +16,29 @@ type effortCatalogExecutor struct {
 	defaultEffort string
 }
 
+type legacyOnlyEffortCatalogExecutor struct {
+	catalog ReasoningEffortCatalog
+	calls   int
+}
+
+func (e *legacyOnlyEffortCatalogExecutor) Run(context.Context, *Session, string) (ExecutionResult, error) {
+	return ExecutionResult{Text: "done"}, nil
+}
+
+func (e *legacyOnlyEffortCatalogExecutor) ReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error) {
+	e.calls++
+	return e.catalog, nil
+}
+
 func (e *effortCatalogExecutor) Run(context.Context, *Session, string) (ExecutionResult, error) {
 	return ExecutionResult{Text: "done"}, nil
 }
 
 func (e *effortCatalogExecutor) ReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error) {
+	return e.catalog, nil
+}
+
+func (e *effortCatalogExecutor) CachedReasoningEffortCatalog(context.Context, *Session) (ReasoningEffortCatalog, error) {
 	return e.catalog, nil
 }
 
@@ -121,6 +139,30 @@ func TestReasoningEffortControlCommandUsesSameCommandsAndKeepsLowCompatibilityDe
 	}
 	if !strings.Contains(reset, "`medium`") {
 		t.Fatalf("control reset message = %q", reset)
+	}
+}
+
+func TestReasoningEffortStatusPreservesLegacyCatalogProvider(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	executor := &legacyOnlyEffortCatalogExecutor{catalog: testEffortCatalogExecutor().catalog}
+	bridge := newBridgeTestBridge(nil, store, executor)
+	session := bridge.reg.SessionByID("s001")
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+	status, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if executor.calls != 1 {
+		t.Fatalf("status catalog calls = %d, want one on-demand lookup", executor.calls)
+	}
+	if !strings.Contains(status, "Available:") || !strings.Contains(status, "gpt-test") {
+		t.Fatalf("status did not render the legacy catalog result: %q", status)
+	}
+	if _, err := bridge.handleReasoningEffortWorkCommand(ctx, session, "list"); err != nil || executor.calls != 2 {
+		t.Fatalf("list = err %v calls %d, want a second on-demand lookup", err, executor.calls)
 	}
 }
 

@@ -54,12 +54,28 @@ type Runner interface {
 	ListThreads(ctx context.Context, opts ListThreadsOptions) ([]Thread, error)
 }
 
+// TurnCancelFenceReconciler is an optional capability for callers that need
+// to prove an earlier same-thread cancellation has completed before allowing
+// another durable owner to run. It returns true only when a previously
+// recorded fence existed and was confirmed/cleared; a false result means that
+// this runner had no persistent fence to reconcile.
+type TurnCancelFenceReconciler interface {
+	ReconcileTurnCancelFence(context.Context, string) (bool, error)
+}
+
 // ModelCatalogReader is an optional runner capability. Keeping it separate
 // from Runner lets lightweight and test runners continue to implement only
 // turn execution while rich app-server clients can discover model-specific
 // reasoning effort choices.
 type ModelCatalogReader interface {
 	ListModels(context.Context) ([]ModelInfo, error)
+}
+
+// CachedModelCatalogReader exposes only a catalog already obtained by a
+// runner. It must never start or reconfigure an app-server; status/list paths
+// use it to avoid turning an inspection command into a new runtime owner.
+type CachedModelCatalogReader interface {
+	CachedModels() ([]ModelInfo, bool)
 }
 
 // ThreadForker is an optional app-server capability. It is deliberately kept

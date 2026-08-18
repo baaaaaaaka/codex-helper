@@ -167,6 +167,73 @@ func TestBeginForkSelectsAndValidatesLatestCompletedCutoffInStoreCAS(t *testing.
 	}
 }
 
+func TestMarkForkNativeIntentRequiresClearParentExecutionAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			store := newTestStore(t)
+			parent := testSession()
+			parent.ID = "fork-intent-parent"
+			parent.Status = SessionStatusActive
+			parent.TeamsChatID = "fork-intent-chat"
+			parent.CodexThreadID = "fork-intent-thread"
+			if _, _, err := store.CreateSession(ctx, parent); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			seedCompletedForkCutoff(t, store, parent.ID, "fork-intent-cutoff", "fork-intent-codex", time.Now().Add(-time.Minute))
+			if sqliteMode {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			op, created, err := store.BeginFork(ctx, ForkBeginRequest{
+				OperationID:       "fork-intent-operation",
+				ParentSessionID:   parent.ID,
+				ParentChatID:      parent.TeamsChatID,
+				ParentThreadID:    parent.CodexThreadID,
+				ChildSession:      SessionContext{ID: "fork-intent-child", Status: SessionStatusStaging},
+				CutoffTurnID:      "fork-intent-cutoff",
+				CutoffCodexTurnID: "fork-intent-codex",
+			})
+			if err != nil || !created {
+				t.Fatalf("BeginFork = %#v created=%v err=%v", op, created, err)
+			}
+			checkpointID := sessionTranscriptCheckpointID(parent.ID)
+			if err := store.Update(ctx, func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: parent.ID,
+					UnresolvedExecution: &ExecutionAnchor{SessionID: parent.ID, State: "unresolved", Generation: 4},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed unresolved execution: %v", err)
+			}
+			if _, err := store.MarkForkNativeIntentIfParentExecutionClear(ctx, op.ID); !errors.Is(err, ErrForkParentFenced) {
+				t.Fatalf("blocked native intent error = %v, want ErrForkParentFenced", err)
+			}
+			blocked, ok, err := store.ForkOperation(ctx, op.ID)
+			if err != nil || !ok {
+				t.Fatalf("blocked ForkOperation = %#v ok=%v err=%v", blocked, ok, err)
+			}
+			if !blocked.NativeForkIntentAt.IsZero() {
+				t.Fatalf("blocked fork recorded native intent at %s", blocked.NativeForkIntentAt)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				checkpoint := state.ImportCheckpoints[checkpointID]
+				checkpoint.UnresolvedExecution = nil
+				state.ImportCheckpoints[checkpointID] = checkpoint
+				return nil
+			}); err != nil {
+				t.Fatalf("clear unresolved execution: %v", err)
+			}
+			marked, err := store.MarkForkNativeIntentIfParentExecutionClear(ctx, op.ID)
+			if err != nil || marked.NativeForkIntentAt.IsZero() {
+				t.Fatalf("clear native intent = %#v err=%v", marked, err)
+			}
+		})
+	}
+}
+
 func TestClaimForkOperationRequiresCurrentLeaseAndSupportsTakeover(t *testing.T) {
 	for _, sqliteMode := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {

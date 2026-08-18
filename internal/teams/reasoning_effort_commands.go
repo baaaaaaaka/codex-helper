@@ -41,13 +41,22 @@ func (b *Bridge) handleReasoningEffortCommand(ctx context.Context, session *Sess
 	}
 	switch sub {
 	case "status", "current":
-		catalog, err := reasoningEffortCatalog(ctx, executor, session)
+		// Prefer a cached read-only catalog so status does not start or
+		// reconfigure a runner. Preserve the cold-start fallback when no cache is
+		// available; read-only commands must remain compatible with old adapters.
+		catalog, err := reasoningEffortCatalogReadOnly(ctx, executor, session)
+		if err != nil {
+			catalog, err = reasoningEffortCatalog(ctx, executor, session)
+		}
 		if err != nil {
 			return formatReasoningEffortStatus(session, executor, ReasoningEffortCatalog{}, err), nil
 		}
 		return formatReasoningEffortStatus(session, executor, catalog, nil), nil
 	case "list", "ls", "options", "choices":
-		catalog, err := reasoningEffortCatalog(ctx, executor, session)
+		catalog, err := reasoningEffortCatalogReadOnly(ctx, executor, session)
+		if err != nil {
+			catalog, err = reasoningEffortCatalog(ctx, executor, session)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -102,6 +111,20 @@ func reasoningEffortCatalog(ctx context.Context, executor Executor, session *Ses
 		return ReasoningEffortCatalog{}, fmt.Errorf("model %q did not advertise any reasoning efforts", catalog.Model)
 	}
 	return catalog, nil
+}
+
+func reasoningEffortCatalogReadOnly(ctx context.Context, executor Executor, session *Session) (ReasoningEffortCatalog, error) {
+	if provider, ok := executor.(ReadOnlyReasoningEffortCatalogProvider); ok {
+		catalog, err := provider.CachedReasoningEffortCatalog(ctx, session)
+		if err != nil {
+			return ReasoningEffortCatalog{}, fmt.Errorf("could not list cached reasoning efforts: %w", err)
+		}
+		if len(catalog.Options) == 0 {
+			return ReasoningEffortCatalog{}, fmt.Errorf("model %q did not advertise any reasoning efforts", catalog.Model)
+		}
+		return catalog, nil
+	}
+	return ReasoningEffortCatalog{}, fmt.Errorf("the active Codex executor does not expose a cached model/list; status/list will not start or reconfigure a runner")
 }
 
 func (b *Bridge) setReasoningEffortFromCatalog(ctx context.Context, session *Session, executor Executor, requested string, source string) (string, error) {

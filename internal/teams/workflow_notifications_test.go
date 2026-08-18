@@ -1264,16 +1264,27 @@ func TestSendQueuedOutboxSuppressesPersistedOwnerMentionWhenWorkflowNotification
 	if _, err := bridge.ConfigureWorkflowNotifications(ctx, urlFile, true); err != nil {
 		t.Fatalf("ConfigureWorkflowNotifications: %v", err)
 	}
+	sourcePath := filepath.Join(t.TempDir(), "workflow-session.jsonl")
+	sourceData := []byte(`{"id":"workflow-legacy","role":"assistant","text":"legacy"}` + "\n")
+	if err := os.WriteFile(sourcePath, sourceData, 0o600); err != nil {
+		t.Fatalf("write workflow transcript: %v", err)
+	}
+	sourceProof := transcriptCheckpointSourceFingerprint(sourcePath, int64(len(sourceData)))
 
 	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
-		ID:               "outbox:transcript-delivery:s001:legacy",
-		SessionID:        "s001",
-		TurnID:           "sync:s001",
-		TeamsChatID:      "chat-1",
-		Kind:             "sync-assistant-b7a357a4d7f59c5d",
-		Body:             "legacy queued answer",
-		MentionOwner:     true,
-		NotificationKind: "turn_completed",
+		ID:                               "outbox:transcript-delivery:s001:legacy",
+		SessionID:                        "s001",
+		TurnID:                           "sync:s001",
+		TeamsChatID:                      "chat-1",
+		Kind:                             "sync-assistant-b7a357a4d7f59c5d",
+		Body:                             "legacy queued answer",
+		MentionOwner:                     true,
+		NotificationKind:                 "turn_completed",
+		TranscriptCheckpointID:           transcriptCheckpointID("s001"),
+		TranscriptSourcePath:             sourcePath,
+		TranscriptSourceProofFingerprint: sourceProof,
+		TranscriptSourceProofOffset:      int64(len(sourceData)),
+		TranscriptSourceProofOffsetKnown: true,
 	})
 	if err != nil {
 		t.Fatalf("seed legacy outbox: %v", err)

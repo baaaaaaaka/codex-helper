@@ -12,6 +12,11 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+// reasoningEffortSourcePending is durable bookkeeping for a deferred model
+// switch. It means the target model's catalog must be resolved only when the
+// switch is activated while idle; it is never exposed as an effective setting.
+const reasoningEffortSourcePending = "pending_model_switch"
+
 func (b *Bridge) handleModelControlCommand(ctx context.Context, msg ChatMessage, arg string) (string, error) {
 	if modelNaturalLanguageListRequest(arg) {
 		session, err := b.ensureControlFallbackSession(ctx)
@@ -354,7 +359,21 @@ func (b *Bridge) switchChatModelProfileWithSource(ctx context.Context, session *
 	previousSnapshot := session.ModelProfile
 	if modelProfileSnapshotsSameRuntime(session.ModelProfile, snapshot) {
 		if strings.TrimSpace(session.ModelSelectionSource) != strings.TrimSpace(selectionSource) {
-			effort, effortSource, effortNotice := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+			if switchable, reason := b.workModelProfileSwitchability(ctx, session); !switchable {
+				if strings.Contains(reason, "queued or running") || strings.Contains(reason, "previous Codex execution") {
+					effort, source := strings.TrimSpace(session.ReasoningEffort), strings.TrimSpace(session.ReasoningEffortSource)
+					if source == "" {
+						source = reasoningEffortSourcePending
+					}
+					if err := b.setPendingSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
+						return "", err
+					}
+					return "Model selection change scheduled for this " + chatKind + " chat. Current queued or running work keeps its captured model; the selection will apply when the chat becomes idle.", nil
+				}
+				return "", fmt.Errorf("cannot change this %s chat's model selection: %s", chatKind, reason)
+			}
+			effort, effortSource := strings.TrimSpace(session.ReasoningEffort), strings.TrimSpace(session.ReasoningEffortSource)
+			effortNotice := ""
 			if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, effortSource); err != nil {
 				return "", err
 			}
@@ -367,8 +386,15 @@ func (b *Bridge) switchChatModelProfileWithSource(ctx context.Context, session *
 		return "Model profile already selected for this " + chatKind + " chat: " + modelSnapshotExactLabel(snapshot) + "\nSelection: " + modelSelectionSourceLabel(selectionSource), nil
 	}
 	if switchable, reason := b.workModelProfileSwitchability(ctx, session); !switchable {
-		if strings.Contains(reason, "queued or running") {
-			effort, source, _ := b.reasoningEffortForModelSwitch(ctx, session, snapshot)
+		if strings.Contains(reason, "queued or running") || strings.Contains(reason, "previous Codex execution") {
+			// Do not ask the target profile for its catalog while an existing
+			// turn owns the current runner. That lookup can evict the active
+			// profile from the runner cache. Resolve the target effort only when
+			// the pending switch is actually activated while idle.
+			effort, source := strings.TrimSpace(session.ReasoningEffort), strings.TrimSpace(session.ReasoningEffortSource)
+			if source == "" {
+				source = reasoningEffortSourcePending
+			}
 			if err := b.setPendingSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
 				return "", err
 			}
@@ -457,6 +483,18 @@ func (b *Bridge) activatePendingSessionModelProfileForQueuedTurn(ctx context.Con
 	}
 	b.modelProfileMu.Lock()
 	defer b.modelProfileMu.Unlock()
+	if b.store != nil {
+		state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, transcriptCheckpointID(session.ID))
+		if err != nil {
+			return err
+		}
+		if checkpoint, ok := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; ok && executionAnchorActive(checkpoint.UnresolvedExecution) {
+			return fmt.Errorf("cannot activate a pending model profile while a previous Codex execution is still unconfirmed")
+		}
+		if _, ambiguous := unresolvedAmbiguousCodexTurn(state, *session); ambiguous {
+			return fmt.Errorf("cannot activate a pending model profile while a previous Codex execution is still unconfirmed")
+		}
+	}
 	return b.activatePendingSessionModelProfileLocked(ctx, session)
 }
 
@@ -468,7 +506,7 @@ func (b *Bridge) activatePendingSessionModelProfileLocked(ctx context.Context, s
 	}
 	effort := session.PendingReasoningEffort
 	source := session.PendingReasoningSource
-	if strings.TrimSpace(source) == "" {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(source) == reasoningEffortSourcePending {
 		effort, source, _ = b.reasoningEffortForModelSwitch(ctx, session, snapshot)
 	}
 	if err := b.setSessionModelProfile(ctx, session, snapshot, selectionSource, effort, source); err != nil {
@@ -478,8 +516,25 @@ func (b *Bridge) activatePendingSessionModelProfileLocked(ctx context.Context, s
 }
 
 func (b *Bridge) workModelProfileSwitchability(ctx context.Context, session *Session) (bool, string) {
-	if b == nil || b.store == nil || session == nil {
-		return false, "durable state is not available"
+	if b == nil || session == nil {
+		return false, "model profile bridge is not available"
+	}
+	// Lightweight/custom bridges used by callers that do not configure durable
+	// Teams state retain their historical in-memory behavior. The unresolved
+	// execution fence is a durable-state contract; without a store there is no
+	// session anchor to inspect or mutate.
+	if b.store == nil {
+		return true, ""
+	}
+	executionState, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, transcriptCheckpointID(session.ID))
+	if err != nil {
+		return false, "could not inspect Codex execution ownership: " + err.Error()
+	}
+	if checkpoint, ok := executionState.ImportCheckpoints[transcriptCheckpointID(session.ID)]; ok && executionAnchorActive(checkpoint.UnresolvedExecution) {
+		return false, "a previous Codex execution is still unconfirmed"
+	}
+	if _, ambiguous := unresolvedAmbiguousCodexTurn(executionState, *session); ambiguous {
+		return false, "a previous Codex execution is still unconfirmed"
 	}
 	state, err := b.store.SessionWorkflowEventSnapshot(ctx, session.ID)
 	if err != nil {

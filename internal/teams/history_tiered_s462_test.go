@@ -1,0 +1,923 @@
+package teams
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+)
+
+// S462 produced ordinary-looking task_started records for persistent goal
+// continuations.  They carry the same metadata as a root task, so checking
+// model_context_window/collaboration_mode_kind cannot establish ownership.
+// The child final must remain quarantined after the prior terminal boundary.
+func TestHistoryTieredScanTailQuarantinesRealGoalContinuationTaskStarted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-s462"}}
+{"type":"response_item","payload":{"id":"outer-final","type":"message","role":"assistant","turn_id":"outer-turn","phase":"final_answer","content":[{"type":"output_text","text":"outer"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}
+{"type":"response_item","payload":{"id":"goal-context","type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">Continue working toward the active thread goal.</codex_internal_context>"}]}}
+{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","phase":"final_answer","internal_chat_message_metadata_passthrough":{"turn_id":"child-turn"},"content":[{"type":"output_text","text":"child continuation answer"}]}}
+`)
+	if err := os.WriteFile(path, transcript, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("goal continuation was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer" {
+		t.Fatalf("finals=%#v, want only the outer final", result.Finals)
+	}
+}
+
+func TestHistoryWatchRewindsZeroOffsetFinalBeforeContinuation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "zero-offset-watch.jsonl")
+	transcript := "{" + `"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"outer"}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"child"}}` + "\n"
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	defer store.Close()
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("sync zero-offset history watch: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load history watch state: %v", err)
+	}
+	checkpoint, ok := state.HistoryWatch[historyWatchCheckpointID(path)]
+	if !ok {
+		t.Fatalf("zero-offset history watch checkpoint missing: %#v", state.HistoryWatch)
+	}
+	if !checkpoint.UnresolvedContinuation {
+		t.Fatalf("zero-offset child continuation was not blocked: %#v", checkpoint)
+	}
+	if checkpoint.LastFinalStartOffset != 0 || !checkpoint.LastFinalStartOffsetKnown {
+		t.Fatalf("zero-offset final boundary = offset %d known=%v, want 0/true", checkpoint.LastFinalStartOffset, checkpoint.LastFinalStartOffsetKnown)
+	}
+	if checkpoint.Offset != 0 {
+		t.Fatalf("history watch advanced past protected zero-offset final: offset=%d checkpoint=%#v", checkpoint.Offset, checkpoint)
+	}
+}
+
+func TestHistoryWatchChangedPathsChecksLegacyProofOnNormalPoll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-watch.jsonl")
+	original := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("write original transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat original transcript: %v", err)
+	}
+	state := teamstore.State{HistoryWatch: map[string]teamstore.HistoryWatchCheckpoint{
+		historyWatchCheckpointID(path): {
+			ID:      historyWatchCheckpointID(path),
+			Path:    path,
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+			Offset:  info.Size(),
+		},
+	}}
+	rewritten := strings.Replace(original, "old answer", "new answer", 1)
+	if len(rewritten) != len(original) {
+		t.Fatalf("test rewrite changed size")
+	}
+	if err := os.WriteFile(path, []byte(rewritten), 0o600); err != nil {
+		t.Fatalf("rewrite transcript: %v", err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore transcript mtime: %v", err)
+	}
+	changes, err := historyWatchChangedPaths([]string{path}, state, false)
+	if err != nil {
+		t.Fatalf("historyWatchChangedPaths: %v", err)
+	}
+	if len(changes) != 1 || cleanComparablePath(changes[0]) != cleanComparablePath(path) {
+		t.Fatalf("legacy same-size rewrite changes = %#v, want %q", changes, path)
+	}
+}
+
+func TestHistoryWatchChangedPathsSkipsSourceRewriteBlockedRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked-watch.jsonl")
+	if err := os.WriteFile(path, []byte(`{"id":"rewritten","role":"assistant"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write blocked transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat blocked transcript: %v", err)
+	}
+	state := teamstore.State{HistoryWatch: map[string]teamstore.HistoryWatchCheckpoint{
+		historyWatchCheckpointID(path): {
+			ID:                   historyWatchCheckpointID(path),
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SourceRewriteBlocked: true,
+		},
+	}}
+	changes, err := historyWatchChangedPaths([]string{path}, state, false)
+	if err != nil {
+		t.Fatalf("historyWatchChangedPaths: %v", err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("blocked checkpoint changes = %#v, want no automatic poll", changes)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove blocked transcript: %v", err)
+	}
+	changes, err = historyWatchChangedPaths(nil, state, false)
+	if err != nil {
+		t.Fatalf("historyWatchChangedPaths after removal: %v", err)
+	}
+	if len(changes) != 1 || changes[0] != path {
+		t.Fatalf("removed blocked checkpoint changes = %#v, want cleanup path", changes)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesNoIDChildEventMessageAfterTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-s462-no-id"}}
+{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}
+{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous child answer"}}
+`)
+	if err := os.WriteFile(path, transcript, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("anonymous child final was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer" {
+		t.Fatalf("finals=%#v, want only the outer final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesTwoAnonymousFinalsAfterTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "two-anonymous-finals.jsonl")
+	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-two-anonymous"}}
+{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}
+{"type":"event_msg","payload":{"type":"agent_message","thread_id":"thread-two-anonymous","phase":"final_answer","message":"anonymous child one"}}
+{"type":"response_item","thread_id":"thread-two-anonymous","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"anonymous child two"}]}}
+`)
+	if err := os.WriteFile(path, transcript, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("two anonymous finals were not blocked: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	for _, final := range result.Finals {
+		if strings.Contains(final.Record.Text, "anonymous child") {
+			t.Fatalf("anonymous child final leaked: %#v", result.Finals)
+		}
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesAnonymousFinalPairBeforeTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gap  string
+	}{
+		{name: "adjacent", gap: ""},
+		{name: "intervening-status", gap: `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"still working"}}` + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "two-anonymous-before-terminal.jsonl")
+			transcript := `{"type":"session_meta","payload":{"id":"thread-two-anonymous-before"}}
+{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous first"}}
+` + tc.gap + `{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"anonymous second"}]}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+`
+			if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+				t.Fatalf("write transcript: %v", err)
+			}
+			result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+			if err != nil {
+				t.Fatalf("historyTieredScanTail: %v", err)
+			}
+			if !result.State.UnresolvedContinuation {
+				t.Fatalf("anonymous pre-terminal pair was accepted: state=%#v finals=%#v", result.State, result.Finals)
+			}
+			for _, final := range result.Finals {
+				if strings.Contains(final.Record.Text, "anonymous ") {
+					t.Fatalf("anonymous pre-terminal final leaked: %#v", result.Finals)
+				}
+			}
+		})
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesAnonymousFinalPairAcrossPolls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anonymous-across-polls.jsonl")
+	first := []byte(`{"type":"session_meta","payload":{"id":"thread-anonymous-polls"}}
+{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous first"}}
+`)
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatalf("write first transcript: %v", err)
+	}
+	state, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if state.State.UnresolvedContinuation || len(state.Finals) != 1 {
+		t.Fatalf("first anonymous final = state=%#v finals=%#v, want one pending final", state.State, state.Finals)
+	}
+	if err := os.WriteFile(path, append(first, []byte(`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"anonymous second"}]}}
+`)...), 0o600); err != nil {
+		t.Fatalf("append second transcript: %v", err)
+	}
+	second, err := historyTieredScanTail(path, state.State, 1<<20)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if !second.State.UnresolvedContinuation {
+		t.Fatalf("second anonymous final was not unresolved: state=%#v finals=%#v", second.State, second.Finals)
+	}
+}
+
+func TestHistoryWatchLegacyCheckpointWithoutFingerprintBlocksBeforeScanning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-history-watch.jsonl")
+	body := []byte(`{"type":"session_meta","payload":{"id":"legacy-watch"}}
+{"thread_id":"legacy-watch","turn_id":"turn-old","id":"old-final","role":"assistant","text":"old answer"}
+{"type":"turn.completed","thread_id":"legacy-watch","turn_id":"turn-old"}
+`)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	defer store.Close()
+	checkpointID := historyWatchCheckpointID(path)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, ready *time.Time) error {
+		history[checkpointID] = teamstore.HistoryWatchCheckpoint{
+			ID:          checkpointID,
+			Path:        path,
+			Size:        info.Size(),
+			ModTime:     info.ModTime(),
+			Offset:      info.Size(),
+			LastFinalID: "old-final",
+		}
+		*ready = time.Now()
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy history-watch checkpoint: %v", err)
+	}
+	appendLine(t, path, `{"thread_id":"legacy-watch","turn_id":"turn-new","id":"new-final","role":"assistant","text":"new answer from an untrusted legacy boundary"}`)
+	appendLine(t, path, `{"type":"turn.completed","thread_id":"legacy-watch","turn_id":"turn-new"}`)
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("sync legacy history-watch checkpoint: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load history-watch state: %v", err)
+	}
+	checkpoint := state.HistoryWatch[checkpointID]
+	if !checkpoint.SourceRewriteBlocked {
+		t.Fatalf("legacy checkpoint was not blocked before scan: %#v", checkpoint)
+	}
+	if checkpoint.Offset != info.Size() {
+		t.Fatalf("legacy checkpoint cursor changed while blocked: got %d want %d", checkpoint.Offset, info.Size())
+	}
+	if checkpoint.SourceFingerprint != "" {
+		t.Fatalf("legacy checkpoint unexpectedly acquired a fingerprint from an untrusted prefix: %#v", checkpoint)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesSourceIDChildEventMessageWithoutTurnIDAfterTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-s462-source-id"}}
+{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}
+{"type":"event_msg","payload":{"id":"child-final","type":"agent_message","phase":"final_answer","message":"source-id child answer without turn provenance"}}
+`)
+	if err := os.WriteFile(path, transcript, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("source-ID child final was accepted: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer" {
+		t.Fatalf("finals=%#v, want only the outer final", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesSourceIDChildAfterFinalWithoutTaskTerminal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-s462-source-id-no-terminal"}}
+{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}
+{"type":"event_msg","payload":{"id":"child-final","type":"agent_message","phase":"final_answer","message":"source-id child after final without task terminal"}}
+`)
+	if err := os.WriteFile(path, transcript, 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation {
+		t.Fatalf("source-ID child final was accepted without explicit terminal: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer" {
+		t.Fatalf("finals=%#v, want only the outer final", result.Finals)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyNoOffsetQuarantinesSourceIDChildEventMessage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-s462-legacy-no-offset"}}`,
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"id":"child-final","type":"agent_message","phase":"final_answer","message":"legacy source-id child answer"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath: path, LastRecordID: "outer-final",
+	}, "thread-s462-legacy-no-offset", "thread-s462-legacy-no-offset")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !result.UnresolvedContinuation && !result.PendingContinuation {
+		t.Fatalf("legacy no-offset child continuation was not blocked: %#v", result)
+	}
+	for _, record := range result.Records {
+		if strings.Contains(record.Text, "legacy source-id child answer") {
+			t.Fatalf("legacy no-offset child answer leaked: %#v", result.Records)
+		}
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyNoOffsetQuarantinesDifferentTurnFinal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	transcript := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-s462-legacy-no-offset-turn"}}`,
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","phase":"final_answer","message":"outer without turn provenance"}}`,
+		`{"type":"response_item","payload":{"id":"child-final","type":"message","role":"assistant","turn_id":"child-turn","phase":"final_answer","content":[{"type":"output_text","text":"legacy different-turn child answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath: path, LastRecordID: "outer-final",
+	}, "thread-s462-legacy-no-offset-turn", "thread-s462-legacy-no-offset-turn")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !result.UnresolvedContinuation && !result.PendingContinuation {
+		t.Fatalf("legacy no-offset different-turn continuation was not blocked: %#v", result)
+	}
+	for _, record := range result.Records {
+		if strings.Contains(record.Text, "legacy different-turn child answer") {
+			t.Fatalf("legacy no-offset different-turn answer leaked: %#v", result.Records)
+		}
+	}
+}
+
+func TestReadLinkedTranscriptDeltaQuarantinesNoIDChildEventMessage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-s462-linked-no-id"}}`,
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial transcript: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous child answer"}}`)
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath: path, LastRecordID: "outer-final", LastSourceLine: 3,
+		LastOffset: info.Size(), SourceSize: info.Size(), SourceModTime: info.ModTime(),
+	}, "thread-s462-linked-no-id", "thread-s462-linked-no-id")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcript.UnresolvedContinuation && !transcript.PendingContinuation {
+		t.Fatalf("anonymous child continuation was not blocked: %#v", transcript)
+	}
+	for _, record := range transcript.Records {
+		if strings.Contains(record.Text, "anonymous child answer") {
+			t.Fatalf("anonymous child answer leaked into linked records: %#v", transcript.Records)
+		}
+	}
+}
+
+func TestReadLinkedTranscriptDeltaRejectsNonEOFPrefixedSourceRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	oldLine := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	trustedTail := `{"id":"trusted-tail","role":"assistant","text":"already trusted"}` + "\n"
+	if err := os.WriteFile(path, []byte(oldLine+trustedTail), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial transcript: %v", err)
+	}
+	offset := int64(len(oldLine))
+	checkpoint := teamstore.ImportCheckpoint{
+		SourcePath:        path,
+		SessionID:         "thread-non-eof-rewrite",
+		LastRecordID:      "old",
+		LastSourceLine:    1,
+		LastOffset:        offset,
+		LastOffsetKnown:   true,
+		SourceSize:        info.Size(),
+		SourceModTime:     info.ModTime(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
+	}
+	if checkpoint.SourceFingerprint == "" {
+		t.Fatal("initial checkpoint fingerprint is empty")
+	}
+	// Rewrite bytes inside the trusted window without changing the line size,
+	// then append a plausible final. The append must not make the rewritten
+	// prefix look like an ordinary incremental tail.
+	rewritten := `{"id":"old","role":"assistant","text":"new answer"}` + "\n"
+	if len(rewritten) != len(oldLine) {
+		t.Fatalf("rewrite fixture changed size: old=%d new=%d", len(oldLine), len(rewritten))
+	}
+	if err := os.WriteFile(path, []byte(rewritten+trustedTail+`{"id":"new-final","role":"assistant","text":"must stay blocked"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite transcript: %v", err)
+	}
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, checkpoint, "thread-non-eof-rewrite", "thread-non-eof-rewrite")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "source_rewritten") {
+		t.Fatalf("diagnostics = %#v, want source_rewritten", transcript.Diagnostics)
+	}
+	if len(transcript.Records) != 0 || transcriptRecordsContainText(transcript.Records, "must stay blocked") {
+		t.Fatalf("rewritten non-EOF delta leaked records: %#v", transcript.Records)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaRejectsSamePrefixSourceReplacement(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	oldLine := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	trustedTail := `{"id":"trusted-tail","role":"assistant","text":"already trusted"}` + "\n"
+	if err := os.WriteFile(path, []byte(oldLine+trustedTail), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial transcript: %v", err)
+	}
+	offset := int64(len(oldLine))
+	checkpoint := teamstore.ImportCheckpoint{
+		SourcePath:        path,
+		SessionID:         "thread-same-prefix-replacement",
+		LastRecordID:      "old",
+		LastSourceLine:    1,
+		LastOffset:        offset,
+		LastOffsetKnown:   true,
+		SourceSize:        info.Size(),
+		SourceModTime:     info.ModTime(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
+	}
+	if checkpoint.SourceFingerprint == "" {
+		t.Fatal("initial checkpoint fingerprint is empty")
+	}
+
+	// Keep the trusted prefix byte-for-byte identical, but replace the path with
+	// a different inode and a plausible new suffix. A bounded content hash alone
+	// would accept this; automatic linked delivery must reject it.
+	replacement := filepath.Join(dir, "replacement.jsonl")
+	if err := os.WriteFile(replacement, []byte(oldLine+trustedTail+`{"id":"new-final","role":"assistant","text":"must stay blocked"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write replacement transcript: %v", err)
+	}
+	oldPath := filepath.Join(dir, "old.jsonl")
+	if err := os.Rename(path, oldPath); err != nil {
+		t.Fatalf("move old transcript: %v", err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatalf("install replacement transcript: %v", err)
+	}
+
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, checkpoint, "thread-same-prefix-replacement", "thread-same-prefix-replacement")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "source_rewritten") {
+		t.Fatalf("diagnostics = %#v, want source_rewritten", transcript.Diagnostics)
+	}
+	if len(transcript.Records) != 0 || transcriptRecordsContainText(transcript.Records, "must stay blocked") {
+		t.Fatalf("replacement delta leaked records: %#v", transcript.Records)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaRejectsKnownZeroOffsetWithRecordID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"id":"new-final","role":"assistant","text":"must stay blocked"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath:      path,
+		LastRecordID:    "stale-record",
+		LastOffset:      0,
+		LastOffsetKnown: true,
+	}, "thread-zero-inconsistent", "thread-zero-inconsistent")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "source_rewritten") {
+		t.Fatalf("diagnostics = %#v, want source_rewritten", transcript.Diagnostics)
+	}
+	if len(transcript.Records) != 0 {
+		t.Fatalf("inconsistent zero-offset checkpoint returned records: %#v", transcript.Records)
+	}
+}
+
+func TestTranscriptCheckpointKnownZeroOffsetDoesNotMeanEOF(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte("prefix\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	zero := transcriptCheckpointSourceFingerprint(path, 0)
+	eof := transcriptCheckpointSourceFingerprint(path, int64(len("prefix\n")))
+	if zero == "" || eof == "" || zero == eof {
+		t.Fatalf("fingerprints at zero/EOF = %q/%q, want distinct non-empty proofs", zero, eof)
+	}
+	if !linkedCheckpointOffsetKnown(teamstore.ImportCheckpoint{LastOffset: 0, LastOffsetKnown: true}) {
+		t.Fatal("known zero offset was not recognized")
+	}
+	if linkedCheckpointOffsetKnown(teamstore.ImportCheckpoint{LastOffset: 0}) {
+		t.Fatal("legacy zero offset was treated as known")
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptQuarantinesNoIDChildEventMessage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-s462-linked-bridge-no-id"}}`,
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s462-linked-bridge-no-id", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-bridge-no-id")
+	*sent = nil
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous child answer"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync linked transcript: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "anonymous child answer") {
+		t.Fatalf("anonymous child answer leaked through bridge: %#v", *sent)
+	}
+	if !sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("missing needs-attention recovery instruction: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID == "" {
+		t.Fatalf("checkpoint = %#v, want blocked at the prior cursor", checkpoint)
+	}
+	firstNoticeCount := strings.Count(sentPlainJoined(*sent), "helper publish-history")
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("repeat linked transcript sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if got := strings.Count(sentPlainJoined(*sent), "helper publish-history"); got != firstNoticeCount {
+		t.Fatalf("needs-attention notice repeated: before=%d after=%d sent=%#v", firstNoticeCount, got, *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptQuarantinesSourceIDChildEventMessageWithoutTurnID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-s462-linked-source-id"}}`,
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s462-linked-source-id", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-source-id")
+	*sent = nil
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"child-final","type":"agent_message","phase":"final_answer","message":"source-id child answer without turn provenance"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync linked transcript: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "source-id child answer without turn provenance") {
+		t.Fatalf("source-ID child answer leaked through bridge: %#v", *sent)
+	}
+	if !sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("missing needs-attention recovery instruction: %#v", *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptBlocksOversizedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-s462-linked-large"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s462-linked-large", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-large")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load seeded state: %v", err)
+	}
+	before := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	*sent = nil
+	largeStatus := `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"` + strings.Repeat("x", historyTieredMaxTailBytes+1024) + `"}}` + "\n"
+	largeFinal := `{"type":"event_msg","payload":{"type":"agent_message","id":"large-final","turn_id":"child-turn","phase":"final_answer","message":"large tail final"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial+largeStatus+largeFinal), 0o600); err != nil {
+		t.Fatalf("write oversized transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync oversized linked transcript: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "large tail final") {
+		t.Fatalf("oversized tail final leaked: %#v", *sent)
+	}
+	if !sentPlainContains(*sent, "tail is larger than the bounded automatic scan limit") || !sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("missing oversized-tail needs-attention notice: %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load final state: %v", err)
+	}
+	after := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if after.Status != importCheckpointStatusBlocked || after.LastRecordID != before.LastRecordID || after.LastOffset != before.LastOffset {
+		t.Fatalf("oversized-tail checkpoint advanced: before=%#v after=%#v", before, after)
+	}
+	*sent = nil
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-large-tail", "2026-08-08T15:30:00Z", "helper publish-history"), "helper publish-history"); err != nil {
+		t.Fatalf("explicit publish-history for oversized tail: %v", err)
+	}
+	if !sentPlainContains(*sent, "large tail final") {
+		t.Fatalf("explicit publish-history did not release oversized backlog: %#v", *sent)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyCheckpointBoundsFullRescan(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"type":"session_meta","payload":{"id":"thread-s462-legacy-large"}}` + "\n" +
+		`{"id":"checkpoint","role":"assistant","text":"old answer"}` + "\n" +
+		`{"id":"tail","role":"assistant","text":"` + strings.Repeat("x", historyTieredMaxTailBytes+1024) + `"}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write oversized legacy transcript: %v", err)
+	}
+	delta, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath: path, LastRecordID: "checkpoint",
+	}, "thread-s462-legacy-large", "thread-s462-legacy-large")
+	if err != nil {
+		t.Fatalf("read legacy oversized delta: %v", err)
+	}
+	if !transcriptHasDiagnostic(delta, "tail_too_large") || len(delta.Records) != 0 {
+		t.Fatalf("legacy oversized delta = %#v, want bounded diagnostic and no records", delta)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyCheckpointPreservesCompletePrefixBeforePartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := strings.Join([]string{
+		`{"id":"checkpoint","role":"assistant","text":"old answer"}`,
+		`{"id":"new-final","role":"assistant","text":"complete answer before partial tail"}`,
+	}, "\n") + "\n"
+	partial := `{"id":"partial","role":"assistant","text":"still being written`
+	if err := os.WriteFile(path, []byte(prefix+partial), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath:   path,
+		LastRecordID: "checkpoint",
+	}, "thread-legacy-partial", "thread-legacy-partial")
+	if err != nil {
+		t.Fatalf("read legacy transcript delta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "incomplete_tail") {
+		t.Fatalf("delta diagnostics = %#v, want incomplete_tail", transcript.Diagnostics)
+	}
+	if len(transcript.Records) != 1 || transcript.Records[0].ItemID != "new-final" || transcript.Records[0].Text != "complete answer before partial tail" {
+		t.Fatalf("delta records = %#v, want the complete record before the partial tail", transcript.Records)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyCheckpointRefusesMissingKeyBeforePartial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := `{"id":"new-final","role":"assistant","text":"complete answer"}` + "\n" +
+		`{"id":"partial","role":"assistant","text":"still being written`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath:   path,
+		LastRecordID: "missing-checkpoint",
+	}, "thread-legacy-partial-missing", "thread-legacy-partial-missing")
+	if err != nil {
+		t.Fatalf("read legacy transcript delta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "checkpoint_not_found") || len(transcript.Records) != 0 {
+		t.Fatalf("delta = %#v, want checkpoint_not_found with no records", transcript)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesAdjacentMixedIDFinalCandidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"mixed-id mirror"}}`,
+		`{"type":"response_item","thread_id":"thread-mixed","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"turn-mixed"},"content":[{"type":"output_text","text":"mixed-id mirror"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("adjacent mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesSameSourceMixedIDFinalCandidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"same-source ambiguous answer"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_tokens":1}}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"same-source ambiguous answer","turn_id":"turn-mixed"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{ThreadID: "thread-same-source"}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("same-source mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesNonAdjacentMixedIDFinalCandidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"ambiguous repeated answer"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_tokens":1}}}`,
+		`{"type":"response_item","thread_id":"thread-mixed","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"turn-mixed"},"content":[{"type":"output_text","text":"ambiguous repeated answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{ThreadID: "thread-mixed"}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
+		t.Fatalf("ambiguous mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailKeepsSameTextAcrossExplicitTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"first-final","type":"agent_message","turn_id":"turn-one","phase":"final_answer","message":"same text"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-one"}}`,
+		`{"type":"response_item","thread_id":"thread-same-text","payload":{"id":"next-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"a distinct next request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-two","started_at":1786181089,"model_context_window":128000,"collaboration_mode_kind":"default"}}`,
+		`{"type":"response_item","thread_id":"thread-same-text","payload":{"type":"message","role":"assistant","turn":{"id":"turn-two"},"phase":"final_answer","content":[{"type":"output_text","text":"same text"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{ThreadID: "thread-same-text"}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation || len(result.Finals) != 2 {
+		t.Fatalf("distinct explicit turns were deduped or quarantined: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-mixed-bridge"}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"old-final","type":"agent_message","phase":"final_answer","message":"old answer"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-mixed-bridge", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-mixed-bridge")
+	*sent = nil
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"mixed-event","type":"agent_message","phase":"final_answer","message":"same ambiguous answer"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"token_count","info":{"total_tokens":1}}}`)
+	appendLine(t, path, `{"type":"response_item","thread_id":"thread-mixed-bridge","payload":{"type":"message","role":"assistant","turn":{"id":"mixed-turn"},"phase":"final_answer","content":[{"type":"output_text","text":"same ambiguous answer"}]}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync mixed-ID transcript: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "same ambiguous answer") {
+		t.Fatalf("ambiguous mixed-ID answer leaked through bridge: %#v", *sent)
+	}
+	if !strings.Contains(joined, "helper publish-history") {
+		t.Fatalf("missing mixed-ID needs-attention notice: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load mixed-ID state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution == nil {
+		t.Fatalf("mixed-ID checkpoint = %#v, want blocked unresolved anchor", checkpoint)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptQuarantinesSameSourceMixedIDMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-same-source-bridge"}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"old-final","type":"agent_message","phase":"final_answer","message":"old answer"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-same-source-bridge", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-same-source-bridge")
+	*sent = nil
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"mixed-event","type":"agent_message","phase":"final_answer","message":"same-source ambiguous answer"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"token_count","info":{"total_tokens":1}}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"same-source ambiguous answer","turn_id":"mixed-turn"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync same-source mixed-ID transcript: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(joined, "same-source ambiguous answer") {
+		t.Fatalf("same-source mixed-ID answer leaked through bridge: %#v", *sent)
+	}
+	if !strings.Contains(joined, "helper publish-history") {
+		t.Fatalf("missing same-source mixed-ID needs-attention notice: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load same-source mixed-ID state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution == nil {
+		t.Fatalf("same-source mixed-ID checkpoint = %#v, want blocked unresolved anchor", checkpoint)
+	}
+}
