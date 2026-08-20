@@ -47,6 +47,16 @@ type Transcript struct {
 	SourceName      string
 	FileFingerprint string
 	ThreadID        string
+	// SourceReadProof authenticates the bounded byte range consumed by an
+	// incremental scan.  The cursor proof above covers only the trusted prefix;
+	// keeping the read-range proof with the scan result lets the bridge reject a
+	// same-size in-place rewrite of the newly read tail before it queues or
+	// advances the checkpoint.  Full imports leave these fields empty because
+	// they already carry their own cold-path proof.
+	SourceReadProofFingerprint string
+	SourceReadProofStartOffset int64
+	SourceReadProofEndOffset   int64
+	SourceReadProofRangeKnown  bool
 	// UnresolvedContinuation is set by the bounded incremental scanner when
 	// execution-bearing work appears after a prior terminal boundary. Callers
 	// performing automatic delivery must fail closed rather than treating the
@@ -1316,6 +1326,48 @@ func transcriptCheckpointSourceFingerprintFromReaderWithIdentity(reader io.Reade
 	_, _ = h.Write([]byte(strconv.FormatInt(start, 10)))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(window)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// transcriptSourceRangeFingerprint authenticates the bytes that were present
+// in the incremental read window, not just the small cursor suffix used by the
+// checkpoint proof.  It is used only by the cold transcript-import path: a
+// same-size in-place rewrite in the middle of a large read window must not be
+// able to pass the old-cursor proof and move the checkpoint past stale records.
+func transcriptSourceRangeFingerprint(sourcePath string, start, end int64) string {
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" || start < 0 || end < start {
+		return ""
+	}
+	f, err := os.Open(sourcePath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() || end > info.Size() {
+		return ""
+	}
+	identity, err := teamstore.SourceFileIdentityFromFileInfo(sourcePath, info)
+	if err != nil || strings.TrimSpace(identity) == "" {
+		return ""
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(identity))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(filepath.Clean(sourcePath)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.FormatInt(start, 10)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.FormatInt(end, 10)))
+	_, _ = h.Write([]byte{0})
+	if _, err := io.Copy(h, io.NewSectionReader(f, start, end-start)); err != nil {
+		return ""
+	}
+	postInfo, err := os.Stat(sourcePath)
+	if err != nil || postInfo.IsDir() || !os.SameFile(info, postInfo) || postInfo.Size() < end {
+		return ""
+	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 

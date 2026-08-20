@@ -898,6 +898,16 @@ func sourceCheckpointFingerprintAtOffsetForTest(t *testing.T, path string, offse
 	return proof
 }
 
+func TestSourceCheckpointRangeFingerprintRejectsOversizedPersistedProof(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, int(maxSourceCheckpointProofRangeBytes+1)), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	if got, err := sourceCheckpointRangeFingerprint(path, 0, maxSourceCheckpointProofRangeBytes+1); err == nil || got != "" {
+		t.Fatalf("oversized source proof = %q err=%v, want fail-closed rejection", got, err)
+	}
+}
+
 func TestBackfillHelperDeliveriesUpdatesEveryLegacyRecordForOutbox(t *testing.T) {
 	now := time.Date(2026, 7, 31, 2, 0, 0, 0, time.UTC)
 	sentAt := now.Add(time.Minute)
@@ -2434,7 +2444,7 @@ func TestSchemaSevenStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	seedSafetyState(t, jsonStore)
 	jsonData, err := os.ReadFile(jsonStore.Path())
 	if err != nil {
-		t.Fatalf("read schema-7 JSON store: %v", err)
+		t.Fatalf("read schema-8 JSON store: %v", err)
 	}
 	if _, err := legacyV6LoadStateDataForTest(jsonData); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(SchemaVersion)) {
 		t.Fatalf("legacy JSON writer result = %v, want schema-%d rejection", err, SchemaVersion)
@@ -2443,14 +2453,168 @@ func TestSchemaSevenStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	sqliteStore := newTestStore(t)
 	seedSafetyState(t, sqliteStore)
 	if _, err := sqliteStore.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-		t.Fatalf("migrate schema-7 safety state to SQLite: %v", err)
+		t.Fatalf("migrate schema-8 safety state to SQLite: %v", err)
 	}
 	pointerData, err := os.ReadFile(sqliteStore.Path())
 	if err != nil {
-		t.Fatalf("read schema-8 SQLite pointer: %v", err)
+		t.Fatalf("read schema-9 SQLite pointer: %v", err)
 	}
 	if _, err := legacyV6LoadStateDataForTest(pointerData); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(storeSQLitePointerSchemaVersion)) {
 		t.Fatalf("legacy SQLite writer result = %v, want pointer schema-%d rejection", err, storeSQLitePointerSchemaVersion)
+	}
+}
+
+func TestRC16JSONFixtureMigratesAndRoundTripsLegacySafetyState(t *testing.T) {
+	ctx := context.Background()
+	fixture, err := os.ReadFile(filepath.Join("testdata", "v0.1.22-rc.16-state.json"))
+	if err != nil {
+		t.Fatalf("read rc16 JSON fixture: %v", err)
+	}
+	var envelope struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(fixture, &envelope); err != nil {
+		t.Fatalf("decode rc16 JSON fixture: %v", err)
+	}
+	if envelope.SchemaVersion != SchemaVersion-1 {
+		t.Fatalf("rc16 JSON fixture schema = %d, want %d", envelope.SchemaVersion, SchemaVersion-1)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open rc16 JSON store: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir rc16 JSON store: %v", err)
+	}
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write rc16 JSON fixture: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load rc16 JSON fixture: %v", err)
+	}
+	assertRC16FixtureState(t, state)
+	if err := store.Update(ctx, func(*State) error { return nil }); err != nil {
+		t.Fatalf("persist migrated rc16 JSON fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated rc16 JSON store: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated rc16 JSON store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	state, err = reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("reload migrated rc16 JSON fixture: %v", err)
+	}
+	assertRC16FixtureState(t, state)
+	if state.SchemaVersion != SchemaVersion {
+		t.Fatalf("round-tripped JSON schema = %d, want %d", state.SchemaVersion, SchemaVersion)
+	}
+}
+
+func TestRC16SQLitePointerFixtureLoadsAndRoundTripsLegacySafetyState(t *testing.T) {
+	ctx := context.Background()
+	stateFixture, err := os.ReadFile(filepath.Join("testdata", "v0.1.22-rc.16-state.json"))
+	if err != nil {
+		t.Fatalf("read rc16 SQLite state fixture: %v", err)
+	}
+	var legacyState State
+	if err := json.Unmarshal(stateFixture, &legacyState); err != nil {
+		t.Fatalf("decode rc16 SQLite state fixture: %v", err)
+	}
+	if legacyState.SchemaVersion != SchemaVersion-1 {
+		t.Fatalf("rc16 SQLite state schema = %d, want %d", legacyState.SchemaVersion, SchemaVersion-1)
+	}
+
+	path := filepath.Join(t.TempDir(), "state.json")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open rc16 SQLite store: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(path), storeSQLiteFileName)
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open rc16 SQLite fixture DB: %v", err)
+	}
+	if err := createOfficialReleaseSQLiteSchemaForTest(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("create rc16 SQLite fixture schema: %v", err)
+	}
+	if err := insertOfficialReleaseSQLiteStateForTest(db, legacyState); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert rc16 SQLite fixture state: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close rc16 SQLite fixture DB: %v", err)
+	}
+	pointerFixture, err := os.ReadFile(filepath.Join("testdata", "v0.1.22-rc.16-sqlite-pointer.json"))
+	if err != nil {
+		t.Fatalf("read rc16 SQLite pointer fixture: %v", err)
+	}
+	var pointer storeSQLitePointer
+	if err := json.Unmarshal(pointerFixture, &pointer); err != nil {
+		t.Fatalf("decode rc16 SQLite pointer fixture: %v", err)
+	}
+	pointer.Path = storeSQLiteFileName
+	pointerData, err := json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("marshal rc16 SQLite pointer: %v", err)
+	}
+	if err := os.WriteFile(path, append(pointerData, '\n'), 0o600); err != nil {
+		t.Fatalf("write rc16 SQLite pointer: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load rc16 SQLite pointer fixture: %v", err)
+	}
+	assertRC16FixtureState(t, state)
+	if err := store.Update(ctx, func(*State) error { return nil }); err != nil {
+		t.Fatalf("persist migrated rc16 SQLite fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated rc16 SQLite store: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated rc16 SQLite store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	state, err = reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("reload migrated rc16 SQLite fixture: %v", err)
+	}
+	assertRC16FixtureState(t, state)
+}
+
+func assertRC16FixtureState(t *testing.T, state State) {
+	t.Helper()
+	if state.SchemaVersion != SchemaVersion {
+		t.Fatalf("fixture state schema = %d, want %d", state.SchemaVersion, SchemaVersion)
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.HelperVersion != "v0.1.22-rc.16" {
+		t.Fatalf("fixture owner = %#v, want rc16 owner", state.ServiceOwner)
+	}
+	if state.Sessions["official-session"].TeamsChatID != "official-chat" {
+		t.Fatalf("fixture session = %#v, want official chat", state.Sessions["official-session"])
+	}
+	if got := state.Turns["official-turn"].CodexTurnID; got != "official-codex-turn" {
+		t.Fatalf("fixture turn codex ID = %q, want official-codex-turn", got)
+	}
+	outbox := state.OutboxMessages["official-outbox"]
+	if outbox.TeamsMessageID != "official-helper-message" || outbox.TranscriptSourceProofFingerprint != "legacy-prefix-proof" {
+		t.Fatalf("fixture outbox = %#v, want legacy identity and source proof", outbox)
+	}
+	checkpoint := state.ImportCheckpoints["transcript:official-session"]
+	if checkpoint.LastOffset != 4096 || !checkpoint.LastOffsetKnown || checkpoint.SourceFingerprint != "legacy-prefix-proof" {
+		t.Fatalf("fixture checkpoint = %#v, want legacy cursor and proof", checkpoint)
+	}
+	if checkpoint.UnresolvedExecution == nil || checkpoint.UnresolvedExecution.Generation != 3 {
+		t.Fatalf("fixture unresolved execution = %#v, want generation 3", checkpoint.UnresolvedExecution)
 	}
 }
 
@@ -4228,6 +4392,75 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	}
 	if limit, ok, err := store.ChatRateLimit(ctx, "chat-1"); err != nil || !ok || limit.Reason != "429" {
 		t.Fatalf("ChatRateLimit sqlite = %#v ok=%v err=%v", limit, ok, err)
+	}
+}
+
+func TestJSONActiveTurnQueueSnapshotDoesNotDecodeUnselectedOutbox(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teams-state", "state.json")
+	now := time.Date(2026, 8, 20, 1, 2, 3, 0, time.UTC)
+	data := fmt.Sprintf(`{"schema_version":%d,"turns":{"turn-running":{"id":"turn-running","session_id":"s1","status":"running","created_at":"%s"}},"inbound_events":{"in-running":{"id":"in-running","session_id":"s1","turn_id":"turn-running"}},"outbox_messages":"intentionally-not-a-map"}`,
+		SchemaVersion, now.Format(time.RFC3339Nano))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir JSON store: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatalf("write JSON store: %v", err)
+	}
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open JSON store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	state, err := store.SessionActiveTurnQueueSnapshot(context.Background(), "s1")
+	if err != nil {
+		t.Fatalf("SessionActiveTurnQueueSnapshot: %v", err)
+	}
+	turn, ok := state.Turns["turn-running"]
+	if !ok || turn.Status != TurnStatusRunning {
+		t.Fatalf("active turn snapshot = %#v, want running turn", state.Turns)
+	}
+}
+
+func TestPendingOutboxPageIgnoreRateLimitIsColdPathOnly(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Date(2026, 8, 20, 2, 0, 0, 0, time.UTC)
+			msg := OutboxMessage{
+				ID: "outbox:legacy-rate-limited", TeamsChatID: "chat-rate-limited",
+				Kind: "sync-status-source-rewritten", Status: OutboxStatusQueued,
+				CreatedAt: now,
+			}
+			if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+				t.Fatalf("QueueOutbox: %v", err)
+			}
+			if _, err := store.SetChatRateLimit(ctx, msg.TeamsChatID, now.Add(time.Hour), "429"); err != nil {
+				t.Fatalf("SetChatRateLimit: %v", err)
+			}
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			ordinary, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 10})
+			if err != nil {
+				t.Fatalf("ordinary PendingOutboxPageAt: %v", err)
+			}
+			if len(ordinary.Messages) != 0 {
+				t.Fatalf("ordinary sender saw rate-limited notice: %#v", ordinary.Messages)
+			}
+			migration, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 10, IgnoreRateLimit: true, IncludeActiveSending: true})
+			if err != nil {
+				t.Fatalf("migration PendingOutboxPageAt: %v", err)
+			}
+			if len(migration.Messages) != 1 || migration.Messages[0].ID != msg.ID {
+				t.Fatalf("migration page = %#v, want legacy notice", migration.Messages)
+			}
+			pending, err := store.HasPendingLegacyHistoryGateOutbox(ctx)
+			if err != nil || !pending {
+				t.Fatalf("HasPendingLegacyHistoryGateOutbox = %v err=%v, want true", pending, err)
+			}
+		})
 	}
 }
 
@@ -6872,6 +7105,102 @@ func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
 	}
 }
 
+func TestEarlierUnsentOutboxSkipsAcceptedSourceRewriteFenceAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 12, 42, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			earlier := OutboxMessage{
+				ID:                     "outbox:accepted-source-fence",
+				TeamsChatID:            "chat-source-fence",
+				TeamsMessageID:         "teams:accepted-source-fence",
+				Sequence:               1,
+				Kind:                   "sync-assistant",
+				Body:                   "old source-fenced history notice",
+				Status:                 OutboxStatusAccepted,
+				BlockedBySourceRewrite: true,
+				CreatedAt:              now,
+			}
+			later := OutboxMessage{
+				ID:          "outbox:ordinary-after-source-fence",
+				TeamsChatID: "chat-source-fence",
+				Sequence:    2,
+				Kind:        "final",
+				Body:        "ordinary answer after recovery fence",
+				CreatedAt:   now.Add(time.Second),
+			}
+			if _, _, err := store.QueueOutbox(ctx, earlier); err != nil {
+				t.Fatalf("QueueOutbox earlier: %v", err)
+			}
+			if _, _, err := store.QueueOutbox(ctx, later); err != nil {
+				t.Fatalf("QueueOutbox later: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if got, ok, err := store.EarlierUnsentOutbox(ctx, later); err != nil {
+				t.Fatalf("EarlierUnsentOutbox: %v", err)
+			} else if ok {
+				t.Fatalf("accepted source-rewrite fence blocked later ordinary outbox: %#v", got)
+			}
+			all, err := store.EarlierUnsentOutboxes(ctx, later)
+			if err != nil {
+				t.Fatalf("EarlierUnsentOutboxes: %v", err)
+			}
+			if len(all) != 0 {
+				t.Fatalf("accepted source-rewrite fence remained in predecessor list: %#v", all)
+			}
+		})
+	}
+}
+
+func TestPendingOutboxSkipsStableAcceptedSourceRewriteFenceAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 4, 30, 13, 0, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			msg := OutboxMessage{
+				ID:                     "outbox:pending-source-fence",
+				TeamsChatID:            "chat-pending-source-fence",
+				TeamsMessageID:         "teams:pending-source-fence",
+				Sequence:               1,
+				Kind:                   "sync-assistant",
+				Body:                   "already accepted source-fenced row",
+				Status:                 OutboxStatusAccepted,
+				BlockedBySourceRewrite: true,
+				CreatedAt:              now,
+				UpdatedAt:              now,
+			}
+			if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+				t.Fatalf("QueueOutbox: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			before, err := store.OutboxMessageByID(ctx, msg.ID)
+			if err != nil {
+				t.Fatalf("OutboxMessageByID before replay: %v", err)
+			}
+			pending, err := store.PendingOutbox(ctx)
+			if err != nil {
+				t.Fatalf("PendingOutbox: %v", err)
+			}
+			if len(pending) != 0 {
+				t.Fatalf("stable accepted source-rewrite row remained pending: %#v", pending)
+			}
+			got, err := store.MarkOutboxSourceRewriteFence(ctx, msg.ID, msg.TeamsMessageID)
+			if err != nil {
+				t.Fatalf("idempotent MarkOutboxSourceRewriteFence: %v", err)
+			}
+			if !got.UpdatedAt.Equal(before.UpdatedAt) {
+				t.Fatalf("idempotent source fence refreshed UpdatedAt: before=%v after=%v", before.UpdatedAt, got.UpdatedAt)
+			}
+		})
+	}
+}
+
 func TestEarlierUnsentOutboxIgnoresSkippedMessages(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -8787,8 +9116,28 @@ func TestOutboxBlocksUpgradeStatusMatrix(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "rc16 queued transcript with old provenance does not block",
+			msg: OutboxMessage{
+				ID: "queued-rc16-transcript", SessionID: "session-rc16", TeamsChatID: "chat-1",
+				TurnID: "import-bg:session-rc16", Kind: "import-assistant-001", Status: OutboxStatusQueued,
+				TranscriptCheckpointID: "transcript:session-rc16", TranscriptSourcePath: "/var/tmp/session.jsonl",
+				TranscriptSourceOffset: 4096, TranscriptSourceOffsetKnown: true,
+			},
+			want: false,
+		},
+		{
 			name: "legacy queued interrupted notice does not block",
 			msg:  OutboxMessage{ID: "queued-interrupted", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusQueued},
+			want: false,
+		},
+		{
+			name: "legacy history gate notice does not block",
+			msg:  OutboxMessage{ID: "queued-history-gate", TeamsChatID: "chat-1", Kind: "sync-status-source-rewritten", Status: OutboxStatusQueued},
+			want: false,
+		},
+		{
+			name: "fresh legacy history gate send does not block",
+			msg:  OutboxMessage{ID: "fresh-history-gate", TeamsChatID: "chat-1", Kind: "sync-status-tail-too-large", Status: OutboxStatusSending, LastSendAttempt: freshAttempt},
 			want: false,
 		},
 		{
@@ -9752,6 +10101,117 @@ func TestSQLiteQueueTranscriptDeliveryOutboxDoesNotLoadColdStateAndTouchesOnlyQu
 	}
 	if _, err := store.Load(ctx); err == nil {
 		t.Fatal("full Load unexpectedly succeeded with corrupt cold state_json")
+	}
+}
+
+func TestQueueTranscriptDeliveryOutboxPersistsSourceProofAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			const proof = "file-proof:stable-prefix"
+			out, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+				Message: OutboxMessage{
+					ID:          "outbox:proof-cross-backend",
+					SessionID:   "s1",
+					TurnID:      "import-bg:s1",
+					TeamsChatID: "chat-1",
+					Kind:        "import-assistant-001",
+					Body:        "background import proof",
+				},
+				Delivery: TranscriptDeliveryRecord{
+					ID:         "delivery:proof-cross-backend",
+					SessionID:  "s1",
+					SourcePath: "/tmp/session.jsonl",
+					SourceLine: 1,
+					Kind:       "import-assistant-001",
+				},
+				Checkpoint: ImportCheckpoint{
+					ID:                "checkpoint:s1",
+					SessionID:         "s1",
+					SourcePath:        "/tmp/session.jsonl",
+					SourceFingerprint: proof,
+					LastOffset:        4096,
+					LastOffsetKnown:   true,
+				},
+			})
+			if err != nil || !created || alreadyDelivered {
+				t.Fatalf("QueueTranscriptDeliveryOutbox out=%#v created=%v alreadyDelivered=%v err=%v", out, created, alreadyDelivered, err)
+			}
+			if out.TranscriptSourceProofFingerprint != proof || out.TranscriptSourceProofOffset != 4096 || !out.TranscriptSourceProofOffsetKnown {
+				t.Fatalf("queued source proof = %#v, want fingerprint=%q offset=4096 known", out, proof)
+			}
+			state, err := store.OutboxStateSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("OutboxStateSnapshot: %v", err)
+			}
+			persisted := state.OutboxMessages[out.ID]
+			if persisted.TranscriptSourceProofFingerprint != proof || persisted.TranscriptSourceProofOffset != 4096 || !persisted.TranscriptSourceProofOffsetKnown {
+				t.Fatalf("persisted source proof = %#v, want fingerprint=%q offset=4096 known", persisted, proof)
+			}
+		})
+	}
+}
+
+func TestOutboxGraphRecoveryProgressPersistsAndResetsAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			queued, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID: "outbox:graph-recovery-progress", TeamsChatID: "chat-1", Kind: "final", Body: "recoverable final",
+			})
+			if err != nil {
+				t.Fatalf("QueueOutbox: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+			if err != nil {
+				t.Fatalf("MarkOutboxSendAttempt: %v", err)
+			}
+			const nextPath = "https://graph.example.test/chats/chat-1/messages?$skiptoken=next-33"
+			if _, err := store.MarkOutboxGraphRecoveryProgressForAttempt(ctx, claimed.ID, claimed.SendAttemptToken, nextPath, "teams-page-32"); err != nil {
+				t.Fatalf("MarkOutboxGraphRecoveryProgressForAttempt: %v", err)
+			}
+			progress, err := store.OutboxMessageByID(ctx, claimed.ID)
+			if err != nil {
+				t.Fatalf("OutboxMessageByID progress: %v", err)
+			}
+			if progress.GraphRecoveryNextPath != nextPath || progress.GraphRecoveryCandidateID != "teams-page-32" {
+				t.Fatalf("durable recovery progress = %#v, want path and candidate", progress)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				msg := state.OutboxMessages[claimed.ID]
+				msg.LastSendAttempt = time.Now().Add(-outboxSendLease - time.Second)
+				state.OutboxMessages[claimed.ID] = msg
+				return nil
+			}); err != nil {
+				t.Fatalf("age send lease: %v", err)
+			}
+			reclaimed, err := store.MarkOutboxSendAttempt(ctx, claimed.ID)
+			if err != nil {
+				t.Fatalf("reclaim send lease: %v", err)
+			}
+			if reclaimed.GraphRecoveryNextPath != "" || reclaimed.GraphRecoveryCandidateID != "" || reclaimed.SendAttemptToken == claimed.SendAttemptToken {
+				t.Fatalf("reclaimed attempt retained stale Graph recovery state: %#v", reclaimed)
+			}
+		})
 	}
 }
 
@@ -15349,6 +15809,31 @@ func TestClearOwnerIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestReadOwnerJSONFallsBackToLegacyLockOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := testOwner("legacy-session", "legacy-turn", testOwnerStart())
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceOwner = nil
+		legacyOwner := owner
+		state.LockOwner = &legacyOwner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy lock owner: %v", err)
+	}
+
+	got, found, err := store.ReadOwner(ctx)
+	if err != nil {
+		t.Fatalf("ReadOwner: %v", err)
+	}
+	if !found {
+		t.Fatal("ReadOwner found = false, want legacy lock owner")
+	}
+	if got.PID != owner.PID || got.StartedAt != owner.StartedAt || got.ActiveSessionID != owner.ActiveSessionID {
+		t.Fatalf("ReadOwner = %#v, want %#v", got, owner)
+	}
+}
+
 func TestClearOwnerIfSameDoesNotClearDifferentOwner(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -17564,6 +18049,65 @@ func TestOutboxAttemptTokenRejectsStaleCompletion(t *testing.T) {
 	}
 	if _, err := store.MarkOutboxSentForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-other"); !errors.Is(err, ErrOutboxSendNotClaimed) {
 		t.Fatalf("conflicting message id error = %v, want ErrOutboxSendNotClaimed", err)
+	}
+}
+
+func TestMarkOutboxSkippedRetiresOnlyUndeliveredRowsAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			createdAt := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages["outbox:queued"] = OutboxMessage{
+					ID: "outbox:queued", TeamsChatID: "chat-1", Kind: "sync-status-backlog-blocked",
+					Body: "legacy queued notice", Status: OutboxStatusQueued, CreatedAt: createdAt,
+				}
+				state.OutboxMessages["outbox:sending"] = OutboxMessage{
+					ID: "outbox:sending", TeamsChatID: "chat-1", Kind: "sync-status-source-rewritten",
+					Body: "legacy sending notice", Status: OutboxStatusSending, CreatedAt: createdAt.Add(time.Second),
+				}
+				state.OutboxMessages["outbox:accepted"] = OutboxMessage{
+					ID: "outbox:accepted", TeamsChatID: "chat-1", Kind: "sync-status-tail-too-large",
+					Body: "already accepted", Status: OutboxStatusAccepted, CreatedAt: createdAt.Add(2 * time.Second),
+				}
+				state.OutboxMessages["outbox:sent"] = OutboxMessage{
+					ID: "outbox:sent", TeamsChatID: "chat-1", Kind: "sync-status-backlog-blocked",
+					Body: "already sent", Status: OutboxStatusSent, CreatedAt: createdAt.Add(3 * time.Second),
+				}
+				state.OutboxMessages["outbox:skipped"] = OutboxMessage{
+					ID: "outbox:skipped", TeamsChatID: "chat-1", Kind: "sync-status-source-rewritten",
+					Body: "already skipped", Status: OutboxStatusSkipped, CreatedAt: createdAt.Add(4 * time.Second),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed outbox state: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			for _, id := range []string{"outbox:queued", "outbox:sending", "outbox:accepted", "outbox:sent", "outbox:skipped"} {
+				if _, err := store.MarkOutboxSkipped(ctx, id, "legacy history gate notice retired"); err != nil {
+					t.Fatalf("MarkOutboxSkipped(%s): %v", id, err)
+				}
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after skip: %v", err)
+			}
+			for _, id := range []string{"outbox:queued", "outbox:sending"} {
+				msg := state.OutboxMessages[id]
+				if msg.Status != OutboxStatusSkipped || msg.LastSendError != "legacy history gate notice retired" || msg.UpdatedAt.IsZero() {
+					t.Fatalf("retired %s = %#v", id, msg)
+				}
+			}
+			for _, id := range []string{"outbox:accepted", "outbox:sent", "outbox:skipped"} {
+				if got := state.OutboxMessages[id].Status; got == OutboxStatusSkipped && id != "outbox:skipped" {
+					t.Fatalf("delivered %s was changed to skipped: %#v", id, state.OutboxMessages[id])
+				}
+			}
+		})
 	}
 }
 

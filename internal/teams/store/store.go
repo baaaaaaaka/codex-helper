@@ -43,6 +43,11 @@ const (
 	maxRetainedHelperDeliveries              = 32768
 	maxStatePointerSize                      = 4096
 	sourceCheckpointFingerprintBytes   int64 = 8 * 1024
+	// Automatic history read proofs are bounded to the same 512 KiB cold-path
+	// scan limit in the teams package. Persisted rows can be older or corrupt,
+	// so reject an oversized range before taking the store projection lock and
+	// reading arbitrary source-file bytes.
+	maxSourceCheckpointProofRangeBytes int64 = 512 * 1024
 )
 
 type SessionStatus string
@@ -510,12 +515,18 @@ type ImportCheckpoint struct {
 	// LastOffsetKnown distinguishes a trusted zero-byte cursor from legacy
 	// checkpoints that never persisted a byte position. A false value for a
 	// zero offset must never be treated as an EOF proof.
-	LastOffsetKnown bool      `json:"last_offset_known,omitempty"`
-	SourceSize      int64     `json:"source_size,omitempty"`
-	SourceModTime   time.Time `json:"source_mod_time,omitempty"`
-	ImportTurnID    string    `json:"import_turn_id,omitempty"`
-	KindPrefix      string    `json:"kind_prefix,omitempty"`
-	Status          string    `json:"status,omitempty"`
+	LastOffsetKnown bool `json:"last_offset_known,omitempty"`
+	// CompletionPending keeps an otherwise fully scanned import recoverable
+	// when the subagent marker or the final "Import complete" outbox row could
+	// not be queued. It is deliberately persisted in the JSON payload so both
+	// the legacy JSON store and the SQLite JSON mirror share the same recovery
+	// semantics.
+	CompletionPending bool      `json:"completion_pending,omitempty"`
+	SourceSize        int64     `json:"source_size,omitempty"`
+	SourceModTime     time.Time `json:"source_mod_time,omitempty"`
+	ImportTurnID      string    `json:"import_turn_id,omitempty"`
+	KindPrefix        string    `json:"kind_prefix,omitempty"`
+	Status            string    `json:"status,omitempty"`
 	// LegacyProbeRevision caches the negative SQLite compatibility probe for
 	// the interrupted-turn set. It is invalidated by a session revision change
 	// and avoids decoding every interrupted row on each hot-path transaction.
@@ -1097,46 +1108,62 @@ type OutboxMessage struct {
 	// that was checked before a linked transcript record was queued.  The
 	// record offset above identifies the delivered item; it is not the proof
 	// boundary and must not be substituted for it.
-	TranscriptSourceProofFingerprint string           `json:"transcript_source_proof_fingerprint,omitempty"`
-	TranscriptSourceProofOffset      int64            `json:"transcript_source_proof_offset,omitempty"`
-	TranscriptSourceProofOffsetKnown bool             `json:"transcript_source_proof_offset_known,omitempty"`
-	SourceTextHash                   string           `json:"source_text_hash,omitempty"`
-	RenderedHash                     string           `json:"rendered_hash,omitempty"`
-	RenderedBytes                    int              `json:"rendered_bytes,omitempty"`
-	AttachmentPath                   string           `json:"attachment_path,omitempty"`
-	AttachmentName                   string           `json:"attachment_name,omitempty"`
-	AttachmentUploadName             string           `json:"attachment_upload_name,omitempty"`
-	AttachmentContentType            string           `json:"attachment_content_type,omitempty"`
-	AttachmentUploadFolder           string           `json:"attachment_upload_folder,omitempty"`
-	AttachmentSize                   int64            `json:"attachment_size,omitempty"`
-	AttachmentHash                   string           `json:"attachment_hash,omitempty"`
-	AttachmentUploadURL              string           `json:"attachment_upload_url,omitempty"`
-	AttachmentUploadExpiry           time.Time        `json:"attachment_upload_expiry,omitempty"`
-	AttachmentUploadOffset           int64            `json:"attachment_upload_offset,omitempty"`
-	DriveItemID                      string           `json:"drive_item_id,omitempty"`
-	DriveItemName                    string           `json:"drive_item_name,omitempty"`
-	DriveItemETag                    string           `json:"drive_item_etag,omitempty"`
-	DriveItemWebURL                  string           `json:"drive_item_web_url,omitempty"`
-	DriveItemWebDav                  string           `json:"drive_item_web_dav,omitempty"`
-	AckKind                          string           `json:"ack_kind,omitempty"`
-	QuoteReplyToMessageID            string           `json:"quote_reply_to_message_id,omitempty"`
-	NotificationKind                 string           `json:"notification_kind,omitempty"`
-	ForkOperationID                  string           `json:"fork_operation_id,omitempty"`
-	ForkHistoryNamespace             string           `json:"fork_history_namespace,omitempty"`
-	ForkOrdinal                      int              `json:"fork_ordinal,omitempty"`
-	ForkBodyHash                     string           `json:"fork_body_hash,omitempty"`
-	ForkRole                         string           `json:"fork_role,omitempty"`
-	MentionOwner                     bool             `json:"mention_owner,omitempty"`
-	MentionUserID                    string           `json:"mention_user_id,omitempty"`
-	MentionUserName                  string           `json:"mention_user_name,omitempty"`
-	TrustedMath                      bool             `json:"trusted_math,omitempty"`
-	MathPlanVersion                  int              `json:"math_plan_version,omitempty"`
-	MathSpans                        []OutboxMathSpan `json:"math_spans,omitempty"`
-	MathMediaFallback                bool             `json:"math_media_fallback,omitempty"`
-	UpgradeNonBlocking               bool             `json:"upgrade_non_blocking,omitempty"`
-	ArtifactIDs                      []string         `json:"artifact_ids,omitempty"`
-	Status                           OutboxStatus     `json:"status"`
-	TeamsMessageID                   string           `json:"teams_message_id,omitempty"`
+	TranscriptSourceProofFingerprint string `json:"transcript_source_proof_fingerprint,omitempty"`
+	TranscriptSourceProofOffset      int64  `json:"transcript_source_proof_offset,omitempty"`
+	TranscriptSourceProofOffsetKnown bool   `json:"transcript_source_proof_offset_known,omitempty"`
+	// TranscriptSourceReadProof* authenticate the complete byte range that was
+	// present when an automatic import read began. The cursor proof above only
+	// covers a bounded suffix before the old cursor; the read proof closes the
+	// same-size in-place rewrite gap inside a large imported tail.
+	TranscriptSourceReadProofFingerprint string    `json:"transcript_source_read_proof_fingerprint,omitempty"`
+	TranscriptSourceReadProofStartOffset int64     `json:"transcript_source_read_proof_start_offset,omitempty"`
+	TranscriptSourceReadProofEndOffset   int64     `json:"transcript_source_read_proof_end_offset,omitempty"`
+	TranscriptSourceReadProofRangeKnown  bool      `json:"transcript_source_read_proof_range_known,omitempty"`
+	SourceTextHash                       string    `json:"source_text_hash,omitempty"`
+	RenderedHash                         string    `json:"rendered_hash,omitempty"`
+	RenderedBytes                        int       `json:"rendered_bytes,omitempty"`
+	AttachmentPath                       string    `json:"attachment_path,omitempty"`
+	AttachmentName                       string    `json:"attachment_name,omitempty"`
+	AttachmentUploadName                 string    `json:"attachment_upload_name,omitempty"`
+	AttachmentContentType                string    `json:"attachment_content_type,omitempty"`
+	AttachmentUploadFolder               string    `json:"attachment_upload_folder,omitempty"`
+	AttachmentSize                       int64     `json:"attachment_size,omitempty"`
+	AttachmentHash                       string    `json:"attachment_hash,omitempty"`
+	AttachmentUploadURL                  string    `json:"attachment_upload_url,omitempty"`
+	AttachmentUploadExpiry               time.Time `json:"attachment_upload_expiry,omitempty"`
+	AttachmentUploadOffset               int64     `json:"attachment_upload_offset,omitempty"`
+	DriveItemID                          string    `json:"drive_item_id,omitempty"`
+	DriveItemName                        string    `json:"drive_item_name,omitempty"`
+	DriveItemETag                        string    `json:"drive_item_etag,omitempty"`
+	DriveItemWebURL                      string    `json:"drive_item_web_url,omitempty"`
+	DriveItemWebDav                      string    `json:"drive_item_web_dav,omitempty"`
+	// AttachmentMessagePostState separates a completed Drive upload from the
+	// later Teams chat POST. "pending" means no chat POST has been started and
+	// the row may safely resume after a crash; "started" means this version
+	// durably entered the POST boundary and the outcome requires exact
+	// Graph-marker recovery. The migration-only "unknown" value means an older
+	// helper persisted a DriveItem without recording whether its Teams POST
+	// started, so compatibility recovery must run before any new POST.
+	AttachmentMessagePostState string           `json:"attachment_message_post_state,omitempty"`
+	AckKind                    string           `json:"ack_kind,omitempty"`
+	QuoteReplyToMessageID      string           `json:"quote_reply_to_message_id,omitempty"`
+	NotificationKind           string           `json:"notification_kind,omitempty"`
+	ForkOperationID            string           `json:"fork_operation_id,omitempty"`
+	ForkHistoryNamespace       string           `json:"fork_history_namespace,omitempty"`
+	ForkOrdinal                int              `json:"fork_ordinal,omitempty"`
+	ForkBodyHash               string           `json:"fork_body_hash,omitempty"`
+	ForkRole                   string           `json:"fork_role,omitempty"`
+	MentionOwner               bool             `json:"mention_owner,omitempty"`
+	MentionUserID              string           `json:"mention_user_id,omitempty"`
+	MentionUserName            string           `json:"mention_user_name,omitempty"`
+	TrustedMath                bool             `json:"trusted_math,omitempty"`
+	MathPlanVersion            int              `json:"math_plan_version,omitempty"`
+	MathSpans                  []OutboxMathSpan `json:"math_spans,omitempty"`
+	MathMediaFallback          bool             `json:"math_media_fallback,omitempty"`
+	UpgradeNonBlocking         bool             `json:"upgrade_non_blocking,omitempty"`
+	ArtifactIDs                []string         `json:"artifact_ids,omitempty"`
+	Status                     OutboxStatus     `json:"status"`
+	TeamsMessageID             string           `json:"teams_message_id,omitempty"`
 	// BlockedByUnresolvedExecution records that Graph accepted this message
 	// concurrently with a newly persisted execution anchor.  The delivery is
 	// reconciled by its stable TeamsMessageID, but transcript checkpoint and
@@ -1152,13 +1179,20 @@ type OutboxMessage struct {
 	// the source proof changed before the final durable delivery CAS. The
 	// message ID is retained for reconciliation; this fence never permits a
 	// retry or transcript side effect.
-	BlockedBySourceRewrite bool      `json:"blocked_by_source_rewrite,omitempty"`
-	CreatedAt              time.Time `json:"created_at,omitempty"`
-	UpdatedAt              time.Time `json:"updated_at,omitempty"`
-	SentAt                 time.Time `json:"sent_at,omitempty"`
-	LastSendAttempt        time.Time `json:"last_send_attempt,omitempty"`
-	SendAttemptToken       string    `json:"send_attempt_token,omitempty"`
-	LastSendError          string    `json:"last_send_error,omitempty"`
+	BlockedBySourceRewrite bool `json:"blocked_by_source_rewrite,omitempty"`
+	// GraphRecoveryNextPath and GraphRecoveryCandidateID make ambiguous-send
+	// reconciliation resumable across polls and helper restarts. The path is
+	// only consumed through the Graph client's same-origin continuation
+	// validator; the candidate ID is accepted only after its marker/body proof
+	// has been checked during an earlier page scan.
+	GraphRecoveryNextPath    string    `json:"graph_recovery_next_path,omitempty"`
+	GraphRecoveryCandidateID string    `json:"graph_recovery_candidate_id,omitempty"`
+	CreatedAt                time.Time `json:"created_at,omitempty"`
+	UpdatedAt                time.Time `json:"updated_at,omitempty"`
+	SentAt                   time.Time `json:"sent_at,omitempty"`
+	LastSendAttempt          time.Time `json:"last_send_attempt,omitempty"`
+	SendAttemptToken         string    `json:"send_attempt_token,omitempty"`
+	LastSendError            string    `json:"last_send_error,omitempty"`
 }
 
 // OutboxReplayFence is a cold-path proof that an outbox message was already
@@ -1226,12 +1260,18 @@ func (c PendingOutboxCursor) IsZero() bool {
 }
 
 type PendingOutboxQuery struct {
-	Now         time.Time
-	SessionID   string
-	TurnID      string
-	TeamsChatID string
-	Limit       int
-	After       PendingOutboxCursor
+	Now                  time.Time
+	SessionID            string
+	TurnID               string
+	TeamsChatID          string
+	Limit                int
+	After                PendingOutboxCursor
+	IncludeActiveSending bool
+	// IgnoreRateLimit is reserved for cold-path migration/reconciliation.  The
+	// normal outbox sender must continue to respect persisted Graph backoff, but
+	// a compatibility cleanup must be able to see an obsolete notice even while
+	// that chat is cooling down.
+	IgnoreRateLimit bool
 }
 
 type PendingOutboxPage struct {
@@ -3317,7 +3357,7 @@ func validateQueuedTranscriptCheckpointProvenance(state *State, msg OutboxMessag
 		// queue-after-scan race this validator is meant to close.  Keep the
 		// source-less legacy compatibility path permissive until its durable
 		// SourceRewriteBlocked marker is observed.
-		if !outboxTurnIsExplicitHistory(msg.TurnID) && strings.TrimSpace(checkpoint.LastRecordID) != "" &&
+		if !outboxTurnIsUserExplicitHistory(msg.TurnID) && strings.TrimSpace(checkpoint.LastRecordID) != "" &&
 			(strings.TrimSpace(checkpoint.SourcePath) != "" || strings.TrimSpace(checkpoint.SourceFingerprint) != "" || strings.TrimSpace(msg.TranscriptSourcePath) != "") {
 			return fmt.Errorf("%w: checkpoint %q is missing for source-bound outbox", ErrSessionStateProvenanceMismatch, checkpointID)
 		}
@@ -3990,7 +4030,7 @@ func (s *Store) loadSelectedStateFieldsUnlocked(ctx context.Context, wantedField
 		state, err := s.loadSQLiteSelectedStateFieldsUnlocked(ctx, pointer, wantedFields)
 		return state, true, err
 	}
-	if len(wantedFields) == 0 || !sessionExecutionStateFieldSet(wantedFields) {
+	if len(wantedFields) == 0 || !jsonSelectedStateFieldSetSupported(wantedFields) {
 		return State{}, false, nil
 	}
 	// Legacy JSON stores do not have a row-per-field backend, but ownership
@@ -4014,6 +4054,37 @@ func sessionExecutionStateFieldSet(fields map[string]struct{}) bool {
 	_, turns := fields["turns"]
 	_, checkpoints := fields["import_checkpoints"]
 	return turns && checkpoints
+}
+
+func jsonSelectedStateFieldSetSupported(fields map[string]struct{}) bool {
+	// Keep this list exact.  A selected JSON projection is a partial State, so
+	// accepting an arbitrary subset can silently drop fields that a caller still
+	// needs (for example UpgradeBlockingStateSnapshot also needs upgrade/control
+	// metadata and must fall back to the complete loader).  These projections are
+	// the bounded callers whose contracts are explicitly limited to the listed
+	// maps; all other callers retain the legacy full-load fallback.
+	return sessionExecutionStateFieldSet(fields) ||
+		exactStateFieldSet(fields, "control_chat", "sessions", "turns", "chat_polls", "import_checkpoints", "service_owner") ||
+		exactStateFieldSet(fields, "control_chat", "turns", "chat_polls", "import_checkpoints", "service_owner") ||
+		exactStateFieldSet(fields, "sessions", "turns", "import_checkpoints", "service_owner") ||
+		exactStateFieldSet(fields, "turns", "inbound_events") ||
+		exactStateFieldSet(fields, "outbox_messages", "chat_rate_limits") ||
+		exactStateFieldSet(fields, "outbox_messages") ||
+		exactStateFieldSet(fields, "chat_rate_limits") ||
+		exactStateFieldSet(fields, "service_owner") ||
+		exactStateFieldSet(fields, "service_owner", "lock_owner")
+}
+
+func exactStateFieldSet(fields map[string]struct{}, wanted ...string) bool {
+	if len(fields) != len(wanted) {
+		return false
+	}
+	for _, field := range wanted {
+		if _, ok := fields[field]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func loadImportCheckpointsByIDsData(data []byte, requested map[string]string) (map[string]ImportCheckpoint, bool, error) {
@@ -6505,6 +6576,23 @@ func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {
 	if now.IsZero() {
 		now = time.Now()
 	}
+	// These notices were emitted by the pre-remediation history gate. They are
+	// obsolete policy diagnostics, not user work or delivery that must survive
+	// an upgrade. Treating them as blockers can prevent the upgrade from ever
+	// reaching the new startup migration that retires them.
+	if IsLegacyHistoryGateNotice(msg) && !outboxDeliveryProtected(msg) {
+		return false
+	}
+	// rc16 and earlier could leave a transcript delivery without any source
+	// identity fields. A queued row has never acquired a send lease; a Sending
+	// row is eligible only after its lease expires and bounded reconciliation has
+	// failed. Retiring either stale shape keeps a compatible upgrade from
+	// depending on an operator-discovered history repair first. Fresh
+	// Sending/accepted rows remain conservative and are handled by the
+	// ambiguous recovery path.
+	if IsLegacyUnverifiableTranscriptOutbox(msg) {
+		return false
+	}
 	if outboxDeliveryProtected(msg) {
 		switch msg.Status {
 		case OutboxStatusQueued:
@@ -6529,6 +6617,184 @@ func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {
 	default:
 		return false
 	}
+}
+
+var legacyHistoryGateBodyMarkers = [...]string{
+	"local codex history sync is paused because the linked transcript was replaced or truncated",
+	"local codex history has a paused backlog",
+	"local codex history sync needs attention before i can",
+	"queued. local codex history sync needs attention before i can",
+	"queued. i am preparing this chat history first",
+	"queued. i’m preparing this chat history first",
+	"queued. i am syncing recent codex updates first",
+	"queued. i’m syncing recent codex updates first",
+	"codex received your question. i’m preparing this chat history first",
+	"codex received your question. i'm preparing this chat history first",
+	"paused automatic history sync",
+	"transcript tail is larger than the bounded automatic scan limit",
+}
+
+// IsLegacyHistoryGateNotice identifies the automatic history-policy notices
+// emitted by versions that incorrectly made transcript import a user-turn
+// admission gate. It deliberately uses exact legacy kinds plus stable body
+// markers; execution-ownership notices are not included.
+func IsLegacyHistoryGateNotice(msg OutboxMessage) bool {
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	switch kind {
+	case "sync-status-backlog-blocked", "sync-status-source-rewritten", "sync-status-tail-too-large":
+		return true
+	}
+	if kind == "import-needs-attention" || kind == "import-bg-needs-attention" {
+		turnID := strings.TrimSpace(msg.TurnID)
+		if !strings.HasPrefix(turnID, "import-bg:") {
+			return false
+		}
+		body := strings.TrimSpace(msg.Body)
+		return containsASCIIFold(body, "local codex history sync needs attention. i could not find the saved transcript checkpoint")
+	}
+	if kind != "ack" {
+		return false
+	}
+	ackKind := strings.ToLower(strings.TrimSpace(msg.AckKind))
+	if ackKind != "" && ackKind != "teams_prompt" && ackKind != "external_prompt" {
+		return false
+	}
+	return containsAnyASCIIFold(strings.TrimSpace(msg.Body), legacyHistoryGateBodyMarkers[:])
+}
+
+// IsLegacyHistoryGateNoticeForSend is the bounded classifier used while
+// walking the pending outbox. Generic legacy acknowledgements are handled by
+// startup/upgrade migration; normal sends must not scan arbitrary ACK bodies.
+func IsLegacyHistoryGateNoticeForSend(msg OutboxMessage) bool {
+	if strings.TrimSpace(msg.TeamsMessageID) != "" {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	switch kind {
+	case "sync-status-backlog-blocked", "sync-status-source-rewritten", "sync-status-tail-too-large":
+		return true
+	case "import-needs-attention", "import-bg-needs-attention":
+		return strings.HasPrefix(strings.TrimSpace(msg.TurnID), "import-bg:")
+	default:
+		return false
+	}
+}
+
+func containsASCIIFold(haystack string, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if len(needle) > len(haystack) {
+		return false
+	}
+	first := asciiFoldByte(needle[0])
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if asciiFoldByte(haystack[i]) != first {
+			continue
+		}
+		if asciiFoldEqualAt(haystack, i, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyASCIIFold(haystack string, needles []string) bool {
+	for i := 0; i < len(haystack); i++ {
+		first := asciiFoldByte(haystack[i])
+		switch first {
+		case 'l', 'q', 'c', 'p', 't':
+		default:
+			continue
+		}
+		for _, needle := range needles {
+			if len(needle) > 0 && asciiFoldByte(needle[0]) == first && asciiFoldEqualAt(haystack, i, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func asciiFoldEqualAt(haystack string, offset int, needle string) bool {
+	if offset < 0 || len(needle) > len(haystack)-offset {
+		return false
+	}
+	for i := 1; i < len(needle); i++ {
+		if asciiFoldByte(haystack[offset+i]) != asciiFoldByte(needle[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiFoldByte(value byte) byte {
+	if value >= 'A' && value <= 'Z' {
+		return value + ('a' - 'A')
+	}
+	return value
+}
+
+// IsLegacyUnverifiableTranscriptOutbox identifies pre-source-proof automatic
+// transcript rows that cannot be safely replayed after an upgrade. Rows with
+// an external identity, attachment state, explicit history, or a durable proof
+// remain protected.
+func IsLegacyUnverifiableTranscriptOutbox(msg OutboxMessage) bool {
+	if strings.TrimSpace(msg.TeamsMessageID) != "" {
+		return false
+	}
+	if len(msg.ArtifactIDs) > 0 || strings.TrimSpace(msg.AttachmentPath) != "" || strings.TrimSpace(msg.DriveItemID) != "" {
+		return false
+	}
+	if msg.Status != OutboxStatusQueued && !(msg.Status == OutboxStatusSending && OutboxSendLeaseExpired(msg, time.Now())) {
+		return false
+	}
+	if !IsAutomaticTranscriptOutbox(msg) {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	if strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "needs_attention") ||
+		strings.HasPrefix(kind, "sync-status-") ||
+		strings.HasPrefix(kind, "import-title") ||
+		strings.HasPrefix(kind, "import-complete") ||
+		strings.HasPrefix(kind, "import-subagent-marker-") ||
+		strings.HasSuffix(kind, "-needs-attention") || kind == "needs-attention" {
+		return false
+	}
+	return strings.TrimSpace(msg.TranscriptSourceProofFingerprint) == "" &&
+		!msg.TranscriptSourceProofOffsetKnown &&
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) == "" &&
+		!msg.TranscriptSourceReadProofRangeKnown
+}
+
+func isRecoverableTranscriptOutboxSkip(msg OutboxMessage) bool {
+	if msg.Status != OutboxStatusSkipped || strings.TrimSpace(msg.TeamsMessageID) != "" {
+		return false
+	}
+	reason := strings.ToLower(strings.TrimSpace(msg.LastSendError))
+	return reason == "obsolete pre-source-proof transcript row" ||
+		strings.HasPrefix(reason, "transcript source provenance was rewritten before graph ")
+}
+
+func legacyHistoryGateNoticeRetirable(msg OutboxMessage, now time.Time, includeActiveSending bool) bool {
+	if !IsLegacyHistoryGateNotice(msg) || outboxDeliveryProtected(msg) || strings.TrimSpace(msg.TeamsMessageID) != "" {
+		return false
+	}
+	switch msg.Status {
+	case OutboxStatusQueued:
+		return true
+	case OutboxStatusSending:
+		return includeActiveSending || OutboxSendLeaseExpired(msg, now)
+	default:
+		return false
+	}
+}
+
+func OutboxSendLeaseExpired(msg OutboxMessage, now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return msg.LastSendAttempt.IsZero() || now.Sub(msg.LastSendAttempt) > outboxSendLease
 }
 
 func outboxDeliveryProtected(msg OutboxMessage) bool {
@@ -6823,20 +7089,48 @@ func importCheckpointIsExplicitHistoryRun(checkpoint ImportCheckpoint) bool {
 	return strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
 }
 
-func outboxTurnIsExplicitHistory(turnID string) bool {
-	turnID = strings.TrimSpace(turnID)
-	return strings.HasPrefix(turnID, "import:") || strings.HasPrefix(turnID, "import-bg:") ||
-		strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
-}
-
 // outboxTurnIsUserExplicitHistory distinguishes a user-directed import from a
-// budgeted background resume.  Both namespaces are allowed to bypass an
-// unresolved execution while the import is explicitly in progress, but a
-// background resume must still honor a durable source-rewrite fence.
+// budgeted background resume.  Only the user-directed operation may explicitly
+// cross an unresolved-execution boundary.  A background resume must honor the
+// durable execution and source-rewrite fences so it cannot publish stale
+// history while a crashed turn is still unresolved.
 func outboxTurnIsUserExplicitHistory(turnID string) bool {
 	turnID = strings.TrimSpace(turnID)
-	return strings.HasPrefix(turnID, "import:") ||
-		strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
+	return strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
+}
+
+func automaticTranscriptTurnID(turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	return strings.HasPrefix(turnID, "sync:") || strings.HasPrefix(turnID, "import:") || strings.HasPrefix(turnID, "import-bg:")
+}
+
+func automaticTranscriptCompletionKind(kind string, notificationKind string) bool {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if !strings.EqualFold(strings.TrimSpace(notificationKind), "turn_completed") {
+		return false
+	}
+	return kind == "final" || strings.HasPrefix(kind, "final-") || strings.HasPrefix(kind, "answer") || strings.HasPrefix(kind, "final-answer")
+}
+
+// IsAutomaticTranscriptOutbox identifies both the original prefixed
+// transcript rows and the compact final/answer rows emitted by older helpers.
+// The latter are recognized only inside an automatic history namespace and
+// with the terminal turn_completed notification, so a normal user-turn final
+// is never treated as legacy history.
+func IsAutomaticTranscriptOutbox(msg OutboxMessage) bool {
+	if outboxTurnIsUserExplicitHistory(msg.TurnID) || !automaticTranscriptTurnID(msg.TurnID) {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	if strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "needs_attention") ||
+		strings.HasSuffix(kind, "-needs-attention") || kind == "needs-attention" ||
+		strings.HasPrefix(kind, "sync-status-") || strings.HasPrefix(kind, "sync-complete") ||
+		strings.HasPrefix(kind, "import-title") || strings.HasPrefix(kind, "import-complete") ||
+		strings.HasPrefix(kind, "import-subagent-marker-") {
+		return false
+	}
+	return strings.HasPrefix(kind, "sync-") || strings.HasPrefix(kind, "import-") || strings.HasPrefix(kind, "codex-") ||
+		automaticTranscriptCompletionKind(kind, msg.NotificationKind)
 }
 
 func outboxKindIsTranscriptLike(kind string, notificationKind string) bool {
@@ -6870,7 +7164,7 @@ func outboxSendBlockedByUnresolvedExecution(state *State, msg OutboxMessage) boo
 	if !stateHasUnresolvedExecution(state, msg.SessionID) {
 		return false
 	}
-	if outboxTurnIsExplicitHistory(msg.TurnID) {
+	if outboxTurnIsUserExplicitHistory(msg.TurnID) {
 		return false
 	}
 	if checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(msg.SessionID)]; ok &&
@@ -7477,6 +7771,55 @@ func sourceCheckpointFingerprintAtOffset(path string, offset int64) (string, err
 	_, _ = h.Write([]byte(strconv.FormatInt(start, 10)))
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write(window)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func sourceCheckpointRangeFingerprint(path string, start, end int64) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" || start < 0 || end < start {
+		return "", fmt.Errorf("invalid source checkpoint proof range")
+	}
+	if end-start > maxSourceCheckpointProofRangeBytes {
+		return "", fmt.Errorf("source checkpoint proof range exceeds bounded size")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() || end > info.Size() {
+		if err == nil {
+			err = fmt.Errorf("source checkpoint proof range exceeds file size")
+		}
+		return "", err
+	}
+	identity, err := SourceFileIdentityFromFileInfo(path, info)
+	if err != nil || strings.TrimSpace(identity) == "" {
+		if err == nil {
+			err = fmt.Errorf("source file identity unavailable")
+		}
+		return "", err
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(identity))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(filepath.Clean(path)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.FormatInt(start, 10)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.FormatInt(end, 10)))
+	_, _ = h.Write([]byte{0})
+	if _, err := io.Copy(h, io.NewSectionReader(f, start, end-start)); err != nil {
+		return "", err
+	}
+	postInfo, err := os.Stat(path)
+	if err != nil || postInfo.IsDir() || !os.SameFile(info, postInfo) || postInfo.Size() < end {
+		if err == nil {
+			err = fmt.Errorf("source file changed during checkpoint range proof")
+		}
+		return "", err
+	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
@@ -8774,7 +9117,7 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	if err := validateQueuedTranscriptCheckpointProvenance(state, msg, checkpoint); err != nil {
 		return OutboxMessage{}, false, false, err
 	}
-	if stateHasUnresolvedExecution(state, msg.SessionID) && !outboxTurnIsExplicitHistory(msg.TurnID) &&
+	if stateHasUnresolvedExecution(state, msg.SessionID) && !outboxTurnIsUserExplicitHistory(msg.TurnID) &&
 		!transcriptDeliveryUsesExactOuterExecutionProof(state, msg, delivery) &&
 		!transcriptDeliveryTrustedBeforeAnchor(state, msg, delivery, checkpoint) {
 		// Transcript delivery and checkpoint advancement are intentionally kept
@@ -8792,12 +9135,38 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	if state.ImportCheckpoints == nil {
 		state.ImportCheckpoints = map[string]ImportCheckpoint{}
 	}
+	existingOutbox, existingOutboxFound := state.OutboxMessages[strings.TrimSpace(msg.ID)]
+	if _, deliveryFound := state.TranscriptDeliveries[delivery.ID]; !deliveryFound {
+		if existing, ok := equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state, msg, delivery); ok {
+			linked := normalizeTranscriptDeliveryRecord(delivery, time.Now())
+			linked.OutboxID = existing.ID
+			linked.TeamsMessageID = existing.TeamsMessageID
+			switch existing.Status {
+			case OutboxStatusSent:
+				linked.Status = TranscriptDeliveryStatusSent
+				linked.SentAt = existing.SentAt
+			case OutboxStatusAccepted:
+				linked.Status = TranscriptDeliveryStatusAccepted
+			default:
+				linked.Status = TranscriptDeliveryStatusQueued
+			}
+			state.TranscriptDeliveries[delivery.ID] = linked
+			return existing, false, existing.Status == OutboxStatusSent, nil
+		}
+	}
 	if existingDelivery, ok := state.TranscriptDeliveries[delivery.ID]; ok {
 		var out OutboxMessage
 		if strings.TrimSpace(existingDelivery.OutboxID) != "" {
 			if existing, ok := state.OutboxMessages[existingDelivery.OutboxID]; ok {
 				out = existing
 			}
+		}
+		requeueCandidate := out
+		if requeueCandidate.ID == "" && existingOutboxFound {
+			requeueCandidate = existingOutbox
+		}
+		if transcriptDeliveryCanBeRequeuedForExplicitHistory(existingDelivery, requeueCandidate, true, msg) {
+			return requeueSkippedTranscriptOutboxLocked(state, requeueCandidate, msg, delivery, existingDelivery, now), false, false, nil
 		}
 		if transcriptDeliverySuppressesQueue(existingDelivery) {
 			applyTranscriptCheckpointLocked(state, checkpoint, now)
@@ -8823,6 +9192,9 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 		state.TranscriptDeliveries[delivery.ID] = existingDelivery
 		return out, created, false, nil
 	}
+	if existingOutboxFound && transcriptDeliveryCanBeRequeuedForExplicitHistory(TranscriptDeliveryRecord{}, existingOutbox, false, msg) {
+		return requeueSkippedTranscriptOutboxLocked(state, existingOutbox, msg, delivery, TranscriptDeliveryRecord{}, now), false, false, nil
+	}
 	out, created, err := queueOutboxLocked(state, msg, now)
 	if err != nil {
 		return OutboxMessage{}, false, false, err
@@ -8836,6 +9208,162 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	}
 	state.TranscriptDeliveries[normalized.ID] = normalized
 	return out, created, false, nil
+}
+
+// equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked bridges an
+// automatic import row to an explicit publish-history retry when both refer to
+// the same source range and rendered batch. The import turn namespace changes
+// by design, so the delivery ID cannot be the only dedupe key here. This scan
+// is restricted to the cold explicit-recovery path; ordinary linked-history
+// queueing retains its O(1) delivery lookup.
+func equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, requested OutboxMessage, delivery TranscriptDeliveryRecord) (OutboxMessage, bool) {
+	if state == nil || !outboxTurnIsUserExplicitHistory(requested.TurnID) {
+		return OutboxMessage{}, false
+	}
+	sourcePath := filepath.Clean(strings.TrimSpace(delivery.SourcePath))
+	sourceRecordID := strings.TrimSpace(delivery.SourceRecordID)
+	textHash := strings.TrimSpace(delivery.TextHash)
+	if sourcePath == "" || sourceRecordID == "" || textHash == "" {
+		return OutboxMessage{}, false
+	}
+	var best OutboxMessage
+	bestRank := -1
+	for _, existingDelivery := range state.TranscriptDeliveries {
+		if existingDelivery.ID == delivery.ID || strings.TrimSpace(existingDelivery.SessionID) != strings.TrimSpace(requested.SessionID) ||
+			!sameTranscriptSourcePath(existingDelivery.SourcePath, sourcePath) ||
+			strings.TrimSpace(existingDelivery.SourceRecordID) != sourceRecordID ||
+			strings.TrimSpace(existingDelivery.TextHash) != textHash {
+			continue
+		}
+		existing, ok := state.OutboxMessages[strings.TrimSpace(existingDelivery.OutboxID)]
+		if !ok || !automaticTranscriptTurnID(existing.TurnID) || strings.TrimSpace(existing.TeamsChatID) != strings.TrimSpace(requested.TeamsChatID) {
+			continue
+		}
+		if existing.Status != OutboxStatusQueued && existing.Status != OutboxStatusSending &&
+			existing.Status != OutboxStatusAccepted && existing.Status != OutboxStatusSent {
+			continue
+		}
+		if outboxSourceProofRequired(existing) && !outboxSourceProofValid(existing) {
+			continue
+		}
+		if existing.Status == OutboxStatusSent || existing.Status == OutboxStatusAccepted {
+			if strings.TrimSpace(existing.TeamsMessageID) == "" {
+				continue
+			}
+		}
+		rank := 0
+		switch existing.Status {
+		case OutboxStatusSending:
+			rank = 1
+		case OutboxStatusAccepted:
+			rank = 2
+		case OutboxStatusSent:
+			rank = 3
+		}
+		if rank > bestRank || rank == bestRank && (best.ID == "" || existing.CreatedAt.Before(best.CreatedAt)) {
+			best = existing
+			bestRank = rank
+		}
+	}
+	return best, best.ID != ""
+}
+
+func transcriptDeliveryCanBeRequeuedForExplicitHistory(existingDelivery TranscriptDeliveryRecord, existingOutbox OutboxMessage, deliveryFound bool, requested OutboxMessage) bool {
+	if !outboxTurnIsUserExplicitHistory(requested.TurnID) || !isRecoverableTranscriptOutboxSkip(existingOutbox) {
+		return false
+	}
+	if deliveryFound {
+		if strings.TrimSpace(existingDelivery.TeamsMessageID) != "" ||
+			existingDelivery.Status == TranscriptDeliveryStatusSent ||
+			existingDelivery.Status == TranscriptDeliveryStatusAccepted {
+			return false
+		}
+	}
+	return strings.TrimSpace(requested.TeamsMessageID) == ""
+}
+
+// requeueSkippedTranscriptOutboxLocked reuses the stable delivery identity.
+// This is deliberately limited to a skipped row with no external message ID:
+// explicit history is allowed to repair a safe local quarantine, while a row
+// that may have reached Graph remains terminal and is handled by reconciliation.
+func requeueSkippedTranscriptOutboxLocked(state *State, existing OutboxMessage, requested OutboxMessage, delivery TranscriptDeliveryRecord, previousDelivery TranscriptDeliveryRecord, now time.Time) OutboxMessage {
+	requested.ID = existing.ID
+	requested.SessionID = firstStoreNonEmptyString(requested.SessionID, existing.SessionID)
+	requested.CodexThreadID = firstStoreNonEmptyString(requested.CodexThreadID, existing.CodexThreadID)
+	requested.TeamsChatID = firstStoreNonEmptyString(requested.TeamsChatID, existing.TeamsChatID)
+	requested.Sequence = existing.Sequence
+	requested.CreatedAt = existing.CreatedAt
+	requested.Status = OutboxStatusQueued
+	requested.TeamsMessageID = ""
+	requested.SendAttemptToken = ""
+	requested.LastSendAttempt = time.Time{}
+	requested.SentAt = time.Time{}
+	requested.LastSendError = ""
+	requested.BlockedBySourceRewrite = false
+	requested.BlockedByUnresolvedExecution = false
+	requested.BlockedByTerminalFailure = false
+	requested.GraphRecoveryNextPath = ""
+	requested.GraphRecoveryCandidateID = ""
+	if requested.PartCount <= 0 {
+		requested.PartCount = existing.PartCount
+		if requested.PartCount <= 0 {
+			requested.PartCount = 1
+		}
+	}
+	if requested.PartIndex <= 0 && requested.PartCount == 1 {
+		requested.PartIndex = 1
+	}
+	if requested.RenderedHash == "" {
+		requested.RenderedHash = bodyHash(requested.Body)
+	}
+	if requested.UpdatedAt.IsZero() {
+		requested.UpdatedAt = now
+	}
+	if requested.UpdatedAt.Before(now) {
+		requested.UpdatedAt = now
+	}
+	if outboxDeliveryTransient(requested) && !outboxDeliveryProtected(requested) {
+		requested.UpgradeNonBlocking = true
+	}
+	state.OutboxMessages[requested.ID] = requested
+
+	if strings.TrimSpace(delivery.ID) != "" {
+		if delivery.CreatedAt.IsZero() {
+			delivery.CreatedAt = previousDelivery.CreatedAt
+		}
+		delivery.OutboxID = requested.ID
+		delivery.Status = TranscriptDeliveryStatusQueued
+		delivery.TeamsMessageID = ""
+		delivery.SentAt = time.Time{}
+		state.TranscriptDeliveries[delivery.ID] = normalizeTranscriptDeliveryRecord(delivery, now)
+	}
+	updatedHelper := false
+	for id, helper := range state.HelperDeliveries {
+		if strings.TrimSpace(helper.OutboxID) != requested.ID {
+			continue
+		}
+		helper.SessionID = requested.SessionID
+		helper.TeamsChatID = requested.TeamsChatID
+		helper.CodexThreadID = requested.CodexThreadID
+		helper.TurnID = requested.TurnID
+		helper.Kind = requested.Kind
+		helper.KindFamily = helperDeliveryKindFamily(requested.Kind)
+		helper.SourceTextHash = firstStoreNonEmptyString(requested.SourceTextHash, bodyHash(requested.Body))
+		helper.RenderedHash = firstStoreNonEmptyString(requested.RenderedHash, bodyHash(requested.Body))
+		helper.VisibleHash = firstStoreNonEmptyString(helper.SourceTextHash, helper.RenderedHash)
+		helper.TeamsMessageID = ""
+		helper.PartIndex = requested.PartIndex
+		helper.PartCount = requested.PartCount
+		helper.Status = HelperDeliveryStatusQueued
+		helper.SentAt = time.Time{}
+		helper.UpdatedAt = now
+		state.HelperDeliveries[id] = helper
+		updatedHelper = true
+	}
+	if !updatedHelper {
+		updateHelperDeliveryForOutboxLocked(state, requested, HelperDeliveryStatusQueued, now)
+	}
+	return requested
 }
 
 // transcriptDeliveryUsesExactOuterExecutionProof permits the final produced by
@@ -9100,7 +9628,8 @@ func normalizeArtifactRecord(record ArtifactRecord, now time.Time) ArtifactRecor
 }
 
 func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, now time.Time) {
-	if state == nil || strings.TrimSpace(checkpoint.ID) == "" || strings.TrimSpace(checkpoint.LastRecordID) == "" {
+	if state == nil || strings.TrimSpace(checkpoint.ID) == "" ||
+		(strings.TrimSpace(checkpoint.LastRecordID) == "" && !checkpoint.CompletionPending && checkpoint.Status != importCheckpointStatusImporting && checkpoint.Status != importCheckpointStatusComplete) {
 		return
 	}
 	previous := state.ImportCheckpoints[checkpoint.ID]
@@ -9142,6 +9671,17 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if checkpoint.UnresolvedExecution == nil {
 		checkpoint.UnresolvedExecution = previous.UnresolvedExecution
 	}
+	// These fields are stateful fences/caches, not part of the abbreviated
+	// checkpoint projections carried by delivery records.  Never let a replay
+	// of an older projection erase a source-rewrite fence or force the cold
+	// compatibility probe to run again on every update.
+	checkpoint.SourceRewriteBlocked = checkpoint.SourceRewriteBlocked || previous.SourceRewriteBlocked
+	if strings.TrimSpace(checkpoint.LegacyProbeRevision) == "" {
+		checkpoint.LegacyProbeRevision = previous.LegacyProbeRevision
+	}
+	if !checkpoint.CompletionPending && status != importCheckpointStatusComplete {
+		checkpoint.CompletionPending = previous.CompletionPending
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -9159,6 +9699,28 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		return claimOutboxSendAttemptLocked(state, msg, now)
 	})
+}
+
+// MarkOutboxGraphRecoveryProgressForAttempt persists the continuation cursor
+// and the one exact-marker candidate found so far. It is deliberately
+// attempt-scoped: a later sender must never inherit a cursor from an older
+// Graph POST attempt.
+func (s *Store) MarkOutboxGraphRecoveryProgressForAttempt(ctx context.Context, outboxID string, attemptToken string, nextPath string, candidateID string) (OutboxMessage, error) {
+	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken) {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		msg.GraphRecoveryNextPath = strings.TrimSpace(nextPath)
+		msg.GraphRecoveryCandidateID = strings.TrimSpace(candidateID)
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
@@ -9195,8 +9757,31 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	msg.LastSendAttempt = now
 	msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now, msg.SendAttemptToken)
 	msg.LastSendError = ""
+	msg.GraphRecoveryNextPath = ""
+	msg.GraphRecoveryCandidateID = ""
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
 	return msg, nil
+}
+
+func legacyAttachmentMessagePostState(msg OutboxMessage) string {
+	if strings.TrimSpace(msg.AttachmentPath) == "" {
+		return ""
+	}
+	if msg.Status == OutboxStatusQueued &&
+		strings.TrimSpace(msg.TeamsMessageID) == "" &&
+		strings.TrimSpace(msg.DriveItemID) == "" &&
+		strings.TrimSpace(msg.SendAttemptToken) == "" &&
+		msg.LastSendAttempt.IsZero() &&
+		strings.TrimSpace(msg.LastSendError) == "" &&
+		strings.TrimSpace(msg.GraphRecoveryCandidateID) == "" {
+		return "pending"
+	}
+	return "unknown"
+}
+
+func LegacyAttachmentMessagePostStateNeedsRecovery(msg OutboxMessage) bool {
+	return strings.TrimSpace(msg.AttachmentPath) != "" &&
+		strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "unknown")
 }
 
 func transcriptDeliveryParentFenceSessionID(msg OutboxMessage) string {
@@ -9269,6 +9854,12 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 		if candidate.ID == msg.ID || candidate.TeamsChatID != chatID || candidate.Sequence <= 0 || candidate.Sequence >= msg.Sequence {
 			continue
 		}
+		if AcceptedSourceRewriteOutboxIsStable(candidate) {
+			// Graph already accepted this row and the durable source-rewrite fence
+			// deliberately prevents a retry. Its stable Teams message ID is
+			// reconciled separately, so it must not strand newer rows in FIFO.
+			continue
+		}
 		switch candidate.Status {
 		case OutboxStatusSent, OutboxStatusSkipped:
 			continue
@@ -9281,11 +9872,67 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 	return earlier, found, nil
 }
 
+// EarlierUnsentOutboxes returns all pending predecessors in send order. It is
+// intentionally separate from EarlierUnsentOutbox because the normal sender
+// only needs the first predecessor; explicit history recovery may pass several
+// obsolete policy notices but must still stop at the first protected message.
+// Callers should use it only on that cold recovery path.
+func (s *Store) EarlierUnsentOutboxes(ctx context.Context, msg OutboxMessage) ([]OutboxMessage, error) {
+	chatID := strings.TrimSpace(msg.TeamsChatID)
+	if chatID == "" || msg.Sequence <= 0 {
+		return nil, nil
+	}
+	if earlier, handled, err := s.earlierUnsentOutboxesSQLite(ctx, msg); handled || err != nil {
+		return earlier, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]OutboxMessage, 0)
+	for _, candidate := range state.OutboxMessages {
+		if candidate.ID == msg.ID || candidate.TeamsChatID != chatID || candidate.Sequence <= 0 || candidate.Sequence >= msg.Sequence {
+			continue
+		}
+		if AcceptedSourceRewriteOutboxIsStable(candidate) {
+			continue
+		}
+		switch candidate.Status {
+		case OutboxStatusSent, OutboxStatusSkipped:
+			continue
+		}
+		out = append(out, candidate)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Sequence != out[j].Sequence {
+			return out[i].Sequence < out[j].Sequence
+		}
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
+// AcceptedSourceRewriteOutboxIsStable identifies the only source-fenced row
+// that is safe to remove from FIFO blocking: Graph accepted it and retained a
+// stable external message ID. Queued/sending rows remain blockers because
+// their external outcome is not known.
+func AcceptedSourceRewriteOutboxIsStable(msg OutboxMessage) bool {
+	return msg.Status == OutboxStatusAccepted &&
+		strings.TrimSpace(msg.TeamsMessageID) != "" &&
+		msg.BlockedBySourceRewrite
+}
+
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
 	return s.markOutboxSendError(ctx, outboxID, "", message, false)
 }
 
 func (s *Store) MarkOutboxSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
+	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
 	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true)
 }
 
@@ -9295,6 +9942,9 @@ func (s *Store) MarkOutboxSendErrorForAttempt(ctx context.Context, outboxID stri
 // POST while inbound echo reconciliation or the normal Graph recovery read has
 // time to discover the accepted message.
 func (s *Store) MarkOutboxAmbiguousSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
+	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		return markOutboxAmbiguousSendErrorLocked(state, msg, attemptToken, message, now)
 	}); handled || err != nil {
@@ -9314,6 +9964,161 @@ func (s *Store) MarkOutboxSkippedForAttempt(ctx context.Context, outboxID string
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		return markOutboxSkippedForAttemptLocked(state, msg, attemptToken, reason, now)
 	})
+}
+
+// MarkOutboxSkipped retires a queued or in-flight message that is no longer
+// valid to publish. It is deliberately separate from the attempt-scoped
+// method: startup migrations may quarantine an obsolete notification before a
+// new send attempt exists. Accepted or sent rows are left untouched because
+// their external delivery outcome is already known.
+func (s *Store) MarkOutboxSkipped(ctx context.Context, outboxID string, reason string) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxSkippedLocked(state, msg, reason, now)
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// RetireLegacyUnverifiableTranscriptOutboxIfStale performs the compatibility
+// retirement under the same JSON/SQLite outbox CAS as the sender. In
+// particular, a stale Sending snapshot must not use the unscoped skip method
+// after a new owner has reclaimed the row.
+func (s *Store) RetireLegacyUnverifiableTranscriptOutboxIfStale(ctx context.Context, outboxID string, reason string) (OutboxMessage, bool, error) {
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !IsLegacyUnverifiableTranscriptOutbox(msg) {
+			return msg, nil
+		}
+		updated, err := markOutboxSkippedLocked(state, msg, reason, now)
+		if err == nil && updated.Status == OutboxStatusSkipped && msg.Status != OutboxStatusSkipped {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
+func markOutboxSkippedLocked(state *State, msg OutboxMessage, reason string, now time.Time) (OutboxMessage, error) {
+	switch msg.Status {
+	case OutboxStatusQueued, OutboxStatusSending:
+		msg.Status = OutboxStatusSkipped
+		msg.LastSendError = trimDiagnostic(firstStoreNonEmptyString(reason, "outbox message superseded"), 240)
+		msg.UpdatedAt = now
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+		return msg, nil
+	case OutboxStatusAccepted, OutboxStatusSent, OutboxStatusSkipped:
+		return msg, nil
+	default:
+		return msg, ErrOutboxSendNotClaimed
+	}
+}
+
+// RetireLegacyHistoryGateOutbox removes obsolete automatic history-policy
+// notices after the caller has quiesced the sender. It includes active
+// sending rows because a stopped service has no legitimate sender left for
+// those rows; accepted/sent rows remain untouched. The migration is exhaustive
+// and idempotent: a large unrelated outbox prefix must not leave an old gate
+// notice behind for the post-upgrade readiness check to rediscover.
+func (s *Store) RetireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int) (int, error) {
+	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, true)
+}
+
+// RetireLegacyHistoryGateOutboxForStartup retires queued and lease-expired
+// legacy notices while leaving a fresh Sending row alone. A control-lease
+// takeover does not prove that a previous process's Graph POST has returned;
+// startup cleanup must leave that ambiguous external side effect recoverable.
+func (s *Store) RetireLegacyHistoryGateOutboxForStartup(ctx context.Context, pageSize int, maxPages int) (int, error) {
+	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, false)
+}
+
+func (s *Store) retireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int, includeActiveSending bool) (int, error) {
+	if pageSize <= 0 {
+		pageSize = 128
+	}
+	if maxPages <= 0 {
+		maxPages = 16
+	}
+	if retired, handled, err := s.retireLegacyHistoryGateOutboxSQLite(ctx, pageSize, maxPages, includeActiveSending); handled || err != nil {
+		return retired, err
+	}
+	// JSON stores have one state document. Updating each candidate through the
+	// generic outbox mutator would reload and atomically rewrite that document
+	// once per notice, turning compatibility cleanup into an O(n) full-file I/O
+	// storm. Scan all candidates, but perform one locked read/modify/write.
+	return s.retireLegacyHistoryGateOutboxJSON(ctx, pageSize, maxPages, includeActiveSending)
+}
+
+func (s *Store) retireLegacyHistoryGateOutboxJSON(ctx context.Context, _ int, _ int, includeActiveSending bool) (int, error) {
+	retired := 0
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		changed := false
+		now := time.Now()
+		for id, msg := range state.OutboxMessages {
+			if msg.Status != OutboxStatusQueued && msg.Status != OutboxStatusSending {
+				continue
+			}
+			if !legacyHistoryGateNoticeRetirable(msg, now, includeActiveSending) {
+				continue
+			}
+			updated, err := markOutboxSkippedLocked(state, msg, "obsolete automatic history-gate notice", now)
+			if err != nil {
+				return false, err
+			}
+			if updated.Status == msg.Status {
+				continue
+			}
+			state.OutboxMessages[id] = updated
+			retired++
+			changed = true
+		}
+		return changed, nil
+	})
+	return retired, err
+}
+
+// HasPendingLegacyHistoryGateOutbox performs an exact cold-path scan of the
+// pending outbox projection. A bounded page scan could report success after a
+// large unrelated prefix, allowing an old history-gate notice beyond the page
+// limit to survive the post-upgrade acceptance gate.
+func (s *Store) HasPendingLegacyHistoryGateOutbox(ctx context.Context) (bool, error) {
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
+	for _, msg := range state.OutboxMessages {
+		if legacyHistoryGateNoticeRetirable(msg, now, false) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *Store) markLegacyHistoryGateOutboxSkipped(ctx context.Context, outboxID string, includeActiveSending bool) (OutboxMessage, bool, error) {
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !legacyHistoryGateNoticeRetirable(msg, now, includeActiveSending) {
+			return msg, nil
+		}
+		updated, err := markOutboxSkippedLocked(state, msg, "obsolete automatic history-gate notice", now)
+		if err == nil && updated.Status == OutboxStatusSkipped && msg.Status != OutboxStatusSkipped {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
 }
 
 func markOutboxSkippedForAttemptLocked(state *State, msg OutboxMessage, attemptToken string, reason string, now time.Time) (OutboxMessage, error) {
@@ -9427,6 +10232,69 @@ func (s *Store) MarkOutboxDriveItemForAttempt(ctx context.Context, outboxID stri
 	return s.markOutboxDriveItem(ctx, outboxID, attemptToken, itemID, name, eTag, webURL, webDavURL, true)
 }
 
+// ClearOutboxDriveItemForAttempt forgets a remote DriveItem that Graph has
+// conclusively reported as deleted. The caller must have an exact, definitive
+// missing-item error: before the Teams chat POST it is a normal replayable
+// upload, and after the POST was marked started it is safe only for the narrow
+// case where Graph proved that the referenced DriveItem no longer exists. The
+// attempt fence keeps a stale worker from clearing a newer upload's identity.
+func (s *Store) ClearOutboxDriveItemForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			(msg.AttachmentMessagePostState != "pending" && msg.AttachmentMessagePostState != "started") {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		clearOutboxDriveItemLocked(state, &msg, now)
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+func clearOutboxDriveItemLocked(state *State, msg *OutboxMessage, now time.Time) {
+	if msg == nil {
+		return
+	}
+	msg.DriveItemID = ""
+	msg.DriveItemName = ""
+	msg.DriveItemETag = ""
+	msg.DriveItemWebURL = ""
+	msg.DriveItemWebDav = ""
+	msg.AttachmentUploadURL = ""
+	msg.AttachmentUploadExpiry = time.Time{}
+	msg.AttachmentUploadOffset = 0
+	msg.AttachmentMessagePostState = "pending"
+	msg.LastSendError = ""
+	if state == nil || len(msg.ArtifactIDs) == 0 {
+		return
+	}
+	for _, id := range msg.ArtifactIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		record, ok := state.ArtifactRecords[id]
+		if !ok || strings.TrimSpace(record.OutboxID) != strings.TrimSpace(msg.ID) {
+			continue
+		}
+		record.DriveItemID = ""
+		record.UploadedAt = time.Time{}
+		if record.Status == "drive_uploaded" || record.Status == "message_failed" {
+			record.Status = "uploading"
+		}
+		record.StatusReason = ""
+		record.UpdatedAt = now
+		state.ArtifactRecords[id] = record
+	}
+}
+
 func (s *Store) markOutboxDriveItem(ctx context.Context, outboxID string, attemptToken string, itemID string, name string, eTag string, webURL string, webDavURL string, requireAttempt bool) (OutboxMessage, error) {
 	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if requireAttempt && (msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken) {
@@ -9538,6 +10406,12 @@ func (s *Store) MarkOutboxSourceRewriteFence(ctx context.Context, outboxID strin
 		if existing := strings.TrimSpace(msg.TeamsMessageID); existing != "" && existing != teamsMessageID {
 			return msg, ErrOutboxSendNotClaimed
 		}
+		if AcceptedSourceRewriteOutboxIsStable(msg) && strings.TrimSpace(msg.TeamsMessageID) == teamsMessageID {
+			// Replay reconciliation is intentionally idempotent. Do not refresh
+			// UpdatedAt or rewrite provenance on every pending flush after a
+			// source-rewrite fence is already stable.
+			return msg, errStoreNoChange
+		}
 		// A source check can race with the final Sent CAS.  Demote that row back
 		// to Accepted and persist the fence instead of treating Sent as immutable;
 		// otherwise a post-CAS rewrite would still run transcript side effects or
@@ -9559,7 +10433,7 @@ func (s *Store) MarkOutboxSourceRewriteFence(ctx context.Context, outboxID strin
 }
 
 func (s *Store) markOutboxAccepted(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, false, requireClaim); handled || err != nil {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, false, requireClaim, false); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
@@ -9588,11 +10462,29 @@ func (s *Store) markOutboxAccepted(ctx context.Context, outboxID string, attempt
 }
 
 func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	return s.markOutboxSent(ctx, outboxID, "", teamsMessageID, false)
+	return s.markOutboxSent(ctx, outboxID, "", teamsMessageID, false, false)
 }
 
 func (s *Store) MarkOutboxSentForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
-	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true)
+	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true, false)
+}
+
+// MarkOutboxSentAfterSourceProof is the fast final-delivery CAS for a Bridge
+// that has just performed its forced source proof immediately before this
+// call. The store still validates the attempt, execution ownership, and
+// persisted source-rewrite fence atomically, but deliberately does not read
+// the transcript file while holding the store lock. A caller must use the
+// ordinary MarkOutboxSent method when it has not performed that proof.
+func (s *Store) MarkOutboxSentAfterSourceProof(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
+	return s.markOutboxSent(ctx, outboxID, "", teamsMessageID, false, true)
+}
+
+// MarkOutboxSentForAttemptAfterSourceProof is the attempt-scoped variant used
+// by the normal Bridge send/recovery path after its final forced source proof.
+// Keeping this boundary explicit prevents an arbitrary store caller from
+// accidentally opting out of source validation.
+func (s *Store) MarkOutboxSentForAttemptAfterSourceProof(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
+	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true, true)
 }
 
 // ApplyOutboxReplayFences promotes already-delivered canonical outbox rows in
@@ -9648,14 +10540,7 @@ func validateOutboxReplayCheckpointProvenance(state *State, msg OutboxMessage) e
 		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" {
 		return nil
 	}
-	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
-	legacySyncOrImport := strings.HasPrefix(kind, "sync-") || strings.HasPrefix(kind, "import-")
-	legacyCodexStatus := strings.HasPrefix(kind, "codex-status-") &&
-		(strings.HasPrefix(strings.TrimSpace(msg.TurnID), "sync:") ||
-			strings.HasPrefix(strings.TrimSpace(msg.TurnID), "import:") ||
-			strings.TrimSpace(msg.TranscriptCheckpointID) != "" ||
-			strings.TrimSpace(msg.TranscriptSourcePath) != "")
-	if !legacySyncOrImport && !legacyCodexStatus {
+	if !IsAutomaticTranscriptOutbox(msg) {
 		return nil
 	}
 	checkpointID := transcriptCheckpointIDForSession(msg.SessionID)
@@ -9719,8 +10604,8 @@ func validateOutboxReplayFence(current OutboxMessage, fence OutboxReplayFence) e
 	return nil
 }
 
-func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim); handled || err != nil {
+func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool, sourceProofPrevalidated bool) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim, sourceProofPrevalidated); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
@@ -9730,18 +10615,19 @@ func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToke
 		if err := markOutboxDeliveryBlockedIfUnresolvedExecution(state, &msg, teamsMessageID); err != nil {
 			return msg, err
 		}
-		return applyOutboxSentProjectionLocked(state, msg, teamsMessageID, now), nil
+		return applyOutboxSentProjectionLocked(state, msg, teamsMessageID, now, sourceProofPrevalidated), nil
 	})
 }
 
-func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time) OutboxMessage {
+func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time, sourceProofPrevalidated ...bool) OutboxMessage {
 	// Replay and the final delivery CAS both pass through this projection.  A
 	// transcript row may be checked by the bridge immediately before the store
 	// transaction, so revalidate its persisted source proof here as the last
 	// durable fence.  If the source changed (or a legacy automatic row has no
 	// proof), retain the stable Teams identity but never promote the row to Sent.
+	prevalidated := len(sourceProofPrevalidated) > 0 && sourceProofPrevalidated[0]
 	if outboxLegacyTranscriptSourceRewriteBlocked(state, msg) ||
-		(outboxSourceProofRequired(msg) && !outboxSourceProofValid(msg)) {
+		(!prevalidated && outboxSourceProofRequired(msg) && !outboxSourceProofValid(msg)) {
 		return applyOutboxSourceRewriteProjectionLocked(state, msg, teamsMessageID, now)
 	}
 	if msg.BlockedBySourceRewrite {
@@ -9820,7 +10706,7 @@ func applyOutboxSourceRewriteProjectionLocked(state *State, msg OutboxMessage, t
 }
 
 func outboxSourceProofRequired(msg OutboxMessage) bool {
-	if outboxTurnIsExplicitHistory(msg.TurnID) {
+	if outboxTurnIsUserExplicitHistory(msg.TurnID) {
 		return false
 	}
 	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
@@ -9829,7 +10715,8 @@ func outboxSourceProofRequired(msg OutboxMessage) bool {
 		return false
 	}
 	if strings.TrimSpace(msg.TranscriptCheckpointID) != "" || strings.TrimSpace(msg.TranscriptSourcePath) != "" ||
-		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" || msg.TranscriptSourceProofOffsetKnown {
+		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" || msg.TranscriptSourceProofOffsetKnown ||
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) != "" || msg.TranscriptSourceReadProofRangeKnown {
 		return true
 	}
 	// Source-less legacy sync rows are handled by the state-aware
@@ -9843,19 +10730,7 @@ func outboxLegacyTranscriptSourceRewriteBlocked(state *State, msg OutboxMessage)
 	if state == nil || outboxTurnIsUserExplicitHistory(msg.TurnID) {
 		return false
 	}
-	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
-	if strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "needs_attention") ||
-		strings.HasSuffix(kind, "-needs-attention") || kind == "needs-attention" ||
-		strings.HasPrefix(kind, "sync-status-") || strings.HasPrefix(kind, "import-title") || strings.HasPrefix(kind, "import-complete") {
-		return false
-	}
-	legacySyncOrImport := strings.HasPrefix(kind, "sync-") || strings.HasPrefix(kind, "import-")
-	legacyCodexStatus := strings.HasPrefix(kind, "codex-status-") &&
-		(strings.HasPrefix(strings.TrimSpace(msg.TurnID), "sync:") ||
-			strings.HasPrefix(strings.TrimSpace(msg.TurnID), "import:") ||
-			strings.TrimSpace(msg.TranscriptCheckpointID) != "" ||
-			strings.TrimSpace(msg.TranscriptSourcePath) != "")
-	if !legacySyncOrImport && !legacyCodexStatus {
+	if !IsAutomaticTranscriptOutbox(msg) {
 		return false
 	}
 	if strings.TrimSpace(msg.SessionID) == "" {
@@ -9914,7 +10789,19 @@ func outboxSourceProofValid(msg OutboxMessage) bool {
 		return false
 	}
 	actual, err := sourceCheckpointFingerprintAtOffset(path, msg.TranscriptSourceProofOffset)
-	return err == nil && strings.TrimSpace(actual) == expected
+	if err != nil || strings.TrimSpace(actual) != expected {
+		return false
+	}
+	if strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) == "" && !msg.TranscriptSourceReadProofRangeKnown {
+		return true
+	}
+	if !msg.TranscriptSourceReadProofRangeKnown || msg.TranscriptSourceReadProofStartOffset < 0 ||
+		msg.TranscriptSourceReadProofEndOffset < msg.TranscriptSourceReadProofStartOffset ||
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) == "" {
+		return false
+	}
+	readActual, readErr := sourceCheckpointRangeFingerprint(path, msg.TranscriptSourceReadProofStartOffset, msg.TranscriptSourceReadProofEndOffset)
+	return readErr == nil && strings.TrimSpace(readActual) == strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint)
 }
 
 func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) error {
@@ -10271,6 +11158,12 @@ func (s *Store) PendingOutboxPageAt(ctx context.Context, query PendingOutboxQuer
 }
 
 func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutboxQuery) bool {
+	if AcceptedSourceRewriteOutboxIsStable(msg) {
+		// Graph already accepted the message and the durable source-rewrite fence
+		// makes it permanently non-retryable. Reconcile it only through explicit
+		// history recovery, not through the ordinary sender poll.
+		return false
+	}
 	if query.SessionID != "" && msg.SessionID != query.SessionID {
 		return false
 	}
@@ -10281,14 +11174,14 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 		return false
 	}
 	acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
-	if !acceptedWithTeamsID {
+	if !query.IgnoreRateLimit && !acceptedWithTeamsID {
 		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(query.Now) {
 			return false
 		}
 	}
 	return acceptedWithTeamsID ||
 		msg.Status == OutboxStatusQueued ||
-		msg.Status == OutboxStatusSending && (msg.LastSendAttempt.IsZero() || query.Now.Sub(msg.LastSendAttempt) > outboxSendLease)
+		msg.Status == OutboxStatusSending && (query.IncludeActiveSending || msg.LastSendAttempt.IsZero() || query.Now.Sub(msg.LastSendAttempt) > outboxSendLease)
 }
 
 func pendingOutboxAfterCursor(msg OutboxMessage, cursor PendingOutboxCursor) bool {
@@ -11158,6 +12051,10 @@ func (s *Store) updateOutbox(ctx context.Context, outboxID string, fn func(*Stat
 		now := time.Now()
 		next, err := fn(state, current, now)
 		if err != nil {
+			if errors.Is(err, errStoreNoChange) {
+				out = current
+				return nil
+			}
 			return err
 		}
 		next.UpdatedAt = now
@@ -11729,6 +12626,9 @@ func migrateStateToCurrent(state State) State {
 		}
 		if msg.RenderedHash == "" {
 			msg.RenderedHash = bodyHash(msg.Body)
+		}
+		if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.AttachmentMessagePostState) == "" {
+			msg.AttachmentMessagePostState = legacyAttachmentMessagePostState(msg)
 		}
 		state.OutboxMessages[id] = msg
 	}

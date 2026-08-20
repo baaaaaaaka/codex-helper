@@ -12,6 +12,55 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+func TestHistoryTieredScanCapturesReadRangeProofForSameSizeTailRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	prefix := []byte(`{"type":"prefix"}` + "\n")
+	tail := []byte(`{"a":1}` + "\n")
+	if err := os.WriteFile(path, append(prefix, tail...), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{Path: path, Offset: int64(len(prefix)), Size: int64(len(prefix)), ModTime: info.ModTime()}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("scan transcript: %v", err)
+	}
+	if !result.ReadProofRangeKnown || result.ReadProofStartOffset != int64(len(prefix)) || result.ReadProofEndOffset != info.Size() {
+		t.Skip("platform does not expose a stable source identity for range proofs")
+	}
+	if err := os.WriteFile(path, append(prefix, []byte(`{"b":1}`+"\n")...), 0o600); err != nil {
+		t.Fatalf("rewrite transcript tail: %v", err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore transcript mtime: %v", err)
+	}
+	proof := outboxQueueOptions{
+		ExpectedSourcePath:            path,
+		ExpectedSourceReadFingerprint: result.ReadProofFingerprint,
+		ExpectedSourceReadStartOffset: result.ReadProofStartOffset,
+		ExpectedSourceReadEndOffset:   result.ReadProofEndOffset,
+		ExpectedSourceReadRangeKnown:  result.ReadProofRangeKnown,
+	}
+	if transcriptSourceReadProofMatches(proof) {
+		t.Fatal("same-size in-place tail rewrite passed the scan read-range proof")
+	}
+}
+
+func TestTranscriptSourceReadProofRejectsOversizedPersistedRange(t *testing.T) {
+	proof := outboxQueueOptions{
+		ExpectedSourcePath:            filepath.Join(t.TempDir(), "transcript.jsonl"),
+		ExpectedSourceReadFingerprint: "persisted-proof",
+		ExpectedSourceReadStartOffset: 0,
+		ExpectedSourceReadEndOffset:   int64(historyTieredMaxTailBytes) + 1,
+		ExpectedSourceReadRangeKnown:  true,
+	}
+	if transcriptSourceReadProofMatches(proof) {
+		t.Fatalf("oversized persisted read proof was accepted: %#v", proof)
+	}
+}
+
 func TestHistoryTieredStatDetectsOnlyChangedFiles(t *testing.T) {
 	dir := t.TempDir()
 	states := make(map[string]historyTieredFileState)

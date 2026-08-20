@@ -151,6 +151,42 @@ func (b *Bridge) retainAmbiguousOutboxEchoAttempt(outboxID string) {
 	b.outboxEchoAttempts.Entries[entry.OutboxID] = entry
 }
 
+// claimKnownAmbiguousOutboxRetry authorizes a same-process explicit retry only
+// for the attempt that this Bridge previously sent and then released as
+// ambiguous. A restart has no such cache entry, and a concurrent sender marks
+// the entry InFlight, so neither case may steal an active send lease and risk a
+// duplicate POST.
+func (b *Bridge) claimKnownAmbiguousOutboxRetry(outboxID string) (uint64, bool) {
+	if b == nil || strings.TrimSpace(outboxID) == "" {
+		return 0, false
+	}
+	now := time.Now()
+	b.outboxEchoAttemptMu.Lock()
+	defer b.outboxEchoAttemptMu.Unlock()
+	entry, ok := b.outboxEchoAttempts.Entries[strings.TrimSpace(outboxID)]
+	if !ok || entry.InFlight || !entry.ExpiresAt.After(now) {
+		return 0, false
+	}
+	entry.InFlight = true
+	b.outboxEchoAttempts.Entries[entry.OutboxID] = entry
+	return entry.Generation, true
+}
+
+func (b *Bridge) releaseKnownAmbiguousOutboxRetry(outboxID string, generation uint64) {
+	if b == nil || strings.TrimSpace(outboxID) == "" || generation == 0 {
+		return
+	}
+	b.outboxEchoAttemptMu.Lock()
+	defer b.outboxEchoAttemptMu.Unlock()
+	entry, ok := b.outboxEchoAttempts.Entries[strings.TrimSpace(outboxID)]
+	if !ok || entry.Generation != generation {
+		return
+	}
+	entry.InFlight = false
+	entry.ExpiresAt = time.Now().Add(outboxEchoAttemptTTL)
+	b.outboxEchoAttempts.Entries[entry.OutboxID] = entry
+}
+
 func (b *Bridge) matchOutboxEchoAttempt(chatID string, plainText string, messageID string, activityAt time.Time) (outboxEchoAttempt, bool) {
 	if b == nil {
 		return outboxEchoAttempt{}, false

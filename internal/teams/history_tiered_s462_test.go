@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -254,6 +255,53 @@ func TestHistoryTieredScanTailQuarantinesAnonymousFinalPairAcrossPolls(t *testin
 	}
 	if !second.State.UnresolvedContinuation {
 		t.Fatalf("second anonymous final was not unresolved: state=%#v finals=%#v", second.State, second.Finals)
+	}
+}
+
+func TestHistoryWatchDeletedSourceRewriteBlockedCheckpointIsCleanedAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "deleted-blocked-watch.jsonl")
+			if err := os.WriteFile(path, []byte(`{"id":"rewritten"}`+"\n"), 0o600); err != nil {
+				t.Fatalf("write blocked transcript: %v", err)
+			}
+			store := newBridgeTestStore(t)
+			defer store.Close()
+			checkpointID := historyWatchCheckpointID(path)
+			if err := store.UpdateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+				history[checkpointID] = teamstore.HistoryWatchCheckpoint{
+					ID: checkpointID, Path: path, Size: 64, Offset: 64,
+					SourceRewriteBlocked: true, UpdatedAt: time.Now(),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed blocked history-watch checkpoint: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove transcript: %v", err)
+			}
+			bridge := &Bridge{store: store}
+			if err := bridge.syncCodexHistoryWatchPath(ctx, path, time.Now()); err != nil {
+				t.Fatalf("sync deleted blocked checkpoint: %v", err)
+			}
+			state, err := store.HistoryWatchState(ctx)
+			if err != nil {
+				t.Fatalf("read history-watch state after cleanup: %v", err)
+			}
+			if _, found := state.HistoryWatch[checkpointID]; found {
+				t.Fatalf("deleted blocked checkpoint survived cleanup: %#v", state.HistoryWatch[checkpointID])
+			}
+			// Cleanup is idempotent: a second poll has no checkpoint to rewrite.
+			if err := bridge.syncCodexHistoryWatchPath(ctx, path, time.Now()); err != nil {
+				t.Fatalf("repeat deleted blocked checkpoint cleanup: %v", err)
+			}
+		})
 	}
 }
 
@@ -605,8 +653,8 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNoIDChildEventMessage(t *testing.T
 	if sentPlainContains(*sent, "anonymous child answer") {
 		t.Fatalf("anonymous child answer leaked through bridge: %#v", *sent)
 	}
-	if !sentPlainContains(*sent, "helper publish-history") {
-		t.Fatalf("missing needs-attention recovery instruction: %#v", *sent)
+	if len(*sent) != 1 || !sentPlainContains(*sent, "previous Codex execution is still unconfirmed") || !sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("execution-ownership ambiguity was not reported exactly once: %#v", *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -651,8 +699,8 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSourceIDChildEventMessageWithoutTu
 	if sentPlainContains(*sent, "source-id child answer without turn provenance") {
 		t.Fatalf("source-ID child answer leaked through bridge: %#v", *sent)
 	}
-	if !sentPlainContains(*sent, "helper publish-history") {
-		t.Fatalf("missing needs-attention recovery instruction: %#v", *sent)
+	if len(*sent) != 1 || !sentPlainContains(*sent, "previous Codex execution is still unconfirmed") || !sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("execution-ownership ambiguity was not reported exactly once: %#v", *sent)
 	}
 }
 
@@ -687,8 +735,8 @@ func TestBridgeSyncLinkedTranscriptBlocksOversizedTail(t *testing.T) {
 	if sentPlainContains(*sent, "large tail final") {
 		t.Fatalf("oversized tail final leaked: %#v", *sent)
 	}
-	if !sentPlainContains(*sent, "tail is larger than the bounded automatic scan limit") || !sentPlainContains(*sent, "helper publish-history") {
-		t.Fatalf("missing oversized-tail needs-attention notice: %#v", *sent)
+	if len(*sent) != 0 {
+		t.Fatalf("automatic oversized-tail check produced user-visible output: %#v", *sent)
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {

@@ -5934,8 +5934,8 @@ func TestBridgeLinkedTranscriptOutboxSourceRewriteDoesNotPostAcrossBackends(t *t
 				t.Fatalf("source rewrite triggered Graph POST: %#v", *sent)
 			}
 			unchanged, err := store.OutboxMessageByID(ctx, outboxID)
-			if err != nil || unchanged.Status != teamstore.OutboxStatusQueued {
-				t.Fatalf("source rewrite outbox = %#v err=%v, want queued without POST", unchanged, err)
+			if err != nil || unchanged.Status == teamstore.OutboxStatusSent {
+				t.Fatalf("source rewrite outbox = %#v err=%v, want non-sent quarantine", unchanged, err)
 			}
 		})
 	}
@@ -6144,22 +6144,17 @@ func TestBridgeSourceRewriteAttentionNoticeRemainsDeliverableAcrossBackends(t *t
 			if err := bridge.blockAutomaticTranscriptSyncForSourceRewrite(ctx, *session, checkpoint.SourcePath, checkpoint); err != nil {
 				t.Fatalf("blockAutomaticTranscriptSyncForSourceRewrite: %v", err)
 			}
-			if got := countSentPlainContaining(*sent, "linked transcript was replaced or truncated"); got != 1 {
-				t.Fatalf("source-rewrite attention count = %d, want exactly one; sent=%#v", got, *sent)
+			if got := countSentPlainContaining(*sent, "linked transcript was replaced or truncated"); got != 0 {
+				t.Fatalf("automatic source-rewrite attention count = %d, want zero; sent=%#v", got, *sent)
 			}
 			state, err := store.Load(ctx)
 			if err != nil {
 				t.Fatalf("load state: %v", err)
 			}
-			var notice teamstore.OutboxMessage
 			for _, candidate := range state.OutboxMessages {
 				if candidate.Kind == "sync-status-source-rewritten" {
-					notice = candidate
-					break
+					t.Fatalf("automatic source-rewrite notice was persisted: %#v", candidate)
 				}
-			}
-			if notice.Status != teamstore.OutboxStatusSent || notice.BlockedBySourceRewrite {
-				t.Fatalf("source-rewrite notice = %#v, want Sent without source fence", notice)
 			}
 		})
 	}
@@ -6579,6 +6574,49 @@ func TestTranscriptOutboxAnchorBlocksOnlyUnprovenTail(t *testing.T) {
 	}
 	if !transcriptOutboxBlockedByUnresolvedAnchor(ctx, store, legacy, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
 		t.Fatal("legacy transcript row without provenance was allowed")
+	}
+}
+
+func TestTranscriptOutboxAnchorCacheReusesSessionSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	const sessionID = "outbox-anchor-cache-session"
+	anchor := teamstore.ExecutionAnchor{
+		SessionID: sessionID, OuterTurnID: "ambiguous-turn",
+		State: executionAnchorStateUnresolved, Generation: 2,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[sessionID] = teamstore.SessionContext{ID: sessionID, Status: teamstore.SessionStatusActive}
+		state.ImportCheckpoints[transcriptCheckpointID(sessionID)] = teamstore.ImportCheckpoint{
+			ID: transcriptCheckpointID(sessionID), SessionID: sessionID,
+			UnresolvedExecution: &anchor, ExecutionAnchorGeneration: anchor.Generation,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed unresolved anchor: %v", err)
+	}
+	outbox := teamstore.OutboxMessage{SessionID: sessionID, Kind: "sync-final", TurnID: "sync:" + sessionID}
+	anchorCache := make(map[string]teamstore.ExecutionAnchor)
+	anchorKnown := make(map[string]bool)
+	if !transcriptOutboxBlockedByUnresolvedAnchor(ctx, store, outbox, anchorCache, anchorKnown) {
+		t.Fatal("initial unresolved anchor was not blocked")
+	}
+	if !anchorKnown[sessionID] {
+		t.Fatal("initial anchor snapshot was not cached")
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		checkpoint := state.ImportCheckpoints[transcriptCheckpointID(sessionID)]
+		checkpoint.UnresolvedExecution = nil
+		state.ImportCheckpoints[checkpoint.ID] = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatalf("clear unresolved anchor: %v", err)
+	}
+	if !transcriptOutboxBlockedByUnresolvedAnchor(ctx, store, outbox, anchorCache, anchorKnown) {
+		t.Fatal("cached anchor was unexpectedly refreshed during the same flush")
+	}
+	if transcriptOutboxBlockedByUnresolvedAnchor(ctx, store, outbox, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
+		t.Fatal("fresh anchor snapshot still reported a cleared anchor")
 	}
 }
 
@@ -12341,7 +12379,7 @@ func TestBridgePublishClosedLinkedSessionCreatesNewWorkChat(t *testing.T) {
 	}
 }
 
-func TestBridgePublishNewSessionDoesNotRawErrorOnStaleCheckpointID(t *testing.T) {
+func TestBridgePublishNewSessionSilentlyBlocksStaleCheckpointID(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -12399,24 +12437,24 @@ func TestBridgePublishNewSessionDoesNotRawErrorOnStaleCheckpointID(t *testing.T)
 	if err != nil {
 		t.Fatalf("publish new session error = %v, want user-facing recovery message", err)
 	}
-	if strings.Contains(message, "transcript checkpoint was not found") || !strings.Contains(message, "Local Codex history sync needs attention") {
-		t.Fatalf("publish response = %q, want attention without raw checkpoint error", message)
+	if strings.Contains(message, "transcript checkpoint was not found") || strings.Contains(message, "Local Codex history sync needs attention") {
+		t.Fatalf("publish response = %q, automatic legacy checkpoint must stay silent", message)
 	}
 	joined := sentPlainJoined(sent)
-	if !strings.Contains(joined, "Local Codex history sync needs attention") || strings.Contains(joined, "refusing to guess") {
-		t.Fatalf("work chat output mismatch:\n%s", joined)
+	if strings.Contains(joined, "Local Codex history sync needs attention") || strings.Contains(joined, "Imported Codex session history") || strings.Contains(joined, "refusing to guess") {
+		t.Fatalf("automatic legacy checkpoint emitted history-gate output:\n%s", joined)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s002")]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silently blocked legacy checkpoint preserved", checkpoint)
 	}
 }
 
-func TestBridgeImportCheckpointMismatchDoesNotMarkComplete(t *testing.T) {
+func TestBridgeImportCheckpointMismatchBlocksSilentlyWithoutMarkingComplete(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -12446,15 +12484,16 @@ func TestBridgeImportCheckpointMismatchDoesNotMarkComplete(t *testing.T) {
 		SessionID: "thread-alpha",
 		FilePath:  transcriptPath,
 	})
-	if err == nil || !strings.Contains(err.Error(), "checkpoint") {
-		t.Fatalf("import error = %v, want checkpoint mismatch", err)
+	if err != nil {
+		t.Fatalf("import error = %v, want silent automatic block", err)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	if got := state.ImportCheckpoints[transcriptCheckpointID("s001")].Status; got != importCheckpointStatusFailed {
-		t.Fatalf("checkpoint status = %q, want failed", got)
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want blocked legacy checkpoint without completion", checkpoint)
 	}
 }
 
@@ -12552,23 +12591,24 @@ func TestBridgePublishExistingSessionDoesNotRawErrorOnMissingCheckpoint(t *testi
 	}
 	for _, want := range []string{
 		"Already published as s001",
-		"Local Codex history sync needs attention",
+		"No new local history was imported automatically.",
 		"Open this Teams work chat",
 	} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("publish message missing %q in:\n%s", want, message)
 		}
 	}
-	if len(*sent) != 0 {
-		t.Fatalf("publish existing missing checkpoint should not send import messages: %#v", *sent)
+	joined := sentPlainJoined(*sent)
+	if strings.Contains(message, "Local Codex history sync needs attention") || strings.Contains(joined, "Local Codex history sync needs attention") || strings.Contains(joined, "Imported Codex session history") {
+		t.Fatalf("publish existing missing checkpoint emitted history-gate output:\nmessage=%s\nchat=%s", message, joined)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silently blocked stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -12582,7 +12622,7 @@ func TestTranscriptCheckpointNotFoundErrorMatchesLegacyRawMessage(t *testing.T) 
 	}
 }
 
-func TestBridgePublishExistingBlockedSessionDoesNotRawErrorOnMissingCheckpoint(t *testing.T) {
+func TestBridgePublishExistingBlockedSessionStaysSilentOnMissingCheckpoint(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -12619,12 +12659,12 @@ func TestBridgePublishExistingBlockedSessionDoesNotRawErrorOnMissingCheckpoint(t
 	if strings.Contains(message, "transcript checkpoint was not found") || strings.Contains(message, "refusing to guess") {
 		t.Fatalf("publish response leaked raw checkpoint error:\n%s", message)
 	}
-	if !strings.Contains(message, "Local Codex history sync needs attention") {
-		t.Fatalf("publish response = %q, want attention message", message)
+	if !strings.Contains(message, "No new local history was imported automatically.") || strings.Contains(message, "Local Codex history sync needs attention") {
+		t.Fatalf("publish response = %q, want truthful silent-block status", message)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "Imported Codex session history") || !strings.Contains(joined, "Local Codex history sync needs attention") {
-		t.Fatalf("work chat output missing title and attention message:\n%s", joined)
+	if strings.Contains(joined, "Imported Codex session history") || strings.Contains(joined, "Local Codex history sync needs attention") {
+		t.Fatalf("work chat output emitted history-gate message:\n%s", joined)
 	}
 	if strings.Contains(joined, "refusing to guess") || strings.Contains(joined, "run `continue` again") {
 		t.Fatalf("work chat output leaked raw checkpoint error:\n%s", joined)
@@ -12634,8 +12674,8 @@ func TestBridgePublishExistingBlockedSessionDoesNotRawErrorOnMissingCheckpoint(t
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silently blocked stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -12775,8 +12815,8 @@ func TestBridgePrepareRecoversFailedTranscriptCheckpointBySourceLine(t *testing.
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" || checkpoint.LastSourceLine != 1 {
-		t.Fatalf("checkpoint was not recovered: %#v", checkpoint)
+	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "stale-checkpoint-key" {
+		t.Fatalf("failed history checkpoint was changed during turn admission: %#v", checkpoint)
 	}
 }
 
@@ -13503,13 +13543,67 @@ func TestBridgeBackgroundImportQueuesOneBatchAndResumesLater(t *testing.T) {
 	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a1" || !strings.HasPrefix(checkpoint.ImportTurnID, "import-bg:") {
 		t.Fatalf("checkpoint after first budgeted batch = %#v, want paused complete at a1", checkpoint)
 	}
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript after first batch: %v", err)
+	}
+	var batchOutbox teamstore.OutboxMessage
+	for _, candidate := range state.OutboxMessages {
+		if candidate.TurnID == "import-bg:"+session.ID && strings.HasPrefix(candidate.ID, "outbox:transcript-delivery:") {
+			batchOutbox = candidate
+			break
+		}
+	}
+	if batchOutbox.ID == "" {
+		t.Fatalf("missing background import batch outbox: %#v", state.OutboxMessages)
+	}
+	wantProof := transcriptCheckpointSourceFingerprint(transcriptPath, info.Size())
+	if batchOutbox.TranscriptSourceProofFingerprint != wantProof ||
+		batchOutbox.TranscriptSourcePath != transcriptPath ||
+		batchOutbox.TranscriptSourceProofOffset != info.Size() ||
+		!batchOutbox.TranscriptSourceProofOffsetKnown {
+		t.Fatalf("background import batch source proof = %#v, want fingerprint=%q offset=%d known", batchOutbox, wantProof, info.Size())
+	}
 
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("resume budgeted import: %v", err)
 	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load state after resumed background import: %v", err)
+	}
+	var completionOutbox teamstore.OutboxMessage
+	for _, candidate := range state.OutboxMessages {
+		if candidate.TurnID == "import-bg:"+session.ID && strings.HasPrefix(candidate.Kind, "import-complete") {
+			completionOutbox = candidate
+			break
+		}
+	}
+	if completionOutbox.ID == "" || completionOutbox.TranscriptSourcePath != transcriptPath ||
+		completionOutbox.TranscriptSourceProofFingerprint == "" || !completionOutbox.TranscriptSourceProofOffsetKnown {
+		t.Fatalf("background completion outbox lost source proof: %#v", completionOutbox)
+	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if !sentPlainContains(*sent, "second budgeted answer") || !sentPlainContains(*sent, "Import complete") {
 		t.Fatalf("resumed background import missing final content: %#v", *sent)
+	}
+	appendFile, err := os.OpenFile(transcriptPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open transcript for post-EOF append: %v", err)
+	}
+	if _, err := appendFile.WriteString(`{"id":"a3","thread_id":"thread-budgeted-import","role":"assistant","text":"appended after completion"}` + "\n"); err != nil {
+		_ = appendFile.Close()
+		t.Fatalf("append transcript after EOF: %v", err)
+	}
+	if err := appendFile.Close(); err != nil {
+		t.Fatalf("close transcript after EOF append: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync appended post-EOF record: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "appended after completion") {
+		t.Fatalf("post-EOF append was not delivered: %#v", *sent)
 	}
 }
 
@@ -13634,7 +13728,7 @@ func TestBridgePollIgnoresImportBatchBeforeAnnotatingUserPrefix(t *testing.T) {
 	}
 }
 
-func TestBridgePollSkipsWorkChatWhileTranscriptImporting(t *testing.T) {
+func TestBridgePollProcessesWorkChatWhileTranscriptImporting(t *testing.T) {
 	var workPolls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -13677,12 +13771,12 @@ func TestBridgePollSkipsWorkChatWhileTranscriptImporting(t *testing.T) {
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
 	}
-	if workPolls != 0 {
-		t.Fatalf("work chat was polled %d time(s) while transcript import was active", workPolls)
+	if workPolls != 1 {
+		t.Fatalf("work chat was polled %d time(s) while transcript import was active, want one poll", workPolls)
 	}
 }
 
-func TestBridgeSessionMessageDefersUntilTranscriptImportCompletes(t *testing.T) {
+func TestBridgeSessionMessageRunsWhileTranscriptImporting(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	executor := &recordingExecutor{result: ExecutionResult{Text: "deferred answer", CodexThreadID: "thread-1", CodexTurnID: "turn-deferred"}}
@@ -13702,34 +13796,27 @@ func TestBridgeSessionMessageDefersUntilTranscriptImportCompletes(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	var deferred teamstore.InboundEvent
+	var inboundEvent teamstore.InboundEvent
 	for _, inbound := range state.InboundEvents {
 		if inbound.TeamsMessageID == "during-import" {
-			deferred = inbound
+			inboundEvent = inbound
 			break
 		}
 	}
-	if deferred.ID == "" || deferred.Status != teamstore.InboundStatusDeferred || deferred.Text != "run after import" {
-		t.Fatalf("message was not deferred cleanly during import: %#v", deferred)
+	if inboundEvent.ID == "" || inboundEvent.Status != teamstore.InboundStatusQueued || inboundEvent.Text != "run after import" {
+		t.Fatalf("message was not admitted while import was active: %#v", inboundEvent)
 	}
-	if len(state.Turns) != 0 || len(*sent) != 0 || len(executor.prompts) != 0 {
-		t.Fatalf("deferred import message should not queue, send ack, or run Codex yet; turns=%#v sent=%#v prompts=%#v", state.Turns, *sent, executor.prompts)
-	}
-
-	if err := bridge.markTranscriptImportComplete(context.Background(), *session, "/tmp/session.jsonl", "a-final", 42); err != nil {
-		t.Fatalf("markTranscriptImportComplete error: %v", err)
-	}
-	if err := bridge.processDeferredInbound(context.Background()); err != nil {
-		t.Fatalf("processDeferredInbound error: %v", err)
+	if len(state.Turns) != 1 || len(*sent) == 0 || len(executor.prompts) != 1 {
+		t.Fatalf("importing history must not gate a normal turn; turns=%#v sent=%#v prompts=%#v", state.Turns, *sent, executor.prompts)
 	}
 	waitForCompletedTurnCount(t, store, "s001", 1)
 	joined := sentPlainText(*sent)
 	if !strings.Contains(joined, "Codex is working. Request accepted.") || !strings.Contains(joined, "deferred answer") {
-		t.Fatalf("deferred message was not replayed after import completion, sent=\n%s", joined)
+		t.Fatalf("normal turn did not complete while import was active, sent=\n%s", joined)
 	}
 }
 
-func TestBridgeSessionMessageReferenceDefersUntilTranscriptImportCompletes(t *testing.T) {
+func TestBridgeSessionMessageReferenceRunsWhileTranscriptImporting(t *testing.T) {
 	graph, sent := newBridgeMessageReferenceGraph(t, http.StatusOK)
 	store := newBridgeTestStore(t)
 	executor := &recordingExecutor{result: ExecutionResult{Text: "deferred quote answer", CodexThreadID: "thread-1", CodexTurnID: "turn-deferred"}}
@@ -13751,14 +13838,8 @@ func TestBridgeSessionMessageReferenceDefersUntilTranscriptImportCompletes(t *te
 	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, "run after import"); err != nil {
 		t.Fatalf("handleSessionMessage during import error: %v", err)
 	}
-	if len(executor.prompts) != 0 {
-		t.Fatalf("executor prompts before import completes = %#v, want none", executor.prompts)
-	}
-	if err := bridge.markTranscriptImportComplete(context.Background(), *session, "/tmp/session.jsonl", "a-final", 42); err != nil {
-		t.Fatalf("markTranscriptImportComplete error: %v", err)
-	}
-	if err := bridge.processDeferredInbound(context.Background()); err != nil {
-		t.Fatalf("processDeferredInbound error: %v", err)
+	if len(executor.prompts) != 1 {
+		t.Fatalf("executor prompts while import is active = %#v, want one", executor.prompts)
 	}
 	if got := executor.prompts; len(got) != 1 ||
 		!strings.Contains(got[0], "run after import") ||
@@ -13799,23 +13880,26 @@ func TestBridgeQueuedTurnsWaitForTranscriptImport(t *testing.T) {
 		t.Fatalf("markTranscriptImportStarted error: %v", err)
 	}
 
-	started, err := bridge.startQueuedTurn(context.Background(), session, "", nil)
+	started, err := bridge.startQueuedTurn(context.Background(), session, turn.ID, func(runCtx context.Context, runSession *Session, claimed teamstore.Turn) error {
+		return bridge.runQueuedTurnWithExecutor(runCtx, bridge.executor, runSession, claimed, runSession.ChatID, "queued input")
+	})
 	if err != nil {
 		t.Fatalf("startQueuedTurn error: %v", err)
 	}
-	if started {
-		t.Fatal("queued turn started while transcript import was active")
+	if !started {
+		t.Fatal("queued turn was incorrectly held while transcript import was active")
 	}
+	waitForBridgeAsyncTurns(t, bridge)
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load state: %v", err)
 	}
-	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusQueued {
-		t.Fatalf("turn status = %q, want queued while import is active", got)
+	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusCompleted {
+		t.Fatalf("turn status = %q, want completed while import is active", got)
 	}
 }
 
-func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
+func TestBridgePublishHistoryRecoversInterruptedHistoryImport(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	transcript := strings.Join([]string{
 		`{"id":"u1","role":"user","text":"hello"}`,
@@ -13844,6 +13928,7 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 	})
 	var sent []bridgeSentMessage
 	failAssistantOnce := true
+	var acceptedAssistantContent string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -13860,14 +13945,29 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 			}
 			if failAssistantOnce && strings.Contains(body.Body.Content, "hi there") {
 				failAssistantOnce = false
+				// Graph may have accepted the POST before its response was lost.
+				acceptedAssistantContent = body.Body.Content
 				http.Error(w, "temporary", http.StatusInternalServerError)
 				return
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			if chatID == "work-chat" && strings.Contains(body.Body.Content, "hi there") {
+				acceptedAssistantContent = body.Body.Content
+			}
 			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):
-			_, _ = fmt.Fprint(w, `{"value":[]}`)
+			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+			if chatID == "work-chat" && acceptedAssistantContent != "" {
+				accepted := bridgeTestMessageWithText("accepted-assistant", acceptedAssistantContent)
+				accepted.ChatID = chatID
+				accepted.CreatedDateTime = time.Now().Add(time.Second).UTC().Format(time.RFC3339)
+				if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{accepted}}); err != nil {
+					t.Fatalf("encode accepted assistant message: %v", err)
+				}
+			} else {
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+			}
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -13895,14 +13995,10 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 	if got := bridge.reg.SessionByCodexThreadID("thread-alpha"); got == nil || got.ChatID != "work-chat" {
 		t.Fatalf("published session not registered after interrupted import: %#v", bridge.reg.Sessions)
 	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-4"), "/workspaces"); err != nil {
-		t.Fatalf("retry /workspaces error: %v", err)
-	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-5"), "/workspace 1"); err != nil {
-		t.Fatalf("retry /workspace error: %v", err)
-	}
-	if err := bridge.handleControlMessage(context.Background(), bridgeTestMessage("control-6"), "/publish 1"); err != nil {
-		t.Fatalf("retry /publish error: %v", err)
+	if session := bridge.reg.SessionByCodexThreadID("thread-alpha"); session == nil {
+		t.Fatal("published session was not registered for explicit history recovery")
+	} else if err := bridge.publishWorkSessionHistory(context.Background(), session); err != nil {
+		t.Fatalf("explicit publish-history recovery error: %v", err)
 	}
 	var imported string
 	for _, msg := range sent {
@@ -13910,6 +14006,10 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 			imported += "\n" + PlainTextFromTeamsHTML(msg.Content)
 		}
 	}
+	// The assistant batch was accepted by Graph before its response was lost;
+	// recovery proves it through the read path, so it is intentionally absent
+	// from the newly POSTed messages captured above.
+	imported += "\n" + PlainTextFromTeamsHTML(acceptedAssistantContent)
 	if strings.Count(imported, "hello") != 1 || strings.Count(imported, "hi there") != 1 {
 		t.Fatalf("retry import should resume without duplicates, imported=%q sent=%#v", imported, sent)
 	}
@@ -13918,7 +14018,7 @@ func TestBridgePublishRetriesInterruptedHistoryImport(t *testing.T) {
 	}
 }
 
-func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *testing.T) {
+func TestBridgePublishHistoryRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	transcript := strings.Join([]string{
 		`{"id":"u1","role":"user","text":"first after title"}`,
@@ -13947,6 +14047,7 @@ func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *test
 	})
 	var sent []bridgeSentMessage
 	failFirstRecordAttempts := 1
+	var acceptedRecordContent string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -13963,12 +14064,26 @@ func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *test
 			}
 			if failFirstRecordAttempts > 0 && strings.Contains(body.Body.Content, "first after title") {
 				failFirstRecordAttempts--
+				// Model an ambiguous Graph response: the POST committed, but its
+				// response was lost before the helper received it.
+				acceptedRecordContent = body.Body.Content
 				http.Error(w, "temporary", http.StatusInternalServerError)
 				return
 			}
 			chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
 			sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content})
 			_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/work-chat/messages":
+			if acceptedRecordContent == "" {
+				_, _ = fmt.Fprint(w, `{"value":[]}`)
+				return
+			}
+			accepted := bridgeTestMessageWithText("accepted-record", acceptedRecordContent)
+			accepted.ChatID = "work-chat"
+			accepted.CreatedDateTime = time.Now().Add(time.Second).UTC().Format(time.RFC3339)
+			if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{accepted}}); err != nil {
+				t.Fatalf("encode accepted record message: %v", err)
+			}
 		default:
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
@@ -13990,8 +14105,10 @@ func TestBridgePublishRetryAfterTitleFailureIsNotSkippedByBackgroundSync(t *test
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("background sync after interrupted publish failed: %v", err)
 	}
-	if _, err := bridge.publishCodexSession(context.Background(), DashboardCommandTarget{Raw: "thread-alpha"}); err != nil {
-		t.Fatalf("retry publish error: %v", err)
+	if session := bridge.reg.SessionByCodexThreadID("thread-alpha"); session == nil {
+		t.Fatal("published session was not registered for explicit history recovery")
+	} else if err := bridge.publishWorkSessionHistory(context.Background(), session); err != nil {
+		t.Fatalf("explicit publish-history recovery error: %v", err)
 	}
 
 	var imported []string
@@ -23773,7 +23890,8 @@ func TestBridgeFreezeNoticePatchAllowsTrustedMathHostedContent(t *testing.T) {
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
-	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.readGraph = graph
 	session := *bridge.reg.SessionByID("s001")
 	body := renderTeamsFreezeNoticeHTML("https://teams.example/control", "r "+resumeKeyForSession(session), "Your Codex work is safe. Paused after 48h idle.")
@@ -24436,9 +24554,11 @@ func TestBridgePollOnceIgnoresStaleControlFallbackRegistryProjection(t *testing.
 	}
 }
 
-func TestBridgePollOnceSkipsWorkChatDuringTranscriptImport(t *testing.T) {
+func TestBridgePollOnceProcessesWorkChatDuringTranscriptImport(t *testing.T) {
 	now := time.Now()
-	readGraph := newBridgePollGraph(t, nil)
+	readGraph := newBridgePollGraph(t, []bridgePollPage{{messages: []ChatMessage{
+		bridgePollMessage("work-during-import", now.UTC().Format(time.RFC3339Nano), "new work during import"),
+	}}})
 	writeGraph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
@@ -24463,7 +24583,8 @@ func TestBridgePollOnceSkipsWorkChatDuringTranscriptImport(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("schedule work poll: %v", err)
 	}
-	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(writeGraph, store, executor)
 	bridge.readGraph = readGraph
 	session := bridge.reg.Sessions[0]
 	if err := bridge.markTranscriptImportStarted(context.Background(), session, "/tmp/session.jsonl"); err != nil {
@@ -24472,6 +24593,9 @@ func TestBridgePollOnceSkipsWorkChatDuringTranscriptImport(t *testing.T) {
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "new work during import") {
+		t.Fatalf("executor prompts = %#v, want work prompt during import", executor.prompts)
 	}
 }
 
@@ -27766,7 +27890,7 @@ func TestBridgeSyncLinkedTranscriptResumesInterruptedImportAfterOwnerRestart(t *
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointReportsAttention(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointStaysSilent(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -27807,11 +27931,11 @@ func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointReportsAtte
 	}
 
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
-		t.Fatalf("sync interrupted missing checkpoint error = %v, want user-facing attention only", err)
+		t.Fatalf("sync interrupted missing checkpoint error = %v, want silent automatic block", err)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "Local Codex history sync needs attention") {
-		t.Fatalf("interrupted import output missing attention message:\n%s", joined)
+	if strings.Contains(joined, "Local Codex history sync needs attention") || strings.Contains(joined, "Imported Codex session history") {
+		t.Fatalf("interrupted import emitted history-gate output:\n%s", joined)
 	}
 	if strings.Contains(joined, "refusing to guess") || strings.Contains(joined, "run `continue` again") {
 		t.Fatalf("interrupted import leaked raw checkpoint error:\n%s", joined)
@@ -27821,8 +27945,8 @@ func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointReportsAtte
 		t.Fatalf("Load final state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint after interrupted import = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint after interrupted import = %#v, want silently blocked stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -31103,8 +31227,8 @@ func TestBridgePrepareLocalCodexBeforeTeamsTurnDiscoversMissingCheckpointSource(
 	if err != nil {
 		t.Fatalf("prepareLocalCodexBeforeTeamsTurn error: %v", err)
 	}
-	if !gate.Block || !strings.Contains(gate.AckBody, "Codex is active in the CLI") {
-		t.Fatalf("gate = %#v, want active local Codex block from discovered transcript", gate)
+	if gate.Block {
+		t.Fatalf("transcript-only local activity incorrectly blocked Teams admission: %#v", gate)
 	}
 }
 
@@ -31370,12 +31494,8 @@ func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("backlog sync error: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("large automatic backlog should send one blocked notice, sent=%#v", *sent)
-	}
-	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if !strings.Contains(plain, "paused automatic history sync") || !strings.Contains(plain, "No history was skipped") {
-		t.Fatalf("blocked notice = %q", plain)
+	if len(*sent) != 0 {
+		t.Fatalf("large automatic backlog should stay silent, sent=%#v", *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -31389,8 +31509,8 @@ func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("repeat backlog sync error: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("blocked backlog notice should not repeat, sent=%#v", *sent)
+	if len(*sent) != 0 {
+		t.Fatalf("silent blocked backlog should not repeat, sent=%#v", *sent)
 	}
 }
 
@@ -31521,7 +31641,7 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 		t.Fatalf("Load blocked state error: %v", err)
 	}
 	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("checkpoint status = %#v, want blocked", checkpoint)
+		t.Fatalf("automatic backlog was not quarantined in the checkpoint: %#v", checkpoint)
 	}
 
 	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
@@ -31557,7 +31677,6 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 
 	joined := sentPlainJoined(*sent)
 	for _, want := range []string{
-		"paused automatic history sync",
 		"blocked backlog answer 000",
 		"Import complete",
 		"done 1: teams prompt after catchup",
@@ -31576,7 +31695,6 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 		}
 	}
 	requirePlainTextInOrder(t, joined,
-		"paused automatic history sync",
 		"blocked backlog answer 000",
 		fmt.Sprintf("blocked backlog answer %03d", transcriptSyncMaxAutoBacklogRecords),
 		"Import complete",
@@ -31692,7 +31810,7 @@ func TestBridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat(t *testing.
 	}
 }
 
-func TestBridgeWorkPublishHistoryMissingCheckpointReportsAttention(t *testing.T) {
+func TestBridgeWorkPublishHistoryMissingCheckpointRecoversExplicitly(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -31725,12 +31843,12 @@ func TestBridgeWorkPublishHistoryMissingCheckpointReportsAttention(t *testing.T)
 		t.Fatalf("helper publish-history error: %v", err)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "Local Codex history sync needs attention") {
-		t.Fatalf("publish-history output missing attention message:\n%s", joined)
+	if !strings.Contains(joined, "hello") || !strings.Contains(joined, "Import complete") {
+		t.Fatalf("publish-history output missing explicit recovery:\n%s", joined)
 	}
-	for _, leak := range []string{"History import failed:", "refusing to guess", "run `continue` again"} {
+	for _, leak := range []string{"Local Codex history sync needs attention", "History import failed:", "refusing to guess", "run `continue` again"} {
 		if strings.Contains(joined, leak) {
-			t.Fatalf("publish-history output leaked %q:\n%s", leak, joined)
+			t.Fatalf("publish-history output leaked stale recovery notice %q:\n%s", leak, joined)
 		}
 	}
 	state, err := store.Load(context.Background())
@@ -31738,8 +31856,8 @@ func TestBridgeWorkPublishHistoryMissingCheckpointReportsAttention(t *testing.T)
 		t.Fatalf("Load final state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" {
+		t.Fatalf("checkpoint = %#v, want complete explicit recovery at u1", checkpoint)
 	}
 }
 
@@ -31797,7 +31915,7 @@ func TestBridgeWorkPublishHistoryRecoversMissingCheckpointBySourceLine(t *testin
 	}
 }
 
-func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
+func TestBridgeRunsTeamsPromptDespiteBlockedHistoryBacklog(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -31833,29 +31951,25 @@ func TestBridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog(t *testing.T) {
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("queued Teams prompt started before history backlog was imported: %q", got)
-	case <-time.After(50 * time.Millisecond):
+		if !strings.Contains(got, "teams prompt after catchup") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams prompt was held by a blocked history backlog")
 	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "helper publish-history") || strings.Contains(joined, "Codex is active in the CLI") {
-		t.Fatalf("blocked backlog ack should be actionable and not claim active CLI:\n%s", joined)
+	if strings.Contains(joined, "Your request is queued") || strings.Contains(joined, "Local Codex history has a paused backlog") {
+		t.Fatalf("blocked backlog incorrectly produced a turn-admission warning:\n%s", joined)
 	}
-	ack := PlainTextFromTeamsHTML((*sent)[len(*sent)-1].Content)
-	requirePlainTextInOrder(t, ack,
-		"Your request is queued.",
-		"Run this command in this Work chat:",
-		"helper publish-history",
-		"Local Codex history has a paused backlog",
-		"Queued requests:",
-		"teams prompt after catchup",
-		"Other options:",
-	)
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load final state error: %v", err)
 	}
-	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
-		t.Fatalf("queued turn count = %d, want 1", got)
+	if got := queuedTurnCountForSession(state, session.ID); got != 0 {
+		t.Fatalf("queued turn count = %d, want no stuck turn", got)
 	}
 }
 
@@ -31942,7 +32056,7 @@ func TestBlockedTeamsPromptAckNextStepsMatchGateReasons(t *testing.T) {
 	}
 }
 
-func TestBridgeTeamsPromptBlocksWhenForegroundSyncCreatesBlockedBacklog(t *testing.T) {
+func TestBridgeTeamsPromptRunsWhenForegroundSyncCreatesBlockedBacklog(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -31975,27 +32089,30 @@ func TestBridgeTeamsPromptBlocksWhenForegroundSyncCreatesBlockedBacklog(t *testi
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams prompt started before foreground history backlog was imported: %q", got)
-	case <-time.After(50 * time.Millisecond):
+		if !strings.Contains(got, "teams prompt after foreground catchup") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams prompt was incorrectly held by the foreground history backlog")
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{
+	for _, unwanted := range []string{
 		"paused automatic history sync",
 		"helper publish-history",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("foreground blocked backlog output missing %q in:\n%s", want, joined)
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("normal Teams work leaked a history gate notice %q:\n%s", unwanted, joined)
 		}
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load final state error: %v", err)
 	}
-	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("checkpoint status = %#v, want blocked", checkpoint)
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status == importCheckpointStatusBlocked {
+		t.Fatalf("normal Teams work left a blocked history checkpoint: %#v", checkpoint)
 	}
-	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
-		t.Fatalf("queued turn count = %d, want 1", got)
+	if got := queuedTurnCountForSession(state, session.ID); got != 0 {
+		t.Fatalf("queued turn count = %d, want no permanently queued turn", got)
 	}
 }
 
@@ -32006,7 +32123,8 @@ func TestBridgeCoworkerPromptDuringTranscriptImportGetsMentionedReceipt(t *testi
 	}
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
-	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	executor := &recordingExecutor{}
+	bridge := newBridgeTestBridge(graph, store, executor)
 	session := bridge.reg.SessionByChatID("chat-1")
 	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
 		t.Fatalf("ensureDurableSession error: %v", err)
@@ -32021,12 +32139,18 @@ func TestBridgeCoworkerPromptDuringTranscriptImportGetsMentionedReceipt(t *testi
 	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, msg, "run this after import"); err != nil {
 		t.Fatalf("handle coworker message during import error: %v", err)
 	}
-	if len(*sent) != 1 {
-		t.Fatalf("sent = %#v, want one deferred receipt", *sent)
+	if len(*sent) != 2 {
+		t.Fatalf("sent = %#v, want receipt and completion", *sent)
 	}
-	plain := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if (*sent)[0].Mentions != 1 || !strings.Contains(plain, "Alex Kim") || !strings.Contains(plain, "Codex received your question") || !strings.Contains(plain, "preparing this chat history") {
-		t.Fatalf("deferred receipt = %#v plain=%q, want coworker mention and import receipt", (*sent)[0], plain)
+	receipt := PlainTextFromTeamsHTML((*sent)[0].Content)
+	if (*sent)[0].Mentions != 1 || !strings.Contains(receipt, "Alex Kim") || !strings.Contains(receipt, "Codex received your question") || strings.Contains(receipt, "preparing this chat history") {
+		t.Fatalf("receipt = %#v plain=%q, want immediate coworker receipt", (*sent)[0], receipt)
+	}
+	if !strings.Contains(PlainTextFromTeamsHTML((*sent)[1].Content), "Codex finished responding") {
+		t.Fatalf("completion = %#v, want immediate completion", (*sent)[1])
+	}
+	if len(executor.prompts) != 1 || !strings.Contains(executor.prompts[0], "run this after import") {
+		t.Fatalf("executor prompts = %#v, want immediate prompt", executor.prompts)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -32039,8 +32163,8 @@ func TestBridgeCoworkerPromptDuringTranscriptImportGetsMentionedReceipt(t *testi
 			break
 		}
 	}
-	if inbound.Status != teamstore.InboundStatusDeferred || inbound.AuthorUserID != "user-2" || inbound.AuthorName != "Alex Kim" {
-		t.Fatalf("deferred coworker inbound = %#v, want deferred author user-2/Alex Kim", inbound)
+	if inbound.Status == teamstore.InboundStatusDeferred || inbound.AuthorUserID != "user-2" || inbound.AuthorName != "Alex Kim" {
+		t.Fatalf("coworker inbound = %#v, want non-deferred author user-2/Alex Kim", inbound)
 	}
 	if got := queuedTurnCountForSession(state, session.ID); got != 0 {
 		t.Fatalf("queued turn count during import = %d, want 0", got)
@@ -32629,8 +32753,8 @@ func TestBridgeSyncLinkedTranscriptsBlocksGrowingLegacyCursorWithoutFingerprintA
 			if strings.Contains(joined, "new final must wait for legacy migration") {
 				t.Fatalf("unverified legacy cursor published new final: %s", joined)
 			}
-			if !strings.Contains(joined, "helper publish-history") {
-				t.Fatalf("legacy cursor blocker notice missing: %#v", *sent)
+			if len(*sent) != 0 {
+				t.Fatalf("automatic legacy cursor check produced user-visible output: %#v", *sent)
 			}
 			state, err := store.Load(ctx)
 			if err != nil {
@@ -32710,8 +32834,8 @@ func TestBridgeSyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint(t *
 	if strings.Contains(joined, "new answer after legacy checkpoint") {
 		t.Fatalf("unverified legacy checkpoint published a new answer:\n%s", joined)
 	}
-	if !strings.Contains(joined, "helper publish-history") {
-		t.Fatalf("legacy checkpoint blocker notice missing:\n%s", joined)
+	if len(*sent) != 0 {
+		t.Fatalf("automatic legacy checkpoint check produced user-visible output:\n%s", joined)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -35176,7 +35300,7 @@ func TestTeamsOriginTextHashesIncludesControlFallbackSource(t *testing.T) {
 	}
 }
 
-func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T) {
+func TestBridgeStartsTeamsPromptDespiteExternalCodexTranscriptActivity(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -35212,17 +35336,15 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams turn started while local CLI transcript was active: %q", got)
-	case <-time.After(50 * time.Millisecond):
+		if !strings.Contains(got, "teams prompt during local") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams turn was held by transcript-only local activity")
 	}
 	activeAck := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if len(*sent) != 1 ||
-		!strings.Contains(activeAck, "Your request is queued") ||
-		!strings.Contains(activeAck, "Currently blocking:") ||
-		!strings.Contains(activeAck, "Local Codex CLI request") ||
-		!strings.Contains(activeAck, "Queued requests:") ||
-		!strings.Contains(activeAck, "teams prompt during local") {
-		t.Fatalf("active local CLI ack = %#v, want one clear queued notice", *sent)
+	if len(*sent) != 1 || strings.Contains(activeAck, "Your request is queued") || strings.Contains(activeAck, "Local Codex CLI request") {
+		t.Fatalf("transcript-only local activity produced an admission block: %#v", *sent)
 	}
 	secondMsg := bridgePollMessage("teams-during-local-second", "2026-05-03T01:01:05Z", "second teams prompt during local")
 	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, secondMsg, "second teams prompt during local"); err != nil {
@@ -35244,25 +35366,8 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.LastRecordID != beforeCheckpoint.LastRecordID || checkpoint.LastSourceLine != beforeCheckpoint.LastSourceLine {
 		t.Fatalf("checkpoint advanced during active local CLI turn: %#v, before %#v", checkpoint, beforeCheckpoint)
 	}
-	if got := queuedTurnCountForSession(state, session.ID); got != 2 {
-		t.Fatalf("queued turn count = %d, want 2", got)
-	}
-
-	completedTranscript := activeTranscript +
-		`{"id":"a-local","role":"assistant","text":"local CLI final answer"}` + "\n"
-	if err := os.WriteFile(transcriptPath, []byte(completedTranscript), 0o600); err != nil {
-		t.Fatalf("write completed transcript: %v", err)
-	}
-	if err := bridge.processQueuedTurns(context.Background()); err != nil {
-		t.Fatalf("processQueuedTurns after local completion error: %v", err)
-	}
-	select {
-	case got := <-executor.started:
-		if !strings.Contains(got, "teams prompt during local") {
-			t.Fatalf("queued Teams prompt = %q", got)
-		}
-	case <-time.After(bridgeAsyncTestTimeout):
-		t.Fatal("queued Teams prompt did not start after local CLI completed")
+	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
+		t.Fatalf("queued turn count = %d, want only the second turn behind the real running turn", got)
 	}
 	executor.release <- struct{}{}
 	select {
@@ -35282,15 +35387,11 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	joined := strings.Join(plain, "\n---\n")
-	if got := strings.Count(joined, "Your request is queued"); got != 2 {
-		t.Fatalf("local-active queued notice count = %d, want 2 in:\n%s", got, joined)
+	if got := strings.Count(joined, "Your request is queued"); got != 1 {
+		t.Fatalf("real running-turn queued notice count = %d, want 1 in:\n%s", got, joined)
 	}
 	for _, want := range []string{
 		"Your request is queued",
-		"Local Codex CLI request",
-		"🧑‍💻 User:\nlocal CLI prompt",
-		"🤖 ⏳ Codex status:\nlocal CLI is editing files",
-		"🤖 ✅ Codex answer:\nlocal CLI final answer",
 		"🤖 ✅ Codex answer:\ndone 1: teams prompt during local",
 		"🤖 ✅ Codex answer:\ndone 2: second teams prompt during local",
 	} {
@@ -35298,8 +35399,8 @@ func TestBridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive(t *testing.T)
 			t.Fatalf("combined transcript missing %q in:\n%s", want, joined)
 		}
 	}
-	if strings.Index(joined, "local CLI final answer") > strings.Index(joined, "done 1: teams prompt during local") {
-		t.Fatalf("Teams turn answer was sent before local CLI catch-up:\n%s", joined)
+	if strings.Contains(joined, "Local Codex CLI request") || strings.Contains(joined, "local CLI final answer") {
+		t.Fatalf("transcript-only local activity leaked into admission output:\n%s", joined)
 	}
 }
 
@@ -35349,7 +35450,7 @@ func TestBridgeStartsTeamsPromptWhenOnlyRecentTeamsTranscriptTailLooksActive(t *
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 }
 
-func TestBridgeStillQueuesTeamsPromptWhenRecentTranscriptTailHasLocalUser(t *testing.T) {
+func TestBridgeStartsTeamsPromptWhenRecentTranscriptTailHasLocalUser(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -35381,16 +35482,22 @@ func TestBridgeStillQueuesTeamsPromptWhenRecentTranscriptTailHasLocalUser(t *tes
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams prompt started while local transcript tail was active: %q", got)
-	case <-time.After(50 * time.Millisecond):
+		if !strings.Contains(got, "new teams prompt") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Teams prompt was held by local transcript activity")
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "Your request is queued") || !strings.Contains(joined, "Local Codex CLI request") {
-		t.Fatalf("local active tail did not queue Teams prompt:\n%s", joined)
+	if strings.Contains(joined, "Your request is queued") || strings.Contains(joined, "Local Codex CLI request") {
+		t.Fatalf("local active tail incorrectly gated Teams prompt:\n%s", joined)
 	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 }
 
-func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
+func TestBridgeQueuesOnlyBehindActualRunningTeamsTurn(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -35437,26 +35544,43 @@ func TestBridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript(t *testing.T) {
 		t.Fatalf("age queued turn: %v", err)
 	}
 
-	if err := bridge.processQueuedTurns(context.Background()); err != nil {
-		t.Fatalf("processQueuedTurns reminder error: %v", err)
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "teams prompt during local") {
+			t.Fatalf("first started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("first Teams prompt did not start")
 	}
 	if err := bridge.processQueuedTurns(context.Background()); err != nil {
-		t.Fatalf("second processQueuedTurns reminder error: %v", err)
+		t.Fatalf("processQueuedTurns while first turn is running: %v", err)
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams turn started while local CLI transcript was active: %q", got)
+		t.Fatalf("second Teams prompt started before first completed: %q", got)
 	case <-time.After(50 * time.Millisecond):
 	}
 	joined := sentPlainJoined(*sent)
-	if got := strings.Count(joined, "Still waiting"); got != 1 {
-		t.Fatalf("queued wait reminder count = %d, want one in:\n%s", got, joined)
+	if strings.Contains(joined, "Still waiting") || strings.Contains(joined, "Local Codex is still active for this chat") {
+		t.Fatalf("transcript observation incorrectly produced a wait gate:\n%s", joined)
 	}
-	for _, want := range []string{"Local Codex is still active for this chat", "helper cancel turn:inbound:chat-1:teams-during-local", "Queued requests:", "teams prompt during local", "second teams prompt during local"} {
+	for _, want := range []string{"teams prompt during local", "second teams prompt during local"} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("queued wait reminder missing %q in:\n%s", want, joined)
+			t.Fatalf("queued prompt output missing %q in:\n%s", want, joined)
 		}
 	}
+	executor.release <- struct{}{}
+	select {
+	case got := <-executor.started:
+		if !strings.Contains(got, "second teams prompt during local") {
+			t.Fatalf("second started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("second Teams prompt did not start after first completed")
+	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 2)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 }
 
 func TestBridgeSkippedOutboxDoesNotBlockQueuedTurnWaitNotice(t *testing.T) {
@@ -35503,23 +35627,25 @@ func TestBridgeSkippedOutboxDoesNotBlockQueuedTurnWaitNotice(t *testing.T) {
 	if err := bridge.processQueuedTurns(context.Background()); err != nil {
 		t.Fatalf("processQueuedTurns error: %v", err)
 	}
-	select {
-	case got := <-executor.started:
-		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
-			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+	started := map[string]bool{}
+	for len(started) < 2 {
+		select {
+		case got := <-executor.started:
+			started[got.SessionID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("queued turns did not both start after skipped s002 outbox: %#v", started)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("s005 queued turn did not start after skipped s002 outbox")
 	}
-	if executor.promptCount("s002") != 0 {
-		t.Fatalf("blocked s002 session started despite active local transcript")
+	if !started["s002"] || !started["s005"] {
+		t.Fatalf("started queued sessions = %#v, want s002 and s005", started)
 	}
 	joined := sentPlainJoined(*sent)
-	if !strings.Contains(joined, "Still waiting") || !strings.Contains(joined, "Local Codex is still active for this chat") {
-		t.Fatalf("skipped outbox blocked queued wait notice; sent:\n%s", joined)
+	if strings.Contains(joined, "Still waiting") || strings.Contains(joined, "Local Codex is still active for this chat") {
+		t.Fatalf("skipped outbox produced a stale local-history wait notice; sent:\n%s", joined)
 	}
 	close(executor.release)
 	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s002", 1)
 	waitForCompletedTurnCount(t, store, "s005", 1)
 }
 
@@ -35621,22 +35747,24 @@ func TestBridgeQueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions(t *testing.
 	if err := bridge.processQueuedTurns(context.Background()); err != nil {
 		t.Fatalf("processQueuedTurns should isolate queued-wait send failure, got: %v", err)
 	}
-	select {
-	case got := <-executor.started:
-		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
-			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+	started := map[string]bool{}
+	for len(started) < 2 {
+		select {
+		case got := <-executor.started:
+			started[got.SessionID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("queued turns did not both start after s002 send failure: %#v", started)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("s005 queued turn did not start after s002 queued-wait send failure")
 	}
-	if executor.promptCount("s002") != 0 {
-		t.Fatalf("blocked s002 session started despite active local transcript")
+	if !started["s002"] || !started["s005"] {
+		t.Fatalf("started queued sessions = %#v, want s002 and s005", started)
 	}
 	if !strings.Contains(out.String(), "Teams best-effort outbox send error") {
 		t.Fatalf("queued-wait send failure was not logged:\n%s", out.String())
 	}
 	close(executor.release)
 	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s002", 1)
 	waitForCompletedTurnCount(t, store, "s005", 1)
 }
 
@@ -35676,30 +35804,31 @@ func TestBridgeQueuedTurnGateErrorDoesNotStarveLaterSessions(t *testing.T) {
 	queueBridgeTurnForTest(t, bridge, blockedSession, "s002-message", "blocked prompt", time.Time{})
 	queueBridgeTurnForTest(t, bridge, laterSession, "s005-message", "later prompt", time.Time{})
 
-	err := bridge.processQueuedTurns(context.Background())
-	if err == nil || !strings.Contains(err.Error(), badTranscriptPath) {
-		t.Fatalf("processQueuedTurns error = %v, want bad transcript failure after continuing", err)
+	if err := bridge.processQueuedTurns(context.Background()); err != nil {
+		t.Fatalf("processQueuedTurns should ignore transcript-only failure: %v", err)
 	}
-	select {
-	case got := <-executor.started:
-		if got.SessionID != "s005" || !strings.Contains(got.Prompt, "later prompt") {
-			t.Fatalf("started queued turn = %#v, want s005 later prompt", got)
+	started := map[string]bool{}
+	for len(started) < 2 {
+		select {
+		case got := <-executor.started:
+			started[got.SessionID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("queued turns did not both start after bad transcript checkpoint: %#v", started)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("s005 queued turn did not start after s002 gate error")
 	}
-	if executor.promptCount("s002") != 0 {
-		t.Fatalf("errored s002 session started despite gate failure")
+	if !started["s002"] || !started["s005"] {
+		t.Fatalf("started queued sessions = %#v, want s002 and s005", started)
 	}
-	if !strings.Contains(out.String(), "Teams queued turn gate error for session s002") {
-		t.Fatalf("queued gate failure was not logged:\n%s", out.String())
+	if strings.Contains(out.String(), "Teams queued turn gate error for session s002") {
+		t.Fatalf("transcript-only gate error was still logged:\n%s", out.String())
 	}
 	close(executor.release)
 	waitForBridgeAsyncTurns(t, bridge)
+	waitForCompletedTurnCount(t, store, "s002", 1)
 	waitForCompletedTurnCount(t, store, "s005", 1)
 }
 
-func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing.T) {
+func TestBridgeStartsTeamsPromptWithoutForegroundTranscriptSync(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -35735,7 +35864,7 @@ func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing
 			t.Fatalf("started prompt = %q", got)
 		}
 	case <-time.After(bridgeAsyncTestTimeout):
-		t.Fatal("Teams prompt did not start after completed local catch-up")
+		t.Fatal("Teams prompt was held by completed local transcript activity")
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
@@ -35746,24 +35875,23 @@ func TestBridgeSyncsCompletedLocalTranscriptBeforeStartingTeamsPrompt(t *testing
 		plain = append(plain, PlainTextFromTeamsHTML(msg.Content))
 	}
 	joined := strings.Join(plain, "\n---\n")
-	for _, want := range []string{
-		"🧑‍💻 User:\nlocal completed prompt",
-		"🤖 ⏳ Codex status:\nlocal completed status",
-		"🤖 ✅ Codex answer:\nlocal completed answer",
-		"Codex is working. Request accepted.",
-		"🤖 ✅ Codex answer:\ndone 1: teams prompt after local",
+	for _, unwanted := range []string{
+		"local completed prompt",
+		"local completed answer",
+		"syncing recent local Codex updates first",
 	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("transcript missing %q in:\n%s", want, joined)
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("foreground transcript observation leaked or gated Teams turn (%q):\n%s", unwanted, joined)
 		}
 	}
-	if strings.Index(joined, "local completed answer") > strings.Index(joined, "Codex is working. Request accepted.") ||
-		strings.Index(joined, "Codex is working. Request accepted.") > strings.Index(joined, "done 1: teams prompt after local") {
-		t.Fatalf("completed local catch-up should precede Teams ack and answer:\n%s", joined)
+	for _, want := range []string{"Codex is working. Request accepted.", "done 1: teams prompt after local"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Teams turn output missing %q:\n%s", want, joined)
+		}
 	}
 }
 
-func TestBridgeQueuedTurnWaitsForLocalTranscriptCatchupLimit(t *testing.T) {
+func TestBridgeQueuedTurnStartsWithoutLocalTranscriptCatchupGate(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -35796,32 +35924,23 @@ func TestBridgeQueuedTurnWaitsForLocalTranscriptCatchupLimit(t *testing.T) {
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams turn started before local catch-up drained: %q", got)
-	case <-time.After(50 * time.Millisecond):
-	}
-	if got := countSentPlainContaining(*sent, "local answer "); got != transcriptSyncMaxRecordsPerSessionPerCycle {
-		t.Fatalf("synced local answer count = %d, want first catch-up batch of %d", got, transcriptSyncMaxRecordsPerSessionPerCycle)
-	}
-	if !sentPlainContains(*sent, "syncing recent local Codex updates first") {
-		t.Fatalf("catch-up queued ack missing in %#v", *sent)
-	}
-
-	if err := bridge.processQueuedTurns(context.Background()); err != nil {
-		t.Fatalf("processQueuedTurns while catch-up remains error: %v", err)
-	}
-	select {
-	case got := <-executor.started:
 		if !strings.Contains(got, "teams prompt after catchup") {
 			t.Fatalf("started prompt = %q", got)
 		}
 	case <-time.After(bridgeAsyncTestTimeout):
-		t.Fatal("Teams prompt did not start after remaining catch-up drained")
+		t.Fatal("Teams turn was held by local catch-up backlog")
+	}
+	if got := countSentPlainContaining(*sent, "local answer "); got != 0 {
+		t.Fatalf("foreground local catch-up unexpectedly published %d records", got)
+	}
+	if sentPlainContains(*sent, "syncing recent local Codex updates first") {
+		t.Fatal("foreground local catch-up produced a queue gate")
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
-	if !sentPlainContains(*sent, "local answer 09") {
-		t.Fatalf("remaining local catch-up was not sent before Teams answer: %#v", *sent)
+	if sentPlainContains(*sent, "local answer 09") {
+		t.Fatalf("foreground local catch-up unexpectedly sent remaining records: %#v", *sent)
 	}
 }
 
@@ -35866,14 +35985,16 @@ func TestBridgeAllowsTeamsPromptAfterLocalTranscriptFailureTerminal(t *testing.T
 	waitForCompletedTurnCount(t, store, session.ID, 1)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{
-		"🧑‍💻 User:\nlocal prompt before failure",
-		"🤖 ⏳ Codex status:\nlocal CLI failed cleanly",
-		"🤖 ✅ Codex answer:\ndone 1: teams prompt after failed local",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("failed local transcript flow missing %q in:\n%s", want, joined)
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone 1: teams prompt after failed local") {
+		t.Fatalf("Teams prompt did not complete after local transcript failure:\n%s", joined)
+	}
+	for _, unwanted := range []string{"local prompt before failure"} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("foreground local failure leaked into Teams output (%q):\n%s", unwanted, joined)
 		}
+	}
+	if !strings.Contains(joined, "local CLI failed cleanly") {
+		t.Fatalf("terminal local transcript status was not preserved:\n%s", joined)
 	}
 }
 
@@ -35929,9 +36050,15 @@ func TestBridgeMissingTranscriptCheckpointDoesNotStarveLaterWorkChatCommands(t *
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Codex turn should not start while checkpoint recovery is blocked: %q", got)
-	default:
+		if !strings.Contains(got, "normal task before status") {
+			t.Fatalf("started prompt = %q", got)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		t.Fatal("Codex turn was incorrectly held by a stale history checkpoint")
 	}
+	executor.release <- struct{}{}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -35940,12 +36067,12 @@ func TestBridgeMissingTranscriptCheckpointDoesNotStarveLaterWorkChatCommands(t *
 	if got := len(state.InboundEvents); got != 1 {
 		t.Fatalf("inbound count = %d, want one queued normal task: %#v", got, state.InboundEvents)
 	}
-	if got := queuedTurnCountForSession(state, session.ID); got != 1 {
-		t.Fatalf("queued turn count = %d, want 1", got)
+	if got := queuedTurnCountForSession(state, session.ID); got != 0 {
+		t.Fatalf("queued turn count = %d, want no permanently queued turn", got)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.LastRecordID != "missing-checkpoint" {
+		t.Fatalf("checkpoint was advanced by turn admission: %#v", checkpoint)
 	}
 	poll := state.ChatPolls[session.ChatID]
 	if poll.LastError != "" || poll.FailureCount != 0 {
@@ -35955,13 +36082,11 @@ func TestBridgeMissingTranscriptCheckpointDoesNotStarveLaterWorkChatCommands(t *
 		t.Fatalf("messages were not marked seen: %#v", bridge.reg.Chats[session.ChatID].SeenMessageIDs)
 	}
 	joined := sentPlainJoined(*sent)
-	for _, want := range []string{
-		"Local Codex history sync needs attention before I can run your request.",
-		"Session: s001",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("work chat output missing %q in:\n%s", want, joined)
-		}
+	if !strings.Contains(joined, "Session: s001") {
+		t.Fatalf("work chat output missing session context:\n%s", joined)
+	}
+	if strings.Contains(joined, "Local Codex history sync needs attention before I can run your request.") {
+		t.Fatalf("stale checkpoint emitted a history gate notice:\n%s", joined)
 	}
 }
 
@@ -36006,8 +36131,8 @@ func TestBridgePrepareRecoversCheckpointNotFoundBySourceLine(t *testing.T) {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" || checkpoint.LastSourceLine != 1 {
-		t.Fatalf("checkpoint = %#v, want recovered complete at u1", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "missing-checkpoint" {
+		t.Fatalf("legacy checkpoint was guessed or advanced during turn admission: %#v", checkpoint)
 	}
 }
 
@@ -36058,7 +36183,7 @@ func TestBridgeSyncLinkedTranscriptMarksMissingCheckpointFailed(t *testing.T) {
 	}
 }
 
-func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
+func TestBridgeStartsTurnWhenOnlyLocalToolTranscriptActivityIsObserved(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -36086,47 +36211,23 @@ func TestBridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity(t *testing.T) {
 	}
 	select {
 	case got := <-executor.started:
-		t.Fatalf("Teams turn started while local tool-only transcript was active: %q", got)
-	case <-time.After(50 * time.Millisecond):
-	}
-	toolAck := PlainTextFromTeamsHTML((*sent)[0].Content)
-	if len(*sent) != 1 ||
-		!strings.Contains(toolAck, "Your request is queued") ||
-		!strings.Contains(toolAck, "Currently blocking:") ||
-		!strings.Contains(toolAck, "Local Codex CLI request") ||
-		!strings.Contains(toolAck, "Queued requests:") ||
-		!strings.Contains(toolAck, "teams prompt during tool") {
-		t.Fatalf("tool-only active ack = %#v", *sent)
-	}
-
-	finishedToolOnly := activeToolOnly +
-		`{"type":"response_item","payload":{"id":"tool-output-local","type":"function_call_output","output":"ok"}}` + "\n" +
-		`{"type":"turn.completed","message":"local CLI completed"}` + "\n"
-	if err := os.WriteFile(transcriptPath, []byte(finishedToolOnly), 0o600); err != nil {
-		t.Fatalf("write completed tool transcript: %v", err)
-	}
-	if err := bridge.processQueuedTurns(context.Background()); err != nil {
-		t.Fatalf("processQueuedTurns after tool-only completion error: %v", err)
-	}
-	select {
-	case got := <-executor.started:
 		if !strings.Contains(got, "teams prompt during tool") {
-			t.Fatalf("queued Teams turn started with prompt = %q", got)
+			t.Fatalf("started prompt = %q", got)
 		}
 	case <-time.After(bridgeAsyncTestTimeout):
-		t.Fatal("Teams turn did not start after local tool-only transcript completed")
+		t.Fatal("Teams turn did not start while only transcript activity was observed")
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 	joined := sentPlainJoined(*sent)
-	for _, leaked := range []string{"exec_command", "go test ./...", "function_call_output", "Imported status update: ok"} {
+	for _, leaked := range []string{"exec_command", "go test ./...", "function_call_output", "Imported status update: ok", "Your request is queued"} {
 		if strings.Contains(joined, leaked) {
 			t.Fatalf("tool-only transcript detail leaked after completion (%q):\n%s", leaked, joined)
 		}
 	}
-	if !strings.Contains(joined, "local CLI completed") || !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone 1: teams prompt during tool") {
-		t.Fatalf("completed tool-only flow missing status/final answer:\n%s", joined)
+	if !strings.Contains(joined, "🤖 ✅ Codex answer:\ndone 1: teams prompt during tool") {
+		t.Fatalf("transcript-only tool flow missing final answer:\n%s", joined)
 	}
 }
 
@@ -38147,6 +38248,11 @@ func newBridgeMultiSessionQueueGraph(t *testing.T, failChat1Posts bool) (*GraphC
 	var sentMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-1/messages/s002-message":
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(bridgePollMessage("s002-message", "2026-05-03T01:00:00Z", "blocked prompt")); err != nil {
+				t.Fatalf("encode queued message: %v", err)
+			}
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/chat-5/messages/s005-message":
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(bridgePollMessage("s005-message", "2026-05-03T01:00:05Z", "later prompt")); err != nil {
