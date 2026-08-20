@@ -34,11 +34,20 @@ import (
 )
 
 const (
-	pollCursorOverlap                       = 2 * time.Minute
-	fastPollInterval                        = time.Second
-	fastPollDuration                        = 90 * time.Second
-	ownerPollMessageTop                     = 20
-	outboxRecoveryMessageTop                = 20
+	pollCursorOverlap        = 2 * time.Minute
+	fastPollInterval         = time.Second
+	fastPollDuration         = 90 * time.Second
+	ownerPollMessageTop      = 20
+	outboxRecoveryMessageTop = 20
+	// Ambiguous-send reconciliation is a cold path.  Follow enough same-origin
+	// Graph pages to cover a busy chat after a restart, while retaining a hard
+	// bound so a missing marker cannot turn recovery into an unbounded history
+	// scan.  The exact durable marker remains mandatory on every page.
+	outboxRecoveryMaxPages                  = 32
+	outboxRecoveryMaxPagesPerFlush          = 8
+	outboxRecoveryRetryBackoff              = 30 * time.Second
+	transcriptSourceProofCacheMaxEntries    = 256
+	historyWatchDeletedProbeInterval        = 5 * time.Minute
 	transcriptSyncMinInterval               = 10 * time.Second
 	transcriptDiscoveryMinInterval          = 5 * time.Minute
 	transcriptDiscoveryFailureMinInterval   = 30 * time.Second
@@ -107,6 +116,7 @@ var parkNoticeGraphLookupTops = []int{20, 10, 5, 1}
 
 var errTranscriptCheckpointNotFound = errors.New("transcript checkpoint was not found")
 var errTranscriptImportBudgetExhausted = errors.New("transcript import batch budget exhausted")
+var errTranscriptAutomaticSourceProofUnavailable = errors.New("automatic transcript source proof is unavailable")
 
 func isTranscriptCheckpointNotFoundError(err error) bool {
 	if err == nil {
@@ -198,10 +208,14 @@ type outboxQueueOptions struct {
 	// delivery. They bind the queued message to the checkpoint prefix that was
 	// verified before scanning. Explicit history publication intentionally does
 	// not use this proof because it establishes a new operator-directed cursor.
-	ExpectedSourcePath        string
-	ExpectedSourceFingerprint string
-	ExpectedSourceOffset      int64
-	ExpectedSourceOffsetKnown bool
+	ExpectedSourcePath            string
+	ExpectedSourceFingerprint     string
+	ExpectedSourceOffset          int64
+	ExpectedSourceOffsetKnown     bool
+	ExpectedSourceReadFingerprint string
+	ExpectedSourceReadStartOffset int64
+	ExpectedSourceReadEndOffset   int64
+	ExpectedSourceReadRangeKnown  bool
 }
 
 type BridgeOptions struct {
@@ -445,6 +459,8 @@ type Bridge struct {
 	ownerStaleAfter                   time.Duration
 	ownerHeartbeatInterval            time.Duration
 	outboxFlushMu                     sync.Mutex
+	outboxRecoveryMu                  sync.Mutex
+	outboxRecoveryNextProbeAt         map[string]time.Time
 	forkReconcileMu                   sync.Mutex
 	forkReconcileAfterID              string
 	outboxSendPaceMu                  sync.Mutex
@@ -465,6 +481,8 @@ type Bridge struct {
 	lastTranscriptDiscoveryFailure    time.Time
 	lastHistoryWatchSync              time.Time
 	lastHistoryWatchReconcile         time.Time
+	historyWatchProbeMu               sync.Mutex
+	historyWatchDeletedProbeAt        map[string]time.Time
 	lastBeaconReconcile               time.Time
 	lastBeaconLeaseMaintenance        time.Time
 	lastSQLiteWALCheckpoint           time.Time
@@ -1048,6 +1066,19 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	} else if !active {
 		return b.runStandbyLoop(ctx, opts)
 	}
+	// Retire obsolete policy notices only after this process owns the control
+	// lease. A standby/duplicate bridge must never mutate an active sender's
+	// Sending row while it is still waiting to become owner.
+	if retired, err := b.retireLegacyHistoryGateOutbox(ctx); err != nil {
+		// This cleanup is a compatibility migration, not a reason to take the
+		// listener offline. The next startup can retry it, while the admission
+		// path is already independent of history checkpoint status.
+		if b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams legacy history-gate outbox cleanup skipped: %v\n", err)
+		}
+	} else if retired > 0 && b.out != nil {
+		_, _ = fmt.Fprintf(b.out, "Teams retired %d obsolete automatic history-gate notice(s)\n", retired)
+	}
 	owner, err := teamstore.CurrentOwner(opts.HelperVersion, "", "", time.Now())
 	if err != nil {
 		return err
@@ -1512,9 +1543,6 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		}
 		session = pollable
 		b.syncRegistrySessionProjection(session)
-		if transcriptImportIsActive(state, session.ID) {
-			continue
-		}
 		poll, hasPoll := state.ChatPolls[session.ChatID]
 		if explicitParkedWorkPollShouldSkip(poll, hasPoll) {
 			if update, ok := explicitParkedWorkPollMaintenanceUpdate(session.ChatID, poll); ok {
@@ -8347,11 +8375,6 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 			return b.deferSessionMessageDuringFork(ctx, session, msg)
 		}
 	}
-	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
-		return err
-	} else if importing {
-		return b.deferSessionMessageDuringTranscriptImport(ctx, session, msg)
-	}
 	if control, blocked, err := b.serviceControlBlocksNewWork(ctx); err != nil {
 		return err
 	} else if blocked {
@@ -8403,7 +8426,7 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 			b.boostPolling(time.Now())
 			return nil
 		}
-		gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		gate, err := b.prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx, session, knownTurns)
 		if err != nil {
 			return err
 		}
@@ -8883,7 +8906,7 @@ func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, sess
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowProtectedAmbiguousBypass: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams ACK send error: %v\n", err)
 	}
 	return nil
@@ -9105,11 +9128,6 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		} else if fenced {
 			continue
 		}
-		if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
-			return err
-		} else if importing {
-			continue
-		}
 		text := strings.TrimSpace(inbound.Text)
 		runInput := ExecutionInput{}
 		cleanupPrompt := func() {}
@@ -9222,22 +9240,23 @@ func (b *Bridge) processQueuedTurnsWithStartBudget(ctx context.Context, startLim
 	if err != nil {
 		return 0, err
 	}
-	running := make(map[string]bool)
-	queued := make(map[string]bool)
+	knownTurnsBySession := make(map[string]sessionTurnQueueState)
 	for _, turn := range state.Turns {
-		switch turn.Status {
-		case teamstore.TurnStatusRunning:
-			running[turn.SessionID] = true
-		case teamstore.TurnStatusQueued:
-			queued[turn.SessionID] = true
-		}
-	}
-	var sessionIDs []string
-	for sessionID := range queued {
-		if transcriptImportIsActive(state, sessionID) {
+		if strings.TrimSpace(turn.SessionID) == "" {
 			continue
 		}
-		if !running[sessionID] {
+		knownTurns := knownTurnsBySession[turn.SessionID]
+		switch turn.Status {
+		case teamstore.TurnStatusRunning:
+			knownTurns.Running = true
+		case teamstore.TurnStatusQueued:
+			knownTurns.Queued++
+		}
+		knownTurnsBySession[turn.SessionID] = knownTurns
+	}
+	var sessionIDs []string
+	for sessionID, knownTurns := range knownTurnsBySession {
+		if knownTurns.Queued > 0 && !knownTurns.Running {
 			sessionIDs = append(sessionIDs, sessionID)
 		}
 	}
@@ -9263,7 +9282,8 @@ func (b *Bridge) processQueuedTurnsWithStartBudget(ctx context.Context, startLim
 		if session == nil {
 			continue
 		}
-		gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+		knownTurns := knownTurnsBySession[sessionID]
+		gate, err := b.prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx, session, &knownTurns)
 		if err != nil {
 			recordSessionErr(session, "gate", err)
 			continue
@@ -9293,19 +9313,13 @@ func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Sess
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
-		return err
-	} else if importing {
-		return nil
-	}
 	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
 	if err != nil {
 		return err
 	}
-	for _, turn := range state.Turns {
-		if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusRunning {
-			return nil
-		}
+	knownTurns := sessionTurnQueueStateFromSnapshot(state, session.ID)
+	if knownTurns.Running {
+		return nil
 	}
 	queued, ok := oldestQueuedTurnForSessionState(state, session.ID)
 	if !ok {
@@ -9331,7 +9345,7 @@ func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Sess
 	if err := b.activatePendingSessionModelProfileForQueuedTurn(ctx, session, queued); err != nil {
 		return err
 	}
-	gate, err := b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
+	gate, err := b.prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx, session, &knownTurns)
 	if err != nil {
 		return err
 	}
@@ -12378,17 +12392,11 @@ type sessionTurnQueueState struct {
 	Queued  int
 }
 
-func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (sessionTurnQueueState, error) {
-	if strings.TrimSpace(sessionID) == "" {
-		return sessionTurnQueueState{}, nil
-	}
-	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
-	if err != nil {
-		return sessionTurnQueueState{}, err
-	}
+func sessionTurnQueueStateFromSnapshot(state teamstore.State, sessionID string) sessionTurnQueueState {
+	sessionID = strings.TrimSpace(sessionID)
 	var out sessionTurnQueueState
 	for _, turn := range state.Turns {
-		if turn.SessionID != sessionID {
+		if strings.TrimSpace(turn.SessionID) != sessionID {
 			continue
 		}
 		switch turn.Status {
@@ -12398,7 +12406,18 @@ func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (s
 			out.Queued++
 		}
 	}
-	return out, nil
+	return out
+}
+
+func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (sessionTurnQueueState, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return sessionTurnQueueState{}, nil
+	}
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
+	if err != nil {
+		return sessionTurnQueueState{}, err
+	}
+	return sessionTurnQueueStateFromSnapshot(state, sessionID), nil
 }
 
 func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferredTurnID string, preferred queuedTurnRunner) (bool, error) {
@@ -12424,11 +12443,6 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 				return false, noticeErr
 			}
 		}
-		return false, nil
-	}
-	if importing, err := b.sessionTranscriptImportInProgress(ctx, session.ID); err != nil {
-		return false, err
-	} else if importing {
 		return false, nil
 	}
 	claimed, ok, err := b.store.ClaimNextQueuedTurn(ctx, session.ID)
@@ -13632,7 +13646,7 @@ func (b *Bridge) sendDeferredServiceControlNotice(ctx context.Context, chatID st
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams deferred ACK send error: %v\n", err)
 	}
 	return nil
@@ -13667,7 +13681,7 @@ func (b *Bridge) sendExternalDeferredReceipt(ctx context.Context, chatID string,
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true}); err != nil && b.out != nil {
+	if err := b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams external receipt send error: %v\n", err)
 	}
 	return nil
@@ -14492,6 +14506,30 @@ func retryTurnReasoningEffortResolution(turn teamstore.Turn, session *Session, e
 	return effectiveSessionReasoningEffortResolution(session, executor)
 }
 
+// retryKnownAmbiguousOutbox is intentionally narrower than the normal outbox
+// flusher. It is used when an idempotent command queues the same deterministic
+// row again in the same Bridge that just observed an ambiguous Graph result.
+// The in-memory attempt claim prevents a concurrent sender from being robbed;
+// a restarted helper must wait for normal lease recovery or an explicit Graph
+// reconciliation instead of guessing that the old POST failed.
+func (b *Bridge) retryKnownAmbiguousOutbox(ctx context.Context, outbox teamstore.OutboxMessage) (bool, error) {
+	if b == nil || outbox.Status != teamstore.OutboxStatusSending || !teamstore.OutboxSendIsAmbiguous(outbox) {
+		return false, nil
+	}
+	generation, ok := b.claimKnownAmbiguousOutboxRetry(outbox.ID)
+	if !ok {
+		return false, nil
+	}
+	defer b.releaseKnownAmbiguousOutboxRetry(outbox.ID, generation)
+	err := b.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{
+		RespectRateLimitBlock:    true,
+		RecordRateLimit:          true,
+		AllowAmbiguousRetry:      true,
+		SkipUnresolvedTranscript: true,
+	})
+	return true, err
+}
+
 func (b *Bridge) queueAndSendOutboxChunks(ctx context.Context, sessionID string, turnID string, chatID string, kind string, text string) error {
 	return b.queueAndSendOutboxChunksWithOptions(ctx, sessionID, turnID, chatID, kind, text, outboxQueueOptions{})
 }
@@ -14508,7 +14546,18 @@ func (b *Bridge) queueOrSendOutboxChunks(ctx context.Context, sessionID string, 
 	if len(queued) == 0 || queueOnly {
 		return nil
 	}
-	flushOpts := outboxFlushOptions{AllowAmbiguousRetry: true, SkipUnresolvedTranscript: true}
+	for _, msg := range queued {
+		if retried, err := b.retryKnownAmbiguousOutbox(ctx, msg); retried {
+			if err != nil {
+				return err
+			}
+		}
+	}
+	flushOpts := outboxFlushOptions{
+		AllowAmbiguousRetry:           outboxTurnAllowsAmbiguousRetry(turnID),
+		AllowProtectedAmbiguousBypass: outboxTurnAllowsProtectedAmbiguousBypass(turnID),
+		SkipUnresolvedTranscript:      true,
+	}
 	if opts.IgnoreEarlierOutbox {
 		flushOpts.IgnoreEarlierOutbox = true
 		flushOpts.SkipUnresolvedTranscript = true
@@ -14595,9 +14644,22 @@ func (b *Bridge) planOutboxChunksWithOptions(sessionID string, turnID string, ch
 		if strings.TrimSpace(opts.ExpectedSourceFingerprint) != "" &&
 			strings.TrimSpace(opts.ExpectedSourcePath) != "" &&
 			opts.ExpectedSourceOffsetKnown {
+			// Keep the path together with the fingerprint and offset.  The
+			// sender must revalidate the same source, and a fingerprint without
+			// its identity is an incomplete proof that can never be accepted.
+			msg.TranscriptSourcePath = strings.TrimSpace(opts.ExpectedSourcePath)
 			msg.TranscriptSourceProofFingerprint = strings.TrimSpace(opts.ExpectedSourceFingerprint)
 			msg.TranscriptSourceProofOffset = opts.ExpectedSourceOffset
 			msg.TranscriptSourceProofOffsetKnown = true
+		}
+		if strings.TrimSpace(opts.ExpectedSourceReadFingerprint) != "" &&
+			strings.TrimSpace(opts.ExpectedSourcePath) != "" &&
+			opts.ExpectedSourceReadRangeKnown {
+			msg.TranscriptSourcePath = strings.TrimSpace(opts.ExpectedSourcePath)
+			msg.TranscriptSourceReadProofFingerprint = strings.TrimSpace(opts.ExpectedSourceReadFingerprint)
+			msg.TranscriptSourceReadProofStartOffset = opts.ExpectedSourceReadStartOffset
+			msg.TranscriptSourceReadProofEndOffset = opts.ExpectedSourceReadEndOffset
+			msg.TranscriptSourceReadProofRangeKnown = true
 		}
 		if isFinal {
 			// Persist one group identity on every terminal chunk.  Failure fencing
@@ -14687,6 +14749,30 @@ func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Cont
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
+	if transcriptImportRunIsAutomatic(turnID) && strings.TrimSpace(opts.ExpectedSourceFingerprint) != "" {
+		// Large/math records bypass the normal batcher and reach this helper
+		// directly. Keep their checkpoint CAS bound to the same source proof as
+		// the queued outbox; the old detailed writer could advance the cursor
+		// after the sender had already fenced a source replacement.
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
+			ctx,
+			session,
+			local.FilePath,
+			transcriptRecordCheckpointKey(record),
+			checkpointLine,
+			checkpointOffset,
+			checkpointID,
+			opts,
+			opts.ParentFenceSessionID,
+		)
+	}
+	if transcriptOutboxAutomaticRun(turnID) && strings.TrimSpace(opts.ExpectedSourceFingerprint) == "" {
+		// Do not leave a proofless automatic delivery row behind for the sender
+		// to quarantine after the checkpoint writer has rejected it. Keeping the
+		// queue and cursor decision together prevents a legacy blocked checkpoint
+		// from silently skipping a visible record.
+		return errTranscriptAutomaticSourceProofUnavailable
+	}
 	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset, checkpointID)
 }
 
@@ -14763,6 +14849,7 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithNamespace(ctx context.Context,
 		if msg.NotificationKind == "" && msg.MentionOwner {
 			msg.NotificationKind = "owner_notification"
 		}
+		applyTranscriptSourceProofToOutbox(&msg, opts)
 		msg = b.prepareOutboxForQueue(ctx, msg)
 		queuedMsg, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
 			Message:  msg,
@@ -14796,7 +14883,13 @@ func (b *Bridge) queueAndSendOutbox(ctx context.Context, msg teamstore.OutboxMes
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	return b.flushPendingOutboxForChat(ctx, queued.TeamsChatID)
+	if retried, err := b.retryKnownAmbiguousOutbox(ctx, queued); retried {
+		return err
+	}
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", queued.TeamsChatID, outboxFlushOptions{
+		AllowProtectedAmbiguousBypass: outboxTurnAllowsProtectedAmbiguousBypass(queued.TurnID),
+		SkipUnresolvedTranscript:      true,
+	})
 }
 
 func (b *Bridge) queueAndBestEffortSendOutbox(ctx context.Context, msg teamstore.OutboxMessage) error {
@@ -14807,7 +14900,16 @@ func (b *Bridge) queueAndBestEffortSendOutbox(ctx context.Context, msg teamstore
 	if queued.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	if err := b.flushPendingOutboxForChat(ctx, queued.TeamsChatID); err != nil && b.out != nil {
+	if retried, retryErr := b.retryKnownAmbiguousOutbox(ctx, queued); retried {
+		if retryErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox retry error: %v\n", retryErr)
+		}
+		return nil
+	}
+	if err := b.flushPendingOutboxFilteredWithOptions(ctx, "", "", queued.TeamsChatID, outboxFlushOptions{
+		AllowProtectedAmbiguousBypass: outboxTurnAllowsProtectedAmbiguousBypass(queued.TurnID),
+		SkipUnresolvedTranscript:      true,
+	}); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams best-effort outbox send error: %v\n", err)
 	}
 	return nil
@@ -14830,7 +14932,10 @@ func (b *Bridge) flushExistingOutboxIfPending(ctx context.Context, outboxID stri
 	if !ok || existing.Status == teamstore.OutboxStatusSent {
 		return nil
 	}
-	return b.flushPendingOutboxForChat(ctx, chatID)
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", chatID, outboxFlushOptions{
+		AllowProtectedAmbiguousBypass: true,
+		SkipUnresolvedTranscript:      true,
+	})
 }
 
 func (b *Bridge) queueOutbox(ctx context.Context, msg teamstore.OutboxMessage) (teamstore.OutboxMessage, error) {
@@ -14958,20 +15063,32 @@ func (b *Bridge) flushPendingOutboxForChat(ctx context.Context, chatID string) e
 }
 
 func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID string, turnID string, chatID string) error {
-	return b.flushPendingOutboxFilteredWithOptions(ctx, sessionID, turnID, chatID, outboxFlushOptions{AllowAmbiguousRetry: true, SkipUnresolvedTranscript: true})
+	return b.flushPendingOutboxFilteredWithOptions(ctx, sessionID, turnID, chatID, outboxFlushOptions{SkipUnresolvedTranscript: true})
 }
 
 type outboxFlushOptions struct {
-	MaxMessages              int
-	AllowAmbiguousRetry      bool
-	SkipUnresolvedTranscript bool
-	IgnoreEarlierOutbox      bool
+	MaxMessages         int
+	AllowAmbiguousRetry bool
+	// AllowProtectedAmbiguousBypass lets a newly-created, distinct user turn
+	// continue past a protected outbox row whose external Graph result is
+	// unknown.  It never retries or retires the older row; it only prevents a
+	// lost response from permanently deadlocking the chat.  Automatic history
+	// rows and another chunk of the same turn remain ordered behind it.
+	AllowProtectedAmbiguousBypass bool
+	SkipUnresolvedTranscript      bool
+	IgnoreEarlierOutbox           bool
 }
 
 func transcriptOutboxBlockedByUnresolvedAnchor(ctx context.Context, store *teamstore.Store, msg teamstore.OutboxMessage, anchorCache map[string]teamstore.ExecutionAnchor, anchorKnown map[string]bool) bool {
 	sessionID := strings.TrimSpace(msg.SessionID)
 	if store == nil || sessionID == "" || !isTranscriptAnswerOutbox(msg) {
 		return false
+	}
+	if anchorCache == nil {
+		anchorCache = make(map[string]teamstore.ExecutionAnchor)
+	}
+	if anchorKnown == nil {
+		anchorKnown = make(map[string]bool)
 	}
 	if !anchorKnown[sessionID] {
 		state, err := store.SessionExecutionStateSnapshot(ctx, sessionID, transcriptCheckpointID(sessionID))
@@ -15038,6 +15155,17 @@ func transcriptOutboxTrustedBeforeAnchor(msg teamstore.OutboxMessage, anchor tea
 func transcriptOutboxSourceProofMatches(msg teamstore.OutboxMessage) bool {
 	expected := strings.TrimSpace(msg.TranscriptSourceProofFingerprint)
 	if expected == "" {
+		// Ordinary user/control outbox rows do not carry transcript provenance.
+		// Keep this predicate allocation-free and avoid the more detailed kind
+		// classification on the hot send path; automatic sync/import namespaces
+		// and rows with any source metadata still take the conservative branch.
+		turnID := strings.TrimSpace(msg.TurnID)
+		if strings.TrimSpace(msg.TranscriptCheckpointID) == "" && strings.TrimSpace(msg.TranscriptSourcePath) == "" &&
+			!msg.TranscriptSourceOffsetKnown && strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) == "" &&
+			!msg.TranscriptSourceReadProofRangeKnown && !strings.HasPrefix(turnID, "sync:") &&
+			!strings.HasPrefix(turnID, "import:") && !strings.HasPrefix(turnID, "import-bg:") {
+			return true
+		}
 		// A linked-transcript row written by an older helper may have no bounded
 		// proof at all.  Once it carries transcript provenance (or has one of the
 		// automatic sync/import kinds), treating the missing proof as a match would
@@ -15068,7 +15196,103 @@ func transcriptOutboxSourceProofMatches(msg teamstore.OutboxMessage) bool {
 		return false
 	}
 	postInfo, err := os.Stat(path)
-	return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= msg.TranscriptSourceProofOffset
+	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() < msg.TranscriptSourceProofOffset {
+		return false
+	}
+	if strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) != "" || msg.TranscriptSourceReadProofRangeKnown {
+		if !msg.TranscriptSourceReadProofRangeKnown || msg.TranscriptSourceReadProofStartOffset < 0 ||
+			msg.TranscriptSourceReadProofEndOffset < msg.TranscriptSourceReadProofStartOffset ||
+			postInfo.Size() < msg.TranscriptSourceReadProofEndOffset {
+			return false
+		}
+		readProof := outboxQueueOptions{
+			ExpectedSourcePath:            path,
+			ExpectedSourceReadFingerprint: msg.TranscriptSourceReadProofFingerprint,
+			ExpectedSourceReadStartOffset: msg.TranscriptSourceReadProofStartOffset,
+			ExpectedSourceReadEndOffset:   msg.TranscriptSourceReadProofEndOffset,
+			ExpectedSourceReadRangeKnown:  msg.TranscriptSourceReadProofRangeKnown,
+		}
+		if !transcriptSourceReadProofMatches(readProof) {
+			return false
+		}
+	}
+	return true
+}
+
+type transcriptSourceProofCacheEntry struct {
+	ExpectedFingerprint string
+	Path                string
+	Offset              int64
+	OffsetKnown         bool
+	ReadFingerprint     string
+	ReadStart           int64
+	ReadEnd             int64
+	ReadRangeKnown      bool
+	Info                os.FileInfo
+}
+
+// transcriptOutboxSourceProofMatchesWithCache avoids repeating the same
+// source read during the pre-claim checks of one flush. The cache is only a
+// cheap stat-validated hint: every pre-POST and post-POST boundary still
+// forces a fresh content proof, and the store CAS remains authoritative.
+func transcriptOutboxSourceProofMatchesWithCache(msg teamstore.OutboxMessage, cache map[string]transcriptSourceProofCacheEntry, force bool) bool {
+	if !force && cache != nil {
+		key := transcriptSourceProofCacheKey(msg)
+		if entry, ok := cache[key]; ok && transcriptSourceProofCacheEntryMatches(entry, msg) {
+			return true
+		}
+	}
+	ok := transcriptOutboxSourceProofMatches(msg)
+	if ok && cache != nil && strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" {
+		if len(cache) < transcriptSourceProofCacheMaxEntries {
+			if info, err := os.Stat(strings.TrimSpace(msg.TranscriptSourcePath)); err == nil && !info.IsDir() {
+				cache[transcriptSourceProofCacheKey(msg)] = transcriptSourceProofCacheEntry{
+					ExpectedFingerprint: strings.TrimSpace(msg.TranscriptSourceProofFingerprint),
+					Path:                strings.TrimSpace(msg.TranscriptSourcePath),
+					Offset:              msg.TranscriptSourceProofOffset,
+					OffsetKnown:         msg.TranscriptSourceProofOffsetKnown,
+					ReadFingerprint:     strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint),
+					ReadStart:           msg.TranscriptSourceReadProofStartOffset,
+					ReadEnd:             msg.TranscriptSourceReadProofEndOffset,
+					ReadRangeKnown:      msg.TranscriptSourceReadProofRangeKnown,
+					Info:                info,
+				}
+			}
+		}
+	}
+	return ok
+}
+
+func transcriptSourceProofCacheKey(msg teamstore.OutboxMessage) string {
+	return strings.Join([]string{
+		strings.TrimSpace(msg.TranscriptSourcePath),
+		strings.TrimSpace(msg.TranscriptSourceProofFingerprint),
+		strconv.FormatInt(msg.TranscriptSourceProofOffset, 10),
+		strconv.FormatBool(msg.TranscriptSourceProofOffsetKnown),
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint),
+		strconv.FormatInt(msg.TranscriptSourceReadProofStartOffset, 10),
+		strconv.FormatInt(msg.TranscriptSourceReadProofEndOffset, 10),
+		strconv.FormatBool(msg.TranscriptSourceReadProofRangeKnown),
+	}, "\x00")
+}
+
+func transcriptSourceProofCacheEntryMatches(entry transcriptSourceProofCacheEntry, msg teamstore.OutboxMessage) bool {
+	if entry.Info == nil || entry.ExpectedFingerprint != strings.TrimSpace(msg.TranscriptSourceProofFingerprint) ||
+		entry.Path != strings.TrimSpace(msg.TranscriptSourcePath) || entry.Offset != msg.TranscriptSourceProofOffset ||
+		entry.OffsetKnown != msg.TranscriptSourceProofOffsetKnown || entry.ReadFingerprint != strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) ||
+		entry.ReadStart != msg.TranscriptSourceReadProofStartOffset || entry.ReadEnd != msg.TranscriptSourceReadProofEndOffset ||
+		entry.ReadRangeKnown != msg.TranscriptSourceReadProofRangeKnown {
+		return false
+	}
+	info, err := os.Stat(entry.Path)
+	return err == nil && !info.IsDir() && os.SameFile(entry.Info, info) && info.Size() == entry.Info.Size() && info.ModTime().Equal(entry.Info.ModTime())
+}
+
+func transcriptOutboxHasSourceProof(msg teamstore.OutboxMessage) bool {
+	return strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" ||
+		msg.TranscriptSourceProofOffsetKnown ||
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) != "" ||
+		msg.TranscriptSourceReadProofRangeKnown
 }
 
 func transcriptOutboxRequiresSourceProof(msg teamstore.OutboxMessage) bool {
@@ -15076,16 +15300,17 @@ func transcriptOutboxRequiresSourceProof(msg teamstore.OutboxMessage) bool {
 		return false
 	}
 	turnID := strings.TrimSpace(msg.TurnID)
-	// `import:` and `import-bg:` are operator-selected history import
-	// namespaces.  They may intentionally read a legacy transcript without an
-	// automatic-sync source proof; treating their rows as automatic sync would
-	// make explicit publish-history fail closed and leave the import half done.
-	if strings.HasPrefix(turnID, "import:") || strings.HasPrefix(turnID, "import-bg:") ||
-		strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:") {
+	// Explicit history publication is an operator-selected reread and may
+	// establish a new boundary for a legacy transcript. Both `import:` and
+	// `import-bg:` are automatic linked-history runs; they must carry a source
+	// proof before reaching Graph. Exempting either one would let a missing
+	// proof fail open in the sender after the row had already been queued.
+	if transcriptOutboxUserExplicitHistory(turnID) {
 		return false
 	}
 	if strings.TrimSpace(msg.TranscriptCheckpointID) != "" || strings.TrimSpace(msg.TranscriptSourcePath) != "" ||
-		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" || msg.TranscriptSourceProofOffsetKnown {
+		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" || msg.TranscriptSourceProofOffsetKnown ||
+		strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint) != "" || msg.TranscriptSourceReadProofRangeKnown {
 		return true
 	}
 	// Source-less legacy rows are handled by the state-aware
@@ -15093,6 +15318,56 @@ func transcriptOutboxRequiresSourceProof(msg teamstore.OutboxMessage) bool {
 	// used. Returning false here means only that the row has no own proof to
 	// validate; it must not bypass that fence or establish a safe boundary.
 	return false
+}
+
+// transcriptAutomaticImportSourceProofMatches verifies the source prefix
+// captured before an automatic import began.  The fingerprint includes the
+// source identity and the bounded content window, so this catches an atomic
+// replacement or an in-place rewrite between read, queue, and checkpoint
+// without reading the complete transcript.  It is used only on the cold
+// import path; ordinary poll/admission paths do not call it.
+func transcriptAutomaticImportSourceProofMatches(proof outboxQueueOptions) bool {
+	if strings.TrimSpace(proof.ExpectedSourcePath) == "" ||
+		strings.TrimSpace(proof.ExpectedSourceFingerprint) == "" ||
+		!proof.ExpectedSourceOffsetKnown || proof.ExpectedSourceOffset < 0 {
+		return false
+	}
+	if transcriptCheckpointSourceFingerprint(proof.ExpectedSourcePath, proof.ExpectedSourceOffset) != strings.TrimSpace(proof.ExpectedSourceFingerprint) {
+		return false
+	}
+	return transcriptSourceReadProofMatches(proof)
+}
+
+func transcriptSourceProofQueueOptionsMatches(proof outboxQueueOptions) bool {
+	if strings.TrimSpace(proof.ExpectedSourcePath) == "" ||
+		strings.TrimSpace(proof.ExpectedSourceFingerprint) == "" ||
+		!proof.ExpectedSourceOffsetKnown || proof.ExpectedSourceOffset < 0 {
+		return false
+	}
+	if transcriptCheckpointSourceFingerprint(proof.ExpectedSourcePath, proof.ExpectedSourceOffset) != strings.TrimSpace(proof.ExpectedSourceFingerprint) {
+		return false
+	}
+	return transcriptSourceReadProofMatches(proof)
+}
+
+func transcriptSourceReadProofMatches(proof outboxQueueOptions) bool {
+	if strings.TrimSpace(proof.ExpectedSourceReadFingerprint) == "" && !proof.ExpectedSourceReadRangeKnown {
+		// Active-turn backfill and legacy callers only carry the cursor proof.
+		// Automatic cold imports always populate the stronger read-range proof.
+		return true
+	}
+	if strings.TrimSpace(proof.ExpectedSourceReadFingerprint) == "" || !proof.ExpectedSourceReadRangeKnown ||
+		proof.ExpectedSourceReadStartOffset < 0 || proof.ExpectedSourceReadEndOffset < proof.ExpectedSourceReadStartOffset {
+		return false
+	}
+	// A persisted proof is untrusted input.  Keep the final sender-side
+	// verification bounded just like the import-side proof so a malformed or
+	// stale row cannot make the outbox lock hold while it reads an arbitrary
+	// amount of a large transcript.
+	if proof.ExpectedSourceReadEndOffset-proof.ExpectedSourceReadStartOffset > int64(historyTieredMaxTailBytes) {
+		return false
+	}
+	return transcriptSourceRangeFingerprint(proof.ExpectedSourcePath, proof.ExpectedSourceReadStartOffset, proof.ExpectedSourceReadEndOffset) == strings.TrimSpace(proof.ExpectedSourceReadFingerprint)
 }
 
 // transcriptOutboxLegacySourceRewriteBlocked is the state-aware safety fence
@@ -15104,19 +15379,7 @@ func (b *Bridge) transcriptOutboxLegacySourceRewriteBlocked(ctx context.Context,
 	if b == nil || b.store == nil || transcriptOutboxUserExplicitHistory(msg.TurnID) {
 		return false
 	}
-	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
-	if strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "needs_attention") ||
-		strings.HasSuffix(kind, "-needs-attention") || kind == "needs-attention" ||
-		strings.HasPrefix(kind, "sync-status-") || strings.HasPrefix(kind, "import-title") || strings.HasPrefix(kind, "import-complete") {
-		return false
-	}
-	legacySyncOrImport := strings.HasPrefix(kind, "sync-") || strings.HasPrefix(kind, "import-")
-	legacyCodexStatus := strings.HasPrefix(kind, "codex-status-") &&
-		(strings.HasPrefix(strings.TrimSpace(msg.TurnID), "sync:") ||
-			strings.HasPrefix(strings.TrimSpace(msg.TurnID), "import:") ||
-			strings.TrimSpace(msg.TranscriptCheckpointID) != "" ||
-			strings.TrimSpace(msg.TranscriptSourcePath) != "")
-	if !legacySyncOrImport && !legacyCodexStatus {
+	if !teamstore.IsAutomaticTranscriptOutbox(msg) {
 		return false
 	}
 	if strings.TrimSpace(msg.SessionID) == "" {
@@ -15150,10 +15413,157 @@ func (b *Bridge) transcriptOutboxLegacySourceRewriteBlocked(ctx context.Context,
 	return true
 }
 
+func (b *Bridge) fenceTranscriptOutboxSourceRewrite(ctx context.Context, msg teamstore.OutboxMessage) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	if !transcriptOutboxUserExplicitHistory(msg.TurnID) && strings.TrimSpace(msg.SessionID) != "" {
+		checkpointID := firstNonEmptyString(msg.TranscriptCheckpointID, transcriptCheckpointID(msg.SessionID))
+		checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			checkpoint = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: msg.SessionID, SourcePath: msg.TranscriptSourcePath}
+		}
+		sourcePath := firstNonEmptyString(msg.TranscriptSourcePath, checkpoint.SourcePath)
+		session := b.reg.SessionByID(msg.SessionID)
+		if session == nil {
+			session = &Session{ID: msg.SessionID, CodexThreadID: msg.CodexThreadID}
+		}
+		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, *session, sourcePath, checkpoint); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// retireTranscriptOutboxBeforePostSourceRewrite handles a source-proof failure
+// after the outbox lease was claimed but before any Graph POST. The row must
+// not be retried as the same transcript, and it must not be marked skipped
+// without first fencing the canonical checkpoint: otherwise a checkpoint that
+// won the queue race could make the rewritten tail look already delivered.
+func (b *Bridge) retireTranscriptOutboxBeforePostSourceRewrite(ctx context.Context, msg teamstore.OutboxMessage, reason string) error {
+	if err := b.fenceTranscriptOutboxSourceRewrite(ctx, msg); err != nil {
+		return err
+	}
+	_, err := b.store.MarkOutboxSkippedForAttempt(ctx, msg.ID, msg.SendAttemptToken, reason)
+	return err
+}
+
 func transcriptOutboxUserExplicitHistory(turnID string) bool {
 	turnID = strings.TrimSpace(turnID)
-	return strings.HasPrefix(turnID, "import:") ||
-		strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
+	return strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
+}
+
+// outboxTurnAllowsAmbiguousRetry is deliberately narrower than the general
+// transcript-history classifier.  A normal outbox flush must never release a
+// Sending row whose Graph outcome is unknown. Only an operator-selected
+// history publication may choose that recovery boundary; background imports
+// use the import-bg namespace and remain fail-closed.
+func outboxTurnAllowsAmbiguousRetry(turnID string) bool {
+	return transcriptOutboxUserExplicitHistory(turnID)
+}
+
+func outboxTurnAllowsProtectedAmbiguousBypass(turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" || transcriptOutboxUserExplicitHistory(turnID) {
+		return false
+	}
+	for _, prefix := range []string{"sync:", "import:", "import-bg:"} {
+		if strings.HasPrefix(turnID, prefix) {
+			return false
+		}
+	}
+	return true
+}
+
+// outboxDeliverySupersedable covers low-value control/progress rows whose
+// ambiguous POST must not hold a later, distinct response behind FIFO forever.
+// It is intentionally separate from Store's turn-lifecycle transient class:
+// the same deterministic ACK/helper row must remain retryable when the
+// originating command is retried in-process.  This predicate is used only
+// after a different later outbox row is already waiting.
+func outboxDeliverySupersedable(msg teamstore.OutboxMessage) bool {
+	if teamstore.OutboxDeliveryProtected(msg) {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	return kind == "ack" || kind == "helper" || strings.HasPrefix(kind, "helper-")
+}
+
+// outboxCanBypassProtectedAmbiguousPredecessor is the liveness counterpart to
+// outboxDeliverySupersedable.  A protected final/attachment must never be
+// retried after an ambiguous POST, but it also must not make a Work chat
+// unusable forever when a later user turn arrives.  The old row remains in
+// Sending with its unknown external outcome; this predicate only permits the
+// later distinct delivery to proceed.
+func outboxCanBypassProtectedAmbiguousPredecessor(current teamstore.OutboxMessage, earlier teamstore.OutboxMessage) bool {
+	if !teamstore.OutboxSendIsAmbiguous(earlier) || !teamstore.OutboxDeliveryProtected(earlier) {
+		return false
+	}
+	if strings.TrimSpace(current.ID) == "" || strings.TrimSpace(current.ID) == strings.TrimSpace(earlier.ID) {
+		return false
+	}
+	currentTurnID := strings.TrimSpace(current.TurnID)
+	earlierTurnID := strings.TrimSpace(earlier.TurnID)
+	if currentTurnID != "" {
+		if currentTurnID == earlierTurnID || transcriptOutboxUserExplicitHistory(currentTurnID) {
+			return false
+		}
+		for _, prefix := range []string{"sync:", "import:", "import-bg:", "publish-history:", "publish-full:"} {
+			if strings.HasPrefix(currentTurnID, prefix) {
+				return false
+			}
+		}
+		// A normal turn ID is sufficient evidence that this is a distinct
+		// user request.  The durable Turn queue already serializes execution;
+		// this only changes the outbound Graph FIFO fence.
+		return true
+	}
+	// Direct helper/control output has no TurnID.  It is safe to let a status,
+	// error, or acknowledgement explain/recover the chat while the unknown
+	// protected delivery remains quarantined.
+	kind := strings.ToLower(strings.TrimSpace(current.Kind))
+	return kind == "ack" || kind == "helper" || strings.HasPrefix(kind, "helper-") || strings.HasPrefix(kind, "error")
+}
+
+// obsoleteHistoryOutboxPredecessor identifies only automatic history-policy
+// rows that an explicit operator-selected history import is allowed to pass.
+// Protected answers and other durable user-visible work remain ordered; this
+// exception exists solely so a stale gate notice or a fenced accepted row
+// cannot deadlock the recovery command behind the policy it is repairing.
+func obsoleteHistoryOutboxPredecessor(msg teamstore.OutboxMessage) bool {
+	if teamstore.OutboxDeliveryProtected(msg) {
+		return false
+	}
+	if teamstore.IsLegacyHistoryGateNotice(msg) || teamstore.IsLegacyUnverifiableTranscriptOutbox(msg) {
+		return true
+	}
+	return msg.BlockedBySourceRewrite && msg.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
+}
+
+// earlierUnsentOutboxSkippingLegacy retires only stale pre-source-proof
+// transcript rows while walking FIFO. Queued rows have never acquired a send
+// lease; Sending rows are eligible only after their lease expires and bounded
+// reconciliation has failed. Fresh rows, accepted identities, and rows with
+// source metadata remain fail-closed and are returned.
+func (b *Bridge) earlierUnsentOutboxSkippingLegacy(ctx context.Context, msg teamstore.OutboxMessage) (teamstore.OutboxMessage, bool, error) {
+	if b == nil || b.store == nil {
+		return teamstore.OutboxMessage{}, false, nil
+	}
+	for {
+		earlier, ok, err := b.store.EarlierUnsentOutbox(ctx, msg)
+		if err != nil || !ok {
+			return earlier, ok, err
+		}
+		if !teamstore.IsLegacyUnverifiableTranscriptOutbox(earlier) {
+			return earlier, true, nil
+		}
+		if _, err := b.store.MarkOutboxSkipped(ctx, earlier.ID, "obsolete pre-source-proof transcript row"); err != nil {
+			return teamstore.OutboxMessage{}, false, err
+		}
+	}
 }
 
 func isTranscriptAnswerOutbox(msg teamstore.OutboxMessage) bool {
@@ -15188,18 +15598,22 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		defer b.outboxFlushMu.Unlock()
 		var firstErr error
 		var firstBlockedErr error
-		anchorCache := make(map[string]teamstore.ExecutionAnchor)
-		anchorKnown := make(map[string]bool)
+		var anchorCache map[string]teamstore.ExecutionAnchor
+		var anchorKnown map[string]bool
+		var sourceProofCache map[string]transcriptSourceProofCacheEntry
+		recoveryProbeBudget := 1
+		recoveryPageBudget := outboxRecoveryMaxPagesPerFlush
 		sent := 0
 		pageLimit := outboxFlushPendingPageSize
 		if opts.MaxMessages > 0 && opts.MaxMessages < pageLimit {
 			pageLimit = opts.MaxMessages
 		}
 		query := teamstore.PendingOutboxQuery{
-			SessionID:   strings.TrimSpace(sessionID),
-			TurnID:      strings.TrimSpace(turnID),
-			TeamsChatID: strings.TrimSpace(chatID),
-			Limit:       pageLimit,
+			SessionID:            strings.TrimSpace(sessionID),
+			TurnID:               strings.TrimSpace(turnID),
+			TeamsChatID:          strings.TrimSpace(chatID),
+			IncludeActiveSending: opts.AllowAmbiguousRetry,
+			Limit:                pageLimit,
 		}
 		for {
 			page, err := b.store.PendingOutboxPageAt(ctx, query)
@@ -15217,10 +15631,23 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
 			})
 			for _, msg := range pending {
-				if opts.SkipUnresolvedTranscript && transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, msg, anchorCache, anchorKnown) {
-					continue
+				if opts.SkipUnresolvedTranscript && isTranscriptAnswerOutbox(msg) {
+					if anchorCache == nil {
+						anchorCache = make(map[string]teamstore.ExecutionAnchor)
+						anchorKnown = make(map[string]bool)
+					}
+					if transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, msg, anchorCache, anchorKnown) {
+						continue
+					}
 				}
-				if err := b.sendQueuedOutboxWithOptions(ctx, msg, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: opts.AllowAmbiguousRetry, IgnoreEarlierOutbox: opts.IgnoreEarlierOutbox, SkipUnresolvedTranscript: opts.SkipUnresolvedTranscript, SentSideEffects: &sentSideEffects}); err != nil {
+				sendOpts := outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: opts.AllowAmbiguousRetry, AllowProtectedAmbiguousBypass: opts.AllowProtectedAmbiguousBypass, IgnoreEarlierOutbox: opts.IgnoreEarlierOutbox, SkipUnresolvedTranscript: opts.SkipUnresolvedTranscript, AnchorCache: anchorCache, AnchorKnown: anchorKnown, RecoveryProbeBudget: &recoveryProbeBudget, RecoveryPageBudget: &recoveryPageBudget, SentSideEffects: &sentSideEffects}
+				if transcriptOutboxHasSourceProof(msg) {
+					if sourceProofCache == nil {
+						sourceProofCache = make(map[string]transcriptSourceProofCacheEntry)
+					}
+					sendOpts.SourceProofCache = sourceProofCache
+				}
+				if err := b.sendQueuedOutboxWithOptions(ctx, msg, sendOpts); err != nil {
 					if isOutboxDeliveryDeferred(err) {
 						if firstBlockedErr == nil {
 							firstBlockedErr = err
@@ -15263,16 +15690,27 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 }
 
 func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
-	return b.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: true})
+	return b.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true})
 }
 
 type outboxSendOptions struct {
-	RespectRateLimitBlock    bool
-	RecordRateLimit          bool
-	AllowAmbiguousRetry      bool
-	IgnoreEarlierOutbox      bool
-	SkipUnresolvedTranscript bool
-	SentSideEffects          *[]sentOutboxSideEffect
+	RespectRateLimitBlock         bool
+	RecordRateLimit               bool
+	AllowAmbiguousRetry           bool
+	AllowProtectedAmbiguousBypass bool
+	IgnoreEarlierOutbox           bool
+	SkipUnresolvedTranscript      bool
+	AnchorCache                   map[string]teamstore.ExecutionAnchor
+	AnchorKnown                   map[string]bool
+	// RecoveryProbeBudget limits expensive Graph history reconciliation within
+	// one global outbox flush. A single ambiguous row must not monopolize the
+	// flush mutex, and repeated no-match probes are separately backed off per
+	// outbox ID. RecoveryPageBudget applies the same bound to Graph continuation
+	// pages; direct single-row sends leave both fields nil.
+	RecoveryProbeBudget *int
+	RecoveryPageBudget  *int
+	SentSideEffects     *[]sentOutboxSideEffect
+	SourceProofCache    map[string]transcriptSourceProofCacheEntry
 }
 
 type sentOutboxSideEffect struct {
@@ -15390,15 +15828,79 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			return err
 		}
 	}
+	// A legacy history-gate diagnostic is never user work. Startup migration
+	// normally retires queued and lease-expired rows after the owner lease is
+	// acquired, but keep the sender fail-closed as a second boundary for rows
+	// created by another process or missed by the migration query. A fresh
+	// Sending row is left alone until its external POST is recoverable or its
+	// lease expires; skipping it here would hide an ambiguous Graph side effect.
+	if (outbox.Status == teamstore.OutboxStatusQueued || outbox.Status == teamstore.OutboxStatusSending) && !teamstore.OutboxDeliveryProtected(outbox) && teamstore.IsLegacyHistoryGateNoticeForSend(outbox) {
+		if outbox.Status == teamstore.OutboxStatusSending && !teamstore.OutboxSendLeaseExpired(outbox, time.Now()) {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		var err error
+		if outbox.Status == teamstore.OutboxStatusSending {
+			// A stale snapshot must not retire a new attempt claimed after this
+			// sender read the row.  Startup migration may use the unscoped method
+			// only while the sender is quiesced; the live sender needs the attempt
+			// CAS even for an obsolete diagnostic.
+			_, err = b.store.MarkOutboxSkippedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "obsolete automatic history-gate notice")
+			if err != nil && strings.TrimSpace(outbox.SendAttemptToken) == "" && errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
+				return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+			}
+		} else {
+			_, err = b.store.MarkOutboxSkipped(ctx, outbox.ID, "obsolete automatic history-gate notice")
+		}
+		return err
+	}
+	// A pre-source-proof queued transcript row has no external-send identity and
+	// cannot be safely associated with the current local file after an upgrade.
+	// It is stale compatibility data, not user work: retire it before the sender
+	// can turn it into a Graph POST. The store method repeats the stale-row
+	// predicate inside its CAS so a reclaimed row cannot be skipped from a stale
+	// sender snapshot.
+	if teamstore.IsLegacyUnverifiableTranscriptOutbox(outbox) {
+		_, _, err := b.store.RetireLegacyUnverifiableTranscriptOutboxIfStale(ctx, outbox.ID, "obsolete pre-source-proof transcript row")
+		if err != nil {
+			return err
+		}
+		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+	}
 	// Source-less transcript rows written by an older helper remain compatible
 	// until their checkpoint is explicitly marked source-rewritten.  Perform
 	// this state-aware fence after ambiguous-send recovery so an in-flight Graph
 	// request still has a chance to reconcile its stable message ID.
 	if outbox.BlockedBySourceRewrite || b.transcriptOutboxLegacySourceRewriteBlocked(ctx, outbox) {
+		if outbox.Status == teamstore.OutboxStatusQueued && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+			if err := b.fenceTranscriptOutboxSourceRewrite(ctx, outbox); err != nil {
+				return err
+			}
+			if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, outbox.TeamsMessageID); fenceErr != nil {
+				return fenceErr
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) == "" && strings.TrimSpace(outbox.SendAttemptToken) != "" {
+			_, markErr := b.store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "transcript source provenance changed after an ambiguous Graph send")
+			if markErr != nil && !errors.Is(markErr, teamstore.ErrOutboxSendNotClaimed) {
+				return markErr
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
 		if outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != "" {
 			if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, outbox.TeamsMessageID); fenceErr != nil {
 				return fenceErr
 			}
+		}
+		if outbox.Status == teamstore.OutboxStatusQueued && !outbox.BlockedBySourceRewrite {
+			if err := b.fenceTranscriptOutboxSourceRewrite(ctx, outbox); err != nil {
+				return err
+			}
+			_, err := b.store.MarkOutboxSkipped(ctx, outbox.ID, "transcript source provenance was rewritten before Graph send")
+			if err != nil {
+				return err
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
 		}
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
 	}
@@ -15406,13 +15908,83 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	// claiming a queued row.  A changed source must never be retried as if it
 	// were the same transcript; the linked-sync path will block and require an
 	// explicit history publication instead.
-	if !transcriptOutboxSourceProofMatches(outbox) {
+	if !transcriptOutboxSourceProofMatchesWithCache(outbox, opts.SourceProofCache, false) {
+		if outbox.Status == teamstore.OutboxStatusQueued && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+			if err := b.fenceTranscriptOutboxSourceRewrite(ctx, outbox); err != nil {
+				return err
+			}
+			if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, outbox.TeamsMessageID); fenceErr != nil {
+				return fenceErr
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) == "" && strings.TrimSpace(outbox.SendAttemptToken) != "" {
+			// The Graph read above found no exact provenance marker, but an old
+			// Sending row still has an unknown external outcome. Preserve the
+			// no-duplicate fence as durable ambiguity. This lets a distinct later
+			// user turn bypass a protected stale transcript row while explicit
+			// recovery can still reconcile the original marker.
+			_, markErr := b.store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "transcript source provenance changed after an ambiguous Graph send")
+			if markErr != nil && !errors.Is(markErr, teamstore.ErrOutboxSendNotClaimed) {
+				return markErr
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
 		if outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != "" {
 			if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, outbox.TeamsMessageID); fenceErr != nil {
 				return fenceErr
 			}
 		}
+		// A queued row has not acquired a Graph lease, so a source-proof
+		// mismatch can be retired before claim. Leaving it queued here is a
+		// permanent FIFO deadlock: the next pass performs the same proof check,
+		// never reaches the fence/skip path, and can never deliver later work.
+		// Fence the canonical checkpoint first so a concurrent scanner cannot
+		// advance over the rewritten source while this stale row is retired.
+		if outbox.Status == teamstore.OutboxStatusQueued && transcriptOutboxHasSourceProof(outbox) {
+			if err := b.fenceTranscriptOutboxSourceRewrite(ctx, outbox); err != nil {
+				return err
+			}
+			_, err := b.store.MarkOutboxSkipped(ctx, outbox.ID, "transcript source provenance was rewritten before Graph claim")
+			if err != nil {
+				return err
+			}
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+	}
+	// A legacy migration can leave a queued row with a durable Graph identity.
+	// Promote that identity before claiming the row; otherwise the generic send
+	// path would issue a duplicate POST. Source-rewrite rows were fenced above,
+	// so this path is safe to complete without another source read.
+	if outbox.Status == teamstore.OutboxStatusQueued && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
+		if err != nil {
+			return err
+		}
+		if sent.Status != teamstore.OutboxStatusSent || sent.BlockedByUnresolvedExecution || sent.BlockedByTerminalFailure {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		b.recordSentOutboxSideEffect(ctx, sent, ChatMessage{ID: outbox.TeamsMessageID}, opts)
+		return nil
+	}
+	// A durable Graph identity is already an external-send proof. Promote it
+	// under the current attempt instead of allowing a stale Sending row to be
+	// claimed and POSTed a second time after a restart.
+	if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+		if strings.TrimSpace(outbox.SendAttemptToken) == "" {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		sent, err := b.store.MarkOutboxSentForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, outbox.TeamsMessageID)
+		if err != nil {
+			return err
+		}
+		if sent.Status != teamstore.OutboxStatusSent || sent.BlockedByUnresolvedExecution || sent.BlockedByTerminalFailure {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		b.forgetOutboxEchoAttempt(outbox.ID)
+		b.recordSentOutboxSideEffect(ctx, sent, ChatMessage{ID: outbox.TeamsMessageID}, opts)
+		return nil
 	}
 	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
 		sent, err := b.store.MarkOutboxSent(ctx, outbox.ID, outbox.TeamsMessageID)
@@ -15444,11 +16016,61 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return err
 	}
 	// Recheck immediately before any retry/recovery/send side effect. The
-	// flusher performs an earlier page-level check, but an anchor can be
-	// persisted between that snapshot and this call. Safe control notices may
-	// pass; transcript answers remain quarantined until ownership is confirmed.
-	if opts.SkipUnresolvedTranscript && transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
+	// flusher performs an earlier page-level check and passes its per-flush
+	// cache here, so ordinary transcript rows do not decode the same session
+	// snapshot twice. The post-claim and pre-POST checks below deliberately use
+	// fresh caches because an anchor may be persisted during this send.
+	anchorCache := opts.AnchorCache
+	anchorKnown := opts.AnchorKnown
+	if anchorCache == nil {
+		anchorCache = make(map[string]teamstore.ExecutionAnchor)
+	}
+	if anchorKnown == nil {
+		anchorKnown = make(map[string]bool)
+	}
+	anchorBlocked := transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, anchorCache, anchorKnown)
+	if opts.SkipUnresolvedTranscript && anchorBlocked {
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(outbox.LastSendAttempt, outbox.CreatedAt)}
+	}
+	if anchorBlocked && outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.SendAttemptToken) != "" {
+		if _, err := b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "execution ownership became unresolved before Graph preparation"); err != nil {
+			return err
+		}
+		// The caller handed us an already-claimed row. Releasing that claim is a
+		// durable no-op and must happen before the generic markerless-Sending
+		// guard, otherwise the guard would report a misleading deferred error.
+		return nil
+	}
+	if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) == "" && outbox.BlockedByTerminalFailure {
+		// A terminal execution failure fences the final row against a late
+		// callback. Its external outcome is still unknown, so do not POST it, but
+		// also do not turn the intentionally retained in-flight row into a noisy
+		// deferred error on every flush.
+		return nil
+	}
+	// A Sending row without a durable Graph identity has an unknown external
+	// outcome, regardless of whether an older version persisted the current
+	// ambiguous-error marker. Never release it back to Queued: doing so can
+	// replay a POST that Graph already accepted. A row with an attempt token is
+	// upgraded to the current durable ambiguous form; pre-CAS rows remain
+	// deferred for explicit reconciliation because there is no safe CAS owner.
+	if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) == "" {
+		if !teamstore.OutboxSendIsAmbiguous(outbox) && strings.TrimSpace(outbox.SendAttemptToken) != "" {
+			if _, err := b.store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "legacy Sending row has no durable Graph identity"); err != nil && !errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
+				return err
+			}
+		}
+		// A normal flush must never replay a POST whose external outcome is
+		// unknown. Explicit history/publish recovery may reconcile an exact
+		// durable marker, but a complete no-match scan is not proof that the POST
+		// was rejected; releasing it would allow a duplicate POST. Pre-CAS rows
+		// without a token can never be reconciled by this sender.
+		if !(opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(outbox) && !teamstore.OutboxDeliveryProtected(outbox) && !isForkDeliveryOutbox(outbox)) {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		if opts.AllowAmbiguousRetry && opts.RecoveryProbeBudget != nil && *opts.RecoveryProbeBudget <= 0 {
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
 	}
 	if opts.AllowAmbiguousRetry && teamstore.OutboxSendIsAmbiguous(outbox) && !teamstore.OutboxDeliveryProtected(outbox) && !isForkDeliveryOutbox(outbox) {
 		if teamstore.OutboxDeliveryTransient(outbox) {
@@ -15458,11 +16080,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			b.forgetOutboxEchoAttempt(outbox.ID)
 			return nil
 		}
-		var err error
-		outbox, err = b.store.MarkOutboxSendErrorForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "explicit retry released ambiguous send lease")
-		if err != nil {
-			return err
-		}
+		// Non-transient ambiguity is intentionally retained. The Graph read
+		// path can settle an exact marker, but it must not turn an empty window
+		// into permission to replay the POST.
+		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
 	}
 	if teamstore.OutboxSendIsAmbiguous(outbox) && isForkDeliveryOutbox(outbox) {
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(outbox.LastSendAttempt, outbox.CreatedAt)}
@@ -15473,7 +16094,30 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 	}
 	if !opts.IgnoreEarlierOutbox {
-		if earlier, ok, err := b.store.EarlierUnsentOutbox(ctx, outbox); err != nil {
+		currentIsExplicitHistory := transcriptOutboxUserExplicitHistory(outbox.TurnID)
+		var earlier teamstore.OutboxMessage
+		var ok bool
+		var err error
+		if currentIsExplicitHistory {
+			// An explicit recovery may pass several obsolete predecessors, but it
+			// must stop at the first protected row. Looking at only the earliest
+			// predecessor would incorrectly jump over a protected answer that
+			// followed an obsolete notice.
+			candidates, candidateErr := b.store.EarlierUnsentOutboxes(ctx, outbox)
+			if candidateErr != nil {
+				return candidateErr
+			}
+			for _, candidate := range candidates {
+				if obsoleteHistoryOutboxPredecessor(candidate) {
+					continue
+				}
+				earlier, ok = candidate, true
+				break
+			}
+		} else {
+			earlier, ok, err = b.earlierUnsentOutboxSkippingLegacy(ctx, outbox)
+		}
+		if err != nil {
 			return err
 		} else if ok {
 			if opts.SkipUnresolvedTranscript && transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, earlier, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
@@ -15509,6 +16153,38 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 					return err
 				}
 				b.forgetOutboxEchoAttempt(earlier.ID)
+			} else if teamstore.OutboxSendIsAmbiguous(earlier) &&
+				teamstore.OutboxDeliveryTransient(earlier) &&
+				!teamstore.OutboxDeliveryProtected(earlier) &&
+				strings.TrimSpace(earlier.SendAttemptToken) != "" {
+				// A progress/queued-status row has no terminal user-visible
+				// meaning. If its POST outcome is ambiguous, dropping that one
+				// progress update is safer than allowing it to hold a later final
+				// answer behind an unresolvable FIFO predecessor. This does not
+				// release or replay the POST; it only marks the non-critical row
+				// skipped under its attempt CAS.
+				if _, err := b.store.MarkOutboxSkippedForAttempt(ctx, earlier.ID, earlier.SendAttemptToken, "ambiguous transient progress superseded by later outbox"); err != nil && !errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
+					return err
+				}
+				b.forgetOutboxEchoAttempt(earlier.ID)
+			} else if teamstore.OutboxSendIsAmbiguous(earlier) &&
+				outboxDeliverySupersedable(earlier) &&
+				strings.TrimSpace(earlier.SendAttemptToken) != "" &&
+				strings.TrimSpace(earlier.ID) != strings.TrimSpace(outbox.ID) {
+				// ACK/helper output is retryable when its own deterministic command
+				// is replayed, but an unknown POST from an older distinct row must
+				// not hold a later user-visible response forever.  Retiring this
+				// row does not replay or claim that Graph rejected it; it only
+				// releases FIFO for the later row under the attempt CAS.
+				if _, err := b.store.MarkOutboxSkippedForAttempt(ctx, earlier.ID, earlier.SendAttemptToken, "ambiguous control output superseded by later outbox"); err != nil && !errors.Is(err, teamstore.ErrOutboxSendNotClaimed) {
+					return err
+				}
+				b.forgetOutboxEchoAttempt(earlier.ID)
+			} else if opts.AllowProtectedAmbiguousBypass && outboxCanBypassProtectedAmbiguousPredecessor(outbox, earlier) {
+				// Keep the protected predecessor durable and ambiguous.  The
+				// current distinct user/control delivery is allowed through so a
+				// transport failure cannot deadlock the chat, but no automatic
+				// retry or "not sent" claim is made about the predecessor.
 			} else {
 				return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(earlier.LastSendAttempt, earlier.CreatedAt)}
 			}
@@ -15586,7 +16262,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		_, _ = b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "session quarantined before Graph POST")
 		return nil
 	}
-	if transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
+	if transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, nil, nil) {
 		_, markErr := b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "execution ownership became unresolved before Graph POST")
 		if markErr != nil {
 			return markErr
@@ -15599,18 +16275,18 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	// automatic retry, and it must not be converted to Skipped while still
 	// pre-send.
 	if b.transcriptOutboxLegacySourceRewriteBlocked(ctx, outbox) {
-		_, markErr := b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "transcript source rewrite became blocked before Graph POST")
+		markErr := b.retireTranscriptOutboxBeforePostSourceRewrite(context.Background(), outbox, "transcript source provenance changed before Graph POST")
 		if markErr != nil {
 			return markErr
 		}
-		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		return nil
 	}
-	if !transcriptOutboxSourceProofMatches(outbox) {
-		_, markErr := b.store.MarkOutboxSkippedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "transcript source provenance changed before Graph POST")
+	if !transcriptOutboxSourceProofMatchesWithCache(outbox, opts.SourceProofCache, true) {
+		markErr := b.retireTranscriptOutboxBeforePostSourceRewrite(ctx, outbox, "transcript source provenance changed before Graph POST")
 		if markErr != nil {
 			return markErr
 		}
-		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		return nil
 	}
 	var msg ChatMessage
 	if outbox.DriveItemID != "" {
@@ -15677,7 +16353,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	// final prefix proof no longer matches, retain the accepted identity behind
 	// a durable source-rewrite fence instead of promoting it to Sent and running
 	// transcript side effects. A later flush must never POST this row again.
-	if !transcriptOutboxSourceProofMatches(outbox) {
+	if !transcriptOutboxSourceProofMatchesWithCache(outbox, opts.SourceProofCache, true) {
 		if _, fenceErr := b.store.MarkOutboxAcceptedSourceRewriteForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID); fenceErr != nil {
 			return fenceErr
 		}
@@ -15697,7 +16373,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	// before registry/global-ledger publication and before the final Sent CAS,
 	// so a rewrite that occurs while Graph is settling cannot acquire a durable
 	// identity and then run transcript side effects as if it were current.
-	if !transcriptOutboxSourceProofMatches(outbox) {
+	if !transcriptOutboxSourceProofMatchesWithCache(outbox, opts.SourceProofCache, true) {
 		if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, msg.ID); fenceErr != nil {
 			return fenceErr
 		}
@@ -15713,9 +16389,29 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	} else {
 		globalOutboundRecorded = true
 	}
-	sent, err := b.store.MarkOutboxSentForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID)
+	// Rows without transcript provenance cannot race a source rewrite between
+	// Graph acceptance and the final CAS.  They still retain the durable
+	// Sending lease and exact helper marker, so a crash before this single CAS
+	// is reconciled by the existing marker probe; the extra Accepted transaction
+	// is only needed for source-bound rows where the stable Graph identity must
+	// be fenced before another source check or side effect.
+	if !transcriptOutboxRequiresSourceProof(outbox) && !transcriptOutboxHasSourceProof(outbox) {
+		sent, err := b.store.MarkOutboxSentForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID)
+		if err != nil {
+			return err
+		}
+		if sent.Status != teamstore.OutboxStatusSent || sent.BlockedByUnresolvedExecution || sent.BlockedByTerminalFailure {
+			b.forgetOutboxEchoAttempt(outbox.ID)
+			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		b.forgetOutboxEchoAttempt(outbox.ID)
+		b.forgetAcceptedOutbox(outbox.ID)
+		b.recordSentOutboxSideEffectWithOptions(ctx, sent, msg, opts, sentOutboxSideEffectOptions{GlobalOutboundRecorded: globalOutboundRecorded})
+		return nil
+	}
+	sent, err := b.store.MarkOutboxSentForAttemptAfterSourceProof(ctx, outbox.ID, outbox.SendAttemptToken, msg.ID)
 	if err == nil {
-		if !transcriptOutboxSourceProofMatches(outbox) {
+		if !transcriptOutboxSourceProofMatchesWithCache(outbox, opts.SourceProofCache, true) {
 			if _, fenceErr := b.store.MarkOutboxSourceRewriteFence(ctx, outbox.ID, msg.ID); fenceErr != nil {
 				return fenceErr
 			}
@@ -16694,7 +17390,12 @@ type outboxDeliveryDeferredError struct {
 }
 
 func (e outboxDeliveryDeferredError) Error() string {
-	return fmt.Sprintf("Teams chat is rate-limited until %s", e.Until.Format(time.RFC3339Nano))
+	// This error also represents safety fences (source proof, unresolved
+	// execution ownership, and ambiguous Graph outcomes). Calling all of those
+	// cases a rate limit makes normal recovery look like a transport problem and
+	// encourages pointless retries. Actual Graph 429s retain their typed status
+	// error and are handled by isGraphRateLimitError.
+	return fmt.Sprintf("Teams delivery is deferred until %s", e.Until.Format(time.RFC3339Nano))
 }
 
 func isOutboxDeliveryDeferred(err error) bool {
@@ -17284,6 +17985,11 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 			return "", fmt.Errorf("check history import for %s: %w", existing.ID, err)
 		}
 		importStatus := "No new local history was imported."
+		if checkpoint, found, checkpointErr := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(existing.ID)); checkpointErr != nil {
+			return "", checkpointErr
+		} else if found && checkpoint.Status == importCheckpointStatusBlocked {
+			importStatus = "No new local history was imported automatically."
+		}
 		if historySyncNeedsAttention {
 			importStatus = transcriptCheckpointNeedsAttentionMessage()
 		} else if hasNew {
@@ -17308,7 +18014,19 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 				}
 				return "", fmt.Errorf("resume history import for %s: %w", existing.ID, err)
 			}
-			if opts.BackgroundImport {
+			// Automatic imports may return nil after deliberately fencing a
+			// legacy/source-proof-less checkpoint.  That is the intended silent
+			// background policy, but this caller still needs to report a truthful
+			// result when it was invoked by an explicit publish/continue command;
+			// otherwise it claims that history was imported although no title or
+			// transcript row was queued.
+			checkpoint, found, checkpointErr := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(existing.ID))
+			if checkpointErr != nil {
+				return "", checkpointErr
+			}
+			if found && checkpoint.Status == importCheckpointStatusBlocked {
+				importStatus = "No new local history was imported automatically."
+			} else if opts.BackgroundImport {
 				importStatus = "New local history import was queued."
 			} else {
 				importStatus = "New local history was imported."
@@ -17493,9 +18211,13 @@ type transcriptImportResult struct {
 	SourceModTimeBeforeRead time.Time
 	SourceSizeAtRead        int64
 	SourceModTimeAtRead     time.Time
-	UnsafeDiagnostics       bool
-	Stats                   transcriptImportStats
-	Complete                bool
+	// SourceProof is the read-start boundary used by automatic linked-history
+	// delivery. It is intentionally process-local and is not persisted in the
+	// result; the outbox/checkpoint carry their own durable copies.
+	SourceProof       outboxQueueOptions
+	UnsafeDiagnostics bool
+	Stats             transcriptImportStats
+	Complete          bool
 }
 
 func (b *Bridge) importCodexTranscriptToTeams(ctx context.Context, session Session, local codexhistory.Session) error {
@@ -17540,6 +18262,34 @@ func (b *Bridge) importCodexTranscriptToTeamsWithTarget(ctx context.Context, ses
 	} else if blocked {
 		return fmt.Errorf("fork operation %q is still preparing this session; transcript publication is temporarily gated", op.ID)
 	}
+	// A normal publish/continue is an automatic history refresh, not an
+	// operator-selected recovery boundary. If an unresolved execution anchor is
+	// already durable, keep this path completely silent: do not queue an import
+	// title and do not transition the checkpoint to failed. Only the explicit
+	// publish-history commands below may reread across that boundary.
+	if !transcriptImportRunIsExplicitHistory(importTurnID) {
+		checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+		if err != nil {
+			return err
+		}
+		if found && transcriptCheckpointAdvanceBlocked(checkpoint) {
+			return nil
+		}
+	}
+	automaticSourceProof := outboxQueueOptions{}
+	if !transcriptImportRunIsExplicitHistory(importTurnID) {
+		var proofErr error
+		automaticSourceProof, proofErr = b.preflightAutomaticTranscriptImportSourceProof(ctx, session, local.FilePath, checkpointID)
+		if proofErr != nil {
+			if errors.Is(proofErr, errTranscriptAutomaticSourceProofUnavailable) {
+				// Do not queue an import title for a source whose automatic boundary
+				// cannot be authenticated. The blocked checkpoint is silent; the
+				// operator-selected publish-history path remains available.
+				return nil
+			}
+			return proofErr
+		}
+	}
 	if strings.TrimSpace(opts.SubagentCheckpointRoot) == "" {
 		opts.SubagentCheckpointRoot = checkpointID
 	}
@@ -17547,12 +18297,19 @@ func (b *Bridge) importCodexTranscriptToTeamsWithTarget(ctx context.Context, ses
 		return err
 	}
 	title := "Imported Codex session history\n\nThe messages below came from your local Codex session. Reply in this chat to continue from here.\n\nSession: " + local.DisplayTitle()
-	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-title", title, outboxQueueOptions{}, opts.QueueOnly); err != nil {
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-title", title, automaticSourceProof, opts.QueueOnly); err != nil {
 		_ = b.markTranscriptImportFailedWithID(ctx, session, local.FilePath, checkpointID)
 		return err
 	}
 	result, err := b.importTranscriptRecordsToTeams(ctx, session, local.FilePath, importTurnID, kindPrefix, checkpointID, opts)
 	if err != nil {
+		if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			// Automatic history remains silently blocked at its last trusted
+			// boundary. Do not turn a source race/legacy proof gap into a failed
+			// import or a repeated needs-attention card; explicit publish-history
+			// is the operator-selected recovery boundary.
+			return nil
+		}
 		_ = b.markTranscriptImportFailedWithID(ctx, session, local.FilePath, checkpointID)
 		if isTranscriptCheckpointNotFoundError(err) {
 			_ = b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage(), outboxQueueOptions{}, opts.QueueOnly)
@@ -17560,15 +18317,60 @@ func (b *Bridge) importCodexTranscriptToTeamsWithTarget(ctx context.Context, ses
 		return err
 	}
 	if !result.Complete {
-		return b.markTranscriptImportPausedAt(ctx, session, local.FilePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix)
+		return b.markTranscriptImportPausedAtWithProof(ctx, session, local.FilePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix, result.SourceProof)
+	}
+	return b.finishTranscriptImport(ctx, session, local, result, checkpointID, importTurnID, kindPrefix, opts)
+}
+
+// finishTranscriptImport makes the post-scan side effects recoverable as one
+// durable phase. The cursor is advanced by the batcher while the checkpoint is
+// still importing; only after subagent markers and the idempotent completion
+// notice are queued do we clear CompletionPending and mark the import complete.
+// A notification failure therefore cannot strand a fully imported transcript in
+// a terminal failed state with no way for the background watcher to retry it.
+func (b *Bridge) finishTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, result transcriptImportResult, checkpointID string, importTurnID string, kindPrefix string, opts transcriptImportRunOptions) error {
+	if err := b.markTranscriptImportCompletionPending(ctx, session, local.FilePath, checkpointID); err != nil {
+		return err
 	}
 	if err := b.importSubagentMarkersToTeamsWithOptions(ctx, session, local, importTurnID, opts); err != nil {
-		_ = b.markTranscriptImportFailedWithID(ctx, session, local.FilePath, checkpointID)
 		return err
 	}
 	complete := formatTranscriptImportCompleteMessage(result.Stats)
-	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete, outboxQueueOptions{}, opts.QueueOnly); err != nil {
-		_ = b.markTranscriptImportFailedWithID(ctx, session, local.FilePath, checkpointID)
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete, result.SourceProof, opts.QueueOnly); err != nil {
+		return err
+	}
+	if err := b.markTranscriptImportCompleteFromResult(ctx, session, local.FilePath, result, checkpointID); err != nil {
+		if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			// The transcript rows are already durable, but their source boundary
+			// changed before the completion CAS. Leave the checkpoint blocked and
+			// let the next explicit history command choose the recovery boundary;
+			// never turn this race into a failed notice loop.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (b *Bridge) finishExplicitTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, result transcriptImportResult, checkpointID string, importTurnID string, kindPrefix string) error {
+	if err := b.markTranscriptImportCompletionPending(ctx, session, local.FilePath, checkpointID); err != nil {
+		return err
+	}
+	if err := b.importSubagentMarkersToTeamsWithOptions(ctx, session, local, importTurnID, transcriptImportRunOptions{
+		SubagentCheckpointRoot: checkpointID,
+	}); err != nil {
+		return err
+	}
+	body := formatTranscriptImportCompleteMessage(result.Stats)
+	if result.Stats.Imported == 0 && result.Stats.SkippedBackground == 0 {
+		body = "No new visible local Codex history needed to be imported. This chat is ready."
+	}
+	if checkpoint, found, checkpointErr := b.store.ImportCheckpoint(ctx, checkpointID); checkpointErr != nil {
+		return checkpointErr
+	} else if found && executionAnchorActive(checkpoint.UnresolvedExecution) {
+		body = "Import complete. History was imported, but the previous Codex execution is still unconfirmed. I did not clear the execution anchor or start/retry a new turn. Check the existing work; normal dispatch resumes only after explicit terminal ownership is confirmed."
+	}
+	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", body, result.SourceProof, false); err != nil {
 		return err
 	}
 	return b.markTranscriptImportCompleteFromResult(ctx, session, local.FilePath, result, checkpointID)
@@ -17782,7 +18584,27 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); err != nil {
 			return transcriptImportResult{}, err
 		}
+		if transcriptImportRunIsAutomatic(importTurnID) {
+			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
+		}
 		return transcriptImportResult{Complete: false, UnsafeDiagnostics: true}, nil
+	}
+	sourceProof := outboxQueueOptions{}
+	if !transcriptImportRunIsExplicitHistory(importTurnID) {
+		sourceProof = transcriptAutomaticImportProofQueueOptions(filePath, checkpoint, sourceSizeBeforeRead)
+		if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) == "" ||
+			!transcriptAutomaticImportSourceProofMatches(sourceProof) {
+			block := b.blockAutomaticTranscriptSyncForSourceRewrite
+			if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) == "" {
+				block = func(blockCtx context.Context, blockSession Session, blockPath string, blockCheckpoint teamstore.ImportCheckpoint) error {
+					return b.blockAutomaticTranscriptSync(blockCtx, blockSession, blockPath, blockCheckpoint, 0)
+				}
+			}
+			if blockErr := block(ctx, session, filePath, checkpoint); blockErr != nil {
+				return transcriptImportResult{}, blockErr
+			}
+			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
+		}
 	}
 	if checkpoint.LastRecordID == "" {
 		transcript, err = ReadSessionTranscript(filePath)
@@ -17815,7 +18637,7 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 				SessionID:   session.CodexThreadID,
 				ProjectPath: session.Cwd,
 				FilePath:    filePath,
-			})
+			}, transcriptImportRunIsExplicitHistory(importTurnID))
 			if recoverErr != nil {
 				return transcriptImportResult{}, recoverErr
 			}
@@ -17841,7 +18663,14 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	}
 	if transcriptHasDiagnostic(transcript, "source_rewritten") || transcriptHasDiagnostic(transcript, "checkpoint_provenance_mismatch") {
 		if !allowAmbiguousImport {
-			_ = b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint)
+			if blockErr := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); blockErr != nil {
+				return transcriptImportResult{}, blockErr
+			}
+			// This is a source-boundary race, not a missing checkpoint selected by
+			// the operator. Keep automatic history silent; the outer import/resume
+			// paths only publish a needs-attention notice for the explicit
+			// checkpoint-not-found error.
+			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
 		} else {
 			_ = b.markTranscriptImportFailedWithID(ctx, session, filePath, checkpointID)
 		}
@@ -17877,6 +18706,16 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 			return transcriptImportResult{Complete: false}, nil
 		}
 	}
+	// The proof was captured before opening/parsing the transcript. Revalidate
+	// it after the read as well: an atomic replacement during parsing must not
+	// bind records from the old descriptor to the new pathname.
+	if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) != "" &&
+		!transcriptAutomaticImportSourceProofMatches(sourceProof) {
+		if blockErr := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); blockErr != nil {
+			return transcriptImportResult{}, blockErr
+		}
+		return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
+	}
 	withSourceBoundary := func(result transcriptImportResult) transcriptImportResult {
 		for _, diagnostic := range transcript.Diagnostics {
 			if diagnostic.Kind == "invalid_json" || diagnostic.Kind == "checkpoint_not_found" || diagnostic.Kind == "checkpoint_provenance_mismatch" || diagnostic.Kind == "incomplete_tail" || diagnostic.Kind == "source_rewritten" || diagnostic.Kind == "tail_too_large" {
@@ -17888,6 +18727,7 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		result.SourceModTimeBeforeRead = sourceModTimeBeforeRead
 		result.SourceSizeAtRead = sourceSizeAtRead
 		result.SourceModTimeAtRead = sourceModTimeAtRead
+		result.SourceProof = sourceProof
 		if result.UnsafeDiagnostics {
 			// A half-written/invalid tail is not an EOF boundary. Keep the
 			// checkpoint at the last complete record and let the next pass retry
@@ -17898,12 +18738,24 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	}
 	stats := transcriptImportStats{Total: len(transcript.Records)}
 	dedupe := newTranscriptDedupeState()
-	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID, opts)
+	batcher := newTranscriptImportBatcher(b, session, filePath, importTurnID, kindPrefix, checkpointID, sourceProof, opts)
 	var lastRecordID string
 	var lastLine int
 	var lastOffset int64
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
+		if !allowAmbiguousImport && sourceProof.ExpectedSourceReadRangeKnown && checkpointOffset > sourceProof.ExpectedSourceReadEndOffset {
+			// The file grew while it was being read. Do not queue a record that was
+			// outside the pre-read snapshot; the next bounded pass will import it
+			// under a fresh read proof.
+			return withSourceBoundary(transcriptImportResult{
+				LastRecordID: lastRecordID,
+				LastLine:     lastLine,
+				LastOffset:   lastOffset,
+				Stats:        stats,
+				Complete:     false,
+			}), nil
+		}
 		if record.Internal {
 			checkpointKey := transcriptRecordCheckpointKey(record)
 			if err := batcher.recordCheckpoint(ctx, checkpointKey, checkpointLine, checkpointOffset); err != nil {
@@ -18020,9 +18872,10 @@ type transcriptImportBatcher struct {
 	maxBatches    int
 	queuedBatches int
 	deliveryNS    string
+	sourceProof   outboxQueueOptions
 }
 
-func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string, opts transcriptImportRunOptions) *transcriptImportBatcher {
+func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, importTurnID string, kindPrefix string, checkpointID string, sourceProof outboxQueueOptions, opts transcriptImportRunOptions) *transcriptImportBatcher {
 	return &transcriptImportBatcher{
 		bridge:       b,
 		session:      session,
@@ -18033,6 +18886,7 @@ func newTranscriptImportBatcher(b *Bridge, session Session, filePath string, imp
 		queueOnly:    opts.QueueOnly,
 		maxBatches:   opts.MaxBatches,
 		deliveryNS:   strings.TrimSpace(opts.DeliveryNamespace),
+		sourceProof:  sourceProof,
 	}
 }
 
@@ -18052,7 +18906,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 			ProjectPath: b.session.Cwd,
 			FilePath:    b.filePath,
 		}
-		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, b.sourceProof, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
 			return err
 		}
 		b.queuedBatches++
@@ -18071,7 +18925,7 @@ func (b *transcriptImportBatcher) add(ctx context.Context, record transcriptImpo
 			ProjectPath: b.session.Cwd,
 			FilePath:    b.filePath,
 		}
-		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, outboxQueueOptions{}, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
+		if err := b.bridge.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, b.session, local, record.Record, record.Record.SourceLine, record.Record.SourceOffset, record.Kind, record.Body, b.sourceProof, b.importTurnID, b.checkpointID, true, b.queueOnly, b.deliveryNS); err != nil {
 			return err
 		}
 		b.queuedBatches++
@@ -18118,7 +18972,24 @@ func (b *transcriptImportBatcher) flushCheckpoint(ctx context.Context) error {
 	}
 	checkpoint := b.checkpoint
 	b.hasCheckpoint = false
-	return b.bridge.recordTranscriptCheckpointProgressDetailedWithID(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID)
+	err := b.bridge.recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx, b.session, b.filePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, b.checkpointID, b.sourceProof)
+	if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+		return b.blockForSourceProofFailure(ctx)
+	}
+	return err
+}
+
+func (b *transcriptImportBatcher) blockForSourceProofFailure(ctx context.Context) error {
+	if b == nil || b.bridge == nil {
+		return errTranscriptAutomaticSourceProofUnavailable
+	}
+	previous := teamstore.ImportCheckpoint{
+		ID: b.checkpointID, SessionID: b.session.ID, SourcePath: b.filePath,
+	}
+	if err := b.bridge.blockAutomaticTranscriptSyncForSourceRewrite(ctx, b.session, b.filePath, previous); err != nil {
+		return err
+	}
+	return errTranscriptAutomaticSourceProofUnavailable
 }
 
 func (b *transcriptImportBatcher) flush(ctx context.Context) error {
@@ -18133,7 +19004,14 @@ func (b *transcriptImportBatcher) flush(ctx context.Context) error {
 	first := b.records[0]
 	last := b.records[len(b.records)-1]
 	kind := transcriptImportBatchOutboxKind(b.kindPrefix, first.Record, last.Record, b.batchIndex)
-	if err := b.bridge.queueOrSendTranscriptImportBatch(ctx, b.session, b.filePath, b.checkpointID, b.importTurnID, kind, html, first.Record, last.Record, b.queueOnly, b.deliveryNS); err != nil {
+	// Validate the same proof immediately before queueing.  The checkpoint
+	// writer validates it again after the queue operation, closing the race in
+	// which the transcript is atomically replaced between those two writes.
+	if strings.TrimSpace(b.sourceProof.ExpectedSourceFingerprint) != "" &&
+		!transcriptAutomaticImportSourceProofMatches(b.sourceProof) {
+		return b.blockForSourceProofFailure(ctx)
+	}
+	if err := b.bridge.queueOrSendTranscriptImportBatch(ctx, b.session, b.filePath, b.checkpointID, b.importTurnID, kind, html, first.Record, last.Record, b.sourceProof, b.queueOnly, b.deliveryNS); err != nil {
 		return err
 	}
 	b.queuedBatches++
@@ -18161,10 +19039,10 @@ func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last
 }
 
 func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord) error {
-	return b.queueOrSendTranscriptImportBatch(ctx, session, sourcePath, checkpointID, turnID, kind, html, first, last, false, "")
+	return b.queueOrSendTranscriptImportBatch(ctx, session, sourcePath, checkpointID, turnID, kind, html, first, last, outboxQueueOptions{}, false, "")
 }
 
-func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord, queueOnly bool, deliveryNamespace string) error {
+func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord, sourceProof outboxQueueOptions, queueOnly bool, deliveryNamespace string) error {
 	html = strings.TrimSpace(html)
 	if html == "" {
 		return nil
@@ -18185,18 +19063,27 @@ func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session S
 		RenderedBytes:   len(html),
 		SourceTextHash:  normalizedTextHash(html),
 	})
+	applyTranscriptSourceProofToOutbox(&msg, sourceProof)
 	queued, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
 		Message:  msg,
 		Delivery: delivery,
 		Checkpoint: teamstore.ImportCheckpoint{
-			ID:        checkpointID,
-			SessionID: session.ID,
+			ID:                checkpointID,
+			SessionID:         session.ID,
+			SourcePath:        sourceProof.ExpectedSourcePath,
+			SourceFingerprint: sourceProof.ExpectedSourceFingerprint,
+			LastOffset:        sourceProof.ExpectedSourceOffset,
+			LastOffsetKnown:   sourceProof.ExpectedSourceOffsetKnown,
 		},
 	})
 	if err != nil || queueOnly || queued.ID == "" || queued.Status == teamstore.OutboxStatusSent {
 		return err
 	}
-	return b.flushPendingOutboxForChat(ctx, queued.TeamsChatID)
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", turnID, queued.TeamsChatID, outboxFlushOptions{
+		AllowAmbiguousRetry:           outboxTurnAllowsAmbiguousRetry(turnID),
+		AllowProtectedAmbiguousBypass: outboxTurnAllowsProtectedAmbiguousBypass(turnID),
+		SkipUnresolvedTranscript:      true,
+	})
 }
 
 func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Session, local codexhistory.Session, importTurnID string) error {
@@ -18349,7 +19236,7 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 		if strings.TrimSpace(checkpoint.LastRecordID) == "" && checkpoint.LastSourceLine <= 0 {
 			return true, nil
 		}
-		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
+		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local, false)
 		if err != nil {
 			return false, err
 		}
@@ -18365,30 +19252,27 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 		return true, nil
 	}
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, filePath) {
-		// This helper is used only by the explicit publish-existing-session
-		// path.  Surface an attention result instead of silently reporting “no
-		// new history”; automatic readers use the blocking path elsewhere.
-		if err := b.markTranscriptImportFailed(ctx, session, filePath); err != nil {
+		// A publish/continue lookup is still an automatic boundary check: it
+		// must not manufacture a source proof merely because the user asked to
+		// reopen an existing session.  Keep the result silent and let the
+		// explicit `helper publish-history` command choose the recovery point.
+		if _, err := b.preflightAutomaticTranscriptImportSourceProof(ctx, session, filePath, transcriptCheckpointID(session.ID)); err != nil && !errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
 			return false, err
 		}
-		return false, errTranscriptCheckpointNotFound
+		return false, nil
 	}
 	transcript, err := b.readLinkedTranscriptDelta(filePath, checkpoint, firstNonEmptyString(local.SessionID, session.CodexThreadID), session.CodexThreadID)
 	if err != nil {
 		return false, err
 	}
 	if transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-		if err := b.markTranscriptImportFailed(ctx, session, filePath); err != nil {
+		// The saved record key disappeared even though the bounded source proof
+		// passed.  Treat this as a source rewrite/corrupt boundary and fence it
+		// without emitting the legacy attention card.
+		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); err != nil {
 			return false, err
 		}
-		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
-		if err != nil {
-			return false, err
-		}
-		if recovered {
-			return b.transcriptHasNewRecords(ctx, session, local)
-		}
-		return false, errTranscriptCheckpointNotFound
+		return false, nil
 	}
 	if transcriptHasDiagnostic(transcript, "source_rewritten") || transcriptHasDiagnostic(transcript, "checkpoint_provenance_mismatch") {
 		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); err != nil {
@@ -18426,6 +19310,10 @@ type localTranscriptDeltaState struct {
 const localTranscriptCompletedTurnSettleWindow = 5 * time.Minute
 
 func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *Session) (localCodexBeforeTeamsGate, error) {
+	return b.prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx, session, nil)
+}
+
+func (b *Bridge) prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx context.Context, session *Session, knownTurns *sessionTurnQueueState) (localCodexBeforeTeamsGate, error) {
 	if b == nil || session == nil {
 		return localCodexBeforeTeamsGate{}, nil
 	}
@@ -18440,121 +19328,36 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurn(ctx context.Context, session *
 			AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
 		}, nil
 	}
-	local, ok, err := b.localCodexSessionForTeamsSessionWithDiscovery(ctx, *session)
-	if err != nil {
-		return localCodexBeforeTeamsGate{}, err
-	}
-	if !ok || strings.TrimSpace(local.FilePath) == "" {
-		return localCodexBeforeTeamsGate{}, nil
-	}
-	delta, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return localCodexBeforeTeamsGate{}, nil
+	// The linked transcript is an observation channel, not proof that a process
+	// still owns this session. In particular, a legacy checkpoint can describe a
+	// perfectly ordinary old tail as importing/blocked/failed, and an appended
+	// tool or user record can look active after the CLI has already exited. None
+	// of those states may prevent a new Teams turn from being accepted.
+	//
+	// Actual helper-owned execution is represented by the durable running-turn
+	// row and is handled by the queue path below. Unknown app-server ownership is
+	// handled by sessionExecutionOwnershipUnresolved above. Keeping this function
+	// free of transcript discovery also makes the admission decision O(1) with
+	// respect to local history size.
+	if knownTurns != nil {
+		if knownTurns.Running {
+			return localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "A Codex request is already running in this Work chat.",
+			}, nil
 		}
-		return localCodexBeforeTeamsGate{}, err
-	}
-	switch delta.CheckpointStatus {
-	case importCheckpointStatusImporting:
-		if delta.CheckpointOrphaned {
-			if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
-				return localCodexBeforeTeamsGate{}, err
-			}
-			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
-		}
-		return localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
-		}, nil
-	case importCheckpointStatusBlocked:
-		if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
-			return localCodexBeforeTeamsGate{}, err
-		}
-		refreshed, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return localCodexBeforeTeamsGate{}, nil
-			}
-			return localCodexBeforeTeamsGate{}, err
-		}
-		if refreshed.CheckpointStatus != importCheckpointStatusBlocked {
-			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
-		}
-		return localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⚠️ Queued. Local Codex history has a paused backlog. Send `helper publish-history` here; I’ll continue after the import finishes.",
-		}, nil
-	case importCheckpointStatusFailed:
-		recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, *session, local)
+	} else {
+		queueState, err := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
 		if err != nil {
 			return localCodexBeforeTeamsGate{}, err
 		}
-		if recovered {
-			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
-		}
-		return localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⚠️ Queued. Local Codex history sync needs attention before I continue this chat.",
-		}, nil
-	}
-	if delta.Active {
-		advanced, err := b.advanceRecentCompletedTeamsTranscriptTail(ctx, *session, local)
-		if err != nil {
-			return localCodexBeforeTeamsGate{}, err
-		}
-		if advanced {
-			return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
-		}
-		if !delta.CheckpointHadRecord && strings.TrimSpace(delta.CheckpointBeforeActive) != "" {
-			if err := b.recordTranscriptCheckpoint(ctx, *session, local.FilePath, delta.CheckpointBeforeActive, delta.CheckpointBeforeLine); err != nil {
-				return localCodexBeforeTeamsGate{}, err
+		for _, turn := range queueState.Turns {
+			if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusRunning {
+				return localCodexBeforeTeamsGate{
+					Block:   true,
+					AckBody: "A Codex request is already running in this Work chat.",
+				}, nil
 			}
-		}
-		return localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⏳ Queued. Codex is active in the CLI for this chat; I’ll respond here after that finishes.",
-		}, nil
-	}
-	if delta.NeedsSync {
-		if err := b.syncSessionTranscript(ctx, *session, local); err != nil {
-			return localCodexBeforeTeamsGate{}, err
-		}
-		remainingDelta, err := b.classifyLocalTranscriptDelta(ctx, *session, local)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return localCodexBeforeTeamsGate{}, nil
-			}
-			return localCodexBeforeTeamsGate{}, err
-		}
-		switch remainingDelta.CheckpointStatus {
-		case importCheckpointStatusImporting:
-			return localCodexBeforeTeamsGate{
-				Block:   true,
-				AckBody: "⏳ Queued. I’m preparing this chat history first, then I’ll respond.",
-			}, nil
-		case importCheckpointStatusBlocked:
-			return localCodexBeforeTeamsGate{
-				Block:   true,
-				AckBody: "⚠️ Queued. Local Codex history has a paused backlog. Send `helper publish-history` here; I’ll continue after the import finishes.",
-			}, nil
-		case importCheckpointStatusFailed:
-			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, *session, local)
-			if err != nil {
-				return localCodexBeforeTeamsGate{}, err
-			}
-			if recovered {
-				return b.prepareLocalCodexBeforeTeamsTurn(ctx, session)
-			}
-			return localCodexBeforeTeamsGate{
-				Block:   true,
-				AckBody: "⚠️ Queued. Local Codex history sync needs attention before I continue this chat.",
-			}, nil
-		}
-		if remainingDelta.Active || remainingDelta.NeedsSync || remainingDelta.HasActionableTranscript {
-			return localCodexBeforeTeamsGate{
-				Block:   true,
-				AckBody: "⏳ Queued. I’m syncing recent Codex updates first, then I’ll respond.",
-			}, nil
 		}
 	}
 	return localCodexBeforeTeamsGate{}, nil
@@ -18810,7 +19613,9 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx co
 	if !sawRecentTeamsTurnRecord {
 		return false, nil
 	}
-	if err := b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), parentFenceSessionID); err != nil {
+	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
+	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
+	if err := b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), sourceProof, parentFenceSessionID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -19180,6 +19985,31 @@ func (b *Bridge) recordSkippedTranscriptDeliveryWithParentFence(ctx context.Cont
 	return err
 }
 
+// recordSkippedTranscriptDeliveryWithSourceProof records the dedupe/quarantine
+// fact first, then advances the linked-transcript cursor through the same
+// source-proof CAS used by visible deliveries. A skipped row must not carry a
+// freshly synthesized checkpoint by itself: doing so would let a same-size
+// rewrite of the unread tail advance the cursor without checking the bytes
+// that this scan actually read. The two writes are intentionally recoverable:
+// a crash after the delivery record but before the cursor CAS is safe, because
+// the next scan finds the durable delivery and retries the CAS.
+func (b *Bridge) recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, sourceProof outboxQueueOptions, parentFenceSessionID string) error {
+	if err := b.recordSkippedTranscriptDeliveryWithParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, teamstore.ImportCheckpoint{}, parentFenceSessionID); err != nil {
+		return err
+	}
+	return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
+		ctx,
+		session,
+		local.FilePath,
+		transcriptRecordCheckpointKey(record),
+		checkpointLine,
+		checkpointOffset,
+		transcriptCheckpointID(session.ID),
+		sourceProof,
+		parentFenceSessionID,
+	)
+}
+
 func (b *Bridge) syncLinkedTranscriptsIfDue(ctx context.Context, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now()
@@ -19535,6 +20365,8 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	}
 	dedupe := newTranscriptDedupeState()
 	pendingCheckpoint := transcriptImportCheckpointRecord{}
+	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
+	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
 	checkpointAdvanceAllowed := true
 	deferredFinalCheckpoint := false
 	rememberCheckpoint := func(record TranscriptRecord, line int, offset int64) {
@@ -19550,7 +20382,7 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 		}
 		pending := pendingCheckpoint
 		pendingCheckpoint = transcriptImportCheckpointRecord{}
-		err := b.recordTranscriptCheckpointProgressDetailedWithID(ctx, *session, local.FilePath, pending.Key, pending.SourceLine, pending.SourceOffset, checkpointID)
+		err := b.recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx, *session, local.FilePath, pending.Key, pending.SourceLine, pending.SourceOffset, checkpointID, sourceProof)
 		if errors.Is(err, teamstore.ErrUnresolvedExecution) && hasFinalCheckpoint {
 			// An exact terminal callback may own the active anchor, but the
 			// intermediate status cursor cannot be committed in a separate
@@ -19787,6 +20619,7 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 	known := newKnownTranscriptOutboxDedupeState(state, sessionCopy.ID, checkpoint.UpdatedAt)
 	dedupe := newTranscriptDedupeState()
 	queued := 0
+	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
 	var pendingInternal transcriptImportCheckpointRecord
 	rememberInternal := func(record TranscriptRecord, line int, offset int64) {
 		key := transcriptRecordCheckpointKey(record)
@@ -19801,7 +20634,7 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 		}
 		checkpoint := pendingInternal
 		pendingInternal = transcriptImportCheckpointRecord{}
-		return b.recordTranscriptCheckpointProgressDetailedWithID(ctx, sessionCopy, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID)
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx, sessionCopy, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof)
 	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
@@ -19935,18 +20768,24 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	if stop {
 		return nil
 	}
+	if hasCheckpoint && checkpoint.SourceRewriteBlocked {
+		// This marker is an explicit manual-recovery boundary. A later append or
+		// a source that happens to resemble the old one must not make automatic
+		// sync reinterpret it as trusted again; only publish-history may clear it.
+		return nil
+	}
 	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
 		return err
 	}
 	if hasCheckpoint {
 		switch checkpoint.Status {
 		case importCheckpointStatusImporting:
-			if transcriptImportCheckpointIsOrphaned(state, checkpoint) {
+			if checkpoint.CompletionPending || transcriptImportCheckpointIsOrphaned(state, checkpoint) {
 				return b.resumeInterruptedTranscriptImport(ctx, session, local, checkpoint)
 			}
 			return nil
 		case importCheckpointStatusFailed:
-			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local)
+			recovered, err := b.recoverFailedTranscriptCheckpoint(ctx, session, local, false)
 			if err != nil {
 				return err
 			}
@@ -19965,6 +20804,25 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		return b.resumeBudgetedTranscriptImport(ctx, session, local, checkpoint)
 	}
 	if !hasCheckpoint {
+		// A first-discovery read has no prior cursor to authenticate. Capture a
+		// bounded proof of the complete source before parsing it, then require the
+		// same proof again before seeding the checkpoint. Without this, an
+		// in-place rewrite between ReadSessionTranscript and the checkpoint write
+		// could make records from source A look like the already-consumed prefix
+		// of source B. This is a cold discovery path; ordinary incremental polls
+		// never execute it.
+		sourceSizeBeforeRead, _ := transcriptSourceFileState(local.FilePath)
+		initialSourceProof := transcriptAutomaticImportProofQueueOptions(local.FilePath, teamstore.ImportCheckpoint{
+			ID:         checkpointID,
+			SessionID:  session.ID,
+			SourcePath: local.FilePath,
+		}, sourceSizeBeforeRead)
+		if strings.TrimSpace(initialSourceProof.ExpectedSourceFingerprint) == "" || !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
+			if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+				return err
+			}
+			return nil
+		}
 		transcript, err := ReadSessionTranscript(local.FilePath)
 		if err != nil {
 			return err
@@ -19980,8 +20838,14 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		} else if stop {
 			return nil
 		}
+		if !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
+			if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+				return err
+			}
+			return nil
+		}
 		last := transcript.Records[len(transcript.Records)-1]
-		return b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset, checkpointID, session.ID)
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset, checkpointID, initialSourceProof, session.ID)
 	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint, local.FilePath) {
 		updated, ok, err := b.backfillLinkedTranscriptCheckpointPositionWithParentFence(ctx, session, local, checkpoint, session.ID)
@@ -19995,6 +20859,23 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			}
 		}
 	}
+	if hasCheckpoint && checkpoint.Status == importCheckpointStatusComplete &&
+		strings.TrimSpace(checkpoint.LastRecordID) != "" && checkpoint.LastOffset <= 0 {
+		// A legacy complete row with no usable byte cursor still gets the old
+		// stale-cursor diagnostic. If its record is genuinely absent, mark it
+		// failed so explicit recovery can repair it; only an existing record
+		// proceeds to the source-proof fence below.
+		sourcePath := strings.TrimSpace(firstNonEmptyString(local.FilePath, checkpoint.SourcePath))
+		if sourcePath != "" {
+			_, found, err := findTranscriptCheckpointPosition(sourcePath, checkpoint.LastRecordID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return b.markTranscriptImportFailedWithParentFence(ctx, session, sourcePath, checkpointID, session.ID)
+			}
+		}
+	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsConservativeLegacyBlock(checkpoint, local.FilePath) {
 		// A pre-fingerprint checkpoint whose cursor is not at the source EOF
 		// cannot prove that the bytes before the cursor are unchanged.  Refuse
@@ -20003,6 +20884,14 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
 	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint, local.FilePath) {
+		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
+	}
+	if hasCheckpoint && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
+		// A legacy blocked checkpoint may still have a normal-looking growing
+		// suffix. Never parse it as an automatic delta: a proofless row could be
+		// fenced at Graph and the old cursor would nevertheless be advanced past
+		// the skipped record. Explicit publish-history is the only operation that
+		// may establish a new boundary for this inherited state.
 		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
 	}
 	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, local.SessionID, session.CodexThreadID)
@@ -20103,6 +20992,8 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	sent := 0
 	pendingCheckpoint := transcriptImportCheckpointRecord{}
 	hasPendingCheckpoint := false
+	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
+	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
 	rememberCheckpoint := func(key string, sourceLine int, sourceOffset int64) {
 		if strings.TrimSpace(key) == "" {
 			return
@@ -20116,7 +21007,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		}
 		checkpoint := pendingCheckpoint
 		hasPendingCheckpoint = false
-		return b.recordTranscriptCheckpointProgressDetailedWithParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, session.ID)
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID)
 	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
@@ -20145,7 +21036,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
 			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
-			if err := b.recordSkippedTranscriptDeliveryWithParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, transcriptDeliveryCheckpoint(session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset), session.ID); err != nil {
+			if err := b.recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, sourceProof, session.ID); err != nil {
 				return err
 			}
 			hasPendingCheckpoint = false
@@ -20153,11 +21044,15 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		}
 		opts := transcriptSyncOutboxOptions(record)
 		opts.ParentFenceSessionID = session.ID
-		proof := transcriptSourceProofQueueOptions(checkpoint)
+		proof := sourceProof
 		opts.ExpectedSourcePath = proof.ExpectedSourcePath
 		opts.ExpectedSourceFingerprint = proof.ExpectedSourceFingerprint
 		opts.ExpectedSourceOffset = proof.ExpectedSourceOffset
 		opts.ExpectedSourceOffsetKnown = proof.ExpectedSourceOffsetKnown
+		opts.ExpectedSourceReadFingerprint = proof.ExpectedSourceReadFingerprint
+		opts.ExpectedSourceReadStartOffset = proof.ExpectedSourceReadStartOffset
+		opts.ExpectedSourceReadEndOffset = proof.ExpectedSourceReadEndOffset
+		opts.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadRangeKnown
 		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
@@ -20472,13 +21367,13 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			if blocked {
 				records = filterTranscriptRecordsBeforeExecutionBoundary(records, historyTieredBoundaryOffset(result.State))
 			}
-			return Transcript{
+			return withHistoryTieredReadProof(Transcript{
 				SourceName:             filePath,
 				UnresolvedContinuation: result.State.UnresolvedContinuation,
 				PendingContinuation:    pending,
 				AmbiguousFinals:        historyTieredFinalRecords(result.AnonymousFinals),
 				Records:                records,
-			}, nil
+			}, result), nil
 		}
 	}
 	// Legacy checkpoints may have a record key but no byte position (or may
@@ -20555,12 +21450,22 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 	if blocked {
 		filtered = filterTranscriptRecordsBeforeExecutionBoundary(filtered, historyTieredBoundaryOffset(result.State))
 	}
-	return Transcript{
+	return withHistoryTieredReadProof(Transcript{
 		SourceName:             filePath,
 		UnresolvedContinuation: result.State.UnresolvedContinuation,
 		PendingContinuation:    pending,
 		Records:                filtered,
-	}, nil
+	}, result), nil
+}
+
+func withHistoryTieredReadProof(transcript Transcript, result historyTieredTailResult) Transcript {
+	if result.ReadProofRangeKnown && strings.TrimSpace(result.ReadProofFingerprint) != "" {
+		transcript.SourceReadProofFingerprint = strings.TrimSpace(result.ReadProofFingerprint)
+		transcript.SourceReadProofStartOffset = result.ReadProofStartOffset
+		transcript.SourceReadProofEndOffset = result.ReadProofEndOffset
+		transcript.SourceReadProofRangeKnown = true
+	}
+	return transcript
 }
 
 func historyTieredFinalRecords(finals []historyTieredFinal) []TranscriptRecord {
@@ -20770,7 +21675,7 @@ func (b *Bridge) linkedCheckpointFileUnchanged(filePath string, checkpoint teams
 }
 
 func linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
-	if checkpoint.Status != importCheckpointStatusComplete {
+	if checkpoint.Status != importCheckpointStatusComplete && checkpoint.Status != importCheckpointStatusBlocked {
 		return false
 	}
 	sourcePath = strings.TrimSpace(firstNonEmptyString(sourcePath, checkpoint.SourcePath))
@@ -20913,7 +21818,7 @@ func linkedCheckpointIdleNoGrowth(filePath string, checkpoint teamstore.ImportCh
 // can fail closed and request explicit history publication; automatic sync must
 // never manufacture an identity proof from the current file.
 func linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
-	if checkpoint.Status != importCheckpointStatusComplete || strings.TrimSpace(checkpoint.LastRecordID) == "" {
+	if checkpoint.Status != importCheckpointStatusComplete && checkpoint.Status != importCheckpointStatusBlocked || strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		return false
 	}
 	if strings.TrimSpace(checkpoint.SourceFingerprint) != "" || strings.TrimSpace(sourcePath) == "" {
@@ -20926,7 +21831,7 @@ func linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint teamstore.Imp
 }
 
 func linkedTranscriptCheckpointNeedsConservativeLegacyBlock(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
-	if checkpoint.Status != importCheckpointStatusComplete || strings.TrimSpace(checkpoint.LastRecordID) == "" ||
+	if checkpoint.Status != importCheckpointStatusComplete && checkpoint.Status != importCheckpointStatusBlocked || strings.TrimSpace(checkpoint.LastRecordID) == "" ||
 		strings.TrimSpace(checkpoint.SourceFingerprint) != "" || strings.TrimSpace(sourcePath) == "" || checkpoint.LastOffset <= 0 {
 		return false
 	}
@@ -20989,6 +21894,12 @@ func (b *Bridge) resumeBudgetedTranscriptImport(ctx context.Context, session Ses
 	if sourcePath == "" {
 		return nil
 	}
+	if _, err := b.preflightAutomaticTranscriptImportSourceProof(ctx, session, sourcePath, checkpoint.ID); err != nil {
+		if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			return nil
+		}
+		return err
+	}
 	importTurnID := strings.TrimSpace(firstNonEmptyString(checkpoint.ImportTurnID, "import:"+session.ID))
 	kindPrefix := strings.TrimSpace(firstNonEmptyString(checkpoint.KindPrefix, "import"))
 	checkpointID := strings.TrimSpace(firstNonEmptyString(checkpoint.ID, transcriptCheckpointID(session.ID)))
@@ -20998,6 +21909,9 @@ func (b *Bridge) resumeBudgetedTranscriptImport(ctx context.Context, session Ses
 	}
 	result, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID, opts)
 	if err != nil {
+		if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			return nil
+		}
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
 		if isTranscriptCheckpointNotFoundError(err) {
 			if sendErr := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage(), outboxQueueOptions{}, true); sendErr != nil {
@@ -21008,22 +21922,11 @@ func (b *Bridge) resumeBudgetedTranscriptImport(ctx context.Context, session Ses
 		return err
 	}
 	if !result.Complete {
-		return b.markTranscriptImportPausedAt(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix)
+		return b.markTranscriptImportPausedAtWithProof(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix, result.SourceProof)
 	}
-	if checkpointID == transcriptCheckpointID(session.ID) {
-		resumedLocal := local
-		resumedLocal.FilePath = sourcePath
-		if err := b.importSubagentMarkersToTeamsWithOptions(ctx, session, resumedLocal, importTurnID, opts); err != nil {
-			_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
-			return err
-		}
-	}
-	complete := formatTranscriptImportCompleteMessage(result.Stats)
-	if err := b.queueOrSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete, outboxQueueOptions{}, true); err != nil {
-		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
-		return err
-	}
-	return b.markTranscriptImportCompleteFromResult(ctx, session, sourcePath, result, checkpointID)
+	resumedLocal := local
+	resumedLocal.FilePath = sourcePath
+	return b.finishTranscriptImport(ctx, session, resumedLocal, result, checkpointID, importTurnID, kindPrefix, opts)
 }
 
 func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
@@ -21034,11 +21937,23 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 	importTurnID := strings.TrimSpace(firstNonEmptyString(checkpoint.ImportTurnID, "import:"+session.ID))
 	kindPrefix := strings.TrimSpace(firstNonEmptyString(checkpoint.KindPrefix, "import"))
 	checkpointID := strings.TrimSpace(firstNonEmptyString(checkpoint.ID, transcriptCheckpointID(session.ID)))
+	explicit := transcriptImportRunIsExplicitHistory(importTurnID)
+	if !explicit {
+		if _, err := b.preflightAutomaticTranscriptImportSourceProof(ctx, session, sourcePath, checkpoint.ID); err != nil {
+			if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+				return nil
+			}
+			return err
+		}
+	}
 	if err := b.markTranscriptImportStartedForRun(ctx, session, sourcePath, checkpointID, importTurnID, kindPrefix); err != nil {
 		return err
 	}
 	result, err := b.importTranscriptRecordsToTeams(ctx, session, sourcePath, importTurnID, kindPrefix, checkpointID, transcriptImportRunOptions{})
 	if err != nil {
+		if !explicit && errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			return nil
+		}
 		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
 		if isTranscriptCheckpointNotFoundError(err) {
 			if sendErr := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-needs-attention", transcriptCheckpointNeedsAttentionMessage()); sendErr != nil {
@@ -21049,28 +21964,28 @@ func (b *Bridge) resumeInterruptedTranscriptImport(ctx context.Context, session 
 		return err
 	}
 	if !result.Complete {
-		return b.markTranscriptImportPausedAt(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix)
+		return b.markTranscriptImportPausedAtWithProof(ctx, session, sourcePath, result.LastRecordID, result.LastLine, result.LastOffset, checkpointID, importTurnID, kindPrefix, result.SourceProof)
 	}
-	if checkpointID == transcriptCheckpointID(session.ID) {
-		resumedLocal := local
-		resumedLocal.FilePath = sourcePath
-		if err := b.importSubagentMarkersToTeams(ctx, session, resumedLocal, importTurnID); err != nil {
-			_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
+	resumedLocal := local
+	resumedLocal.FilePath = sourcePath
+	if explicit {
+		if err := b.finishExplicitTranscriptImport(ctx, session, resumedLocal, result, checkpointID, importTurnID, kindPrefix); err != nil {
 			return err
 		}
+		return b.processQueuedTurns(ctx)
 	}
-	complete := formatTranscriptImportCompleteMessage(result.Stats)
-	if err := b.queueAndSendOutboxChunks(ctx, session.ID, importTurnID, session.ChatID, kindPrefix+"-complete", complete); err != nil {
-		_ = b.markTranscriptImportFailedWithID(ctx, session, sourcePath, checkpointID)
-		return err
-	}
-	if err := b.markTranscriptImportCompleteFromResult(ctx, session, sourcePath, result, checkpointID); err != nil {
+	if err := b.finishTranscriptImport(ctx, session, resumedLocal, result, checkpointID, importTurnID, kindPrefix, transcriptImportRunOptions{
+		SubagentCheckpointRoot: checkpointID,
+	}); err != nil {
+		if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+			return nil
+		}
 		return err
 	}
 	return b.processQueuedTurns(ctx)
 }
 
-func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
+func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session Session, local codexhistory.Session, allowExplicitBoundary bool) (bool, error) {
 	if b == nil || b.store == nil {
 		return false, nil
 	}
@@ -21093,80 +22008,66 @@ func (b *Bridge) recoverFailedTranscriptCheckpoint(ctx context.Context, session 
 			return false, err
 		}
 		if !transcriptHasDiagnostic(transcript, "checkpoint_not_found") {
-			if len(transcript.Records) == 0 {
-				// The saved key was found at the end of the file.  Keep the
-				// existing cursor, but do not manufacture an unproven legacy
-				// boundary; the caller will remain fail-closed until an explicit
-				// import establishes a source proof.
+			if !allowExplicitBoundary {
+				// A suffix proves only that the source has moved past the saved
+				// cursor. It does not prove that those records reached Teams. An
+				// automatic failed-import repair must not advance over them.
 				return false, nil
 			}
-			return true, b.markRecoveredTranscriptCheckpoint(ctx, session, sourcePath, transcript.Records[len(transcript.Records)-1])
+			// The key is still present. Make the failed checkpoint readable by
+			// the explicit importer, but keep the cursor at the last durable
+			// boundary. Advancing to the suffix end here used to silently skip
+			// records whose Graph delivery had never been confirmed; the explicit
+			// import can now re-read and deduplicate the suffix normally.
+			return true, b.markFailedTranscriptCheckpointReady(ctx, session, checkpoint)
 		}
 	}
-	if checkpoint.LastSourceLine <= 0 {
+	if !allowExplicitBoundary {
+		// Source-line recovery is an operator-selected boundary only. The
+		// background watcher remains silent and leaves the failed cursor for
+		// `helper publish-history` instead of guessing a new import position.
 		return false, nil
 	}
-	transcript, err := ReadSessionTranscript(sourcePath)
-	if err != nil {
-		return false, err
-	}
-	var recovered TranscriptRecord
-	for _, record := range transcript.Records {
-		if record.SourceLine <= checkpoint.LastSourceLine {
-			recovered = record
-		}
-		if strings.TrimSpace(checkpoint.LastRecordID) != "" &&
-			(record.ItemID == checkpoint.LastRecordID || record.DedupeKey == checkpoint.LastRecordID) {
-			recovered = record
-			break
-		}
-	}
-	if strings.TrimSpace(transcriptRecordCheckpointKey(recovered)) == "" {
-		return false, nil
-	}
-	return true, b.markRecoveredTranscriptCheckpoint(ctx, session, sourcePath, recovered)
+	// The saved key is gone. A line number is not a delivery ledger: after an
+	// in-place rewrite, a different record can occupy the same line and the
+	// old recovery code would advance past it as if it had already been sent.
+	// Explicit publish-history is allowed to choose a new boundary, so choose
+	// the conservative one—re-read from the beginning and let the existing
+	// delivery ledger/idempotent outbox dedupe already-visible records.
+	return true, b.resetFailedTranscriptCheckpointForExplicitImport(ctx, session, checkpoint, sourcePath)
 }
 
-// markRecoveredTranscriptCheckpoint records the exact cursor observed by the
-// explicit failed-import recovery reader.  Unlike the normal incremental path,
-// this is an intentional repair operation, but it still persists a bounded
-// source proof and an explicit zero/known offset so the next automatic poll
-// cannot fall back to the legacy “find a record key” heuristic.
-func (b *Bridge) markRecoveredTranscriptCheckpoint(ctx context.Context, session Session, sourcePath string, record TranscriptRecord) error {
-	if b == nil || b.store == nil {
-		return nil
-	}
-	key := transcriptRecordCheckpointKey(record)
-	if strings.TrimSpace(key) == "" {
-		return nil
-	}
-	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	offset := record.SourceOffset
-	if offset < 0 {
-		offset = 0
-	}
-	fingerprint := transcriptCheckpointSourceFingerprint(sourcePath, offset)
+func (b *Bridge) markFailedTranscriptCheckpointReady(ctx context.Context, session Session, checkpoint teamstore.ImportCheckpoint) error {
 	checkpointID := transcriptCheckpointID(session.ID)
-	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
-		if executionAnchorActive(checkpoint.UnresolvedExecution) {
-			return checkpoint, false, teamstore.ErrUnresolvedExecution
-		}
-		checkpoint.ID = checkpointID
-		checkpoint.SessionID = session.ID
-		checkpoint.SourcePath = sourcePath
-		checkpoint.SourceRewriteBlocked = false
-		checkpoint.SourceFingerprint = fingerprint
-		checkpoint.LastRecordID = key
-		checkpoint.LastSourceLine = record.SourceLine
-		checkpoint.LastOffset = offset
-		checkpoint.LastOffsetKnown = true
-		checkpoint.SourceSize = sourceSize
-		checkpoint.SourceModTime = sourceModTime
-		checkpoint.ImportTurnID = ""
-		checkpoint.KindPrefix = ""
-		checkpoint.Status = importCheckpointStatusComplete
-		checkpoint.UpdatedAt = now
-		return checkpoint, true, nil
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		current.ID = checkpointID
+		current.SessionID = session.ID
+		current.Status = importCheckpointStatusComplete
+		current.CompletionPending = false
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
+}
+
+func (b *Bridge) resetFailedTranscriptCheckpointForExplicitImport(ctx context.Context, session Session, checkpoint teamstore.ImportCheckpoint, sourcePath string) error {
+	checkpointID := transcriptCheckpointID(session.ID)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		current.ID = checkpointID
+		current.SessionID = session.ID
+		current.SourcePath = sourcePath
+		current.SourceRewriteBlocked = false
+		current.LastRecordID = ""
+		current.LastSourceLine = 0
+		current.LastOffset = 0
+		current.LastOffsetKnown = false
+		current.SourceFingerprint = ""
+		current.SourceSize = 0
+		current.SourceModTime = time.Time{}
+		current.CompletionPending = false
+		current.Status = importCheckpointStatusComplete
+		current.UpdatedAt = now
+		return current, true, nil
 	})
 	return err
 }
@@ -21360,47 +22261,28 @@ func executionAnchorDiagnostics(session Session, sourcePath string, checkpoint t
 }
 
 func (b *Bridge) blockAutomaticTranscriptSync(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint, backlogRecords int) error {
+	// A bounded automatic scan is a background delivery policy, not a reason to
+	// interrupt the Teams request path. Persist the trusted boundary and let the
+	// next background poll or an explicit publish-history command decide how to
+	// consume the backlog. Older versions posted a needs_attention message here,
+	// which turned a normal backlog into a notification storm after restart.
+	_ = backlogRecords
 	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
-	body := fmt.Sprintf("Local Codex history has %d visible new item(s), so I paused automatic history sync to avoid flooding this Teams chat.\n\nNo history was skipped. To import the backlog, send `helper publish-history` here.", backlogRecords)
-	idSeed := firstNonEmptyString(checkpoint.LastRecordID, fmt.Sprintf("line-%d", checkpoint.LastSourceLine), "start")
-	outboxID := "outbox:sync:" + session.ID + ":backlog-blocked:" + shortStableID(idSeed)
-	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
-		ID:          outboxID,
-		SessionID:   session.ID,
-		TurnID:      "sync:" + session.ID,
-		TeamsChatID: session.ChatID,
-		Kind:        "sync-status-backlog-blocked",
-		Body:        body,
-	})
+	return nil
 }
 
 func (b *Bridge) blockAutomaticTranscriptSyncForSourceRewrite(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint) error {
+	// Source-proof failure is intentionally fail-closed for automatic history
+	// delivery, but it is silent. The checkpoint records the diagnostic state;
+	// only an explicit publish-history command is allowed to ask the user for a
+	// recovery boundary. This prevents old checkpoints from repeatedly emitting
+	// a long warning on every poll and from becoming a turn-admission gate.
 	if err := b.markTranscriptImportBlockedForSourceRewrite(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
-	body := "Local Codex history sync is paused because the linked transcript was replaced or truncated before the saved checkpoint. I did not guess a new import position, so no answer was published twice or skipped. Review the local history, then send `helper publish-history` (or `helper publish-history full`) to choose an explicit recovery boundary."
-	seed := firstNonEmptyString(checkpoint.LastRecordID, fmt.Sprintf("line-%d", checkpoint.LastSourceLine), "source-rewritten")
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
-		ID:               "outbox:sync:" + session.ID + ":source-rewritten:" + shortStableID(seed),
-		SessionID:        session.ID,
-		TurnID:           "sync:" + session.ID,
-		TeamsChatID:      session.ChatID,
-		Kind:             "sync-status-source-rewritten",
-		Body:             body,
-		MentionOwner:     true,
-		NotificationKind: "needs_attention",
-	})
-	if err != nil || queued.Status == teamstore.OutboxStatusSent {
-		return err
-	}
-	return b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{
-		RespectRateLimitBlock: true,
-		RecordRateLimit:       true,
-		AllowAmbiguousRetry:   false,
-		IgnoreEarlierOutbox:   true,
-	})
+	return nil
 }
 
 // blockAutomaticTranscriptSyncForTailTooLarge keeps the periodic linked-history
@@ -21411,32 +22293,26 @@ func (b *Bridge) blockAutomaticTranscriptSyncForTailTooLarge(ctx context.Context
 	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
-	body := "Local Codex history sync is paused because the transcript tail is larger than the bounded automatic scan limit. No new answer was published and the checkpoint was not advanced. After reviewing the local Codex work, send `helper publish-history` here to import the backlog explicitly."
-	seed := firstNonEmptyString(checkpoint.LastRecordID, fmt.Sprintf("line-%d", checkpoint.LastSourceLine), sourcePath, "tail-too-large")
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
-		ID:               "outbox:sync:" + session.ID + ":tail-too-large:" + shortStableID(seed),
-		SessionID:        session.ID,
-		TurnID:           "sync:" + session.ID,
-		TeamsChatID:      session.ChatID,
-		Kind:             "sync-status-tail-too-large",
-		Body:             body,
-		MentionOwner:     true,
-		NotificationKind: "needs_attention",
-	})
-	if err != nil || queued.Status == teamstore.OutboxStatusSent {
-		return err
-	}
-	return b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{
-		RespectRateLimitBlock: true,
-		RecordRateLimit:       true,
-		AllowAmbiguousRetry:   false,
-		IgnoreEarlierOutbox:   true,
-	})
+	return nil
 }
 
 func shortStableID(seed string) string {
 	sum := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(sum[:])[:12]
+}
+
+// retireLegacyHistoryGateOutbox removes only obsolete automatic history-policy
+// notices emitted by versions that incorrectly made history delivery a user
+// turn gate. The listener calls this before it starts sending. Queued and
+// lease-expired Sending rows are safe to retire; a fresh Sending row remains
+// recoverable until its ambiguous Graph request is no longer in flight. It
+// intentionally does not inspect or mutate accepted/sent rows, and it leaves
+// execution-ownership warnings alone.
+func (b *Bridge) retireLegacyHistoryGateOutbox(ctx context.Context) (int, error) {
+	if b == nil || b.store == nil {
+		return 0, nil
+	}
+	return b.store.RetireLegacyHistoryGateOutboxForStartup(ctx, 128, 16)
 }
 
 func transcriptImportIsActive(state teamstore.State, sessionID string) bool {
@@ -22164,6 +23040,150 @@ func transcriptSourceProofQueueOptions(checkpoint teamstore.ImportCheckpoint) ou
 	}
 }
 
+func addTranscriptReadProofToQueueOptions(proof *outboxQueueOptions, transcript Transcript) {
+	if proof == nil || !transcript.SourceReadProofRangeKnown || strings.TrimSpace(transcript.SourceReadProofFingerprint) == "" {
+		return
+	}
+	if transcript.SourceReadProofStartOffset < 0 || transcript.SourceReadProofEndOffset < transcript.SourceReadProofStartOffset {
+		return
+	}
+	proof.ExpectedSourceReadFingerprint = strings.TrimSpace(transcript.SourceReadProofFingerprint)
+	proof.ExpectedSourceReadStartOffset = transcript.SourceReadProofStartOffset
+	proof.ExpectedSourceReadEndOffset = transcript.SourceReadProofEndOffset
+	proof.ExpectedSourceReadRangeKnown = true
+}
+
+// applyTranscriptSourceProofToOutbox copies the complete automatic-import
+// proof onto delivery rows that bypass the generic outbox planner. Large
+// records and HTML batches use QueueTranscriptDeliveryOutbox directly, so
+// relying on the planner's proof projection would leave those rows with only
+// the cursor proof and allow a same-size tail rewrite to pass the sender
+// fence. This helper is cold-path transcript work and intentionally does
+// nothing for explicit history or legacy callers that did not supply a proof.
+func applyTranscriptSourceProofToOutbox(msg *teamstore.OutboxMessage, proof outboxQueueOptions) {
+	if msg == nil || strings.TrimSpace(proof.ExpectedSourcePath) == "" {
+		return
+	}
+	if strings.TrimSpace(proof.ExpectedSourceFingerprint) != "" && proof.ExpectedSourceOffsetKnown && proof.ExpectedSourceOffset >= 0 {
+		msg.TranscriptSourcePath = strings.TrimSpace(proof.ExpectedSourcePath)
+		msg.TranscriptSourceProofFingerprint = strings.TrimSpace(proof.ExpectedSourceFingerprint)
+		msg.TranscriptSourceProofOffset = proof.ExpectedSourceOffset
+		msg.TranscriptSourceProofOffsetKnown = true
+	}
+	if strings.TrimSpace(proof.ExpectedSourceReadFingerprint) != "" && proof.ExpectedSourceReadRangeKnown &&
+		proof.ExpectedSourceReadStartOffset >= 0 && proof.ExpectedSourceReadEndOffset >= proof.ExpectedSourceReadStartOffset {
+		msg.TranscriptSourcePath = strings.TrimSpace(proof.ExpectedSourcePath)
+		msg.TranscriptSourceReadProofFingerprint = strings.TrimSpace(proof.ExpectedSourceReadFingerprint)
+		msg.TranscriptSourceReadProofStartOffset = proof.ExpectedSourceReadStartOffset
+		msg.TranscriptSourceReadProofEndOffset = proof.ExpectedSourceReadEndOffset
+		msg.TranscriptSourceReadProofRangeKnown = true
+	}
+}
+
+// transcriptAutomaticImportProofQueueOptions binds every automatic history
+// import row to the source prefix that was observed before the read began.
+// Existing checkpoints use their durable proof.  A first import has no
+// checkpoint yet, so its proof is the bounded fingerprint of the complete
+// source prefix observed at read start.  This helper is on the cold import
+// path; ordinary poll/admission paths do not pay for it.
+func transcriptAutomaticImportProofQueueOptions(sourcePath string, checkpoint teamstore.ImportCheckpoint, sourceSizeBeforeRead int64) outboxQueueOptions {
+	if checkpoint.SourceRewriteBlocked {
+		return outboxQueueOptions{}
+	}
+	proof := transcriptSourceProofQueueOptions(checkpoint)
+	if strings.TrimSpace(proof.ExpectedSourceFingerprint) != "" {
+		start := int64(0)
+		if linkedCheckpointOffsetKnown(checkpoint) && checkpoint.LastOffset >= 0 {
+			start = checkpoint.LastOffset
+		}
+		if sourceSizeBeforeRead < start {
+			return outboxQueueOptions{}
+		}
+		if sourceSizeBeforeRead-start > historyTieredMaxTailBytes {
+			// Do not hash an unbounded automatic backlog merely to decide whether
+			// it is safe to import. The normal policy for a large suffix is the
+			// silent explicit-history boundary; publish-history can perform the
+			// deliberate full reread.
+			return outboxQueueOptions{}
+		}
+		proof.ExpectedSourceReadFingerprint = transcriptSourceRangeFingerprint(sourcePath, start, sourceSizeBeforeRead)
+		proof.ExpectedSourceReadStartOffset = start
+		proof.ExpectedSourceReadEndOffset = sourceSizeBeforeRead
+		proof.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadFingerprint != ""
+		if !proof.ExpectedSourceReadRangeKnown {
+			return outboxQueueOptions{}
+		}
+		return proof
+	}
+	// A checkpoint with a record key but no durable identity-bound proof is an
+	// old/unverifiable boundary. Do not manufacture a proof from the current
+	// file (especially not from its current EOF): that would turn a replaced
+	// rc16-era transcript into an apparently safe suffix and silently skip or
+	// duplicate history. Explicit publish-history is the recovery boundary for
+	// this shape; automatic/background import stays paused and silent.
+	if strings.TrimSpace(checkpoint.LastRecordID) != "" {
+		return outboxQueueOptions{}
+	}
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath == "" || sourceSizeBeforeRead < 0 {
+		return outboxQueueOptions{}
+	}
+	if sourceSizeBeforeRead > historyTieredMaxTailBytes {
+		return outboxQueueOptions{}
+	}
+	fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(sourcePath, sourceSizeBeforeRead))
+	readFingerprint := transcriptSourceRangeFingerprint(sourcePath, 0, sourceSizeBeforeRead)
+	if fingerprint == "" || readFingerprint == "" {
+		return outboxQueueOptions{}
+	}
+	return outboxQueueOptions{
+		ExpectedSourcePath:            sourcePath,
+		ExpectedSourceFingerprint:     fingerprint,
+		ExpectedSourceOffset:          sourceSizeBeforeRead,
+		ExpectedSourceOffsetKnown:     true,
+		ExpectedSourceReadFingerprint: readFingerprint,
+		ExpectedSourceReadStartOffset: 0,
+		ExpectedSourceReadEndOffset:   sourceSizeBeforeRead,
+		ExpectedSourceReadRangeKnown:  true,
+	}
+}
+
+// preflightAutomaticTranscriptImportSourceProof prevents an automatic import
+// from queueing even its title when the existing checkpoint cannot be bound to
+// the current source. This is deliberately cold-path work; the ordinary Teams
+// admission and outbox paths do not call it.
+func (b *Bridge) preflightAutomaticTranscriptImportSourceProof(ctx context.Context, session Session, sourcePath string, checkpointID string) (outboxQueueOptions, error) {
+	if b == nil || b.store == nil {
+		return outboxQueueOptions{}, nil
+	}
+	checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+	if err != nil {
+		return outboxQueueOptions{}, err
+	}
+	if !found {
+		checkpoint = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: session.ID, SourcePath: sourcePath}
+	}
+	sourceSize, _ := transcriptSourceFileState(sourcePath)
+	if checkpoint.SourceRewriteBlocked {
+		return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
+	}
+	proof := transcriptAutomaticImportProofQueueOptions(sourcePath, checkpoint, sourceSize)
+	if strings.TrimSpace(proof.ExpectedSourceFingerprint) != "" &&
+		transcriptAutomaticImportSourceProofMatches(proof) {
+		return proof, nil
+	}
+	if strings.TrimSpace(proof.ExpectedSourceFingerprint) == "" {
+		if err := b.blockAutomaticTranscriptSync(ctx, session, sourcePath, checkpoint, 0); err != nil {
+			return outboxQueueOptions{}, err
+		}
+		return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
+	}
+	if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, sourcePath, checkpoint); err != nil {
+		return outboxQueueOptions{}, err
+	}
+	return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
+}
+
 type transcriptDedupeState struct {
 	seenSourceText        map[string]bool
 	seenNonUserTextByKind map[string]bool
@@ -22333,10 +23353,18 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithParentFence(ctx context.C
 }
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
-	return b.recordTranscriptCheckpointProgressDetailedWithParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, "")
+	return b.recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, outboxQueueOptions{})
 }
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, parentFenceSessionID string) error {
+	return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, outboxQueueOptions{}, parentFenceSessionID)
+}
+
+func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions) error {
+	return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, sourceProof, "")
+}
+
+func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions, parentFenceSessionID string) error {
 	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
@@ -22351,13 +23379,20 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx c
 		return b.store.UpdateImportCheckpoint(ctx, id, fn)
 	}
 	_, _, err := updateCheckpoint(checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) != "" &&
+			!transcriptSourceProofQueueOptionsMatches(sourceProof) {
+			// The outbox may already be queued, but its own sender-side proof will
+			// keep it from Graph. Do not advance the cursor over a source rewrite
+			// that happened between queue and checkpoint.
+			return previous, false, errTranscriptAutomaticSourceProofUnavailable
+		}
 		// This progress API is also used by active-turn and recovery readers,
 		// which may have scanned the source outside the store transaction.  Before
 		// advancing a cursor, revalidate the previously trusted prefix while the
 		// current checkpoint is still available.  Otherwise a replacement between
 		// the scan and this write could manufacture a fresh fingerprint and move
 		// the cursor across bytes that were never proven to belong to this source.
-		if !transcriptImportRunAllowsAmbiguous(previous.ImportTurnID, "") && strings.TrimSpace(previous.LastRecordID) != "" {
+		if !transcriptImportRunIsExplicitHistory(previous.ImportTurnID) && strings.TrimSpace(previous.LastRecordID) != "" {
 			if linkedTranscriptCheckpointNeedsAutomaticSourceProof(previous, sourcePath) || !linkedCheckpointPrefixMatches(sourcePath, previous) {
 				return previous, false, teamstore.ErrUnresolvedExecution
 			}
@@ -22398,6 +23433,9 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx c
 			Status:                    status,
 			UnresolvedExecution:       previous.UnresolvedExecution,
 			ExecutionAnchorGeneration: previous.ExecutionAnchorGeneration,
+			SourceRewriteBlocked:      previous.SourceRewriteBlocked,
+			CompletionPending:         previous.CompletionPending,
+			LegacyProbeRevision:       previous.LegacyProbeRevision,
 			UpdatedAt:                 now,
 		}
 		if importCheckpointSameExceptUpdatedAt(previous, next) {
@@ -22405,6 +23443,13 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx c
 		}
 		return next, true, nil
 	})
+	if errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+		if blockErr := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, sourcePath, teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID, SourcePath: sourcePath,
+		}); blockErr != nil {
+			return blockErr
+		}
+	}
 	return err
 }
 
@@ -22435,6 +23480,7 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 	return left.ID == right.ID &&
 		left.SessionID == right.SessionID &&
 		left.SourcePath == right.SourcePath &&
+		left.SourceRewriteBlocked == right.SourceRewriteBlocked &&
 		left.SourceFingerprint == right.SourceFingerprint &&
 		left.LastRecordID == right.LastRecordID &&
 		left.LastSourceLine == right.LastSourceLine &&
@@ -22444,6 +23490,8 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.SourceModTime.Equal(right.SourceModTime) &&
 		left.ImportTurnID == right.ImportTurnID &&
 		left.KindPrefix == right.KindPrefix &&
+		left.LegacyProbeRevision == right.LegacyProbeRevision &&
+		left.CompletionPending == right.CompletionPending &&
 		left.Status == right.Status &&
 		left.ExecutionAnchorGeneration == right.ExecutionAnchorGeneration &&
 		executionAnchorsEqual(left.UnresolvedExecution, right.UnresolvedExecution)
@@ -22566,10 +23614,22 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithID(ctx context.Context, se
 // the read snapshot; an append that races the import is intentionally left for
 // the next pass instead of being skipped by an optimistic EOF cursor.
 func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, session Session, sourcePath string, result transcriptImportResult, checkpointID string) error {
+	if strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint) != "" &&
+		!transcriptAutomaticImportSourceProofMatches(result.SourceProof) {
+		if blockErr := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, sourcePath, teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID, SourcePath: sourcePath,
+		}); blockErr != nil {
+			return blockErr
+		}
+		return errTranscriptAutomaticSourceProofUnavailable
+	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	readBoundaryStable := result.SourceSizeBeforeRead == result.SourceSizeAtRead &&
 		result.SourceModTimeBeforeRead.Equal(result.SourceModTimeAtRead)
 	if !result.UnsafeDiagnostics && readBoundaryStable && result.SourceSizeAtRead == sourceSize && result.SourceModTimeAtRead.Equal(sourceModTime) {
+		if strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint) != "" {
+			return b.markTranscriptImportCompleteAtEOFWithSourceProof(ctx, session, sourcePath, result, checkpointID)
+		}
 		return b.markTranscriptImportCompleteAtEOFWithID(ctx, session, sourcePath, result.LastRecordID, result.LastLine, checkpointID)
 	}
 	if strings.TrimSpace(checkpointID) == "" {
@@ -22578,6 +23638,10 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if transcriptCheckpointAdvanceBlocked(checkpoint) {
 			return checkpoint, false, teamstore.ErrUnresolvedExecution
+		}
+		if strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint) != "" &&
+			!transcriptAutomaticImportSourceProofMatches(result.SourceProof) {
+			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
 		}
 		sourceRewritten := cleanComparablePath(checkpoint.SourcePath) == cleanComparablePath(sourcePath) &&
 			((sourceSize < checkpoint.SourceSize) ||
@@ -22600,9 +23664,18 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 		}
 		checkpoint.SourceSize = sourceSize
 		checkpoint.SourceModTime = sourceModTime
-		checkpoint.SourceFingerprint = firstNonEmptyString(transcriptCheckpointSourceFingerprint(sourcePath, checkpoint.LastOffset), checkpoint.SourceFingerprint)
+		if strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint) != "" &&
+			checkpoint.LastOffset == result.SourceProof.ExpectedSourceOffset {
+			checkpoint.SourceFingerprint = strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint)
+		} else {
+			checkpoint.SourceFingerprint = firstNonEmptyString(transcriptCheckpointSourceFingerprint(sourcePath, checkpoint.LastOffset), checkpoint.SourceFingerprint)
+		}
+		if transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
+			checkpoint.SourceRewriteBlocked = false
+		}
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
+		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
 		return checkpoint, true, nil
@@ -22610,9 +23683,119 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 	return err
 }
 
-func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, importTurnID string, kindPrefix string) error {
+// markTranscriptImportCompleteAtEOFWithSourceProof closes the automatic EOF
+// path with the same source proof that was captured before scanning. The
+// ordinary detailed helper recomputes a fingerprint from the current pathname;
+// that is unsafe if a same-size replacement happens between the preflight and
+// the checkpoint update. Keeping the expected proof in the transaction makes
+// the checkpoint conservative even when the source changes during finalization.
+func (b *Bridge) markTranscriptImportCompleteAtEOFWithSourceProof(ctx context.Context, session Session, sourcePath string, result transcriptImportResult, checkpointID string) error {
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
+	}
+	proof := result.SourceProof
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if transcriptCheckpointAdvanceBlocked(checkpoint) {
+			return checkpoint, false, teamstore.ErrUnresolvedExecution
+		}
+		explicitHistory := transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID)
+		if cleanComparablePath(proof.ExpectedSourcePath) != cleanComparablePath(sourcePath) ||
+			!transcriptAutomaticImportSourceProofMatches(proof) {
+			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
+		}
+		sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+		if sourceSize != result.SourceSizeAtRead || !sourceModTime.Equal(result.SourceModTimeAtRead) {
+			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
+		}
+		checkpoint.ID = checkpointID
+		checkpoint.SessionID = session.ID
+		checkpoint.SourcePath = sourcePath
+		if strings.TrimSpace(result.LastRecordID) != "" {
+			checkpoint.LastRecordID = result.LastRecordID
+			checkpoint.LastSourceLine = result.LastLine
+		}
+		checkpoint.LastOffset = sourceSize
+		checkpoint.LastOffsetKnown = true
+		checkpoint.SourceSize = sourceSize
+		checkpoint.SourceModTime = sourceModTime
+		// The proof captured before this import authenticates the old cursor
+		// prefix.  Completion moves the cursor to the current EOF, so retaining
+		// that partial-cursor fingerprint would make the next append look like a
+		// source rewrite.  The size/mtime and prefix CAS above prove that this is
+		// still the same snapshot; persist a proof for the new EOF boundary.
+		checkpoint.SourceFingerprint = strings.TrimSpace(transcriptCheckpointSourceFingerprint(sourcePath, sourceSize))
+		if checkpoint.SourceFingerprint == "" {
+			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
+		}
+		if explicitHistory {
+			// An explicit history publication is the operator-selected recovery
+			// boundary for a source rewrite. Once its own final cursor is durable,
+			// the automatic watcher may trust the new source again.
+			checkpoint.SourceRewriteBlocked = false
+		}
+		checkpoint.ImportTurnID = ""
+		checkpoint.KindPrefix = ""
+		checkpoint.CompletionPending = false
+		checkpoint.Status = importCheckpointStatusComplete
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	})
+	return err
+}
+
+// markTranscriptImportCompletionPending records that the transcript scan and
+// its durable cursor reached the completion phase, but the subagent marker and
+// final import notice still need to be made idempotently. Keeping this bit
+// separate from Status lets the same owner retry a failed notification without
+// treating a fully scanned transcript as a fresh source boundary.
+func (b *Bridge) markTranscriptImportCompletionPending(ctx context.Context, session Session, sourcePath string, checkpointID string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	checkpointID = strings.TrimSpace(firstNonEmptyString(checkpointID, transcriptCheckpointID(session.ID)))
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
+		checkpoint.SessionID = session.ID
+		if strings.TrimSpace(sourcePath) != "" {
+			checkpoint.SourcePath = sourcePath
+		}
+		checkpoint.Status = importCheckpointStatusImporting
+		checkpoint.CompletionPending = true
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	})
+	return err
+}
+
+func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, importTurnID string, kindPrefix string) error {
+	return b.markTranscriptImportPausedAtWithProof(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, importTurnID, kindPrefix, outboxQueueOptions{})
+}
+
+// markTranscriptImportPausedAtWithProof keeps a budgeted automatic import
+// bound to the source snapshot that produced its records. The old helper
+// recomputed the checkpoint fingerprint from the current pathname at pause
+// time; a replacement between the scan and this write could therefore bind an
+// old LastRecordID to a new file. Explicit history has no automatic proof and
+// keeps the compatibility wrapper above.
+func (b *Bridge) markTranscriptImportPausedAtWithProof(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, importTurnID string, kindPrefix string, sourceProof outboxQueueOptions) error {
+	if strings.TrimSpace(checkpointID) == "" {
+		checkpointID = transcriptCheckpointID(session.ID)
+	}
+	if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) != "" &&
+		!transcriptAutomaticImportSourceProofMatches(sourceProof) {
+		checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			checkpoint = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: session.ID, SourcePath: sourcePath}
+		}
+		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, sourcePath, checkpoint); err != nil {
+			return err
+		}
+		// A source race at the pause boundary is a silent automatic recovery
+		// point. The caller must not turn it into a repeated attention notice.
+		return nil
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
 	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
@@ -22651,6 +23834,7 @@ func (b *Bridge) markTranscriptImportPausedAt(ctx context.Context, session Sessi
 		if strings.TrimSpace(kindPrefix) != "" {
 			checkpoint.KindPrefix = strings.TrimSpace(kindPrefix)
 		}
+		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
 		return checkpoint, true, nil
@@ -22668,6 +23852,7 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		if transcriptCheckpointAdvanceBlocked(checkpoint) {
 			return checkpoint, false, teamstore.ErrUnresolvedExecution
 		}
+		explicitHistory := transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID)
 		previousSourcePath := checkpoint.SourcePath
 		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
@@ -22690,6 +23875,10 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 			checkpoint.KindPrefix = ""
 		}
 		checkpoint.SourceFingerprint = firstNonEmptyString(sourceFingerprint, transcriptCheckpointSourceFingerprint(sourcePath, checkpoint.LastOffset), checkpoint.SourceFingerprint)
+		if explicitHistory {
+			checkpoint.SourceRewriteBlocked = false
+		}
+		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
 		return checkpoint, true, nil
@@ -22700,12 +23889,26 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 func transcriptImportRunAllowsAmbiguous(currentTurnID string, requestedTurnID string) bool {
 	for _, value := range []string{currentTurnID, requestedTurnID} {
 		value = strings.TrimSpace(value)
-		if strings.HasPrefix(value, "import:") || strings.HasPrefix(value, "import-bg:") ||
-			strings.HasPrefix(value, "publish-history:") || strings.HasPrefix(value, "publish-full:") {
+		if strings.HasPrefix(value, "publish-history:") || strings.HasPrefix(value, "publish-full:") {
 			return true
 		}
 	}
 	return false
+}
+
+func transcriptImportRunIsAutomatic(turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	return strings.HasPrefix(turnID, "import:") || strings.HasPrefix(turnID, "import-bg:")
+}
+
+func transcriptOutboxAutomaticRun(turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	return strings.HasPrefix(turnID, "sync:") || transcriptImportRunIsAutomatic(turnID)
+}
+
+func transcriptImportRunIsExplicitHistory(turnID string) bool {
+	turnID = strings.TrimSpace(turnID)
+	return strings.HasPrefix(turnID, "publish-history:") || strings.HasPrefix(turnID, "publish-full:")
 }
 
 func transcriptCheckpointAdvanceBlocked(checkpoint teamstore.ImportCheckpoint) bool {

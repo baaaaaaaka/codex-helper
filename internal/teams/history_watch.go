@@ -353,6 +353,18 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		// A source rewrite is an explicit safety boundary.  Do not let a later
 		// append make the watcher reinterpret the rewritten prefix; explicit
 		// history import is required to establish a new trusted cursor.
+		if !b.historyWatchDeletedSourceProbeDue(path, now) {
+			return nil
+		}
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			b.clearHistoryWatchDeletedSourceProbe(path)
+			// A blocked checkpoint for a deleted transcript is no longer useful.
+			// Remove it with the same expected-checkpoint CAS used by the normal
+			// deletion path; a concurrent explicit recovery must win over cleanup.
+			return b.removeHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint)
+		} else if statErr != nil {
+			return statErr
+		}
 		return nil
 	}
 	blockSourceRewrite := func() error {
@@ -468,6 +480,17 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		}
 		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
 	}
+	// The scanner's bounded read proof covers the bytes that produced the
+	// records below.  Prefix validation alone is insufficient here: an
+	// in-place rewrite in the newly-read tail could leave the old checkpoint
+	// prefix intact while changing the final that is about to be published.
+	// HistoryWatch is a cold periodic path, so re-reading this bounded range is
+	// preferable to adding another read or lock to ordinary message delivery.
+	if result.BytesRead > 0 || len(result.Records) > 0 || len(result.Finals) > 0 {
+		if !historyWatchReadProofMatches(path, result) {
+			return blockSourceRewrite()
+		}
+	}
 	// Keep this second guard immediately adjacent to the first publish call.
 	// It narrows the scan-to-publish window without changing the durable final
 	// CAS semantics below.
@@ -507,8 +530,57 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		if !handled {
 			return nil
 		}
+		if !historyWatchReadProofMatches(path, result) {
+			return blockSourceRewrite()
+		}
+	}
+	if len(result.Finals) == 0 && (result.BytesRead > 0 || len(result.Records) > 0) {
+		if !historyWatchReadProofMatches(path, result) {
+			return blockSourceRewrite()
+		}
 	}
 	return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, result.State, now)
+}
+
+// historyWatchDeletedSourceProbeDue keeps the compatibility cleanup for
+// deleted blocked checkpoints out of the normal per-poll file-stat path. A
+// blocked checkpoint is already fail-closed; probing it again is only useful
+// occasionally to retire a transcript that disappeared after the rewrite.
+// The in-memory gate is deliberately bounded and is lost on restart, where a
+// single startup probe is cheap and useful.
+func (b *Bridge) historyWatchDeletedSourceProbeDue(path string, now time.Time) bool {
+	if b == nil {
+		return true
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	b.historyWatchProbeMu.Lock()
+	defer b.historyWatchProbeMu.Unlock()
+	if b.historyWatchDeletedProbeAt == nil {
+		b.historyWatchDeletedProbeAt = make(map[string]time.Time)
+	}
+	if next, ok := b.historyWatchDeletedProbeAt[path]; ok && now.Before(next) {
+		return false
+	}
+	if len(b.historyWatchDeletedProbeAt) >= 1024 {
+		for key := range b.historyWatchDeletedProbeAt {
+			delete(b.historyWatchDeletedProbeAt, key)
+			break
+		}
+	}
+	b.historyWatchDeletedProbeAt[path] = now.Add(historyWatchDeletedProbeInterval)
+	return true
+}
+
+func (b *Bridge) clearHistoryWatchDeletedSourceProbe(path string) {
+	if b == nil {
+		return
+	}
+	b.historyWatchProbeMu.Lock()
+	delete(b.historyWatchDeletedProbeAt, strings.TrimSpace(path))
+	b.historyWatchProbeMu.Unlock()
 }
 
 // historyWatchSourcePrefixMatches verifies the source identity and bounded
@@ -541,6 +613,18 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 	}
 	postInfo, err := os.Stat(path)
 	return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= previous.Offset
+}
+
+// historyWatchReadProofMatches verifies the exact bounded range consumed by
+// historyTieredScanTail.  It is intentionally used only by HistoryWatch's
+// cold scan-to-publish path; the normal Teams outbox path has its own
+// source-proof cache and final CAS.
+func historyWatchReadProofMatches(path string, result historyTieredTailResult) bool {
+	if !result.ReadProofRangeKnown || strings.TrimSpace(result.ReadProofFingerprint) == "" ||
+		result.ReadProofStartOffset < 0 || result.ReadProofEndOffset < result.ReadProofStartOffset {
+		return false
+	}
+	return transcriptSourceRangeFingerprint(path, result.ReadProofStartOffset, result.ReadProofEndOffset) == strings.TrimSpace(result.ReadProofFingerprint)
 }
 
 func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchCheckpoint) historyTieredFileState {

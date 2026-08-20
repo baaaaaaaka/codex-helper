@@ -204,28 +204,10 @@ func TestForkWorkSessionDeterministicGraphEndToEnd(t *testing.T) {
 	if !historyQueued {
 		t.Fatal("fork history did not reach the durable outbox")
 	}
-	markedSending := false
-	for _, message := range stateBeforeFlush.OutboxMessages {
-		if message.ForkOperationID != operationID || !isForkHistoryOutbox(message) {
-			continue
-		}
-		if _, err := store.MarkOutboxSendAttempt(ctx, message.ID); err != nil {
-			t.Fatalf("mark history sending: %v", err)
-		}
-		if err := store.Update(ctx, func(state *teamstore.State) error {
-			current := state.OutboxMessages[message.ID]
-			current.LastSendAttempt = time.Now().Add(-3 * time.Minute)
-			state.OutboxMessages[message.ID] = current
-			return nil
-		}); err != nil {
-			t.Fatalf("age history sending lease: %v", err)
-		}
-		markedSending = true
-		break
-	}
-	if !markedSending {
-		t.Fatal("fork history did not create a recoverable outbox item")
-	}
+	// Keep the durable history row queued for the normal owner to claim. A
+	// stale Sending row without a Graph provenance marker is intentionally
+	// fail-closed; ambiguous fork recovery is covered separately by the bridge
+	// recovery tests.
 
 	var state teamstore.State
 	var op teamstore.ForkOperation

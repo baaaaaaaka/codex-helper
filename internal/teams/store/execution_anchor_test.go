@@ -1732,6 +1732,66 @@ func TestQueueTranscriptDeliveryRequiresExplicitCodexTurnProofAcrossBackends(t *
 	}
 }
 
+func TestBackgroundImportDoesNotBypassUnresolvedExecutionAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now()
+			const sessionID = "background-import-fence-session"
+			const checkpointID = "transcript:" + sessionID
+			const threadID = "background-import-fence-thread"
+			const codexTurnID = "background-import-fence-codex"
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive}
+				state.Turns["background-import-fence-turn"] = Turn{
+					ID: "background-import-fence-turn", SessionID: sessionID, Status: TurnStatusRunning,
+					CodexThreadID: threadID, CodexTurnID: codexTurnID, StartedAt: now,
+				}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID,
+					UnresolvedExecution: &ExecutionAnchor{
+						SessionID: sessionID, ThreadID: threadID, OuterTurnID: "background-import-fence-turn",
+						CodexTurnID: codexTurnID, State: "unresolved", Generation: 1,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed background import fence: %v", err)
+			}
+			if backend == "sqlite" {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			_, _, _, err := store.QueueTranscriptDeliveryOutbox(ctx, TranscriptDeliveryQueueRequest{
+				Message: OutboxMessage{
+					ID: "outbox:background-import-fence", SessionID: sessionID,
+					TurnID: "import-bg:background-import-fence", CodexThreadID: threadID,
+					TeamsChatID: "background-import-fence-chat", Kind: "import-bg-batch-assistant",
+					Body: "background history must remain fenced",
+				},
+				Delivery: TranscriptDeliveryRecord{
+					ID: "delivery:background-import-fence", SessionID: sessionID,
+					CodexThreadID: threadID, Kind: "import-bg-batch-assistant",
+					Status: TranscriptDeliveryStatusQueued,
+				},
+				Checkpoint: ImportCheckpoint{ID: checkpointID, SessionID: sessionID},
+			})
+			if !errors.Is(err, ErrUnresolvedExecution) {
+				t.Fatalf("background import queue error = %v, want ErrUnresolvedExecution", err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load background import fence state: %v", err)
+			}
+			if _, found := state.OutboxMessages["outbox:background-import-fence"]; found {
+				t.Fatal("background import queued transcript delivery across unresolved execution")
+			}
+		})
+	}
+}
+
 func TestQuarantineQueuedTerminalAnswerOutboxPreservesAcceptedIdentityAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []string{"json", "sqlite"} {

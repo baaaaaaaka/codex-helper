@@ -26,9 +26,9 @@ const (
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
 	// Pointer schema 6 was emitted while the JSON state schema was 5. Pointer
-	// schemas 6 and 7 remain readable for migration, but the current pointer
-	// schema (8) is an upgrade-only boundary because schema-6 helpers cannot
-	// preserve unresolved-execution and terminal-outbox safety fields.
+	// schemas 6 through 8 remain readable for migration, but the current
+	// pointer schema (9) is an upgrade-only boundary because schema-7 helpers
+	// cannot preserve the source read-proof and delivery-recovery safety fields.
 	storeSQLiteMinPointerSchemaVersion = 6
 	sqliteImportCheckpointImporting    = "importing"
 	sqliteWALAutocheckpointPages       = 0
@@ -2778,6 +2778,16 @@ func seedMissingSQLiteRuntimeOptionalState(ctx context.Context, q interface {
 }
 
 func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) error) (bool, error) {
+	return s.updateSQLiteRuntimeStateWithTx(ctx, fn, nil)
+}
+
+// updateSQLiteRuntimeStateWithTx applies a runtime-state mutation without
+// decoding unrelated hot rows. An optional afterTx callback can update a
+// small, explicitly selected set of split-table rows in the same transaction.
+// This is used by lifecycle migrations that need runtime-state atomicity while
+// still preserving the runtime fast path for stores with a damaged/unrelated
+// hot row.
+func (s *Store) updateSQLiteRuntimeStateWithTx(ctx context.Context, fn func(*State) error, afterTx func(context.Context, *sql.Tx) error) (bool, error) {
 	handled := false
 	err := s.withStateLock(ctx, func() error {
 		pointer, ok, err := s.currentSQLitePointerUnlocked()
@@ -2811,6 +2821,11 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 		if err := fn(&state); err != nil {
 			if errors.Is(err, errStoreNoChange) && (seedRuntime || seedOptional) {
 				state.ensure(time.Now())
+				if afterTx != nil {
+					if err := afterTx(ctx, tx); err != nil {
+						return err
+					}
+				}
 				if saveErr := saveSQLiteRuntimeStateTx(ctx, tx, state); saveErr != nil {
 					return saveErr
 				}
@@ -2819,6 +2834,11 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 			return err
 		}
 		state.ensure(time.Now())
+		if afterTx != nil {
+			if err := afterTx(ctx, tx); err != nil {
+				return err
+			}
+		}
 		if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
 			return err
 		}
@@ -2828,6 +2848,115 @@ func (s *Store) updateSQLiteRuntimeState(ctx context.Context, fn func(*State) er
 		return handled, nil
 	}
 	return handled, err
+}
+
+// retireLegacyHistoryGateOutboxSQLiteTx retires only obsolete history-gate
+// notices while the caller owns the store transaction. It deliberately reads
+// raw outbox rows instead of the full state document: a malformed unrelated
+// hot row must not prevent an upgrade from establishing its drain fence.
+func retireLegacyHistoryGateOutboxSQLiteTx(ctx context.Context, tx *sql.Tx, pageSize int, _ int, includeActiveSending bool) (int, error) {
+	if pageSize <= 0 {
+		pageSize = 128
+	}
+	type candidate struct {
+		id        string
+		createdAt int64
+		message   OutboxMessage
+	}
+	var retired int
+	var afterCreatedAt int64
+	var afterID string
+	for {
+		clauses := []string{"status IN (?, ?)"}
+		args := []any{string(OutboxStatusQueued), string(OutboxStatusSending)}
+		if afterID != "" || afterCreatedAt != 0 {
+			clauses = append(clauses, "(created_at > ? OR (created_at = ? AND id > ?))")
+			args = append(args, afterCreatedAt, afterCreatedAt, afterID)
+		}
+		args = append(args, pageSize+1)
+		rows, err := tx.QueryContext(ctx, `SELECT id, created_at, json
+FROM outbox_messages
+WHERE `+strings.Join(clauses, " AND ")+`
+ORDER BY created_at, id
+LIMIT ?`, args...)
+		if err != nil {
+			return retired, err
+		}
+		rowsRead := 0
+		candidates := make([]candidate, 0, pageSize)
+		for rows.Next() {
+			var rowID string
+			var createdAt int64
+			var raw []byte
+			if err := rows.Scan(&rowID, &createdAt, &raw); err != nil {
+				_ = rows.Close()
+				return retired, err
+			}
+			rowsRead++
+			afterCreatedAt = createdAt
+			afterID = rowID
+			var msg OutboxMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				continue
+			}
+			if strings.TrimSpace(msg.ID) == "" || msg.ID != rowID {
+				continue
+			}
+			candidates = append(candidates, candidate{id: rowID, createdAt: createdAt, message: msg})
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return retired, err
+		}
+		if err := rows.Close(); err != nil {
+			return retired, err
+		}
+		for _, item := range candidates {
+			if !legacyHistoryGateNoticeRetirable(item.message, time.Now(), includeActiveSending) {
+				continue
+			}
+			state := newState()
+			state.OutboxMessages[item.id] = item.message
+			if err := loadSQLiteOutboxLinkedRecordsTx(ctx, tx, &state, item.id); err != nil {
+				return retired, err
+			}
+			updated, err := markOutboxSkippedLocked(&state, item.message, "obsolete automatic history-gate notice", time.Now())
+			if err != nil {
+				return retired, err
+			}
+			if updated.Status == item.message.Status {
+				continue
+			}
+			if err := upsertSQLiteOutboxTx(ctx, tx, updated); err != nil {
+				return retired, err
+			}
+			if err := upsertSQLiteOutboxLinkedRecordsTx(ctx, tx, state); err != nil {
+				return retired, err
+			}
+			retired++
+		}
+		if rowsRead <= pageSize {
+			return retired, nil
+		}
+	}
+}
+
+func (s *Store) retireLegacyHistoryGateOutboxSQLite(ctx context.Context, pageSize int, maxPages int, includeActiveSending bool) (int, bool, error) {
+	retired := 0
+	handled, err := s.updateSQLiteRuntimeStateWithTx(ctx, func(_ *State) error {
+		return nil
+	}, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		retired, err = retireLegacyHistoryGateOutboxSQLiteTx(ctx, tx, pageSize, maxPages, includeActiveSending)
+		if err != nil {
+			return err
+		}
+		if retired == 0 {
+			return errStoreNoChange
+		}
+		return nil
+	})
+	return retired, handled, err
 }
 
 // rebindSQLiteScopeForMigration updates only the bounded runtime projection and
@@ -6713,7 +6842,8 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 
 			needCreateOutbox := false
 			switch {
-			case deliveryFound && transcriptDeliverySuppressesQueue(existingDelivery):
+			case deliveryFound && transcriptDeliverySuppressesQueue(existingDelivery) &&
+				!transcriptDeliveryCanBeRequeuedForExplicitHistory(existingDelivery, state.OutboxMessages[strings.TrimSpace(existingDelivery.OutboxID)], true, msg):
 				needCreateOutbox = false
 			case deliveryFound:
 				outboxID := strings.TrimSpace(existingDelivery.OutboxID)
@@ -6736,6 +6866,8 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 
 			beforeDelivery, hadDelivery := state.TranscriptDeliveries[deliveryID]
 			beforeCheckpoint, hadCheckpoint := state.ImportCheckpoints[checkpointID]
+			beforeOutboxID := strings.TrimSpace(msg.ID)
+			beforeOutbox, hadOutbox := state.OutboxMessages[beforeOutboxID]
 			beforeHelpers := make(map[string]HelperDeliveryRecord, len(state.HelperDeliveries))
 			for id, record := range state.HelperDeliveries {
 				beforeHelpers[id] = record
@@ -6748,6 +6880,12 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 			if created {
 				if err := upsertSQLiteOutboxTx(ctx, tx, out); err != nil {
 					return err
+				}
+			} else if strings.TrimSpace(out.ID) != "" {
+				if after, ok := state.OutboxMessages[out.ID]; ok && (!hadOutbox || !reflect.DeepEqual(beforeOutbox, after)) {
+					if err := upsertSQLiteOutboxTx(ctx, tx, after); err != nil {
+						return err
+					}
 				}
 			}
 			if after, ok := state.TranscriptDeliveries[deliveryID]; ok && (!hadDelivery || !reflect.DeepEqual(beforeDelivery, after)) {
@@ -6887,6 +7025,10 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 			now := time.Now()
 			next, err := fn(&state, current, now)
 			if err != nil {
+				if errors.Is(err, errStoreNoChange) {
+					out = current
+					return tx.Commit()
+				}
 				return err
 			}
 			next.UpdatedAt = now
@@ -6919,7 +7061,7 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 	return out, handled, err
 }
 
-func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) (OutboxMessage, bool, error) {
+func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, sent bool, requireClaim bool, sourceProofPrevalidated bool) (OutboxMessage, bool, error) {
 	var out OutboxMessage
 	handled := false
 	sessionID := ""
@@ -7031,7 +7173,7 @@ func (s *Store) markOutboxDeliveredSQLite(ctx context.Context, outboxID string, 
 				return err
 			}
 			if sent {
-				msg = applyOutboxSentProjectionLocked(&state, msg, teamsMessageID, now)
+				msg = applyOutboxSentProjectionLocked(&state, msg, teamsMessageID, now, sourceProofPrevalidated)
 			} else {
 				if msg.Status != OutboxStatusSent {
 					msg.Status = OutboxStatusAccepted
@@ -7369,12 +7511,16 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 		clauses := []string{
 			"o.status IN (?, ?, ?)",
 			"(o.status <> ? OR o.teams_message_id <> '')",
-			"(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)",
+			"NOT (o.status = ? AND o.teams_message_id <> '' AND COALESCE(json_extract(o.json, '$.blocked_by_source_rewrite'), 0) = 1)",
 		}
 		args := []any{
 			string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted),
 			string(OutboxStatusAccepted),
-			string(OutboxStatusAccepted), sqliteTime(query.Now),
+			string(OutboxStatusAccepted),
+		}
+		if !query.IgnoreRateLimit {
+			clauses = append(clauses, "(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
+			args = append(args, string(OutboxStatusAccepted), sqliteTime(query.Now))
 		}
 		if query.SessionID = strings.TrimSpace(query.SessionID); query.SessionID != "" {
 			clauses = append(clauses, "o.session_id = ?")
@@ -7558,8 +7704,9 @@ WHERE teams_chat_id = ?
   AND sequence > 0
   AND sequence < ?
   AND status NOT IN (?, ?)
+  AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
 ORDER BY sequence, created_at, id
-LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped))
+LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted))
 		if err != nil {
 			return err
 		}
@@ -7567,6 +7714,51 @@ LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSe
 		return nil
 	})
 	return out, found, handled, err
+}
+
+func (s *Store) earlierUnsentOutboxesSQLite(ctx context.Context, msg OutboxMessage) ([]OutboxMessage, bool, error) {
+	var out []OutboxMessage
+	handled := false
+	chatID := strings.TrimSpace(msg.TeamsChatID)
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		rows, err := db.QueryContext(ctx, `SELECT json FROM outbox_messages
+WHERE teams_chat_id = ?
+  AND id <> ?
+  AND sequence > 0
+  AND sequence < ?
+  AND status NOT IN (?, ?)
+  AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
+ORDER BY sequence, created_at, id`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var candidate OutboxMessage
+			if err := json.Unmarshal(raw, &candidate); err != nil {
+				return err
+			}
+			out = append(out, candidate)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	return out, handled, err
 }
 
 func (s *Store) chatPollSQLite(ctx context.Context, chatID string) (ChatPollState, bool, bool, error) {

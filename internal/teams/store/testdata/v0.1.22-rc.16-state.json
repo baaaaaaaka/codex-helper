@@ -1,0 +1,244 @@
+{
+  "schema_version": 6,
+  "created_at": "2026-06-10T09:30:00Z",
+  "updated_at": "2026-06-10T10:30:00Z",
+  "service_owner": {
+    "pid": 4242,
+    "hostname": "official-release-host",
+    "executable_path": "/usr/local/bin/codex-proxy",
+    "helper_version": "v0.1.22-rc.16",
+    "last_heartbeat": "2026-06-10T10:30:00Z",
+    "active_session_id": "official-session",
+    "active_turn_id": "official-turn"
+  },
+  "sessions": {
+    "official-session": {
+      "id": "official-session",
+      "status": "active",
+      "teams_chat_id": "official-chat",
+      "teams_chat_url": "https://teams.example/official-chat",
+      "teams_topic": "official upgrade fixture",
+      "codex_thread_id": "official-thread",
+      "latest_turn_id": "official-turn",
+      "cwd": "/workspace/official-upgrade",
+      "created_at": "2026-06-10T09:40:00Z",
+      "updated_at": "2026-06-10T10:25:00Z"
+    }
+  },
+  "turns": {
+    "official-turn": {
+      "id": "official-turn",
+      "session_id": "official-session",
+      "inbound_event_id": "official-inbound",
+      "status": "completed",
+      "codex_thread_id": "official-thread",
+      "codex_turn_id": "official-codex-turn",
+      "queued_at": "2026-06-10T09:46:00Z",
+      "completed_at": "2026-06-10T09:50:00Z",
+      "created_at": "2026-06-10T09:46:00Z",
+      "updated_at": "2026-06-10T09:50:00Z"
+    }
+  },
+  "inbound_events": {
+    "official-inbound": {
+      "id": "official-inbound",
+      "session_id": "official-session",
+      "teams_chat_id": "official-chat",
+      "teams_message_id": "official-user-message",
+      "text": "upgrade from v0.1.22-rc.16",
+      "source": "teams",
+      "status": "queued",
+      "turn_id": "official-turn",
+      "created_at": "2026-06-10T09:45:00Z",
+      "updated_at": "2026-06-10T09:45:00Z"
+    }
+  },
+  "outbox_messages": {
+    "official-outbox": {
+      "id": "official-outbox",
+      "session_id": "official-session",
+      "turn_id": "official-turn",
+      "codex_thread_id": "official-thread",
+      "teams_chat_id": "official-chat",
+      "kind": "final",
+      "transcript_checkpoint_id": "transcript:official-session",
+      "transcript_source_path": "/tmp/official-session.jsonl",
+      "transcript_source_offset": 4096,
+      "transcript_source_offset_known": true,
+      "transcript_source_proof_fingerprint": "legacy-prefix-proof",
+      "transcript_source_proof_offset": 4096,
+      "transcript_source_proof_offset_known": true,
+      "body": "legacy answer from v0.1.22-rc.16",
+      "sequence": 9,
+      "artifact_ids": ["official-artifact"],
+      "status": "sent",
+      "teams_message_id": "official-helper-message",
+      "created_at": "2026-06-10T09:51:00Z",
+      "updated_at": "2026-06-10T09:51:00Z",
+      "sent_at": "2026-06-10T09:51:00Z"
+    }
+  },
+  "message_provenance": {
+    "official-provenance-inbound": {
+      "id": "official-provenance-inbound",
+      "teams_chat_id": "official-chat",
+      "teams_message_id": "official-user-message",
+      "origin": "user_inbound",
+      "session_id": "official-session",
+      "turn_id": "official-turn",
+      "inbound_id": "official-inbound",
+      "created_at": "2026-06-10T09:45:00Z",
+      "updated_at": "2026-06-10T09:45:00Z"
+    },
+    "official-provenance-outbox": {
+      "id": "official-provenance-outbox",
+      "teams_chat_id": "official-chat",
+      "teams_message_id": "official-helper-message",
+      "origin": "helper_outbox",
+      "session_id": "official-session",
+      "turn_id": "official-turn",
+      "outbox_id": "official-outbox",
+      "created_at": "2026-06-10T09:51:00Z",
+      "updated_at": "2026-06-10T09:51:00Z"
+    }
+  },
+  "chat_polls": {
+    "official-chat": {
+      "chat_id": "official-chat",
+      "seeded": true,
+      "state": "parked",
+      "next_poll_at": "2026-06-10T11:30:00Z",
+      "parked_at": "2026-06-10T10:00:00Z",
+      "park_notice_sent_at": "2026-06-10T10:01:00Z",
+      "updated_at": "2026-06-10T10:01:00Z"
+    }
+  },
+  "transcript_ledger": {
+    "official-ledger": {
+      "id": "official-ledger",
+      "session_id": "official-session",
+      "codex_thread_id": "official-thread",
+      "source_path": "/tmp/official-session.jsonl",
+      "source_line": 77,
+      "source_record_id": "official-record",
+      "kind": "final",
+      "teams_origin_id": "official-helper-message",
+      "outbox_id": "official-outbox",
+      "imported_at": "2026-06-10T09:52:00Z",
+      "created_at": "2026-06-10T09:52:00Z",
+      "updated_at": "2026-06-10T09:52:00Z"
+    }
+  },
+  "transcript_deliveries": {
+    "official-delivery": {
+      "id": "official-delivery",
+      "session_id": "official-session",
+      "codex_thread_id": "official-thread",
+      "source_path": "/tmp/official-session.jsonl",
+      "source_line": 77,
+      "source_record_id": "official-record",
+      "kind": "final",
+      "text_hash": "official-text-hash",
+      "outbox_id": "official-outbox",
+      "teams_message_id": "official-helper-message",
+      "status": "sent",
+      "created_at": "2026-06-10T09:52:00Z",
+      "updated_at": "2026-06-10T09:52:00Z",
+      "sent_at": "2026-06-10T09:52:00Z"
+    }
+  },
+  "helper_deliveries": {
+    "official-helper-delivery": {
+      "id": "official-helper-delivery",
+      "session_id": "official-session",
+      "teams_chat_id": "official-chat",
+      "codex_thread_id": "official-thread",
+      "turn_id": "official-turn",
+      "kind": "final",
+      "kind_family": "final",
+      "outbox_id": "official-outbox",
+      "teams_message_id": "official-helper-message",
+      "status": "sent",
+      "created_at": "2026-06-10T09:51:00Z",
+      "updated_at": "2026-06-10T09:51:00Z",
+      "sent_at": "2026-06-10T09:51:00Z"
+    }
+  },
+  "import_checkpoints": {
+    "transcript:official-session": {
+      "id": "transcript:official-session",
+      "session_id": "official-session",
+      "source_path": "/tmp/official-session.jsonl",
+      "source_fingerprint": "legacy-prefix-proof",
+      "last_record_id": "official-record",
+      "last_source_line": 77,
+      "last_offset": 4096,
+      "last_offset_known": true,
+      "source_size": 4096,
+      "import_turn_id": "official-import-turn",
+      "kind_prefix": "assistant",
+      "status": "complete",
+      "unresolved_execution": {
+        "session_id": "official-session",
+        "thread_id": "official-thread",
+        "outer_turn_id": "official-turn",
+        "codex_turn_id": "official-codex-turn",
+        "transcript_source": "/tmp/official-session.jsonl",
+        "source_fingerprint": "legacy-prefix-proof",
+        "cutoff_record_id": "official-record",
+        "cutoff_line": 77,
+        "cutoff_offset": 4096,
+        "reason": "rc16 upgrade fixture",
+        "state": "unresolved",
+        "generation": 3,
+        "created_at": "2026-06-10T09:52:00Z",
+        "updated_at": "2026-06-10T09:52:00Z"
+      },
+      "updated_at": "2026-06-10T09:52:00Z"
+    }
+  },
+  "chat_sequences": {
+    "official-chat": {
+      "chat_id": "official-chat",
+      "next": 10,
+      "updated_at": "2026-06-10T09:51:00Z"
+    }
+  },
+  "chat_rate_limits": {
+    "official-chat": {
+      "chat_id": "official-chat",
+      "blocked_until": "2026-06-10T10:40:00Z",
+      "reason": "official-release-fixture"
+    }
+  },
+  "artifact_records": {
+    "official-artifact": {
+      "id": "official-artifact",
+      "session_id": "official-session",
+      "turn_id": "official-turn",
+      "path": "official-report.txt",
+      "upload_name": "official-report-upload.txt",
+      "drive_item_id": "official-drive-item",
+      "outbox_id": "official-outbox",
+      "teams_message_id": "official-helper-message",
+      "status": "uploaded",
+      "uploaded_at": "2026-06-10T09:51:00Z",
+      "sent_at": "2026-06-10T09:51:00Z",
+      "created_at": "2026-06-10T09:50:00Z",
+      "updated_at": "2026-06-10T09:51:00Z"
+    }
+  },
+  "notifications": {
+    "official-notification": {
+      "id": "official-notification",
+      "session_id": "official-session",
+      "turn_id": "official-turn",
+      "kind": "turn_completed",
+      "status": "sent",
+      "title": "official notification",
+      "sent_at": "2026-06-10T09:51:00Z",
+      "created_at": "2026-06-10T09:51:00Z",
+      "updated_at": "2026-06-10T09:51:00Z"
+    }
+  }
+}

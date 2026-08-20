@@ -11,8 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 const historyTieredTailReaderSize = 4 * 1024
@@ -97,13 +100,17 @@ type historyTieredTailResult struct {
 	// AnonymousFinals is retained separately when a pair is quarantined. The
 	// ordinary Records/Finals views intentionally omit that pair so callers
 	// cannot publish it without an explicit compatibility proof.
-	AnonymousFinals []historyTieredFinal
-	Truncated       bool
-	TooLarge        bool
-	Incomplete      bool
-	BytesRead       int64
-	LinesRead       int
-	MaxTailBytes    int64
+	AnonymousFinals      []historyTieredFinal
+	Truncated            bool
+	TooLarge             bool
+	Incomplete           bool
+	BytesRead            int64
+	LinesRead            int
+	MaxTailBytes         int64
+	ReadProofFingerprint string
+	ReadProofStartOffset int64
+	ReadProofEndOffset   int64
+	ReadProofRangeKnown  bool
 }
 
 // historyTieredLineHint is a deliberately conservative, allocation-free
@@ -288,13 +295,30 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			return historyTieredTailResult{}, err
 		}
 	}
+	// Hash the exact bounded suffix consumed by this scan while it is read.
+	// Limiting the reader to the initial file size makes an append racing the
+	// scan part of the next poll rather than silently widening this proof.
+	readEnd := info.Size()
+	readProof := sha256.New()
+	readProofReady := false
+	if identity, identityErr := teamstore.SourceFileIdentityFromFileInfo(path, info); identityErr == nil && strings.TrimSpace(identity) != "" {
+		_, _ = readProof.Write([]byte(identity))
+		_, _ = readProof.Write([]byte{0})
+		_, _ = readProof.Write([]byte(filepath.Clean(path)))
+		_, _ = readProof.Write([]byte{0})
+		_, _ = readProof.Write([]byte(strconv.FormatInt(previous.Offset, 10)))
+		_, _ = readProof.Write([]byte{0})
+		_, _ = readProof.Write([]byte(strconv.FormatInt(readEnd, 10)))
+		_, _ = readProof.Write([]byte{0})
+		readProofReady = true
+	}
 
 	parseState := transcriptParseState{
 		sessionID: strings.TrimSpace(previous.SessionID),
 		threadID:  strings.TrimSpace(previous.ThreadID),
 		turnID:    strings.TrimSpace(previous.TurnID),
 	}
-	reader := bufio.NewReaderSize(f, historyTieredTailReaderSize)
+	reader := bufio.NewReaderSize(io.LimitReader(f, readEnd-previous.Offset), historyTieredTailReaderSize)
 	lineNo := previous.Line
 	offset := previous.Offset
 	pending := previous.pendingAssistant
@@ -361,6 +385,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			if readProofReady {
+				_, _ = readProof.Write(line)
+			}
 			lineStartOffset := offset
 			if err == io.EOF && !bytes.HasSuffix(line, []byte("\n")) {
 				result.Incomplete = true
@@ -679,6 +706,17 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		result.Records = transcript.Records
 	}
 	result.State = next
+	if readProofReady && !result.Truncated && !result.TooLarge && !result.Incomplete && next.Offset == readEnd {
+		// Revalidate the pathname identity after the scan. The sender and
+		// checkpoint CAS perform their own final proof checks, so this is only a
+		// cheap way to pass the exact bytes read to the bridge.
+		if postInfo, postErr := os.Stat(path); postErr == nil && !postInfo.IsDir() && os.SameFile(info, postInfo) && postInfo.Size() >= readEnd {
+			result.ReadProofFingerprint = "sha256:" + hex.EncodeToString(readProof.Sum(nil))
+			result.ReadProofStartOffset = previous.Offset
+			result.ReadProofEndOffset = readEnd
+			result.ReadProofRangeKnown = true
+		}
+	}
 	// Two anonymous finals are ambiguous even when the explicit terminal event
 	// has not arrived yet (for example one event_msg and one response_item). A
 	// single anonymous fragment remains compatible with the existing
