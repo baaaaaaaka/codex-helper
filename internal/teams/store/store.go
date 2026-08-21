@@ -508,6 +508,12 @@ type ImportCheckpoint struct {
 	// complete JSONL record beyond the per-record cap. The cursor remains before
 	// that record; unchanged sources may be skipped until explicit recovery.
 	OversizedRecordBlocked bool `json:"oversized_record_blocked,omitempty"`
+	// SourceRewriteRecoveryIdentity records the source identity for which an
+	// automatic rebase was already attempted. It prevents a blocked, migrated
+	// source with a missing/unreliable anchor from being rescanned from byte zero
+	// on every poll. A new Codex atomic replacement gets a new identity and is
+	// retried; a successful rebase clears this marker.
+	SourceRewriteRecoveryIdentity string `json:"source_rewrite_recovery_identity,omitempty"`
 	// SourceFingerprint is a bounded content fingerprint for the last trusted
 	// cursor.  It is deliberately optional so old checkpoints remain readable;
 	// callers must fail closed rather than use the unchanged-file fast path when
@@ -733,20 +739,21 @@ type HistoryWatchCheckpoint struct {
 	// SourceFingerprint is a bounded fingerprint of the trusted prefix at
 	// Offset.  It is optional for legacy checkpoints; a missing value forces a
 	// conservative migration/reconcile rather than proving an unchanged file.
-	SourceFingerprint      string `json:"source_fingerprint,omitempty"`
-	SourceRewriteBlocked   bool   `json:"source_rewrite_blocked,omitempty"`
-	OversizedRecordBlocked bool   `json:"oversized_record_blocked,omitempty"`
-	Offset                 int64  `json:"offset,omitempty"`
-	Line                   int    `json:"line,omitempty"`
-	SessionID              string `json:"session_id,omitempty"`
-	ThreadID               string `json:"thread_id,omitempty"`
-	TeamsOriginThreadID    string `json:"teams_origin_thread_id,omitempty"`
-	TurnID                 string `json:"turn_id,omitempty"`
-	TeamsOriginTurnID      string `json:"teams_origin_turn_id,omitempty"`
-	ExternalUserPromptSeen bool   `json:"external_user_prompt_seen,omitempty"`
-	LastFinalID            string `json:"last_final_id,omitempty"`
-	LastFinalLine          int    `json:"last_final_line,omitempty"`
-	LastFinalStartOffset   int64  `json:"last_final_start_offset,omitempty"`
+	SourceFingerprint             string `json:"source_fingerprint,omitempty"`
+	SourceRewriteBlocked          bool   `json:"source_rewrite_blocked,omitempty"`
+	OversizedRecordBlocked        bool   `json:"oversized_record_blocked,omitempty"`
+	SourceRewriteRecoveryIdentity string `json:"source_rewrite_recovery_identity,omitempty"`
+	Offset                        int64  `json:"offset,omitempty"`
+	Line                          int    `json:"line,omitempty"`
+	SessionID                     string `json:"session_id,omitempty"`
+	ThreadID                      string `json:"thread_id,omitempty"`
+	TeamsOriginThreadID           string `json:"teams_origin_thread_id,omitempty"`
+	TurnID                        string `json:"turn_id,omitempty"`
+	TeamsOriginTurnID             string `json:"teams_origin_turn_id,omitempty"`
+	ExternalUserPromptSeen        bool   `json:"external_user_prompt_seen,omitempty"`
+	LastFinalID                   string `json:"last_final_id,omitempty"`
+	LastFinalLine                 int    `json:"last_final_line,omitempty"`
+	LastFinalStartOffset          int64  `json:"last_final_start_offset,omitempty"`
 	// LastFinalStartOffsetKnown distinguishes a valid zero-byte final start
 	// from an old checkpoint that never persisted the boundary position.
 	LastFinalStartOffsetKnown bool   `json:"last_final_start_offset_known,omitempty"`

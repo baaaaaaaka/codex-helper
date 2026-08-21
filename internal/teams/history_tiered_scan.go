@@ -42,19 +42,20 @@ var (
 )
 
 type historyTieredFileState struct {
-	Path                   string
-	Size                   int64
-	ModTime                time.Time
-	SourceFingerprint      string
-	SourceRewriteBlocked   bool
-	OversizedRecordBlocked bool
-	Offset                 int64
-	Line                   int
-	SessionID              string
-	ThreadID               string
-	TeamsOriginThreadID    string
-	TurnID                 string
-	TeamsOriginTurnID      string
+	Path                          string
+	Size                          int64
+	ModTime                       time.Time
+	SourceFingerprint             string
+	SourceRewriteBlocked          bool
+	OversizedRecordBlocked        bool
+	SourceRewriteRecoveryIdentity string
+	Offset                        int64
+	Line                          int
+	SessionID                     string
+	ThreadID                      string
+	TeamsOriginThreadID           string
+	TurnID                        string
+	TeamsOriginTurnID             string
 	// ExternalUserPromptSeen is a positive ownership hint for a new root turn.
 	// It is set only by a visible, non-internal user record after the most recent
 	// terminal boundary and is consumed by the following task_started marker.

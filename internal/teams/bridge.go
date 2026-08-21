@@ -18632,6 +18632,22 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	var transcript Transcript
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	allowAmbiguousImport := transcriptImportRunAllowsAmbiguous(importTurnID, "")
+	if !allowAmbiguousImport && checkpoint.SourceRewriteBlocked {
+		if rebased, err := b.rebaseLinkedTranscriptSourceRewrite(ctx, session, codexhistory.Session{
+			SessionID: session.CodexThreadID,
+			FilePath:  filePath,
+		}, checkpoint); err != nil {
+			return transcriptImportResult{}, err
+		} else if rebased {
+			state, err = b.store.Load(ctx)
+			if err != nil {
+				return transcriptImportResult{}, err
+			}
+			checkpoint = state.ImportCheckpoints[checkpointID]
+		} else {
+			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
+		}
+	}
 	sourceSizeBeforeRead, sourceModTimeBeforeRead := transcriptSourceFileState(filePath)
 	if !allowAmbiguousImport && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, filePath) {
 		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); err != nil {
@@ -20889,6 +20905,25 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		return nil
 	}
 	checkpointID := transcriptCheckpointID(session.ID)
+	if hasCheckpoint && checkpoint.SourceRewriteBlocked {
+		if rebased, err := b.rebaseLinkedTranscriptSourceRewrite(ctx, session, local, checkpoint); err != nil {
+			return err
+		} else if rebased {
+			updated, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return nil
+			}
+			checkpoint = updated
+			hasCheckpoint = true
+		} else {
+			// Keep the existing fail-closed behavior until a new paginated
+			// rollout identity supplies a reliable anchor.
+			return nil
+		}
+	}
 	stop, checkpoint, hasCheckpoint, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint)
 	if err != nil {
 		return err
@@ -20897,9 +20932,8 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		return nil
 	}
 	if hasCheckpoint && checkpoint.SourceRewriteBlocked {
-		// This marker is an explicit manual-recovery boundary. A later append or
-		// a source that happens to resemble the old one must not make automatic
-		// sync reinterpret it as trusted again; only publish-history may clear it.
+		// Rebase was attempted above. If it could not prove a stable anchor, keep
+		// the explicit manual-recovery boundary and do not reinterpret the file.
 		return nil
 	}
 	if hasCheckpoint && checkpoint.OversizedRecordBlocked {
@@ -22452,9 +22486,10 @@ func (b *Bridge) blockAutomaticTranscriptSync(ctx context.Context, session Sessi
 func (b *Bridge) blockAutomaticTranscriptSyncForSourceRewrite(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint) error {
 	// Source-proof failure is intentionally fail-closed for automatic history
 	// delivery, but it is silent. The checkpoint records the diagnostic state;
-	// only an explicit publish-history command is allowed to ask the user for a
-	// recovery boundary. This prevents old checkpoints from repeatedly emitting
-	// a long warning on every poll and from becoming a turn-admission gate.
+	// a later Codex paginated migration may clear it only after the old stable
+	// record is found; otherwise explicit publish-history remains the recovery
+	// boundary. This prevents old checkpoints from repeatedly emitting a long
+	// warning on every poll and from becoming a turn-admission gate.
 	if err := b.markTranscriptImportBlockedForSourceRewrite(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
@@ -23351,6 +23386,25 @@ func (b *Bridge) preflightAutomaticTranscriptImportSourceProof(ctx context.Conte
 	if !found {
 		checkpoint = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: session.ID, SourcePath: sourcePath}
 	}
+	if checkpoint.SourceRewriteBlocked {
+		if rebased, err := b.rebaseLinkedTranscriptSourceRewrite(ctx, session, codexhistory.Session{
+			SessionID: session.CodexThreadID,
+			FilePath:  sourcePath,
+		}, checkpoint); err != nil {
+			return outboxQueueOptions{}, err
+		} else if rebased {
+			updated, updatedFound, err := b.store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil {
+				return outboxQueueOptions{}, err
+			}
+			if !updatedFound {
+				return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
+			}
+			checkpoint = updated
+		} else {
+			return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
+		}
+	}
 	sourceSize, _ := transcriptSourceFileState(sourcePath)
 	if checkpoint.SourceRewriteBlocked {
 		return outboxQueueOptions{}, errTranscriptAutomaticSourceProofUnavailable
@@ -23606,26 +23660,27 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			return previous, false, teamstore.ErrUnresolvedExecution
 		}
 		next := teamstore.ImportCheckpoint{
-			ID:                        checkpointID,
-			SessionID:                 session.ID,
-			SourcePath:                sourcePath,
-			SourceFingerprint:         firstNonEmptyString(candidateFingerprint, previous.SourceFingerprint),
-			LastRecordID:              lastRecordID,
-			LastSourceLine:            lastLine,
-			LastOffset:                firstNonZeroInt64(lastOffset, previous.LastOffset),
-			LastOffsetKnown:           true,
-			SourceSize:                sourceSize,
-			SourceModTime:             sourceModTime,
-			ImportTurnID:              previous.ImportTurnID,
-			KindPrefix:                previous.KindPrefix,
-			Status:                    status,
-			UnresolvedExecution:       previous.UnresolvedExecution,
-			ExecutionAnchorGeneration: previous.ExecutionAnchorGeneration,
-			SourceRewriteBlocked:      previous.SourceRewriteBlocked,
-			OversizedRecordBlocked:    false,
-			CompletionPending:         previous.CompletionPending,
-			LegacyProbeRevision:       previous.LegacyProbeRevision,
-			UpdatedAt:                 now,
+			ID:                            checkpointID,
+			SessionID:                     session.ID,
+			SourcePath:                    sourcePath,
+			SourceFingerprint:             firstNonEmptyString(candidateFingerprint, previous.SourceFingerprint),
+			LastRecordID:                  lastRecordID,
+			LastSourceLine:                lastLine,
+			LastOffset:                    firstNonZeroInt64(lastOffset, previous.LastOffset),
+			LastOffsetKnown:               true,
+			SourceSize:                    sourceSize,
+			SourceModTime:                 sourceModTime,
+			ImportTurnID:                  previous.ImportTurnID,
+			KindPrefix:                    previous.KindPrefix,
+			Status:                        status,
+			UnresolvedExecution:           previous.UnresolvedExecution,
+			ExecutionAnchorGeneration:     previous.ExecutionAnchorGeneration,
+			SourceRewriteBlocked:          previous.SourceRewriteBlocked,
+			OversizedRecordBlocked:        false,
+			SourceRewriteRecoveryIdentity: previous.SourceRewriteRecoveryIdentity,
+			CompletionPending:             previous.CompletionPending,
+			LegacyProbeRevision:           previous.LegacyProbeRevision,
+			UpdatedAt:                     now,
 		}
 		if importCheckpointSameExceptUpdatedAt(previous, next) {
 			return previous, false, nil
@@ -23671,6 +23726,7 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.SourcePath == right.SourcePath &&
 		left.SourceRewriteBlocked == right.SourceRewriteBlocked &&
 		left.OversizedRecordBlocked == right.OversizedRecordBlocked &&
+		left.SourceRewriteRecoveryIdentity == right.SourceRewriteRecoveryIdentity &&
 		left.SourceFingerprint == right.SourceFingerprint &&
 		left.LastRecordID == right.LastRecordID &&
 		left.LastSourceLine == right.LastSourceLine &&
@@ -24178,6 +24234,7 @@ func (b *Bridge) markTranscriptImportBlockedWithOptions(ctx context.Context, ses
 		if sourceRewrite {
 			checkpoint.SourceRewriteBlocked = true
 			checkpoint.OversizedRecordBlocked = false
+			checkpoint.SourceRewriteRecoveryIdentity = ""
 		}
 		if strings.TrimSpace(sourcePath) != "" {
 			checkpoint.SourcePath = sourcePath
