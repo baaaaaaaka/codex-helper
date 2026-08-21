@@ -49,8 +49,8 @@ func BenchmarkReadLinkedTranscriptDeltaLargeTailFromOffset(b *testing.B) {
 		if err != nil {
 			b.Fatalf("read linked transcript delta: %v", err)
 		}
-		if !transcriptHasDiagnostic(delta, "tail_too_large") || len(delta.Records) != 0 {
-			b.Fatalf("delta = %#v, want bounded tail diagnostic and no records", delta)
+		if transcriptHasDiagnostic(delta, "tail_too_large") || len(delta.Records) == 0 || transcriptRecordsContainText(delta.Records, "large linked final") {
+			b.Fatalf("delta = %#v, want bounded prefix records without the final beyond the scan budget", delta)
 		}
 	}
 }

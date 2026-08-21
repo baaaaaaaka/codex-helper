@@ -20,6 +20,12 @@ import (
 
 const historyTieredTailReaderSize = 4 * 1024
 
+// A tail budget may end in the middle of one JSONL record. Allow that single
+// record to finish without widening the normal scan to the rest of the file;
+// genuinely pathological records remain resumable/quarantined at the same
+// line boundary.
+const historyTieredMaxRecordBytes = 8 * 1024 * 1024
+
 var (
 	historyTieredContinuationMarkers = [][]byte{
 		[]byte(`"task_started"`), []byte(`"task.started"`), []byte(`"task/started"`), []byte(`"task-started"`),
@@ -36,18 +42,19 @@ var (
 )
 
 type historyTieredFileState struct {
-	Path                 string
-	Size                 int64
-	ModTime              time.Time
-	SourceFingerprint    string
-	SourceRewriteBlocked bool
-	Offset               int64
-	Line                 int
-	SessionID            string
-	ThreadID             string
-	TeamsOriginThreadID  string
-	TurnID               string
-	TeamsOriginTurnID    string
+	Path                   string
+	Size                   int64
+	ModTime                time.Time
+	SourceFingerprint      string
+	SourceRewriteBlocked   bool
+	OversizedRecordBlocked bool
+	Offset                 int64
+	Line                   int
+	SessionID              string
+	ThreadID               string
+	TeamsOriginThreadID    string
+	TurnID                 string
+	TeamsOriginTurnID      string
 	// ExternalUserPromptSeen is a positive ownership hint for a new root turn.
 	// It is set only by a visible, non-internal user record after the most recent
 	// terminal boundary and is consumed by the following task_started marker.
@@ -100,9 +107,18 @@ type historyTieredTailResult struct {
 	// AnonymousFinals is retained separately when a pair is quarantined. The
 	// ordinary Records/Finals views intentionally omit that pair so callers
 	// cannot publish it without an explicit compatibility proof.
-	AnonymousFinals      []historyTieredFinal
-	Truncated            bool
-	TooLarge             bool
+	AnonymousFinals []historyTieredFinal
+	Truncated       bool
+	TooLarge        bool
+	// BudgetExhausted means the scanner consumed a safe complete prefix of a
+	// tail larger than MaxTailBytes. TooLarge is retained for compatibility with
+	// older callers, but BudgetExhausted makes this a resumable result rather
+	// than a hard history gate.
+	BudgetExhausted bool
+	// OversizedRecord means the scanner reached one complete JSONL record that
+	// exceeds the explicit per-record cap. It is a durable quarantine boundary,
+	// not resumable byte-budget progress.
+	OversizedRecord      bool
 	Incomplete           bool
 	BytesRead            int64
 	LinesRead            int
@@ -211,6 +227,19 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 		}
 		state := states[path]
 		truncated := state.Size > 0 && info.Size() < state.Size
+		// A bounded scan can deliberately leave a durable cursor before the
+		// observed EOF. The file may be unchanged since that scan, but the
+		// unread suffix is still work and must be revisited on the next poll.
+		// Stat equality alone cannot represent this resumable state.
+		if state.Offset > 0 && state.Offset < info.Size() {
+			changes = append(changes, historyTieredStatChange{
+				Path:      path,
+				Size:      info.Size(),
+				ModTime:   info.ModTime(),
+				Truncated: truncated,
+			})
+			continue
+		}
 		if state.Size == info.Size() && state.ModTime.Equal(info.ModTime()) {
 			if !verifyUnchanged || info.Size() == 0 {
 				continue
@@ -277,12 +306,10 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	}
 
 	tailBytes := info.Size() - previous.Offset
-	if maxTailBytes > 0 && tailBytes > maxTailBytes {
-		return historyTieredTailResult{
-			State:        previous,
-			TooLarge:     true,
-			MaxTailBytes: maxTailBytes,
-		}, nil
+	scanEnd := info.Size()
+	budgeted := maxTailBytes > 0 && tailBytes > maxTailBytes
+	if budgeted {
+		scanEnd = previous.Offset + maxTailBytes
 	}
 
 	f, err := os.Open(path)
@@ -318,7 +345,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		threadID:  strings.TrimSpace(previous.ThreadID),
 		turnID:    strings.TrimSpace(previous.TurnID),
 	}
-	reader := bufio.NewReaderSize(io.LimitReader(f, readEnd-previous.Offset), historyTieredTailReaderSize)
+	reader := bufio.NewReaderSize(io.LimitReader(f, scanEnd-previous.Offset), historyTieredTailReaderSize)
 	lineNo := previous.Line
 	offset := previous.Offset
 	pending := previous.pendingAssistant
@@ -381,22 +408,47 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	result := historyTieredTailResult{
 		State:        next,
 		MaxTailBytes: maxTailBytes,
+		TooLarge:     budgeted,
 	}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			if readProofReady {
-				_, _ = readProof.Write(line)
-			}
 			lineStartOffset := offset
 			if err == io.EOF && !bytes.HasSuffix(line, []byte("\n")) {
-				result.Incomplete = true
-				// Keep the source-size cursor at the last complete byte.  The
-				// file may grow by completing this same line; recording the full
-				// current size would make the next pass incorrectly take the
-				// unchanged fast path and lose the tail.
-				next.Size = lineStartOffset
-				break
+				if budgeted {
+					completed, complete, oversized, readErr := historyTieredCompleteBudgetedLine(f, line, historyTieredMaxRecordBytes)
+					if readErr != nil {
+						return result, readErr
+					}
+					if complete {
+						line = completed
+						err = nil
+					} else if oversized {
+						// Keep the cursor before an oversized JSONL record. It is
+						// not safe to skip an unparsed line; explicit history import
+						// remains available for this pathological record.
+						result.OversizedRecord = true
+						break
+					} else {
+						result.Incomplete = true
+						next.Size = lineStartOffset
+						break
+					}
+				} else {
+					if readProofReady {
+						_, _ = readProof.Write(line)
+					}
+					result.Incomplete = true
+					// Keep the source-size cursor at the last complete byte. The
+					// file may grow by completing this same line; recording the full
+					// current size would make the next pass incorrectly take the
+					// unchanged fast path and lose the tail.
+					next.Size = lineStartOffset
+					break
+				}
+			}
+			if readProofReady {
+				_, _ = readProof.Write(line)
 			}
 			lineNo++
 			offset += int64(len(line))
@@ -685,6 +737,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			return result, err
 		}
 	}
+	if budgeted && !result.OversizedRecord && !result.Incomplete && !result.Truncated {
+		result.BudgetExhausted = true
+	}
 
 	next.Offset = offset
 	next.Line = lineNo
@@ -714,6 +769,14 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			result.ReadProofFingerprint = "sha256:" + hex.EncodeToString(readProof.Sum(nil))
 			result.ReadProofStartOffset = previous.Offset
 			result.ReadProofEndOffset = readEnd
+			result.ReadProofRangeKnown = true
+		}
+	}
+	if budgeted && !result.Truncated && !result.Incomplete && next.Offset > previous.Offset {
+		if fingerprint := transcriptSourceRangeFingerprint(path, previous.Offset, next.Offset); fingerprint != "" {
+			result.ReadProofFingerprint = fingerprint
+			result.ReadProofStartOffset = previous.Offset
+			result.ReadProofEndOffset = next.Offset
 			result.ReadProofRangeKnown = true
 		}
 	}
@@ -755,6 +818,41 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		result.State.UnresolvedContinuationOffset = result.State.Offset
 	}
 	return result, nil
+}
+
+func historyTieredCompleteBudgetedLine(file *os.File, prefix []byte, maxBytes int64) ([]byte, bool, bool, error) {
+	if file == nil || maxBytes <= 0 {
+		return nil, false, true, nil
+	}
+	line := append([]byte(nil), prefix...)
+	reader := bufio.NewReaderSize(file, historyTieredTailReaderSize)
+	for {
+		if int64(len(line)) >= maxBytes {
+			return nil, false, true, nil
+		}
+		chunk, err := reader.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if int64(len(line)+len(chunk)) > maxBytes {
+				return nil, false, true, nil
+			}
+			line = append(line, chunk...)
+			if bytes.HasSuffix(chunk, []byte("\n")) {
+				return line, true, false, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return line, false, false, nil
+			}
+			if err == bufio.ErrBufferFull {
+				// ReadSlice returns the available fragment and keeps the reader
+				// positioned at the next byte. Continue accumulating only this
+				// single record until the explicit cap is reached.
+				continue
+			}
+			return nil, false, false, err
+		}
+	}
 }
 
 func historyTieredLineHasExplicitTurnID(line []byte) bool {

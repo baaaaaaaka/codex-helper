@@ -8388,6 +8388,7 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 	if message := attachmentPreflightMessage(msg); message != "" {
 		return b.rejectSessionAttachmentWithMessage(ctx, session, msg, message)
 	}
+	queueOptions := turnQueueOptions{}
 	if b.asyncTurns {
 		var turns sessionTurnQueueState
 		if knownTurns != nil {
@@ -8430,6 +8431,7 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 		if err != nil {
 			return err
 		}
+		queueOptions.StartNewCodexThread = gate.StartNewCodexThread
 		if gate.Block {
 			if err := b.ensureDurableSession(ctx, session); err != nil {
 				return err
@@ -8461,7 +8463,7 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
+	turn, turnCreated, err := b.queueTurnWithOptions(ctx, session, inbound, queueOptions)
 	if err != nil {
 		return err
 	}
@@ -9333,14 +9335,16 @@ func (b *Bridge) processQueuedTurnsForSession(ctx context.Context, session *Sess
 		}
 		return b.applyPendingSessionModelProfileIfIdle(ctx, session)
 	}
-	if unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, *session); err != nil {
+	unresolved, err := b.sessionLiveExecutionOwnershipUnresolved(ctx, *session)
+	if err != nil {
 		return err
-	} else if unresolved {
-		gate := localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
+	}
+	if unresolved {
+		if prepared, markErr := b.store.MarkTurnForIsolatedCodexThread(ctx, queued.ID); markErr != nil && !errors.Is(markErr, teamstore.ErrUnresolvedExecution) {
+			return markErr
+		} else if markErr == nil && prepared.ID != "" {
+			queued = prepared
 		}
-		return b.sendQueuedTurnAttentionIfDue(ctx, session, queued, gate, time.Now())
 	}
 	if err := b.activatePendingSessionModelProfileForQueuedTurn(ctx, session, queued); err != nil {
 		return err
@@ -11475,7 +11479,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		sessionID = session.ID
 	}
 	if turn.Status == teamstore.TurnStatusRunning {
-		if unresolved, ownershipErr := b.sessionExecutionOwnershipUnresolved(ctx, *session); ownershipErr != nil {
+		if unresolved, ownershipErr := b.liveTurnExecutionOwnershipUnresolved(ctx, *session, turn); ownershipErr != nil {
 			return ownershipErr
 		} else if unresolved {
 			requeued, requeueErr := b.store.RequeueTurn(ctx, turn.ID)
@@ -11522,20 +11526,37 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	// Recheck a still-queued turn immediately before any thread resolution or
 	// MarkTurnRunning so deferred/control fallback cannot bypass the anchor.
 	if turn.Status == teamstore.TurnStatusQueued {
-		if unresolved, ownershipErr := b.sessionExecutionOwnershipUnresolved(ctx, *session); ownershipErr != nil {
+		if unresolved, ownershipErr := b.liveTurnExecutionOwnershipUnresolved(ctx, *session, turn); ownershipErr != nil {
 			return ownershipErr
 		} else if unresolved {
-			gate := localCodexBeforeTeamsGate{
-				Block:   true,
-				AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
+			// A queued normal Teams message may have captured the quarantined old
+			// thread just before a different message established the live branch.
+			// Repair that projection only after the exceptional gate is confirmed;
+			// the ordinary queued-turn path performs no extra durable write.
+			prepared, markErr := b.store.MarkTurnForIsolatedCodexThread(ctx, turn.ID)
+			if markErr != nil && !errors.Is(markErr, teamstore.ErrUnresolvedExecution) {
+				return markErr
 			}
-			return b.sendQueuedTurnAttentionIfDue(ctx, session, turn, gate, time.Now())
+			if markErr == nil && prepared.ID != "" {
+				turn = prepared
+				session = sessionWithTurnExecutionConfig(session, turn)
+				unresolved = false
+			}
+			if unresolved {
+				gate := localCodexBeforeTeamsGate{
+					Block:   true,
+					AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
+				}
+				return b.sendQueuedTurnAttentionIfDue(ctx, session, turn, gate, time.Now())
+			}
 		}
 	}
-	if blocked, err := b.resolveCodexThreadBeforeRun(ctx, session, turn); err != nil {
-		return err
-	} else if blocked {
-		return nil
+	if !turn.StartNewCodexThread {
+		if blocked, err := b.resolveCodexThreadBeforeRun(ctx, session, turn); err != nil {
+			return err
+		} else if blocked {
+			return nil
+		}
 	}
 	startedTurn, err := b.store.MarkTurnRunning(ctx, turn.ID, session.CodexThreadID, "")
 	if err != nil {
@@ -11564,7 +11585,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 	// it because transcript recovery can persist an anchor between the earlier
 	// bridge snapshot and this point; RequeueTurn then restores the queued
 	// state without dispatching a second same-thread request.
-	if unresolved, ownershipErr := b.sessionExecutionOwnershipUnresolved(ctx, *session); ownershipErr != nil {
+	if unresolved, ownershipErr := b.liveTurnExecutionOwnershipUnresolved(ctx, *session, turn); ownershipErr != nil {
 		durableCtx := ctx
 		if durableCtx == nil || durableCtx.Err() != nil {
 			durableCtx = context.Background()
@@ -12424,26 +12445,44 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 	if session == nil {
 		return false, nil
 	}
-	// Keep the ownership check at the claim boundary too. Deferred/control
-	// replay can enter here without the ordinary inbound gate, and a stale
-	// caller snapshot must not bypass a persisted unresolved execution anchor.
-	if unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, *session); err != nil {
+	// Keep the live ownership check at the claim boundary too. Deferred/control
+	// replay can enter here without the ordinary inbound gate. A stale history
+	// anchor may upgrade an old queued turn to an isolated branch, but it must
+	// never permit a same-thread claim.
+	if unresolved, err := b.sessionLiveExecutionOwnershipUnresolved(ctx, *session); err != nil {
 		return false, err
 	} else if unresolved {
-		gate := localCodexBeforeTeamsGate{
-			Block:   true,
-			AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
-		}
 		queueState, loadErr := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
 		if loadErr != nil {
 			return false, loadErr
 		}
 		if queued, ok := oldestQueuedTurnForSessionState(queueState, session.ID); ok {
-			if noticeErr := b.sendQueuedTurnAttentionIfDue(ctx, session, queued, gate, time.Now()); noticeErr != nil {
-				return false, noticeErr
+			// Repair a queued row captured before the first isolated branch was
+			// started. Once a live branch exists, ClaimNextQueuedTurn retargets
+			// stale rows in its own transaction without this extra write.
+			prepared, markErr := b.store.MarkTurnForIsolatedCodexThread(ctx, queued.ID)
+			if markErr != nil && !errors.Is(markErr, teamstore.ErrUnresolvedExecution) {
+				return false, markErr
+			}
+			if markErr == nil && prepared.ID != "" {
+				queueState, loadErr = b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
+				if loadErr != nil {
+					return false, loadErr
+				}
 			}
 		}
-		return false, nil
+		if sessionTurnQueueStateFromSnapshot(queueState, session.ID).Running {
+			gate := localCodexBeforeTeamsGate{
+				Block:   true,
+				AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
+			}
+			if queued, ok := oldestQueuedTurnForSessionState(queueState, session.ID); ok {
+				if noticeErr := b.sendQueuedTurnAttentionIfDue(ctx, session, queued, gate, time.Now()); noticeErr != nil {
+					return false, noticeErr
+				}
+			}
+			return false, nil
+		}
 	}
 	claimed, ok, err := b.store.ClaimNextQueuedTurn(ctx, session.ID)
 	if err != nil || !ok {
@@ -14403,7 +14442,15 @@ func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, 
 	return nil
 }
 
+type turnQueueOptions struct {
+	StartNewCodexThread bool
+}
+
 func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamstore.InboundEvent) (teamstore.Turn, bool, error) {
+	return b.queueTurnWithOptions(ctx, session, inbound, turnQueueOptions{})
+}
+
+func (b *Bridge) queueTurnWithOptions(ctx context.Context, session *Session, inbound teamstore.InboundEvent, options turnQueueOptions) (teamstore.Turn, bool, error) {
 	b.modelProfileMu.Lock()
 	defer b.modelProfileMu.Unlock()
 	leaseGeneration := b.currentLeaseGeneration()
@@ -14430,6 +14477,7 @@ func (b *Bridge) queueTurn(ctx context.Context, session *Session, inbound teamst
 		MachineID:             b.machine.ID,
 		LeaseGeneration:       leaseGeneration,
 		CodexThreadID:         threadID,
+		StartNewCodexThread:   options.StartNewCodexThread,
 		ModelGeneration:       modelGeneration,
 		ModelProfile:          modelSnapshot,
 		ReasoningEffort:       reasoningEffort,
@@ -14442,6 +14490,11 @@ func sessionWithTurnExecutionConfig(session *Session, turn teamstore.Turn) *Sess
 		return session
 	}
 	clone := *session
+	if turn.StartNewCodexThread {
+		// An isolated live branch must never resume the quarantined historical
+		// thread. Empty means StartThread for both app-server and CLI adapters.
+		clone.CodexThreadID = ""
+	}
 	if !turn.ModelProfile.IsZero() {
 		clone.ModelProfile = turn.ModelProfile
 	}
@@ -15364,7 +15417,7 @@ func transcriptSourceReadProofMatches(proof outboxQueueOptions) bool {
 	// verification bounded just like the import-side proof so a malformed or
 	// stale row cannot make the outbox lock hold while it reads an arbitrary
 	// amount of a large transcript.
-	if proof.ExpectedSourceReadEndOffset-proof.ExpectedSourceReadStartOffset > int64(historyTieredMaxTailBytes) {
+	if proof.ExpectedSourceReadEndOffset-proof.ExpectedSourceReadStartOffset > int64(historyTieredMaxTailBytes+historyTieredMaxRecordBytes) {
 		return false
 	}
 	return transcriptSourceRangeFingerprint(proof.ExpectedSourcePath, proof.ExpectedSourceReadStartOffset, proof.ExpectedSourceReadEndOffset) == strings.TrimSpace(proof.ExpectedSourceReadFingerprint)
@@ -19292,8 +19345,9 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 }
 
 type localCodexBeforeTeamsGate struct {
-	Block   bool
-	AckBody string
+	Block               bool
+	AckBody             string
+	StartNewCodexThread bool
 }
 
 type localTranscriptDeltaState struct {
@@ -19320,9 +19374,30 @@ func (b *Bridge) prepareLocalCodexBeforeTeamsTurnWithQueueState(ctx context.Cont
 	if err := b.ensureDurableSession(ctx, session); err != nil {
 		return localCodexBeforeTeamsGate{}, err
 	}
-	if unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, *session); err != nil {
+	if unresolved, err := b.sessionLiveExecutionOwnershipUnresolved(ctx, *session); err != nil {
 		return localCodexBeforeTeamsGate{}, err
 	} else if unresolved {
+		running := false
+		if knownTurns != nil {
+			running = knownTurns.Running
+		} else {
+			queueState, err := b.store.SessionActiveTurnQueueSnapshot(ctx, session.ID)
+			if err != nil {
+				return localCodexBeforeTeamsGate{}, err
+			}
+			for _, turn := range queueState.Turns {
+				if turn.SessionID == session.ID && turn.Status == teamstore.TurnStatusRunning {
+					running = true
+					break
+				}
+			}
+		}
+		if !running {
+			// The old execution remains fenced for history and delivery, but it
+			// no longer owns the live conversation. Start this turn on a fresh
+			// Codex thread instead of making a stale checkpoint a queue gate.
+			return localCodexBeforeTeamsGate{StartNewCodexThread: true}, nil
+		}
 		return localCodexBeforeTeamsGate{
 			Block:   true,
 			AckBody: "⚠️ Queued. A previous Codex execution is still unconfirmed; I will not start another same-thread turn or retry automatically. Check recent work, then send `helper publish-history` if you want to publish pending history.",
@@ -20743,6 +20818,59 @@ func (b *Bridge) syncSessionTranscript(ctx context.Context, session Session, loc
 	return b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint)
 }
 
+// seedBoundedTranscriptCheckpoint establishes an identity-bound empty prefix
+// for a newly discovered large source, or for the pre-cursor blocked row that
+// an older automatic importer left behind. It deliberately refuses to replace
+// a source-rewrite fence or a checkpoint that already owns a record cursor.
+// The next incremental scan supplies the stronger read-range proof before any
+// visible delivery or cursor advance.
+func (b *Bridge) seedBoundedTranscriptCheckpoint(ctx context.Context, session Session, local codexhistory.Session, checkpointID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(local.FilePath) == "" {
+		return false, nil
+	}
+	sourceSize, sourceModTime := transcriptSourceFileState(local.FilePath)
+	if sourceSize <= historyTieredMaxTailBytes {
+		return false, nil
+	}
+	_, changed, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(previous teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if found && previous.SourceRewriteBlocked {
+			return previous, false, nil
+		}
+		if found && strings.TrimSpace(previous.LastRecordID) != "" {
+			return previous, false, nil
+		}
+		if found && previous.LastOffsetKnown && strings.TrimSpace(previous.SourceFingerprint) != "" && strings.TrimSpace(previous.SourcePath) != "" {
+			return previous, false, nil
+		}
+		fingerprint := transcriptCheckpointSourceFingerprint(local.FilePath, 0)
+		if strings.TrimSpace(fingerprint) == "" {
+			return previous, false, errTranscriptAutomaticSourceProofUnavailable
+		}
+		next := previous
+		if strings.TrimSpace(next.ID) == "" {
+			next.ID = checkpointID
+		}
+		if strings.TrimSpace(next.SessionID) == "" {
+			next.SessionID = session.ID
+		}
+		next.SourcePath = local.FilePath
+		next.SourceFingerprint = fingerprint
+		next.LastRecordID = ""
+		next.LastSourceLine = 0
+		next.LastOffset = 0
+		next.LastOffsetKnown = true
+		next.SourceSize = sourceSize
+		next.SourceModTime = sourceModTime
+		next.Status = importCheckpointStatusComplete
+		next.CompletionPending = false
+		next.SourceRewriteBlocked = false
+		next.OversizedRecordBlocked = false
+		next.UpdatedAt = now
+		return next, true, nil
+	})
+	return changed, err
+}
+
 func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session Session, local codexhistory.Session, state teamstore.State, checkpoint teamstore.ImportCheckpoint, hasCheckpoint bool) (err error) {
 	defer func() {
 		// A fork can begin after the initial read-only ParentFork check. The
@@ -20774,6 +20902,18 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		// sync reinterpret it as trusted again; only publish-history may clear it.
 		return nil
 	}
+	if hasCheckpoint && checkpoint.OversizedRecordBlocked {
+		// A pathological record is a durable manual-recovery boundary. Avoid
+		// rescanning the same bounded prefix on every background poll while still
+		// checking that the trusted prefix itself has not been replaced.
+		if !linkedCheckpointPrefixMatches(local.FilePath, checkpoint) {
+			return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
+		}
+		if sourceSize, sourceModTime := transcriptSourceFileState(local.FilePath); sourceSize == checkpoint.SourceSize &&
+			!sourceModTime.IsZero() && sourceModTime.Equal(checkpoint.SourceModTime) {
+			return nil
+		}
+	}
 	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
 		return err
 	}
@@ -20803,49 +20943,84 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	if hasCheckpoint && transcriptImportCheckpointNeedsBudgetedResume(checkpoint, local.FilePath) {
 		return b.resumeBudgetedTranscriptImport(ctx, session, local, checkpoint)
 	}
+	if hasCheckpoint && !checkpoint.SourceRewriteBlocked && strings.TrimSpace(checkpoint.LastRecordID) == "" {
+		if changed, seedErr := b.seedBoundedTranscriptCheckpoint(ctx, session, local, checkpointID); seedErr != nil {
+			return seedErr
+		} else if changed {
+			state, err = b.store.TranscriptImportStateSnapshot(ctx)
+			if err != nil {
+				return err
+			}
+			checkpoint, hasCheckpoint = state.ImportCheckpoints[checkpointID]
+		}
+	}
 	if !hasCheckpoint {
-		// A first-discovery read has no prior cursor to authenticate. Capture a
-		// bounded proof of the complete source before parsing it, then require the
-		// same proof again before seeding the checkpoint. Without this, an
-		// in-place rewrite between ReadSessionTranscript and the checkpoint write
-		// could make records from source A look like the already-consumed prefix
-		// of source B. This is a cold discovery path; ordinary incremental polls
-		// never execute it.
 		sourceSizeBeforeRead, _ := transcriptSourceFileState(local.FilePath)
-		initialSourceProof := transcriptAutomaticImportProofQueueOptions(local.FilePath, teamstore.ImportCheckpoint{
-			ID:         checkpointID,
-			SessionID:  session.ID,
-			SourcePath: local.FilePath,
-		}, sourceSizeBeforeRead)
-		if strings.TrimSpace(initialSourceProof.ExpectedSourceFingerprint) == "" || !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
-			if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+		if sourceSizeBeforeRead > historyTieredMaxTailBytes {
+			// A newly discovered large transcript must enter the same resumable
+			// bounded scanner as an existing linked checkpoint. A full-file proof
+			// would either read an unbounded source or turn an ordinary large
+			// backlog into a permanent automatic source-proof block. The empty
+			// prefix is a valid, identity-bound starting boundary; every later
+			// cursor still requires the normal read-range proof and checkpoint CAS.
+			_, seedErr := b.seedBoundedTranscriptCheckpoint(ctx, session, local, checkpointID)
+			if seedErr != nil {
+				return seedErr
+			}
+			state, err = b.store.TranscriptImportStateSnapshot(ctx)
+			if err != nil {
 				return err
 			}
-			return nil
-		}
-		transcript, err := ReadSessionTranscript(local.FilePath)
-		if err != nil {
-			return err
-		}
-		if len(transcript.Records) == 0 {
-			return nil
-		}
-		// The initial full-transcript read is also subject to the second gate.
-		// An execution can become ambiguous while the read is in progress; do
-		// not advance a fresh checkpoint until ownership is checked again.
-		if stop, _, _, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint); err != nil {
-			return err
-		} else if stop {
-			return nil
-		}
-		if !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
-			if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+			checkpoint, hasCheckpoint = state.ImportCheckpoints[checkpointID]
+			if !hasCheckpoint {
+				return errTranscriptAutomaticSourceProofUnavailable
+			}
+			// Continue through the ordinary incremental path below. It will scan
+			// only a bounded prefix and queue a durable resumable checkpoint.
+		} else {
+			// A first-discovery read has no prior cursor to authenticate. Capture a
+			// bounded proof of the complete source before parsing it, then require the
+			// same proof again before seeding the checkpoint. Without this, an
+			// in-place rewrite between ReadSessionTranscript and the checkpoint write
+			// could make records from source A look like the already-consumed prefix
+			// of source B. This is a cold discovery path; ordinary incremental polls
+			// never execute it.
+			sourceSizeBeforeRead, _ := transcriptSourceFileState(local.FilePath)
+			initialSourceProof := transcriptAutomaticImportProofQueueOptions(local.FilePath, teamstore.ImportCheckpoint{
+				ID:         checkpointID,
+				SessionID:  session.ID,
+				SourcePath: local.FilePath,
+			}, sourceSizeBeforeRead)
+			if strings.TrimSpace(initialSourceProof.ExpectedSourceFingerprint) == "" || !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
+				if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+					return err
+				}
+				return nil
+			}
+			transcript, err := ReadSessionTranscript(local.FilePath)
+			if err != nil {
 				return err
 			}
-			return nil
+			if len(transcript.Records) == 0 {
+				return nil
+			}
+			// The initial full-transcript read is also subject to the second gate.
+			// An execution can become ambiguous while the read is in progress; do
+			// not advance a fresh checkpoint until ownership is checked again.
+			if stop, _, _, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint); err != nil {
+				return err
+			} else if stop {
+				return nil
+			}
+			if !transcriptAutomaticImportSourceProofMatches(initialSourceProof) {
+				if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+					return err
+				}
+				return nil
+			}
+			last := transcript.Records[len(transcript.Records)-1]
+			return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset, checkpointID, initialSourceProof, session.ID)
 		}
-		last := transcript.Records[len(transcript.Records)-1]
-		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, firstNonEmptyString(last.DedupeKey, last.ItemID), last.SourceLine, last.SourceOffset, checkpointID, initialSourceProof, session.ID)
 	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsPositionBackfill(checkpoint, local.FilePath) {
 		updated, ok, err := b.backfillLinkedTranscriptCheckpointPositionWithParentFence(ctx, session, local, checkpoint, session.ID)
@@ -21310,7 +21485,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				Message: "transcript source prefix changed while the incremental tail was scanned",
 			}}}, nil
 		}
-		if result.TooLarge {
+		if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
 			return Transcript{
 				SourceName: filePath,
 				Diagnostics: []TranscriptDiagnostic{{
@@ -21360,7 +21535,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				}},
 			}, nil
 		}
-		if !result.TooLarge && !result.Truncated && !result.Incomplete {
+		if (!result.TooLarge || result.BudgetExhausted) && !result.Truncated && !result.Incomplete {
 			records := filterTranscriptRecordsAfterCheckpoint(result.Records, checkpoint.LastRecordID)
 			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation
 			pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
@@ -21392,7 +21567,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 	if err != nil {
 		return Transcript{}, err
 	}
-	if result.TooLarge {
+	if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
 		return Transcript{
 			SourceName: filePath,
 			Diagnostics: []TranscriptDiagnostic{{
@@ -22057,6 +22232,7 @@ func (b *Bridge) resetFailedTranscriptCheckpointForExplicitImport(ctx context.Co
 		current.SessionID = session.ID
 		current.SourcePath = sourcePath
 		current.SourceRewriteBlocked = false
+		current.OversizedRecordBlocked = false
 		current.LastRecordID = ""
 		current.LastSourceLine = 0
 		current.LastOffset = 0
@@ -22293,7 +22469,19 @@ func (b *Bridge) blockAutomaticTranscriptSyncForTailTooLarge(ctx context.Context
 	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
 		return err
 	}
-	return nil
+	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, transcriptCheckpointID(session.ID), func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		current.ID = transcriptCheckpointID(session.ID)
+		current.SessionID = session.ID
+		current.SourcePath = sourcePath
+		current.OversizedRecordBlocked = true
+		current.SourceSize = sourceSize
+		current.SourceModTime = sourceModTime
+		current.Status = importCheckpointStatusBlocked
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
 }
 
 func shortStableID(seed string) string {
@@ -23434,6 +23622,7 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			UnresolvedExecution:       previous.UnresolvedExecution,
 			ExecutionAnchorGeneration: previous.ExecutionAnchorGeneration,
 			SourceRewriteBlocked:      previous.SourceRewriteBlocked,
+			OversizedRecordBlocked:    false,
 			CompletionPending:         previous.CompletionPending,
 			LegacyProbeRevision:       previous.LegacyProbeRevision,
 			UpdatedAt:                 now,
@@ -23481,6 +23670,7 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.SessionID == right.SessionID &&
 		left.SourcePath == right.SourcePath &&
 		left.SourceRewriteBlocked == right.SourceRewriteBlocked &&
+		left.OversizedRecordBlocked == right.OversizedRecordBlocked &&
 		left.SourceFingerprint == right.SourceFingerprint &&
 		left.LastRecordID == right.LastRecordID &&
 		left.LastSourceLine == right.LastSourceLine &&
@@ -23673,6 +23863,7 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 		if transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
 			checkpoint.SourceRewriteBlocked = false
 		}
+		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
 		checkpoint.CompletionPending = false
@@ -23733,6 +23924,7 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithSourceProof(ctx context.Co
 			// the automatic watcher may trust the new source again.
 			checkpoint.SourceRewriteBlocked = false
 		}
+		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
 		checkpoint.CompletionPending = false
@@ -23878,6 +24070,7 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		if explicitHistory {
 			checkpoint.SourceRewriteBlocked = false
 		}
+		checkpoint.OversizedRecordBlocked = false
 		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
@@ -23984,6 +24177,7 @@ func (b *Bridge) markTranscriptImportBlockedWithOptions(ctx context.Context, ses
 		checkpoint.SessionID = session.ID
 		if sourceRewrite {
 			checkpoint.SourceRewriteBlocked = true
+			checkpoint.OversizedRecordBlocked = false
 		}
 		if strings.TrimSpace(sourcePath) != "" {
 			checkpoint.SourcePath = sourcePath

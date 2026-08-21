@@ -790,3 +790,68 @@ func (b *Bridge) sessionExecutionOwnershipUnresolved(ctx context.Context, sessio
 	}
 	return true, nil
 }
+
+// sessionLiveExecutionOwnershipUnresolved is the live-turn view of the
+// execution fence. The strict view above remains authoritative for transcript
+// recovery and old outbox delivery. Once a fresh thread has been durably
+// recorded as the session's live branch, that old history fence must no longer
+// reject ordinary new Teams turns on the fresh thread.
+func (b *Bridge) sessionLiveExecutionOwnershipUnresolved(ctx context.Context, session Session) (bool, error) {
+	unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, session)
+	if err != nil || !unresolved {
+		return unresolved, err
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, checkpointID)
+	if err != nil {
+		return true, err
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	anchor := checkpoint.UnresolvedExecution
+	liveSessionThreadID := strings.TrimSpace(session.CodexThreadID)
+	// SessionExecutionStateSnapshot intentionally excludes the sessions table
+	// from the normal hot path.  Once the strict probe has found an active
+	// anchor, however, the registry projection may be stale after a restart;
+	// read the single durable session row before deciding whether the fresh live
+	// branch is allowed to proceed.
+	if durableSessions, lookupErr := b.store.SessionsByID(ctx, []string{session.ID}); lookupErr != nil {
+		return true, lookupErr
+	} else if durable, ok := durableSessions[strings.TrimSpace(session.ID)]; ok && strings.TrimSpace(durable.CodexThreadID) != "" {
+		liveSessionThreadID = strings.TrimSpace(durable.CodexThreadID)
+	}
+	if executionAnchorActive(anchor) && strings.TrimSpace(anchor.LiveBranchThreadID) != "" &&
+		strings.TrimSpace(anchor.LiveBranchThreadID) == liveSessionThreadID {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (b *Bridge) liveTurnExecutionOwnershipUnresolved(ctx context.Context, session Session, turn teamstore.Turn) (bool, error) {
+	if turn.StartNewCodexThread {
+		return false, nil
+	}
+	unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, session)
+	if err != nil || !unresolved {
+		return unresolved, err
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, checkpointID)
+	if err != nil {
+		return true, err
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	anchor := checkpoint.UnresolvedExecution
+	liveSessionThreadID := strings.TrimSpace(session.CodexThreadID)
+	if durableSessions, lookupErr := b.store.SessionsByID(ctx, []string{session.ID}); lookupErr != nil {
+		return true, lookupErr
+	} else if durable, ok := durableSessions[strings.TrimSpace(session.ID)]; ok && strings.TrimSpace(durable.CodexThreadID) != "" {
+		liveSessionThreadID = strings.TrimSpace(durable.CodexThreadID)
+	}
+	if executionAnchorActive(anchor) && strings.TrimSpace(anchor.LiveBranchThreadID) != "" {
+		liveThread := strings.TrimSpace(anchor.LiveBranchThreadID)
+		if liveThread == liveSessionThreadID || liveThread == strings.TrimSpace(turn.CodexThreadID) {
+			return false, nil
+		}
+	}
+	return true, nil
+}

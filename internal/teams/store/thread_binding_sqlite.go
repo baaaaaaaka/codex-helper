@@ -40,6 +40,22 @@ func (s *Store) bindCodexThreadForRunningTurnSQLite(ctx context.Context, request
 			if err := validateCodexThreadStartBinding(session, sessionOK, turn, turnOK, lease, owner, request, nowForStore()); err != nil {
 				return err
 			}
+			checkpointID := ""
+			var checkpoint ImportCheckpoint
+			checkpointOK := false
+			if turn.StartNewCodexThread {
+				checkpointID = sessionTranscriptCheckpointID(request.SessionID)
+				var err error
+				checkpoint, checkpointOK, err = loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID)
+				if err != nil {
+					return err
+				}
+				if checkpointOK {
+					if err := validateImportCheckpointProvenance(checkpoint, request.SessionID, checkpointID); err != nil {
+						return err
+					}
+				}
+			}
 
 			result.Session = session
 			result.Turn = turn
@@ -51,11 +67,30 @@ func (s *Store) bindCodexThreadForRunningTurnSQLite(ctx context.Context, request
 			session.UpdatedAt = now
 			turn.CodexThreadID = request.ThreadID
 			turn.UpdatedAt = now
+			state := State{
+				Sessions:          map[string]SessionContext{request.SessionID: session},
+				Turns:             map[string]Turn{request.TurnID: turn},
+				ImportCheckpoints: map[string]ImportCheckpoint{},
+			}
+			previousLiveBranchThreadID := ""
+			if checkpointOK {
+				state.ImportCheckpoints[checkpointID] = checkpoint
+				if checkpoint.UnresolvedExecution != nil {
+					previousLiveBranchThreadID = checkpoint.UnresolvedExecution.LiveBranchThreadID
+				}
+			}
+			recordLiveBranchThreadLocked(&state, turn, request.ThreadID, now)
 			if err := upsertSQLiteSessionTx(ctx, tx, session); err != nil {
 				return err
 			}
 			if err := upsertSQLiteTurnTx(ctx, tx, turn); err != nil {
 				return err
+			}
+			if next := state.ImportCheckpoints[checkpointID]; checkpointOK && next.UnresolvedExecution != nil &&
+				next.UnresolvedExecution.LiveBranchThreadID != previousLiveBranchThreadID {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, next); err != nil {
+					return err
+				}
 			}
 			if err := tx.Commit(); err != nil {
 				return &codexThreadStartBindingCommitError{Err: err}

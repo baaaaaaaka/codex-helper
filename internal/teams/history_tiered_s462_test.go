@@ -704,7 +704,7 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSourceIDChildEventMessageWithoutTu
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptBlocksOversizedTail(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptAdvancesOversizedTailIncrementally(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-s462-linked-large"}}` + "\n" +
 		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -728,34 +728,103 @@ func TestBridgeSyncLinkedTranscriptBlocksOversizedTail(t *testing.T) {
 	if err := os.WriteFile(path, []byte(initial+largeStatus+largeFinal), 0o600); err != nil {
 		t.Fatalf("write oversized transcript: %v", err)
 	}
-	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
 		t.Fatalf("sync oversized linked transcript: %v", err)
 	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if sentPlainContains(*sent, "large tail final") {
 		t.Fatalf("oversized tail final leaked: %#v", *sent)
 	}
-	if len(*sent) != 0 {
-		t.Fatalf("automatic oversized-tail check produced user-visible output: %#v", *sent)
+	if !sentPlainContains(*sent, strings.Repeat("x", 40)) {
+		t.Fatalf("bounded oversized-tail prefix was not delivered: %#v", *sent)
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load final state: %v", err)
 	}
 	after := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if after.Status != importCheckpointStatusBlocked || after.LastRecordID != before.LastRecordID || after.LastOffset != before.LastOffset {
-		t.Fatalf("oversized-tail checkpoint advanced: before=%#v after=%#v", before, after)
+	if after.Status == importCheckpointStatusBlocked || after.LastOffset <= before.LastOffset || after.LastOffset >= after.SourceSize {
+		t.Fatalf("oversized-tail checkpoint did not make a bounded resumable advance: before=%#v after=%#v", before, after)
 	}
 	*sent = nil
-	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-large-tail", "2026-08-08T15:30:00Z", "helper publish-history"), "helper publish-history"); err != nil {
-		t.Fatalf("explicit publish-history for oversized tail: %v", err)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("resume oversized linked transcript: %v", err)
 	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if !sentPlainContains(*sent, "large tail final") {
-		t.Fatalf("explicit publish-history did not release oversized backlog: %#v", *sent)
+		t.Fatalf("automatic bounded resume did not release oversized backlog: %#v", *sent)
 	}
 }
 
-func TestReadLinkedTranscriptDeltaLegacyCheckpointBoundsFullRescan(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptQuarantinesOversizedRecordWithoutRescanning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-s462-linked-oversized-record"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s462-linked-oversized-record", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-oversized-record")
+	giantRecord := `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"` + strings.Repeat("x", historyTieredMaxRecordBytes+1) + `"}}` + "\n"
+	finalRecord := `{"type":"event_msg","payload":{"type":"agent_message","id":"after-oversized-record","phase":"final_answer","message":"must wait for recovery"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial+giantRecord+finalRecord), 0o600); err != nil {
+		t.Fatalf("write oversized-record transcript: %v", err)
+	}
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("first oversized-record sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "must wait for recovery") || sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("automatic oversized-record scan emitted user-visible output: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load quarantined state: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if !checkpoint.OversizedRecordBlocked || checkpoint.Status != importCheckpointStatusBlocked {
+		t.Fatalf("checkpoint = %#v, want an oversized-record quarantine", checkpoint)
+	}
+	if checkpoint.LastOffset <= 0 || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("checkpoint = %#v, want the trusted prefix cursor before the giant record", checkpoint)
+	}
+	firstUpdatedAt := checkpoint.UpdatedAt
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("repeat unchanged oversized-record sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if len(*sent) != 0 {
+		t.Fatalf("unchanged oversized-record checkpoint emitted output on repeat: %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("reload quarantined state: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if !checkpoint.OversizedRecordBlocked || !checkpoint.UpdatedAt.Equal(firstUpdatedAt) {
+		t.Fatalf("unchanged oversized-record checkpoint changed on repeat: first=%#v second=%#v", firstUpdatedAt, checkpoint)
+	}
+
+	// An append changes the source identity metadata. Automatic sync may retry
+	// the bounded recovery path, but it must keep the giant record quarantined.
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"new safe record"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("changed oversized-record sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "must wait for recovery") {
+		t.Fatalf("changed oversized-record sync crossed the quarantined record: %#v", *sent)
+	}
+}
+
+func TestReadLinkedTranscriptDeltaLegacyCheckpointResumesBoundedFullRescan(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	body := `{"type":"session_meta","payload":{"id":"thread-s462-legacy-large"}}` + "\n" +
 		`{"id":"checkpoint","role":"assistant","text":"old answer"}` + "\n" +
@@ -769,8 +838,8 @@ func TestReadLinkedTranscriptDeltaLegacyCheckpointBoundsFullRescan(t *testing.T)
 	if err != nil {
 		t.Fatalf("read legacy oversized delta: %v", err)
 	}
-	if !transcriptHasDiagnostic(delta, "tail_too_large") || len(delta.Records) != 0 {
-		t.Fatalf("legacy oversized delta = %#v, want bounded diagnostic and no records", delta)
+	if transcriptHasDiagnostic(delta, "tail_too_large") || len(delta.Records) != 1 || delta.Records[0].ItemID != "tail" {
+		t.Fatalf("legacy oversized delta = %#v, want the bounded consumed record", delta)
 	}
 }
 

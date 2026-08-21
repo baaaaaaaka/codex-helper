@@ -152,6 +152,11 @@ func (s *Store) bindCodexThreadForRunningTurnJSON(ctx context.Context, request C
 			session.UpdatedAt = now
 			turn.CodexThreadID = request.ThreadID
 			turn.UpdatedAt = now
+			// The callback bind is the first durable proof of the isolated live
+			// branch. Record it in the same state transaction so a helper crash
+			// after binding cannot make the next queued message create another
+			// fresh branch while the old history anchor remains unresolved.
+			recordLiveBranchThreadLocked(&state, turn, request.ThreadID, now)
 			if state.Sessions == nil {
 				state.Sessions = make(map[string]SessionContext)
 			}
@@ -231,10 +236,10 @@ func validateCodexThreadStartBinding(session SessionContext, sessionOK bool, tur
 			return &CodexThreadStartBindingFenceError{SessionID: request.SessionID, TurnID: request.TurnID, Reason: "service owner is serving another turn", Owner: true}
 		}
 	}
-	if existing := strings.TrimSpace(session.CodexThreadID); existing != "" && existing != request.ThreadID {
+	if existing := strings.TrimSpace(session.CodexThreadID); existing != "" && existing != request.ThreadID && !turn.StartNewCodexThread {
 		return CodexThreadBindingConflictError{SessionID: request.SessionID, Existing: existing, Observed: request.ThreadID}
 	}
-	if existing := strings.TrimSpace(turn.CodexThreadID); existing != "" && existing != request.ThreadID {
+	if existing := strings.TrimSpace(turn.CodexThreadID); existing != "" && existing != request.ThreadID && !turn.StartNewCodexThread {
 		return CodexThreadBindingConflictError{SessionID: request.SessionID, Existing: existing, Observed: request.ThreadID}
 	}
 	return nil

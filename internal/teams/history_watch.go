@@ -189,7 +189,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			fileState := historyTieredFileStateFromHistoryWatch(checkpoint)
 			fileState.Path = path
 			states[path] = fileState
-			if fileState.SourceRewriteBlocked {
+			if fileState.SourceRewriteBlocked || fileState.OversizedRecordBlocked {
 				// A blocked checkpoint is an explicit manual-recovery boundary.
 				// Until publish-history/baseline replaces it, no stat change can
 				// make the path automatically trustworthy again. Excluding it here
@@ -411,19 +411,28 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && !historyWatchSourcePrefixMatches(path, previous) {
 		return blockSourceRewrite()
 	}
-	if result.TooLarge {
+	if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
 		// History watch is a periodic discovery path.  Do not turn a large
-		// append into an unbounded read.  Record only the observed file stat so
-		// an unchanged oversized tail is not rescanned on every poll; the logical
-		// cursor remains untouched and an explicit history import can read it.
+		// append into an unbounded read. Record the observed file stat while
+		// keeping the logical cursor untouched; a single pathological record still
+		// requires explicit history import, while a normal bounded prefix remains
+		// resumable through the BudgetExhausted path above.
 		if info, statErr := os.Stat(path); statErr != nil {
 			return statErr
 		} else {
-			result.State.Path = path
-			result.State.Size = info.Size()
-			result.State.ModTime = info.ModTime()
+			blockedState := result.State
+			if result.OversizedRecord {
+				// Do not skip complete records before the pathological line: they
+				// were not published by this pass and must remain in the explicit
+				// recovery range.
+				blockedState = previous
+			}
+			blockedState.Path = path
+			blockedState.Size = info.Size()
+			blockedState.ModTime = info.ModTime()
+			blockedState.OversizedRecordBlocked = result.OversizedRecord
+			return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
 		}
-		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, result.State, now)
 	}
 	if result.Incomplete || result.Truncated {
 		// Do not publish a final observed before an unterminated/truncated
@@ -634,6 +643,7 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		ModTime:                   checkpoint.ModTime,
 		SourceFingerprint:         strings.TrimSpace(checkpoint.SourceFingerprint),
 		SourceRewriteBlocked:      checkpoint.SourceRewriteBlocked,
+		OversizedRecordBlocked:    checkpoint.OversizedRecordBlocked,
 		Offset:                    checkpoint.Offset,
 		Line:                      checkpoint.Line,
 		SessionID:                 strings.TrimSpace(checkpoint.SessionID),
@@ -706,6 +716,7 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		ModTime:                      state.ModTime,
 		SourceFingerprint:            strings.TrimSpace(state.SourceFingerprint),
 		SourceRewriteBlocked:         state.SourceRewriteBlocked,
+		OversizedRecordBlocked:       state.OversizedRecordBlocked,
 		Offset:                       state.Offset,
 		Line:                         state.Line,
 		SessionID:                    strings.TrimSpace(state.SessionID),

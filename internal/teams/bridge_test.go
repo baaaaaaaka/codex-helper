@@ -29327,7 +29327,7 @@ func TestBridgeSyncLinkedTranscriptDeliveredLedgerDoesNotTriggerBacklogBlockAfte
 	}
 }
 
-func TestBridgeReadLinkedTranscriptDeltaBlocksOversizedTail(t *testing.T) {
+func TestBridgeReadLinkedTranscriptDeltaResumesOversizedTail(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-large-linked-tail"}}` + "\n" +
 		`{"id":"old","thread_id":"thread-large-linked-tail","role":"assistant","text":"old answer"}` + "\n"
@@ -29361,11 +29361,14 @@ func TestBridgeReadLinkedTranscriptDeltaBlocksOversizedTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read linked transcript delta: %v", err)
 	}
-	if !transcriptHasDiagnostic(delta, "tail_too_large") {
-		t.Fatalf("delta diagnostics = %#v, want tail_too_large", delta.Diagnostics)
+	if transcriptHasDiagnostic(delta, "tail_too_large") {
+		t.Fatalf("bounded delta retained tail_too_large diagnostic: %#v", delta.Diagnostics)
 	}
-	if len(delta.Records) != 0 {
-		t.Fatalf("oversized tail records = %#v, want no records", delta.Records)
+	if len(delta.Records) == 0 || !transcriptRecordsContainText(delta.Records, strings.Repeat("x", 40)) {
+		t.Fatalf("bounded oversized tail records = %#v, want the consumed prefix", delta.Records)
+	}
+	if transcriptRecordsContainText(delta.Records, "large linked final") {
+		t.Fatalf("bounded oversized tail reached final beyond the scan budget: %#v", delta.Records)
 	}
 	if transcriptRecordsContainText(delta.Records, "old answer") {
 		t.Fatalf("delta records included checkpoint prefix: %#v", delta.Records)
@@ -33321,6 +33324,7 @@ func TestBridgeHistoryWatchBoundsLargeTailWithoutPublishing(t *testing.T) {
 	}
 	var body strings.Builder
 	body.WriteString(`{"type":"session_meta","payload":{"id":"thread-large-tail"}}` + "\n")
+	body.WriteString(`{"type":"response_item","payload":{"id":"prompt-large-tail","type":"message","role":"user","content":[{"type":"input_text","text":"large tail prompt"}]}}` + "\n")
 	body.WriteString(`{"type":"event_msg","payload":{"id":"status-big","type":"agent_message","phase":"commentary","message":"`)
 	body.WriteString(strings.Repeat("x", historyTieredMaxTailBytes+1024))
 	body.WriteString(`"}}` + "\n")
@@ -33333,9 +33337,6 @@ func TestBridgeHistoryWatchBoundsLargeTailWithoutPublishing(t *testing.T) {
 		t.Fatalf("large-tail history watch sync error: %v", err)
 	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
-	if bridge.reg.SessionByCodexThreadID("thread-large-tail") != nil {
-		t.Fatal("history watch created a session from an oversized tail")
-	}
 	if sentPlainContains(*sent, "large tail final") {
 		t.Fatalf("history watch published final from an oversized tail: %#v", *sent)
 	}
@@ -33344,8 +33345,29 @@ func TestBridgeHistoryWatchBoundsLargeTailWithoutPublishing(t *testing.T) {
 		t.Fatalf("history watch state: %v", err)
 	}
 	checkpoint := state.HistoryWatch[historyWatchCheckpointID(transcriptPath)]
-	if checkpoint.Offset != 0 || checkpoint.Size <= 0 {
-		t.Fatalf("oversized-tail checkpoint = %#v, want unchanged cursor with observed size", checkpoint)
+	if checkpoint.Offset <= 0 || checkpoint.Size <= checkpoint.Offset || checkpoint.Offset >= checkpoint.Size {
+		t.Fatalf("oversized-tail checkpoint = %#v, want bounded resumable cursor", checkpoint)
+	}
+	*sent = nil
+	for attempt := 0; attempt < 3 && !sentPlainContains(*sent, "large tail final"); attempt++ {
+		if err := bridge.syncCodexHistoryFinals(context.Background(), now.Add(20*time.Second+time.Duration(attempt+1)*time.Second), false); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("resumed large-tail history watch error: %v", err)
+		}
+		if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("resumed large-tail linked transcript error: %v", err)
+		}
+		if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("flush resumed large-tail history outbox: %v", err)
+		}
+		if err := bridge.flushPendingWorkflowNotifications(context.Background()); err != nil {
+			t.Fatalf("flush resumed large-tail workflow notifications: %v", err)
+		}
+		if err := bridge.flushPendingOutbox(context.Background(), "", ""); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("flush resumed large-tail history outbox after workflow: %v", err)
+		}
+	}
+	if bridge.reg.SessionByCodexThreadID("thread-large-tail") == nil || !sentPlainContains(*sent, "large tail final") {
+		t.Fatalf("history watch did not resume and publish the bounded tail: session=%v sent=%#v", bridge.reg.SessionByCodexThreadID("thread-large-tail"), *sent)
 	}
 }
 
