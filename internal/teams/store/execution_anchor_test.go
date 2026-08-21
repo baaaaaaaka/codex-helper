@@ -47,6 +47,113 @@ func TestMarkTurnRunningRespectsUnresolvedExecutionAcrossBackends(t *testing.T) 
 	}
 }
 
+func TestIsolatedLiveBranchSurvivesUnresolvedHistoryFenceAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "isolated-live-session"
+			const oldTurnID = "isolated-old-turn"
+			const turnID = "isolated-live-turn"
+			const checkpointID = "transcript:" + sessionID
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, CodexThreadID: "thread-old", TeamsChatID: "isolated-live-chat"}
+				state.Turns[oldTurnID] = Turn{ID: oldTurnID, SessionID: sessionID, Status: TurnStatusInterrupted, CodexThreadID: "thread-old", RecoveryReason: "ambiguous Codex execution: helper restart", InterruptedAt: now}
+				state.Turns[turnID] = Turn{ID: turnID, SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", QueuedAt: now, CreatedAt: now}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked, UnresolvedExecution: &ExecutionAnchor{
+					SessionID: sessionID, ThreadID: "thread-old", OuterTurnID: oldTurnID, CodexTurnID: "codex-old", State: "unresolved", Generation: 4,
+				}}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			prepared, err := store.MarkTurnForIsolatedCodexThread(ctx, turnID)
+			if err != nil || !prepared.StartNewCodexThread {
+				t.Fatalf("prepare isolated turn = %#v err=%v", prepared, err)
+			}
+			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || claimed.Status != TurnStatusRunning || claimed.CodexThreadID != "" {
+				t.Fatalf("claim isolated turn = %#v ok=%v err=%v", claimed, ok, err)
+			}
+			bound, err := store.BindCodexThreadForRunningTurn(ctx, CodexThreadStartBindingRequest{
+				SessionID: sessionID, TurnID: turnID, ThreadID: "thread-new", ModelGeneration: 0,
+			})
+			if err != nil || bound.Turn.CodexThreadID != "thread-new" {
+				t.Fatalf("bind isolated thread = %#v err=%v", bound, err)
+			}
+			boundCheckpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || boundCheckpoint.UnresolvedExecution == nil || boundCheckpoint.UnresolvedExecution.LiveBranchThreadID != "thread-new" {
+				t.Fatalf("live branch was not durable at bind = %#v found=%v err=%v", boundCheckpoint, found, err)
+			}
+			final := OutboxMessage{ID: "outbox:" + turnID + ":final", SessionID: sessionID, TurnID: turnID, TeamsChatID: "isolated-live-chat", Kind: "final", NotificationKind: "turn_completed", Body: "new branch final", SourceTextHash: "isolated-live-hash", PartIndex: 1, PartCount: 1}
+			completed, err := store.CompleteTurnWithFinal(ctx, CompleteTurnWithFinalRequest{
+				SessionID: sessionID, TurnID: turnID, CodexThreadID: "thread-new", CodexTurnID: "codex-new",
+				Progress: TranscriptCheckpointProgress{ID: checkpointID, SessionID: sessionID}, FinalOutbox: []OutboxMessage{final},
+			})
+			if err != nil || completed.Status != TurnStatusCompleted {
+				t.Fatalf("complete isolated turn = %#v err=%v", completed, err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil || checkpoint.UnresolvedExecution.LiveBranchThreadID != "thread-new" {
+				t.Fatalf("live branch checkpoint = %#v found=%v err=%v", checkpoint, found, err)
+			}
+			claimedOutbox, err := store.MarkOutboxSendAttempt(ctx, final.ID)
+			if err != nil || claimedOutbox.Status != OutboxStatusSending {
+				t.Fatalf("claim isolated final = %#v err=%v", claimedOutbox, err)
+			}
+			if _, err := store.MarkOutboxSent(ctx, final.ID, "teams-isolated-message"); err != nil {
+				t.Fatalf("send isolated final: %v", err)
+			}
+			const nextTurnID = "isolated-next-turn"
+			if _, _, err := store.QueueTurn(ctx, Turn{ID: nextTurnID, SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-new", QueuedAt: now.Add(time.Second), CreatedAt: now.Add(time.Second)}); err != nil {
+				t.Fatalf("queue next branch turn: %v", err)
+			}
+			next, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || next.ID != nextTurnID || next.Status != TurnStatusRunning || next.CodexThreadID != "thread-new" {
+				t.Fatalf("claim next live branch turn = %#v ok=%v err=%v", next, ok, err)
+			}
+		})
+	}
+}
+
+func TestQueuedTurnCapturedBeforeLiveBranchIsRetargetedAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "retarget-live-session"
+			const turnID = "retarget-live-turn"
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, CodexThreadID: "thread-live"}
+				state.Turns[turnID] = Turn{ID: turnID, SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", StartNewCodexThread: true, QueuedAt: now, CreatedAt: now}
+				state.ImportCheckpoints["transcript:"+sessionID] = ImportCheckpoint{
+					ID: "transcript:" + sessionID, SessionID: sessionID,
+					UnresolvedExecution: &ExecutionAnchor{SessionID: sessionID, ThreadID: "thread-old", LiveBranchThreadID: "thread-live", State: "unresolved", Generation: 5},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			prepared, err := store.MarkTurnForIsolatedCodexThread(ctx, turnID)
+			if err != nil || prepared.CodexThreadID != "thread-live" || prepared.StartNewCodexThread {
+				t.Fatalf("retarget queued turn = %#v err=%v, want live branch without fresh-thread flag", prepared, err)
+			}
+			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || claimed.CodexThreadID != "thread-live" || claimed.StartNewCodexThread {
+				t.Fatalf("claim retargeted turn = %#v ok=%v err=%v", claimed, ok, err)
+			}
+		})
+	}
+}
+
 func TestCompleteTurnWithFinalCommitsOwnerAndFinalAtomicallyAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []string{"json", "sqlite"} {

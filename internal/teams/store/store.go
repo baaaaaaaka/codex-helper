@@ -504,6 +504,10 @@ type ImportCheckpoint struct {
 	// older helper after automatic scanning proves that the linked source was
 	// replaced or truncated. Ordinary backlog blocking must not strand them.
 	SourceRewriteBlocked bool `json:"source_rewrite_blocked,omitempty"`
+	// OversizedRecordBlocked records a bounded automatic scan that reached a
+	// complete JSONL record beyond the per-record cap. The cursor remains before
+	// that record; unchanged sources may be skipped until explicit recovery.
+	OversizedRecordBlocked bool `json:"oversized_record_blocked,omitempty"`
 	// SourceFingerprint is a bounded content fingerprint for the last trusted
 	// cursor.  It is deliberately optional so old checkpoints remain readable;
 	// callers must fail closed rather than use the unchanged-file fast path when
@@ -678,6 +682,11 @@ type PersistInterruptedTurnWithAnchorResult struct {
 type ExecutionAnchor struct {
 	SessionID string `json:"session_id,omitempty"`
 	ThreadID  string `json:"thread_id,omitempty"`
+	// LiveBranchThreadID is a safe, newly-created Codex thread that the Teams
+	// session may use after the original execution was quarantined. The
+	// original ThreadID remains fenced for transcript recovery; this field only
+	// separates the live conversation from that unresolved historical owner.
+	LiveBranchThreadID string `json:"live_branch_thread_id,omitempty"`
 	// OuterTurnID identifies the durable Teams turn record. CodexTurnID is the
 	// execution identity written by app-server into the transcript; they are
 	// intentionally separate because a durable turn ID is an internal store
@@ -726,6 +735,7 @@ type HistoryWatchCheckpoint struct {
 	// conservative migration/reconcile rather than proving an unchanged file.
 	SourceFingerprint      string `json:"source_fingerprint,omitempty"`
 	SourceRewriteBlocked   bool   `json:"source_rewrite_blocked,omitempty"`
+	OversizedRecordBlocked bool   `json:"oversized_record_blocked,omitempty"`
 	Offset                 int64  `json:"offset,omitempty"`
 	Line                   int    `json:"line,omitempty"`
 	SessionID              string `json:"session_id,omitempty"`
@@ -1052,18 +1062,21 @@ type InboundAttachmentContext struct {
 }
 
 type Turn struct {
-	ID              string                `json:"id"`
-	SessionID       string                `json:"session_id"`
-	InboundEventID  string                `json:"inbound_event_id,omitempty"`
-	ScopeID         string                `json:"scope_id,omitempty"`
-	MachineID       string                `json:"machine_id,omitempty"`
-	LeaseGeneration int64                 `json:"lease_generation,omitempty"`
-	Status          TurnStatus            `json:"status"`
-	CodexThreadID   string                `json:"codex_thread_id,omitempty"`
-	ModelGeneration int                   `json:"model_generation,omitempty"`
-	CodexTurnID     string                `json:"codex_turn_id,omitempty"`
-	ModelProfile    modelprofile.Snapshot `json:"model_profile,omitempty"`
-	ReasoningEffort string                `json:"reasoning_effort,omitempty"`
+	ID              string     `json:"id"`
+	SessionID       string     `json:"session_id"`
+	InboundEventID  string     `json:"inbound_event_id,omitempty"`
+	ScopeID         string     `json:"scope_id,omitempty"`
+	MachineID       string     `json:"machine_id,omitempty"`
+	LeaseGeneration int64      `json:"lease_generation,omitempty"`
+	Status          TurnStatus `json:"status"`
+	CodexThreadID   string     `json:"codex_thread_id,omitempty"`
+	// StartNewCodexThread marks a live turn admitted after an older execution
+	// lost ownership proof. It must never resume the quarantined thread.
+	StartNewCodexThread bool                  `json:"start_new_codex_thread,omitempty"`
+	ModelGeneration     int                   `json:"model_generation,omitempty"`
+	CodexTurnID         string                `json:"codex_turn_id,omitempty"`
+	ModelProfile        modelprofile.Snapshot `json:"model_profile,omitempty"`
+	ReasoningEffort     string                `json:"reasoning_effort,omitempty"`
 	// ReasoningEffortSource makes an intentionally empty runtime fallback a
 	// captured turn value rather than indistinguishable legacy missing data.
 	ReasoningEffortSource string    `json:"reasoning_effort_source,omitempty"`
@@ -6953,7 +6966,13 @@ func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexT
 	if session, ok := state.Sessions[strings.TrimSpace(turn.SessionID)]; ok && session.Status == SessionStatusQuarantined {
 		return turn, fmt.Errorf("session %q is quarantined", turn.SessionID)
 	}
-	if stateHasUnresolvedExecution(state, turn.SessionID) {
+	if turn.Status == TurnStatusQueued {
+		// A live branch may have been recorded after the bridge loaded this
+		// queued row. Retarget only to that already verified branch; do not infer
+		// a first fresh branch inside this generic start API.
+		retargetQueuedTurnToLiveBranchLocked(state, &turn)
+	}
+	if !turnCanStartWhileUnresolvedExecutionLocked(state, turn) {
 		// Keep the ownership fence in the same durable mutation as the
 		// queued->running transition.  This closes the snapshot/check/mark
 		// race in synchronous and control-fallback paths.
@@ -6963,12 +6982,18 @@ func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexT
 	if turn.StartedAt.IsZero() {
 		turn.StartedAt = now
 	}
-	if codexThreadID != "" {
+	if turn.StartNewCodexThread {
+		// Queueing retains the old thread as diagnostic provenance. Once the
+		// isolated turn becomes running, clear that projection before the new
+		// thread is created so adapters cannot accidentally resume the old one.
+		turn.CodexThreadID = ""
+	} else if codexThreadID != "" {
 		turn.CodexThreadID = codexThreadID
 	}
 	if codexTurnID != "" {
 		turn.CodexTurnID = codexTurnID
 	}
+	recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
 	updateSessionFromTurn(state, turn, now)
 	return turn, nil
 }
@@ -6988,12 +7013,6 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 			return nil
 		}
 		if _, fenced := activeForkForSessionLocked(state, sessionID); fenced {
-			return nil
-		}
-		if stateHasUnresolvedExecution(state, sessionID) {
-			// The ownership check is repeated inside the same durable-state
-			// mutation as the claim.  A stale bridge snapshot must not turn a
-			// queued request into a running turn after an anchor was persisted.
 			return nil
 		}
 		for _, turn := range state.Turns {
@@ -7020,7 +7039,19 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 		})
 		now := time.Now()
 		turn := queued[0]
+		if retargetQueuedTurnToLiveBranchLocked(state, &turn) {
+			state.Turns[turn.ID] = turn
+		}
+		if !turnCanStartWhileUnresolvedExecutionLocked(state, turn) {
+			// The ownership check is repeated inside the same durable-state
+			// mutation as the claim. A stale bridge snapshot must not turn a
+			// queued request into a running turn after an anchor was persisted.
+			return nil
+		}
 		turn.Status = TurnStatusRunning
+		if turn.StartNewCodexThread {
+			turn.CodexThreadID = ""
+		}
 		if turn.StartedAt.IsZero() {
 			turn.StartedAt = now
 		}
@@ -7074,6 +7105,32 @@ func (s *Store) RequeueTurn(ctx context.Context, turnID string) (Turn, error) {
 		updateSessionFromTurn(state, turn, now)
 		return turn, nil
 	})
+}
+
+// MarkTurnForIsolatedCodexThread upgrades a legacy queued turn that was
+// persisted before live turns were separated from an unresolved historical
+// execution. It is idempotent and deliberately refuses to modify a running
+// turn; callers must never switch the thread of an execution already in
+// flight.
+func (s *Store) MarkTurnForIsolatedCodexThread(ctx context.Context, turnID string) (Turn, error) {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return Turn{}, fmt.Errorf("turn id is required")
+	}
+	apply := func(state *State, turn Turn, _ time.Time) (Turn, error) {
+		if turn.Status != TurnStatusQueued {
+			return turn, nil
+		}
+		if hasRunningTurnForSessionLocked(state, turn.SessionID) {
+			return turn, ErrUnresolvedExecution
+		}
+		prepared, _ := prepareTurnForIsolatedBranchLocked(state, turn)
+		return prepared, nil
+	}
+	if out, handled, err := s.updateTurnSQLite(ctx, turnID, false, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurn(ctx, turnID, apply)
 }
 
 func sessionTranscriptCheckpointID(sessionID string) string {
@@ -7151,6 +7208,21 @@ func outboxKindIsTranscriptLike(kind string, notificationKind string) bool {
 		strings.EqualFold(strings.TrimSpace(notificationKind), "turn_completed")
 }
 
+func outboxBelongsToIsolatedLiveBranchLocked(state *State, msg OutboxMessage) bool {
+	if state == nil || strings.TrimSpace(msg.TurnID) == "" {
+		return false
+	}
+	turn, ok := state.Turns[strings.TrimSpace(msg.TurnID)]
+	if !ok {
+		return false
+	}
+	threadID := strings.TrimSpace(msg.CodexThreadID)
+	if threadID == "" {
+		threadID = strings.TrimSpace(turn.CodexThreadID)
+	}
+	return turnUsesIsolatedLiveBranchLocked(state, turn, threadID)
+}
+
 func outboxSendBlockedByUnresolvedExecution(state *State, msg OutboxMessage) bool {
 	// A terminal-failure fence remains effective after its execution anchor is
 	// cleared.  Without this durable per-outbox marker, an in-flight final can
@@ -7173,6 +7245,12 @@ func outboxSendBlockedByUnresolvedExecution(state *State, msg OutboxMessage) boo
 			SourcePath:   msg.TranscriptSourcePath,
 			SourceOffset: msg.TranscriptSourceOffset,
 		}, checkpoint) {
+		return false
+	}
+	if outboxBelongsToIsolatedLiveBranchLocked(state, msg) {
+		// The unresolved anchor protects the old transcript owner. A final or
+		// status row owned by the explicitly isolated live branch is independent
+		// and may be delivered normally.
 		return false
 	}
 	return outboxKindIsTranscriptLike(msg.Kind, msg.NotificationKind)
@@ -7301,6 +7379,128 @@ func stateHasUnresolvedExecution(state *State, sessionID string) bool {
 	return false
 }
 
+func unresolvedExecutionAnchorLocked(state *State, sessionID string) (ExecutionAnchor, bool) {
+	if state == nil {
+		return ExecutionAnchor{}, false
+	}
+	checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(sessionID)]
+	if !ok || !importCheckpointHasUnresolvedExecution(checkpoint) || checkpoint.UnresolvedExecution == nil {
+		return ExecutionAnchor{}, false
+	}
+	return *checkpoint.UnresolvedExecution, true
+}
+
+func hasRunningTurnForSessionLocked(state *State, sessionID string) bool {
+	if state == nil {
+		return false
+	}
+	for _, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) == strings.TrimSpace(sessionID) && turn.Status == TurnStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// turnCanStartWhileUnresolvedExecutionLocked is the narrow live-execution
+// escape hatch. It never clears or weakens the old anchor: a first isolated
+// turn may start only on a fresh thread, and later turns may run only on the
+// thread recorded as that fresh live branch.
+func turnCanStartWhileUnresolvedExecutionLocked(state *State, turn Turn) bool {
+	if state == nil || !stateHasUnresolvedExecution(state, turn.SessionID) {
+		return true
+	}
+	if hasRunningTurnForSessionLocked(state, turn.SessionID) && turn.Status != TurnStatusRunning {
+		return false
+	}
+	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
+	if ok && strings.TrimSpace(anchor.LiveBranchThreadID) != "" &&
+		strings.TrimSpace(turn.CodexThreadID) == strings.TrimSpace(anchor.LiveBranchThreadID) &&
+		!turn.StartNewCodexThread {
+		return true
+	}
+	return turn.StartNewCodexThread
+}
+
+func prepareTurnForIsolatedBranchLocked(state *State, turn Turn) (Turn, bool) {
+	if state == nil || turn.Status != TurnStatusQueued || !stateHasUnresolvedExecution(state, turn.SessionID) {
+		return turn, false
+	}
+	if retargetQueuedTurnToLiveBranchLocked(state, &turn) {
+		return turn, true
+	}
+	if turn.StartNewCodexThread {
+		return turn, false
+	}
+	return prepareFirstIsolatedBranchTurnLocked(turn), true
+}
+
+func retargetQueuedTurnToLiveBranchLocked(state *State, turn *Turn) bool {
+	if state == nil || turn == nil || turn.Status != TurnStatusQueued {
+		return false
+	}
+	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
+	if !ok || strings.TrimSpace(anchor.LiveBranchThreadID) == "" {
+		return false
+	}
+	liveThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
+	if !turn.StartNewCodexThread && strings.TrimSpace(turn.CodexThreadID) == liveThreadID {
+		return false
+	}
+	turn.CodexThreadID = liveThreadID
+	turn.StartNewCodexThread = false
+	return true
+}
+
+func prepareFirstIsolatedBranchTurnLocked(turn Turn) Turn {
+	turn.StartNewCodexThread = true
+	turn.CodexThreadID = ""
+	return turn
+}
+
+func turnUsesIsolatedLiveBranchLocked(state *State, turn Turn, codexThreadID string) bool {
+	if state == nil || !stateHasUnresolvedExecution(state, turn.SessionID) {
+		return false
+	}
+	threadID := strings.TrimSpace(codexThreadID)
+	if threadID == "" {
+		threadID = strings.TrimSpace(turn.CodexThreadID)
+	}
+	if threadID == "" {
+		return false
+	}
+	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
+	if ok && strings.TrimSpace(anchor.LiveBranchThreadID) == threadID && strings.TrimSpace(anchor.OuterTurnID) != strings.TrimSpace(turn.ID) {
+		return true
+	}
+	// A legacy state can be materialized by the bridge immediately before the
+	// turn runs. The turn marker is still a safe proof that this is the new
+	// branch; it is never set on historical rows.
+	return turn.StartNewCodexThread
+}
+
+func recordLiveBranchThreadLocked(state *State, turn Turn, codexThreadID string, now time.Time) {
+	if state == nil || !turn.StartNewCodexThread || strings.TrimSpace(codexThreadID) == "" {
+		return
+	}
+	checkpointID := sessionTranscriptCheckpointID(turn.SessionID)
+	checkpoint, ok := state.ImportCheckpoints[checkpointID]
+	if !ok || !importCheckpointHasUnresolvedExecution(checkpoint) || checkpoint.UnresolvedExecution == nil {
+		return
+	}
+	anchor := *checkpoint.UnresolvedExecution
+	if strings.TrimSpace(anchor.ThreadID) == strings.TrimSpace(codexThreadID) {
+		return
+	}
+	if strings.TrimSpace(anchor.LiveBranchThreadID) != "" && strings.TrimSpace(anchor.LiveBranchThreadID) != strings.TrimSpace(codexThreadID) {
+		return
+	}
+	anchor.LiveBranchThreadID = strings.TrimSpace(codexThreadID)
+	anchor.UpdatedAt = now
+	checkpoint.UnresolvedExecution = &anchor
+	state.ImportCheckpoints[checkpointID] = checkpoint
+}
+
 // turnCompletionAllowedByUnresolvedExecutionLocked is the terminal-owner
 // fence.  A completion callback may commit a running turn while an anchor is
 // active only when the callback carries the exact outer turn, thread, and
@@ -7327,6 +7527,15 @@ func turnCompletionAllowedByUnresolvedExecutionLocked(state *State, turn Turn, c
 	expectedCodexTurn := strings.TrimSpace(codexTurnID)
 	if expectedThread == "" || expectedCodexTurn == "" {
 		return false
+	}
+	if turn.StartNewCodexThread {
+		if anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID); !ok || expectedThread != strings.TrimSpace(anchor.ThreadID) {
+			return true
+		}
+	}
+	if turnUsesIsolatedLiveBranchLocked(state, turn, expectedThread) &&
+		expectedThread != strings.TrimSpace(anchor.ThreadID) {
+		return true
 	}
 	return strings.TrimSpace(anchor.OuterTurnID) == strings.TrimSpace(turn.ID) &&
 		strings.TrimSpace(anchor.ThreadID) != "" && strings.TrimSpace(anchor.ThreadID) == expectedThread &&
@@ -7377,6 +7586,7 @@ func markTurnCompletedLocked(state *State, turn Turn, codexThreadID string, code
 	if codexTurnID != "" {
 		turn.CodexTurnID = codexTurnID
 	}
+	recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
 	updateSessionFromTurn(state, turn, now)
 	return turn, nil
 }
@@ -7886,22 +8096,36 @@ func completeTurnWithFinalLocked(state *State, req CompleteTurnWithFinalRequest,
 		}
 	}
 	anchorCleared := false
+	liveBranchRecorded := false
+	liveBranchCompletion := false
 	if checkpointFound && importCheckpointHasUnresolvedExecution(checkpoint) && checkpoint.UnresolvedExecution != nil {
 		anchor := checkpoint.UnresolvedExecution
-		if strings.TrimSpace(req.CodexTurnID) == "" || strings.TrimSpace(anchor.CodexTurnID) == "" || req.AnchorGeneration <= 0 || anchor.Generation != req.AnchorGeneration ||
+		if turnUsesIsolatedLiveBranchLocked(state, current, req.CodexThreadID) && strings.TrimSpace(req.CodexThreadID) != strings.TrimSpace(anchor.ThreadID) {
+			// Keep the old execution anchor for history/delivery quarantine, but
+			// record the new thread as the only live branch allowed to continue
+			// this Teams conversation.
+			anchor.LiveBranchThreadID = strings.TrimSpace(req.CodexThreadID)
+			anchor.UpdatedAt = now
+			checkpoint.UnresolvedExecution = anchor
+			state.ImportCheckpoints[checkpoint.ID] = checkpoint
+			liveBranchRecorded = true
+			liveBranchCompletion = true
+		} else if strings.TrimSpace(req.CodexTurnID) == "" || strings.TrimSpace(anchor.CodexTurnID) == "" || req.AnchorGeneration <= 0 || anchor.Generation != req.AnchorGeneration ||
 			strings.TrimSpace(anchor.SessionID) != "" && strings.TrimSpace(anchor.SessionID) != req.SessionID ||
 			strings.TrimSpace(anchor.ThreadID) != req.CodexThreadID ||
 			strings.TrimSpace(anchor.OuterTurnID) != req.TurnID ||
 			strings.TrimSpace(anchor.CodexTurnID) != req.CodexTurnID {
 			return current, ErrUnresolvedExecution
 		}
-		if !completionSourceProofVerified(*anchor, req.Progress) {
-			return current, ErrUnresolvedExecution
-		}
-		checkpoint.UnresolvedExecution = nil
-		anchorCleared = true
-		if checkpoint.ExecutionAnchorGeneration < anchor.Generation {
-			checkpoint.ExecutionAnchorGeneration = anchor.Generation
+		if !liveBranchCompletion {
+			if !completionSourceProofVerified(*anchor, req.Progress) {
+				return current, ErrUnresolvedExecution
+			}
+			checkpoint.UnresolvedExecution = nil
+			anchorCleared = true
+			if checkpoint.ExecutionAnchorGeneration < anchor.Generation {
+				checkpoint.ExecutionAnchorGeneration = anchor.Generation
+			}
 		}
 	}
 	if err := validateTerminalFinalOutboxPlan(state, req.FinalOutbox, req.SessionID, req.TurnID); err != nil {
@@ -7924,7 +8148,7 @@ func completeTurnWithFinalLocked(state *State, req CompleteTurnWithFinalRequest,
 	completed.UpdatedAt = now
 	state.Turns[req.TurnID] = completed
 	updateSessionFromTurn(state, completed, now)
-	if checkpointChanged || anchorCleared {
+	if checkpointChanged || anchorCleared || liveBranchRecorded {
 		if strings.TrimSpace(nextCheckpoint.Status) == "" || nextCheckpoint.Status == importCheckpointStatusBlocked {
 			nextCheckpoint.Status = importCheckpointStatusComplete
 		}
@@ -8112,7 +8336,7 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 			// because failure is less visible than an answer.
 			return turn, ErrUnresolvedExecution
 		}
-		if stateHasUnresolvedExecution(state, turn.SessionID) {
+		if stateHasUnresolvedExecution(state, turn.SessionID) && !turnUsesIsolatedLiveBranchLocked(state, turn, codexThreadID) {
 			return turn, ErrUnresolvedExecution
 		}
 		turn.Status = TurnStatusFailed
@@ -8124,6 +8348,7 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 		if codexTurnID != "" {
 			turn.CodexTurnID = codexTurnID
 		}
+		recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
 		markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now)
 		updateSessionFromTurn(state, turn, now)
 		return turn, nil
@@ -8148,7 +8373,7 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 		if !turnCompletionAllowedByUnresolvedExecutionLocked(state, turn, codexThreadID, codexTurnID) {
 			return turn, ErrUnresolvedExecution
 		}
-		if stateHasUnresolvedExecution(state, turn.SessionID) {
+		if stateHasUnresolvedExecution(state, turn.SessionID) && !turnUsesIsolatedLiveBranchLocked(state, turn, codexThreadID) {
 			return turn, ErrUnresolvedExecution
 		}
 		turn.Status = TurnStatusFailed
@@ -8160,6 +8385,7 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 		if codexTurnID != "" {
 			turn.CodexTurnID = codexTurnID
 		}
+		recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
 		markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now)
 		updateSessionFromTurn(state, turn, now)
 		return turn, nil

@@ -53,7 +53,7 @@ func TestTranscriptSourceReadProofRejectsOversizedPersistedRange(t *testing.T) {
 		ExpectedSourcePath:            filepath.Join(t.TempDir(), "transcript.jsonl"),
 		ExpectedSourceReadFingerprint: "persisted-proof",
 		ExpectedSourceReadStartOffset: 0,
-		ExpectedSourceReadEndOffset:   int64(historyTieredMaxTailBytes) + 1,
+		ExpectedSourceReadEndOffset:   int64(historyTieredMaxTailBytes + historyTieredMaxRecordBytes + 1),
 		ExpectedSourceReadRangeKnown:  true,
 	}
 	if transcriptSourceReadProofMatches(proof) {
@@ -470,11 +470,11 @@ func TestHistoryTieredScanTailCapsLargeTail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if !result.TooLarge || result.BytesRead != 0 {
-		t.Fatalf("large tail result = %#v, want capped without read", result)
+	if !result.TooLarge || !result.BudgetExhausted || result.BytesRead <= 0 {
+		t.Fatalf("large tail result = %#v, want a bounded resumable prefix", result)
 	}
-	if result.State.Size != 0 || result.State.Offset != 0 {
-		t.Fatalf("large tail state = %#v, want previous state preserved", result.State)
+	if result.State.Size <= 0 || result.State.Offset <= 0 || result.State.Offset >= 128*3 {
+		t.Fatalf("large tail state = %#v, want a cursor inside the source", result.State)
 	}
 }
 
@@ -502,6 +502,24 @@ func TestHistoryTieredScanTailCanRecoverAfterLargeTailCap(t *testing.T) {
 	}
 	if len(result.Finals) != 1 {
 		t.Fatalf("recovered finals = %#v, want one", result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesOversizedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := `{"type":"event_msg","payload":{"type":"agent_message","message":"` + strings.Repeat("x", historyTieredMaxRecordBytes+1) + `"}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatalf("write oversized record: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if !result.TooLarge || !result.OversizedRecord || result.BudgetExhausted || result.Incomplete {
+		t.Fatalf("oversized record result = %#v, want durable quarantine boundary", result)
+	}
+	if result.State.Offset != 0 || result.State.Line != 0 {
+		t.Fatalf("oversized record advanced cursor: %#v", result.State)
 	}
 }
 

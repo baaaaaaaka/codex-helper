@@ -6055,11 +6055,6 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 			if err != nil {
 				return err
 			}
-			if checkpointFound && importCheckpointHasUnresolvedExecution(checkpoint) {
-				// Keep the ownership fence in the same SQLite transaction as the
-				// claim so a stale bridge snapshot cannot start a same-session turn.
-				return tx.Commit()
-			}
 			legacyState := State{
 				legacyUnresolvedSessions: map[string]bool{},
 				ImportCheckpoints:        map[string]ImportCheckpoint{},
@@ -6072,9 +6067,6 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 			}
 			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &legacyState, sessionID); err != nil {
 				return err
-			}
-			if legacyState.legacyUnresolvedSessions[sessionID] {
-				return tx.Commit()
 			}
 			var running int
 			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE session_id = ? AND status = ? LIMIT 1`, sessionID, string(TurnStatusRunning)).Scan(&running); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -6090,9 +6082,27 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 				}
 				return tx.Commit()
 			}
-			state := State{SchemaVersion: SchemaVersion, Sessions: map[string]SessionContext{sessionID: session}, Turns: map[string]Turn{turn.ID: turn}}
+			state := State{
+				SchemaVersion:            SchemaVersion,
+				Sessions:                 map[string]SessionContext{sessionID: session},
+				Turns:                    map[string]Turn{turn.ID: turn},
+				ImportCheckpoints:        map[string]ImportCheckpoint{},
+				legacyUnresolvedSessions: legacyState.legacyUnresolvedSessions,
+			}
+			if checkpointFound {
+				state.ImportCheckpoints[checkpoint.ID] = checkpoint
+			}
+			if retargetQueuedTurnToLiveBranchLocked(&state, &turn) {
+				state.Turns[turn.ID] = turn
+			}
+			if !turnCanStartWhileUnresolvedExecutionLocked(&state, turn) {
+				return tx.Commit()
+			}
 			now := time.Now()
 			turn.Status = TurnStatusRunning
+			if turn.StartNewCodexThread {
+				turn.CodexThreadID = ""
+			}
 			if turn.StartedAt.IsZero() {
 				turn.StartedAt = now
 			}

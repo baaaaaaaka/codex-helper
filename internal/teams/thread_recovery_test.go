@@ -381,6 +381,159 @@ func TestRunQueuedTurnFreshFirstTurnCanStartNewThread(t *testing.T) {
 	}
 }
 
+func TestRunQueuedTurnIsolatesLiveBranchFromUnresolvedHistoryOwner(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "new branch answer", CodexThreadID: "thread-new", CodexTurnID: "codex-turn-new"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	session := bridge.reg.SessionByID("s001")
+	seedThreadRecoverySession(t, store, session, "thread-old", "")
+	now := time.Now()
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID,
+			UnresolvedExecution: &teamstore.ExecutionAnchor{
+				SessionID: session.ID, ThreadID: "thread-old", OuterTurnID: "turn-old", CodexTurnID: "codex-turn-old",
+				State: "unresolved", Generation: 7, CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		state.Turns["turn-old"] = teamstore.Turn{
+			ID: "turn-old", SessionID: session.ID, Status: teamstore.TurnStatusInterrupted,
+			CodexThreadID: "thread-old", CodexTurnID: "codex-turn-old", InterruptedAt: now,
+			RecoveryReason: recoveryReasonAmbiguousCodexExecutionPrefix + " old owner",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed unresolved history owner: %v", err)
+	}
+	turn := seedQueuedThreadRecoveryTurn(t, store, session.ID, "turn-new-branch")
+	turn.StartNewCodexThread = true
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		queued := state.Turns[turn.ID]
+		queued.StartNewCodexThread = true
+		state.Turns[turn.ID] = queued
+		return nil
+	}); err != nil {
+		t.Fatalf("mark queued turn for isolated branch: %v", err)
+	}
+
+	if err := bridge.runQueuedTurnInputWithExecutor(ctx, executor, session, turn, session.ChatID, ExecutionInput{Prompt: "continue safely"}); err != nil {
+		t.Fatalf("runQueuedTurnInputWithExecutor error: %v", err)
+	}
+	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "" {
+		t.Fatalf("executor session thread = %#v, want a fresh empty thread binding", executor.sessions)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	if got := state.Turns[turn.ID].Status; got != teamstore.TurnStatusCompleted {
+		t.Fatalf("new branch turn status = %q, want completed: turn=%#v executor=%#v", got, state.Turns[turn.ID], executor)
+	}
+	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-new" {
+		t.Fatalf("durable live branch thread = %q, want thread-new", got)
+	}
+	anchor := state.ImportCheckpoints[checkpointID].UnresolvedExecution
+	if anchor == nil || anchor.LiveBranchThreadID != "thread-new" {
+		t.Fatalf("history owner anchor = %#v, want retained fence with live branch thread-new", anchor)
+	}
+}
+
+func TestBridgeAcceptsTeamsTurnOnFreshBranchAfterUnresolvedHistoryOwner(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "fresh branch answer", CodexThreadID: "thread-new", CodexTurnID: "codex-new"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = false
+	session := bridge.reg.SessionByID("s001")
+	seedThreadRecoverySession(t, store, session, "thread-old", "")
+	now := time.Now()
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID,
+			UnresolvedExecution: &teamstore.ExecutionAnchor{
+				SessionID: session.ID, ThreadID: "thread-old", OuterTurnID: "turn-old", CodexTurnID: "codex-old",
+				State: "unresolved", Generation: 11, CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		state.Turns["turn-old"] = teamstore.Turn{
+			ID: "turn-old", SessionID: session.ID, Status: teamstore.TurnStatusInterrupted,
+			CodexThreadID: "thread-old", CodexTurnID: "codex-old", InterruptedAt: now,
+			RecoveryReason: recoveryReasonAmbiguousCodexExecutionPrefix + " old owner",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed unresolved history owner: %v", err)
+	}
+	if err := bridge.handleSessionMessage(ctx, session.ChatID, bridgePollMessage("fresh-branch-prompt", "2026-08-21T01:00:00Z", "run on the recovered chat"), "run on the recovered chat"); err != nil {
+		t.Fatalf("handle fresh-branch Teams prompt: %v", err)
+	}
+	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "" {
+		t.Fatalf("executor session = %#v, want an empty thread for fresh start", executor.sessions)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	if got := state.Turns["turn-old"].Status; got != teamstore.TurnStatusInterrupted {
+		t.Fatalf("old unresolved turn status = %q, want interrupted", got)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.UnresolvedExecution == nil || checkpoint.UnresolvedExecution.LiveBranchThreadID != "thread-new" {
+		t.Fatalf("live branch anchor = %#v, want retained old fence plus thread-new", checkpoint.UnresolvedExecution)
+	}
+	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-new" {
+		t.Fatalf("durable session thread = %q, want thread-new", got)
+	}
+}
+
+func TestLiveExecutionGateUsesDurableBranchAfterRegistryRestart(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByID("s001")
+	seedThreadRecoverySession(t, store, session, "thread-live", "")
+	now := time.Now()
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID,
+			UnresolvedExecution: &teamstore.ExecutionAnchor{
+				SessionID: session.ID, ThreadID: "thread-old", OuterTurnID: "turn-old",
+				State: "unresolved", Generation: 9, LiveBranchThreadID: "thread-live",
+				CreatedAt: now, UpdatedAt: now,
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed unresolved history owner: %v", err)
+	}
+	// Simulate a post-restart in-memory projection that has not caught up with
+	// the durable live branch. The gate must consult the durable row only after
+	// the strict unresolved-owner probe succeeds.
+	session.CodexThreadID = "thread-old"
+	unresolved, err := bridge.sessionLiveExecutionOwnershipUnresolved(ctx, *session)
+	if err != nil {
+		t.Fatalf("sessionLiveExecutionOwnershipUnresolved: %v", err)
+	}
+	if unresolved {
+		t.Fatal("live branch was blocked by a stale registry thread")
+	}
+	turn := teamstore.Turn{ID: "turn-live", SessionID: session.ID, CodexThreadID: "thread-live"}
+	unresolved, err = bridge.liveTurnExecutionOwnershipUnresolved(ctx, *session, turn)
+	if err != nil {
+		t.Fatalf("liveTurnExecutionOwnershipUnresolved: %v", err)
+	}
+	if unresolved {
+		t.Fatal("turn on durable live branch was blocked by a stale registry thread")
+	}
+}
+
 func TestRunQueuedTurnBlocksJournalReadErrorBeforeExecutor(t *testing.T) {
 	ctx := context.Background()
 	graph, sent := newBridgeTestGraph(t)

@@ -293,10 +293,83 @@ func (b *Bridge) bindObservedCodexThreadOrInterrupt(ctx context.Context, session
 	if threadID == "" {
 		return false, nil
 	}
+	if turn.StartNewCodexThread {
+		if err := b.bindIsolatedCodexThreadForRunningTurn(ctx, session, turn, threadID, source); err != nil {
+			return true, b.interruptTurnForThreadRecovery(ctx, session, turn, codexThreadConflictKind, err.Error())
+		}
+		return false, nil
+	}
 	if err := b.bindSessionCodexThreadIfSafe(ctx, session, turn.ID, threadID, source); err != nil {
 		return true, b.interruptTurnForThreadRecovery(ctx, session, turn, codexThreadConflictKind, err.Error())
 	}
 	return false, nil
+}
+
+// bindIsolatedCodexThreadForRunningTurn commits the first callback observed
+// from a live branch that was deliberately started after the historical
+// thread's ownership became unresolved.  The ordinary binding helper must
+// continue to reject a thread mismatch; this path uses the same fenced,
+// running-turn transaction as the pre-dispatch hook and is the only place
+// allowed to replace the quarantined session projection.
+func (b *Bridge) bindIsolatedCodexThreadForRunningTurn(ctx context.Context, session *Session, turn teamstore.Turn, threadID string, source string) error {
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" || session == nil {
+		return nil
+	}
+	if b == nil || b.store == nil {
+		session.CodexThreadID = threadID
+		return nil
+	}
+	owner, lease := b.currentOwnerAndLease()
+	machineID := ""
+	leaseGeneration := lease.Generation
+	if leaseGeneration > 0 {
+		machineID = strings.TrimSpace(b.machine.ID)
+	}
+	result, err := b.store.BindCodexThreadForRunningTurn(ctx, teamstore.CodexThreadStartBindingRequest{
+		SessionID:       session.ID,
+		TurnID:          turn.ID,
+		ThreadID:        threadID,
+		ModelGeneration: turn.ModelGeneration,
+		MachineID:       machineID,
+		LeaseGeneration: leaseGeneration,
+		Owner:           owner,
+	})
+	if err != nil {
+		var conflict teamstore.CodexThreadBindingConflictError
+		if errors.As(err, &conflict) {
+			observed := strings.TrimSpace(conflict.Observed)
+			if observed == "" {
+				observed = threadID
+			}
+			return codexThreadConflictError{SessionID: session.ID, Existing: conflict.Existing, Observed: observed, Source: source}
+		}
+		return err
+	}
+	if result.Session.CodexThreadID != "" {
+		session.CodexThreadID = result.Session.CodexThreadID
+	}
+	projectionChanged := b.updateSessionCodexThreadProjection(session, session.ID, threadID)
+	if projectionChanged && strings.TrimSpace(b.registryPath) != "" {
+		if err := b.Save(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams registry thread projection save skipped for %s: %v\n", session.ID, err)
+		}
+	}
+	if result.Changed {
+		_ = b.appendThreadLinkJournal(ctx, threadLinkJournalRecord{
+			Source:          source,
+			ScopeID:         b.scope.ID,
+			MachineID:       b.machine.ID,
+			SessionID:       session.ID,
+			ChatID:          session.ChatID,
+			TeamsTurnID:     turn.ID,
+			CodexThreadID:   threadID,
+			ModelGeneration: turn.ModelGeneration,
+			ModelProfile:    session.ModelProfile,
+			Cwd:             session.Cwd,
+		})
+	}
+	return nil
 }
 
 func (b *Bridge) interruptTurnForThreadRecovery(ctx context.Context, session *Session, turn teamstore.Turn, kind string, message string) error {
