@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 func TestRegistryEnsurePersistsStablePortOutsideLegacyConfig(t *testing.T) {
@@ -257,6 +259,57 @@ func TestRegistryConcurrentStateWritesRemainReadable(t *testing.T) {
 	}
 	if got, err := r.Load(reg.ProfileID); err != nil || got.HTTPPort != reg.HTTPPort {
 		t.Fatalf("concurrent registry load = %#v/%v", got, err)
+	}
+}
+
+func TestRegistryLoadHonorsRegistrationLock(t *testing.T) {
+	dir := t.TempDir()
+	writer, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := writer.Ensure(context.Background(), "profile-a", "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := flock.New(writer.lockPath(reg.ProfileID))
+	locked, err := lock.TryLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked {
+		t.Fatal("failed to acquire registration lock for test")
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	reader, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		_, loadErr := reader.Load(reg.ProfileID)
+		done <- loadErr
+	}()
+	<-started
+	select {
+	case loadErr := <-done:
+		t.Fatalf("Load bypassed registration lock: %v", loadErr)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	if err := lock.Unlock(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case loadErr := <-done:
+		if loadErr != nil {
+			t.Fatalf("Load after registration lock release: %v", loadErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Load did not resume after registration lock release")
 	}
 }
 

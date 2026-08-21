@@ -22,11 +22,12 @@ import (
 )
 
 const (
-	CurrentSchema    = 1
-	StateReady       = "ready"
-	StatePending     = "pending"
-	StateBlocked     = "blocked"
-	eventLogMaxBytes = 2 << 20
+	CurrentSchema              = 1
+	StateReady                 = "ready"
+	StatePending               = "pending"
+	StateBlocked               = "blocked"
+	registrationLockRetryDelay = 10 * time.Millisecond
+	eventLogMaxBytes           = 2 << 20
 )
 
 var (
@@ -122,6 +123,21 @@ func (r *Registry) lockPath(profileID string) string {
 	return r.path(profileID) + ".lock"
 }
 
+func (r *Registry) acquireRegistrationLock(ctx context.Context, profileID string) (*flock.Flock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lock := flock.New(r.lockPath(profileID))
+	locked, err := lock.TryLockContext(ctx, registrationLockRetryDelay)
+	if err != nil {
+		return nil, fmt.Errorf("lock app gateway registration: %w", err)
+	}
+	if !locked {
+		return nil, errors.New("app gateway registration lock was not acquired")
+	}
+	return lock, nil
+}
+
 func (r *Registry) leasePath(profileID string) string {
 	return r.path(profileID) + ".lease"
 }
@@ -168,12 +184,19 @@ func (r *Registry) Load(profileID string) (Registration, error) {
 	if profileID == "" {
 		return Registration{}, fmt.Errorf("%w: profile id is required", ErrInvalidRegistration)
 	}
+	lock, err := r.acquireRegistrationLock(context.Background(), profileID)
+	if err != nil {
+		return Registration{}, err
+	}
+	defer func() { _ = lock.Unlock() }()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.load(profileID)
+	return r.loadLocked(profileID)
 }
 
-func (r *Registry) load(profileID string) (Registration, error) {
+// loadLocked reads a registration while the caller holds both the per-profile
+// registration lock and r.mu.
+func (r *Registry) loadLocked(profileID string) (Registration, error) {
 	path := r.path(profileID)
 	b, err := os.ReadFile(path)
 	if err == nil {
@@ -230,19 +253,15 @@ func (r *Registry) ensure(ctx context.Context, profileID, fingerprint string, pr
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	lock := flock.New(r.lockPath(profileID))
-	locked, err := lock.TryLockContext(ctx, 5*time.Second)
+	lock, err := r.acquireRegistrationLock(ctx, profileID)
 	if err != nil {
-		return Registration{}, fmt.Errorf("lock app gateway registration: %w", err)
-	}
-	if !locked {
-		return Registration{}, errors.New("app gateway registration lock was not acquired")
+		return Registration{}, err
 	}
 	defer func() { _ = lock.Unlock() }()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	reg, err := r.load(profileID)
+	reg, err := r.loadLocked(profileID)
 	if err == nil {
 		changed := false
 		if preferredPort > 0 && preferredPort != reg.HTTPPort && reg.State != StateReady && reg.LastReadyAt.IsZero() && reg.OwnerPID == 0 {
@@ -321,13 +340,9 @@ func (r *Registry) Save(reg Registration) error {
 	if err := Validate(reg); err != nil {
 		return err
 	}
-	lock := flock.New(r.lockPath(reg.ProfileID))
-	locked, err := lock.TryLockContext(context.Background(), 5*time.Second)
+	lock, err := r.acquireRegistrationLock(context.Background(), reg.ProfileID)
 	if err != nil {
-		return fmt.Errorf("lock app gateway registration: %w", err)
-	}
-	if !locked {
-		return errors.New("app gateway registration lock was not acquired")
+		return err
 	}
 	defer func() { _ = lock.Unlock() }()
 	r.mu.Lock()
