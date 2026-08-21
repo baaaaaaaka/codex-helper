@@ -178,6 +178,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	states := make(map[string]historyTieredFileState, len(state.HistoryWatch))
 	blockedPaths := make(map[string]bool)
 	missingBlockedPaths := make(map[string]bool)
+	rebasePaths := make(map[string]bool)
 	// Legacy HistoryWatch rows have no bounded prefix proof.  Even on the
 	// normal (non-reconcile) poll, verify those rows before treating an equal
 	// size/mtime as unchanged; otherwise a same-size rewrite can remain
@@ -196,6 +197,16 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 				// avoids a repeated stat/lock/sync cycle; the sync path already
 				// returns without removing or advancing such a checkpoint.
 				blockedPaths[path] = true
+				// Codex publishes a migrated rollout by atomically replacing the
+				// same path. Only a new paginated file identity is an automatic
+				// recovery candidate; legacy files retain the explicit recovery
+				// boundary and are not repeatedly scanned.
+				if fileState.SourceRewriteBlocked {
+					if identity, ok := codexPaginatedHistoryIdentity(path, firstNonEmptyString(fileState.ThreadID, fileState.SessionID)); ok &&
+						identity != strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) {
+						rebasePaths[path] = true
+					}
+				}
 				continue
 			}
 			if fileState.Offset > 0 && strings.TrimSpace(fileState.SourceFingerprint) == "" {
@@ -224,7 +235,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		filtered := make([]string, 0, len(paths))
 		for _, path := range paths {
 			cleanPath := cleanComparablePath(path)
-			if blockedPaths[cleanPath] && !missingBlockedPaths[cleanPath] {
+			if blockedPaths[cleanPath] && !missingBlockedPaths[cleanPath] && !rebasePaths[cleanPath] {
 				continue
 			}
 			filtered = append(filtered, path)
@@ -232,6 +243,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		paths = filtered
 	}
 	for path := range missingBlockedPaths {
+		paths = append(paths, path)
+	}
+	for path := range rebasePaths {
 		paths = append(paths, path)
 	}
 	if len(paths) == 0 {
@@ -266,6 +280,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		for path := range missingBlockedPaths {
 			out = append(out, path)
 		}
+		for path := range rebasePaths {
+			out = append(out, path)
+		}
 		return uniqueSortedCleanPaths(out), nil
 	}
 	changes, err := historyTieredDetectStatChanges(paths, states, verifyUnchanged)
@@ -277,6 +294,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		out = append(out, change.Path)
 	}
 	for path := range missingBlockedPaths {
+		out = append(out, path)
+	}
+	for path := range rebasePaths {
 		out = append(out, path)
 	}
 	return uniqueSortedCleanPaths(out), nil
@@ -350,9 +370,15 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		previous.Path = path
 	}
 	if previous.SourceRewriteBlocked {
-		// A source rewrite is an explicit safety boundary.  Do not let a later
-		// append make the watcher reinterpret the rewritten prefix; explicit
-		// history import is required to establish a new trusted cursor.
+		// A source rewrite is an explicit safety boundary. A Codex migration may
+		// safely rebase it once the same path is a paginated rollout and the old
+		// final can be located by stable identity. All delivery state remains
+		// untouched by this operation.
+		if rebased, err := b.rebaseHistoryWatchSourceRewrite(ctx, id, expectedCheckpoint, previous, path, now); err != nil {
+			return err
+		} else if rebased {
+			return nil
+		}
 		if !b.historyWatchDeletedSourceProbeDue(path, now) {
 			return nil
 		}
@@ -380,6 +406,7 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		blocked.Size = info.Size()
 		blocked.ModTime = info.ModTime()
 		blocked.SourceRewriteBlocked = true
+		blocked.SourceRewriteRecoveryIdentity = ""
 		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blocked, now)
 	}
 	legacyFingerprintMissing := previous.Size > 0 && strings.TrimSpace(previous.SourceFingerprint) == ""
@@ -638,27 +665,28 @@ func historyWatchReadProofMatches(path string, result historyTieredTailResult) b
 
 func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchCheckpoint) historyTieredFileState {
 	return historyTieredFileState{
-		Path:                      strings.TrimSpace(checkpoint.Path),
-		Size:                      checkpoint.Size,
-		ModTime:                   checkpoint.ModTime,
-		SourceFingerprint:         strings.TrimSpace(checkpoint.SourceFingerprint),
-		SourceRewriteBlocked:      checkpoint.SourceRewriteBlocked,
-		OversizedRecordBlocked:    checkpoint.OversizedRecordBlocked,
-		Offset:                    checkpoint.Offset,
-		Line:                      checkpoint.Line,
-		SessionID:                 strings.TrimSpace(checkpoint.SessionID),
-		ThreadID:                  strings.TrimSpace(checkpoint.ThreadID),
-		TeamsOriginThreadID:       strings.TrimSpace(checkpoint.TeamsOriginThreadID),
-		TurnID:                    strings.TrimSpace(checkpoint.TurnID),
-		TeamsOriginTurnID:         strings.TrimSpace(checkpoint.TeamsOriginTurnID),
-		ExternalUserPromptSeen:    checkpoint.ExternalUserPromptSeen,
-		LastFinalID:               strings.TrimSpace(checkpoint.LastFinalID),
-		LastFinalLine:             checkpoint.LastFinalLine,
-		LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
-		LastFinalStartOffsetKnown: checkpoint.LastFinalStartOffsetKnown,
-		LastFinalThreadID:         strings.TrimSpace(checkpoint.LastFinalThreadID),
-		LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
-		LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
+		Path:                          strings.TrimSpace(checkpoint.Path),
+		Size:                          checkpoint.Size,
+		ModTime:                       checkpoint.ModTime,
+		SourceFingerprint:             strings.TrimSpace(checkpoint.SourceFingerprint),
+		SourceRewriteBlocked:          checkpoint.SourceRewriteBlocked,
+		OversizedRecordBlocked:        checkpoint.OversizedRecordBlocked,
+		SourceRewriteRecoveryIdentity: strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
+		Offset:                        checkpoint.Offset,
+		Line:                          checkpoint.Line,
+		SessionID:                     strings.TrimSpace(checkpoint.SessionID),
+		ThreadID:                      strings.TrimSpace(checkpoint.ThreadID),
+		TeamsOriginThreadID:           strings.TrimSpace(checkpoint.TeamsOriginThreadID),
+		TurnID:                        strings.TrimSpace(checkpoint.TurnID),
+		TeamsOriginTurnID:             strings.TrimSpace(checkpoint.TeamsOriginTurnID),
+		ExternalUserPromptSeen:        checkpoint.ExternalUserPromptSeen,
+		LastFinalID:                   strings.TrimSpace(checkpoint.LastFinalID),
+		LastFinalLine:                 checkpoint.LastFinalLine,
+		LastFinalStartOffset:          checkpoint.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:     checkpoint.LastFinalStartOffsetKnown,
+		LastFinalThreadID:             strings.TrimSpace(checkpoint.LastFinalThreadID),
+		LastFinalTurnID:               strings.TrimSpace(checkpoint.LastFinalTurnID),
+		LastFinalTextHash:             strings.TrimSpace(checkpoint.LastFinalTextHash),
 		// Older history-watch checkpoints persisted only LastFinalID.  In this
 		// watcher namespace that ID is a real final boundary (unlike linked
 		// transcript checkpoints, whose LastRecordID may be any record), so
@@ -710,37 +738,38 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		}
 	}
 	checkpoint := teamstore.HistoryWatchCheckpoint{
-		ID:                           id,
-		Path:                         strings.TrimSpace(state.Path),
-		Size:                         state.Size,
-		ModTime:                      state.ModTime,
-		SourceFingerprint:            strings.TrimSpace(state.SourceFingerprint),
-		SourceRewriteBlocked:         state.SourceRewriteBlocked,
-		OversizedRecordBlocked:       state.OversizedRecordBlocked,
-		Offset:                       state.Offset,
-		Line:                         state.Line,
-		SessionID:                    strings.TrimSpace(state.SessionID),
-		ThreadID:                     strings.TrimSpace(state.ThreadID),
-		TeamsOriginThreadID:          strings.TrimSpace(state.TeamsOriginThreadID),
-		TurnID:                       strings.TrimSpace(state.TurnID),
-		TeamsOriginTurnID:            strings.TrimSpace(state.TeamsOriginTurnID),
-		ExternalUserPromptSeen:       state.ExternalUserPromptSeen,
-		LastFinalID:                  strings.TrimSpace(state.LastFinalID),
-		LastFinalLine:                state.LastFinalLine,
-		LastFinalStartOffset:         state.LastFinalStartOffset,
-		LastFinalStartOffsetKnown:    state.LastFinalStartOffsetKnown,
-		LastFinalThreadID:            strings.TrimSpace(state.LastFinalThreadID),
-		LastFinalTurnID:              strings.TrimSpace(state.LastFinalTurnID),
-		LastFinalTextHash:            strings.TrimSpace(state.LastFinalTextHash),
-		TerminalBoundarySeen:         state.TerminalBoundarySeen,
-		TerminalBoundaryLine:         state.TerminalBoundaryLine,
-		UnresolvedContinuation:       state.UnresolvedContinuation,
-		UnresolvedContinuationLine:   state.UnresolvedContinuationLine,
-		UnresolvedContinuationOffset: state.UnresolvedContinuationOffset,
-		PendingRootTaskStarted:       state.PendingRootTaskStarted,
-		PendingRootTaskStartedLine:   state.PendingRootTaskStartedLine,
-		PendingRootTaskStartedOffset: state.PendingRootTaskStartedOffset,
-		UpdatedAt:                    now,
+		ID:                            id,
+		Path:                          strings.TrimSpace(state.Path),
+		Size:                          state.Size,
+		ModTime:                       state.ModTime,
+		SourceFingerprint:             strings.TrimSpace(state.SourceFingerprint),
+		SourceRewriteBlocked:          state.SourceRewriteBlocked,
+		OversizedRecordBlocked:        state.OversizedRecordBlocked,
+		SourceRewriteRecoveryIdentity: strings.TrimSpace(state.SourceRewriteRecoveryIdentity),
+		Offset:                        state.Offset,
+		Line:                          state.Line,
+		SessionID:                     strings.TrimSpace(state.SessionID),
+		ThreadID:                      strings.TrimSpace(state.ThreadID),
+		TeamsOriginThreadID:           strings.TrimSpace(state.TeamsOriginThreadID),
+		TurnID:                        strings.TrimSpace(state.TurnID),
+		TeamsOriginTurnID:             strings.TrimSpace(state.TeamsOriginTurnID),
+		ExternalUserPromptSeen:        state.ExternalUserPromptSeen,
+		LastFinalID:                   strings.TrimSpace(state.LastFinalID),
+		LastFinalLine:                 state.LastFinalLine,
+		LastFinalStartOffset:          state.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:     state.LastFinalStartOffsetKnown,
+		LastFinalThreadID:             strings.TrimSpace(state.LastFinalThreadID),
+		LastFinalTurnID:               strings.TrimSpace(state.LastFinalTurnID),
+		LastFinalTextHash:             strings.TrimSpace(state.LastFinalTextHash),
+		TerminalBoundarySeen:          state.TerminalBoundarySeen,
+		TerminalBoundaryLine:          state.TerminalBoundaryLine,
+		UnresolvedContinuation:        state.UnresolvedContinuation,
+		UnresolvedContinuationLine:    state.UnresolvedContinuationLine,
+		UnresolvedContinuationOffset:  state.UnresolvedContinuationOffset,
+		PendingRootTaskStarted:        state.PendingRootTaskStarted,
+		PendingRootTaskStartedLine:    state.PendingRootTaskStartedLine,
+		PendingRootTaskStartedOffset:  state.PendingRootTaskStartedOffset,
+		UpdatedAt:                     now,
 	}
 	applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)
 	return checkpoint
