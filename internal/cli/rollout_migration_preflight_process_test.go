@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
 func TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup(t *testing.T) {
@@ -81,7 +82,11 @@ exit 64
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Kill(pid, 0); err == nil {
+	deadline = time.Now().Add(2 * time.Second)
+	for proc.IsAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if proc.IsAlive(pid) {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 		t.Fatalf("migration child process %d survived process-group cancellation", pid)
 	}
