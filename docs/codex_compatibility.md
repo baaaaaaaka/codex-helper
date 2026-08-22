@@ -10,6 +10,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.150.0-alpha.2 | pass | fail | pass | pass | pass | pass | 2026-08-21T05:02:34Z |
 | 0.150.0-alpha.1 | pass | fail | pass | pass | pass | pass | 2026-08-21T02:17:52Z |
 | 0.149.0 | pass | pass | pass | pass | pass | pass | 2026-08-21T16:38:37Z |
+| 0.149.0-alpha.7.2 | pass | pass | pass | pass | pass | pass | 2026-08-22T20:11:15Z |
 | 0.149.0-alpha.7.1 | pass | pass | pass | pass | pass | pass | 2026-08-21T16:38:37Z |
 | 0.149.0-alpha.7 | pass | fail | pass | pass | pass | pass | 2026-08-20T21:58:36Z |
 | 0.149.0-alpha.4.1 | pass | fail | pass | pass | pass | pass | 2026-08-21T04:10:06Z |
@@ -207,7 +208,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.133.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-20T18:40:09Z |
 | 0.132.0 | pass | pass | pass | pass | pass | pass | 2026-05-26T16:36:52Z |
 | 0.132.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-18T22:54:07Z |
-| 0.131.0 | pass | pass | pass | pass | pass | pass | 2026-08-19T19:51:12Z |
+| 0.131.0 | pass | pass | pass | pass | pass | pass | 2026-08-22T20:11:16Z |
 | 0.131.0-alpha.22 | pass | pass | pass | pass | pass | pass | 2026-05-16T01:48:39Z |
 | 0.131.0-alpha.21 | pass | pass | pass | pass | pass | pass | 2026-05-15T20:38:57Z |
 | 0.131.0-alpha.9 | pass | pass | pass | pass | pass | pass | 2026-05-15T05:47:15Z |
