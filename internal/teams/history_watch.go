@@ -179,6 +179,8 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	blockedPaths := make(map[string]bool)
 	missingBlockedPaths := make(map[string]bool)
 	rebasePaths := make(map[string]bool)
+	deferredPaths := make(map[string]bool)
+	missingDeferredPaths := make(map[string]bool)
 	// Legacy HistoryWatch rows have no bounded prefix proof.  Even on the
 	// normal (non-reconcile) poll, verify those rows before treating an equal
 	// size/mtime as unchanged; otherwise a same-size rewrite can remain
@@ -190,7 +192,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			fileState := historyTieredFileStateFromHistoryWatch(checkpoint)
 			fileState.Path = path
 			states[path] = fileState
-			if fileState.SourceRewriteBlocked || fileState.OversizedRecordBlocked {
+			if fileState.SourceRewriteBlocked {
 				// A blocked checkpoint is an explicit manual-recovery boundary.
 				// Until publish-history/baseline replaces it, no stat change can
 				// make the path automatically trustworthy again. Excluding it here
@@ -207,6 +209,14 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 						rebasePaths[path] = true
 					}
 				}
+				continue
+			}
+			if fileState.LegacySourceUnverified {
+				// An inherited cursor is a silent, history-only boundary. Do not
+				// rescan it on every append; explicit publish-history chooses the
+				// recovery position. Keep a deletion probe so stale rows do not
+				// accumulate forever.
+				deferredPaths[path] = true
 				continue
 			}
 			if fileState.Offset > 0 && strings.TrimSpace(fileState.SourceFingerprint) == "" {
@@ -231,11 +241,25 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			continue
 		}
 	}
-	if len(blockedPaths) > 0 {
+	for path := range deferredPaths {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			missingDeferredPaths[path] = true
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.IsDir() {
+			continue
+		}
+	}
+	if len(blockedPaths) > 0 || len(deferredPaths) > 0 {
 		filtered := make([]string, 0, len(paths))
 		for _, path := range paths {
 			cleanPath := cleanComparablePath(path)
-			if blockedPaths[cleanPath] && !missingBlockedPaths[cleanPath] && !rebasePaths[cleanPath] {
+			if (blockedPaths[cleanPath] && !missingBlockedPaths[cleanPath] && !rebasePaths[cleanPath]) ||
+				(deferredPaths[cleanPath] && !missingDeferredPaths[cleanPath]) {
 				continue
 			}
 			filtered = append(filtered, path)
@@ -243,6 +267,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		paths = filtered
 	}
 	for path := range missingBlockedPaths {
+		paths = append(paths, path)
+	}
+	for path := range missingDeferredPaths {
 		paths = append(paths, path)
 	}
 	for path := range rebasePaths {
@@ -280,6 +307,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		for path := range missingBlockedPaths {
 			out = append(out, path)
 		}
+		for path := range missingDeferredPaths {
+			out = append(out, path)
+		}
 		for path := range rebasePaths {
 			out = append(out, path)
 		}
@@ -294,6 +324,9 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		out = append(out, change.Path)
 	}
 	for path := range missingBlockedPaths {
+		out = append(out, path)
+	}
+	for path := range missingDeferredPaths {
 		out = append(out, path)
 	}
 	for path := range rebasePaths {
@@ -369,6 +402,18 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 	if strings.TrimSpace(previous.Path) == "" {
 		previous.Path = path
 	}
+	if previous.LegacySourceUnverified {
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			return b.removeHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint)
+		} else if statErr != nil {
+			return statErr
+		}
+		// This is deliberately a no-op for automatic history polling. The
+		// inherited cursor has no source identity proof, so appending or rewriting
+		// the file cannot safely establish a new suffix boundary. The explicit
+		// publish-history command is the recovery operation.
+		return nil
+	}
 	if previous.SourceRewriteBlocked {
 		// A source rewrite is an explicit safety boundary. A Codex migration may
 		// safely rebase it once the same path is a paginated rollout and the old
@@ -412,11 +457,17 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 	legacyFingerprintMissing := previous.Size > 0 && strings.TrimSpace(previous.SourceFingerprint) == ""
 	if legacyFingerprintMissing {
 		// A legacy cursor has no proof that the bytes before Offset still belong
-		// to this source.  Scanning even a commentary-only suffix would mint a
-		// new fingerprint from the rewritten file and make a later final look
-		// trusted.  Require an explicit history publication/baseline to establish
-		// the first content-bound cursor; never infer it from the current EOF.
-		return blockSourceRewrite()
+		// to this source. Migrate it to a silent history-only boundary instead of
+		// marking the whole chat blocked or emitting a recovery notice. Do not
+		// update the cursor to the current file size: that would silently skip a
+		// replacement suffix. Explicit publish-history establishes the next
+		// content-bound boundary.
+		migrated := previous
+		migrated.Path = path
+		migrated.LegacySourceUnverified = true
+		migrated.SourceRewriteBlocked = false
+		migrated.OversizedRecordBlocked = false
+		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, migrated, now)
 	}
 	if previous.Size > 0 && previous.Offset >= 0 && strings.TrimSpace(previous.SourceFingerprint) != "" {
 		if !historyWatchSourcePrefixMatches(path, previous) {
@@ -438,43 +489,51 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && !historyWatchSourcePrefixMatches(path, previous) {
 		return blockSourceRewrite()
 	}
-	if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
-		// History watch is a periodic discovery path.  Do not turn a large
-		// append into an unbounded read. Record the observed file stat while
-		// keeping the logical cursor untouched; a single pathological record still
-		// requires explicit history import, while a normal bounded prefix remains
-		// resumable through the BudgetExhausted path above.
-		if info, statErr := os.Stat(path); statErr != nil {
-			return statErr
-		} else {
-			blockedState := result.State
-			if result.OversizedRecord {
-				// Do not skip complete records before the pathological line: they
-				// were not published by this pass and must remain in the explicit
-				// recovery range.
-				blockedState = previous
-			}
-			blockedState.Path = path
-			blockedState.Size = info.Size()
-			blockedState.ModTime = info.ModTime()
-			blockedState.OversizedRecordBlocked = result.OversizedRecord
-			return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
-		}
-	}
 	if result.Incomplete || result.Truncated {
 		// Do not publish a final observed before an unterminated/truncated
 		// record.  The scanner state contains metadata for complete records
 		// before the incomplete line, but those records have not been published
-		// by this path.  Persisting that state would make the next pass skip a
-		// valid final permanently.  A truncated source is already reset by the
-		// scanner; an incomplete append must roll back to the previous trusted
-		// cursor and retry the complete prefix after the writer settles.
+		// by this path.  Persisting a complete-prefix cursor would make the next
+		// pass skip a valid final permanently.  A truncated source is already reset
+		// by the scanner; an incomplete append retains only its bounded read hint.
 		if result.Incomplete && !result.Truncated {
-			rollback := previous
-			rollback.Path = path
-			return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, rollback, now)
+			// The scanner may have observed complete records before the partial
+			// line, but this watcher has not published them yet.  Keep the
+			// previous semantic cursor/final boundary and persist only the
+			// bounded partial-line observation.  Otherwise a final before the
+			// incomplete tail can be recorded as already delivered while the
+			// logical cursor still points before it.
+			partial := previous
+			partial.Path = path
+			partial.Size = result.State.Size
+			partial.ModTime = result.State.ModTime
+			// HistoryWatch does not publish the complete records observed before
+			// the partial line.  Reuse the existing partial-read hint, but make its
+			// replay origin the last durable newline; otherwise completion would
+			// resume at the partial line and permanently skip an earlier final.
+			partial.PartialLineStartOffset = previous.Offset
+			partial.PartialReadOffset = result.State.PartialReadOffset
+			partial.PartialObservedSize = result.State.PartialObservedSize
+			partial.PartialLine = previous.Line + 1
+			partial.PartialStartedAt = result.State.PartialStartedAt
+			partial.PartialSourceIdentity = result.State.PartialSourceIdentity
+			return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, partial, now)
 		}
 		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, result.State, now)
+	}
+	if result.State.TranscriptQuarantine != nil && !result.State.UnresolvedContinuation {
+		// A mirror/anonymous-final ambiguity is a history frontier, not proof
+		// that a Codex process still owns the thread. Keep the logical cursor at
+		// the previous durable position and persist only the bounded observation;
+		// do not create an execution anchor or emit a blocker notice.
+		blockedState := previous
+		blockedState.Path = path
+		if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() {
+			blockedState.Size = info.Size()
+			blockedState.ModTime = info.ModTime()
+		}
+		blockedState.TranscriptQuarantine = result.State.TranscriptQuarantine
+		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
 	}
 	if result.State.UnresolvedContinuation {
 		// Do not publish finals from a tail that contains execution-bearing work
@@ -670,10 +729,17 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		ModTime:                       checkpoint.ModTime,
 		SourceFingerprint:             strings.TrimSpace(checkpoint.SourceFingerprint),
 		SourceRewriteBlocked:          checkpoint.SourceRewriteBlocked,
+		LegacySourceUnverified:        checkpoint.LegacySourceUnverified,
 		OversizedRecordBlocked:        checkpoint.OversizedRecordBlocked,
 		SourceRewriteRecoveryIdentity: strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
 		Offset:                        checkpoint.Offset,
 		Line:                          checkpoint.Line,
+		PartialLineStartOffset:        checkpoint.PartialLineStartOffset,
+		PartialReadOffset:             checkpoint.PartialReadOffset,
+		PartialObservedSize:           checkpoint.PartialObservedSize,
+		PartialLine:                   checkpoint.PartialLine,
+		PartialStartedAt:              checkpoint.PartialStartedAt,
+		PartialSourceIdentity:         strings.TrimSpace(checkpoint.PartialSourceIdentity),
 		SessionID:                     strings.TrimSpace(checkpoint.SessionID),
 		ThreadID:                      strings.TrimSpace(checkpoint.ThreadID),
 		TeamsOriginThreadID:           strings.TrimSpace(checkpoint.TeamsOriginThreadID),
@@ -699,6 +765,7 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		PendingRootTaskStarted:       checkpoint.PendingRootTaskStarted,
 		PendingRootTaskStartedLine:   checkpoint.PendingRootTaskStartedLine,
 		PendingRootTaskStartedOffset: checkpoint.PendingRootTaskStartedOffset,
+		TranscriptQuarantine:         checkpoint.TranscriptQuarantine,
 		pendingAssistant:             historyWatchPendingAssistantFromCheckpoint(checkpoint),
 	}
 }
@@ -730,7 +797,7 @@ func (b *Bridge) recordHistoryWatchCheckpointIfCurrent(ctx context.Context, id s
 }
 
 func historyWatchCheckpointFromState(id string, state historyTieredFileState, now time.Time) teamstore.HistoryWatchCheckpoint {
-	if !state.SourceRewriteBlocked {
+	if !state.SourceRewriteBlocked && !state.LegacySourceUnverified {
 		if fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(state.Path, state.Offset)); fingerprint != "" {
 			state.SourceFingerprint = fingerprint
 		} else if state.Size > 0 {
@@ -738,16 +805,25 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		}
 	}
 	checkpoint := teamstore.HistoryWatchCheckpoint{
-		ID:                            id,
-		Path:                          strings.TrimSpace(state.Path),
-		Size:                          state.Size,
-		ModTime:                       state.ModTime,
-		SourceFingerprint:             strings.TrimSpace(state.SourceFingerprint),
-		SourceRewriteBlocked:          state.SourceRewriteBlocked,
-		OversizedRecordBlocked:        state.OversizedRecordBlocked,
+		ID:                     id,
+		Path:                   strings.TrimSpace(state.Path),
+		Size:                   state.Size,
+		ModTime:                state.ModTime,
+		SourceFingerprint:      strings.TrimSpace(state.SourceFingerprint),
+		SourceRewriteBlocked:   state.SourceRewriteBlocked,
+		LegacySourceUnverified: state.LegacySourceUnverified,
+		// Complete oversized JSONL records are now advanced as opaque ignored
+		// dispositions; retain the field only for old on-disk compatibility.
+		OversizedRecordBlocked:        false,
 		SourceRewriteRecoveryIdentity: strings.TrimSpace(state.SourceRewriteRecoveryIdentity),
 		Offset:                        state.Offset,
 		Line:                          state.Line,
+		PartialLineStartOffset:        state.PartialLineStartOffset,
+		PartialReadOffset:             state.PartialReadOffset,
+		PartialObservedSize:           state.PartialObservedSize,
+		PartialLine:                   state.PartialLine,
+		PartialStartedAt:              state.PartialStartedAt,
+		PartialSourceIdentity:         strings.TrimSpace(state.PartialSourceIdentity),
 		SessionID:                     strings.TrimSpace(state.SessionID),
 		ThreadID:                      strings.TrimSpace(state.ThreadID),
 		TeamsOriginThreadID:           strings.TrimSpace(state.TeamsOriginThreadID),
@@ -769,6 +845,7 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		PendingRootTaskStarted:        state.PendingRootTaskStarted,
 		PendingRootTaskStartedLine:    state.PendingRootTaskStartedLine,
 		PendingRootTaskStartedOffset:  state.PendingRootTaskStartedOffset,
+		TranscriptQuarantine:          state.TranscriptQuarantine,
 		UpdatedAt:                     now,
 	}
 	applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)

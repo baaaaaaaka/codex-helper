@@ -827,23 +827,38 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 	var lastTokenCountLine int
 	var usageTimeline []codexUsageObservation
 	atTurnStart := false
-	reader := bufio.NewReader(r)
 	lineNo := 0
 	finish := func() CodexTokenStats {
 		stats := finishCodexTokenStats(usage, fallback, rateLimits, diagnostics, tokenSourceLine, lastTokenCountLine, modelTierUsage.snapshot(), modelTierUsage.modelSnapshot())
 		stats.usageTimeline = append([]codexUsageObservation(nil), usageTimeline...)
 		return stats
 	}
+	reader := bufio.NewReaderSize(r, 64*1024)
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) == 0 && readErr == io.EOF {
-			break
+		read, readErr := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		if read.BytesRead == 0 {
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return finish(), fmt.Errorf("read Codex token stats: %w", readErr)
+			}
+			continue
 		}
 		if readErr != nil && readErr != io.EOF {
 			return finish(), fmt.Errorf("read Codex token stats: %w", readErr)
 		}
 		lineNo++
-		line = bytes.TrimSpace(line)
+		complete := read.Complete || (readErr == io.EOF && read.BytesRead > 0)
+		if !complete || read.Oversized {
+			diagnostics = append(diagnostics, TokenStatsDiagnostic{
+				SourceLine: lineNo,
+				Kind:       "oversized_record",
+				Message:    "token stats record is incomplete or exceeds the bounded parser limit",
+			})
+			break
+		}
+		line := bytes.TrimSpace(read.Line)
 		if len(line) == 0 || line[0] != '{' {
 			if readErr == io.EOF {
 				break
@@ -862,11 +877,11 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			}
 			continue
 		}
-		if context, ok := parseCodexModelTierContext(event); ok {
+		if modelContext, ok := parseCodexModelTierContext(event); ok {
 			if event.Type == "event_msg" || event.Type == "thread_settings_applied" {
-				modelTierUsage.applySettings(context)
+				modelTierUsage.applySettings(modelContext)
 			} else {
-				modelTierUsage.applyTurnContext(context)
+				modelTierUsage.applyTurnContext(modelContext)
 			}
 		}
 		if event.Type == "turn_context" {
@@ -889,16 +904,16 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 					if !tokenCount.nativeTotalPresent {
 						nativeTotal = tokenCount.Info.Last
 					}
-					context := modelTierUsage.current
+					modelContext := modelTierUsage.current
 					usageTimeline = append(usageTimeline, codexUsageObservation{
 						Timestamp:          parseCodexEventTimestamp(event.Timestamp),
 						SourceLine:         lineNo,
 						NativeTotal:        nativeTotal,
 						ReconstructedTotal: usage.info().Total,
 						Delta:              usageDelta,
-						Model:              context.Model,
-						Tier:               context.Tier,
-						Effort:             context.Effort,
+						Model:              modelContext.Model,
+						Tier:               modelContext.Tier,
+						Effort:             modelContext.Effort,
 						Cumulative:         tokenCount.nativeTotalPresent,
 					})
 				}
@@ -912,23 +927,23 @@ func ParseCodexTokenStats(r io.Reader) (CodexTokenStats, error) {
 			}
 			continue
 		}
-		if usage := normalizeCodexUsage(event.Usage); usage.hasTokens() {
+		if eventUsage := normalizeCodexUsage(event.Usage); eventUsage.hasTokens() {
 			atTurnStart = false
-			modelTierUsage.observeFallbackUsage(usage)
+			modelTierUsage.observeFallbackUsage(eventUsage)
 			fallback = CodexTokenStats{
 				SourceLine:       lineNo,
 				Source:           "event usage",
-				Info:             CodexTokenUsageInfo{Total: usage, Last: usage},
+				Info:             CodexTokenUsageInfo{Total: eventUsage, Last: eventUsage},
 				UsedFallbackOnly: true,
 			}
-			context := modelTierUsage.current
+			modelContext := modelTierUsage.current
 			usageTimeline = append(usageTimeline, codexUsageObservation{
 				Timestamp:  parseCodexEventTimestamp(event.Timestamp),
 				SourceLine: lineNo,
-				Delta:      usage,
-				Model:      context.Model,
-				Tier:       context.Tier,
-				Effort:     context.Effort,
+				Delta:      eventUsage,
+				Model:      modelContext.Model,
+				Tier:       modelContext.Tier,
+				Effort:     modelContext.Effort,
 				Cumulative: false,
 			})
 		}

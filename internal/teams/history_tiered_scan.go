@@ -26,6 +26,20 @@ const historyTieredTailReaderSize = 4 * 1024
 // line boundary.
 const historyTieredMaxRecordBytes = 8 * 1024 * 1024
 
+// historyTieredMaxRecordReadBytes is an independent framing safety valve. A
+// complete JSONL record may be larger than the per-pass history budget (for
+// example an image accidentally serialized as base64), but a newline-less
+// record must not make one poll read an unbounded file. The scanner persists a
+// partial read cursor when this cap is reached and resumes only after growth.
+const historyTieredMaxRecordReadBytes int64 = 64 * 1024 * 1024
+
+// A complete oversized record is still a safe newline-bounded disposition.
+// Its read-range proof may therefore cover the per-pass budget plus the full
+// bounded record envelope, rather than the smaller decoded-record cap.  This
+// keeps a real image/base64 record (for example ~10 MiB) recoverable without
+// allowing an unbounded persisted proof to make the sender reread a file.
+const historyTieredMaxReadProofBytes int64 = historyTieredMaxTailBytes + historyTieredMaxRecordReadBytes
+
 var (
 	historyTieredContinuationMarkers = [][]byte{
 		[]byte(`"task_started"`), []byte(`"task.started"`), []byte(`"task/started"`), []byte(`"task-started"`),
@@ -47,15 +61,25 @@ type historyTieredFileState struct {
 	ModTime                       time.Time
 	SourceFingerprint             string
 	SourceRewriteBlocked          bool
+	LegacySourceUnverified        bool
 	OversizedRecordBlocked        bool
 	SourceRewriteRecoveryIdentity string
 	Offset                        int64
 	Line                          int
-	SessionID                     string
-	ThreadID                      string
-	TeamsOriginThreadID           string
-	TurnID                        string
-	TeamsOriginTurnID             string
+	// Partial* represent a record that has not reached a newline. Offset and
+	// Line remain the last complete JSONL boundary; these fields are only a
+	// resumable read hint and never a publishable cursor.
+	PartialLineStartOffset int64
+	PartialReadOffset      int64
+	PartialObservedSize    int64
+	PartialLine            int
+	PartialStartedAt       time.Time
+	PartialSourceIdentity  string
+	SessionID              string
+	ThreadID               string
+	TeamsOriginThreadID    string
+	TurnID                 string
+	TeamsOriginTurnID      string
 	// ExternalUserPromptSeen is a positive ownership hint for a new root turn.
 	// It is set only by a visible, non-internal user record after the most recent
 	// terminal boundary and is consumed by the following task_started marker.
@@ -86,6 +110,13 @@ type historyTieredFileState struct {
 	PendingRootTaskStarted       bool
 	PendingRootTaskStartedLine   int
 	PendingRootTaskStartedOffset int64
+	// Transient end boundary for the pending marker. The durable checkpoint
+	// stores the resulting ignored disposition, not the marker payload.
+	PendingRootTaskStartedEndOffset int64
+	// TranscriptQuarantine is a history-only frontier. It is intentionally
+	// separate from UnresolvedContinuation: ambiguous transcript mirrors do
+	// not prove that an app-server execution is still alive.
+	TranscriptQuarantine *teamstore.TranscriptQuarantine
 
 	pendingAssistant historyTieredAssistantCandidate
 }
@@ -105,12 +136,12 @@ type historyTieredTailResult struct {
 	State   historyTieredFileState
 	Records []TranscriptRecord
 	Finals  []historyTieredFinal
-	// AnonymousFinals is retained separately when a pair is quarantined. The
-	// ordinary Records/Finals views intentionally omit that pair so callers
-	// cannot publish it without an explicit compatibility proof.
-	AnonymousFinals []historyTieredFinal
-	Truncated       bool
-	TooLarge        bool
+	// QuarantinedFinals is retained separately when a final group is
+	// ambiguous. The ordinary Records/Finals views intentionally omit that
+	// group so callers cannot publish it without an explicit boundary choice.
+	QuarantinedFinals []historyTieredFinal
+	Truncated         bool
+	TooLarge          bool
 	// BudgetExhausted means the scanner consumed a safe complete prefix of a
 	// tail larger than MaxTailBytes. TooLarge is retained for compatibility with
 	// older callers, but BudgetExhausted makes this a resumable result rather
@@ -128,6 +159,65 @@ type historyTieredTailResult struct {
 	ReadProofStartOffset int64
 	ReadProofEndOffset   int64
 	ReadProofRangeKnown  bool
+	LastConsumedRecordID string
+	LastConsumedLine     int
+	LastConsumedOffset   int64
+}
+
+type historyTieredRecordRead struct {
+	Line      []byte
+	Complete  bool
+	Oversized bool
+	// BytesRead includes prefix bytes already consumed by the bounded reader.
+	// It is used to advance the safe cursor past a complete oversized record.
+	BytesRead int64
+}
+
+func historyTieredReadJSONLRecord(reader *bufio.Reader, maxBytes int64, maxReadBytes int64) (historyTieredRecordRead, error) {
+	if reader == nil || maxBytes <= 0 || maxReadBytes <= 0 {
+		return historyTieredRecordRead{}, nil
+	}
+	var line []byte
+	var total int64
+	oversized := false
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		if len(chunk) > 0 {
+			total += int64(len(chunk))
+			if !oversized {
+				if total <= maxBytes {
+					line = append(line, chunk...)
+				} else {
+					oversized = true
+					if int64(len(line)) > maxBytes {
+						line = line[:maxBytes]
+					}
+				}
+			}
+			if bytes.HasSuffix(chunk, []byte{'\n'}) {
+				return historyTieredRecordRead{Line: line, Complete: true, Oversized: oversized, BytesRead: total}, nil
+			}
+		}
+		if total >= maxReadBytes {
+			return historyTieredRecordRead{Line: line, Oversized: oversized, BytesRead: total}, nil
+		}
+		if err != nil {
+			if err == io.EOF {
+				if total == 0 {
+					return historyTieredRecordRead{}, io.EOF
+				}
+				// The framer only calls a record complete after seeing its JSONL
+				// newline. Parser callers may explicitly treat a non-empty EOF as
+				// the final record boundary, while the incremental history scanner
+				// must retain it as a partial tail until a newline is durable.
+				return historyTieredRecordRead{Line: line, Oversized: oversized, BytesRead: total}, io.EOF
+			}
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			return historyTieredRecordRead{Line: line, Oversized: oversized, BytesRead: total}, err
+		}
+	}
 }
 
 // historyTieredLineHint is a deliberately conservative, allocation-free
@@ -201,11 +291,12 @@ func historyTieredASCIIAlpha(value byte) bool {
 }
 
 type historyTieredFinal struct {
-	Key                     string
-	Record                  TranscriptRecord
-	TerminalLine            int
-	TerminalKind            string
-	NoTurnIDNeedsQuarantine bool
+	Key                      string
+	Record                   TranscriptRecord
+	TerminalLine             int
+	TerminalKind             string
+	NoTurnIDNeedsQuarantine  bool
+	TranscriptOnlyQuarantine bool
 }
 
 func historyTieredDetectStatChanges(paths []string, states map[string]historyTieredFileState, verifyUnchangedOpt ...bool) ([]historyTieredStatChange, error) {
@@ -305,6 +396,63 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		next = historyTieredFileState{Path: path}
 		return historyTieredTailResult{State: next, Truncated: true}, nil
 	}
+	if previous.PartialLineStartOffset >= previous.Offset && previous.PartialReadOffset > previous.PartialLineStartOffset {
+		identity := historyTieredSourceIdentity(path, info)
+		if strings.TrimSpace(previous.PartialSourceIdentity) != "" && identity != "" && identity != strings.TrimSpace(previous.PartialSourceIdentity) {
+			next := previous
+			next.Path = path
+			next.Size = info.Size()
+			next.ModTime = info.ModTime()
+			return historyTieredTailResult{State: next, Truncated: true}, nil
+		}
+		if previous.PartialReadOffset > info.Size() {
+			next := previous
+			next.Path = path
+			next.Size = info.Size()
+			next.ModTime = info.ModTime()
+			return historyTieredTailResult{State: next, Truncated: true}, nil
+		}
+		if previous.PartialReadOffset == info.Size() && previous.PartialObservedSize == info.Size() && previous.ModTime.Equal(info.ModTime()) {
+			next := previous
+			next.Path = path
+			next.Size = info.Size()
+			next.ModTime = info.ModTime()
+			return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
+		}
+		if hasNewline, err := historyTieredPartialHasNewline(path, previous.PartialReadOffset, info.Size()); err != nil {
+			return historyTieredTailResult{}, err
+		} else if !hasNewline {
+			next := previous
+			next.Path = path
+			next.Size = info.Size()
+			next.ModTime = info.ModTime()
+			next.PartialReadOffset = info.Size()
+			next.PartialObservedSize = info.Size()
+			next.PartialSourceIdentity = firstNonEmptyString(next.PartialSourceIdentity, identity)
+			return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
+		}
+		// The writer completed the record. Re-read only that record from its
+		// start with the normal bounded parser; this keeps the persisted state
+		// small and avoids a cross-poll JSON lexer.
+		previous.Offset = previous.PartialLineStartOffset
+		previous.Line = previous.PartialLine - 1
+		if previous.Line < 0 {
+			previous.Line = 0
+		}
+		previous.PartialLineStartOffset = 0
+		previous.PartialReadOffset = 0
+		previous.PartialObservedSize = 0
+		previous.PartialLine = 0
+		previous.PartialStartedAt = time.Time{}
+		previous.PartialSourceIdentity = ""
+	}
+	// The partial-completion branch rewinds the local scan cursor to the start
+	// of the now-complete record. Refresh the result state after that rewind so
+	// stale Partial* fields are not persisted alongside the new newline cursor.
+	next = previous
+	next.Path = path
+	next.Size = info.Size()
+	next.ModTime = info.ModTime()
 
 	tailBytes := info.Size() - previous.Offset
 	scanEnd := info.Size()
@@ -397,54 +545,87 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	// by a previous scan) authorizes no-ID final quarantine.
 	terminalBoundarySeen := previous.TerminalBoundarySeen || previous.UnresolvedContinuation
 	terminalEventBoundarySeen := previous.TerminalBoundarySeen || previous.UnresolvedContinuation
+	previousAnonymousFinalCandidate := previous.TerminalBoundarySeen && !previous.UnresolvedContinuation &&
+		previous.LastFinalStartOffsetKnown && (previous.LastFinalStartOffset > 0 || previous.LastFinalLine > 0) &&
+		strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.LastFinalTurnID) == ""
 	next.TerminalBoundarySeen = previous.TerminalBoundarySeen || previous.UnresolvedContinuation
 	if next.TerminalBoundarySeen && next.TerminalBoundaryLine == 0 {
 		next.TerminalBoundaryLine = previous.LastFinalLine
 	}
+	// Final-text de-duplication is a checkpoint-boundary check, not a
+	// same-scan check.  `next` is updated after every final in this scan; using
+	// it here would suppress the second record in a newly observed anonymous
+	// mirror pair before compaction can quarantine the pair.  Keep the durable
+	// boundary separate and clear it only when this scan proves a fresh root
+	// turn, never when it merely observes another final.
+	finalDedupBoundary := previous
 	suppressFinalsAfterContinuation := previous.UnresolvedContinuation || previous.PendingRootTaskStarted
 	externalUserPromptSeen := previous.ExternalUserPromptSeen
 	pendingRootTaskStarted := previous.PendingRootTaskStarted && !previous.UnresolvedContinuation
 	pendingRootTaskStartedLine := previous.PendingRootTaskStartedLine
 	pendingRootTaskStartedOffset := previous.PendingRootTaskStartedOffset
+	pendingRootTaskStartedEndOffset := previous.PendingRootTaskStartedEndOffset
 	result := historyTieredTailResult{
 		State:        next,
 		MaxTailBytes: maxTailBytes,
 		TooLarge:     budgeted,
 	}
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		line := read.Line
+		if read.BytesRead > 0 {
 			lineStartOffset := offset
-			if err == io.EOF && !bytes.HasSuffix(line, []byte("\n")) {
-				if budgeted {
-					completed, complete, oversized, readErr := historyTieredCompleteBudgetedLine(f, line, historyTieredMaxRecordBytes)
+			if !read.Complete {
+				if budgeted && lineStartOffset+read.BytesRead >= scanEnd {
+					completed, readErr := historyTieredCompleteBudgetedLine(f, line, read.BytesRead, readEnd-scanEnd, historyTieredMaxRecordBytes)
 					if readErr != nil {
 						return result, readErr
 					}
-					if complete {
-						line = completed
+					if completed.Complete {
+						if completed.Oversized {
+							// A complete oversized record has a safe JSONL boundary even
+							// though its payload is intentionally not decoded. Keep the
+							// cursor moving and emit a deterministic opaque disposition so
+							// later status/final records remain reachable.
+							lineNo++
+							offset = lineStartOffset + completed.BytesRead
+							result.BytesRead += completed.BytesRead
+							result.LinesRead++
+							result.OversizedRecord = true
+							if record := historyTieredOversizedRecord(path, lineNo, lineStartOffset, offset, line); record.ItemID != "" {
+								result.Records = append(result.Records, record)
+							}
+							// Preserve the per-pass budget. The next poll starts at the
+							// complete boundary and can reach the following records.
+							break
+						}
+						line = completed.Line
+						read = completed
 						err = nil
-					} else if oversized {
-						// Keep the cursor before an oversized JSONL record. It is
-						// not safe to skip an unparsed line; explicit history import
-						// remains available for this pathological record.
-						result.OversizedRecord = true
-						break
 					} else {
 						result.Incomplete = true
-						next.Size = lineStartOffset
+						next.Size = info.Size()
+						next.PartialLineStartOffset = lineStartOffset
+						next.PartialReadOffset = lineStartOffset + completed.BytesRead
+						next.PartialObservedSize = info.Size()
+						next.PartialLine = lineNo + 1
+						next.PartialStartedAt = firstNonZeroTime(previous.PartialStartedAt, info.ModTime())
+						next.PartialSourceIdentity = firstNonEmptyString(previous.PartialSourceIdentity, historyTieredSourceIdentity(path, info))
 						break
 					}
 				} else {
-					if readProofReady {
-						_, _ = readProof.Write(line)
-					}
 					result.Incomplete = true
 					// Keep the source-size cursor at the last complete byte. The
 					// file may grow by completing this same line; recording the full
 					// current size would make the next pass incorrectly take the
 					// unchanged fast path and lose the tail.
-					next.Size = lineStartOffset
+					next.Size = info.Size()
+					next.PartialLineStartOffset = lineStartOffset
+					next.PartialReadOffset = lineStartOffset + read.BytesRead
+					next.PartialObservedSize = info.Size()
+					next.PartialLine = lineNo + 1
+					next.PartialStartedAt = firstNonZeroTime(previous.PartialStartedAt, info.ModTime())
+					next.PartialSourceIdentity = firstNonEmptyString(previous.PartialSourceIdentity, historyTieredSourceIdentity(path, info))
 					break
 				}
 			}
@@ -452,8 +633,8 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				_, _ = readProof.Write(line)
 			}
 			lineNo++
-			offset += int64(len(line))
-			result.BytesRead += int64(len(line))
+			offset += read.BytesRead
+			result.BytesRead += read.BytesRead
 			result.LinesRead++
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {
@@ -501,6 +682,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStarted = true
 							pendingRootTaskStartedLine = lineNo - 1
 							pendingRootTaskStartedOffset = lineStartOffset
+							pendingRootTaskStartedEndOffset = offset
 							suppressFinalsAfterContinuation = true
 						}
 						externalUserPromptSeen = false
@@ -508,6 +690,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStarted = false
 							pendingRootTaskStartedLine = 0
 							pendingRootTaskStartedOffset = 0
+							pendingRootTaskStartedEndOffset = 0
 							// A proven new root turn starts a fresh terminal scope. Clear
 							// any old child marker so one ambiguous continuation cannot
 							// permanently pause an otherwise healthy local session.
@@ -519,6 +702,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							next.LastFinalThreadID = ""
 							next.LastFinalTurnID = ""
 							next.LastFinalTextHash = ""
+							finalDedupBoundary.LastFinalThreadID = ""
+							finalDedupBoundary.LastFinalTurnID = ""
+							finalDedupBoundary.LastFinalTextHash = ""
 							next.TerminalBoundarySeen = false
 							next.TerminalBoundaryLine = 0
 							next.UnresolvedContinuation = false
@@ -558,6 +744,13 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					next.UnresolvedContinuationOffset = unresolvedOffset
 					break
 				}
+				// A complete newline-bounded line always has a durable ignored
+				// disposition, even when the parser emits no TranscriptRecord.
+				// This is what lets a marker-only or opaque tool line move the
+				// linked cursor without making the scanner publish it.
+				result.LastConsumedRecordID = historyTieredConsumedRecordKey(path, lineNo, lineStartOffset, offset)
+				result.LastConsumedLine = lineNo
+				result.LastConsumedOffset = offset
 				for i := range records {
 					records[i].TurnIDExplicit = historyTieredLineHasExplicitTurnIDWithHint(trimmed, hints.MayTurnField)
 					records[i].SourceStartOffset = lineStartOffset
@@ -585,13 +778,38 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				// an anonymous final after an explicitly-owned outer final cannot be
 				// attributed to that owner.
 				scopeBoundaryBeforeFinal := persistedFinalBoundary || terminalEventBoundarySeen || (terminalBoundarySeen && priorTurnID != "")
-				if ambiguous, childTurnID := historyTieredVisibleFinalNeedsQuarantine(records, priorTurnID, scopeBoundaryBeforeFinal, knownFinalBoundary || terminalEventBoundarySeen, legacyNoOffsetCheckpointBoundary, terminalEventBoundarySeen); ambiguous {
-					if !next.UnresolvedContinuation {
-						next.UnresolvedContinuation = true
-						next.UnresolvedContinuationLine = lineNo - 1
-						next.UnresolvedContinuationOffset = lineStartOffset
+				anonymousFinalNeedsQuarantine := false
+				transcriptOnlyFinalNeedsQuarantine := false
+				if ambiguous, childTurnID, anonymousOnly := historyTieredVisibleFinalNeedsQuarantine(records, priorTurnID, scopeBoundaryBeforeFinal, knownFinalBoundary || terminalEventBoundarySeen, legacyNoOffsetCheckpointBoundary, terminalEventBoundarySeen); ambiguous {
+					// A no-ID final is not enough to establish a live child owner. Keep
+					// it as a candidate until the bounded scan can see whether a second
+					// final is the normal event_msg/response_item mirror. A single
+					// candidate is still promoted to the real execution fence below.
+					deferAsTranscriptQuarantine := anonymousOnly || previousAnonymousFinalCandidate || historyTieredFinalsCouldBeMixedIDMirror(result.Finals, records)
+					if deferAsTranscriptQuarantine {
+						anonymousFinalNeedsQuarantine = anonymousOnly
+						transcriptOnlyFinalNeedsQuarantine = previousAnonymousFinalCandidate
+						if anonymousOnly {
+							// parseTranscriptLine may have carried the previous outer
+							// turn ID into a record whose source line did not contain
+							// one. Clear that inherited value before the final is
+							// materialized; otherwise the end-of-scan promotion would
+							// mistake the anonymous candidate for the old owner.
+							for i := range records {
+								if records[i].Kind == TranscriptKindAssistant && !records[i].TurnIDExplicit {
+									records[i].TurnID = ""
+								}
+							}
+						}
+						childTurnID = ""
+					} else {
+						if !next.UnresolvedContinuation {
+							next.UnresolvedContinuation = true
+							next.UnresolvedContinuationLine = lineNo - 1
+							next.UnresolvedContinuationOffset = lineStartOffset
+						}
+						suppressFinalsAfterContinuation = true
 					}
-					suppressFinalsAfterContinuation = true
 					parseState.turnID = strings.TrimSpace(childTurnID)
 				}
 				// Some app-server revisions emit a child response_item without a
@@ -610,28 +828,31 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				// inherit that old turn. The ordinary linked bridge path does not
 				// populate TurnID for its generic checkpoint, so valid no-ID mirrors
 				// remain compatible there.
+				responseItemAnonymousFinalNeedsQuarantine := false
+				responseItemTranscriptOnlyFinalNeedsQuarantine := false
 				responseItemBoundarySeen := terminalBoundarySeen || legacyNoOffsetCheckpointBoundary || legacyResponseItemBoundary || legacyCursorBoundary
 				if responseItemBoundarySeen && (knownFinalBoundary || priorTurnID != "") && !suppressFinalsAfterContinuation && historyTieredLineIsResponseItem(trimmed) {
-					for _, record := range records {
+					for i := range records {
+						record := &records[i]
 						if record.Internal || record.Kind != TranscriptKindAssistant || !strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer") {
 							continue
 						}
 						if !record.TurnIDExplicit || strings.TrimSpace(record.TurnID) == "" {
-							// A visible final response_item after a known terminal scope
-							// must carry its own execution identity.  Inheriting the
-							// previous outer turn would publish an orphan answer under
-							// the wrong Teams request.  A legacy LastFinalID-only
-							// checkpoint is already a known terminal scope even though
-							// it lacks a prior turn ID; quarantine that combination too.
-							if priorTurnID == "" && !legacyNoOffsetCheckpointBoundary && !legacyResponseItemBoundary {
-								continue
-							}
-							next.UnresolvedContinuation = true
-							next.UnresolvedContinuationLine = lineNo - 1
-							next.UnresolvedContinuationOffset = lineStartOffset
-							suppressFinalsAfterContinuation = true
-							parseState.turnID = ""
-							break
+							// Missing execution identity remains a deferred candidate. If
+							// it is the only candidate, the end-of-scan promotion below
+							// creates the real unresolved execution fence; if a typed
+							// mirror is present, it becomes transcript-only quarantine.
+							record.TurnID = ""
+							responseItemAnonymousFinalNeedsQuarantine = true
+							continue
+						}
+						if previousAnonymousFinalCandidate && historyTieredFinalMatchesPreviousAnonymous(*record, previous) {
+							// A typed response_item arriving after an anonymous final
+							// may be the canonical mirror from the next poll. Defer it
+							// to transcript-only compaction instead of promoting it to
+							// a new execution owner here.
+							responseItemTranscriptOnlyFinalNeedsQuarantine = true
+							continue
 						}
 						if priorTurnID != "" && strings.TrimSpace(record.TurnID) == priorTurnID {
 							continue
@@ -647,15 +868,16 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				for _, record := range records {
 					if !record.Internal && record.Kind == TranscriptKindUser && strings.TrimSpace(record.Text) != "" && !shouldSkipTranscriptUserText(record.Text) {
 						externalUserPromptSeen = true
-						if pendingRootTaskStarted && !next.UnresolvedContinuation {
+						if (pendingRootTaskStarted || terminalBoundarySeen) && !next.UnresolvedContinuation {
 							// A visible user prompt following a root-shaped task_started
 							// proves that it was a normal new outer request rather than
-							// an internal goal continuation. Release only this pending
-							// candidate; an already durable unresolved anchor remains
-							// fail-closed.
+							// an internal goal continuation. This also handles a marker
+							// whose ignored cursor was committed on the previous poll;
+							// an already durable unresolved anchor remains fail-closed.
 							pendingRootTaskStarted = false
 							pendingRootTaskStartedLine = 0
 							pendingRootTaskStartedOffset = 0
+							pendingRootTaskStartedEndOffset = 0
 							terminalBoundarySeen = false
 							suppressFinalsAfterContinuation = false
 							next.LastFinalID = ""
@@ -665,6 +887,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							next.LastFinalThreadID = ""
 							next.LastFinalTurnID = ""
 							next.LastFinalTextHash = ""
+							finalDedupBoundary.LastFinalThreadID = ""
+							finalDedupBoundary.LastFinalTurnID = ""
+							finalDedupBoundary.LastFinalTextHash = ""
 							next.TerminalBoundarySeen = false
 							next.TerminalBoundaryLine = 0
 						}
@@ -684,7 +909,23 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 						if signals.FinalAnswer && !suppressFinalsAfterContinuation {
 							terminalBoundarySeen = true
 							final := historyTieredFinalFromCandidate(pending, record.SourceLine, "final_answer", scopeBoundaryBeforeFinal)
-							if final.Key != "" && !historyTieredFinalMatchesPersistedBoundary(final.Record, next) && final.Key != next.LastFinalID {
+							if (anonymousFinalNeedsQuarantine || responseItemAnonymousFinalNeedsQuarantine) && strings.TrimSpace(final.Record.TurnID) == "" {
+								final.NoTurnIDNeedsQuarantine = true
+							}
+							if responseItemTranscriptOnlyFinalNeedsQuarantine {
+								final.TranscriptOnlyQuarantine = true
+							}
+							if transcriptOnlyFinalNeedsQuarantine {
+								final.TranscriptOnlyQuarantine = true
+							}
+							if previousAnonymousFinalCandidate && historyTieredFinalMatchesPreviousAnonymous(final.Record, previous) {
+								// The previous poll already committed an anonymous final. A
+								// same-text typed surface arriving later is still only a
+								// possible mirror; do not let the cross-poll split bypass
+								// the transcript-only quarantine.
+								final.TranscriptOnlyQuarantine = true
+							}
+							if final.Key != "" && !historyTieredFinalMatchesPersistedBoundary(final.Record, finalDedupBoundary) && final.Key != next.LastFinalID {
 								result.Finals = append(result.Finals, final)
 								next.LastFinalID = final.Key
 								next.LastFinalLine = final.Record.SourceLine
@@ -712,7 +953,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					terminalTurnID := firstNonEmptyString(signals.TurnID, parseState.turnID)
 					if pending.Record.Text != "" && historyTieredTurnMatches(pending.Record.TurnID, terminalTurnID) {
 						final := historyTieredFinalFromCandidate(pending, lineNo, signals.TerminalKind, scopeBoundaryBeforeFinal)
-						if final.Key != "" && !historyTieredFinalMatchesPersistedBoundary(final.Record, next) && final.Key != next.LastFinalID {
+						if final.Key != "" && !historyTieredFinalMatchesPersistedBoundary(final.Record, finalDedupBoundary) && final.Key != next.LastFinalID {
 							result.Finals = append(result.Finals, final)
 							next.LastFinalID = final.Key
 							next.LastFinalLine = final.Record.SourceLine
@@ -738,7 +979,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			return result, err
 		}
 	}
-	if budgeted && !result.OversizedRecord && !result.Incomplete && !result.Truncated {
+	if budgeted && !result.Incomplete && !result.Truncated {
 		result.BudgetExhausted = true
 	}
 
@@ -751,6 +992,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.PendingRootTaskStarted = pendingRootTaskStarted
 	next.PendingRootTaskStartedLine = pendingRootTaskStartedLine
 	next.PendingRootTaskStartedOffset = pendingRootTaskStartedOffset
+	next.PendingRootTaskStartedEndOffset = pendingRootTaskStartedEndOffset
 	next.pendingAssistant = pending
 	if len(result.Records) > 0 {
 		transcript := Transcript{
@@ -781,79 +1023,250 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			result.ReadProofRangeKnown = true
 		}
 	}
-	// Two anonymous finals are ambiguous even when the explicit terminal event
-	// has not arrived yet (for example one event_msg and one response_item). A
-	// single anonymous fragment remains compatible with the existing
-	// wait-for-terminal behavior, but a pair must never be published as two
-	// answers or attributed to one outer owner. Persist the unresolved boundary
-	// so a linked-transcript caller also fails closed; HistoryWatch checks the
-	// per-final marker before publishing.
+	// Anonymous finals are resolved only after the bounded scan has seen the
+	// complete candidate group. A single no-ID final after a trusted terminal is
+	// a real execution-ownership ambiguity; two or more candidates are a
+	// transcript-only quarantine because they may be the event_msg/response_item
+	// mirror emitted for one answer. Neither case may publish the candidates.
 	anonymous := make([]int, 0, 2)
 	for i := range result.Finals {
 		if strings.TrimSpace(result.Finals[i].Record.TurnID) == "" {
 			anonymous = append(anonymous, i)
 		}
 	}
-	if len(anonymous) >= 2 {
-		result.AnonymousFinals = make([]historyTieredFinal, 0, len(anonymous))
-		for _, i := range anonymous {
-			result.Finals[i].NoTurnIDNeedsQuarantine = true
-			result.AnonymousFinals = append(result.AnonymousFinals, result.Finals[i])
+	if len(anonymous) == 1 && result.Finals[anonymous[0]].NoTurnIDNeedsQuarantine {
+		anonymousIndex := anonymous[0]
+		mixedIDMirror := false
+		for i := range result.Finals {
+			if i == anonymousIndex || !historyTieredFinalCouldBeMixedIDMirror(result.Finals[anonymousIndex], result.Finals[i]) {
+				continue
+			}
+			mixedIDMirror = true
+			result.Finals[i].TranscriptOnlyQuarantine = true
 		}
-		if !result.State.UnresolvedContinuation {
-			result.State.UnresolvedContinuation = true
-			first := result.Finals[anonymous[0]].Record
-			result.State.UnresolvedContinuationLine = first.SourceLine
-			result.State.UnresolvedContinuationOffset = first.SourceStartOffset
+		if mixedIDMirror {
+			result.Finals[anonymousIndex].TranscriptOnlyQuarantine = true
+		} else if previousAnonymousFinalCandidate {
+			result.QuarantinedFinals = append(result.QuarantinedFinals, result.Finals[anonymousIndex])
+		} else {
+			if !result.State.UnresolvedContinuation {
+				result.State.UnresolvedContinuation = true
+				first := result.Finals[anonymousIndex].Record
+				result.State.UnresolvedContinuationLine = first.SourceLine
+				result.State.UnresolvedContinuationOffset = first.SourceStartOffset
+			}
+		}
+		if !mixedIDMirror {
+			result.Finals = append(append([]historyTieredFinal(nil), result.Finals[:anonymousIndex]...), result.Finals[anonymousIndex+1:]...)
 		}
 	}
+	if len(anonymous) >= 2 {
+		for _, i := range anonymous {
+			result.Finals[i].NoTurnIDNeedsQuarantine = true
+		}
+	}
+	if len(result.Finals) > 0 {
+		retained := make([]historyTieredFinal, 0, len(result.Finals))
+		for _, final := range result.Finals {
+			if final.TranscriptOnlyQuarantine {
+				result.QuarantinedFinals = append(result.QuarantinedFinals, final)
+				continue
+			}
+			retained = append(retained, final)
+		}
+		result.Finals = retained
+	}
 	var ambiguousMirror bool
-	result.Finals, ambiguousMirror = compactHistoryTieredFinals(result.Finals)
-	if ambiguousMirror && !result.State.UnresolvedContinuation {
-		// A mixed-ID pair with identical text but no trustworthy source
-		// relationship cannot be safely classified as either a mirror or two
-		// distinct turns. Do not publish either candidate; the bridge will
-		// persist the blocked boundary and emit one idempotent notice.
-		result.State.UnresolvedContinuation = true
-		result.State.UnresolvedContinuationLine = result.State.Line
-		result.State.UnresolvedContinuationOffset = result.State.Offset
+	var compactedQuarantine []historyTieredFinal
+	result.Finals, compactedQuarantine, ambiguousMirror = compactHistoryTieredFinals(result.Finals)
+	if ambiguousMirror {
+		result.QuarantinedFinals = append(result.QuarantinedFinals, compactedQuarantine...)
+	}
+	if len(result.QuarantinedFinals) > 0 {
+		kind := "ambiguous_final_group"
+		if len(anonymous) > 0 {
+			kind = "anonymous_final_group"
+		} else if ambiguousMirror {
+			kind = "mixed_id_final_mirror"
+		}
+		result.State.TranscriptQuarantine = historyTieredTranscriptQuarantine(result.State, kind, result.QuarantinedFinals)
+		if previousAnonymousFinalCandidate && result.State.TranscriptQuarantine != nil {
+			quarantine := result.State.TranscriptQuarantine
+			if previous.LastFinalStartOffsetKnown && previous.LastFinalStartOffset < quarantine.FrontierOffset {
+				quarantine.FrontierRecordID = strings.TrimSpace(previous.LastFinalID)
+				quarantine.FrontierLine = previous.LastFinalLine
+				quarantine.FrontierOffset = previous.LastFinalStartOffset
+			}
+			previousHash := strings.TrimSpace(previous.LastFinalTextHash)
+			if previousHash != "" && len(quarantine.CandidateTextHashes) < 4 {
+				seen := false
+				for _, hash := range quarantine.CandidateTextHashes {
+					if hash == previousHash {
+						seen = true
+						break
+					}
+				}
+				if !seen {
+					quarantine.CandidateTextHashes = append(quarantine.CandidateTextHashes, previousHash)
+				}
+			}
+		}
 	}
 	return result, nil
 }
 
-func historyTieredCompleteBudgetedLine(file *os.File, prefix []byte, maxBytes int64) ([]byte, bool, bool, error) {
-	if file == nil || maxBytes <= 0 {
-		return nil, false, true, nil
+// historyTieredCompleteBudgetedLine drains the remainder of one record after a
+// per-pass tail budget ended in its middle. It captures only ordinary-sized
+// records; once the independent record cap is crossed it keeps draining in
+// small chunks until the newline and returns an opaque, complete disposition.
+// A newline-less record is reported incomplete and its consumed byte count is
+// persisted as a partial read hint by the caller.
+func historyTieredCompleteBudgetedLine(file *os.File, prefix []byte, prefixBytes int64, remaining int64, maxBytes int64) (historyTieredRecordRead, error) {
+	if file == nil || remaining <= 0 || maxBytes <= 0 {
+		return historyTieredRecordRead{Line: prefix, BytesRead: prefixBytes}, nil
 	}
+	readLimit := remaining
+	if cap := historyTieredMaxRecordReadBytes - prefixBytes; cap < readLimit {
+		readLimit = cap
+	}
+	if readLimit < 0 {
+		readLimit = 0
+	}
+	reader := bufio.NewReaderSize(io.LimitReader(file, readLimit), historyTieredTailReaderSize)
 	line := append([]byte(nil), prefix...)
-	reader := bufio.NewReaderSize(file, historyTieredTailReaderSize)
+	total := prefixBytes
+	oversized := total > maxBytes
 	for {
-		if int64(len(line)) >= maxBytes {
-			return nil, false, true, nil
-		}
 		chunk, err := reader.ReadSlice('\n')
 		if len(chunk) > 0 {
-			if int64(len(line)+len(chunk)) > maxBytes {
-				return nil, false, true, nil
+			total += int64(len(chunk))
+			if !oversized {
+				if total <= maxBytes {
+					line = append(line, chunk...)
+				} else {
+					oversized = true
+					// The prefix is useful for the bounded visibility hint. Keep
+					// it, but never append the opaque payload after the cap.
+					if int64(len(line)) > maxBytes {
+						line = line[:maxBytes]
+					}
+				}
 			}
-			line = append(line, chunk...)
 			if bytes.HasSuffix(chunk, []byte("\n")) {
-				return line, true, false, nil
+				if oversized {
+					line = line[:minInt64(int64(len(line)), maxBytes)]
+				}
+				return historyTieredRecordRead{Line: line, Complete: true, Oversized: oversized, BytesRead: total}, nil
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				return line, false, false, nil
+				return historyTieredRecordRead{Line: line, Oversized: oversized, BytesRead: total}, nil
 			}
 			if err == bufio.ErrBufferFull {
 				// ReadSlice returns the available fragment and keeps the reader
-				// positioned at the next byte. Continue accumulating only this
-				// single record until the explicit cap is reached.
+				// positioned at the next byte. Continue draining this record.
 				continue
 			}
-			return nil, false, false, err
+			return historyTieredRecordRead{Line: line, Oversized: oversized, BytesRead: total}, err
 		}
 	}
+}
+
+func historyTieredPartialHasNewline(path string, startOffset int64, endOffset int64) (bool, error) {
+	if strings.TrimSpace(path) == "" || startOffset < 0 || endOffset <= startOffset {
+		return false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
+		return false, err
+	}
+	reader := bufio.NewReaderSize(io.LimitReader(f, endOffset-startOffset), historyTieredTailReaderSize)
+	for {
+		chunk, readErr := reader.ReadSlice('\n')
+		if bytes.Contains(chunk, []byte{'\n'}) {
+			return true, nil
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return false, nil
+			}
+			if readErr == bufio.ErrBufferFull {
+				continue
+			}
+			return false, readErr
+		}
+	}
+}
+
+func minInt64(left, right int64) int {
+	if left < right {
+		return int(left)
+	}
+	return int(right)
+}
+
+func historyTieredSourceIdentity(path string, info os.FileInfo) string {
+	if info == nil {
+		return ""
+	}
+	identity, err := teamstore.SourceFileIdentityFromFileInfo(path, info)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(identity)
+}
+
+func historyTieredOversizedRecord(path string, lineNo int, startOffset int64, endOffset int64, prefix []byte) TranscriptRecord {
+	if lineNo <= 0 || startOffset < 0 || endOffset <= startOffset {
+		return TranscriptRecord{}
+	}
+	sum := sha256.New()
+	_, _ = sum.Write([]byte(filepath.Clean(path)))
+	_, _ = sum.Write([]byte{0})
+	_, _ = sum.Write([]byte(strconv.FormatInt(startOffset, 10)))
+	_, _ = sum.Write([]byte{0})
+	_, _ = sum.Write([]byte(strconv.FormatInt(endOffset, 10)))
+	_, _ = sum.Write([]byte{0})
+	_, _ = sum.Write(prefix)
+	key := "oversized:" + hex.EncodeToString(sum.Sum(nil))[:24]
+	kind := TranscriptKindUnknown
+	text := ""
+	// A giant opaque tool/image record is safely ignored. If the bounded
+	// envelope proves that this is a visible final/status record, leave one
+	// deterministic placeholder so the user sees a delivery rather than a
+	// silent cursor jump. The payload itself is never copied into the record.
+	if bytes.Contains(prefix, []byte(`"phase":"final_answer"`)) || bytes.Contains(prefix, []byte(`"phase": "final_answer"`)) {
+		kind = TranscriptKindAssistant
+		text = "Imported transcript record exceeded the local display limit; the original payload remains in the local Codex transcript."
+	} else if bytes.Contains(prefix, []byte(`"turn_completed"`)) || bytes.Contains(prefix, []byte(`"turn.completed"`)) || bytes.Contains(prefix, []byte(`"status"`)) {
+		kind = TranscriptKindStatus
+		text = "Imported oversized transcript status record; the original payload remains in the local Codex transcript."
+	}
+	return TranscriptRecord{
+		ItemID:            key,
+		SourceItemID:      key,
+		DedupeKey:         key,
+		Kind:              kind,
+		Text:              text,
+		SourceLine:        lineNo,
+		SourceStartOffset: startOffset,
+		SourceOffset:      endOffset,
+		SourceType:        "oversized_record",
+	}
+}
+
+func historyTieredConsumedRecordKey(path string, lineNo int, startOffset int64, endOffset int64) string {
+	if lineNo <= 0 || startOffset < 0 || endOffset <= startOffset {
+		return ""
+	}
+	payload := filepath.Clean(path) + "\x00" + strconv.Itoa(lineNo) + "\x00" + strconv.FormatInt(startOffset, 10) + "\x00" + strconv.FormatInt(endOffset, 10)
+	sum := sha256.Sum256([]byte(payload))
+	return "ignored:" + hex.EncodeToString(sum[:])[:24]
 }
 
 func historyTieredLineHasExplicitTurnID(line []byte) bool {
@@ -994,9 +1407,9 @@ func stringValue(value any) string {
 	return text
 }
 
-func historyTieredVisibleFinalNeedsQuarantine(records []TranscriptRecord, priorTurnID string, terminalBoundarySeen bool, knownFinalBoundary bool, legacyAnonymousBoundary bool, explicitTerminalBoundary bool) (bool, string) {
+func historyTieredVisibleFinalNeedsQuarantine(records []TranscriptRecord, priorTurnID string, terminalBoundarySeen bool, knownFinalBoundary bool, legacyAnonymousBoundary bool, explicitTerminalBoundary bool) (bool, string, bool) {
 	if !terminalBoundarySeen && !knownFinalBoundary && !legacyAnonymousBoundary {
-		return false, ""
+		return false, "", false
 	}
 	priorTurnID = strings.TrimSpace(priorTurnID)
 	for _, record := range records {
@@ -1010,7 +1423,7 @@ func historyTieredVisibleFinalNeedsQuarantine(records []TranscriptRecord, priorT
 			// the outer execution. This includes event_msg/agent_message records
 			// with a source item ID: that ID identifies a transcript record, not
 			// the owning Codex execution.
-			return true, ""
+			return true, "", true
 		}
 		if priorTurnID == "" && !legacyAnonymousBoundary && !explicitTerminalBoundary {
 			// A linked checkpoint may carry only a generic record key. Until an
@@ -1033,9 +1446,9 @@ func historyTieredVisibleFinalNeedsQuarantine(records []TranscriptRecord, priorT
 		// its own explicit execution ID proves it belongs to that same turn.  A
 		// different child ID (or an explicit ID with no prior scope) is
 		// quarantined.
-		return true, turnID
+		return true, turnID, false
 	}
-	return false, ""
+	return false, "", false
 }
 
 func historyTieredOrdinaryRootTaskStarted(value map[string]json.RawMessage) bool {
@@ -1183,9 +1596,9 @@ func historyTieredFinalFromCandidate(candidate historyTieredAssistantCandidate, 
 	}
 }
 
-func compactHistoryTieredFinals(finals []historyTieredFinal) ([]historyTieredFinal, bool) {
+func compactHistoryTieredFinals(finals []historyTieredFinal) ([]historyTieredFinal, []historyTieredFinal, bool) {
 	if len(finals) < 2 {
-		return finals, false
+		return finals, nil, false
 	}
 	// app-server can expose one assistant final both as an event_msg and as a
 	// response_item. They have different source IDs, so ID-only dedupe would
@@ -1252,8 +1665,10 @@ func compactHistoryTieredFinals(finals []historyTieredFinal) ([]historyTieredFin
 		deduped = append(deduped, current)
 	}
 	out := make([]historyTieredFinal, 0, len(deduped))
+	quarantined := make([]historyTieredFinal, 0, len(ambiguousIndexes))
 	for i := range deduped {
 		if ambiguousIndexes[i] {
+			quarantined = append(quarantined, deduped[i])
 			continue
 		}
 		if historyTieredFinalIsPrefixShadowed(deduped, i) {
@@ -1261,7 +1676,7 @@ func compactHistoryTieredFinals(finals []historyTieredFinal) ([]historyTieredFin
 		}
 		out = append(out, deduped[i])
 	}
-	return out, len(ambiguousIndexes) > 0
+	return out, quarantined, len(ambiguousIndexes) > 0
 }
 
 func historyTieredFinalMirrorKey(final historyTieredFinal) string {
@@ -1317,6 +1732,71 @@ func historyTieredFinalCouldBeMixedIDMirror(left historyTieredFinal, right histo
 		return false
 	}
 	return true
+}
+
+func historyTieredFinalsCouldBeMixedIDMirror(existing []historyTieredFinal, records []TranscriptRecord) bool {
+	for _, current := range records {
+		if current.Internal || current.Kind != TranscriptKindAssistant ||
+			!strings.EqualFold(strings.TrimSpace(current.Phase), "final_answer") ||
+			strings.TrimSpace(current.TurnID) == "" {
+			continue
+		}
+		candidate := historyTieredFinal{Record: current}
+		for _, prior := range existing {
+			if strings.TrimSpace(prior.Record.TurnID) == "" && prior.NoTurnIDNeedsQuarantine &&
+				historyTieredFinalCouldBeMixedIDMirror(prior, candidate) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func historyTieredFinalMatchesPreviousAnonymous(record TranscriptRecord, previous historyTieredFileState) bool {
+	if strings.TrimSpace(record.TurnID) == "" || strings.TrimSpace(previous.LastFinalTextHash) == "" {
+		return false
+	}
+	if normalizedTextHash(strings.TrimSpace(record.Text)) != strings.TrimSpace(previous.LastFinalTextHash) {
+		return false
+	}
+	previousThread := strings.TrimSpace(previous.LastFinalThreadID)
+	recordThread := strings.TrimSpace(record.ThreadID)
+	return previousThread == "" || recordThread == "" || strings.EqualFold(previousThread, recordThread)
+}
+
+func historyTieredTranscriptQuarantine(state historyTieredFileState, kind string, finals []historyTieredFinal) *teamstore.TranscriptQuarantine {
+	if len(finals) == 0 {
+		return nil
+	}
+	quarantine := &teamstore.TranscriptQuarantine{
+		Kind:              strings.TrimSpace(kind),
+		SourcePath:        strings.TrimSpace(state.Path),
+		SourceFingerprint: strings.TrimSpace(state.SourceFingerprint),
+	}
+	first := finals[0]
+	quarantine.FrontierRecordID = strings.TrimSpace(first.Key)
+	quarantine.FrontierLine = first.Record.SourceLine
+	quarantine.FrontierOffset = first.Record.SourceStartOffset
+	frontierSet := first.Record.SourceStartOffset >= 0
+	seenHashes := make(map[string]bool, 4)
+	for _, final := range finals {
+		if len(quarantine.CandidateTextHashes) >= 4 {
+			break
+		}
+		hash := normalizedTextHash(strings.TrimSpace(final.Record.Text))
+		if hash == "" || seenHashes[hash] {
+			continue
+		}
+		seenHashes[hash] = true
+		quarantine.CandidateTextHashes = append(quarantine.CandidateTextHashes, hash)
+		if final.Record.SourceStartOffset >= 0 && (!frontierSet || final.Record.SourceStartOffset < quarantine.FrontierOffset) {
+			quarantine.FrontierRecordID = strings.TrimSpace(final.Key)
+			quarantine.FrontierLine = final.Record.SourceLine
+			quarantine.FrontierOffset = final.Record.SourceStartOffset
+			frontierSet = true
+		}
+	}
+	return quarantine
 }
 
 func historyTieredFinalPreferred(candidate historyTieredFinal, current historyTieredFinal) bool {

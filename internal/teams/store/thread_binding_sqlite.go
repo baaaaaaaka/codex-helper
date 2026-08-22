@@ -72,12 +72,8 @@ func (s *Store) bindCodexThreadForRunningTurnSQLite(ctx context.Context, request
 				Turns:             map[string]Turn{request.TurnID: turn},
 				ImportCheckpoints: map[string]ImportCheckpoint{},
 			}
-			previousLiveBranchThreadID := ""
 			if checkpointOK {
 				state.ImportCheckpoints[checkpointID] = checkpoint
-				if checkpoint.UnresolvedExecution != nil {
-					previousLiveBranchThreadID = checkpoint.UnresolvedExecution.LiveBranchThreadID
-				}
 			}
 			recordLiveBranchThreadLocked(&state, turn, request.ThreadID, now)
 			if err := upsertSQLiteSessionTx(ctx, tx, session); err != nil {
@@ -86,8 +82,7 @@ func (s *Store) bindCodexThreadForRunningTurnSQLite(ctx context.Context, request
 			if err := upsertSQLiteTurnTx(ctx, tx, turn); err != nil {
 				return err
 			}
-			if next := state.ImportCheckpoints[checkpointID]; checkpointOK && next.UnresolvedExecution != nil &&
-				next.UnresolvedExecution.LiveBranchThreadID != previousLiveBranchThreadID {
+			if next := state.ImportCheckpoints[checkpointID]; checkpointOK && !importCheckpointEqualExceptUpdatedAt(checkpoint, next) {
 				if err := upsertSQLiteImportCheckpointTx(ctx, tx, next); err != nil {
 					return err
 				}

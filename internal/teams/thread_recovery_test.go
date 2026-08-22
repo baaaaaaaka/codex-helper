@@ -491,6 +491,54 @@ func TestBridgeAcceptsTeamsTurnOnFreshBranchAfterUnresolvedHistoryOwner(t *testi
 	}
 }
 
+func TestBridgeAcceptsTeamsTurnAfterTranscriptQuarantineOnFreshBranch(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{Text: "transcript quarantine branch answer", CodexThreadID: "thread-new", CodexTurnID: "codex-new"}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = false
+	session := bridge.reg.SessionByID("s001")
+	seedThreadRecoverySession(t, store, session, "thread-old", "")
+	now := time.Now()
+	checkpointID := transcriptCheckpointID(session.ID)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID, Status: "blocked",
+			TranscriptQuarantine: &teamstore.TranscriptQuarantine{
+				Kind: "mixed_id_final_mirror", SourcePath: "/old/session.jsonl",
+			},
+		}
+		state.Turns["transcript-quarantine-old"] = teamstore.Turn{
+			ID: "transcript-quarantine-old", SessionID: session.ID, Status: teamstore.TurnStatusCompleted,
+			CodexThreadID: "thread-old", CompletedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed transcript quarantine: %v", err)
+	}
+	if err := bridge.handleSessionMessage(ctx, session.ChatID, bridgePollMessage("transcript-quarantine-prompt", "2026-08-21T01:00:00Z", "continue after the mirror"), "continue after the mirror"); err != nil {
+		t.Fatalf("handle Teams prompt after transcript quarantine: %v", err)
+	}
+	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "" {
+		t.Fatalf("executor session = %#v, want a fresh empty thread", executor.sessions)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load final state: %v", err)
+	}
+	if got := state.Turns[state.Sessions[session.ID].LatestTurnID].Status; got != teamstore.TurnStatusCompleted {
+		t.Fatalf("transcript-quarantine turn status = %q, want completed", got)
+	}
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.LiveBranchThreadID != "thread-new" {
+		t.Fatalf("transcript quarantine branch projection = %#v, want retained history-only quarantine on thread-new", checkpoint)
+	}
+	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-new" {
+		t.Fatalf("durable session thread = %q, want thread-new", got)
+	}
+}
+
 func TestLiveExecutionGateUsesDurableBranchAfterRegistryRestart(t *testing.T) {
 	ctx := context.Background()
 	graph, _ := newBridgeTestGraph(t)

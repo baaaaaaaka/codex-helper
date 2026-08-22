@@ -55,16 +55,17 @@ func readCodexHistoryHeader(path string) (codexHistoryHeader, bool, error) {
 	}
 	defer f.Close()
 	reader := bufio.NewReaderSize(f, 64*1024)
-	line, err := reader.ReadBytes('\n')
-	if len(line) == 0 {
+	read, err := historyTieredReadJSONLRecord(reader, historyRebaseMaxLineBytes, historyRebaseMaxLineBytes)
+	if read.BytesRead == 0 {
 		if err == io.EOF {
 			return codexHistoryHeader{}, false, nil
 		}
 		return codexHistoryHeader{}, false, err
 	}
-	if len(line) > historyRebaseMaxLineBytes {
+	if !read.Complete || read.Oversized {
 		return codexHistoryHeader{}, false, nil
 	}
+	line := read.Line
 	var envelope struct {
 		Type    string          `json:"type"`
 		Payload json.RawMessage `json:"payload"`
@@ -140,13 +141,15 @@ func historyWatchRebaseAnchorScan(path string, previous historyTieredFileState, 
 	var offset int64
 	var lineNo int
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if len(line) > historyRebaseMaxLineBytes {
+		read, readErr := historyTieredReadJSONLRecord(reader, historyRebaseMaxLineBytes, historyRebaseMaxLineBytes)
+		complete := read.Complete || (readErr == io.EOF && read.BytesRead > 0)
+		if read.BytesRead > 0 {
+			line := read.Line
+			if read.Oversized || !complete {
 				return historyWatchRebaseAnchor{}, false, historyRebaseStableSource(path, info, source.Identity)
 			}
 			lineStart := offset
-			nextOffset := offset + int64(len(line))
+			nextOffset := offset + read.BytesRead
 			lineNo++
 			trimmed := bytes.TrimSpace(line)
 			if len(trimmed) > 0 {

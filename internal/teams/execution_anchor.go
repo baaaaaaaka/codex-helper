@@ -521,32 +521,33 @@ func observeUnresolvedExecutionTail(anchor teamstore.ExecutionAnchor) executionA
 	out.Scanned = true
 	seen := make(map[string]struct{})
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if readErr == io.EOF {
+		read, readErr := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		complete := read.Complete || (readErr == io.EOF && read.BytesRead > 0)
+		if read.BytesRead > 0 {
+			if !complete || read.Oversized {
 				out.Unknown = true
-				break
-			}
-			var obj map[string]json.RawMessage
-			if err := json.Unmarshal(line, &obj); err != nil {
-				out.Unknown = true
-			} else if task, thread, ok := executionAnchorLineSignal(obj); ok {
-				if expected := strings.TrimSpace(anchor.ThreadID); expected != "" && thread != "" && thread != expected {
-					// A shared Codex home can contain unrelated records. Keep the
-					// anchor unresolved, but do not attribute another thread's ID.
-				} else {
-					out.Continuation = true
-					if task != "" {
-						if _, exists := seen[task]; !exists && len(out.TaskIDs) < executionAnchorObservedTaskCap {
-							seen[task] = struct{}{}
-							out.TaskIDs = append(out.TaskIDs, task)
+			} else {
+				var obj map[string]json.RawMessage
+				if err := json.Unmarshal(read.Line, &obj); err != nil {
+					out.Unknown = true
+				} else if task, thread, ok := executionAnchorLineSignal(obj); ok {
+					if expected := strings.TrimSpace(anchor.ThreadID); expected != "" && thread != "" && thread != expected {
+						// A shared Codex home can contain unrelated records. Keep the
+						// anchor unresolved, but do not attribute another thread's ID.
+					} else {
+						out.Continuation = true
+						if task != "" {
+							if _, exists := seen[task]; !exists && len(out.TaskIDs) < executionAnchorObservedTaskCap {
+								seen[task] = struct{}{}
+								out.TaskIDs = append(out.TaskIDs, task)
+							}
 						}
 					}
 				}
 			}
 		}
 		if readErr != nil {
-			if readErr == io.EOF && len(line) == 0 {
+			if readErr == io.EOF {
 				break
 			}
 			if readErr != io.EOF {
@@ -756,10 +757,19 @@ func (b *Bridge) guardAutomaticTranscriptSync(ctx context.Context, session Sessi
 }
 
 func (b *Bridge) sessionExecutionOwnershipUnresolved(ctx context.Context, session Session) (bool, error) {
+	unresolved, _, err := b.sessionExecutionOwnershipState(ctx, session)
+	return unresolved, err
+}
+
+// sessionExecutionOwnershipState returns the strict execution-fence result and
+// the durable snapshot used to reach it. Live-turn admission can inspect a
+// history-only transcript quarantine from this snapshot without an additional
+// store read on the common trusted path.
+func (b *Bridge) sessionExecutionOwnershipState(ctx context.Context, session Session) (bool, teamstore.State, error) {
 	checkpointID := transcriptCheckpointID(session.ID)
 	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, checkpointID)
 	if err != nil {
-		return true, err
+		return true, state, err
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	if executionAnchorActive(checkpoint.UnresolvedExecution) {
@@ -769,26 +779,28 @@ func (b *Bridge) sessionExecutionOwnershipUnresolved(ctx context.Context, sessio
 		// may clear the anchor.
 		if executionAnchorTurnOwnershipConfirmed(state, *checkpoint.UnresolvedExecution) {
 			if err := b.clearUnresolvedExecutionAnchorWithProof(ctx, executionAnchorProofFromAnchor(session.ID, *checkpoint.UnresolvedExecution, executionAnchorProofTurn)); err != nil {
-				return true, err
+				return true, state, err
 			}
-			return b.recheckExecutionOwnershipAfterAnchorClear(ctx, session)
+			unresolved, err := b.recheckExecutionOwnershipAfterAnchorClear(ctx, session)
+			return unresolved, state, err
 		}
 		if confirmed, err := b.reconcileExecutionFenceIfDue(ctx, session, *checkpoint.UnresolvedExecution); err == nil && confirmed {
 			if err := b.clearUnresolvedExecutionAnchorWithProof(ctx, executionAnchorProofFromAnchor(session.ID, *checkpoint.UnresolvedExecution, executionAnchorProofFence)); err != nil {
-				return true, err
+				return true, state, err
 			}
-			return b.recheckExecutionOwnershipAfterAnchorClear(ctx, session)
+			unresolved, err := b.recheckExecutionOwnershipAfterAnchorClear(ctx, session)
+			return unresolved, state, err
 		}
-		return true, nil
+		return true, state, nil
 	}
 	turn, ambiguous := unresolvedAmbiguousCodexTurn(state, session)
 	if !ambiguous {
-		return false, nil
+		return false, state, nil
 	}
 	if _, err := b.ensureUnresolvedExecutionAnchor(ctx, session, codexhistory.Session{}, checkpoint, turn); err != nil {
-		return true, err
+		return true, state, err
 	}
-	return true, nil
+	return true, state, nil
 }
 
 // sessionLiveExecutionOwnershipUnresolved is the live-turn view of the
@@ -797,27 +809,31 @@ func (b *Bridge) sessionExecutionOwnershipUnresolved(ctx context.Context, sessio
 // recorded as the session's live branch, that old history fence must no longer
 // reject ordinary new Teams turns on the fresh thread.
 func (b *Bridge) sessionLiveExecutionOwnershipUnresolved(ctx context.Context, session Session) (bool, error) {
-	unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, session)
-	if err != nil || !unresolved {
-		return unresolved, err
-	}
-	checkpointID := transcriptCheckpointID(session.ID)
-	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, checkpointID)
+	unresolved, state, err := b.sessionExecutionOwnershipState(ctx, session)
 	if err != nil {
 		return true, err
 	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	if !unresolved {
+		checkpoint := state.ImportCheckpoints[checkpointID]
+		quarantine := checkpoint.TranscriptQuarantine
+		if quarantine == nil {
+			return false, nil
+		}
+		if strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
+			return true, nil
+		}
+		liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
+		if err != nil {
+			return true, err
+		}
+		return strings.TrimSpace(quarantine.LiveBranchThreadID) != liveSessionThreadID, nil
+	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	anchor := checkpoint.UnresolvedExecution
-	liveSessionThreadID := strings.TrimSpace(session.CodexThreadID)
-	// SessionExecutionStateSnapshot intentionally excludes the sessions table
-	// from the normal hot path.  Once the strict probe has found an active
-	// anchor, however, the registry projection may be stale after a restart;
-	// read the single durable session row before deciding whether the fresh live
-	// branch is allowed to proceed.
-	if durableSessions, lookupErr := b.store.SessionsByID(ctx, []string{session.ID}); lookupErr != nil {
-		return true, lookupErr
-	} else if durable, ok := durableSessions[strings.TrimSpace(session.ID)]; ok && strings.TrimSpace(durable.CodexThreadID) != "" {
-		liveSessionThreadID = strings.TrimSpace(durable.CodexThreadID)
+	liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
+	if err != nil {
+		return true, err
 	}
 	if executionAnchorActive(anchor) && strings.TrimSpace(anchor.LiveBranchThreadID) != "" &&
 		strings.TrimSpace(anchor.LiveBranchThreadID) == liveSessionThreadID {
@@ -830,22 +846,35 @@ func (b *Bridge) liveTurnExecutionOwnershipUnresolved(ctx context.Context, sessi
 	if turn.StartNewCodexThread {
 		return false, nil
 	}
-	unresolved, err := b.sessionExecutionOwnershipUnresolved(ctx, session)
-	if err != nil || !unresolved {
-		return unresolved, err
-	}
-	checkpointID := transcriptCheckpointID(session.ID)
-	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, checkpointID)
+	unresolved, state, err := b.sessionExecutionOwnershipState(ctx, session)
 	if err != nil {
 		return true, err
 	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	if !unresolved {
+		checkpoint := state.ImportCheckpoints[checkpointID]
+		quarantine := checkpoint.TranscriptQuarantine
+		if quarantine == nil {
+			return false, nil
+		}
+		if strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
+			return true, nil
+		}
+		liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
+		if err != nil {
+			return true, err
+		}
+		liveThread := strings.TrimSpace(quarantine.LiveBranchThreadID)
+		if liveThread == liveSessionThreadID || liveThread == strings.TrimSpace(turn.CodexThreadID) {
+			return false, nil
+		}
+		return true, nil
+	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	anchor := checkpoint.UnresolvedExecution
-	liveSessionThreadID := strings.TrimSpace(session.CodexThreadID)
-	if durableSessions, lookupErr := b.store.SessionsByID(ctx, []string{session.ID}); lookupErr != nil {
-		return true, lookupErr
-	} else if durable, ok := durableSessions[strings.TrimSpace(session.ID)]; ok && strings.TrimSpace(durable.CodexThreadID) != "" {
-		liveSessionThreadID = strings.TrimSpace(durable.CodexThreadID)
+	liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
+	if err != nil {
+		return true, err
 	}
 	if executionAnchorActive(anchor) && strings.TrimSpace(anchor.LiveBranchThreadID) != "" {
 		liveThread := strings.TrimSpace(anchor.LiveBranchThreadID)
@@ -854,4 +883,14 @@ func (b *Bridge) liveTurnExecutionOwnershipUnresolved(ctx context.Context, sessi
 		}
 	}
 	return true, nil
+}
+
+func (b *Bridge) durableSessionThreadID(ctx context.Context, session Session) (string, error) {
+	liveSessionThreadID := strings.TrimSpace(session.CodexThreadID)
+	if durableSessions, err := b.store.SessionsByID(ctx, []string{session.ID}); err != nil {
+		return liveSessionThreadID, err
+	} else if durable, ok := durableSessions[strings.TrimSpace(session.ID)]; ok && strings.TrimSpace(durable.CodexThreadID) != "" {
+		liveSessionThreadID = strings.TrimSpace(durable.CodexThreadID)
+	}
+	return liveSessionThreadID, nil
 }

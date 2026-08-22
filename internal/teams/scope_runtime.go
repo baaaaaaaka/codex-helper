@@ -1045,18 +1045,25 @@ func copyThreadLinkMigrationJournal(targetPath string, sourcePath string, source
 	reader := bufio.NewReaderSize(source, threadLinkJournalMaxLineByte)
 	total := 0
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		total += len(line)
+		read, readErr := historyTieredReadJSONLRecord(reader, int64(threadLinkJournalMaxLineByte), int64(threadLinkJournalMaxReplayByte))
+		if read.BytesRead == 0 && errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
+		}
+		total += int(read.BytesRead)
 		if total > threadLinkJournalMaxReplayByte {
 			return errors.New("thread-link journal replay budget exceeded")
 		}
-		if len(line) > threadLinkJournalMaxLineByte {
+		if read.Oversized {
 			return fmt.Errorf("thread-link journal line exceeds %d bytes", threadLinkJournalMaxLineByte)
 		}
+		if !read.Complete {
+			return errors.New("thread-link journal ends with an incomplete record")
+		}
+		line := read.Line
 		if len(line) > 0 {
-			if line[len(line)-1] != '\n' {
-				return errors.New("thread-link journal ends with an incomplete record")
-			}
 			raw := strings.TrimSpace(string(line))
 			if raw == "" {
 				if _, err := target.Write([]byte{'\n'}); err != nil {
@@ -1094,12 +1101,6 @@ func copyThreadLinkMigrationJournal(targetPath string, sourcePath string, source
 					return err
 				}
 			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return readErr
 		}
 	}
 	if err := target.Sync(); err != nil {

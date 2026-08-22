@@ -504,6 +504,11 @@ type ImportCheckpoint struct {
 	// older helper after automatic scanning proves that the linked source was
 	// replaced or truncated. Ordinary backlog blocking must not strand them.
 	SourceRewriteBlocked bool `json:"source_rewrite_blocked,omitempty"`
+	// LegacySourceUnverified marks an inherited checkpoint that predates
+	// identity-bound source proof. It is intentionally not Status=blocked:
+	// automatic history suffix reads pause silently at this boundary, while
+	// live request admission and delivery remain independent of it.
+	LegacySourceUnverified bool `json:"legacy_source_unverified,omitempty"`
 	// OversizedRecordBlocked records a bounded automatic scan that reached a
 	// complete JSONL record beyond the per-record cap. The cursor remains before
 	// that record; unchanged sources may be skipped until explicit recovery.
@@ -526,6 +531,19 @@ type ImportCheckpoint struct {
 	// checkpoints that never persisted a byte position. A false value for a
 	// zero offset must never be treated as an EOF proof.
 	LastOffsetKnown bool `json:"last_offset_known,omitempty"`
+	// LastFinal* preserves the terminal boundary provenance needed by the
+	// incremental linked-transcript scanner. LastRecordID is a generic cursor;
+	// it cannot safely identify an anonymous final whose mirror may arrive in a
+	// later poll.
+	LastFinalID               string `json:"last_final_id,omitempty"`
+	LastFinalLine             int    `json:"last_final_line,omitempty"`
+	LastFinalStartOffset      int64  `json:"last_final_start_offset,omitempty"`
+	LastFinalStartOffsetKnown bool   `json:"last_final_start_offset_known,omitempty"`
+	LastFinalThreadID         string `json:"last_final_thread_id,omitempty"`
+	LastFinalTurnID           string `json:"last_final_turn_id,omitempty"`
+	LastFinalTextHash         string `json:"last_final_text_hash,omitempty"`
+	TerminalBoundarySeen      bool   `json:"terminal_boundary_seen,omitempty"`
+	TerminalBoundaryLine      int    `json:"terminal_boundary_line,omitempty"`
 	// CompletionPending keeps an otherwise fully scanned import recoverable
 	// when the subagent marker or the final "Import complete" outbox row could
 	// not be queued. It is deliberately persisted in the JSON payload so both
@@ -534,9 +552,19 @@ type ImportCheckpoint struct {
 	CompletionPending bool      `json:"completion_pending,omitempty"`
 	SourceSize        int64     `json:"source_size,omitempty"`
 	SourceModTime     time.Time `json:"source_mod_time,omitempty"`
-	ImportTurnID      string    `json:"import_turn_id,omitempty"`
-	KindPrefix        string    `json:"kind_prefix,omitempty"`
-	Status            string    `json:"status,omitempty"`
+	// Partial* describe an unterminated JSONL record without storing its
+	// payload. LastOffset remains the last complete newline; PartialReadOffset
+	// is only a bounded read cursor used to avoid rereading an unchanged tail.
+	// A partial record is never a publishable checkpoint boundary.
+	PartialLineStartOffset int64     `json:"partial_line_start_offset,omitempty"`
+	PartialReadOffset      int64     `json:"partial_read_offset,omitempty"`
+	PartialObservedSize    int64     `json:"partial_observed_size,omitempty"`
+	PartialLine            int       `json:"partial_line,omitempty"`
+	PartialStartedAt       time.Time `json:"partial_started_at,omitempty"`
+	PartialSourceIdentity  string    `json:"partial_source_identity,omitempty"`
+	ImportTurnID           string    `json:"import_turn_id,omitempty"`
+	KindPrefix             string    `json:"kind_prefix,omitempty"`
+	Status                 string    `json:"status,omitempty"`
 	// LegacyProbeRevision caches the negative SQLite compatibility probe for
 	// the interrupted-turn set. It is invalidated by a session revision change
 	// and avoids decoding every interrupted row on each hot-path transaction.
@@ -545,6 +573,10 @@ type ImportCheckpoint struct {
 	// checkpoint row.  It adds no SQL table/schema migration while preserving
 	// execution ownership ambiguity across helper restarts.
 	UnresolvedExecution *ExecutionAnchor `json:"unresolved_execution,omitempty"`
+	// TranscriptQuarantine records a bounded history-only ambiguity.  Unlike
+	// UnresolvedExecution it is not evidence that an app-server process still
+	// owns the thread and must never be used as an execution completion fence.
+	TranscriptQuarantine *TranscriptQuarantine `json:"transcript_quarantine,omitempty"`
 	// ExecutionAnchorGeneration is retained after an anchor is cleared so a
 	// late callback cannot accidentally clear a subsequently recreated anchor
 	// with the same outer turn ID.
@@ -598,6 +630,19 @@ type TranscriptCheckpointProgress struct {
 	LastOffsetKnown         bool
 	SourceSize              int64
 	SourceModTime           time.Time
+	// Final-boundary provenance is optional metadata for the generic cursor.
+	// It lets a later incremental scan distinguish an anonymous final from an
+	// arbitrary assistant/status record even when the cursor was committed by
+	// the terminal-turn CAS rather than the linked-history importer.
+	LastFinalID               string
+	LastFinalLine             int
+	LastFinalStartOffset      int64
+	LastFinalStartOffsetKnown bool
+	LastFinalThreadID         string
+	LastFinalTurnID           string
+	LastFinalTextHash         string
+	TerminalBoundarySeen      bool
+	TerminalBoundaryLine      int
 }
 
 // CompleteTurnWithFinalRequest is the narrow durable commit used by a real
@@ -717,6 +762,22 @@ type ExecutionAnchor struct {
 	UpdatedAt             time.Time `json:"updated_at,omitempty"`
 }
 
+// TranscriptQuarantine is a durable, bounded observation that automatic
+// history import reached records whose execution ownership cannot be proved
+// from the transcript alone.  It deliberately contains no inferred Codex
+// owner or retry capability.  An explicit history import may choose a new
+// boundary and clear it; ordinary polling keeps the frontier unchanged.
+type TranscriptQuarantine struct {
+	Kind                string   `json:"kind,omitempty"`
+	SourcePath          string   `json:"source_path,omitempty"`
+	SourceFingerprint   string   `json:"source_fingerprint,omitempty"`
+	FrontierRecordID    string   `json:"frontier_record_id,omitempty"`
+	FrontierLine        int      `json:"frontier_line,omitempty"`
+	FrontierOffset      int64    `json:"frontier_offset,omitempty"`
+	CandidateTextHashes []string `json:"candidate_text_hashes,omitempty"`
+	LiveBranchThreadID  string   `json:"live_branch_thread_id,omitempty"`
+}
+
 type ChatSequenceState struct {
 	ChatID    string    `json:"chat_id"`
 	Next      int64     `json:"next"`
@@ -741,19 +802,29 @@ type HistoryWatchCheckpoint struct {
 	// conservative migration/reconcile rather than proving an unchanged file.
 	SourceFingerprint             string `json:"source_fingerprint,omitempty"`
 	SourceRewriteBlocked          bool   `json:"source_rewrite_blocked,omitempty"`
+	LegacySourceUnverified        bool   `json:"legacy_source_unverified,omitempty"`
 	OversizedRecordBlocked        bool   `json:"oversized_record_blocked,omitempty"`
 	SourceRewriteRecoveryIdentity string `json:"source_rewrite_recovery_identity,omitempty"`
 	Offset                        int64  `json:"offset,omitempty"`
 	Line                          int    `json:"line,omitempty"`
-	SessionID                     string `json:"session_id,omitempty"`
-	ThreadID                      string `json:"thread_id,omitempty"`
-	TeamsOriginThreadID           string `json:"teams_origin_thread_id,omitempty"`
-	TurnID                        string `json:"turn_id,omitempty"`
-	TeamsOriginTurnID             string `json:"teams_origin_turn_id,omitempty"`
-	ExternalUserPromptSeen        bool   `json:"external_user_prompt_seen,omitempty"`
-	LastFinalID                   string `json:"last_final_id,omitempty"`
-	LastFinalLine                 int    `json:"last_final_line,omitempty"`
-	LastFinalStartOffset          int64  `json:"last_final_start_offset,omitempty"`
+	// Partial* mirror ImportCheckpoint's resumable unterminated-record state.
+	// They are intentionally not folded into Offset: only a newline may advance
+	// the durable history cursor.
+	PartialLineStartOffset int64     `json:"partial_line_start_offset,omitempty"`
+	PartialReadOffset      int64     `json:"partial_read_offset,omitempty"`
+	PartialObservedSize    int64     `json:"partial_observed_size,omitempty"`
+	PartialLine            int       `json:"partial_line,omitempty"`
+	PartialStartedAt       time.Time `json:"partial_started_at,omitempty"`
+	PartialSourceIdentity  string    `json:"partial_source_identity,omitempty"`
+	SessionID              string    `json:"session_id,omitempty"`
+	ThreadID               string    `json:"thread_id,omitempty"`
+	TeamsOriginThreadID    string    `json:"teams_origin_thread_id,omitempty"`
+	TurnID                 string    `json:"turn_id,omitempty"`
+	TeamsOriginTurnID      string    `json:"teams_origin_turn_id,omitempty"`
+	ExternalUserPromptSeen bool      `json:"external_user_prompt_seen,omitempty"`
+	LastFinalID            string    `json:"last_final_id,omitempty"`
+	LastFinalLine          int       `json:"last_final_line,omitempty"`
+	LastFinalStartOffset   int64     `json:"last_final_start_offset,omitempty"`
 	// LastFinalStartOffsetKnown distinguishes a valid zero-byte final start
 	// from an old checkpoint that never persisted the boundary position.
 	LastFinalStartOffsetKnown bool   `json:"last_final_start_offset_known,omitempty"`
@@ -780,7 +851,10 @@ type HistoryWatchCheckpoint struct {
 	PendingAssistantStartOffset  int64     `json:"pending_assistant_start_offset,omitempty"`
 	PendingAssistantOffset       int64     `json:"pending_assistant_offset,omitempty"`
 	PendingAssistantSourceType   string    `json:"pending_assistant_source_type,omitempty"`
-	UpdatedAt                    time.Time `json:"updated_at,omitempty"`
+	// TranscriptQuarantine is a history-only frontier. It must not be
+	// interpreted as an unresolved Codex execution owner by live turn paths.
+	TranscriptQuarantine *TranscriptQuarantine `json:"transcript_quarantine,omitempty"`
+	UpdatedAt            time.Time             `json:"updated_at,omitempty"`
 }
 
 type ArtifactRecord struct {
@@ -3587,32 +3661,82 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 	if status == "" || status == importCheckpointStatusBlocked {
 		status = importCheckpointStatusComplete
 	}
+	if previous.SourceRewriteBlocked || previous.OversizedRecordBlocked {
+		status = importCheckpointStatusBlocked
+	}
+	if previous.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(previous) {
+		status = importCheckpointStatusBlocked
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
+	quarantine := previous.TranscriptQuarantine
+	if importCheckpointIsExplicitHistoryRun(previous) {
+		quarantine = checkpoint.TranscriptQuarantine
+	}
 	outCheckpoint := ImportCheckpoint{
-		ID:                  id,
-		SessionID:           firstStoreNonEmptyString(checkpoint.SessionID, previous.SessionID),
-		SourcePath:          strings.TrimSpace(checkpoint.SourcePath),
-		SourceFingerprint:   firstStoreNonEmptyString(checkpoint.SourceFingerprint, previous.SourceFingerprint),
-		LastRecordID:        strings.TrimSpace(checkpoint.LastRecordID),
-		LastSourceLine:      checkpoint.LastSourceLine,
-		LastOffset:          firstStoreNonZeroInt64(checkpoint.LastOffset, previous.LastOffset),
-		LastOffsetKnown:     checkpoint.LastOffsetKnown || previous.LastOffsetKnown || checkpoint.LastOffset != 0 || previous.LastOffset != 0,
-		SourceSize:          checkpoint.SourceSize,
-		SourceModTime:       checkpoint.SourceModTime,
-		ImportTurnID:        previous.ImportTurnID,
-		KindPrefix:          previous.KindPrefix,
-		Status:              status,
-		UnresolvedExecution: previous.UnresolvedExecution,
+		ID:                   id,
+		SessionID:            firstStoreNonEmptyString(checkpoint.SessionID, previous.SessionID),
+		SourcePath:           firstStoreNonEmptyString(checkpoint.SourcePath, previous.SourcePath),
+		SourceFingerprint:    firstStoreNonEmptyString(checkpoint.SourceFingerprint, previous.SourceFingerprint),
+		LastRecordID:         strings.TrimSpace(checkpoint.LastRecordID),
+		LastSourceLine:       firstStoreNonZeroInt(checkpoint.LastSourceLine, previous.LastSourceLine),
+		LastOffset:           firstStoreNonZeroInt64(checkpoint.LastOffset, previous.LastOffset),
+		LastOffsetKnown:      checkpoint.LastOffsetKnown || previous.LastOffsetKnown || checkpoint.LastOffset != 0 || previous.LastOffset != 0,
+		SourceSize:           firstStoreNonZeroInt64(checkpoint.SourceSize, previous.SourceSize),
+		SourceModTime:        firstStoreNonZeroTime(checkpoint.SourceModTime, previous.SourceModTime),
+		ImportTurnID:         previous.ImportTurnID,
+		KindPrefix:           previous.KindPrefix,
+		Status:               status,
+		UnresolvedExecution:  previous.UnresolvedExecution,
+		TranscriptQuarantine: quarantine,
+		// A normal record checkpoint is not proof that an inherited legacy
+		// cursor has been explicitly re-established. Preserve the marker until
+		// the explicit history path clears it; otherwise a late generic writer
+		// could silently turn an unverified checkpoint back into an automatic
+		// source-proof checkpoint.
+		LegacySourceUnverified:        previous.LegacySourceUnverified && !importCheckpointIsExplicitHistoryRun(previous),
+		LastFinalID:                   previous.LastFinalID,
+		LastFinalLine:                 previous.LastFinalLine,
+		LastFinalStartOffset:          previous.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:     previous.LastFinalStartOffsetKnown,
+		LastFinalThreadID:             previous.LastFinalThreadID,
+		LastFinalTurnID:               previous.LastFinalTurnID,
+		LastFinalTextHash:             previous.LastFinalTextHash,
+		TerminalBoundarySeen:          previous.TerminalBoundarySeen,
+		TerminalBoundaryLine:          previous.TerminalBoundaryLine,
+		SourceRewriteBlocked:          previous.SourceRewriteBlocked || checkpoint.SourceRewriteBlocked,
+		OversizedRecordBlocked:        previous.OversizedRecordBlocked || checkpoint.OversizedRecordBlocked,
+		SourceRewriteRecoveryIdentity: firstStoreNonEmptyString(checkpoint.SourceRewriteRecoveryIdentity, previous.SourceRewriteRecoveryIdentity),
+		CompletionPending:             previous.CompletionPending || checkpoint.CompletionPending,
+		LegacyProbeRevision:           firstStoreNonEmptyString(checkpoint.LegacyProbeRevision, previous.LegacyProbeRevision),
 		// Preserve the monotonic generation even when a normal transcript
 		// checkpoint update does not carry an anchor.  A late callback must not
 		// be able to clear a recreated anchor after this reconstruction.
 		ExecutionAnchorGeneration: maxStoreInt64(previous.ExecutionAnchorGeneration, checkpoint.ExecutionAnchorGeneration),
 		UpdatedAt:                 now,
 	}
+	if previous.PartialReadOffset > previous.PartialLineStartOffset && outCheckpoint.LastOffset <= previous.PartialLineStartOffset {
+		outCheckpoint.PartialLineStartOffset = previous.PartialLineStartOffset
+		outCheckpoint.PartialReadOffset = previous.PartialReadOffset
+		outCheckpoint.PartialObservedSize = previous.PartialObservedSize
+		outCheckpoint.PartialLine = previous.PartialLine
+		outCheckpoint.PartialStartedAt = previous.PartialStartedAt
+		outCheckpoint.PartialSourceIdentity = previous.PartialSourceIdentity
+	}
 	if checkpoint.UnresolvedExecution != nil {
 		outCheckpoint.UnresolvedExecution = checkpoint.UnresolvedExecution
+	}
+	if strings.TrimSpace(checkpoint.LastFinalID) != "" {
+		outCheckpoint.LastFinalID = strings.TrimSpace(checkpoint.LastFinalID)
+		outCheckpoint.LastFinalLine = checkpoint.LastFinalLine
+		outCheckpoint.LastFinalStartOffset = checkpoint.LastFinalStartOffset
+		outCheckpoint.LastFinalStartOffsetKnown = checkpoint.LastFinalStartOffsetKnown
+		outCheckpoint.LastFinalThreadID = strings.TrimSpace(checkpoint.LastFinalThreadID)
+		outCheckpoint.LastFinalTurnID = strings.TrimSpace(checkpoint.LastFinalTurnID)
+		outCheckpoint.LastFinalTextHash = strings.TrimSpace(checkpoint.LastFinalTextHash)
+		outCheckpoint.TerminalBoundarySeen = checkpoint.TerminalBoundarySeen
+		outCheckpoint.TerminalBoundaryLine = checkpoint.TerminalBoundaryLine
 	}
 	state.ImportCheckpoints[id] = outCheckpoint
 
@@ -3634,6 +3758,15 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 }
 
 func firstStoreNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func firstStoreNonZeroInt(values ...int) int {
 	for _, value := range values {
 		if value != 0 {
 			return value
@@ -7397,6 +7530,43 @@ func unresolvedExecutionAnchorLocked(state *State, sessionID string) (ExecutionA
 	return *checkpoint.UnresolvedExecution, true
 }
 
+func transcriptQuarantineActive(checkpoint ImportCheckpoint) bool {
+	return checkpoint.TranscriptQuarantine != nil
+}
+
+// liveBranchThreadIDLocked returns the already-admitted thread for either kind
+// of history fence. The execution anchor remains the stronger source when both
+// fields exist; transcript quarantine never becomes an execution owner merely
+// by participating in this live-branch projection.
+func liveBranchThreadIDLocked(state *State, sessionID string) (string, bool) {
+	if anchor, ok := unresolvedExecutionAnchorLocked(state, sessionID); ok {
+		// An active execution anchor is authoritative even before its isolated
+		// branch has been admitted. Never fall through to an older
+		// transcript-only branch token while the stronger fence is present.
+		liveThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
+		return liveThreadID, liveThreadID != ""
+	}
+	if state == nil {
+		return "", false
+	}
+	checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(sessionID)]
+	if !ok || !transcriptQuarantineActive(checkpoint) || strings.TrimSpace(checkpoint.TranscriptQuarantine.LiveBranchThreadID) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(checkpoint.TranscriptQuarantine.LiveBranchThreadID), true
+}
+
+func liveBranchAdmissionActive(state *State, sessionID string) bool {
+	if stateHasUnresolvedExecution(state, sessionID) {
+		return true
+	}
+	if state == nil {
+		return false
+	}
+	checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(sessionID)]
+	return ok && transcriptQuarantineActive(checkpoint)
+}
+
 func hasRunningTurnForSessionLocked(state *State, sessionID string) bool {
 	if state == nil {
 		return false
@@ -7414,15 +7584,14 @@ func hasRunningTurnForSessionLocked(state *State, sessionID string) bool {
 // turn may start only on a fresh thread, and later turns may run only on the
 // thread recorded as that fresh live branch.
 func turnCanStartWhileUnresolvedExecutionLocked(state *State, turn Turn) bool {
-	if state == nil || !stateHasUnresolvedExecution(state, turn.SessionID) {
+	if state == nil || !liveBranchAdmissionActive(state, turn.SessionID) {
 		return true
 	}
 	if hasRunningTurnForSessionLocked(state, turn.SessionID) && turn.Status != TurnStatusRunning {
 		return false
 	}
-	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
-	if ok && strings.TrimSpace(anchor.LiveBranchThreadID) != "" &&
-		strings.TrimSpace(turn.CodexThreadID) == strings.TrimSpace(anchor.LiveBranchThreadID) &&
+	liveThreadID, ok := liveBranchThreadIDLocked(state, turn.SessionID)
+	if ok && strings.TrimSpace(turn.CodexThreadID) == liveThreadID &&
 		!turn.StartNewCodexThread {
 		return true
 	}
@@ -7430,7 +7599,7 @@ func turnCanStartWhileUnresolvedExecutionLocked(state *State, turn Turn) bool {
 }
 
 func prepareTurnForIsolatedBranchLocked(state *State, turn Turn) (Turn, bool) {
-	if state == nil || turn.Status != TurnStatusQueued || !stateHasUnresolvedExecution(state, turn.SessionID) {
+	if state == nil || turn.Status != TurnStatusQueued || !liveBranchAdmissionActive(state, turn.SessionID) {
 		return turn, false
 	}
 	if retargetQueuedTurnToLiveBranchLocked(state, &turn) {
@@ -7446,11 +7615,10 @@ func retargetQueuedTurnToLiveBranchLocked(state *State, turn *Turn) bool {
 	if state == nil || turn == nil || turn.Status != TurnStatusQueued {
 		return false
 	}
-	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
-	if !ok || strings.TrimSpace(anchor.LiveBranchThreadID) == "" {
+	liveThreadID, ok := liveBranchThreadIDLocked(state, turn.SessionID)
+	if !ok || liveThreadID == "" {
 		return false
 	}
-	liveThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
 	if !turn.StartNewCodexThread && strings.TrimSpace(turn.CodexThreadID) == liveThreadID {
 		return false
 	}
@@ -7466,7 +7634,7 @@ func prepareFirstIsolatedBranchTurnLocked(turn Turn) Turn {
 }
 
 func turnUsesIsolatedLiveBranchLocked(state *State, turn Turn, codexThreadID string) bool {
-	if state == nil || !stateHasUnresolvedExecution(state, turn.SessionID) {
+	if state == nil || !liveBranchAdmissionActive(state, turn.SessionID) {
 		return false
 	}
 	threadID := strings.TrimSpace(codexThreadID)
@@ -7476,8 +7644,10 @@ func turnUsesIsolatedLiveBranchLocked(state *State, turn Turn, codexThreadID str
 	if threadID == "" {
 		return false
 	}
-	anchor, ok := unresolvedExecutionAnchorLocked(state, turn.SessionID)
-	if ok && strings.TrimSpace(anchor.LiveBranchThreadID) == threadID && strings.TrimSpace(anchor.OuterTurnID) != strings.TrimSpace(turn.ID) {
+	if liveThreadID, ok := liveBranchThreadIDLocked(state, turn.SessionID); ok && liveThreadID == threadID {
+		if anchor, hasAnchor := unresolvedExecutionAnchorLocked(state, turn.SessionID); hasAnchor {
+			return strings.TrimSpace(anchor.OuterTurnID) != strings.TrimSpace(turn.ID)
+		}
 		return true
 	}
 	// A legacy state can be materialized by the bridge immediately before the
@@ -7492,19 +7662,33 @@ func recordLiveBranchThreadLocked(state *State, turn Turn, codexThreadID string,
 	}
 	checkpointID := sessionTranscriptCheckpointID(turn.SessionID)
 	checkpoint, ok := state.ImportCheckpoints[checkpointID]
-	if !ok || !importCheckpointHasUnresolvedExecution(checkpoint) || checkpoint.UnresolvedExecution == nil {
+	if !ok || !liveBranchAdmissionActive(state, turn.SessionID) {
 		return
 	}
-	anchor := *checkpoint.UnresolvedExecution
-	if strings.TrimSpace(anchor.ThreadID) == strings.TrimSpace(codexThreadID) {
+	if importCheckpointHasUnresolvedExecution(checkpoint) && checkpoint.UnresolvedExecution != nil {
+		anchor := *checkpoint.UnresolvedExecution
+		if strings.TrimSpace(anchor.ThreadID) == strings.TrimSpace(codexThreadID) {
+			return
+		}
+		if strings.TrimSpace(anchor.LiveBranchThreadID) != "" && strings.TrimSpace(anchor.LiveBranchThreadID) != strings.TrimSpace(codexThreadID) {
+			return
+		}
+		anchor.LiveBranchThreadID = strings.TrimSpace(codexThreadID)
+		anchor.UpdatedAt = now
+		checkpoint.UnresolvedExecution = &anchor
+		state.ImportCheckpoints[checkpointID] = checkpoint
 		return
 	}
-	if strings.TrimSpace(anchor.LiveBranchThreadID) != "" && strings.TrimSpace(anchor.LiveBranchThreadID) != strings.TrimSpace(codexThreadID) {
+	quarantine := checkpoint.TranscriptQuarantine
+	if quarantine == nil {
 		return
 	}
-	anchor.LiveBranchThreadID = strings.TrimSpace(codexThreadID)
-	anchor.UpdatedAt = now
-	checkpoint.UnresolvedExecution = &anchor
+	if strings.TrimSpace(quarantine.LiveBranchThreadID) != "" && strings.TrimSpace(quarantine.LiveBranchThreadID) != strings.TrimSpace(codexThreadID) {
+		return
+	}
+	copyQuarantine := *quarantine
+	copyQuarantine.LiveBranchThreadID = strings.TrimSpace(codexThreadID)
+	checkpoint.TranscriptQuarantine = &copyQuarantine
 	state.ImportCheckpoints[checkpointID] = checkpoint
 }
 
@@ -7673,8 +7857,22 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 	if progress.SourceSize != 0 || current.SourceSize == 0 {
 		next.SourceSize = progress.SourceSize
 	}
+	if strings.TrimSpace(progress.LastFinalID) != "" {
+		next.LastFinalID = strings.TrimSpace(progress.LastFinalID)
+		next.LastFinalLine = progress.LastFinalLine
+		next.LastFinalStartOffset = progress.LastFinalStartOffset
+		next.LastFinalStartOffsetKnown = progress.LastFinalStartOffsetKnown
+		next.LastFinalThreadID = strings.TrimSpace(progress.LastFinalThreadID)
+		next.LastFinalTurnID = strings.TrimSpace(progress.LastFinalTurnID)
+		next.LastFinalTextHash = strings.TrimSpace(progress.LastFinalTextHash)
+		next.TerminalBoundarySeen = progress.TerminalBoundarySeen
+		next.TerminalBoundaryLine = progress.TerminalBoundaryLine
+	}
 	if strings.TrimSpace(next.Status) == "" || next.Status == "blocked" {
 		next.Status = "complete"
+	}
+	if current.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(current) {
+		next.Status = importCheckpointStatusBlocked
 	}
 	next.UpdatedAt = now
 	if found && importCheckpointEqualExceptUpdatedAt(current, next) {
@@ -9873,6 +10071,9 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if status == "" || status == "blocked" {
 		status = "complete"
 	}
+	if previous.SourceRewriteBlocked || previous.OversizedRecordBlocked || previous.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(previous) {
+		status = importCheckpointStatusBlocked
+	}
 	if checkpoint.SessionID == "" {
 		checkpoint.SessionID = previous.SessionID
 	}
@@ -9904,11 +10105,46 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if checkpoint.UnresolvedExecution == nil {
 		checkpoint.UnresolvedExecution = previous.UnresolvedExecution
 	}
+	if !checkpoint.SourceRewriteBlocked {
+		checkpoint.SourceRewriteBlocked = previous.SourceRewriteBlocked
+	}
+	if !checkpoint.OversizedRecordBlocked {
+		checkpoint.OversizedRecordBlocked = previous.OversizedRecordBlocked
+	}
+	if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) == "" {
+		checkpoint.SourceRewriteRecoveryIdentity = previous.SourceRewriteRecoveryIdentity
+	}
+	if !importCheckpointIsExplicitHistoryRun(checkpoint) {
+		if checkpoint.TranscriptQuarantine == nil {
+			checkpoint.TranscriptQuarantine = previous.TranscriptQuarantine
+		}
+		checkpoint.LegacySourceUnverified = checkpoint.LegacySourceUnverified || previous.LegacySourceUnverified
+	}
+	if checkpoint.LastFinalID == "" {
+		checkpoint.LastFinalID = previous.LastFinalID
+		checkpoint.LastFinalLine = previous.LastFinalLine
+		checkpoint.LastFinalStartOffset = previous.LastFinalStartOffset
+		checkpoint.LastFinalStartOffsetKnown = previous.LastFinalStartOffsetKnown
+		checkpoint.LastFinalThreadID = previous.LastFinalThreadID
+		checkpoint.LastFinalTurnID = previous.LastFinalTurnID
+		checkpoint.LastFinalTextHash = previous.LastFinalTextHash
+		checkpoint.TerminalBoundarySeen = previous.TerminalBoundarySeen
+		checkpoint.TerminalBoundaryLine = previous.TerminalBoundaryLine
+	}
+	if checkpoint.PartialReadOffset == 0 && previous.PartialReadOffset > previous.PartialLineStartOffset {
+		checkpoint.PartialLineStartOffset = previous.PartialLineStartOffset
+		checkpoint.PartialReadOffset = previous.PartialReadOffset
+		checkpoint.PartialObservedSize = previous.PartialObservedSize
+		checkpoint.PartialLine = previous.PartialLine
+		checkpoint.PartialStartedAt = previous.PartialStartedAt
+		checkpoint.PartialSourceIdentity = previous.PartialSourceIdentity
+	}
 	// These fields are stateful fences/caches, not part of the abbreviated
 	// checkpoint projections carried by delivery records.  Never let a replay
 	// of an older projection erase a source-rewrite fence or force the cold
 	// compatibility probe to run again on every update.
 	checkpoint.SourceRewriteBlocked = checkpoint.SourceRewriteBlocked || previous.SourceRewriteBlocked
+	checkpoint.LegacyProbeRevision = firstStoreNonEmptyString(checkpoint.LegacyProbeRevision, previous.LegacyProbeRevision)
 	if strings.TrimSpace(checkpoint.LegacyProbeRevision) == "" {
 		checkpoint.LegacyProbeRevision = previous.LegacyProbeRevision
 	}
@@ -9980,6 +10216,11 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	switch msg.Status {
 	case OutboxStatusQueued:
 	case OutboxStatusSending:
+		if OutboxSendIsAmbiguous(msg) {
+			// The external POST may have succeeded. A lease timeout is not
+			// evidence of rejection, so never reclaim this row automatically.
+			return msg, ErrOutboxSendNotClaimed
+		}
 		if !msg.LastSendAttempt.IsZero() && now.Sub(msg.LastSendAttempt) <= outboxSendLease {
 			return msg, ErrOutboxSendNotClaimed
 		}
@@ -10093,6 +10334,11 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 			// reconciled separately, so it must not strand newer rows in FIFO.
 			continue
 		}
+		if OutboxSendIsAmbiguous(candidate) {
+			// An unknown external outcome is reconciled separately and must not
+			// hold newer live/control work behind a stale history send.
+			continue
+		}
 		switch candidate.Status {
 		case OutboxStatusSent, OutboxStatusSkipped:
 			continue
@@ -10128,6 +10374,9 @@ func (s *Store) EarlierUnsentOutboxes(ctx context.Context, msg OutboxMessage) ([
 			continue
 		}
 		if AcceptedSourceRewriteOutboxIsStable(candidate) {
+			continue
+		}
+		if OutboxSendIsAmbiguous(candidate) {
 			continue
 		}
 		switch candidate.Status {
@@ -11395,6 +11644,12 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 		// Graph already accepted the message and the durable source-rewrite fence
 		// makes it permanently non-retryable. Reconcile it only through explicit
 		// history recovery, not through the ordinary sender poll.
+		return false
+	}
+	if OutboxSendIsAmbiguous(msg) {
+		// Unknown external outcome is an explicit recovery item, not an
+		// automatically reclaimable pending send and not a FIFO blocker for live
+		// work in the same chat.
 		return false
 	}
 	if query.SessionID != "" && msg.SessionID != query.SessionID {

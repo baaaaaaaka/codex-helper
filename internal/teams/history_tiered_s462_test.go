@@ -73,6 +73,39 @@ func TestHistoryWatchRewindsZeroOffsetFinalBeforeContinuation(t *testing.T) {
 	}
 }
 
+func TestHistoryWatchQuarantinesMirrorAmbiguityWithoutExecutionFence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mirror-watch.jsonl")
+	transcript := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-watch-mirror"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"anonymous mirror one"}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"anonymous mirror two"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(transcript), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("sync mirror history watch: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load mirror history watch state: %v", err)
+	}
+	checkpoint, ok := state.HistoryWatch[historyWatchCheckpointID(path)]
+	if !ok {
+		t.Fatalf("mirror history-watch checkpoint missing: %#v", state.HistoryWatch)
+	}
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedContinuation {
+		t.Fatalf("mirror ambiguity became an execution fence: %#v", checkpoint)
+	}
+	if checkpoint.Offset != 0 || checkpoint.LastFinalID != "" {
+		t.Fatalf("mirror ambiguity advanced the logical history cursor: %#v", checkpoint)
+	}
+}
+
 func TestHistoryWatchChangedPathsChecksLegacyProofOnNormalPoll(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-watch.jsonl")
 	original := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -186,8 +219,8 @@ func TestHistoryTieredScanTailQuarantinesTwoAnonymousFinalsAfterTerminal(t *test
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if !result.State.UnresolvedContinuation {
-		t.Fatalf("two anonymous finals were not blocked: state=%#v finals=%#v", result.State, result.Finals)
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil {
+		t.Fatalf("two anonymous finals were not transcript-quarantined: state=%#v finals=%#v", result.State, result.Finals)
 	}
 	for _, final := range result.Finals {
 		if strings.Contains(final.Record.Text, "anonymous child") {
@@ -218,8 +251,8 @@ func TestHistoryTieredScanTailQuarantinesAnonymousFinalPairBeforeTerminal(t *tes
 			if err != nil {
 				t.Fatalf("historyTieredScanTail: %v", err)
 			}
-			if !result.State.UnresolvedContinuation {
-				t.Fatalf("anonymous pre-terminal pair was accepted: state=%#v finals=%#v", result.State, result.Finals)
+			if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil {
+				t.Fatalf("anonymous pre-terminal pair was not transcript-quarantined: state=%#v finals=%#v", result.State, result.Finals)
 			}
 			for _, final := range result.Finals {
 				if strings.Contains(final.Record.Text, "anonymous ") {
@@ -253,8 +286,8 @@ func TestHistoryTieredScanTailQuarantinesAnonymousFinalPairAcrossPolls(t *testin
 	if err != nil {
 		t.Fatalf("second scan: %v", err)
 	}
-	if !second.State.UnresolvedContinuation {
-		t.Fatalf("second anonymous final was not unresolved: state=%#v finals=%#v", second.State, second.Finals)
+	if second.State.UnresolvedContinuation || second.State.TranscriptQuarantine == nil {
+		t.Fatalf("second anonymous final was not transcript-quarantined: state=%#v finals=%#v", second.State, second.Finals)
 	}
 }
 
@@ -305,7 +338,7 @@ func TestHistoryWatchDeletedSourceRewriteBlockedCheckpointIsCleanedAcrossBackend
 	}
 }
 
-func TestHistoryWatchLegacyCheckpointWithoutFingerprintBlocksBeforeScanning(t *testing.T) {
+func TestHistoryWatchLegacyCheckpointWithoutFingerprintDefersSilently(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-history-watch.jsonl")
 	body := []byte(`{"type":"session_meta","payload":{"id":"legacy-watch"}}
 {"thread_id":"legacy-watch","turn_id":"turn-old","id":"old-final","role":"assistant","text":"old answer"}
@@ -346,14 +379,49 @@ func TestHistoryWatchLegacyCheckpointWithoutFingerprintBlocksBeforeScanning(t *t
 		t.Fatalf("load history-watch state: %v", err)
 	}
 	checkpoint := state.HistoryWatch[checkpointID]
-	if !checkpoint.SourceRewriteBlocked {
-		t.Fatalf("legacy checkpoint was not blocked before scan: %#v", checkpoint)
+	if checkpoint.SourceRewriteBlocked || !checkpoint.LegacySourceUnverified {
+		t.Fatalf("legacy checkpoint was not migrated to a silent history-only boundary: %#v", checkpoint)
 	}
 	if checkpoint.Offset != info.Size() {
 		t.Fatalf("legacy checkpoint cursor changed while blocked: got %d want %d", checkpoint.Offset, info.Size())
 	}
 	if checkpoint.SourceFingerprint != "" {
 		t.Fatalf("legacy checkpoint unexpectedly acquired a fingerprint from an untrusted prefix: %#v", checkpoint)
+	}
+}
+
+func TestExplicitHistoryClearsLegacySourceUnverifiedMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-explicit-recovery.jsonl")
+	body := `{"id":"recovered-final","role":"assistant","text":"recovered answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	defer store.Close()
+	checkpointID := "transcript:legacy-explicit-recovery"
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(checkpoint teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.ID = checkpointID
+		checkpoint.SessionID = "legacy-explicit-recovery"
+		checkpoint.SourcePath = path
+		checkpoint.LastRecordID = "old-final"
+		checkpoint.LegacySourceUnverified = true
+		checkpoint.ImportTurnID = "publish-history:legacy-explicit-recovery"
+		checkpoint.Status = importCheckpointStatusImporting
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed legacy checkpoint: %v", err)
+	}
+	bridge := &Bridge{store: store}
+	if err := bridge.markTranscriptImportCompleteDetailedWithID(context.Background(), Session{ID: "legacy-explicit-recovery"}, path, "recovered-final", 1, checkpointID, true); err != nil {
+		t.Fatalf("complete explicit history: %v", err)
+	}
+	checkpoint, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load recovered checkpoint: found=%v err=%v", found, err)
+	}
+	if checkpoint.LegacySourceUnverified || checkpoint.SourceFingerprint == "" || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("explicit recovery left an unusable legacy checkpoint: %#v", checkpoint)
 	}
 }
 
@@ -756,7 +824,53 @@ func TestBridgeSyncLinkedTranscriptAdvancesOversizedTailIncrementally(t *testing
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptQuarantinesOversizedRecordWithoutRescanning(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptPublishesSafePrefixBeforePendingRootMarker(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-s512-safe-prefix"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s512-safe-prefix", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s512-safe-prefix")
+	*sent = nil
+
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","id":"safe-prefix-final","turn_id":"outer-turn","phase":"final_answer","message":"safe prefix answer must be delivered"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"pending-root","started_at":1786181089,"model_context_window":128000,"collaboration_mode_kind":"default"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("sync pending-root transcript: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "safe prefix answer must be delivered") {
+		t.Fatalf("safe prefix final was lost when the scan ended at task_started: %#v", *sent)
+	}
+	if sentPlainContains(*sent, "previous Codex execution is still unconfirmed") || sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("pending root marker emitted an execution/history gate for a safe prefix: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load pending-root state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.LastOffset <= 0 || checkpoint.LastOffset != checkpoint.SourceSize || checkpoint.Status == importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil {
+		t.Fatalf("checkpoint after safe prefix = %#v, want progress through the ignored marker without an owner fence", checkpoint)
+	}
+	first := sentPlainJoined(*sent)
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("repeat pending-root transcript sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if strings.Contains(sentPlainJoined(*sent), "safe prefix answer must be delivered") {
+		t.Fatalf("safe prefix final was replayed on the pending marker poll: first=%s repeat=%#v", first, *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptAdvancesPastOversizedRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-s462-linked-oversized-record"}}` + "\n" +
 		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
@@ -769,6 +883,11 @@ func TestBridgeSyncLinkedTranscriptQuarantinesOversizedRecordWithoutRescanning(t
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-oversized-record")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load seeded state: %v", err)
+	}
+	before := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
 	giantRecord := `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"` + strings.Repeat("x", historyTieredMaxRecordBytes+1) + `"}}` + "\n"
 	finalRecord := `{"type":"event_msg","payload":{"type":"agent_message","id":"after-oversized-record","phase":"final_answer","message":"must wait for recovery"}}` + "\n"
 	if err := os.WriteFile(path, []byte(initial+giantRecord+finalRecord), 0o600); err != nil {
@@ -782,45 +901,94 @@ func TestBridgeSyncLinkedTranscriptQuarantinesOversizedRecordWithoutRescanning(t
 	if sentPlainContains(*sent, "must wait for recovery") || sentPlainContains(*sent, "helper publish-history") {
 		t.Fatalf("automatic oversized-record scan emitted user-visible output: %#v", *sent)
 	}
-	state, err := store.Load(context.Background())
+	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load quarantined state: %v", err)
 	}
 	checkpointID := transcriptCheckpointID(session.ID)
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if !checkpoint.OversizedRecordBlocked || checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("checkpoint = %#v, want an oversized-record quarantine", checkpoint)
+	if checkpoint.OversizedRecordBlocked || checkpoint.Status == importCheckpointStatusBlocked {
+		t.Fatalf("checkpoint = %#v, want a resumable bounded cursor", checkpoint)
 	}
-	if checkpoint.LastOffset <= 0 || checkpoint.LastOffset >= checkpoint.SourceSize {
-		t.Fatalf("checkpoint = %#v, want the trusted prefix cursor before the giant record", checkpoint)
+	if checkpoint.LastOffset <= before.LastOffset || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("checkpoint = %#v, want the cursor after the giant record and before the final", checkpoint)
 	}
-	firstUpdatedAt := checkpoint.UpdatedAt
 	*sent = nil
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
-		t.Fatalf("repeat unchanged oversized-record sync: %v", err)
+		t.Fatalf("resume unchanged oversized-record sync: %v", err)
 	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
-	if len(*sent) != 0 {
-		t.Fatalf("unchanged oversized-record checkpoint emitted output on repeat: %#v", *sent)
+	if !sentPlainContains(*sent, "must wait for recovery") {
+		t.Fatalf("resumable oversized-record scan did not deliver the following final: %#v", *sent)
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("reload quarantined state: %v", err)
 	}
 	checkpoint = state.ImportCheckpoints[checkpointID]
-	if !checkpoint.OversizedRecordBlocked || !checkpoint.UpdatedAt.Equal(firstUpdatedAt) {
-		t.Fatalf("unchanged oversized-record checkpoint changed on repeat: first=%#v second=%#v", firstUpdatedAt, checkpoint)
+	if checkpoint.OversizedRecordBlocked || checkpoint.LastOffset < checkpoint.SourceSize {
+		t.Fatalf("resumed oversized-record checkpoint = %#v, want EOF cursor", checkpoint)
 	}
 
-	// An append changes the source identity metadata. Automatic sync may retry
-	// the bounded recovery path, but it must keep the giant record quarantined.
+	// A later append remains ordinary incremental history; the old oversized
+	// record does not turn the source into a permanent history gate.
 	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"new safe record"}}`)
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
 		t.Fatalf("changed oversized-record sync: %v", err)
 	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
-	if sentPlainContains(*sent, "must wait for recovery") {
-		t.Fatalf("changed oversized-record sync crossed the quarantined record: %#v", *sent)
+	if sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("changed oversized-record sync emitted a recovery gate: %#v", *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptAdvancesPastLargeInvisibleCompleteRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-s519-invisible"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-s519-invisible", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s519-invisible")
+	*sent = nil
+
+	// This models the image/tool record reported by s519: it is a complete
+	// newline-bounded JSON object, larger than the normal scan budget but still
+	// below the opaque-record cap, and its envelope has no visible text.
+	invisible := `{"type":"item.completed","item":{"type":"message","role":"assistant","metadata":"` +
+		strings.Repeat("x", historyTieredMaxRecordBytes-512*1024) + `"}}` + "\n"
+	final := `{"type":"event_msg","payload":{"type":"agent_message","id":"s519-final","phase":"final_answer","message":"final after invisible image"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial+invisible+final), 0o600); err != nil {
+		t.Fatalf("write invisible-record transcript: %v", err)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("first invisible-record sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "final after invisible image") {
+		t.Fatalf("first scan reached final beyond the bounded invisible record: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load invisible-record checkpoint: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastOffset <= 0 || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("invisible complete record did not create a resumable ignored cursor: %#v", checkpoint)
+	}
+
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("resume invisible-record sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "final after invisible image") {
+		t.Fatalf("final after invisible record was not delivered: %#v", *sent)
 	}
 }
 
@@ -901,8 +1069,31 @@ func TestHistoryTieredScanTailQuarantinesAdjacentMixedIDFinalCandidates(t *testi
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
-		t.Fatalf("adjacent mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil || len(result.Finals) != 0 {
+		t.Fatalf("adjacent mixed-ID candidates escaped transcript quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	}
+	if result.State.TranscriptQuarantine.FrontierOffset != 0 || result.State.TranscriptQuarantine.FrontierLine != 1 {
+		t.Fatalf("mixed-ID quarantine frontier = %#v, want the first record at offset 0/line 1", result.State.TranscriptQuarantine)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesMixedIDMirrorAfterTerminalBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "terminal-mixed-id-mirror.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"outer-final","type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"same terminal mirror"}}`,
+		`{"type":"response_item","thread_id":"thread-terminal-mirror","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"mirror-turn"},"content":[{"type":"output_text","text":"same terminal mirror"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil || len(result.Finals) != 1 || result.Finals[0].Record.Text != "outer answer" {
+		t.Fatalf("terminal mixed-ID mirror escaped transcript quarantine: state=%#v finals=%#v quarantined=%#v", result.State, result.Finals, result.QuarantinedFinals)
 	}
 }
 
@@ -920,8 +1111,8 @@ func TestHistoryTieredScanTailQuarantinesSameSourceMixedIDFinalCandidates(t *tes
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
-		t.Fatalf("same-source mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil || len(result.Finals) != 0 {
+		t.Fatalf("same-source mixed-ID candidates escaped transcript quarantine: state=%#v finals=%#v", result.State, result.Finals)
 	}
 }
 
@@ -939,8 +1130,105 @@ func TestHistoryTieredScanTailQuarantinesNonAdjacentMixedIDFinalCandidates(t *te
 	if err != nil {
 		t.Fatalf("historyTieredScanTail: %v", err)
 	}
-	if !result.State.UnresolvedContinuation || len(result.Finals) != 0 {
-		t.Fatalf("ambiguous mixed-ID candidates escaped quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil || len(result.Finals) != 0 {
+		t.Fatalf("ambiguous mixed-ID candidates escaped transcript quarantine: state=%#v finals=%#v", result.State, result.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesSameTextAnonymousFinalCandidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"anonymous-first","type":"agent_message","phase":"final_answer","message":"repeated anonymous answer"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_tokens":1}}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"repeated anonymous answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:                 path,
+		TerminalBoundarySeen: true,
+		LastFinalID:          "old-final",
+		LastFinalTextHash:    normalizedTextHash("old answer"),
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation || result.State.TranscriptQuarantine == nil || len(result.Finals) != 0 || len(result.QuarantinedFinals) != 2 {
+		t.Fatalf("same-text anonymous candidates escaped transcript quarantine: state=%#v finals=%#v quarantined=%#v", result.State, result.Finals, result.QuarantinedFinals)
+	}
+}
+
+func TestHistoryTieredScanTailQuarantinesCrossPollMixedIDMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cross-poll-mirror.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"cross-poll mirror"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write first transcript surface: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{Path: path}, 1<<20)
+	if err != nil {
+		t.Fatalf("first historyTieredScanTail: %v", err)
+	}
+	if first.State.UnresolvedContinuation || first.State.TranscriptQuarantine != nil || len(first.Finals) != 1 {
+		t.Fatalf("first surface = state=%#v finals=%#v quarantine=%#v, want one provisional final", first.State, first.Finals, first.State.TranscriptQuarantine)
+	}
+	appendLine(t, path, `{"type":"response_item","thread_id":"thread-cross-poll","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"typed-mirror-turn"},"content":[{"type":"output_text","text":"cross-poll mirror"}]}}`)
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("second historyTieredScanTail: %v", err)
+	}
+	if second.State.UnresolvedContinuation || second.State.TranscriptQuarantine == nil || len(second.Finals) != 0 {
+		t.Fatalf("cross-poll mirror escaped transcript quarantine: state=%#v finals=%#v quarantined=%#v", second.State, second.Finals, second.QuarantinedFinals)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptQuarantinesCrossPollMixedIDMirror(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cross-poll-bridge.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-cross-poll-bridge"}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"old-final","type":"agent_message","phase":"final_answer","message":"old answer"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-cross-poll-bridge", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-cross-poll-bridge")
+	*sent = nil
+	firstAnswer := "cross-poll answer"
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"event-final","type":"agent_message","phase":"final_answer","message":"`+firstAnswer+`"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync first surface: %v", err)
+	}
+	if strings.Count(sentPlainJoined(*sent), firstAnswer) != 1 {
+		t.Fatalf("first surface output = %#v, want one answer", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load after first surface: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastFinalID == "" || !checkpoint.LastFinalStartOffsetKnown || checkpoint.LastFinalTextHash == "" {
+		t.Fatalf("first surface did not persist final boundary provenance: %#v", checkpoint)
+	}
+	if len(state.TranscriptLedger) == 0 {
+		t.Fatalf("first surface did not retain transcript delivery ledger")
+	}
+	appendLine(t, path, `{"type":"response_item","thread_id":"thread-cross-poll-bridge","payload":{"type":"message","role":"assistant","phase":"final_answer","turn":{"id":"typed-mirror-turn"},"content":[{"type":"output_text","text":"`+firstAnswer+`"}]}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("sync second surface: %v", err)
+	}
+	if strings.Count(sentPlainJoined(*sent), firstAnswer) != 1 {
+		t.Fatalf("cross-poll mirror was delivered twice: %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load after second surface: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedExecution != nil || checkpoint.LastRecordID == "" && checkpoint.LastOffset != 0 {
+		t.Fatalf("cross-poll checkpoint = %#v, want retained history-only quarantine", checkpoint)
 	}
 }
 
@@ -989,16 +1277,16 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror(t *testin
 	if strings.Contains(joined, "same ambiguous answer") {
 		t.Fatalf("ambiguous mixed-ID answer leaked through bridge: %#v", *sent)
 	}
-	if !strings.Contains(joined, "helper publish-history") {
-		t.Fatalf("missing mixed-ID needs-attention notice: %#v", *sent)
+	if strings.Contains(joined, "helper publish-history") {
+		t.Fatalf("transcript-only ambiguity emitted a recovery notice: %#v", *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load mixed-ID state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution == nil {
-		t.Fatalf("mixed-ID checkpoint = %#v, want blocked unresolved anchor", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("mixed-ID checkpoint = %#v, want silent transcript quarantine", checkpoint)
 	}
 }
 
@@ -1026,15 +1314,128 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSameSourceMixedIDMirror(t *testing
 	if strings.Contains(joined, "same-source ambiguous answer") {
 		t.Fatalf("same-source mixed-ID answer leaked through bridge: %#v", *sent)
 	}
-	if !strings.Contains(joined, "helper publish-history") {
-		t.Fatalf("missing same-source mixed-ID needs-attention notice: %#v", *sent)
+	if strings.Contains(joined, "helper publish-history") {
+		t.Fatalf("transcript-only ambiguity emitted a recovery notice: %#v", *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load same-source mixed-ID state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution == nil {
-		t.Fatalf("same-source mixed-ID checkpoint = %#v, want blocked unresolved anchor", checkpoint)
+	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("same-source mixed-ID checkpoint = %#v, want silent transcript quarantine", checkpoint)
+	}
+}
+
+func TestBridgeWorkPublishHistoryRecoversTranscriptQuarantine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	initial := `{"type":"session_meta","payload":{"id":"thread-explicit-quarantine"}}` + "\n" +
+		`{"id":"old-final","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, "thread-explicit-quarantine", path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-explicit-quarantine")
+	*sent = nil
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"mirror-event","type":"agent_message","phase":"final_answer","message":"quarantined answer"}}`)
+	appendLine(t, path, `{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"quarantined answer"}]}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
+		t.Fatalf("automatic quarantine sync: %v", err)
+	}
+	if sentPlainContains(*sent, "quarantined answer") || sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("automatic quarantine produced user-visible output: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load quarantined state: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedExecution != nil {
+		t.Fatalf("automatic mirror state = %#v, want history-only quarantine", checkpoint)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-quarantine", "2026-08-22T02:00:00Z", "helper publish-history"), "helper publish-history"); err != nil {
+		t.Fatalf("explicit publish-history recovery: %v", err)
+	}
+	joined := sentPlainJoined(*sent)
+	if strings.Count(joined, "quarantined answer") != 1 || !strings.Contains(joined, "Import complete") {
+		t.Fatalf("explicit recovery output = %q, want one answer and completion", joined)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load recovered state: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.TranscriptQuarantine != nil || checkpoint.UnresolvedExecution != nil {
+		t.Fatalf("explicit recovery checkpoint = %#v, want complete without quarantine/fence", checkpoint)
+	}
+}
+
+func TestPersistTranscriptQuarantineDoesNotOverwriteNewerBranchOrRecovery(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			graph, _ := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if backend == "sqlite" {
+				if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			session := bridge.reg.SessionByChatID("chat-1")
+			checkpointID := transcriptCheckpointID(session.ID)
+			quarantine := &teamstore.TranscriptQuarantine{Kind: "mixed_id_final_mirror", SourcePath: "/old/rollout.jsonl", FrontierOffset: 128}
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: session.ID, SourcePath: quarantine.SourcePath, Status: importCheckpointStatusBlocked, TranscriptQuarantine: quarantine}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed quarantine: %v", err)
+			}
+			stale, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+			if err != nil || !found {
+				t.Fatalf("load stale checkpoint: %#v found=%v err=%v", stale, found, err)
+			}
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				current := state.ImportCheckpoints[checkpointID]
+				current.TranscriptQuarantine = &teamstore.TranscriptQuarantine{Kind: quarantine.Kind, SourcePath: quarantine.SourcePath, FrontierOffset: quarantine.FrontierOffset, LiveBranchThreadID: "thread-live"}
+				state.ImportCheckpoints[checkpointID] = current
+				return nil
+			}); err != nil {
+				t.Fatalf("seed live branch winner: %v", err)
+			}
+			if err := bridge.persistTranscriptQuarantine(context.Background(), *session, quarantine.SourcePath, stale, quarantine); err != nil {
+				t.Fatalf("stale quarantine persistence after branch bind: %v", err)
+			}
+			current, _, err := store.ImportCheckpoint(context.Background(), checkpointID)
+			if err != nil || current.TranscriptQuarantine == nil || current.TranscriptQuarantine.LiveBranchThreadID != "thread-live" {
+				t.Fatalf("stale writer erased live branch: %#v err=%v", current, err)
+			}
+
+			stale, _, err = store.ImportCheckpoint(context.Background(), checkpointID)
+			if err != nil {
+				t.Fatalf("reload checkpoint before explicit clear: %v", err)
+			}
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				current := state.ImportCheckpoints[checkpointID]
+				current.TranscriptQuarantine = nil
+				current.Status = importCheckpointStatusComplete
+				state.ImportCheckpoints[checkpointID] = current
+				return nil
+			}); err != nil {
+				t.Fatalf("seed explicit recovery winner: %v", err)
+			}
+			if err := bridge.persistTranscriptQuarantine(context.Background(), *session, quarantine.SourcePath, stale, quarantine); err != nil {
+				t.Fatalf("stale quarantine persistence after explicit recovery: %v", err)
+			}
+			current, _, err = store.ImportCheckpoint(context.Background(), checkpointID)
+			if err != nil || current.TranscriptQuarantine != nil || current.Status != importCheckpointStatusComplete {
+				t.Fatalf("stale writer resurrected quarantine: %#v err=%v", current, err)
+			}
+		})
 	}
 }

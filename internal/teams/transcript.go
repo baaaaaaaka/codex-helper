@@ -41,6 +41,11 @@ type TranscriptParseOptions struct {
 	InitialTurnID    string
 	InitialLineNo    int
 	InitialOffset    int64
+	// RequireFinalNewline makes file-backed/full-history parsing fail closed on
+	// a writer tail that has not reached a JSONL boundary. The default remains
+	// permissive for in-memory protocol fixtures and callers that already own a
+	// stable complete snapshot.
+	RequireFinalNewline bool
 }
 
 type Transcript struct {
@@ -67,14 +72,61 @@ type Transcript struct {
 	// or an internal continuation. Automatic linked sync must leave its
 	// checkpoint unchanged and rescan when the next record supplies ownership.
 	PendingContinuation bool
-	// AmbiguousFinals carries the anonymous final candidates that caused the
-	// scanner's pair quarantine. They are kept separate from Records so normal
-	// automatic callers cannot accidentally publish them; a very narrow bridge
-	// dedupe path may inspect them when one is already proven to be a live-status
-	// mirror.
-	AmbiguousFinals []TranscriptRecord
-	Records         []TranscriptRecord
-	Diagnostics     []TranscriptDiagnostic
+	// QuarantinedFinals carries final candidates that the scanner could not
+	// safely attribute to an execution. They are kept separate from Records so
+	// automatic callers cannot accidentally publish them. The quarantine is a
+	// history-only observation; it is never an execution-owner proof.
+	QuarantinedFinals    []TranscriptRecord
+	TranscriptQuarantine *teamstore.TranscriptQuarantine
+	// FinalBoundary is the latest final provenance observed by the bounded
+	// scanner. It is persisted with the generic import cursor so a mirror that
+	// arrives on the next poll is still recognized as an ambiguous anonymous
+	// continuation rather than a new publishable answer.
+	FinalBoundary *TranscriptFinalBoundary
+	// Partial records an unterminated JSONL read that has not reached a safe
+	// newline boundary. It is persisted as a bounded read hint only; callers
+	// must not publish or advance LastOffset from it.
+	Partial *TranscriptPartialProgress
+	// Consumed records a complete, newline-bounded record that the scanner
+	// intentionally did not turn into a user-visible TranscriptRecord (for
+	// example task_started/session metadata or an opaque tool envelope). It is
+	// an ignored disposition, not a delivery claim. The bridge may persist this
+	// cursor only when the scan has no unresolved/quarantined frontier.
+	Consumed *TranscriptConsumedProgress
+	// TailBudgetExhausted means the bounded scanner consumed a complete safe
+	// prefix but stopped before source EOF. Import callers must keep the
+	// checkpoint resumable at that prefix rather than treating the snapshot as
+	// a complete EOF import.
+	TailBudgetExhausted bool
+	Records             []TranscriptRecord
+	Diagnostics         []TranscriptDiagnostic
+}
+
+type TranscriptPartialProgress struct {
+	LineStartOffset int64
+	ReadOffset      int64
+	ObservedSize    int64
+	Line            int
+	StartedAt       time.Time
+	SourceIdentity  string
+}
+
+type TranscriptConsumedProgress struct {
+	RecordID string
+	Line     int
+	Offset   int64
+}
+
+type TranscriptFinalBoundary struct {
+	ID               string
+	Line             int
+	StartOffset      int64
+	StartOffsetKnown bool
+	ThreadID         string
+	TurnID           string
+	TextHash         string
+	TerminalSeen     bool
+	TerminalLine     int
 }
 
 type TranscriptRecord struct {
@@ -115,7 +167,7 @@ func ReadSessionTranscript(filePath string) (Transcript, error) {
 	if abs, err := filepath.Abs(filePath); err == nil {
 		sourceName = abs
 	}
-	return ParseCodexTranscript(f, TranscriptParseOptions{SourceName: sourceName})
+	return ParseCodexTranscript(f, TranscriptParseOptions{SourceName: sourceName, RequireFinalNewline: true})
 }
 
 func ReadSessionTranscriptSince(filePath string, afterKey string) (Transcript, error) {
@@ -165,19 +217,23 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 	var checkpointOffset int64 = -1
 	checkpointLine := 0
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		complete := read.Complete
+		if read.BytesRead > 0 {
+			line := read.Line
 			lineNo++
-			nextOffset := offset + int64(len(line))
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
-				if checkpointLineMatches(trimmed, lineNo, afterKey, state, sourceName) {
+			nextOffset := offset + read.BytesRead
+			if complete && !read.Oversized {
+				trimmed := bytes.TrimSpace(line)
+				if len(trimmed) > 0 {
+					if checkpointLineMatches(trimmed, lineNo, afterKey, state, sourceName) {
+						advanceTranscriptScanState(trimmed, lineNo, &state)
+						checkpointOffset = nextOffset
+						checkpointLine = lineNo
+						break
+					}
 					advanceTranscriptScanState(trimmed, lineNo, &state)
-					checkpointOffset = nextOffset
-					checkpointLine = lineNo
-					break
 				}
-				advanceTranscriptScanState(trimmed, lineNo, &state)
 			}
 			offset = nextOffset
 		}
@@ -195,12 +251,13 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 		return Transcript{}, false, err
 	}
 	transcript, err := ParseCodexTranscript(f, TranscriptParseOptions{
-		SourceName:       sourceName,
-		InitialSessionID: state.sessionID,
-		InitialThreadID:  state.threadID,
-		InitialTurnID:    state.turnID,
-		InitialLineNo:    checkpointLine,
-		InitialOffset:    checkpointOffset,
+		SourceName:          sourceName,
+		InitialSessionID:    state.sessionID,
+		InitialThreadID:     state.threadID,
+		InitialTurnID:       state.turnID,
+		InitialLineNo:       checkpointLine,
+		InitialOffset:       checkpointOffset,
+		RequireFinalNewline: true,
 	})
 	if err != nil {
 		return transcript, false, err
@@ -283,37 +340,41 @@ func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcr
 	lineNo := 0
 	var offset int64
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		complete := read.Complete
+		if read.BytesRead > 0 {
+			line := read.Line
 			lineNo++
 			lineStartOffset := offset
-			nextOffset := offset + int64(len(line))
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
-				records, index, ok := checkpointLineMatchRecords(trimmed, lineNo, afterKey, state, sourceName)
-				if ok {
-					pos := transcriptCheckpointPosition{
-						Line:          lineNo,
-						Offset:        nextOffset,
-						SourceSize:    info.Size(),
-						SourceModTime: info.ModTime(),
-					}
-					for i := index + 1; i < len(records); i++ {
-						if records[i].SourceLine != records[index].SourceLine {
-							break
+			nextOffset := offset + read.BytesRead
+			if complete && !read.Oversized {
+				trimmed := bytes.TrimSpace(line)
+				if len(trimmed) > 0 {
+					records, index, ok := checkpointLineMatchRecords(trimmed, lineNo, afterKey, state, sourceName)
+					if ok {
+						pos := transcriptCheckpointPosition{
+							Line:          lineNo,
+							Offset:        nextOffset,
+							SourceSize:    info.Size(),
+							SourceModTime: info.ModTime(),
 						}
-						if strings.TrimSpace(transcriptRecordCheckpointKey(records[i])) != "" {
-							pos.Line = lineNo
-							if pos.Line > 0 {
-								pos.Line--
+						for i := index + 1; i < len(records); i++ {
+							if records[i].SourceLine != records[index].SourceLine {
+								break
 							}
-							pos.Offset = lineStartOffset
-							break
+							if strings.TrimSpace(transcriptRecordCheckpointKey(records[i])) != "" {
+								pos.Line = lineNo
+								if pos.Line > 0 {
+									pos.Line--
+								}
+								pos.Offset = lineStartOffset
+								break
+							}
 						}
+						return pos, true, nil
 					}
-					return pos, true, nil
+					advanceTranscriptScanState(trimmed, lineNo, &state)
 				}
-				advanceTranscriptScanState(trimmed, lineNo, &state)
 			}
 			offset = nextOffset
 		}
@@ -381,10 +442,11 @@ func transcriptSuffixMayNeedPrefixSourceCounts(filePath string, checkpointOffset
 	defer f.Close()
 	reader := bufio.NewReaderSize(io.LimitReader(f, checkpointOffset), 64*1024)
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		complete := read.Complete
+		if read.BytesRead > 0 && complete && !read.Oversized {
 			for sourceID := range sourceIDs {
-				if bytes.Contains(line, []byte(sourceID)) {
+				if bytes.Contains(read.Line, []byte(sourceID)) {
 					return true
 				}
 			}
@@ -408,21 +470,38 @@ func ParseCodexTranscript(r io.Reader, opts TranscriptParseOptions) (Transcript,
 	offset := opts.InitialOffset
 
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
+		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		complete := read.Complete || (!opts.RequireFinalNewline && err == io.EOF && read.BytesRead > 0)
+		if read.BytesRead > 0 {
 			lineStartOffset := offset
 			lineNo++
-			offset += int64(len(line))
-			_, _ = digest.Write(line)
-			trimmed := bytes.TrimSpace(line)
-			if len(trimmed) > 0 {
-				records, diagnostics := parseTranscriptLine(trimmed, lineNo, &state)
-				for i := range records {
-					records[i].SourceStartOffset = lineStartOffset
-					records[i].SourceOffset = offset
+			offset += read.BytesRead
+			if read.Oversized && complete {
+				transcript.Records = append(transcript.Records, historyTieredOversizedRecord(transcript.SourceName, lineNo, lineStartOffset, offset, read.Line))
+				transcript.Diagnostics = append(transcript.Diagnostics, TranscriptDiagnostic{
+					SourceLine: lineNo,
+					Kind:       "oversized_record",
+					Message:    "oversized JSONL record was retained as an opaque disposition",
+				})
+			} else if complete {
+				_, _ = digest.Write(read.Line)
+				trimmed := bytes.TrimSpace(read.Line)
+				if len(trimmed) > 0 {
+					records, diagnostics := parseTranscriptLine(trimmed, lineNo, &state)
+					for i := range records {
+						records[i].SourceStartOffset = lineStartOffset
+						records[i].SourceOffset = offset
+					}
+					transcript.Records = append(transcript.Records, records...)
+					transcript.Diagnostics = append(transcript.Diagnostics, diagnostics...)
 				}
-				transcript.Records = append(transcript.Records, records...)
-				transcript.Diagnostics = append(transcript.Diagnostics, diagnostics...)
+			} else {
+				transcript.Diagnostics = append(transcript.Diagnostics, TranscriptDiagnostic{
+					SourceLine: lineNo,
+					Kind:       "incomplete_tail",
+					Message:    "transcript source ended with an incomplete JSON record",
+				})
+				break
 			}
 		}
 		if err != nil {

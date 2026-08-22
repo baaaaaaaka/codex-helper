@@ -204,6 +204,11 @@ type outboxQueueOptions struct {
 	NotificationKind     string
 	IgnoreEarlierOutbox  bool
 	ParentFenceSessionID string
+	// FinalBoundary carries the scanner's durable final provenance through the
+	// visible-delivery path. Automatic transcript delivery advances the cursor
+	// in the same transaction as the outbox admission, so the boundary cannot
+	// be recovered later from the generic record cursor alone.
+	FinalBoundary *TranscriptFinalBoundary
 	// ExpectedSource* are populated only for automatic linked-transcript
 	// delivery. They bind the queued message to the checkpoint prefix that was
 	// verified before scanning. Explicit history publication intentionally does
@@ -458,9 +463,10 @@ type Bridge struct {
 	owner                             teamstore.OwnerMetadata
 	ownerStaleAfter                   time.Duration
 	ownerHeartbeatInterval            time.Duration
-	outboxFlushMu                     sync.Mutex
 	outboxRecoveryMu                  sync.Mutex
 	outboxRecoveryNextProbeAt         map[string]time.Time
+	outboxChatFlushMu                 sync.Mutex
+	outboxChatFlushLocks              map[string]*sync.Mutex
 	forkReconcileMu                   sync.Mutex
 	forkReconcileAfterID              string
 	outboxSendPaceMu                  sync.Mutex
@@ -12050,6 +12056,18 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 			SourceSize:              sourceSize,
 			SourceModTime:           sourceModTime,
 		}
+		if preFinal.FinalBoundary != nil {
+			boundary := preFinal.FinalBoundary
+			progress.LastFinalID = boundary.ID
+			progress.LastFinalLine = boundary.Line
+			progress.LastFinalStartOffset = boundary.StartOffset
+			progress.LastFinalStartOffsetKnown = boundary.StartOffsetKnown
+			progress.LastFinalThreadID = boundary.ThreadID
+			progress.LastFinalTurnID = boundary.TurnID
+			progress.LastFinalTextHash = boundary.TextHash
+			progress.TerminalBoundarySeen = boundary.TerminalSeen
+			progress.TerminalBoundaryLine = boundary.TerminalLine
+		}
 	}
 	completionRequest := teamstore.CompleteTurnWithFinalRequest{
 		SessionID:        session.ID,
@@ -12131,6 +12149,13 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 	if !found {
 		return ExecutionResult{}, false
 	}
+	if checkpoint.TranscriptQuarantine != nil {
+		// Completion recovery is an automatic ownership path. A transcript-only
+		// frontier is not evidence that the newest final belongs to this turn, so
+		// never recover across it; explicit publish-history is the only selected
+		// boundary that may clear the quarantine.
+		return ExecutionResult{}, false
+	}
 	local, ok := linkedTranscriptLocalFromCheckpoint(*session, checkpoint)
 	if !ok {
 		return ExecutionResult{}, false
@@ -12153,13 +12178,24 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 		SourceFingerprint:         strings.TrimSpace(checkpoint.SourceFingerprint),
 		Offset:                    checkpoint.LastOffset,
 		Line:                      checkpoint.LastSourceLine,
+		PartialLineStartOffset:    checkpoint.PartialLineStartOffset,
+		PartialReadOffset:         checkpoint.PartialReadOffset,
+		PartialObservedSize:       checkpoint.PartialObservedSize,
+		PartialLine:               checkpoint.PartialLine,
+		PartialStartedAt:          checkpoint.PartialStartedAt,
+		PartialSourceIdentity:     strings.TrimSpace(checkpoint.PartialSourceIdentity),
 		SessionID:                 firstNonEmptyString(local.SessionID, session.CodexThreadID),
 		ThreadID:                  firstNonEmptyString(observed.CodexThreadID, turn.CodexThreadID, local.SessionID, session.CodexThreadID),
 		TurnID:                    firstNonEmptyString(observed.CodexTurnID, turn.CodexTurnID),
-		LastFinalID:               strings.TrimSpace(checkpoint.LastRecordID),
-		LastFinalLine:             checkpoint.LastSourceLine,
-		LastFinalStartOffset:      checkpoint.LastOffset,
-		LastFinalStartOffsetKnown: checkpoint.LastOffsetKnown || checkpoint.LastOffset > 0,
+		LastFinalID:               firstNonEmptyString(checkpoint.LastFinalID, checkpoint.LastRecordID),
+		LastFinalLine:             checkpoint.LastFinalLine,
+		LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
+		LastFinalStartOffsetKnown: checkpoint.LastFinalStartOffsetKnown,
+		LastFinalThreadID:         strings.TrimSpace(checkpoint.LastFinalThreadID),
+		LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
+		LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
+		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen,
+		TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
 	}
 	recovered, ok := b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, previous)
 	if !ok {
@@ -14802,11 +14838,32 @@ func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Cont
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
+	if transcriptOutboxAutomaticRun(turnID) && strings.TrimSpace(opts.ExpectedSourceFingerprint) != "" && opts.FinalBoundary != nil && transcriptFinalBoundaryFitsProgress(*opts.FinalBoundary, transcriptRecordCheckpointKey(record), checkpointOffset) {
+		// A normal linked sync uses the legacy atomic checkpoint+ledger writer for
+		// ordinary records. Only a final with scanner provenance takes this
+		// source-proof path, because the detailed writer also carries the final
+		// boundary needed by the next poll. Record its ledger after the proof CAS
+		// succeeds so replay protection is retained without adding a second write
+		// to the hot status path.
+		if err := b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
+			ctx,
+			session,
+			local.FilePath,
+			transcriptRecordCheckpointKey(record),
+			checkpointLine,
+			checkpointOffset,
+			checkpointID,
+			opts,
+			opts.ParentFenceSessionID,
+			*opts.FinalBoundary,
+		); err != nil {
+			return err
+		}
+		return b.recordTranscriptLedgerAfterCheckpointProgress(ctx, session, local.FilePath, transcriptRecordCheckpointKey(record), checkpointLine, checkpointOffset, checkpointID, opts.ParentFenceSessionID)
+	}
 	if transcriptImportRunIsAutomatic(turnID) && strings.TrimSpace(opts.ExpectedSourceFingerprint) != "" {
-		// Large/math records bypass the normal batcher and reach this helper
-		// directly. Keep their checkpoint CAS bound to the same source proof as
-		// the queued outbox; the old detailed writer could advance the cursor
-		// after the sender had already fenced a source replacement.
+		// Import/background readers retain the existing source-proof checkpoint
+		// path; their explicit import ledger is managed by the import batcher.
 		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
 			ctx,
 			session,
@@ -15417,7 +15474,7 @@ func transcriptSourceReadProofMatches(proof outboxQueueOptions) bool {
 	// verification bounded just like the import-side proof so a malformed or
 	// stale row cannot make the outbox lock hold while it reads an arbitrary
 	// amount of a large transcript.
-	if proof.ExpectedSourceReadEndOffset-proof.ExpectedSourceReadStartOffset > int64(historyTieredMaxTailBytes+historyTieredMaxRecordBytes) {
+	if proof.ExpectedSourceReadEndOffset-proof.ExpectedSourceReadStartOffset > historyTieredMaxReadProofBytes {
 		return false
 	}
 	return transcriptSourceRangeFingerprint(proof.ExpectedSourcePath, proof.ExpectedSourceReadStartOffset, proof.ExpectedSourceReadEndOffset) == strings.TrimSpace(proof.ExpectedSourceReadFingerprint)
@@ -15645,10 +15702,9 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
+	unlockChat := b.lockOutboxChatFlush(chatID)
 	var sentSideEffects []sentOutboxSideEffect
-	b.outboxFlushMu.Lock()
 	err := func() error {
-		defer b.outboxFlushMu.Unlock()
 		var firstErr error
 		var firstBlockedErr error
 		var anchorCache map[string]teamstore.ExecutionAnchor
@@ -15736,10 +15792,38 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		}
 		return firstBlockedErr
 	}()
+	// Sent-outbox side effects may queue a workflow/fallback notification and
+	// flush the same chat synchronously. Release the chat lane before invoking
+	// them; holding it here would make that legitimate re-entrant path deadlock.
+	unlockChat()
 	for _, effect := range sentSideEffects {
 		b.handleSentOutboxSideEffects(ctx, effect.Outbox, effect.TeamsMessage)
 	}
 	return err
+}
+
+// lockOutboxChatFlush preserves ordering for concurrent flushes of one Teams
+// chat without reintroducing the old process-wide lock. A global/main-loop
+// flush passes an empty chat ID and relies on the store claim CAS; a targeted
+// chat flush gets a stable per-chat mutex so two callers cannot race a Graph
+// send and turn a normal claim conflict into a user-visible delivery error.
+func (b *Bridge) lockOutboxChatFlush(chatID string) func() {
+	chatID = strings.TrimSpace(chatID)
+	if b == nil || chatID == "" {
+		return func() {}
+	}
+	b.outboxChatFlushMu.Lock()
+	if b.outboxChatFlushLocks == nil {
+		b.outboxChatFlushLocks = make(map[string]*sync.Mutex)
+	}
+	lock := b.outboxChatFlushLocks[chatID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		b.outboxChatFlushLocks[chatID] = lock
+	}
+	b.outboxChatFlushMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
@@ -18077,8 +18161,12 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 			if checkpointErr != nil {
 				return "", checkpointErr
 			}
-			if found && checkpoint.Status == importCheckpointStatusBlocked {
-				importStatus = "No new local history was imported automatically."
+			if found && (checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LegacySourceUnverified) {
+				// A legacy source-proof migration is deliberately history-only. The
+				// automatic path did not import or skip a new suffix, so do not claim
+				// that a new history batch was delivered merely because migration
+				// normalized the old row to complete.
+				importStatus = "No new local history was imported."
 			} else if opts.BackgroundImport {
 				importStatus = "New local history import was queued."
 			} else {
@@ -18324,6 +18412,20 @@ func (b *Bridge) importCodexTranscriptToTeamsWithTarget(ctx context.Context, ses
 		checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
 		if err != nil {
 			return err
+		}
+		if found && checkpoint.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(importTurnID) {
+			// A transcript-only quarantine is intentionally silent during automatic
+			// polling. It is not an execution owner and must not create an import
+			// title, retry notice, or queue gate. Explicit publish-history remains
+			// the operator-selected recovery boundary.
+			return nil
+		}
+		if found && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
+			// Upgrade-era checkpoints must not enter the automatic preflight path:
+			// that path quite correctly rejects an unproven suffix, but its old
+			// failure state was a repeated history gate. Migrate the row once to a
+			// silent history-only boundary and leave live admission independent.
+			return b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint)
 		}
 		if found && transcriptCheckpointAdvanceBlocked(checkpoint) {
 			return nil
@@ -18650,11 +18752,13 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	}
 	sourceSizeBeforeRead, sourceModTimeBeforeRead := transcriptSourceFileState(filePath)
 	if !allowAmbiguousImport && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, filePath) {
-		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, filePath, checkpoint); err != nil {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, session, filePath, checkpoint); err != nil {
 			return transcriptImportResult{}, err
 		}
 		if transcriptImportRunIsAutomatic(importTurnID) {
-			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
+			// Inherited source-proof gaps are history-only migration work. Do not
+			// turn them into a queued user request or a visible warning.
+			return transcriptImportResult{Complete: false}, nil
 		}
 		return transcriptImportResult{Complete: false, UnsafeDiagnostics: true}, nil
 	}
@@ -18676,7 +18780,14 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		}
 	}
 	if checkpoint.LastRecordID == "" {
-		transcript, err = ReadSessionTranscript(filePath)
+		if !allowAmbiguousImport && sourceSizeBeforeRead > int64(historyTieredMaxTailBytes) {
+			// A newly discovered large source uses the same resumable bounded
+			// scanner as an incremental suffix. The empty checkpoint is a safe
+			// offset-zero boundary; later passes advance it through the normal CAS.
+			transcript, err = b.readLinkedTranscriptDelta(filePath, checkpoint, session.CodexThreadID, session.CodexThreadID)
+		} else {
+			transcript, err = ReadSessionTranscript(filePath)
+		}
 		if err != nil {
 			return transcriptImportResult{}, fmt.Errorf("read local transcript: %w", err)
 		}
@@ -18719,7 +18830,12 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 			}
 			checkpoint = state.ImportCheckpoints[checkpointID]
 			if strings.TrimSpace(checkpoint.LastRecordID) == "" {
-				transcript, err = ReadSessionTranscript(filePath)
+				currentSize, _ := transcriptSourceFileState(filePath)
+				if !allowAmbiguousImport && currentSize > int64(historyTieredMaxTailBytes) {
+					transcript, err = b.readLinkedTranscriptDelta(filePath, checkpoint, session.CodexThreadID, session.CodexThreadID)
+				} else {
+					transcript, err = ReadSessionTranscript(filePath)
+				}
 				if err != nil {
 					return transcriptImportResult{}, fmt.Errorf("read local transcript: %w", err)
 				}
@@ -18729,6 +18845,13 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 				return transcriptImportResult{}, errTranscriptCheckpointNotFound
 			}
 		}
+	}
+	// The bounded linked reader authenticates exactly the range it consumed. A
+	// large suffix is intentionally split across passes; do not require a
+	// single read-range hash for the whole suffix before admitting the current
+	// safe batch.
+	if !transcriptImportRunIsExplicitHistory(importTurnID) {
+		addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
 	}
 	if transcriptHasDiagnostic(transcript, "source_rewritten") || transcriptHasDiagnostic(transcript, "checkpoint_provenance_mismatch") {
 		if !allowAmbiguousImport {
@@ -18745,7 +18868,13 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		}
 		return transcriptImportResult{}, errTranscriptCheckpointNotFound
 	}
-	if (transcript.UnresolvedContinuation || transcript.PendingContinuation) && allowAmbiguousImport {
+	if transcript.TranscriptQuarantine != nil && !allowAmbiguousImport {
+		if err := b.persistTranscriptQuarantine(ctx, session, filePath, checkpoint, transcript.TranscriptQuarantine); err != nil {
+			return transcriptImportResult{}, err
+		}
+		return transcriptImportResult{Complete: false}, nil
+	}
+	if (transcript.UnresolvedContinuation || transcript.PendingContinuation || transcript.TranscriptQuarantine != nil) && allowAmbiguousImport {
 		// Automatic linked reads intentionally hide the ambiguous tail from all
 		// callers. An explicit publish-history command is the one exception: it
 		// is an operator-selected history import, so re-read the bounded suffix
@@ -18759,6 +18888,10 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		}
 		transcript.Records = explicit.Records
 		transcript.Diagnostics = append(transcript.Diagnostics, explicit.Diagnostics...)
+		transcript.UnresolvedContinuation = false
+		transcript.PendingContinuation = false
+		transcript.QuarantinedFinals = nil
+		transcript.TranscriptQuarantine = nil
 	}
 	sourceSizeAtRead, sourceModTimeAtRead := transcriptSourceFileState(filePath)
 	if transcript.UnresolvedContinuation && !allowAmbiguousImport {
@@ -18787,7 +18920,7 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	}
 	withSourceBoundary := func(result transcriptImportResult) transcriptImportResult {
 		for _, diagnostic := range transcript.Diagnostics {
-			if diagnostic.Kind == "invalid_json" || diagnostic.Kind == "checkpoint_not_found" || diagnostic.Kind == "checkpoint_provenance_mismatch" || diagnostic.Kind == "incomplete_tail" || diagnostic.Kind == "source_rewritten" || diagnostic.Kind == "tail_too_large" {
+			if diagnostic.Kind == "invalid_json" || diagnostic.Kind == "checkpoint_not_found" || diagnostic.Kind == "checkpoint_provenance_mismatch" || diagnostic.Kind == "incomplete_tail" || diagnostic.Kind == "source_rewritten" {
 				result.UnsafeDiagnostics = true
 				break
 			}
@@ -18797,10 +18930,11 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		result.SourceSizeAtRead = sourceSizeAtRead
 		result.SourceModTimeAtRead = sourceModTimeAtRead
 		result.SourceProof = sourceProof
-		if result.UnsafeDiagnostics {
+		if result.UnsafeDiagnostics || transcript.TailBudgetExhausted {
 			// A half-written/invalid tail is not an EOF boundary. Keep the
-			// checkpoint at the last complete record and let the next pass retry
-			// after the writer has finished the line.
+			// checkpoint at the last complete record and let the next pass resume
+			// the bounded suffix. A budgeted scan has a valid newline boundary but
+			// must not be promoted to source EOF.
 			result.Complete = false
 		}
 		return result
@@ -18896,7 +19030,7 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		LastLine:     last.SourceLine,
 		LastOffset:   last.SourceOffset,
 		Stats:        stats,
-		Complete:     true,
+		Complete:     !transcript.TailBudgetExhausted,
 	}), nil
 }
 
@@ -18918,6 +19052,7 @@ type activeTurnTranscriptPreparation struct {
 	FinalCheckpoint   transcriptImportCheckpointRecord
 	FinalSourcePath   string
 	FinalCheckpointID string
+	FinalBoundary     *TranscriptFinalBoundary
 }
 
 func (p activeTurnTranscriptPreparation) HasFinalCheckpoint() bool {
@@ -19301,6 +19436,11 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 		return false, err
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.TranscriptQuarantine != nil {
+		// A history-only ambiguity is not actionable work. Treat it as a silent
+		// recovery boundary until an explicit history command selects a position.
+		return false, nil
+	}
 	if checkpoint.Status == importCheckpointStatusFailed {
 		if strings.TrimSpace(checkpoint.LastRecordID) == "" && checkpoint.LastSourceLine <= 0 {
 			return true, nil
@@ -19321,11 +19461,7 @@ func (b *Bridge) transcriptHasNewRecords(ctx context.Context, session Session, l
 		return true, nil
 	}
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, filePath) {
-		// A publish/continue lookup is still an automatic boundary check: it
-		// must not manufacture a source proof merely because the user asked to
-		// reopen an existing session.  Keep the result silent and let the
-		// explicit `helper publish-history` command choose the recovery point.
-		if _, err := b.preflightAutomaticTranscriptImportSourceProof(ctx, session, filePath, transcriptCheckpointID(session.ID)); err != nil && !errors.Is(err, errTranscriptAutomaticSourceProofUnavailable) {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, session, filePath, checkpoint); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -19531,10 +19667,10 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 		return out, nil
 	}
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
-		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint); err != nil {
 			return out, err
 		}
-		out.CheckpointStatus = importCheckpointStatusBlocked
+		out.CheckpointStatus = importCheckpointStatusComplete
 		return out, nil
 	}
 	var transcript Transcript
@@ -19639,7 +19775,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx co
 		return false, nil
 	}
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
-		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -19706,7 +19842,11 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx co
 	}
 	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
 	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
-	if err := b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), sourceProof, parentFenceSessionID); err != nil {
+	if transcript.FinalBoundary != nil && transcriptFinalBoundaryFitsProgress(*transcript.FinalBoundary, lastKey, lastOffset) {
+		if err := b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), sourceProof, parentFenceSessionID, *transcript.FinalBoundary); err != nil {
+			return false, err
+		}
+	} else if err := b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, lastKey, lastLine, lastOffset, transcriptCheckpointID(session.ID), sourceProof, parentFenceSessionID); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -20084,7 +20224,7 @@ func (b *Bridge) recordSkippedTranscriptDeliveryWithParentFence(ctx context.Cont
 // that this scan actually read. The two writes are intentionally recoverable:
 // a crash after the delivery record but before the cursor CAS is safe, because
 // the next scan finds the durable delivery and retries the CAS.
-func (b *Bridge) recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, sourceProof outboxQueueOptions, parentFenceSessionID string) error {
+func (b *Bridge) recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, body string, sourceProof outboxQueueOptions, parentFenceSessionID string, finalBoundary ...TranscriptFinalBoundary) error {
 	if err := b.recordSkippedTranscriptDeliveryWithParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, teamstore.ImportCheckpoint{}, parentFenceSessionID); err != nil {
 		return err
 	}
@@ -20098,6 +20238,7 @@ func (b *Bridge) recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ct
 		transcriptCheckpointID(session.ID),
 		sourceProof,
 		parentFenceSessionID,
+		finalBoundary...,
 	)
 }
 
@@ -20216,23 +20357,11 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 			local, ok = linkedTranscriptLocalFromCheckpoint(session, checkpoint)
 		}
 		if ok {
-			if hasCheckpoint && linkedTranscriptCheckpointNeedsConservativeLegacyBlock(checkpoint, local.FilePath) {
-				// A pre-fingerprint checkpoint whose cursor is not at the source
-				// EOF cannot prove that the bytes before the cursor are unchanged.
-				// Do not incrementally scan a grown file from that unverified
-				// boundary; an explicit history import can establish a new cursor.
-				if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
-					return err
-				}
-				continue
-			}
-			// A complete EOF checkpoint without SourceFingerprint has no durable
-			// proof that the current inode is the source that produced its last
-			// record. Never manufacture such a proof from the current file: an
-			// atomic replacement can preserve size/mtime and record IDs. Require an
-			// explicit history publication to establish a new trusted boundary.
-			if linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint, local.FilePath) {
-				if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint); err != nil {
+			if hasCheckpoint && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
+				// Legacy source-proof gaps are migrated as a silent history-only
+				// boundary. They must not stop live request admission or create a
+				// visible recovery notice.
+				if err := b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint); err != nil {
 					return err
 				}
 				continue
@@ -20426,7 +20555,7 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	// scan an unproven cursor from a replaced or newly grown source.  Explicit
 	// history publication has its own import path and is intentionally excluded.
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
-		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, *session, local.FilePath, checkpoint); err != nil {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, *session, local.FilePath, checkpoint); err != nil {
 			return preparation, err
 		}
 		return preparation, nil
@@ -20446,6 +20575,10 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 		return preparation, nil
 	}
 	finalCheckpoint, finalIndex, hasFinalCheckpoint := activeTurnTranscriptFinalCheckpoint(transcript.Records, turn, threadID)
+	var finalBoundary *TranscriptFinalBoundary
+	if hasFinalCheckpoint && finalIndex >= 0 && finalIndex < len(transcript.Records) {
+		finalBoundary = transcriptFinalBoundaryForRecord(transcript.Records[finalIndex], true, transcript.Records[finalIndex].SourceLine)
+	}
 	teamsOriginHashes := map[string]bool(nil)
 	teamsOriginDisplays := map[string]string(nil)
 	var known *knownTranscriptOutboxDedupeState
@@ -20521,6 +20654,7 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 				preparation.FinalCheckpoint = finalCheckpoint
 				preparation.FinalSourcePath = local.FilePath
 				preparation.FinalCheckpointID = checkpointID
+				preparation.FinalBoundary = finalBoundary
 			}
 			return preparation, nil
 		}
@@ -20686,7 +20820,7 @@ func (b *Bridge) queueRunningTurnTranscriptBackfill(ctx context.Context, session
 		checkpoint = liveCheckpoint
 	}
 	if linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
-		if err := b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, sessionCopy, local.FilePath, checkpoint); err != nil {
+		if err := b.deferLegacyTranscriptCheckpoint(ctx, sessionCopy, local.FilePath, checkpoint); err != nil {
 			return 0, err
 		}
 		return 0, nil
@@ -20936,17 +21070,11 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		// the explicit manual-recovery boundary and do not reinterpret the file.
 		return nil
 	}
-	if hasCheckpoint && checkpoint.OversizedRecordBlocked {
-		// A pathological record is a durable manual-recovery boundary. Avoid
-		// rescanning the same bounded prefix on every background poll while still
-		// checking that the trusted prefix itself has not been replaced.
-		if !linkedCheckpointPrefixMatches(local.FilePath, checkpoint) {
-			return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
-		}
-		if sourceSize, sourceModTime := transcriptSourceFileState(local.FilePath); sourceSize == checkpoint.SourceSize &&
-			!sourceModTime.IsZero() && sourceModTime.Equal(checkpoint.SourceModTime) {
-			return nil
-		}
+	if hasCheckpoint && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
+		// Migrate inherited proofless state before any position backfill or
+		// budgeted-resume path can reinterpret the current file. This is a silent
+		// history-only boundary; it must not become live queue admission.
+		return b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint)
 	}
 	if err := b.maybeUpdateWorkChatTitleFromLocalSession(ctx, &session, local); err != nil {
 		return err
@@ -21085,23 +21213,11 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			}
 		}
 	}
-	if hasCheckpoint && linkedTranscriptCheckpointNeedsConservativeLegacyBlock(checkpoint, local.FilePath) {
-		// A pre-fingerprint checkpoint whose cursor is not at the source EOF
-		// cannot prove that the bytes before the cursor are unchanged.  Refuse
-		// to scan its growing suffix automatically; explicit history publication
-		// is the recovery path that creates a trusted cursor.
-		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
-	}
-	if hasCheckpoint && linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint, local.FilePath) {
-		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
-	}
 	if hasCheckpoint && linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint, local.FilePath) {
-		// A legacy blocked checkpoint may still have a normal-looking growing
-		// suffix. Never parse it as an automatic delta: a proofless row could be
-		// fenced at Graph and the old cursor would nevertheless be advanced past
-		// the skipped record. Explicit publish-history is the only operation that
-		// may establish a new boundary for this inherited state.
-		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
+		// A legacy checkpoint without identity-bound provenance is history-only
+		// migration state. Preserve its cursor, but do not turn it into a blocked
+		// live session or repeatedly emit a recovery diagnostic.
+		return b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint)
 	}
 	transcript, err := b.readLinkedTranscriptDelta(local.FilePath, checkpoint, local.SessionID, session.CodexThreadID)
 	if err != nil {
@@ -21113,47 +21229,69 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	if transcriptHasDiagnostic(transcript, "source_rewritten") || transcriptHasDiagnostic(transcript, "checkpoint_provenance_mismatch") {
 		return b.blockAutomaticTranscriptSyncForSourceRewrite(ctx, session, local.FilePath, checkpoint)
 	}
-	if transcriptHasDiagnostic(transcript, "tail_too_large") {
-		return b.blockAutomaticTranscriptSyncForTailTooLarge(ctx, session, local.FilePath, checkpoint)
-	}
-	if transcript.UnresolvedContinuation {
-		// The scanner intentionally treats two anonymous finals as ambiguous. A
-		// narrow compatibility exception is safe when the delta contains only
-		// that pair and one candidate is provably the exact text of a live status
-		// already delivered for this session. In that case the known candidate is
-		// a mirror, while the other candidate is the actual final; all other
-		// anonymous pairs remain fail-closed and create the durable anchor below.
-		released, releaseErr := b.releaseKnownAnonymousFinalMirrorPair(ctx, session, transcript, checkpoint)
-		if releaseErr != nil {
-			return releaseErr
+	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
+	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
+	persistConsumedProgress := func() error {
+		if transcript.Consumed == nil {
+			return nil
 		}
-		if released {
-			transcript.Records = append(transcript.Records, transcript.AmbiguousFinals...)
-			transcript.AmbiguousFinals = nil
-			transcript.UnresolvedContinuation = false
-		} else {
-			// The scanner found a child/goal execution after a terminal boundary but
-			// no durable owner for it. Materialize the same fail-closed anchor used by
-			// cancellation recovery before any record can be queued or checkpointed.
-			return b.blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx, session, local, checkpoint)
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
+			ctx, session, local.FilePath, transcript.Consumed.RecordID, transcript.Consumed.Line,
+			transcript.Consumed.Offset, checkpointID, sourceProof, session.ID,
+		)
+	}
+	if transcript.Partial != nil {
+		// Persist only the resumable read hint. The logical checkpoint remains at
+		// the previous complete newline and no outbox or user-visible notice is
+		// created for a writer that has not finished its JSONL record.
+		if err := b.persistLinkedTranscriptPartial(ctx, session, local.FilePath, checkpoint, transcript.Partial); err != nil {
+			return err
 		}
 	}
-	if transcript.PendingContinuation {
-		// Keep the saved checkpoint before the pending task marker. The next
-		// poll can then observe a visible user prompt and prove a fresh root, or
-		// observe a child final and materialize the unresolved anchor.
-		return nil
+	deferUnresolvedContinuation := transcript.UnresolvedContinuation
+	if transcript.UnresolvedContinuation && len(transcript.Records) == 0 {
+		// There is no safe prefix to deliver before the execution boundary. Keep
+		// the existing durable owner fence for this case; transcript-only mirror
+		// ambiguity is represented by TranscriptQuarantine below and never reaches
+		// this branch.
+		return b.blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx, session, local, checkpoint)
+	}
+	if transcript.TranscriptQuarantine != nil {
+		// Persist only the bounded history frontier. This is deliberately silent:
+		// the next user request must not be turned into an unresolved-execution
+		// warning merely because the local transcript has two possible mirrors.
+		if err := b.persistTranscriptQuarantine(ctx, session, local.FilePath, checkpoint, transcript.TranscriptQuarantine); err != nil {
+			return err
+		}
+	}
+	if transcript.PendingContinuation && len(transcript.Records) == 0 {
+		// Commit the marker's ignored disposition and advance the saved checkpoint
+		// past that complete newline. The next poll can then observe a visible user
+		// prompt and prove a fresh root, or observe a child final and materialize the
+		// unresolved anchor; it must not rescan the marker forever.
+		if stop, _, _, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint); err != nil {
+			return err
+		} else if stop {
+			return nil
+		}
+		return persistConsumedProgress()
 	}
 	if transcriptHasDiagnostic(transcript, "incomplete_tail") || transcriptHasDiagnostic(transcript, "invalid_json") {
-		// A linked transcript can contain a complete final immediately before a
-		// writer's partial JSON record.  Do not publish that prefix or advance the
-		// cursor: the next poll must rescan it after the writer settles, matching
-		// the history-watch fail-closed behavior.  Continuation checks intentionally
-		// run first so a child execution is never hidden by an incomplete tail.
+		// A linked transcript can contain complete records immediately before a
+		// writer's partial or malformed JSON record. Do not publish that prefix or
+		// advance the cursor: the next poll must rescan it after the writer settles,
+		// matching the history-watch fail-closed behavior. Continuation checks
+		// intentionally run first so a child execution is never hidden by an
+		// incomplete tail.
 		return nil
 	}
 	if len(transcript.Records) == 0 {
-		return nil
+		if stop, _, _, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint); err != nil {
+			return err
+		} else if stop {
+			return nil
+		}
+		return persistConsumedProgress()
 	}
 	if stop, _, _, err := b.guardAutomaticTranscriptSync(ctx, session, local, checkpoint, hasCheckpoint); err != nil {
 		return err
@@ -21201,14 +21339,17 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	sent := 0
 	pendingCheckpoint := transcriptImportCheckpointRecord{}
 	hasPendingCheckpoint := false
-	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
-	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
+	var pendingFinalBoundary *TranscriptFinalBoundary
 	rememberCheckpoint := func(key string, sourceLine int, sourceOffset int64) {
 		if strings.TrimSpace(key) == "" {
 			return
 		}
 		pendingCheckpoint = transcriptImportCheckpointRecord{Key: key, SourceLine: sourceLine, SourceOffset: sourceOffset}
 		hasPendingCheckpoint = true
+		if transcript.FinalBoundary != nil && transcriptFinalBoundaryFitsProgress(*transcript.FinalBoundary, key, sourceOffset) {
+			boundary := *transcript.FinalBoundary
+			pendingFinalBoundary = &boundary
+		}
 	}
 	flushPendingCheckpoint := func() error {
 		if !hasPendingCheckpoint {
@@ -21216,7 +21357,26 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		}
 		checkpoint := pendingCheckpoint
 		hasPendingCheckpoint = false
-		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID)
+		boundary := pendingFinalBoundary
+		pendingFinalBoundary = nil
+		if boundary == nil {
+			return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID)
+		}
+		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID, *boundary)
+	}
+	finishSafePrefix := func() error {
+		if err := flushPendingCheckpoint(); err != nil {
+			return err
+		}
+		if err := persistConsumedProgress(); err != nil {
+			return err
+		}
+		if deferUnresolvedContinuation {
+			// Establish the owner fence only after the safe prefix has committed;
+			// otherwise the fence correctly prevents even that prefix's CAS.
+			return b.blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx, session, local, checkpoint)
+		}
+		return nil
 	}
 	for i, record := range transcript.Records {
 		checkpointLine, checkpointOffset := transcriptCheckpointPositionForRecord(transcript.Records, i)
@@ -21245,7 +21405,11 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			shouldSkipTeamsOriginTranscriptRecord(record, body, teamsOriginTerminalHashes) ||
 			known.shouldSkip(record, body) ||
 			dedupe.shouldSkip(record, body) {
-			if err := b.recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, sourceProof, session.ID); err != nil {
+			var finalBoundary []TranscriptFinalBoundary
+			if transcript.FinalBoundary != nil && transcriptFinalBoundaryFitsProgress(*transcript.FinalBoundary, transcriptRecordCheckpointKey(record), checkpointOffset) {
+				finalBoundary = []TranscriptFinalBoundary{*transcript.FinalBoundary}
+			}
+			if err := b.recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, sourceProof, session.ID, finalBoundary...); err != nil {
 				return err
 			}
 			hasPendingCheckpoint = false
@@ -21262,6 +21426,10 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		opts.ExpectedSourceReadStartOffset = proof.ExpectedSourceReadStartOffset
 		opts.ExpectedSourceReadEndOffset = proof.ExpectedSourceReadEndOffset
 		opts.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadRangeKnown
+		if transcript.FinalBoundary != nil && transcriptFinalBoundaryFitsProgress(*transcript.FinalBoundary, transcriptRecordCheckpointKey(record), checkpointOffset) {
+			boundary := *transcript.FinalBoundary
+			opts.FinalBoundary = &boundary
+		}
 		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
@@ -21271,137 +21439,10 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			// A hidden collaboration record may follow the last visible record
 			// admitted to this cycle.  Persist its checkpoint before returning so
 			// the next 10-second scan does not re-read the same internal tail.
-			return flushPendingCheckpoint()
+			return finishSafePrefix()
 		}
 	}
-	return flushPendingCheckpoint()
-}
-
-// releaseKnownAnonymousFinalMirrorPair recognizes only the smallest
-// compatibility case for anonymous final pairs: exactly two visible records,
-// no other execution-bearing record in the delta, and at least one record
-// already delivered as a live status for this same session. It deliberately
-// reloads the dedupe snapshot instead of trusting the caller's read snapshot,
-// because the proof is a durable outbox/delivery fact. The caller still runs
-// the normal final ownership/checkpoint CAS before any answer is sent.
-func (b *Bridge) releaseKnownAnonymousFinalMirrorPair(ctx context.Context, session Session, transcript Transcript, checkpoint teamstore.ImportCheckpoint) (bool, error) {
-	if b == nil || b.store == nil || !transcript.UnresolvedContinuation {
-		return false, nil
-	}
-	if checkpoint.UnresolvedExecution != nil {
-		return false, nil
-	}
-	// The compatibility release is scoped to the same durable transcript
-	// owner.  An anonymous record may omit thread_id, but a supplied thread
-	// identity must agree with both the checkpoint and the durable session.
-	if strings.TrimSpace(checkpoint.SessionID) != "" && strings.TrimSpace(checkpoint.SessionID) != strings.TrimSpace(session.ID) {
-		return false, nil
-	}
-	expectedThreadID := strings.TrimSpace(session.CodexThreadID)
-	if strings.TrimSpace(session.ID) == "" || strings.TrimSpace(checkpoint.SourcePath) == "" {
-		return false, nil
-	}
-	if len(transcript.AmbiguousFinals) != 2 || len(transcript.Records) != 0 {
-		return false, nil
-	}
-	for _, record := range transcript.AmbiguousFinals {
-		if record.Internal || strings.TrimSpace(record.Text) == "" ||
-			record.Kind != TranscriptKindAssistant ||
-			!strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer") ||
-			strings.TrimSpace(record.TurnID) != "" {
-			return false, nil
-		}
-		if threadID := strings.TrimSpace(record.ThreadID); threadID != "" && (expectedThreadID == "" || threadID != expectedThreadID) {
-			return false, nil
-		}
-	}
-	state, err := b.store.SessionTranscriptDedupeSnapshot(ctx, session.ID, transcriptCheckpointID(session.ID))
-	if err != nil {
-		return false, err
-	}
-	// Do not use the general dedupe state here.  It intentionally includes
-	// prior assistant/final deliveries, which would let an old final with the
-	// same text act as proof for a new anonymous child.  Only a durable live
-	// status mirror can release this narrow compatibility pair.
-	statusHashes := knownDeliveredLiveStatusMirrorHashesSince(state, session, checkpoint, checkpoint.UpdatedAt)
-	knownCount := 0
-	for _, record := range transcript.AmbiguousFinals {
-		body := formatTranscriptRecordForTeams(record)
-		hash := normalizedTextHash(body)
-		if transcriptRecordIsKnownLiveStatusMirrorCandidate(record) && hash != "" && statusHashes[hash] {
-			knownCount++
-		}
-	}
-	return knownCount > 0, nil
-}
-
-// knownDeliveredLiveStatusMirrorHashesSince is intentionally narrower than
-// knownTranscriptOutboxHashesSince.  A queued or merely claimed status row is
-// not evidence that the live forwarder showed the user anything: it may still
-// be skipped or fail.  The anonymous-final compatibility exception therefore
-// accepts only a durable Sent delivery, or an Accepted delivery with a stable
-// Graph message ID.  This keeps an unsent status outbox from becoming proof
-// that a later anonymous final is a mirror.
-func knownDeliveredLiveStatusMirrorHashesSince(state teamstore.State, session Session, checkpoint teamstore.ImportCheckpoint, since time.Time) map[string]bool {
-	hashes := make(map[string]bool)
-	sessionID := strings.TrimSpace(session.ID)
-	checkpointSessionID := strings.TrimSpace(checkpoint.SessionID)
-	if sessionID == "" || (checkpointSessionID != "" && checkpointSessionID != sessionID) {
-		return hashes
-	}
-	expectedPath := cleanComparablePath(checkpoint.SourcePath)
-	expectedFingerprint := strings.TrimSpace(checkpoint.SourceFingerprint)
-	expectedThread := strings.TrimSpace(session.CodexThreadID)
-	// The compatibility exception is only safe when the live status itself is
-	// tied to the same trusted source and thread.  Legacy status rows without a
-	// source proof are not ownership evidence for anonymous finals.
-	if expectedPath == "" || expectedFingerprint == "" || expectedThread == "" {
-		return hashes
-	}
-	add := func(hash string) {
-		if hash = strings.TrimSpace(hash); hash != "" {
-			hashes[hash] = true
-		}
-	}
-	for _, outbox := range state.OutboxMessages {
-		if outbox.SessionID != sessionID || strings.TrimSpace(outbox.Body) == "" {
-			continue
-		}
-		if cleanComparablePath(outbox.TranscriptSourcePath) != expectedPath ||
-			strings.TrimSpace(outbox.TranscriptSourceProofFingerprint) != expectedFingerprint ||
-			strings.TrimSpace(outbox.CodexThreadID) != expectedThread {
-			continue
-		}
-		kind, ok := deliveredOutboxTranscriptKind(outbox.Kind)
-		if !ok || kind != TranscriptKindStatus || !transcriptKnownDeliveryInDedupeWindow(state, sessionID, outbox.TurnID, outbox.CreatedAt, since, kind) {
-			continue
-		}
-		if outbox.Status != teamstore.OutboxStatusSent &&
-			!(outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != "") {
-			continue
-		}
-		add(normalizedTextHash(formatKnownOutboxBodyForTranscriptDedupe(kind, outbox.Body)))
-		add(outbox.SourceTextHash)
-	}
-	// HelperDeliveryRecord has no source path/fingerprint.  Do not treat it as
-	// proof here; its linked outbox (when present) is checked above instead.
-	for _, delivery := range state.TranscriptDeliveries {
-		if delivery.SessionID != sessionID || delivery.OutboxID != "" {
-			continue
-		}
-		if cleanComparablePath(delivery.SourcePath) != expectedPath || strings.TrimSpace(delivery.CodexThreadID) != expectedThread {
-			continue
-		}
-		if delivery.Kind != string(TranscriptKindStatus) || !transcriptDeliveryTextDedupeInWindow(delivery, since, TranscriptKindStatus) {
-			continue
-		}
-		if delivery.Status != teamstore.TranscriptDeliveryStatusSent &&
-			!(delivery.Status == teamstore.TranscriptDeliveryStatusAccepted && strings.TrimSpace(delivery.TeamsMessageID) != "") {
-			continue
-		}
-		add(delivery.TextHash)
-	}
-	return hashes
+	return finishSafePrefix()
 }
 
 // linkedCheckpointPrefixHasTerminalBoundary is a bounded upgrade probe for
@@ -21482,6 +21523,12 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			Message: "transcript checkpoint source path does not match the linked source",
 		}}}, nil
 	}
+	if checkpoint.LegacySourceUnverified {
+		return Transcript{SourceName: filePath, Diagnostics: []TranscriptDiagnostic{{
+			Kind:    "legacy_source_unverified",
+			Message: "inherited transcript checkpoint has no identity-bound source proof",
+		}}}, nil
+	}
 	if b.linkedCheckpointFileUnchanged(filePath, checkpoint) {
 		return Transcript{SourceName: filePath}, nil
 	}
@@ -21494,15 +21541,28 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		}
 		previous := historyTieredFileState{
 			Path:                      filePath,
+			PartialLineStartOffset:    checkpoint.PartialLineStartOffset,
+			PartialReadOffset:         checkpoint.PartialReadOffset,
+			PartialObservedSize:       checkpoint.PartialObservedSize,
+			PartialLine:               checkpoint.PartialLine,
+			PartialStartedAt:          checkpoint.PartialStartedAt,
+			PartialSourceIdentity:     strings.TrimSpace(checkpoint.PartialSourceIdentity),
 			Size:                      checkpoint.SourceSize,
 			ModTime:                   checkpoint.SourceModTime,
 			Offset:                    checkpoint.LastOffset,
 			Line:                      checkpoint.LastSourceLine,
 			SessionID:                 strings.TrimSpace(sessionID),
 			ThreadID:                  strings.TrimSpace(threadID),
-			TerminalBoundarySeen:      linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
-			LastFinalID:               strings.TrimSpace(checkpoint.LastRecordID),
-			LastFinalStartOffsetKnown: checkpoint.LastOffsetKnown || checkpoint.LastOffset > 0,
+			TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
+			TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
+			LastFinalID:               firstNonEmptyString(checkpoint.LastFinalID, checkpoint.LastRecordID),
+			LastFinalLine:             checkpoint.LastFinalLine,
+			LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
+			LastFinalStartOffsetKnown: checkpoint.LastFinalStartOffsetKnown,
+			LastFinalThreadID:         strings.TrimSpace(checkpoint.LastFinalThreadID),
+			LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
+			LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
+			TranscriptQuarantine:      checkpoint.TranscriptQuarantine,
 		}
 		result, err := historyTieredScanTail(filePath, previous, historyTieredMaxTailBytes)
 		if err != nil {
@@ -21519,16 +21579,6 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				Message: "transcript source prefix changed while the incremental tail was scanned",
 			}}}, nil
 		}
-		if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
-			return Transcript{
-				SourceName: filePath,
-				Diagnostics: []TranscriptDiagnostic{{
-					SourceLine: previous.Line + 1,
-					Kind:       "tail_too_large",
-					Message:    fmt.Sprintf("transcript tail exceeds bounded automatic scan limit (%d bytes)", result.MaxTailBytes),
-				}},
-			}, nil
-		}
 		if result.Incomplete {
 			// Never fall back to the full parser while the writer has an
 			// unterminated tail. That parser can return an earlier final and make
@@ -21538,23 +21588,24 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			// Keep only the records before an unresolved or still-pending marker.
 			// Explicit `publish-history` re-reads the full suffix below; automatic
 			// live callers must never see the quarantined child tail.
-			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation
+			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
 			pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 			if blocked {
 				records = filterTranscriptRecordsBeforeExecutionBoundary(records, historyTieredBoundaryOffset(result.State))
 			}
-			return Transcript{
+			return withHistoryTieredReadProof(Transcript{
 				SourceName:             filePath,
 				UnresolvedContinuation: result.State.UnresolvedContinuation,
 				PendingContinuation:    pending,
-				AmbiguousFinals:        historyTieredFinalRecords(result.AnonymousFinals),
+				QuarantinedFinals:      historyTieredFinalRecords(result.QuarantinedFinals),
+				TranscriptQuarantine:   result.State.TranscriptQuarantine,
 				Records:                records,
 				Diagnostics: []TranscriptDiagnostic{{
 					SourceLine: previous.Line + 1,
 					Kind:       "incomplete_tail",
 					Message:    "transcript source ended with an incomplete JSON record",
 				}},
-			}, nil
+			}, result), nil
 		}
 		if result.Truncated {
 			// A replaced/truncated source invalidates the old cursor. Do not
@@ -21569,9 +21620,9 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				}},
 			}, nil
 		}
-		if (!result.TooLarge || result.BudgetExhausted) && !result.Truncated && !result.Incomplete {
+		if !result.Truncated && !result.Incomplete {
 			records := filterTranscriptRecordsAfterCheckpoint(result.Records, checkpoint.LastRecordID)
-			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation
+			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
 			pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 			if blocked {
 				records = filterTranscriptRecordsBeforeExecutionBoundary(records, historyTieredBoundaryOffset(result.State))
@@ -21580,7 +21631,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				SourceName:             filePath,
 				UnresolvedContinuation: result.State.UnresolvedContinuation,
 				PendingContinuation:    pending,
-				AmbiguousFinals:        historyTieredFinalRecords(result.AnonymousFinals),
+				QuarantinedFinals:      historyTieredFinalRecords(result.QuarantinedFinals),
+				TranscriptQuarantine:   result.State.TranscriptQuarantine,
 				Records:                records,
 			}, result), nil
 		}
@@ -21591,24 +21643,28 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 	// machine, then filter only after the saved key is proven present.
 	previous := historyTieredFileState{
 		Path:                      filePath,
+		PartialLineStartOffset:    checkpoint.PartialLineStartOffset,
+		PartialReadOffset:         checkpoint.PartialReadOffset,
+		PartialObservedSize:       checkpoint.PartialObservedSize,
+		PartialLine:               checkpoint.PartialLine,
+		PartialStartedAt:          checkpoint.PartialStartedAt,
+		PartialSourceIdentity:     strings.TrimSpace(checkpoint.PartialSourceIdentity),
 		SessionID:                 strings.TrimSpace(sessionID),
 		ThreadID:                  strings.TrimSpace(threadID),
-		TerminalBoundarySeen:      linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
-		LastFinalID:               strings.TrimSpace(checkpoint.LastRecordID),
-		LastFinalStartOffsetKnown: checkpoint.LastOffsetKnown || checkpoint.LastOffset > 0,
+		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
+		TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
+		LastFinalID:               firstNonEmptyString(checkpoint.LastFinalID, checkpoint.LastRecordID),
+		LastFinalLine:             checkpoint.LastFinalLine,
+		LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
+		LastFinalStartOffsetKnown: checkpoint.LastFinalStartOffsetKnown,
+		LastFinalThreadID:         strings.TrimSpace(checkpoint.LastFinalThreadID),
+		LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
+		LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
+		TranscriptQuarantine:      checkpoint.TranscriptQuarantine,
 	}
 	result, err := historyTieredScanTail(filePath, previous, historyTieredMaxTailBytes)
 	if err != nil {
 		return Transcript{}, err
-	}
-	if (result.OversizedRecord || result.TooLarge && !result.BudgetExhausted) && !result.Incomplete {
-		return Transcript{
-			SourceName: filePath,
-			Diagnostics: []TranscriptDiagnostic{{
-				Kind:    "tail_too_large",
-				Message: fmt.Sprintf("transcript tail exceeds bounded automatic scan limit (%d bytes)", result.MaxTailBytes),
-			}},
-		}, nil
 	}
 	if result.Truncated {
 		return Transcript{SourceName: filePath, Diagnostics: []TranscriptDiagnostic{{
@@ -21629,23 +21685,24 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				Message: "transcript checkpoint was not found in the complete prefix; refusing to guess an import position",
 			}}}, nil
 		}
-		blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation
+		blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
 		pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 		if blocked {
 			filtered = filterTranscriptRecordsBeforeExecutionBoundary(filtered, historyTieredBoundaryOffset(result.State))
 		}
-		return Transcript{
+		return withHistoryTieredReadProof(Transcript{
 			SourceName:             filePath,
 			UnresolvedContinuation: result.State.UnresolvedContinuation,
 			PendingContinuation:    pending,
-			AmbiguousFinals:        historyTieredFinalRecords(result.AnonymousFinals),
+			QuarantinedFinals:      historyTieredFinalRecords(result.QuarantinedFinals),
+			TranscriptQuarantine:   result.State.TranscriptQuarantine,
 			Records:                filtered,
 			Diagnostics: []TranscriptDiagnostic{{
 				SourceLine: result.State.Line + 1,
 				Kind:       "incomplete_tail",
 				Message:    "transcript source ended with an incomplete JSON record",
 			}},
-		}, nil
+		}, result), nil
 	}
 	filtered, found := filterTranscriptRecordsAfterCheckpointStrict(result.Records, checkpoint.LastRecordID)
 	if !found {
@@ -21654,7 +21711,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			Message: "transcript checkpoint was not found; refusing to guess an import position",
 		}}}, nil
 	}
-	blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation
+	blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
 	pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 	if blocked {
 		filtered = filterTranscriptRecordsBeforeExecutionBoundary(filtered, historyTieredBoundaryOffset(result.State))
@@ -21663,11 +21720,42 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		SourceName:             filePath,
 		UnresolvedContinuation: result.State.UnresolvedContinuation,
 		PendingContinuation:    pending,
+		QuarantinedFinals:      historyTieredFinalRecords(result.QuarantinedFinals),
+		TranscriptQuarantine:   result.State.TranscriptQuarantine,
 		Records:                filtered,
 	}, result), nil
 }
 
 func withHistoryTieredReadProof(transcript Transcript, result historyTieredTailResult) Transcript {
+	transcript.TailBudgetExhausted = result.TooLarge || result.BudgetExhausted
+	transcript.FinalBoundary = historyTieredFinalBoundaryFromResult(result)
+	if !result.Incomplete && !result.Truncated && !result.State.UnresolvedContinuation && result.State.TranscriptQuarantine == nil {
+		consumedID := strings.TrimSpace(result.LastConsumedRecordID)
+		consumedLine := result.LastConsumedLine
+		consumedOffset := result.LastConsumedOffset
+		if result.State.PendingRootTaskStarted && result.State.PendingRootTaskStartedEndOffset > result.State.PendingRootTaskStartedOffset {
+			consumedID = historyTieredConsumedRecordKey(result.State.Path, result.State.PendingRootTaskStartedLine, result.State.PendingRootTaskStartedOffset, result.State.PendingRootTaskStartedEndOffset)
+			consumedLine = result.State.PendingRootTaskStartedLine
+			consumedOffset = result.State.PendingRootTaskStartedEndOffset
+		}
+		if consumedID != "" && consumedLine > 0 && consumedOffset > 0 {
+			transcript.Consumed = &TranscriptConsumedProgress{
+				RecordID: consumedID,
+				Line:     consumedLine,
+				Offset:   consumedOffset,
+			}
+		}
+	}
+	if result.State.PartialLineStartOffset > result.State.Offset {
+		transcript.Partial = &TranscriptPartialProgress{
+			LineStartOffset: result.State.PartialLineStartOffset,
+			ReadOffset:      result.State.PartialReadOffset,
+			ObservedSize:    result.State.PartialObservedSize,
+			Line:            result.State.PartialLine,
+			StartedAt:       result.State.PartialStartedAt,
+			SourceIdentity:  strings.TrimSpace(result.State.PartialSourceIdentity),
+		}
+	}
 	if result.ReadProofRangeKnown && strings.TrimSpace(result.ReadProofFingerprint) != "" {
 		transcript.SourceReadProofFingerprint = strings.TrimSpace(result.ReadProofFingerprint)
 		transcript.SourceReadProofStartOffset = result.ReadProofStartOffset
@@ -21675,6 +21763,50 @@ func withHistoryTieredReadProof(transcript Transcript, result historyTieredTailR
 		transcript.SourceReadProofRangeKnown = true
 	}
 	return transcript
+}
+
+func historyTieredFinalBoundaryFromResult(result historyTieredTailResult) *TranscriptFinalBoundary {
+	if len(result.Finals) == 0 {
+		return nil
+	}
+	selected := result.Finals[len(result.Finals)-1]
+	if result.State.LastFinalStartOffsetKnown {
+		for _, final := range result.Finals {
+			if final.Record.SourceStartOffset == result.State.LastFinalStartOffset {
+				selected = final
+			}
+		}
+	}
+	record := selected.Record
+	boundaryID := transcriptRecordCheckpointKey(record)
+	if strings.TrimSpace(boundaryID) == "" {
+		boundaryID = strings.TrimSpace(selected.Key)
+	}
+	if strings.TrimSpace(boundaryID) == "" {
+		return nil
+	}
+	return transcriptFinalBoundaryForRecord(record, result.State.TerminalBoundarySeen, result.State.TerminalBoundaryLine, boundaryID)
+}
+
+func transcriptFinalBoundaryForRecord(record TranscriptRecord, terminalSeen bool, terminalLine int, fallbackID ...string) *TranscriptFinalBoundary {
+	boundaryID := transcriptRecordCheckpointKey(record)
+	if strings.TrimSpace(boundaryID) == "" && len(fallbackID) > 0 {
+		boundaryID = strings.TrimSpace(fallbackID[0])
+	}
+	if strings.TrimSpace(boundaryID) == "" {
+		return nil
+	}
+	return &TranscriptFinalBoundary{
+		ID:               boundaryID,
+		Line:             record.SourceLine,
+		StartOffset:      record.SourceStartOffset,
+		StartOffsetKnown: record.SourceStartOffset >= 0,
+		ThreadID:         strings.TrimSpace(record.ThreadID),
+		TurnID:           strings.TrimSpace(record.TurnID),
+		TextHash:         normalizedTextHash(strings.TrimSpace(record.Text)),
+		TerminalSeen:     terminalSeen,
+		TerminalLine:     terminalLine,
+	}
 }
 
 func historyTieredFinalRecords(finals []historyTieredFinal) []TranscriptRecord {
@@ -21731,6 +21863,9 @@ func historyTieredBoundaryOffset(state historyTieredFileState) int64 {
 	}
 	if state.PendingRootTaskStarted {
 		return state.PendingRootTaskStartedOffset
+	}
+	if state.TranscriptQuarantine != nil {
+		return state.TranscriptQuarantine.FrontierOffset
 	}
 	return 0
 }
@@ -22084,6 +22219,47 @@ func linkedTranscriptCheckpointNeedsAutomaticSourceProof(checkpoint teamstore.Im
 		linkedTranscriptCheckpointNeedsFingerprintBackfill(checkpoint, sourcePath)
 }
 
+// deferLegacyTranscriptCheckpoint migrates a pre-source-proof checkpoint into
+// an explicit history-only state. The old cursor is retained because it is not
+// safe to guess a new import position, but the checkpoint must not become a
+// live-turn admission blocker or a user-visible recovery notification. An
+// operator can later choose an exact boundary through publish-history.
+func (b *Bridge) deferLegacyTranscriptCheckpoint(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if !found {
+			current = previous
+		}
+		if current.SourceRewriteBlocked {
+			return current, false, nil
+		}
+		before := current
+		current.ID = checkpointID
+		current.SessionID = session.ID
+		if strings.TrimSpace(sourcePath) != "" {
+			current.SourcePath = sourcePath
+		}
+		current.LegacySourceUnverified = true
+		// Older source-proof code used blocked, failed, or importing states for
+		// this exact condition. Complete is a neutral history-only status here:
+		// the marker is checked before any automatic suffix scan and live turn
+		// admission never uses it as an execution owner.
+		if current.Status != importCheckpointStatusComplete {
+			current.Status = importCheckpointStatusComplete
+		}
+		current.CompletionPending = false
+		if importCheckpointSameExceptUpdatedAt(before, current) {
+			return current, false, nil
+		}
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
+}
+
 func transcriptImportCheckpointNeedsBudgetedResume(checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
 	if checkpoint.Status != importCheckpointStatusComplete {
 		return false
@@ -22274,6 +22450,7 @@ func (b *Bridge) resetFailedTranscriptCheckpointForExplicitImport(ctx context.Co
 		current.SourceFingerprint = ""
 		current.SourceSize = 0
 		current.SourceModTime = time.Time{}
+		current.TranscriptQuarantine = nil
 		current.CompletionPending = false
 		current.Status = importCheckpointStatusComplete
 		current.UpdatedAt = now
@@ -22407,12 +22584,18 @@ func (b *Bridge) blockAutomaticTranscriptSyncForAmbiguousExecution(ctx context.C
 	// tail must remain quarantined until ownership is confirmed. Bypass normal
 	// same-chat predecessor ordering so an older ambiguous answer cannot be
 	// recursively retried as a side effect of delivering the blocker notice.
-	return b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{
+	err = b.sendQueuedOutboxWithOptions(ctx, queued, outboxSendOptions{
 		RespectRateLimitBlock: true,
 		RecordRateLimit:       true,
 		AllowAmbiguousRetry:   false,
 		IgnoreEarlierOutbox:   true,
 	})
+	if isOutboxDeliveryDeferred(err) {
+		// A diagnostic notice is best-effort. A Graph pacing/rate-limit delay
+		// must not turn the transcript scanner itself into a failing sync cycle.
+		return nil
+	}
+	return err
 }
 
 func (b *Bridge) blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
@@ -22437,6 +22620,117 @@ func (b *Bridge) blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx conte
 		return err
 	}
 	return b.blockAutomaticTranscriptSyncForAmbiguousExecution(ctx, session, local.FilePath, checkpoint, turn)
+}
+
+func (b *Bridge) persistTranscriptQuarantine(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint, quarantine *teamstore.TranscriptQuarantine) error {
+	if b == nil || b.store == nil || quarantine == nil || strings.TrimSpace(session.ID) == "" {
+		return nil
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	copyQuarantine := *quarantine
+	copyQuarantine.SourcePath = firstNonEmptyString(copyQuarantine.SourcePath, sourcePath, previous.SourcePath)
+	copyQuarantine.SourceFingerprint = firstNonEmptyString(copyQuarantine.SourceFingerprint, previous.SourceFingerprint)
+	copyQuarantine.CandidateTextHashes = append([]string(nil), copyQuarantine.CandidateTextHashes...)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		// The scan was performed outside the store lock. Treat the checkpoint
+		// supplied with that scan as an optimistic snapshot: if a live-branch
+		// bind, explicit recovery, or another cursor writer won in the meantime,
+		// discard this stale observation instead of replacing the newer quarantine
+		// object and status.
+		if strings.TrimSpace(previous.ID) != "" {
+			if !found || !importCheckpointSameExceptUpdatedAt(previous, current) {
+				return current, false, nil
+			}
+		} else if found {
+			return current, false, nil
+		}
+		if executionAnchorActive(current.UnresolvedExecution) {
+			// A real execution fence is stronger than a history observation. Do
+			// not replace its diagnostics or weaken its existing recovery path.
+			return current, false, nil
+		}
+		before := current
+		current.ID = checkpointID
+		current.SessionID = session.ID
+		current.SourcePath = firstNonEmptyString(current.SourcePath, copyQuarantine.SourcePath)
+		if strings.TrimSpace(current.LastRecordID) == "" {
+			current.LastRecordID = previous.LastRecordID
+			current.LastSourceLine = previous.LastSourceLine
+			current.LastOffset = previous.LastOffset
+			current.LastOffsetKnown = previous.LastOffsetKnown
+		}
+		if current.SourceFingerprint == "" {
+			current.SourceFingerprint = previous.SourceFingerprint
+		}
+		if current.SourceSize == 0 {
+			current.SourceSize = previous.SourceSize
+		}
+		if current.SourceModTime.IsZero() {
+			current.SourceModTime = previous.SourceModTime
+		}
+		current.TranscriptQuarantine = &copyQuarantine
+		current.Status = importCheckpointStatusBlocked
+		current.CompletionPending = false
+		if current.UpdatedAt.IsZero() || !importCheckpointSameExceptUpdatedAt(before, current) {
+			current.UpdatedAt = now
+		}
+		if importCheckpointSameExceptUpdatedAt(before, current) {
+			return current, false, nil
+		}
+		return current, true, nil
+	})
+	return err
+}
+
+func (b *Bridge) persistLinkedTranscriptPartial(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint, partial *TranscriptPartialProgress) error {
+	if b == nil || b.store == nil || partial == nil || strings.TrimSpace(session.ID) == "" || partial.LineStartOffset < 0 || partial.ReadOffset < partial.LineStartOffset {
+		return nil
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if !found {
+			return current, false, nil
+		}
+		// A newer cursor or source generation won while the file was being read.
+		// Never replace it with a stale partial hint.
+		if current.LastOffset > previous.LastOffset || (strings.TrimSpace(previous.SourceFingerprint) != "" && current.SourceFingerprint != previous.SourceFingerprint) {
+			return current, false, nil
+		}
+		if strings.TrimSpace(current.SourcePath) != "" && cleanComparablePath(current.SourcePath) != cleanComparablePath(sourcePath) {
+			return current, false, nil
+		}
+		identity := strings.TrimSpace(partial.SourceIdentity)
+		if identity == "" {
+			identity = strings.TrimSpace(current.PartialSourceIdentity)
+		}
+		if identity == "" {
+			return current, false, nil
+		}
+		before := current
+		current.ID = checkpointID
+		current.SessionID = session.ID
+		current.SourcePath = firstNonEmptyString(current.SourcePath, sourcePath)
+		current.PartialLineStartOffset = partial.LineStartOffset
+		current.PartialReadOffset = partial.ReadOffset
+		current.PartialObservedSize = partial.ObservedSize
+		current.PartialLine = partial.Line
+		current.PartialStartedAt = partial.StartedAt
+		current.PartialSourceIdentity = identity
+		current.OversizedRecordBlocked = false
+		if info, statErr := os.Stat(sourcePath); statErr == nil && !info.IsDir() {
+			current.SourceSize = info.Size()
+			current.SourceModTime = info.ModTime()
+		}
+		if current.Status == "" {
+			current.Status = importCheckpointStatusComplete
+		}
+		if importCheckpointSameExceptUpdatedAt(before, current) {
+			return current, false, nil
+		}
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
 }
 
 func executionAnchorDiagnostics(session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint, turn teamstore.Turn) string {
@@ -22494,29 +22788,6 @@ func (b *Bridge) blockAutomaticTranscriptSyncForSourceRewrite(ctx context.Contex
 		return err
 	}
 	return nil
-}
-
-// blockAutomaticTranscriptSyncForTailTooLarge keeps the periodic linked-history
-// poll bounded.  The checkpoint remains at the last durable cursor and an
-// explicit publish-history command remains available for an operator who has
-// reviewed the backlog and accepts the full read.
-func (b *Bridge) blockAutomaticTranscriptSyncForTailTooLarge(ctx context.Context, session Session, sourcePath string, checkpoint teamstore.ImportCheckpoint) error {
-	if err := b.markTranscriptImportBlocked(ctx, session, sourcePath, checkpoint); err != nil {
-		return err
-	}
-	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
-	_, _, err := b.store.UpdateImportCheckpoint(ctx, transcriptCheckpointID(session.ID), func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
-		current.ID = transcriptCheckpointID(session.ID)
-		current.SessionID = session.ID
-		current.SourcePath = sourcePath
-		current.OversizedRecordBlocked = true
-		current.SourceSize = sourceSize
-		current.SourceModTime = sourceModTime
-		current.Status = importCheckpointStatusBlocked
-		current.UpdatedAt = now
-		return current, true, nil
-	})
-	return err
 }
 
 func shortStableID(seed string) string {
@@ -23250,13 +23521,35 @@ func transcriptSyncOutboxOptions(record TranscriptRecord) outboxQueueOptions {
 }
 
 func transcriptSourceProofQueueOptions(checkpoint teamstore.ImportCheckpoint) outboxQueueOptions {
-	if strings.TrimSpace(checkpoint.SourcePath) == "" ||
-		strings.TrimSpace(checkpoint.SourceFingerprint) == "" ||
-		!linkedCheckpointOffsetKnown(checkpoint) {
+	path := strings.TrimSpace(checkpoint.SourcePath)
+	if path == "" {
+		return outboxQueueOptions{}
+	}
+	if strings.TrimSpace(checkpoint.SourceFingerprint) == "" {
+		// An explicitly empty checkpoint is a safe zero-byte boundary only when
+		// it has no record key. Backfill its identity-bound prefix proof so a
+		// fail-closed scanner can still publish a safe prefix before it creates an
+		// unresolved-execution anchor. Any non-empty legacy key remains untrusted
+		// and must go through the legacy migration path instead.
+		if checkpoint.LastRecordID != "" || checkpoint.LastOffset != 0 {
+			return outboxQueueOptions{}
+		}
+		fingerprint := transcriptCheckpointSourceFingerprint(path, 0)
+		if fingerprint == "" {
+			return outboxQueueOptions{}
+		}
+		return outboxQueueOptions{
+			ExpectedSourcePath:        path,
+			ExpectedSourceFingerprint: fingerprint,
+			ExpectedSourceOffset:      0,
+			ExpectedSourceOffsetKnown: true,
+		}
+	}
+	if !linkedCheckpointOffsetKnown(checkpoint) {
 		return outboxQueueOptions{}
 	}
 	return outboxQueueOptions{
-		ExpectedSourcePath:        checkpoint.SourcePath,
+		ExpectedSourcePath:        path,
 		ExpectedSourceFingerprint: checkpoint.SourceFingerprint,
 		ExpectedSourceOffset:      checkpoint.LastOffset,
 		ExpectedSourceOffsetKnown: true,
@@ -23313,6 +23606,27 @@ func transcriptAutomaticImportProofQueueOptions(sourcePath string, checkpoint te
 	if checkpoint.SourceRewriteBlocked {
 		return outboxQueueOptions{}
 	}
+	// Preserve the strong whole-read proof for a first import that fits in one
+	// bounded pass. The generic linked-sync helper deliberately uses an
+	// identity-bound zero-prefix proof for an empty checkpoint, but a small cold
+	// import has already read the complete source and can safely bind its
+	// outbox to that EOF snapshot.
+	if strings.TrimSpace(checkpoint.LastRecordID) == "" && checkpoint.LastOffset == 0 && sourceSizeBeforeRead >= 0 && sourceSizeBeforeRead <= int64(historyTieredMaxTailBytes) {
+		fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(sourcePath, sourceSizeBeforeRead))
+		readFingerprint := strings.TrimSpace(transcriptSourceRangeFingerprint(sourcePath, 0, sourceSizeBeforeRead))
+		if fingerprint == "" || readFingerprint == "" {
+			return outboxQueueOptions{}
+		}
+		return outboxQueueOptions{
+			ExpectedSourcePath:            strings.TrimSpace(sourcePath),
+			ExpectedSourceFingerprint:     fingerprint,
+			ExpectedSourceOffset:          sourceSizeBeforeRead,
+			ExpectedSourceOffsetKnown:     true,
+			ExpectedSourceReadFingerprint: readFingerprint,
+			ExpectedSourceReadEndOffset:   sourceSizeBeforeRead,
+			ExpectedSourceReadRangeKnown:  true,
+		}
+	}
 	proof := transcriptSourceProofQueueOptions(checkpoint)
 	if strings.TrimSpace(proof.ExpectedSourceFingerprint) != "" {
 		start := int64(0)
@@ -23322,20 +23636,19 @@ func transcriptAutomaticImportProofQueueOptions(sourcePath string, checkpoint te
 		if sourceSizeBeforeRead < start {
 			return outboxQueueOptions{}
 		}
-		if sourceSizeBeforeRead-start > historyTieredMaxTailBytes {
-			// Do not hash an unbounded automatic backlog merely to decide whether
-			// it is safe to import. The normal policy for a large suffix is the
-			// silent explicit-history boundary; publish-history can perform the
-			// deliberate full reread.
-			return outboxQueueOptions{}
+		if sourceSizeBeforeRead-start <= int64(historyTieredMaxTailBytes) {
+			proof.ExpectedSourceReadFingerprint = transcriptSourceRangeFingerprint(sourcePath, start, sourceSizeBeforeRead)
+			proof.ExpectedSourceReadStartOffset = start
+			proof.ExpectedSourceReadEndOffset = sourceSizeBeforeRead
+			proof.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadFingerprint != ""
+			if !proof.ExpectedSourceReadRangeKnown {
+				return outboxQueueOptions{}
+			}
 		}
-		proof.ExpectedSourceReadFingerprint = transcriptSourceRangeFingerprint(sourcePath, start, sourceSizeBeforeRead)
-		proof.ExpectedSourceReadStartOffset = start
-		proof.ExpectedSourceReadEndOffset = sourceSizeBeforeRead
-		proof.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadFingerprint != ""
-		if !proof.ExpectedSourceReadRangeKnown {
-			return outboxQueueOptions{}
-		}
+		// A suffix larger than one automatic pass is still safe to import in
+		// bounded batches. The scanner adds a read-range proof for the current
+		// batch after it has read it; hashing the whole backlog here would
+		// recreate the old tail_too_large gate and its livelock.
 		return proof
 	}
 	// A checkpoint with a record key but no durable identity-bound proof is an
@@ -23351,24 +23664,37 @@ func transcriptAutomaticImportProofQueueOptions(sourcePath string, checkpoint te
 	if sourcePath == "" || sourceSizeBeforeRead < 0 {
 		return outboxQueueOptions{}
 	}
-	if sourceSizeBeforeRead > historyTieredMaxTailBytes {
-		return outboxQueueOptions{}
-	}
 	fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(sourcePath, sourceSizeBeforeRead))
-	readFingerprint := transcriptSourceRangeFingerprint(sourcePath, 0, sourceSizeBeforeRead)
-	if fingerprint == "" || readFingerprint == "" {
+	if fingerprint == "" {
 		return outboxQueueOptions{}
 	}
-	return outboxQueueOptions{
-		ExpectedSourcePath:            sourcePath,
-		ExpectedSourceFingerprint:     fingerprint,
-		ExpectedSourceOffset:          sourceSizeBeforeRead,
-		ExpectedSourceOffsetKnown:     true,
-		ExpectedSourceReadFingerprint: readFingerprint,
-		ExpectedSourceReadStartOffset: 0,
-		ExpectedSourceReadEndOffset:   sourceSizeBeforeRead,
-		ExpectedSourceReadRangeKnown:  true,
+	proof = outboxQueueOptions{
+		ExpectedSourcePath:        sourcePath,
+		ExpectedSourceFingerprint: fingerprint,
+		ExpectedSourceOffset:      sourceSizeBeforeRead,
+		ExpectedSourceOffsetKnown: true,
 	}
+	// For a small first source retain the stronger whole-read proof. For a
+	// large first source, the bounded reader supplies the proof for each pass
+	// after it has consumed only the current safe prefix.
+	if sourceSizeBeforeRead <= int64(historyTieredMaxTailBytes) {
+		proof.ExpectedSourceReadFingerprint = transcriptSourceRangeFingerprint(sourcePath, 0, sourceSizeBeforeRead)
+		proof.ExpectedSourceReadStartOffset = 0
+		proof.ExpectedSourceReadEndOffset = sourceSizeBeforeRead
+		proof.ExpectedSourceReadRangeKnown = proof.ExpectedSourceReadFingerprint != ""
+		if !proof.ExpectedSourceReadRangeKnown {
+			return outboxQueueOptions{}
+		}
+	} else {
+		// The zero-length prefix is the only safe automatic starting boundary
+		// when the complete source is larger than one bounded pass.
+		proof.ExpectedSourceOffset = 0
+		proof.ExpectedSourceFingerprint = transcriptCheckpointSourceFingerprint(sourcePath, 0)
+		if strings.TrimSpace(proof.ExpectedSourceFingerprint) == "" {
+			return outboxQueueOptions{}
+		}
+	}
+	return proof
 }
 
 // preflightAutomaticTranscriptImportSourceProof prevents an automatic import
@@ -23606,7 +23932,7 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx c
 	return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, sourceProof, "")
 }
 
-func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions, parentFenceSessionID string) error {
+func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions, parentFenceSessionID string, finalBoundary ...TranscriptFinalBoundary) error {
 	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
@@ -23655,6 +23981,15 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 		if status == "" || status == importCheckpointStatusBlocked {
 			status = importCheckpointStatusComplete
 		}
+		if previous.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(previous.ImportTurnID) &&
+			!transcriptQuarantineAllowsAutomaticBranch(session, previous, sourcePath) &&
+			!transcriptCheckpointProgressBeforeQuarantine(previous, sourcePath, lastOffset) {
+			// Automatic checkpoint progress must not silently cross a quarantined
+			// mirror group. A safe prefix before the frontier may still advance, and
+			// a newly admitted live branch may replace the old source with its own
+			// transcript; all other automatic callers must stop here.
+			return previous, false, teamstore.ErrUnresolvedExecution
+		}
 		candidateFingerprint := transcriptCheckpointSourceFingerprint(sourcePath, lastOffset)
 		if lastOffset < 0 || sourceSize < lastOffset || (lastOffset > 0 && strings.TrimSpace(candidateFingerprint) == "") {
 			return previous, false, teamstore.ErrUnresolvedExecution
@@ -23674,13 +24009,39 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			KindPrefix:                    previous.KindPrefix,
 			Status:                        status,
 			UnresolvedExecution:           previous.UnresolvedExecution,
+			TranscriptQuarantine:          previous.TranscriptQuarantine,
 			ExecutionAnchorGeneration:     previous.ExecutionAnchorGeneration,
 			SourceRewriteBlocked:          previous.SourceRewriteBlocked,
+			LegacySourceUnverified:        previous.LegacySourceUnverified,
 			OversizedRecordBlocked:        false,
 			SourceRewriteRecoveryIdentity: previous.SourceRewriteRecoveryIdentity,
 			CompletionPending:             previous.CompletionPending,
 			LegacyProbeRevision:           previous.LegacyProbeRevision,
+			LastFinalID:                   previous.LastFinalID,
+			LastFinalLine:                 previous.LastFinalLine,
+			LastFinalStartOffset:          previous.LastFinalStartOffset,
+			LastFinalStartOffsetKnown:     previous.LastFinalStartOffsetKnown,
+			LastFinalThreadID:             previous.LastFinalThreadID,
+			LastFinalTurnID:               previous.LastFinalTurnID,
+			LastFinalTextHash:             previous.LastFinalTextHash,
+			TerminalBoundarySeen:          previous.TerminalBoundarySeen,
+			TerminalBoundaryLine:          previous.TerminalBoundaryLine,
 			UpdatedAt:                     now,
+		}
+		if len(finalBoundary) > 0 && transcriptFinalBoundaryFitsProgress(finalBoundary[0], lastRecordID, lastOffset) {
+			boundary := finalBoundary[0]
+			next.LastFinalID = strings.TrimSpace(boundary.ID)
+			next.LastFinalLine = boundary.Line
+			next.LastFinalStartOffset = boundary.StartOffset
+			next.LastFinalStartOffsetKnown = boundary.StartOffsetKnown
+			next.LastFinalThreadID = strings.TrimSpace(boundary.ThreadID)
+			next.LastFinalTurnID = strings.TrimSpace(boundary.TurnID)
+			next.LastFinalTextHash = strings.TrimSpace(boundary.TextHash)
+			next.TerminalBoundarySeen = boundary.TerminalSeen
+			next.TerminalBoundaryLine = boundary.TerminalLine
+		}
+		if next.TranscriptQuarantine != nil && transcriptQuarantineAllowsAutomaticBranch(session, previous, sourcePath) {
+			next.TranscriptQuarantine = nil
 		}
 		if importCheckpointSameExceptUpdatedAt(previous, next) {
 			return previous, false, nil
@@ -23695,6 +24056,46 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 		}
 	}
 	return err
+}
+
+// recordTranscriptLedgerAfterCheckpointProgress keeps the delivery ledger
+// coupled to the rare final-boundary proof path. The ordinary linked-sync
+// writer already records its ledger atomically; a source-proof progress write
+// cannot use that legacy API without dropping its CAS metadata, so it records
+// the deterministic ledger row after its successful checkpoint CAS while
+// reusing the canonical checkpoint snapshot.
+func (b *Bridge) recordTranscriptLedgerAfterCheckpointProgress(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, parentFenceSessionID string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
+		return nil
+	}
+	checkpoint, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+	if err != nil || !found {
+		return err
+	}
+	if checkpoint.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
+		return teamstore.ErrUnresolvedExecution
+	}
+	checkpoint.SourcePath = firstNonEmptyString(checkpoint.SourcePath, sourcePath)
+	checkpoint.LastRecordID = firstNonEmptyString(checkpoint.LastRecordID, lastRecordID)
+	if checkpoint.LastSourceLine == 0 {
+		checkpoint.LastSourceLine = lastLine
+	}
+	if !checkpoint.LastOffsetKnown {
+		checkpoint.LastOffset = lastOffset
+		checkpoint.LastOffsetKnown = true
+	}
+	ledger := teamstore.TranscriptLedgerRecord{
+		ID:             transcriptLedgerID(session.ID, checkpointID, lastRecordID),
+		SessionID:      session.ID,
+		CodexThreadID:  session.CodexThreadID,
+		SourcePath:     checkpoint.SourcePath,
+		SourceLine:     lastLine,
+		SourceRecordID: lastRecordID,
+	}
+	if strings.TrimSpace(parentFenceSessionID) != "" {
+		return b.store.RecordTranscriptCheckpointIfParentUnfenced(ctx, parentFenceSessionID, checkpoint, ledger)
+	}
+	return b.store.RecordTranscriptCheckpoint(ctx, checkpoint, ledger)
 }
 
 func transcriptCheckpointProgressAlreadyAhead(previous teamstore.ImportCheckpoint, sourcePath string, lastLine int, lastOffset int64) bool {
@@ -23725,6 +24126,7 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.SessionID == right.SessionID &&
 		left.SourcePath == right.SourcePath &&
 		left.SourceRewriteBlocked == right.SourceRewriteBlocked &&
+		left.LegacySourceUnverified == right.LegacySourceUnverified &&
 		left.OversizedRecordBlocked == right.OversizedRecordBlocked &&
 		left.SourceRewriteRecoveryIdentity == right.SourceRewriteRecoveryIdentity &&
 		left.SourceFingerprint == right.SourceFingerprint &&
@@ -23732,6 +24134,15 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.LastSourceLine == right.LastSourceLine &&
 		left.LastOffset == right.LastOffset &&
 		left.LastOffsetKnown == right.LastOffsetKnown &&
+		left.LastFinalID == right.LastFinalID &&
+		left.LastFinalLine == right.LastFinalLine &&
+		left.LastFinalStartOffset == right.LastFinalStartOffset &&
+		left.LastFinalStartOffsetKnown == right.LastFinalStartOffsetKnown &&
+		left.LastFinalThreadID == right.LastFinalThreadID &&
+		left.LastFinalTurnID == right.LastFinalTurnID &&
+		left.LastFinalTextHash == right.LastFinalTextHash &&
+		left.TerminalBoundarySeen == right.TerminalBoundarySeen &&
+		left.TerminalBoundaryLine == right.TerminalBoundaryLine &&
 		left.SourceSize == right.SourceSize &&
 		left.SourceModTime.Equal(right.SourceModTime) &&
 		left.ImportTurnID == right.ImportTurnID &&
@@ -23740,7 +24151,8 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.CompletionPending == right.CompletionPending &&
 		left.Status == right.Status &&
 		left.ExecutionAnchorGeneration == right.ExecutionAnchorGeneration &&
-		executionAnchorsEqual(left.UnresolvedExecution, right.UnresolvedExecution)
+		executionAnchorsEqual(left.UnresolvedExecution, right.UnresolvedExecution) &&
+		transcriptQuarantinesEqual(left.TranscriptQuarantine, right.TranscriptQuarantine)
 }
 
 func executionAnchorsEqual(left *teamstore.ExecutionAnchor, right *teamstore.ExecutionAnchor) bool {
@@ -23748,6 +24160,54 @@ func executionAnchorsEqual(left *teamstore.ExecutionAnchor, right *teamstore.Exe
 		return left == nil && right == nil
 	}
 	return reflect.DeepEqual(left, right)
+}
+
+func transcriptQuarantinesEqual(left *teamstore.TranscriptQuarantine, right *teamstore.TranscriptQuarantine) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return reflect.DeepEqual(left, right)
+}
+
+func transcriptQuarantineAllowsAutomaticBranch(session Session, checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
+	quarantine := checkpoint.TranscriptQuarantine
+	if quarantine == nil || strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
+		return false
+	}
+	if strings.TrimSpace(session.CodexThreadID) != strings.TrimSpace(quarantine.LiveBranchThreadID) {
+		return false
+	}
+	oldPath := cleanComparablePath(quarantine.SourcePath)
+	newPath := cleanComparablePath(sourcePath)
+	return oldPath == "" || newPath == "" || oldPath != newPath
+}
+
+func transcriptCheckpointProgressBeforeQuarantine(checkpoint teamstore.ImportCheckpoint, sourcePath string, lastOffset int64) bool {
+	quarantine := checkpoint.TranscriptQuarantine
+	if quarantine == nil || lastOffset < 0 {
+		return false
+	}
+	checkpointPath := cleanComparablePath(checkpoint.SourcePath)
+	quarantinePath := cleanComparablePath(quarantine.SourcePath)
+	sourcePath = cleanComparablePath(sourcePath)
+	if (quarantinePath != "" && sourcePath != "" && quarantinePath != sourcePath) ||
+		(checkpointPath != "" && sourcePath != "" && checkpointPath != sourcePath) {
+		return false
+	}
+	// The cursor is an end offset while FrontierOffset is the start of the
+	// first quarantined record. Equality is safe: it means the cursor ends
+	// immediately before that record and has not crossed the frontier.
+	return lastOffset <= quarantine.FrontierOffset
+}
+
+func transcriptFinalBoundaryFitsProgress(boundary TranscriptFinalBoundary, lastRecordID string, lastOffset int64) bool {
+	if strings.TrimSpace(boundary.ID) == "" {
+		return false
+	}
+	if strings.TrimSpace(boundary.ID) == strings.TrimSpace(lastRecordID) {
+		return true
+	}
+	return boundary.StartOffsetKnown && lastOffset >= boundary.StartOffset
 }
 
 func transcriptSourceFileState(sourcePath string) (int64, time.Time) {
@@ -23885,6 +24345,10 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 		if transcriptCheckpointAdvanceBlocked(checkpoint) {
 			return checkpoint, false, teamstore.ErrUnresolvedExecution
 		}
+		if checkpoint.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) &&
+			!transcriptQuarantineAllowsAutomaticBranch(session, checkpoint, sourcePath) {
+			return checkpoint, false, teamstore.ErrUnresolvedExecution
+		}
 		if strings.TrimSpace(result.SourceProof.ExpectedSourceFingerprint) != "" &&
 			!transcriptAutomaticImportSourceProofMatches(result.SourceProof) {
 			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
@@ -23918,7 +24382,9 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 		}
 		if transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
 			checkpoint.SourceRewriteBlocked = false
+			checkpoint.LegacySourceUnverified = false
 		}
+		checkpoint.TranscriptQuarantine = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
@@ -23946,6 +24412,10 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithSourceProof(ctx context.Co
 			return checkpoint, false, teamstore.ErrUnresolvedExecution
 		}
 		explicitHistory := transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID)
+		if checkpoint.TranscriptQuarantine != nil && !explicitHistory &&
+			!transcriptQuarantineAllowsAutomaticBranch(session, checkpoint, sourcePath) {
+			return checkpoint, false, teamstore.ErrUnresolvedExecution
+		}
 		if cleanComparablePath(proof.ExpectedSourcePath) != cleanComparablePath(sourcePath) ||
 			!transcriptAutomaticImportSourceProofMatches(proof) {
 			return checkpoint, false, errTranscriptAutomaticSourceProofUnavailable
@@ -23979,7 +24449,9 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithSourceProof(ctx context.Co
 			// boundary for a source rewrite. Once its own final cursor is durable,
 			// the automatic watcher may trust the new source again.
 			checkpoint.SourceRewriteBlocked = false
+			checkpoint.LegacySourceUnverified = false
 		}
+		checkpoint.TranscriptQuarantine = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
@@ -24069,6 +24541,13 @@ func (b *Bridge) markTranscriptImportPausedAtWithProof(ctx context.Context, sess
 			checkpoint.SourceSize = sourceSize
 			checkpoint.SourceModTime = sourceModTime
 			checkpoint.SourceFingerprint = firstNonEmptyString(transcriptCheckpointSourceFingerprint(sourcePath, checkpoint.LastOffset), checkpoint.SourceFingerprint)
+			if transcriptImportRunIsExplicitHistory(importTurnID) {
+				// This explicit cursor is the operator-selected recovery boundary.
+				// Once it has a content-bound fingerprint, do not leave the
+				// inherited marker behind or automatic polling will keep treating
+				// this verified checkpoint as legacy forever.
+				checkpoint.LegacySourceUnverified = false
+			}
 		} else if strings.TrimSpace(checkpoint.SourcePath) == "" {
 			checkpoint.SourcePath = sourcePath
 			checkpoint.SourceSize = sourceSize
@@ -24083,6 +24562,9 @@ func (b *Bridge) markTranscriptImportPausedAtWithProof(ctx context.Context, sess
 			checkpoint.KindPrefix = strings.TrimSpace(kindPrefix)
 		}
 		checkpoint.CompletionPending = false
+		if transcriptImportRunIsExplicitHistory(importTurnID) {
+			checkpoint.TranscriptQuarantine = nil
+		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
 		return checkpoint, true, nil
@@ -24101,6 +24583,10 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 			return checkpoint, false, teamstore.ErrUnresolvedExecution
 		}
 		explicitHistory := transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID)
+		if checkpoint.TranscriptQuarantine != nil && !explicitHistory &&
+			!transcriptQuarantineAllowsAutomaticBranch(session, checkpoint, sourcePath) {
+			return checkpoint, false, teamstore.ErrUnresolvedExecution
+		}
 		previousSourcePath := checkpoint.SourcePath
 		checkpoint.ID = checkpointID
 		checkpoint.SessionID = session.ID
@@ -24125,7 +24611,9 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 		checkpoint.SourceFingerprint = firstNonEmptyString(sourceFingerprint, transcriptCheckpointSourceFingerprint(sourcePath, checkpoint.LastOffset), checkpoint.SourceFingerprint)
 		if explicitHistory {
 			checkpoint.SourceRewriteBlocked = false
+			checkpoint.LegacySourceUnverified = false
 		}
+		checkpoint.TranscriptQuarantine = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete
@@ -24228,6 +24716,9 @@ func (b *Bridge) markTranscriptImportBlockedWithOptions(ctx context.Context, ses
 		}
 		if checkpoint.UnresolvedExecution == nil {
 			checkpoint.UnresolvedExecution = previous.UnresolvedExecution
+		}
+		if checkpoint.TranscriptQuarantine == nil {
+			checkpoint.TranscriptQuarantine = previous.TranscriptQuarantine
 		}
 		checkpoint.ID = id
 		checkpoint.SessionID = session.ID

@@ -120,6 +120,54 @@ func TestIsolatedLiveBranchSurvivesUnresolvedHistoryFenceAcrossBackends(t *testi
 	}
 }
 
+func TestTranscriptQuarantineAdmitsOnlyAnIsolatedLiveBranchAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "transcript-quarantine-session"
+			const turnID = "transcript-quarantine-turn"
+			const checkpointID = "transcript:" + sessionID
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, CodexThreadID: "thread-old"}
+				state.Turns[turnID] = Turn{ID: turnID, SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", QueuedAt: now, CreatedAt: now}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked,
+					TranscriptQuarantine: &TranscriptQuarantine{Kind: "mixed_id_final_mirror", SourcePath: "/old/session.jsonl"},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed transcript quarantine: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if unresolved, err := store.SessionExecutionOwnershipProbe(ctx, sessionID, checkpointID); err != nil || unresolved {
+				t.Fatalf("transcript quarantine became strict execution ownership: unresolved=%v err=%v", unresolved, err)
+			}
+			prepared, err := store.MarkTurnForIsolatedCodexThread(ctx, turnID)
+			if err != nil || !prepared.StartNewCodexThread {
+				t.Fatalf("prepare isolated transcript-quarantine turn = %#v err=%v", prepared, err)
+			}
+			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || !claimed.StartNewCodexThread || claimed.Status != TurnStatusRunning {
+				t.Fatalf("claim isolated transcript-quarantine turn = %#v ok=%v err=%v", claimed, ok, err)
+			}
+			bound, err := store.BindCodexThreadForRunningTurn(ctx, CodexThreadStartBindingRequest{
+				SessionID: sessionID, TurnID: turnID, ThreadID: "thread-new", ModelGeneration: 0,
+			})
+			if err != nil || bound.Turn.CodexThreadID != "thread-new" {
+				t.Fatalf("bind isolated transcript-quarantine thread = %#v err=%v", bound, err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.LiveBranchThreadID != "thread-new" {
+				t.Fatalf("transcript quarantine live branch = %#v found=%v err=%v", checkpoint, found, err)
+			}
+		})
+	}
+}
+
 func TestQueuedTurnCapturedBeforeLiveBranchIsRetargetedAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []string{"json", "sqlite"} {
@@ -149,6 +197,113 @@ func TestQueuedTurnCapturedBeforeLiveBranchIsRetargetedAcrossBackends(t *testing
 			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
 			if err != nil || !ok || claimed.CodexThreadID != "thread-live" || claimed.StartNewCodexThread {
 				t.Fatalf("claim retargeted turn = %#v ok=%v err=%v", claimed, ok, err)
+			}
+		})
+	}
+}
+
+func TestActiveExecutionAnchorOverridesOlderTranscriptQuarantineBranchAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "anchor-over-quarantine-session"
+			const turnID = "anchor-over-quarantine-turn"
+			const checkpointID = "transcript:" + sessionID
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, CodexThreadID: "thread-old"}
+				state.Turns[turnID] = Turn{ID: turnID, SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", QueuedAt: now, CreatedAt: now}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked,
+					UnresolvedExecution:  &ExecutionAnchor{SessionID: sessionID, ThreadID: "thread-old", OuterTurnID: "old-turn", CodexTurnID: "old-codex-turn", State: "unresolved", Generation: 3},
+					TranscriptQuarantine: &TranscriptQuarantine{Kind: "mixed_id_final_mirror", LiveBranchThreadID: "stale-quarantine-branch"},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			prepared, err := store.MarkTurnForIsolatedCodexThread(ctx, turnID)
+			if err != nil || !prepared.StartNewCodexThread || prepared.CodexThreadID != "" {
+				t.Fatalf("prepared turn = %#v err=%v, want a fresh branch rather than stale quarantine branch", prepared, err)
+			}
+			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || !claimed.StartNewCodexThread {
+				t.Fatalf("claimed turn = %#v ok=%v err=%v", claimed, ok, err)
+			}
+			if _, err := store.BindCodexThreadForRunningTurn(ctx, CodexThreadStartBindingRequest{
+				SessionID: sessionID, TurnID: turnID, ThreadID: "thread-anchor-live", ModelGeneration: 0,
+			}); err != nil {
+				t.Fatalf("bind fresh branch: %v", err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil || checkpoint.UnresolvedExecution.LiveBranchThreadID != "thread-anchor-live" || checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.LiveBranchThreadID != "stale-quarantine-branch" {
+				t.Fatalf("strong anchor/quarantine branch state = %#v found=%v err=%v", checkpoint, found, err)
+			}
+		})
+	}
+}
+
+func TestTranscriptQuarantineConcurrentQueuedAdmissionsShareLiveBranchAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const sessionID = "quarantine-concurrent-session"
+			const checkpointID = "transcript:" + sessionID
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, CodexThreadID: "thread-old"}
+				state.Turns["quarantine-turn-a"] = Turn{ID: "quarantine-turn-a", SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", QueuedAt: now, CreatedAt: now}
+				state.Turns["quarantine-turn-b"] = Turn{ID: "quarantine-turn-b", SessionID: sessionID, Status: TurnStatusQueued, CodexThreadID: "thread-old", QueuedAt: now.Add(time.Millisecond), CreatedAt: now.Add(time.Millisecond)}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked,
+					TranscriptQuarantine: &TranscriptQuarantine{Kind: "mixed_id_final_mirror", SourcePath: "/sessions/quarantine.jsonl"},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			start := make(chan struct{})
+			errs := make(chan error, 2)
+			for _, turnID := range []string{"quarantine-turn-a", "quarantine-turn-b"} {
+				go func(turnID string) {
+					<-start
+					_, err := store.MarkTurnForIsolatedCodexThread(ctx, turnID)
+					errs <- err
+				}(turnID)
+			}
+			close(start)
+			for i := 0; i < 2; i++ {
+				if err := <-errs; err != nil {
+					t.Fatalf("concurrent admission %d: %v", i, err)
+				}
+			}
+
+			first, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || !first.StartNewCodexThread {
+				t.Fatalf("first isolated claim = %#v ok=%v err=%v", first, ok, err)
+			}
+			bound, err := store.BindCodexThreadForRunningTurn(ctx, CodexThreadStartBindingRequest{
+				SessionID: sessionID, TurnID: first.ID, ThreadID: "thread-live", ModelGeneration: 0,
+			})
+			if err != nil || bound.Turn.CodexThreadID != "thread-live" {
+				t.Fatalf("bind first isolated branch = %#v err=%v", bound, err)
+			}
+			if _, err := store.MarkTurnCompleted(ctx, first.ID, "thread-live", "codex-first"); err != nil {
+				t.Fatalf("complete first isolated branch: %v", err)
+			}
+
+			second, ok, err := store.ClaimNextQueuedTurn(ctx, sessionID)
+			if err != nil || !ok || second.StartNewCodexThread || second.CodexThreadID != "thread-live" {
+				t.Fatalf("second isolated claim = %#v ok=%v err=%v, want the admitted live branch", second, ok, err)
 			}
 		})
 	}

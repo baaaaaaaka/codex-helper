@@ -6199,7 +6199,7 @@ func TestStoreSourceRewriteFenceDemotesSentAcrossBackends(t *testing.T) {
 	}
 }
 
-func TestBridgeActiveTurnLegacyCheckpointBlocksBeforeSourceScanAcrossBackends(t *testing.T) {
+func TestBridgeActiveTurnLegacyCheckpointDefersBeforeSourceScanAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []struct {
 		name      string
@@ -6279,8 +6279,8 @@ func TestBridgeActiveTurnLegacyCheckpointBlocksBeforeSourceScanAcrossBackends(t 
 				t.Fatalf("load state: %v", err)
 			}
 			checkpoint := state.ImportCheckpoints[checkpointID]
-			if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "old" || checkpoint.LastOffset != int64(len(old)) {
-				t.Fatalf("legacy checkpoint after active scan = %#v, want blocked at old cursor", checkpoint)
+			if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "old" || checkpoint.LastOffset != int64(len(old)) {
+				t.Fatalf("legacy checkpoint after active scan = %#v, want silent history-only migration at old cursor", checkpoint)
 			}
 			for _, msg := range state.OutboxMessages {
 				if msg.SessionID == session.ID && strings.Contains(msg.Body, "stale") {
@@ -12449,12 +12449,12 @@ func TestBridgePublishNewSessionSilentlyBlocksStaleCheckpointID(t *testing.T) {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s002")]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
-		t.Fatalf("checkpoint = %#v, want silently blocked legacy checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silent history-only legacy checkpoint preserved", checkpoint)
 	}
 }
 
-func TestBridgeImportCheckpointMismatchBlocksSilentlyWithoutMarkingComplete(t *testing.T) {
+func TestBridgeImportCheckpointMismatchDefersSilentlyWithoutMarkingSourceTrusted(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -12492,8 +12492,8 @@ func TestBridgeImportCheckpointMismatchBlocksSilentlyWithoutMarkingComplete(t *t
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
-		t.Fatalf("checkpoint = %#v, want blocked legacy checkpoint without completion", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silent history-only checkpoint without completion or source proof", checkpoint)
 	}
 }
 
@@ -12591,7 +12591,7 @@ func TestBridgePublishExistingSessionDoesNotRawErrorOnMissingCheckpoint(t *testi
 	}
 	for _, want := range []string{
 		"Already published as s001",
-		"No new local history was imported automatically.",
+		"No new local history was imported.",
 		"Open this Teams work chat",
 	} {
 		if !strings.Contains(message, want) {
@@ -12607,8 +12607,8 @@ func TestBridgePublishExistingSessionDoesNotRawErrorOnMissingCheckpoint(t *testi
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
-		t.Fatalf("checkpoint = %#v, want silently blocked stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silent history-only stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -12659,8 +12659,8 @@ func TestBridgePublishExistingBlockedSessionStaysSilentOnMissingCheckpoint(t *te
 	if strings.Contains(message, "transcript checkpoint was not found") || strings.Contains(message, "refusing to guess") {
 		t.Fatalf("publish response leaked raw checkpoint error:\n%s", message)
 	}
-	if !strings.Contains(message, "No new local history was imported automatically.") || strings.Contains(message, "Local Codex history sync needs attention") {
-		t.Fatalf("publish response = %q, want truthful silent-block status", message)
+	if !strings.Contains(message, "No new local history was imported.") || strings.Contains(message, "Local Codex history sync needs attention") {
+		t.Fatalf("publish response = %q, want truthful silent history-only status", message)
 	}
 	joined := sentPlainJoined(*sent)
 	if strings.Contains(joined, "Imported Codex session history") || strings.Contains(joined, "Local Codex history sync needs attention") {
@@ -12674,8 +12674,8 @@ func TestBridgePublishExistingBlockedSessionStaysSilentOnMissingCheckpoint(t *te
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
-		t.Fatalf("checkpoint = %#v, want silently blocked stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint = %#v, want silent history-only stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -27213,8 +27213,8 @@ func TestBridgeSyncLinkedTranscriptSkipsInternalAgentMessagesAndAdvancesCheckpoi
 		t.Fatalf("load state after internal-only tail: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "child-final" || checkpoint.LastOffset != int64(len(initial+internalTail)) || checkpoint.Status != importCheckpointStatusComplete {
-		t.Fatalf("checkpoint after internal-only tail = %#v, want child-final at EOF", checkpoint)
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.LastOffset != int64(len(initial+internalTail)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after internal-only tail = %#v, want ignored disposition at EOF", checkpoint)
 	}
 	if len(state.TranscriptDeliveries) != 0 {
 		t.Fatalf("internal records created transcript deliveries: %#v", state.TranscriptDeliveries)
@@ -27245,8 +27245,8 @@ func TestBridgeSyncLinkedTranscriptSkipsInternalAgentMessagesAndAdvancesCheckpoi
 		t.Fatalf("load final state: %v", err)
 	}
 	checkpoint = state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "child-final-2" || checkpoint.LastOffset != int64(len(wantBody)) {
-		t.Fatalf("checkpoint after visible final = %#v, want final hidden tail at EOF", checkpoint)
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.LastOffset != int64(len(wantBody)) {
+		t.Fatalf("checkpoint after visible final = %#v, want final hidden tail's ignored disposition at EOF", checkpoint)
 	}
 
 	sentBeforeRepeat := len(*sent)
@@ -27306,8 +27306,8 @@ func TestBridgeSyncLinkedTranscriptSkipsChatGPTAppInternalEventsAndAdvancesCheck
 		t.Fatalf("load state after ChatGPT app internal tail: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID == "" || !strings.Contains(checkpoint.LastRecordID, ":line:") || checkpoint.LastOffset != int64(len(internalBody)) || checkpoint.Status != importCheckpointStatusComplete {
-		t.Fatalf("checkpoint after ChatGPT app internal tail = %#v, want line-based turn_context checkpoint at EOF", checkpoint)
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.LastOffset != int64(len(internalBody)) || checkpoint.Status != importCheckpointStatusComplete {
+		t.Fatalf("checkpoint after ChatGPT app internal tail = %#v, want ignored disposition at EOF", checkpoint)
 	}
 	if len(state.TranscriptDeliveries) != 0 {
 		t.Fatalf("ChatGPT app internal records created transcript deliveries: %#v", state.TranscriptDeliveries)
@@ -27363,8 +27363,8 @@ func TestBridgeSyncLinkedTranscriptSkipsChatGPTAppInternalEventsAndAdvancesCheck
 		t.Fatalf("load final ChatGPT app sync state: %v", err)
 	}
 	checkpoint = state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "post-final-reasoning" || checkpoint.LastOffset != int64(len(wantBody)) {
-		t.Fatalf("checkpoint after visible final = %#v, want post-final hidden tail at EOF", checkpoint)
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.LastOffset != int64(len(wantBody)) {
+		t.Fatalf("checkpoint after visible final = %#v, want post-final hidden tail's ignored disposition at EOF", checkpoint)
 	}
 
 	sentBeforeRepeat := len(*sent)
@@ -27890,7 +27890,7 @@ func TestBridgeSyncLinkedTranscriptResumesInterruptedImportAfterOwnerRestart(t *
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointStaysSilent(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointMigratesSilently(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	if err := os.WriteFile(transcriptPath, []byte(`{"id":"u1","role":"user","text":"hello"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
@@ -27945,8 +27945,8 @@ func TestBridgeSyncLinkedTranscriptInterruptedImportMissingCheckpointStaysSilent
 		t.Fatalf("Load final state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
-		t.Fatalf("checkpoint after interrupted import = %#v, want silently blocked stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" || checkpoint.SourceRewriteBlocked {
+		t.Fatalf("checkpoint after interrupted import = %#v, want silent history-only stale checkpoint preserved", checkpoint)
 	}
 }
 
@@ -28861,8 +28861,8 @@ func TestBridgeSyncLinkedTranscriptDedupesQueuedLiveFinal(t *testing.T) {
 		t.Fatalf("Load after sync error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.LastRecordID != "a2" {
-		t.Fatalf("checkpoint = %#v, want advanced past deduped live final", checkpoint)
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") {
+		t.Fatalf("checkpoint = %#v, want ignored disposition past deduped live final", checkpoint)
 	}
 	if err := bridge.flushPendingOutboxForChat(context.Background(), session.ChatID); err != nil {
 		t.Fatalf("flush queued live final after transcript sync: %v", err)
@@ -28930,7 +28930,7 @@ func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedCommentary(t *testing.T) {
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedFinalAnswerFragmentSentAsStatus(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptQuarantinesLiveStreamedFinalAnswerFragmentSentAsStatus(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -28978,14 +28978,24 @@ func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedFinalAnswerFragmentSentAsS
 	}
 
 	joined := sentPlainJoined(*sent)
-	if strings.Contains(joined, "🤖 ✅ Codex answer:\n"+fragment) {
-		t.Fatalf("live-streamed progress fragment was replayed as an answer:\n%s", joined)
+	if strings.Contains(joined, fragment) || strings.Contains(joined, "the actual final answer") {
+		t.Fatalf("automatic mixed final ambiguity produced user-visible output:\n%s", joined)
 	}
-	if strings.Contains(joined, "🤖 ⏳ Codex status:\n"+fragment) {
-		t.Fatalf("live-streamed progress fragment was replayed as a status:\n%s", joined)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("Load quarantined state: %v", err)
 	}
-	if !strings.Contains(joined, "🤖 ✅ Codex answer:\nthe actual final answer") {
-		t.Fatalf("genuine final answer should still be delivered:\n%s", joined)
+	checkpoint = state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedExecution != nil {
+		t.Fatalf("automatic mixed final state = %#v, want silent transcript quarantine", checkpoint)
+	}
+
+	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-streamed-final", "2026-08-22T02:00:00Z", "helper publish-history"), "helper publish-history"); err != nil {
+		t.Fatalf("explicit publish-history recovery: %v", err)
+	}
+	joined = sentPlainJoined(*sent)
+	if strings.Count(joined, "the actual final answer") != 1 {
+		t.Fatalf("explicit recovery output = %q, want one actual final answer", joined)
 	}
 }
 
@@ -30081,7 +30091,7 @@ func TestBridgeSyncLinkedTranscriptStressSkipsLiveStatusesBeforeCheckpointWindow
 		t.Fatalf("Load state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if !strings.Contains(checkpoint.LastRecordID, fmt.Sprintf("s-live-%03d", statusCount-1)) || checkpoint.Status != importCheckpointStatusComplete {
+	if !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.Status != importCheckpointStatusComplete {
 		t.Fatalf("checkpoint did not advance past known live status burst: %#v", checkpoint)
 	}
 }
@@ -30297,8 +30307,8 @@ func TestBridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow(t *testin
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.LastRecordID != "a-live-final" {
-		t.Fatalf("checkpoint = %#v, want advanced past deduped live final", checkpoint)
+	if !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "source:old" {
+		t.Fatalf("checkpoint = %#v, want silent history-only migration without guessing a new cursor", checkpoint)
 	}
 }
 
@@ -31558,8 +31568,8 @@ func TestBridgeSyncLinkedTranscriptDoesNotBlockLargeBackgroundBacklog(t *testing
 		t.Fatalf("Load error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a2" {
-		t.Fatalf("checkpoint = %#v, want complete at a2", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") {
+		t.Fatalf("checkpoint = %#v, want complete after ignored background backlog", checkpoint)
 	}
 }
 
@@ -31605,8 +31615,8 @@ func TestBridgeSyncLinkedTranscriptRecoversOldBlockedBackgroundBacklog(t *testin
 		t.Fatalf("Load final state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "a2" {
-		t.Fatalf("checkpoint = %#v, want recovered complete at a2", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") {
+		t.Fatalf("checkpoint = %#v, want recovered complete after ignored background backlog", checkpoint)
 	}
 }
 
@@ -31835,7 +31845,12 @@ func TestBridgeWorkPublishHistoryMissingCheckpointRecoversExplicitly(t *testing.
 			SourcePath:   transcriptPath,
 			LastRecordID: "missing-checkpoint",
 			Status:       importCheckpointStatusBlocked,
-			UpdatedAt:    time.Now(),
+			TranscriptQuarantine: &teamstore.TranscriptQuarantine{
+				Kind:             "mixed_id_final_mirror",
+				SourcePath:       transcriptPath,
+				FrontierRecordID: "missing-checkpoint",
+			},
+			UpdatedAt: time.Now(),
 		}
 		return nil
 	}); err != nil {
@@ -31859,7 +31874,7 @@ func TestBridgeWorkPublishHistoryMissingCheckpointRecoversExplicitly(t *testing.
 		t.Fatalf("Load final state error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" {
+	if checkpoint.Status != importCheckpointStatusComplete || checkpoint.LastRecordID != "u1" || checkpoint.TranscriptQuarantine != nil {
 		t.Fatalf("checkpoint = %#v, want complete explicit recovery at u1", checkpoint)
 	}
 }
@@ -32489,15 +32504,11 @@ func TestLinkedTranscriptIdleNoGrowthDoesNotBypassLaterPrefixProof(t *testing.T)
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointMetadata(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptsMigratesLegacyCheckpointWithoutReinterpretingSource(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(body), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
-	}
-	info, err := os.Stat(transcriptPath)
-	if err != nil {
-		t.Fatalf("stat transcript: %v", err)
 	}
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -32535,12 +32546,12 @@ func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointMetadata(t *testing
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "old" || checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() || checkpoint.SourceModTime.IsZero() {
-		t.Fatalf("backfilled checkpoint = %#v, want old at EOF size %d", checkpoint, info.Size())
+	if checkpoint.LastRecordID != "old" || checkpoint.LastOffset != 0 || checkpoint.SourceSize != 0 || !checkpoint.LegacySourceUnverified || checkpoint.SourceFingerprint != "" {
+		t.Fatalf("migrated checkpoint = %#v, want the old unverified cursor preserved without a new source position", checkpoint)
 	}
 	backfilledUpdatedAt := checkpoint.UpdatedAt
 	if backfilledUpdatedAt.Equal(legacyUpdatedAt) {
-		t.Fatalf("legacy checkpoint was not marked blocked after position recovery: %#v", checkpoint)
+		t.Fatalf("legacy checkpoint was not marked as migrated: %#v", checkpoint)
 	}
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("repeat legacy checkpoint sync: %v", err)
@@ -32554,7 +32565,7 @@ func TestBridgeSyncLinkedTranscriptsBackfillsLegacyCheckpointMetadata(t *testing
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptsBlocksLegacyEOFCheckpointWithoutFingerprintAcrossBackends(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptsMigratesLegacyEOFCheckpointWithoutFingerprintAcrossBackends(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		useSQLite bool
@@ -32616,8 +32627,8 @@ func TestBridgeSyncLinkedTranscriptsBlocksLegacyEOFCheckpointWithoutFingerprintA
 				t.Fatalf("Load migrated state: %v", err)
 			}
 			checkpoint := state.ImportCheckpoints[checkpointID]
-			if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.SourceFingerprint != "" || checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() {
-				t.Fatalf("legacy checkpoint = %#v, want blocked without an auto-created fingerprint", checkpoint)
+			if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.SourceFingerprint != "" || checkpoint.LastOffset != info.Size() || checkpoint.SourceSize != info.Size() {
+				t.Fatalf("legacy checkpoint = %#v, want a silent history-only migration without an auto-created fingerprint", checkpoint)
 			}
 			blockedUpdatedAt := checkpoint.UpdatedAt
 
@@ -32629,14 +32640,14 @@ func TestBridgeSyncLinkedTranscriptsBlocksLegacyEOFCheckpointWithoutFingerprintA
 				t.Fatalf("Load unchanged state: %v", err)
 			}
 			checkpoint = state.ImportCheckpoints[checkpointID]
-			if checkpoint.SourceFingerprint != "" || checkpoint.Status != importCheckpointStatusBlocked || !checkpoint.UpdatedAt.Equal(blockedUpdatedAt) {
-				t.Fatalf("unchanged poll rewrote blocked checkpoint: %#v, want fingerprint/timestamp unchanged", checkpoint)
+			if checkpoint.SourceFingerprint != "" || checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || !checkpoint.UpdatedAt.Equal(blockedUpdatedAt) {
+				t.Fatalf("unchanged poll rewrote migrated checkpoint: %#v, want fingerprint/timestamp unchanged", checkpoint)
 			}
 		})
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptsBlocksUntrustedLegacyFingerprintAcrossBackends(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptsMigratesUntrustedLegacyFingerprintAcrossBackends(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		useSQLite bool
@@ -32689,14 +32700,14 @@ func TestBridgeSyncLinkedTranscriptsBlocksUntrustedLegacyFingerprintAcrossBacken
 				t.Fatalf("load state: %v", err)
 			}
 			checkpoint := state.ImportCheckpoints[checkpointID]
-			if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.SourceFingerprint != "" {
-				t.Fatalf("untrusted checkpoint = %#v, want blocked without fingerprint", checkpoint)
+			if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.SourceFingerprint != "" {
+				t.Fatalf("untrusted checkpoint = %#v, want silent history-only migration without fingerprint", checkpoint)
 			}
 		})
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptsBlocksGrowingLegacyCursorWithoutFingerprintAcrossBackends(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptsMigratesGrowingLegacyCursorWithoutFingerprintAcrossBackends(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		useSQLite bool
@@ -32764,8 +32775,8 @@ func TestBridgeSyncLinkedTranscriptsBlocksGrowingLegacyCursorWithoutFingerprintA
 				t.Fatalf("load blocked legacy state: %v", err)
 			}
 			checkpoint := state.ImportCheckpoints[checkpointID]
-			if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID != "old-final" || checkpoint.SourceFingerprint != "" {
-				t.Fatalf("blocked legacy checkpoint = %#v, want prior cursor without fingerprint", checkpoint)
+			if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "old-final" || checkpoint.SourceFingerprint != "" {
+				t.Fatalf("migrated legacy checkpoint = %#v, want prior cursor without fingerprint", checkpoint)
 			}
 		})
 	}
@@ -32799,7 +32810,7 @@ func TestLinkedCheckpointPrefixTerminalProbeParsesTypedRecordsOnly(t *testing.T)
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptsMigratesLegacyCheckpointWithoutFingerprint(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	body := `{"id":"old","role":"assistant","text":"old answer"}` + "\n" +
 		`{"id":"new","role":"assistant","text":"new answer after legacy checkpoint"}` + "\n"
@@ -32845,8 +32856,8 @@ func TestBridgeSyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint(t *
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.LastRecordID != "old" || checkpoint.SourceFingerprint != "" || checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("checkpoint after legacy block = %#v, want old cursor, no fingerprint, blocked", checkpoint)
+	if checkpoint.LastRecordID != "old" || checkpoint.SourceFingerprint != "" || checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified {
+		t.Fatalf("checkpoint after legacy migration = %#v, want old cursor, no fingerprint, history-only marker", checkpoint)
 	}
 }
 
@@ -36200,8 +36211,8 @@ func TestBridgeSyncLinkedTranscriptMarksMissingCheckpointFailed(t *testing.T) {
 		t.Fatalf("Load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusFailed || checkpoint.LastRecordID != "missing-checkpoint" {
-		t.Fatalf("checkpoint = %#v, want failed stale checkpoint preserved", checkpoint)
+	if checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified || checkpoint.LastRecordID != "missing-checkpoint" {
+		t.Fatalf("checkpoint = %#v, want silent legacy migration with stale cursor preserved", checkpoint)
 	}
 }
 

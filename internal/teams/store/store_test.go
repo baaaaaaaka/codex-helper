@@ -44,6 +44,79 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+func TestTranscriptQuarantineSurvivesHistoryWatchBackendRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	want := HistoryWatchCheckpoint{
+		ID:                        "watch:quarantine-roundtrip",
+		Path:                      "/sessions/rollout.jsonl",
+		Size:                      4096,
+		Offset:                    0,
+		Line:                      1,
+		SessionID:                 "quarantine-roundtrip",
+		ThreadID:                  "thread-roundtrip",
+		LastFinalID:               "old-final",
+		LastFinalLine:             1,
+		LastFinalStartOffset:      0,
+		LastFinalStartOffsetKnown: true,
+		TranscriptQuarantine: &TranscriptQuarantine{
+			Kind:                "mixed_id_final_mirror",
+			SourcePath:          "/sessions/rollout.jsonl",
+			SourceFingerprint:   "sha256:source-prefix",
+			FrontierRecordID:    "frontier-final",
+			FrontierLine:        2,
+			FrontierOffset:      0,
+			CandidateTextHashes: []string{"sha256:candidate-a", "sha256:candidate-b"},
+			LiveBranchThreadID:  "thread-live-branch",
+		},
+	}
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			store, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			if err := store.UpdateHistoryWatch(ctx, func(history map[string]HistoryWatchCheckpoint, ready *time.Time) error {
+				history[want.ID] = want
+				return nil
+			}); err != nil {
+				_ = store.Close()
+				t.Fatalf("seed history watch checkpoint: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			assertQuarantine := func(tag string, current *Store) {
+				t.Helper()
+				state, err := current.HistoryWatchState(ctx)
+				if err != nil {
+					t.Fatalf("%s HistoryWatchState: %v", tag, err)
+				}
+				got, ok := state.HistoryWatch[want.ID]
+				if !ok {
+					t.Fatalf("%s checkpoint missing: %#v", tag, state.HistoryWatch)
+				}
+				if !reflect.DeepEqual(got.TranscriptQuarantine, want.TranscriptQuarantine) {
+					t.Fatalf("%s quarantine = %#v, want %#v", tag, got.TranscriptQuarantine, want.TranscriptQuarantine)
+				}
+				if got.LastFinalStartOffset != want.LastFinalStartOffset || !got.LastFinalStartOffsetKnown {
+					t.Fatalf("%s zero-offset final boundary = %#v, want %#v", tag, got, want)
+				}
+			}
+			assertQuarantine("initial", store)
+			if err := store.Close(); err != nil {
+				t.Fatalf("close before reopen: %v", err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer func() { _ = reopened.Close() }()
+			assertQuarantine("reopened", reopened)
+		})
+	}
+}
+
 func TestLoadPathReadOnlyJSONDoesNotCreateLockOrModifyFiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	state := newState()
@@ -7105,6 +7178,74 @@ func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
 	}
 }
 
+func TestAmbiguousSendingOutboxIsNotReclaimedOrFIFOBoundAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 22, 18, 0, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			ambiguous := OutboxMessage{
+				ID:               "outbox:ambiguous-send",
+				TeamsChatID:      "chat-ambiguous-send",
+				Sequence:         1,
+				Kind:             "final",
+				Body:             "the external POST outcome is unknown",
+				Status:           OutboxStatusSending,
+				SendAttemptToken: "attempt-ambiguous",
+				LastSendAttempt:  now.Add(-2 * time.Hour),
+				LastSendError:    "ambiguous Graph send; response lost",
+				CreatedAt:        now,
+				UpdatedAt:        now,
+			}
+			later := OutboxMessage{
+				ID:          "outbox:after-ambiguous-send",
+				TeamsChatID: ambiguous.TeamsChatID,
+				Sequence:    2,
+				Kind:        "ack",
+				Body:        "live control acknowledgement",
+				Status:      OutboxStatusQueued,
+				CreatedAt:   now.Add(time.Second),
+				UpdatedAt:   now.Add(time.Second),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[ambiguous.ID] = ambiguous
+				state.OutboxMessages[later.ID] = later
+				return nil
+			}); err != nil {
+				t.Fatalf("seed ambiguous outbox: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, ambiguous.ID)
+			if !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("MarkOutboxSendAttempt = %#v err=%v, want a durable no-reclaim result", claimed, err)
+			}
+			persisted, err := store.OutboxMessageByID(ctx, ambiguous.ID)
+			if err != nil {
+				t.Fatalf("load ambiguous outbox: %v", err)
+			}
+			if persisted.Status != OutboxStatusSending || persisted.SendAttemptToken != ambiguous.SendAttemptToken || persisted.LastSendError != ambiguous.LastSendError {
+				t.Fatalf("ambiguous outbox changed after stale claim: %#v", persisted)
+			}
+			if earlier, ok, err := store.EarlierUnsentOutbox(ctx, later); err != nil {
+				t.Fatalf("EarlierUnsentOutbox: %v", err)
+			} else if ok {
+				t.Fatalf("ambiguous outbox blocked later live/control row: %#v", earlier)
+			}
+			pending, err := store.PendingOutbox(ctx)
+			if err != nil {
+				t.Fatalf("PendingOutbox: %v", err)
+			}
+			for _, msg := range pending {
+				if msg.ID == ambiguous.ID {
+					t.Fatalf("ambiguous outbox appeared in automatic pending query: %#v", pending)
+				}
+			}
+		})
+	}
+}
+
 func TestEarlierUnsentOutboxSkipsAcceptedSourceRewriteFenceAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 4, 30, 12, 42, 0, 0, time.UTC)
@@ -9541,18 +9682,19 @@ func TestRecordTranscriptCheckpointPreservesLegacySemantics(t *testing.T) {
 	previousMod := time.Date(2026, 6, 16, 7, 30, 0, 0, time.UTC)
 	if err := store.UpdateSession(ctx, "s1", func(state *State) error {
 		state.ImportCheckpoints["checkpoint:s1"] = ImportCheckpoint{
-			ID:             "checkpoint:s1",
-			SessionID:      "s1",
-			SourcePath:     "/tmp/old.jsonl",
-			LastRecordID:   "old-record",
-			LastSourceLine: 12,
-			LastOffset:     4096,
-			SourceSize:     8192,
-			SourceModTime:  previousMod,
-			ImportTurnID:   "import-turn-1",
-			KindPrefix:     "assistant",
-			Status:         importCheckpointStatusBlocked,
-			UpdatedAt:      previousMod,
+			ID:                     "checkpoint:s1",
+			SessionID:              "s1",
+			SourcePath:             "/tmp/old.jsonl",
+			LastRecordID:           "old-record",
+			LastSourceLine:         12,
+			LastOffset:             4096,
+			SourceSize:             8192,
+			SourceModTime:          previousMod,
+			ImportTurnID:           "import-turn-1",
+			KindPrefix:             "assistant",
+			Status:                 importCheckpointStatusBlocked,
+			LegacySourceUnverified: true,
+			UpdatedAt:              previousMod,
 		}
 		state.ImportCheckpoints["checkpoint:failed"] = ImportCheckpoint{
 			ID:             "checkpoint:failed",
@@ -9617,7 +9759,7 @@ func TestRecordTranscriptCheckpointPreservesLegacySemantics(t *testing.T) {
 	if checkpoint.SourcePath != "/tmp/new.jsonl" || checkpoint.SourceSize != 16384 || !checkpoint.SourceModTime.Equal(newMod) {
 		t.Fatalf("checkpoint source metadata = %#v, want new source metadata", checkpoint)
 	}
-	if checkpoint.ImportTurnID != "import-turn-1" || checkpoint.KindPrefix != "assistant" || checkpoint.Status != importCheckpointStatusComplete {
+	if checkpoint.ImportTurnID != "import-turn-1" || checkpoint.KindPrefix != "assistant" || checkpoint.Status != importCheckpointStatusComplete || !checkpoint.LegacySourceUnverified {
 		t.Fatalf("checkpoint preserved fields/status = %#v", checkpoint)
 	}
 	if ledger := state.TranscriptLedger["ledger:s1:new-record"]; ledger.ID == "" || ledger.SourceRecordID != "new-record" || ledger.ImportedAt.IsZero() || ledger.CreatedAt.IsZero() || ledger.UpdatedAt.IsZero() {
@@ -18111,7 +18253,7 @@ func TestMarkOutboxSkippedRetiresOnlyUndeliveredRowsAcrossBackends(t *testing.T)
 	}
 }
 
-func TestAmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends(t *testing.T) {
+func TestAmbiguousOutboxSendStaysUncertainAndStrictAttemptStateAcrossBackends(t *testing.T) {
 	for _, sqliteMode := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
 			ctx := context.Background()
@@ -18146,15 +18288,21 @@ func TestAmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends(t *tes
 				t.Fatalf("ambiguous outbox became immediately retryable: %#v", pending)
 			}
 			pending, err = store.PendingOutboxAt(ctx, ambiguous.LastSendAttempt.Add(3*time.Minute))
-			if err != nil || !slices.ContainsFunc(pending, func(msg OutboxMessage) bool { return msg.ID == "out-1" }) {
-				t.Fatalf("ambiguous outbox did not become recoverable after lease: pending=%#v err=%v", pending, err)
+			if err != nil {
+				t.Fatalf("PendingOutboxAt after lease: %v", err)
+			}
+			if slices.ContainsFunc(pending, func(msg OutboxMessage) bool { return msg.ID == "out-1" }) {
+				t.Fatalf("ambiguous outbox became automatically recoverable after lease: pending=%#v", pending)
+			}
+			if _, err := store.MarkOutboxSendAttempt(ctx, "out-1"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("ambiguous outbox reclaim error = %v, want ErrOutboxSendNotClaimed", err)
 			}
 			if _, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", "", "teams-1"); !errors.Is(err, ErrOutboxSendNotClaimed) {
 				t.Fatalf("empty strict attempt token error = %v, want ErrOutboxSendNotClaimed", err)
 			}
 			accepted, err := store.MarkOutboxAcceptedForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-1")
 			if err != nil || accepted.Status != OutboxStatusAccepted {
-				t.Fatalf("recovered accepted outbox: out=%#v err=%v", accepted, err)
+				t.Fatalf("explicitly reconciled accepted outbox: out=%#v err=%v", accepted, err)
 			}
 
 			claimed2, err := store.MarkOutboxSendAttempt(ctx, "out-2")

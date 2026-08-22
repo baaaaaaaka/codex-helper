@@ -7522,11 +7522,13 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 			"o.status IN (?, ?, ?)",
 			"(o.status <> ? OR o.teams_message_id <> '')",
 			"NOT (o.status = ? AND o.teams_message_id <> '' AND COALESCE(json_extract(o.json, '$.blocked_by_source_rewrite'), 0) = 1)",
+			"NOT (o.status = ? AND COALESCE(json_extract(o.json, '$.last_send_error'), '') LIKE 'ambiguous Graph send;%')",
 		}
 		args := []any{
 			string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted),
 			string(OutboxStatusAccepted),
 			string(OutboxStatusAccepted),
+			string(OutboxStatusSending),
 		}
 		if !query.IgnoreRateLimit {
 			clauses = append(clauses, "(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
@@ -7712,11 +7714,12 @@ func (s *Store) earlierUnsentOutboxSQLite(ctx context.Context, msg OutboxMessage
 WHERE teams_chat_id = ?
   AND id <> ?
   AND sequence > 0
-  AND sequence < ?
-  AND status NOT IN (?, ?)
-  AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
+	AND sequence < ?
+	AND status NOT IN (?, ?)
+	AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
+	AND NOT (status = ? AND COALESCE(json_extract(json, '$.last_send_error'), '') LIKE 'ambiguous Graph send;%')
 ORDER BY sequence, created_at, id
-LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted))
+LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending))
 		if err != nil {
 			return err
 		}
@@ -7743,10 +7746,11 @@ func (s *Store) earlierUnsentOutboxesSQLite(ctx context.Context, msg OutboxMessa
 WHERE teams_chat_id = ?
   AND id <> ?
   AND sequence > 0
-  AND sequence < ?
-  AND status NOT IN (?, ?)
-  AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
-ORDER BY sequence, created_at, id`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted))
+	AND sequence < ?
+	AND status NOT IN (?, ?)
+	AND NOT (status = ? AND teams_message_id <> '' AND COALESCE(json_extract(json, '$.blocked_by_source_rewrite'), 0) = 1)
+	AND NOT (status = ? AND COALESCE(json_extract(json, '$.last_send_error'), '') LIKE 'ambiguous Graph send;%')
+	ORDER BY sequence, created_at, id`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending))
 		if err != nil {
 			return err
 		}

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,8 +52,8 @@ func TestBridgeSQLiteLinkedTranscriptChangedTailExercisesParentForkGuard(t *test
 			if err != nil {
 				t.Fatalf("read changed-tail checkpoint: %v", err)
 			}
-			if !found || checkpoint.LastRecordID != "internal-tail" || checkpoint.Status != importCheckpointStatusComplete {
-				t.Fatalf("changed-tail checkpoint = %#v found=%v, want internal-tail at EOF", checkpoint, found)
+			if !found || !strings.HasPrefix(checkpoint.LastRecordID, "ignored:") || checkpoint.Status != importCheckpointStatusComplete {
+				t.Fatalf("changed-tail checkpoint = %#v found=%v, want ignored disposition at EOF", checkpoint, found)
 			}
 		})
 	}
