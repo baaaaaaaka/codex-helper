@@ -101,6 +101,21 @@ func TestRunCodexCLIInvocationRejectsAAAForNativeOnlySurface(t *testing.T) {
 	}
 }
 
+func TestRunCodexCLIInvocationMigratesExplicitInteractiveResumeTarget(t *testing.T) {
+	fixture := writeCodexTUIBrokerFixture(t)
+	store := newCodexOpenTestStore(t)
+	threadID := "11111111-2222-3333-4444-555555555555"
+	if err := runCodexCLIInvocation(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil,
+		[]string{fixture.path, "resume", threadID}, false, runTargetOptions{Cwd: fixture.workDir, Log: io.Discard}); err != nil {
+		t.Fatalf("runCodexCLIInvocation: %v", err)
+	}
+	assertCodexRolloutMigration(t, fixture, threadID)
+	tuiArgs := readArgLines(t, fixture.tuiArgs)
+	if len(tuiArgs) != 8 || tuiArgs[6] != "resume" || tuiArgs[7] != threadID {
+		t.Fatalf("TUI args = %#v, want unchanged explicit resume target", tuiArgs)
+	}
+}
+
 func TestLiveCodexExecFacadeUsesOriginalBinaryAndAssignedGPU(t *testing.T) {
 	codexPath := strings.TrimSpace(os.Getenv("CXP_LIVE_CODEX"))
 	if codexPath == "" {

@@ -23,6 +23,7 @@ import (
 const codexRemoteTUIFeatureConfig = "features.tui_app_server=true"
 
 type codexTUIBeforeBroker func(context.Context, codexrunner.AppServerTransportStarter, codexrunner.AppServerLaunchContext) ([]string, error)
+type codexTUIPreBroker func(context.Context, codexrunner.AppServerLaunchContext, *execIdentity) error
 
 func normalizeWorkingDir(cwd string) (string, error) {
 	cwd = strings.TrimSpace(cwd)
@@ -198,7 +199,7 @@ func runCodexTUIViaBroker(
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
 		tail = []string{"resume", sessionID}
 	}
-	return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, nil, tail, nil, log)
+	return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, nil, tail, nil, sessionID, log)
 }
 
 func runCodexTUIInvocationViaBroker(
@@ -218,7 +219,35 @@ func runCodexTUIInvocationViaBroker(
 	appServerExtraArgs []string,
 	log io.Writer,
 ) error {
-	return runCodexTUIInvocationViaBrokerWithHook(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, log)
+	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, nil, log)
+}
+
+func runCodexTUIInvocationViaBrokerWithPreflight(
+	ctx context.Context,
+	root *rootOptions,
+	store *config.Store,
+	profile *config.Profile,
+	instances []config.Instance,
+	cwd string,
+	codexPath string,
+	codexDir string,
+	useProxy bool,
+	agentAutoApprove bool,
+	modelProfileRef string,
+	tuiGlobalArgs []string,
+	tuiTail []string,
+	appServerExtraArgs []string,
+	threadID string,
+	log io.Writer,
+) error {
+	threadID = strings.TrimSpace(threadID)
+	var preflight codexTUIPreBroker
+	if threadID != "" {
+		preflight = func(ctx context.Context, launch codexrunner.AppServerLaunchContext, identity *execIdentity) error {
+			return migrateCodexRolloutBeforeTUI(ctx, launch, identity, threadID)
+		}
+	}
+	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, preflight, log)
 }
 
 func runCodexTUIInvocationViaBrokerWithHook(
@@ -237,6 +266,28 @@ func runCodexTUIInvocationViaBrokerWithHook(
 	tuiTail []string,
 	appServerExtraArgs []string,
 	beforeBroker codexTUIBeforeBroker,
+	log io.Writer,
+) error {
+	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, beforeBroker, nil, log)
+}
+
+func runCodexTUIInvocationViaBrokerWithHooks(
+	ctx context.Context,
+	root *rootOptions,
+	store *config.Store,
+	profile *config.Profile,
+	instances []config.Instance,
+	cwd string,
+	codexPath string,
+	codexDir string,
+	useProxy bool,
+	agentAutoApprove bool,
+	modelProfileRef string,
+	tuiGlobalArgs []string,
+	tuiTail []string,
+	appServerExtraArgs []string,
+	beforeBroker codexTUIBeforeBroker,
+	preflight codexTUIPreBroker,
 	log io.Writer,
 ) error {
 	cwd, err := normalizeWorkingDir(cwd)
@@ -358,6 +409,11 @@ func runCodexTUIInvocationViaBrokerWithHook(
 		ExtraEnv:         extraEnv,
 		Timeout:          30 * time.Second,
 		ConfigureCommand: configureIdentity,
+	}
+	if preflight != nil {
+		if err := preflight(ctx, launchContext, paths.ExecIdentity); err != nil {
+			return err
+		}
 	}
 	if beforeBroker != nil {
 		updatedTail, err := beforeBroker(ctx, starter, launchContext)

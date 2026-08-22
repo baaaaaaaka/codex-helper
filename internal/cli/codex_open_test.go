@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -31,6 +32,7 @@ func TestRunCodexNewSessionUsesOriginalTUIAndPolicyAppServer(t *testing.T) {
 		t.Fatalf("original Codex fixture changed: before=%s after=%s err=%v", before, after, err)
 	}
 	assertStandardBrokerLaunch(t, fixture)
+	assertNoCodexRolloutMigration(t, fixture)
 }
 
 func TestRunCodexNewSessionUsesManagedNodeWithoutSystemNode(t *testing.T) {
@@ -41,20 +43,66 @@ func TestRunCodexNewSessionUsesManagedNodeWithoutSystemNode(t *testing.T) {
 		t.Fatalf("runCodexNewSession through managed Node: %v", err)
 	}
 	assertStandardBrokerLaunch(t, fixture)
+	assertNoCodexRolloutMigration(t, fixture)
 }
 
 func TestRunCodexSessionPreservesResumeExperience(t *testing.T) {
 	fixture := writeCodexTUIBrokerFixture(t)
 	store := newCodexOpenTestStore(t)
-	session := codexhistory.Session{SessionID: "session-existing", ProjectPath: fixture.workDir}
+	threadID := "11111111-2222-3333-4444-555555555555"
+	session := codexhistory.Session{SessionID: threadID, ProjectPath: fixture.workDir}
 	if err := runCodexSession(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil, session, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", false, io.Discard); err != nil {
 		t.Fatalf("runCodexSession: %v", err)
 	}
 	tuiArgs := readArgLines(t, fixture.tuiArgs)
-	if len(tuiArgs) != 8 || tuiArgs[0] != "-c" || tuiArgs[1] != codexRemoteTUIFeatureConfig || tuiArgs[2] != "--remote" || !strings.HasPrefix(tuiArgs[3], "ws://127.0.0.1:") || strings.Contains(strings.TrimPrefix(tuiArgs[3], "ws://"), "/") || tuiArgs[4] != "--remote-auth-token-env" || tuiArgs[5] != codexrunner.RemoteBrokerAuthTokenEnv || tuiArgs[6] != "resume" || tuiArgs[7] != "session-existing" {
+	if len(tuiArgs) != 8 || tuiArgs[0] != "-c" || tuiArgs[1] != codexRemoteTUIFeatureConfig || tuiArgs[2] != "--remote" || !strings.HasPrefix(tuiArgs[3], "ws://127.0.0.1:") || strings.Contains(strings.TrimPrefix(tuiArgs[3], "ws://"), "/") || tuiArgs[4] != "--remote-auth-token-env" || tuiArgs[5] != codexrunner.RemoteBrokerAuthTokenEnv || tuiArgs[6] != "resume" || tuiArgs[7] != threadID {
 		t.Fatalf("TUI args = %#v", tuiArgs)
 	}
+	assertCodexRolloutMigration(t, fixture, threadID)
 	assertBrokerCapabilityToken(t, fixture)
+}
+
+func TestRunCodexSessionBlocksBrokerWhenRolloutMigrationFails(t *testing.T) {
+	fixture := writeCodexTUIBrokerFixture(t)
+	store := newCodexOpenTestStore(t)
+	threadID := "11111111-2222-3333-4444-555555555555"
+	t.Setenv("CXP_TEST_MIGRATION_STATUS", "failed")
+	err := runCodexSession(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil,
+		codexhistory.Session{SessionID: threadID, ProjectPath: fixture.workDir}, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "migrate legacy Codex rollout") {
+		t.Fatalf("runCodexSession error = %v, want migration failure", err)
+	}
+	if _, statErr := os.Stat(fixture.tuiArgs); !os.IsNotExist(statErr) {
+		t.Fatalf("TUI started after migration failure: stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.appServerArgs); !os.IsNotExist(statErr) {
+		t.Fatalf("app-server started after migration failure: stat err=%v", statErr)
+	}
+	events, err := os.ReadFile(fixture.events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(events)); !reflect.DeepEqual(got, []string{"migration-start"}) {
+		t.Fatalf("lifecycle events = %#v, want only migration-start", got)
+	}
+}
+
+func TestRunCodexSessionBlocksBrokerWhenMigrationReportIsInvalid(t *testing.T) {
+	fixture := writeCodexTUIBrokerFixture(t)
+	store := newCodexOpenTestStore(t)
+	threadID := "11111111-2222-3333-4444-555555555555"
+	t.Setenv("CXP_TEST_MIGRATION_STATUS", "bad-json")
+	err := runCodexSession(context.Background(), &rootOptions{configPath: store.Path()}, store, nil, nil,
+		codexhistory.Session{SessionID: threadID, ProjectPath: fixture.workDir}, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", false, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "parse JSON report") {
+		t.Fatalf("runCodexSession error = %v, want invalid report error", err)
+	}
+	if _, statErr := os.Stat(fixture.migrationArgs); statErr != nil {
+		t.Fatalf("migration did not run before invalid report was rejected: %v", statErr)
+	}
+	if _, statErr := os.Stat(fixture.tuiArgs); !os.IsNotExist(statErr) {
+		t.Fatalf("TUI started after invalid migration report: stat err=%v", statErr)
+	}
 }
 
 func TestRunCodexForkSessionForksBeforeResumingChildThroughRemoteTUI(t *testing.T) {
@@ -78,6 +126,7 @@ func TestRunCodexForkSessionForksBeforeResumingChildThroughRemoteTUI(t *testing.
 	if forkIndex < 0 || tuiIndex < 0 || forkIndex >= tuiIndex {
 		t.Fatalf("fork lifecycle events = %#v, want fork before remote TUI", events)
 	}
+	assertNoCodexRolloutMigration(t, fixture)
 }
 
 func indexOfString(values []string, want string) int {
@@ -140,6 +189,8 @@ type codexTUIBrokerFixture struct {
 	tuiSQLiteHome string
 	appServerArgs string
 	appSQLiteHome string
+	migrationArgs string
+	migrationEnv  string
 	events        string
 }
 
@@ -163,6 +214,8 @@ func writeCodexTUIBrokerFixture(t *testing.T) codexTUIBrokerFixture {
 	tuiSQLiteHome := filepath.Join(dir, "tui.sqlite-home")
 	appServerArgs := filepath.Join(dir, "app-server.args")
 	appSQLiteHome := filepath.Join(dir, "app-server.sqlite-home")
+	migrationArgs := filepath.Join(dir, "migration.args")
+	migrationEnv := filepath.Join(dir, "migration.env")
 	events := filepath.Join(dir, "events")
 	t.Setenv(codexrunner.RemoteBrokerAuthTokenEnv, "poisoned-inherited-token")
 	script := fmt.Sprintf(`#!/bin/sh
@@ -172,10 +225,36 @@ case "${1:-}" in
     echo 'codex-cli 0.133.0'
     exit 0
     ;;
-  --help)
-    echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'
-    exit 0
-    ;;
+	  --help)
+	    echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'
+	    exit 0
+	    ;;
+	  migrate-rollouts)
+	    printf 'migration-start\n' >> %s
+	    printf '%%s\n' "$@" > %s
+	    printf '%%s\n' "${%s:-}" > %s
+	    printf '%%s\n' "${%s:-}" >> %s
+	    printf '%%s\n' "${%s:-}" >> %s
+	    migration_thread_id=
+	    previous=
+	    for arg in "$@"; do
+	      if [ "$previous" = '--thread' ]; then
+	        migration_thread_id="$arg"
+	      fi
+	      previous="$arg"
+	    done
+	    status="${CXP_TEST_MIGRATION_STATUS:-migrated}"
+	    if [ "$status" = 'process-failure' ]; then
+	      echo 'migration process failed' >&2
+	      exit 17
+	    fi
+	    if [ "$status" = 'bad-json' ]; then
+	      printf 'not-json\n'
+	      exit 0
+	    fi
+	    printf '{"outcomes":[{"thread_id":"%%s","status":"%%s"}]}\n' "$migration_thread_id" "$status"
+	    exit 0
+	    ;;
 	  app-server)
 	    printf 'app-server-start\n' >> %s
 	    printf '%%s\n' "$@" > %s
@@ -208,11 +287,11 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-	`, shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
+	`, shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(migrationArgs), envCodexHome, shellSingleQuoteForBeaconCLITest(migrationEnv), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(migrationEnv), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(migrationEnv), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return codexTUIBrokerFixture{path: path, workDir: workDir, tuiArgs: tuiArgs, tuiAuthToken: tuiAuthToken, tuiSQLiteHome: tuiSQLiteHome, appServerArgs: appServerArgs, appSQLiteHome: appSQLiteHome, events: events}
+	return codexTUIBrokerFixture{path: path, workDir: workDir, tuiArgs: tuiArgs, tuiAuthToken: tuiAuthToken, tuiSQLiteHome: tuiSQLiteHome, appServerArgs: appServerArgs, appSQLiteHome: appSQLiteHome, migrationArgs: migrationArgs, migrationEnv: migrationEnv, events: events}
 }
 
 func newCodexOpenTestStore(t *testing.T) *config.Store {
@@ -250,6 +329,40 @@ func assertStandardBrokerLaunch(t *testing.T, fixture codexTUIBrokerFixture) {
 		if strings.Contains(appArgs, forbidden) || strings.Contains(strings.Join(tuiArgs, "\n"), forbidden) {
 			t.Fatalf("launch retained forbidden execution signal %q", forbidden)
 		}
+	}
+}
+
+func assertCodexRolloutMigration(t *testing.T, fixture codexTUIBrokerFixture, threadID string) {
+	t.Helper()
+	wantArgs := []string{"migrate-rollouts", "--apply", "--thread", threadID, "--json"}
+	if got := readArgLines(t, fixture.migrationArgs); !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("migration args = %#v, want %#v", got, wantArgs)
+	}
+	envRaw, err := os.ReadFile(fixture.migrationEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envLines := strings.Split(strings.TrimSuffix(string(envRaw), "\n"), "\n")
+	if len(envLines) != 3 || strings.TrimSpace(envLines[0]) == "" || envLines[1] != "" || envLines[2] != "" {
+		t.Fatalf("migration environment = %#v, want Codex home plus no broker token/SQLite home", envLines)
+	}
+	eventsRaw, err := os.ReadFile(fixture.events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := strings.Fields(string(eventsRaw))
+	migrationIndex := indexOfString(events, "migration-start")
+	appServerIndex := indexOfString(events, "app-server-start")
+	tuiIndex := indexOfString(events, "tui-start")
+	if migrationIndex < 0 || appServerIndex < 0 || tuiIndex < 0 || migrationIndex >= appServerIndex || appServerIndex >= tuiIndex {
+		t.Fatalf("lifecycle events = %#v, want migration before app-server before TUI", events)
+	}
+}
+
+func assertNoCodexRolloutMigration(t *testing.T, fixture codexTUIBrokerFixture) {
+	t.Helper()
+	if _, err := os.Stat(fixture.migrationArgs); !os.IsNotExist(err) {
+		t.Fatalf("unexpected rollout migration invocation: stat err=%v", err)
 	}
 }
 

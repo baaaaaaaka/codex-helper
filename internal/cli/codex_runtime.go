@@ -210,7 +210,11 @@ func runCodexCLIInvocation(
 		if invocation.Command != "" {
 			tail = append([]string{invocation.Command}, invocation.Args...)
 		}
-		return runCodexTUIInvocationViaBroker(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.AgentAutoApprove, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, opts.Log)
+		threadID := ""
+		if invocation.Command == "resume" {
+			threadID = explicitCodexResumeThreadID(invocation.Args)
+		}
+		return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.AgentAutoApprove, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, threadID, opts.Log)
 	case "exec", "e":
 		execArgs := codexFacadeArgsWithGlobalInputs(invocation, invocation.Args)
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, execArgs)
