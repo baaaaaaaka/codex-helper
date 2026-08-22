@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-08-22T13:04:32Z",
+  "generated_at": "2026-08-22T17:33:23Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.22_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.22_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.22_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.22_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.22-rc.22",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-08-22T17:16:19Z",
+      "tag_name": "v0.1.22-rc.22",
+      "version": "0.1.22-rc.22"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-06-28T07:28:36Z",
       "tag_name": "v0.1.13-rc.23",
       "version": "0.1.13-rc.23"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.22_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.22_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.22_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.22_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.13-rc.22 \u2014 transparent migration and hardened original-Codex broker",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-06-28T05:28:31Z",
-      "tag_name": "v0.1.13-rc.22",
-      "version": "0.1.13-rc.22"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
