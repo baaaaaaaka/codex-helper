@@ -28175,7 +28175,7 @@ func TestBridgeSyncLinkedTranscriptBlocksOrphanContinuationWithoutDurableTurn(t 
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptBlocksContinuationAfterCompletedOuterTurnWithoutAnchor(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptQuarantinesContinuationAfterCompletedOuterTurnWithoutAnchor(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	threadID := "thread-completed-outer-orphan"
 	initial := `{"type":"session_meta","payload":{"id":"` + threadID + `"}}` + "\n" +
@@ -28205,20 +28205,17 @@ func TestBridgeSyncLinkedTranscriptBlocksContinuationAfterCompletedOuterTurnWith
 	if strings.Contains(joined, "orphan child answer must not be published") {
 		t.Fatalf("continuation leaked after completed outer turn: %s", joined)
 	}
-	if !strings.Contains(joined, "previous Codex execution is still unconfirmed") {
-		t.Fatalf("continuation blocker notice missing: %#v", *sent)
-	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.UnresolvedExecution == nil {
-		t.Fatalf("continuation did not persist an execution anchor: %#v", checkpoint)
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("continuation did not remain history-only: %#v", checkpoint)
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptBlocksContinuationBeforeIncompleteTail(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptQuarantinesContinuationBeforeIncompleteTail(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	threadID := "thread-continuation-incomplete-tail"
 	initial := `{"type":"session_meta","payload":{"id":"` + threadID + `"}}` + "\n" +
@@ -28248,16 +28245,13 @@ func TestBridgeSyncLinkedTranscriptBlocksContinuationBeforeIncompleteTail(t *tes
 	if strings.Contains(joined, "child answer before incomplete tail must not be published") {
 		t.Fatalf("continuation leaked before incomplete tail settled: %s", joined)
 	}
-	if !strings.Contains(joined, "previous Codex execution is still unconfirmed") {
-		t.Fatalf("continuation blocker notice missing: %#v", *sent)
-	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.UnresolvedExecution == nil {
-		t.Fatalf("continuation did not persist an execution anchor: %#v", checkpoint)
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("continuation did not remain history-only: %#v", checkpoint)
 	}
 }
 
@@ -29458,7 +29452,7 @@ func TestBridgePendingTranscriptPauseKeepsCheckpointCursor(t *testing.T) {
 	}
 }
 
-func TestBridgeSyncExistingEmptyCheckpointUsesFailClosedScanner(t *testing.T) {
+func TestBridgeSyncExistingEmptyCheckpointUsesHistoryOnlyQuarantine(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	lines := []string{
 		`{"type":"session_meta","payload":{"id":"thread-empty-checkpoint"}}`,
@@ -29516,8 +29510,8 @@ func TestBridgeSyncExistingEmptyCheckpointUsesFailClosedScanner(t *testing.T) {
 		t.Fatalf("load state after sync: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.UnresolvedExecution == nil || strings.TrimSpace(checkpoint.UnresolvedExecution.State) == "resolved" {
-		t.Fatalf("empty checkpoint sync did not persist unresolved anchor: %#v", checkpoint)
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("empty checkpoint sync did not persist history-only quarantine: %#v", checkpoint)
 	}
 }
 
@@ -31463,7 +31457,7 @@ func TestBridgeSyncLinkedTranscriptRetriesRemainingRecordsFromSameLine(t *testin
 	}
 }
 
-func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t *testing.T) {
+func TestBridgeSyncLinkedTranscriptPacesLargeAutomaticBacklogWithoutBlocking(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -31507,23 +31501,24 @@ func TestBridgeSyncLinkedTranscriptBlocksLargeAutomaticBacklogWithoutAdvancing(t
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("backlog sync error: %v", err)
 	}
-	if len(*sent) != 0 {
-		t.Fatalf("large automatic backlog should stay silent, sent=%#v", *sent)
+	if len(*sent) == 0 || len(*sent) > transcriptSyncMaxRecordsPerSessionPerCycle {
+		t.Fatalf("large automatic backlog was not paced to one cycle: sent=%d messages=%#v", len(*sent), *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s001")]
-	if checkpoint.LastRecordID != "source:old" || checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("checkpoint = %#v, want blocked without advancing past source:old", checkpoint)
+	if checkpoint.LastRecordID == "source:old" || checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastOffset <= 0 || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("checkpoint = %#v, want a resumable cursor inside the backlog", checkpoint)
 	}
 
+	sentAfterFirstCycle := len(*sent)
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
 		t.Fatalf("repeat backlog sync error: %v", err)
 	}
-	if len(*sent) != 0 {
-		t.Fatalf("silent blocked backlog should not repeat, sent=%#v", *sent)
+	if len(*sent) <= sentAfterFirstCycle {
+		t.Fatalf("second paced backlog cycle did not deliver more history: first=%d second=%d", sentAfterFirstCycle, len(*sent))
 	}
 }
 
@@ -31620,7 +31615,7 @@ func TestBridgeSyncLinkedTranscriptRecoversOldBlockedBackgroundBacklog(t *testin
 	}
 }
 
-func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testing.T) {
+func TestBridgeWorkPublishHistoryCompletesPacedBacklogAndRunsQueuedTurn(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -31653,8 +31648,8 @@ func TestBridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn(t *testi
 	if err != nil {
 		t.Fatalf("Load blocked state error: %v", err)
 	}
-	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status != importCheckpointStatusBlocked {
-		t.Fatalf("automatic backlog was not quarantined in the checkpoint: %#v", checkpoint)
+	if checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]; checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastRecordID == "source:old" {
+		t.Fatalf("automatic backlog did not make resumable progress: %#v", checkpoint)
 	}
 
 	inbound, _, err := store.PersistInbound(context.Background(), teamstore.InboundEvent{
@@ -36506,6 +36501,45 @@ func TestBridgeMainLoopOutboxFlushUsesSmallBudget(t *testing.T) {
 				t.Fatalf("queued messages after budgeted flush = %d, want 2", queued)
 			}
 		})
+	}
+}
+
+func TestBridgeTargetedOutboxFlushUsesCountAndByteBudget(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	body := strings.Repeat("x", 200*1024)
+	for i := 0; i < targetedOutboxFlushMaxMessages+2; i++ {
+		msg := teamstore.OutboxMessage{
+			ID:          fmt.Sprintf("outbox:targeted-budget-%d", i),
+			TeamsChatID: "chat-targeted-budget",
+			Kind:        "helper",
+			Body:        body,
+		}
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %d error: %v", i, err)
+		}
+	}
+
+	if err := bridge.flushPendingOutboxForChat(ctx, "chat-targeted-budget"); err != nil {
+		t.Fatalf("targeted outbox flush error: %v", err)
+	}
+	if got := len(*sent); got != 2 {
+		t.Fatalf("targeted flush sent %d messages, want 2 under %d-byte budget", got, targetedOutboxFlushMaxBytes)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load state: %v", err)
+	}
+	queued := 0
+	for _, msg := range state.OutboxMessages {
+		if msg.Status == teamstore.OutboxStatusQueued {
+			queued++
+		}
+	}
+	if queued != targetedOutboxFlushMaxMessages {
+		t.Fatalf("queued messages after targeted byte budget = %d, want %d", queued, targetedOutboxFlushMaxMessages)
 	}
 }
 

@@ -453,7 +453,7 @@ func (g *GraphClient) SendHTML(ctx context.Context, chatID string, html string) 
 }
 
 func (g *GraphClient) SendHTMLWithoutRateLimitRetry(ctx context.Context, chatID string, html string) (ChatMessage, error) {
-	return g.sendHTMLWithOptions(ctx, chatID, html, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendHTMLWithOptions(ctx, chatID, html, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 }
 
 func (g *GraphClient) sendHTMLWithOptions(ctx context.Context, chatID string, html string, opts graphRequestOptions) (ChatMessage, error) {
@@ -473,7 +473,7 @@ func (g *GraphClient) SendHTMLWithMentions(ctx context.Context, chatID string, h
 }
 
 func (g *GraphClient) SendHTMLWithMentionsWithoutRateLimitRetry(ctx context.Context, chatID string, html string, mentions []ChatMention) (ChatMessage, error) {
-	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendHTMLWithMentionsWithOptions(ctx, chatID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 }
 
 func (g *GraphClient) SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx context.Context, chatID string, html string, mentions []ChatMention, hosted []OutboundHostedContent) (ChatMessage, error) {
@@ -498,7 +498,7 @@ func (g *GraphClient) SendHTMLWithHostedContentsWithoutRateLimitRetry(ctx contex
 		body["hostedContents"] = payload
 	}
 	var msg ChatMessage
-	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 	return msg, err
 }
 
@@ -507,7 +507,7 @@ func (g *GraphClient) SendHTMLReplyWithQuote(ctx context.Context, chatID string,
 }
 
 func (g *GraphClient) SendHTMLReplyWithQuoteWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention) (ChatMessage, error) {
-	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendHTMLReplyWithQuoteWithOptions(ctx, chatID, messageID, html, mentions, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 }
 
 func (g *GraphClient) SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRetry(ctx context.Context, chatID string, messageID string, html string, mentions []ChatMention, hosted []OutboundHostedContent) (ChatMessage, error) {
@@ -540,7 +540,7 @@ func (g *GraphClient) SendHTMLReplyWithQuoteAndHostedContentsWithoutRateLimitRet
 		"replyMessage": replyMessage,
 	}
 	var msg ChatMessage
-	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages/replyWithQuote", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	err = g.doWithOptions(ctx, http.MethodPost, "/chats/"+url.PathEscape(chatID)+"/messages/replyWithQuote", body, &msg, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 	return msg, err
 }
 
@@ -841,7 +841,7 @@ func (g *GraphClient) SendDriveItemAttachment(ctx context.Context, chatID string
 }
 
 func (g *GraphClient) SendDriveItemAttachmentWithoutRateLimitRetry(ctx context.Context, chatID string, item DriveItem, message string) (ChatMessage, error) {
-	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, "", graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, "", graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 }
 
 func (g *GraphClient) SendDriveItemAttachmentWithProvenance(ctx context.Context, chatID string, item DriveItem, message string, outboxID string) (ChatMessage, error) {
@@ -849,7 +849,7 @@ func (g *GraphClient) SendDriveItemAttachmentWithProvenance(ctx context.Context,
 }
 
 func (g *GraphClient) SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(ctx context.Context, chatID string, item DriveItem, message string, outboxID string) (ChatMessage, error) {
-	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, outboxID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.sendDriveItemAttachmentWithProvenanceAndOptions(ctx, chatID, item, message, outboxID, graphRequestOptions{returnRateLimitWithoutRetry: true, noReplayAfterFirstRequest: true})
 }
 
 func (g *GraphClient) sendDriveItemAttachmentWithProvenanceAndOptions(ctx context.Context, chatID string, item DriveItem, message string, outboxID string, opts graphRequestOptions) (ChatMessage, error) {
@@ -1188,6 +1188,11 @@ func trimGraphBasePath(requestURI string, baseURL string) string {
 
 type graphRequestOptions struct {
 	returnRateLimitWithoutRetry bool
+	// noReplayAfterFirstRequest is used for non-idempotent outbox POSTs. Once
+	// the HTTP client has handed the request to the network, an auth refresh,
+	// 429/5xx retry, or fallback must not issue a second POST with unknown
+	// external outcome. The caller records the result as ambiguous instead.
+	noReplayAfterFirstRequest bool
 }
 
 func (g *GraphClient) do(ctx context.Context, method string, path string, body any, out any) error {
@@ -1226,7 +1231,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		if err != nil {
 			return err
 		}
-		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !opts.noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
 			token, err = g.auth.RefreshAccessToken(ctx)
 			if err != nil {
@@ -1235,7 +1240,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		retryable := !opts.noReplayAfterFirstRequest && shouldRetryGraphRequest(method, resp.StatusCode)
 		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
 			retryable = false
 		}

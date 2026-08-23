@@ -40,7 +40,7 @@ func TestHistoryTieredScanTailQuarantinesRealGoalContinuationTaskStarted(t *test
 	}
 }
 
-func TestHistoryWatchRewindsZeroOffsetFinalBeforeContinuation(t *testing.T) {
+func TestHistoryWatchAdvancesPhysicalCursorPastContinuation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "zero-offset-watch.jsonl")
 	transcript := "{" + `"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"outer"}}` + "\n" +
 		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}` + "\n" +
@@ -68,8 +68,54 @@ func TestHistoryWatchRewindsZeroOffsetFinalBeforeContinuation(t *testing.T) {
 	if checkpoint.LastFinalStartOffset != 0 || !checkpoint.LastFinalStartOffsetKnown {
 		t.Fatalf("zero-offset final boundary = offset %d known=%v, want 0/true", checkpoint.LastFinalStartOffset, checkpoint.LastFinalStartOffsetKnown)
 	}
-	if checkpoint.Offset != 0 {
-		t.Fatalf("history watch advanced past protected zero-offset final: offset=%d checkpoint=%#v", checkpoint.Offset, checkpoint)
+	if checkpoint.Offset <= 0 || checkpoint.Offset != int64(len(transcript)) {
+		t.Fatalf("history watch did not commit the physical cursor: offset=%d checkpoint=%#v", checkpoint.Offset, checkpoint)
+	}
+	if checkpoint.PendingHistoryRange == nil || checkpoint.PendingHistoryRange.StartOffset <= 0 || checkpoint.PendingHistoryRange.ExclusiveEnd != checkpoint.Offset {
+		t.Fatalf("history watch missing bounded pending range: %#v", checkpoint)
+	}
+}
+
+func TestHistoryTieredScanUnresolvedContinuationReleasesAfterLaterPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "continuation-recovery.jsonl")
+	initial := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-continuation-recovery"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"outer-turn","phase":"final_answer","message":"outer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"outer-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn","started_at":1786181089,"model_context_window":258400,"collaboration_mode_kind":"default"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","turn_id":"child-turn","phase":"final_answer","message":"child must wait"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if !first.State.UnresolvedContinuation || first.State.Offset != int64(len(initial)) {
+		t.Fatalf("first scan state=%#v, want unresolved at physical EOF", first.State)
+	}
+
+	appendLine(t, path, `{"type":"response_item","payload":{"id":"new-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"new explicit Teams request"}]}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"new-root","started_at":1786181090,"model_context_window":258400,"collaboration_mode_kind":"default"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"new-root","phase":"final_answer","message":"new root answer"}}`)
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	if second.State.UnresolvedContinuation || second.State.PendingHistoryRange != nil || second.State.TranscriptQuarantine != nil {
+		t.Fatalf("later prompt did not release unresolved range: state=%#v", second.State)
+	}
+	if len(second.Finals) != 1 || second.Finals[0].Record.Text != "new root answer" {
+		t.Fatalf("second scan finals=%#v, want only new root answer", second.Finals)
+	}
+
+	repeat, err := historyTieredScanTail(path, second.State, 1<<20)
+	if err != nil {
+		t.Fatalf("repeat scan: %v", err)
+	}
+	if len(repeat.Finals) != 0 {
+		t.Fatalf("repeat scan finals=%#v, want no duplicate", repeat.Finals)
 	}
 }
 
@@ -101,8 +147,49 @@ func TestHistoryWatchQuarantinesMirrorAmbiguityWithoutExecutionFence(t *testing.
 	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedContinuation {
 		t.Fatalf("mirror ambiguity became an execution fence: %#v", checkpoint)
 	}
-	if checkpoint.Offset != 0 || checkpoint.LastFinalID != "" {
-		t.Fatalf("mirror ambiguity advanced the logical history cursor: %#v", checkpoint)
+	if checkpoint.Offset <= 0 || checkpoint.PendingHistoryRange == nil {
+		t.Fatalf("mirror ambiguity did not retain a physical cursor plus pending range: %#v", checkpoint)
+	}
+}
+
+func TestHistoryWatchAdvancesPastMalformedRecordWithoutLivelock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "malformed-watch.jsonl")
+	contents := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-watch-malformed"}}`,
+		`{"broken":`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write malformed transcript: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("first malformed history-watch sync: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load first history-watch state: %v", err)
+	}
+	checkpoint, ok := state.HistoryWatch[historyWatchCheckpointID(path)]
+	if !ok {
+		t.Fatalf("malformed history-watch checkpoint missing: %#v", state.HistoryWatch)
+	}
+	if checkpoint.Offset != int64(len(contents)) || checkpoint.Line != 2 {
+		t.Fatalf("malformed history-watch cursor = %#v, want offset %d/line 2", checkpoint, len(contents))
+	}
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.Kind != "malformed_record" || checkpoint.UnresolvedContinuation {
+		t.Fatalf("malformed history-watch disposition = %#v, want opaque history-only quarantine", checkpoint)
+	}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("repeat malformed history-watch sync: %v", err)
+	}
+	repeated, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load repeated history-watch state: %v", err)
+	}
+	checkpoint = repeated.HistoryWatch[historyWatchCheckpointID(path)]
+	if checkpoint.Offset != int64(len(contents)) || checkpoint.Line != 2 {
+		t.Fatalf("repeat malformed history-watch cursor = %#v, want stable consumed boundary", checkpoint)
 	}
 }
 
@@ -721,16 +808,16 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNoIDChildEventMessage(t *testing.T
 	if sentPlainContains(*sent, "anonymous child answer") {
 		t.Fatalf("anonymous child answer leaked through bridge: %#v", *sent)
 	}
-	if len(*sent) != 1 || !sentPlainContains(*sent, "previous Codex execution is still unconfirmed") || !sentPlainContains(*sent, "helper publish-history") {
-		t.Fatalf("execution-ownership ambiguity was not reported exactly once: %#v", *sent)
+	if len(*sent) != 0 {
+		t.Fatalf("history-only ambiguity emitted a live execution notice: %#v", *sent)
 	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.LastRecordID == "" {
-		t.Fatalf("checkpoint = %#v, want blocked at the prior cursor", checkpoint)
+	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastRecordID == "" || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.PendingHistoryRange == nil || checkpoint.LastOffset <= int64(len(initial)) {
+		t.Fatalf("checkpoint = %#v, want non-blocking history-only quarantine after physical progress", checkpoint)
 	}
 	firstNoticeCount := strings.Count(sentPlainJoined(*sent), "helper publish-history")
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
@@ -738,7 +825,7 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNoIDChildEventMessage(t *testing.T
 	}
 	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if got := strings.Count(sentPlainJoined(*sent), "helper publish-history"); got != firstNoticeCount {
-		t.Fatalf("needs-attention notice repeated: before=%d after=%d sent=%#v", firstNoticeCount, got, *sent)
+		t.Fatalf("history-only quarantine emitted a repeat notice: before=%d after=%d sent=%#v", firstNoticeCount, got, *sent)
 	}
 }
 
@@ -757,7 +844,7 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSourceIDChildEventMessageWithoutTu
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-source-id")
+	session := seedLinkedTranscriptForTest(t, bridge, path, "thread-s462-linked-source-id")
 	*sent = nil
 	appendLine(t, path, `{"type":"event_msg","payload":{"id":"child-final","type":"agent_message","phase":"final_answer","message":"source-id child answer without turn provenance"}}`)
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
@@ -767,8 +854,16 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSourceIDChildEventMessageWithoutTu
 	if sentPlainContains(*sent, "source-id child answer without turn provenance") {
 		t.Fatalf("source-ID child answer leaked through bridge: %#v", *sent)
 	}
-	if len(*sent) != 1 || !sentPlainContains(*sent, "previous Codex execution is still unconfirmed") || !sentPlainContains(*sent, "helper publish-history") {
-		t.Fatalf("execution-ownership ambiguity was not reported exactly once: %#v", *sent)
+	if len(*sent) != 0 {
+		t.Fatalf("history-only ambiguity emitted a live execution notice: %#v", *sent)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state: %v", err)
+	}
+	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("checkpoint = %#v, want history-only quarantine", checkpoint)
 	}
 }
 
@@ -939,6 +1034,64 @@ func TestBridgeSyncLinkedTranscriptAdvancesPastOversizedRecord(t *testing.T) {
 	flushBridgeQueuedNotificationsForTest(t, bridge)
 	if sentPlainContains(*sent, "helper publish-history") {
 		t.Fatalf("changed oversized-record sync emitted a recovery gate: %#v", *sent)
+	}
+}
+
+func TestBridgeSyncLinkedTranscriptAdvancesPastMalformedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	threadID := "thread-s520-malformed"
+	initial := `{"type":"session_meta","payload":{"id":"` + threadID + `"}}` + "\n" +
+		`{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	restoreDiscover := stubDiscoverCodexSession(t, threadID, path)
+	defer restoreDiscover()
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := seedLinkedTranscriptForTest(t, bridge, path, threadID)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load seeded state: %v", err)
+	}
+	before := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
+	malformed := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"broken-turn","message":"broken"}` + "\n"
+	after := `{"type":"event_msg","payload":{"id":"after-malformed","type":"agent_message","thread_id":"` + threadID + `","turn_id":"new-turn","phase":"final_answer","message":"after malformed"}}` + "\n"
+	if err := os.WriteFile(path, []byte(initial+malformed+after), 0o600); err != nil {
+		t.Fatalf("write malformed continuation: %v", err)
+	}
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("first malformed sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if sentPlainContains(*sent, "after malformed") || sentPlainContains(*sent, "helper publish-history") {
+		t.Fatalf("malformed boundary emitted later history or a gate: %#v", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load malformed checkpoint: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint := state.ImportCheckpoints[checkpointID]
+	if checkpoint.LastOffset <= before.LastOffset || checkpoint.LastOffset >= checkpoint.SourceSize {
+		t.Fatalf("malformed checkpoint = %#v, want cursor after malformed line and before final", checkpoint)
+	}
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.Kind != "malformed_record" {
+		t.Fatalf("malformed checkpoint quarantine = %#v", checkpoint.TranscriptQuarantine)
+	}
+	if checkpoint.UnresolvedExecution != nil {
+		t.Fatalf("malformed history created live execution owner: %#v", checkpoint.UnresolvedExecution)
+	}
+
+	*sent = nil
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("resume after malformed sync: %v", err)
+	}
+	flushBridgeQueuedNotificationsForTest(t, bridge)
+	if !sentPlainContains(*sent, "after malformed") {
+		t.Fatalf("later final was not delivered after malformed boundary: %#v", *sent)
 	}
 }
 
@@ -1253,6 +1406,36 @@ func TestHistoryTieredScanTailKeepsSameTextAcrossExplicitTurns(t *testing.T) {
 	}
 }
 
+func TestHistoryTieredScanTailDoesNotCompactSameTextAcrossPromptScopes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "same-text-prompt-scopes.jsonl")
+	body := strings.Join([]string{
+		`{"type":"event_msg","payload":{"id":"anonymous-final","type":"agent_message","phase":"final_answer","message":"same scoped text"}}`,
+		`{"type":"response_item","thread_id":"thread-same-scope","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"new outer request"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"new-turn","started_at":1786181089,"model_context_window":128000,"collaboration_mode_kind":"default"}}`,
+		`{"type":"response_item","thread_id":"thread-same-scope","payload":{"type":"message","role":"assistant","turn":{"id":"new-turn"},"phase":"final_answer","content":[{"type":"output_text","text":"same scoped text"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{
+		Path:                      path,
+		ThreadID:                  "thread-same-scope",
+		TerminalBoundarySeen:      true,
+		LastFinalID:               "prior-final",
+		LastFinalStartOffsetKnown: true,
+		LastFinalStartOffset:      1,
+	}, 1<<20)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.UnresolvedContinuation {
+		t.Fatalf("same-text finals across a visible prompt were gated as an execution owner: state=%#v quarantined=%#v", result.State, result.QuarantinedFinals)
+	}
+	if len(result.Finals) != 1 || result.Finals[0].Record.Text != "same scoped text" || result.Finals[0].Record.TurnID != "new-turn" {
+		t.Fatalf("same-text prompt scopes finals = %#v, want the new request final", result.Finals)
+	}
+}
+
 func TestBridgeSyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"type":"session_meta","payload":{"id":"thread-mixed-bridge"}}` + "\n" +
@@ -1285,8 +1468,8 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror(t *testin
 		t.Fatalf("load mixed-ID state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
-		t.Fatalf("mixed-ID checkpoint = %#v, want silent transcript quarantine", checkpoint)
+	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.PendingHistoryRange == nil {
+		t.Fatalf("mixed-ID checkpoint = %#v, want non-blocking silent transcript quarantine", checkpoint)
 	}
 }
 
@@ -1322,8 +1505,8 @@ func TestBridgeSyncLinkedTranscriptQuarantinesSameSourceMixedIDMirror(t *testing
 		t.Fatalf("load same-source mixed-ID state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status != importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
-		t.Fatalf("same-source mixed-ID checkpoint = %#v, want silent transcript quarantine", checkpoint)
+	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.PendingHistoryRange == nil {
+		t.Fatalf("same-source mixed-ID checkpoint = %#v, want non-blocking silent transcript quarantine", checkpoint)
 	}
 }
 

@@ -406,6 +406,52 @@ func TestGraphRetriesPostTooManyRequestsAfterRetryAfter(t *testing.T) {
 	}
 }
 
+func TestGraphOutboxPostDoesNotReplayAfterRateLimit(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var attempts int
+	var sleeps []time.Duration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		attempts++
+		if req.Method != http.MethodPost || req.URL.String() != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+		}
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"send outcome unknown"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, &sleeps)
+	_, err := graph.SendHTMLWithoutRateLimitRetry(context.Background(), "chat-1", "outbox message")
+	if err == nil {
+		t.Fatal("expected rate-limit error")
+	}
+	if attempts != 1 || len(sleeps) != 0 {
+		t.Fatalf("outbox POST replayed after 429: attempts=%d sleeps=%v", attempts, sleeps)
+	}
+}
+
+func TestGraphOutboxPostDoesNotRefreshAndReplayAfterUnauthorized(t *testing.T) {
+	auth := &fakeGraphAuth{token: "old-access", refreshedToken: "new-access"}
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		attempts++
+		if req.Method != http.MethodPost || req.URL.String() != "/chats/chat-1/messages" {
+			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+		}
+		http.Error(w, `{"error":{"code":"InvalidAuthenticationToken","message":"expired"}}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	_, err := graph.SendHTMLWithoutRateLimitRetry(context.Background(), "chat-1", "outbox message")
+	if err == nil {
+		t.Fatal("expected unauthorized error")
+	}
+	if attempts != 1 || auth.refreshCalls != 0 {
+		t.Fatalf("outbox POST refreshed/replayed after 401: attempts=%d refreshes=%d", attempts, auth.refreshCalls)
+	}
+}
+
 func TestGraphStatusErrorRedactsDynamicPathValues(t *testing.T) {
 	err := (&GraphStatusError{
 		Method:     http.MethodGet,

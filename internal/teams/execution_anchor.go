@@ -101,7 +101,7 @@ type executionAnchorTailObservation struct {
 }
 
 func executionAnchorActive(anchor *teamstore.ExecutionAnchor) bool {
-	return anchor != nil && strings.TrimSpace(anchor.State) != "resolved"
+	return anchor != nil && strings.TrimSpace(anchor.State) != "resolved" && !teamstore.ExecutionAnchorIsHistoryOnly(anchor)
 }
 
 func executionAnchorForLegacyTurn(session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint, turn teamstore.Turn) teamstore.ExecutionAnchor {
@@ -116,6 +116,7 @@ func executionAnchorForLegacyTurn(session Session, local codexhistory.Session, c
 		SourcePath:        sourcePath,
 		SourceFingerprint: strings.TrimSpace(checkpoint.SourceFingerprint),
 		Reason:            strings.TrimSpace(turn.RecoveryReason),
+		Provenance:        teamstore.ExecutionAnchorProvenanceRuntime,
 		State:             executionAnchorStateUnresolved,
 		Generation:        1,
 		CreatedAt:         now,
@@ -205,6 +206,13 @@ func (b *Bridge) ensureUnresolvedExecutionAnchor(ctx context.Context, session Se
 		if executionAnchorActive(current.UnresolvedExecution) {
 			next := *current.UnresolvedExecution
 			changed := false
+			if strings.TrimSpace(next.Provenance) == "" {
+				// Rows created before typed provenance are not upgraded to runtime
+				// proof silently. Keep them fail-closed as legacy_unknown until an
+				// real execution path writes a fresh anchor.
+				next.Provenance = teamstore.ExecutionAnchorProvenanceLegacy
+				changed = true
+			}
 			if next.Generation <= 0 {
 				next.Generation = current.ExecutionAnchorGeneration
 				if next.Generation <= 0 {
@@ -302,6 +310,7 @@ func (b *Bridge) persistUnresolvedExecutionAnchorForTurn(ctx context.Context, se
 			OuterTurnID: strings.TrimSpace(turn.ID),
 			CodexTurnID: strings.TrimSpace(turn.CodexTurnID),
 			Reason:      strings.TrimSpace(turn.RecoveryReason),
+			Provenance:  teamstore.ExecutionAnchorProvenanceRuntime,
 			State:       executionAnchorStateUnresolved,
 		},
 	}
@@ -813,22 +822,10 @@ func (b *Bridge) sessionLiveExecutionOwnershipUnresolved(ctx context.Context, se
 	if err != nil {
 		return true, err
 	}
-	checkpointID := transcriptCheckpointID(session.ID)
 	if !unresolved {
-		checkpoint := state.ImportCheckpoints[checkpointID]
-		quarantine := checkpoint.TranscriptQuarantine
-		if quarantine == nil {
-			return false, nil
-		}
-		if strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
-			return true, nil
-		}
-		liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
-		if err != nil {
-			return true, err
-		}
-		return strings.TrimSpace(quarantine.LiveBranchThreadID) != liveSessionThreadID, nil
+		return false, nil
 	}
+	checkpointID := transcriptCheckpointID(session.ID)
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	anchor := checkpoint.UnresolvedExecution
 	liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
@@ -852,23 +849,7 @@ func (b *Bridge) liveTurnExecutionOwnershipUnresolved(ctx context.Context, sessi
 	}
 	checkpointID := transcriptCheckpointID(session.ID)
 	if !unresolved {
-		checkpoint := state.ImportCheckpoints[checkpointID]
-		quarantine := checkpoint.TranscriptQuarantine
-		if quarantine == nil {
-			return false, nil
-		}
-		if strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
-			return true, nil
-		}
-		liveSessionThreadID, err := b.durableSessionThreadID(ctx, session)
-		if err != nil {
-			return true, err
-		}
-		liveThread := strings.TrimSpace(quarantine.LiveBranchThreadID)
-		if liveThread == liveSessionThreadID || liveThread == strings.TrimSpace(turn.CodexThreadID) {
-			return false, nil
-		}
-		return true, nil
+		return false, nil
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
 	anchor := checkpoint.UnresolvedExecution

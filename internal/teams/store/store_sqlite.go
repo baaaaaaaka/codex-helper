@@ -5968,6 +5968,7 @@ func materializeSQLiteLegacyExecutionAnchorTx(ctx context.Context, tx *sql.Tx, s
 		SourcePath:        strings.TrimSpace(checkpoint.SourcePath),
 		SourceFingerprint: strings.TrimSpace(checkpoint.SourceFingerprint),
 		Reason:            strings.TrimSpace(turn.RecoveryReason),
+		Provenance:        ExecutionAnchorProvenanceLegacy,
 		State:             "unresolved",
 		Generation:        generation,
 		CreatedAt:         firstStoreNonZeroTime(turn.InterruptedAt, turn.UpdatedAt, turn.CreatedAt, time.Now()),

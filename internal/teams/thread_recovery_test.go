@@ -491,11 +491,11 @@ func TestBridgeAcceptsTeamsTurnOnFreshBranchAfterUnresolvedHistoryOwner(t *testi
 	}
 }
 
-func TestBridgeAcceptsTeamsTurnAfterTranscriptQuarantineOnFreshBranch(t *testing.T) {
+func TestBridgeAcceptsTeamsTurnAfterTranscriptQuarantineOnExistingBranch(t *testing.T) {
 	ctx := context.Background()
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
-	executor := &recordingExecutor{result: ExecutionResult{Text: "transcript quarantine branch answer", CodexThreadID: "thread-new", CodexTurnID: "codex-new"}}
+	executor := &recordingExecutor{result: ExecutionResult{Text: "transcript quarantine branch answer", CodexThreadID: "thread-old", CodexTurnID: "codex-new"}}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.asyncTurns = false
 	session := bridge.reg.SessionByID("s001")
@@ -520,8 +520,8 @@ func TestBridgeAcceptsTeamsTurnAfterTranscriptQuarantineOnFreshBranch(t *testing
 	if err := bridge.handleSessionMessage(ctx, session.ChatID, bridgePollMessage("transcript-quarantine-prompt", "2026-08-21T01:00:00Z", "continue after the mirror"), "continue after the mirror"); err != nil {
 		t.Fatalf("handle Teams prompt after transcript quarantine: %v", err)
 	}
-	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "" {
-		t.Fatalf("executor session = %#v, want a fresh empty thread", executor.sessions)
+	if len(executor.sessions) != 1 || executor.sessions[0].CodexThreadID != "thread-old" {
+		t.Fatalf("executor session = %#v, want the existing live thread", executor.sessions)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
@@ -531,11 +531,11 @@ func TestBridgeAcceptsTeamsTurnAfterTranscriptQuarantineOnFreshBranch(t *testing
 		t.Fatalf("transcript-quarantine turn status = %q, want completed", got)
 	}
 	checkpoint := state.ImportCheckpoints[checkpointID]
-	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.LiveBranchThreadID != "thread-new" {
-		t.Fatalf("transcript quarantine branch projection = %#v, want retained history-only quarantine on thread-new", checkpoint)
+	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.LiveBranchThreadID != "" {
+		t.Fatalf("transcript quarantine became a live branch projection = %#v", checkpoint)
 	}
-	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-new" {
-		t.Fatalf("durable session thread = %q, want thread-new", got)
+	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-old" {
+		t.Fatalf("durable session thread = %q, want thread-old", got)
 	}
 }
 

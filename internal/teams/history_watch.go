@@ -366,11 +366,13 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 			}
 			id := historyWatchCheckpointID(path)
 			fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, info.Size()))
+			generation := historyTieredSourceIdentity(path, info)
 			historyWatch[id] = teamstore.HistoryWatchCheckpoint{
 				ID:                   id,
 				Path:                 path,
 				Size:                 info.Size(),
 				ModTime:              info.ModTime(),
+				SourceGeneration:     generation,
 				SourceFingerprint:    fingerprint,
 				SourceRewriteBlocked: info.Size() > 0 && fingerprint == "",
 				Offset:               info.Size(),
@@ -521,59 +523,35 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		}
 		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, result.State, now)
 	}
-	if result.State.TranscriptQuarantine != nil && !result.State.UnresolvedContinuation {
+	historyOnlyDisposition := false
+	if result.State.TranscriptQuarantine != nil && !result.State.UnresolvedContinuation &&
+		!historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine) {
 		// A mirror/anonymous-final ambiguity is a history frontier, not proof
-		// that a Codex process still owns the thread. Keep the logical cursor at
-		// the previous durable position and persist only the bounded observation;
-		// do not create an execution anchor or emit a blocker notice.
-		blockedState := previous
-		blockedState.Path = path
-		if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() {
-			blockedState.Size = info.Size()
-			blockedState.ModTime = info.ModTime()
+		// that a Codex process still owns the thread. Keep the physical cursor
+		// monotonic and retain one bounded semantic range; do not create an
+		// execution anchor or emit a blocker notice. Continue through the normal
+		// safe-final path below so a final before the ambiguous range is not lost.
+		historyOnlyDisposition = true
+		if result.State.PendingHistoryRange == nil {
+			start := result.State.TranscriptQuarantine.FrontierOffset
+			end := result.State.Offset
+			result.State.PendingHistoryRange = historyTieredPendingHistoryRange(result.State, start, end, result.State.TranscriptQuarantine.Kind)
 		}
-		blockedState.TranscriptQuarantine = result.State.TranscriptQuarantine
-		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
 	}
+	// A malformed or complete oversized JSONL record is an opaque byte-range
+	// disposition, not an execution boundary. The scanner has already consumed
+	// its newline and reset parser context, so keep the physical cursor and let
+	// the normal final-publish path handle any safe records before that gap. A
+	// later poll resumes after the gap instead of retrying it forever.
 	if result.State.UnresolvedContinuation {
-		// Do not publish finals from a tail that contains execution-bearing work
-		// after a previous terminal boundary. Persist the marker before returning
-		// so a helper restart cannot forget this fail-closed decision.
-		blockedState := result.State
-		if blockedState.UnresolvedContinuationOffset >= 0 && blockedState.UnresolvedContinuationOffset < blockedState.Offset {
-			blockedState.Offset = blockedState.UnresolvedContinuationOffset
-			blockedState.Line = blockedState.UnresolvedContinuationLine
-			if blockedState.LastFinalStartOffsetKnown && blockedState.LastFinalStartOffset < blockedState.Offset {
-				blockedState.Offset = blockedState.LastFinalStartOffset
-				blockedState.Line = blockedState.LastFinalLine - 1
-				if blockedState.Line < 0 {
-					blockedState.Line = 0
-				}
-			}
-			if strings.TrimSpace(blockedState.LastFinalID) == "" {
-				blockedState.LastFinalID = previous.LastFinalID
-			}
-			if !blockedState.LastFinalStartOffsetKnown {
-				blockedState.LastFinalStartOffset = previous.LastFinalStartOffset
-				blockedState.LastFinalStartOffsetKnown = previous.LastFinalStartOffsetKnown
-			}
-			if blockedState.LastFinalLine == 0 {
-				blockedState.LastFinalLine = previous.LastFinalLine
-			}
-			if blockedState.SessionID == "" {
-				blockedState.SessionID = previous.SessionID
-			}
-			if blockedState.ThreadID == "" {
-				blockedState.ThreadID = previous.ThreadID
-			}
-			if blockedState.TurnID == "" {
-				blockedState.TurnID = previous.TurnID
-			}
-			if blockedState.pendingAssistant.Record.ItemID == "" {
-				blockedState.pendingAssistant = previous.pendingAssistant
-			}
+		// Do not publish the ambiguous child tail, but do commit the physical
+		// cursor and its exact bounded pending range. Rewinding to the marker was
+		// the s512 livelock: every poll rediscovered the same final/marker pair.
+		// Safe finals before that boundary continue through the normal publish path.
+		historyOnlyDisposition = true
+		if result.State.PendingHistoryRange == nil {
+			result.State.PendingHistoryRange = historyTieredPendingHistoryRange(result.State, result.State.UnresolvedContinuationOffset, result.State.Offset, "unresolved_continuation")
 		}
-		return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, blockedState, now)
 	}
 	// The scanner's bounded read proof covers the bytes that produced the
 	// records below.  Prefix validation alone is insufficient here: an
@@ -592,9 +570,13 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && !historyWatchSourcePrefixMatches(path, previous) {
 		return blockSourceRewrite()
 	}
-	start, err := b.publishHistoryWatchSessionStart(ctx, path, result)
-	if err != nil {
-		return err
+	start := historyWatchSessionStartResult{}
+	if !historyOnlyDisposition {
+		var err error
+		start, err = b.publishHistoryWatchSessionStart(ctx, path, result)
+		if err != nil {
+			return err
+		}
 	}
 	if start.blocked {
 		return nil
@@ -623,6 +605,13 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 			return err
 		}
 		if !handled {
+			if historyOnlyDisposition {
+				// Without a discovered destination there is no safe way to claim
+				// this final as delivered. Preserve the durable history-only
+				// boundary, matching the old watcher behavior, and let a later
+				// discovery or explicit import choose the destination.
+				return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint, result.State, now)
+			}
 			return nil
 		}
 		if !historyWatchReadProofMatches(path, result) {
@@ -727,6 +716,7 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		Path:                          strings.TrimSpace(checkpoint.Path),
 		Size:                          checkpoint.Size,
 		ModTime:                       checkpoint.ModTime,
+		SourceGeneration:              strings.TrimSpace(checkpoint.SourceGeneration),
 		SourceFingerprint:             strings.TrimSpace(checkpoint.SourceFingerprint),
 		SourceRewriteBlocked:          checkpoint.SourceRewriteBlocked,
 		LegacySourceUnverified:        checkpoint.LegacySourceUnverified,
@@ -757,8 +747,9 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		// watcher namespace that ID is a real final boundary (unlike linked
 		// transcript checkpoints, whose LastRecordID may be any record), so
 		// hydrate the explicit boundary bit for incremental ownership checks.
-		TerminalBoundarySeen:         checkpoint.TerminalBoundarySeen || strings.TrimSpace(checkpoint.LastFinalID) != "",
+		TerminalBoundarySeen:         checkpoint.TerminalBoundarySeen || checkpoint.TerminalBoundary != nil || strings.TrimSpace(checkpoint.LastFinalID) != "",
 		TerminalBoundaryLine:         checkpoint.TerminalBoundaryLine,
+		TerminalBoundary:             checkpoint.TerminalBoundary,
 		UnresolvedContinuation:       checkpoint.UnresolvedContinuation,
 		UnresolvedContinuationLine:   checkpoint.UnresolvedContinuationLine,
 		UnresolvedContinuationOffset: checkpoint.UnresolvedContinuationOffset,
@@ -766,6 +757,8 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		PendingRootTaskStartedLine:   checkpoint.PendingRootTaskStartedLine,
 		PendingRootTaskStartedOffset: checkpoint.PendingRootTaskStartedOffset,
 		TranscriptQuarantine:         checkpoint.TranscriptQuarantine,
+		ContextGap:                   checkpoint.ContextGap,
+		PendingHistoryRange:          checkpoint.PendingHistoryRange,
 		pendingAssistant:             historyWatchPendingAssistantFromCheckpoint(checkpoint),
 	}
 }
@@ -809,6 +802,7 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		Path:                   strings.TrimSpace(state.Path),
 		Size:                   state.Size,
 		ModTime:                state.ModTime,
+		SourceGeneration:       strings.TrimSpace(state.SourceGeneration),
 		SourceFingerprint:      strings.TrimSpace(state.SourceFingerprint),
 		SourceRewriteBlocked:   state.SourceRewriteBlocked,
 		LegacySourceUnverified: state.LegacySourceUnverified,
@@ -837,8 +831,9 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		LastFinalThreadID:             strings.TrimSpace(state.LastFinalThreadID),
 		LastFinalTurnID:               strings.TrimSpace(state.LastFinalTurnID),
 		LastFinalTextHash:             strings.TrimSpace(state.LastFinalTextHash),
-		TerminalBoundarySeen:          state.TerminalBoundarySeen,
+		TerminalBoundarySeen:          state.TerminalBoundarySeen || state.TerminalBoundary != nil,
 		TerminalBoundaryLine:          state.TerminalBoundaryLine,
+		TerminalBoundary:              state.TerminalBoundary,
 		UnresolvedContinuation:        state.UnresolvedContinuation,
 		UnresolvedContinuationLine:    state.UnresolvedContinuationLine,
 		UnresolvedContinuationOffset:  state.UnresolvedContinuationOffset,
@@ -846,6 +841,8 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		PendingRootTaskStartedLine:    state.PendingRootTaskStartedLine,
 		PendingRootTaskStartedOffset:  state.PendingRootTaskStartedOffset,
 		TranscriptQuarantine:          state.TranscriptQuarantine,
+		ContextGap:                    state.ContextGap,
+		PendingHistoryRange:           state.PendingHistoryRange,
 		UpdatedAt:                     now,
 	}
 	applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)

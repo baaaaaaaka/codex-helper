@@ -65,30 +65,40 @@ const (
 	persistentPollFailureRestartMinCount    = 3
 	recentDuplicateSessionPromptWindow      = 3 * time.Minute
 
-	// Automatic transcript sync is for small local Codex CLI catch-up. Large
-	// history import must stay explicit, otherwise helper startup can flood a
-	// Teams chat and delay inbound polling.
+	// Automatic transcript sync is deliberately bounded per cycle.  A large
+	// backlog must be paced by the scanner cursor and this per-cycle limit, not
+	// converted into a permanent history checkpoint block that users cannot
+	// recover from during ordinary polling.
 	transcriptSyncMaxRecordsPerSessionPerCycle = 8
 	liveTranscriptBackfillMaxRecords           = 3
-	transcriptSyncMaxAutoBacklogRecords        = 80
-	transcriptImportMaxBatchesPerCycle         = 1
-	transcriptImportBatchSeparatorHTML         = "<p>&nbsp;</p>"
-	mainLoopOutboxFlushMaxMessages             = 2
-	outboxFlushPendingPageSize                 = 64
-	stagedAttachmentReconcileGrace             = 24 * time.Hour
-	mainLoopWorkflowFlushMaxNotifications      = 1
-	maxQueuedTurnStartsPerCycle                = 16
-	attachmentUploadCheckpointBytes            = 64 * 1024 * 1024
-	attachmentUploadCheckpointInterval         = 30 * time.Second
-	maxParkNoticeSendsPerPollCycle             = maxWorkChatPollsPerCycle
-	autoParkSweepInterval                      = time.Minute
-	autoParkCandidatePrefetch                  = 16
-	autoParkCandidatesPerSweep                 = 1
-	autoParkSweepGraphTimeout                  = 10 * time.Second
-	parkNoticeGraphFallbackLookupTTL           = 5 * time.Minute
-	graphOutboxSendMinInterval                 = 1200 * time.Millisecond
-	sqliteWALCheckpointMinInterval             = 5 * time.Minute
-	sqliteWALCheckpointMinBytes                = 64 * 1024 * 1024
+	// Kept as a fixture-size constant for compatibility with historical tests;
+	// it is no longer an automatic blocking threshold.
+	transcriptSyncMaxAutoBacklogRecords = 80
+	transcriptImportMaxBatchesPerCycle  = 1
+	transcriptImportBatchSeparatorHTML  = "<p>&nbsp;</p>"
+	mainLoopOutboxFlushMaxMessages      = 2
+	// A synchronous chat-triggered flush must make progress for the new live
+	// request without allowing an old history backlog to monopolize the chat
+	// lane.  The first message is always allowed, even when it is larger than
+	// the byte budget; otherwise one large but valid answer could starve the
+	// queue forever.
+	targetedOutboxFlushMaxMessages        = 8
+	targetedOutboxFlushMaxBytes           = 512 * 1024
+	outboxFlushPendingPageSize            = 64
+	stagedAttachmentReconcileGrace        = 24 * time.Hour
+	mainLoopWorkflowFlushMaxNotifications = 1
+	maxQueuedTurnStartsPerCycle           = 16
+	attachmentUploadCheckpointBytes       = 64 * 1024 * 1024
+	attachmentUploadCheckpointInterval    = 30 * time.Second
+	maxParkNoticeSendsPerPollCycle        = maxWorkChatPollsPerCycle
+	autoParkSweepInterval                 = time.Minute
+	autoParkCandidatePrefetch             = 16
+	autoParkCandidatesPerSweep            = 1
+	autoParkSweepGraphTimeout             = 10 * time.Second
+	parkNoticeGraphFallbackLookupTTL      = 5 * time.Minute
+	graphOutboxSendMinInterval            = 1200 * time.Millisecond
+	sqliteWALCheckpointMinInterval        = 5 * time.Minute
+	sqliteWALCheckpointMinBytes           = 64 * 1024 * 1024
 
 	// Live Graph chat sends in this tenant failed at 102,290 bytes of HTML
 	// body content. Split far below that to reduce Teams client rendering
@@ -12175,6 +12185,7 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 		Path:                      local.FilePath,
 		Size:                      checkpoint.SourceSize,
 		ModTime:                   checkpoint.SourceModTime,
+		SourceGeneration:          strings.TrimSpace(checkpoint.SourceGeneration),
 		SourceFingerprint:         strings.TrimSpace(checkpoint.SourceFingerprint),
 		Offset:                    checkpoint.LastOffset,
 		Line:                      checkpoint.LastSourceLine,
@@ -12194,8 +12205,11 @@ func (b *Bridge) completedTurnResultFromLinkedTranscript(ctx context.Context, se
 		LastFinalThreadID:         strings.TrimSpace(checkpoint.LastFinalThreadID),
 		LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
 		LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
-		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen,
+		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || checkpoint.TerminalBoundary != nil,
 		TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
+		TerminalBoundary:          checkpoint.TerminalBoundary,
+		ContextGap:                checkpoint.ContextGap,
+		PendingHistoryRange:       checkpoint.PendingHistoryRange,
 	}
 	recovered, ok := b.completedTurnResultFromLocalCodexHistorySince(ctx, session, turn, observed, local, previous)
 	if !ok {
@@ -15169,7 +15183,11 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 }
 
 func (b *Bridge) flushPendingOutboxForChat(ctx context.Context, chatID string) error {
-	return b.flushPendingOutboxFiltered(ctx, "", "", chatID)
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", chatID, outboxFlushOptions{
+		MaxMessages:              targetedOutboxFlushMaxMessages,
+		MaxBytes:                 targetedOutboxFlushMaxBytes,
+		SkipUnresolvedTranscript: true,
+	})
 }
 
 func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID string, turnID string, chatID string) error {
@@ -15178,6 +15196,7 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 
 type outboxFlushOptions struct {
 	MaxMessages         int
+	MaxBytes            int
 	AllowAmbiguousRetry bool
 	// AllowProtectedAmbiguousBypass lets a newly-created, distinct user turn
 	// continue past a protected outbox row whose external Graph result is
@@ -15713,6 +15732,8 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		recoveryProbeBudget := 1
 		recoveryPageBudget := outboxRecoveryMaxPagesPerFlush
 		sent := 0
+		sentBytes := 0
+		budgetExhausted := false
 		pageLimit := outboxFlushPendingPageSize
 		if opts.MaxMessages > 0 && opts.MaxMessages < pageLimit {
 			pageLimit = opts.MaxMessages
@@ -15740,6 +15761,10 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
 			})
 			for _, msg := range pending {
+				if opts.MaxBytes > 0 && sent > 0 && sentBytes+len(msg.Body) > opts.MaxBytes {
+					budgetExhausted = true
+					break
+				}
 				if opts.SkipUnresolvedTranscript && isTranscriptAnswerOutbox(msg) {
 					if anchorCache == nil {
 						anchorCache = make(map[string]teamstore.ExecutionAnchor)
@@ -15769,11 +15794,17 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 					continue
 				}
 				sent++
+				sentBytes += len(msg.Body)
 				if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+					budgetExhausted = true
+					break
+				}
+				if opts.MaxBytes > 0 && sentBytes >= opts.MaxBytes {
+					budgetExhausted = true
 					break
 				}
 			}
-			if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+			if budgetExhausted {
 				break
 			}
 			if !page.More {
@@ -15787,7 +15818,7 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		if firstErr != nil {
 			return firstErr
 		}
-		if opts.MaxMessages > 0 && sent >= opts.MaxMessages {
+		if budgetExhausted {
 			return nil
 		}
 		return firstBlockedErr
@@ -21231,13 +21262,25 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	}
 	sourceProof := transcriptSourceProofQueueOptions(checkpoint)
 	addTranscriptReadProofToQueueOptions(&sourceProof, transcript)
+	refreshCheckpoint := func() error {
+		latest, found, err := b.store.ImportCheckpoint(ctx, checkpointID)
+		if err != nil {
+			return err
+		}
+		if found {
+			checkpoint = latest
+			hasCheckpoint = true
+		}
+		return nil
+	}
 	persistConsumedProgress := func() error {
 		if transcript.Consumed == nil {
 			return nil
 		}
-		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(
+		observation := transcriptCheckpointObservationForTranscript(transcript, &checkpoint, hasCheckpoint)
+		return b.recordTranscriptCheckpointObservation(
 			ctx, session, local.FilePath, transcript.Consumed.RecordID, transcript.Consumed.Line,
-			transcript.Consumed.Offset, checkpointID, sourceProof, session.ID,
+			transcript.Consumed.Offset, checkpointID, sourceProof, session.ID, observation,
 		)
 	}
 	if transcript.Partial != nil {
@@ -21247,20 +21290,30 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		if err := b.persistLinkedTranscriptPartial(ctx, session, local.FilePath, checkpoint, transcript.Partial); err != nil {
 			return err
 		}
+		if err := refreshCheckpoint(); err != nil {
+			return err
+		}
 	}
 	deferUnresolvedContinuation := transcript.UnresolvedContinuation
 	if transcript.UnresolvedContinuation && len(transcript.Records) == 0 {
-		// There is no safe prefix to deliver before the execution boundary. Keep
-		// the existing durable owner fence for this case; transcript-only mirror
-		// ambiguity is represented by TranscriptQuarantine below and never reaches
-		// this branch.
-		return b.blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx, session, local, checkpoint)
+		// There is no safe prefix to deliver before the execution boundary. This
+		// is still transcript evidence, not proof that an app-server process owns
+		// the chat. Commit the physical cursor plus the bounded pending range
+		// before retaining the silent history-only quarantine; otherwise the same
+		// marker is scanned forever and s512 never reaches later evidence.
+		if err := persistConsumedProgress(); err != nil {
+			return err
+		}
+		return b.persistHistoryOnlyContinuationQuarantine(ctx, session, local, checkpoint, transcript)
 	}
 	if transcript.TranscriptQuarantine != nil {
 		// Persist only the bounded history frontier. This is deliberately silent:
 		// the next user request must not be turned into an unresolved-execution
 		// warning merely because the local transcript has two possible mirrors.
 		if err := b.persistTranscriptQuarantine(ctx, session, local.FilePath, checkpoint, transcript.TranscriptQuarantine); err != nil {
+			return err
+		}
+		if err := refreshCheckpoint(); err != nil {
 			return err
 		}
 	}
@@ -21327,16 +21380,13 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 	teamsOriginHashes := teamsOriginTextHashes(state, session.ID)
 	teamsOriginDisplays := teamsOriginDisplayTexts(state, session.ID)
 	teamsOriginTerminalHashes := teamsOriginTerminalTextHashes(state, session.ID)
-	knownForCount := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	now := time.Now()
-	visibleBacklog := countVisibleTranscriptSyncRecords(state, session, local, transcript.Records, teamsOriginHashes, teamsOriginDisplays, teamsOriginTerminalHashes, knownForCount, newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now, checkpoint))
-	if visibleBacklog > transcriptSyncMaxAutoBacklogRecords {
-		return b.blockAutomaticTranscriptSync(ctx, session, local.FilePath, checkpoint, visibleBacklog)
-	}
 	dedupe := newTranscriptDedupeState()
 	known := newKnownTranscriptOutboxDedupeState(state, session.ID, checkpoint.UpdatedAt)
 	recentTeamsMirror := newRecentCompletedTeamsTranscriptMirrorSkipper(state, session.ID, now, checkpoint)
 	sent := 0
+	processedAllTranscriptRecords := false
+	checkpointNeedsRefresh := false
 	pendingCheckpoint := transcriptImportCheckpointRecord{}
 	hasPendingCheckpoint := false
 	var pendingFinalBoundary *TranscriptFinalBoundary
@@ -21355,26 +21405,71 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		if !hasPendingCheckpoint {
 			return nil
 		}
-		checkpoint := pendingCheckpoint
+		pending := pendingCheckpoint
 		hasPendingCheckpoint = false
 		boundary := pendingFinalBoundary
 		pendingFinalBoundary = nil
+		observation := transcriptCheckpointObservationForTranscript(transcript, &checkpoint, hasCheckpoint)
+		var err error
 		if boundary == nil {
-			return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID)
+			err = b.recordTranscriptCheckpointObservation(ctx, session, local.FilePath, pending.Key, pending.SourceLine, pending.SourceOffset, checkpointID, sourceProof, session.ID, observation)
+		} else {
+			err = b.recordTranscriptCheckpointObservation(ctx, session, local.FilePath, pending.Key, pending.SourceLine, pending.SourceOffset, checkpointID, sourceProof, session.ID, observation, *boundary)
 		}
-		return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, local.FilePath, checkpoint.Key, checkpoint.SourceLine, checkpoint.SourceOffset, checkpointID, sourceProof, session.ID, *boundary)
+		if err != nil {
+			return err
+		}
+		// A scan may flush several bounded visible prefixes in one cycle. Refresh
+		// the optimistic snapshot after each successful CAS so the next prefix is
+		// compared with the cursor this reader actually committed, not the stale
+		// snapshot from the beginning of the scan.
+		if latest, found, loadErr := b.store.ImportCheckpoint(ctx, checkpointID); loadErr != nil {
+			return loadErr
+		} else if found {
+			checkpoint = latest
+			hasCheckpoint = true
+		}
+		checkpointNeedsRefresh = false
+		return nil
+	}
+	persistDeferredHistoryQuarantine := func() error {
+		current, found, err := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(session.ID))
+		if err != nil {
+			return err
+		}
+		if !found {
+			current = checkpoint
+		}
+		return b.persistHistoryOnlyContinuationQuarantine(ctx, session, local, current, transcript)
 	}
 	finishSafePrefix := func() error {
 		if err := flushPendingCheckpoint(); err != nil {
 			return err
 		}
+		if checkpointNeedsRefresh {
+			if err := refreshCheckpoint(); err != nil {
+				return err
+			}
+			checkpointNeedsRefresh = false
+		}
+		if len(transcript.Records) > 0 && !processedAllTranscriptRecords {
+			// The scanner may have read a complete bounded prefix containing
+			// more records than this cycle is allowed to deliver.  Consumed is
+			// the scanner's physical end, not proof that every visible record
+			// before it was delivered; never jump over the unsent suffix.
+			if deferUnresolvedContinuation {
+				return persistDeferredHistoryQuarantine()
+			}
+			return nil
+		}
 		if err := persistConsumedProgress(); err != nil {
 			return err
 		}
 		if deferUnresolvedContinuation {
-			// Establish the owner fence only after the safe prefix has committed;
-			// otherwise the fence correctly prevents even that prefix's CAS.
-			return b.blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx, session, local, checkpoint)
+			// The scanner found an ambiguous history boundary after the safe
+			// prefix. Persist only a history quarantine; never promote this
+			// transcript observation into an execution owner or a live queue gate.
+			return persistDeferredHistoryQuarantine()
 		}
 		return nil
 	}
@@ -21412,6 +21507,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			if err := b.recordSkippedTranscriptDeliveryWithSourceProofAndParentFence(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, sourceProof, session.ID, finalBoundary...); err != nil {
 				return err
 			}
+			checkpointNeedsRefresh = true
 			hasPendingCheckpoint = false
 			continue
 		}
@@ -21433,6 +21529,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 		if err := b.queueAndSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts); err != nil {
 			return err
 		}
+		checkpointNeedsRefresh = true
 		hasPendingCheckpoint = false
 		sent++
 		if sent >= transcriptSyncMaxRecordsPerSessionPerCycle {
@@ -21442,6 +21539,7 @@ func (b *Bridge) syncSessionTranscriptFromSnapshot(ctx context.Context, session 
 			return finishSafePrefix()
 		}
 	}
+	processedAllTranscriptRecords = true
 	return finishSafePrefix()
 }
 
@@ -21541,6 +21639,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		}
 		previous := historyTieredFileState{
 			Path:                      filePath,
+			SourceGeneration:          strings.TrimSpace(checkpoint.SourceGeneration),
 			PartialLineStartOffset:    checkpoint.PartialLineStartOffset,
 			PartialReadOffset:         checkpoint.PartialReadOffset,
 			PartialObservedSize:       checkpoint.PartialObservedSize,
@@ -21553,8 +21652,9 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			Line:                      checkpoint.LastSourceLine,
 			SessionID:                 strings.TrimSpace(sessionID),
 			ThreadID:                  strings.TrimSpace(threadID),
-			TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
+			TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || checkpoint.TerminalBoundary != nil || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
 			TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
+			TerminalBoundary:          checkpoint.TerminalBoundary,
 			LastFinalID:               firstNonEmptyString(checkpoint.LastFinalID, checkpoint.LastRecordID),
 			LastFinalLine:             checkpoint.LastFinalLine,
 			LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
@@ -21563,6 +21663,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
 			LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
 			TranscriptQuarantine:      checkpoint.TranscriptQuarantine,
+			ContextGap:                checkpoint.ContextGap,
+			PendingHistoryRange:       checkpoint.PendingHistoryRange,
 		}
 		result, err := historyTieredScanTail(filePath, previous, historyTieredMaxTailBytes)
 		if err != nil {
@@ -21588,7 +21690,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			// Keep only the records before an unresolved or still-pending marker.
 			// Explicit `publish-history` re-reads the full suffix below; automatic
 			// live callers must never see the quarantined child tail.
-			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
+			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation ||
+				(result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine))
 			pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 			if blocked {
 				records = filterTranscriptRecordsBeforeExecutionBoundary(records, historyTieredBoundaryOffset(result.State))
@@ -21622,7 +21725,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		}
 		if !result.Truncated && !result.Incomplete {
 			records := filterTranscriptRecordsAfterCheckpoint(result.Records, checkpoint.LastRecordID)
-			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
+			blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation ||
+				(result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine))
 			pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 			if blocked {
 				records = filterTranscriptRecordsBeforeExecutionBoundary(records, historyTieredBoundaryOffset(result.State))
@@ -21643,6 +21747,7 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 	// machine, then filter only after the saved key is proven present.
 	previous := historyTieredFileState{
 		Path:                      filePath,
+		SourceGeneration:          strings.TrimSpace(checkpoint.SourceGeneration),
 		PartialLineStartOffset:    checkpoint.PartialLineStartOffset,
 		PartialReadOffset:         checkpoint.PartialReadOffset,
 		PartialObservedSize:       checkpoint.PartialObservedSize,
@@ -21651,8 +21756,9 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		PartialSourceIdentity:     strings.TrimSpace(checkpoint.PartialSourceIdentity),
 		SessionID:                 strings.TrimSpace(sessionID),
 		ThreadID:                  strings.TrimSpace(threadID),
-		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
+		TerminalBoundarySeen:      checkpoint.TerminalBoundarySeen || checkpoint.TerminalBoundary != nil || linkedCheckpointPrefixHasTerminalBoundaryForThread(filePath, checkpoint.LastOffset, threadID),
 		TerminalBoundaryLine:      checkpoint.TerminalBoundaryLine,
+		TerminalBoundary:          checkpoint.TerminalBoundary,
 		LastFinalID:               firstNonEmptyString(checkpoint.LastFinalID, checkpoint.LastRecordID),
 		LastFinalLine:             checkpoint.LastFinalLine,
 		LastFinalStartOffset:      checkpoint.LastFinalStartOffset,
@@ -21661,6 +21767,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 		LastFinalTurnID:           strings.TrimSpace(checkpoint.LastFinalTurnID),
 		LastFinalTextHash:         strings.TrimSpace(checkpoint.LastFinalTextHash),
 		TranscriptQuarantine:      checkpoint.TranscriptQuarantine,
+		ContextGap:                checkpoint.ContextGap,
+		PendingHistoryRange:       checkpoint.PendingHistoryRange,
 	}
 	result, err := historyTieredScanTail(filePath, previous, historyTieredMaxTailBytes)
 	if err != nil {
@@ -21685,7 +21793,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 				Message: "transcript checkpoint was not found in the complete prefix; refusing to guess an import position",
 			}}}, nil
 		}
-		blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
+		blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation ||
+			(result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine))
 		pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 		if blocked {
 			filtered = filterTranscriptRecordsBeforeExecutionBoundary(filtered, historyTieredBoundaryOffset(result.State))
@@ -21711,7 +21820,8 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 			Message: "transcript checkpoint was not found; refusing to guess an import position",
 		}}}, nil
 	}
-	blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation || result.State.TranscriptQuarantine != nil
+	blocked := result.State.PendingRootTaskStarted || result.State.UnresolvedContinuation ||
+		(result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine))
 	pending := result.State.PendingRootTaskStarted && !result.State.UnresolvedContinuation
 	if blocked {
 		filtered = filterTranscriptRecordsBeforeExecutionBoundary(filtered, historyTieredBoundaryOffset(result.State))
@@ -21729,14 +21839,45 @@ func (b *Bridge) readLinkedTranscriptDelta(filePath string, checkpoint teamstore
 func withHistoryTieredReadProof(transcript Transcript, result historyTieredTailResult) Transcript {
 	transcript.TailBudgetExhausted = result.TooLarge || result.BudgetExhausted
 	transcript.FinalBoundary = historyTieredFinalBoundaryFromResult(result)
-	if !result.Incomplete && !result.Truncated && !result.State.UnresolvedContinuation && result.State.TranscriptQuarantine == nil {
+	transcript.ContextGap = result.State.ContextGap
+	transcript.TerminalBoundary = result.State.TerminalBoundary
+	if !result.Incomplete && !result.Truncated {
 		consumedID := strings.TrimSpace(result.LastConsumedRecordID)
 		consumedLine := result.LastConsumedLine
 		consumedOffset := result.LastConsumedOffset
+		if result.State.UnresolvedContinuation {
+			// The physical scanner has already consumed complete records through
+			// the current bounded snapshot, but the suffix is not publishable.
+			// Persist that physical progress with a bounded semantic range instead
+			// of rewinding to the marker and livelocking forever.
+			if pending := historyTieredPendingHistoryRange(result.State, result.State.UnresolvedContinuationOffset, result.State.Offset, "unresolved_continuation"); pending != nil {
+				transcript.PendingHistoryRange = pending
+			}
+		}
+		if result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine) && transcript.PendingHistoryRange == nil {
+			start := result.State.TranscriptQuarantine.FrontierOffset
+			if start < 0 {
+				start = result.State.Offset
+			}
+			end := result.State.TranscriptQuarantine.ExclusiveEndOffset
+			if end < result.State.Offset {
+				end = result.State.Offset
+			}
+			transcript.PendingHistoryRange = historyTieredPendingHistoryRange(result.State, start, end, result.State.TranscriptQuarantine.Kind)
+		}
 		if result.State.PendingRootTaskStarted && result.State.PendingRootTaskStartedEndOffset > result.State.PendingRootTaskStartedOffset {
 			consumedID = historyTieredConsumedRecordKey(result.State.Path, result.State.PendingRootTaskStartedLine, result.State.PendingRootTaskStartedOffset, result.State.PendingRootTaskStartedEndOffset)
 			consumedLine = result.State.PendingRootTaskStartedLine
 			consumedOffset = result.State.PendingRootTaskStartedEndOffset
+		}
+		if result.State.UnresolvedContinuation || (result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine)) {
+			if result.State.Offset > 0 && result.State.Offset >= consumedOffset {
+				consumedOffset = result.State.Offset
+				consumedLine = result.State.Line
+				if consumedID == "" {
+					consumedID = historyTieredConsumedRecordKey(result.State.Path, result.State.Line, 0, result.State.Offset)
+				}
+			}
 		}
 		if consumedID != "" && consumedLine > 0 && consumedOffset > 0 {
 			transcript.Consumed = &TranscriptConsumedProgress{
@@ -21763,6 +21904,26 @@ func withHistoryTieredReadProof(transcript Transcript, result historyTieredTailR
 		transcript.SourceReadProofRangeKnown = true
 	}
 	return transcript
+}
+
+func historyTieredPendingHistoryRange(state historyTieredFileState, startOffset, endOffset int64, kind string) *teamstore.HistoryPendingRange {
+	if endOffset <= startOffset || startOffset < 0 || strings.TrimSpace(state.SourceGeneration) == "" {
+		return nil
+	}
+	fingerprint := transcriptSourceRangeFingerprint(state.Path, startOffset, endOffset)
+	if strings.TrimSpace(fingerprint) == "" {
+		return nil
+	}
+	return &teamstore.HistoryPendingRange{
+		SourceGeneration: strings.TrimSpace(state.SourceGeneration),
+		RangeID:          historyTieredGapID(state.Path, state.SourceGeneration, kind, startOffset, endOffset),
+		Kind:             strings.TrimSpace(firstNonEmptyString(kind, "history_ambiguity")),
+		StartRecordID:    strings.TrimSpace(state.LastFinalID),
+		StartLine:        state.UnresolvedContinuationLine,
+		StartOffset:      startOffset,
+		ExclusiveEnd:     endOffset,
+		RangeFingerprint: fingerprint,
+	}
 }
 
 func historyTieredFinalBoundaryFromResult(result historyTieredTailResult) *TranscriptFinalBoundary {
@@ -22451,6 +22612,8 @@ func (b *Bridge) resetFailedTranscriptCheckpointForExplicitImport(ctx context.Co
 		current.SourceSize = 0
 		current.SourceModTime = time.Time{}
 		current.TranscriptQuarantine = nil
+		current.PendingHistoryRange = nil
+		current.ContextGap = nil
 		current.CompletionPending = false
 		current.Status = importCheckpointStatusComplete
 		current.UpdatedAt = now
@@ -22599,27 +22762,36 @@ func (b *Bridge) blockAutomaticTranscriptSyncForAmbiguousExecution(ctx context.C
 }
 
 func (b *Bridge) blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
-	state, err := b.store.SessionExecutionStateSnapshot(ctx, session.ID, transcriptCheckpointID(session.ID))
-	if err != nil {
-		return err
-	}
-	turn, ambiguous := unresolvedAmbiguousCodexTurn(state, session)
-	if !ambiguous {
-		// There is no durable Teams owner for this continuation. Keep the
-		// synthetic boundary in the existing checkpoint JSON only; do not invent
-		// a durable Turn row that could later be retried as user work.
-		turn = teamstore.Turn{
-			SessionID:      session.ID,
-			CodexThreadID:  firstNonEmptyString(session.CodexThreadID, local.SessionID),
-			RecoveryReason: recoveryReasonAmbiguousCodexExecutionPrefix + " orphan continuation",
-			Status:         teamstore.TurnStatusInterrupted,
+	return b.persistHistoryOnlyContinuationQuarantine(ctx, session, local, checkpoint, Transcript{
+		SourceName:             local.FilePath,
+		UnresolvedContinuation: true,
+	})
+}
+
+func (b *Bridge) persistHistoryOnlyContinuationQuarantine(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint, transcript Transcript) error {
+	quarantine := transcript.TranscriptQuarantine
+	if quarantine == nil {
+		quarantine = &teamstore.TranscriptQuarantine{
+			Kind:              "unresolved_continuation",
+			SourcePath:        firstNonEmptyString(local.FilePath, checkpoint.SourcePath),
+			SourceFingerprint: checkpoint.SourceFingerprint,
+		}
+		if transcript.FinalBoundary != nil {
+			quarantine.FrontierRecordID = transcript.FinalBoundary.ID
+			quarantine.FrontierLine = transcript.FinalBoundary.Line
+			quarantine.FrontierOffset = transcript.FinalBoundary.StartOffset
 		}
 	}
-	checkpoint, err = b.ensureUnresolvedExecutionAnchor(ctx, session, local, checkpoint, turn)
-	if err != nil {
+	// A physical observation may have advanced the checkpoint immediately before
+	// this call. Use the durable winner as the optimistic snapshot so the
+	// quarantine is attached to that new cursor instead of being discarded as a
+	// stale write.
+	if current, found, err := b.store.ImportCheckpoint(ctx, transcriptCheckpointID(session.ID)); err != nil {
 		return err
+	} else if found {
+		checkpoint = current
 	}
-	return b.blockAutomaticTranscriptSyncForAmbiguousExecution(ctx, session, local.FilePath, checkpoint, turn)
+	return b.persistTranscriptQuarantine(ctx, session, local.FilePath, checkpoint, quarantine)
 }
 
 func (b *Bridge) persistTranscriptQuarantine(ctx context.Context, session Session, sourcePath string, previous teamstore.ImportCheckpoint, quarantine *teamstore.TranscriptQuarantine) error {
@@ -22669,7 +22841,14 @@ func (b *Bridge) persistTranscriptQuarantine(ctx context.Context, session Sessio
 			current.SourceModTime = previous.SourceModTime
 		}
 		current.TranscriptQuarantine = &copyQuarantine
-		current.Status = importCheckpointStatusBlocked
+		// This is a history-only disposition. Keep the checkpoint usable for
+		// live admission; `blocked` here used to turn a safe transcript
+		// ambiguity into a chat-wide gate and made the warning recur after
+		// restart. Source rewrite and real runtime ownership have separate
+		// durable predicates.
+		if current.Status == "" || current.Status == importCheckpointStatusBlocked {
+			current.Status = importCheckpointStatusComplete
+		}
 		current.CompletionPending = false
 		if current.UpdatedAt.IsZero() || !importCheckpointSameExceptUpdatedAt(before, current) {
 			current.UpdatedAt = now
@@ -23933,6 +24112,44 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx c
 }
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions, parentFenceSessionID string, finalBoundary ...TranscriptFinalBoundary) error {
+	return b.recordTranscriptCheckpointObservation(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, sourceProof, parentFenceSessionID, nil, finalBoundary...)
+}
+
+// transcriptCheckpointObservation is the narrow extension used when a scan
+// has physically consumed a suffix but must retain a bounded semantic history
+// range. Ordinary visible progress keeps the legacy helper above; gap progress
+// uses this path so cursor and disposition are committed by one checkpoint CAS.
+type transcriptCheckpointObservation struct {
+	// ReplaceSemanticState distinguishes a scanner snapshot that explicitly
+	// observed the current semantic state (including an intentional nil/clear)
+	// from legacy callers that only want to advance the physical cursor.
+	ReplaceSemanticState bool
+	// ExpectedCheckpoint is the scan's optimistic snapshot.  The bridge writer
+	// compares it inside the store CAS so a slow reader cannot overwrite a newer
+	// cursor or semantic disposition at the same offset.
+	ExpectedCheckpoint      *teamstore.ImportCheckpoint
+	ExpectedCheckpointFound bool
+	PendingHistoryRange     *teamstore.HistoryPendingRange
+	ContextGap              *teamstore.ContextGapState
+	TerminalBoundary        *teamstore.TerminalBoundary
+}
+
+func transcriptCheckpointObservationForTranscript(transcript Transcript, expected *teamstore.ImportCheckpoint, expectedFound bool) *transcriptCheckpointObservation {
+	observation := &transcriptCheckpointObservation{
+		ReplaceSemanticState: true,
+		PendingHistoryRange:  transcript.PendingHistoryRange,
+		ContextGap:           transcript.ContextGap,
+		TerminalBoundary:     transcript.TerminalBoundary,
+	}
+	if expected != nil {
+		snapshot := *expected
+		observation.ExpectedCheckpoint = &snapshot
+		observation.ExpectedCheckpointFound = expectedFound
+	}
+	return observation
+}
+
+func (b *Bridge) recordTranscriptCheckpointObservation(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions, parentFenceSessionID string, observation *transcriptCheckpointObservation, finalBoundary ...TranscriptFinalBoundary) error {
 	if b == nil || b.store == nil || strings.TrimSpace(lastRecordID) == "" {
 		return nil
 	}
@@ -23940,13 +24157,38 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
 	sourceSize, sourceModTime := transcriptSourceFileState(sourcePath)
+	sourceGeneration := ""
+	if info, statErr := os.Stat(sourcePath); statErr == nil && !info.IsDir() {
+		sourceGeneration = historyTieredSourceIdentity(sourcePath, info)
+	}
 	updateCheckpoint := func(id string, fn func(teamstore.ImportCheckpoint, bool, time.Time) (teamstore.ImportCheckpoint, bool, error)) (teamstore.ImportCheckpoint, bool, error) {
 		if strings.TrimSpace(parentFenceSessionID) != "" {
 			return b.store.UpdateImportCheckpointIfParentUnfenced(ctx, parentFenceSessionID, id, fn)
 		}
 		return b.store.UpdateImportCheckpoint(ctx, id, fn)
 	}
-	_, _, err := updateCheckpoint(checkpointID, func(previous teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	_, _, err := updateCheckpoint(checkpointID, func(previous teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if observation != nil && observation.ExpectedCheckpoint != nil {
+			expected := *observation.ExpectedCheckpoint
+			expectedCursorUsable := linkedCheckpointOffsetKnown(expected) || (!expected.LastOffsetKnown && expected.LastOffset == 0)
+			sameSource := found && observation.ExpectedCheckpointFound &&
+				cleanComparablePath(previous.SourcePath) == cleanComparablePath(expected.SourcePath) &&
+				(strings.TrimSpace(expected.SourceGeneration) == "" || strings.TrimSpace(previous.SourceGeneration) == strings.TrimSpace(expected.SourceGeneration)) &&
+				linkedCheckpointOffsetKnown(previous) && expectedCursorUsable &&
+				previous.LastOffset >= expected.LastOffset
+			if sameSource && previous.LastOffset >= lastOffset && previous.LastOffset > expected.LastOffset {
+				// A competing reader already committed this or a later physical
+				// cursor for the same source. Never roll it back; the current
+				// reader's outbox dedupe/ledger path will make its stale prefix a
+				// no-op.
+				return previous, false, nil
+			}
+			if found != observation.ExpectedCheckpointFound ||
+				(found && !sameSource) ||
+				(found && sameSource && previous.LastOffset == lastOffset && !importCheckpointSameExceptUpdatedAt(previous, expected)) {
+				return previous, false, teamstore.ErrTranscriptObservationConflict
+			}
+		}
 		if strings.TrimSpace(sourceProof.ExpectedSourceFingerprint) != "" &&
 			!transcriptSourceProofQueueOptionsMatches(sourceProof) {
 			// The outbox may already be queued, but its own sender-side proof will
@@ -23981,7 +24223,7 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 		if status == "" || status == importCheckpointStatusBlocked {
 			status = importCheckpointStatusComplete
 		}
-		if previous.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(previous.ImportTurnID) &&
+		if observation == nil && previous.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(previous.TranscriptQuarantine) && !transcriptImportRunIsExplicitHistory(previous.ImportTurnID) &&
 			!transcriptQuarantineAllowsAutomaticBranch(session, previous, sourcePath) &&
 			!transcriptCheckpointProgressBeforeQuarantine(previous, sourcePath, lastOffset) {
 			// Automatic checkpoint progress must not silently cross a quarantined
@@ -23998,6 +24240,7 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			ID:                            checkpointID,
 			SessionID:                     session.ID,
 			SourcePath:                    sourcePath,
+			SourceGeneration:              firstNonEmptyString(previous.SourceGeneration, sourceGeneration),
 			SourceFingerprint:             firstNonEmptyString(candidateFingerprint, previous.SourceFingerprint),
 			LastRecordID:                  lastRecordID,
 			LastSourceLine:                lastLine,
@@ -24010,6 +24253,8 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			Status:                        status,
 			UnresolvedExecution:           previous.UnresolvedExecution,
 			TranscriptQuarantine:          previous.TranscriptQuarantine,
+			ContextGap:                    previous.ContextGap,
+			PendingHistoryRange:           previous.PendingHistoryRange,
 			ExecutionAnchorGeneration:     previous.ExecutionAnchorGeneration,
 			SourceRewriteBlocked:          previous.SourceRewriteBlocked,
 			LegacySourceUnverified:        previous.LegacySourceUnverified,
@@ -24026,7 +24271,25 @@ func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProofAndPar
 			LastFinalTextHash:             previous.LastFinalTextHash,
 			TerminalBoundarySeen:          previous.TerminalBoundarySeen,
 			TerminalBoundaryLine:          previous.TerminalBoundaryLine,
+			TerminalBoundary:              previous.TerminalBoundary,
 			UpdatedAt:                     now,
+		}
+		if observation != nil {
+			next.ContextGap = observation.ContextGap
+			next.PendingHistoryRange = observation.PendingHistoryRange
+			next.TerminalBoundary = observation.TerminalBoundary
+			if observation.ReplaceSemanticState {
+				next.TerminalBoundarySeen = observation.TerminalBoundary != nil
+				if observation.TerminalBoundary != nil {
+					next.TerminalBoundaryLine = observation.TerminalBoundary.Line
+				} else {
+					next.TerminalBoundaryLine = 0
+				}
+			}
+		}
+		if observation != nil && observation.TerminalBoundary != nil {
+			next.TerminalBoundarySeen = true
+			next.TerminalBoundaryLine = observation.TerminalBoundary.Line
 		}
 		if len(finalBoundary) > 0 && transcriptFinalBoundaryFitsProgress(finalBoundary[0], lastRecordID, lastOffset) {
 			boundary := finalBoundary[0]
@@ -24072,7 +24335,7 @@ func (b *Bridge) recordTranscriptLedgerAfterCheckpointProgress(ctx context.Conte
 	if err != nil || !found {
 		return err
 	}
-	if checkpoint.TranscriptQuarantine != nil && !transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
+	if checkpoint.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(checkpoint.TranscriptQuarantine) && !transcriptImportRunIsExplicitHistory(checkpoint.ImportTurnID) {
 		return teamstore.ErrUnresolvedExecution
 	}
 	checkpoint.SourcePath = firstNonEmptyString(checkpoint.SourcePath, sourcePath)
@@ -24125,6 +24388,7 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 	return left.ID == right.ID &&
 		left.SessionID == right.SessionID &&
 		left.SourcePath == right.SourcePath &&
+		left.SourceGeneration == right.SourceGeneration &&
 		left.SourceRewriteBlocked == right.SourceRewriteBlocked &&
 		left.LegacySourceUnverified == right.LegacySourceUnverified &&
 		left.OversizedRecordBlocked == right.OversizedRecordBlocked &&
@@ -24143,6 +24407,9 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 		left.LastFinalTextHash == right.LastFinalTextHash &&
 		left.TerminalBoundarySeen == right.TerminalBoundarySeen &&
 		left.TerminalBoundaryLine == right.TerminalBoundaryLine &&
+		reflect.DeepEqual(left.TerminalBoundary, right.TerminalBoundary) &&
+		reflect.DeepEqual(left.ContextGap, right.ContextGap) &&
+		reflect.DeepEqual(left.PendingHistoryRange, right.PendingHistoryRange) &&
 		left.SourceSize == right.SourceSize &&
 		left.SourceModTime.Equal(right.SourceModTime) &&
 		left.ImportTurnID == right.ImportTurnID &&
@@ -24385,6 +24652,8 @@ func (b *Bridge) markTranscriptImportCompleteFromResult(ctx context.Context, ses
 			checkpoint.LegacySourceUnverified = false
 		}
 		checkpoint.TranscriptQuarantine = nil
+		checkpoint.PendingHistoryRange = nil
+		checkpoint.ContextGap = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
@@ -24452,6 +24721,8 @@ func (b *Bridge) markTranscriptImportCompleteAtEOFWithSourceProof(ctx context.Co
 			checkpoint.LegacySourceUnverified = false
 		}
 		checkpoint.TranscriptQuarantine = nil
+		checkpoint.PendingHistoryRange = nil
+		checkpoint.ContextGap = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.ImportTurnID = ""
 		checkpoint.KindPrefix = ""
@@ -24564,6 +24835,8 @@ func (b *Bridge) markTranscriptImportPausedAtWithProof(ctx context.Context, sess
 		checkpoint.CompletionPending = false
 		if transcriptImportRunIsExplicitHistory(importTurnID) {
 			checkpoint.TranscriptQuarantine = nil
+			checkpoint.PendingHistoryRange = nil
+			checkpoint.ContextGap = nil
 		}
 		checkpoint.Status = importCheckpointStatusComplete
 		checkpoint.UpdatedAt = now
@@ -24614,6 +24887,8 @@ func (b *Bridge) markTranscriptImportCompleteDetailedWithID(ctx context.Context,
 			checkpoint.LegacySourceUnverified = false
 		}
 		checkpoint.TranscriptQuarantine = nil
+		checkpoint.PendingHistoryRange = nil
+		checkpoint.ContextGap = nil
 		checkpoint.OversizedRecordBlocked = false
 		checkpoint.CompletionPending = false
 		checkpoint.Status = importCheckpointStatusComplete

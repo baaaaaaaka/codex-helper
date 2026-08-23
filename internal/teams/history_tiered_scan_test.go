@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,6 +81,60 @@ func TestTranscriptSourceReadProofAcceptsCompleteOversizedRecordRange(t *testing
 	}
 	if !transcriptSourceReadProofMatches(proof) {
 		t.Fatalf("complete oversized record proof was rejected: range=%d limit=%d", len(body), historyTieredMaxReadProofBytes)
+	}
+}
+
+func TestHistoryTieredScanPersistsTerminalBoundaryWithoutVisibleFinal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "terminal-only.jsonl")
+	body := []byte(`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-terminal-only"}}` + "\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write terminal-only transcript: %v", err)
+	}
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if len(result.Finals) != 0 {
+		t.Fatalf("terminal-only scan produced visible finals: %#v", result.Finals)
+	}
+	boundary := result.State.TerminalBoundary
+	if boundary == nil || boundary.RecordID == "" || boundary.StartOffset != 0 || boundary.ExclusiveEndOffset != int64(len(body)) || boundary.RangeFingerprint == "" {
+		t.Fatalf("terminal-only boundary = %#v, want exact source proof", boundary)
+	}
+	transcript := withHistoryTieredReadProof(Transcript{}, result)
+	if transcript.TerminalBoundary == nil || transcript.TerminalBoundary.RecordID != boundary.RecordID {
+		t.Fatalf("terminal-only boundary was not propagated to Transcript: %#v", transcript.TerminalBoundary)
+	}
+}
+
+func TestHistoryTieredOpaqueGapRemainsReachableAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opaque-gap-restart.jsonl")
+	body := []byte(`{"type":"session_meta","payload":{"id":"opaque-gap-restart"}}` + "\n" +
+		`{"broken":` + "\n" +
+		`{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"after opaque gap"}}` + "\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write opaque-gap transcript: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if first.State.ContextGap == nil || first.State.Offset <= 0 || first.State.TranscriptQuarantine == nil {
+		t.Fatalf("first scan = %#v, want committed opaque gap", first.State)
+	}
+	second, err := historyTieredScanTail(path, first.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("post-restart scan: %v", err)
+	}
+	if len(second.Finals) != 1 || second.Finals[0].Record.Text != "after opaque gap" {
+		t.Fatalf("post-restart finals = %#v, want the suffix final", second.Finals)
+	}
+	third, err := historyTieredScanTail(path, second.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("repeat post-restart scan: %v", err)
+	}
+	if len(third.Finals) != 0 {
+		t.Fatalf("repeat post-restart finals = %#v, want no duplicate", third.Finals)
 	}
 }
 
@@ -550,7 +605,7 @@ func TestHistoryTieredScanTailCanRecoverAfterLargeTailCap(t *testing.T) {
 
 func TestHistoryTieredScanTailAdvancesPastOversizedRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
-	line := `{"type":"event_msg","payload":{"type":"agent_message","message":"` + strings.Repeat("x", historyTieredMaxRecordBytes+1) + `"}}` + "\n"
+	line := `{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"` + strings.Repeat("x", historyTieredMaxRecordBytes+1) + `"}}` + "\n"
 	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
 		t.Fatalf("write oversized record: %v", err)
 	}
@@ -566,6 +621,9 @@ func TestHistoryTieredScanTailAdvancesPastOversizedRecord(t *testing.T) {
 	}
 	if result.Records[0].Kind != TranscriptKindUnknown || result.Records[0].SourceType != "oversized_record" {
 		t.Fatalf("oversized record disposition = %#v", result.Records[0])
+	}
+	if result.Records[0].Text != "" {
+		t.Fatalf("oversized record guessed visible text from bounded prefix: %#v", result.Records[0])
 	}
 }
 
@@ -597,6 +655,129 @@ func TestHistoryTieredScanTailPersistsPartialReadHintAndResumesAfterNewline(t *t
 	}
 	if resumed.Incomplete || resumed.State.Offset <= first.State.Offset || resumed.State.PartialLineStartOffset != 0 {
 		t.Fatalf("resumed partial result = %#v", resumed)
+	}
+}
+
+func TestHistoryTieredScanTailDrainsOversizedPartialRecordAcrossPolls(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversized-partial.jsonl")
+	prefix := []byte(`{"type":"session_meta","payload":{"id":"oversized-partial"}}` + "\n")
+	if err := os.WriteFile(path, prefix, 0o600); err != nil {
+		t.Fatalf("write oversized-partial prefix: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open oversized-partial payload: %v", err)
+	}
+	_, writeErr := f.Write(bytes.Repeat([]byte{'x'}, int(historyTieredMaxRecordReadBytes)+1024))
+	closeErr := f.Close()
+	if writeErr != nil || closeErr != nil {
+		t.Fatalf("write oversized-partial payload: write=%v close=%v", writeErr, closeErr)
+	}
+
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("initial oversized-partial scan: %v", err)
+	}
+	if !first.Incomplete || first.State.PartialReadOffset <= first.State.PartialLineStartOffset {
+		t.Fatalf("initial oversized-partial result = %#v, want resumable partial state", first)
+	}
+	appendLine(t, path, "")
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"agent_message","phase":"final_answer","message":"after huge opaque record"}}`)
+
+	second, err := historyTieredScanTail(path, first.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("completed oversized-partial scan: %v", err)
+	}
+	if second.Incomplete || !second.OversizedRecord || second.State.Offset <= first.State.Offset || len(second.Records) != 1 {
+		t.Fatalf("completed oversized-partial result = %#v, want one opaque disposition and a durable cursor", second)
+	}
+	if second.Records[0].SourceType != "oversized_record" || second.State.ContextGap == nil {
+		t.Fatalf("oversized-partial disposition/state = record=%#v state=%#v", second.Records[0], second.State)
+	}
+
+	third, err := historyTieredScanTail(path, second.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("post-oversized-partial scan: %v", err)
+	}
+	if len(third.Finals) != 1 || third.Finals[0].Record.Text != "after huge opaque record" {
+		t.Fatalf("post-oversized-partial finals = %#v, want the following final", third.Finals)
+	}
+}
+
+func TestHistoryTieredScanTailConsumesCompleteMalformedLineAndResetsContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	malformed := `{"type":"event_msg","payload":{"type":"agent_message","turn_id":"old-turn","message":"broken"}`
+	later := `{"type":"event_msg","payload":{"id":"later-final","type":"agent_message","thread_id":"thread-1","turn_id":"new-turn","phase":"final_answer","message":"later final"}}`
+	contents := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-1"}}`,
+		`{"type":"event_msg","payload":{"id":"old-final","type":"agent_message","thread_id":"thread-1","turn_id":"old-turn","phase":"final_answer","message":"old final"}}`,
+		malformed,
+		later,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write malformed transcript: %v", err)
+	}
+
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	if first.Incomplete || first.State.Offset <= 0 || first.State.Offset >= int64(len(contents)) {
+		t.Fatalf("first scan state = %#v, want a complete cursor ending at malformed line", first)
+	}
+	if first.State.TranscriptQuarantine == nil || first.State.TranscriptQuarantine.Kind != "malformed_record" {
+		t.Fatalf("first scan quarantine = %#v, want malformed_record", first.State.TranscriptQuarantine)
+	}
+	if first.LastConsumedRecordID == "" || first.LastConsumedOffset != first.State.Offset {
+		t.Fatalf("first scan consumed = %q/%d, state offset %d", first.LastConsumedRecordID, first.LastConsumedOffset, first.State.Offset)
+	}
+	if strings.Contains(string(first.State.TranscriptQuarantine.CandidateTextHashes[0]), malformed) {
+		t.Fatal("malformed raw payload was stored instead of a bounded hash")
+	}
+	for _, record := range first.Records {
+		if strings.Contains(record.Text, "later final") {
+			t.Fatalf("later final was read past malformed boundary: %#v", first.Records)
+		}
+	}
+
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("second scan: %v", err)
+	}
+	foundLater := false
+	for _, record := range second.Records {
+		if record.ItemID == "later-final" || strings.Contains(record.Text, "later final") {
+			foundLater = true
+			if record.TurnID != "new-turn" || !record.TurnIDExplicit {
+				t.Fatalf("later record inherited malformed context: %#v", record)
+			}
+		}
+	}
+	if !foundLater {
+		t.Fatalf("later final was not reachable after malformed line: %#v", second)
+	}
+}
+
+func TestHistoryTieredScanTailDoesNotRetryStableMalformedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	contents := `{"type":"session_meta","payload":{"id":"thread-1"}}` + "\n" +
+		`{"broken":` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write malformed transcript: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, 1<<20)
+	if err != nil {
+		t.Fatalf("first scan: %v", err)
+	}
+	second, err := historyTieredScanTail(path, first.State, 1<<20)
+	if err != nil {
+		t.Fatalf("repeat scan: %v", err)
+	}
+	if second.State.Offset != first.State.Offset || second.State.Line != first.State.Line {
+		t.Fatalf("stable malformed cursor moved unexpectedly: first=%#v second=%#v", first.State, second.State)
+	}
+	if second.Incomplete || second.State.TranscriptQuarantine == nil || second.State.TranscriptQuarantine.Kind != "malformed_record" {
+		t.Fatalf("repeat scan = %#v, want stable malformed disposition", second)
 	}
 }
 

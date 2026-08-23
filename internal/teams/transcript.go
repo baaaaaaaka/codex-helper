@@ -78,6 +78,17 @@ type Transcript struct {
 	// history-only observation; it is never an execution-owner proof.
 	QuarantinedFinals    []TranscriptRecord
 	TranscriptQuarantine *teamstore.TranscriptQuarantine
+	ContextGap           *teamstore.ContextGapState
+	// TerminalBoundary is persisted independently of visible final delivery.
+	// A terminal/status record can be the only reliable scope boundary in a
+	// transcript, so linked import must retain its exact source proof across a
+	// restart as well as history-watch.
+	TerminalBoundary *teamstore.TerminalBoundary
+	// PendingHistoryRange records a physically consumed but semantically
+	// quarantined suffix. It prevents a safe scanner from rereading the same
+	// unresolved marker forever while keeping its records out of automatic
+	// visible delivery.
+	PendingHistoryRange *teamstore.HistoryPendingRange
 	// FinalBoundary is the latest final provenance observed by the bounded
 	// scanner. It is persisted with the generic import cursor so a mirror that
 	// arrives on the next poll is still recognized as an ambiguous anonymous

@@ -78,6 +78,8 @@ const (
 // ordinary turn/storage failures so it cannot be surfaced as a user answer.
 var ErrUnresolvedExecution = errors.New("Codex execution ownership is unresolved")
 
+var ErrTranscriptObservationConflict = errors.New("transcript observation conflict")
+
 type InboundStatus string
 
 const (
@@ -497,9 +499,10 @@ type HelperDeliveryRecord struct {
 }
 
 type ImportCheckpoint struct {
-	ID         string `json:"id"`
-	SessionID  string `json:"session_id"`
-	SourcePath string `json:"source_path,omitempty"`
+	ID               string `json:"id"`
+	SessionID        string `json:"session_id"`
+	SourcePath       string `json:"source_path,omitempty"`
+	SourceGeneration string `json:"source_generation,omitempty"`
 	// SourceRewriteBlocked fences source-less transcript rows written by an
 	// older helper after automatic scanning proves that the linked source was
 	// replaced or truncated. Ordinary backlog blocking must not strand them.
@@ -535,15 +538,16 @@ type ImportCheckpoint struct {
 	// incremental linked-transcript scanner. LastRecordID is a generic cursor;
 	// it cannot safely identify an anonymous final whose mirror may arrive in a
 	// later poll.
-	LastFinalID               string `json:"last_final_id,omitempty"`
-	LastFinalLine             int    `json:"last_final_line,omitempty"`
-	LastFinalStartOffset      int64  `json:"last_final_start_offset,omitempty"`
-	LastFinalStartOffsetKnown bool   `json:"last_final_start_offset_known,omitempty"`
-	LastFinalThreadID         string `json:"last_final_thread_id,omitempty"`
-	LastFinalTurnID           string `json:"last_final_turn_id,omitempty"`
-	LastFinalTextHash         string `json:"last_final_text_hash,omitempty"`
-	TerminalBoundarySeen      bool   `json:"terminal_boundary_seen,omitempty"`
-	TerminalBoundaryLine      int    `json:"terminal_boundary_line,omitempty"`
+	LastFinalID               string            `json:"last_final_id,omitempty"`
+	LastFinalLine             int               `json:"last_final_line,omitempty"`
+	LastFinalStartOffset      int64             `json:"last_final_start_offset,omitempty"`
+	LastFinalStartOffsetKnown bool              `json:"last_final_start_offset_known,omitempty"`
+	LastFinalThreadID         string            `json:"last_final_thread_id,omitempty"`
+	LastFinalTurnID           string            `json:"last_final_turn_id,omitempty"`
+	LastFinalTextHash         string            `json:"last_final_text_hash,omitempty"`
+	TerminalBoundarySeen      bool              `json:"terminal_boundary_seen,omitempty"`
+	TerminalBoundaryLine      int               `json:"terminal_boundary_line,omitempty"`
+	TerminalBoundary          *TerminalBoundary `json:"terminal_boundary,omitempty"`
 	// CompletionPending keeps an otherwise fully scanned import recoverable
 	// when the subagent marker or the final "Import complete" outbox row could
 	// not be queued. It is deliberately persisted in the JSON payload so both
@@ -577,6 +581,14 @@ type ImportCheckpoint struct {
 	// UnresolvedExecution it is not evidence that an app-server process still
 	// owns the thread and must never be used as an execution completion fence.
 	TranscriptQuarantine *TranscriptQuarantine `json:"transcript_quarantine,omitempty"`
+	// ContextGap is the durable proof for a complete opaque/malformed range.
+	// It lets the scanner preserve the post-gap parser context across restarts
+	// instead of resetting the same range repeatedly.
+	ContextGap *ContextGapState `json:"context_gap,omitempty"`
+	// PendingHistoryRange separates a physically consumed suffix from its
+	// semantic/publish boundary. It is intentionally bounded to one active
+	// range; unresolved history must not become a live execution owner.
+	PendingHistoryRange *HistoryPendingRange `json:"pending_history_range,omitempty"`
 	// ExecutionAnchorGeneration is retained after an anchor is cleared so a
 	// late callback cannot accidentally clear a subsequently recreated anchor
 	// with the same outer turn ID.
@@ -726,6 +738,103 @@ type PersistInterruptedTurnWithAnchorResult struct {
 	Terminal bool
 }
 
+// ContextGapPhase describes the small, monotonic state machine used when the
+// scanner consumes a complete JSONL range that cannot safely be decoded.  The
+// range is an audit/disposition boundary, not an execution owner.  Keeping the
+// phase explicit prevents a restart from treating an already-reset parser as
+// a new gap on every poll.
+type ContextGapPhase string
+
+const (
+	ContextGapPhaseNone             ContextGapPhase = "none"
+	ContextGapPhaseDetected         ContextGapPhase = "detected"
+	ContextGapPhaseDrained          ContextGapPhase = "drained"
+	ContextGapPhaseResetApplied     ContextGapPhase = "reset_applied"
+	ContextGapPhasePostGapCommitted ContextGapPhase = "post_gap_committed"
+	ContextGapPhaseRetired          ContextGapPhase = "retired"
+)
+
+const contextGapStateSchemaVersion = 1
+
+// ContextGapState is deliberately compact. It records one active
+// newline-bounded parser gap and its exact byte proof; it is not an unbounded
+// range ledger. A later gap supersedes the previous active value only after
+// the previous range has been committed.
+type ContextGapState struct {
+	SchemaVersion      int             `json:"schema_version,omitempty"`
+	SourceGeneration   string          `json:"source_generation,omitempty"`
+	GapID              string          `json:"gap_id,omitempty"`
+	Kind               string          `json:"kind,omitempty"`
+	FrontierKnown      bool            `json:"frontier_known,omitempty"`
+	StartRecordID      string          `json:"start_record_id,omitempty"`
+	StartLine          int             `json:"start_line,omitempty"`
+	StartOffset        int64           `json:"start_offset,omitempty"`
+	ExclusiveEndOffset int64           `json:"exclusive_end_offset,omitempty"`
+	ConsumedThrough    int64           `json:"consumed_through,omitempty"`
+	RangeFingerprint   string          `json:"range_fingerprint,omitempty"`
+	Phase              ContextGapPhase `json:"phase,omitempty"`
+}
+
+// HistoryPendingRange is the bounded semantic disposition for bytes that
+// were physically consumed but whose visible events cannot be published until
+// an explicit ownership proof exists. It is orthogonal to the physical
+// checkpoint cursor. Only one active range is retained per checkpoint; a
+// second unresolved range is not allowed to evict the first one.
+type HistoryPendingRange struct {
+	SourceGeneration string `json:"source_generation,omitempty"`
+	RangeID          string `json:"range_id,omitempty"`
+	Kind             string `json:"kind,omitempty"`
+	StartRecordID    string `json:"start_record_id,omitempty"`
+	StartLine        int    `json:"start_line,omitempty"`
+	StartOffset      int64  `json:"start_offset,omitempty"`
+	ExclusiveEnd     int64  `json:"exclusive_end_offset,omitempty"`
+	RangeFingerprint string `json:"range_fingerprint,omitempty"`
+}
+
+// TerminalBoundary is independent from visible final delivery. A Codex
+// transcript can emit only a terminal/status event (or an opaque final), and
+// that event must still survive restart as an ownership boundary.
+type TerminalBoundary struct {
+	SourceGeneration   string `json:"source_generation,omitempty"`
+	RecordID           string `json:"record_id,omitempty"`
+	Line               int    `json:"line,omitempty"`
+	StartOffset        int64  `json:"start_offset,omitempty"`
+	ExclusiveEndOffset int64  `json:"exclusive_end_offset,omitempty"`
+	RangeFingerprint   string `json:"range_fingerprint,omitempty"`
+	Kind               string `json:"kind,omitempty"`
+}
+
+func (g *ContextGapState) valid() bool {
+	if g == nil {
+		return true
+	}
+	if g.SchemaVersion == 0 {
+		g.SchemaVersion = contextGapStateSchemaVersion
+	}
+	if strings.TrimSpace(g.SourceGeneration) == "" || strings.TrimSpace(g.GapID) == "" ||
+		strings.TrimSpace(g.Kind) == "" || !g.FrontierKnown || g.StartOffset < 0 ||
+		g.ExclusiveEndOffset <= g.StartOffset || g.ConsumedThrough < g.ExclusiveEndOffset ||
+		strings.TrimSpace(g.RangeFingerprint) == "" {
+		return false
+	}
+	switch g.Phase {
+	case ContextGapPhaseDetected, ContextGapPhaseDrained, ContextGapPhaseResetApplied,
+		ContextGapPhasePostGapCommitted, ContextGapPhaseRetired:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *HistoryPendingRange) valid() bool {
+	if r == nil {
+		return true
+	}
+	return strings.TrimSpace(r.SourceGeneration) != "" && strings.TrimSpace(r.RangeID) != "" &&
+		strings.TrimSpace(r.Kind) != "" && r.StartOffset >= 0 && r.ExclusiveEnd > r.StartOffset &&
+		strings.TrimSpace(r.RangeFingerprint) != ""
+}
+
 // ExecutionAnchor records the last durable boundary before Codex execution
 // ownership became ambiguous.  Internal Codex task IDs are not required to
 // match the outer Teams turn ID: native goal continuations can create new
@@ -742,14 +851,18 @@ type ExecutionAnchor struct {
 	// execution identity written by app-server into the transcript; they are
 	// intentionally separate because a durable turn ID is an internal store
 	// key and is not required to match the Codex protocol turn ID.
-	OuterTurnID           string    `json:"outer_turn_id,omitempty"`
-	CodexTurnID           string    `json:"codex_turn_id,omitempty"`
-	SourcePath            string    `json:"transcript_source,omitempty"`
-	SourceFingerprint     string    `json:"source_fingerprint,omitempty"`
-	CutoffRecordID        string    `json:"cutoff_record_id,omitempty"`
-	CutoffLine            int       `json:"cutoff_line,omitempty"`
-	CutoffOffset          int64     `json:"cutoff_offset,omitempty"`
-	Reason                string    `json:"reason,omitempty"`
+	OuterTurnID       string `json:"outer_turn_id,omitempty"`
+	CodexTurnID       string `json:"codex_turn_id,omitempty"`
+	SourcePath        string `json:"transcript_source,omitempty"`
+	SourceFingerprint string `json:"source_fingerprint,omitempty"`
+	CutoffRecordID    string `json:"cutoff_record_id,omitempty"`
+	CutoffLine        int    `json:"cutoff_line,omitempty"`
+	CutoffOffset      int64  `json:"cutoff_offset,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	// Provenance is orthogonal to Reason. New runtime anchors must be marked
+	// runtime; history-only observations and legacy rows cannot be used as live
+	// ownership proof.
+	Provenance            string    `json:"provenance,omitempty"`
 	ObservedTaskIDs       []string  `json:"observed_internal_task_ids,omitempty"`
 	ObservedSourceSize    int64     `json:"observed_source_size,omitempty"`
 	ObservedSourceModTime time.Time `json:"observed_source_mod_time,omitempty"`
@@ -769,11 +882,15 @@ type ExecutionAnchor struct {
 // boundary and clear it; ordinary polling keeps the frontier unchanged.
 type TranscriptQuarantine struct {
 	Kind                string   `json:"kind,omitempty"`
+	GapID               string   `json:"gap_id,omitempty"`
 	SourcePath          string   `json:"source_path,omitempty"`
+	SourceGeneration    string   `json:"source_generation,omitempty"`
 	SourceFingerprint   string   `json:"source_fingerprint,omitempty"`
 	FrontierRecordID    string   `json:"frontier_record_id,omitempty"`
 	FrontierLine        int      `json:"frontier_line,omitempty"`
 	FrontierOffset      int64    `json:"frontier_offset,omitempty"`
+	ExclusiveEndOffset  int64    `json:"exclusive_end_offset,omitempty"`
+	RangeFingerprint    string   `json:"range_fingerprint,omitempty"`
 	CandidateTextHashes []string `json:"candidate_text_hashes,omitempty"`
 	LiveBranchThreadID  string   `json:"live_branch_thread_id,omitempty"`
 }
@@ -797,6 +914,10 @@ type HistoryWatchCheckpoint struct {
 	Path    string    `json:"path,omitempty"`
 	Size    int64     `json:"size,omitempty"`
 	ModTime time.Time `json:"mod_time,omitempty"`
+	// SourceGeneration is the identity of the opened source file for the
+	// current physical cursor. It is stronger than path/mtime and prevents a
+	// same-size replacement from inheriting parser context.
+	SourceGeneration string `json:"source_generation,omitempty"`
 	// SourceFingerprint is a bounded fingerprint of the trusted prefix at
 	// Offset.  It is optional for legacy checkpoints; a missing value forces a
 	// conservative migration/reconcile rather than proving an unchanged file.
@@ -827,12 +948,13 @@ type HistoryWatchCheckpoint struct {
 	LastFinalStartOffset   int64     `json:"last_final_start_offset,omitempty"`
 	// LastFinalStartOffsetKnown distinguishes a valid zero-byte final start
 	// from an old checkpoint that never persisted the boundary position.
-	LastFinalStartOffsetKnown bool   `json:"last_final_start_offset_known,omitempty"`
-	LastFinalThreadID         string `json:"last_final_thread_id,omitempty"`
-	LastFinalTurnID           string `json:"last_final_turn_id,omitempty"`
-	LastFinalTextHash         string `json:"last_final_text_hash,omitempty"`
-	TerminalBoundarySeen      bool   `json:"terminal_boundary_seen,omitempty"`
-	TerminalBoundaryLine      int    `json:"terminal_boundary_line,omitempty"`
+	LastFinalStartOffsetKnown bool              `json:"last_final_start_offset_known,omitempty"`
+	LastFinalThreadID         string            `json:"last_final_thread_id,omitempty"`
+	LastFinalTurnID           string            `json:"last_final_turn_id,omitempty"`
+	LastFinalTextHash         string            `json:"last_final_text_hash,omitempty"`
+	TerminalBoundarySeen      bool              `json:"terminal_boundary_seen,omitempty"`
+	TerminalBoundaryLine      int               `json:"terminal_boundary_line,omitempty"`
+	TerminalBoundary          *TerminalBoundary `json:"terminal_boundary,omitempty"`
 	// UnresolvedContinuation is a durable fail-closed marker. It survives a
 	// helper restart so the watcher cannot reinterpret a later child task as
 	// an ordinary next turn after losing its in-memory scan state.
@@ -854,6 +976,8 @@ type HistoryWatchCheckpoint struct {
 	// TranscriptQuarantine is a history-only frontier. It must not be
 	// interpreted as an unresolved Codex execution owner by live turn paths.
 	TranscriptQuarantine *TranscriptQuarantine `json:"transcript_quarantine,omitempty"`
+	ContextGap           *ContextGapState      `json:"context_gap,omitempty"`
+	PendingHistoryRange  *HistoryPendingRange  `json:"pending_history_range,omitempty"`
 	UpdatedAt            time.Time             `json:"updated_at,omitempty"`
 }
 
@@ -3303,7 +3427,36 @@ func validateImportCheckpointProvenance(checkpoint ImportCheckpoint, sessionID s
 	if checkpointID == "" || strings.TrimSpace(checkpoint.ID) != checkpointID {
 		return fmt.Errorf("%w: checkpoint row id %q does not match requested %q", ErrSessionStateProvenanceMismatch, checkpoint.ID, checkpointID)
 	}
-	return validateImportCheckpointSession(checkpoint, sessionID, checkpointID)
+	if err := validateImportCheckpointSession(checkpoint, sessionID, checkpointID); err != nil {
+		return err
+	}
+	return validateImportCheckpointRangeProof(checkpoint, checkpointID)
+}
+
+func validateImportCheckpointRangeProof(checkpoint ImportCheckpoint, checkpointID string) error {
+	if !ContextGapStateValid(checkpoint.ContextGap) {
+		return fmt.Errorf("%w: checkpoint %q has invalid context-gap proof", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	if !HistoryPendingRangeValid(checkpoint.PendingHistoryRange) {
+		return fmt.Errorf("%w: checkpoint %q has invalid pending history range", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	if !TerminalBoundaryValid(checkpoint.TerminalBoundary) {
+		return fmt.Errorf("%w: checkpoint %q has invalid terminal-boundary proof", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	sourceGeneration := strings.TrimSpace(checkpoint.SourceGeneration)
+	if sourceGeneration == "" && (checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil || checkpoint.TerminalBoundary != nil) {
+		return fmt.Errorf("%w: checkpoint %q has range proof without source generation", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	if checkpoint.ContextGap != nil && strings.TrimSpace(checkpoint.ContextGap.SourceGeneration) != sourceGeneration {
+		return fmt.Errorf("%w: checkpoint %q context-gap generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return fmt.Errorf("%w: checkpoint %q pending-range generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {
+		return fmt.Errorf("%w: checkpoint %q terminal-boundary generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
+	}
+	return nil
 }
 
 // validateImportCheckpointUpdateProvenance prevents a callback that looked up
@@ -3348,7 +3501,7 @@ func validateImportCheckpointUpdateProvenance(id string, current ImportCheckpoin
 			}
 		}
 	}
-	return nil
+	return validateImportCheckpointRangeProof(next, id)
 }
 
 // validateTranscriptCheckpointRecordProvenance is shared by the JSON and
@@ -3664,9 +3817,6 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 	if previous.SourceRewriteBlocked || previous.OversizedRecordBlocked {
 		status = importCheckpointStatusBlocked
 	}
-	if previous.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(previous) {
-		status = importCheckpointStatusBlocked
-	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -3678,6 +3828,7 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		ID:                   id,
 		SessionID:            firstStoreNonEmptyString(checkpoint.SessionID, previous.SessionID),
 		SourcePath:           firstStoreNonEmptyString(checkpoint.SourcePath, previous.SourcePath),
+		SourceGeneration:     firstStoreNonEmptyString(checkpoint.SourceGeneration, previous.SourceGeneration),
 		SourceFingerprint:    firstStoreNonEmptyString(checkpoint.SourceFingerprint, previous.SourceFingerprint),
 		LastRecordID:         strings.TrimSpace(checkpoint.LastRecordID),
 		LastSourceLine:       firstStoreNonZeroInt(checkpoint.LastSourceLine, previous.LastSourceLine),
@@ -3705,6 +3856,9 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		LastFinalTextHash:             previous.LastFinalTextHash,
 		TerminalBoundarySeen:          previous.TerminalBoundarySeen,
 		TerminalBoundaryLine:          previous.TerminalBoundaryLine,
+		TerminalBoundary:              previous.TerminalBoundary,
+		ContextGap:                    previous.ContextGap,
+		PendingHistoryRange:           previous.PendingHistoryRange,
 		SourceRewriteBlocked:          previous.SourceRewriteBlocked || checkpoint.SourceRewriteBlocked,
 		OversizedRecordBlocked:        previous.OversizedRecordBlocked || checkpoint.OversizedRecordBlocked,
 		SourceRewriteRecoveryIdentity: firstStoreNonEmptyString(checkpoint.SourceRewriteRecoveryIdentity, previous.SourceRewriteRecoveryIdentity),
@@ -3737,6 +3891,9 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		outCheckpoint.LastFinalTextHash = strings.TrimSpace(checkpoint.LastFinalTextHash)
 		outCheckpoint.TerminalBoundarySeen = checkpoint.TerminalBoundarySeen
 		outCheckpoint.TerminalBoundaryLine = checkpoint.TerminalBoundaryLine
+	}
+	if checkpoint.TerminalBoundary != nil {
+		outCheckpoint.TerminalBoundary = checkpoint.TerminalBoundary
 	}
 	state.ImportCheckpoints[id] = outCheckpoint
 
@@ -4743,18 +4900,29 @@ func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, erro
 // retry an incomplete tail, but they must not rewrite the durable store on
 // every poll while the source file is unchanged.
 func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) error {
+	apply := func(history map[string]HistoryWatchCheckpoint, ready *time.Time) error {
+		if err := fn(history, ready); err != nil {
+			return err
+		}
+		for id, checkpoint := range history {
+			if err := validateHistoryWatchCheckpointState(checkpoint, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	update := func(state *State) (bool, error) {
 		before := cloneHistoryWatchCheckpoints(state.HistoryWatch)
 		beforeReady := state.HistoryWatchReady
 		if state.HistoryWatch == nil {
 			state.HistoryWatch = make(map[string]HistoryWatchCheckpoint)
 		}
-		if err := fn(state.HistoryWatch, &state.HistoryWatchReady); err != nil {
+		if err := apply(state.HistoryWatch, &state.HistoryWatchReady); err != nil {
 			return false, err
 		}
 		return !historyWatchCheckpointsEqual(before, state.HistoryWatch) || !beforeReady.Equal(state.HistoryWatchReady), nil
 	}
-	if handled, err := s.updateSQLiteHistoryWatchIfChanged(ctx, fn); handled || err != nil {
+	if handled, err := s.updateSQLiteHistoryWatchIfChanged(ctx, apply); handled || err != nil {
 		return err
 	}
 	return s.UpdateIfChanged(ctx, update)
@@ -4772,6 +4940,9 @@ func (s *Store) UpdateHistoryWatchCheckpointIfCurrent(ctx context.Context, id st
 		return ErrHistoryWatchCheckpointConflict
 	}
 	next.ID = id
+	if err := validateHistoryWatchCheckpointState(next, id); err != nil {
+		return err
+	}
 	update := func(history map[string]HistoryWatchCheckpoint, _ *time.Time) error {
 		current, found := history[id]
 		if expected == nil {
@@ -7278,7 +7449,8 @@ func sessionTranscriptCheckpointID(sessionID string) string {
 }
 
 func importCheckpointHasUnresolvedExecution(checkpoint ImportCheckpoint) bool {
-	return checkpoint.UnresolvedExecution != nil && strings.TrimSpace(checkpoint.UnresolvedExecution.State) != "resolved"
+	return checkpoint.UnresolvedExecution != nil && strings.TrimSpace(checkpoint.UnresolvedExecution.State) != "resolved" &&
+		!ExecutionAnchorIsHistoryOnly(checkpoint.UnresolvedExecution)
 }
 
 func importCheckpointIsExplicitHistoryRun(checkpoint ImportCheckpoint) bool {
@@ -7534,37 +7706,41 @@ func transcriptQuarantineActive(checkpoint ImportCheckpoint) bool {
 	return checkpoint.TranscriptQuarantine != nil
 }
 
-// liveBranchThreadIDLocked returns the already-admitted thread for either kind
-// of history fence. The execution anchor remains the stronger source when both
-// fields exist; transcript quarantine never becomes an execution owner merely
-// by participating in this live-branch projection.
+// transcriptQuarantineBlocksAutomaticProgress distinguishes an opaque parser
+// gap from an execution/ownership ambiguity. The former has a durable
+// newline-bounded disposition and may be crossed by the physical cursor; the
+// latter remains a history frontier until an explicit recovery command chooses
+// the boundary. Neither kind participates in live admission.
+func transcriptQuarantineBlocksAutomaticProgress(quarantine *TranscriptQuarantine) bool {
+	if quarantine == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(quarantine.Kind)) {
+	case "malformed_record", "opaque_record", "oversized_record":
+		return false
+	default:
+		return true
+	}
+}
+
+// liveBranchThreadIDLocked returns the already-admitted thread for a real
+// execution anchor. Transcript quarantine is deliberately excluded: it is a
+// history observation and must never become a live execution owner merely by
+// carrying a legacy branch token.
 func liveBranchThreadIDLocked(state *State, sessionID string) (string, bool) {
 	if anchor, ok := unresolvedExecutionAnchorLocked(state, sessionID); ok {
-		// An active execution anchor is authoritative even before its isolated
-		// branch has been admitted. Never fall through to an older
-		// transcript-only branch token while the stronger fence is present.
 		liveThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
 		return liveThreadID, liveThreadID != ""
 	}
-	if state == nil {
-		return "", false
-	}
-	checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(sessionID)]
-	if !ok || !transcriptQuarantineActive(checkpoint) || strings.TrimSpace(checkpoint.TranscriptQuarantine.LiveBranchThreadID) == "" {
-		return "", false
-	}
-	return strings.TrimSpace(checkpoint.TranscriptQuarantine.LiveBranchThreadID), true
+	return "", false
 }
 
 func liveBranchAdmissionActive(state *State, sessionID string) bool {
-	if stateHasUnresolvedExecution(state, sessionID) {
-		return true
-	}
-	if state == nil {
-		return false
-	}
-	checkpoint, ok := state.ImportCheckpoints[sessionTranscriptCheckpointID(sessionID)]
-	return ok && transcriptQuarantineActive(checkpoint)
+	// Only durable runtime ownership participates in live admission. A blocked
+	// or quarantined transcript may pause history import, but it is not evidence
+	// that a Codex process owns the chat and must never queue or start-isolated
+	// gate a new Teams request.
+	return stateHasUnresolvedExecution(state, sessionID)
 }
 
 func hasRunningTurnForSessionLocked(state *State, sessionID string) bool {
@@ -7679,17 +7855,6 @@ func recordLiveBranchThreadLocked(state *State, turn Turn, codexThreadID string,
 		state.ImportCheckpoints[checkpointID] = checkpoint
 		return
 	}
-	quarantine := checkpoint.TranscriptQuarantine
-	if quarantine == nil {
-		return
-	}
-	if strings.TrimSpace(quarantine.LiveBranchThreadID) != "" && strings.TrimSpace(quarantine.LiveBranchThreadID) != strings.TrimSpace(codexThreadID) {
-		return
-	}
-	copyQuarantine := *quarantine
-	copyQuarantine.LiveBranchThreadID = strings.TrimSpace(codexThreadID)
-	checkpoint.TranscriptQuarantine = &copyQuarantine
-	state.ImportCheckpoints[checkpointID] = checkpoint
 }
 
 // turnCompletionAllowedByUnresolvedExecutionLocked is the terminal-owner
@@ -7870,9 +8035,6 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 	}
 	if strings.TrimSpace(next.Status) == "" || next.Status == "blocked" {
 		next.Status = "complete"
-	}
-	if current.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(current) {
-		next.Status = importCheckpointStatusBlocked
 	}
 	next.UpdatedAt = now
 	if found && importCheckpointEqualExceptUpdatedAt(current, next) {
@@ -10071,7 +10233,7 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if status == "" || status == "blocked" {
 		status = "complete"
 	}
-	if previous.SourceRewriteBlocked || previous.OversizedRecordBlocked || previous.TranscriptQuarantine != nil && !importCheckpointIsExplicitHistoryRun(previous) {
+	if previous.SourceRewriteBlocked || previous.OversizedRecordBlocked {
 		status = importCheckpointStatusBlocked
 	}
 	if checkpoint.SessionID == "" {
@@ -10079,6 +10241,9 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	}
 	if checkpoint.SourcePath == "" {
 		checkpoint.SourcePath = previous.SourcePath
+	}
+	if checkpoint.SourceGeneration == "" {
+		checkpoint.SourceGeneration = previous.SourceGeneration
 	}
 	if checkpoint.SourceFingerprint == "" {
 		checkpoint.SourceFingerprint = previous.SourceFingerprint
@@ -10104,6 +10269,15 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	}
 	if checkpoint.UnresolvedExecution == nil {
 		checkpoint.UnresolvedExecution = previous.UnresolvedExecution
+	}
+	if checkpoint.TerminalBoundary == nil {
+		checkpoint.TerminalBoundary = previous.TerminalBoundary
+	}
+	if checkpoint.ContextGap == nil {
+		checkpoint.ContextGap = previous.ContextGap
+	}
+	if checkpoint.PendingHistoryRange == nil {
+		checkpoint.PendingHistoryRange = previous.PendingHistoryRange
 	}
 	if !checkpoint.SourceRewriteBlocked {
 		checkpoint.SourceRewriteBlocked = previous.SourceRewriteBlocked
