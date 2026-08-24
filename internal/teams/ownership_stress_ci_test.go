@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,12 +73,21 @@ func capOwnershipStressKnob(value int, max int) int {
 	return value
 }
 
+func ownershipStressTestTimeout(base time.Duration) time.Duration {
+	if runtime.GOOS == "windows" {
+		// Windows file-backed SQLite and temporary-directory operations are
+		// substantially slower when the full package suite is running.
+		return 30 * time.Second
+	}
+	return base
+}
+
 // TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI combines a long
 // Graph outage with local TUI activity.  It checks two independent cursors:
 // Graph failure must not advance the Teams inbound cursor, and the later local
 // transcript sync must still publish every new visible TUI record exactly once.
 func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 	defer cancel()
 	scale := loadTeamsOwnershipStressScale()
 	transcriptPath := filepathForOwnershipStress(t)
@@ -1356,7 +1366,7 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 // import is genuinely in flight; a later bounded sync must deliver both
 // batches exactly once.
 func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 	defer cancel()
 	transcriptPath := filepathForOwnershipStress(t)
 	initial := strings.Join([]string{
@@ -1496,7 +1506,7 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 // be durably deferred, but it must not start a Codex writer until the import
 // has finished.
 func TestTeamsOwnershipStressTranscriptSyncDoesNotStartTeamsPromptBeforeCatchupCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 	defer cancel()
 	transcriptPath := filepathForOwnershipStress(t)
 	initial := strings.Join([]string{
@@ -2262,7 +2272,7 @@ func TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI(t *testing.T) {
 // auto-park sweeper.  An old safety state may defer work, but it must not turn
 // into a permanent freeze that hides the new message.
 func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 	defer cancel()
 	now := time.Now()
 	outageAt := now.Add(-72 * time.Hour)
