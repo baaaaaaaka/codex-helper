@@ -51,6 +51,7 @@ func bridgeIdleWaitTimeoutForTest() time.Duration {
 var discoverCodexSessionTestMu sync.Mutex
 
 type recordingExecutor struct {
+	mu       sync.Mutex
 	prompts  []string
 	sessions []Session
 	result   ExecutionResult
@@ -59,14 +60,18 @@ type recordingExecutor struct {
 }
 
 func (e *recordingExecutor) Run(_ context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	e.mu.Lock()
 	e.prompts = append(e.prompts, prompt)
 	if session != nil {
 		e.sessions = append(e.sessions, *session)
 	}
-	if e.before != nil {
-		e.before()
+	before := e.before
+	result, err := e.result, e.err
+	e.mu.Unlock()
+	if before != nil {
+		before()
 	}
-	return e.result, e.err
+	return result, err
 }
 
 type bridgeCodexLauncher struct {
@@ -16742,8 +16747,11 @@ func TestBridgeRetryTurnPreservesMessageReferenceContext(t *testing.T) {
 	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("retry-command"), "helper retry "+turn.ID); err != nil {
 		t.Fatalf("handleSessionMessage error: %v", err)
 	}
+	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("retry-command"), "helper retry "+turn.ID); err != nil {
+		t.Fatalf("replayed handleSessionMessage error: %v", err)
+	}
 	if got := executor.prompts; len(got) != 1 {
-		t.Fatalf("executor prompts = %#v, want one prompt", got)
+		t.Fatalf("executor prompts = %#v, want one prompt after replay", got)
 	} else if !strings.Contains(got[0], "retry this") || !strings.Contains(got[0], "full quoted body") {
 		t.Fatalf("retry prompt missing referenced message context:\n%s", got[0])
 	}
@@ -21341,15 +21349,25 @@ func TestBridgePollOnceBoostsAfterRealInboundAndFinalOutput(t *testing.T) {
 }
 
 func TestBridgePollOncePrioritizesControlAfterControlActivity(t *testing.T) {
-	readGraph := newBridgePollGraph(t, []bridgePollPage{{
-		messages: []ChatMessage{bridgePollMessage("control-help", "2026-05-02T01:05:00Z", "help")},
-		assert: func(t *testing.T, r *http.Request) {
-			t.Helper()
-			if !strings.Contains(r.URL.Path, "/chats/control-chat/messages") {
-				t.Fatalf("first poll should read control chat, got %s", r.URL.Path)
-			}
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{
+			messages: []ChatMessage{bridgePollMessage("control-help", "2026-05-02T01:05:00Z", "help")},
+			assert: func(t *testing.T, r *http.Request) {
+				t.Helper()
+				if !strings.Contains(r.URL.Path, "/chats/control-chat/messages") {
+					t.Fatalf("first poll should read control chat, got %s", r.URL.Path)
+				}
+			},
 		},
-	}})
+		{
+			assert: func(t *testing.T, r *http.Request) {
+				t.Helper()
+				if !strings.Contains(r.URL.Path, "/chats/chat-1/messages") {
+					t.Fatalf("work poll should follow control poll, got %s", r.URL.Path)
+				}
+			},
+		},
+	})
 	writeGraph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", time.Date(2026, 5, 2, 1, 0, 0, 0, time.UTC), true, false, 1); err != nil {
@@ -22108,20 +22126,18 @@ func TestInboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch(t *testi
 
 func TestBridgePollOnceRotatesDueWorkChatsWhenPerCycleLimitIsReached(t *testing.T) {
 	now := time.Now()
-	wantPaths := []string{
-		"/chats/chat-01/messages",
-		"/chats/chat-02/messages",
-		"/chats/chat-03/messages",
-		"/chats/chat-04/messages",
-	}
+	var gotPathsMu sync.Mutex
+	gotPaths := make(map[string]int)
 	var pages []bridgePollPage
-	for _, wantPath := range wantPaths {
-		path := wantPath
+	for i := 0; i < 4; i++ {
 		pages = append(pages, bridgePollPage{assert: func(t *testing.T, r *http.Request) {
 			t.Helper()
-			if r.URL.Path != path {
-				t.Fatalf("poll path = %s, want %s", r.URL.Path, path)
+			if !strings.HasPrefix(r.URL.Path, "/chats/chat-0") || !strings.HasSuffix(r.URL.Path, "/messages") {
+				t.Fatalf("unexpected work poll path = %s", r.URL.Path)
 			}
+			gotPathsMu.Lock()
+			gotPaths[r.URL.Path]++
+			gotPathsMu.Unlock()
 		}})
 	}
 	readGraph := newBridgePollGraph(t, pages)
@@ -22165,25 +22181,48 @@ func TestBridgePollOnceRotatesDueWorkChatsWhenPerCycleLimitIsReached(t *testing.
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("second pollOnce error: %v", err)
 	}
+	gotPathsMu.Lock()
+	defer gotPathsMu.Unlock()
+	wantCounts := map[string]int{
+		"/chats/chat-01/messages": 1,
+		"/chats/chat-02/messages": 1,
+		"/chats/chat-03/messages": 1,
+		"/chats/chat-04/messages": 1,
+	}
+	if len(gotPaths) != len(wantCounts) {
+		t.Fatalf("rotating poll paths = %#v, want one read for each of %#v", gotPaths, wantCounts)
+	}
+	for path, want := range wantCounts {
+		if gotPaths[path] != want {
+			t.Fatalf("rotating poll path %s read %d times, want %d; all paths=%#v", path, gotPaths[path], want, gotPaths)
+		}
+	}
 }
 
 func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T) {
 	now := time.Now()
-	wantPaths := []string{
-		"/chats/chat-99/messages",
-		"/chats/chat-01/messages",
+	wantPaths := map[string]bool{
+		"/chats/chat-99/messages": true,
+		"/chats/chat-01/messages": true,
 	}
-	var pages []bridgePollPage
-	for _, wantPath := range wantPaths {
-		path := wantPath
-		pages = append(pages, bridgePollPage{assert: func(t *testing.T, r *http.Request) {
-			t.Helper()
-			if r.URL.Path != path {
-				t.Fatalf("poll path = %s, want %s", r.URL.Path, path)
-			}
-		}})
+	var gotPathsMu sync.Mutex
+	var gotPaths []string
+	assertSelectedPath := func(t *testing.T, r *http.Request) {
+		t.Helper()
+		if !wantPaths[r.URL.Path] {
+			t.Fatalf("poll path = %s, want one of %#v", r.URL.Path, wantPaths)
+		}
+		gotPathsMu.Lock()
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotPathsMu.Unlock()
 	}
-	readGraph := newBridgePollGraph(t, pages)
+	// pollOnce dispatches selected chats concurrently; the scheduler contract is
+	// which chats are selected under the cap, not the order in which Graph sees
+	// their requests.
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{assert: assertSelectedPath},
+		{assert: assertSelectedPath},
+	})
 	writeGraph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
@@ -22238,6 +22277,20 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
+	}
+	gotPathsMu.Lock()
+	defer gotPathsMu.Unlock()
+	if len(gotPaths) != len(wantPaths) {
+		t.Fatalf("selected poll paths = %#v, want one read for each of %#v", gotPaths, wantPaths)
+	}
+	counts := map[string]int{}
+	for _, path := range gotPaths {
+		counts[path]++
+	}
+	for path := range wantPaths {
+		if counts[path] != 1 {
+			t.Fatalf("selected poll path %s read %d times, want once; all paths=%#v", path, counts[path], gotPaths)
+		}
 	}
 }
 
@@ -22917,15 +22970,11 @@ func TestBridgeIdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuation
 	}
 }
 
-func TestBridgeIdleWorkChatAutoParkSweeperRecoversStaleContinuationErrorWithTerminalHead(t *testing.T) {
+func TestBridgeIdleWorkChatAutoParkSweeperPreservesStaleContinuationWithTerminalHead(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-49 * time.Hour)
 	cursor := now.Add(-49*time.Hour + time.Minute)
-	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{
-		{messages: nil},
-		{messages: nil},
-		{messages: nil},
-	}, http.StatusBadRequest, false)
+	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{{messages: nil}}, http.StatusBadRequest, false)
 	writeGraph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
@@ -22958,17 +23007,17 @@ func TestBridgeIdleWorkChatAutoParkSweeperRecoversStaleContinuationErrorWithTerm
 	bridge.reg.Sessions[0].UpdatedAt = oldActivity
 
 	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
-		t.Fatalf("auto-park sweep error: %v", err)
+		t.Fatalf("auto-park sweep should isolate stale continuation: %v", err)
 	}
-	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 1 {
-		t.Fatalf("freeze notice not sent after stale continuation recovery: %#v", *sent)
+	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 0 {
+		t.Fatalf("stale continuation must not be parked as if its backlog was delivered: %#v", *sent)
 	}
 	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
 	if err != nil || !ok {
 		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
 	}
-	if poll.PollState != inboundPollStateParked || poll.ContinuationPath != "" || poll.ParkNoticeSentAt.IsZero() || poll.LastError != "" {
-		t.Fatalf("stale continuation error was not recovered into parked state: %#v", poll)
+	if poll.PollState != inboundPollStateBlocked || poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=old" || poll.LastError == "" || poll.BlockedUntil.IsZero() {
+		t.Fatalf("stale continuation was not retained as a recoverable per-chat error: %#v", poll)
 	}
 }
 
@@ -23014,17 +23063,17 @@ func TestBridgeIdleWorkChatAutoParkSweeperPreservesFreshHeadContinuationAfterSta
 	bridge.reg.Chats["chat-1"] = ChatState{SeenMessageIDs: []string{"fresh-seen"}}
 
 	if err := bridge.maybeRunIdleWorkChatAutoPark(context.Background(), now); err != nil {
-		t.Fatalf("auto-park sweep error: %v", err)
+		t.Fatalf("auto-park sweep should isolate stale continuation: %v", err)
 	}
 	if countSentPlainContainingForChat(*sent, "chat-1", "This chat is paused") != 0 {
-		t.Fatalf("fresh head continuation should not park chat yet: %#v", *sent)
+		t.Fatalf("stale continuation should not park chat yet: %#v", *sent)
 	}
 	poll, ok, err := store.ChatPoll(context.Background(), "chat-1")
 	if err != nil || !ok {
 		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
 	}
-	if !strings.Contains(poll.ContinuationPath, "$skiptoken=fresh-head") || !poll.ParkNoticeSentAt.IsZero() {
-		t.Fatalf("fresh head continuation was not preserved for next recovery sweep: %#v", poll)
+	if poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=old" || poll.DeferredContinuationPath != "/chats/chat-1/messages?$skiptoken=fresh-head" || !poll.ParkNoticeSentAt.IsZero() || poll.LastError == "" {
+		t.Fatalf("both stale and fresh frontiers were not retained for recovery: %#v", poll)
 	}
 }
 
@@ -23098,7 +23147,7 @@ func TestBridgeIdleWorkChatAutoParkSweeperDoesNotRecoverContinuationForQueuedOrR
 	}
 }
 
-func TestBridgePollOnceRecoversStaleWorkContinuationErrorWithTerminalHead(t *testing.T) {
+func TestBridgePollOncePreservesStaleWorkContinuationWithTerminalHead(t *testing.T) {
 	now := time.Now()
 	oldActivity := now.Add(-time.Hour)
 	readGraph := newIdleContinuationErrorRecoveryGraph(t, []bridgePollPage{
@@ -23138,8 +23187,8 @@ func TestBridgePollOnceRecoversStaleWorkContinuationErrorWithTerminalHead(t *tes
 		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
 	}
 
-	if err := bridge.pollOnce(context.Background(), 20); err != nil {
-		t.Fatalf("pollOnce error: %v", err)
+	if err := bridge.pollOnce(context.Background(), 20); err == nil {
+		t.Fatal("pollOnce must report the per-chat stale continuation gap")
 	}
 	if len(*sent) != 0 {
 		t.Fatalf("stale continuation recovery should not send messages: %#v", *sent)
@@ -23148,8 +23197,8 @@ func TestBridgePollOnceRecoversStaleWorkContinuationErrorWithTerminalHead(t *tes
 	if err != nil || !ok {
 		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
 	}
-	if poll.ContinuationPath != "" || poll.LastError != "" || !poll.BlockedUntil.IsZero() || poll.FailureCount != 0 {
-		t.Fatalf("stale continuation was not cleared without backoff: %#v", poll)
+	if poll.PollState != inboundPollStateBlocked || poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=old" || poll.LastError == "" || poll.BlockedUntil.IsZero() || poll.FailureCount == 0 {
+		t.Fatalf("stale continuation was not retained with a recoverable backoff: %#v", poll)
 	}
 }
 
@@ -24219,11 +24268,12 @@ func TestBridgePollOnceDoesNotRepeatFreezeNoticeFromSentOutbox(t *testing.T) {
 	}
 }
 
-func TestBridgePollOnceSkipsAlreadyParkedNoticeSentWithoutGraphOrRewrite(t *testing.T) {
+func TestBridgePollOnceProbesAlreadyParkedNoticeSentWithoutFreezeRewrite(t *testing.T) {
 	now := time.Now()
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = newBridgePollGraph(t, []bridgePollPage{{messages: nil}})
 	session := bridge.reg.Sessions[0]
 	oldActivity := now.Add(-49 * time.Hour)
 	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
@@ -24278,8 +24328,8 @@ func TestBridgePollOnceSkipsAlreadyParkedNoticeSentWithoutGraphOrRewrite(t *test
 	if err != nil || !ok {
 		t.Fatalf("ChatPoll after ok=%v err=%v", ok, err)
 	}
-	if !after.UpdatedAt.Equal(before.UpdatedAt) || !after.ParkedAt.Equal(before.ParkedAt) || !after.ParkNoticeSentAt.Equal(before.ParkNoticeSentAt) {
-		t.Fatalf("already parked chat was rewritten: before=%#v after=%#v", before, after)
+	if !after.UpdatedAt.After(before.UpdatedAt) || !after.ParkedAt.Equal(before.ParkedAt) || !after.ParkNoticeSentAt.Equal(before.ParkNoticeSentAt) || after.PollState != inboundPollStateParked || !after.NextPollAt.After(now) {
+		t.Fatalf("already parked chat probe did not preserve the freeze boundary and schedule a future probe: before=%#v after=%#v", before, after)
 	}
 }
 
@@ -24337,6 +24387,7 @@ func TestBridgePollOnceRepairsAlreadyNotifiedParkedPollMissingParkedAt(t *testin
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.readGraph = newBridgePollGraph(t, []bridgePollPage{{messages: nil}})
 	session := bridge.reg.Sessions[0]
 	oldActivity := now.Add(-49 * time.Hour)
 	if _, _, err := store.CreateSession(context.Background(), teamstore.SessionContext{
@@ -24705,7 +24756,7 @@ func TestBridgeControlParkRejectsQueuedOrRunningSession(t *testing.T) {
 	}
 }
 
-func TestBridgePollOnceSkipsExplicitParkedPollWithStaleContinuation(t *testing.T) {
+func TestBridgePollOnceKeepsExplicitParkedPollBlockedUntilRetryDeadline(t *testing.T) {
 	now := time.Now()
 	readGraph := newBridgePollGraph(t, nil)
 	writeGraph, sent := newBridgeTestGraph(t)
@@ -24753,13 +24804,13 @@ func TestBridgePollOnceSkipsExplicitParkedPollWithStaleContinuation(t *testing.T
 	if err != nil || !ok {
 		t.Fatalf("ChatPoll ok=%v err=%v", ok, err)
 	}
-	if poll.PollState != inboundPollStateParked ||
-		poll.ContinuationPath != "" ||
-		!poll.BlockedUntil.IsZero() ||
-		poll.FailureCount != 0 ||
-		poll.LastError != "" ||
-		!poll.LastErrorAt.IsZero() {
-		t.Fatalf("explicit parked poll was not cleaned without polling: %#v", poll)
+	if poll.PollState != inboundPollStateBlocked ||
+		poll.ContinuationPath == "" ||
+		poll.BlockedUntil.IsZero() ||
+		poll.FailureCount == 0 ||
+		poll.LastError == "" ||
+		poll.LastErrorAt.IsZero() {
+		t.Fatalf("parked poll did not retain its retryable continuation failure: %#v", poll)
 	}
 }
 
@@ -25206,8 +25257,8 @@ func TestBridgeControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep(t *t
 	if requestsByChat["control-chat"] != 1 {
 		t.Fatalf("control requests after control poll block = %d, want still 1 so control chat does not amplify Graph 429; all=%#v", requestsByChat["control-chat"], requestsByChat)
 	}
-	if requestsByChat["chat-1"] != 1 {
-		t.Fatalf("work chat requests after control poll block = %d, want 1 so user messages can still be read; all=%#v", requestsByChat["chat-1"], requestsByChat)
+	if requestsByChat["chat-1"] != 2 {
+		t.Fatalf("work chat requests after control poll block = %d, want the initial isolated poll plus the second due poll; all=%#v", requestsByChat["chat-1"], requestsByChat)
 	}
 	workPoll, ok, err := store.ChatPoll(context.Background(), "chat-1")
 	if err != nil || !ok {
@@ -25348,6 +25399,10 @@ func TestBridgeListenReturnsPersistentPollFailureForRestart(t *testing.T) {
 	}
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	// Isolate the persistent control-chat failure watchdog. The scheduler now
+	// continues with Work candidates after a control read failure, so the
+	// default in-memory Work session must not add an unrelated Graph request.
+	bridge.reg.Sessions = nil
 	bridge.reg.ControlChatTopic = ControlChatTitle(ChatTitleOptions{MachineLabel: firstNonEmptyString(bridge.machine.Label, machineLabel()), Profile: bridge.scope.Profile})
 	bridge.persistentPollFailureFirstAt = time.Now().Add(-persistentPollFailureRestartAfter - time.Second)
 	bridge.persistentPollFailureCount = persistentPollFailureRestartMinCount - 1
@@ -25464,12 +25519,15 @@ func TestBridgeOnlyControlPollSuccessResetsFailureWatchdog(t *testing.T) {
 func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
 	now := time.Now()
 	requestsByChat := map[string]int{}
+	var requestsMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		requestsMu.Lock()
 		requestsByChat[chatID]++
+		requestsMu.Unlock()
 		if chatID == "chat-1" {
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
@@ -25528,10 +25586,16 @@ func TestBridgePollOnceContinuesOtherDueChatsAfterReadRateLimit(t *testing.T) {
 	if err == nil || !isGraphRateLimitError(err) {
 		t.Fatalf("pollOnce error = %v, want first chat Graph 429", err)
 	}
+	requestsMu.Lock()
+	gotRequests := map[string]int{}
+	for chatID, count := range requestsByChat {
+		gotRequests[chatID] = count
+	}
+	requestsMu.Unlock()
 	for _, chatID := range []string{"chat-1", "chat-2", "chat-3"} {
 		want := 1
-		if requestsByChat[chatID] != want {
-			t.Fatalf("requests for %s = %d, want %d; all requests=%#v", chatID, requestsByChat[chatID], want, requestsByChat)
+		if gotRequests[chatID] != want {
+			t.Fatalf("requests for %s = %d, want %d; all requests=%#v", chatID, gotRequests[chatID], want, gotRequests)
 		}
 	}
 	blocked, ok, err := store.ChatPoll(context.Background(), "chat-1")
@@ -37824,17 +37888,21 @@ type bridgePollPage struct {
 
 func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 	t.Helper()
+	var pagesMu sync.Mutex
 	nextPage := 0
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		w := httptest.NewRecorder()
 		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
+		pagesMu.Lock()
 		if nextPage >= len(pages) {
+			pagesMu.Unlock()
 			t.Fatalf("unexpected extra Graph poll: %s", r.URL.String())
 		}
 		page := pages[nextPage]
 		nextPage++
+		pagesMu.Unlock()
 		if page.assert != nil {
 			page.assert(t, r)
 		}
@@ -37849,6 +37917,8 @@ func newBridgePollGraph(t *testing.T, pages []bridgePollPage) *GraphClient {
 		return w.Result(), nil
 	})}
 	t.Cleanup(func() {
+		pagesMu.Lock()
+		defer pagesMu.Unlock()
 		if nextPage != len(pages) {
 			t.Fatalf("Graph poll count = %d, want %d", nextPage, len(pages))
 		}
@@ -39042,6 +39112,7 @@ func seedIdleWorkPoll(t *testing.T, store *teamstore.Store, controlChatID string
 func newBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 	t.Helper()
 	var sent []bridgeSentMessage
+	var sentMu sync.Mutex
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		w := httptest.NewRecorder()
 		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
@@ -39057,9 +39128,12 @@ func newBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessage) {
 			t.Fatalf("decode Graph request: %v", err)
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		sentMu.Lock()
 		sent = append(sent, bridgeSentMessage{ChatID: chatID, Content: body.Body.Content, Mentions: len(body.Mentions)})
+		messageID := len(sent)
+		sentMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, len(sent))
+		_, _ = fmt.Fprintf(w, `{"id":"sent-%d","messageType":"message"}`, messageID)
 		return w.Result(), nil
 	})}
 	return &GraphClient{

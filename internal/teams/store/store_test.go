@@ -44,6 +44,429 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+// TestSQLiteFullUpdateIsAtomicAndRecoversAfterCapacityReturns models the
+// actual SQLITE_FULL failure seen by Teams when the state filesystem fills.
+// PRAGMA max_page_count gives the test a deterministic quota without relying
+// on root privileges or a runner-wide disk condition.
+func TestSQLiteFullUpdateIsAtomicAndRecoversAfterCapacityReturns(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["full-session"] = SessionContext{
+			ID:          "full-session",
+			Status:      SessionStatusActive,
+			TeamsChatID: "full-chat",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var pageCount int
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return err
+		}
+		if pageCount < 1 {
+			return fmt.Errorf("SQLite page count = %d, want positive", pageCount)
+		}
+		var maxPageCount int
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, pageCount)).Scan(&maxPageCount); err != nil {
+			return err
+		}
+		if maxPageCount != pageCount {
+			return fmt.Errorf("SQLite max page count = %d, want %d", maxPageCount, pageCount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("set SQLite page quota: %v", err)
+	}
+	largeText := strings.Repeat("sqlite-full-payload ", 256*1024)
+	err := store.Update(ctx, func(state *State) error {
+		state.InboundEvents["full-inbound"] = InboundEvent{
+			ID:          "full-inbound",
+			SessionID:   "full-session",
+			TeamsChatID: "full-chat",
+			Text:        largeText,
+			Status:      InboundStatusPersisted,
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "full") {
+		t.Fatalf("quota-limited update error = %v, want SQLITE_FULL-like error", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load state after SQLITE_FULL: %v", err)
+	}
+	if _, ok := state.InboundEvents["full-inbound"]; ok {
+		t.Fatal("failed SQLITE_FULL update partially committed inbound event")
+	}
+
+	// Restore capacity and prove that the same store remains writable.  This
+	// is the recovery boundary required by the Teams service after disk space
+	// is freed; the failed transaction must not poison the connection.
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite after full error")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		_, err = db.ExecContext(ctx, `PRAGMA max_page_count = 100000`)
+		return err
+	}); err != nil {
+		t.Fatalf("restore SQLite page capacity: %v", err)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.InboundEvents["recovered-inbound"] = InboundEvent{
+			ID:          "recovered-inbound",
+			SessionID:   "full-session",
+			TeamsChatID: "full-chat",
+			Text:        "space restored",
+			Status:      InboundStatusPersisted,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("update after restoring SQLite capacity: %v", err)
+	}
+}
+
+// TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns covers the
+// narrow persistence edge between a successful Graph POST and the local
+// accepted-message CAS.  A later recovery must be able to finish the same
+// outbox row without issuing another POST; a failed local CAS must not turn
+// the row into a false Accepted/Sent state.
+func TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	queued, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "outbox:sqlite-full-accepted-cas",
+		TeamsChatID: "chat-full-cas",
+		Kind:        "final",
+		Body:        strings.Repeat("accepted CAS payload ", 256*1024),
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+	if err != nil || claimed.SendAttemptToken == "" {
+		t.Fatalf("MarkOutboxSendAttempt: outbox=%#v err=%v", claimed, err)
+	}
+	// The oversized accepted ID makes the CAS require a fresh SQLite page even
+	// when the queued row already occupies its own overflow pages.  It is only
+	// a deterministic quota trigger; production Graph IDs are much smaller.
+	acceptedID := "teams-full-cas-" + strings.Repeat("x", 2*1024*1024)
+
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		var pageCount int
+		if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return err
+		}
+		if pageCount < 1 {
+			return fmt.Errorf("SQLite page count = %d, want positive", pageCount)
+		}
+		var maxPageCount int
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, pageCount)).Scan(&maxPageCount); err != nil {
+			return err
+		}
+		if maxPageCount != pageCount {
+			return fmt.Errorf("SQLite max page count = %d, want %d", maxPageCount, pageCount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("set SQLite page quota: %v", err)
+	}
+
+	if _, err := store.MarkOutboxAcceptedForAttempt(ctx, queued.ID, claimed.SendAttemptToken, acceptedID); err == nil || !strings.Contains(strings.ToLower(err.Error()), "full") {
+		t.Fatalf("accepted CAS error = %v, want SQLITE_FULL-like error", err)
+	}
+	failed, err := store.OutboxMessageByID(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("load outbox after failed accepted CAS: %v", err)
+	}
+	if failed.Status != OutboxStatusSending || failed.TeamsMessageID != "" || failed.SendAttemptToken != claimed.SendAttemptToken {
+		t.Fatalf("failed accepted CAS mutated outbox: %#v", failed)
+	}
+
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite after full error")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		_, err = db.ExecContext(ctx, `PRAGMA max_page_count = 100000`)
+		return err
+	}); err != nil {
+		t.Fatalf("restore SQLite page capacity: %v", err)
+	}
+	accepted, err := store.MarkOutboxAcceptedForAttempt(ctx, queued.ID, claimed.SendAttemptToken, acceptedID)
+	if err != nil || accepted.Status != OutboxStatusAccepted || accepted.TeamsMessageID != acceptedID {
+		t.Fatalf("recovered accepted CAS: outbox=%#v err=%v", accepted, err)
+	}
+	sent, err := store.MarkOutboxSentForAttempt(ctx, queued.ID, claimed.SendAttemptToken, acceptedID)
+	if err != nil || sent.Status != OutboxStatusSent || sent.TeamsMessageID != acceptedID {
+		t.Fatalf("recovered sent CAS: outbox=%#v err=%v", sent, err)
+	}
+}
+
+// TestSQLiteFullInboundRetryAfterReopenIsExactlyOnce models a Teams message
+// arriving while the state filesystem is full. The failed persistence must
+// leave no partial inbound/turn, and the same Graph message must be retryable
+// after capacity is restored and the helper reopens its store.
+func TestSQLiteFullInboundRetryAfterReopenIsExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, created, err := store.CreateSession(ctx, SessionContext{
+		ID:          "full-retry-session",
+		Status:      SessionStatusActive,
+		TeamsChatID: "full-retry-chat",
+	}); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var pageCount int
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return err
+		}
+		if pageCount < 1 {
+			return fmt.Errorf("SQLite page count = %d, want positive", pageCount)
+		}
+		var maxPageCount int
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, pageCount)).Scan(&maxPageCount); err != nil {
+			return err
+		}
+		if maxPageCount != pageCount {
+			return fmt.Errorf("SQLite max page count = %d, want %d", maxPageCount, pageCount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("set SQLite page quota: %v", err)
+	}
+	failedInbound := InboundEvent{
+		ID:             "inbound:full-retry-message",
+		SessionID:      "full-retry-session",
+		TeamsChatID:    "full-retry-chat",
+		TeamsMessageID: "teams-message-full-retry",
+		Text:           strings.Repeat("sqlite-full-inbound ", 256*1024),
+		Source:         "teams",
+		Status:         InboundStatusPersisted,
+	}
+	if _, _, err := store.PersistInbound(ctx, failedInbound); err == nil || !strings.Contains(strings.ToLower(err.Error()), "full") {
+		t.Fatalf("PersistInbound under quota error = %v, want SQLITE_FULL-like error", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after failed inbound persistence: %v", err)
+	}
+	if _, ok := state.InboundEvents[failedInbound.ID]; ok {
+		t.Fatal("failed inbound persistence left a partial inbound row")
+	}
+
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite after full error")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		_, err = db.ExecContext(ctx, `PRAGMA max_page_count = 100000`)
+		return err
+	}); err != nil {
+		t.Fatalf("restore SQLite page capacity: %v", err)
+	}
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close full store: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen after full store: %v", err)
+	}
+	defer reopened.Close()
+	retried, created, err := reopened.PersistInbound(ctx, failedInbound)
+	if err != nil || !created || retried.ID != failedInbound.ID {
+		t.Fatalf("retry PersistInbound created=%v inbound=%#v err=%v", created, retried, err)
+	}
+	queued, turnCreated, err := reopened.QueueTurn(ctx, Turn{ID: "turn:full-retry-message", SessionID: failedInbound.SessionID, InboundEventID: retried.ID})
+	if err != nil || !turnCreated || queued.InboundEventID != retried.ID {
+		t.Fatalf("retry QueueTurn created=%v turn=%#v err=%v", turnCreated, queued, err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("close recovered store: %v", err)
+	}
+	finalStore, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen recovered store: %v", err)
+	}
+	defer finalStore.Close()
+	state, err = finalStore.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load recovered store: %v", err)
+	}
+	inboundCount := 0
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsChatID == failedInbound.TeamsChatID && inbound.TeamsMessageID == failedInbound.TeamsMessageID {
+			inboundCount++
+		}
+	}
+	if inboundCount != 1 {
+		t.Fatalf("recovered inbound rows = %d, want exactly one", inboundCount)
+	}
+	turnCount := 0
+	for _, turn := range state.Turns {
+		if turn.InboundEventID == failedInbound.ID {
+			turnCount++
+		}
+	}
+	if turnCount != 1 {
+		t.Fatalf("recovered turns for inbound = %d, want exactly one", turnCount)
+	}
+}
+
+func TestSQLiteFullDeferredContinuationWriteRemainsRetryable(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.RecordChatPollSuccessWithContinuation(ctx, "chat-full-deferred", time.Now(), true, true, 20, "/chats/chat-full-deferred/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed deferred poll: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	setQuota := func(maxPageCount int) error {
+		return store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("store is not backed by SQLite")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			_, err = db.ExecContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, maxPageCount))
+			return err
+		})
+	}
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("store is not backed by SQLite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		var pageCount int
+		if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return err
+		}
+		var maxPageCount int
+		if err := db.QueryRowContext(ctx, fmt.Sprintf(`PRAGMA max_page_count = %d`, pageCount)).Scan(&maxPageCount); err != nil {
+			return err
+		}
+		if maxPageCount != pageCount {
+			return fmt.Errorf("SQLite max page count = %d, want %d", maxPageCount, pageCount)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("set deferred SQLite quota: %v", err)
+	}
+	largePath := "/chats/chat-full-deferred/messages?$skiptoken=" + strings.Repeat("x", 2*1024*1024)
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:                      "chat-full-deferred",
+		DeferredContinuationPath:    largePath,
+		SetDeferredContinuationPath: true,
+	}); err == nil || !strings.Contains(strings.ToLower(err.Error()), "full") {
+		t.Fatalf("deferred continuation under quota error = %v, want SQLITE_FULL-like error", err)
+	}
+	poll, ok, err := store.ChatPoll(ctx, "chat-full-deferred")
+	if err != nil || !ok {
+		t.Fatalf("load deferred poll after full: ok=%v err=%v", ok, err)
+	}
+	if poll.DeferredContinuationPath != "" {
+		t.Fatalf("failed deferred write partially committed: %#v", poll)
+	}
+	if err := setQuota(100000); err != nil {
+		t.Fatalf("restore deferred SQLite quota: %v", err)
+	}
+	const recoveredPath = "/chats/chat-full-deferred/messages?$skiptoken=recovered"
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:                      "chat-full-deferred",
+		DeferredContinuationPath:    recoveredPath,
+		SetDeferredContinuationPath: true,
+	}); err != nil {
+		t.Fatalf("deferred write after capacity recovery: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close deferred full store: %v", err)
+	}
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("reopen deferred full store: %v", err)
+	}
+	defer reopened.Close()
+	poll, ok, err = reopened.ChatPoll(ctx, "chat-full-deferred")
+	if err != nil || !ok || poll.DeferredContinuationPath != recoveredPath {
+		t.Fatalf("reopened deferred recovery = %#v ok=%v err=%v", poll, ok, err)
+	}
+}
+
 func TestTranscriptQuarantineSurvivesHistoryWatchBackendRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	want := HistoryWatchCheckpoint{
@@ -2490,26 +2913,31 @@ func TestSQLitePointerSchemaRejectsLegacyLoaders(t *testing.T) {
 	}
 }
 
-func TestSchemaSevenStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
+func TestSchemaEightStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	ctx := context.Background()
 	seedSafetyState := func(t *testing.T, store *Store) {
 		t.Helper()
 		if err := store.Update(ctx, func(state *State) error {
-			state.Sessions["schema7-session"] = SessionContext{ID: "schema7-session", Status: SessionStatusActive, TeamsChatID: "schema7-chat"}
-			state.ImportCheckpoints["transcript:schema7-session"] = ImportCheckpoint{
-				ID: "transcript:schema7-session", SessionID: "schema7-session",
+			state.Sessions["schema8-session"] = SessionContext{ID: "schema8-session", Status: SessionStatusActive, TeamsChatID: "schema8-chat"}
+			state.ImportCheckpoints["transcript:schema8-session"] = ImportCheckpoint{
+				ID: "transcript:schema8-session", SessionID: "schema8-session",
 				UnresolvedExecution: &ExecutionAnchor{
-					SessionID: "schema7-session", ThreadID: "schema7-thread", OuterTurnID: "schema7-turn", CodexTurnID: "schema7-codex",
+					SessionID: "schema8-session", ThreadID: "schema8-thread", OuterTurnID: "schema8-turn", CodexTurnID: "schema8-codex",
 					Generation: 4, State: "unresolved", SourcePath: "/tmp/schema7.jsonl", SourceFingerprint: "prefix-proof",
 				},
 			}
-			state.OutboxMessages["schema7-final"] = OutboxMessage{
-				ID: "schema7-final", SessionID: "schema7-session", TurnID: "schema7-turn", Kind: "final",
-				TerminalGroupID: "schema7-group", BlockedByTerminalFailure: true,
+			state.ChatPolls["schema8-chat"] = ChatPollState{
+				ChatID: "schema8-chat", Seeded: true, PollState: "warm",
+				ContinuationPath:         "/chats/schema8-chat/messages?$skiptoken=old",
+				DeferredContinuationPath: "/chats/schema8-chat/messages?$skiptoken=deferred",
+			}
+			state.OutboxMessages["schema8-final"] = OutboxMessage{
+				ID: "schema8-final", SessionID: "schema8-session", TurnID: "schema8-turn", Kind: "final",
+				TerminalGroupID: "schema8-group", BlockedByTerminalFailure: true,
 			}
 			return nil
 		}); err != nil {
-			t.Fatalf("seed schema-7 safety state: %v", err)
+			t.Fatalf("seed schema-8 safety state: %v", err)
 		}
 	}
 
@@ -2537,6 +2965,39 @@ func TestSchemaSevenStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	}
 }
 
+func TestChatPollDeferredContinuationSurvivesSQLiteReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, err := store.RecordChatPollSuccessWithContinuation(ctx, "chat-deferred", time.Now(), true, true, 20, "/chats/chat-deferred/messages?$skiptoken=old"); err != nil {
+		t.Fatalf("seed chat poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID:                      "chat-deferred",
+		DeferredContinuationPath:    "/chats/chat-deferred/messages?$skiptoken=head",
+		SetDeferredContinuationPath: true,
+	}); err != nil {
+		t.Fatalf("persist deferred continuation: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate deferred poll: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close deferred store: %v", err)
+	}
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("reopen deferred store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	poll, ok, err := reopened.ChatPoll(ctx, "chat-deferred")
+	if err != nil || !ok {
+		t.Fatalf("load reopened deferred poll: ok=%v err=%v", ok, err)
+	}
+	if poll.ContinuationPath == "" || poll.DeferredContinuationPath != "/chats/chat-deferred/messages?$skiptoken=head" {
+		t.Fatalf("reopened deferred poll lost a frontier: %#v", poll)
+	}
+}
+
 func TestRC16JSONFixtureMigratesAndRoundTripsLegacySafetyState(t *testing.T) {
 	ctx := context.Background()
 	fixture, err := os.ReadFile(filepath.Join("testdata", "v0.1.22-rc.16-state.json"))
@@ -2549,8 +3010,8 @@ func TestRC16JSONFixtureMigratesAndRoundTripsLegacySafetyState(t *testing.T) {
 	if err := json.Unmarshal(fixture, &envelope); err != nil {
 		t.Fatalf("decode rc16 JSON fixture: %v", err)
 	}
-	if envelope.SchemaVersion != SchemaVersion-1 {
-		t.Fatalf("rc16 JSON fixture schema = %d, want %d", envelope.SchemaVersion, SchemaVersion-1)
+	if envelope.SchemaVersion != SchemaVersion-2 {
+		t.Fatalf("rc16 JSON fixture schema = %d, want %d", envelope.SchemaVersion, SchemaVersion-2)
 	}
 
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -2600,8 +3061,8 @@ func TestRC16SQLitePointerFixtureLoadsAndRoundTripsLegacySafetyState(t *testing.
 	if err := json.Unmarshal(stateFixture, &legacyState); err != nil {
 		t.Fatalf("decode rc16 SQLite state fixture: %v", err)
 	}
-	if legacyState.SchemaVersion != SchemaVersion-1 {
-		t.Fatalf("rc16 SQLite state schema = %d, want %d", legacyState.SchemaVersion, SchemaVersion-1)
+	if legacyState.SchemaVersion != SchemaVersion-2 {
+		t.Fatalf("rc16 SQLite state schema = %d, want %d", legacyState.SchemaVersion, SchemaVersion-2)
 	}
 
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -4356,8 +4817,8 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HotPollScheduleState sqlite error: %v", err)
 	}
-	if _, ok := hotPollState.ChatPolls["chat-parked-clean"]; ok || hotPollState.ChatPolls["chat-parked-stale"].ContinuationPath == "" {
-		t.Fatalf("hot poll state should skip only clean parked rows: %#v", hotPollState.ChatPolls)
+	if _, ok := hotPollState.ChatPolls["chat-parked-clean"]; !ok || hotPollState.ChatPolls["chat-parked-stale"].ContinuationPath == "" {
+		t.Fatalf("hot poll state should retain due parked probe rows: %#v", hotPollState.ChatPolls)
 	}
 	if len(hotPollState.Sessions) != 0 {
 		t.Fatalf("hot poll state should not load sessions eagerly: %d", len(hotPollState.Sessions))
@@ -4372,8 +4833,8 @@ func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HotPollScheduleSnapshot sqlite error: %v", err)
 	}
-	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; ok || !parkedSkip["chat-parked-clean"] {
-		t.Fatalf("hot poll schedule should skip clean parked row: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
+	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; !ok || !parkedSkip["chat-parked-clean"] {
+		t.Fatalf("hot poll schedule should retain due clean parked probe: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
 	}
 	if hotPollSchedule.ChatPolls["chat-parked-stale"].ContinuationPath == "" || parkedSkip["chat-parked-stale"] {
 		t.Fatalf("hot poll schedule should retain stale parked row for maintenance: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
@@ -4792,7 +5253,7 @@ func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *test
 	for _, session := range candidates {
 		got[session.ID] = true
 	}
-	want := map[string]bool{"s-dirty": true, "s-warm": true, "s-missing": true}
+	want := map[string]bool{"s-clean": true, "s-dirty": true, "s-warm": true, "s-missing": true}
 	if len(got) != len(want) {
 		t.Fatalf("candidate ids = %#v, want %#v", got, want)
 	}
@@ -4801,7 +5262,7 @@ func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *test
 			t.Fatalf("candidate ids = %#v, missing %s", got, id)
 		}
 	}
-	for _, id := range []string{"s-clean", "s-closed", "s-control"} {
+	for _, id := range []string{"s-closed", "s-control"} {
 		if got[id] {
 			t.Fatalf("candidate ids = %#v, should not include %s", got, id)
 		}
@@ -4931,8 +5392,8 @@ func TestSQLiteHotPollScheduleSnapshotBackfillsParkedSkipColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HotPollScheduleSnapshot after derived-column backfill: %v", err)
 	}
-	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; ok || !parkedSkip["chat-parked-clean"] {
-		t.Fatalf("backfill should make clean parked row skippable: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
+	if _, ok := hotPollSchedule.ChatPolls["chat-parked-clean"]; !ok || !parkedSkip["chat-parked-clean"] {
+		t.Fatalf("backfill should make clean parked row probe-eligible: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
 	}
 	if hotPollSchedule.ChatPolls["chat-parked-stale"].ContinuationPath == "" || parkedSkip["chat-parked-stale"] {
 		t.Fatalf("backfill should keep stale parked row in hot snapshot: polls=%#v skip=%#v", hotPollSchedule.ChatPolls, parkedSkip)
@@ -12095,6 +12556,210 @@ func TestClaimNextQueuedTurnSerializesPerSession(t *testing.T) {
 	}
 }
 
+func TestSQLiteClaimNextQueuedTurnRepairsMalformedCanonicalCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	for _, testCase := range []struct {
+		name string
+		raw  any
+	}{
+		{name: "malformed-json", raw: []byte(`{"broken"`)},
+		{name: "empty-json", raw: []byte{}},
+		{name: "null-json", raw: []byte("null")},
+		{name: "invalid-typed-anchor-field", raw: []byte(`{"execution_anchor_generation":"not-an-integer"}`)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := newTestStore(t)
+			session := testSession()
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			queued, _, err := store.QueueTurn(ctx, Turn{ID: "turn:malformed-checkpoint", SessionID: session.ID})
+			if err != nil {
+				t.Fatalf("QueueTurn: %v", err)
+			}
+			checkpointID := sessionTranscriptCheckpointID(session.ID)
+			if err := store.Update(ctx, func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID:        checkpointID,
+					SessionID: session.ID,
+					Status:    importCheckpointStatusComplete,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed checkpoint: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			if err := store.withStateLock(ctx, func() error {
+				pointer, ok, err := store.currentSQLitePointerUnlocked()
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("store is not backed by SQLite")
+				}
+				db, err := store.sqliteDBUnlocked(pointer)
+				if err != nil {
+					return err
+				}
+				_, err = db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, testCase.raw, checkpointID)
+				return err
+			}); err != nil {
+				t.Fatalf("corrupt canonical checkpoint: %v", err)
+			}
+
+			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID)
+			if err != nil || ok {
+				t.Fatalf("ClaimNextQueuedTurn claimed=%#v ok=%v err=%v, want unresolved owner fence", claimed, ok, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load repaired state: %v", err)
+			}
+			repaired := state.ImportCheckpoints[checkpointID]
+			if state.Turns[queued.ID].Status != TurnStatusQueued {
+				t.Fatalf("queued turn status = %q, want queued", state.Turns[queued.ID].Status)
+			}
+			if repaired.Status != importCheckpointStatusComplete || !repaired.LegacySourceUnverified || repaired.UnresolvedExecution == nil || repaired.TranscriptQuarantine == nil || repaired.TranscriptQuarantine.Kind != malformedCanonicalCheckpointKind {
+				t.Fatalf("repaired checkpoint = %#v, want unresolved quarantine", repaired)
+			}
+		})
+	}
+
+	t.Run("canonical-only-owner-survives-restart", func(t *testing.T) {
+		store := newTestStore(t)
+		session := testSession()
+		if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+			t.Fatalf("CreateSession created=%v err=%v", created, err)
+		}
+		queued, _, err := store.QueueTurn(ctx, Turn{ID: "turn:canonical-only-owner", SessionID: session.ID})
+		if err != nil {
+			t.Fatalf("QueueTurn: %v", err)
+		}
+		checkpointID := sessionTranscriptCheckpointID(session.ID)
+		if err := store.Update(ctx, func(state *State) error {
+			state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+				ID:        checkpointID,
+				SessionID: session.ID,
+				Status:    importCheckpointStatusComplete,
+				UnresolvedExecution: &ExecutionAnchor{
+					SessionID:  session.ID,
+					ThreadID:   session.CodexThreadID,
+					Provenance: ExecutionAnchorProvenanceLegacy,
+					State:      "unresolved",
+				},
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed owner checkpoint: %v", err)
+		}
+		migrateStoreToSQLiteForTest(t, store)
+		if err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("store is not backed by SQLite")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			_, err = db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, []byte(`{"broken"`), checkpointID)
+			return err
+		}); err != nil {
+			t.Fatalf("corrupt canonical owner checkpoint: %v", err)
+		}
+		path := store.Path()
+		if err := store.Close(); err != nil {
+			t.Fatalf("close before restart: %v", err)
+		}
+		restarted, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen store: %v", err)
+		}
+		defer restarted.Close()
+		claimed, ok, err := restarted.ClaimNextQueuedTurn(ctx, session.ID)
+		if err != nil || ok {
+			t.Fatalf("ClaimNextQueuedTurn after restart claimed=%#v ok=%v err=%v, want no claim", claimed, ok, err)
+		}
+		state, err := restarted.Load(ctx)
+		if err != nil {
+			t.Fatalf("Load after restart fenced claim: %v", err)
+		}
+		repaired := state.ImportCheckpoints[checkpointID]
+		if repaired.UnresolvedExecution == nil {
+			t.Fatalf("restart dropped unresolved owner fence: %#v", repaired)
+		}
+		if state.Turns[queued.ID].Status != TurnStatusQueued {
+			t.Fatalf("canonical-only queued turn status = %q, want queued", state.Turns[queued.ID].Status)
+		}
+	})
+
+	t.Run("malformed-history-does-not-bypass-interrupted-owner", func(t *testing.T) {
+		store := newTestStore(t)
+		session := testSession()
+		if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+			t.Fatalf("CreateSession created=%v err=%v", created, err)
+		}
+		interrupted, _, err := store.QueueTurn(ctx, Turn{ID: "turn:interrupted-owner", SessionID: session.ID})
+		if err != nil {
+			t.Fatalf("Queue interrupted turn: %v", err)
+		}
+		if _, err := store.MarkTurnRunning(ctx, interrupted.ID, "thread:old-owner", "codex:old-owner"); err != nil {
+			t.Fatalf("MarkTurnRunning: %v", err)
+		}
+		if _, err := store.MarkTurnInterrupted(ctx, interrupted.ID, "ambiguous Codex execution: checkpoint corruption test"); err != nil {
+			t.Fatalf("MarkTurnInterrupted: %v", err)
+		}
+		queued, _, err := store.QueueTurn(ctx, Turn{ID: "turn:after-interrupted-owner", SessionID: session.ID})
+		if err != nil {
+			t.Fatalf("Queue follow-up turn: %v", err)
+		}
+		checkpointID := sessionTranscriptCheckpointID(session.ID)
+		if err := store.Update(ctx, func(state *State) error {
+			state.ImportCheckpoints[checkpointID] = ImportCheckpoint{ID: checkpointID, SessionID: session.ID, Status: importCheckpointStatusComplete}
+			return nil
+		}); err != nil {
+			t.Fatalf("seed interrupted checkpoint: %v", err)
+		}
+		migrateStoreToSQLiteForTest(t, store)
+		if err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("store is not backed by SQLite")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			_, err = db.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, []byte(`{"broken"`), checkpointID)
+			return err
+		}); err != nil {
+			t.Fatalf("corrupt interrupted checkpoint: %v", err)
+		}
+
+		claimed, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID)
+		if err != nil || ok {
+			t.Fatalf("ClaimNextQueuedTurn claimed=%#v ok=%v err=%v, want unresolved owner fence", claimed, ok, err)
+		}
+		state, err := store.Load(ctx)
+		if err != nil {
+			t.Fatalf("Load fenced state: %v", err)
+		}
+		if got := state.Turns[queued.ID].Status; got != TurnStatusQueued {
+			t.Fatalf("follow-up turn status = %q, want queued", got)
+		}
+		repaired := state.ImportCheckpoints[checkpointID]
+		if repaired.UnresolvedExecution == nil || repaired.UnresolvedExecution.ThreadID != "thread:old-owner" {
+			t.Fatalf("repaired interrupted checkpoint = %#v, want legacy execution anchor", repaired)
+		}
+	})
+}
+
 func TestInterruptedTurnCannotBeCompletedOrFailed(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -13012,6 +13677,55 @@ func TestChatPollScheduleCanClearContinuationPath(t *testing.T) {
 	}
 	if poll.ContinuationPath != "" {
 		t.Fatalf("continuation path was not cleared: %#v", poll)
+	}
+}
+
+func TestChatPollScheduleClearsCurrentWithoutDroppingDeferredFrontier(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if _, err := store.RecordChatPollSuccessWithContinuation(ctx, "chat-1", now, true, true, 50, "/chats/chat-1/messages?$skiptoken=current"); err != nil {
+				t.Fatalf("seed current continuation: %v", err)
+			}
+			if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:                      "chat-1",
+				DeferredContinuationPath:    "/chats/chat-1/messages?$skiptoken=deferred",
+				SetDeferredContinuationPath: true,
+			}); err != nil {
+				t.Fatalf("seed deferred continuation: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store: %v", err)
+				}
+			}
+			poll, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:                "chat-1",
+				ClearContinuationPath: true,
+			})
+			if err != nil {
+				t.Fatalf("clear current continuation: %v", err)
+			}
+			if poll.ContinuationPath != "" || poll.DeferredContinuationPath == "" {
+				t.Fatalf("clearing current continuation lost deferred frontier: %#v", poll)
+			}
+			poll, err = store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:                        "chat-1",
+				ClearDeferredContinuationPath: true,
+			})
+			if err != nil {
+				t.Fatalf("clear deferred continuation: %v", err)
+			}
+			if poll.ContinuationPath != "" || poll.DeferredContinuationPath != "" {
+				t.Fatalf("explicit deferred clear left frontier state: %#v", poll)
+			}
+		})
 	}
 }
 

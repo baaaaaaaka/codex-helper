@@ -250,7 +250,7 @@ func (b *Bridge) noteUnprovenancedHelperEcho(ctx context.Context, chatID string,
 	if b == nil || b.store == nil || strings.TrimSpace(msg.ID) == "" {
 		return false, nil
 	}
-	session := b.reg.SessionByChatID(strings.TrimSpace(chatID))
+	session := b.sessionByChatIDForPoll(strings.TrimSpace(chatID))
 	if session == nil || strings.TrimSpace(session.ID) == "" {
 		return false, nil
 	}

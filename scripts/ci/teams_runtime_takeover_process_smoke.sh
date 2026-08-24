@@ -28,8 +28,11 @@ docker run --rm \
   --pids-limit 64 \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  --tmpfs /state:rw,nosuid,nodev,size=32m \
   --env CXP_TEAMS_TAKEOVER_REAL_PROCESS_DOCKER=1 \
+  --env CXP_TEAMS_BOUNDARY_DOCKER=1 \
+  --env CXP_TEAMS_BOUNDARY_FS_ROOT=/state \
   "$image" \
-  -test.run '^TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI$' \
+  -test.run '^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI)$' \
   -test.count=1 \
   -test.v

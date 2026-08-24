@@ -1,8 +1,12 @@
 package teams
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -365,9 +369,13 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 				continue
 			}
 			id := historyWatchCheckpointID(path)
-			fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, info.Size()))
+			boundary, err := historyWatchBaselineBoundary(path, info.Size())
+			if err != nil {
+				return err
+			}
+			fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, boundary.Offset))
 			generation := historyTieredSourceIdentity(path, info)
-			historyWatch[id] = teamstore.HistoryWatchCheckpoint{
+			checkpoint := teamstore.HistoryWatchCheckpoint{
 				ID:                   id,
 				Path:                 path,
 				Size:                 info.Size(),
@@ -375,13 +383,86 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 				SourceGeneration:     generation,
 				SourceFingerprint:    fingerprint,
 				SourceRewriteBlocked: info.Size() > 0 && fingerprint == "",
-				Offset:               info.Size(),
+				Offset:               boundary.Offset,
+				Line:                 boundary.Line,
 				UpdatedAt:            now,
 			}
+			if boundary.Partial {
+				checkpoint.PartialLineStartOffset = boundary.Offset
+				checkpoint.PartialReadOffset = info.Size()
+				checkpoint.PartialObservedSize = info.Size()
+				checkpoint.PartialLine = boundary.Line + 1
+				checkpoint.PartialStartedAt = info.ModTime()
+				checkpoint.PartialSourceIdentity = generation
+			}
+			historyWatch[id] = checkpoint
 		}
 		*ready = now
 		return nil
 	})
+}
+
+type historyWatchBaselineBoundaryResult struct {
+	Offset  int64
+	Line    int
+	Partial bool
+}
+
+// historyWatchBaselineBoundary returns the last durable JSONL delimiter. A
+// startup baseline may skip existing complete records, but must not skip an
+// unterminated record that a live Codex writer can finish after startup. A
+// valid JSON value at EOF is complete even without a final delimiter.
+func historyWatchBaselineBoundary(path string, size int64) (historyWatchBaselineBoundaryResult, error) {
+	boundary := historyWatchBaselineBoundaryResult{}
+	if strings.TrimSpace(path) == "" || size <= 0 {
+		return boundary, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return boundary, err
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(io.LimitReader(f, size), historyTieredTailReaderSize)
+	var offset int64
+	var suffix []byte
+	suffixTooLarge := false
+	for offset < size {
+		chunk, readErr := reader.ReadSlice('\n')
+		offset += int64(len(chunk))
+		if bytes.HasSuffix(chunk, []byte{'\n'}) {
+			boundary.Offset = offset
+			boundary.Line++
+			suffix = suffix[:0]
+			suffixTooLarge = false
+		} else if !suffixTooLarge {
+			if len(suffix)+len(chunk) <= historyTieredMaxRecordBytes {
+				suffix = append(suffix, chunk...)
+			} else {
+				suffixTooLarge = true
+				suffix = nil
+			}
+		}
+		if readErr != nil {
+			if readErr == bufio.ErrBufferFull {
+				continue
+			}
+			if readErr == io.EOF {
+				break
+			}
+			return boundary, readErr
+		}
+	}
+	if boundary.Offset == size {
+		return boundary, nil
+	}
+	trimmed := bytes.TrimSpace(suffix)
+	if !suffixTooLarge && len(trimmed) > 0 && json.Valid(trimmed) {
+		boundary.Offset = size
+		boundary.Line++
+		return boundary, nil
+	}
+	boundary.Partial = size > boundary.Offset
+	return boundary, nil
 }
 
 func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now time.Time) error {

@@ -27,11 +27,12 @@ import (
 )
 
 const (
-	// SchemaVersion 7 is an intentional upgrade-only boundary.  The
-	// unresolved-execution anchor and terminal outbox fences are safety data;
-	// helpers built against schema 6 do not know how to preserve them.  A
-	// schema-7 store must therefore never be written by an older helper.
-	SchemaVersion = 7
+	// SchemaVersion 8 is an intentional upgrade-only boundary.  The
+	// unresolved-execution anchor, terminal outbox fences, and deferred Graph
+	// continuation frontier are safety data; helpers built against schema 7 do
+	// not know how to preserve them.  A schema-8 store must therefore never be
+	// written by an older helper.
+	SchemaVersion = 8
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -1129,24 +1130,28 @@ type AutoUpdateRecord struct {
 }
 
 type ChatPollState struct {
-	ChatID                string    `json:"chat_id"`
-	Seeded                bool      `json:"seeded,omitempty"`
-	PollState             string    `json:"state,omitempty"`
-	PreviousPollState     string    `json:"previous_state,omitempty"`
-	NextPollAt            time.Time `json:"next_poll_at,omitempty"`
-	LastActivityAt        time.Time `json:"last_activity_at,omitempty"`
-	BlockedUntil          time.Time `json:"blocked_until,omitempty"`
-	FailureCount          int       `json:"failure_count,omitempty"`
-	ParkedAt              time.Time `json:"parked_at,omitempty"`
-	ParkNoticeSentAt      time.Time `json:"park_notice_sent_at,omitempty"`
-	LastModifiedCursor    time.Time `json:"last_modified_cursor,omitempty"`
-	ContinuationPath      string    `json:"continuation_path,omitempty"`
-	LastSuccessfulPollAt  time.Time `json:"last_successful_poll_at,omitempty"`
-	LastError             string    `json:"last_error,omitempty"`
-	LastErrorAt           time.Time `json:"last_error_at,omitempty"`
-	LastWindowFullAt      time.Time `json:"last_window_full_at,omitempty"`
-	LastWindowFullMessage string    `json:"last_window_full_message,omitempty"`
-	UpdatedAt             time.Time `json:"updated_at,omitempty"`
+	ChatID             string    `json:"chat_id"`
+	Seeded             bool      `json:"seeded,omitempty"`
+	PollState          string    `json:"state,omitempty"`
+	PreviousPollState  string    `json:"previous_state,omitempty"`
+	NextPollAt         time.Time `json:"next_poll_at,omitempty"`
+	LastActivityAt     time.Time `json:"last_activity_at,omitempty"`
+	BlockedUntil       time.Time `json:"blocked_until,omitempty"`
+	FailureCount       int       `json:"failure_count,omitempty"`
+	ParkedAt           time.Time `json:"parked_at,omitempty"`
+	ParkNoticeSentAt   time.Time `json:"park_notice_sent_at,omitempty"`
+	LastModifiedCursor time.Time `json:"last_modified_cursor,omitempty"`
+	ContinuationPath   string    `json:"continuation_path,omitempty"`
+	// DeferredContinuationPath holds one fresh head page while an older durable
+	// continuation is being drained. Keeping the two frontiers separate avoids
+	// losing the fresh page when a later head response is no longer truncated.
+	DeferredContinuationPath string    `json:"deferred_continuation_path,omitempty"`
+	LastSuccessfulPollAt     time.Time `json:"last_successful_poll_at,omitempty"`
+	LastError                string    `json:"last_error,omitempty"`
+	LastErrorAt              time.Time `json:"last_error_at,omitempty"`
+	LastWindowFullAt         time.Time `json:"last_window_full_at,omitempty"`
+	LastWindowFullMessage    string    `json:"last_window_full_message,omitempty"`
+	UpdatedAt                time.Time `json:"updated_at,omitempty"`
 }
 
 type IdleWorkChatParkCandidate struct {
@@ -1160,21 +1165,25 @@ func chatPollParkedSkipEligible(poll ChatPollState) bool {
 		!poll.ParkedAt.IsZero() &&
 		poll.BlockedUntil.IsZero() &&
 		strings.TrimSpace(poll.ContinuationPath) == "" &&
+		strings.TrimSpace(poll.DeferredContinuationPath) == "" &&
 		poll.FailureCount == 0 &&
 		strings.TrimSpace(poll.LastError) == "" &&
 		poll.LastErrorAt.IsZero()
 }
 
 type ChatPollScheduleUpdate struct {
-	ChatID                string
-	PollState             string
-	PreviousPollState     string
-	NextPollAt            time.Time
-	LastActivityAt        time.Time
-	BlockedUntil          time.Time
-	ClearBlockedUntil     bool
-	ClearContinuationPath bool
-	ResetFailures         bool
+	ChatID                        string
+	PollState                     string
+	PreviousPollState             string
+	NextPollAt                    time.Time
+	LastActivityAt                time.Time
+	BlockedUntil                  time.Time
+	ClearBlockedUntil             bool
+	ClearContinuationPath         bool
+	DeferredContinuationPath      string
+	SetDeferredContinuationPath   bool
+	ClearDeferredContinuationPath bool
+	ResetFailures                 bool
 }
 
 type FinalAnswerPollBoostRequest struct {
@@ -5503,7 +5512,20 @@ func (s *Store) ReleaseControlLeaseIfHolder(ctx context.Context, machineID strin
 		if lease.HolderMachineID != machineID || lease.Generation != generation {
 			return nil
 		}
-		state.ControlLease = ControlLease{}
+		// Retain the monotonic generation after release.  A same-machine
+		// restart must receive a new generation; otherwise a delayed cleanup
+		// callback from the previous process can match the replacement lease.
+		if strings.TrimSpace(lease.ScopeID) == "" {
+			lease.ScopeID = state.Scope.ID
+		}
+		lease.HolderMachineID = ""
+		lease.HolderKind = ""
+		lease.Priority = 0
+		lease.Status = ""
+		lease.LeaseUntil = time.Time{}
+		lease.LastHeartbeat = time.Time{}
+		lease.UpdatedAt = time.Now()
+		state.ControlLease = lease
 		if machine := state.Machines[machineID]; machine.ID != "" {
 			machine.Status = MachineStatusStandby
 			machine.UpdatedAt = time.Now()
@@ -7451,6 +7473,10 @@ func sessionTranscriptCheckpointID(sessionID string) string {
 func importCheckpointHasUnresolvedExecution(checkpoint ImportCheckpoint) bool {
 	return checkpoint.UnresolvedExecution != nil && strings.TrimSpace(checkpoint.UnresolvedExecution.State) != "resolved" &&
 		!ExecutionAnchorIsHistoryOnly(checkpoint.UnresolvedExecution)
+}
+
+func importCheckpointHasMalformedCanonicalFence(checkpoint ImportCheckpoint) bool {
+	return checkpoint.TranscriptQuarantine != nil && strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), malformedCanonicalCheckpointKind)
 }
 
 func importCheckpointIsExplicitHistoryRun(checkpoint ImportCheckpoint) bool {
@@ -12346,6 +12372,18 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 	if update.ClearContinuationPath && poll.ContinuationPath != "" {
 		poll.ContinuationPath = ""
 		changed = true
+	}
+	if update.ClearDeferredContinuationPath {
+		if poll.DeferredContinuationPath != "" {
+			poll.DeferredContinuationPath = ""
+			changed = true
+		}
+	} else if update.SetDeferredContinuationPath {
+		deferred := strings.TrimSpace(update.DeferredContinuationPath)
+		if poll.DeferredContinuationPath != deferred {
+			poll.DeferredContinuationPath = deferred
+			changed = true
+		}
 	}
 	if update.ResetFailures {
 		if poll.FailureCount != 0 {

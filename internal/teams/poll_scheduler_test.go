@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -30,8 +31,8 @@ func TestInboundPollDecisionThresholds(t *testing.T) {
 		{name: "cold at cool boundary", idle: 4 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
 		{name: "cold", idle: 5 * time.Hour, want: inboundPollStateCold, interval: inboundPollColdInterval},
 		{name: "cold just before park boundary", idle: 48*time.Hour - time.Nanosecond, want: inboundPollStateCold, interval: inboundPollColdInterval},
-		{name: "parked at boundary", idle: 48 * time.Hour, want: inboundPollStateParked, parked: true},
-		{name: "parked", idle: 49 * time.Hour, want: inboundPollStateParked, parked: true},
+		{name: "parked at boundary", idle: 48 * time.Hour, want: inboundPollStateParked, interval: inboundPollParkProbeInterval, parked: true},
+		{name: "parked", idle: 49 * time.Hour, want: inboundPollStateParked, interval: inboundPollParkProbeInterval, parked: true},
 		{name: "running overrides idle", idle: 49 * time.Hour, running: true, want: inboundPollStateRunning, interval: inboundPollRunningInterval},
 	}
 	for _, tc := range cases {
@@ -363,7 +364,68 @@ func TestInboundPollParkNoticeRetriesUntilRecorded(t *testing.T) {
 		Poll:    poll,
 		Now:     now,
 	})
-	if !decision.ShouldPark || decision.ShouldNotifyPark {
-		t.Fatalf("parked with notice should not notify again: %#v", decision)
+	if decision.ShouldPark || decision.ShouldNotifyPark || !decision.ParkedProbe || !decision.Due {
+		t.Fatalf("parked with notice should become a due probe: %#v", decision)
+	}
+}
+
+func TestInboundPollParkProbeRespectsNextPollAt(t *testing.T) {
+	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Minute)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-1",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:           "chat-1",
+			Seeded:           true,
+			PollState:        inboundPollStateParked,
+			ParkedAt:         now.Add(-72 * time.Hour),
+			ParkNoticeSentAt: now.Add(-71 * time.Hour),
+			NextPollAt:       future,
+			LastActivityAt:   now.Add(-72 * time.Hour),
+		},
+		Now: now,
+	})
+	if decision.ShouldPark || !decision.ParkedProbe || decision.Due || !decision.NextPollAt.Equal(future) || decision.Interval != inboundPollParkProbeInterval {
+		t.Fatalf("future parked probe decision = %#v, want deferred low-frequency probe", decision)
+	}
+}
+
+func TestLimitInboundPollDecisionsReservesParkedProbeUnderHotLoad(t *testing.T) {
+	decisions := make([]inboundPollDecision, 0, 10)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID: "hot-" + strconv.Itoa(i),
+			State:  inboundPollStateHot,
+			Due:    true,
+		})
+	}
+	decisions = append(decisions, inboundPollDecision{
+		ChatID: "parked-probe",
+		State:  inboundPollStateParked,
+		Due:    true,
+	})
+	decisions = append(decisions, inboundPollDecision{
+		ChatID: "warm-backlog",
+		State:  inboundPollStateWarm,
+		Due:    true,
+	})
+
+	limited := limitInboundPollDecisions(decisions, 8)
+	if len(limited) != 8 {
+		t.Fatalf("limited decisions = %d, want 8", len(limited))
+	}
+	seenParked := false
+	seenWarm := false
+	for _, decision := range limited {
+		seenParked = seenParked || decision.State == inboundPollStateParked
+		seenWarm = seenWarm || decision.ChatID == "warm-backlog"
+	}
+	if !seenParked {
+		t.Fatalf("per-cycle limit dropped every parked probe: %#v", limited)
+	}
+	if !seenWarm {
+		t.Fatalf("per-cycle limit dropped every due non-hot chat: %#v", limited)
 	}
 }
