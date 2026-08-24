@@ -22201,21 +22201,28 @@ func TestBridgePollOnceRotatesDueWorkChatsWhenPerCycleLimitIsReached(t *testing.
 
 func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T) {
 	now := time.Now()
-	wantPaths := []string{
-		"/chats/chat-99/messages",
-		"/chats/chat-01/messages",
+	wantPaths := map[string]bool{
+		"/chats/chat-99/messages": true,
+		"/chats/chat-01/messages": true,
 	}
-	var pages []bridgePollPage
-	for _, wantPath := range wantPaths {
-		path := wantPath
-		pages = append(pages, bridgePollPage{assert: func(t *testing.T, r *http.Request) {
-			t.Helper()
-			if r.URL.Path != path {
-				t.Fatalf("poll path = %s, want %s", r.URL.Path, path)
-			}
-		}})
+	var gotPathsMu sync.Mutex
+	var gotPaths []string
+	assertSelectedPath := func(t *testing.T, r *http.Request) {
+		t.Helper()
+		if !wantPaths[r.URL.Path] {
+			t.Fatalf("poll path = %s, want one of %#v", r.URL.Path, wantPaths)
+		}
+		gotPathsMu.Lock()
+		gotPaths = append(gotPaths, r.URL.Path)
+		gotPathsMu.Unlock()
 	}
-	readGraph := newBridgePollGraph(t, pages)
+	// pollOnce dispatches selected chats concurrently; the scheduler contract is
+	// which chats are selected under the cap, not the order in which Graph sees
+	// their requests.
+	readGraph := newBridgePollGraph(t, []bridgePollPage{
+		{assert: assertSelectedPath},
+		{assert: assertSelectedPath},
+	})
 	writeGraph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	if _, err := store.RecordChatPollSuccess(context.Background(), "control-chat", now.Add(-time.Minute), true, false, 1); err != nil {
@@ -22270,6 +22277,20 @@ func TestBridgePollOncePrioritizesRunningWorkChatUnderPerCycleLimit(t *testing.T
 
 	if err := bridge.pollOnce(context.Background(), 20); err != nil {
 		t.Fatalf("pollOnce error: %v", err)
+	}
+	gotPathsMu.Lock()
+	defer gotPathsMu.Unlock()
+	if len(gotPaths) != len(wantPaths) {
+		t.Fatalf("selected poll paths = %#v, want one read for each of %#v", gotPaths, wantPaths)
+	}
+	counts := map[string]int{}
+	for _, path := range gotPaths {
+		counts[path]++
+	}
+	for path := range wantPaths {
+		if counts[path] != 1 {
+			t.Fatalf("selected poll path %s read %d times, want once; all paths=%#v", path, counts[path], gotPaths)
+		}
 	}
 }
 
