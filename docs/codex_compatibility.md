@@ -10,11 +10,12 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.150.0-alpha.3 | pass | pass | pass | pass | pass | pass | 2026-08-21T17:59:58Z |
 | 0.150.0-alpha.2 | pass | fail | pass | pass | pass | pass | 2026-08-21T05:02:34Z |
 | 0.150.0-alpha.1 | pass | fail | pass | pass | pass | pass | 2026-08-21T02:17:52Z |
+| 0.149.1 | pass | pass | pass | pass | pass | pass | 2026-08-24T02:17:22Z |
 | 0.149.0 | pass | pass | pass | pass | pass | pass | 2026-08-21T16:38:37Z |
 | 0.149.0-alpha.7.2 | pass | pass | pass | pass | pass | pass | 2026-08-22T20:11:15Z |
 | 0.149.0-alpha.7.1 | pass | pass | pass | pass | pass | pass | 2026-08-21T16:38:37Z |
 | 0.149.0-alpha.7 | pass | fail | pass | pass | pass | pass | 2026-08-20T21:58:36Z |
-| 0.149.0-alpha.4.3 | fail | fail | pass | pass | pass | pass | 2026-08-24T00:34:58Z |
+| 0.149.0-alpha.4.3 | pass | pass | pass | pass | pass | pass | 2026-08-24T02:17:22Z |
 | 0.149.0-alpha.4.1 | pass | fail | pass | pass | pass | pass | 2026-08-21T04:10:06Z |
 | 0.149.0-alpha.4 | pass | fail | pass | pass | pass | pass | 2026-08-20T18:29:00Z |
 | 0.149.0-alpha.3 | pass | fail | pass | pass | pass | pass | 2026-08-20T09:05:37Z |
