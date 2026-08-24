@@ -58,13 +58,13 @@ func (b *Bridge) SendWorkflowNotificationTest(ctx context.Context) error {
 	if !cfg.Enabled {
 		return fmt.Errorf("Teams workflow notifications are disabled")
 	}
-	controlURL := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatURL, state.ControlChat.TeamsChatURL))
+	controlURL := strings.TrimSpace(firstNonEmptyString(b.controlChatURLForPoll(), state.ControlChat.TeamsChatURL))
 	if !safeTeamsOpenURL(controlURL) {
 		tenantID := ""
 		if b.graph != nil {
 			tenantID = b.graph.tenantID()
 		}
-		controlURL = TeamsChatURL(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID), tenantID)
+		controlURL = TeamsChatURL(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID), tenantID)
 	}
 	if controlURL == "" {
 		return fmt.Errorf("Teams control chat is not configured")
@@ -124,7 +124,7 @@ func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLF
 	out, err := b.store.UpdateWorkflowConfig(ctx, func(current teamstore.WorkflowNotificationConfig, control teamstore.ControlChatBinding, now time.Time) (teamstore.WorkflowNotificationConfig, bool, error) {
 		next := teamstore.WorkflowNotificationConfig{UpdatedAt: time.Now()}
 		if enabled {
-			controlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, control.TeamsChatID))
+			controlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), control.TeamsChatID))
 			if controlChatID == "" {
 				return teamstore.WorkflowNotificationConfig{}, false, fmt.Errorf("Teams control chat must be configured before enabling workflow notifications")
 			}
@@ -217,7 +217,7 @@ func (b *Bridge) queueDetectedCodexAnswerNotification(ctx context.Context, event
 	}
 	cfg, cfgErr := b.effectiveWorkflowNotificationConfig(state)
 	if cfgErr == nil && cfg.Enabled {
-		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 		if workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
 			if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err == nil {
 				return b.queueWorkflowNotification(ctx, event)
@@ -379,7 +379,7 @@ func (b *Bridge) workflowUserAttentionAvailable(ctx context.Context) bool {
 	}
 	cfg, err := b.effectiveWorkflowNotificationConfig(state)
 	if err == nil && cfg.Enabled {
-		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+		currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 		if workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
 			if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err == nil {
 				return true
@@ -408,7 +408,7 @@ func (b *Bridge) workflowCardAvailableFromState(state teamstore.State, cfg teams
 	if b == nil || !cfg.Enabled {
 		return false
 	}
-	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
 		return false
 	}
@@ -440,7 +440,7 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 	if !cfg.Enabled {
 		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, fallbackReason)
 	}
-	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
 		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable because the control chat changed.")
 	}
@@ -826,7 +826,7 @@ func (b *Bridge) flushPendingWorkflowNotificationsWithLimit(ctx context.Context,
 	if !cfg.Enabled {
 		return nil
 	}
-	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.reg.ControlChatID, state.ControlChat.TeamsChatID))
+	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 	if strings.TrimSpace(cfg.ControlChatID) != "" && currentControlChatID != "" && strings.TrimSpace(cfg.ControlChatID) != currentControlChatID {
 		return nil
 	}
@@ -1239,11 +1239,8 @@ func workflowSessionForOutbox(b *Bridge, state teamstore.State, outbox teamstore
 	if session := b.sessionForIDState(state, outbox.SessionID); session != nil {
 		return session
 	}
-	for _, session := range b.reg.Sessions {
-		if strings.TrimSpace(session.ChatID) == strings.TrimSpace(outbox.TeamsChatID) {
-			copy := session
-			return &copy
-		}
+	if session := b.sessionByChatIDForPoll(outbox.TeamsChatID); session != nil {
+		return session
 	}
 	return nil
 }
@@ -1266,7 +1263,7 @@ func workflowNotificationChatTitle(b *Bridge, session *Session, outbox teamstore
 }
 
 func workflowControlChatTitle(b *Bridge, state teamstore.State) string {
-	title := strings.TrimSpace(firstNonEmptyString(state.ControlChat.TeamsChatTopic, b.reg.ControlChatTopic))
+	title := strings.TrimSpace(firstNonEmptyString(state.ControlChat.TeamsChatTopic, b.controlChatTopicForPoll()))
 	if title != "" {
 		return workflowLimitRunes(title, workflowNotificationMaxTitleRunes)
 	}
@@ -1280,8 +1277,8 @@ func workflowNotificationButtonURL(b *Bridge, session *Session, outbox teamstore
 	if session != nil && safeTeamsOpenURL(session.ChatURL) {
 		return strings.TrimSpace(session.ChatURL)
 	}
-	if b != nil && strings.TrimSpace(outbox.TeamsChatID) == strings.TrimSpace(b.reg.ControlChatID) && safeTeamsOpenURL(b.reg.ControlChatURL) {
-		return strings.TrimSpace(b.reg.ControlChatURL)
+	if b != nil && strings.TrimSpace(outbox.TeamsChatID) == b.controlChatIDForPoll() && safeTeamsOpenURL(b.controlChatURLForPoll()) {
+		return b.controlChatURLForPoll()
 	}
 	tenantID := ""
 	if b != nil && b.graph != nil {

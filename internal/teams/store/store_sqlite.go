@@ -577,8 +577,12 @@ func (s *Store) hotPollScheduleSQLite(ctx context.Context, includeParkedSkip boo
 		if err != nil {
 			return err
 		}
+		parkProbeDueAt := sqliteTime(time.Now())
 		selected, err := loadSQLiteSelectedStateWithChatPollQuery(ctx, db, hotPollScheduleBaseFields,
-			`SELECT json FROM chat_polls WHERE COALESCE(parked_skip_eligible, 0) = 0`,
+			`SELECT json FROM chat_polls
+WHERE COALESCE(parked_skip_eligible, 0) = 0
+   OR (poll_state = ? AND COALESCE(next_poll_at, 0) <= ?)`,
+			chatPollStateParked, parkProbeDueAt,
 		)
 		if err != nil {
 			return err
@@ -2239,7 +2243,7 @@ func loadSQLiteHasSessions(ctx context.Context, db *sql.DB) (bool, error) {
 
 func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlChatID string, idleBefore time.Time) ([]SessionContext, error) {
 	controlChatID = strings.TrimSpace(controlChatID)
-	args := []any{string(SessionStatusActive), controlChatID, controlChatID}
+	args := []any{string(SessionStatusActive), controlChatID, controlChatID, chatPollStateParked, sqliteTime(time.Now())}
 	excludeIdle := ""
 	if !idleBefore.IsZero() {
 		excludeIdle = `  AND NOT (
@@ -2247,16 +2251,16 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
     AND COALESCE(p.last_activity_at, 0) <= ?
     AND COALESCE(s.updated_at, 0) <= ?
     AND COALESCE(p.parked_skip_eligible, 0) = 0
-    AND p.poll_state IN (?, ?)
+    AND p.poll_state IN (?)
     AND NOT EXISTS (
       SELECT 1 FROM turns t
       WHERE t.session_id = s.id
         AND t.status IN (?, ?)
     )
   )
-`
+		`
 		idleBeforeUnix := sqliteTime(idleBefore)
-		args = append(args, idleBeforeUnix, idleBeforeUnix, chatPollStateCold, chatPollStateParked, string(TurnStatusQueued), string(TurnStatusRunning))
+		args = append(args, idleBeforeUnix, idleBeforeUnix, chatPollStateCold, string(TurnStatusQueued), string(TurnStatusRunning))
 	}
 	rows, err := db.QueryContext(ctx, `SELECT s.json
 FROM sessions s
@@ -2264,7 +2268,7 @@ LEFT JOIN chat_polls p ON p.chat_id = s.teams_chat_id
 WHERE (s.status IS NULL OR s.status = '' OR s.status = ?)
   AND COALESCE(s.teams_chat_id, '') != ''
   AND (? = '' OR s.teams_chat_id != ?)
-  AND (p.chat_id IS NULL OR COALESCE(p.parked_skip_eligible, 0) = 0)
+  AND (p.chat_id IS NULL OR COALESCE(p.parked_skip_eligible, 0) = 0 OR (p.poll_state = ? AND COALESCE(p.next_poll_at, 0) <= ?))
 `+excludeIdle+`ORDER BY s.updated_at DESC, s.id`, args...)
 	if err != nil {
 		return nil, err
@@ -3025,7 +3029,7 @@ func (s *Store) importCheckpointSQLite(ctx context.Context, id string) (ImportCh
 		if err != nil {
 			return err
 		}
-		out, found, err = loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+		out, found, _, err = loadSQLiteCanonicalCheckpointRow(ctx, db, id, "")
 		return err
 	})
 	return out, found, handled, err
@@ -3055,26 +3059,25 @@ func (s *Store) loadSQLiteImportCheckpointsByIDsUnlocked(ctx context.Context, po
 			args = append(args, id)
 		}
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
-		rows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		rows, err := db.QueryContext(ctx, `SELECT id, session_id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var id string
+			var sessionColumn string
 			var raw []byte
-			if err := rows.Scan(&id, &raw); err != nil {
+			if err := rows.Scan(&id, &sessionColumn, &raw); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			var checkpoint ImportCheckpoint
-			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			sessionID := strings.TrimSpace(requested[id])
+			if strings.TrimSpace(sessionColumn) != "" && strings.TrimSpace(sessionColumn) != sessionID {
 				_ = rows.Close()
-				return nil, err
+				return nil, fmt.Errorf("%w: checkpoint %q SQL session %q does not match requested %q", ErrSessionStateProvenanceMismatch, id, sessionColumn, sessionID)
 			}
-			if strings.TrimSpace(checkpoint.ID) == "" {
-				checkpoint.ID = id
-			}
-			if err := validateImportCheckpointProvenance(checkpoint, requested[id], id); err != nil {
+			checkpoint, _, err := decodeSQLiteCanonicalCheckpoint(raw, id, sessionID, false)
+			if err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
@@ -3112,7 +3115,7 @@ func (s *Store) updateImportCheckpointSQLite(ctx context.Context, parentSessionI
 		if err := ensureSQLiteParentUnfencedTx(ctx, tx, parentSessionID); err != nil {
 			return err
 		}
-		current, found, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+		current, found, _, err := loadSQLiteCanonicalCheckpointRow(ctx, tx, id, "")
 		if err != nil {
 			return err
 		}
@@ -5141,12 +5144,9 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 		return State{}, err
 	}
 	if checkpointID != "" {
-		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+		if checkpoint, ok, _, err := loadSQLiteCanonicalCheckpointRow(ctx, db, checkpointID, sessionID); err != nil {
 			return State{}, err
 		} else if ok {
-			if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
-				return State{}, err
-			}
 			state.ImportCheckpoints[checkpoint.ID] = checkpoint
 		}
 	}
@@ -5218,12 +5218,9 @@ func (s *Store) loadSQLiteSessionExecutionOwnershipProbeUnlocked(ctx context.Con
 		return false, err
 	}
 	if checkpointID != "" {
-		if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, db, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID); err != nil {
+		if checkpoint, ok, _, err := loadSQLiteCanonicalCheckpointRow(ctx, db, checkpointID, sessionID); err != nil {
 			return false, err
 		} else if ok {
-			if err := validateImportCheckpointProvenance(checkpoint, sessionID, checkpointID); err != nil {
-				return false, err
-			}
 			if importCheckpointHasUnresolvedExecution(checkpoint) {
 				return true, nil
 			}
@@ -5282,19 +5279,15 @@ func (s *Store) loadSQLiteSessionExecutionOwnershipProbesUnlocked(ctx context.Co
 			args = append(args, sessionTranscriptCheckpointID(sessionID))
 		}
 		placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
-		checkpointRows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		checkpointRows, err := db.QueryContext(ctx, `SELECT id, session_id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
 		for checkpointRows.Next() {
 			var id string
+			var sessionColumn string
 			var raw []byte
-			if err := checkpointRows.Scan(&id, &raw); err != nil {
-				_ = checkpointRows.Close()
-				return nil, err
-			}
-			var checkpoint ImportCheckpoint
-			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			if err := checkpointRows.Scan(&id, &sessionColumn, &raw); err != nil {
 				_ = checkpointRows.Close()
 				return nil, err
 			}
@@ -5302,7 +5295,12 @@ func (s *Store) loadSQLiteSessionExecutionOwnershipProbesUnlocked(ctx context.Co
 			if !wanted {
 				continue
 			}
-			if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+			if strings.TrimSpace(sessionColumn) != "" && strings.TrimSpace(sessionColumn) != sessionID {
+				_ = checkpointRows.Close()
+				return nil, fmt.Errorf("%w: checkpoint %q SQL session %q does not match requested %q", ErrSessionStateProvenanceMismatch, id, sessionColumn, sessionID)
+			}
+			checkpoint, _, err := decodeSQLiteCanonicalCheckpoint(raw, id, sessionID, false)
+			if err != nil {
 				_ = checkpointRows.Close()
 				return nil, err
 			}
@@ -5487,14 +5485,15 @@ func (s *Store) loadSQLiteLinkedTranscriptSessionSnapshotUnlocked(ctx context.Co
 		for i, id := range batch {
 			args[i] = id
 		}
-		rows, err := db.QueryContext(ctx, `SELECT id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
+		rows, err := db.QueryContext(ctx, `SELECT id, session_id, json FROM import_checkpoints WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return LinkedTranscriptSessionSnapshot{}, err
 		}
 		for rows.Next() {
 			var id string
+			var sessionColumn string
 			var raw []byte
-			if err := rows.Scan(&id, &raw); err != nil {
+			if err := rows.Scan(&id, &sessionColumn, &raw); err != nil {
 				_ = rows.Close()
 				return LinkedTranscriptSessionSnapshot{}, err
 			}
@@ -5502,12 +5501,12 @@ func (s *Store) loadSQLiteLinkedTranscriptSessionSnapshotUnlocked(ctx context.Co
 			if !wanted {
 				continue
 			}
-			var checkpoint ImportCheckpoint
-			if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			if strings.TrimSpace(sessionColumn) != "" && strings.TrimSpace(sessionColumn) != sessionID {
 				_ = rows.Close()
-				return LinkedTranscriptSessionSnapshot{}, err
+				return LinkedTranscriptSessionSnapshot{}, fmt.Errorf("%w: checkpoint %q SQL session %q does not match requested %q", ErrSessionStateProvenanceMismatch, id, sessionColumn, sessionID)
 			}
-			if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+			checkpoint, _, err := decodeSQLiteCanonicalCheckpoint(raw, id, sessionID, false)
+			if err != nil {
 				_ = rows.Close()
 				return LinkedTranscriptSessionSnapshot{}, err
 			}
@@ -5850,7 +5849,7 @@ func markSQLiteLegacyUnresolvedSessionTx(ctx context.Context, tx *sql.Tx, state 
 			return err
 		}
 	}
-	if checkpoint, ok := state.ImportCheckpoints[checkpointID]; ok && importCheckpointHasUnresolvedExecution(checkpoint) {
+	if checkpoint, ok := state.ImportCheckpoints[checkpointID]; ok && importCheckpointHasUnresolvedExecution(checkpoint) && !importCheckpointHasMalformedCanonicalFence(checkpoint) {
 		// Once the compatibility probe has materialized the canonical anchor,
 		// every subsequent transaction can use this single indexed checkpoint
 		// row instead of decoding all interrupted turns again.
@@ -5953,7 +5952,7 @@ func materializeSQLiteLegacyExecutionAnchorTx(ctx context.Context, tx *sql.Tx, s
 		checkpoint = ImportCheckpoint{ID: checkpointID, SessionID: sessionID}
 		state.ImportCheckpoints[checkpointID] = checkpoint
 	}
-	if importCheckpointHasUnresolvedExecution(checkpoint) {
+	if importCheckpointHasUnresolvedExecution(checkpoint) && !importCheckpointHasMalformedCanonicalFence(checkpoint) {
 		return nil
 	}
 	generation := checkpoint.ExecutionAnchorGeneration + 1
@@ -5987,6 +5986,99 @@ func materializeSQLiteLegacyExecutionAnchorTx(ctx context.Context, tx *sql.Tx, s
 	return upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint)
 }
 
+const malformedCanonicalCheckpointKind = "malformed_canonical_checkpoint"
+
+func malformedCanonicalImportCheckpoint(id string, sessionID string) ImportCheckpoint {
+	now := time.Now()
+	return ImportCheckpoint{
+		ID:                     strings.TrimSpace(id),
+		SessionID:              strings.TrimSpace(sessionID),
+		Status:                 importCheckpointStatusComplete,
+		LegacySourceUnverified: true,
+		UnresolvedExecution: &ExecutionAnchor{
+			SessionID:  strings.TrimSpace(sessionID),
+			Reason:     "malformed canonical transcript checkpoint",
+			Provenance: ExecutionAnchorProvenanceLegacy,
+			State:      "unresolved",
+			Generation: 1,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+		},
+		TranscriptQuarantine: &TranscriptQuarantine{
+			Kind: malformedCanonicalCheckpointKind,
+		},
+	}
+}
+
+func decodeSQLiteCanonicalCheckpoint(raw []byte, id string, sessionID string, repairMalformed bool) (ImportCheckpoint, bool, error) {
+	id = strings.TrimSpace(id)
+	sessionID = strings.TrimSpace(sessionID)
+	if id == "" || sessionID == "" {
+		return ImportCheckpoint{}, false, fmt.Errorf("%w: canonical checkpoint identity is incomplete", ErrSessionStateProvenanceMismatch)
+	}
+	var checkpoint ImportCheckpoint
+	trimmed := strings.TrimSpace(string(raw))
+	unmarshalErr := json.Unmarshal(raw, &checkpoint)
+	if trimmed == "" || trimmed == "null" || unmarshalErr != nil {
+		if _, canonical := canonicalCheckpointSessionID(id); !canonical {
+			if unmarshalErr == nil {
+				unmarshalErr = fmt.Errorf("JSON is null or empty")
+			}
+			return ImportCheckpoint{}, false, fmt.Errorf("malformed non-canonical import checkpoint %q: %w", id, unmarshalErr)
+		}
+		if repairMalformed {
+			return malformedCanonicalImportCheckpoint(id, sessionID), true, nil
+		}
+		if unmarshalErr == nil {
+			unmarshalErr = fmt.Errorf("JSON is null or empty")
+		}
+		return ImportCheckpoint{}, false, fmt.Errorf("malformed canonical import checkpoint %q: %w", id, unmarshalErr)
+	}
+	if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
+		return ImportCheckpoint{}, false, err
+	}
+	return checkpoint, false, nil
+}
+
+func canonicalCheckpointSessionID(id string) (string, bool) {
+	const prefix = "transcript:"
+	if !strings.HasPrefix(strings.TrimSpace(id), prefix) {
+		return "", false
+	}
+	sessionID := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(id), prefix))
+	return sessionID, sessionID != ""
+}
+
+func loadSQLiteCanonicalCheckpointRow(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, id string, sessionID string) (ImportCheckpoint, bool, bool, error) {
+	id = strings.TrimSpace(id)
+	sessionID = strings.TrimSpace(sessionID)
+	var sessionColumn string
+	var raw []byte
+	err := q.QueryRowContext(ctx, `SELECT session_id, json FROM import_checkpoints WHERE id = ?`, id).Scan(&sessionColumn, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportCheckpoint{}, false, false, nil
+	}
+	if err != nil {
+		return ImportCheckpoint{}, false, false, err
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(sessionColumn)
+	}
+	if sessionID == "" {
+		sessionID, _ = canonicalCheckpointSessionID(id)
+	}
+	if strings.TrimSpace(sessionColumn) != "" && sessionID != strings.TrimSpace(sessionColumn) {
+		return ImportCheckpoint{}, false, false, fmt.Errorf("%w: checkpoint %q SQL session %q does not match requested %q", ErrSessionStateProvenanceMismatch, id, sessionColumn, sessionID)
+	}
+	checkpoint, repaired, err := decodeSQLiteCanonicalCheckpoint(raw, id, sessionID, false)
+	if err != nil {
+		return ImportCheckpoint{}, false, false, err
+	}
+	return checkpoint, true, repaired, nil
+}
+
 // loadSQLiteSessionTranscriptCheckpointTx loads the canonical per-session
 // transcript checkpoint in addition to any operation-specific checkpoint the
 // caller requested.  An explicit/full-history operation may use a different
@@ -6007,17 +6099,47 @@ func loadSQLiteSessionTranscriptCheckpointTx(ctx context.Context, tx *sql.Tx, st
 		// the map key alone: an embedded foreign ID/session must fail closed.
 		return validateImportCheckpointProvenance(checkpoint, sessionID, id)
 	}
-	checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, id)
+	checkpoint, ok, repaired, err := loadSQLiteQueueClaimCheckpointTx(ctx, tx, sessionID)
 	if err != nil {
 		return err
 	}
 	if ok {
-		if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
-			return err
+		if repaired {
+			if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+				return err
+			}
 		}
 		state.ImportCheckpoints[checkpoint.ID] = checkpoint
 	}
 	return nil
+}
+
+// loadSQLiteQueueClaimCheckpointTx is deliberately narrower than the generic
+// JSON loader. A legacy/corrupt canonical checkpoint is unknown execution
+// ownership, not proof that the old thread is safe to reuse. It is converted
+// into an unresolved fence and the caller persists that repair before making
+// a claim. A valid row with the wrong embedded identity still fails closed
+// through the normal provenance check.
+func loadSQLiteQueueClaimCheckpointTx(ctx context.Context, tx *sql.Tx, sessionID string) (ImportCheckpoint, bool, bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	id := sessionTranscriptCheckpointID(sessionID)
+	var sessionColumn string
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT session_id, json FROM import_checkpoints WHERE id = ?`, id).Scan(&sessionColumn, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ImportCheckpoint{}, false, false, nil
+	}
+	if err != nil {
+		return ImportCheckpoint{}, false, false, err
+	}
+	if strings.TrimSpace(sessionColumn) != "" && strings.TrimSpace(sessionColumn) != sessionID {
+		return ImportCheckpoint{}, false, false, fmt.Errorf("%w: checkpoint %q SQL session %q does not match requested %q", ErrSessionStateProvenanceMismatch, id, sessionColumn, sessionID)
+	}
+	checkpoint, repaired, err := decodeSQLiteCanonicalCheckpoint(raw, id, sessionID, true)
+	if err != nil {
+		return ImportCheckpoint{}, false, false, err
+	}
+	return checkpoint, true, repaired, nil
 }
 
 func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string) (Turn, bool, bool, error) {
@@ -6052,9 +6174,14 @@ func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string)
 			} else if fenced {
 				return tx.Commit()
 			}
-			checkpoint, checkpointFound, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, sessionTranscriptCheckpointID(sessionID))
+			checkpoint, checkpointFound, repaired, err := loadSQLiteQueueClaimCheckpointTx(ctx, tx, sessionID)
 			if err != nil {
 				return err
+			}
+			if repaired {
+				if err := upsertSQLiteImportCheckpointTx(ctx, tx, checkpoint); err != nil {
+					return err
+				}
 			}
 			legacyState := State{
 				legacyUnresolvedSessions: map[string]bool{},
@@ -6197,13 +6324,8 @@ func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutb
 					state.Sessions[current.SessionID] = session
 				}
 			}
-			if checkpoint, ok, err := loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, sessionTranscriptCheckpointID(current.SessionID)); err != nil {
+			if err := loadSQLiteSessionTranscriptCheckpointTx(ctx, tx, &state, current.SessionID); err != nil {
 				return err
-			} else if ok {
-				if err := validateImportCheckpointProvenance(checkpoint, current.SessionID, sessionTranscriptCheckpointID(current.SessionID)); err != nil {
-					return err
-				}
-				state.ImportCheckpoints[checkpoint.ID] = checkpoint
 			}
 			checkpointID := sessionTranscriptCheckpointID(current.SessionID)
 			beforeCheckpoint, beforeCheckpointFound := state.ImportCheckpoints[checkpointID]
