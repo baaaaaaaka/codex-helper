@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-08-23T11:58:26Z",
+  "generated_at": "2026-08-24T14:18:24Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.25_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.25_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.25_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.25_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.22-rc.25",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-08-24T14:11:46Z",
+      "tag_name": "v0.1.22-rc.25",
+      "version": "0.1.22-rc.25"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-06-29T01:24:50Z",
       "tag_name": "v0.1.13-rc.26",
       "version": "0.1.13-rc.26"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.25_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.25_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.25_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.25_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.13-rc.25 \u2014 official-origin routing and hardened standard approvals",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-06-28T13:49:18Z",
-      "tag_name": "v0.1.13-rc.25",
-      "version": "0.1.13-rc.25"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
