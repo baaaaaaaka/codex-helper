@@ -273,14 +273,16 @@ func (b *Bridge) updateSessionCodexThreadProjection(session *Session, sessionID 
 	threadID = strings.TrimSpace(threadID)
 	changed := false
 	if b != nil {
+		b.regMu.Lock()
 		if current := b.reg.SessionByID(sessionID); current != nil {
 			if strings.TrimSpace(current.CodexThreadID) != threadID {
 				current.CodexThreadID = threadID
 				current.UpdatedAt = time.Now()
-				b.markRegistryProjectionDirty()
+				b.registryProjectionDirty = true
 				changed = true
 			}
 		}
+		b.regMu.Unlock()
 	}
 	if session != nil {
 		session.CodexThreadID = threadID

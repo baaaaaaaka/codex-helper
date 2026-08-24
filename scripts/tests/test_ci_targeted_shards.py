@@ -7,6 +7,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
+OWNERSHIP_STRESS_TESTS = ROOT / "internal" / "teams" / "ownership_stress_ci_test.go"
 
 
 def targeted_job() -> str:
@@ -98,7 +99,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
             "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
             "Teams runtime safety resolver syscall budget": "state-perf",
-            "Teams runtime safety real-process takeover": "state-perf",
+            "Teams runtime safety real-process, SIGKILL, and disk-full boundaries": "state-perf",
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
             "Teams SQLite store migration and perf regressions": "state-perf",
             "Teams perf benchmark smoke": "state-perf",
@@ -130,6 +131,27 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn("TestCXPPerfModelSQLite", state)
         self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", state)
         self.assertIn("Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)", state)
+
+    def test_teams_ownership_stress_gate_is_strict_and_nonempty(self):
+        blocks = step_blocks(targeted_job())
+        block = blocks["Teams ownership stress regressions"]
+        smoke = (ROOT / "scripts" / "ci" / "teams_ownership_stress_docker_smoke.sh").read_text(encoding="utf-8")
+        self.assertIn("bash scripts/ci/teams_ownership_stress_docker_smoke.sh", block)
+        self.assertIn("CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT=1", smoke)
+        self.assertIn("-test.run '^TestTeamsOwnershipStress'", smoke)
+        self.assertTrue((ROOT / "scripts" / "ci" / "Dockerfile.teams-ownership-stress").is_file())
+        tests = re.findall(r"^func (TestTeamsOwnershipStress\w*)\(", OWNERSHIP_STRESS_TESTS.read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertGreater(len(tests), 0)
+
+    def test_targeted_poll_selectors_match_current_test_names(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("SkipsExplicitParkedPollWithStaleContinuation", workflow)
+        self.assertNotIn("RecoversStaleWorkContinuationErrorWithTerminalHead", workflow)
+        self.assertNotIn("RecoversStaleContinuationErrorWithTerminalHead", workflow)
+        self.assertIn("KeepsExplicitParkedPollBlockedUntilRetryDeadline", workflow)
+        self.assertIn("PreservesStaleWorkContinuationWithTerminalHead", workflow)
+        self.assertIn("PreservesStaleContinuationWithTerminalHead", workflow)
+        self.assertIn("ProbesAlreadyParkedNoticeSentWithoutFreezeRewrite", workflow)
 
     def test_windows_codex_e2e_installs_before_runtime_consumers(self):
         job = targeted_job()

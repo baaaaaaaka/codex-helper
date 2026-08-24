@@ -413,6 +413,20 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		// generation transition.
 		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceGeneration: sourceGeneration, Size: info.Size(), ModTime: info.ModTime()}, Truncated: true}, nil
 	}
+	if strings.TrimSpace(previous.SourceFingerprint) != "" && previous.Offset >= 0 && previous.Offset == previous.Size {
+		currentFingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, previous.Offset))
+		if currentFingerprint == "" || currentFingerprint != strings.TrimSpace(previous.SourceFingerprint) {
+			next := historyTieredFileState{
+				Path:                 path,
+				Size:                 info.Size(),
+				ModTime:              info.ModTime(),
+				SourceGeneration:     sourceGeneration,
+				SourceFingerprint:    currentFingerprint,
+				SourceRewriteBlocked: true,
+			}
+			return historyTieredTailResult{State: next, Truncated: true}, nil
+		}
+	}
 	if previous.PartialLineStartOffset >= previous.Offset && previous.PartialReadOffset > previous.PartialLineStartOffset {
 		identity := historyTieredSourceIdentity(path, info)
 		if strings.TrimSpace(previous.PartialSourceIdentity) != "" && identity != "" && identity != strings.TrimSpace(previous.PartialSourceIdentity) {
@@ -679,7 +693,16 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		if read.BytesRead > 0 {
 			lineStartOffset := offset
 			if !read.Complete {
-				if budgeted && lineStartOffset+read.BytesRead >= scanEnd {
+				trimmed := bytes.TrimSpace(line)
+				completeAtEOF := err == io.EOF && !read.Oversized && len(trimmed) > 0 && json.Valid(trimmed)
+				if completeAtEOF {
+					// A process can exit immediately after writing a valid JSON
+					// object and before its delimiter. Treat that EOF as a safe
+					// boundary; otherwise a completed final can remain stranded
+					// behind the incremental cursor forever.
+					read.Complete = true
+					err = nil
+				} else if budgeted && lineStartOffset+read.BytesRead >= scanEnd {
 					completed, readErr := historyTieredCompleteBudgetedLine(f, line, read.BytesRead, readEnd-scanEnd, historyTieredMaxRecordBytes)
 					if readErr != nil {
 						return result, readErr
@@ -1196,6 +1219,13 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.PendingRootTaskStartedOffset = pendingRootTaskStartedOffset
 	next.PendingRootTaskStartedEndOffset = pendingRootTaskStartedEndOffset
 	next.pendingAssistant = pending
+	if !result.Truncated && (next.Offset == info.Size() || strings.TrimSpace(previous.SourceFingerprint) == "") {
+		// Direct scanner callers also need a proof for the current physical
+		// cursor, not just the first cursor. Without refreshing it after a
+		// complete opaque record, the next pass would compare the new offset
+		// against a proof for the old prefix and falsely report a rewrite.
+		next.SourceFingerprint = strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, next.Offset))
+	}
 	if len(result.Records) > 0 {
 		transcript := Transcript{
 			SourceName:      path,

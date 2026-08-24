@@ -521,6 +521,7 @@ type Bridge struct {
 	asyncTurnWG                       sync.WaitGroup
 	asyncTurnStateMu                  sync.Mutex
 	activeAsyncTurns                  int
+	warningMu                         sync.Mutex
 	helperRestartWG                   sync.WaitGroup
 	runningTurnMu                     sync.Mutex
 	runningTurnCancels                map[string]*runningTurnCancel
@@ -1457,6 +1458,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		Now:     now,
 	})
 	controlStateReusable := false
+	var controlPollErr error
 	if !controlDecision.Due {
 		controlStateReusable = inboundPollDecisionAlreadyPersisted(controlPoll, hasControlPoll, controlDecision)
 		if !controlStateReusable {
@@ -1465,13 +1467,11 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			}
 		}
 	} else {
-		controlHandled, err := b.pollChatWithRoleStateOptions(ctx, b.reg.ControlChatID, effectiveOwnerPollTop(top), inboundPollRoleControl, false, controlPoll, hasControlPoll, pollChatWithRoleOptions{}, b.handleControlMessage)
-		if err != nil {
-			return err
-		}
-		if controlHandled {
-			return nil
-		}
+		// A control command consumes one bounded control quantum. Continue into
+		// work scheduling in the same cycle so a continuous control backlog
+		// cannot starve every work chat; the next cycle will re-read durable
+		// state before making another scheduling decision.
+		_, controlPollErr = b.pollChatWithRoleStateOptions(ctx, b.reg.ControlChatID, effectiveOwnerPollTop(top), inboundPollRoleControl, false, controlPoll, hasControlPoll, pollChatWithRoleOptions{}, b.handleControlMessage)
 	}
 	if err := b.pollStagedForkChildren(ctx, top); err != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams staged fork child poll error: %v\n", err)
@@ -1560,12 +1560,6 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		session = pollable
 		b.syncRegistrySessionProjection(session)
 		poll, hasPoll := state.ChatPolls[session.ChatID]
-		if explicitParkedWorkPollShouldSkip(poll, hasPoll) {
-			if update, ok := explicitParkedWorkPollMaintenanceUpdate(session.ChatID, poll); ok {
-				pendingScheduleUpdates = append(pendingScheduleUpdates, update)
-			}
-			continue
-		}
 		pollsByChat[session.ChatID] = poll
 		hasPollByChat[session.ChatID] = hasPoll
 		pollableByChat[session.ChatID] = session
@@ -1616,34 +1610,131 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		return err
 	}
 	sortInboundPollDecisions(decisions)
-	if limit := b.effectiveMaxWorkChatPollsPerCycle(); len(decisions) > limit {
-		decisions = decisions[:limit]
+	decisions = limitInboundPollDecisions(decisions, b.effectiveMaxWorkChatPollsPerCycle())
+	type workPollResult struct {
+		Index int
+		Turns sessionTurnQueueState
+		Err   error
+	}
+	workerCount := len(decisions)
+	if workerCount > maxConcurrentWorkChatPolls {
+		workerCount = maxConcurrentWorkChatPolls
+	}
+	jobs := make(chan int, len(decisions))
+	results := make(chan workPollResult, len(decisions))
+	for index := range decisions {
+		jobs <- index
+	}
+	close(jobs)
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				decision := decisions[index]
+				session, ok := pollableByChat[decision.ChatID]
+				if !ok {
+					results <- workPollResult{Index: index}
+					continue
+				}
+				s := session
+				turns := queueStateBySession[s.ID]
+				pollOptions := pollChatWithRoleOptions{
+					AllowBacklogDrain:        decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
+					MaxBacklogActions:        1,
+					RecoverStaleContinuation: true,
+					ParkedProbe:              decision.ParkedProbe,
+				}
+				_, pollErr := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
+					return b.handleResolvedSessionMessageWithQueueState(ctx, &s, s.ChatID, msg, text, &turns, nil)
+				})
+				results <- workPollResult{Index: index, Turns: turns, Err: pollErr}
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+	orderedResults := make([]workPollResult, len(decisions))
+	for result := range results {
+		if result.Index >= 0 && result.Index < len(orderedResults) {
+			orderedResults[result.Index] = result
+		}
 	}
 	var firstErr error
-	for _, decision := range decisions {
-		session, ok := pollableByChat[decision.ChatID]
-		if !ok {
-			continue
+	for index, result := range orderedResults {
+		decision := decisions[index]
+		if session, ok := pollableByChat[decision.ChatID]; ok {
+			queueStateBySession[session.ID] = result.Turns
 		}
-		s := session
-		turns := queueStateBySession[s.ID]
-		pollOptions := pollChatWithRoleOptions{
-			AllowBacklogDrain:        decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
-			MaxBacklogActions:        1,
-			RecoverStaleContinuation: true,
+		if result.Err != nil && firstErr == nil {
+			firstErr = result.Err
 		}
-		if _, err := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
-			return b.handleResolvedSessionMessageWithQueueState(ctx, &s, s.ChatID, msg, text, &turns, nil)
-		}); err != nil {
-			queueStateBySession[s.ID] = turns
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		queueStateBySession[s.ID] = turns
+	}
+	if firstErr == nil {
+		firstErr = controlPollErr
 	}
 	return firstErr
+}
+
+func (b *Bridge) sessionByChatIDForPoll(chatID string) *Session {
+	if b == nil {
+		return nil
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	session := b.reg.SessionByChatID(chatID)
+	if session == nil {
+		return nil
+	}
+	copy := *session
+	return &copy
+}
+
+func (b *Bridge) registryChatHasSeenMessagesForPoll(chatID string) bool {
+	if b == nil {
+		return false
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	chat, ok := b.reg.Chats[strings.TrimSpace(chatID)]
+	return ok && len(chat.SeenMessageIDs) > 0
+}
+
+func (b *Bridge) registryHasSeenOrSentForPoll(chatID string, messageID string) bool {
+	if b == nil {
+		return false
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	return b.reg.HasSeen(chatID, messageID) || b.reg.HasSent(chatID, messageID)
+}
+
+func (b *Bridge) controlChatIDForPoll() string {
+	if b == nil {
+		return ""
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	return strings.TrimSpace(b.reg.ControlChatID)
+}
+
+func (b *Bridge) controlChatURLForPoll() string {
+	if b == nil {
+		return ""
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	return strings.TrimSpace(b.reg.ControlChatURL)
+}
+
+func (b *Bridge) controlChatTopicForPoll() string {
+	if b == nil {
+		return ""
+	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	return strings.TrimSpace(b.reg.ControlChatTopic)
 }
 
 func (b *Bridge) syncControlChatProjectionFromState(ctx context.Context, state teamstore.State) error {
@@ -1770,6 +1861,12 @@ func parkedWorkPollCanSkipCandidate(chatID string, poll teamstore.ChatPollState,
 
 func workPollCandidateCanSkip(chatID string, poll teamstore.ChatPollState, hasPoll bool, parkedPollSkip map[string]bool) bool {
 	if hasPoll {
+		// Parked chats are low-frequency probe candidates. Their durable
+		// NextPollAt controls whether a Graph read is due; dropping them here
+		// would make an old parked checkpoint permanently unreachable.
+		if strings.TrimSpace(poll.PollState) == inboundPollStateParked {
+			return false
+		}
 		return parkedWorkPollCanSkipCandidate(chatID, poll, hasPoll)
 	}
 	return parkedPollSkip[strings.TrimSpace(chatID)]
@@ -1964,6 +2061,17 @@ type pollChatWithRoleOptions struct {
 	AllowBacklogDrain        bool
 	MaxBacklogActions        int
 	RecoverStaleContinuation bool
+	ParkedProbe              bool
+}
+
+func withInboundPollGraphTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if inboundPollGraphTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, inboundPollGraphTimeout)
 }
 
 func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
@@ -1975,7 +2083,9 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if seeded && !poll.LastModifiedCursor.IsZero() {
 		modifiedAfter = poll.LastModifiedCursor.Add(-pollCursorOverlap)
 	}
-	window, err := b.readClient().ListMessagesWindowWithoutRateLimitRetry(ctx, chatID, top, modifiedAfter)
+	readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
+	window, err := b.readClient().ListMessagesWindowWithoutRateLimitRetry(readCtx, chatID, top, modifiedAfter)
+	cancelRead()
 	if err != nil {
 		_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
 		return false, err
@@ -1984,6 +2094,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if err != nil {
 		return headResult.Handled, err
 	}
+	activeClaimHeldCursor := headResult.ActiveClaimHeld
 	maxModified := headResult.MaxModified
 	windowFull := headResult.WindowFull
 	fetched := headResult.Fetched
@@ -1991,24 +2102,72 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	activityAt := headResult.ActivityAt
 	continuationPath := existingWorkContinuationPath(role, poll)
 	headContinuationPath := ""
+	deferredContinuationPath := strings.TrimSpace(poll.DeferredContinuationPath)
+	deferredContinuationWasPersisted := deferredContinuationPath != ""
+	clearDeferredContinuationPath := false
 	if seeded && role != inboundPollRoleControl && window.Truncated {
 		headContinuationPath = strings.TrimSpace(window.NextPath)
 		if strings.TrimSpace(continuationPath) == "" {
 			continuationPath = headContinuationPath
+		} else if headContinuationPath != "" && headContinuationPath != continuationPath && deferredContinuationPath == "" {
+			// A head response and an older durable continuation are two
+			// independent Graph frontiers. Keep the fresh head page until the
+			// older frontier has drained instead of overwriting either one.
+			deferredContinuationPath = headContinuationPath
+		} else if headContinuationPath != "" && headContinuationPath != continuationPath && deferredContinuationPath != "" && deferredContinuationPath != headContinuationPath {
+			// There is no safe place for a third independent frontier in the
+			// bounded state model.  Keep the two durable paths and fail this
+			// chat locally instead of silently dropping the new head path.
+			frontierErr := fmt.Errorf("multiple Graph continuation frontiers require recovery for chat %s", chatID)
+			_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, frontierErr.Error(), inboundPollBlockedUntil(poll, frontierErr, time.Now()))
+			return headResult.Handled, frontierErr
 		}
 	}
 	clearedStaleTerminalHeadContinuation := false
-	if seeded && role != inboundPollRoleControl && !handled && opts.AllowBacklogDrain && strings.TrimSpace(poll.ContinuationPath) != "" {
-		backlogWindow, backlogErr := b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, poll.ContinuationPath)
+	// Head traffic must not starve an already durable continuation. The
+	// continuation is still limited to MaxBacklogActions (normally one) and
+	// remains behind the same per-chat poll call, so this is a fairness quantum,
+	// not an unbounded backlog drain or a second concurrent writer.
+	if seeded && role != inboundPollRoleControl && opts.AllowBacklogDrain && strings.TrimSpace(poll.ContinuationPath) != "" {
+		readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
+		backlogWindow, backlogErr := b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(readCtx, poll.ContinuationPath)
+		cancelRead()
 		if backlogErr != nil {
 			if opts.RecoverStaleContinuation && stalePollContinuationError(backlogErr) {
-				if headContinuationPath != "" && shouldKeepTerminalHeadContinuation(poll, headResult) {
-					continuationPath = headContinuationPath
-				} else {
-					continuationPath = ""
-					clearedStaleTerminalHeadContinuation = headContinuationPath != ""
+				// A stale Graph continuation proves only that this particular
+				// cursor can no longer be dereferenced.  It does not prove that
+				// the records behind it were delivered or deleted.  Keep the old
+				// frontier and, when the head exposed another page, persist that
+				// page as a separate deferred frontier.  Returning the error keeps
+				// this chat recoverable without falsely recording a clean cursor;
+				// the scheduler will continue unrelated chats.
+				if headContinuationPath != "" && headContinuationPath != continuationPath {
+					if deferredContinuationPath != "" && deferredContinuationPath != headContinuationPath {
+						frontierErr := fmt.Errorf("multiple Graph continuation frontiers require recovery for chat %s", chatID)
+						_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, frontierErr.Error(), inboundPollBlockedUntil(poll, frontierErr, time.Now()))
+						return handled, frontierErr
+					}
+					if strings.TrimSpace(poll.DeferredContinuationPath) == "" {
+						if _, persistErr := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+							ChatID:                      chatID,
+							DeferredContinuationPath:    headContinuationPath,
+							SetDeferredContinuationPath: true,
+						}); persistErr != nil {
+							_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, persistErr.Error(), inboundPollBlockedUntil(poll, persistErr, time.Now()))
+							return handled, persistErr
+						}
+					}
 				}
+				_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
+				return handled, backlogErr
 			} else {
+				if deferredContinuationPath != "" && strings.TrimSpace(poll.DeferredContinuationPath) == "" {
+					_, _ = b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+						ChatID:                      chatID,
+						DeferredContinuationPath:    deferredContinuationPath,
+						SetDeferredContinuationPath: true,
+					})
+				}
 				_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
 				return handled, backlogErr
 			}
@@ -2018,13 +2177,23 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 				return handled || backlogResult.Handled, backlogErr
 			}
 			handled = handled || backlogResult.Handled
+			activeClaimHeldCursor = activeClaimHeldCursor || backlogResult.ActiveClaimHeld
 			activityAt = latestTime(activityAt, backlogResult.ActivityAt)
 			maxModified = latestTime(maxModified, backlogResult.MaxModified)
 			windowFull = windowFull || backlogResult.WindowFull
 			fetched += backlogResult.Fetched
 			if !backlogResult.ActionLimitReached {
 				if backlogWindow.Truncated {
+					if strings.TrimSpace(backlogWindow.NextPath) == strings.TrimSpace(poll.ContinuationPath) {
+						repeatedErr := fmt.Errorf("Graph continuation repeated without progress for chat %s", chatID)
+						_ = b.store.RecordChatPollErrorWithBlock(ctx, chatID, repeatedErr.Error(), inboundPollBlockedUntil(poll, repeatedErr, time.Now()))
+						return handled, repeatedErr
+					}
 					continuationPath = backlogWindow.NextPath
+				} else if deferredContinuationPath != "" && (deferredContinuationWasPersisted || shouldKeepTerminalHeadContinuation(poll, headResult)) {
+					continuationPath = deferredContinuationPath
+					deferredContinuationPath = ""
+					clearDeferredContinuationPath = true
 				} else if headContinuationPath != "" && shouldKeepTerminalHeadContinuation(poll, headResult) {
 					continuationPath = headContinuationPath
 				} else {
@@ -2040,21 +2209,28 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if headContinuationPath != "" && strings.TrimSpace(poll.ContinuationPath) != "" && strings.TrimSpace(continuationPath) != headContinuationPath {
 		maxModified = poll.LastModifiedCursor
 	}
+	if activeClaimHeldCursor {
+		// A later continuation page may contain newer messages than a head
+		// message still claimed by another live owner. Do not let successful
+		// backlog handling advance the cursor past that unresolved claim.
+		maxModified = poll.LastModifiedCursor
+	}
 	if role == inboundPollRoleControl {
 		b.notePollSuccess(time.Now())
 	}
 	if handled && activityAt.IsZero() {
 		activityAt = time.Now()
 	}
-	if session := b.reg.SessionByChatID(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
+	if session := b.sessionByChatIDForPoll(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
 		_, err := b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, maxModified, true, false, fetched, "", func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
 			return teamstore.ChatPollScheduleUpdate{
-				ChatID:                chatID,
-				PollState:             inboundPollStateParked,
-				PreviousPollState:     poll.PreviousPollState,
-				ClearBlockedUntil:     true,
-				ClearContinuationPath: true,
-				ResetFailures:         true,
+				ChatID:                        chatID,
+				PollState:                     inboundPollStateParked,
+				PreviousPollState:             poll.PreviousPollState,
+				ClearBlockedUntil:             true,
+				ClearContinuationPath:         true,
+				ClearDeferredContinuationPath: true,
+				ResetFailures:                 true,
 			}, nil
 		})
 		if err == nil {
@@ -2065,13 +2241,18 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		}
 		return handled, err
 	}
-	_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, fetched, continuationPath, activityAt)
+	if opts.ParkedProbe && role == inboundPollRoleWork && !handled {
+		_, err = b.recordParkedProbeSuccessAndSchedule(ctx, chatID, maxModified, true, windowFull, fetched, continuationPath, activityAt)
+	} else {
+		_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, fetched, continuationPath, deferredContinuationPath, clearDeferredContinuationPath, activityAt)
+	}
 	return handled, err
 }
 
 type pollMessageWindowResult struct {
 	Handled            bool
 	ActionLimitReached bool
+	ActiveClaimHeld    bool
 	ActivityAt         time.Time
 	MaxModified        time.Time
 	WindowFull         bool
@@ -2084,22 +2265,30 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		return messageSortTime(msgs[i]).Before(messageSortTime(msgs[j]))
 	})
 	result := pollMessageWindowResult{
-		MaxModified: maxMessageModifiedTime(msgs),
-		WindowFull:  window.Truncated || len(msgs) >= normalizedMessageTop(top),
-		Fetched:     len(msgs),
+		WindowFull: window.Truncated || len(msgs) >= normalizedMessageTop(top),
+		Fetched:    len(msgs),
 	}
 	if !hasPoll || !poll.Seeded {
-		if len(b.reg.Chats[chatID].SeenMessageIDs) == 0 {
+		if !b.registryChatHasSeenMessagesForPoll(chatID) {
+			result.MaxModified = maxMessageModifiedTime(msgs)
 			for _, msg := range msgs {
 				b.markRegistrySeen(chatID, msg.ID)
 			}
 			return result, nil
 		}
 	}
+	result.MaxModified = time.Time{}
+	recordMessageProgress := func(msg ChatMessage) {
+		if modified := messageModifiedTime(msg); modified.After(result.MaxModified) {
+			result.MaxModified = modified
+		}
+	}
 	actions := 0
+	activeClaimHeldCursor := false
 	for i, msg := range msgs {
-		if session := b.reg.SessionByChatID(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
+		if session := b.sessionByChatIDForPoll(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
 			b.markRegistrySeen(chatID, msg.ID)
+			recordMessageProgress(msg)
 			continue
 		}
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
@@ -2110,15 +2299,18 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		}
 		if ignore {
 			b.markRegistrySeen(chatID, msg.ID)
+			recordMessageProgress(msg)
 			continue
 		}
 		if isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
 			b.markRegistrySeen(chatID, msg.ID)
+			recordMessageProgress(msg)
 			continue
 		}
 		text := promptTextFromTeamsMessageHTML(msg.Body.Content)
 		if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
 			b.markRegistrySeen(chatID, msg.ID)
+			recordMessageProgress(msg)
 			continue
 		}
 		if role == inboundPollRoleWork {
@@ -2130,6 +2322,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			}
 			if ignoreForAudience {
 				b.markRegistrySeen(chatID, msg.ID)
+				recordMessageProgress(msg)
 				continue
 			}
 			if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
@@ -2138,6 +2331,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 					return result, err
 				}
 				b.markRegistrySeen(chatID, msg.ID)
+				recordMessageProgress(msg)
 				continue
 			}
 		}
@@ -2147,7 +2341,19 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			return result, err
 		}
 		if !claimed {
-			b.markRegistrySeen(chatID, msg.ID)
+			// A durable claim held by another live owner is not a consumed
+			// message.  Do not advance this process's in-memory seen cursor or
+			// a later poll would skip it after the owner releases a failed claim.
+			if globalClaim.ExistingStatus != "claimed" {
+				b.markRegistrySeen(chatID, msg.ID)
+				recordMessageProgress(msg)
+			} else {
+				// This page contains a message another live owner may still
+				// release after a failed handler.  Do not advance the durable
+				// modified-time cursor past it, even if newer messages in the
+				// same page were handled successfully.
+				activeClaimHeldCursor = true
+			}
 			continue
 		}
 		if b.currentLeaseGeneration() > 0 {
@@ -2165,6 +2371,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 					_ = b.store.RecordChatPollError(ctx, chatID, completeErr.Error())
 					return result, completeErr
 				}
+				recordMessageProgress(msg)
 				continue
 			}
 			releaseGlobalInbound(ctx, globalClaim)
@@ -2176,6 +2383,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
+		recordMessageProgress(msg)
 		b.annotateIncomingUserMessage(ctx, chatID, msg)
 		result.Handled = true
 		result.ActivityAt = latestTime(result.ActivityAt, time.Now(), messageSortTime(msg))
@@ -2185,6 +2393,10 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			result.ActionLimitReached = true
 			break
 		}
+	}
+	if activeClaimHeldCursor {
+		result.ActiveClaimHeld = true
+		result.MaxModified = poll.LastModifiedCursor
 	}
 	return result, nil
 }
@@ -2276,15 +2488,20 @@ func messageSortTime(msg ChatMessage) time.Time {
 func maxMessageModifiedTime(messages []ChatMessage) time.Time {
 	var max time.Time
 	for _, msg := range messages {
-		t := parseGraphTime(msg.LastModifiedDateTime)
-		if t.IsZero() {
-			t = parseGraphTime(msg.CreatedDateTime)
-		}
+		t := messageModifiedTime(msg)
 		if t.After(max) {
 			max = t
 		}
 	}
 	return max
+}
+
+func messageModifiedTime(msg ChatMessage) time.Time {
+	t := parseGraphTime(msg.LastModifiedDateTime)
+	if t.IsZero() {
+		t = parseGraphTime(msg.CreatedDateTime)
+	}
+	return t
 }
 
 func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time) error {
@@ -2294,9 +2511,16 @@ func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role 
 	return err
 }
 
-func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID string, role inboundPollRole, running bool, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, activityAt time.Time) (teamstore.ChatPollState, error) {
+func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID string, role inboundPollRole, running bool, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, deferredContinuationPath string, clearDeferredContinuationPath bool, activityAt time.Time) (teamstore.ChatPollState, error) {
 	poll, err := b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
-		return chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, time.Now()), nil
+		update := chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, time.Now())
+		if clearDeferredContinuationPath {
+			update.ClearDeferredContinuationPath = true
+		} else if deferred := strings.TrimSpace(deferredContinuationPath); deferred != "" {
+			update.DeferredContinuationPath = deferred
+			update.SetDeferredContinuationPath = true
+		}
+		return update, nil
 	})
 	if err != nil {
 		return poll, err
@@ -2307,6 +2531,19 @@ func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID st
 		}
 	}
 	return poll, nil
+}
+
+func (b *Bridge) recordParkedProbeSuccessAndSchedule(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, activityAt time.Time) (teamstore.ChatPollState, error) {
+	return b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
+		return teamstore.ChatPollScheduleUpdate{
+			ChatID:            chatID,
+			PollState:         inboundPollStateParked,
+			NextPollAt:        time.Now().Add(inboundPollParkProbeInterval),
+			LastActivityAt:    activityAt,
+			ClearBlockedUntil: true,
+			ResetFailures:     true,
+		}, nil
+	})
 }
 
 func chatPollScheduleUpdateAfterPoll(chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time, now time.Time) teamstore.ChatPollScheduleUpdate {
@@ -2340,6 +2577,69 @@ func (b *Bridge) effectiveMaxWorkChatPollsPerCycle() int {
 		return b.maxWorkChatPollsPerCycle
 	}
 	return maxWorkChatPollsPerCycle
+}
+
+// limitInboundPollDecisions keeps one due parked probe and one due non-hot
+// work chat in a cycle otherwise saturated by continuously hot chats. Parked
+// probes are the only path that can notice a new message after a long service
+// outage, while warm/cool/cold chats may contain an ordinary user message that
+// must not wait forever behind hot traffic. Replacements are in-place and only
+// run when the normal limit is hit.
+func limitInboundPollDecisions(decisions []inboundPollDecision, limit int) []inboundPollDecision {
+	if limit <= 0 || len(decisions) <= limit {
+		return decisions
+	}
+	selected := decisions[:limit]
+	isNonHotDue := func(decision inboundPollDecision) bool {
+		switch decision.State {
+		case inboundPollStateWarm, inboundPollStateCool, inboundPollStateCold, inboundPollStateCatchup:
+			return decision.Due
+		default:
+			return false
+		}
+	}
+	parkedSelected := false
+	for _, decision := range selected {
+		parkedSelected = parkedSelected || decision.State == inboundPollStateParked
+	}
+	if !parkedSelected {
+		for _, decision := range decisions[limit:] {
+			if decision.State != inboundPollStateParked {
+				continue
+			}
+			replace := len(selected) - 1
+			for index := len(selected) - 1; index >= 0; index-- {
+				if !isNonHotDue(selected[index]) && selected[index].State != inboundPollStateParked {
+					replace = index
+					break
+				}
+			}
+			selected[replace] = decision
+			parkedSelected = true
+			break
+		}
+	}
+	nonHotSelected := false
+	for _, decision := range selected {
+		nonHotSelected = nonHotSelected || isNonHotDue(decision)
+	}
+	if !nonHotSelected {
+		for _, decision := range decisions[limit:] {
+			if !isNonHotDue(decision) {
+				continue
+			}
+			replace := len(selected) - 1
+			for index := len(selected) - 1; index >= 0; index-- {
+				if selected[index].State != inboundPollStateParked && !isNonHotDue(selected[index]) {
+					replace = index
+					break
+				}
+			}
+			selected[replace] = decision
+			break
+		}
+	}
+	return selected
 }
 
 func (b *Bridge) effectiveMaxQueuedTurnStartsPerCycle() int {
@@ -2399,7 +2699,14 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 			handled, err := b.recoverIdleWorkChatContinuationBeforePark(parkCtx, state, session, poll)
 			if err != nil {
 				cancel()
-				return err
+				// A stale continuation is local to this chat.  Its durable
+				// error/backoff was already recorded by the poll path; do not
+				// abort the idle sweep and suppress parking/recovery checks for
+				// every unrelated chat.
+				if b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams idle continuation recovery for %s deferred: %v\n", session.ChatID, err)
+				}
+				continue
 			}
 			processed++
 			countedCandidate = true
@@ -3300,7 +3607,7 @@ func parseGraphTime(value string) time.Time {
 }
 
 func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole, legacyGeneratedOutputFallback bool) (bool, error) {
-	if msg.ID == "" || b.reg.HasSeen(chatID, msg.ID) || b.reg.HasSent(chatID, msg.ID) {
+	if msg.ID == "" || b.registryHasSeenOrSentForPoll(chatID, msg.ID) {
 		return true, nil
 	}
 	if msg.MessageType != "" && msg.MessageType != "message" {
@@ -3665,7 +3972,7 @@ func (b *Bridge) recordIgnoredGroupChatMessage(ctx context.Context, chatID strin
 		TeamsChatID:    chatID,
 		TeamsMessageID: msg.ID,
 		Origin:         teamstore.MessageOriginUserInbound,
-		SessionID:      sessionIDForChat(b.reg.SessionByChatID(chatID)),
+		SessionID:      sessionIDForChat(b.sessionByChatIDForPoll(chatID)),
 		Kind:           "ignored_group_chat",
 		RenderedHash:   normalizedTextHash(promptTextFromTeamsMessageHTML(msg.Body.Content)),
 		Diagnostic:     strings.TrimSpace(firstNonEmptyString(reason, "ignored")),
@@ -4242,16 +4549,27 @@ func (b *Bridge) annotateIncomingUserMessageWithUserMarker(ctx context.Context, 
 		return
 	}
 	if attachmentContext {
-		if !b.annotationWarned && b.out != nil {
+		if b.claimAnnotationWarning() {
 			_, _ = fmt.Fprintf(b.out, "Teams user message attachment-preserving annotation failed for this message: %v\n", outcome.Err)
-			b.annotationWarned = true
 		}
 		return
 	}
-	if !b.annotationWarned && b.out != nil {
+	if b.claimAnnotationWarning() {
 		_, _ = fmt.Fprintf(b.out, "Teams user message annotation failed for this message: %v\n", outcome.Err)
-		b.annotationWarned = true
 	}
+}
+
+func (b *Bridge) claimAnnotationWarning() bool {
+	if b == nil || b.out == nil {
+		return false
+	}
+	b.warningMu.Lock()
+	defer b.warningMu.Unlock()
+	if b.annotationWarned {
+		return false
+	}
+	b.annotationWarned = true
+	return true
 }
 
 func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Context, chatID string, msg ChatMessage, transcripts []ASRTranscript) {
@@ -4270,9 +4588,8 @@ func (b *Bridge) annotateIncomingUserMessageWithASRTranscripts(ctx context.Conte
 	}
 	outcome := b.applyTeamsMessageEdit(ctx, chatID, msg, annotated, teamsMessageEditOptions{})
 	if outcome.Err != nil {
-		if !b.annotationWarned && b.out != nil {
+		if b.claimAnnotationWarning() {
 			_, _ = fmt.Fprintf(b.out, "Teams user ASR transcript annotation failed for this message: %v\n", outcome.Err)
-			b.annotationWarned = true
 		}
 	}
 }
@@ -4286,7 +4603,7 @@ func (b *Bridge) queueIncomingUserMarkerMirror(ctx context.Context, chatID strin
 		return nil
 	}
 	sessionID := ""
-	if session := b.reg.SessionByChatID(chatID); session != nil {
+	if session := b.sessionByChatIDForPoll(chatID); session != nil {
 		sessionID = session.ID
 	}
 	return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
@@ -8317,7 +8634,7 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 			} else if blocked {
 				return b.rejectSessionWork(ctx, session, msg, control)
 			}
-			return b.retryTurnCommand(ctx, session, strings.TrimSpace(parsed.Argument))
+			return b.retryTurnCommand(ctx, session, strings.TrimSpace(parsed.Argument), msg.ID)
 		case DashboardCommandRestoreThread:
 			return b.restoreThreadCommand(ctx, session, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandCancel:
@@ -8534,7 +8851,7 @@ func (b *Bridge) rejectExternalWorkCommand(ctx context.Context, session *Session
 	return b.queueAndSendOutbox(ctx, outbox)
 }
 
-func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID string) error {
+func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID string, commandID string) error {
 	if turnID == "" {
 		return b.sendToChat(ctx, session.ChatID, "usage: `helper retry last`, `helper retry <turn-id>`, or `!retry <turn-id>`")
 	}
@@ -8578,8 +8895,8 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 		return b.sendToChat(ctx, session.ChatID, "retry failed while reading the original Teams message: "+err.Error())
 	}
 	retryEffort, retryEffortSource := retryTurnReasoningEffortResolution(turn, session, b.executor)
-	retryTurn, _, err := b.store.QueueTurn(ctx, teamstore.Turn{
-		ID:                    retryTurnID(turn.ID),
+	retryTurn, created, err := b.store.QueueTurn(ctx, teamstore.Turn{
+		ID:                    retryTurnID(turn.ID, commandID),
 		SessionID:             session.ID,
 		CodexThreadID:         session.CodexThreadID,
 		ModelGeneration:       session.ModelGeneration,
@@ -8590,6 +8907,12 @@ func (b *Bridge) retryTurnCommand(ctx context.Context, session *Session, turnID 
 	})
 	if err != nil {
 		return err
+	}
+	if !created {
+		// The same Teams command can be observed again after an owner handoff
+		// or an uncertain response. Its deterministic retry turn is already the
+		// durable execution record; never run it a second time.
+		return nil
 	}
 	return b.runPreparedQueuedTurnFromMessage(ctx, session, retryTurn, session.ChatID, msg, inbound.Text, b.executor)
 }
@@ -9687,8 +10010,11 @@ func (b *Bridge) sessionForIDState(state teamstore.State, sessionID string) *Ses
 	if ok || len(state.Sessions) > 0 {
 		return nil
 	}
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
 	if session := b.reg.SessionByID(sessionID); session != nil {
-		return session
+		copy := *session
+		return &copy
 	}
 	return nil
 }
@@ -12387,8 +12713,13 @@ func (b *Bridge) turnInterrupted(ctx context.Context, turnID string) (bool, erro
 	return ok && turn.Status == teamstore.TurnStatusInterrupted, nil
 }
 
-func retryTurnID(turnID string) string {
-	return strings.TrimSpace(turnID) + ":retry:" + fmt.Sprintf("%d", time.Now().UnixNano())
+func retryTurnID(turnID string, commandID string) string {
+	turnID = strings.TrimSpace(turnID)
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return turnID + ":retry:" + fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return turnID + ":retry:" + shortStableID(commandID)
 }
 
 func (b *Bridge) rejectSessionAttachment(ctx context.Context, session *Session, msg ChatMessage) error {
@@ -15989,6 +16320,14 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	// fence; otherwise a changed source would hide the durable Graph message
 	// and a restart could later POST a duplicate.
 	if outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.TeamsMessageID) == "" {
+		// An ownership anchor that appeared after the claim is a stronger fence
+		// than an inconclusive Graph read. Do not probe Graph or turn the normal
+		// no-op into a visible deferred error; retain the Sending lease for later
+		// reconciliation once ownership is resolved.
+		if transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, nil, nil) {
+			_, err := b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "execution ownership became unresolved before Graph recovery")
+			return err
+		}
 		if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
 			if err != nil && opts.RecordRateLimit {
 				b.recordGraphReadRateLimit(context.Background(), outbox.TeamsChatID, err)
@@ -16686,31 +17025,33 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 	if strings.TrimSpace(outbox.TeamsMessageID) != "" || outbox.LastSendAttempt.IsZero() {
 		return false, nil
 	}
+	if opts.RecoveryProbeBudget != nil {
+		if *opts.RecoveryProbeBudget <= 0 {
+			return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		(*opts.RecoveryProbeBudget)--
+	}
 	if blockedUntil, ok := b.chatReadBlockedUntil(ctx, outbox.TeamsChatID); ok {
 		return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: blockedUntil}
 	}
-	messages, err := b.readClient().ListMessagesWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outboxRecoveryMessageTop)
-	if err != nil {
-		return true, err
-	}
 	minActivity := outbox.LastSendAttempt.Add(-2 * time.Minute)
-	for _, msg := range messages {
+	reconcile := func(msg ChatMessage) (bool, error) {
 		if strings.TrimSpace(msg.ID) == "" || !messageAuthoredByCurrentUser(msg, b.user) {
-			continue
+			return false, nil
 		}
 		if isForkDeliveryOutbox(outbox) && helperOutboxProvenanceMarkerID(msg.Body.Content) != strings.TrimSpace(outbox.ID) {
 			// Fork history must never be settled by a coincidentally identical
 			// user message in the staged chat. Only the durable outbox marker can
 			// prove that an ambiguous Graph POST actually produced this message.
-			continue
+			return false, nil
 		}
 		activity := chatMessageActivityTime(msg)
 		if !activity.IsZero() && activity.Before(minActivity) {
-			continue
+			return false, nil
 		}
 		incomingKey := comparableTeamsPlainText(PlainTextFromTeamsHTML(msg.Body.Content))
 		if !outboxRenderedPlainTextMatches(outbox, b.user, incomingKey) {
-			continue
+			return false, nil
 		}
 		// A restart may discover a Graph message after the source changed while
 		// the original POST was in flight. Reconcile the stable Graph ID behind a
@@ -16762,7 +17103,81 @@ func (b *Bridge) recoverAcceptedOutboxFromGraph(ctx context.Context, outbox team
 		}
 		return true, err
 	}
-	return false, nil
+
+	pageBudget := outboxRecoveryMaxPages
+	if opts.RecoveryPageBudget != nil {
+		pageBudget = *opts.RecoveryPageBudget
+	}
+	if pageBudget <= 0 {
+		return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+	}
+	nextPath := strings.TrimSpace(outbox.GraphRecoveryNextPath)
+	seenPaths := make(map[string]bool)
+	for {
+		// Count the head page and every continuation page against the same
+		// bounded recovery budget.  The budget is shared with the caller's
+		// flush, so a busy outbox cannot turn a single ambiguous send into an
+		// unbounded Graph read loop.
+		if pageBudget <= 0 {
+			return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		pageBudget--
+		if opts.RecoveryPageBudget != nil {
+			*opts.RecoveryPageBudget = pageBudget
+		}
+		var window MessageWindow
+		var err error
+		if nextPath == "" {
+			window, err = b.readClient().ListMessagesWindowWithoutRateLimitRetry(ctx, outbox.TeamsChatID, outboxRecoveryMessageTop, time.Time{})
+		} else {
+			if seenPaths[nextPath] {
+				return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+			}
+			seenPaths[nextPath] = true
+			window, err = b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(ctx, nextPath)
+		}
+		if err != nil {
+			return true, err
+		}
+		for _, msg := range window.Messages {
+			matched, reconcileErr := reconcile(msg)
+			if matched || reconcileErr != nil {
+				return true, reconcileErr
+			}
+		}
+		if !window.Truncated || strings.TrimSpace(window.NextPath) == "" {
+			if strings.TrimSpace(outbox.SendAttemptToken) != "" {
+				_, _ = b.store.MarkOutboxGraphRecoveryProgressForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "", "")
+			}
+			// An exhausted no-match scan is still inconclusive: Graph may have
+			// accepted the POST but the message may be outside the bounded
+			// evidence window. Keep the no-duplicate fence and do not fall through
+			// to a new POST.
+			return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		nextPath = strings.TrimSpace(window.NextPath)
+		if pageBudget <= 0 {
+			// Preserve the continuation when this bounded pass ran out of
+			// evidence budget. Clearing it would force the next pass to restart
+			// at the head and could make a very old accepted message permanently
+			// unreachable without ever permitting a duplicate POST.
+			if strings.TrimSpace(outbox.SendAttemptToken) != "" {
+				updated, progressErr := b.store.MarkOutboxGraphRecoveryProgressForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, nextPath, "")
+				if progressErr != nil {
+					return true, progressErr
+				}
+				outbox = updated
+			}
+			return true, outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
+		}
+		if strings.TrimSpace(outbox.SendAttemptToken) != "" {
+			updated, progressErr := b.store.MarkOutboxGraphRecoveryProgressForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, nextPath, "")
+			if progressErr != nil {
+				return true, progressErr
+			}
+			outbox = updated
+		}
+	}
 }
 
 func (b *Bridge) recordSentOutboxSideEffect(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, opts outboxSendOptions) {
@@ -16830,11 +17245,23 @@ func (b *Bridge) markChatUnreadForSentAnswer(ctx context.Context, outbox teamsto
 		readAt = readAt.Add(-time.Millisecond)
 	}
 	if err := b.graph.MarkChatUnreadForUserWithoutRateLimitRetry(ctx, outbox.TeamsChatID, b.user, readAt); err != nil {
-		if b.out != nil && !b.markAnswerUnreadWarned {
+		if b.claimAnswerUnreadWarning() {
 			_, _ = fmt.Fprintf(b.out, "Teams mark-unread after Codex answer failed: %v\n", err)
-			b.markAnswerUnreadWarned = true
 		}
 	}
+}
+
+func (b *Bridge) claimAnswerUnreadWarning() bool {
+	if b == nil || b.out == nil {
+		return false
+	}
+	b.warningMu.Lock()
+	defer b.warningMu.Unlock()
+	if b.markAnswerUnreadWarned {
+		return false
+	}
+	b.markAnswerUnreadWarned = true
+	return true
 }
 
 func (b *Bridge) boostWorkPollAfterSentLiveFinalAnswer(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) {

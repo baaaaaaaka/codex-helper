@@ -2,7 +2,9 @@ package teams
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,20 +29,26 @@ type globalInboundLedger struct {
 }
 
 type globalInboundItem struct {
-	ChatID    string    `json:"chat_id"`
-	MessageID string    `json:"message_id"`
-	Owner     string    `json:"owner,omitempty"`
-	Status    string    `json:"status,omitempty"`
-	ClaimedAt time.Time `json:"claimed_at,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	ChatID     string    `json:"chat_id"`
+	MessageID  string    `json:"message_id"`
+	Owner      string    `json:"owner,omitempty"`
+	ClaimToken string    `json:"claim_token,omitempty"`
+	Status     string    `json:"status,omitempty"`
+	ClaimedAt  time.Time `json:"claimed_at,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty"`
 }
 
 type globalInboundClaim struct {
-	Path      string
-	Key       string
-	ChatID    string
-	MessageID string
-	Owner     string
+	Path       string
+	Key        string
+	ChatID     string
+	MessageID  string
+	Owner      string
+	ClaimToken string
+	// ExistingStatus is populated when another durable owner already holds the
+	// message.  Callers must not mark such a message as locally seen: the
+	// claim may be released after that poll and the message remains retryable.
+	ExistingStatus string
 }
 
 func globalInboundLedgerPathForRegistry(registryPath string) (string, bool) {
@@ -79,13 +87,20 @@ func completeGlobalInbound(ctx context.Context, claim globalInboundClaim) error 
 		return nil
 	}
 	return updateGlobalInboundSQLite(ctx, claim.Path, func(tx *sql.Tx, now time.Time) error {
-		item, _, err := loadGlobalInboundSQLiteItem(ctx, tx, claim.Key)
+		item, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, claim.Key)
 		if err != nil {
 			return err
 		}
+		// Completion is a compare-and-swap on the immutable claim token.  An
+		// old poll goroutine may finish after a lease takeover (including an
+		// ABA takeover by the same machine), and must never complete the new
+		// owner's claim or recreate a row that was deliberately released.
+		if !ok || item.Status != "claimed" || item.Owner != claim.Owner ||
+			strings.TrimSpace(claim.ClaimToken) == "" || item.ClaimToken != claim.ClaimToken {
+			return nil
+		}
 		item.ChatID = claim.ChatID
 		item.MessageID = claim.MessageID
-		item.Owner = claim.Owner
 		item.Status = "done"
 		item.UpdatedAt = now
 		return upsertGlobalInboundSQLiteTx(ctx, tx, claim.Key, item)
@@ -101,7 +116,8 @@ func releaseGlobalInbound(ctx context.Context, claim globalInboundClaim) {
 		if err != nil {
 			return err
 		}
-		if !ok || item.Owner != claim.Owner || item.Status != "claimed" {
+		if !ok || item.Owner != claim.Owner || item.Status != "claimed" ||
+			strings.TrimSpace(claim.ClaimToken) == "" || item.ClaimToken != claim.ClaimToken {
 			return nil
 		}
 		_, err = tx.ExecContext(ctx, `DELETE FROM inbound_ledger WHERE key = ?`, claim.Key)
@@ -124,6 +140,7 @@ func claimGlobalInbound(ctx context.Context, path string, chatID string, message
 			return err
 		}
 		if ok {
+			claim.ExistingStatus = item.Status
 			switch item.Status {
 			case "done":
 				return nil
@@ -133,13 +150,16 @@ func claimGlobalInbound(ctx context.Context, path string, chatID string, message
 				}
 			}
 		}
+		claim.ClaimToken = globalInboundClaimToken(claim.Key, owner, now, item.ClaimToken)
+		claim.ExistingStatus = "claimed"
 		if err := upsertGlobalInboundSQLiteTx(ctx, tx, claim.Key, globalInboundItem{
-			ChatID:    chatID,
-			MessageID: messageID,
-			Owner:     owner,
-			Status:    "claimed",
-			ClaimedAt: now,
-			UpdatedAt: now,
+			ChatID:     chatID,
+			MessageID:  messageID,
+			Owner:      owner,
+			ClaimToken: claim.ClaimToken,
+			Status:     "claimed",
+			ClaimedAt:  now,
+			UpdatedAt:  now,
 		}); err != nil {
 			return err
 		}
@@ -147,6 +167,12 @@ func claimGlobalInbound(ctx context.Context, path string, chatID string, message
 		return nil
 	})
 	return claim, claimed, err
+}
+
+func globalInboundClaimToken(key string, owner string, now time.Time, previous string) string {
+	payload := strings.TrimSpace(key) + "\x00" + strings.TrimSpace(owner) + "\x00" + now.UTC().Format(time.RFC3339Nano) + "\x00" + strings.TrimSpace(previous)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:16])
 }
 
 func updateGlobalInboundSQLite(ctx context.Context, path string, fn func(*sql.Tx, time.Time) error) error {

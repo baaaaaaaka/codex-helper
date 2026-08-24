@@ -114,3 +114,69 @@ func TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI(t *test
 		t.Fatalf("offline takeover left legacy source after writer exit: %v", err)
 	}
 }
+
+// TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI covers the OS
+// termination boundary separately from the graceful SIGTERM path above. The
+// takeover must wait while the real writer owns the lock, then recover the
+// legacy state after the process is forcibly killed without touching the
+// source before that point.
+func TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI(t *testing.T) {
+	if os.Getenv(runtimeSafetyTakeoverRealProcessCIEnv) != "1" {
+		t.Skip("runs only in the ephemeral Docker offline-takeover shard")
+	}
+	fixture := seedRuntimeSafetyTakeoverFixture(t)
+	readyPath := filepath.Join(t.TempDir(), "writer-ready")
+	cmd := exec.Command(os.Args[0], "-test.run", "^TestTeamsRuntimeSafetyTakeoverWriterProcessHelper$", "-test.count=1")
+	cmd.Env = append(
+		os.Environ(),
+		runtimeSafetyTakeoverWriterHelperEnv+"=1",
+		runtimeSafetyTakeoverWriterReadyEnv+"="+readyPath,
+		runtimeSafetyTakeoverWriterLockEnv+"="+fixture.LegacyPath+".lock",
+	)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start real legacy writer process for SIGKILL test: %v", err)
+	}
+	waited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waited)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-waited:
+		default:
+			_ = cmd.Process.Kill()
+			<-waited
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat SIGKILL writer readiness: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("SIGKILL writer process did not become ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err == nil {
+		t.Fatal("offline takeover succeeded while SIGKILL writer still held the store lock")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("SIGKILL real legacy writer process: %v", err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGKILL writer process did not exit")
+	}
+	if err := CompleteOfflineRuntimeStoreTakeover(context.Background(), fixture.Scope, fixture.LegacyPath); err != nil {
+		t.Fatalf("offline takeover after SIGKILL: %v", err)
+	}
+	if _, err := os.Stat(fixture.LegacyPath); !os.IsNotExist(err) {
+		t.Fatalf("offline takeover after SIGKILL left legacy source: %v", err)
+	}
+}

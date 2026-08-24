@@ -18,13 +18,14 @@ const (
 	inboundPollStateCatchup = "catchup"
 	inboundPollStateBlocked = "blocked"
 
-	inboundPollHotInterval     = time.Second
-	inboundPollRunningInterval = 3 * time.Second
-	inboundPollWarmInterval    = 5 * time.Second
-	inboundPollCoolInterval    = 10 * time.Second
-	inboundPollColdInterval    = 30 * time.Second
-	inboundPollControlInterval = 5 * time.Second
-	inboundPollCatchupInterval = 10 * time.Second
+	inboundPollHotInterval       = time.Second
+	inboundPollRunningInterval   = 3 * time.Second
+	inboundPollWarmInterval      = 5 * time.Second
+	inboundPollCoolInterval      = 10 * time.Second
+	inboundPollColdInterval      = 30 * time.Second
+	inboundPollControlInterval   = 5 * time.Second
+	inboundPollCatchupInterval   = 10 * time.Second
+	inboundPollParkProbeInterval = 10 * time.Minute
 
 	inboundPollHotWindow  = 2 * time.Minute
 	inboundPollWarmWindow = 15 * time.Minute
@@ -32,7 +33,16 @@ const (
 	inboundPollParkAfter  = 48 * time.Hour
 
 	maxWorkChatPollsPerCycle = 8
+	// A single slow Graph chat must not hold every other due chat behind it,
+	// while the bound keeps request pressure and store contention predictable.
+	maxConcurrentWorkChatPolls = 4
 )
+
+// Keep each Graph read bounded independently from the listener context. The
+// listener must be able to continue with other chats when a Graph connection
+// stops making progress, while the caller still controls the overall poll
+// cycle lifetime.
+var inboundPollGraphTimeout = 10 * time.Second
 
 const DefaultMaxWorkChatPollsPerCycle = maxWorkChatPollsPerCycle
 
@@ -66,6 +76,7 @@ type inboundPollDecision struct {
 	Interval         time.Duration
 	ShouldPark       bool
 	ShouldNotifyPark bool
+	ParkedProbe      bool
 }
 
 func decideInboundPoll(input inboundPollInput) inboundPollDecision {
@@ -103,11 +114,26 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		interval = inboundPollColdInterval
 		parked = false
 	}
+	if input.Role == inboundPollRoleWork && strings.TrimSpace(poll.PollState) == inboundPollStateParked && !poll.ParkNoticeSentAt.IsZero() && !chatPollHasUnrecoveredRetryableError(poll) && !input.ForceActivityAt.After(poll.LastActivityAt) {
+		decision.State = inboundPollStateParked
+		decision.Interval = inboundPollParkProbeInterval
+		decision.ParkedProbe = true
+		decision.NextPollAt = poll.NextPollAt
+		if decision.NextPollAt.IsZero() {
+			decision.Due = true
+			decision.NextPollAt = now
+		} else {
+			decision.Due = !now.Before(decision.NextPollAt)
+		}
+		return decision
+	}
 	decision.State = state
 	decision.Interval = interval
 	decision.ShouldPark = parked
 	if parked {
 		decision.ShouldNotifyPark = poll.ParkNoticeSentAt.IsZero()
+		decision.Interval = inboundPollParkProbeInterval
+		decision.NextPollAt = now.Add(decision.Interval)
 		return decision
 	}
 	next := poll.NextPollAt
