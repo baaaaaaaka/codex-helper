@@ -51,6 +51,7 @@ func bridgeIdleWaitTimeoutForTest() time.Duration {
 var discoverCodexSessionTestMu sync.Mutex
 
 type recordingExecutor struct {
+	mu       sync.Mutex
 	prompts  []string
 	sessions []Session
 	result   ExecutionResult
@@ -59,14 +60,18 @@ type recordingExecutor struct {
 }
 
 func (e *recordingExecutor) Run(_ context.Context, session *Session, prompt string) (ExecutionResult, error) {
+	e.mu.Lock()
 	e.prompts = append(e.prompts, prompt)
 	if session != nil {
 		e.sessions = append(e.sessions, *session)
 	}
-	if e.before != nil {
-		e.before()
+	before := e.before
+	result, err := e.result, e.err
+	e.mu.Unlock()
+	if before != nil {
+		before()
 	}
-	return e.result, e.err
+	return result, err
 }
 
 type bridgeCodexLauncher struct {
