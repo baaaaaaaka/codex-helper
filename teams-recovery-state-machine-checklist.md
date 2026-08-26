@@ -150,3 +150,4 @@ Scope: fix the linked-transcript pending-root race and the safe-prefix/quarantin
   - `scripts/ci/teams_ownership_stress_docker_smoke.sh`
   - focused benchmark runs for warm no-change scans and checkpoint reads
 - The benchmark comparison showed no meaningful hot-path regression: warm no-change allocations remained unchanged, the linked read stayed within measurement noise, and the tiered scan was slightly faster in the repeated run. `actionlint`/`yamllint` were unavailable locally; the CI selector was validated with `go test -list` and matched 19 recovery tests.
+- The Windows source-identity path now relies only on the mandatory `GetFileInformationByHandle` result. It uses the handle's creation and last-write times, avoiding an optional `FileBasicInfo` query that can fail under the Windows race-test environment and incorrectly erase source proof. `state_file_stamp_windows_test.go` guards the non-empty, stable identity contract.
