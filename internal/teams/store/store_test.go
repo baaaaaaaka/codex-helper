@@ -44,6 +44,100 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+// TestInvalidOptionalRecoveryProofLoadsAsHistoryOnlyAcrossBackends protects
+// the upgrade boundary for old checkpoints.  A partially written or otherwise
+// inconsistent semantic range must remain readable so one bad chat cannot
+// abort startup or the multi-session linked-transcript snapshot.  The row
+// identity/session binding is still checked; only the optional proof is
+// downgraded to an automatic-inert marker.
+func TestInvalidOptionalRecoveryProofLoadsAsHistoryOnlyAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			session := testSession()
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			checkpointID := sessionTranscriptCheckpointID(session.ID)
+			historyID := "history-watch:invalid-proof"
+			invalidRange := &HistoryPendingRange{
+				SourceGeneration: "generation-1",
+				RangeID:          "range-1",
+				Kind:             "pending_root_task_started",
+				StartOffset:      0,
+				// This is deliberately omitted to model a legacy row that
+				// persisted a real zero cursor without the later presence bit.
+				ExclusiveEnd:     128,
+				RangeFingerprint: "range-fingerprint",
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID:                  checkpointID,
+					SessionID:           session.ID,
+					SourcePath:          "/tmp/invalid-proof.jsonl",
+					SourceGeneration:    "generation-1",
+					LastOffsetKnown:     true,
+					PendingHistoryRange: invalidRange,
+					Status:              importCheckpointStatusComplete,
+				}
+				state.HistoryWatch[historyID] = HistoryWatchCheckpoint{
+					ID:                  historyID,
+					Path:                "/tmp/invalid-proof.jsonl",
+					SourceGeneration:    "generation-1",
+					PendingHistoryRange: invalidRange,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed invalid optional proof: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			assertLoadable := func(stage string) {
+				t.Helper()
+				checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+				if err != nil || !found {
+					t.Fatalf("%s ImportCheckpoint found=%v err=%v", stage, found, err)
+				}
+				if !checkpoint.RecoveryProofUnusable || checkpoint.PendingHistoryRange == nil {
+					t.Fatalf("%s checkpoint = %#v, want present unusable proof", stage, checkpoint)
+				}
+				selected, err := store.ImportCheckpointsForSessions(ctx, []string{session.ID})
+				if err != nil || !selected[checkpointID].RecoveryProofUnusable {
+					t.Fatalf("%s selected checkpoints=%#v err=%v", stage, selected, err)
+				}
+				snapshot, err := store.LinkedTranscriptSessionSnapshot(ctx, []string{session.ID})
+				if err != nil || !snapshot.Checkpoints[checkpointID].RecoveryProofUnusable {
+					t.Fatalf("%s linked snapshot checkpoints=%#v err=%v", stage, snapshot.Checkpoints, err)
+				}
+				watch, err := store.HistoryWatchState(ctx)
+				if err != nil {
+					t.Fatalf("%s HistoryWatchState: %v", stage, err)
+				}
+				watchCheckpoint, ok := watch.HistoryWatch[historyID]
+				if !ok || !watchCheckpoint.RecoveryProofUnusable || watchCheckpoint.PendingHistoryRange == nil {
+					t.Fatalf("%s history watch checkpoint=%#v, want present unusable proof", stage, watch.HistoryWatch[historyID])
+				}
+			}
+
+			assertLoadable("initial")
+			path := store.Path()
+			if err := store.Close(); err != nil {
+				t.Fatalf("close before reopen: %v", err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+			store = reopened
+			assertLoadable("reopened")
+		})
+	}
+}
+
 // TestSQLiteFullUpdateIsAtomicAndRecoversAfterCapacityReturns models the
 // actual SQLITE_FULL failure seen by Teams when the state filesystem fills.
 // PRAGMA max_page_count gives the test a deterministic quota without relying

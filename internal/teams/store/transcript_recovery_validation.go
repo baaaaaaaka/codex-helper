@@ -52,6 +52,54 @@ func HistoryPendingRangeValid(rng *HistoryPendingRange) bool {
 	return rng == nil || rng.valid()
 }
 
+// importCheckpointOptionalProofUsable is deliberately separate from the
+// identity/provenance validators.  A malformed optional range proof should
+// make automatic history conservative, but must not make the entire store
+// unreadable or turn a history-only issue into a live execution fence.
+func importCheckpointOptionalProofUsable(checkpoint ImportCheckpoint) bool {
+	if !ContextGapStateValid(checkpoint.ContextGap) ||
+		!HistoryPendingRangeValid(checkpoint.PendingHistoryRange) ||
+		!TerminalBoundaryValid(checkpoint.TerminalBoundary) {
+		return false
+	}
+	sourceGeneration := strings.TrimSpace(checkpoint.SourceGeneration)
+	if sourceGeneration == "" && (checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil || checkpoint.TerminalBoundary != nil) {
+		return false
+	}
+	if checkpoint.ContextGap != nil && strings.TrimSpace(checkpoint.ContextGap.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	return true
+}
+
+func historyWatchOptionalProofUsable(checkpoint HistoryWatchCheckpoint) bool {
+	if !ContextGapStateValid(checkpoint.ContextGap) ||
+		!HistoryPendingRangeValid(checkpoint.PendingHistoryRange) ||
+		!TerminalBoundaryValid(checkpoint.TerminalBoundary) {
+		return false
+	}
+	sourceGeneration := strings.TrimSpace(checkpoint.SourceGeneration)
+	if sourceGeneration == "" && (checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil || checkpoint.TerminalBoundary != nil) {
+		return false
+	}
+	if checkpoint.ContextGap != nil && strings.TrimSpace(checkpoint.ContextGap.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	return true
+}
+
 func TerminalBoundaryValid(boundary *TerminalBoundary) bool {
 	if boundary == nil {
 		return true
@@ -96,7 +144,10 @@ func validateHistoryWatchCheckpointState(checkpoint HistoryWatchCheckpoint, id s
 	if checkpoint.PartialReadOffset > 0 && checkpoint.Size > 0 && checkpoint.PartialReadOffset > checkpoint.Size {
 		return fmt.Errorf("%w: history-watch row %q partial cursor exceeds file size", ErrSessionStateProvenanceMismatch, id)
 	}
-	if !ContextGapStateValid(checkpoint.ContextGap) || !HistoryPendingRangeValid(checkpoint.PendingHistoryRange) || !TerminalBoundaryValid(checkpoint.TerminalBoundary) {
+	if checkpoint.RecoveryProofUnusable {
+		return nil
+	}
+	if !historyWatchOptionalProofUsable(checkpoint) {
 		return fmt.Errorf("%w: history-watch row %q has invalid recovery proof", ErrSessionStateProvenanceMismatch, id)
 	}
 	sourceGeneration := strings.TrimSpace(checkpoint.SourceGeneration)

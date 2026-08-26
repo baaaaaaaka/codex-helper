@@ -223,6 +223,13 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 				deferredPaths[path] = true
 				continue
 			}
+			if fileState.RecoveryProofUnusable {
+				// A malformed optional proof is retained as a silent, history-only
+				// boundary. Do not let the watcher reinterpret the current file or
+				// emit a live-chat blocker until explicit recovery replaces it.
+				deferredPaths[path] = true
+				continue
+			}
 			if fileState.Offset > 0 && strings.TrimSpace(fileState.SourceFingerprint) == "" {
 				legacyPaths[path] = true
 			}
@@ -495,6 +502,17 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 		// inherited cursor has no source identity proof, so appending or rewriting
 		// the file cannot safely establish a new suffix boundary. The explicit
 		// publish-history command is the recovery operation.
+		return nil
+	}
+	if previous.RecoveryProofUnusable {
+		if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+			return b.removeHistoryWatchCheckpointIfCurrent(ctx, id, expectedCheckpoint)
+		} else if statErr != nil {
+			return statErr
+		}
+		// The row is still usable for live state discovery, but its optional
+		// source proof is not safe for automatic suffix scanning. Keep the
+		// physical cursor untouched and wait for explicit recovery.
 		return nil
 	}
 	if previous.SourceRewriteBlocked {
@@ -801,6 +819,7 @@ func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchChe
 		SourceFingerprint:             strings.TrimSpace(checkpoint.SourceFingerprint),
 		SourceRewriteBlocked:          checkpoint.SourceRewriteBlocked,
 		LegacySourceUnverified:        checkpoint.LegacySourceUnverified,
+		RecoveryProofUnusable:         checkpoint.RecoveryProofUnusable,
 		OversizedRecordBlocked:        checkpoint.OversizedRecordBlocked,
 		SourceRewriteRecoveryIdentity: strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
 		Offset:                        checkpoint.Offset,
@@ -887,6 +906,7 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		SourceFingerprint:      strings.TrimSpace(state.SourceFingerprint),
 		SourceRewriteBlocked:   state.SourceRewriteBlocked,
 		LegacySourceUnverified: state.LegacySourceUnverified,
+		RecoveryProofUnusable:  state.RecoveryProofUnusable,
 		// Complete oversized JSONL records are now advanced as opaque ignored
 		// dispositions; retain the field only for old on-disk compatibility.
 		OversizedRecordBlocked:        false,

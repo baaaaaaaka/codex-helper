@@ -637,6 +637,28 @@ jobs:
           go test ./internal/teams -count=1 -run '^Test(Bridge(ActiveTurnLegacyCheckpointBlocksBeforeSourceScanAcrossBackends|ReadLinkedTranscriptDeltaBlocksOversizedTail|SyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint)|HistoryTieredStatReconcileDetectsSameSizeSameMtimeRewrite|StoreSourceRewriteFenceDemotesSentAcrossBackends|TranscriptOutboxAnchorBlocksOnlyUnprovenTail)$' -v
           go test ./internal/teams -count=1 -run '^Test(Bridge(ExactCompletionResolvesInterruptedTurnWithProof|TerminalFailureAfterFirstChunkFencesRemainingChunks|LinkedTranscriptOutboxSourceRewriteDoesNotPostAcrossBackends|LegacyTranscriptOutboxWithoutSourceProofDoesNotPostAcrossBackends|LegacySourceLessTranscriptOutboxIsFencedAfterSourceRewriteAcrossBackends|SourceRewriteAttentionNoticeRemainsDeliverableAcrossBackends|ActiveTurnCheckpointProvenanceMismatchHasNoSideEffectsAcrossBackends)|HistoryTieredScanTailQuarantines(AnonymousFinalPairBeforeTerminal|TwoAnonymousFinalsAfterTerminal|AnonymousFinalPairAcrossPolls)|ExecutionFenceProbeCacheIsBounded)$' -v
 
+      - name: Teams transcript recovery state-machine regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          recovery_pattern='^Test(BridgeSyncLinkedTranscript(ReleasesPendingRootAcross(Polls|SQLiteStoreReopen)|ReleasesPendingRootSeenInOnePoll|KeepsLiveTeamsTurnUsableAfterQuarantineRestart|RecordsSafePrefixDeliveryBeforeHistoryQuarantine|QuarantinesCrossPollMixedIDMirror)|ReadLinkedTranscriptDeltaUnusableRecoveryProofIsSilent|ExplicitHistoryRecoveryUsesStoredPendingRange|BridgePollRetains(OldContinuationWhenHeadWindowTimesOut|BothFrontiersWhenOldContinuationRateLimitsAfterFullHeadWindow)|BridgeLinkedTranscript(AppendsDuringDrainAndResumesAcrossRestart|ConcurrentSQLiteSyncPublishesExactlyOnce|Graph429RetainsCheckpointUntilOutboxDelivery)|HistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset|HistoryTieredOpaqueGapRemainsReachableAfterRestart|HistoryTieredScanTail(AdvancesPastOversizedRecord|CanRecoverAfterLargeTailCap|ConsumesCompleteMalformedLineAndResetsContext|DoesNotRetryStableMalformedLine))$'
+          store_recovery_pattern='^TestInvalidOptionalRecoveryProofLoadsAsHistoryOnlyAcrossBackends$'
+          teams_list="$(go test ./internal/teams -run '^$' -list "$recovery_pattern")"
+          if ! printf '%s\n' "$teams_list" | grep -q '^Test'; then
+            echo "Teams recovery selector matched zero tests" >&2
+            exit 1
+          fi
+          store_list="$(go test ./internal/teams/store -run '^$' -list "$store_recovery_pattern")"
+          if ! printf '%s\n' "$store_list" | grep -q '^Test'; then
+            echo "Teams store recovery selector matched zero tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams -count=1 -run "$recovery_pattern" -v
+          go test ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
+          go test -race ./internal/teams -count=1 -run "$recovery_pattern" -v
+          go test -race ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
+
       - name: Teams ownership stress regressions
         if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
