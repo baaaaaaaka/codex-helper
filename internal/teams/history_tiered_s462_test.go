@@ -816,8 +816,8 @@ func TestBridgeSyncLinkedTranscriptQuarantinesNoIDChildEventMessage(t *testing.T
 		t.Fatalf("load state: %v", err)
 	}
 	checkpoint := state.ImportCheckpoints[transcriptCheckpointID(session.ID)]
-	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastRecordID == "" || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.PendingHistoryRange == nil || checkpoint.LastOffset <= int64(len(initial)) {
-		t.Fatalf("checkpoint = %#v, want non-blocking history-only quarantine after physical progress", checkpoint)
+	if checkpoint.Status == importCheckpointStatusBlocked || checkpoint.LastRecordID == "" || checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil || checkpoint.PendingHistoryRange == nil || checkpoint.LastOffset != checkpoint.SourceSize {
+		t.Fatalf("checkpoint = %#v, want non-blocking history-only quarantine with a physical EOF cursor", checkpoint)
 	}
 	firstNoticeCount := strings.Count(sentPlainJoined(*sent), "helper publish-history")
 	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil {
@@ -1382,6 +1382,55 @@ func TestBridgeSyncLinkedTranscriptQuarantinesCrossPollMixedIDMirror(t *testing.
 	checkpoint = state.ImportCheckpoints[checkpointID]
 	if checkpoint.TranscriptQuarantine == nil || checkpoint.UnresolvedExecution != nil || checkpoint.LastRecordID == "" && checkpoint.LastOffset != 0 {
 		t.Fatalf("cross-poll checkpoint = %#v, want retained history-only quarantine", checkpoint)
+	}
+	if checkpoint.LastOffset != checkpoint.SourceSize || checkpoint.PendingHistoryRange == nil || checkpoint.PendingHistoryRange.ExclusiveEnd != checkpoint.LastOffset {
+		t.Fatalf("cross-poll checkpoint cursor = %#v, want physical EOF plus bounded semantic range", checkpoint)
+	}
+
+	// A later real Teams turn must remain reachable even while the older
+	// transcript-only range is waiting for explicit history recovery. The new
+	// root marker is at the physical cursor, so its proof must not clear the
+	// older range or become trapped behind it.
+	seedTranscriptTeamsTurnForTest(t, store, session, "next-root-after-cross-poll")
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		for id, turn := range state.Turns {
+			if turn.SessionID != session.ID || turn.CodexTurnID != "next-root-after-cross-poll" {
+				continue
+			}
+			old := time.Now().Add(-10 * time.Minute)
+			turn.CreatedAt = old
+			turn.StartedAt = old
+			turn.CompletedAt = old
+			turn.UpdatedAt = old
+			state.Turns[id] = turn
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("age next Teams turn outside mirror window: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"next-root-after-cross-poll","started_at":1786181090,"model_context_window":128000,"collaboration_mode_kind":"default"}}`)
+	appendLine(t, path, `{"type":"response_item","thread_id":"thread-cross-poll-bridge","payload":{"id":"next-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"next Teams request after quarantine"}]}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"next-final","type":"agent_message","turn_id":"next-root-after-cross-poll","phase":"final_answer","message":"next root remains usable"}}`)
+	appendLine(t, path, `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"next-root-after-cross-poll"}}`)
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("sync next root after cross-poll quarantine: %v", err)
+	}
+	if sentPlainContains(*sent, "next root remains usable") {
+		t.Fatalf("next root final was published before its release rescan: %#v", *sent)
+	}
+	if err := bridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("rescan next root after cross-poll quarantine: %v", err)
+	}
+	if countSentPlainContaining(*sent, "next root remains usable") != 1 {
+		t.Fatalf("next root final deliveries after old quarantine = %#v, want one", *sent)
+	}
+	state, err = store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load next root after cross-poll quarantine: %v", err)
+	}
+	checkpoint = state.ImportCheckpoints[checkpointID]
+	if checkpoint.PendingHistoryRange == nil || checkpoint.TranscriptQuarantine == nil {
+		t.Fatalf("next root cleared the older explicit-recovery range: %#v", checkpoint)
 	}
 }
 

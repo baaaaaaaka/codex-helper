@@ -590,11 +590,39 @@ type ImportCheckpoint struct {
 	// semantic/publish boundary. It is intentionally bounded to one active
 	// range; unresolved history must not become a live execution owner.
 	PendingHistoryRange *HistoryPendingRange `json:"pending_history_range,omitempty"`
+	// HistoryRootReleased records a source-proven root prompt after a pending
+	// marker was cleared. It suppresses the bounded legacy terminal probe until
+	// the new root emits its own terminal event; otherwise the old prefix would
+	// recreate the just-cleared boundary on the next poll.
+	HistoryRootReleased bool `json:"history_root_released,omitempty"`
+	// RecoveryProofUnusable marks an optional recovery proof that was present on
+	// disk but failed its internal consistency checks while loading.  It is a
+	// history-only compatibility state: the row remains readable and live
+	// execution must not be blocked by a malformed legacy proof.  The automatic
+	// history path treats it like LegacySourceUnverified until an explicit
+	// recovery operation replaces the proof.
+	RecoveryProofUnusable bool `json:"recovery_proof_unusable,omitempty"`
 	// ExecutionAnchorGeneration is retained after an anchor is cleared so a
 	// late callback cannot accidentally clear a subsequently recreated anchor
 	// with the same outer turn ID.
 	ExecutionAnchorGeneration int64     `json:"execution_anchor_generation,omitempty"`
 	UpdatedAt                 time.Time `json:"updated_at,omitempty"`
+}
+
+// UnmarshalJSON keeps a malformed optional recovery proof from turning an
+// otherwise identifiable checkpoint into a store-wide startup failure.  Row
+// identity and session provenance are still validated by the caller; only the
+// optional source-bound range proofs are downgraded to a silent history-only
+// state here.
+func (c *ImportCheckpoint) UnmarshalJSON(data []byte) error {
+	type checkpointJSON ImportCheckpoint
+	var decoded checkpointJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = ImportCheckpoint(decoded)
+	c.RecoveryProofUnusable = c.RecoveryProofUnusable || !importCheckpointOptionalProofUsable(*c)
+	return nil
 }
 
 // LinkedTranscriptSessionSnapshot is the single read used by the linked
@@ -782,13 +810,17 @@ type ContextGapState struct {
 // checkpoint cursor. Only one active range is retained per checkpoint; a
 // second unresolved range is not allowed to evict the first one.
 type HistoryPendingRange struct {
+	SourcePath       string `json:"source_path,omitempty"`
 	SourceGeneration string `json:"source_generation,omitempty"`
 	RangeID          string `json:"range_id,omitempty"`
 	Kind             string `json:"kind,omitempty"`
 	StartRecordID    string `json:"start_record_id,omitempty"`
 	StartLine        int    `json:"start_line,omitempty"`
 	StartOffset      int64  `json:"start_offset,omitempty"`
+	StartOffsetKnown bool   `json:"start_offset_known,omitempty"`
 	ExclusiveEnd     int64  `json:"exclusive_end_offset,omitempty"`
+	MarkerThreadID   string `json:"marker_thread_id,omitempty"`
+	MarkerTurnID     string `json:"marker_turn_id,omitempty"`
 	RangeFingerprint string `json:"range_fingerprint,omitempty"`
 }
 
@@ -831,9 +863,17 @@ func (r *HistoryPendingRange) valid() bool {
 	if r == nil {
 		return true
 	}
-	return strings.TrimSpace(r.SourceGeneration) != "" && strings.TrimSpace(r.RangeID) != "" &&
-		strings.TrimSpace(r.Kind) != "" && r.StartOffset >= 0 && r.ExclusiveEnd > r.StartOffset &&
-		strings.TrimSpace(r.RangeFingerprint) != ""
+	kind := strings.ToLower(strings.TrimSpace(r.Kind))
+	if strings.TrimSpace(r.SourcePath) == "" || strings.TrimSpace(r.SourceGeneration) == "" || strings.TrimSpace(r.RangeID) == "" ||
+		kind == "" || r.StartOffset < 0 || (!r.StartOffsetKnown && r.StartOffset == 0) || r.ExclusiveEnd <= r.StartOffset ||
+		strings.TrimSpace(r.RangeFingerprint) == "" {
+		return false
+	}
+	if kind == "pending_root_task_started" {
+		return r.StartLine > 0 && strings.TrimSpace(r.StartRecordID) != "" &&
+			strings.TrimSpace(r.MarkerThreadID) != "" && strings.TrimSpace(r.MarkerTurnID) != ""
+	}
+	return true
 }
 
 // ExecutionAnchor records the last durable boundary before Codex execution
@@ -925,6 +965,7 @@ type HistoryWatchCheckpoint struct {
 	SourceFingerprint             string `json:"source_fingerprint,omitempty"`
 	SourceRewriteBlocked          bool   `json:"source_rewrite_blocked,omitempty"`
 	LegacySourceUnverified        bool   `json:"legacy_source_unverified,omitempty"`
+	RecoveryProofUnusable         bool   `json:"recovery_proof_unusable,omitempty"`
 	OversizedRecordBlocked        bool   `json:"oversized_record_blocked,omitempty"`
 	SourceRewriteRecoveryIdentity string `json:"source_rewrite_recovery_identity,omitempty"`
 	Offset                        int64  `json:"offset,omitempty"`
@@ -1242,6 +1283,20 @@ type SessionContext struct {
 	QuarantineMessageIDs        []string              `json:"quarantine_message_ids,omitempty"`
 	CreatedAt                   time.Time             `json:"created_at,omitempty"`
 	UpdatedAt                   time.Time             `json:"updated_at,omitempty"`
+}
+
+// UnmarshalJSON applies the same compatibility rule as ImportCheckpoint:
+// optional recovery metadata may be stale or partially written in an older
+// store, but the identifiable HistoryWatch row itself must remain loadable.
+func (c *HistoryWatchCheckpoint) UnmarshalJSON(data []byte) error {
+	type checkpointJSON HistoryWatchCheckpoint
+	var decoded checkpointJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = HistoryWatchCheckpoint(decoded)
+	c.RecoveryProofUnusable = c.RecoveryProofUnusable || !historyWatchOptionalProofUsable(*c)
+	return nil
 }
 
 type InboundEvent struct {
@@ -3443,27 +3498,13 @@ func validateImportCheckpointProvenance(checkpoint ImportCheckpoint, sessionID s
 }
 
 func validateImportCheckpointRangeProof(checkpoint ImportCheckpoint, checkpointID string) error {
-	if !ContextGapStateValid(checkpoint.ContextGap) {
-		return fmt.Errorf("%w: checkpoint %q has invalid context-gap proof", ErrSessionStateProvenanceMismatch, checkpointID)
+	if checkpoint.RecoveryProofUnusable {
+		// The row identity/session checks above remain strict.  Only the optional
+		// source-bound proof is downgraded to a silent history-only state.
+		return nil
 	}
-	if !HistoryPendingRangeValid(checkpoint.PendingHistoryRange) {
-		return fmt.Errorf("%w: checkpoint %q has invalid pending history range", ErrSessionStateProvenanceMismatch, checkpointID)
-	}
-	if !TerminalBoundaryValid(checkpoint.TerminalBoundary) {
-		return fmt.Errorf("%w: checkpoint %q has invalid terminal-boundary proof", ErrSessionStateProvenanceMismatch, checkpointID)
-	}
-	sourceGeneration := strings.TrimSpace(checkpoint.SourceGeneration)
-	if sourceGeneration == "" && (checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil || checkpoint.TerminalBoundary != nil) {
-		return fmt.Errorf("%w: checkpoint %q has range proof without source generation", ErrSessionStateProvenanceMismatch, checkpointID)
-	}
-	if checkpoint.ContextGap != nil && strings.TrimSpace(checkpoint.ContextGap.SourceGeneration) != sourceGeneration {
-		return fmt.Errorf("%w: checkpoint %q context-gap generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
-	}
-	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
-		return fmt.Errorf("%w: checkpoint %q pending-range generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
-	}
-	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {
-		return fmt.Errorf("%w: checkpoint %q terminal-boundary generation does not match source", ErrSessionStateProvenanceMismatch, checkpointID)
+	if !importCheckpointOptionalProofUsable(checkpoint) {
+		return fmt.Errorf("%w: checkpoint %q has invalid recovery proof", ErrSessionStateProvenanceMismatch, checkpointID)
 	}
 	return nil
 }
@@ -3856,6 +3897,7 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		// could silently turn an unverified checkpoint back into an automatic
 		// source-proof checkpoint.
 		LegacySourceUnverified:        previous.LegacySourceUnverified && !importCheckpointIsExplicitHistoryRun(previous),
+		RecoveryProofUnusable:         previous.RecoveryProofUnusable && !importCheckpointIsExplicitHistoryRun(previous),
 		LastFinalID:                   previous.LastFinalID,
 		LastFinalLine:                 previous.LastFinalLine,
 		LastFinalStartOffset:          previous.LastFinalStartOffset,
@@ -3868,6 +3910,7 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		TerminalBoundary:              previous.TerminalBoundary,
 		ContextGap:                    previous.ContextGap,
 		PendingHistoryRange:           previous.PendingHistoryRange,
+		HistoryRootReleased:           previous.HistoryRootReleased || checkpoint.HistoryRootReleased,
 		SourceRewriteBlocked:          previous.SourceRewriteBlocked || checkpoint.SourceRewriteBlocked,
 		OversizedRecordBlocked:        previous.OversizedRecordBlocked || checkpoint.OversizedRecordBlocked,
 		SourceRewriteRecoveryIdentity: firstStoreNonEmptyString(checkpoint.SourceRewriteRecoveryIdentity, previous.SourceRewriteRecoveryIdentity),
@@ -10319,7 +10362,9 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 			checkpoint.TranscriptQuarantine = previous.TranscriptQuarantine
 		}
 		checkpoint.LegacySourceUnverified = checkpoint.LegacySourceUnverified || previous.LegacySourceUnverified
+		checkpoint.RecoveryProofUnusable = checkpoint.RecoveryProofUnusable || previous.RecoveryProofUnusable
 	}
+	checkpoint.HistoryRootReleased = checkpoint.HistoryRootReleased || previous.HistoryRootReleased
 	if checkpoint.LastFinalID == "" {
 		checkpoint.LastFinalID = previous.LastFinalID
 		checkpoint.LastFinalLine = previous.LastFinalLine

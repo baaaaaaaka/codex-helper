@@ -33,6 +33,6 @@ docker run --rm \
   --env CXP_TEAMS_BOUNDARY_DOCKER=1 \
   --env CXP_TEAMS_BOUNDARY_FS_ROOT=/state \
   "$image" \
-  -test.run '^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI)$' \
+  -test.run '^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI|TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI)$' \
   -test.count=1 \
   -test.v

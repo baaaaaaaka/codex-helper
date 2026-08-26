@@ -89,6 +89,12 @@ type Transcript struct {
 	// unresolved marker forever while keeping its records out of automatic
 	// visible delivery.
 	PendingHistoryRange *teamstore.HistoryPendingRange
+	// RootReleaseWitness is a transient, source-bound proof that a previously
+	// quarantined root marker is followed by a complete external prompt.  It is
+	// never persisted and never delivered; the bridge must validate it against
+	// the durable Teams turn before clearing the semantic history frontier.
+	RootReleaseWitness  *TranscriptRootReleaseWitness
+	HistoryRootReleased bool
 	// FinalBoundary is the latest final provenance observed by the bounded
 	// scanner. It is persisted with the generic import cursor so a mirror that
 	// arrives on the next poll is still recognized as an ambiguous anonymous
@@ -111,6 +117,25 @@ type Transcript struct {
 	TailBudgetExhausted bool
 	Records             []TranscriptRecord
 	Diagnostics         []TranscriptDiagnostic
+}
+
+type TranscriptRootReleaseWitness struct {
+	SourcePath       string
+	SourceGeneration string
+	RangeFingerprint string
+	MarkerRecordID   string
+	MarkerLine       int
+	MarkerStart      int64
+	MarkerEnd        int64
+	MarkerThreadID   string
+	MarkerTurnID     string
+	PromptRecordID   string
+	PromptLine       int
+	PromptStart      int64
+	PromptEnd        int64
+	PromptThreadID   string
+	PromptTurnID     string
+	PromptTextHash   string
 }
 
 type TranscriptPartialProgress struct {
@@ -179,6 +204,34 @@ func ReadSessionTranscript(filePath string) (Transcript, error) {
 		sourceName = abs
 	}
 	return ParseCodexTranscript(f, TranscriptParseOptions{SourceName: sourceName, RequireFinalNewline: true})
+}
+
+// ReadSessionTranscriptFromOffset parses a suffix beginning at an already
+// selected JSONL line boundary. It is intentionally a cold-path primitive for
+// explicit history recovery; automatic linked polling must use the bounded
+// stateful scanner so it can preserve parser context and ownership fences.
+// InitialLineNo/InitialOffset keep source positions stable, while the initial
+// protocol IDs let a recovery marker establish the context for ID-less suffix
+// records without rereading the entire transcript.
+func ReadSessionTranscriptFromOffset(filePath string, opts TranscriptParseOptions) (Transcript, error) {
+	if strings.TrimSpace(filePath) == "" {
+		return Transcript{}, fmt.Errorf("transcript path is required")
+	}
+	if opts.InitialOffset < 0 || opts.InitialLineNo < 0 {
+		return Transcript{}, fmt.Errorf("transcript suffix boundary is invalid")
+	}
+	f, err := os.Open(filePath)
+	if err != nil {
+		return Transcript{}, err
+	}
+	defer f.Close()
+	if _, err := f.Seek(opts.InitialOffset, io.SeekStart); err != nil {
+		return Transcript{}, err
+	}
+	if strings.TrimSpace(opts.SourceName) == "" {
+		opts.SourceName = filePath
+	}
+	return ParseCodexTranscript(f, opts)
 }
 
 func ReadSessionTranscriptSince(filePath string, afterKey string) (Transcript, error) {

@@ -63,6 +63,7 @@ type historyTieredFileState struct {
 	SourceFingerprint             string
 	SourceRewriteBlocked          bool
 	LegacySourceUnverified        bool
+	RecoveryProofUnusable         bool
 	OversizedRecordBlocked        bool
 	SourceRewriteRecoveryIdentity string
 	Offset                        int64
@@ -115,12 +116,16 @@ type historyTieredFileState struct {
 	// Transient end boundary for the pending marker. The durable checkpoint
 	// stores the resulting ignored disposition, not the marker payload.
 	PendingRootTaskStartedEndOffset int64
+	PendingRootTaskStartedRecordID  string
+	PendingRootTaskStartedThreadID  string
+	PendingRootTaskStartedTurnID    string
 	// TranscriptQuarantine is a history-only frontier. It is intentionally
 	// separate from UnresolvedContinuation: ambiguous transcript mirrors do
 	// not prove that an app-server execution is still alive.
 	TranscriptQuarantine *teamstore.TranscriptQuarantine
 	ContextGap           *teamstore.ContextGapState
 	PendingHistoryRange  *teamstore.HistoryPendingRange
+	HistoryRootReleased  bool
 
 	pendingAssistant historyTieredAssistantCandidate
 }
@@ -143,9 +148,10 @@ type historyTieredTailResult struct {
 	// QuarantinedFinals is retained separately when a final group is
 	// ambiguous. The ordinary Records/Finals views intentionally omit that
 	// group so callers cannot publish it without an explicit boundary choice.
-	QuarantinedFinals []historyTieredFinal
-	Truncated         bool
-	TooLarge          bool
+	QuarantinedFinals  []historyTieredFinal
+	RootReleaseWitness *TranscriptRootReleaseWitness
+	Truncated          bool
+	TooLarge           bool
 	// BudgetExhausted means the scanner consumed a safe complete prefix of a
 	// tail larger than MaxTailBytes. TooLarge is retained for compatibility with
 	// older callers, but BudgetExhausted makes this a resumable result rather
@@ -166,6 +172,95 @@ type historyTieredTailResult struct {
 	LastConsumedRecordID string
 	LastConsumedLine     int
 	LastConsumedOffset   int64
+}
+
+// historyTieredFrontier is the small typed view shared by automatic readers
+// when a scan has more than one semantic boundary. Offset zero is valid, so
+// Present is never encoded by a sentinel offset.
+type historyTieredFrontier struct {
+	Present          bool
+	Usable           bool
+	Crossed          bool
+	Offset           int64
+	Kind             string
+	SourcePath       string
+	SourceGeneration string
+	OwnerThreadID    string
+	OwnerTurnID      string
+}
+
+func historyTieredFrontierForState(state historyTieredFileState) historyTieredFrontier {
+	var frontier historyTieredFrontier
+	baseProofUsable := !state.RecoveryProofUnusable && strings.TrimSpace(state.Path) != "" && strings.TrimSpace(state.SourceGeneration) != ""
+	consider := func(present bool, usable bool, offset int64, kind string, sourcePath string, sourceGeneration string, ownerThreadID string, ownerTurnID string) {
+		if !present || offset < 0 || (frontier.Present && offset >= frontier.Offset) {
+			return
+		}
+		frontier = historyTieredFrontier{
+			Present:          true,
+			Usable:           usable,
+			Offset:           offset,
+			Kind:             strings.TrimSpace(kind),
+			SourcePath:       strings.TrimSpace(firstNonEmptyString(sourcePath, state.Path)),
+			SourceGeneration: strings.TrimSpace(firstNonEmptyString(sourceGeneration, state.SourceGeneration)),
+			OwnerThreadID:    strings.TrimSpace(ownerThreadID),
+			OwnerTurnID:      strings.TrimSpace(ownerTurnID),
+		}
+	}
+	consider(state.UnresolvedContinuation, baseProofUsable, state.UnresolvedContinuationOffset, "unresolved_continuation", "", "", "", "")
+	consider(state.PendingRootTaskStarted, baseProofUsable && strings.TrimSpace(state.PendingRootTaskStartedRecordID) != "" && strings.TrimSpace(state.PendingRootTaskStartedThreadID) != "" && strings.TrimSpace(state.PendingRootTaskStartedTurnID) != "", state.PendingRootTaskStartedOffset, "pending_root_task_started", "", "", state.PendingRootTaskStartedThreadID, state.PendingRootTaskStartedTurnID)
+	// HistoryRootReleased means that the persisted range/quarantine was crossed
+	// by a positively-proven new Teams root.  Keep that old range for explicit
+	// recovery, but do not let it hide later live transcript records.  A newly
+	// detected transient root/continuation remains active and is represented by
+	// the fields above; an ambiguous quarantine created after the release is
+	// active only when its frontier is beyond the retained old range.
+	oldSemanticStateReleased := state.HistoryRootReleased
+	if pending := state.PendingHistoryRange; pending != nil && (!oldSemanticStateReleased || historyTieredPendingRangeIsCurrentAfterRelease(state, pending)) {
+		usable := baseProofUsable && teamstore.HistoryPendingRangeValid(pending) &&
+			cleanComparablePath(pending.SourcePath) == cleanComparablePath(state.Path) &&
+			strings.TrimSpace(pending.SourceGeneration) == strings.TrimSpace(state.SourceGeneration)
+		consider(true, usable, pending.StartOffset, pending.Kind, pending.SourcePath, pending.SourceGeneration, pending.MarkerThreadID, pending.MarkerTurnID)
+	}
+	if state.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(state.TranscriptQuarantine) {
+		quarantine := state.TranscriptQuarantine
+		if !oldSemanticStateReleased || historyTieredQuarantineIsCurrentAfterRelease(state, quarantine) {
+			usable := baseProofUsable && strings.TrimSpace(quarantine.SourcePath) != "" &&
+				cleanComparablePath(quarantine.SourcePath) == cleanComparablePath(state.Path) &&
+				(strings.TrimSpace(quarantine.SourceGeneration) == "" || strings.TrimSpace(quarantine.SourceGeneration) == strings.TrimSpace(state.SourceGeneration))
+			consider(true, usable, quarantine.FrontierOffset, quarantine.Kind, quarantine.SourcePath, quarantine.SourceGeneration, "", "")
+		}
+	}
+	if frontier.Present {
+		frontier.Crossed = state.Offset >= frontier.Offset
+	}
+	return frontier
+}
+
+func historyTieredPendingRangeIsCurrentAfterRelease(state historyTieredFileState, pending *teamstore.HistoryPendingRange) bool {
+	if pending == nil {
+		return false
+	}
+	if state.UnresolvedContinuation && strings.EqualFold(strings.TrimSpace(pending.Kind), "unresolved_continuation") && pending.StartOffset == state.UnresolvedContinuationOffset {
+		return true
+	}
+	return state.PendingRootTaskStarted && strings.EqualFold(strings.TrimSpace(pending.Kind), "pending_root_task_started") && pending.StartOffset == state.PendingRootTaskStartedOffset
+}
+
+func historyTieredQuarantineIsCurrentAfterRelease(state historyTieredFileState, quarantine *teamstore.TranscriptQuarantine) bool {
+	if quarantine == nil {
+		return false
+	}
+	if state.UnresolvedContinuation && quarantine.FrontierOffset >= state.UnresolvedContinuationOffset {
+		return true
+	}
+	if state.PendingRootTaskStarted && quarantine.FrontierOffset >= state.PendingRootTaskStartedOffset {
+		return true
+	}
+	if pending := state.PendingHistoryRange; pending != nil && pending.ExclusiveEnd > pending.StartOffset && quarantine.FrontierOffset >= pending.ExclusiveEnd {
+		return true
+	}
+	return false
 }
 
 type historyTieredRecordRead struct {
@@ -559,6 +654,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		previous.PendingRootTaskStartedLine = 0
 		previous.PendingRootTaskStartedOffset = 0
 		previous.PendingRootTaskStartedEndOffset = 0
+		previous.PendingRootTaskStartedRecordID = ""
+		previous.PendingRootTaskStartedThreadID = ""
+		previous.PendingRootTaskStartedTurnID = ""
 		previous.pendingAssistant = historyTieredAssistantCandidate{}
 		previous.ContextGap = historyTieredContextGapState(previous.TranscriptQuarantine, next.SourceGeneration, previous.Offset)
 	}
@@ -627,18 +725,18 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	// ordinary root task_started below can still reset the scope.  This is a
 	// one-time safety bias for pre-anchor state and avoids attributing a child
 	// final to the previous Teams turn.
-	legacyCursorBoundary := !contextGap && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) == ""
+	legacyCursorBoundary := !contextGap && !previous.HistoryRootReleased && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) == ""
 	// A linked checkpoint with a generic record key and no remembered turn ID
 	// still needs a conservative task-started boundary so an unprompted root
 	// marker becomes pending instead of being treated as a fresh owner.
-	legacyCheckpointBoundary := !contextGap && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) == "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
+	legacyCheckpointBoundary := !contextGap && !previous.HistoryRootReleased && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) == "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
 	// A legacy no-offset checkpoint may contain only a final de-duplication key,
 	// without a source cursor, turn identity, or explicit terminal boundary.
 	// Treat that exact shape as a conservative visible-final scope. Offset-based
 	// linked checkpoints use LastRecordID as a generic record key and retain
 	// normal mirror compatibility unless the bounded prefix probe established a
 	// real terminal boundary.
-	legacyNoOffsetCheckpointBoundary := !contextGap && previous.Offset == 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) == "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
+	legacyNoOffsetCheckpointBoundary := !contextGap && !previous.HistoryRootReleased && previous.Offset == 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) == "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
 	// A few pre-anchor callers persisted the outer turn identity alongside only
 	// the final de-duplication key.  That is not enough evidence to classify an
 	// ordinary event_msg mirror as a child (doing so regresses valid backfill),
@@ -646,7 +744,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	// below.  response_item is the app-server's canonical visible-final shape
 	// and must not inherit the old outer turn when it appears with a new/missing
 	// identity after such a checkpoint.
-	legacyResponseItemBoundary := !contextGap && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) != "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
+	legacyResponseItemBoundary := !contextGap && !previous.HistoryRootReleased && previous.Offset > 0 && strings.TrimSpace(previous.LastFinalID) != "" && strings.TrimSpace(previous.TurnID) != "" && !previous.TerminalBoundarySeen && !previous.UnresolvedContinuation
 	// Only a boundary persisted by a prior scan proves that this tail follows a
 	// completed scope. A final observed earlier in the same scan is still part
 	// of the current batch (older transcripts can contain multiple no-ID final
@@ -682,6 +780,10 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	pendingRootTaskStartedLine := previous.PendingRootTaskStartedLine
 	pendingRootTaskStartedOffset := previous.PendingRootTaskStartedOffset
 	pendingRootTaskStartedEndOffset := previous.PendingRootTaskStartedEndOffset
+	pendingRootTaskStartedRecordID := strings.TrimSpace(previous.PendingRootTaskStartedRecordID)
+	pendingRootTaskStartedThreadID := strings.TrimSpace(previous.PendingRootTaskStartedThreadID)
+	pendingRootTaskStartedTurnID := strings.TrimSpace(previous.PendingRootTaskStartedTurnID)
+	var rootReleaseWitness *TranscriptRootReleaseWitness
 	result := historyTieredTailResult{
 		State:        next,
 		MaxTailBytes: maxTailBytes,
@@ -730,6 +832,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStartedLine = 0
 							pendingRootTaskStartedOffset = 0
 							pendingRootTaskStartedEndOffset = 0
+							pendingRootTaskStartedRecordID = ""
+							pendingRootTaskStartedThreadID = ""
+							pendingRootTaskStartedTurnID = ""
 							pending = historyTieredAssistantCandidate{}
 							suppressFinalsAfterContinuation = false
 							// Preserve the per-pass budget. The next poll starts at the
@@ -790,6 +895,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				pendingRootTaskStartedLine = 0
 				pendingRootTaskStartedOffset = 0
 				pendingRootTaskStartedEndOffset = 0
+				pendingRootTaskStartedRecordID = ""
+				pendingRootTaskStartedThreadID = ""
+				pendingRootTaskStartedTurnID = ""
 				pending = historyTieredAssistantCandidate{}
 				suppressFinalsAfterContinuation = false
 				break
@@ -799,6 +907,11 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				hints := historyTieredLineHints(trimmed)
 				signals := historyTieredLineSignalsWithHints(trimmed, hints)
 				if signals.FinalAnswer || signals.TurnCompleted || signals.TerminalFailed {
+					// Once a positively-proven root has released an older semantic
+					// frontier, keep that release marker through the new root's
+					// terminal records.  The old range remains available for explicit
+					// recovery, but must not become an active frontier again merely
+					// because this later root produced a final.
 					kind := signals.TerminalKind
 					if strings.TrimSpace(kind) == "" {
 						kind = "terminal"
@@ -850,6 +963,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStartedLine = lineNo - 1
 							pendingRootTaskStartedOffset = lineStartOffset
 							pendingRootTaskStartedEndOffset = offset
+							pendingRootTaskStartedRecordID = historyTieredConsumedRecordKey(path, pendingRootTaskStartedLine, pendingRootTaskStartedOffset, pendingRootTaskStartedEndOffset)
+							pendingRootTaskStartedThreadID = firstNonEmptyString(signals.ThreadID, parseState.threadID, previous.ThreadID)
+							pendingRootTaskStartedTurnID = strings.TrimSpace(continuationTurnID)
 							suppressFinalsAfterContinuation = true
 						}
 						externalUserPromptSeen = false
@@ -858,6 +974,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStartedLine = 0
 							pendingRootTaskStartedOffset = 0
 							pendingRootTaskStartedEndOffset = 0
+							pendingRootTaskStartedRecordID = ""
+							pendingRootTaskStartedThreadID = ""
+							pendingRootTaskStartedTurnID = ""
 							// A proven new root turn starts a fresh terminal scope. Clear
 							// any old child marker so one ambiguous continuation cannot
 							// permanently pause an otherwise healthy local session.
@@ -928,6 +1047,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					next.PendingRootTaskStartedLine = 0
 					next.PendingRootTaskStartedOffset = 0
 					next.PendingRootTaskStartedEndOffset = 0
+					next.PendingRootTaskStartedRecordID = ""
+					next.PendingRootTaskStartedThreadID = ""
+					next.PendingRootTaskStartedTurnID = ""
 					next.pendingAssistant = historyTieredAssistantCandidate{}
 					next.TranscriptQuarantine = &teamstore.TranscriptQuarantine{
 						Kind:                "malformed_record",
@@ -949,6 +1071,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					pendingRootTaskStartedLine = 0
 					pendingRootTaskStartedOffset = 0
 					pendingRootTaskStartedEndOffset = 0
+					pendingRootTaskStartedRecordID = ""
+					pendingRootTaskStartedThreadID = ""
+					pendingRootTaskStartedTurnID = ""
 					pending = historyTieredAssistantCandidate{}
 					suppressFinalsAfterContinuation = false
 					break
@@ -1078,6 +1203,29 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					if !record.Internal && record.Kind == TranscriptKindUser && strings.TrimSpace(record.Text) != "" && !shouldSkipTranscriptUserText(record.Text) {
 						externalUserPromptSeen = true
 						if pendingRootTaskStarted || terminalBoundarySeen || next.UnresolvedContinuation {
+							if pendingRootTaskStarted && rootReleaseWitness == nil {
+								promptID := transcriptRecordCheckpointKey(record)
+								if strings.TrimSpace(promptID) == "" {
+									promptID = historyTieredConsumedRecordKey(path, record.SourceLine, record.SourceStartOffset, record.SourceOffset)
+								}
+								rootReleaseWitness = &TranscriptRootReleaseWitness{
+									SourcePath:       path,
+									SourceGeneration: strings.TrimSpace(next.SourceGeneration),
+									MarkerRecordID:   pendingRootTaskStartedRecordID,
+									MarkerLine:       pendingRootTaskStartedLine,
+									MarkerStart:      pendingRootTaskStartedOffset,
+									MarkerEnd:        pendingRootTaskStartedEndOffset,
+									MarkerThreadID:   pendingRootTaskStartedThreadID,
+									MarkerTurnID:     pendingRootTaskStartedTurnID,
+									PromptRecordID:   promptID,
+									PromptLine:       record.SourceLine,
+									PromptStart:      record.SourceStartOffset,
+									PromptEnd:        record.SourceOffset,
+									PromptThreadID:   strings.TrimSpace(record.ThreadID),
+									PromptTurnID:     strings.TrimSpace(record.TurnID),
+									PromptTextHash:   normalizedTextHash(strings.TrimSpace(record.Text)),
+								}
+							}
 							scopeEpoch++
 							// This prompt starts a new outer request. Do not compare an
 							// anonymous final from the previous scope with a later typed
@@ -1093,6 +1241,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							pendingRootTaskStartedLine = 0
 							pendingRootTaskStartedOffset = 0
 							pendingRootTaskStartedEndOffset = 0
+							pendingRootTaskStartedRecordID = ""
+							pendingRootTaskStartedThreadID = ""
+							pendingRootTaskStartedTurnID = ""
 							terminalBoundarySeen = false
 							suppressFinalsAfterContinuation = false
 							next.LastFinalID = ""
@@ -1218,6 +1369,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.PendingRootTaskStartedLine = pendingRootTaskStartedLine
 	next.PendingRootTaskStartedOffset = pendingRootTaskStartedOffset
 	next.PendingRootTaskStartedEndOffset = pendingRootTaskStartedEndOffset
+	next.PendingRootTaskStartedRecordID = pendingRootTaskStartedRecordID
+	next.PendingRootTaskStartedThreadID = pendingRootTaskStartedThreadID
+	next.PendingRootTaskStartedTurnID = pendingRootTaskStartedTurnID
 	next.pendingAssistant = pending
 	if !result.Truncated && (next.Offset == info.Size() || strings.TrimSpace(previous.SourceFingerprint) == "") {
 		// Direct scanner callers also need a proof for the current physical
@@ -1255,6 +1409,14 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			result.ReadProofRangeKnown = true
 		}
 	}
+	if rootReleaseWitness != nil {
+		rootReleaseWitness.SourceGeneration = strings.TrimSpace(next.SourceGeneration)
+		rootReleaseWitness.RangeFingerprint = transcriptSourceRangeFingerprint(path, rootReleaseWitness.MarkerStart, rootReleaseWitness.PromptEnd)
+		if strings.TrimSpace(rootReleaseWitness.RangeFingerprint) == "" {
+			rootReleaseWitness = nil
+		}
+	}
+	result.RootReleaseWitness = rootReleaseWitness
 	// Anonymous finals are resolved only after the bounded scan has seen the
 	// complete candidate group. A single no-ID final after a trusted terminal is
 	// a real execution-ownership ambiguity; two or more candidates are a
@@ -1458,6 +1620,9 @@ func historyTieredResetOpaqueParserState(state *historyTieredFileState) {
 	state.PendingRootTaskStartedLine = 0
 	state.PendingRootTaskStartedOffset = 0
 	state.PendingRootTaskStartedEndOffset = 0
+	state.PendingRootTaskStartedRecordID = ""
+	state.PendingRootTaskStartedThreadID = ""
+	state.PendingRootTaskStartedTurnID = ""
 	state.pendingAssistant = historyTieredAssistantCandidate{}
 }
 

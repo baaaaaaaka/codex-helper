@@ -13,6 +13,43 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+func TestHistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset(t *testing.T) {
+	state := historyTieredFileState{
+		Path:                         "/tmp/session.jsonl",
+		SourceGeneration:             "generation-1",
+		Offset:                       900,
+		UnresolvedContinuation:       true,
+		UnresolvedContinuationOffset: 700,
+		TranscriptQuarantine: &teamstore.TranscriptQuarantine{
+			Kind:               "mixed_id_final_mirror",
+			SourcePath:         "/tmp/session.jsonl",
+			SourceGeneration:   "generation-1",
+			FrontierOffset:     400,
+			ExclusiveEndOffset: 500,
+		},
+	}
+	frontier := historyTieredFrontierForState(state)
+	if !frontier.Present || !frontier.Usable || !frontier.Crossed || frontier.Offset != 400 || frontier.Kind != "mixed_id_final_mirror" {
+		t.Fatalf("earliest frontier = %#v, want crossed quarantine at offset 400", frontier)
+	}
+	state.TranscriptQuarantine = nil
+	state.PendingRootTaskStarted = true
+	state.PendingRootTaskStartedOffset = 0
+	state.PendingRootTaskStartedRecordID = "ignored:pending-root"
+	state.PendingRootTaskStartedThreadID = "thread-1"
+	state.PendingRootTaskStartedTurnID = "turn-1"
+	frontier = historyTieredFrontierForState(state)
+	if !frontier.Present || !frontier.Usable || frontier.Offset != 0 || frontier.Kind != "pending_root_task_started" || frontier.OwnerTurnID != "turn-1" {
+		t.Fatalf("zero-offset frontier = %#v, want present pending-root frontier at zero", frontier)
+	}
+	if got := historyTieredBoundaryOffset(state); got != 0 {
+		t.Fatalf("zero-offset boundary = %d, want 0 while remaining present", got)
+	}
+	if got := filterTranscriptRecordsBeforeHistoryTieredFrontier([]TranscriptRecord{{SourceStartOffset: 0, Text: "must stay hidden"}}, state); len(got) != 0 {
+		t.Fatalf("zero-offset frontier exposed %d records", len(got))
+	}
+}
+
 func TestHistoryTieredScanCapturesReadRangeProofForSameSizeTailRewrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	prefix := []byte(`{"type":"prefix"}` + "\n")
@@ -1516,6 +1553,33 @@ func TestReadLinkedTranscriptDeltaLegacyCheckpointUsesFailClosedScanner(t *testi
 		if strings.Contains(record.Text, "legacy checkpoint child answer") {
 			t.Fatalf("legacy checkpoint child leaked through linked delta: %#v", transcript.Records)
 		}
+	}
+}
+
+func TestReadLinkedTranscriptDeltaUnusableRecoveryProofIsSilent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	lines := []string{
+		`{"type":"session_meta","payload":{"id":"thread-invalid-proof"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"old-final","turn_id":"old-turn","phase":"final_answer","message":"old answer"}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"old-turn"}}`,
+		`{"type":"event_msg","payload":{"type":"agent_message","id":"new-final","turn_id":"new-turn","phase":"final_answer","message":"new answer"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	transcript, err := (&Bridge{}).readLinkedTranscriptDelta(path, teamstore.ImportCheckpoint{
+		SourcePath:            path,
+		LastRecordID:          "old-final",
+		RecoveryProofUnusable: true,
+	}, "thread-invalid-proof", "thread-invalid-proof")
+	if err != nil {
+		t.Fatalf("readLinkedTranscriptDelta: %v", err)
+	}
+	if !transcriptHasDiagnostic(transcript, "legacy_source_unverified") {
+		t.Fatalf("diagnostics = %#v, want silent legacy_source_unverified", transcript.Diagnostics)
+	}
+	if transcript.UnresolvedContinuation || transcript.PendingContinuation || len(transcript.Records) != 0 {
+		t.Fatalf("unusable-proof transcript = %#v, want no records or execution gate", transcript)
 	}
 }
 

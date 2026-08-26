@@ -29577,6 +29577,9 @@ func TestBridgeSyncExistingEmptyCheckpointUsesHistoryOnlyQuarantine(t *testing.T
 	if checkpoint.UnresolvedExecution != nil || checkpoint.TranscriptQuarantine == nil {
 		t.Fatalf("empty checkpoint sync did not persist history-only quarantine: %#v", checkpoint)
 	}
+	if checkpoint.LastOffset != checkpoint.SourceSize || checkpoint.PendingHistoryRange == nil || checkpoint.PendingHistoryRange.ExclusiveEnd != checkpoint.LastOffset {
+		t.Fatalf("empty checkpoint sync cursor = %#v, want physical EOF plus bounded semantic range", checkpoint)
+	}
 }
 
 func transcriptRecordsContainText(records []TranscriptRecord, text string) bool {
