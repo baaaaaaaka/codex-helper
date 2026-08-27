@@ -185,6 +185,9 @@ counted as completed by this checklist.
 - [x] Reconcile durable child PID/PGID state before a new supervisor starts;
   refuse a new child when the old leader is gone but its recorded group is
   still alive.
+- [x] Treat the normal leader-exit/process-group-exit race during final
+  cleanup as idempotent success, while retaining the fail-closed behavior when
+  the recorded process group remains alive.
 - [x] Keep Windows/macOS boundary code compiling without claiming Unix
   process-group semantics on Windows.
 
@@ -194,6 +197,8 @@ counted as completed by this checklist.
   child status clearing, and no context-deadline hang.
 - [x] Keep the existing supervisor health-restart and stress/fail-closed tests
   green.
+- [x] Add regression coverage for a disappeared leader with both a gone and a
+  still-live recorded process group.
 - [x] Run the supervisor regressions in `-race`.
 - [x] Compile the affected CLI package for Linux, macOS amd64/arm64, and
   Windows amd64.

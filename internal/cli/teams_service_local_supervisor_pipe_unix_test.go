@@ -176,6 +176,47 @@ func TestTeamsServiceLocalSupervisorChildHealthRestartWithSeparatePipeHolder(t *
 	}
 }
 
+func TestDefaultTeamsLocalSupervisorTerminateProcessGroupToleratesGoneLeader(t *testing.T) {
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevProcessGroupAlive := teamsLocalSupervisorProcessGroupAlive
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorProcessGroupAlive = prevProcessGroupAlive
+	})
+
+	teamsLocalSupervisorProcessGroupID = func(int) (int, error) {
+		return 0, syscall.ESRCH
+	}
+	teamsLocalSupervisorProcessGroupAlive = func(int) bool {
+		return false
+	}
+
+	if err := defaultTeamsLocalSupervisorTerminateProcessGroup(12345, 67890, 0); err != nil {
+		t.Fatalf("terminate process group with gone leader: %v", err)
+	}
+}
+
+func TestDefaultTeamsLocalSupervisorTerminateProcessGroupRejectsGoneLeaderWithLiveGroup(t *testing.T) {
+	prevProcessGroupID := teamsLocalSupervisorProcessGroupID
+	prevProcessGroupAlive := teamsLocalSupervisorProcessGroupAlive
+	t.Cleanup(func() {
+		teamsLocalSupervisorProcessGroupID = prevProcessGroupID
+		teamsLocalSupervisorProcessGroupAlive = prevProcessGroupAlive
+	})
+
+	teamsLocalSupervisorProcessGroupID = func(int) (int, error) {
+		return 0, syscall.ESRCH
+	}
+	teamsLocalSupervisorProcessGroupAlive = func(int) bool {
+		return true
+	}
+
+	err := defaultTeamsLocalSupervisorTerminateProcessGroup(12345, 67890, 0)
+	if err == nil || !strings.Contains(err.Error(), "leader pid 67890 disappeared") {
+		t.Fatalf("terminate process group with live group: %v, want fail-closed leader race error", err)
+	}
+}
+
 func shellQuoteForSupervisorTest(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }

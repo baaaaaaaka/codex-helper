@@ -41,7 +41,9 @@ func teamsServiceLocalSupervisorChildGone(pid int, _ int) bool {
 	return !teamsLocalSupervisorProcessAlive(pid)
 }
 
-func teamsLocalSupervisorProcessGroupAlive(_ int) bool {
+var teamsLocalSupervisorProcessGroupAlive = defaultTeamsLocalSupervisorProcessGroupAlive
+
+func defaultTeamsLocalSupervisorProcessGroupAlive(_ int) bool {
 	return false
 }
 
