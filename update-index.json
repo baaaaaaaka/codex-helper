@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-08-27T16:11:13Z",
+  "generated_at": "2026-08-27T16:49:47Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.31_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.31_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.31_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.31_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.22-rc.31",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-08-27T16:32:46Z",
+      "tag_name": "v0.1.22-rc.31",
+      "version": "0.1.22-rc.31"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-07-01T09:24:39Z",
       "tag_name": "v0.1.13-rc.42",
       "version": "0.1.13-rc.42"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.35_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.35_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.35_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.13-rc.35_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.13-rc.35 \u2014 Teams inline TeX rendering",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-07-01T02:54:14Z",
-      "tag_name": "v0.1.13-rc.35",
-      "version": "0.1.13-rc.35"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
