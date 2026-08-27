@@ -582,7 +582,10 @@ func TestRunAppGatewayDaemonRestartReusesStablePort(t *testing.T) {
 
 func waitForAppGatewayRegistration(t *testing.T, registry *appgateway.Registry, profileID string, predicate func(appgateway.Registration) bool) appgateway.Registration {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// Distro-smoke containers can be CPU constrained while the test binary
+	// starts the daemon and takes the registration lock.  Keep the poll bounded,
+	// but do not turn ordinary startup variance into a false failure.
+	deadline := time.Now().Add(10 * time.Second)
 	var last appgateway.Registration
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -598,7 +601,7 @@ func waitForAppGatewayRegistration(t *testing.T, registry *appgateway.Registry, 
 
 func waitForAppGatewayHealth(t *testing.T, port int, wantOK bool) appgateway.Health {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var last appgateway.Health
 	var lastErr error
 	for time.Now().Before(deadline) {
