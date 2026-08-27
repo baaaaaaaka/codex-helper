@@ -5150,11 +5150,19 @@ func TestImportCheckpointUsesNarrowSQLiteLookup(t *testing.T) {
 	if !found || !reflect.DeepEqual(got, checkpoint) {
 		t.Fatalf("ImportCheckpoint sqlite = %#v found=%v, want %#v true", got, found, checkpoint)
 	}
-	if _, _, err := store.ImportCheckpoint(ctx, "transcript:broken"); err == nil {
-		t.Fatal("ImportCheckpoint corrupt requested row error = nil, want JSON error")
+	broken, found, err := store.ImportCheckpoint(ctx, "transcript:broken")
+	if err != nil {
+		t.Fatalf("ImportCheckpoint corrupt requested row: %v", err)
 	}
-	if _, err := store.Load(ctx); err == nil {
-		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated import checkpoint")
+	if !found || broken.ID != "transcript:broken" || broken.SessionID != "broken" ||
+		broken.TranscriptQuarantine == nil || broken.TranscriptQuarantine.Kind != malformedCanonicalCheckpointKind ||
+		broken.UnresolvedExecution == nil || !broken.RecoveryProofUnusable {
+		t.Fatalf("ImportCheckpoint corrupt requested row = %#v found=%v, want deterministic opaque fence", broken, found)
+	}
+	if loaded, err := store.Load(ctx); err != nil {
+		t.Fatalf("full Load with corrupt unrelated import checkpoint: %v", err)
+	} else if loaded.ImportCheckpoints["transcript:broken"].TranscriptQuarantine == nil {
+		t.Fatalf("full Load omitted opaque checkpoint: %#v", loaded.ImportCheckpoints["transcript:broken"])
 	}
 }
 
@@ -5212,8 +5220,10 @@ func TestUpdateImportCheckpointUsesNarrowSQLiteWrite(t *testing.T) {
 	if !found || got.LastRecordID != "record-2" || got.LastSourceLine != 20 || got.LastOffset != 200 {
 		t.Fatalf("ImportCheckpoint after update = %#v found=%v", got, found)
 	}
-	if _, err := store.Load(ctx); err == nil {
-		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated import checkpoint")
+	if loaded, err := store.Load(ctx); err != nil {
+		t.Fatalf("full Load with corrupt unrelated import checkpoint: %v", err)
+	} else if loaded.ImportCheckpoints["transcript:broken"].TranscriptQuarantine == nil {
+		t.Fatalf("full Load omitted opaque checkpoint: %#v", loaded.ImportCheckpoints["transcript:broken"])
 	}
 }
 
@@ -12650,7 +12660,7 @@ func TestClaimNextQueuedTurnSerializesPerSession(t *testing.T) {
 	}
 }
 
-func TestSQLiteClaimNextQueuedTurnRepairsMalformedCanonicalCheckpoint(t *testing.T) {
+func TestSQLiteClaimNextQueuedTurnFencesMalformedCanonicalCheckpoint(t *testing.T) {
 	ctx := context.Background()
 	for _, testCase := range []struct {
 		name string
@@ -12700,6 +12710,7 @@ func TestSQLiteClaimNextQueuedTurnRepairsMalformedCanonicalCheckpoint(t *testing
 			}); err != nil {
 				t.Fatalf("corrupt canonical checkpoint: %v", err)
 			}
+			rawBeforeClaim := sqliteRawImportCheckpointJSONForTest(t, store, checkpointID)
 
 			claimed, ok, err := store.ClaimNextQueuedTurn(ctx, session.ID)
 			if err != nil || ok {
@@ -12715,6 +12726,9 @@ func TestSQLiteClaimNextQueuedTurnRepairsMalformedCanonicalCheckpoint(t *testing
 			}
 			if repaired.Status != importCheckpointStatusComplete || !repaired.LegacySourceUnverified || repaired.UnresolvedExecution == nil || repaired.TranscriptQuarantine == nil || repaired.TranscriptQuarantine.Kind != malformedCanonicalCheckpointKind {
 				t.Fatalf("repaired checkpoint = %#v, want unresolved quarantine", repaired)
+			}
+			if rawAfterClaim := sqliteRawImportCheckpointJSONForTest(t, store, checkpointID); string(rawAfterClaim) != string(rawBeforeClaim) {
+				t.Fatalf("opaque checkpoint raw changed during claim: before=%q after=%q", rawBeforeClaim, rawAfterClaim)
 			}
 		})
 	}
@@ -12847,9 +12861,11 @@ func TestSQLiteClaimNextQueuedTurnRepairsMalformedCanonicalCheckpoint(t *testing
 		if got := state.Turns[queued.ID].Status; got != TurnStatusQueued {
 			t.Fatalf("follow-up turn status = %q, want queued", got)
 		}
-		repaired := state.ImportCheckpoints[checkpointID]
-		if repaired.UnresolvedExecution == nil || repaired.UnresolvedExecution.ThreadID != "thread:old-owner" {
-			t.Fatalf("repaired interrupted checkpoint = %#v, want legacy execution anchor", repaired)
+		fenced := state.ImportCheckpoints[checkpointID]
+		if fenced.UnresolvedExecution == nil || fenced.TranscriptQuarantine == nil ||
+			fenced.TranscriptQuarantine.Kind != malformedCanonicalCheckpointKind ||
+			fenced.UnresolvedExecution.ThreadID != "" || !fenced.RecoveryProofUnusable {
+			t.Fatalf("opaque interrupted checkpoint = %#v, want identity-only unresolved fence", fenced)
 		}
 	})
 }

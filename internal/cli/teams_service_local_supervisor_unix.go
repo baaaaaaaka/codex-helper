@@ -115,6 +115,16 @@ func teamsLocalSupervisorProcessGroupAlive(pgid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+func teamsServiceLocalSupervisorChildGone(pid int, pgid int) bool {
+	if pid > 0 && teamsLocalSupervisorProcessAlive(pid) {
+		return false
+	}
+	if pgid > 0 && teamsLocalSupervisorProcessGroupAlive(pgid) {
+		return false
+	}
+	return true
+}
+
 func defaultTeamsLocalSupervisorVerifyProcessIdentity(pid int, configPath string) error {
 	if runtime.GOOS != "linux" {
 		return nil

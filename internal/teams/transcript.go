@@ -1495,6 +1495,33 @@ func transcriptSourceRangeFingerprint(sourcePath string, start, end int64) strin
 	if err != nil || strings.TrimSpace(identity) == "" {
 		return ""
 	}
+	fingerprint := transcriptSourceRangeFingerprintFromReader(f, sourcePath, identity, start, end)
+	if fingerprint == "" {
+		return ""
+	}
+	fdInfo, err := f.Stat()
+	if err != nil || fdInfo.IsDir() || !os.SameFile(info, fdInfo) || fdInfo.Size() < end {
+		return ""
+	}
+	// Keep the path check as well as the descriptor check: an atomic replace
+	// must not bind a proof read from the old descriptor to the new pathname.
+	postInfo, err := os.Stat(sourcePath)
+	if err != nil || postInfo.IsDir() || !os.SameFile(info, postInfo) || postInfo.Size() < end {
+		return ""
+	}
+	return fingerprint
+}
+
+// transcriptSourceRangeFingerprintFromReader hashes an exact byte range from
+// the already-open source descriptor. Callers that use the result as a proof
+// must fstat the descriptor after this function returns and compare it with
+// the pathname; this helper deliberately does not reopen the path.
+func transcriptSourceRangeFingerprintFromReader(reader io.ReaderAt, sourcePath string, identity string, start, end int64) string {
+	sourcePath = strings.TrimSpace(sourcePath)
+	identity = strings.TrimSpace(identity)
+	if reader == nil || sourcePath == "" || identity == "" || start < 0 || end < start {
+		return ""
+	}
 	h := sha256.New()
 	_, _ = h.Write([]byte(identity))
 	_, _ = h.Write([]byte{0})
@@ -1504,11 +1531,7 @@ func transcriptSourceRangeFingerprint(sourcePath string, start, end int64) strin
 	_, _ = h.Write([]byte{0})
 	_, _ = h.Write([]byte(strconv.FormatInt(end, 10)))
 	_, _ = h.Write([]byte{0})
-	if _, err := io.Copy(h, io.NewSectionReader(f, start, end-start)); err != nil {
-		return ""
-	}
-	postInfo, err := os.Stat(sourcePath)
-	if err != nil || postInfo.IsDir() || !os.SameFile(info, postInfo) || postInfo.Size() < end {
+	if _, err := io.Copy(h, io.NewSectionReader(reader, start, end-start)); err != nil {
 		return ""
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))

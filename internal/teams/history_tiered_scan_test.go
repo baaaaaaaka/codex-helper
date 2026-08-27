@@ -24,8 +24,11 @@ func TestHistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset(t *testing.T) 
 			Kind:               "mixed_id_final_mirror",
 			SourcePath:         "/tmp/session.jsonl",
 			SourceGeneration:   "generation-1",
+			FrontierRecordID:   "ignored:mirror",
+			FrontierLine:       4,
 			FrontierOffset:     400,
 			ExclusiveEndOffset: 500,
+			RangeFingerprint:   "sha256:range",
 		},
 	}
 	frontier := historyTieredFrontierForState(state)
@@ -47,6 +50,24 @@ func TestHistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset(t *testing.T) 
 	}
 	if got := filterTranscriptRecordsBeforeHistoryTieredFrontier([]TranscriptRecord{{SourceStartOffset: 0, Text: "must stay hidden"}}, state); len(got) != 0 {
 		t.Fatalf("zero-offset frontier exposed %d records", len(got))
+	}
+}
+
+func TestHistoryTieredMetadataOnlyQuarantineCannotAdvanceFrontier(t *testing.T) {
+	state := historyTieredFileState{
+		Path:             "/tmp/session.jsonl",
+		SourceGeneration: "generation-1",
+		Offset:           512,
+		TranscriptQuarantine: &teamstore.TranscriptQuarantine{
+			Kind:                "mixed_id_final_mirror",
+			SourcePath:          "/tmp/session.jsonl",
+			SourceGeneration:    "generation-1",
+			CandidateTextHashes: []string{"sha256:candidate"},
+		},
+	}
+	frontier := historyTieredFrontierForState(state)
+	if frontier.Present {
+		t.Fatalf("metadata-only quarantine = %#v, want no cursor frontier", frontier)
 	}
 }
 

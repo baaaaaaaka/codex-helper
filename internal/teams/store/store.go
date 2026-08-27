@@ -155,6 +155,22 @@ var ErrTerminalOutboxConflict = errors.New("terminal outbox identity conflict")
 // must fail closed instead of being treated as a missing checkpoint.
 var ErrSessionStateProvenanceMismatch = errors.New("session state provenance mismatch")
 
+// ErrOpaqueCheckpoint means that a SQLite checkpoint's raw payload is not
+// safely representable as a typed checkpoint. Callers may inspect the
+// deterministic fallback, but a normal update must not overwrite the raw row;
+// only an explicit repair operation may do so.
+var ErrOpaqueCheckpoint = errors.New("opaque import checkpoint requires explicit repair")
+
+// ErrCheckpointRepairConflict means that the exact raw row observed by an
+// explicit repair caller is no longer current. The caller must re-read the
+// row and make a new, deliberate decision; a stale repair must never win.
+var ErrCheckpointRepairConflict = errors.New("import checkpoint repair compare-and-swap conflict")
+
+// ErrSQLiteCheckpointRepairUnavailable is returned when the explicit opaque
+// row repair API is used before the store has a SQLite backend. JSON stores
+// remain strict and are not silently rewritten by this SQLite-only operation.
+var ErrSQLiteCheckpointRepairUnavailable = errors.New("opaque checkpoint repair requires SQLite storage")
+
 // ErrHistoryWatchCheckpointConflict means that a history watcher tried to
 // publish a checkpoint based on a stale read.  A watcher must leave the newer
 // cursor intact and retry from a fresh snapshot on the next poll; treating
@@ -7519,7 +7535,28 @@ func importCheckpointHasUnresolvedExecution(checkpoint ImportCheckpoint) bool {
 }
 
 func importCheckpointHasMalformedCanonicalFence(checkpoint ImportCheckpoint) bool {
-	return checkpoint.TranscriptQuarantine != nil && strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), malformedCanonicalCheckpointKind)
+	if checkpoint.TranscriptQuarantine != nil && (strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), malformedCanonicalCheckpointKind) ||
+		strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), invalidCanonicalCheckpointKind)) {
+		return true
+	}
+	return false
+}
+
+// importCheckpointHasOpaqueRaw reports whether a typed view originated from a
+// SQLite row whose exact bytes must survive until an explicit repair. This is
+// broader than the execution fence: a readable row with a bad optional proof
+// is history-only and must not block live admission, but it still cannot be
+// silently serialized over by a normal SQLite upsert.
+func importCheckpointHasOpaqueRaw(checkpoint ImportCheckpoint) bool {
+	if importCheckpointHasMalformedCanonicalFence(checkpoint) {
+		return true
+	}
+	// A syntactically valid checkpoint can still contain an incomplete proof.
+	// Once the loader marks it unusable, retaining that payload through an
+	// ordinary typed upsert would erase the exact raw row that an explicit
+	// repair must inspect.  Deliberate repair/reproof paths clear the marker
+	// only after constructing a complete proof.
+	return checkpoint.RecoveryProofUnusable && !importCheckpointOptionalProofUsable(checkpoint)
 }
 
 func importCheckpointIsExplicitHistoryRun(checkpoint ImportCheckpoint) bool {

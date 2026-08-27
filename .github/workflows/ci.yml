@@ -1044,6 +1044,16 @@ jobs:
           go test ./internal/teams -count=1 -run "$history_watch_pattern" -v
           go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
 
+      - name: Teams recovery safety behavior regressions (Linux)
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          transcript_recovery_pattern='Test(BridgeSyncLinkedTranscript(PersistsHistoryQuarantineWithLegacyGeneration|ReleasesPendingRootAcrossPolls|ReleasesPendingRootAcrossSQLiteStoreReopen|ReleasesPendingRootSeenInOnePoll|AdvancesPastMalformedRecord|AdvancesPastLargeInvisibleCompleteRecord)|ExplicitHistoryRecoveryUsesStoredPendingRange)$'
+          go test ./internal/teams -count=1 -run "$transcript_recovery_pattern" -v
+          go test ./internal/teams/store -count=1 -run '^TestSQLite(MalformedCanonicalCheckpointIsIsolatedFromScopedReads|OpaqueCheckpointRepairUsesRawCAS|OperationCheckpointUpdateAcceptsValidNonCanonicalRow|NullableCheckpointMetadataIsolatedAndPreserved|CanonicalCheckpointSQLIdentityConflictIsolated)$' -v
+          go test ./internal/cli -count=1 -run '^TestTeamsServiceLocalSupervisorChild(HealthRestartWithSeparatePipeHolder|HealthRestartsChild)$' -v -timeout=60s
+
       - name: Cross-compile check (Linux only)
         if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
         shell: bash
