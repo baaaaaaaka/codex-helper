@@ -222,12 +222,12 @@ func historyTieredFrontierForState(state historyTieredFileState) historyTieredFr
 			strings.TrimSpace(pending.SourceGeneration) == strings.TrimSpace(state.SourceGeneration)
 		consider(true, usable, pending.StartOffset, pending.Kind, pending.SourcePath, pending.SourceGeneration, pending.MarkerThreadID, pending.MarkerTurnID)
 	}
-	if state.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(state.TranscriptQuarantine) {
+	if state.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(state.TranscriptQuarantine) && teamstore.TranscriptQuarantineHasFrontier(state.TranscriptQuarantine) {
 		quarantine := state.TranscriptQuarantine
 		if !oldSemanticStateReleased || historyTieredQuarantineIsCurrentAfterRelease(state, quarantine) {
-			usable := baseProofUsable && strings.TrimSpace(quarantine.SourcePath) != "" &&
+			usable := baseProofUsable && teamstore.TranscriptQuarantineFrontierUsable(quarantine) && strings.TrimSpace(quarantine.SourcePath) != "" &&
 				cleanComparablePath(quarantine.SourcePath) == cleanComparablePath(state.Path) &&
-				(strings.TrimSpace(quarantine.SourceGeneration) == "" || strings.TrimSpace(quarantine.SourceGeneration) == strings.TrimSpace(state.SourceGeneration))
+				strings.TrimSpace(quarantine.SourceGeneration) == strings.TrimSpace(state.SourceGeneration)
 			consider(true, usable, quarantine.FrontierOffset, quarantine.Kind, quarantine.SourcePath, quarantine.SourceGeneration, "", "")
 		}
 	}
@@ -508,9 +508,25 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		// generation transition.
 		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceGeneration: sourceGeneration, Size: info.Size(), ModTime: info.ModTime()}, Truncated: true}, nil
 	}
+	f, err := os.Open(path)
+	if err != nil {
+		return historyTieredTailResult{}, err
+	}
+	defer f.Close()
+	fdInfo, err := f.Stat()
+	if err != nil || fdInfo.IsDir() || !os.SameFile(info, fdInfo) || fdInfo.Size() < previous.Offset {
+		return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
+	}
+	fdIdentity, identityErr := teamstore.SourceFileIdentityFromFileInfo(path, fdInfo)
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && previous.Offset >= 0 && previous.Offset == previous.Size {
-		currentFingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, previous.Offset))
+		currentFingerprint := ""
+		if identityErr == nil && strings.TrimSpace(fdIdentity) != "" {
+			currentFingerprint = strings.TrimSpace(transcriptCheckpointSourceFingerprintFromReaderWithIdentity(f, path, fdIdentity, fdInfo.Size(), previous.Offset))
+		}
 		if currentFingerprint == "" || currentFingerprint != strings.TrimSpace(previous.SourceFingerprint) {
+			if !historyTieredSourceObservationStable(f, info, path, previous.Offset) {
+				return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
+			}
 			next := historyTieredFileState{
 				Path:                 path,
 				Size:                 info.Size(),
@@ -523,7 +539,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		}
 	}
 	if previous.PartialLineStartOffset >= previous.Offset && previous.PartialReadOffset > previous.PartialLineStartOffset {
-		identity := historyTieredSourceIdentity(path, info)
+		identity := strings.TrimSpace(fdIdentity)
 		if strings.TrimSpace(previous.PartialSourceIdentity) != "" && identity != "" && identity != strings.TrimSpace(previous.PartialSourceIdentity) {
 			next := previous
 			next.Path = path
@@ -545,10 +561,13 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			next.ModTime = info.ModTime()
 			return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
 		}
-		newlineEnd, scannedThrough, hasNewline, err := historyTieredFindPartialNewline(path, previous.PartialReadOffset, info.Size(), historyTieredMaxRecordReadBytes)
+		newlineEnd, scannedThrough, hasNewline, err := historyTieredFindPartialNewlineFromReader(f, previous.PartialReadOffset, info.Size(), historyTieredMaxRecordReadBytes)
 		if err != nil {
 			return historyTieredTailResult{}, err
 		} else if !hasNewline {
+			if !historyTieredSourceObservationStable(f, info, path, info.Size()) {
+				return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
+			}
 			next := previous
 			next.Path = path
 			next.Size = info.Size()
@@ -583,7 +602,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			next.PartialStartedAt = time.Time{}
 			next.PartialSourceIdentity = ""
 			historyTieredResetOpaqueParserState(&next)
-			next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantine(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", recordID, lineNo, previous.PartialLineStartOffset, newlineEnd, nil)
+			next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", recordID, lineNo, previous.PartialLineStartOffset, newlineEnd, nil, f, fdIdentity)
 			next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, newlineEnd)
 			result := historyTieredTailResult{
 				State:                next,
@@ -600,11 +619,14 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			if record := historyTieredOversizedRecord(path, lineNo, previous.PartialLineStartOffset, newlineEnd, nil); record.ItemID != "" {
 				result.Records = []TranscriptRecord{record}
 			}
-			if fingerprint := transcriptSourceRangeFingerprint(path, previous.Offset, newlineEnd); fingerprint != "" {
+			if fingerprint := transcriptSourceRangeFingerprintFromReader(f, path, fdIdentity, previous.Offset, newlineEnd); fingerprint != "" {
 				result.ReadProofFingerprint = fingerprint
 				result.ReadProofStartOffset = previous.Offset
 				result.ReadProofEndOffset = newlineEnd
 				result.ReadProofRangeKnown = true
+			}
+			if !historyTieredSourceObservationStable(f, info, path, newlineEnd) {
+				return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
 			}
 			return result, nil
 		}
@@ -675,11 +697,6 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		scanEnd = previous.Offset + maxTailBytes
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return historyTieredTailResult{}, err
-	}
-	defer f.Close()
 	if previous.Offset > 0 {
 		if _, err := f.Seek(previous.Offset, io.SeekStart); err != nil {
 			return historyTieredTailResult{}, err
@@ -691,8 +708,8 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	readEnd := info.Size()
 	readProof := sha256.New()
 	readProofReady := false
-	if identity, identityErr := teamstore.SourceFileIdentityFromFileInfo(path, info); identityErr == nil && strings.TrimSpace(identity) != "" {
-		_, _ = readProof.Write([]byte(identity))
+	if identityErr == nil && strings.TrimSpace(fdIdentity) != "" {
+		_, _ = readProof.Write([]byte(fdIdentity))
 		_, _ = readProof.Write([]byte{0})
 		_, _ = readProof.Write([]byte(filepath.Clean(path)))
 		_, _ = readProof.Write([]byte{0})
@@ -822,7 +839,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 							result.OversizedRecord = true
 							if record := historyTieredOversizedRecord(path, lineNo, lineStartOffset, offset, line); record.ItemID != "" {
 								result.Records = append(result.Records, record)
-								next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantine(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", record.ItemID, lineNo, lineStartOffset, offset, line)
+								next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", record.ItemID, lineNo, lineStartOffset, offset, line, f, fdIdentity)
 								next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, offset)
 							}
 							historyTieredResetOpaqueParserState(&next)
@@ -885,7 +902,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				result.OversizedRecord = true
 				if record := historyTieredOversizedRecord(path, lineNo, lineStartOffset, offset, line); record.ItemID != "" {
 					result.Records = append(result.Records, record)
-					next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantine(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", record.ItemID, lineNo, lineStartOffset, offset, line)
+					next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", record.ItemID, lineNo, lineStartOffset, offset, line, f, fdIdentity)
 					next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, offset)
 				}
 				historyTieredResetOpaqueParserState(&next)
@@ -916,7 +933,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					if strings.TrimSpace(kind) == "" {
 						kind = "terminal"
 					}
-					if boundary := historyTieredTerminalBoundary(path, next.SourceGeneration, lineNo, lineStartOffset, offset, kind); boundary != nil {
+					if boundary := historyTieredTerminalBoundaryFromReader(path, next.SourceGeneration, lineNo, lineStartOffset, offset, kind, f, fdIdentity); boundary != nil {
 						next.TerminalBoundary = boundary
 					}
 				}
@@ -1018,7 +1035,6 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					// this opaque range, retain its raw hash for audit/reconciliation,
 					// and reset parser context before the next poll.  We do not expose
 					// any record derived from malformed bytes.
-					hash := sha256.Sum256(line)
 					result.LastConsumedRecordID = historyTieredConsumedRecordKey(path, lineNo, lineStartOffset, offset)
 					result.LastConsumedLine = lineNo
 					result.LastConsumedOffset = offset
@@ -1051,19 +1067,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					next.PendingRootTaskStartedThreadID = ""
 					next.PendingRootTaskStartedTurnID = ""
 					next.pendingAssistant = historyTieredAssistantCandidate{}
-					next.TranscriptQuarantine = &teamstore.TranscriptQuarantine{
-						Kind:                "malformed_record",
-						GapID:               historyTieredGapID(path, next.SourceGeneration, "malformed_record", lineStartOffset, offset),
-						SourcePath:          path,
-						SourceGeneration:    next.SourceGeneration,
-						SourceFingerprint:   strings.TrimSpace(previous.SourceFingerprint),
-						FrontierRecordID:    result.LastConsumedRecordID,
-						FrontierLine:        lineNo,
-						FrontierOffset:      lineStartOffset,
-						ExclusiveEndOffset:  offset,
-						RangeFingerprint:    transcriptSourceRangeFingerprint(path, lineStartOffset, offset),
-						CandidateTextHashes: []string{"sha256:" + hex.EncodeToString(hash[:])},
-					}
+					next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "malformed_record", result.LastConsumedRecordID, lineNo, lineStartOffset, offset, line, f, fdIdentity)
 					next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, offset)
 					parseState.turnID = ""
 					externalUserPromptSeen = false
@@ -1378,7 +1382,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		// cursor, not just the first cursor. Without refreshing it after a
 		// complete opaque record, the next pass would compare the new offset
 		// against a proof for the old prefix and falsely report a rewrite.
-		next.SourceFingerprint = strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, next.Offset))
+		if strings.TrimSpace(fdIdentity) != "" {
+			next.SourceFingerprint = strings.TrimSpace(transcriptCheckpointSourceFingerprintFromReaderWithIdentity(f, path, fdIdentity, fdInfo.Size(), next.Offset))
+		}
 	}
 	if len(result.Records) > 0 {
 		transcript := Transcript{
@@ -1393,16 +1399,40 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	if readProofReady && !result.Truncated && !result.TooLarge && !result.Incomplete && next.Offset == readEnd {
 		// Revalidate the pathname identity after the scan. The sender and
 		// checkpoint CAS perform their own final proof checks, so this is only a
-		// cheap way to pass the exact bytes read to the bridge.
-		if postInfo, postErr := os.Stat(path); postErr == nil && !postInfo.IsDir() && os.SameFile(info, postInfo) && postInfo.Size() >= readEnd {
+		// cheap way to pass the exact bytes read to the bridge. The descriptor
+		// check is important: a pathname stat alone can observe a replacement
+		// while the scanner was reading the old inode.
+		fdPostInfo, fdPostErr := f.Stat()
+		postInfo, postErr := os.Stat(path)
+		if fdPostErr == nil && postErr == nil && !fdPostInfo.IsDir() && !postInfo.IsDir() &&
+			os.SameFile(fdInfo, fdPostInfo) && os.SameFile(info, postInfo) && fdPostInfo.Size() >= readEnd && postInfo.Size() >= readEnd {
 			result.ReadProofFingerprint = "sha256:" + hex.EncodeToString(readProof.Sum(nil))
 			result.ReadProofStartOffset = previous.Offset
 			result.ReadProofEndOffset = readEnd
 			result.ReadProofRangeKnown = true
 		}
 	}
+	fdPostInfo, fdPostErr := f.Stat()
+	postInfo, postErr := os.Stat(path)
+	sourceStable := fdPostErr == nil && postErr == nil && !fdPostInfo.IsDir() && !postInfo.IsDir() &&
+		os.SameFile(fdInfo, fdPostInfo) && os.SameFile(info, postInfo) && fdPostInfo.Size() >= readEnd && postInfo.Size() >= readEnd
+	if !sourceStable {
+		// The records were parsed from a descriptor whose source identity is no
+		// longer provably the current pathname. Do not expose them to the bridge
+		// or allow a path-reopened fingerprint to advance the checkpoint.
+		result.Records = nil
+		result.Finals = nil
+		result.QuarantinedFinals = nil
+		result.Truncated = true
+		result.State = historyTieredFileState{Path: path}
+		return result, nil
+	}
 	if budgeted && !result.Truncated && !result.Incomplete && next.Offset > previous.Offset {
-		if fingerprint := transcriptSourceRangeFingerprint(path, previous.Offset, next.Offset); fingerprint != "" {
+		fingerprint := ""
+		if strings.TrimSpace(fdIdentity) != "" {
+			fingerprint = transcriptSourceRangeFingerprintFromReader(f, path, fdIdentity, previous.Offset, next.Offset)
+		}
+		if fingerprint != "" {
 			result.ReadProofFingerprint = fingerprint
 			result.ReadProofStartOffset = previous.Offset
 			result.ReadProofEndOffset = next.Offset
@@ -1411,7 +1441,9 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	}
 	if rootReleaseWitness != nil {
 		rootReleaseWitness.SourceGeneration = strings.TrimSpace(next.SourceGeneration)
-		rootReleaseWitness.RangeFingerprint = transcriptSourceRangeFingerprint(path, rootReleaseWitness.MarkerStart, rootReleaseWitness.PromptEnd)
+		if strings.TrimSpace(fdIdentity) != "" {
+			rootReleaseWitness.RangeFingerprint = transcriptSourceRangeFingerprintFromReader(f, path, fdIdentity, rootReleaseWitness.MarkerStart, rootReleaseWitness.PromptEnd)
+		}
 		if strings.TrimSpace(rootReleaseWitness.RangeFingerprint) == "" {
 			rootReleaseWitness = nil
 		}
@@ -1489,7 +1521,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		} else if ambiguousMirror {
 			kind = "mixed_id_final_mirror"
 		}
-		result.State.TranscriptQuarantine = historyTieredTranscriptQuarantine(result.State, kind, result.QuarantinedFinals)
+		result.State.TranscriptQuarantine = historyTieredTranscriptQuarantine(result.State, kind, result.QuarantinedFinals, f, fdIdentity)
 		if previousAnonymousFinalCandidate && result.State.TranscriptQuarantine != nil {
 			quarantine := result.State.TranscriptQuarantine
 			if previous.LastFinalStartOffsetKnown && previous.LastFinalStartOffset < quarantine.FrontierOffset {
@@ -1510,13 +1542,33 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					quarantine.CandidateTextHashes = append(quarantine.CandidateTextHashes, previousHash)
 				}
 			}
+			historyTieredAttachQuarantineRangeProof(result.State, quarantine, f, fdIdentity)
 		}
 	}
 	if result.State.UnresolvedContinuation && result.State.PendingHistoryRange == nil {
 		result.State.PendingHistoryRange = historyTieredPendingHistoryRange(result.State, result.State.UnresolvedContinuationOffset, result.State.Offset, "unresolved_continuation")
 	}
-	if result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine) && result.State.PendingHistoryRange == nil {
+	if result.State.TranscriptQuarantine != nil && !historyTieredQuarantineIsContextGap(result.State.TranscriptQuarantine) &&
+		teamstore.TranscriptQuarantineFrontierUsable(result.State.TranscriptQuarantine) && result.State.PendingHistoryRange == nil {
 		result.State.PendingHistoryRange = historyTieredPendingHistoryRange(result.State, result.State.TranscriptQuarantine.FrontierOffset, result.State.Offset, result.State.TranscriptQuarantine.Kind)
+	}
+	// All proof reads above use the same descriptor. Re-check the descriptor and
+	// pathname after the final proof hash as well, so a replacement that occurs
+	// while hashing cannot make the old descriptor's result look current.
+	fdPostInfo, fdPostErr = f.Stat()
+	postInfo, postErr = os.Stat(path)
+	if fdPostErr != nil || postErr != nil || fdPostInfo.IsDir() || postInfo.IsDir() ||
+		!os.SameFile(fdInfo, fdPostInfo) || !os.SameFile(info, postInfo) || fdPostInfo.Size() < readEnd || postInfo.Size() < readEnd {
+		result.Records = nil
+		result.Finals = nil
+		result.QuarantinedFinals = nil
+		result.RootReleaseWitness = nil
+		result.ReadProofFingerprint = ""
+		result.ReadProofStartOffset = 0
+		result.ReadProofEndOffset = 0
+		result.ReadProofRangeKnown = false
+		result.Truncated = true
+		result.State = historyTieredFileState{Path: path}
 	}
 	return result, nil
 }
@@ -1632,11 +1684,11 @@ func historyTieredGapID(path, sourceGeneration, kind string, startOffset, endOff
 	return "gap:" + hex.EncodeToString(sum[:])[:24]
 }
 
-func historyTieredTerminalBoundary(path, sourceGeneration string, line int, startOffset, endOffset int64, kind string) *teamstore.TerminalBoundary {
+func historyTieredTerminalBoundaryFromReader(path, sourceGeneration string, line int, startOffset, endOffset int64, kind string, reader io.ReaderAt, sourceIdentity string) *teamstore.TerminalBoundary {
 	if startOffset < 0 || endOffset <= startOffset || strings.TrimSpace(sourceGeneration) == "" {
 		return nil
 	}
-	fingerprint := transcriptSourceRangeFingerprint(path, startOffset, endOffset)
+	fingerprint := transcriptSourceRangeFingerprintFromReader(reader, path, sourceIdentity, startOffset, endOffset)
 	if strings.TrimSpace(fingerprint) == "" {
 		return nil
 	}
@@ -1678,7 +1730,7 @@ func historyTieredContextGapState(quarantine *teamstore.TranscriptQuarantine, so
 	}
 }
 
-func historyTieredOpaqueRecordQuarantine(path string, sourceFingerprint string, sourceGeneration string, kind string, recordID string, line int, offset int64, endOffset int64, raw []byte) *teamstore.TranscriptQuarantine {
+func historyTieredOpaqueRecordQuarantineFromReader(path string, sourceFingerprint string, sourceGeneration string, kind string, recordID string, line int, offset int64, endOffset int64, raw []byte, reader io.ReaderAt, sourceIdentity string) *teamstore.TranscriptQuarantine {
 	quarantine := &teamstore.TranscriptQuarantine{
 		Kind:               strings.TrimSpace(kind),
 		GapID:              historyTieredGapID(path, sourceGeneration, kind, offset, endOffset),
@@ -1689,7 +1741,7 @@ func historyTieredOpaqueRecordQuarantine(path string, sourceFingerprint string, 
 		FrontierLine:       line,
 		FrontierOffset:     offset,
 		ExclusiveEndOffset: endOffset,
-		RangeFingerprint:   transcriptSourceRangeFingerprint(path, offset, endOffset),
+		RangeFingerprint:   transcriptSourceRangeFingerprintFromReader(reader, path, sourceIdentity, offset, endOffset),
 	}
 	if len(raw) > 0 {
 		hash := sha256.Sum256(raw)
@@ -1703,23 +1755,18 @@ func historyTieredOpaqueRecordQuarantine(path string, sourceFingerprint string, 
 // the exact byte through which it scanned when the cap was reached. Keeping
 // that second cursor durable prevents a complete-but-huge record from being
 // re-read from its beginning on every poll.
-func historyTieredFindPartialNewline(path string, startOffset int64, endOffset int64, maxBytes int64) (newlineEnd int64, scannedThrough int64, found bool, err error) {
-	if strings.TrimSpace(path) == "" || startOffset < 0 || endOffset <= startOffset || maxBytes <= 0 {
+func historyTieredFindPartialNewlineFromReader(file *os.File, startOffset int64, endOffset int64, maxBytes int64) (newlineEnd int64, scannedThrough int64, found bool, err error) {
+	if file == nil || startOffset < 0 || endOffset <= startOffset || maxBytes <= 0 {
 		return startOffset, startOffset, false, nil
 	}
 	limit := endOffset - startOffset
 	if limit > maxBytes {
 		limit = maxBytes
 	}
-	f, err := os.Open(path)
-	if err != nil {
+	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
 		return startOffset, startOffset, false, err
 	}
-	defer f.Close()
-	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		return startOffset, startOffset, false, err
-	}
-	reader := bufio.NewReaderSize(io.LimitReader(f, limit), historyTieredTailReaderSize)
+	reader := bufio.NewReaderSize(io.LimitReader(file, limit), historyTieredTailReaderSize)
 	consumed := int64(0)
 	for {
 		chunk, readErr := reader.ReadSlice('\n')
@@ -1758,6 +1805,24 @@ func historyTieredSourceIdentity(path string, info os.FileInfo) string {
 		return ""
 	}
 	return strings.TrimSpace(identity)
+}
+
+// historyTieredSourceObservationStable verifies that the descriptor used for
+// parsing still names the same file as the watched path and that neither view
+// shrank below the bytes already observed. It deliberately allows an append:
+// the bounded read is committed at the old end and the append is handled by
+// the next poll.
+func historyTieredSourceObservationStable(file *os.File, initial os.FileInfo, path string, minimumSize int64) bool {
+	if file == nil || initial == nil || minimumSize < 0 {
+		return false
+	}
+	fdInfo, fdErr := file.Stat()
+	pathInfo, pathErr := os.Stat(path)
+	if fdErr != nil || pathErr != nil || fdInfo.IsDir() || pathInfo.IsDir() ||
+		!os.SameFile(initial, fdInfo) || !os.SameFile(initial, pathInfo) {
+		return false
+	}
+	return fdInfo.Size() >= minimumSize && pathInfo.Size() >= minimumSize
 }
 
 func historyTieredOversizedRecord(path string, lineNo int, startOffset int64, endOffset int64, prefix []byte) TranscriptRecord {
@@ -2303,13 +2368,14 @@ func historyTieredFinalMatchesPreviousAnonymous(record TranscriptRecord, previou
 	return previousThread == "" || recordThread == "" || strings.EqualFold(previousThread, recordThread)
 }
 
-func historyTieredTranscriptQuarantine(state historyTieredFileState, kind string, finals []historyTieredFinal) *teamstore.TranscriptQuarantine {
+func historyTieredTranscriptQuarantine(state historyTieredFileState, kind string, finals []historyTieredFinal, proofReader *os.File, sourceIdentity string) *teamstore.TranscriptQuarantine {
 	if len(finals) == 0 {
 		return nil
 	}
 	quarantine := &teamstore.TranscriptQuarantine{
 		Kind:              strings.TrimSpace(kind),
 		SourcePath:        strings.TrimSpace(state.Path),
+		SourceGeneration:  strings.TrimSpace(state.SourceGeneration),
 		SourceFingerprint: strings.TrimSpace(state.SourceFingerprint),
 	}
 	first := finals[0]
@@ -2335,7 +2401,43 @@ func historyTieredTranscriptQuarantine(state historyTieredFileState, kind string
 			frontierSet = true
 		}
 	}
+	historyTieredAttachQuarantineRangeProof(state, quarantine, proofReader, sourceIdentity)
 	return quarantine
+}
+
+// historyTieredAttachQuarantineRangeProof turns the candidate's first record
+// into a usable bounded frontier only when the exact bytes through the current
+// complete scan boundary can be fingerprinted. If that proof is unavailable,
+// retain the candidate hashes as metadata but clear the partial boundary so a
+// half-written quarantine cannot masquerade as a cursor.
+func historyTieredAttachQuarantineRangeProof(state historyTieredFileState, quarantine *teamstore.TranscriptQuarantine, proofReader io.ReaderAt, sourceIdentity string) {
+	if quarantine == nil {
+		return
+	}
+	quarantine.SourceGeneration = strings.TrimSpace(firstNonEmptyString(quarantine.SourceGeneration, state.SourceGeneration))
+	start := quarantine.FrontierOffset
+	end := state.Offset
+	if strings.TrimSpace(quarantine.SourcePath) == "" || strings.TrimSpace(quarantine.SourceGeneration) == "" ||
+		proofReader == nil || strings.TrimSpace(sourceIdentity) == "" ||
+		strings.TrimSpace(quarantine.FrontierRecordID) == "" || quarantine.FrontierLine <= 0 || start < 0 || end <= start {
+		quarantine.FrontierRecordID = ""
+		quarantine.FrontierLine = 0
+		quarantine.FrontierOffset = 0
+		quarantine.ExclusiveEndOffset = 0
+		quarantine.RangeFingerprint = ""
+		return
+	}
+	fingerprint := transcriptSourceRangeFingerprintFromReader(proofReader, quarantine.SourcePath, sourceIdentity, start, end)
+	if strings.TrimSpace(fingerprint) == "" {
+		quarantine.FrontierRecordID = ""
+		quarantine.FrontierLine = 0
+		quarantine.FrontierOffset = 0
+		quarantine.ExclusiveEndOffset = 0
+		quarantine.RangeFingerprint = ""
+		return
+	}
+	quarantine.ExclusiveEndOffset = end
+	quarantine.RangeFingerprint = fingerprint
 }
 
 func historyTieredFinalPreferred(candidate historyTieredFinal, current historyTieredFinal) bool {

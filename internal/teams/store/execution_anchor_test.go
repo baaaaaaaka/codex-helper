@@ -1567,11 +1567,12 @@ func TestMarkTurnCompletedWithTranscriptCheckpointRejectsCrossSessionCheckpoint(
 				t.Fatalf("cross-session completion changed turn: found=%v err=%v turn=%#v", found, err, turn)
 			}
 			checkpoint, found, err := store.ImportCheckpoint(ctx, "transcript:provenance-session")
-			if err != nil || !found {
-				t.Fatalf("load provenance checkpoint: found=%v err=%v", found, err)
-			}
-			if checkpoint.SessionID != "other-session" || checkpoint.LastRecordID != "old-record" || checkpoint.LastOffset != 64 {
-				t.Fatalf("cross-session completion changed checkpoint: %#v", checkpoint)
+			if backend == "sqlite" {
+				if !errors.Is(err, ErrSessionStateProvenanceMismatch) || found || checkpoint.ID != "" {
+					t.Fatalf("load provenance checkpoint: checkpoint=%#v found=%v err=%v, want isolated provenance error", checkpoint, found, err)
+				}
+			} else if err != nil || !found || checkpoint.SessionID != "other-session" || checkpoint.LastRecordID != "old-record" || checkpoint.LastOffset != 64 {
+				t.Fatalf("cross-session completion changed checkpoint: checkpoint=%#v found=%v err=%v", checkpoint, found, err)
 			}
 		})
 	}

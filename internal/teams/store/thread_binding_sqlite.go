@@ -46,7 +46,7 @@ func (s *Store) bindCodexThreadForRunningTurnSQLite(ctx context.Context, request
 			if turn.StartNewCodexThread {
 				checkpointID = sessionTranscriptCheckpointID(request.SessionID)
 				var err error
-				checkpoint, checkpointOK, err = loadSQLiteJSONRow[ImportCheckpoint](ctx, tx, `SELECT json FROM import_checkpoints WHERE id = ?`, checkpointID)
+				checkpoint, checkpointOK, err = loadSQLiteCheckpointForID(ctx, tx, `SELECT id, session_id, status, updated_at, json FROM import_checkpoints WHERE id = ?`, checkpointID)
 				if err != nil {
 					return err
 				}

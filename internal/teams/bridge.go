@@ -23755,6 +23755,34 @@ func (b *Bridge) persistTranscriptQuarantineWithRange(ctx context.Context, sessi
 		copy := *pendingRange
 		copyPendingRange = &copy
 	}
+	if copyPendingRange != nil {
+		// The scanner may produce the semantic range separately from the
+		// quarantine summary (notably for mixed-ID final mirrors).  Keep the
+		// summary self-describing as well: a nested proof must never look valid
+		// merely because a sibling field happened to carry its missing boundary.
+		copyQuarantine.FrontierRecordID = firstNonEmptyString(copyQuarantine.FrontierRecordID, copyPendingRange.StartRecordID)
+		if copyQuarantine.FrontierLine == 0 {
+			copyQuarantine.FrontierLine = copyPendingRange.StartLine
+		}
+		if copyQuarantine.FrontierOffset == 0 && copyPendingRange.StartOffset != 0 {
+			copyQuarantine.FrontierOffset = copyPendingRange.StartOffset
+		}
+		if copyQuarantine.ExclusiveEndOffset == 0 {
+			copyQuarantine.ExclusiveEndOffset = copyPendingRange.ExclusiveEnd
+		}
+		copyQuarantine.RangeFingerprint = firstNonEmptyString(copyQuarantine.RangeFingerprint, copyPendingRange.RangeFingerprint)
+	}
+	// A legacy checkpoint has no generation, but the scanner's bounded range is
+	// itself a fresh source observation. Carry that one generation onto the
+	// quarantine before validation; otherwise the parent remains proofless while
+	// its pending range is proof-bound, and the next ordinary update rejects the
+	// exact history-only state it just discovered.
+	copyQuarantine.SourceGeneration = firstNonEmptyString(copyQuarantine.SourceGeneration, func() string {
+		if copyPendingRange != nil {
+			return copyPendingRange.SourceGeneration
+		}
+		return previous.SourceGeneration
+	}())
 	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		// The scan was performed outside the store lock. Treat the checkpoint
 		// supplied with that scan as an optimistic snapshot: if a live-branch
@@ -23786,6 +23814,12 @@ func (b *Bridge) persistTranscriptQuarantineWithRange(ctx context.Context, sessi
 		if current.SourceFingerprint == "" {
 			current.SourceFingerprint = previous.SourceFingerprint
 		}
+		current.SourceGeneration = firstNonEmptyString(current.SourceGeneration, copyQuarantine.SourceGeneration, func() string {
+			if copyPendingRange != nil {
+				return copyPendingRange.SourceGeneration
+			}
+			return ""
+		}())
 		if current.SourceSize == 0 {
 			current.SourceSize = previous.SourceSize
 		}
@@ -25257,6 +25291,17 @@ func (b *Bridge) recordTranscriptCheckpointObservation(ctx context.Context, sess
 		if observation != nil && observation.TerminalBoundary != nil {
 			next.TerminalBoundarySeen = true
 			next.TerminalBoundaryLine = observation.TerminalBoundary.Line
+		}
+		if transcriptImportRunIsExplicitHistory(previous.ImportTurnID) {
+			// Explicit history is the operator-selected boundary for an inherited
+			// or ambiguous transcript. Once it has durably queued progress, do not
+			// carry the old history-only quarantine into the next checkpoint CAS;
+			// an incomplete legacy shape would otherwise fail validation before the
+			// final completion CAS gets a chance to clear it.
+			next.TranscriptQuarantine = nil
+			next.PendingHistoryRange = nil
+			next.ContextGap = nil
+			next.RecoveryProofUnusable = false
 		}
 		if len(finalBoundary) > 0 && transcriptFinalBoundaryFitsProgress(finalBoundary[0], lastRecordID, lastOffset) {
 			boundary := finalBoundary[0]

@@ -52,6 +52,54 @@ func HistoryPendingRangeValid(rng *HistoryPendingRange) bool {
 	return rng == nil || rng.valid()
 }
 
+// TranscriptQuarantineValid validates only the shape of a persisted
+// quarantine.  A metadata-only quarantine is intentionally valid: it is an
+// explanation/fence, but it contains no frontier that can advance a cursor.
+// Only fields that describe a concrete byte frontier require the complete
+// source observation; source names, generations, fingerprints, and candidate
+// hashes may be retained as diagnostic metadata without becoming a proof.
+func TranscriptQuarantineValid(quarantine *TranscriptQuarantine) bool {
+	if quarantine == nil {
+		return true
+	}
+	if strings.TrimSpace(quarantine.Kind) == "" {
+		return false
+	}
+	hasFrontier := strings.TrimSpace(quarantine.FrontierRecordID) != "" ||
+		quarantine.FrontierLine != 0 || quarantine.FrontierOffset != 0 ||
+		quarantine.ExclusiveEndOffset != 0 || strings.TrimSpace(quarantine.RangeFingerprint) != ""
+	if !hasFrontier {
+		return true
+	}
+	return strings.TrimSpace(quarantine.SourcePath) != "" &&
+		strings.TrimSpace(quarantine.SourceGeneration) != "" &&
+		strings.TrimSpace(quarantine.FrontierRecordID) != "" &&
+		quarantine.FrontierLine > 0 &&
+		quarantine.FrontierOffset >= 0 &&
+		quarantine.ExclusiveEndOffset > quarantine.FrontierOffset &&
+		strings.TrimSpace(quarantine.RangeFingerprint) != ""
+}
+
+// TranscriptQuarantineHasFrontier distinguishes a diagnostic quarantine from
+// one that claims a concrete cursor boundary. It is intentionally weaker than
+// TranscriptQuarantineValid so callers can fail closed on a malformed claimed
+// frontier while still ignoring metadata-only explanations for cursor
+// advancement.
+func TranscriptQuarantineHasFrontier(quarantine *TranscriptQuarantine) bool {
+	if quarantine == nil {
+		return false
+	}
+	return strings.TrimSpace(quarantine.FrontierRecordID) != "" ||
+		quarantine.FrontierLine != 0 || quarantine.FrontierOffset != 0 ||
+		quarantine.ExclusiveEndOffset != 0 || strings.TrimSpace(quarantine.RangeFingerprint) != ""
+}
+
+// TranscriptQuarantineFrontierUsable is the only predicate that permits an
+// automatic scanner to use a quarantine as a physical frontier.
+func TranscriptQuarantineFrontierUsable(quarantine *TranscriptQuarantine) bool {
+	return TranscriptQuarantineHasFrontier(quarantine) && TranscriptQuarantineValid(quarantine)
+}
+
 // importCheckpointOptionalProofUsable is deliberately separate from the
 // identity/provenance validators.  A malformed optional range proof should
 // make automatic history conservative, but must not make the entire store
@@ -59,6 +107,7 @@ func HistoryPendingRangeValid(rng *HistoryPendingRange) bool {
 func importCheckpointOptionalProofUsable(checkpoint ImportCheckpoint) bool {
 	if !ContextGapStateValid(checkpoint.ContextGap) ||
 		!HistoryPendingRangeValid(checkpoint.PendingHistoryRange) ||
+		!TranscriptQuarantineValid(checkpoint.TranscriptQuarantine) ||
 		!TerminalBoundaryValid(checkpoint.TerminalBoundary) {
 		return false
 	}
@@ -70,6 +119,9 @@ func importCheckpointOptionalProofUsable(checkpoint ImportCheckpoint) bool {
 		return false
 	}
 	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return false
+	}
+	if quarantine := checkpoint.TranscriptQuarantine; quarantine != nil && strings.TrimSpace(quarantine.SourceGeneration) != "" && strings.TrimSpace(quarantine.SourceGeneration) != sourceGeneration {
 		return false
 	}
 	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {

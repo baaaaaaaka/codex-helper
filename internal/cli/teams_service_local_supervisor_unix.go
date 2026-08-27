@@ -66,6 +66,15 @@ func defaultTeamsLocalSupervisorTerminateProcessGroup(pgid int, leaderPID int, g
 	if leaderPID > 0 {
 		livePGID, err := teamsLocalSupervisorProcessGroupID(leaderPID)
 		if err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				if !teamsLocalSupervisorProcessGroupAlive(pgid) {
+					// The leader can exit after the caller's identity check but
+					// before this final cleanup check. If the entire recorded
+					// group is gone too, cleanup already succeeded.
+					return nil
+				}
+				return fmt.Errorf("refusing to terminate process group %d because leader pid %d disappeared while the group remains alive", pgid, leaderPID)
+			}
 			return err
 		}
 		if livePGID != pgid {
@@ -107,12 +116,24 @@ func waitTeamsLocalSupervisorProcessGroupGone(pgid int, grace time.Duration) boo
 	return !teamsLocalSupervisorProcessGroupAlive(pgid)
 }
 
-func teamsLocalSupervisorProcessGroupAlive(pgid int) bool {
+var teamsLocalSupervisorProcessGroupAlive = defaultTeamsLocalSupervisorProcessGroupAlive
+
+func defaultTeamsLocalSupervisorProcessGroupAlive(pgid int) bool {
 	if pgid <= 0 {
 		return false
 	}
 	err := syscall.Kill(-pgid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func teamsServiceLocalSupervisorChildGone(pid int, pgid int) bool {
+	if pid > 0 && teamsLocalSupervisorProcessAlive(pid) {
+		return false
+	}
+	if pgid > 0 && teamsLocalSupervisorProcessGroupAlive(pgid) {
+		return false
+	}
+	return true
 }
 
 func defaultTeamsLocalSupervisorVerifyProcessIdentity(pid int, configPath string) error {

@@ -29,6 +29,10 @@ const (
 	teamsServiceLocalSupervisorRetireTimeout     = 3 * time.Second
 	teamsServiceLocalSupervisorMaxLogBytes       = 5 * 1024 * 1024
 	teamsServiceLocalSupervisorLogBackups        = 3
+	// A service child can leave a copy of the supervisor's stdout/stderr pipe
+	// in a detached descendant.  WaitDelay bounds os/exec's pipe-drain phase;
+	// it is deliberately separate from the process-group termination grace.
+	teamsServiceLocalSupervisorWaitDelay = time.Second
 )
 
 type teamsServiceLocalSupervisorBackend struct{}
@@ -102,6 +106,7 @@ var (
 )
 
 var errTeamsServiceLocalSupervisorStatusMalformed = errors.New("local supervisor status is malformed")
+var errTeamsServiceLocalSupervisorCleanupFailed = errors.New("local supervisor child cleanup failed")
 
 func newTeamsServiceLocalSupervisorCmd() *cobra.Command {
 	var configPath string
@@ -293,6 +298,16 @@ func (b teamsServiceLocalSupervisorBackend) start(ctx context.Context, configPat
 	cfg, err := readTeamsServiceLocalSupervisorConfig(configPath)
 	if err != nil {
 		return nil, err
+	}
+	if status, ok, err := readTeamsServiceLocalSupervisorStatus(); err != nil {
+		return nil, err
+	} else if ok && (status.ChildPID > 0 || status.ChildPGID > 0) {
+		// A supervisor can disappear after recording its child identity. Reconcile
+		// that durable nonterminal child before starting a new supervisor; replacing
+		// it first would create two writers and would lose the only cleanup handle.
+		if err := reconcileTeamsServiceLocalSupervisorChild(ctx, status); err != nil {
+			return nil, err
+		}
 	}
 	if err := ensureTeamsServiceLocalSupervisorDir(filepath.Dir(configPath)); err != nil {
 		return nil, err
@@ -600,6 +615,17 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 	}
 	_ = writeTeamsServiceLocalSupervisorStatus(status)
 	defer func() {
+		if strings.EqualFold(strings.TrimSpace(status.State), "cleanup_failed") {
+			// Keep the target identity as a durable stop barrier.  Clearing it
+			// here would let a later start launch a replacement while the old
+			// child (or one of its original process-group members) is still live.
+			status.SupervisorPID = 0
+			status.SupervisorPGID = 0
+			status.SupervisorIdentity = nil
+			status.UpdatedAt = time.Now()
+			_ = writeTeamsServiceLocalSupervisorStatus(status)
+			return
+		}
 		status.State = "stopped"
 		status.SupervisorPID = 0
 		status.SupervisorPGID = 0
@@ -615,10 +641,25 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 		if err := supervisorCtx.Err(); err != nil {
 			return nil
 		}
-		if runErr := runTeamsServiceLocalSupervisorChild(supervisorCtx, cfg, &status, logWriter); runErr != nil && !errors.Is(runErr, context.Canceled) {
+		runErr := runTeamsServiceLocalSupervisorChild(supervisorCtx, cfg, &status, logWriter)
+		if errors.Is(runErr, errTeamsServiceLocalSupervisorCleanupFailed) {
+			// A cleanup failure is a safety stop.  Do not enter the restart delay
+			// and accidentally launch a second child while the old identity may
+			// still be alive.  The retained child status is reconciled by the next
+			// explicit start/repair operation.
+			status.LastError = runErr.Error()
+			status.State = "cleanup_failed"
+			status.UpdatedAt = time.Now()
+			_ = writeTeamsServiceLocalSupervisorStatus(status)
+			return runErr
+		}
+		if runErr != nil && !errors.Is(runErr, context.Canceled) {
 			status.LastError = runErr.Error()
 			status.UpdatedAt = time.Now()
 			_ = writeTeamsServiceLocalSupervisorStatus(status)
+		}
+		if supervisorCtx.Err() != nil {
+			return nil
 		}
 		if err := logWriter.RotateIfNeeded(); err != nil {
 			status.LastError = "local supervisor log rotation failed: " + err.Error()
@@ -640,6 +681,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	configureTargetProcessGroup(cmd)
+	cmd.WaitDelay = teamsServiceLocalSupervisorWaitDelay
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -662,7 +704,13 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 	for {
 		select {
 		case <-ctx.Done():
-			_ = teamsServiceLocalSupervisorTerminateTarget(cmd, teamsServiceLocalSupervisorTerminationWait)
+			markTeamsServiceLocalSupervisorChildStopping(status, "local supervisor context is shutting down")
+			waitErr, cleanupErr := cleanupTeamsServiceLocalSupervisorChild(cmd, done, childPGID, teamsServiceLocalSupervisorTerminationWait)
+			if cleanupErr != nil {
+				markTeamsServiceLocalSupervisorChildCleanupFailed(status, cleanupErr)
+				return errors.Join(errTeamsServiceLocalSupervisorCleanupFailed, ctx.Err(), cleanupErr)
+			}
+			clearTeamsServiceLocalSupervisorChild(status, waitErr)
 			return ctx.Err()
 		case <-ticker.C:
 			if decision, err := teamsServiceLocalSupervisorCheckChildHealth(ctx, &healthState); err != nil {
@@ -677,45 +725,119 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 					status.LastError = "local supervisor health check restarting child: " + decision.Reason
 					status.UpdatedAt = time.Now()
 					_ = writeTeamsServiceLocalSupervisorStatus(*status)
-					if err := teamsServiceLocalSupervisorTerminateTarget(cmd, teamsServiceLocalSupervisorTerminationWait); err != nil {
-						status.LastError = "local supervisor health check could not terminate child: " + err.Error()
-						status.UpdatedAt = time.Now()
-						_ = writeTeamsServiceLocalSupervisorStatus(*status)
-						return errors.New(status.LastError)
+					markTeamsServiceLocalSupervisorChildStopping(status, status.LastError)
+					waitErr, cleanupErr := cleanupTeamsServiceLocalSupervisorChild(cmd, done, childPGID, teamsServiceLocalSupervisorTerminationWait)
+					if cleanupErr != nil {
+						cleanupErr = fmt.Errorf("local supervisor health check could not terminate child: %w", cleanupErr)
+						markTeamsServiceLocalSupervisorChildCleanupFailed(status, cleanupErr)
+						return errors.Join(errTeamsServiceLocalSupervisorCleanupFailed, cleanupErr)
 					}
-					select {
-					case err := <-done:
-						status.LastChildExitAt = time.Now()
-						status.UpdatedAt = status.LastChildExitAt
-						status.ChildPID = 0
-						status.ChildPGID = 0
-						status.ChildIdentity = nil
-						status.State = "waiting"
-						status.LastExitCode = teamsServiceLocalSupervisorExitCode(err)
-						_ = writeTeamsServiceLocalSupervisorStatus(*status)
-						return fmt.Errorf("local supervisor health check restarted child: %s", decision.Reason)
-					case <-ctx.Done():
-						return ctx.Err()
-					}
+					clearTeamsServiceLocalSupervisorChild(status, waitErr)
+					return fmt.Errorf("local supervisor health check restarted child: %s", decision.Reason)
 				}
 			}
 			status.UpdatedAt = time.Now()
 			_ = writeTeamsServiceLocalSupervisorStatus(*status)
 		case err := <-done:
-			status.LastChildExitAt = time.Now()
-			status.UpdatedAt = status.LastChildExitAt
-			status.ChildPID = 0
-			status.ChildPGID = 0
-			status.ChildIdentity = nil
-			status.State = "waiting"
-			status.LastExitCode = teamsServiceLocalSupervisorExitCode(err)
-			if err != nil {
-				status.LastError = err.Error()
+			if !teamsServiceLocalSupervisorChildGone(cmd.Process.Pid, childPGID) {
+				cleanupErr := fmt.Errorf("child pid %d or process group %d remains after cmd.Wait", cmd.Process.Pid, childPGID)
+				markTeamsServiceLocalSupervisorChildCleanupFailed(status, cleanupErr)
+				return errors.Join(errTeamsServiceLocalSupervisorCleanupFailed, cleanupErr)
 			}
-			_ = writeTeamsServiceLocalSupervisorStatus(*status)
+			clearTeamsServiceLocalSupervisorChild(status, err)
 			return err
 		}
 	}
+}
+
+func markTeamsServiceLocalSupervisorChildStopping(status *teamsServiceLocalSupervisorStatus, reason string) {
+	if status == nil {
+		return
+	}
+	status.State = "stopping"
+	if strings.TrimSpace(reason) != "" {
+		status.LastError = strings.TrimSpace(reason)
+	}
+	status.UpdatedAt = time.Now()
+	_ = writeTeamsServiceLocalSupervisorStatus(*status)
+}
+
+func markTeamsServiceLocalSupervisorChildCleanupFailed(status *teamsServiceLocalSupervisorStatus, err error) {
+	if status == nil {
+		return
+	}
+	status.State = "cleanup_failed"
+	if err != nil {
+		status.LastError = err.Error()
+	}
+	status.UpdatedAt = time.Now()
+	_ = writeTeamsServiceLocalSupervisorStatus(*status)
+}
+
+func clearTeamsServiceLocalSupervisorChild(status *teamsServiceLocalSupervisorStatus, waitErr error) {
+	if status == nil {
+		return
+	}
+	status.LastChildExitAt = time.Now()
+	status.UpdatedAt = status.LastChildExitAt
+	status.ChildPID = 0
+	status.ChildPGID = 0
+	status.ChildIdentity = nil
+	status.State = "waiting"
+	status.LastExitCode = teamsServiceLocalSupervisorExitCode(waitErr)
+	if waitErr != nil && !errors.Is(waitErr, exec.ErrWaitDelay) {
+		status.LastError = waitErr.Error()
+	}
+	_ = writeTeamsServiceLocalSupervisorStatus(*status)
+}
+
+func cleanupTeamsServiceLocalSupervisorChild(cmd *exec.Cmd, done <-chan error, childPGID int, grace time.Duration) (error, error) {
+	if cmd == nil || cmd.Process == nil {
+		return nil, nil
+	}
+	terminateErr := teamsServiceLocalSupervisorTerminateTarget(cmd, grace)
+	waitErr, completed := waitTeamsServiceLocalSupervisorChild(done, teamsServiceLocalSupervisorCleanupDeadline(grace))
+	if !completed {
+		if terminateErr != nil {
+			return waitErr, fmt.Errorf("terminate child pid %d: %w; waiting for child to be reaped timed out", cmd.Process.Pid, terminateErr)
+		}
+		return waitErr, fmt.Errorf("waiting for child pid %d to be reaped timed out", cmd.Process.Pid)
+	}
+	if terminateErr != nil {
+		return waitErr, fmt.Errorf("terminate child pid %d: %w", cmd.Process.Pid, terminateErr)
+	}
+	if !teamsServiceLocalSupervisorChildGone(cmd.Process.Pid, childPGID) {
+		return waitErr, fmt.Errorf("child pid %d or process group %d remains after cleanup", cmd.Process.Pid, childPGID)
+	}
+	return waitErr, nil
+}
+
+func waitTeamsServiceLocalSupervisorChild(done <-chan error, timeout time.Duration) (error, bool) {
+	if done == nil {
+		return nil, true
+	}
+	if timeout <= 0 {
+		timeout = teamsServiceLocalSupervisorWaitDelay + time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+func teamsServiceLocalSupervisorCleanupDeadline(grace time.Duration) time.Duration {
+	if grace < 0 {
+		grace = 0
+	}
+	deadline := grace + teamsServiceLocalSupervisorWaitDelay + time.Second
+	if deadline < teamsServiceLocalSupervisorWaitDelay+time.Second {
+		return teamsServiceLocalSupervisorWaitDelay + time.Second
+	}
+	return deadline
 }
 
 func defaultTeamsServiceLocalSupervisorCheckChildHealth(ctx context.Context, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
@@ -1001,6 +1123,9 @@ func stopTeamsServiceLocalSupervisorChildFromStatus(ctx context.Context, status 
 		return fmt.Errorf("refusing to stop local supervisor child process group %d because status has no child pid to verify", status.ChildPGID)
 	}
 	if status.ChildPID > 0 && !teamsLocalSupervisorProcessAlive(status.ChildPID) {
+		if status.ChildPGID > 0 && teamsLocalSupervisorProcessGroupAlive(status.ChildPGID) {
+			return fmt.Errorf("refusing to stop local supervisor child process group %d because its recorded leader pid %d is gone", status.ChildPGID, status.ChildPID)
+		}
 		return nil
 	}
 	if verify && status.ChildPID > 0 {
@@ -1027,6 +1152,27 @@ func stopTeamsServiceLocalSupervisorChildFromStatus(ctx context.Context, status 
 		return fmt.Errorf("refusing to stop local supervisor child process group %d because it matches the current process group", status.ChildPGID)
 	}
 	return teamsLocalSupervisorTerminateProcessGroup(status.ChildPGID, status.ChildPID, teamsServiceLocalSupervisorTerminationWait)
+}
+
+func reconcileTeamsServiceLocalSupervisorChild(ctx context.Context, status teamsServiceLocalSupervisorStatus) error {
+	if status.ChildPID <= 0 && status.ChildPGID <= 0 {
+		return nil
+	}
+	if err := stopTeamsServiceLocalSupervisorChildFromStatus(ctx, status, true); err != nil {
+		return fmt.Errorf("cannot start local supervisor while previous child cleanup is unresolved: %w", err)
+	}
+	if !teamsServiceLocalSupervisorChildGone(status.ChildPID, status.ChildPGID) {
+		return fmt.Errorf("cannot start local supervisor while previous child pid %d or process group %d remains", status.ChildPID, status.ChildPGID)
+	}
+	status.ChildPID = 0
+	status.ChildPGID = 0
+	status.ChildIdentity = nil
+	status.State = "stopped"
+	status.UpdatedAt = time.Now()
+	if err := writeTeamsServiceLocalSupervisorStatus(status); err != nil {
+		return fmt.Errorf("cannot persist reconciled local supervisor child state: %w", err)
+	}
+	return nil
 }
 
 func teamsServiceLocalSupervisorChildSpecForStatus(status teamsServiceLocalSupervisorStatus) (teamsServiceSpec, error) {

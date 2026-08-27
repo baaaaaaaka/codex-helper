@@ -37,6 +37,16 @@ func defaultTeamsLocalSupervisorProcessAlive(pid int) bool {
 	return pid > 0
 }
 
+func teamsServiceLocalSupervisorChildGone(pid int, _ int) bool {
+	return !teamsLocalSupervisorProcessAlive(pid)
+}
+
+var teamsLocalSupervisorProcessGroupAlive = defaultTeamsLocalSupervisorProcessGroupAlive
+
+func defaultTeamsLocalSupervisorProcessGroupAlive(_ int) bool {
+	return false
+}
+
 var teamsLocalSupervisorTerminateProcessGroup = defaultTeamsLocalSupervisorTerminateProcessGroup
 
 func defaultTeamsLocalSupervisorTerminateProcessGroup(_ int, _ int, _ time.Duration) error {
