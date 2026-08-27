@@ -491,7 +491,10 @@ func appServerProcessHelperArgs() ([]string, bool) {
 
 func readProcessTestLine(t *testing.T, transport AppServerLineTransport) []byte {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Windows hosted runners can take a few seconds to create a PowerShell
+	// fixture before its first line is available. Keep this bounded, but avoid
+	// turning runner startup variance into a false process-lifecycle failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	line, err := transport.ReadLine(ctx)
 	if err != nil {
