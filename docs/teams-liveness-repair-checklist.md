@@ -39,13 +39,13 @@ fails, and oversized Graph error bodies hiding the real HTTP status.
 
 ## SQLite liveness path
 
-- [x] Add a dedicated cached runtime SQLite handle so owner heartbeat and
-      lease validation do not wait behind `Store.mu`, the state-file flock, or
-      a long full-state callback.
-- [x] Serialize that handle with close/rebind/migration and read the current
-      pointer while holding the same runtime mutex, preventing a stale inode
-      from being reopened after migration.
-- [x] Open the runtime handle without setup PRAGMAs or permission changes;
+- [x] Add a cached runtime access path so owner heartbeat and lease validation
+      do not wait behind `Store.mu`, the state-file flock, or a long full-state
+      callback.
+- [x] Share the single physical SQLite handle between runtime and normal store
+      work, while serializing handle close/rebind/migration with the runtime
+      mutex; this avoids cross-handle WAL snapshot conflicts.
+- [x] Open a runtime-first handle without setup PRAGMAs or permission changes;
       retain schema validation and a bounded busy timeout.
 - [x] Make heartbeat, owner read, lease validation, claim, release, and clear
       paths decode only the required typed runtime rows.
@@ -60,8 +60,8 @@ fails, and oversized Graph error bodies hiding the real HTTP status.
       stale full-state write cannot resurrect the cleared owner.
 - [x] Recognize SQLite busy extended errors, including `SQLITE_BUSY_SNAPSHOT`,
       and retry the complete short heartbeat operation from a fresh snapshot.
-- [x] Close the runtime handle before SQLite migration can replace the database
-      inode or pointer.
+- [x] Quiesce and close the shared SQLite handle before SQLite migration can
+      replace the database inode or pointer.
 
 ## Bridge and ownership lifecycle
 

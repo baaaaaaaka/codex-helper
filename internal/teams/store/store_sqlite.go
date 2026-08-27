@@ -116,13 +116,13 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 	}
 	var out StoreSQLiteMigrationResult
 	err := s.withStateLock(ctx, func() error {
-		// A runtime heartbeat may use a cached handle without the business
-		// state-file lock. Quiesce and close it before a migration can replace
-		// the SQLite inode or rewrite the pointer; the next liveness operation
-		// will reopen the validated current database.
+		// A runtime heartbeat may use the shared SQLite handle without the
+		// business state-file lock. Quiesce and close it before a migration can
+		// replace the SQLite inode or rewrite the pointer; the next liveness
+		// operation will reopen the validated current database.
 		s.sqliteRuntimeMu.Lock()
 		defer s.sqliteRuntimeMu.Unlock()
-		if err := s.closeSQLiteRuntimeDBLocked(); err != nil {
+		if err := s.closeSQLiteDBLocked(); err != nil {
 			return err
 		}
 		source, err := os.ReadFile(s.path)
@@ -136,7 +136,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if pointer, ok, err := storeSQLitePointerFromData(source); err != nil {
 			return err
 		} else if ok {
-			state, err := s.loadSQLiteStateUnlocked(ctx, pointer)
+			state, err := s.loadSQLiteStateWithSQLiteLock(ctx, pointer)
 			if err != nil {
 				return err
 			}
@@ -619,6 +619,17 @@ func (s *Store) loadSQLiteStateUnlocked(ctx context.Context, pointer storeSQLite
 	return loadSQLiteState(ctx, db)
 }
 
+// loadSQLiteStateWithSQLiteLock is used by migration while it already holds
+// sqliteRuntimeMu. All ordinary callers use loadSQLiteStateUnlocked, which
+// acquires the handle lock through sqliteDBUnlocked.
+func (s *Store) loadSQLiteStateWithSQLiteLock(ctx context.Context, pointer storeSQLitePointer) (State, error) {
+	db, err := s.sqliteDBUnlockedLocked(pointer)
+	if err != nil {
+		return State{}, err
+	}
+	return loadSQLiteState(ctx, db)
+}
+
 func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State) error {
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
@@ -797,6 +808,12 @@ func (s *Store) hasSessionsSQLite(ctx context.Context) (bool, bool, error) {
 }
 
 func (s *Store) sqliteDBUnlocked(pointer storeSQLitePointer) (*sql.DB, error) {
+	s.sqliteRuntimeMu.Lock()
+	defer s.sqliteRuntimeMu.Unlock()
+	return s.sqliteDBUnlockedLocked(pointer)
+}
+
+func (s *Store) sqliteDBUnlockedLocked(pointer storeSQLitePointer) (*sql.DB, error) {
 	path, err := s.storeSQLitePath(pointer)
 	if err != nil {
 		return nil, err
@@ -822,11 +839,12 @@ func (s *Store) sqliteDBUnlocked(pointer storeSQLitePointer) (*sql.DB, error) {
 	return db, nil
 }
 
-// withSQLiteRuntimeDB runs a liveness-only operation through a dedicated
-// SQLite handle. Full Store operations serialize on Store.mu and the state
-// file lock while they execute user callbacks; heartbeats must not inherit
-// either of those potentially long waits. The handle is still serialized
-// against Store.Close and pointer rebinding by sqliteRuntimeMu.
+// withSQLiteRuntimeDB runs a liveness-only operation without acquiring
+// Store.mu. Full Store operations serialize on Store.mu and the state file
+// lock while they execute user callbacks; heartbeats must not inherit either
+// of those potentially long waits. The operation shares sqliteDB, whose
+// single physical connection serializes its transaction with normal store
+// work, and sqliteRuntimeMu makes closing/rebinding the handle safe.
 func (s *Store) withSQLiteRuntimeDB(ctx context.Context, fn func(*sql.DB) error) (bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -841,29 +859,31 @@ func (s *Store) withSQLiteRuntimeDB(ctx context.Context, fn func(*sql.DB) error)
 	if err != nil {
 		return true, err
 	}
-	if s.sqliteRuntimeDB != nil && s.sqliteRuntimeDBPath != path {
-		_ = s.sqliteRuntimeDB.Close()
-		s.sqliteRuntimeDB = nil
-		s.sqliteRuntimeDBPath = ""
+	if s.sqliteDB != nil && s.sqliteDBPath != path {
+		if err := s.sqliteDB.Close(); err != nil {
+			return true, err
+		}
+		s.sqliteDB = nil
+		s.sqliteDBPath = ""
 	}
-	if s.sqliteRuntimeDB == nil {
+	if s.sqliteDB == nil {
 		db, err := openExistingSQLiteRuntimeStore(path)
 		if err != nil {
 			return true, err
 		}
-		s.sqliteRuntimeDB = db
-		s.sqliteRuntimeDBPath = path
+		s.sqliteDB = db
+		s.sqliteDBPath = path
 	}
-	return true, fn(s.sqliteRuntimeDB)
+	return true, fn(s.sqliteDB)
 }
 
-func (s *Store) closeSQLiteRuntimeDBLocked() error {
-	if s.sqliteRuntimeDB == nil {
+func (s *Store) closeSQLiteDBLocked() error {
+	if s.sqliteDB == nil {
 		return nil
 	}
-	err := s.sqliteRuntimeDB.Close()
-	s.sqliteRuntimeDB = nil
-	s.sqliteRuntimeDBPath = ""
+	err := s.sqliteDB.Close()
+	s.sqliteDB = nil
+	s.sqliteDBPath = ""
 	return err
 }
 

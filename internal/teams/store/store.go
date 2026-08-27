@@ -1772,12 +1772,11 @@ type Store struct {
 	messageLookup messageLookupCache
 	sqliteDB      *sql.DB
 	sqliteDBPath  string
-	// The runtime metadata handle is separate from sqliteDB so liveness
-	// operations do not wait behind Store.mu while a full-state callback is
-	// running. sqliteRuntimeMu also makes closing/rebinding the handle safe.
+	// sqliteRuntimeMu protects the SQLite handle pointer while liveness
+	// operations bypass Store.mu. The liveness path shares sqliteDB so
+	// database/sql serializes its short transactions with normal store work,
+	// avoiding cross-handle WAL snapshot conflicts.
 	sqliteRuntimeMu          sync.Mutex
-	sqliteRuntimeDB          *sql.DB
-	sqliteRuntimeDBPath      string
 	sqlitePointerCached      bool
 	sqlitePointerTrusted     bool
 	sqlitePointer            storeSQLitePointer
@@ -2001,17 +2000,14 @@ func (s *Store) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.sqliteRuntimeMu.Lock()
+	defer s.sqliteRuntimeMu.Unlock()
 	var closeErr error
 	if s.sqliteDB != nil {
 		closeErr = s.sqliteDB.Close()
 		s.sqliteDB = nil
 		s.sqliteDBPath = ""
 	}
-	s.sqliteRuntimeMu.Lock()
-	if runtimeErr := s.closeSQLiteRuntimeDBLocked(); closeErr == nil {
-		closeErr = runtimeErr
-	}
-	s.sqliteRuntimeMu.Unlock()
 	return closeErr
 }
 
