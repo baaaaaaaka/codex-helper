@@ -9,6 +9,7 @@ package teams
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -908,6 +909,215 @@ func TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI(t *testing.T) {
 	mu.Unlock()
 	if gotRequests != 5 {
 		t.Fatalf("worker wave requests = %d, want all five due chats to reach Graph", gotRequests)
+	}
+}
+
+// TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI
+// composes two independent service liveness boundaries. Four due chats occupy
+// every Graph worker until their per-request deadline, while a fifth chat is
+// waiting for the next worker wave. The owner heartbeat must still advance on
+// the SQLite runtime projection, the control lease must remain valid, and the
+// fifth chat must reach Graph instead of being lost behind the outage.
+func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *testing.T) {
+	previousTimeout := inboundPollGraphTimeout
+	inboundPollGraphTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { inboundPollGraphTimeout = previousTimeout })
+
+	// Race instrumentation makes the first SQLite connection/schema path and
+	// the worker-wave setup materially slower. Keep the same bounded scenario,
+	// but leave enough time for the barrier to become observable on a busy CI
+	// runner.
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(10*time.Second))
+	defer cancel()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	seedOwnershipStressControlIdle(t, store)
+
+	sessions := make([]*Session, 0, 5)
+	first := bridge.reg.SessionByID("s001")
+	if first == nil {
+		t.Fatal("missing first work session")
+	}
+	if err := bridge.ensureDurableSession(ctx, first); err != nil {
+		t.Fatalf("ensure first durable session: %v", err)
+	}
+	sessions = append(sessions, first)
+	for i := 2; i <= 5; i++ {
+		sessions = append(sessions, appendBridgeTestSession(t, bridge, store, fmt.Sprintf("s%03d", i), fmt.Sprintf("heartbeat-wave-chat-%02d", i)))
+	}
+	for _, session := range sessions {
+		seedOwnershipStressDuePoll(t, store, session.ChatID)
+	}
+	bridge.maxWorkChatPollsPerCycle = len(sessions)
+	bridge.leaseDuration = time.Minute
+	if active, err := bridge.claimControlLease(ctx); err != nil || !active {
+		t.Fatalf("claim control lease: active=%t err=%v", active, err)
+	}
+	owner, err := teamstore.CurrentOwner("sqlite-worker-saturation", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("CurrentOwner: %v", err)
+	}
+	owner.ScopeID = bridge.scope.ID
+	owner.MachineID = bridge.machine.ID
+	owner.LeaseGeneration = bridge.currentLeaseGeneration()
+	bridge.setOwner(owner, time.Minute)
+	bridge.ownerHeartbeatInterval = 5 * time.Millisecond
+	if err := bridge.recordOwnerHeartbeat(ctx, "", ""); err != nil {
+		t.Fatalf("initial owner heartbeat: %v", err)
+	}
+	initialOwner, ok, err := store.ReadOwner(ctx)
+	if err != nil || !ok {
+		t.Fatalf("read initial owner: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate saturated worker store to SQLite: %v", err)
+	}
+
+	var mu sync.Mutex
+	requestCount := 0
+	activeRequests := 0
+	maxActiveRequests := 0
+	var saturatedOnce sync.Once
+	var fifthOnce sync.Once
+	saturated := make(chan struct{})
+	fifthRead := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasSuffix(r.URL.Path, "/messages") {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		requestCount++
+		ordinal := requestCount
+		if ordinal <= 4 {
+			activeRequests++
+			if activeRequests > maxActiveRequests {
+				maxActiveRequests = activeRequests
+			}
+		}
+		if activeRequests == maxConcurrentWorkChatPolls {
+			saturatedOnce.Do(func() { close(saturated) })
+		}
+		mu.Unlock()
+		if ordinal <= 4 {
+			<-r.Context().Done()
+			mu.Lock()
+			activeRequests--
+			mu.Unlock()
+			return
+		}
+		if ordinal == 5 {
+			fifthOnce.Do(func() { close(fifthRead) })
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"value":[]}`)
+	}))
+	t.Cleanup(server.Close)
+	bridge.readGraph = &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	heartbeatDone := bridge.startOwnerHeartbeat(heartbeatCtx)
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- bridge.pollOnce(ctx, 20) }()
+	pollFinished := false
+	t.Cleanup(func() {
+		stopHeartbeat()
+		cancel()
+		if !pollFinished {
+			select {
+			case err := <-pollDone:
+				if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("poll cycle cleanup error: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Errorf("poll cycle did not stop during test cleanup")
+			}
+		}
+		select {
+		case err := <-heartbeatDone:
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("owner heartbeat cleanup error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("owner heartbeat did not stop during test cleanup")
+		}
+	})
+	select {
+	case <-saturated:
+	case pollErr := <-pollDone:
+		pollFinished = true
+		t.Fatalf("poll cycle ended before four Graph workers became saturated: %v", pollErr)
+	case <-ctx.Done():
+		t.Fatal("four Graph workers did not become saturated")
+	}
+
+	heartbeatDeadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	heartbeatAdvanced := false
+	for !heartbeatAdvanced {
+		latest, found, readErr := store.ReadOwner(ctx)
+		if readErr != nil {
+			t.Fatalf("read owner during saturated Graph workers: %v", readErr)
+		}
+		if found && latest.LastHeartbeat.After(initialOwner.LastHeartbeat) {
+			heartbeatAdvanced = true
+			break
+		}
+		select {
+		case <-heartbeatDeadline.C:
+			t.Fatal("owner heartbeat did not advance while all Graph workers were blocked")
+		case <-ticker.C:
+		}
+	}
+	if !heartbeatDeadline.Stop() {
+		select {
+		case <-heartbeatDeadline.C:
+		default:
+		}
+	}
+	ticker.Stop()
+
+	select {
+	case <-fifthRead:
+	case <-ctx.Done():
+		t.Fatal("fifth due chat did not reach Graph after the first worker wave")
+	}
+	select {
+	case pollErr := <-pollDone:
+		pollFinished = true
+		if pollErr != nil && !errors.Is(pollErr, context.Canceled) && !errors.Is(pollErr, context.DeadlineExceeded) {
+			t.Fatalf("poll cycle returned unexpected error after saturated Graph workers: %v", pollErr)
+		}
+	case <-ctx.Done():
+		t.Fatal("poll cycle did not finish after saturated Graph workers timed out")
+	}
+
+	mu.Lock()
+	gotRequests := requestCount
+	mu.Unlock()
+	if gotRequests != 5 {
+		t.Fatalf("saturated Graph worker requests = %d, want exactly five due chats", gotRequests)
+	}
+	if maxActiveRequests != maxConcurrentWorkChatPolls {
+		t.Fatalf("maximum simultaneous Graph worker requests = %d, want %d", maxActiveRequests, maxConcurrentWorkChatPolls)
+	}
+	latestOwner, found, err := store.ReadOwner(ctx)
+	if err != nil || !found {
+		t.Fatalf("read final owner: found=%v err=%v", found, err)
+	}
+	if !latestOwner.LastHeartbeat.After(initialOwner.LastHeartbeat) {
+		t.Fatalf("final owner heartbeat did not advance: initial=%s final=%s", initialOwner.LastHeartbeat, latestOwner.LastHeartbeat)
+	}
+	lease := bridge.currentLease()
+	if _, err := store.ValidateControlLease(ctx, bridge.machine.ID, lease.Generation, time.Now()); err != nil {
+		t.Fatalf("control lease was lost during saturated Graph workers: %v", err)
 	}
 }
 

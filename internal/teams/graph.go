@@ -20,14 +20,15 @@ import (
 )
 
 const (
-	graphBaseURL            = "https://graph.microsoft.com/v1.0"
-	defaultGraphRetries     = 3
-	defaultBackoffBase      = 200 * time.Millisecond
-	defaultBackoffMax       = 2 * time.Second
-	defaultGraphHTTPTimeout = 30 * time.Second
-	maxHostedContentBytes   = 20 << 20
-	maxSharedFileBytes      = 20 << 20
-	maxDriveItemJSONBytes   = 2 << 20
+	graphBaseURL              = "https://graph.microsoft.com/v1.0"
+	defaultGraphRetries       = 3
+	defaultBackoffBase        = 200 * time.Millisecond
+	defaultBackoffMax         = 2 * time.Second
+	defaultGraphHTTPTimeout   = 30 * time.Second
+	maxGraphJSONResponseBytes = 8 << 20
+	maxHostedContentBytes     = 20 << 20
+	maxSharedFileBytes        = 20 << 20
+	maxDriveItemJSONBytes     = 2 << 20
 	// Use Graph's documented resumable-upload path above 10 MiB. This is a
 	// protocol boundary, not an application file-size limit: larger files are
 	// still accepted up to maxTeamsTransferBytes and are sent in sessions.
@@ -189,6 +190,14 @@ type GraphStatusError struct {
 	Code       string
 	Message    string
 	RetryAfter time.Duration
+}
+
+type GraphResponseTooLargeError struct {
+	Limit int64
+}
+
+func (e *GraphResponseTooLargeError) Error() string {
+	return fmt.Sprintf("Graph response exceeds %d bytes", e.Limit)
 }
 
 func (e *GraphStatusError) Error() string {
@@ -1253,16 +1262,20 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			retries++
 			continue
 		}
-		raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		raw, err := readLimited(resp.Body, maxGraphJSONResponseBytes)
 		closeErr := resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			// Preserve the HTTP status as the primary diagnostic even when the
+			// error body itself exceeds the local read bound. Otherwise a 429/5xx
+			// response is misreported as truncated JSON or a size failure and the
+			// caller loses retry/rate-limit semantics.
+			return graphStatusError(method, path, resp, raw)
+		}
 		if err != nil {
 			return err
 		}
 		if closeErr != nil {
 			return closeErr
-		}
-		if resp.StatusCode >= 400 {
-			return graphStatusError(method, path, resp, raw)
 		}
 		if out == nil || len(bytes.TrimSpace(raw)) == 0 {
 			return nil
@@ -1320,14 +1333,14 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 		}
 		raw, err := readLimited(resp.Body, maxBytes)
 		closeErr := resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return nil, "", graphStatusError(method, path, resp, raw)
+		}
 		if err != nil {
 			return nil, "", err
 		}
 		if closeErr != nil {
 			return nil, "", closeErr
-		}
-		if resp.StatusCode >= 400 {
-			return nil, "", graphStatusError(method, path, resp, raw)
 		}
 		return raw, resp.Header.Get("Content-Type"), nil
 	}
@@ -1385,14 +1398,14 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 		}
 		raw, err := readLimited(resp.Body, maxResponseBytes)
 		closeErr := resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			return nil, graphStatusError(method, path, resp, raw)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if closeErr != nil {
 			return nil, closeErr
-		}
-		if resp.StatusCode >= 400 {
-			return nil, graphStatusError(method, path, resp, raw)
 		}
 		return raw, nil
 	}
@@ -1687,7 +1700,7 @@ func readLimited(body io.Reader, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(raw)) > maxBytes {
-		return nil, fmt.Errorf("Graph response exceeds %d bytes", maxBytes)
+		return nil, &GraphResponseTooLargeError{Limit: maxBytes}
 	}
 	return raw, nil
 }

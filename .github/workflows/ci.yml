@@ -659,6 +659,34 @@ jobs:
           go test -race ./internal/teams -count=1 -run "$recovery_pattern" -v
           go test -race ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
 
+      - name: Teams liveness regressions
+        if: matrix.shard == 'core'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli_pattern='^TestTeamsRuntimeSafetyWatchdogDoesNotRestartLiveManagedChildBeforeOwnerRegistration$'
+          store_pattern='^Test(ControlLeaseClaimIgnoresUnrelatedCorruptRuntimeRow|LivenessFallbackIgnoresCorruptOptionalRuntimeRow|RecordOwnerHeartbeat(DoesNotWaitBehindFullStateUpdate|IsolatedFromUnrelatedCorruptRuntimeRow)|SQLiteFullStateUpdateDoesNotResurrectClearedOwner)$'
+          teams_pattern='^Test(BridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails|GraphOversized(JSONResponseIsNotMisclassifiedAsCorruptJSON|ErrorPreservesHTTPStatusAndRetryAfter)|TeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI)$'
+          for spec in "./internal/cli:$cli_pattern" "./internal/teams/store:$store_pattern" "./internal/teams:$teams_pattern"; do
+            package="${spec%%:*}"
+            pattern="${spec#*:}"
+            listed="$(go test "$package" -run '^$' -list "$pattern")"
+            if ! printf '%s\n' "$listed" | grep -q '^Test'; then
+              echo "Teams liveness selector matched zero tests in $package: $pattern" >&2
+              exit 1
+            fi
+            go test "$package" -count=1 -run "$pattern" -v
+          done
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            supervisor_pattern='^TestTeamsServiceLocalSupervisorDoesNotRestartChildBeforeOwnerRegistration$'
+            listed="$(go test ./internal/cli -run '^$' -list "$supervisor_pattern")"
+            if ! printf '%s\n' "$listed" | grep -q '^Test'; then
+              echo "Teams supervisor liveness selector matched zero tests: $supervisor_pattern" >&2
+              exit 1
+            fi
+            go test ./internal/cli -count=1 -run "$supervisor_pattern" -v
+          fi
+
       - name: Teams ownership stress regressions
         if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash

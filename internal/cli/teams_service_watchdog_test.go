@@ -148,6 +148,102 @@ func TestTeamsRuntimeSafetyWatchdogIgnoresHistoricalPollFromPreviousOwnerGenerat
 	}
 }
 
+// A replacement child can be alive before it has completed listener
+// initialization and persisted its first owner heartbeat.  The stale owner
+// row is evidence about the previous child, not evidence that the replacement
+// child is dead.  Keep this at the real watchdog collection boundary: a
+// synthetic snapshot test would miss the single-store path that currently
+// ignores the managed-child identity.
+func TestTeamsRuntimeSafetyWatchdogDoesNotRestartLiveManagedChildBeforeOwnerRegistration(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	statePath := filepath.Join(tmp, "canonical", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatalf("mkdir watchdog state dir: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write watchdog state placeholder: %v", err)
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	now := time.Now()
+	previousOwner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		ScopeID:         "scope-startup-grace",
+		LeaseGeneration: 11,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-10 * time.Minute),
+	}
+	state := teamsstore.State{
+		Scope:        teamsstore.ScopeIdentity{ID: previousOwner.ScopeID},
+		ServiceOwner: &previousOwner,
+		LockOwner:    &previousOwner,
+	}
+
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevLoadState := teamsServiceWatchdogLoadState
+	prevInstalled := teamsServiceWatchdogInstalled
+	prevActive := teamsServiceWatchdogActive
+	prevManagedChild := teamsServiceWatchdogManagedChild
+	t.Cleanup(func() {
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogLoadState = prevLoadState
+		teamsServiceWatchdogInstalled = prevInstalled
+		teamsServiceWatchdogActive = prevActive
+		teamsServiceWatchdogManagedChild = prevManagedChild
+	})
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		return []string{statePath}, nil
+	}
+	teamsServiceWatchdogLoadState = func(context.Context, string) (teamsstore.State, error) {
+		return state, nil
+	}
+	teamsServiceWatchdogInstalled = func() (bool, error) { return true, nil }
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return true, nil }
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{
+			PID:       os.Getpid(),
+			StartedAt: now.Add(-time.Second),
+		}, true
+	}
+
+	var healthState teamsServiceWatchdogState
+	for sample := 1; sample <= defaultTeamsServiceWatchdogConsecutiveStale; sample++ {
+		decision, err := defaultTeamsServiceLocalSupervisorCheckChildHealth(context.Background(), &healthState)
+		if err != nil {
+			t.Fatalf("health sample %d: %v", sample, err)
+		}
+		if decision.Action == teamsServiceWatchdogActionRestart {
+			t.Fatalf("health sample %d restarted a live replacement child before owner registration: decision=%+v state=%+v", sample, decision, healthState)
+		}
+	}
+
+	// A different live child is not evidence that the stale owner belongs to
+	// this service. Keep the opposite boundary explicit so a startup fix cannot
+	// degrade into "any live process suppresses recovery forever".
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		return teamsServiceWatchdogManagedChildIdentity{
+			PID:       os.Getpid() + 1,
+			StartedAt: now.Add(-2 * time.Second),
+		}, true
+	}
+	healthState = teamsServiceWatchdogState{}
+	for sample := 1; sample <= defaultTeamsServiceWatchdogConsecutiveStale; sample++ {
+		decision, err := defaultTeamsServiceLocalSupervisorCheckChildHealth(context.Background(), &healthState)
+		if err != nil {
+			t.Fatalf("mismatched-child health sample %d: %v", sample, err)
+		}
+		if sample == defaultTeamsServiceWatchdogConsecutiveStale && decision.Action != teamsServiceWatchdogActionRestart {
+			t.Fatalf("mismatched-child health sample %d action = %q, want restart: decision=%+v", sample, decision.Action, decision)
+		}
+	}
+}
+
 func TestTeamsServiceWatchdogDoesNotRestartFreshOwnerWithActiveTurn(t *testing.T) {
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})

@@ -1766,12 +1766,18 @@ func (e CodexThreadBindingConflictError) Error() string {
 }
 
 type Store struct {
-	path                     string
-	mu                       sync.Mutex
-	lock                     *flock.Flock
-	messageLookup            messageLookupCache
-	sqliteDB                 *sql.DB
-	sqliteDBPath             string
+	path          string
+	mu            sync.Mutex
+	lock          *flock.Flock
+	messageLookup messageLookupCache
+	sqliteDB      *sql.DB
+	sqliteDBPath  string
+	// The runtime metadata handle is separate from sqliteDB so liveness
+	// operations do not wait behind Store.mu while a full-state callback is
+	// running. sqliteRuntimeMu also makes closing/rebinding the handle safe.
+	sqliteRuntimeMu          sync.Mutex
+	sqliteRuntimeDB          *sql.DB
+	sqliteRuntimeDBPath      string
 	sqlitePointerCached      bool
 	sqlitePointerTrusted     bool
 	sqlitePointer            storeSQLitePointer
@@ -1995,13 +2001,18 @@ func (s *Store) Close() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sqliteDB == nil {
-		return nil
+	var closeErr error
+	if s.sqliteDB != nil {
+		closeErr = s.sqliteDB.Close()
+		s.sqliteDB = nil
+		s.sqliteDBPath = ""
 	}
-	err := s.sqliteDB.Close()
-	s.sqliteDB = nil
-	s.sqliteDBPath = ""
-	return err
+	s.sqliteRuntimeMu.Lock()
+	if runtimeErr := s.closeSQLiteRuntimeDBLocked(); closeErr == nil {
+		closeErr = runtimeErr
+	}
+	s.sqliteRuntimeMu.Unlock()
+	return closeErr
 }
 
 func (s *Store) Path() string {
@@ -5565,6 +5576,9 @@ func (s *Store) ReleaseControlLeaseIfHolder(ctx context.Context, machineID strin
 	if machineID == "" || generation <= 0 {
 		return false, nil
 	}
+	if released, handled, err := s.releaseControlLeaseSQLite(ctx, machineID, generation); handled || err != nil {
+		return released, err
+	}
 	released := false
 	err := s.Update(ctx, func(state *State) error {
 		lease := state.ControlLease
@@ -6221,6 +6235,9 @@ func (s *Store) ReadOwner(ctx context.Context) (OwnerMetadata, bool, error) {
 }
 
 func (s *Store) ClearOwner(ctx context.Context) error {
+	if handled, err := s.clearOwnerSQLite(ctx); handled || err != nil {
+		return err
+	}
 	return s.Update(ctx, func(state *State) error {
 		state.ServiceOwner = nil
 		state.LockOwner = nil
@@ -6239,6 +6256,9 @@ func (s *Store) ClearOwnerIfSame(ctx context.Context, owner OwnerMetadata) (bool
 		state.LockOwner = nil
 		cleared = true
 		return nil
+	}
+	if cleared, handled, err := s.clearOwnerIfSameSQLite(ctx, owner); handled || err != nil {
+		return cleared, err
 	}
 	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
 		return cleared, err

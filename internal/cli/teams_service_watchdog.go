@@ -67,8 +67,15 @@ type teamsServiceWatchdogSnapshot struct {
 	OwnerActiveTurn                    bool
 	LastOwnerHeartbeat                 time.Time
 	FreshOwnerStartedAt                time.Time
-	PollActivityFound                  bool
-	PollActivityAt                     time.Time
+	// ManagedChildStarting is true only when the local supervisor has
+	// positively identified a live child and the store still describes no
+	// owner, or the previous owner used the same PID with an older start time.
+	// That is the narrow startup window in which a stale row is expected while
+	// the replacement listener records its first owner heartbeat.
+	ManagedChildStarting  bool
+	ManagedChildStartedAt time.Time
+	PollActivityFound     bool
+	PollActivityAt        time.Time
 }
 
 type teamsServiceWatchdogState struct {
@@ -95,8 +102,9 @@ type teamsServiceWatchdogResult struct {
 }
 
 type teamsServiceWatchdogManagedChildIdentity struct {
-	PID       int
-	StartedAt time.Time
+	PID                 int
+	StartedAt           time.Time
+	ManagedBySupervisor bool
 }
 
 var (
@@ -299,10 +307,9 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		hasOwner bool
 	}
 	var managedChild teamsServiceWatchdogManagedChildIdentity
-	managedChildFound := false
+	managedChild, managedChildFound := teamsServiceWatchdogManagedChild()
+	managedChildFound = managedChildFound && managedChild.PID > 0 && !managedChild.StartedAt.IsZero()
 	if len(paths) > 1 {
-		managedChild, managedChildFound = teamsServiceWatchdogManagedChild()
-		managedChildFound = managedChildFound && managedChild.PID > 0 && !managedChild.StartedAt.IsZero()
 		binding, bindingFound, _ := teams.LoadActiveStoreBindingReadOnly()
 		if bindingFound && (!managedChildFound || teamsServiceWatchdogBindingMatchesManagedChildGeneration(binding, managedChild)) {
 			for _, path := range paths {
@@ -327,6 +334,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 				snapshot.Active = active
 				snapshot.StateFiles = len(paths)
 				snapshot.AuthoritativeStorePath = path
+				annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, owner, hasOwner, managedChild)
 				return snapshot, nil
 			}
 		}
@@ -401,6 +409,9 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.Active = active
 		snapshot.StateFiles = stateFiles
 		snapshot.AuthoritativeStorePath = selected.path
+		if managedChildFound {
+			annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, selected.owner, selected.hasOwner, managedChild)
+		}
 		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
 	} else {
 		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
@@ -433,7 +444,18 @@ func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChild
 	if err := teamsServiceLocalSupervisorVerifyRecordedIdentity(status.ChildPID, status.ChildIdentity, "local supervisor child"); err != nil {
 		return teamsServiceWatchdogManagedChildIdentity{}, false
 	}
-	return teamsServiceWatchdogManagedChildIdentity{PID: status.ChildPID, StartedAt: status.LastChildStartAt}, true
+	return teamsServiceWatchdogManagedChildIdentity{PID: status.ChildPID, StartedAt: status.LastChildStartAt, ManagedBySupervisor: true}, true
+}
+
+func annotateTeamsServiceWatchdogManagedChildStartup(snapshot *teamsServiceWatchdogSnapshot, owner teamsstore.OwnerMetadata, hasOwner bool, child teamsServiceWatchdogManagedChildIdentity) {
+	if snapshot == nil || child.PID <= 0 || child.StartedAt.IsZero() {
+		return
+	}
+	snapshot.ManagedChildStartedAt = child.StartedAt
+	if child.ManagedBySupervisor || !hasOwner || (owner.PID == child.PID &&
+		!owner.StartedAt.IsZero() && owner.StartedAt.Before(child.StartedAt)) {
+		snapshot.ManagedChildStarting = true
+	}
 }
 
 func teamsServiceWatchdogOwnerMatchesManagedChild(owner teamsstore.OwnerMetadata, child teamsServiceWatchdogManagedChildIdentity) bool {
@@ -710,6 +732,11 @@ func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts
 	lastActivity := snapshot.LastOwnerHeartbeat
 	if snapshot.PollActivityAt.After(lastActivity) {
 		lastActivity = snapshot.PollActivityAt
+	}
+	if snapshot.ManagedChildStarting && !snapshot.ManagedChildStartedAt.IsZero() &&
+		!snapshot.ManagedChildStartedAt.After(opts.Now) &&
+		opts.Now.Sub(snapshot.ManagedChildStartedAt) <= opts.PollStaleAfter {
+		return false, "managed Teams child is still initializing its owner heartbeat"
 	}
 	if !snapshot.OwnerFresh {
 		if !lastActivity.IsZero() && !lastActivity.After(opts.Now) && opts.Now.Sub(lastActivity) <= opts.OwnerStaleAfter {

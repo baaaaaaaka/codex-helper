@@ -14990,6 +14990,351 @@ func TestRecordOwnerHeartbeatWritesAndReadsOwner(t *testing.T) {
 	}
 }
 
+// Heartbeats are liveness evidence for the watchdog and must not wait behind
+// an unrelated full-state write. This deliberately holds the store mutex in
+// Update while a heartbeat is attempted; the targeted SQLite runtime path
+// must still complete without waiting for the callback to be released.
+func TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	owner := testOwner("session-heartbeat", "", testOwnerStart())
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, testOwnerStart()); err != nil {
+		t.Fatalf("seed owner heartbeat: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpdate := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(func() {
+		releaseUpdate()
+	})
+
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- store.Update(ctx, func(state *State) error {
+			close(entered)
+			<-release
+			state.ServiceControl.Reason = "long unrelated state update"
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case err := <-updateDone:
+		t.Fatalf("full state update returned before reaching the blocking hook: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("full state update did not reach the blocking hook")
+	}
+
+	heartbeatDone := make(chan error, 1)
+	heartbeatAt := time.Now().UTC()
+	go func() {
+		_, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, heartbeatAt)
+		heartbeatDone <- err
+	}()
+
+	// This is a generous liveness bound rather than a latency SLA; the
+	// important distinction is that it must not wait for the deliberately
+	// blocked full-state update.
+	select {
+	case err := <-heartbeatDone:
+		if err != nil {
+			t.Fatalf("heartbeat returned while the unrelated update was blocked: %v", err)
+		}
+	case <-time.After(time.Second):
+		releaseUpdate()
+		select {
+		case err := <-updateDone:
+			if err != nil {
+				t.Fatalf("release full state update: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("full state update did not finish after its test hook was released")
+		}
+		select {
+		case err := <-heartbeatDone:
+			if err != nil {
+				t.Fatalf("heartbeat after releasing full state update: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("heartbeat did not finish after its blocking update was released")
+		}
+		t.Fatal("heartbeat remained blocked behind an unrelated full state update")
+	}
+
+	releaseUpdate()
+	select {
+	case err := <-updateDone:
+		if err != nil {
+			t.Fatalf("release full state update: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full state update did not finish after its test hook was released")
+	}
+	read, ok, err := store.ReadOwner(ctx)
+	if err != nil || !ok {
+		t.Fatalf("read owner after concurrent heartbeat/update: ok=%v err=%v", ok, err)
+	}
+	if !read.LastHeartbeat.Equal(heartbeatAt) {
+		t.Fatalf("full state update overwrote the newer heartbeat: got=%s want=%s", read.LastHeartbeat, heartbeatAt)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load state after concurrent heartbeat/update: %v", err)
+	}
+	if state.ServiceControl.Reason != "long unrelated state update" {
+		t.Fatalf("full state update was lost while recording heartbeat: reason=%q", state.ServiceControl.Reason)
+	}
+}
+
+// A malformed optional runtime row must not make the liveness heartbeat fail.
+// The heartbeat only needs the owner/lease projection; decoding an unrelated
+// optional row couples liveness to an independent piece of state. Exercise all
+// optional runtime rows and reopen the store so this covers the actual restart
+// path rather than only an in-process SQLite handle.
+func TestRecordOwnerHeartbeatIsolatedFromUnrelatedCorruptRuntimeRow(t *testing.T) {
+	ctx := context.Background()
+	for _, key := range []string{sqliteRuntimeKeyServiceControl, sqliteRuntimeKeyUpgrade, sqliteRuntimeKeyAutoUpdate} {
+		t.Run(key, func(t *testing.T) {
+			store := newTestStore(t)
+			initialHeartbeat := testOwnerStart()
+			owner := testOwner("runtime-row-heartbeat", "", initialHeartbeat)
+			owner.ScopeID = "scope-runtime-row"
+			owner.MachineID = "machine-runtime-row"
+			owner.LeaseGeneration = 7
+			lease := ControlLease{
+				ScopeID:         owner.ScopeID,
+				HolderMachineID: owner.MachineID,
+				Generation:      owner.LeaseGeneration,
+				Status:          ControlLeaseStatusActive,
+				LeaseUntil:      initialHeartbeat.Add(time.Hour),
+				LastHeartbeat:   initialHeartbeat,
+				UpdatedAt:       initialHeartbeat,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = ScopeIdentity{ID: owner.ScopeID}
+				state.ServiceOwner = &owner
+				state.LockOwner = &owner
+				state.ControlLease = lease
+				return nil
+			}); err != nil {
+				t.Fatalf("seed owner and lease: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			corruptRuntimeRow := []byte(`{"broken-runtime-row"`)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				result, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, corruptRuntimeRow, key)
+				if err != nil {
+					return err
+				}
+				affected, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if affected != 1 {
+					return fmt.Errorf("updated %d %s runtime rows, want one", affected, key)
+				}
+				return nil
+			})
+
+			storePath := store.Path()
+			if err := store.Close(); err != nil {
+				t.Fatalf("close migrated store: %v", err)
+			}
+			reopened, err := Open(storePath)
+			if err != nil {
+				t.Fatalf("reopen migrated store: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := reopened.Close(); err != nil {
+					t.Errorf("close reopened store: %v", err)
+				}
+			})
+
+			nextHeartbeat := initialHeartbeat.Add(time.Minute)
+			if _, err := reopened.RecordOwnerHeartbeat(ctx, owner, time.Minute, nextHeartbeat); err != nil {
+				t.Fatalf("RecordOwnerHeartbeat with corrupt unrelated %s row: %v", key, err)
+			}
+			if _, err := reopened.Load(ctx); err == nil {
+				t.Fatalf("full Load with corrupt unrelated %s row unexpectedly succeeded", key)
+			}
+			persisted, found, err := reopened.ReadOwner(ctx)
+			if err != nil || !found {
+				t.Fatalf("ReadOwner with corrupt unrelated %s row: found=%v err=%v", key, found, err)
+			}
+			if !persisted.LastHeartbeat.Equal(nextHeartbeat) {
+				t.Fatalf("persisted owner heartbeat = %s, want %s", persisted.LastHeartbeat, nextHeartbeat)
+			}
+			if persisted.MachineID != owner.MachineID || persisted.PID != owner.PID {
+				t.Fatalf("persisted owner identity changed: got=%#v want=%#v", persisted, owner)
+			}
+			if !persisted.StartedAt.Equal(owner.StartedAt) {
+				t.Fatalf("persisted owner start time changed: got=%s want=%s", persisted.StartedAt, owner.StartedAt)
+			}
+			if _, err := reopened.ValidateControlLease(ctx, owner.MachineID, owner.LeaseGeneration, initialHeartbeat.Add(time.Second)); err != nil {
+				t.Fatalf("ValidateControlLease with corrupt unrelated %s row: %v", key, err)
+			}
+
+			var persistedRaw []byte
+			withSQLiteTxForTest(t, reopened, func(tx *sql.Tx) error {
+				var raw []byte
+				if err := tx.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyServiceOwner).Scan(&raw); err != nil {
+					return err
+				}
+				persistedRaw = append([]byte(nil), raw...)
+				var unrelated []byte
+				if err := tx.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, key).Scan(&unrelated); err != nil {
+					return err
+				}
+				if string(unrelated) != string(corruptRuntimeRow) {
+					return fmt.Errorf("unrelated %s runtime row changed: got=%q want=%q", key, unrelated, corruptRuntimeRow)
+				}
+				return nil
+			})
+			var rawOwner OwnerMetadata
+			if err := json.Unmarshal(persistedRaw, &rawOwner); err != nil {
+				t.Fatalf("decode persisted owner: %v", err)
+			}
+			if !rawOwner.LastHeartbeat.Equal(nextHeartbeat) {
+				t.Fatalf("raw persisted owner heartbeat = %s, want %s", rawOwner.LastHeartbeat, nextHeartbeat)
+			}
+		})
+	}
+}
+
+// If the owner projection is incomplete during an older migration or partial
+// repair, the liveness fallback may consult state_json. It must still ignore a
+// malformed optional row while reconstructing that small ownership view.
+func TestLivenessFallbackIgnoresCorruptOptionalRuntimeRow(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	initialHeartbeat := testOwnerStart()
+	owner := testOwner("runtime-fallback", "", initialHeartbeat)
+	owner.ScopeID = "scope-runtime-fallback"
+	owner.MachineID = "machine-runtime-fallback"
+	owner.LeaseGeneration = 11
+	lease := ControlLease{
+		ScopeID:         owner.ScopeID,
+		HolderMachineID: owner.MachineID,
+		Generation:      owner.LeaseGeneration,
+		Status:          ControlLeaseStatusActive,
+		LeaseUntil:      initialHeartbeat.Add(time.Hour),
+		LastHeartbeat:   initialHeartbeat,
+		UpdatedAt:       initialHeartbeat,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: owner.ScopeID}
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		state.ControlLease = lease
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner and lease: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	corruptRuntimeRow := []byte(`{"broken-runtime-row"`)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, corruptRuntimeRow, sqliteRuntimeKeyServiceControl); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key IN (?, ?)`, sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner)
+		return err
+	})
+
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close migrated store: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen migrated store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	nextHeartbeat := initialHeartbeat.Add(time.Minute)
+	if _, err := reopened.RecordOwnerHeartbeat(ctx, owner, time.Minute, nextHeartbeat); err != nil {
+		t.Fatalf("RecordOwnerHeartbeat with incomplete owner projection: %v", err)
+	}
+	persisted, found, err := reopened.ReadOwner(ctx)
+	if err != nil || !found {
+		t.Fatalf("ReadOwner after liveness fallback: found=%v err=%v", found, err)
+	}
+	if !persisted.LastHeartbeat.Equal(nextHeartbeat) || persisted.MachineID != owner.MachineID {
+		t.Fatalf("fallback owner = %#v, want heartbeat=%s machine=%q", persisted, nextHeartbeat, owner.MachineID)
+	}
+	var unrelated []byte
+	withSQLiteTxForTest(t, reopened, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyServiceControl).Scan(&unrelated)
+	})
+	if string(unrelated) != string(corruptRuntimeRow) {
+		t.Fatalf("fallback rewrote corrupt optional row: got=%q want=%q", unrelated, corruptRuntimeRow)
+	}
+}
+
+// Control-lease acquisition is part of service liveness. It must use only
+// the required ownership projection, so an unrelated malformed optional row
+// cannot strand a replacement service in standby.
+func TestControlLeaseClaimIgnoresUnrelatedCorruptRuntimeRow(t *testing.T) {
+	ctx := context.Background()
+	for _, key := range []string{sqliteRuntimeKeyServiceControl, sqliteRuntimeKeyUpgrade, sqliteRuntimeKeyAutoUpdate} {
+		t.Run(key, func(t *testing.T) {
+			store := newTestStore(t)
+			now := testOwnerStart()
+			scope := ScopeIdentity{ID: "scope-control-row"}
+			machine := MachineRecord{ID: "machine-control-row", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = scope
+				state.Machines[machine.ID] = machine
+				return nil
+			}); err != nil {
+				t.Fatalf("seed scope and machine: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			corruptRuntimeRow := []byte(`{"broken-runtime-row"`)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, corruptRuntimeRow, key)
+				return err
+			})
+
+			path := store.Path()
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+
+			owner, err := CurrentOwner("control-row-test", "", "", now)
+			if err != nil {
+				t.Fatalf("CurrentOwner: %v", err)
+			}
+			owner.ScopeID = scope.ID
+			owner.MachineID = machine.ID
+			decision, err := reopened.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: machine, Owner: owner, Duration: time.Minute, Now: now,
+			})
+			if err != nil {
+				t.Fatalf("ClaimControlLease with corrupt %s row: %v", key, err)
+			}
+			if decision.Mode != LeaseModeActive || decision.Lease.HolderMachineID != machine.ID {
+				t.Fatalf("lease decision with corrupt %s row = %#v, want active control lease", key, decision)
+			}
+			if _, err := reopened.ValidateControlLease(ctx, machine.ID, decision.Lease.Generation, now); err != nil {
+				t.Fatalf("ValidateControlLease with corrupt %s row: %v", key, err)
+			}
+			if released, err := reopened.ReleaseControlLeaseIfHolder(ctx, machine.ID, decision.Lease.Generation); err != nil || !released {
+				t.Fatalf("release control lease with corrupt %s row: released=%v err=%v", key, released, err)
+			}
+		})
+	}
+}
+
 func TestDeferredInboundSortedByChatAndMessageTime(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -15829,6 +16174,74 @@ func TestSQLiteOwnerLeaseColdUpdatesPreserveHotTables(t *testing.T) {
 	}
 	if owner, ok := state.readOwner(); !ok || owner.MachineID != machine.ID || !owner.LastHeartbeat.Equal(heartbeatAt) {
 		t.Fatalf("loaded owner = %#v ok=%v", owner, ok)
+	}
+}
+
+// A full-state writer can be holding a stale snapshot while a lifecycle path
+// clears the owner through the targeted runtime projection. The explicit null
+// rows are a durable tombstone: the later cold write must not resurrect the
+// owner from its stale State value.
+func TestSQLiteFullStateUpdateDoesNotResurrectClearedOwner(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := testOwnerStart()
+	owner := testOwner("session-stale-owner", "turn-stale-owner", now)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ServiceOwner = &owner
+		state.LockOwner = &owner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	stale, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load stale state: %v", err)
+	}
+	if _, ok := stale.readOwner(); !ok {
+		t.Fatal("stale state did not contain the seeded owner")
+	}
+	if err := store.ClearOwner(ctx); err != nil {
+		t.Fatalf("clear owner: %v", err)
+	}
+	if _, ok, err := store.ReadOwner(ctx); err != nil {
+		t.Fatalf("read owner after clear: %v", err)
+	} else if ok {
+		t.Fatal("owner remained after targeted clear")
+	}
+
+	// Write the stale snapshot as an unrelated cold-state update. This calls
+	// the same SQLite full-state writer used by Store.Update, but avoids making
+	// the test depend on a timing window to retain the old snapshot.
+	stale.ServiceControl.Reason = "unrelated cold update"
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		return store.saveSQLiteStateUnlocked(pointer, stale)
+	}); err != nil {
+		t.Fatalf("save stale full state: %v", err)
+	}
+
+	if _, ok, err := store.ReadOwner(ctx); err != nil {
+		t.Fatalf("read owner after stale full-state update: %v", err)
+	} else if ok {
+		t.Fatal("stale full-state update resurrected the cleared owner")
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after stale full-state update: %v", err)
+	}
+	if loadedOwner, ok := state.readOwner(); ok {
+		t.Fatalf("loaded state resurrected cleared owner: %#v", loadedOwner)
+	}
+	if state.ServiceControl.Reason != "unrelated cold update" {
+		t.Fatalf("unrelated cold update was lost: %q", state.ServiceControl.Reason)
 	}
 }
 

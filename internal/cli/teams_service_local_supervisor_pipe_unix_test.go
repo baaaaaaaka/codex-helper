@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 const supervisorPipeHolderEnv = "CXP_TEST_SUPERVISOR_PIPE_HOLDER"
@@ -173,6 +176,118 @@ func TestTeamsServiceLocalSupervisorChildHealthRestartWithSeparatePipeHolder(t *
 	}
 	if status.LastHealthReason != "test stale child with separate pipe holder" || status.LastHealthAction != teamsServiceWatchdogActionRestart {
 		t.Fatalf("health status = reason %q action %q", status.LastHealthReason, status.LastHealthAction)
+	}
+}
+
+// Exercise the actual local-supervisor child loop rather than only testing a
+// watchdog decision.  During startup the replacement child is already alive,
+// but the previous owner's stale row can remain until listener initialization
+// records the new owner.  A stale row must not make the supervisor terminate
+// that replacement child before it gets a chance to initialize.
+func TestTeamsServiceLocalSupervisorDoesNotRestartChildBeforeOwnerRegistration(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+
+	statePath := filepath.Join(tmp, "canonical", "state.json")
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		t.Fatalf("mkdir watchdog state dir: %v", err)
+	}
+	if err := os.WriteFile(statePath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write watchdog state placeholder: %v", err)
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	now := time.Now()
+	previousOwner := teamsstore.OwnerMetadata{
+		PID:             os.Getpid(),
+		Hostname:        hostname,
+		ScopeID:         "scope-supervisor-startup",
+		LeaseGeneration: 19,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeat:   now.Add(-10 * time.Minute),
+	}
+	watchdogState := teamsstore.State{
+		Scope:        teamsstore.ScopeIdentity{ID: previousOwner.ScopeID},
+		ServiceOwner: &previousOwner,
+		LockOwner:    &previousOwner,
+	}
+
+	fake := filepath.Join(tmp, "fake-cxp")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatalf("write fake child: %v", err)
+	}
+
+	status := teamsServiceLocalSupervisorStatus{
+		Version:        teamsServiceLocalSupervisorStatusVersion,
+		ConfigPath:     filepath.Join(tmp, "local-supervisor.json"),
+		SupervisorPID:  os.Getpid(),
+		SupervisorPGID: teamsLocalSupervisorCurrentProcessGroupID(),
+		UpdatedAt:      now,
+	}
+	prevHeartbeat := teamsServiceLocalSupervisorHeartbeatEvery
+	prevTerminationWait := teamsServiceLocalSupervisorTerminationWait
+	prevHealth := teamsServiceLocalSupervisorCheckChildHealth
+	prevStorePaths := teamsServiceWatchdogStorePaths
+	prevLoadState := teamsServiceWatchdogLoadState
+	prevInstalled := teamsServiceWatchdogInstalled
+	prevActive := teamsServiceWatchdogActive
+	prevManagedChild := teamsServiceWatchdogManagedChild
+	managedChildCalls := 0
+	t.Cleanup(func() {
+		teamsServiceLocalSupervisorHeartbeatEvery = prevHeartbeat
+		teamsServiceLocalSupervisorTerminationWait = prevTerminationWait
+		teamsServiceLocalSupervisorCheckChildHealth = prevHealth
+		teamsServiceWatchdogStorePaths = prevStorePaths
+		teamsServiceWatchdogLoadState = prevLoadState
+		teamsServiceWatchdogInstalled = prevInstalled
+		teamsServiceWatchdogActive = prevActive
+		teamsServiceWatchdogManagedChild = prevManagedChild
+	})
+	teamsServiceLocalSupervisorHeartbeatEvery = 10 * time.Millisecond
+	teamsServiceLocalSupervisorTerminationWait = 100 * time.Millisecond
+	teamsServiceWatchdogStorePaths = func() ([]string, error) {
+		return []string{statePath}, nil
+	}
+	teamsServiceWatchdogLoadState = func(context.Context, string) (teamsstore.State, error) {
+		return watchdogState, nil
+	}
+	teamsServiceWatchdogInstalled = func() (bool, error) { return true, nil }
+	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return true, nil }
+	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
+		managedChildCalls++
+		if status.ChildPID <= 0 || status.LastChildStartAt.IsZero() {
+			return teamsServiceWatchdogManagedChildIdentity{}, false
+		}
+		return teamsServiceWatchdogManagedChildIdentity{
+			PID:       status.ChildPID,
+			StartedAt: status.LastChildStartAt,
+		}, true
+	}
+	teamsServiceLocalSupervisorCheckChildHealth = defaultTeamsServiceLocalSupervisorCheckChildHealth
+
+	logPath := filepath.Join(tmp, "supervisor.log")
+	logWriter, err := openTeamsServiceLocalSupervisorLogWriter(logPath)
+	if err != nil {
+		t.Fatalf("open supervisor log writer: %v", err)
+	}
+	defer logWriter.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err = runTeamsServiceLocalSupervisorChild(ctx, teamsServiceLocalSupervisorConfig{
+		Version: teamsServiceLocalSupervisorConfigVersion,
+		Spec: teamsServiceSpec{
+			Executable: fake,
+			WorkingDir: tmp,
+		},
+	}, &status, logWriter)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("supervisor child ended with %v, want context deadline without watchdog restart (managed-child calls=%d)", err, managedChildCalls)
+	}
+	if status.ChildPID != 0 || status.ChildPGID != 0 || status.State != "waiting" {
+		t.Fatalf("status after context cleanup = %#v, want cleared waiting child", status)
 	}
 }
 

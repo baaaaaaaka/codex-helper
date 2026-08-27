@@ -19,6 +19,7 @@ import (
 	"time"
 
 	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
@@ -72,6 +73,19 @@ var sqliteMigrationTestHook func(stage string) error
 // verify that one metadata attempt acquires exactly one physical connection.
 var sqliteRuntimeMetadataConnectionTestHook func()
 
+// IsSQLiteBusyError reports both SQLITE_BUSY and its extended variants (for
+// example SQLITE_BUSY_SNAPSHOT). A deferred SQLite transaction can observe a
+// stale WAL snapshot and fail immediately while upgrading a read to a write;
+// callers that own a liveness loop should retry the whole short transaction
+// from a fresh snapshot instead of terminating the service.
+func IsSQLiteBusyError(err error) bool {
+	var sqliteErr *sqlite.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+	return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+}
+
 // SQLite defaults to 999 host parameters. Keep headroom for fixed query
 // arguments (for example a status predicate) and avoid making a large linked
 // transcript poll fail just because many sessions are registered.
@@ -102,6 +116,15 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 	}
 	var out StoreSQLiteMigrationResult
 	err := s.withStateLock(ctx, func() error {
+		// A runtime heartbeat may use a cached handle without the business
+		// state-file lock. Quiesce and close it before a migration can replace
+		// the SQLite inode or rewrite the pointer; the next liveness operation
+		// will reopen the validated current database.
+		s.sqliteRuntimeMu.Lock()
+		defer s.sqliteRuntimeMu.Unlock()
+		if err := s.closeSQLiteRuntimeDBLocked(); err != nil {
+			return err
+		}
 		source, err := os.ReadFile(s.path)
 		if errors.Is(err, os.ErrNotExist) {
 			out.State = newState()
@@ -797,6 +820,51 @@ func (s *Store) sqliteDBUnlocked(pointer storeSQLitePointer) (*sql.DB, error) {
 	s.sqliteDB = db
 	s.sqliteDBPath = path
 	return db, nil
+}
+
+// withSQLiteRuntimeDB runs a liveness-only operation through a dedicated
+// SQLite handle. Full Store operations serialize on Store.mu and the state
+// file lock while they execute user callbacks; heartbeats must not inherit
+// either of those potentially long waits. The handle is still serialized
+// against Store.Close and pointer rebinding by sqliteRuntimeMu.
+func (s *Store) withSQLiteRuntimeDB(ctx context.Context, fn func(*sql.DB) error) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.sqliteRuntimeMu.Lock()
+	defer s.sqliteRuntimeMu.Unlock()
+	pointer, ok, err := s.currentSQLitePointerReadOnly()
+	if err != nil || !ok {
+		return false, err
+	}
+	path, err := s.storeSQLitePath(pointer)
+	if err != nil {
+		return true, err
+	}
+	if s.sqliteRuntimeDB != nil && s.sqliteRuntimeDBPath != path {
+		_ = s.sqliteRuntimeDB.Close()
+		s.sqliteRuntimeDB = nil
+		s.sqliteRuntimeDBPath = ""
+	}
+	if s.sqliteRuntimeDB == nil {
+		db, err := openExistingSQLiteRuntimeStore(path)
+		if err != nil {
+			return true, err
+		}
+		s.sqliteRuntimeDB = db
+		s.sqliteRuntimeDBPath = path
+	}
+	return true, fn(s.sqliteRuntimeDB)
+}
+
+func (s *Store) closeSQLiteRuntimeDBLocked() error {
+	if s.sqliteRuntimeDB == nil {
+		return nil
+	}
+	err := s.sqliteRuntimeDB.Close()
+	s.sqliteRuntimeDB = nil
+	s.sqliteRuntimeDBPath = ""
+	return err
 }
 
 type SQLiteWALCheckpointResult struct {
@@ -1528,6 +1596,33 @@ func openExistingSQLiteStore(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// openExistingSQLiteRuntimeStore opens the liveness handle without changing
+// journal mode, synchronous mode, permissions, or other database settings.
+// Those setup operations belong to migration/open, not to a heartbeat racing
+// with normal business writes.
+func openExistingSQLiteRuntimeStore(path string) (*sql.DB, error) {
+	if err := validateExistingSQLiteStorePath(path); err != nil {
+		return nil, err
+	}
+	db, err := openSQLiteHandle(path, false)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := validateSQLiteStoreInitialized(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := validateSQLiteRequiredTables(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
 func validateExistingSQLiteStorePath(path string) error {
 	identity, err := sqliteReadOnlyFileIdentityForPath(path)
 	if err != nil {
@@ -1869,6 +1964,14 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	if err != nil {
 		return err
 	}
+	// A runtime heartbeat uses a dedicated handle and may commit after this
+	// State snapshot was loaded but before the full-state writer reaches the
+	// runtime projection. Preserve newer liveness rows so an unrelated cold
+	// update cannot roll the watchdog evidence back. Explicit owner/lease
+	// mutations use their targeted APIs; this merge is for stale snapshots.
+	if err := preserveNewerSQLiteLivenessRows(ctx, tx, &state); err != nil {
+		return err
+	}
 	for _, table := range []string{"state_meta", "runtime_state", "sessions", "inbound_events", "turns", "outbox_messages", "message_provenance", "chat_polls", "chat_sequences", "chat_rate_limits", "import_checkpoints", "transcript_ledger", "transcript_deliveries", "helper_deliveries", "artifact_records", "notifications", "fork_operations", "fork_history_items"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return err
@@ -1970,6 +2073,93 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func preserveNewerSQLiteLivenessRows(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, state *State) error {
+	if state == nil {
+		return nil
+	}
+	var currentOwner *OwnerMetadata
+	ownerRowPresent := false
+	nullOwnerRows := 0
+	for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+		var ownerRaw []byte
+		err := q.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, key).Scan(&ownerRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		ownerRowPresent = true
+		var current *OwnerMetadata
+		if err := json.Unmarshal(ownerRaw, &current); err != nil {
+			return err
+		}
+		if current == nil {
+			nullOwnerRows++
+			continue
+		}
+		if currentOwner == nil || current.LastHeartbeat.After(currentOwner.LastHeartbeat) {
+			currentOwner = current
+		}
+	}
+	if nullOwnerRows == 2 {
+		// The current writer clears both owner rows in one transaction. Treat
+		// that pair of NULLs as an explicit durable clear even when the
+		// full-state snapshot still contains the old owner; otherwise an
+		// unrelated cold write could resurrect a process that was deliberately
+		// released. A single NULL is allowed for rc16/older projections, where
+		// the legacy state commonly contained only one owner copy.
+		state.ServiceOwner = nil
+		state.LockOwner = nil
+	} else if ownerRowPresent && currentOwner != nil {
+		stateOwner, stateHasOwner := state.readOwner()
+		if !stateHasOwner || currentOwner.LastHeartbeat.After(stateOwner.LastHeartbeat) {
+			state.writeOwner(*currentOwner)
+		}
+	}
+	var leaseRaw []byte
+	err := q.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyControlLease).Scan(&leaseRaw)
+	if err == nil {
+		var current ControlLease
+		if err := json.Unmarshal(leaseRaw, &current); err != nil {
+			return err
+		}
+		if current.Generation > state.ControlLease.Generation ||
+			current.UpdatedAt.After(state.ControlLease.UpdatedAt) {
+			state.ControlLease = current
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
+}
+
+func clearSQLiteOwnerRuntimeTx(ctx context.Context, tx *sql.Tx) error {
+	for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_state(key, json) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET json = excluded.json`, key, []byte("null")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) clearOwnerSQLite(ctx context.Context) (bool, error) {
+	return s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := clearSQLiteOwnerRuntimeTx(ctx, tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 type opaqueSQLiteCheckpointRow struct {
@@ -4104,40 +4294,195 @@ func loadSQLiteHistoryWatchInboundRows(ctx context.Context, db *sql.DB, column s
 
 func (s *Store) claimControlLeaseSQLite(ctx context.Context, claim ControlLeaseClaim) (ControlLeaseDecision, bool, error) {
 	var out ControlLeaseDecision
-	handled, err := s.updateSQLiteRuntimeState(ctx, func(state *State) error {
-		decision, err := claimControlLeaseInState(state, claim)
-		out = decision
-		return err
-	})
-	return out, handled, err
-}
-
-func (s *Store) validateControlLeaseSQLite(ctx context.Context, machineID string, generation int64, now time.Time) (ControlLease, bool, error) {
-	var out ControlLease
-	handled := false
-	err := s.withStateLock(ctx, func() error {
-		pointer, ok, err := s.currentSQLitePointerUnlocked()
-		if err != nil || !ok {
-			return err
-		}
-		handled = true
-		db, err := s.sqliteDBUnlocked(pointer)
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
-		state, seen, err := loadSQLiteRuntimeState(ctx, db)
+		defer tx.Rollback()
+		state, seen, err := loadSQLiteRequiredRuntimeState(ctx, tx)
 		if err != nil {
 			return err
 		}
 		if !sqliteRuntimeStateUsable(seen) {
-			state, err = loadSQLiteColdState(ctx, db)
+			state, err = loadSQLiteLivenessState(ctx, tx)
 			if err != nil {
 				return err
 			}
 		}
-		lease := state.ControlLease
-		out = lease
-		if lease.HolderMachineID != machineID || lease.Generation != generation || !lease.LeaseUntil.After(now) {
+		decision, err := claimControlLeaseInState(&state, claim)
+		out = decision
+		if err != nil && !errors.Is(err, errStoreNoChange) {
+			return err
+		}
+		if !errors.Is(err, errStoreNoChange) {
+			if err := saveSQLiteRequiredRuntimeStateTx(ctx, tx, state); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+	return out, handled, err
+}
+
+func loadSQLiteRequiredRuntimeState(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, map[string]bool, error) {
+	state := State{SchemaVersion: SchemaVersion, Machines: map[string]MachineRecord{}}
+	seen := make(map[string]bool)
+	keys := make([]string, len(sqliteRuntimeRequiredKeys))
+	args := make([]any, len(sqliteRuntimeRequiredKeys))
+	for i, key := range sqliteRuntimeRequiredKeys {
+		keys[i] = "?"
+		args[i] = key
+	}
+	rows, err := q.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (`+strings.Join(keys, ",")+`)`, args...)
+	if err != nil {
+		return State{}, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var raw []byte
+		if err := rows.Scan(&key, &raw); err != nil {
+			return State{}, nil, err
+		}
+		seen[key] = true
+		switch key {
+		case sqliteRuntimeKeyScope:
+			if err := json.Unmarshal(raw, &state.Scope); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyMachineIdentity:
+			if err := json.Unmarshal(raw, &state.MachineIdentity); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyMachines:
+			if err := json.Unmarshal(raw, &state.Machines); err != nil {
+				return State{}, nil, err
+			}
+			if state.Machines == nil {
+				state.Machines = map[string]MachineRecord{}
+			}
+		case sqliteRuntimeKeyControlLease:
+			if err := json.Unmarshal(raw, &state.ControlLease); err != nil {
+				return State{}, nil, err
+			}
+		case sqliteRuntimeKeyServiceOwner:
+			var owner *OwnerMetadata
+			if err := json.Unmarshal(raw, &owner); err != nil {
+				return State{}, nil, err
+			}
+			state.ServiceOwner = owner
+		case sqliteRuntimeKeyLockOwner:
+			var owner *OwnerMetadata
+			if err := json.Unmarshal(raw, &owner); err != nil {
+				return State{}, nil, err
+			}
+			state.LockOwner = owner
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return State{}, nil, err
+	}
+	state.ensure(time.Time{})
+	return state, seen, nil
+}
+
+func saveSQLiteRequiredRuntimeStateTx(ctx context.Context, tx *sql.Tx, state State) error {
+	values := map[string]any{
+		sqliteRuntimeKeyScope:           state.Scope,
+		sqliteRuntimeKeyMachineIdentity: state.MachineIdentity,
+		sqliteRuntimeKeyMachines:        state.Machines,
+		sqliteRuntimeKeyControlLease:    state.ControlLease,
+		sqliteRuntimeKeyServiceOwner:    state.ServiceOwner,
+		sqliteRuntimeKeyLockOwner:       state.LockOwner,
+	}
+	for _, key := range sqliteRuntimeRequiredKeys {
+		raw, err := json.Marshal(values[key])
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_state(key, json) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET json = excluded.json`, key, raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// loadSQLiteLivenessState is the compatibility fallback for an incomplete
+// runtime projection. It starts from the cold state document but overlays only
+// the ownership/lease rows that are required for a liveness decision. Optional
+// lifecycle rows must not be decoded here: a damaged upgrade or auto-update
+// row must not prevent a replacement owner from claiming the service.
+func loadSQLiteLivenessState(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) (State, error) {
+	var raw []byte
+	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return State{}, errors.New("sqlite teams store is missing state metadata")
+		}
+		return State{}, err
+	}
+	if len(raw) == 0 {
+		return State{}, errors.New("sqlite teams store has empty state metadata")
+	}
+	state, err := loadStateData(raw)
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	runtimeState, seen, err := loadSQLiteRequiredRuntimeState(ctx, q)
+	if err != nil {
+		return State{}, err
+	}
+	// Overlay each required row independently. A partially materialized
+	// projection is expected during older migrations or narrow repairs; rows
+	// that are present (including an explicit NULL owner) are still stronger
+	// evidence than the cold document. Missing rows continue to use the cold
+	// compatibility value. Optional runtime rows are intentionally never read.
+	if seen[sqliteRuntimeKeyScope] {
+		state.Scope = runtimeState.Scope
+	}
+	if seen[sqliteRuntimeKeyMachineIdentity] {
+		state.MachineIdentity = runtimeState.MachineIdentity
+	}
+	if seen[sqliteRuntimeKeyMachines] {
+		state.Machines = runtimeState.Machines
+	}
+	if seen[sqliteRuntimeKeyControlLease] {
+		state.ControlLease = runtimeState.ControlLease
+	}
+	if seen[sqliteRuntimeKeyServiceOwner] {
+		state.ServiceOwner = runtimeState.ServiceOwner
+	}
+	if seen[sqliteRuntimeKeyLockOwner] {
+		state.LockOwner = runtimeState.LockOwner
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+func (s *Store) validateControlLeaseSQLite(ctx context.Context, machineID string, generation int64, now time.Time) (ControlLease, bool, error) {
+	var out ControlLease
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		var raw []byte
+		err := db.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyControlLease).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			state, loadErr := loadSQLiteLivenessState(ctx, db)
+			if loadErr != nil {
+				return loadErr
+			}
+			out = state.ControlLease
+		} else if err != nil {
+			return err
+		} else if err := json.Unmarshal(raw, &out); err != nil {
+			return err
+		}
+		if out.HolderMachineID != machineID || out.Generation != generation || !out.LeaseUntil.After(now) {
 			return ErrControlLeaseNotHeld
 		}
 		return nil
@@ -4145,36 +4490,143 @@ func (s *Store) validateControlLeaseSQLite(ctx context.Context, machineID string
 	return out, handled, err
 }
 
+func (s *Store) releaseControlLeaseSQLite(ctx context.Context, machineID string, generation int64) (bool, bool, error) {
+	released := false
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, seen, err := loadSQLiteRequiredRuntimeState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			state, err = loadSQLiteLivenessState(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		lease := state.ControlLease
+		if lease.HolderMachineID != machineID || lease.Generation != generation {
+			return tx.Commit()
+		}
+		if strings.TrimSpace(lease.ScopeID) == "" {
+			lease.ScopeID = state.Scope.ID
+		}
+		lease.HolderMachineID = ""
+		lease.HolderKind = ""
+		lease.Priority = 0
+		lease.Status = ""
+		lease.LeaseUntil = time.Time{}
+		lease.LastHeartbeat = time.Time{}
+		lease.UpdatedAt = time.Now()
+		state.ControlLease = lease
+		if machine := state.Machines[machineID]; machine.ID != "" {
+			machine.Status = MachineStatusStandby
+			machine.UpdatedAt = time.Now()
+			state.Machines[machineID] = machine
+		}
+		if err := saveSQLiteRequiredRuntimeStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		released = true
+		return tx.Commit()
+	})
+	return released, handled, err
+}
+
 func (s *Store) recordOwnerHeartbeatSQLite(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, bool, error) {
 	var out OwnerMetadata
-	handled, err := s.updateSQLiteRuntimeState(ctx, func(state *State) error {
-		next, err := recordOwnerHeartbeatInState(state, owner, staleAfter, now)
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, _, present, err := loadSQLiteOwnerRuntime(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !present {
+			state, err = loadSQLiteLivenessState(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		next, err := recordOwnerHeartbeatInState(&state, owner, staleAfter, now)
+		if err != nil {
+			return err
+		}
 		out = next
-		return err
+		if err := saveSQLiteOwnerRuntimeTx(ctx, tx, next); err != nil {
+			return err
+		}
+		return tx.Commit()
 	})
 	return out, handled, err
+}
+
+// loadSQLiteOwnerRuntime intentionally reads only the two owner rows. An
+// unrelated optional runtime row (upgrade/service-control/auto-update) is not
+// part of liveness proof and must not be able to stop a heartbeat or owner
+// diagnostic.
+func loadSQLiteOwnerRuntime(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (State, bool, bool, error) {
+	state := State{}
+	present := false
+	for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+		var raw []byte
+		err := q.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, key).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return State{}, false, false, err
+		}
+		present = true
+		var owner *OwnerMetadata
+		if err := json.Unmarshal(raw, &owner); err != nil {
+			return State{}, false, false, err
+		}
+		if owner == nil {
+			continue
+		}
+		if key == sqliteRuntimeKeyServiceOwner {
+			state.ServiceOwner = owner
+		} else {
+			state.LockOwner = owner
+		}
+	}
+	return state, state.ServiceOwner != nil || state.LockOwner != nil, present, nil
+}
+
+func saveSQLiteOwnerRuntimeTx(ctx context.Context, tx *sql.Tx, owner OwnerMetadata) error {
+	raw, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_state(key, json) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET json = excluded.json`, key, raw); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) readOwnerSQLite(ctx context.Context) (OwnerMetadata, bool, bool, error) {
 	var out OwnerMetadata
 	found := false
-	handled := false
-	err := s.withStateLock(ctx, func() error {
-		pointer, ok, err := s.currentSQLitePointerUnlocked()
-		if err != nil || !ok {
-			return err
-		}
-		handled = true
-		db, err := s.sqliteDBUnlocked(pointer)
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		state, _, present, err := loadSQLiteOwnerRuntime(ctx, db)
 		if err != nil {
 			return err
 		}
-		state, seen, err := loadSQLiteRuntimeState(ctx, db)
-		if err != nil {
-			return err
-		}
-		if !sqliteRuntimeStateUsable(seen) {
-			state, err = loadSQLiteColdState(ctx, db)
+		if !present {
+			state, err = loadSQLiteLivenessState(ctx, db)
 			if err != nil {
 				return err
 			}
@@ -4183,6 +4635,39 @@ func (s *Store) readOwnerSQLite(ctx context.Context) (OwnerMetadata, bool, bool,
 		return nil
 	})
 	return out, found, handled, err
+}
+
+func (s *Store) clearOwnerIfSameSQLite(ctx context.Context, owner OwnerMetadata) (bool, bool, error) {
+	cleared := false
+	handled, err := s.withSQLiteRuntimeDB(ctx, func(db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		state, seen, err := loadSQLiteRequiredRuntimeState(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if !sqliteRuntimeStateUsable(seen) {
+			state, err = loadSQLiteLivenessState(ctx, tx)
+			if err != nil {
+				return err
+			}
+		}
+		existing, ok := state.readOwner()
+		if !ok || !sameOwnerInstance(existing, owner) {
+			return tx.Commit()
+		}
+		state.ServiceOwner = nil
+		state.LockOwner = nil
+		if err := saveSQLiteRequiredRuntimeStateTx(ctx, tx, state); err != nil {
+			return err
+		}
+		cleared = true
+		return tx.Commit()
+	})
+	return cleared, handled, err
 }
 
 func upsertSQLiteSessionTx(ctx context.Context, tx *sql.Tx, v SessionContext) error {

@@ -1084,6 +1084,17 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	} else if !active {
 		return b.runStandbyLoop(ctx, opts)
 	}
+	// Install cleanup immediately after claiming the lease. Listener
+	// initialization can still fail while establishing the first owner
+	// heartbeat; leaving cleanup until after that boundary strands a lease
+	// whose process never became an owner and forces every replacement to wait
+	// for expiry.
+	claimedMachineID := b.machine.ID
+	claimedLeaseGeneration := b.currentLeaseGeneration()
+	defer func() {
+		b.clearOwnerIfSame(context.Background())
+		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), claimedMachineID, claimedLeaseGeneration)
+	}()
 	// Retire obsolete policy notices only after this process owns the control
 	// lease. A standby/duplicate bridge must never mutate an active sender's
 	// Sending row while it is still waiting to become owner.
@@ -1112,10 +1123,6 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		return err
 	}
 	b.writeManagedActiveStoreBinding()
-	defer func() {
-		b.clearOwnerIfSame(context.Background())
-		_, _ = b.store.ReleaseControlLeaseIfHolder(context.Background(), b.machine.ID, b.currentLeaseGeneration())
-	}()
 	if err := b.clearStaleHelperReloadDrainOnStart(ctx); err != nil {
 		return err
 	}
@@ -13674,7 +13681,9 @@ func (b *Bridge) startActiveOwnerHeartbeat(ctx context.Context, sessionID string
 				done <- nil
 				return
 			case <-timer.C:
-				if err := b.recordOwnerHeartbeat(ctx, sessionID, turnID); err != nil {
+				if err := runOwnerHeartbeatWithRetry(ctx, func() error {
+					return b.recordOwnerHeartbeat(ctx, sessionID, turnID)
+				}); err != nil {
 					done <- err
 					return
 				}
@@ -13697,7 +13706,9 @@ func (b *Bridge) startOwnerHeartbeat(ctx context.Context) <-chan error {
 				done <- nil
 				return
 			case <-timer.C:
-				if err := b.recordCurrentOwnerHeartbeat(ctx); err != nil {
+				if err := runOwnerHeartbeatWithRetry(ctx, func() error {
+					return b.recordCurrentOwnerHeartbeat(ctx)
+				}); err != nil {
 					done <- err
 					return
 				}
@@ -13706,6 +13717,37 @@ func (b *Bridge) startOwnerHeartbeat(ctx context.Context) <-chan error {
 		}
 	}()
 	return done
+}
+
+const ownerHeartbeatBusyRetryDelay = 25 * time.Millisecond
+
+// runOwnerHeartbeatWithRetry retries only a SQLite busy result, and retries
+// the complete operation so a BUSY_SNAPSHOT cannot reuse a stale read. Other
+// storage errors remain fatal to the heartbeat and are reported to the
+// listener. Cancellation is treated as the normal shutdown path even if the
+// driver reports a lock error while unwinding a transaction.
+func runOwnerHeartbeatWithRetry(ctx context.Context, heartbeat func() error) error {
+	for {
+		err := heartbeat()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !teamstore.IsSQLiteBusyError(err) {
+			return err
+		}
+		timer := time.NewTimer(ownerHeartbeatBusyRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil
+		case <-timer.C:
+		}
+	}
 }
 
 func (b *Bridge) activeOwnerHeartbeatInterval() time.Duration {
@@ -13962,12 +14004,8 @@ func (b *Bridge) recordOwnerHeartbeat(ctx context.Context, activeSessionID strin
 		return err
 	}
 	if b.currentLeaseGeneration() > 0 {
-		active, err := b.refreshControlLease(ctx)
-		if err != nil {
+		if err := b.refreshControlLeaseForHeartbeat(ctx); err != nil {
 			return err
-		}
-		if !active {
-			return teamstore.ErrControlLeaseNotHeld
 		}
 	}
 	b.ownerMu.Lock()
@@ -13994,12 +14032,8 @@ func (b *Bridge) recordCurrentOwnerHeartbeat(ctx context.Context) error {
 		return err
 	}
 	if b.currentLeaseGeneration() > 0 {
-		active, err := b.refreshControlLease(ctx)
-		if err != nil {
+		if err := b.refreshControlLeaseForHeartbeat(ctx); err != nil {
 			return err
-		}
-		if !active {
-			return teamstore.ErrControlLeaseNotHeld
 		}
 	}
 	b.ownerMu.Lock()
@@ -14016,6 +14050,33 @@ func (b *Bridge) recordCurrentOwnerHeartbeat(ctx context.Context) error {
 		return err
 	}
 	b.owner = updated
+	return nil
+}
+
+// refreshControlLeaseForHeartbeat keeps the frequent owner heartbeat on the
+// read path while the lease has ample remaining time. Rewriting the complete
+// lease projection on every heartbeat needlessly competes with durable poll
+// progress writes and can starve the liveness signal under a busy SQLite
+// writer. Refresh before the lease reaches its midpoint so a normal heartbeat
+// cadence still renews it well before expiry.
+func (b *Bridge) refreshControlLeaseForHeartbeat(ctx context.Context) error {
+	lease := b.currentLease()
+	now := time.Now()
+	refreshAfter := b.leaseDuration / 2
+	if refreshAfter <= 0 {
+		refreshAfter = 15 * time.Second
+	}
+	if !lease.LeaseUntil.IsZero() && lease.LeaseUntil.After(now.Add(refreshAfter)) {
+		_, err := b.store.ValidateControlLease(ctx, b.machine.ID, lease.Generation, now)
+		return err
+	}
+	active, err := b.refreshControlLease(ctx)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return teamstore.ErrControlLeaseNotHeld
+	}
 	return nil
 }
 

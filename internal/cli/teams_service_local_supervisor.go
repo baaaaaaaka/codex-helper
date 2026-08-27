@@ -713,11 +713,18 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 			clearTeamsServiceLocalSupervisorChild(status, waitErr)
 			return ctx.Err()
 		case <-ticker.C:
-			if decision, err := teamsServiceLocalSupervisorCheckChildHealth(ctx, &healthState); err != nil {
+			decision, err := teamsServiceLocalSupervisorCheckChildHealth(ctx, &healthState)
+			if err != nil {
 				status.LastHealthCheckAt = time.Now()
 				status.LastHealthReason = "health check unavailable: " + err.Error()
 				status.LastHealthAction = ""
 			} else {
+				if teamsServiceLocalSupervisorSuppressStartupRestart(*status, decision) {
+					decision = teamsServiceWatchdogDecision{
+						Action: teamsServiceWatchdogActionNoop,
+						Reason: "managed Teams child is still initializing its owner heartbeat",
+					}
+				}
 				status.LastHealthCheckAt = time.Now()
 				status.LastHealthReason = decision.Reason
 				status.LastHealthAction = firstNonEmptyCLI(decision.Action, teamsServiceWatchdogActionNoop)
@@ -747,6 +754,22 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 			clearTeamsServiceLocalSupervisorChild(status, err)
 			return err
 		}
+	}
+}
+
+func teamsServiceLocalSupervisorSuppressStartupRestart(status teamsServiceLocalSupervisorStatus, decision teamsServiceWatchdogDecision) bool {
+	if decision.Action != teamsServiceWatchdogActionRestart || status.LastChildStartAt.IsZero() ||
+		!time.Now().Before(status.LastChildStartAt.Add(teamsServiceLocalSupervisorReadyTimeout)) {
+		return false
+	}
+	// Only suppress stale-evidence decisions that can be caused by the
+	// previous generation. A concrete test/administrative restart request must
+	// still be honored during startup.
+	switch strings.TrimSpace(decision.Reason) {
+	case "helper owner heartbeat is stale", "helper owner is missing", "control chat polling never became active":
+		return true
+	default:
+		return false
 	}
 }
 
