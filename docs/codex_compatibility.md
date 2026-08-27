@@ -6,6 +6,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0.150.0 | pass | pass | pass | pass | pass | pass | 2026-08-26T21:26:10Z |
 | 0.150.0-alpha.13 | pass | pass | pass | pass | pass | pass | 2026-08-26T11:54:37Z |
+| 0.150.0-alpha.12.1 | pass | fail | pass | pass | pass | pass | 2026-08-27T00:56:51Z |
 | 0.150.0-alpha.12 | pass | pass | pass | pass | pass | pass | 2026-08-26T10:59:30Z |
 | 0.150.0-alpha.11 | pass | pass | pass | pass | pass | pass | 2026-08-25T21:51:44Z |
 | 0.150.0-alpha.10 | pass | pass | pass | pass | pass | pass | 2026-08-25T20:53:40Z |
