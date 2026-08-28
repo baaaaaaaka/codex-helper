@@ -722,7 +722,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 				if teamsServiceLocalSupervisorSuppressStartupRestart(*status, decision) {
 					decision = teamsServiceWatchdogDecision{
 						Action: teamsServiceWatchdogActionNoop,
-						Reason: "managed Teams child is still initializing its owner heartbeat",
+						Reason: "managed Teams child is alive; waiting for owner heartbeat",
 					}
 				}
 				status.LastHealthCheckAt = time.Now()
