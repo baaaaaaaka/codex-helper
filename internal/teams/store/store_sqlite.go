@@ -28,9 +28,9 @@ const (
 	storeSQLiteFileName             = "store.sqlite"
 	storeSQLitePointerSchemaVersion = SchemaVersion + 1
 	// Pointer schema 6 was emitted while the JSON state schema was 5. Pointer
-	// schemas 6 through 8 remain readable for migration, but the current
-	// pointer schema (9) is an upgrade-only boundary because schema-7 helpers
-	// cannot preserve the source read-proof and delivery-recovery safety fields.
+	// schemas 6 through 9 remain readable for migration, but the current
+	// pointer schema (10) is an upgrade-only boundary because schema-8 helpers
+	// cannot preserve the durable frontier/page/attempt safety fields.
 	storeSQLiteMinPointerSchemaVersion = 6
 	sqliteImportCheckpointImporting    = "importing"
 	sqliteWALAutocheckpointPages       = 0
@@ -435,7 +435,34 @@ func (s *Store) currentSQLitePointerUnlocked() (storeSQLitePointer, bool, error)
 	if err != nil {
 		return storeSQLitePointer{}, false, err
 	}
-	return s.sqlitePointerFromDataUnlocked(data, info)
+	pointer, ok, err := s.sqlitePointerFromDataUnlocked(data, info)
+	if err != nil || !ok || pointer.SchemaVersion >= storeSQLitePointerSchemaVersion {
+		return pointer, ok, err
+	}
+	pointer, err = s.upgradeSQLitePointerUnlocked(pointer)
+	if err != nil {
+		return storeSQLitePointer{}, false, err
+	}
+	return pointer, true, nil
+}
+
+func (s *Store) upgradeSQLitePointerUnlocked(pointer storeSQLitePointer) (storeSQLitePointer, error) {
+	if pointer.SchemaVersion >= storeSQLitePointerSchemaVersion {
+		return pointer, nil
+	}
+	// Pointer schema upgrades are metadata-only and must happen before any
+	// normal writer can touch the database. Validate the target path first so a
+	// malformed pointer remains fail-closed and byte-for-byte unchanged. Once
+	// published, older helpers reject the store instead of rewriting rows with
+	// a struct that predates the durable poll frontier fields.
+	if _, err := s.storeSQLitePath(pointer); err != nil {
+		return pointer, err
+	}
+	pointer.SchemaVersion = storeSQLitePointerSchemaVersion
+	if err := s.writeSQLitePointerUnlocked(pointer); err != nil {
+		return storeSQLitePointer{}, err
+	}
+	return pointer, nil
 }
 
 func (s *Store) currentSQLitePointerReadOnly() (storeSQLitePointer, bool, error) {
@@ -2097,9 +2124,13 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 
 func preserveNewerSQLiteLivenessRows(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, state *State) error {
 	if state == nil {
 		return nil
+	}
+	if err := preserveNewerSQLiteChatPollRows(ctx, q, state); err != nil {
+		return err
 	}
 	var currentOwner *OwnerMetadata
 	ownerRowPresent := false
@@ -2156,6 +2187,71 @@ func preserveNewerSQLiteLivenessRows(ctx context.Context, q interface {
 		return err
 	}
 	return nil
+}
+
+// preserveNewerSQLiteChatPollRows prevents a stale full-state snapshot from
+// erasing a targeted frontier/page/attempt update. Chat-poll rows are kept in
+// a split table because they are updated on the polling hot path, while cold
+// Store.Update still rewrites the state projection. The store-wide UpdatedAt
+// is the snapshot watermark: a row newer than it was written after the
+// snapshot was read. Equal-revision, equal-time conflicts are ambiguous and
+// fail closed instead of choosing a cursor or pending page arbitrarily.
+func preserveNewerSQLiteChatPollRows(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, state *State) error {
+	if state == nil {
+		return nil
+	}
+	if state.ChatPolls == nil {
+		state.ChatPolls = make(map[string]ChatPollState)
+	}
+	rows, err := q.QueryContext(ctx, `SELECT chat_id, json FROM chat_polls`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var rowChatID string
+		var raw []byte
+		if err := rows.Scan(&rowChatID, &raw); err != nil {
+			return err
+		}
+		rowChatID = strings.TrimSpace(rowChatID)
+		if rowChatID == "" {
+			return fmt.Errorf("%w: SQLite chat poll row has no chat id", ErrChatPollStateConflict)
+		}
+		var current ChatPollState
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return fmt.Errorf("%w: decode chat poll %q: %v", ErrChatPollStateConflict, rowChatID, err)
+		}
+		if strings.TrimSpace(current.ChatID) == "" {
+			current.ChatID = rowChatID
+		}
+		if strings.TrimSpace(current.ChatID) != rowChatID {
+			return fmt.Errorf("%w: chat poll row key %q contains chat %q", ErrChatPollStateConflict, rowChatID, current.ChatID)
+		}
+		existing, present := state.ChatPolls[rowChatID]
+		if !present {
+			// A DB-only row is normally a targeted write made after the stale
+			// snapshot. Preserve it only when its own watermark proves that
+			// ordering; a current full-state deletion has a newer global
+			// UpdatedAt and therefore remains authoritative. Operational-looking
+			// fields are not sufficient evidence: using them here would resurrect
+			// a row that the current snapshot intentionally deleted.
+			if current.UpdatedAt.After(state.UpdatedAt) {
+				state.ChatPolls[rowChatID] = current
+			}
+			continue
+		}
+		if current.PollRevision > existing.PollRevision || current.UpdatedAt.After(existing.UpdatedAt) && current.PollRevision >= existing.PollRevision {
+			state.ChatPolls[rowChatID] = current
+			continue
+		}
+		if current.PollRevision == existing.PollRevision && current.UpdatedAt.Equal(existing.UpdatedAt) && !reflect.DeepEqual(current, existing) {
+			return fmt.Errorf("%w: chat %q has revision %d with two payloads", ErrChatPollStateConflict, rowChatID, current.PollRevision)
+		}
+	}
+	return rows.Err()
 }
 
 func clearSQLiteOwnerRuntimeTx(ctx context.Context, tx *sql.Tx) error {
@@ -2625,6 +2721,11 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
     AND COALESCE(s.updated_at, 0) <= ?
     AND COALESCE(p.parked_skip_eligible, 0) = 0
     AND p.poll_state IN (?)
+    AND COALESCE(json_extract(p.json, '$.continuation_path'), '') = ''
+    AND COALESCE(json_extract(p.json, '$.deferred_continuation_path'), '') = ''
+    AND json_type(p.json, '$.pending_page') IS NULL
+    AND json_type(p.json, '$.gap') IS NULL
+    AND json_type(p.json, '$.attempt') IS NULL
     AND NOT EXISTS (
       SELECT 1 FROM turns t
       WHERE t.session_id = s.id
@@ -6725,14 +6826,20 @@ func messageLookupSQLiteDirect(ctx context.Context, db *sql.DB, chatID string, t
 			out.HasDeliveredOutbox = true
 		}
 	}
-	var exists int
-	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events WHERE teams_chat_id = ? AND teams_message_id = ? LIMIT 1`, chatID, teamsMessageID).Scan(&exists); err != nil {
+	var inboundRaw []byte
+	if err := db.QueryRowContext(ctx, `SELECT json FROM inbound_events WHERE teams_chat_id = ? AND teams_message_id = ? LIMIT 1`, chatID, teamsMessageID).Scan(&inboundRaw); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return MessageLookup{}, err
 		}
-	} else if exists == 1 {
+	} else {
+		var event InboundEvent
+		if err := json.Unmarshal(inboundRaw, &event); err != nil {
+			return MessageLookup{}, err
+		}
 		out.HasInbound = true
+		out.InboundNeedsQueue = inboundEventNeedsQueue(event)
 	}
+	var exists int
 	exists = 0
 	if err := db.QueryRowContext(ctx, `SELECT 1 FROM outbox_messages WHERE teams_chat_id = ? AND teams_message_id = ? AND status IN (?, ?) LIMIT 1`, chatID, teamsMessageID, string(OutboxStatusAccepted), string(OutboxStatusSent)).Scan(&exists); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -6770,6 +6877,7 @@ func buildSQLiteMessageLookupCache(ctx context.Context, db *sql.DB, stamp stateF
 		Provenance:          map[string]MessageProvenanceRecord{},
 		ProvenanceCanonical: map[string]bool{},
 		Inbound:             map[string]bool{},
+		InboundNeedsQueue:   map[string]bool{},
 		DeliveredOutbox:     map[string]bool{},
 	}
 	rows, err := db.QueryContext(ctx, `SELECT id, json FROM message_provenance`)
@@ -6809,18 +6917,27 @@ func buildSQLiteMessageLookupCache(ctx context.Context, db *sql.DB, stamp stateF
 			cache.DeliveredOutbox[key] = true
 		}
 	}
-	rows, err = db.QueryContext(ctx, `SELECT teams_chat_id, teams_message_id FROM inbound_events WHERE teams_message_id <> ''`)
+	rows, err = db.QueryContext(ctx, `SELECT teams_chat_id, teams_message_id, json FROM inbound_events WHERE teams_message_id <> ''`)
 	if err != nil {
 		return messageLookupCache{}, err
 	}
 	for rows.Next() {
 		var chatID, teamsMessageID string
-		if err := rows.Scan(&chatID, &teamsMessageID); err != nil {
+		var raw []byte
+		if err := rows.Scan(&chatID, &teamsMessageID, &raw); err != nil {
 			rows.Close()
 			return messageLookupCache{}, err
 		}
 		if key := messageLookupKey(chatID, teamsMessageID); key != "" {
 			cache.Inbound[key] = true
+			var event InboundEvent
+			if err := json.Unmarshal(raw, &event); err != nil {
+				rows.Close()
+				return messageLookupCache{}, err
+			}
+			if inboundEventNeedsQueue(event) {
+				cache.InboundNeedsQueue[key] = true
+			}
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -8983,6 +9100,56 @@ func (s *Store) chatPollSQLite(ctx context.Context, chatID string) (ChatPollStat
 	return out, found, handled, err
 }
 
+// updateChatPollSQLite is the narrow write path for the high-frequency poll
+// frontier. It deliberately updates one JSON row in one short transaction;
+// using Store.Update here would delete/recreate every operational table from a
+// potentially stale full-state snapshot.
+func (s *Store) updateChatPollSQLite(ctx context.Context, chatID string, mutate func(*ChatPollState) error) (ChatPollState, bool, bool, error) {
+	var out ChatPollState
+	changed := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if poll, ok, err := loadSQLiteJSONRow[ChatPollState](ctx, tx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID); err != nil {
+			return err
+		} else if ok {
+			out = poll
+		}
+		before := out
+		if err := mutate(&out); err != nil {
+			if errors.Is(err, errStoreNoChange) {
+				handled = true
+				return nil
+			}
+			return err
+		}
+		out.ChatID = chatID
+		if reflect.DeepEqual(before, out) {
+			handled = true
+			return nil
+		}
+		if err := upsertSQLiteChatPollTx(ctx, tx, out); err != nil {
+			return err
+		}
+		changed = true
+		handled = true
+		return tx.Commit()
+	})
+	return out, changed, handled, err
+}
+
 func (s *Store) chatSessionActivitySQLite(ctx context.Context, chatID string) (bool, bool, bool, error) {
 	matched := false
 	active := false
@@ -9061,6 +9228,10 @@ func (s *Store) recordChatPollSuccessWithContinuationAndScheduleSQLite(ctx conte
 			}
 			changed = changed || scheduleChanged
 		}
+		if changed {
+			invalidateChatPollAttempt(&poll)
+			state.ChatPolls[chatID] = poll
+		}
 		out = poll
 		handled = true
 		if !changed {
@@ -9097,6 +9268,7 @@ func (s *Store) recordChatPollErrorWithBlockSQLite(ctx context.Context, chatID s
 			state.ChatPolls[chatID] = poll
 		}
 		poll := applyChatPollErrorWithBlockLocked(&state, chatID, message, blockedUntil, time.Now())
+		invalidateChatPollAttempt(&poll)
 		if err := upsertSQLiteChatPollTx(ctx, tx, poll); err != nil {
 			return err
 		}
@@ -9131,6 +9303,9 @@ func (s *Store) markChatPollParkNoticeSentSQLite(ctx context.Context, chatID str
 		out.ChatID = chatID
 		out.ParkNoticeSentAt = at
 		out.UpdatedAt = time.Now()
+		out.PollRevision++
+		out.ScheduleRevision++
+		invalidateChatPollAttempt(&out)
 		handled = true
 		if err := upsertSQLiteChatPollTx(ctx, tx, out); err != nil {
 			return err
@@ -9198,6 +9373,10 @@ func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []Cha
 			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(&state, update, now)
 			if err != nil {
 				return err
+			}
+			if updateChanged {
+				invalidateChatPollAttempt(&poll)
+				state.ChatPolls[poll.ChatID] = poll
 			}
 			out[poll.ChatID] = poll
 			changed = changed || updateChanged
@@ -9271,6 +9450,14 @@ func (s *Store) boostChatPollAfterFinalAnswerSQLite(ctx context.Context, req Fin
 		next, updateChanged, err := applyChatPollScheduleUpdateLocked(&state, finalAnswerPollBoostScheduleUpdate(req), req.NextPollAt)
 		if err != nil {
 			return err
+		}
+		if updateChanged && next.Attempt != nil {
+			// A final-answer delivery may race the poll that discovered the
+			// inbound page. This update changes only scheduling/activity fields;
+			// merge it into the active poll capability instead of making the
+			// page owner look stale and leaving its receipt stranded.
+			next.Attempt.ExpectedPollRevision = next.PollRevision
+			next.Attempt.ExpectedScheduleRevision = next.ScheduleRevision
 		}
 		out = next
 		changed = updateChanged

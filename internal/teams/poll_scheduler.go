@@ -85,12 +85,20 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		now = time.Now()
 	}
 	poll := input.Poll
-	lastActivity := latestTime(poll.LastActivityAt, input.SessionUpdatedAt, input.ForceActivityAt)
+	// Once a poll row has a durable activity timestamp, it is authoritative.
+	// Session UpdatedAt also changes for metadata (title/model/binding) and must
+	// not accidentally wake an old parked/backlogged chat. Use it only to seed
+	// an uninitialized poll row, then apply explicit forced activity separately.
+	lastActivity := poll.LastActivityAt
+	if lastActivity.IsZero() && poll.LastSuccessfulPollAt.IsZero() {
+		lastActivity = input.SessionUpdatedAt
+	}
+	lastActivity = latestTime(lastActivity, input.ForceActivityAt)
 	decision := inboundPollDecision{
 		ChatID:         strings.TrimSpace(input.ChatID),
 		LastActivityAt: lastActivity,
 	}
-	if poll.BlockedUntil.After(now) {
+	if poll.BlockedUntil.After(now) && !pollPageHasOperationalFrontier(poll) {
 		previous := strings.TrimSpace(poll.PreviousPollState)
 		if previous == "" && poll.PollState != "" && poll.PollState != inboundPollStateBlocked {
 			previous = poll.PollState
@@ -101,7 +109,28 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		decision.NextPollAt = poll.BlockedUntil
 		return decision
 	}
-	if input.ForceCatchup || !input.HasPoll || !poll.Seeded {
+	if input.ForceCatchup {
+		decision.State = inboundPollStateCatchup
+		decision.Due = true
+		decision.Interval = inboundPollCatchupInterval
+		decision.NextPollAt = now
+		return decision
+	}
+	if !input.HasPoll || !poll.Seeded {
+		// A first read can fail before the chat has ever been seeded. Keep the
+		// durable retry deadline authoritative in that state too; otherwise the
+		// catch-up branch would immediately retry a 429/network failure and turn
+		// an isolated chat error into a tight Graph loop.
+		if poll.FailureCount > 0 && poll.NextPollAt.After(now) {
+			state := strings.TrimSpace(poll.PollState)
+			if state == "" || state == inboundPollStateBlocked {
+				state = inboundPollStateWarm
+			}
+			decision.State = state
+			decision.Due = false
+			decision.NextPollAt = poll.NextPollAt
+			return decision
+		}
 		decision.State = inboundPollStateCatchup
 		decision.Due = true
 		decision.Interval = inboundPollCatchupInterval
@@ -109,12 +138,36 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		return decision
 	}
 	state, interval, parked := classifyInboundPollState(input.Role, input.Running, lastActivity, now)
-	if parked && input.Role == inboundPollRoleWork && chatPollHasUnrecoveredRetryableError(poll) {
+	if poll.BlockedUntil.After(now) && pollPageHasOperationalFrontier(poll) {
+		// An operational frontier must remain visible to the scheduler, but a
+		// transient retry deadline still applies. Keep this as ordinary due
+		// scheduling state rather than exposing a semantic chat block or issuing
+		// a request before Retry-After/backoff expires.
+		if parked {
+			state = inboundPollStateCold
+			interval = inboundPollColdInterval
+		}
+		decision.State = state
+		decision.Interval = interval
+		decision.BlockedUntil = poll.BlockedUntil
+		decision.NextPollAt = poll.BlockedUntil
+		decision.Due = false
+		decision.ShouldPark = false
+		return decision
+	}
+	if parked && input.Role == inboundPollRoleWork && (chatPollHasUnrecoveredRetryableError(poll) || pollPageHasOperationalFrontier(poll)) {
 		state = inboundPollStateCold
 		interval = inboundPollColdInterval
 		parked = false
 	}
 	if input.Role == inboundPollRoleWork && strings.TrimSpace(poll.PollState) == inboundPollStateParked && !poll.ParkNoticeSentAt.IsZero() && !chatPollHasUnrecoveredRetryableError(poll) && !input.ForceActivityAt.After(poll.LastActivityAt) {
+		if pollPageHasOperationalFrontier(poll) {
+			decision.State = inboundPollStateCold
+			decision.Interval = inboundPollColdInterval
+			decision.Due = true
+			decision.NextPollAt = now
+			return decision
+		}
 		decision.State = inboundPollStateParked
 		decision.Interval = inboundPollParkProbeInterval
 		decision.ParkedProbe = true

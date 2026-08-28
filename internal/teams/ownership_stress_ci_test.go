@@ -1200,11 +1200,14 @@ func TestTeamsOwnershipStressOverlappingOutOfOrderPagesAreExactlyOnceCI(t *testi
 	if _, err := bridge.pollChatWithRole(ctx, session.ChatID, 20, inboundPollRoleWork, false, handle); err != nil {
 		t.Fatalf("overlapping continuation poll: %v", err)
 	}
-	// The normal backlog quantum is one actionable message.  A third pass is
-	// therefore required to consume the remaining overlap page and clear its
-	// durable continuation rather than pretending that one pass drained it.
+	// The normal backlog quantum is one actionable message. The old page itself
+	// can therefore need a replay after its first message is handled; the
+	// staged receipt must make that replay local and exactly-once.
 	if _, err := bridge.pollChatWithRole(ctx, session.ChatID, 20, inboundPollRoleWork, false, handle); err != nil {
 		t.Fatalf("final overlap continuation poll: %v", err)
+	}
+	if _, err := bridge.pollChatWithRole(ctx, session.ChatID, 20, inboundPollRoleWork, false, handle); err != nil {
+		t.Fatalf("replay remaining overlap continuation poll: %v", err)
 	}
 
 	counts := map[string]int{}
@@ -1229,8 +1232,8 @@ func TestTeamsOwnershipStressOverlappingOutOfOrderPagesAreExactlyOnceCI(t *testi
 	mu.Lock()
 	gotRequests := append([]string(nil), requests...)
 	mu.Unlock()
-	if len(gotRequests) < 5 || gotRequests[0] != "" || gotRequests[1] != "" || gotRequests[2] != "older" || gotRequests[3] != "" || gotRequests[4] != "older" {
-		t.Fatalf("Graph requests = %v, want head, head+continuation, head+continuation", gotRequests)
+	if len(gotRequests) != 2 || gotRequests[0] != "" || gotRequests[1] != "older" {
+		t.Fatalf("Graph requests = %v, want one head and one continuation read; staged replays must be local", gotRequests)
 	}
 }
 
@@ -1543,8 +1546,8 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 			}
 
 			err := bridge.pollOnce(ctx, 20)
-			if err == nil {
-				t.Fatalf("pollOnce returned nil after continuation status %d", testCase.status)
+			if err != nil {
+				t.Fatalf("pollOnce leaked continuation status %d to the listener: %v", testCase.status, err)
 			}
 			mu.Lock()
 			otherRequests := requests["chat-2"]
@@ -2580,10 +2583,11 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 		t.Fatalf("multi-day cold chat was not an auto-park candidate: handled=%v candidates=%#v", handled, candidates)
 	}
 
-	// The first owner comes back while Graph is still unavailable.  This is
-	// the failure that creates the block which the later owner must reconcile.
-	// The idle sweep deliberately contains this per-chat error so an unrelated
-	// idle chat is not suppressed by one stale continuation.
+	// The first owner comes back while Graph is still unavailable. The idle
+	// sweep deliberately contains this per-chat error so an unrelated idle chat
+	// is not suppressed by one stale continuation. This is a retry schedule, not
+	// a semantic chat block: the operational frontier remains visible and the
+	// listener can continue serving other chats.
 	if err := first.maybeRunIdleWorkChatAutoPark(ctx, now); err != nil {
 		t.Fatalf("idle sweep leaked a local continuation failure: %v", err)
 	}
@@ -2591,8 +2595,8 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	if err != nil || !ok {
 		t.Fatalf("read blocked multi-day poll: ok=%v err=%v", ok, err)
 	}
-	if blocked.PollState != inboundPollStateBlocked || blocked.ContinuationPath != oldContinuation || blocked.BlockedUntil.IsZero() {
-		t.Fatalf("failed recovery did not preserve a recoverable blocked continuation: %#v", blocked)
+	if blocked.PollState == inboundPollStateBlocked || blocked.ContinuationPath != oldContinuation || !blocked.BlockedUntil.IsZero() || blocked.LastError == "" || blocked.FailureCount == 0 {
+		t.Fatalf("failed recovery did not preserve a recoverable non-blocking continuation: %#v", blocked)
 	}
 
 	// Exercise the actual process boundary before the fresh owner takes over.
@@ -2666,6 +2670,28 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	}
 	if err := second.pollOnce(ctx, 20); err != nil {
 		t.Fatalf("fresh owner scheduler handoff after multi-day outage: %v", err)
+	}
+	// One poll quantum recovers the old continuation. The fresh head is a
+	// separate durable page and must be read by the next due quantum; keeping
+	// these operations separate is what prevents a stale continuation from
+	// monopolizing or overwriting the head frontier.
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load state after old continuation recovery: %v", err)
+	}
+	if got := ownershipStressInboundCount(state, session.ID, oldMessage.ID); got != 1 {
+		teamsOwnershipStressFinding(t, "old continuation was not recovered after the expired block: inbound=%d state=%#v", got, state)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         session.ChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     time.Now().Add(-time.Minute),
+		LastActivityAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("make fresh head recovery due: %v", err)
+	}
+	if err := second.pollOnce(ctx, 20); err != nil {
+		t.Fatalf("fresh owner head recovery after old continuation: %v", err)
 	}
 	if err := second.maybeRunIdleWorkChatAutoPark(ctx, now); err != nil {
 		t.Fatalf("fresh owner auto-park recovery after multi-day outage: %v", err)
@@ -3012,15 +3038,15 @@ func TestTeamsOwnershipStressParkedStaleContinuationWithNewMessageCI(t *testing.
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
 
-	if err := bridge.pollOnce(ctx, 20); err == nil {
-		t.Fatal("stale parked continuation unexpectedly reported clean success")
+	if err := bridge.pollOnce(ctx, 20); err != nil {
+		t.Fatalf("stale parked continuation leaked a chat-local error: %v", err)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("load parked stale state: %v", err)
 	}
-	if len(executor.prompts) != 1 || ownershipStressInboundCount(state, session.ID, waiting.ID) != 1 || ownershipStressCompletedTurnCount(state, session.ID) != 1 {
-		t.Fatalf("new message was not admitted exactly once before stale recovery: prompts=%v state=%#v", executor.prompts, state)
+	if len(executor.prompts) != 0 || ownershipStressInboundCount(state, session.ID, waiting.ID) != 0 || ownershipStressCompletedTurnCount(state, session.ID) != 0 {
+		t.Fatalf("stale continuation should defer the head until its frontier is reconciled: prompts=%v state=%#v", executor.prompts, state)
 	}
 	if countSentPlainContainingForChat(*sent, session.ChatID, "This chat is paused") != 0 {
 		t.Fatalf("stale parked recovery emitted a duplicate freeze notice: %#v", *sent)
@@ -3029,8 +3055,8 @@ func TestTeamsOwnershipStressParkedStaleContinuationWithNewMessageCI(t *testing.
 	if err != nil || !ok {
 		t.Fatalf("read parked stale poll: ok=%v err=%v", ok, err)
 	}
-	if poll.ContinuationPath != oldContinuation || poll.LastError == "" {
-		t.Fatalf("stale parked frontier was not retained for recovery: %#v", poll)
+	if poll.ContinuationPath != "" || poll.Gap == nil || poll.LastError == "" {
+		t.Fatalf("stale parked frontier was not isolated in a recovery gap: %#v", poll)
 	}
 
 	mu.Lock()
@@ -3055,8 +3081,12 @@ func TestTeamsOwnershipStressParkedStaleContinuationWithNewMessageCI(t *testing.
 	if poll.ContinuationPath != "" || !poll.LastErrorAt.IsZero() || poll.PollState == inboundPollStateBlocked {
 		t.Fatalf("parked stale recovery left chat frozen: %#v", poll)
 	}
-	if len(executor.prompts) != 1 {
-		t.Fatalf("parked stale recovery replayed new message: prompts=%v", executor.prompts)
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("reload parked stale state after gap recovery: %v", err)
+	}
+	if len(executor.prompts) != 1 || ownershipStressInboundCount(state, session.ID, waiting.ID) != 1 || ownershipStressCompletedTurnCount(state, session.ID) != 1 {
+		t.Fatalf("new message was not admitted exactly once by the gap recovery lane: prompts=%v state=%#v", executor.prompts, state)
 	}
 }
 
@@ -3111,7 +3141,6 @@ func TestTeamsOwnershipStressActiveInboundHandoffRemainsRetryableCI(t *testing.T
 	}
 
 	readGraph := newBridgePollGraph(t, []bridgePollPage{
-		{messages: []ChatMessage{bridgeTestMessageWithText("handoff-message", "retry after owner failure")}},
 		{messages: []ChatMessage{bridgeTestMessageWithText("handoff-message", "retry after owner failure")}},
 	})
 	writeGraph, _ := newBridgeTestGraph(t)
@@ -3221,6 +3250,12 @@ func TestTeamsOwnershipStressActiveClaimDoesNotAdvanceCursorCI(t *testing.T) {
 	}
 	if len(handledIDs) != 2 || handledIDs[1] != oldMessage.ID {
 		t.Fatalf("released active claim was not retried exactly once: handled=%v", handledIDs)
+	}
+	// The one-action quantum leaves the already-seen newer record in the staged
+	// page after retrying the released older claim. A final local replay must
+	// consume that record and commit the cursor without a third Graph read.
+	if _, err := bridge.pollChatWithRole(ctx, "chat-1", 20, inboundPollRoleWork, false, handle); err != nil {
+		t.Fatalf("final active-claim page replay: %v", err)
 	}
 	second, ok, err := store.ChatPoll(ctx, "chat-1")
 	if err != nil || !ok {
@@ -3332,8 +3367,14 @@ func TestTeamsOwnershipStressActiveClaimWithMultipleFrontiersDoesNotAdvanceCurso
 	if _, err := bridge.pollChatWithRole(ctx, "chat-1", 20, inboundPollRoleWork, false, handle); err != nil {
 		t.Fatalf("poll after old multi-frontier claim release: %v", err)
 	}
+	if _, err := bridge.pollChatWithRole(ctx, "chat-1", 20, inboundPollRoleWork, false, handle); err != nil {
+		t.Fatalf("poll after deferred multi-frontier frontier promotion: %v", err)
+	}
 	if len(handledIDs) != 2 || handledIDs[1] != claimedHead.ID {
 		t.Fatalf("released active head was not retried exactly once: handled=%v", handledIDs)
+	}
+	if _, err := bridge.pollChatWithRole(ctx, "chat-1", 20, inboundPollRoleWork, false, handle); err != nil {
+		t.Fatalf("drain deferred multi-frontier page: %v", err)
 	}
 	second, ok, err := store.ChatPoll(ctx, "chat-1")
 	if err != nil || !ok {
@@ -3436,8 +3477,8 @@ func TestTeamsOwnershipStressActionLimitedContinuationDoesNotSkipActiveClaimCI(t
 // TestTeamsOwnershipStressExpiredContinuationRetainsFrontierCI models a
 // multi-day outage invalidating a saved Graph skip token. A terminal head page
 // cannot prove that the unread records behind the old token were delivered, so
-// the service must retain a recoverable per-chat error rather than recording a
-// clean cursor.
+// the service immediately enters an explicit recovery gap for a token-specific
+// failure, rather than a permanent scheduler block or a blind retry loop.
 func TestTeamsOwnershipStressExpiredContinuationRetainsFrontierCI(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -3489,22 +3530,21 @@ func TestTeamsOwnershipStressExpiredContinuationRetainsFrontierCI(t *testing.T) 
 	}, true, pollChatWithRoleOptions{AllowBacklogDrain: true, RecoverStaleContinuation: true}, func(context.Context, ChatMessage, string) error {
 		return nil
 	}); err == nil {
-		t.Fatal("expired continuation must not be reported as a clean poll")
+		t.Fatal("expired continuation unexpectedly succeeded")
 	}
 	got, ok, err := store.ChatPoll(ctx, "chat-1")
 	if err != nil || !ok {
 		t.Fatalf("read expired continuation poll: ok=%v err=%v", ok, err)
 	}
-	if got.ContinuationPath != continuation || got.PollState != inboundPollStateBlocked || got.LastError == "" || got.BlockedUntil.IsZero() {
-		t.Fatalf("expired continuation frontier was not retained as recoverable state: %#v", got)
+	if got.ContinuationPath != "" || got.Gap == nil || got.PollState == inboundPollStateBlocked || !got.BlockedUntil.IsZero() || got.LastError == "" {
+		t.Fatalf("expired continuation did not become an explicit non-blocking gap: %#v", got)
 	}
 }
 
 // TestTeamsOwnershipStressMultipleContinuationFrontiersRemainDurableCI covers
-// the A+B+C interleaving: an older continuation A is active, a prior head
-// frontier B is deferred, and a later head response exposes C.  A single
-// deferred slot cannot represent all three, so the safe result is a local
-// recoverable error with A and B untouched, never a clean cursor advance.
+// the legacy A+B representation. New runtime code drains A first and promotes
+// B only after A completes; it never issues a third head request while A is
+// operational.
 func TestTeamsOwnershipStressMultipleContinuationFrontiersRemainDurableCI(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -3528,14 +3568,16 @@ func TestTeamsOwnershipStressMultipleContinuationFrontiersRemainDurableCI(t *tes
 		t.Fatalf("seed multiple continuation frontiers: %v", err)
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("$skiptoken") != "" {
-			t.Fatalf("overflow guard should stop before reading an old frontier: %s", r.URL.String())
+		if token := r.URL.Query().Get("$skiptoken"); token != "old" && token != "deferred" {
+			t.Fatalf("unexpected frontier request: %s", r.URL.String())
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"value":           []ChatMessage{},
-			"@odata.nextLink": freshContinuation,
-		})
+		switch r.URL.Query().Get("$skiptoken") {
+		case "old":
+			_ = json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{}})
+		case "deferred":
+			_ = json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{}})
+		}
 	}))
 	t.Cleanup(server.Close)
 	readGraph := &GraphClient{
@@ -3562,22 +3604,23 @@ func TestTeamsOwnershipStressMultipleContinuationFrontiersRemainDurableCI(t *tes
 	if _, err := bridge.pollChatWithRoleStateOptions(ctx, "chat-1", 20, inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{
 		AllowBacklogDrain:        true,
 		RecoverStaleContinuation: true,
-	}, func(context.Context, ChatMessage, string) error { return nil }); err == nil {
-		t.Fatal("multiple continuation frontiers must not be reported as a clean poll")
+	}, func(context.Context, ChatMessage, string) error { return nil }); err != nil {
+		t.Fatalf("legacy first frontier poll: %v", err)
 	}
 	got, ok, err := store.ChatPoll(ctx, "chat-1")
 	if err != nil || !ok {
 		t.Fatalf("read multiple-frontier poll: ok=%v err=%v", ok, err)
 	}
-	if got.ContinuationPath != oldContinuation || got.DeferredContinuationPath != deferredContinuation || got.PollState != inboundPollStateBlocked || !strings.Contains(got.LastError, "multiple Graph continuation frontiers") {
-		t.Fatalf("multiple-frontier state lost a durable path: %#v", got)
+	if got.ContinuationPath != deferredContinuation || got.DeferredContinuationPath != "" || got.PollState == inboundPollStateBlocked {
+		t.Fatalf("legacy deferred frontier was not promoted: %#v", got)
 	}
+	_ = freshContinuation
 }
 
 // TestTeamsOwnershipStressRepeatedContinuationStopsLivelockCI models Graph
 // returning the same nextLink forever. The service must stop the per-chat
-// loop with an explicit recoverable error instead of recording success and
-// issuing the same request on every cycle.
+// loop with an explicit gap instead of recording success and issuing the same
+// request forever.
 func TestTeamsOwnershipStressRepeatedContinuationStopsLivelockCI(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -3626,17 +3669,19 @@ func TestTeamsOwnershipStressRepeatedContinuationStopsLivelockCI(t *testing.T) {
 		LastModifiedCursor: now.Add(-time.Hour),
 		ContinuationPath:   continuation,
 	}
-	if _, err := bridge.pollChatWithRoleStateOptions(ctx, "chat-1", 20, inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{
-		AllowBacklogDrain: true,
-	}, func(context.Context, ChatMessage, string) error { return nil }); err == nil {
-		t.Fatal("repeated continuation must not be reported as a clean poll")
+	for attempt := 0; attempt < continuationFailureBudget; attempt++ {
+		if _, err := bridge.pollChatWithRoleStateOptions(ctx, "chat-1", 20, inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{
+			AllowBacklogDrain: true,
+		}, func(context.Context, ChatMessage, string) error { return nil }); err == nil {
+			t.Fatalf("repeated continuation attempt %d unexpectedly succeeded", attempt+1)
+		}
 	}
 	got, ok, err := store.ChatPoll(ctx, "chat-1")
 	if err != nil || !ok {
 		t.Fatalf("read repeated continuation state: ok=%v err=%v", ok, err)
 	}
-	if got.ContinuationPath != continuation || got.PollState != inboundPollStateBlocked || !strings.Contains(got.LastError, "repeated without progress") {
-		t.Fatalf("repeated continuation was not isolated with durable evidence: %#v", got)
+	if got.ContinuationPath != "" || got.Gap == nil || got.PollState == inboundPollStateBlocked || !strings.Contains(got.LastError, "no progress") {
+		t.Fatalf("repeated continuation was not isolated with a durable gap: %#v", got)
 	}
 }
 

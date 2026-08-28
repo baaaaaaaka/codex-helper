@@ -483,6 +483,7 @@ type Bridge struct {
 	outboxSendPaceMu                  sync.Mutex
 	outboxSendPaceLast                map[string]time.Time
 	pollMu                            sync.Mutex
+	pollProcessInstanceID             string
 	fastPollUntil                     time.Time
 	lastPollErrorLog                  string
 	lastPollErrorLogAt                time.Time
@@ -1571,6 +1572,17 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		pollsByChat[session.ChatID] = poll
 		hasPollByChat[session.ChatID] = hasPoll
 		pollableByChat[session.ChatID] = session
+		// Repair a legacy parked marker that was persisted without ParkedAt.
+		// This is metadata-only and must preserve any still-operational frontier
+		// or retry error instead of turning repair into an implicit discard.
+		if hasPoll && strings.TrimSpace(poll.PollState) == inboundPollStateParked &&
+			!poll.ParkNoticeSentAt.IsZero() && poll.ParkedAt.IsZero() {
+			if update, ok := explicitParkedWorkPollMaintenanceUpdate(session.ChatID, poll); ok {
+				pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+				poll = applyLocalParkedPollMaintenance(poll)
+				pollsByChat[session.ChatID] = poll
+			}
+		}
 		decision := decideInboundPoll(inboundPollInput{
 			ChatID:           session.ChatID,
 			Role:             inboundPollRoleWork,
@@ -1657,7 +1669,11 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 				_, pollErr := b.pollChatWithRoleStateOptions(ctx, s.ChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, runningBySession[s.ID], pollsByChat[s.ChatID], hasPollByChat[s.ChatID], pollOptions, func(ctx context.Context, msg ChatMessage, text string) error {
 					return b.handleResolvedSessionMessageWithQueueState(ctx, &s, s.ChatID, msg, text, &turns, nil)
 				})
-				results <- workPollResult{Index: index, Turns: turns, Err: pollErr}
+				result := workPollResult{Index: index, Turns: turns}
+				if isProcessWidePollFailure(pollErr) {
+					result.Err = pollErr
+				}
+				results <- result
 			}
 		}()
 	}
@@ -1669,20 +1685,28 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 			orderedResults[result.Index] = result
 		}
 	}
-	var firstErr error
+	var workPollErr error
 	for index, result := range orderedResults {
 		decision := decisions[index]
 		if session, ok := pollableByChat[decision.ChatID]; ok {
 			queueStateBySession[session.ID] = result.Turns
 		}
-		if result.Err != nil && firstErr == nil {
-			firstErr = result.Err
+		if workPollErr == nil && result.Err != nil {
+			workPollErr = result.Err
 		}
+		// A work-chat Graph/handler failure is durable chat-scoped state. It
+		// must not be promoted to the listener watchdog: one poisoned chat
+		// cannot make the service restart and lose progress for every other
+		// chat. The per-chat poll path records the error and schedules its own
+		// retry. Only control, lease, and store failures remain process-wide.
 	}
-	if firstErr == nil {
-		firstErr = controlPollErr
+	if controlPollErr != nil && workPollErr != nil {
+		return errors.Join(pollControlFailure(controlPollErr), workPollErr)
 	}
-	return firstErr
+	if workPollErr != nil {
+		return workPollErr
+	}
+	return pollControlFailure(controlPollErr)
 }
 
 func (b *Bridge) sessionByChatIDForPoll(chatID string) *Session {
@@ -1886,19 +1910,40 @@ func explicitParkedWorkPollMaintenanceUpdate(chatID string, poll teamstore.ChatP
 	}
 	if poll.ParkedAt.IsZero() ||
 		!poll.BlockedUntil.IsZero() ||
-		strings.TrimSpace(poll.ContinuationPath) != "" ||
+		poll.Attempt != nil ||
 		poll.FailureCount != 0 ||
 		strings.TrimSpace(poll.LastError) != "" ||
 		!poll.LastErrorAt.IsZero() {
-		return teamstore.ChatPollScheduleUpdate{
-			ChatID:                chatID,
-			PollState:             inboundPollStateParked,
-			ClearBlockedUntil:     true,
-			ClearContinuationPath: true,
-			ResetFailures:         true,
-		}, true
+		operational := pollPageHasOperationalFrontier(poll)
+		update := teamstore.ChatPollScheduleUpdate{
+			ChatID:            chatID,
+			PollState:         inboundPollStateParked,
+			ClearBlockedUntil: !operational,
+			ResetFailures:     !operational,
+		}
+		// A parked marker is a scheduling state, not permission to discard an
+		// operational page. Only the old, frontier-free repair path may clear
+		// legacy errors; P/D/pending/gap remain visible to the poller.
+		if !pollPageHasOperationalFrontier(poll) {
+			update.ClearContinuationPath = true
+			update.ClearDeferredContinuationPath = true
+		}
+		return update, true
 	}
 	return teamstore.ChatPollScheduleUpdate{}, false
+}
+
+func applyLocalParkedPollMaintenance(poll teamstore.ChatPollState) teamstore.ChatPollState {
+	if poll.ParkedAt.IsZero() {
+		poll.ParkedAt = time.Now()
+	}
+	if !pollPageHasOperationalFrontier(poll) {
+		poll.BlockedUntil = time.Time{}
+		poll.FailureCount = 0
+		poll.LastError = ""
+		poll.LastErrorAt = time.Time{}
+	}
+	return poll
 }
 
 func isControlFallbackSessionID(sessionID string) bool {
@@ -2082,7 +2127,10 @@ func withInboundPollGraphTimeout(ctx context.Context) (context.Context, context.
 	return context.WithTimeout(ctx, inboundPollGraphTimeout)
 }
 
-func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
+// pollChatWithRoleStateOptionsLegacy is retained temporarily as a reference
+// for compatibility tests while the production path below uses one durable
+// frontier and a fenced page receipt. It is not called by runtime code.
+func (b *Bridge) pollChatWithRoleStateOptionsLegacy(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
 	if err := b.ensureStore(); err != nil {
 		return false, err
 	}
@@ -2257,14 +2305,371 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	return handled, err
 }
 
+// pollChatWithRoleStateOptions performs exactly one logical page operation.
+// The old implementation read the fresh head and then an older continuation
+// in one call, which created a second operational frontier and made a stalled
+// continuation able to starve the head forever. The order here is explicit:
+// replay a pending page, drain P, recover a gap, then read the head.
+func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
+	if err := b.ensureStore(); err != nil {
+		return false, pollStoreFailure(err)
+	}
+	fresh, freshHasPoll, err := normalizePollFrontier(ctx, b.store, chatID)
+	if err != nil {
+		return false, pollStoreFailure(err)
+	}
+	// A few internal callers pass a durable snapshot that predates the
+	// per-chat row (for example immediately after a store-generation
+	// migration). Use it only when the authoritative row is absent; once a
+	// row exists, never let a caller snapshot overwrite newer state.
+	if !freshHasPoll && hasPoll {
+		seed := poll
+		if strings.TrimSpace(seed.ChatID) == "" {
+			seed.ChatID = strings.TrimSpace(chatID)
+		}
+		if _, _, seedErr := b.store.UpdateChatPoll(ctx, chatID, func(current *teamstore.ChatPollState) error {
+			if strings.TrimSpace(current.ChatID) == "" {
+				*current = seed
+			}
+			return nil
+		}); seedErr != nil {
+			return false, pollStoreFailure(seedErr)
+		}
+		fresh, freshHasPoll, err = normalizePollFrontier(ctx, b.store, chatID)
+		if err != nil {
+			return false, pollStoreFailure(err)
+		}
+	}
+	if !freshHasPoll {
+		fresh.ChatID = strings.TrimSpace(chatID)
+	}
+	poll = fresh
+	hasPoll = freshHasPoll
+	frontier, requestPath, modifiedAfter := pollPageRequestForState(chatID, top, role, poll)
+	if poll.PendingPage != nil {
+		frontier = strings.TrimSpace(poll.PendingPage.Frontier)
+		if frontier == "" {
+			frontier = pollFrontierHead
+		}
+		requestPath = strings.TrimSpace(poll.PendingPage.RequestPath)
+	}
+	if requestPath == "" {
+		invalidPathErr := fmt.Errorf("empty Graph request path for chat %s", chatID)
+		// A missing path can only be produced by a malformed durable page
+		// receipt. Retire that receipt into the bounded gap evidence lane before
+		// returning; otherwise every poll cycle would select the same page,
+		// fail before acquiring a capability, and livelock this chat forever.
+		if poll.PendingPage != nil {
+			_, _, repairErr := b.store.UpdateChatPoll(ctx, chatID, func(current *teamstore.ChatPollState) error {
+				if current.PendingPage == nil || strings.TrimSpace(current.PendingPage.RequestPath) != "" {
+					return nil
+				}
+				openPollGap(current, "invalid-pending-page", invalidPathErr.Error(), "", time.Now())
+				current.Attempt = nil
+				return nil
+			})
+			if repairErr != nil {
+				return false, pollStoreFailure(repairErr)
+			}
+		}
+		return false, invalidPathErr
+	}
+	if b.currentLeaseGeneration() > 0 {
+		if err := b.ensureActiveControlLease(ctx); err != nil {
+			return false, pollLeaseFailure(err)
+		}
+	}
+	expectedRevisionHint := poll.PollRevision
+	attemptPoll, acquired, err := b.store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+		ChatID:                  chatID,
+		Owner:                   strings.TrimSpace(b.machine.ID),
+		ProcessIncarnation:      b.pollProcessIncarnation(),
+		LeaseGeneration:         b.currentLeaseGeneration(),
+		ExpectedPollRevision:    poll.PollRevision,
+		HasExpectedPollRevision: true,
+		ExpectedFrontier:        pollFrontierIdentity(frontier, requestPath),
+		ExpectedReceiptID: func() string {
+			if poll.PendingPage != nil {
+				return poll.PendingPage.ReceiptID
+			}
+			return ""
+		}(),
+		Now: time.Now(),
+	})
+	if err != nil {
+		return false, pollStoreFailure(err)
+	}
+	if !acquired || attemptPoll.Attempt == nil {
+		return false, nil
+	}
+	attemptID := attemptPoll.Attempt.ID
+	expectedRevision := attemptPoll.PollRevision
+	if expectedRevision == 0 {
+		expectedRevision = expectedRevisionHint + 1
+	}
+	if b.currentLeaseGeneration() > 0 {
+		if err := b.ensureActiveControlLease(ctx); err != nil {
+			_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+			if abandonErr != nil {
+				return false, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", err, abandonErr))
+			}
+			return false, pollLeaseFailure(err)
+		}
+	}
+	// The Graph client deliberately accepts the generic /chats/{id}/messages
+	// shape for several callers. A persisted poll frontier is narrower: it must
+	// belong to this exact chat before either replaying a receipt or issuing a
+	// network request. Treat a corrupt/cross-chat frontier as an explicit local
+	// gap so it cannot leak records or livelock on the same bad path.
+	if !pollRequestPathBelongsToChat(chatID, requestPath) ||
+		poll.PendingPage != nil && strings.TrimSpace(poll.PendingPage.ChatID) != strings.TrimSpace(chatID) {
+		identityErr := fmt.Errorf("%w: poll request path is not owned by chat %q", errPendingPageIdentity, chatID)
+		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, identityErr, true, false)
+		if commitErr != nil {
+			return false, pollStoreFailure(commitErr)
+		}
+		if !committed {
+			return false, nil
+		}
+		return false, identityErr
+	}
+
+	var window MessageWindow
+	if poll.PendingPage != nil {
+		if poll.PendingPage.FrontierEpoch != 0 && poll.FrontierEpoch != 0 && poll.PendingPage.FrontierEpoch != poll.FrontierEpoch {
+			pageErr := fmt.Errorf("%w: page epoch %d does not match frontier epoch %d", errPendingPageIdentity, poll.PendingPage.FrontierEpoch, poll.FrontierEpoch)
+			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, pageErr, true, false)
+			if commitErr != nil {
+				return false, pollStoreFailure(commitErr)
+			}
+			if !committed {
+				return false, nil
+			}
+			return false, pageErr
+		}
+		window, err = pendingPageToWindow(poll.PendingPage)
+		if err != nil {
+			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, err, true, false)
+			if commitErr != nil {
+				return false, pollStoreFailure(commitErr)
+			}
+			if !committed {
+				return false, nil
+			}
+			return false, err
+		}
+	} else {
+		readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
+		if frontier == pollFrontierContinuation || frontier == pollFrontierGap {
+			window, err = b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(readCtx, requestPath)
+		} else {
+			window, err = b.readClient().ListMessagesWindowWithoutRateLimitRetry(readCtx, chatID, top, modifiedAfter)
+		}
+		cancelRead()
+		if err != nil {
+			forceGap := false
+			var responseTooLarge *GraphResponseTooLargeError
+			if errors.As(err, &responseTooLarge) {
+				forceGap = true
+			}
+			// A continuation-specific token failure is strong evidence that
+			// this opaque Graph cursor is no longer dereferenceable. Open the
+			// directional recovery lane immediately, while generic 400/404/410
+			// and transport failures remain on the bounded retry path below.
+			if (frontier == pollFrontierContinuation || frontier == pollFrontierGap) && continuationErrorIsPermanent(requestPath, err) {
+				forceGap = true
+			}
+			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, err, forceGap, false)
+			if commitErr != nil {
+				return false, pollStoreFailure(commitErr)
+			}
+			if !committed {
+				return false, nil
+			}
+			return false, err
+		}
+		// An unseeded head page is a baseline only. Persist that fact with the
+		// receipt before handling it; a process crash must not make a replayed
+		// baseline look like a deliverable user backlog.
+		baselineOnly := !freshHasPoll || !poll.Seeded
+		page, pageErr := pendingPageFromWindow(chatID, requestPath, frontier, normalizeFrontierEpochForPoll(poll), window, baselineOnly)
+		if pageErr != nil {
+			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, pageErr, true, false)
+			if commitErr != nil {
+				return false, pollStoreFailure(commitErr)
+			}
+			if !committed {
+				return false, nil
+			}
+			return false, pageErr
+		}
+		if b.currentLeaseGeneration() > 0 {
+			if leaseErr := b.ensureActiveControlLease(ctx); leaseErr != nil {
+				_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+				if abandonErr != nil {
+					return false, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", leaseErr, abandonErr))
+				}
+				return false, pollLeaseFailure(leaseErr)
+			}
+		}
+		stagedPoll, staged, stageErr := b.store.MutateChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(current *teamstore.ChatPollState) error {
+			if current.PendingPage != nil {
+				return nil
+			}
+			current.PendingPage = page
+			if current.FrontierEpoch == 0 {
+				current.FrontierEpoch = page.FrontierEpoch
+			}
+			return nil
+		})
+		if stageErr != nil {
+			return false, pollStoreFailure(stageErr)
+		}
+		if !staged {
+			return false, nil
+		}
+		poll = stagedPoll
+		expectedRevision = poll.PollRevision
+		window.baselineOnly = page.BaselineOnly
+	}
+
+	quarantine := false
+	if role == inboundPollRoleWork {
+		if session := b.sessionByChatIDForPoll(chatID); session != nil {
+			quarantine = b.sessionQuarantineFenced(session.ID)
+		}
+	}
+	result, handlerErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll || freshHasPoll, window, top, opts.MaxBacklogActions, handle)
+	if b.currentLeaseGeneration() > 0 {
+		if leaseErr := b.ensureActiveControlLease(ctx); leaseErr != nil {
+			_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+			if abandonErr != nil {
+				return result.Handled, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", leaseErr, abandonErr))
+			}
+			return result.Handled, pollLeaseFailure(leaseErr)
+		}
+	}
+	// A successful handler can deliver a final answer before returning. Its
+	// outbox side effect may safely update only poll scheduling fields and merge
+	// the new revision into this capability. Refresh that narrowly-authorized
+	// revision; any other concurrent mutation leaves the attempt stale and is
+	// handled as a no-op below.
+	if refreshed, live, refreshErr := b.refreshChatPollAttemptRevision(ctx, chatID, attemptID, expectedRevision); refreshErr != nil {
+		return result.Handled, pollStoreFailure(refreshErr)
+	} else if !live {
+		return result.Handled, nil
+	} else {
+		expectedRevision = refreshed
+	}
+	if handlerErr != nil {
+		if errors.Is(handlerErr, teamstore.ErrControlLeaseNotHeld) {
+			return result.Handled, pollLeaseFailure(handlerErr)
+		}
+		if recordID := strings.TrimSpace(result.PendingRecordRefetchFailedID); recordID != "" {
+			stagedPoll, staged, mutateErr := b.store.MutateChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(current *teamstore.ChatPollState) error {
+				_, err := notePendingPageRefetchFailure(current.PendingPage, recordID)
+				return err
+			})
+			if mutateErr != nil {
+				return result.Handled, pollStoreFailure(mutateErr)
+			}
+			if !staged {
+				return result.Handled, nil
+			}
+			expectedRevision = stagedPoll.PollRevision
+		}
+		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, handlerErr, false, false)
+		if commitErr != nil {
+			return result.Handled, pollStoreFailure(commitErr)
+		}
+		if !committed {
+			return result.Handled, nil
+		}
+		return result.Handled, handlerErr
+	}
+	if role == inboundPollRoleWork {
+		// The echo/quarantine fence can be raised while the page is being
+		// handled. Re-read it before committing the page; otherwise the commit
+		// would schedule a normal continuation and immediately reprocess the
+		// helper output that caused the fence.
+		if session := b.sessionByChatIDForPoll(chatID); session != nil {
+			quarantine = quarantine || b.sessionQuarantineFenced(session.ID)
+		}
+	}
+	if continuationPageHasNoProgress(poll, frontier, requestPath, window) {
+		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, errContinuationNoProgress, false, true)
+		if commitErr != nil {
+			return result.Handled, pollStoreFailure(commitErr)
+		}
+		if !committed {
+			return result.Handled, nil
+		}
+		return result.Handled, errContinuationNoProgress
+	}
+	if !result.PageComplete {
+		committed, commitErr := b.commitPollAttemptPartial(ctx, chatID, attemptID, expectedRevision, result, quarantine)
+		if commitErr != nil {
+			return result.Handled, pollStoreFailure(commitErr)
+		}
+		if !committed {
+			return result.Handled, nil
+		}
+		return result.Handled, nil
+	}
+	committed, commitErr := b.commitPollAttemptSuccess(ctx, chatID, attemptID, expectedRevision, role, running, frontier, requestPath, window, result, quarantine)
+	if commitErr != nil {
+		return result.Handled, pollStoreFailure(commitErr)
+	}
+	if !committed {
+		return result.Handled, nil
+	}
+	if role == inboundPollRoleControl {
+		b.notePollSuccess(time.Now())
+	}
+	return result.Handled, nil
+}
+
+func (b *Bridge) refreshChatPollAttemptRevision(ctx context.Context, chatID, attemptID string, expectedRevision uint64) (uint64, bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(attemptID) == "" {
+		return expectedRevision, false, nil
+	}
+	poll, found, err := b.store.ChatPoll(ctx, chatID)
+	if err != nil {
+		return expectedRevision, false, err
+	}
+	if !found || poll.Attempt == nil || strings.TrimSpace(poll.Attempt.ID) != strings.TrimSpace(attemptID) {
+		return expectedRevision, false, nil
+	}
+	// Only a revision explicitly adopted by the active attempt is refreshable.
+	// Generic schedule/cursor mutations do not update this field and therefore
+	// still make an old handler result stale.
+	if poll.PollRevision != poll.Attempt.ExpectedPollRevision {
+		return expectedRevision, false, nil
+	}
+	if poll.PollRevision > expectedRevision {
+		return poll.PollRevision, true, nil
+	}
+	return expectedRevision, true, nil
+}
+
+func normalizeFrontierEpochForPoll(poll teamstore.ChatPollState) uint64 {
+	if poll.FrontierEpoch == 0 {
+		return 1
+	}
+	return poll.FrontierEpoch
+}
+
 type pollMessageWindowResult struct {
-	Handled            bool
-	ActionLimitReached bool
-	ActiveClaimHeld    bool
-	ActivityAt         time.Time
-	MaxModified        time.Time
-	WindowFull         bool
-	Fetched            int
+	Handled                      bool
+	ActionLimitReached           bool
+	ActiveClaimHeld              bool
+	PageComplete                 bool
+	PendingRecordRefetchFailedID string
+	QuarantinedRecordIDs         []string
+	ActivityAt                   time.Time
+	MaxModified                  time.Time
+	WindowFull                   bool
+	Fetched                      int
 }
 
 func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, role inboundPollRole, poll teamstore.ChatPollState, hasPoll bool, window MessageWindow, top int, maxActions int, handle func(context.Context, ChatMessage, string) error) (pollMessageWindowResult, error) {
@@ -2276,12 +2681,28 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		WindowFull: window.Truncated || len(msgs) >= normalizedMessageTop(top),
 		Fetched:    len(msgs),
 	}
-	if !hasPoll || !poll.Seeded {
+	// Only an explicitly staged baseline receipt may establish the initial
+	// boundary. A mutable `Seeded == false` check would discard a receipt after
+	// a crash between staging and the seed commit.
+	if window.baselineOnly {
+		// A staged baseline is an explicit initialization boundary. Its records
+		// are historical regardless of what the in-memory registry happens to
+		// contain after a restart; never let a partially persisted projection
+		// turn the same baseline page into live user input.
+		result.MaxModified = maxMessageModifiedTime(msgs)
+		for _, msg := range msgs {
+			b.markRegistrySeen(chatID, msg.ID)
+		}
+		result.PageComplete = true
+		return result, nil
+	}
+	if poll.PendingPage == nil && (!hasPoll || !poll.Seeded) {
 		if !b.registryChatHasSeenMessagesForPoll(chatID) {
 			result.MaxModified = maxMessageModifiedTime(msgs)
 			for _, msg := range msgs {
 				b.markRegistrySeen(chatID, msg.ID)
 			}
+			result.PageComplete = true
 			return result, nil
 		}
 	}
@@ -2295,14 +2716,58 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 	activeClaimHeldCursor := false
 	for i, msg := range msgs {
 		if session := b.sessionByChatIDForPoll(chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
+			// Containment must isolate unprovenanced helper echoes without
+			// discarding a real user message that happens to share the fetched
+			// page. Reuse the normal provenance/idempotency classifier for safe
+			// helper records; leave the first non-ignorable record in PendingPage
+			// for replay after explicit unquarantine.
+			legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
+			ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
+			if err != nil {
+				return result, err
+			}
+			if ignore || isPromptlessTeamsAttachmentPlaceholderMessage(msg) {
+				b.markRegistrySeen(chatID, msg.ID)
+				recordMessageProgress(msg)
+				continue
+			}
+			result.ActionLimitReached = true
+			break
+		}
+		if msg.quarantinedForPoll {
+			// This is an explicit terminal disposition for one oversized Graph
+			// record after bounded re-fetch failures. Consume only this record;
+			// later records in the same staged page remain eligible for normal
+			// handling and the page can finally advance.
 			b.markRegistrySeen(chatID, msg.ID)
 			recordMessageProgress(msg)
+			result.QuarantinedRecordIDs = append(result.QuarantinedRecordIDs, msg.ID)
 			continue
+		}
+		if msg.oversizedForPoll {
+			// The list decoder retained only stable identity/order metadata for
+			// this record. Re-fetch the individual message under the larger,
+			// explicitly bounded recovery limit before classification. A failed
+			// re-fetch leaves the staged page untouched, so retry/backoff can
+			// recover it without silently dropping a user prompt.
+			readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
+			fullMessage, fetchErr := b.readClient().GetMessageForPoll(readCtx, chatID, msg.ID)
+			cancelRead()
+			if fetchErr != nil {
+				result.PendingRecordRefetchFailedID = msg.ID
+				return result, fetchErr
+			}
+			if strings.TrimSpace(fullMessage.ID) != strings.TrimSpace(msg.ID) {
+				return result, fmt.Errorf("Graph message re-fetch changed identity: got %q, want %q", fullMessage.ID, msg.ID)
+			}
+			if fetchedChatID := strings.TrimSpace(fullMessage.ChatID); fetchedChatID != "" && fetchedChatID != strings.TrimSpace(chatID) {
+				return result, fmt.Errorf("Graph message re-fetch changed chat: got %q, want %q", fetchedChatID, chatID)
+			}
+			msg = fullMessage
 		}
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
 		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
 		if err != nil {
-			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
 		if ignore {
@@ -2325,7 +2790,6 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			var ignoreForAudience bool
 			msg, text, ignoreForAudience, err = b.prepareWorkChatMessageForAudience(ctx, chatID, msg, text)
 			if err != nil {
-				b.recordChatPollHandlerError(ctx, chatID, poll, err)
 				return result, err
 			}
 			if ignoreForAudience {
@@ -2335,7 +2799,6 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			}
 			if strings.TrimSpace(text) == "" && len(msg.Attachments) == 0 && len(HostedContentIDsFromHTML(msg.Body.Content)) == 0 {
 				if err := b.sendToChat(ctx, chatID, "Mention received, but there is no Codex request text. Add the task after `@codex`."); err != nil {
-					b.recordChatPollHandlerError(ctx, chatID, poll, err)
 					return result, err
 				}
 				b.markRegistrySeen(chatID, msg.ID)
@@ -2345,7 +2808,6 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		}
 		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
 		if err != nil {
-			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
 		if !claimed {
@@ -2367,7 +2829,6 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		if b.currentLeaseGeneration() > 0 {
 			if err := b.ensureActiveControlLease(ctx); err != nil {
 				releaseGlobalInbound(ctx, globalClaim)
-				b.recordChatPollHandlerError(ctx, chatID, poll, err)
 				return result, err
 			}
 		}
@@ -2376,19 +2837,16 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 				b.markRegistrySent(chatID, msg.ID)
 				b.markRegistrySeen(chatID, msg.ID)
 				if completeErr := completeGlobalInbound(ctx, globalClaim); completeErr != nil {
-					_ = b.store.RecordChatPollError(ctx, chatID, completeErr.Error())
 					return result, completeErr
 				}
 				recordMessageProgress(msg)
 				continue
 			}
 			releaseGlobalInbound(ctx, globalClaim)
-			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
 		b.markRegistrySeen(chatID, msg.ID)
 		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
-			b.recordChatPollHandlerError(ctx, chatID, poll, err)
 			return result, err
 		}
 		recordMessageProgress(msg)
@@ -2406,6 +2864,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		result.ActiveClaimHeld = true
 		result.MaxModified = poll.LastModifiedCursor
 	}
+	result.PageComplete = !result.ActionLimitReached && !result.ActiveClaimHeld
 	return result, nil
 }
 
@@ -2428,11 +2887,24 @@ func stalePollContinuationError(err error) bool {
 	if !errors.As(err, &graphErr) {
 		return false
 	}
+	// This compatibility helper is used only by older callers that have
+	// already established that the request was a continuation. The production
+	// poll path uses stalePollContinuationErrorForPath, which requires a token
+	// clue for ambiguous 404/410 responses.
+	return graphErr.StatusCode == http.StatusGone || graphErr.StatusCode == http.StatusNotFound ||
+		graphErr.StatusCode == http.StatusBadRequest && graphContinuationTokenError(graphErr)
+}
+
+func stalePollContinuationErrorForPath(path string, err error) bool {
+	var graphErr *GraphStatusError
+	if !errors.As(err, &graphErr) {
+		return false
+	}
 	switch graphErr.StatusCode {
 	case http.StatusGone:
-		return true
+		return graphContinuationTokenError(graphErr) || strings.Contains(strings.ToLower(path), "skiptoken")
 	case http.StatusNotFound:
-		return true
+		return graphContinuationTokenError(graphErr)
 	case http.StatusBadRequest:
 		return graphContinuationTokenError(graphErr)
 	default:
@@ -2451,17 +2923,6 @@ func graphContinuationTokenError(err *GraphStatusError) bool {
 		}
 	}
 	return false
-}
-
-func (b *Bridge) recordChatPollHandlerError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
-	if b == nil || b.store == nil || err == nil {
-		return
-	}
-	if isGraphRateLimitError(err) {
-		b.recordChatPollBackoffError(ctx, chatID, poll, err)
-		return
-	}
-	_ = b.store.RecordChatPollError(ctx, chatID, err.Error())
 }
 
 func (b *Bridge) recordChatPollBackoffError(ctx context.Context, chatID string, poll teamstore.ChatPollState, err error) {
@@ -2703,7 +3164,7 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 			parkCtx, cancel = context.WithTimeout(ctx, autoParkSweepGraphTimeout)
 		}
 		countedCandidate := false
-		if strings.TrimSpace(poll.ContinuationPath) != "" {
+		if pollPageHasOperationalFrontier(poll) {
 			handled, err := b.recoverIdleWorkChatContinuationBeforePark(parkCtx, state, session, poll)
 			if err != nil {
 				cancel()
@@ -2732,7 +3193,7 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 			}
 			state = latestState
 			session, poll, decision, ok = b.idleWorkChatAutoParkDecision(state, candidate, now)
-			if !ok || strings.TrimSpace(poll.ContinuationPath) != "" {
+			if !ok || pollPageHasOperationalFrontier(poll) {
 				cancel()
 				if processed >= autoParkCandidatesPerSweep {
 					break
@@ -2756,7 +3217,7 @@ func (b *Bridge) sweepIdleWorkChatAutoPark(ctx context.Context, now time.Time) e
 }
 
 func (b *Bridge) recoverIdleWorkChatContinuationBeforePark(ctx context.Context, state teamstore.State, session Session, poll teamstore.ChatPollState) (bool, error) {
-	if strings.TrimSpace(poll.ContinuationPath) == "" {
+	if !pollPageHasOperationalFrontier(poll) {
 		return false, nil
 	}
 	// The poll window performs audience/provenance work before invoking the
@@ -2820,6 +3281,16 @@ func (b *Bridge) idleWorkChatAutoParkDecision(state teamstore.State, candidate t
 		SessionUpdatedAt: session.UpdatedAt,
 		Now:              now,
 	})
+	operational := pollPageHasOperationalFrontier(poll)
+	if operational {
+		// An idle chat with P, pending data, or an open gap is a recovery
+		// candidate, not a park candidate. Drain one due quantum and re-read
+		// the durable row before sending any park notice.
+		if !decision.Due {
+			return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
+		}
+		return session, poll, decision, true
+	}
 	if !decision.ShouldPark || !decision.ShouldNotifyPark {
 		return Session{}, teamstore.ChatPollState{}, inboundPollDecision{}, false
 	}
@@ -2848,15 +3319,14 @@ func inboundPollDecisionScheduleUpdate(decision inboundPollDecision) (teamstore.
 		return teamstore.ChatPollScheduleUpdate{}, false
 	}
 	return teamstore.ChatPollScheduleUpdate{
-		ChatID:                decision.ChatID,
-		PollState:             decision.State,
-		PreviousPollState:     decision.PreviousState,
-		NextPollAt:            decision.NextPollAt,
-		LastActivityAt:        decision.LastActivityAt,
-		BlockedUntil:          decision.BlockedUntil,
-		ClearBlockedUntil:     decision.State != inboundPollStateBlocked,
-		ClearContinuationPath: decision.State == inboundPollStateParked,
-		ResetFailures:         decision.State == inboundPollStateParked,
+		ChatID:            decision.ChatID,
+		PollState:         decision.State,
+		PreviousPollState: decision.PreviousState,
+		NextPollAt:        decision.NextPollAt,
+		LastActivityAt:    decision.LastActivityAt,
+		BlockedUntil:      decision.BlockedUntil,
+		ClearBlockedUntil: decision.State != inboundPollStateBlocked && decision.BlockedUntil.IsZero(),
+		ResetFailures:     decision.State == inboundPollStateParked,
 	}, true
 }
 
@@ -2895,11 +3365,14 @@ func inboundPollDecisionAlreadyPersisted(poll teamstore.ChatPollState, hasPoll b
 	if strings.TrimSpace(decision.State) == inboundPollStateBlocked {
 		return poll.BlockedUntil.Equal(decision.BlockedUntil)
 	}
+	if !decision.BlockedUntil.IsZero() {
+		return poll.BlockedUntil.Equal(decision.BlockedUntil)
+	}
 	if !poll.BlockedUntil.IsZero() {
 		return false
 	}
 	if strings.TrimSpace(decision.State) == inboundPollStateParked {
-		return strings.TrimSpace(poll.ContinuationPath) == "" && poll.FailureCount == 0 && strings.TrimSpace(poll.LastError) == "" && poll.LastErrorAt.IsZero()
+		return !pollPageHasOperationalFrontier(poll) && poll.FailureCount == 0 && strings.TrimSpace(poll.LastError) == "" && poll.LastErrorAt.IsZero()
 	}
 	return true
 }
@@ -3649,11 +4122,25 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			case teamstore.MessageOriginHelperOutbox:
 				b.markRegistrySent(chatID, msg.ID)
 				return true, nil
-			case teamstore.MessageOriginUserInbound:
+			case teamstore.MessageOriginQuarantinedEcho:
+				// This message was classified as an unprovenanced helper echo
+				// when the self-echo breaker tripped. It is a durable discard
+				// fact, not proof of a delivered outbox, but it must not be
+				// counted again when an explicit unquarantine replays the
+				// staged page.
+				b.markRegistrySent(chatID, msg.ID)
 				return true, nil
+			case teamstore.MessageOriginUserInbound:
+				// PersistInbound records provenance before QueueTurn. If the process
+				// dies, or queue admission fails, the durable event has no TurnID and
+				// remains retryable. Only a linked inbound event is a terminal
+				// duplicate; provenance alone must not suppress an unqueued prompt.
+				if !lookup.InboundNeedsQueue {
+					return true, nil
+				}
 			}
 		}
-		if lookup.HasInbound {
+		if lookup.HasInbound && !lookup.InboundNeedsQueue {
 			return true, nil
 		}
 		if lookup.HasDeliveredOutbox {
@@ -3825,7 +4312,7 @@ func (b *Bridge) trustedMathHostedContentMessage(ctx context.Context, session Se
 				return true, nil
 			}
 		}
-		if lookup.HasInbound {
+		if lookup.HasInbound && !lookup.InboundNeedsQueue {
 			return false, nil
 		}
 	}
@@ -26500,14 +26987,13 @@ func (b *Bridge) parkWorkChatSession(ctx context.Context, session *Session) (str
 		return "", err
 	}
 	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID:                session.ChatID,
-		PollState:             inboundPollStateParked,
-		PreviousPollState:     "",
-		NextPollAt:            time.Time{},
-		LastActivityAt:        now,
-		ClearBlockedUntil:     true,
-		ClearContinuationPath: true,
-		ResetFailures:         true,
+		ChatID:            session.ChatID,
+		PollState:         inboundPollStateParked,
+		PreviousPollState: "",
+		NextPollAt:        time.Time{},
+		LastActivityAt:    now,
+		ClearBlockedUntil: true,
+		ResetFailures:     true,
 	}); err != nil {
 		return "", err
 	}
@@ -26616,14 +27102,13 @@ func (b *Bridge) resumeWorkChat(ctx context.Context, session *Session, now time.
 		now = time.Now()
 	}
 	if _, err := b.store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID:                session.ChatID,
-		PollState:             inboundPollStateHot,
-		PreviousPollState:     "",
-		NextPollAt:            now,
-		LastActivityAt:        now,
-		ClearBlockedUntil:     true,
-		ClearContinuationPath: true,
-		ResetFailures:         true,
+		ChatID:            session.ChatID,
+		PollState:         inboundPollStateHot,
+		PreviousPollState: "",
+		NextPollAt:        now,
+		LastActivityAt:    now,
+		ClearBlockedUntil: true,
+		ResetFailures:     true,
 	}); err != nil {
 		return err
 	}

@@ -3007,6 +3007,77 @@ func TestSQLitePointerSchemaRejectsLegacyLoaders(t *testing.T) {
 	}
 }
 
+func TestSQLiteLegacyPointerUpgradesBeforeNormalWrite(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatPolls["legacy-pointer-frontier"] = ChatPollState{
+			ChatID: "legacy-pointer-frontier", Seeded: true, PollState: chatPollStateWarm,
+			ContinuationPath: "/chats/legacy-pointer-frontier/messages?$skiptoken=opaque",
+			FrontierEpoch:    4, QuarantinedRecordIDs: []string{"record-proof"},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy-pointer frontier: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.Close(); err != nil {
+		t.Fatalf("close current sqlite store: %v", err)
+	}
+	pointerData, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read current pointer: %v", err)
+	}
+	var pointer map[string]any
+	if err := json.Unmarshal(pointerData, &pointer); err != nil {
+		t.Fatalf("decode current pointer: %v", err)
+	}
+	legacyPointerSchema := storeSQLitePointerSchemaVersion - 1
+	pointer["schema_version"] = legacyPointerSchema
+	legacyPointerData, err := json.Marshal(pointer)
+	if err != nil {
+		t.Fatalf("encode legacy pointer: %v", err)
+	}
+	legacyPointerData = append(legacyPointerData, '\n')
+	if err := os.WriteFile(store.Path(), legacyPointerData, 0o600); err != nil {
+		t.Fatalf("write legacy pointer: %v", err)
+	}
+	reopened, err := Open(store.Path())
+	if err != nil {
+		t.Fatalf("open legacy pointer store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	state, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("load legacy pointer store: %v", err)
+	}
+	poll, ok := state.ChatPolls["legacy-pointer-frontier"]
+	if !ok || poll.ContinuationPath == "" || len(poll.QuarantinedRecordIDs) != 1 {
+		t.Fatalf("legacy pointer frontier after load = %#v ok=%v", poll, ok)
+	}
+	upgradedData, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read upgraded pointer: %v", err)
+	}
+	var upgraded storeSQLitePointer
+	if err := json.Unmarshal(upgradedData, &upgraded); err != nil {
+		t.Fatalf("decode upgraded pointer: %v", err)
+	}
+	if upgraded.SchemaVersion != storeSQLitePointerSchemaVersion {
+		t.Fatalf("upgraded pointer schema = %d, want %d", upgraded.SchemaVersion, storeSQLitePointerSchemaVersion)
+	}
+	if _, _, err := reopened.UpdateChatPoll(ctx, "legacy-pointer-frontier", func(poll *ChatPollState) error {
+		poll.LastError = "normal writer preserved frontier"
+		return nil
+	}); err != nil {
+		t.Fatalf("normal targeted write after pointer upgrade: %v", err)
+	}
+	poll, ok, err = reopened.ChatPoll(ctx, "legacy-pointer-frontier")
+	if err != nil || !ok || poll.ContinuationPath == "" || len(poll.QuarantinedRecordIDs) != 1 {
+		t.Fatalf("frontier after normal write = %#v ok=%v err=%v", poll, ok, err)
+	}
+}
+
 func TestSchemaEightStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	ctx := context.Background()
 	seedSafetyState := func(t *testing.T, store *Store) {
@@ -3092,6 +3163,196 @@ func TestChatPollDeferredContinuationSurvivesSQLiteReopen(t *testing.T) {
 	}
 }
 
+func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if _, changed, err := store.UpdateChatPoll(ctx, "chat-attempt", func(poll *ChatPollState) error {
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.NextPollAt = time.Now()
+				return nil
+			}); err != nil || !changed {
+				t.Fatalf("seed attempt poll: changed=%v err=%v", changed, err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			now := time.Now().UTC()
+			first, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:             "chat-attempt",
+				Owner:              "machine-a",
+				ProcessIncarnation: "process-a",
+				LeaseGeneration:    12,
+				ExpectedFrontier:   "continuation:/chats/chat-attempt/messages?$skiptoken=one",
+				Now:                now,
+			})
+			if err != nil || !acquired || first.Attempt == nil {
+				t.Fatalf("begin attempt: acquired=%v attempt=%#v err=%v", acquired, first.Attempt, err)
+			}
+			second, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:             "chat-attempt",
+				Owner:              "machine-b",
+				ProcessIncarnation: "process-b",
+				LeaseGeneration:    13,
+				Now:                now.Add(time.Second),
+			})
+			if err != nil || acquired || second.Attempt == nil || second.Attempt.ID != first.Attempt.ID {
+				t.Fatalf("live attempt was replaced: acquired=%v first=%#v second=%#v err=%v", acquired, first.Attempt, second.Attempt, err)
+			}
+
+			staged, applied, err := store.MutateChatPollAttempt(ctx, "chat-attempt", first.Attempt.ID, first.PollRevision, func(poll *ChatPollState) error {
+				poll.PendingPage = &ChatPollPendingPage{
+					ReceiptID:   "receipt-attempt",
+					ChatID:      "chat-attempt",
+					RequestPath: "/chats/chat-attempt/messages?$skiptoken=one",
+				}
+				return nil
+			})
+			if err != nil || !applied || staged.Attempt == nil || staged.PendingPage == nil {
+				t.Fatalf("stage attempt page: applied=%v state=%#v err=%v", applied, staged, err)
+			}
+			staleBegin, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:                  "chat-attempt",
+				Owner:                   "machine-stale",
+				ProcessIncarnation:      "process-stale",
+				LeaseGeneration:         99,
+				ExpectedPollRevision:    first.PollRevision,
+				HasExpectedPollRevision: true,
+				Now:                     now.Add(2 * time.Second),
+			})
+			if err != nil || acquired || staleBegin.Attempt == nil || staleBegin.Attempt.ID != first.Attempt.ID {
+				t.Fatalf("stale snapshot acquired a new attempt: acquired=%v state=%#v err=%v", acquired, staleBegin, err)
+			}
+			if _, committed, err := store.CommitChatPollAttempt(ctx, "chat-attempt", first.Attempt.ID, first.PollRevision, func(poll *ChatPollState) error {
+				poll.LastError = "stale writer must not commit"
+				return nil
+			}); err != nil || committed {
+				t.Fatalf("stale attempt commit: committed=%v err=%v", committed, err)
+			}
+			abandoned, released, err := store.AbandonChatPollAttempt(ctx, "chat-attempt", first.Attempt.ID, staged.PollRevision)
+			if err != nil || !released || abandoned.Attempt != nil || abandoned.PendingPage == nil {
+				t.Fatalf("abandon attempt lost staged page: released=%v state=%#v err=%v", released, abandoned, err)
+			}
+
+			if err := store.Close(); err != nil {
+				t.Fatalf("close attempt store: %v", err)
+			}
+			reopened, err := Open(store.Path())
+			if err != nil {
+				t.Fatalf("reopen attempt store: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+			poll, ok, err := reopened.ChatPoll(ctx, "chat-attempt")
+			if err != nil || !ok || poll.Attempt != nil || poll.PendingPage == nil {
+				t.Fatalf("reopened attempt state = %#v ok=%v err=%v", poll, ok, err)
+			}
+		})
+	}
+}
+
+func TestChatPollLifecycleChangesFenceActiveAttemptAcrossBackends(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["lifecycle-session"] = SessionContext{
+					ID: "lifecycle-session", Status: SessionStatusActive, TeamsChatID: "lifecycle-chat",
+				}
+				state.ChatPolls["lifecycle-chat"] = ChatPollState{
+					ChatID: "lifecycle-chat", Seeded: true, PollState: chatPollStateWarm,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed lifecycle state: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			now := time.Now().UTC()
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: "lifecycle-chat", Owner: "machine-a", ProcessIncarnation: "process-a",
+				LeaseGeneration: 9, ExpectedFrontier: "head:/chats/lifecycle-chat/messages?$top=20", Now: now,
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin lifecycle attempt: acquired=%v attempt=%#v err=%v", acquired, attempt.Attempt, err)
+			}
+			initialRevision := attempt.PollRevision
+			quarantineReport, err := store.QuarantineSession(ctx, SessionQuarantineRequest{
+				SessionID: "lifecycle-session", Reason: "test quarantine", Now: now.Add(time.Second),
+			})
+			if err != nil || !quarantineReport.Changed {
+				t.Fatalf("quarantine lifecycle session: changed=%v err=%v", quarantineReport.Changed, err)
+			}
+			quarantined, ok, err := store.ChatPoll(ctx, "lifecycle-chat")
+			if err != nil || !ok || quarantined.PollRevision <= initialRevision || quarantined.Attempt != nil {
+				t.Fatalf("quarantine did not immediately invalidate active poll: %#v ok=%v err=%v", quarantined, ok, err)
+			}
+			if _, committed, err := store.CommitChatPollAttempt(ctx, "lifecycle-chat", attempt.Attempt.ID, initialRevision, func(poll *ChatPollState) error {
+				poll.LastError = "stale lifecycle writer must not commit"
+				return nil
+			}); err != nil || committed {
+				t.Fatalf("quarantine-fenced commit: committed=%v err=%v", committed, err)
+			}
+			unquarantineReport, err := store.UnquarantineSession(ctx, SessionUnquarantineRequest{
+				SessionID: "lifecycle-session", Now: now.Add(2 * time.Second),
+			})
+			if err != nil || !unquarantineReport.Changed {
+				t.Fatalf("unquarantine lifecycle session: changed=%v err=%v", unquarantineReport.Changed, err)
+			}
+			resumed, ok, err := store.ChatPoll(ctx, "lifecycle-chat")
+			if err != nil || !ok || resumed.PollRevision <= quarantined.PollRevision || resumed.Attempt != nil {
+				t.Fatalf("unquarantine did not retain invalidated active poll state: %#v ok=%v err=%v", resumed, ok, err)
+			}
+			if _, committed, err := store.CommitChatPollAttempt(ctx, "lifecycle-chat", attempt.Attempt.ID, initialRevision, func(poll *ChatPollState) error {
+				poll.LastError = "stale unquarantine writer must not commit"
+				return nil
+			}); err != nil || committed {
+				t.Fatalf("unquarantine-fenced commit: committed=%v err=%v", committed, err)
+			}
+
+			replacement, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:                  "lifecycle-chat",
+				Owner:                   "machine-b",
+				ProcessIncarnation:      "process-b",
+				LeaseGeneration:         10,
+				ExpectedPollRevision:    resumed.PollRevision,
+				HasExpectedPollRevision: true,
+				ExpectedFrontier:        "head:/chats/lifecycle-chat/messages?$top=20",
+				Now:                     now.Add(3 * time.Second),
+			})
+			if err != nil || !acquired || replacement.Attempt == nil {
+				t.Fatalf("begin replacement lifecycle attempt: acquired=%v attempt=%#v err=%v", acquired, replacement.Attempt, err)
+			}
+			scheduled, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:         "lifecycle-chat",
+				PollState:      chatPollStateHot,
+				NextPollAt:     now.Add(4 * time.Second),
+				LastActivityAt: now.Add(4 * time.Second),
+			})
+			if err != nil || scheduled.Attempt != nil {
+				t.Fatalf("schedule mutation did not fence active poll: state=%#v err=%v", scheduled, err)
+			}
+			if _, committed, err := store.CommitChatPollAttempt(ctx, "lifecycle-chat", replacement.Attempt.ID, replacement.PollRevision, func(poll *ChatPollState) error {
+				poll.LastError = "stale scheduler writer must not commit"
+				return nil
+			}); err != nil || committed {
+				t.Fatalf("schedule-fenced commit: committed=%v err=%v", committed, err)
+			}
+		})
+	}
+}
+
 func TestRC16JSONFixtureMigratesAndRoundTripsLegacySafetyState(t *testing.T) {
 	ctx := context.Background()
 	fixture, err := os.ReadFile(filepath.Join("testdata", "v0.1.22-rc.16-state.json"))
@@ -3104,8 +3365,9 @@ func TestRC16JSONFixtureMigratesAndRoundTripsLegacySafetyState(t *testing.T) {
 	if err := json.Unmarshal(fixture, &envelope); err != nil {
 		t.Fatalf("decode rc16 JSON fixture: %v", err)
 	}
-	if envelope.SchemaVersion != SchemaVersion-2 {
-		t.Fatalf("rc16 JSON fixture schema = %d, want %d", envelope.SchemaVersion, SchemaVersion-2)
+	const rc16JSONSchemaVersion = 6
+	if envelope.SchemaVersion != rc16JSONSchemaVersion {
+		t.Fatalf("rc16 JSON fixture schema = %d, want %d", envelope.SchemaVersion, rc16JSONSchemaVersion)
 	}
 
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -3155,8 +3417,9 @@ func TestRC16SQLitePointerFixtureLoadsAndRoundTripsLegacySafetyState(t *testing.
 	if err := json.Unmarshal(stateFixture, &legacyState); err != nil {
 		t.Fatalf("decode rc16 SQLite state fixture: %v", err)
 	}
-	if legacyState.SchemaVersion != SchemaVersion-2 {
-		t.Fatalf("rc16 SQLite state schema = %d, want %d", legacyState.SchemaVersion, SchemaVersion-2)
+	const rc16SQLiteStateSchemaVersion = 6
+	if legacyState.SchemaVersion != rc16SQLiteStateSchemaVersion {
+		t.Fatalf("rc16 SQLite state schema = %d, want %d", legacyState.SchemaVersion, rc16SQLiteStateSchemaVersion)
 	}
 
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -5380,9 +5643,17 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 	oldActivity := now.Add(-49 * time.Hour)
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["s-idle"] = SessionContext{ID: "s-idle", Status: SessionStatusActive, TeamsChatID: "chat-idle", UpdatedAt: oldActivity}
+		state.Sessions["s-frontier"] = SessionContext{ID: "s-frontier", Status: SessionStatusActive, TeamsChatID: "chat-frontier", UpdatedAt: oldActivity}
+		state.Sessions["s-pending"] = SessionContext{ID: "s-pending", Status: SessionStatusActive, TeamsChatID: "chat-pending", UpdatedAt: oldActivity}
+		state.Sessions["s-gap"] = SessionContext{ID: "s-gap", Status: SessionStatusActive, TeamsChatID: "chat-gap", UpdatedAt: oldActivity}
+		state.Sessions["s-attempt"] = SessionContext{ID: "s-attempt", Status: SessionStatusActive, TeamsChatID: "chat-attempt", UpdatedAt: oldActivity}
 		state.Sessions["s-running"] = SessionContext{ID: "s-running", Status: SessionStatusActive, TeamsChatID: "chat-running", UpdatedAt: oldActivity}
 		state.Sessions["s-recent"] = SessionContext{ID: "s-recent", Status: SessionStatusActive, TeamsChatID: "chat-recent", UpdatedAt: now}
 		state.ChatPolls["chat-idle"] = ChatPollState{ChatID: "chat-idle", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.ChatPolls["chat-frontier"] = ChatPollState{ChatID: "chat-frontier", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), ContinuationPath: "/chats/chat-frontier/messages?$skiptoken=backlog", UpdatedAt: now}
+		state.ChatPolls["chat-pending"] = ChatPollState{ChatID: "chat-pending", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), PendingPage: &ChatPollPendingPage{ReceiptID: "receipt-pending", ChatID: "chat-pending", RequestPath: "/chats/chat-pending/messages?$top=1"}, UpdatedAt: now}
+		state.ChatPolls["chat-gap"] = ChatPollState{ChatID: "chat-gap", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Gap: &ChatPollGap{Epoch: 1, Kind: "unverified-continuation"}, UpdatedAt: now}
+		state.ChatPolls["chat-attempt"] = ChatPollState{ChatID: "chat-attempt", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Attempt: &ChatPollAttempt{ID: "attempt-1", ExpiresAt: now.Add(time.Hour)}, UpdatedAt: now}
 		state.ChatPolls["chat-running"] = ChatPollState{ChatID: "chat-running", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
 		state.ChatPolls["chat-recent"] = ChatPollState{ChatID: "chat-recent", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
 		state.Turns["turn-running"] = Turn{ID: "turn-running", SessionID: "s-running", Status: TurnStatusRunning, StartedAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Minute)}
@@ -5406,7 +5677,7 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 	if got["s-idle"] {
 		t.Fatalf("idle auto-park candidate stayed in hot poll candidates: %#v", got)
 	}
-	for _, id := range []string{"s-running", "s-recent"} {
+	for _, id := range []string{"s-frontier", "s-pending", "s-gap", "s-attempt", "s-running", "s-recent"} {
 		if !got[id] {
 			t.Fatalf("candidate ids = %#v, missing %s", got, id)
 		}
@@ -5419,8 +5690,12 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 	if !handled {
 		t.Fatal("IdleWorkChatParkCandidates was not handled")
 	}
-	if len(parkCandidates) != 1 || parkCandidates[0].Session.ID != "s-idle" || parkCandidates[0].Poll.ChatID != "chat-idle" {
-		t.Fatalf("park candidates = %#v, want only s-idle", parkCandidates)
+	parkIDs := make(map[string]bool, len(parkCandidates))
+	for _, candidate := range parkCandidates {
+		parkIDs[candidate.Session.ID] = true
+	}
+	if len(parkIDs) != 5 || !parkIDs["s-idle"] || !parkIDs["s-frontier"] || !parkIDs["s-pending"] || !parkIDs["s-gap"] || !parkIDs["s-attempt"] {
+		t.Fatalf("park candidates = %#v, want clean idle plus operational recovery candidates", parkCandidates)
 	}
 }
 
@@ -11419,6 +11694,45 @@ func TestHasInboundMessage(t *testing.T) {
 	}
 }
 
+func TestMessageLookupMarksUnqueuedInboundAsRetryable(t *testing.T) {
+	for _, sqliteMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			inbound := testInbound()
+			inbound.Status = InboundStatusPersisted
+			persisted, created, err := store.PersistInbound(ctx, inbound)
+			if err != nil || !created {
+				t.Fatalf("PersistInbound created=%v err=%v", created, err)
+			}
+			if sqliteMode {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			lookup, err := store.MessageLookup(ctx, persisted.TeamsChatID, persisted.TeamsMessageID)
+			if err != nil {
+				t.Fatalf("MessageLookup persisted inbound: %v", err)
+			}
+			if !lookup.HasInbound || !lookup.InboundNeedsQueue {
+				t.Fatalf("persisted inbound lookup = %#v, want retryable inbound", lookup)
+			}
+			turn, turnCreated, err := store.QueueTurn(ctx, Turn{SessionID: persisted.SessionID, InboundEventID: persisted.ID})
+			if err != nil || !turnCreated {
+				t.Fatalf("QueueTurn created=%v err=%v", turnCreated, err)
+			}
+			lookup, err = store.MessageLookup(ctx, persisted.TeamsChatID, persisted.TeamsMessageID)
+			if err != nil {
+				t.Fatalf("MessageLookup queued inbound: %v", err)
+			}
+			if !lookup.HasInbound || lookup.InboundNeedsQueue || turn.ID == "" {
+				t.Fatalf("queued inbound lookup = %#v, turn=%#v; want linked non-retryable inbound", lookup, turn)
+			}
+		})
+	}
+}
+
 func TestMessageProvenanceRecordsHelperOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -12204,6 +12518,45 @@ func TestMessageProvenanceAllowsHelperOutboxToReplaceEarlyInbound(t *testing.T) 
 	}
 	if !strings.Contains(got.Diagnostic, "replaced user_inbound") {
 		t.Fatalf("diagnostic = %q, want replaced user_inbound", got.Diagnostic)
+	}
+}
+
+func TestMessageProvenanceQuarantineLabelNeverOverridesAuthoritativeLedger(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	record := func(messageID, origin string) MessageProvenanceRecord {
+		return MessageProvenanceRecord{
+			TeamsChatID:    "chat-quarantine-precedence",
+			TeamsMessageID: messageID,
+			Origin:         origin,
+			InboundID:      "inbound-" + messageID,
+			OutboxID:       "outbox-" + messageID,
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		messageID  string
+		first      string
+		second     string
+		wantOrigin string
+	}{
+		{name: "user wins", messageID: "user-first", first: MessageOriginUserInbound, second: MessageOriginQuarantinedEcho, wantOrigin: MessageOriginUserInbound},
+		{name: "helper wins", messageID: "helper-first", first: MessageOriginHelperOutbox, second: MessageOriginQuarantinedEcho, wantOrigin: MessageOriginHelperOutbox},
+		{name: "authoritative user refines quarantine", messageID: "quarantine-first-user", first: MessageOriginQuarantinedEcho, second: MessageOriginUserInbound, wantOrigin: MessageOriginUserInbound},
+		{name: "authoritative helper refines quarantine", messageID: "quarantine-first-helper", first: MessageOriginQuarantinedEcho, second: MessageOriginHelperOutbox, wantOrigin: MessageOriginHelperOutbox},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.RecordMessageProvenance(ctx, record(tc.messageID, tc.first)); err != nil {
+				t.Fatalf("record first provenance: %v", err)
+			}
+			if _, err := store.RecordMessageProvenance(ctx, record(tc.messageID, tc.second)); err != nil {
+				t.Fatalf("record second provenance: %v", err)
+			}
+			got, ok, err := store.MessageProvenance(ctx, "chat-quarantine-precedence", tc.messageID)
+			if err != nil || !ok || got.Origin != tc.wantOrigin {
+				t.Fatalf("provenance = %#v ok=%v err=%v, want origin %q", got, ok, err, tc.wantOrigin)
+			}
+		})
 	}
 }
 
@@ -13973,7 +14326,7 @@ func TestBoostChatPollAfterFinalAnswerGuardsAndSQLiteParity(t *testing.T) {
 					}
 					return
 				}
-				if got != after {
+				if !reflect.DeepEqual(got, after) {
 					t.Fatalf("returned poll differs from stored poll:\ngot=%#v\nafter=%#v", got, after)
 				}
 				if after.PollState != chatPollStateHot || !after.NextPollAt.Equal(boostAt) || !after.LastActivityAt.Equal(answerAt) || !after.UpdatedAt.Equal(boostAt) {
@@ -16245,6 +16598,98 @@ func TestSQLiteFullStateUpdateDoesNotResurrectClearedOwner(t *testing.T) {
 	}
 }
 
+// A targeted poll write can happen after a caller has loaded a full-state
+// snapshot. The later cold write must preserve the newer frontier and any
+// newly-created poll row, while an intentional deletion made by a current
+// snapshot must still win.
+func TestSQLiteFullStateUpdatePreservesNewerChatPollFrontier(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	old := time.Now().Add(-time.Hour).UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatPolls["chat-poll"] = ChatPollState{
+			ChatID:             "chat-poll",
+			Seeded:             true,
+			PollState:          chatPollStateWarm,
+			NextPollAt:         old,
+			LastModifiedCursor: old,
+			UpdatedAt:          old,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed chat poll: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	stale, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load stale state: %v", err)
+	}
+	if _, changed, err := store.UpdateChatPoll(ctx, "chat-poll", func(poll *ChatPollState) error {
+		poll.ContinuationPath = "/chats/chat-poll/messages?$skiptoken=new-frontier"
+		poll.NextPollAt = time.Now()
+		return nil
+	}); err != nil || !changed {
+		t.Fatalf("targeted frontier update: changed=%v err=%v", changed, err)
+	}
+	if _, changed, err := store.UpdateChatPoll(ctx, "chat-added", func(poll *ChatPollState) error {
+		poll.Seeded = true
+		poll.PollState = chatPollStateWarm
+		poll.ContinuationPath = "/chats/chat-added/messages?$skiptoken=new-frontier"
+		poll.NextPollAt = time.Now()
+		return nil
+	}); err != nil || !changed {
+		t.Fatalf("targeted new poll update: changed=%v err=%v", changed, err)
+	}
+	staleRevision := stale.ChatPolls["chat-poll"].PollRevision
+
+	stale.ServiceControl.Reason = "unrelated stale cold update"
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		return store.saveSQLiteStateUnlocked(pointer, stale)
+	}); err != nil {
+		t.Fatalf("save stale full state: %v", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after stale full-state update: %v", err)
+	}
+	frontier := state.ChatPolls["chat-poll"]
+	if frontier.ContinuationPath != "/chats/chat-poll/messages?$skiptoken=new-frontier" || frontier.PollRevision <= staleRevision {
+		t.Fatalf("newer chat poll frontier was lost: %#v (stale=%#v)", frontier, stale.ChatPolls["chat-poll"])
+	}
+	if _, ok := state.ChatPolls["chat-added"]; !ok {
+		t.Fatal("new targeted chat poll row was lost by stale full-state update")
+	}
+	if state.ServiceControl.Reason != "unrelated stale cold update" {
+		t.Fatalf("unrelated stale cold update was lost: %q", state.ServiceControl.Reason)
+	}
+
+	// Store.Update loads a current snapshot and advances the global state
+	// watermark before saving, so an explicit recreation/deletion is not
+	// mistaken for a DB-only row from a stale writer.
+	if err := store.Update(ctx, func(state *State) error {
+		delete(state.ChatPolls, "chat-added")
+		return nil
+	}); err != nil {
+		t.Fatalf("delete current chat poll: %v", err)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after explicit chat poll deletion: %v", err)
+	}
+	if _, ok := state.ChatPolls["chat-added"]; ok {
+		t.Fatal("explicit current chat poll deletion was resurrected")
+	}
+}
+
 func TestSQLiteHistoryWatchColdUpdatePreservesSplitTables(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -17536,6 +17981,7 @@ func legacyMessageLookupFromState(state State, chatID string, teamsMessageID str
 	for _, event := range state.InboundEvents {
 		if strings.TrimSpace(event.TeamsChatID) == chatID && strings.TrimSpace(event.TeamsMessageID) == teamsMessageID {
 			out.HasInbound = true
+			out.InboundNeedsQueue = inboundEventNeedsQueue(event)
 			break
 		}
 	}
@@ -17555,6 +18001,7 @@ func legacyMessageLookupFromState(state State, chatID string, teamsMessageID str
 func messageLookupEqual(left MessageLookup, right MessageLookup) bool {
 	return left.HasProvenance == right.HasProvenance &&
 		left.HasInbound == right.HasInbound &&
+		left.InboundNeedsQueue == right.InboundNeedsQueue &&
 		left.HasDeliveredOutbox == right.HasDeliveredOutbox &&
 		left.Provenance.ID == right.Provenance.ID &&
 		left.Provenance.TeamsChatID == right.Provenance.TeamsChatID &&
@@ -19361,7 +19808,7 @@ func TestQuarantineSessionIsTargetedAndFencesPendingWork(t *testing.T) {
 				t.Fatalf("linked delivery rows not contained: transcript=%#v helper=%#v artifact=%#v", state.TranscriptDeliveries, state.HelperDeliveries, state.ArtifactRecords)
 			}
 			poll := state.ChatPolls["chat-1"]
-			if poll.PollState != chatPollStateParked || !poll.NextPollAt.IsZero() || poll.ContinuationPath != "" || poll.FailureCount != 0 {
+			if poll.PollState != chatPollStateParked || !poll.NextPollAt.IsZero() || poll.ContinuationPath != "/next" || poll.FailureCount != 0 {
 				t.Fatalf("quarantined poll: %#v", poll)
 			}
 			if _, claimed, err := store.ClaimNextQueuedTurn(ctx, "s1"); err != nil || claimed {

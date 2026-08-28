@@ -26,9 +26,16 @@ const (
 	defaultBackoffMax         = 2 * time.Second
 	defaultGraphHTTPTimeout   = 30 * time.Second
 	maxGraphJSONResponseBytes = 8 << 20
-	maxHostedContentBytes     = 20 << 20
-	maxSharedFileBytes        = 20 << 20
-	maxDriveItemJSONBytes     = 2 << 20
+	// Teams messages may contain inline images/tool payloads much larger than
+	// an ordinary JSON response. Message polling gets a larger bounded envelope
+	// and compacts individual records above maxGraphMessageRecordBytes for an
+	// explicit per-message recovery read; all other Graph JSON responses retain
+	// the smaller default bound.
+	maxGraphMessagesResponseBytes = 64 << 20
+	maxGraphMessageRecordBytes    = 8 << 20
+	maxHostedContentBytes         = 20 << 20
+	maxSharedFileBytes            = 20 << 20
+	maxDriveItemJSONBytes         = 2 << 20
 	// Use Graph's documented resumable-upload path above 10 MiB. This is a
 	// protocol boundary, not an application file-size limit: larger files are
 	// still accepted up to maxTeamsTransferBytes and are sent in sessions.
@@ -126,6 +133,14 @@ type ChatMessage struct {
 	} `json:"body"`
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 	Mentions    []json.RawMessage   `json:"mentions,omitempty"`
+	// oversizedForPoll is set only by the inbound Graph decoder. It is not
+	// serialized into Teams payloads; the durable poll receipt carries the
+	// corresponding disposition separately.
+	oversizedForPoll bool
+	// quarantinedForPoll is set by a durable pending-page disposition after the
+	// bounded oversized-record re-fetch budget is exhausted. It is not a
+	// provider field and must never be sent back to Graph.
+	quarantinedForPoll bool
 }
 
 type MessageAttachment struct {
@@ -165,6 +180,10 @@ type MessageWindow struct {
 	Messages  []ChatMessage
 	Truncated bool
 	NextPath  string
+	// baselineOnly marks a page used only to establish the initial poll
+	// boundary. It is carried by the durable receipt so a restart cannot
+	// accidentally reinterpret that page as a deliverable backlog.
+	baselineOnly bool
 }
 
 type ChatMention struct {
@@ -914,6 +933,17 @@ func (g *GraphClient) GetMessageWithoutRateLimitRetry(ctx context.Context, chatI
 	return g.getMessageWithOptions(ctx, chatID, messageID, graphRequestOptions{returnRateLimitWithoutRetry: true})
 }
 
+// GetMessageForPoll re-fetches a message whose list-page body was compacted
+// because it exceeded the ordinary JSON bound. The larger bound is limited to
+// this explicit recovery read; ordinary message GETs keep the smaller default
+// response ceiling.
+func (g *GraphClient) GetMessageForPoll(ctx context.Context, chatID string, messageID string) (ChatMessage, error) {
+	return g.getMessageWithOptions(ctx, chatID, messageID, graphRequestOptions{
+		returnRateLimitWithoutRetry: true,
+		responseMaxBytes:            maxGraphMessagesResponseBytes,
+	})
+}
+
 func (g *GraphClient) getMessageWithOptions(ctx context.Context, chatID string, messageID string, opts graphRequestOptions) (ChatMessage, error) {
 	var msg ChatMessage
 	err := g.doWithOptions(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messageID), nil, &msg, opts)
@@ -1059,11 +1089,14 @@ func (g *GraphClient) ListMessagesWindowWithoutRateLimitRetry(ctx context.Contex
 }
 
 func (g *GraphClient) ListMessagesWindowFromPath(ctx context.Context, path string) (MessageWindow, error) {
+	// Keep the public/registry path on the ordinary bounded Graph response.
+	// The Teams poller uses the explicit no-retry variant below because it can
+	// safely compact oversized individual records and quarantine them by ID.
 	return g.listMessagesWindowFromPath(ctx, path, graphRequestOptions{})
 }
 
 func (g *GraphClient) ListMessagesWindowFromPathWithoutRateLimitRetry(ctx context.Context, path string) (MessageWindow, error) {
-	return g.listMessagesWindowFromPath(ctx, path, graphRequestOptions{returnRateLimitWithoutRetry: true})
+	return g.listMessagesWindowFromPath(ctx, path, graphRequestOptions{returnRateLimitWithoutRetry: true, responseMaxBytes: maxGraphMessagesResponseBytes})
 }
 
 func (g *GraphClient) listMessagesWindowFromPath(ctx context.Context, path string, opts graphRequestOptions) (MessageWindow, error) {
@@ -1085,14 +1118,101 @@ func (g *GraphClient) listMessagesWindowFromPath(ctx context.Context, path strin
 }
 
 func (g *GraphClient) listMessagesPage(ctx context.Context, path string, opts graphRequestOptions) ([]ChatMessage, string, error) {
-	var payload struct {
-		Value    []ChatMessage `json:"value"`
-		NextLink string        `json:"@odata.nextLink"`
-	}
+	var payload graphMessagePage
 	if err := g.doWithOptions(ctx, http.MethodGet, path, nil, &payload, opts); err != nil {
 		return nil, "", err
 	}
 	return payload.Value, payload.NextLink, nil
+}
+
+// graphMessagePage keeps the ordinary polling path on the old direct
+// []ChatMessage decoder. Only a response that exceeds the normal JSON bound
+// takes the RawMessage path, where individual oversized records can be
+// reduced to identity/order metadata without retaining their base64 body.
+// This is important because message polling is a hot path and an extra raw
+// copy for every ordinary page would be a permanent allocation regression.
+type graphMessagePage struct {
+	Value    []ChatMessage `json:"value"`
+	NextLink string        `json:"@odata.nextLink"`
+}
+
+func (p *graphMessagePage) UnmarshalJSON(data []byte) error {
+	if len(data) <= maxGraphJSONResponseBytes {
+		type plainGraphMessagePage struct {
+			Value    []ChatMessage `json:"value"`
+			NextLink string        `json:"@odata.nextLink"`
+		}
+		var plain plainGraphMessagePage
+		if err := json.Unmarshal(data, &plain); err != nil {
+			return err
+		}
+		p.Value = plain.Value
+		p.NextLink = plain.NextLink
+		return nil
+	}
+
+	var envelope struct {
+		Value    json.RawMessage `json:"value"`
+		NextLink string          `json:"@odata.nextLink"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return err
+	}
+	if len(envelope.Value) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Value), []byte("null")) {
+		// A large non-page response must retain the old bounded-response
+		// diagnostic. Without this check, a malformed object with an arbitrary
+		// padding field would be accepted as an empty message page.
+		return &GraphResponseTooLargeError{Limit: maxGraphJSONResponseBytes}
+	}
+	var records []json.RawMessage
+	if err := json.Unmarshal(envelope.Value, &records); err != nil {
+		return err
+	}
+	messages := make([]ChatMessage, 0, len(records))
+	for index, raw := range records {
+		if len(raw) > maxGraphMessageRecordBytes {
+			message, err := compactOversizedGraphMessage(raw)
+			if err != nil {
+				return fmt.Errorf("Graph message %d is oversized and has no safe identity: %w", index, err)
+			}
+			messages = append(messages, message)
+			continue
+		}
+		var message ChatMessage
+		if err := json.Unmarshal(raw, &message); err != nil {
+			return fmt.Errorf("decode Graph message %d: %w", index, err)
+		}
+		messages = append(messages, message)
+	}
+	p.Value = messages
+	p.NextLink = envelope.NextLink
+	return nil
+}
+
+func compactOversizedGraphMessage(raw []byte) (ChatMessage, error) {
+	var metadata struct {
+		ID                   string `json:"id"`
+		ChatID               string `json:"chatId,omitempty"`
+		CreatedDateTime      string `json:"createdDateTime"`
+		LastModifiedDateTime string `json:"lastModifiedDateTime"`
+		DeletedDateTime      string `json:"deletedDateTime,omitempty"`
+		MessageType          string `json:"messageType"`
+	}
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		return ChatMessage{}, err
+	}
+	if strings.TrimSpace(metadata.ID) == "" {
+		return ChatMessage{}, fmt.Errorf("message id is missing")
+	}
+	return ChatMessage{
+		ID:                   metadata.ID,
+		ChatID:               metadata.ChatID,
+		CreatedDateTime:      metadata.CreatedDateTime,
+		LastModifiedDateTime: metadata.LastModifiedDateTime,
+		DeletedDateTime:      metadata.DeletedDateTime,
+		MessageType:          metadata.MessageType,
+		oversizedForPoll:     true,
+	}, nil
 }
 
 func chatMessagesPath(chatID string, top int, modifiedAfter time.Time) string {
@@ -1197,6 +1317,7 @@ func trimGraphBasePath(requestURI string, baseURL string) string {
 
 type graphRequestOptions struct {
 	returnRateLimitWithoutRetry bool
+	responseMaxBytes            int64
 	// noReplayAfterFirstRequest is used for non-idempotent outbox POSTs. Once
 	// the HTTP client has handed the request to the network, an auth refresh,
 	// 429/5xx retry, or fallback must not issue a second POST with unknown
@@ -1262,7 +1383,11 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			retries++
 			continue
 		}
-		raw, err := readLimited(resp.Body, maxGraphJSONResponseBytes)
+		maxResponseBytes := int64(maxGraphJSONResponseBytes)
+		if opts.responseMaxBytes > maxResponseBytes {
+			maxResponseBytes = opts.responseMaxBytes
+		}
+		raw, err := readLimited(resp.Body, maxResponseBytes)
 		closeErr := resp.Body.Close()
 		if resp.StatusCode >= 400 {
 			// Preserve the HTTP status as the primary diagnostic even when the

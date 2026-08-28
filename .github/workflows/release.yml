@@ -445,6 +445,25 @@ jobs:
           go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
           go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
 
+      - name: Teams frontier recovery and fenced-page regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          frontier_pattern='^TestPollFrontier'
+          store_pattern='^Test(ChatPollAttemptLifecyclePersistsAndRejectsStaleWriter|ChatPollLifecycleChangesFenceActiveAttemptAcrossBackends|RC16JSONFixtureMigratesAndRoundTripsLegacySafetyState|RC16SQLitePointerFixtureLoadsAndRoundTripsLegacySafetyState|SQLiteFullStateUpdatePreservesNewerChatPollFrontier|SQLiteLegacyPointerUpgradesBeforeNormalWrite)$'
+          frontier_tests="$(go test ./internal/teams -list "$frontier_pattern")"
+          if ! grep -q '^Test' <<<"$frontier_tests"; then
+            echo "frontier selector matched no tests" >&2
+            exit 1
+          fi
+          store_tests="$(go test ./internal/teams/store -list "$store_pattern")"
+          if ! grep -q '^Test' <<<"$store_tests"; then
+            echo "fenced-store selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams -count=1 -run "$frontier_pattern" -v
+          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
+
       - name: Teams test user-directory isolation guard
         if: runner.os == 'Linux'
         shell: bash

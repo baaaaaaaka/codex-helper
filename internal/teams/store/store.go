@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -27,12 +28,12 @@ import (
 )
 
 const (
-	// SchemaVersion 8 is an intentional upgrade-only boundary.  The
-	// unresolved-execution anchor, terminal outbox fences, and deferred Graph
-	// continuation frontier are safety data; helpers built against schema 7 do
-	// not know how to preserve them.  A schema-8 store must therefore never be
+	// SchemaVersion 9 is an intentional upgrade-only boundary. The durable
+	// Graph frontier, immutable pending-page receipt, poll attempt capability,
+	// and revision fields are safety data; helpers built against schema 8 do not
+	// know how to preserve them. A schema-9 store must therefore never be
 	// written by an older helper.
-	SchemaVersion = 8
+	SchemaVersion = 9
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -121,8 +122,9 @@ const (
 )
 
 const (
-	MessageOriginHelperOutbox = "helper_outbox"
-	MessageOriginUserInbound  = "user_inbound"
+	MessageOriginHelperOutbox    = "helper_outbox"
+	MessageOriginUserInbound     = "user_inbound"
+	MessageOriginQuarantinedEcho = "quarantined_helper_echo"
 )
 
 var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
@@ -1208,8 +1210,131 @@ type ChatPollState struct {
 	LastErrorAt              time.Time `json:"last_error_at,omitempty"`
 	LastWindowFullAt         time.Time `json:"last_window_full_at,omitempty"`
 	LastWindowFullMessage    string    `json:"last_window_full_message,omitempty"`
-	UpdatedAt                time.Time `json:"updated_at,omitempty"`
+	// PollRevision is the compare-and-swap version for the operational chat
+	// frontier. ScheduleRevision is kept separate so a scheduling-only update
+	// cannot make a Graph page response look current when it used an older
+	// operational state.
+	PollRevision     uint64 `json:"poll_revision,omitempty"`
+	ScheduleRevision uint64 `json:"schedule_revision,omitempty"`
+	// FrontierEpoch changes when a legacy deferred lane is promoted or a
+	// caller explicitly reseeds the chat. A pending page from another epoch is
+	// never replayed into the current frontier.
+	FrontierEpoch uint64 `json:"frontier_epoch,omitempty"`
+	// PendingPage is a bounded immutable receipt for the page being handled. It
+	// lets a restart replay the exact Graph response without skipping records
+	// that followed an action limit.
+	PendingPage *ChatPollPendingPage `json:"pending_page,omitempty"`
+	// Gap is an explicit, directional degraded recovery lane. RecoveryCursor
+	// is not SafeCursor proof and must never be substituted for it.
+	Gap *ChatPollGap `json:"gap,omitempty"`
+	// ContinuationFailure* bound permanent skip-token failures and repeated
+	// pages; otherwise one poisoned continuation can starve newer messages.
+	ContinuationFailureCount    int       `json:"continuation_failure_count,omitempty"`
+	ContinuationFirstFailureAt  time.Time `json:"continuation_first_failure_at,omitempty"`
+	ContinuationLastFailureAt   time.Time `json:"continuation_last_failure_at,omitempty"`
+	ContinuationLastPath        string    `json:"continuation_last_path,omitempty"`
+	ContinuationNoProgressCount int       `json:"continuation_no_progress_count,omitempty"`
+	// Continuation histories are bounded evidence for detecting a Graph cursor
+	// cycle. The nextLink is opaque and can change even when Graph keeps
+	// returning the same page, so the last failure alone is not enough to
+	// distinguish progress from a livelock.
+	ContinuationPathHistory            []string `json:"continuation_path_history,omitempty"`
+	ContinuationPageFingerprintHistory []string `json:"continuation_page_fingerprint_history,omitempty"`
+	// QuarantinedRecordIDs records individual Graph records that could not be
+	// re-fetched after the bounded oversized-record policy. It is intentionally
+	// bounded and independent of the chat-wide gap state: one irrecoverable
+	// attachment must not pin later messages in the same page.
+	QuarantinedRecordIDs []string `json:"quarantined_record_ids,omitempty"`
+	// Attempt is the short-lived durable capability for the poll owner.
+	Attempt   *ChatPollAttempt `json:"attempt,omitempty"`
+	UpdatedAt time.Time        `json:"updated_at,omitempty"`
 }
+
+// ChatPollPendingPage is transport-neutral: store cannot import the Teams
+// package, so the bridge stores normalized JSON message envelopes. The bridge
+// bounds every record/page before writing it. RecordIDs and RecordHashes make
+// a changed replay payload explicit instead of silently accepting it.
+type ChatPollPendingPage struct {
+	ReceiptID          string `json:"receipt_id"`
+	ChatID             string `json:"chat_id"`
+	RequestPath        string `json:"request_path"`
+	RequestFingerprint string `json:"request_fingerprint,omitempty"`
+	Frontier           string `json:"frontier,omitempty"`
+	FrontierEpoch      uint64 `json:"frontier_epoch,omitempty"`
+	// BaselineOnly is true only for the first page used to seed a chat. It must
+	// survive a crash between page staging and the seed commit; otherwise a
+	// replay can silently discard a real user message as historical baseline.
+	BaselineOnly    bool              `json:"baseline_only,omitempty"`
+	NextPath        string            `json:"next_path,omitempty"`
+	Records         []json.RawMessage `json:"records,omitempty"`
+	RecordIDs       []string          `json:"record_ids,omitempty"`
+	RecordHashes    []string          `json:"record_hashes,omitempty"`
+	Dispositions    []string          `json:"dispositions,omitempty"`
+	RefetchFailures []int             `json:"refetch_failures,omitempty"`
+	ReceivedAt      time.Time         `json:"received_at,omitempty"`
+}
+
+// ChatPollGap represents a deliberate, directional recovery lane. SafeCursor
+// is the last normal cursor known safe; RecoveryCursor only permits bounded
+// newer progress while the unresolved range remains visible.
+type ChatPollGap struct {
+	Epoch          uint64    `json:"epoch"`
+	Kind           string    `json:"kind"`
+	Reason         string    `json:"reason,omitempty"`
+	Evidence       string    `json:"evidence,omitempty"`
+	FrontierPath   string    `json:"frontier_path,omitempty"`
+	RecoveryPath   string    `json:"recovery_path,omitempty"`
+	SafeCursor     time.Time `json:"safe_cursor,omitempty"`
+	RecoveryCursor time.Time `json:"recovery_cursor,omitempty"`
+	OpenedAt       time.Time `json:"opened_at,omitempty"`
+	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
+	NoticeEpoch    uint64    `json:"notice_epoch,omitempty"`
+	// QuarantinedPage retains the bounded receipt that could not be safely
+	// replayed. It is evidence for manual repair/reconciliation only; the
+	// normal scheduler never treats it as an executable pending page.
+	QuarantinedPage *ChatPollPendingPage `json:"quarantined_page,omitempty"`
+}
+
+// ChatPollAttempt is the durable capability used to fence stale Graph and
+// handler completions. Owner and ProcessIncarnation prevent same-machine ABA
+// takeovers from being mistaken for the original process.
+type ChatPollAttempt struct {
+	ID                       string    `json:"id"`
+	Owner                    string    `json:"owner,omitempty"`
+	ProcessIncarnation       string    `json:"process_incarnation,omitempty"`
+	LeaseGeneration          int64     `json:"lease_generation,omitempty"`
+	ExpectedPollRevision     uint64    `json:"expected_poll_revision,omitempty"`
+	ExpectedScheduleRevision uint64    `json:"expected_schedule_revision,omitempty"`
+	ExpectedFrontier         string    `json:"expected_frontier,omitempty"`
+	ExpectedReceiptID        string    `json:"expected_receipt_id,omitempty"`
+	StartedAt                time.Time `json:"started_at,omitempty"`
+	ExpiresAt                time.Time `json:"expires_at,omitempty"`
+}
+
+type ChatPollAttemptRequest struct {
+	ChatID                  string
+	Owner                   string
+	ProcessIncarnation      string
+	LeaseGeneration         int64
+	ExpectedPollRevision    uint64
+	HasExpectedPollRevision bool
+	ExpectedFrontier        string
+	ExpectedReceiptID       string
+	Now                     time.Time
+	TTL                     time.Duration
+}
+
+var (
+	ErrChatPollAttemptBusy  = errors.New("chat poll attempt is already owned")
+	ErrChatPollAttemptStale = errors.New("chat poll attempt is stale")
+	// ErrChatPollStateConflict is returned when a full SQLite state snapshot and
+	// the targeted chat-poll row have the same revision but different payloads.
+	// Choosing either payload would be an unsafe guess, so the cold write fails
+	// closed and leaves the durable row intact.
+	ErrChatPollStateConflict = errors.New("chat poll state conflict")
+)
+
+var chatPollAttemptSequence atomic.Uint64
 
 type IdleWorkChatParkCandidate struct {
 	Session SessionContext
@@ -1223,6 +1348,9 @@ func chatPollParkedSkipEligible(poll ChatPollState) bool {
 		poll.BlockedUntil.IsZero() &&
 		strings.TrimSpace(poll.ContinuationPath) == "" &&
 		strings.TrimSpace(poll.DeferredContinuationPath) == "" &&
+		poll.PendingPage == nil &&
+		poll.Gap == nil &&
+		poll.Attempt == nil &&
 		poll.FailureCount == 0 &&
 		strings.TrimSpace(poll.LastError) == "" &&
 		poll.LastErrorAt.IsZero()
@@ -1639,9 +1767,13 @@ type MessageProvenanceRecord struct {
 }
 
 type MessageLookup struct {
-	Provenance         MessageProvenanceRecord
-	HasProvenance      bool
-	HasInbound         bool
+	Provenance    MessageProvenanceRecord
+	HasProvenance bool
+	HasInbound    bool
+	// InboundNeedsQueue identifies a durable user message that was recorded
+	// before its turn was linked. It is retryable input, not a consumed
+	// duplicate; callers must not suppress it merely because HasInbound is true.
+	InboundNeedsQueue  bool
 	HasDeliveredOutbox bool
 }
 
@@ -1668,6 +1800,7 @@ type messageLookupCache struct {
 	Provenance          map[string]MessageProvenanceRecord
 	ProvenanceCanonical map[string]bool
 	Inbound             map[string]bool
+	InboundNeedsQueue   map[string]bool
 	DeliveredOutbox     map[string]bool
 }
 
@@ -12110,6 +12243,10 @@ func (s *Store) RecordChatPollSuccessWithContinuation(ctx context.Context, chatI
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
 		poll, changed := applyChatPollSuccessLocked(state, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now)
+		if changed {
+			invalidateChatPollAttempt(&poll)
+			state.ChatPolls[chatID] = poll
+		}
 		out = poll
 		if !changed {
 			return errStoreNoChange
@@ -12155,6 +12292,10 @@ func (s *Store) RecordChatPollSuccessWithContinuationAndSchedule(ctx context.Con
 			}
 			changed = changed || scheduleChanged
 		}
+		if changed {
+			invalidateChatPollAttempt(&poll)
+			state.ChatPolls[chatID] = poll
+		}
 		out = poll
 		if !changed {
 			return errStoreNoChange
@@ -12180,6 +12321,10 @@ func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor 
 	poll.BlockedUntil = time.Time{}
 	poll.FailureCount = 0
 	poll.ContinuationPath = continuationPath
+	if strings.TrimSpace(continuationPath) == "" {
+		poll.ContinuationPathHistory = nil
+		poll.ContinuationPageFingerprintHistory = nil
+	}
 	if windowFull {
 		poll.LastWindowFullAt = now
 		poll.LastWindowFullMessage = fmt.Sprintf("Graph returned a full message window (%d messages); older unprocessed messages may require a larger recovery pass", fetched)
@@ -12187,6 +12332,7 @@ func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor 
 		poll.LastWindowFullMessage = ""
 	}
 	poll.UpdatedAt = now
+	poll.PollRevision++
 	state.ChatPolls[chatID] = poll
 	return poll, true
 }
@@ -12231,7 +12377,9 @@ func (s *Store) RecordChatPollErrorWithBlock(ctx context.Context, chatID string,
 	}
 	return s.Update(ctx, func(state *State) error {
 		now := time.Now()
-		applyChatPollErrorWithBlockLocked(state, chatID, message, blockedUntil, now)
+		poll := applyChatPollErrorWithBlockLocked(state, chatID, message, blockedUntil, now)
+		invalidateChatPollAttempt(&poll)
+		state.ChatPolls[chatID] = poll
 		return nil
 	})
 }
@@ -12254,6 +12402,7 @@ func applyChatPollErrorWithBlockLocked(state *State, chatID string, message stri
 		poll.NextPollAt = blockedUntil
 	}
 	poll.UpdatedAt = now
+	poll.PollRevision++
 	state.ChatPolls[chatID] = poll
 	return poll
 }
@@ -12273,6 +12422,8 @@ func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollSched
 			out = poll
 			return errStoreNoChange
 		}
+		invalidateChatPollAttempt(&poll)
+		state.ChatPolls[poll.ChatID] = poll
 		out = poll
 		return nil
 	})
@@ -12295,6 +12446,10 @@ func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollS
 			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(state, update, now)
 			if err != nil {
 				return err
+			}
+			if updateChanged {
+				invalidateChatPollAttempt(&poll)
+				state.ChatPolls[poll.ChatID] = poll
 			}
 			nextOut[poll.ChatID] = poll
 			changed = changed || updateChanged
@@ -12334,6 +12489,14 @@ func (s *Store) BoostChatPollAfterFinalAnswer(ctx context.Context, req FinalAnsw
 		next, updateChanged, err := applyChatPollScheduleUpdateLocked(state, finalAnswerPollBoostScheduleUpdate(req), req.NextPollAt)
 		if err != nil {
 			return err
+		}
+		if updateChanged && next.Attempt != nil {
+			// A final-answer delivery may race the poll that discovered the
+			// inbound page. This update changes only scheduling/activity fields;
+			// merge it into the active poll capability instead of making the
+			// page owner look stale and leaving its receipt stranded.
+			next.Attempt.ExpectedPollRevision = next.PollRevision
+			next.Attempt.ExpectedScheduleRevision = next.ScheduleRevision
 		}
 		out = next
 		changed = updateChanged
@@ -12467,9 +12630,16 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 			changed = true
 		}
 	}
-	if update.ClearContinuationPath && poll.ContinuationPath != "" {
-		poll.ContinuationPath = ""
-		changed = true
+	if update.ClearContinuationPath {
+		if poll.ContinuationPath != "" {
+			poll.ContinuationPath = ""
+			changed = true
+		}
+		if len(poll.ContinuationPathHistory) != 0 || len(poll.ContinuationPageFingerprintHistory) != 0 {
+			poll.ContinuationPathHistory = nil
+			poll.ContinuationPageFingerprintHistory = nil
+			changed = true
+		}
 	}
 	if update.ClearDeferredContinuationPath {
 		if poll.DeferredContinuationPath != "" {
@@ -12501,6 +12671,8 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 		return poll, false, nil
 	}
 	poll.UpdatedAt = now
+	poll.PollRevision++
+	poll.ScheduleRevision++
 	state.ChatPolls[chatID] = poll
 	return poll, true, nil
 }
@@ -12522,6 +12694,9 @@ func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, a
 		poll.ChatID = chatID
 		poll.ParkNoticeSentAt = at
 		poll.UpdatedAt = time.Now()
+		poll.PollRevision++
+		poll.ScheduleRevision++
+		invalidateChatPollAttempt(&poll)
 		state.ChatPolls[chatID] = poll
 		out = poll
 		return nil
@@ -12672,11 +12847,17 @@ func applySessionQuarantine(state *State, req SessionQuarantineRequest) (Session
 	if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
 		poll := state.ChatPolls[chatID]
 		poll.ChatID = chatID
+		// Quarantine is a lifecycle boundary for the poll owner. Advance both
+		// revisions and invalidate the capability immediately. The old handler's
+		// attempt ID can no longer commit, while a later explicit unquarantine can
+		// replay the retained page without waiting for the old TTL to expire.
+		poll.PollRevision++
+		poll.ScheduleRevision++
+		poll.Attempt = nil
 		poll.PreviousPollState = poll.PollState
 		poll.PollState = chatPollStateParked
 		poll.NextPollAt = time.Time{}
 		poll.BlockedUntil = time.Time{}
-		poll.ContinuationPath = ""
 		poll.FailureCount = 0
 		poll.LastError = ""
 		poll.LastErrorAt = time.Time{}
@@ -12734,11 +12915,17 @@ func applySessionUnquarantine(state *State, req SessionUnquarantineRequest) (Ses
 	if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
 		poll := state.ChatPolls[chatID]
 		poll.ChatID = chatID
+		// Unquarantine starts a new scheduling epoch. Any poll attempt that was
+		// active while the session was quarantined is invalidated so a new owner
+		// can replay the retained page immediately; the old attempt ID remains
+		// unusable because it was cleared together with the lifecycle revision.
+		poll.PollRevision++
+		poll.ScheduleRevision++
+		poll.Attempt = nil
 		poll.PreviousPollState = poll.PollState
 		poll.PollState = chatPollStateCold
 		poll.NextPollAt = req.Now
 		poll.BlockedUntil = time.Time{}
-		poll.ContinuationPath = ""
 		poll.FailureCount = 0
 		poll.ParkedAt = time.Time{}
 		poll.ParkNoticeSentAt = time.Time{}
@@ -12919,6 +13106,10 @@ func (s *Store) loadUnlocked(ctx context.Context) (State, error) {
 		s.clearSQLitePointerCacheUnlocked()
 		return State{}, err
 	} else if ok {
+		if pointer, err = s.upgradeSQLitePointerUnlocked(pointer); err != nil {
+			s.clearSQLitePointerCacheUnlocked()
+			return State{}, err
+		}
 		if info, statErr := os.Stat(s.path); statErr == nil {
 			s.cacheSQLitePointerUnlocked(pointer, info, false)
 			s.sqlitePointerFingerprint = sha256Bytes(data)
@@ -13906,9 +14097,27 @@ func recordMessageProvenanceLocked(state *State, record MessageProvenanceRecord,
 			existing.Diagnostic = "ignored user_inbound provenance for helper_outbox Teams message"
 			state.MessageProvenance[existing.ID] = existing
 			return existing
+		case strings.TrimSpace(existing.Origin) == MessageOriginHelperOutbox && strings.TrimSpace(record.Origin) == MessageOriginQuarantinedEcho:
+			// A breaker observation is weaker than a durable outbound ledger.
+			// Never let a later quarantine pass hide the fact that this ID was
+			// already emitted by the helper.
+			existing.Diagnostic = "ignored quarantined_echo provenance for helper_outbox Teams message"
+			state.MessageProvenance[existing.ID] = existing
+			return existing
+		case strings.TrimSpace(existing.Origin) == MessageOriginUserInbound && strings.TrimSpace(record.Origin) == MessageOriginQuarantinedEcho:
+			// The inbound ledger is stronger than a best-effort breaker label.
+			// Preserve it so a transient quarantine cannot turn a real user
+			// message into a permanently suppressed helper echo.
+			existing.Diagnostic = "ignored quarantined_echo provenance for user_inbound Teams message"
+			state.MessageProvenance[existing.ID] = existing
+			return existing
 		case strings.TrimSpace(existing.Origin) == MessageOriginUserInbound && strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox:
 			record.Diagnostic = "replaced user_inbound provenance with helper_outbox Teams message"
 			suppressInboundExecutionForHelperOutboxLocked(state, existing, now)
+		case strings.TrimSpace(existing.Origin) == MessageOriginQuarantinedEcho && (strings.TrimSpace(record.Origin) == MessageOriginUserInbound || strings.TrimSpace(record.Origin) == MessageOriginHelperOutbox):
+			// A later authoritative ledger record can refine a breaker-only
+			// observation. Allow that stronger provenance to replace quarantine.
+			record.Diagnostic = "replaced quarantined_echo provenance with authoritative Teams message record"
 		}
 	}
 	if record.CreatedAt.IsZero() {
@@ -14025,6 +14234,7 @@ func buildMessageLookupCache(state State, stamp stateFileStamp) messageLookupCac
 		Provenance:          make(map[string]MessageProvenanceRecord, len(state.MessageProvenance)),
 		ProvenanceCanonical: make(map[string]bool, len(state.MessageProvenance)),
 		Inbound:             make(map[string]bool, len(state.InboundEvents)+len(state.MessageProvenance)),
+		InboundNeedsQueue:   make(map[string]bool, len(state.InboundEvents)),
 		DeliveredOutbox:     make(map[string]bool, len(state.OutboxMessages)+len(state.MessageProvenance)),
 	}
 	for id, record := range state.MessageProvenance {
@@ -14050,6 +14260,9 @@ func buildMessageLookupCache(state State, stamp stateFileStamp) messageLookupCac
 		key := messageLookupKey(event.TeamsChatID, event.TeamsMessageID)
 		if key != "" {
 			cache.Inbound[key] = true
+			if inboundEventNeedsQueue(event) {
+				cache.InboundNeedsQueue[key] = true
+			}
 		}
 	}
 	for _, msg := range state.OutboxMessages {
@@ -14079,6 +14292,7 @@ func (c messageLookupCache) lookup(stamp stateFileStamp, chatID string, teamsMes
 		out.HasProvenance = true
 	}
 	out.HasInbound = c.Inbound[key]
+	out.InboundNeedsQueue = c.InboundNeedsQueue[key]
 	out.HasDeliveredOutbox = c.DeliveredOutbox[key]
 	return out, true
 }
@@ -14119,13 +14333,32 @@ func messageLookupLocked(state *State, chatID string, teamsMessageID string) Mes
 			out.HasDeliveredOutbox = true
 		}
 	}
-	if _, ok := inboundEventByTeamsMessageLocked(state, chatID, teamsMessageID); ok {
+	if event, ok := inboundEventByTeamsMessageLocked(state, chatID, teamsMessageID); ok {
 		out.HasInbound = true
+		out.InboundNeedsQueue = inboundEventNeedsQueue(event)
 	}
 	if deliveredOutboxMessageLocked(state, chatID, teamsMessageID) {
 		out.HasDeliveredOutbox = true
 	}
 	return out
+}
+
+func inboundEventNeedsQueue(event InboundEvent) bool {
+	if strings.TrimSpace(event.TurnID) != "" {
+		return false
+	}
+	switch event.Status {
+	case "", InboundStatusPersisted:
+		return true
+	case InboundStatusQueued:
+		// QueueTurn commits the queued status and TurnID together. A queued
+		// event without a turn link is therefore a malformed or legacy record,
+		// not a safely retryable pre-admission event. Hold it rather than risk
+		// executing an already-admitted request a second time.
+		return false
+	default:
+		return false
+	}
 }
 
 func messageProvenanceLocked(state *State, chatID string, teamsMessageID string) (MessageProvenanceRecord, bool) {

@@ -18,8 +18,8 @@ import (
 
 // TestBridgePollRetainsOldContinuationWhenHeadWindowTimesOut combines the
 // long-outage shape with a full head window and a stalled old continuation.
-// A failed continuation must not erase either frontier: the old cursor remains
-// retryable, while the fresh head nextLink is saved independently.
+// The operational contract is one frontier per quantum: the stalled P is
+// retried first and the head is not read until P has completed.
 func TestBridgePollRetainsOldContinuationWhenHeadWindowTimesOut(t *testing.T) {
 	previousTimeout := inboundPollGraphTimeout
 	inboundPollGraphTimeout = 100 * time.Millisecond
@@ -84,14 +84,14 @@ func TestBridgePollRetainsOldContinuationWhenHeadWindowTimesOut(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("poll after stalled continuation: ok=%v err=%v state=%#v", ok, err, poll)
 	}
-	if poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=old" || poll.DeferredContinuationPath != "/chats/chat-1/messages?$skiptoken=head-next" {
-		t.Fatalf("frontiers after timeout = %#v, want old continuation plus deferred head frontier", poll)
+	if poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=old" || poll.DeferredContinuationPath != "" {
+		t.Fatalf("frontiers after timeout = %#v, want only old continuation", poll)
 	}
 	if !poll.LastModifiedCursor.Equal(cursor) {
 		t.Fatalf("cursor advanced across unresolved old continuation: got %s want %s", poll.LastModifiedCursor, cursor)
 	}
-	if got := strings.Join(handled, ","); got != "fresh head" {
-		t.Fatalf("handled after timeout = %q, want only fresh head", got)
+	if got := strings.Join(handled, ","); got != "" {
+		t.Fatalf("handled after timeout = %q, want no message", got)
 	}
 
 	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, handle); err != nil {
@@ -101,27 +101,36 @@ func TestBridgePollRetainsOldContinuationWhenHeadWindowTimesOut(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("poll after old continuation recovery: ok=%v err=%v state=%#v", ok, err, poll)
 	}
-	if poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=head-next" || poll.DeferredContinuationPath != "" {
-		t.Fatalf("frontiers after old continuation recovery = %#v, want deferred head frontier promoted", poll)
+	if poll.ContinuationPath != "" || poll.DeferredContinuationPath != "" {
+		t.Fatalf("frontiers after old continuation recovery = %#v, want drained old frontier", poll)
 	}
 
 	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, handle); err != nil {
-		t.Fatalf("recover head continuation: %v", err)
+		t.Fatalf("read fresh head: %v", err)
 	}
-	if got := strings.Join(handled, ","); got != "fresh head,old backlog,head continuation" {
-		t.Fatalf("handled messages = %q, want each frontier exactly once", got)
+	if got := strings.Join(handled, ","); got != "old backlog,fresh head" {
+		t.Fatalf("handled messages = %q, want old backlog then fresh head", got)
 	}
 	poll, ok, err = store.ChatPoll(context.Background(), "chat-1")
-	if err != nil || !ok || poll.ContinuationPath != "" || poll.DeferredContinuationPath != "" {
-		t.Fatalf("final poll state = %#v ok=%v err=%v, want both frontiers drained", poll, ok, err)
+	if err != nil || !ok || poll.ContinuationPath != "/chats/chat-1/messages?$skiptoken=head-next" || poll.DeferredContinuationPath != "" {
+		t.Fatalf("final poll state = %#v ok=%v err=%v, want fresh head continuation retained", poll, ok, err)
+	}
+
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, handle); err != nil {
+		t.Fatalf("replay fresh head page: %v", err)
+	}
+	if _, err := bridge.pollChat(context.Background(), "chat-1", 50, handle); err != nil {
+		t.Fatalf("drain fresh head continuation: %v", err)
+	}
+	if got := strings.Join(handled, ","); got != "old backlog,fresh head,head continuation" {
+		t.Fatalf("final handled messages = %q, want all records", got)
 	}
 }
 
 // TestBridgePollRetainsBothFrontiersWhenOldContinuationRateLimitsAfterFullHeadWindow
-// is the rate-limit version of the dual-frontier outage shape. A full head
-// page creates a fresh continuation while an older durable continuation is
-// still pending. The 429 must block only this chat and preserve both paths; a
-// later recovery must drain the old path before promoting the fresh one.
+// is the rate-limit version of the dual-frontier outage shape. A 429 on P is a
+// chat-scoped retry schedule, not a semantic block, and no head frontier is
+// created until P has completed.
 func TestBridgePollRetainsBothFrontiersWhenOldContinuationRateLimitsAfterFullHeadWindow(t *testing.T) {
 	ctx := context.Background()
 	chatID := "chat-full-head-429"
@@ -188,14 +197,14 @@ func TestBridgePollRetainsBothFrontiersWhenOldContinuationRateLimitsAfterFullHea
 	if err != nil || !ok {
 		t.Fatalf("poll after rate-limited continuation: ok=%v err=%v state=%#v", ok, err, poll)
 	}
-	if poll.PollState != inboundPollStateBlocked || !poll.BlockedUntil.After(time.Now()) || poll.FailureCount == 0 || !strings.Contains(strings.ToLower(poll.LastError), "rate limited") {
-		t.Fatalf("rate-limited continuation did not persist a poll block: %#v", poll)
+	if poll.PollState == inboundPollStateBlocked || !poll.BlockedUntil.IsZero() || poll.FailureCount == 0 || !strings.Contains(strings.ToLower(poll.LastError), "rate limited") {
+		t.Fatalf("rate-limited continuation became a semantic block: %#v", poll)
 	}
-	if poll.ContinuationPath != oldPath || poll.DeferredContinuationPath != headPath || !poll.LastModifiedCursor.Equal(cursor) {
-		t.Fatalf("frontiers after rate limit = %#v, want old continuation, deferred head continuation, unchanged cursor", poll)
+	if poll.ContinuationPath != oldPath || poll.DeferredContinuationPath != "" || !poll.LastModifiedCursor.Equal(cursor) {
+		t.Fatalf("frontiers after rate limit = %#v, want only old continuation and unchanged cursor", poll)
 	}
-	if got := strings.Join(handled, ","); got != "head-429-1" {
-		t.Fatalf("handled after rate limit = %q, want only fresh head", got)
+	if got := strings.Join(handled, ","); got != "" {
+		t.Fatalf("handled after rate limit = %q, want no head message", got)
 	}
 
 	mu.Lock()
@@ -218,11 +227,6 @@ func TestBridgePollRetainsBothFrontiersWhenOldContinuationRateLimitsAfterFullHea
 		}
 	})
 	restarted := newBridgeTestBridge(graph, recoveredStore, &recordingExecutor{})
-	// The real service restores this in-memory seen-ID projection together with
-	// its registry. Preserve the already handled head message so the restart
-	// test isolates durable continuation recovery rather than re-testing the
-	// unrelated registry projection.
-	restarted.reg.Chats[chatID] = ChatState{SeenMessageIDs: []string{"head-429-1"}}
 	if _, err := recoveredStore.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
 		ChatID:            chatID,
 		PollState:         inboundPollStateWarm,
@@ -236,14 +240,17 @@ func TestBridgePollRetainsBothFrontiersWhenOldContinuationRateLimitsAfterFullHea
 		t.Fatalf("recover old continuation after restart: %v", err)
 	}
 	if _, err := restarted.pollChat(ctx, chatID, 1, handle); err != nil {
-		t.Fatalf("recover head continuation after restart: %v", err)
+		t.Fatalf("read fresh head after restart: %v", err)
 	}
-	if got := strings.Join(handled, ","); got != "head-429-1,old-429-1,head-429-2" {
-		t.Fatalf("handled messages = %q, want both frontiers exactly once", got)
+	if _, err := restarted.pollChat(ctx, chatID, 1, handle); err != nil {
+		t.Fatalf("drain fresh head continuation after restart: %v", err)
+	}
+	if got := strings.Join(handled, ","); got != "old-429-1,head-429-1,head-429-2" {
+		t.Fatalf("handled messages = %q, want old then fresh frontier", got)
 	}
 	poll, ok, err = recoveredStore.ChatPoll(ctx, chatID)
 	if err != nil || !ok || poll.ContinuationPath != "" || poll.DeferredContinuationPath != "" {
-		t.Fatalf("final dual-frontier rate-limit poll = %#v ok=%v err=%v, want both frontiers drained", poll, ok, err)
+		t.Fatalf("final rate-limit poll = %#v ok=%v err=%v, want frontier drained", poll, ok, err)
 	}
 	mu.Lock()
 	requests := oldContinuationRequests
