@@ -247,8 +247,8 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 	}
 
 	err := bridge.pollOnce(ctx, 20)
-	if err == nil || !isGraphRateLimitError(err) {
-		t.Fatalf("initial pollOnce error = %v, want first Graph 429 while polling other chats", err)
+	if err != nil {
+		t.Fatalf("initial pollOnce leaked a chat-local Graph 429: %v", err)
 	}
 	openChats := scale.Chats - len(blockedChats)
 	if got := len(executor.prompts); got != openChats {

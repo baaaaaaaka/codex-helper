@@ -867,6 +867,12 @@ func (s *Store) stageForkChat(ctx context.Context, operationID string, chatID st
 		if !start.IsZero() {
 			poll.LastModifiedCursor = start
 		}
+		// Fork staging replaces the chat/session binding outside the poll-owner
+		// capability. Fence any older poll completion immediately; a retained
+		// page remains available for the new owner to reconcile.
+		poll.PollRevision++
+		poll.ScheduleRevision++
+		invalidateChatPollAttempt(&poll)
 		poll.UpdatedAt = now
 		state.ChatPolls[chatID] = poll
 		out = *op

@@ -337,6 +337,21 @@ func (b *Bridge) noteUnprovenancedHelperEcho(ctx context.Context, chatID string,
 		return false, err
 	}
 	b.cancelRunningTurnsForQuarantine(key, report.Session.QuarantineReason)
+	for _, triggerID := range triggerIDs {
+		if strings.TrimSpace(triggerID) == "" {
+			continue
+		}
+		_, _ = b.store.RecordMessageProvenance(ctx, teamstore.MessageProvenanceRecord{
+			TeamsChatID:    chatID,
+			TeamsMessageID: triggerID,
+			Origin:         teamstore.MessageOriginQuarantinedEcho,
+			SessionID:      key,
+			Kind:           "quarantined_helper_echo",
+			Diagnostic:     "self-echo breaker trigger; suppress on staged-page replay",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		})
+	}
 	b.syncRegistrySessionProjection(registrySessionFromDurable(report.Session))
 	b.queueQuarantineControlNotice(ctx, report)
 	return true, nil
