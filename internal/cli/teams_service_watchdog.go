@@ -67,11 +67,11 @@ type teamsServiceWatchdogSnapshot struct {
 	OwnerActiveTurn                    bool
 	LastOwnerHeartbeat                 time.Time
 	FreshOwnerStartedAt                time.Time
-	// ManagedChildStarting is true only when the local supervisor has
-	// positively identified a live child and the store still describes no
-	// owner, or the previous owner used the same PID with an older start time.
-	// That is the narrow startup window in which a stale row is expected while
-	// the replacement listener records its first owner heartbeat.
+	// ManagedChildStarting is true when the local supervisor has positively
+	// identified a live child, but the store still has no owner or only has
+	// evidence from a previous child generation. A live managed child is kept
+	// alive while it retries Graph/proxy initialization; the owner heartbeat is
+	// the local liveness proof once listener initialization has completed.
 	ManagedChildStarting  bool
 	ManagedChildStartedAt time.Time
 	PollActivityFound     bool
@@ -452,7 +452,8 @@ func annotateTeamsServiceWatchdogManagedChildStartup(snapshot *teamsServiceWatch
 		return
 	}
 	snapshot.ManagedChildStartedAt = child.StartedAt
-	if child.ManagedBySupervisor || !hasOwner || (owner.PID == child.PID &&
+	if !hasOwner || (child.ManagedBySupervisor && !owner.StartedAt.IsZero() &&
+		owner.StartedAt.Before(child.StartedAt)) || (owner.PID == child.PID &&
 		!owner.StartedAt.IsZero() && owner.StartedAt.Before(child.StartedAt)) {
 		snapshot.ManagedChildStarting = true
 	}
@@ -733,10 +734,8 @@ func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts
 	if snapshot.PollActivityAt.After(lastActivity) {
 		lastActivity = snapshot.PollActivityAt
 	}
-	if snapshot.ManagedChildStarting && !snapshot.ManagedChildStartedAt.IsZero() &&
-		!snapshot.ManagedChildStartedAt.After(opts.Now) &&
-		opts.Now.Sub(snapshot.ManagedChildStartedAt) <= opts.PollStaleAfter {
-		return false, "managed Teams child is still initializing its owner heartbeat"
+	if snapshot.ManagedChildStarting {
+		return false, "managed Teams child is alive; waiting for owner heartbeat"
 	}
 	if !snapshot.OwnerFresh {
 		if !lastActivity.IsZero() && !lastActivity.After(opts.Now) && opts.Now.Sub(lastActivity) <= opts.OwnerStaleAfter {
@@ -760,12 +759,12 @@ func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts
 	}
 	if currentOwnerPollFound {
 		if !snapshot.PollActivityAt.After(opts.Now) && opts.Now.Sub(snapshot.PollActivityAt) > opts.PollStaleAfter {
-			return true, "control chat polling is stale"
+			return false, "helper owner is fresh; control chat polling is stale and will retry"
 		}
 		return false, "helper owner and control chat polling are fresh"
 	}
 	if !snapshot.FreshOwnerStartedAt.IsZero() && !snapshot.FreshOwnerStartedAt.After(opts.Now) && opts.Now.Sub(snapshot.FreshOwnerStartedAt) > opts.PollStaleAfter {
-		return true, "control chat polling never became active"
+		return false, "helper owner is fresh; control chat polling has not become active and will retry"
 	}
 	return false, "helper owner is fresh; waiting for first control chat poll"
 }

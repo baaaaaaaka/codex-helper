@@ -106,7 +106,7 @@ func TestTeamsServiceWatchdogTreatsPollErrorAsRecentActivity(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceWatchdogRestartsWhenControlPollStaleDespiteFreshOwner(t *testing.T) {
+func TestTeamsServiceWatchdogDoesNotRestartWhenControlPollStaleDespiteFreshOwner(t *testing.T) {
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
 	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
 	snapshot := teamsServiceWatchdogSnapshot{
@@ -122,8 +122,131 @@ func TestTeamsServiceWatchdogRestartsWhenControlPollStaleDespiteFreshOwner(t *te
 	}
 
 	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart {
-		t.Fatalf("decision = %+v, want restart for stale control polling", decision)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale {
+		t.Fatalf("decision = %+v, want non-stale noop while owner heartbeat is fresh", decision)
+	}
+	if !strings.Contains(decision.Reason, "will retry") {
+		t.Fatalf("reason = %q, want Graph retry diagnostic", decision.Reason)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartFreshOwnerBeforeFirstControlPoll(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:           true,
+		Active:              true,
+		StateFiles:          1,
+		OwnerFound:          true,
+		OwnerFresh:          true,
+		LastOwnerHeartbeat:  now.Add(-5 * time.Second),
+		FreshOwnerStartedAt: now.Add(-24 * time.Hour),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale {
+		t.Fatalf("decision = %+v, want non-stale noop while owner heartbeat is fresh", decision)
+	}
+	if !strings.Contains(decision.Reason, "has not become active") {
+		t.Fatalf("reason = %q, want deferred control-poll diagnostic", decision.Reason)
+	}
+}
+
+func TestTeamsServiceWatchdogKeepsLiveManagedChildWaitingForOwnerPastPollThreshold(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: now})
+	snapshot := teamsServiceWatchdogSnapshot{
+		Installed:             true,
+		Active:                true,
+		StateFiles:            1,
+		OwnerFound:            true,
+		LastOwnerHeartbeat:    now.Add(-24 * time.Hour),
+		ManagedChildStarting:  true,
+		ManagedChildStartedAt: now.Add(-24 * time.Hour),
+	}
+
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 100}, opts)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale {
+		t.Fatalf("decision = %+v, want non-stale noop for a live managed child awaiting owner", decision)
+	}
+	if !strings.Contains(decision.Reason, "child is alive") {
+		t.Fatalf("reason = %q, want live-child diagnostic", decision.Reason)
+	}
+}
+
+func TestTeamsServiceWatchdogDoesNotRestartDuringExtendedControlPollOutage(t *testing.T) {
+	lockCLITestHooks(t)
+
+	start := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "watchdog.json")
+	prevPath := teamsServiceWatchdogStatePath
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	prevStart := teamsServiceWatchdogStartService
+	t.Cleanup(func() {
+		teamsServiceWatchdogStatePath = prevPath
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+		teamsServiceWatchdogStartService = prevStart
+	})
+	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
+	teamsServiceWatchdogCollectSnapshot = func(_ context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		return teamsServiceWatchdogSnapshot{
+			Installed:           true,
+			Active:              true,
+			StateFiles:          1,
+			OwnerFound:          true,
+			OwnerFresh:          true,
+			LastOwnerHeartbeat:  opts.Now.Add(-5 * time.Second),
+			FreshOwnerStartedAt: opts.Now.Add(-24 * time.Hour),
+			PollActivityFound:   true,
+			PollActivityAt:      opts.Now.Add(-24 * time.Hour),
+		}, nil
+	}
+	teamsServiceWatchdogStartService = func(context.Context, bool) error {
+		t.Fatal("fresh owner with a control-poll outage must not restart the service")
+		return nil
+	}
+
+	for i := 0; i < 30; i++ {
+		now := start.Add(time.Duration(i) * time.Minute)
+		result, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{Now: now})
+		if err != nil {
+			t.Fatalf("watchdog sample %d: %v", i, err)
+		}
+		if result.Decision.Action != teamsServiceWatchdogActionNoop || result.Decision.Stale {
+			t.Fatalf("watchdog sample %d decision = %+v, want non-stale noop", i, result.Decision)
+		}
+	}
+	state, err := loadTeamsServiceWatchdogState()
+	if err != nil {
+		t.Fatalf("load watchdog state: %v", err)
+	}
+	if state.ConsecutiveStale != 0 || state.LastAction != "" {
+		t.Fatalf("watchdog state after extended Graph outage = %+v, want no restart evidence", state)
+	}
+}
+
+func TestTeamsServiceWatchdogManagedReplacementRecognizesPreviousGeneration(t *testing.T) {
+	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	previousOwner := teamsstore.OwnerMetadata{
+		PID:       41,
+		StartedAt: now.Add(-time.Hour),
+	}
+	child := teamsServiceWatchdogManagedChildIdentity{
+		PID:                 42,
+		StartedAt:           now.Add(-time.Minute),
+		ManagedBySupervisor: true,
+	}
+	snapshot := teamsServiceWatchdogSnapshot{}
+	annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, previousOwner, true, child)
+	if !snapshot.ManagedChildStarting || !snapshot.ManagedChildStartedAt.Equal(child.StartedAt) {
+		t.Fatalf("managed replacement snapshot = %+v, want previous-generation startup evidence", snapshot)
+	}
+
+	child.ManagedBySupervisor = false
+	snapshot = teamsServiceWatchdogSnapshot{}
+	annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, previousOwner, true, child)
+	if snapshot.ManagedChildStarting {
+		t.Fatalf("unmanaged child with a different owner PID was treated as a replacement: %+v", snapshot)
 	}
 }
 
@@ -1001,8 +1124,8 @@ func TestTeamsRuntimeSafetyWatchdogDoesNotCombineOwnerAndPollAcrossStoresCI(t *t
 		t.Fatalf("managed-child selection mixed or selected the wrong store: %+v", snapshot)
 	}
 	decision = evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 2}, opts)
-	if decision.Action != teamsServiceWatchdogActionRestart || !strings.Contains(decision.Reason, "never became active") {
-		t.Fatalf("managed-child decision = %+v, want stale owner-store poll restart", decision)
+	if decision.Action != teamsServiceWatchdogActionNoop || decision.Stale || !strings.Contains(decision.Reason, "has not become active") {
+		t.Fatalf("managed-child decision = %+v, want owner-store poll degradation without restart", decision)
 	}
 
 	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {
@@ -1788,15 +1911,11 @@ func TestRunTeamsServiceWatchdogOnceRestartsAfterConsecutiveStaleState(t *testin
 	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
 	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
 		return teamsServiceWatchdogSnapshot{
-			Installed:           true,
-			Active:              true,
-			StateFiles:          1,
-			OwnerFound:          true,
-			OwnerFresh:          true,
-			LastOwnerHeartbeat:  now.Add(-5 * time.Second),
-			FreshOwnerStartedAt: now.Add(-30 * time.Minute),
-			PollActivityFound:   true,
-			PollActivityAt:      now.Add(-3 * time.Minute),
+			Installed:          true,
+			Active:             true,
+			StateFiles:         1,
+			OwnerFound:         true,
+			LastOwnerHeartbeat: now.Add(-3 * time.Minute),
 		}, nil
 	}
 	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
@@ -1841,7 +1960,7 @@ func TestRunTeamsServiceWatchdogOnceRestartsAfterConsecutiveStaleState(t *testin
 	}
 }
 
-func TestRunTeamsServiceWatchdogOnceRequiresPersistentStaleAndResetsOnFreshPoll(t *testing.T) {
+func TestRunTeamsServiceWatchdogOnceRequiresPersistentStaleAndResetsOnFreshOwner(t *testing.T) {
 	lockCLITestHooks(t)
 
 	start := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
@@ -1863,21 +1982,22 @@ func TestRunTeamsServiceWatchdogOnceRequiresPersistentStaleAndResetsOnFreshPoll(
 		}
 		stale := staleSamples[sample]
 		sample++
-		pollAt := opts.Now.Add(-10 * time.Second)
-		if stale {
-			pollAt = opts.Now.Add(-3 * time.Minute)
+		snapshot := teamsServiceWatchdogSnapshot{
+			Installed:          true,
+			Active:             true,
+			StateFiles:         1,
+			OwnerFound:         true,
+			OwnerFresh:         !stale,
+			LastOwnerHeartbeat: opts.Now.Add(-5 * time.Second),
 		}
-		return teamsServiceWatchdogSnapshot{
-			Installed:           true,
-			Active:              true,
-			StateFiles:          1,
-			OwnerFound:          true,
-			OwnerFresh:          true,
-			LastOwnerHeartbeat:  opts.Now.Add(-5 * time.Second),
-			FreshOwnerStartedAt: opts.Now.Add(-30 * time.Minute),
-			PollActivityFound:   true,
-			PollActivityAt:      pollAt,
-		}, nil
+		if stale {
+			snapshot.LastOwnerHeartbeat = opts.Now.Add(-3 * time.Minute)
+		} else {
+			snapshot.FreshOwnerStartedAt = opts.Now.Add(-30 * time.Minute)
+			snapshot.PollActivityFound = true
+			snapshot.PollActivityAt = opts.Now.Add(-10 * time.Second)
+		}
+		return snapshot, nil
 	}
 	restartCalls := 0
 	teamsServiceWatchdogStartService = func(_ context.Context, restart bool) error {
@@ -1934,15 +2054,11 @@ func TestRunTeamsServiceWatchdogOnceSuccessfulRestartCooldownSuppressesRestartSt
 	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
 	teamsServiceWatchdogCollectSnapshot = func(_ context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
 		return teamsServiceWatchdogSnapshot{
-			Installed:           true,
-			Active:              true,
-			StateFiles:          1,
-			OwnerFound:          true,
-			OwnerFresh:          true,
-			LastOwnerHeartbeat:  opts.Now.Add(-5 * time.Second),
-			FreshOwnerStartedAt: opts.Now.Add(-30 * time.Minute),
-			PollActivityFound:   true,
-			PollActivityAt:      opts.Now.Add(-3 * time.Minute),
+			Installed:          true,
+			Active:             true,
+			StateFiles:         1,
+			OwnerFound:         true,
+			LastOwnerHeartbeat: opts.Now.Add(-3 * time.Minute),
 		}, nil
 	}
 	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
@@ -1992,15 +2108,11 @@ func TestRunTeamsServiceWatchdogOnceDoesNotCooldownFailedRestart(t *testing.T) {
 	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
 	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
 		return teamsServiceWatchdogSnapshot{
-			Installed:           true,
-			Active:              true,
-			StateFiles:          1,
-			OwnerFound:          true,
-			OwnerFresh:          true,
-			LastOwnerHeartbeat:  now.Add(-5 * time.Second),
-			FreshOwnerStartedAt: now.Add(-30 * time.Minute),
-			PollActivityFound:   true,
-			PollActivityAt:      now.Add(-3 * time.Minute),
+			Installed:          true,
+			Active:             true,
+			StateFiles:         1,
+			OwnerFound:         true,
+			LastOwnerHeartbeat: now.Add(-3 * time.Minute),
 		}, nil
 	}
 	if err := saveTeamsServiceWatchdogState(teamsServiceWatchdogState{ConsecutiveStale: 2, LastReason: "previous stale", UpdatedAt: now.Add(-10 * time.Second)}); err != nil {
