@@ -566,13 +566,27 @@ func pollPageBackoff(poll teamstore.ChatPollState, err error, now time.Time) tim
 }
 
 func (b *Bridge) commitPollAttemptFailure(ctx context.Context, chatID, attemptID string, expectedRevision uint64, source, path string, pollErr error, forceGap bool, noProgress bool) (bool, error) {
+	return b.commitPollAttemptFailureInternal(ctx, chatID, attemptID, nil, expectedRevision, source, path, pollErr, forceGap, noProgress)
+}
+
+func (b *Bridge) commitPollAttemptFailureWithCapability(ctx context.Context, chatID string, capability teamstore.ChatPollAttemptCapability, expectedRevision uint64, source, path string, pollErr error, forceGap bool, noProgress bool) (bool, error) {
+	return b.commitPollAttemptFailureInternal(ctx, chatID, capability.ID, &capability, expectedRevision, source, path, pollErr, forceGap, noProgress)
+}
+
+func (b *Bridge) commitPollAttemptFailureInternal(ctx context.Context, chatID, attemptID string, capability *teamstore.ChatPollAttemptCapability, expectedRevision uint64, source, path string, pollErr error, forceGap bool, noProgress bool) (bool, error) {
 	if pollErr == nil {
 		pollErr = errors.New("Teams poll failed")
 	}
 	message := trimPollDiagnostic(pollErr.Error())
 	permanentFrontier := source == pollFrontierContinuation || source == pollFrontierGap
 	now := time.Now()
-	_, committed, err := b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(poll *teamstore.ChatPollState) error {
+	commit := func(fn func(*teamstore.ChatPollState) error) (teamstore.ChatPollState, bool, error) {
+		if capability != nil {
+			return b.store.CommitChatPollAttemptWithCapability(ctx, chatID, *capability, expectedRevision, fn)
+		}
+		return b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, fn)
+	}
+	_, committed, err := commit(func(poll *teamstore.ChatPollState) error {
 		poll.LastError = message
 		poll.LastErrorAt = now
 		poll.FailureCount++
@@ -654,8 +668,22 @@ func (b *Bridge) commitPollAttemptFailure(ctx context.Context, chatID, attemptID
 }
 
 func (b *Bridge) commitPollAttemptPartial(ctx context.Context, chatID, attemptID string, expectedRevision uint64, result pollMessageWindowResult, quarantine bool) (bool, error) {
+	return b.commitPollAttemptPartialInternal(ctx, chatID, attemptID, nil, expectedRevision, result, quarantine)
+}
+
+func (b *Bridge) commitPollAttemptPartialWithCapability(ctx context.Context, chatID string, capability teamstore.ChatPollAttemptCapability, expectedRevision uint64, result pollMessageWindowResult, quarantine bool) (bool, error) {
+	return b.commitPollAttemptPartialInternal(ctx, chatID, capability.ID, &capability, expectedRevision, result, quarantine)
+}
+
+func (b *Bridge) commitPollAttemptPartialInternal(ctx context.Context, chatID, attemptID string, capability *teamstore.ChatPollAttemptCapability, expectedRevision uint64, result pollMessageWindowResult, quarantine bool) (bool, error) {
 	now := time.Now()
-	_, committed, err := b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(poll *teamstore.ChatPollState) error {
+	commit := func(fn func(*teamstore.ChatPollState) error) (teamstore.ChatPollState, bool, error) {
+		if capability != nil {
+			return b.store.CommitChatPollAttemptWithCapability(ctx, chatID, *capability, expectedRevision, fn)
+		}
+		return b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, fn)
+	}
+	_, committed, err := commit(func(poll *teamstore.ChatPollState) error {
 		if result.ActivityAt.After(poll.LastActivityAt) {
 			poll.LastActivityAt = result.ActivityAt
 		}
@@ -687,8 +715,16 @@ func (b *Bridge) commitPollAttemptPartial(ctx context.Context, chatID, attemptID
 }
 
 func (b *Bridge) commitPollAttemptSuccess(ctx context.Context, chatID, attemptID string, expectedRevision uint64, role inboundPollRole, running bool, source, path string, window MessageWindow, result pollMessageWindowResult, quarantine bool) (bool, error) {
+	return b.commitPollAttemptSuccessInternal(ctx, chatID, attemptID, nil, expectedRevision, role, running, source, path, window, result, quarantine)
+}
+
+func (b *Bridge) commitPollAttemptSuccessWithCapability(ctx context.Context, chatID string, capability teamstore.ChatPollAttemptCapability, expectedRevision uint64, role inboundPollRole, running bool, source, path string, window MessageWindow, result pollMessageWindowResult, quarantine bool) (bool, error) {
+	return b.commitPollAttemptSuccessInternal(ctx, chatID, capability.ID, &capability, expectedRevision, role, running, source, path, window, result, quarantine)
+}
+
+func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, attemptID string, capability *teamstore.ChatPollAttemptCapability, expectedRevision uint64, role inboundPollRole, running bool, source, path string, window MessageWindow, result pollMessageWindowResult, quarantine bool) (bool, error) {
 	now := time.Now()
-	_, committed, err := b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(poll *teamstore.ChatPollState) error {
+	apply := func(poll *teamstore.ChatPollState) error {
 		hadDeferredContinuation := strings.TrimSpace(poll.DeferredContinuationPath) != ""
 		pendingPage := poll.PendingPage
 		pageFingerprint := pendingPageContentFingerprint(pendingPage)
@@ -841,7 +877,14 @@ func (b *Bridge) commitPollAttemptSuccess(ctx context.Context, chatID, attemptID
 		}
 		poll.UpdatedAt = now
 		return nil
-	})
+	}
+	var committed bool
+	var err error
+	if capability != nil {
+		_, committed, err = b.store.CommitChatPollAttemptWithCapability(ctx, chatID, *capability, expectedRevision, apply)
+	} else {
+		_, committed, err = b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, apply)
+	}
 	if err != nil {
 		return committed, err
 	}

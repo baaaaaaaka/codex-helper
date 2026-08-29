@@ -65,6 +65,10 @@ const (
 	persistentPollFailureRestartAfter       = 10 * time.Minute
 	persistentPollFailureRestartMinCount    = 3
 	recentDuplicateSessionPromptWindow      = 3 * time.Minute
+	// A maintenance phase may be slow because it is reading a large local
+	// backlog or waiting on Graph, but it must not hold the listener loop
+	// indefinitely. The budget is per phase, not per chat.
+	mainLoopPhaseBudget = 15 * time.Second
 
 	// Automatic transcript sync is deliberately bounded per cycle.  A large
 	// backlog must be paced by the scanner cursor and this per-cycle limit, not
@@ -78,6 +82,11 @@ const (
 	transcriptImportMaxBatchesPerCycle  = 1
 	transcriptImportBatchSeparatorHTML  = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages      = 2
+	// A failed/deferred row must consume a bounded amount of work just like a
+	// successful send. Otherwise a large prefix of rows that all fail can be
+	// scanned on every Listen tick and starve polling/transcript work.
+	mainLoopOutboxFlushMaxScannedMessages = 64
+	mainLoopOutboxFlushMaxPages           = 4
 	// A synchronous chat-triggered flush must make progress for the new live
 	// request without allowing an old history backlog to monopolize the chat
 	// lane.  The first message is always allowed, even when it is larger than
@@ -85,6 +94,8 @@ const (
 	// queue forever.
 	targetedOutboxFlushMaxMessages        = 8
 	targetedOutboxFlushMaxBytes           = 512 * 1024
+	targetedOutboxFlushMaxScannedMessages = 256
+	targetedOutboxFlushMaxPages           = 8
 	outboxFlushPendingPageSize            = 64
 	stagedAttachmentReconcileGrace        = 24 * time.Hour
 	mainLoopWorkflowFlushMaxNotifications = 1
@@ -235,12 +246,15 @@ type outboxQueueOptions struct {
 }
 
 type BridgeOptions struct {
-	RegistryPath                       string
-	StorePath                          string
-	Store                              *teamstore.Store
-	HelperVersion                      string
-	OwnerStaleAfter                    time.Duration
-	Interval                           time.Duration
+	RegistryPath    string
+	StorePath       string
+	Store           *teamstore.Store
+	HelperVersion   string
+	OwnerStaleAfter time.Duration
+	Interval        time.Duration
+	// PhaseBudget bounds one listener phase. Zero uses the production default;
+	// tests may set a short value to exercise timeout recovery.
+	PhaseBudget                        time.Duration
 	Once                               bool
 	Top                                int
 	MaxWorkChatPollsPerCycle           int
@@ -412,6 +426,44 @@ type PersistentPollFailureError struct {
 	Err   error
 }
 
+type teamsPhaseDeadlineError struct {
+	Phase  string
+	Budget time.Duration
+	Err    error
+}
+
+func (e *teamsPhaseDeadlineError) Error() string {
+	if e == nil {
+		return "Teams phase deadline exceeded"
+	}
+	if e.Err == nil {
+		return fmt.Sprintf("Teams phase %q exceeded %s budget", e.Phase, e.Budget)
+	}
+	return fmt.Sprintf("Teams phase %q exceeded %s budget: %v", e.Phase, e.Budget, e.Err)
+}
+
+func (e *teamsPhaseDeadlineError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func isTeamsPhaseDeadline(err error) bool {
+	var deadline *teamsPhaseDeadlineError
+	return errors.As(err, &deadline) && deadline != nil
+}
+
+type mainLoopPhaseStats struct {
+	Runs             uint64
+	DeadlineExceeded uint64
+	Errors           uint64
+	LastDuration     time.Duration
+	LastError        string
+}
+
+type teamsPhaseExecutionContextKey struct{}
+
 func (e *PersistentPollFailureError) Error() string {
 	if e == nil {
 		return ""
@@ -504,6 +556,9 @@ type Bridge struct {
 	lastBeaconReconcile               time.Time
 	lastBeaconLeaseMaintenance        time.Time
 	lastSQLiteWALCheckpoint           time.Time
+	phaseBudget                       time.Duration
+	phaseStatsMu                      sync.Mutex
+	phaseStats                        map[string]mainLoopPhaseStats
 	executionFenceProbeMu             sync.Mutex
 	executionFenceProbeAt             map[string]time.Time
 	maxWorkChatPollsPerCycle          int
@@ -539,6 +594,89 @@ type Bridge struct {
 	globalOutboundBackfilled          bool
 	deferredNoticeMu                  sync.Mutex
 	deferredInterruptedPending        bool
+}
+
+// withTeamsPhaseExecutionContext carries the listener lifetime through a
+// phase's short-lived maintenance context. Async work that crosses a durable
+// claim boundary must use the former, while admission and bookkeeping should
+// still use the latter.
+func withTeamsPhaseExecutionContext(ctx context.Context, executionCtx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if executionCtx == nil {
+		executionCtx = ctx
+	}
+	return context.WithValue(ctx, teamsPhaseExecutionContextKey{}, executionCtx)
+}
+
+func teamsPhaseExecutionContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	if executionCtx, ok := ctx.Value(teamsPhaseExecutionContextKey{}).(context.Context); ok && executionCtx != nil {
+		return executionCtx
+	}
+	return ctx
+}
+
+// runMainLoopPhase gives each maintenance phase an independent cancellation
+// boundary. It intentionally keeps the phase callback's existing error type
+// and wraps only a deadline, so callers can continue using errors.Is/errors.As
+// for store, lease, Graph, and chat-scoped failures.
+func (b *Bridge) runMainLoopPhase(ctx context.Context, name string, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "unnamed"
+	}
+	phaseCtx := ctx
+	cancel := func() {}
+	budget := time.Duration(0)
+	if b != nil && b.phaseBudget > 0 {
+		budget = b.phaseBudget
+		phaseCtx, cancel = context.WithTimeout(ctx, budget)
+	}
+	started := time.Now()
+	err := fn(phaseCtx)
+	deadlineExceeded := budget > 0 && errors.Is(phaseCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+	cancel()
+	if deadlineExceeded {
+		err = &teamsPhaseDeadlineError{Phase: name, Budget: budget, Err: err}
+	}
+	if b != nil {
+		b.phaseStatsMu.Lock()
+		if b.phaseStats == nil {
+			b.phaseStats = make(map[string]mainLoopPhaseStats)
+		}
+		stats := b.phaseStats[name]
+		stats.Runs++
+		stats.LastDuration = time.Since(started)
+		if deadlineExceeded {
+			stats.DeadlineExceeded++
+		}
+		if err != nil {
+			stats.Errors++
+			stats.LastError = trimPollDiagnostic(err.Error())
+		}
+		b.phaseStats[name] = stats
+		b.phaseStatsMu.Unlock()
+	}
+	return err
+}
+
+func (b *Bridge) mainLoopPhaseStatsSnapshot(name string) mainLoopPhaseStats {
+	if b == nil {
+		return mainLoopPhaseStats{}
+	}
+	b.phaseStatsMu.Lock()
+	defer b.phaseStatsMu.Unlock()
+	return b.phaseStats[strings.TrimSpace(name)]
 }
 
 type runningTurnCancel struct {
@@ -997,6 +1135,10 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if opts.OwnerStaleAfter <= 0 {
 		opts.OwnerStaleAfter = 2 * time.Minute
 	}
+	if opts.PhaseBudget <= 0 {
+		opts.PhaseBudget = mainLoopPhaseBudget
+	}
+	b.phaseBudget = opts.PhaseBudget
 	if b.scope.ID == "" {
 		b.scope = ScopeIdentityForUser(b.user)
 	}
@@ -1182,96 +1324,211 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 			b.clearOwnerIfSame(context.Background())
 			return b.runStandbyLoop(ctx, opts)
 		}
-		if err := b.flushPendingOutboxMainLoop(ctx); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
+		cycleCtx, cancelCycle := context.WithCancel(ctx)
+		cycleDegraded := false
+		var cycleError error
+		runPhase := func(name string, fn func(context.Context) error) error {
+			if cycleDegraded {
+				return nil
+			}
+			phaseBaseCtx := withTeamsPhaseExecutionContext(cycleCtx, ctx)
+			err := b.runMainLoopPhase(phaseBaseCtx, name, fn)
+			if teamstore.IsProcessWideStateError(err) {
+				cycleDegraded = true
+				cycleError = err
+				// Do not let later phases perform more durable writes after a
+				// process-wide store/lease failure. The next cycle gets a fresh
+				// context and can resume once the store is healthy again.
+				cancelCycle()
+			}
+			return err
+		}
+		processQueuedTurnsPhase := func(startLimit int, enforceStartLimit bool) (int, error) {
+			started := 0
+			err := runPhase("queued-turns", func(phaseCtx context.Context) error {
+				var err error
+				started, err = b.processQueuedTurnsWithStartBudgetAndExecutionContext(phaseCtx, ctx, startLimit, enforceStartLimit)
+				return err
+			})
+			return started, err
+		}
+		if err := runPhase("outbox", b.flushPendingOutboxMainLoop); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
-		if err := b.flushPendingWorkflowNotificationsWithLimit(ctx, mainLoopWorkflowFlushMaxNotifications); err != nil && b.out != nil {
+		if err := runPhase("workflow", func(phaseCtx context.Context) error {
+			return b.flushPendingWorkflowNotificationsWithLimit(phaseCtx, mainLoopWorkflowFlushMaxNotifications)
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification flush error: %v\n", err)
 		}
-		if err := b.pollOnce(ctx, opts.Top); err != nil {
+		pollErr := runPhase("poll", func(phaseCtx context.Context) error {
+			return b.pollOnce(phaseCtx, opts.Top)
+		})
+		if pollErr != nil {
 			if b.out != nil {
-				if b.shouldLogPollError(err, time.Now()) {
-					_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", err)
+				if b.shouldLogPollError(pollErr, time.Now()) {
+					_, _ = fmt.Fprintf(b.out, "Teams poll error: %v\n", pollErr)
 				}
 			}
-			if restartErr := b.notePollFailure(err, time.Now()); restartErr != nil {
-				return restartErr
+			// A phase deadline is a bounded degraded result, not evidence of
+			// persistent Graph failure. In particular, it must not feed the
+			// supervisor's restart threshold and create a restart loop.
+			if !cycleDegraded && !isTeamsPhaseDeadline(pollErr) {
+				if restartErr := b.notePollFailure(pollErr, time.Now()); restartErr != nil {
+					cancelCycle()
+					return restartErr
+				}
 			}
 		}
-		if err := b.reconcileForkOperations(ctx); err != nil && b.out != nil {
+		if err := runPhase("fork-reconcile", b.reconcileForkOperations); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams fork recovery error: %v\n", err)
 		}
-		if err := b.maybeRunIdleWorkChatAutoPark(ctx, time.Now()); err != nil && b.out != nil {
+		if err := runPhase("idle-auto-park", func(phaseCtx context.Context) error {
+			return b.maybeRunIdleWorkChatAutoPark(phaseCtx, time.Now())
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams idle auto-park error: %v\n", err)
 		}
 		queuedTurnStartLimit := b.effectiveMaxQueuedTurnStartsPerCycle()
 		queuedTurnStartLimitActive := queuedTurnStartLimit > 0
 		queuedTurnStarts := 0
-		if started, err := b.processQueuedTurnsWithStartBudget(ctx, queuedTurnStartLimit, queuedTurnStartLimitActive); err != nil {
+		if !cycleDegraded {
+			started, err := processQueuedTurnsPhase(queuedTurnStartLimit, queuedTurnStartLimitActive)
 			queuedTurnStarts += started
-			if b.out != nil {
+			if err != nil && b.out != nil {
 				_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
 			}
-		} else {
-			queuedTurnStarts += started
+			if teamstore.IsProcessWideStateError(err) {
+				cycleDegraded = true
+				cycleError = err
+				cancelCycle()
+			}
 		}
-		if err := b.syncLinkedTranscriptsIfDue(ctx, time.Now()); err != nil && b.out != nil {
+		if err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
+			return b.syncLinkedTranscriptsIfDue(phaseCtx, time.Now())
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
 		}
-		if err := b.syncCodexHistoryFinalsIfDue(ctx, time.Now()); err != nil && b.out != nil {
+		if err := runPhase("history-watch", func(phaseCtx context.Context) error {
+			return b.syncCodexHistoryFinalsIfDue(phaseCtx, time.Now())
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams history watch error: %v\n", err)
 		}
-		if err := b.maybeRunHelperAutoUpdate(ctx, opts); err != nil && b.out != nil {
+		if err := runPhase("helper-auto-update", func(phaseCtx context.Context) error {
+			return b.maybeRunHelperAutoUpdate(phaseCtx, opts)
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper auto-update error: %v\n", err)
 		}
-		if _, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(ctx); err != nil && b.out != nil {
+		if err := runPhase("helper-upgrade-notice", func(phaseCtx context.Context) error {
+			_, err := b.queueCompletedHelperUpgradeNoticeIfNeeded(phaseCtx)
+			return err
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams helper upgrade completion notice error: %v\n", err)
 		}
-		if err := b.maybeRunPendingCodexUpgrade(ctx); err != nil && b.out != nil {
+		if err := runPhase("codex-upgrade", b.maybeRunPendingCodexUpgrade); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade error: %v\n", err)
 		}
-		if err := b.maybeRunBeaconReconcile(ctx, time.Now()); err != nil && b.out != nil {
+		if err := runPhase("beacon-reconcile", func(phaseCtx context.Context) error {
+			return b.maybeRunBeaconReconcile(phaseCtx, time.Now())
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams beacon reconcile error: %v\n", err)
 		}
-		if err := b.maybeRunBeaconLeaseMaintenance(ctx, time.Now()); err != nil && b.out != nil {
+		if err := runPhase("beacon-lease-maintenance", func(phaseCtx context.Context) error {
+			return b.maybeRunBeaconLeaseMaintenance(phaseCtx, time.Now())
+		}); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams beacon lease maintenance error: %v\n", err)
 		}
+		if cycleDegraded {
+			cancelCycle()
+			if opts.Once {
+				return cycleError
+			}
+			sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleepInterval):
+			}
+			continue
+		}
 		if drained, err := b.drainComplete(ctx); err != nil {
+			cancelCycle()
 			return err
 		} else if drained {
+			cancelCycle()
 			if b.out != nil {
 				_, _ = fmt.Fprintln(b.out, "Teams bridge drained; exiting.")
 			}
 			return nil
 		}
-		if err := b.processDeferredInbound(ctx); err != nil && b.out != nil {
+		if err := runPhase("deferred-inbound", b.processDeferredInbound); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams deferred input processing error: %v\n", err)
 		}
-		if !queuedTurnStartLimitActive || queuedTurnStarts < queuedTurnStartLimit {
+		if !cycleDegraded && (!queuedTurnStartLimitActive || queuedTurnStarts < queuedTurnStartLimit) {
 			remainingQueuedTurnStarts := queuedTurnStartLimit - queuedTurnStarts
 			if !queuedTurnStartLimitActive {
 				remainingQueuedTurnStarts = 0
 			}
-			if started, err := b.processQueuedTurnsWithStartBudget(ctx, remainingQueuedTurnStarts, queuedTurnStartLimitActive); err != nil {
-				queuedTurnStarts += started
-				if b.out != nil {
-					_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
-				}
-			} else {
-				queuedTurnStarts += started
+			started, err := processQueuedTurnsPhase(remainingQueuedTurnStarts, queuedTurnStartLimitActive)
+			queuedTurnStarts += started
+			if err != nil && b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams queued turn processing error: %v\n", err)
+			}
+			if teamstore.IsProcessWideStateError(err) {
+				cycleDegraded = true
+				cycleError = err
+				cancelCycle()
 			}
 		}
-		if err := b.sendDeferredInterruptedTurnNotices(ctx); err != nil && b.out != nil {
+		if cycleDegraded {
+			cancelCycle()
+			if opts.Once {
+				return cycleError
+			}
+			sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleepInterval):
+			}
+			continue
+		}
+		if err := runPhase("interrupted-notices", b.sendDeferredInterruptedTurnNotices); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
 		}
-		if err := b.Save(); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams registry projection save skipped: %v\n", err)
+		if saveErr := b.Save(); saveErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams registry projection save skipped: %v\n", saveErr)
+			}
+			if teamstore.IsProcessWideStateError(saveErr) {
+				cancelCycle()
+				if opts.Once {
+					return saveErr
+				}
+				sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(sleepInterval):
+				}
+				continue
+			}
 		}
+		cancelCycle()
 		if opts.Once {
 			return nil
 		}
-		if err := b.maybeCheckpointSQLiteWAL(ctx, time.Now()); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams sqlite WAL checkpoint skipped: %v\n", err)
+		if walErr := b.maybeCheckpointSQLiteWAL(ctx, time.Now()); walErr != nil {
+			if b.out != nil {
+				_, _ = fmt.Fprintf(b.out, "Teams sqlite WAL checkpoint skipped: %v\n", walErr)
+			}
+			if teamstore.IsProcessWideStateError(walErr) {
+				sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(sleepInterval):
+				}
+				continue
+			}
 		}
 		sleepInterval := b.nextPollInterval(opts.Interval, time.Now())
 		select {
@@ -2402,14 +2659,19 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if !acquired || attemptPoll.Attempt == nil {
 		return false, nil
 	}
-	attemptID := attemptPoll.Attempt.ID
+	attemptCapability := teamstore.ChatPollAttemptCapability{
+		ID:                 attemptPoll.Attempt.ID,
+		Owner:              attemptPoll.Attempt.Owner,
+		ProcessIncarnation: attemptPoll.Attempt.ProcessIncarnation,
+		LeaseGeneration:    attemptPoll.Attempt.LeaseGeneration,
+	}
 	expectedRevision := attemptPoll.PollRevision
 	if expectedRevision == 0 {
 		expectedRevision = expectedRevisionHint + 1
 	}
 	if b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
-			_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+			_, _, abandonErr := b.store.AbandonChatPollAttemptWithCapability(ctx, chatID, attemptCapability, expectedRevision)
 			if abandonErr != nil {
 				return false, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", err, abandonErr))
 			}
@@ -2424,7 +2686,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if !pollRequestPathBelongsToChat(chatID, requestPath) ||
 		poll.PendingPage != nil && strings.TrimSpace(poll.PendingPage.ChatID) != strings.TrimSpace(chatID) {
 		identityErr := fmt.Errorf("%w: poll request path is not owned by chat %q", errPendingPageIdentity, chatID)
-		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, identityErr, true, false)
+		committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, identityErr, true, false)
 		if commitErr != nil {
 			return false, pollStoreFailure(commitErr)
 		}
@@ -2438,7 +2700,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	if poll.PendingPage != nil {
 		if poll.PendingPage.FrontierEpoch != 0 && poll.FrontierEpoch != 0 && poll.PendingPage.FrontierEpoch != poll.FrontierEpoch {
 			pageErr := fmt.Errorf("%w: page epoch %d does not match frontier epoch %d", errPendingPageIdentity, poll.PendingPage.FrontierEpoch, poll.FrontierEpoch)
-			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, pageErr, true, false)
+			committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, pageErr, true, false)
 			if commitErr != nil {
 				return false, pollStoreFailure(commitErr)
 			}
@@ -2449,7 +2711,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		}
 		window, err = pendingPageToWindow(poll.PendingPage)
 		if err != nil {
-			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, err, true, false)
+			committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, err, true, false)
 			if commitErr != nil {
 				return false, pollStoreFailure(commitErr)
 			}
@@ -2479,7 +2741,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 			if (frontier == pollFrontierContinuation || frontier == pollFrontierGap) && continuationErrorIsPermanent(requestPath, err) {
 				forceGap = true
 			}
-			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, err, forceGap, false)
+			committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, err, forceGap, false)
 			if commitErr != nil {
 				return false, pollStoreFailure(commitErr)
 			}
@@ -2494,7 +2756,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		baselineOnly := !freshHasPoll || !poll.Seeded
 		page, pageErr := pendingPageFromWindow(chatID, requestPath, frontier, normalizeFrontierEpochForPoll(poll), window, baselineOnly)
 		if pageErr != nil {
-			committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, pageErr, true, false)
+			committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, pageErr, true, false)
 			if commitErr != nil {
 				return false, pollStoreFailure(commitErr)
 			}
@@ -2505,14 +2767,14 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		}
 		if b.currentLeaseGeneration() > 0 {
 			if leaseErr := b.ensureActiveControlLease(ctx); leaseErr != nil {
-				_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+				_, _, abandonErr := b.store.AbandonChatPollAttemptWithCapability(ctx, chatID, attemptCapability, expectedRevision)
 				if abandonErr != nil {
 					return false, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", leaseErr, abandonErr))
 				}
 				return false, pollLeaseFailure(leaseErr)
 			}
 		}
-		stagedPoll, staged, stageErr := b.store.MutateChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(current *teamstore.ChatPollState) error {
+		stagedPoll, staged, stageErr := b.store.MutateChatPollAttemptWithCapability(ctx, chatID, attemptCapability, expectedRevision, func(current *teamstore.ChatPollState) error {
 			if current.PendingPage != nil {
 				return nil
 			}
@@ -2542,7 +2804,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	result, handlerErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll || freshHasPoll, window, top, opts.MaxBacklogActions, handle)
 	if b.currentLeaseGeneration() > 0 {
 		if leaseErr := b.ensureActiveControlLease(ctx); leaseErr != nil {
-			_, _, abandonErr := b.store.AbandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision)
+			_, _, abandonErr := b.store.AbandonChatPollAttemptWithCapability(ctx, chatID, attemptCapability, expectedRevision)
 			if abandonErr != nil {
 				return result.Handled, pollLeaseFailure(fmt.Errorf("poll lease lost: %w; abandon attempt: %v", leaseErr, abandonErr))
 			}
@@ -2554,7 +2816,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	// the new revision into this capability. Refresh that narrowly-authorized
 	// revision; any other concurrent mutation leaves the attempt stale and is
 	// handled as a no-op below.
-	if refreshed, live, refreshErr := b.refreshChatPollAttemptRevision(ctx, chatID, attemptID, expectedRevision); refreshErr != nil {
+	if refreshed, live, refreshErr := b.refreshChatPollAttemptRevision(ctx, chatID, attemptCapability, expectedRevision); refreshErr != nil {
 		return result.Handled, pollStoreFailure(refreshErr)
 	} else if !live {
 		return result.Handled, nil
@@ -2566,7 +2828,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 			return result.Handled, pollLeaseFailure(handlerErr)
 		}
 		if recordID := strings.TrimSpace(result.PendingRecordRefetchFailedID); recordID != "" {
-			stagedPoll, staged, mutateErr := b.store.MutateChatPollAttempt(ctx, chatID, attemptID, expectedRevision, func(current *teamstore.ChatPollState) error {
+			stagedPoll, staged, mutateErr := b.store.MutateChatPollAttemptWithCapability(ctx, chatID, attemptCapability, expectedRevision, func(current *teamstore.ChatPollState) error {
 				_, err := notePendingPageRefetchFailure(current.PendingPage, recordID)
 				return err
 			})
@@ -2578,7 +2840,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 			}
 			expectedRevision = stagedPoll.PollRevision
 		}
-		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, handlerErr, false, false)
+		committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, handlerErr, false, false)
 		if commitErr != nil {
 			return result.Handled, pollStoreFailure(commitErr)
 		}
@@ -2597,7 +2859,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		}
 	}
 	if continuationPageHasNoProgress(poll, frontier, requestPath, window) {
-		committed, commitErr := b.commitPollAttemptFailure(ctx, chatID, attemptID, expectedRevision, frontier, requestPath, errContinuationNoProgress, false, true)
+		committed, commitErr := b.commitPollAttemptFailureWithCapability(ctx, chatID, attemptCapability, expectedRevision, frontier, requestPath, errContinuationNoProgress, false, true)
 		if commitErr != nil {
 			return result.Handled, pollStoreFailure(commitErr)
 		}
@@ -2607,7 +2869,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		return result.Handled, errContinuationNoProgress
 	}
 	if !result.PageComplete {
-		committed, commitErr := b.commitPollAttemptPartial(ctx, chatID, attemptID, expectedRevision, result, quarantine)
+		committed, commitErr := b.commitPollAttemptPartialWithCapability(ctx, chatID, attemptCapability, expectedRevision, result, quarantine)
 		if commitErr != nil {
 			return result.Handled, pollStoreFailure(commitErr)
 		}
@@ -2616,7 +2878,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		}
 		return result.Handled, nil
 	}
-	committed, commitErr := b.commitPollAttemptSuccess(ctx, chatID, attemptID, expectedRevision, role, running, frontier, requestPath, window, result, quarantine)
+	committed, commitErr := b.commitPollAttemptSuccessWithCapability(ctx, chatID, attemptCapability, expectedRevision, role, running, frontier, requestPath, window, result, quarantine)
 	if commitErr != nil {
 		return result.Handled, pollStoreFailure(commitErr)
 	}
@@ -2629,15 +2891,18 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	return result.Handled, nil
 }
 
-func (b *Bridge) refreshChatPollAttemptRevision(ctx context.Context, chatID, attemptID string, expectedRevision uint64) (uint64, bool, error) {
-	if b == nil || b.store == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(attemptID) == "" {
+func (b *Bridge) refreshChatPollAttemptRevision(ctx context.Context, chatID string, capability teamstore.ChatPollAttemptCapability, expectedRevision uint64) (uint64, bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(capability.ID) == "" {
 		return expectedRevision, false, nil
 	}
 	poll, found, err := b.store.ChatPoll(ctx, chatID)
 	if err != nil {
 		return expectedRevision, false, err
 	}
-	if !found || poll.Attempt == nil || strings.TrimSpace(poll.Attempt.ID) != strings.TrimSpace(attemptID) {
+	if !found || poll.Attempt == nil || strings.TrimSpace(poll.Attempt.ID) != strings.TrimSpace(capability.ID) ||
+		strings.TrimSpace(poll.Attempt.Owner) != strings.TrimSpace(capability.Owner) ||
+		strings.TrimSpace(poll.Attempt.ProcessIncarnation) != strings.TrimSpace(capability.ProcessIncarnation) ||
+		poll.Attempt.LeaseGeneration != capability.LeaseGeneration {
 		return expectedRevision, false, nil
 	}
 	// Only a revision explicitly adopted by the active attempt is refreshable.
@@ -10059,6 +10324,21 @@ func (b *Bridge) processQueuedTurns(ctx context.Context) error {
 }
 
 func (b *Bridge) processQueuedTurnsWithStartBudget(ctx context.Context, startLimit int, enforceStartLimit bool) (int, error) {
+	return b.processQueuedTurnsWithStartBudgetAndExecutionContext(ctx, teamsPhaseExecutionContext(ctx), startLimit, enforceStartLimit)
+}
+
+// processQueuedTurnsWithStartBudgetAndExecutionContext keeps the admission
+// work bounded by ctx while giving an asynchronously started turn the longer
+// listener lifetime in executionCtx. A phase timeout must not cancel a turn
+// after it has crossed the durable claim boundary; the listener context still
+// cancels it when the service itself shuts down.
+func (b *Bridge) processQueuedTurnsWithStartBudgetAndExecutionContext(ctx context.Context, executionCtx context.Context, startLimit int, enforceStartLimit bool) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if executionCtx == nil {
+		executionCtx = ctx
+	}
 	if !b.asyncTurns {
 		return 0, nil
 	}
@@ -10132,7 +10412,7 @@ func (b *Bridge) processQueuedTurnsWithStartBudget(ctx context.Context, startLim
 			}
 			continue
 		}
-		if startedNow, err := b.startQueuedTurn(ctx, session, "", nil); err != nil {
+		if startedNow, err := b.startQueuedTurnWithExecutionContext(ctx, executionCtx, session, "", nil); err != nil {
 			recordSessionErr(session, "start", err)
 			continue
 		} else if startedNow {
@@ -13320,8 +13600,23 @@ func (b *Bridge) sessionTurnQueueState(ctx context.Context, sessionID string) (s
 }
 
 func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferredTurnID string, preferred queuedTurnRunner) (bool, error) {
+	return b.startQueuedTurnWithExecutionContext(ctx, teamsPhaseExecutionContext(ctx), session, preferredTurnID, preferred)
+}
+
+// startQueuedTurnWithExecutionContext separates the short-lived admission
+// context from the lifetime of the asynchronous Codex turn. The former is
+// used for the claim and start-side bookkeeping; the latter is captured by
+// the worker so a maintenance-phase deadline cannot cancel an already
+// claimed turn.
+func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, executionCtx context.Context, session *Session, preferredTurnID string, preferred queuedTurnRunner) (bool, error) {
 	if session == nil {
 		return false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if executionCtx == nil {
+		executionCtx = ctx
 	}
 	// Keep the live ownership check at the claim boundary too. Deferred/control
 	// replay can enter here without the ordinary inbound gate. A stale history
@@ -13372,7 +13667,7 @@ func (b *Bridge) startQueuedTurn(ctx context.Context, session *Session, preferre
 		}
 	}
 	sessionSnapshot := *session
-	runCtx := ctx
+	runCtx := executionCtx
 	b.asyncTurnStateMu.Lock()
 	b.activeAsyncTurns++
 	b.asyncTurnWG.Add(1)
@@ -16061,13 +16356,21 @@ func (b *Bridge) flushPendingOutbox(ctx context.Context, sessionID string, turnI
 }
 
 func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
-	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", "", outboxFlushOptions{MaxMessages: mainLoopOutboxFlushMaxMessages, SkipUnresolvedTranscript: true})
+	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", "", outboxFlushOptions{
+		MaxMessages:              mainLoopOutboxFlushMaxMessages,
+		MaxScanned:               mainLoopOutboxFlushMaxScannedMessages,
+		MaxPages:                 mainLoopOutboxFlushMaxPages,
+		SkipUnresolvedTranscript: true,
+	})
 }
 
 func (b *Bridge) flushPendingOutboxForChat(ctx context.Context, chatID string) error {
 	return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", chatID, outboxFlushOptions{
 		MaxMessages:              targetedOutboxFlushMaxMessages,
 		MaxBytes:                 targetedOutboxFlushMaxBytes,
+		MaxScanned:               targetedOutboxFlushMaxScannedMessages,
+		MaxPages:                 targetedOutboxFlushMaxPages,
+		IgnoreRetryGate:          true,
 		SkipUnresolvedTranscript: true,
 	})
 }
@@ -16079,6 +16382,8 @@ func (b *Bridge) flushPendingOutboxFiltered(ctx context.Context, sessionID strin
 type outboxFlushOptions struct {
 	MaxMessages         int
 	MaxBytes            int
+	MaxScanned          int
+	MaxPages            int
 	AllowAmbiguousRetry bool
 	// AllowProtectedAmbiguousBypass lets a newly-created, distinct user turn
 	// continue past a protected outbox row whose external Graph result is
@@ -16088,6 +16393,7 @@ type outboxFlushOptions struct {
 	AllowProtectedAmbiguousBypass bool
 	SkipUnresolvedTranscript      bool
 	IgnoreEarlierOutbox           bool
+	IgnoreRetryGate               bool
 }
 
 func transcriptOutboxBlockedByUnresolvedAnchor(ctx context.Context, store *teamstore.Store, msg teamstore.OutboxMessage, anchorCache map[string]teamstore.ExecutionAnchor, anchorKnown map[string]bool) bool {
@@ -16616,18 +16922,26 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		sent := 0
 		sentBytes := 0
 		budgetExhausted := false
+		scanned := 0
+		pages := 0
 		pageLimit := outboxFlushPendingPageSize
-		if opts.MaxMessages > 0 && opts.MaxMessages < pageLimit {
-			pageLimit = opts.MaxMessages
+		if opts.MaxScanned > 0 && opts.MaxScanned < pageLimit {
+			pageLimit = opts.MaxScanned
 		}
 		query := teamstore.PendingOutboxQuery{
 			SessionID:            strings.TrimSpace(sessionID),
 			TurnID:               strings.TrimSpace(turnID),
 			TeamsChatID:          strings.TrimSpace(chatID),
 			IncludeActiveSending: opts.AllowAmbiguousRetry,
+			IgnoreRetryGate:      opts.IgnoreRetryGate,
 			Limit:                pageLimit,
 		}
 		for {
+			if opts.MaxPages > 0 && pages >= opts.MaxPages {
+				budgetExhausted = true
+				break
+			}
+			pages++
 			page, err := b.store.PendingOutboxPageAt(ctx, query)
 			if err != nil {
 				return err
@@ -16643,6 +16957,11 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
 			})
 			for _, msg := range pending {
+				if opts.MaxScanned > 0 && scanned >= opts.MaxScanned {
+					budgetExhausted = true
+					break
+				}
+				scanned++
 				if opts.MaxBytes > 0 && sent > 0 && sentBytes+len(msg.Body) > opts.MaxBytes {
 					budgetExhausted = true
 					break
@@ -16664,6 +16983,12 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 					sendOpts.SourceProofCache = sourceProofCache
 				}
 				if err := b.sendQueuedOutboxWithOptions(ctx, msg, sendOpts); err != nil {
+					if ctx.Err() == nil {
+						until := outboxRetryGateUntil(err, time.Now())
+						if _, deferErr := b.store.DeferOutboxDeliveryUntil(ctx, msg.ID, until); deferErr != nil && firstErr == nil {
+							firstErr = deferErr
+						}
+					}
 					if isOutboxDeliveryDeferred(err) {
 						if firstBlockedErr == nil {
 							firstBlockedErr = err
@@ -16713,6 +17038,21 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		b.handleSentOutboxSideEffects(ctx, effect.Outbox, effect.TeamsMessage)
 	}
 	return err
+}
+
+// outboxRetryGateUntil converts both safety deferrals and ordinary send
+// failures into a bounded durable retry time. A deferred row remains queued
+// and is therefore still recoverable; the gate only prevents a hot loop from
+// repeatedly reading and rechecking the same row before its inputs can change.
+func outboxRetryGateUntil(err error, now time.Time) time.Time {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var deferred outboxDeliveryDeferredError
+	if errors.As(err, &deferred) && deferred.Until.After(now) {
+		return deferred.Until.UTC()
+	}
+	return now.Add(outboxRecoveryRetryBackoff).UTC()
 }
 
 // lockOutboxChatFlush preserves ordering for concurrent flushes of one Teams
@@ -16820,22 +17160,25 @@ func (b *Bridge) waitForOutboxSendPace(ctx context.Context, chatID string) error
 		b.outboxSendPaceLast = make(map[string]time.Time)
 	}
 	last := b.outboxSendPaceLast[chatID]
-	delay := graphOutboxSendMinInterval - now.Sub(last)
-	if last.IsZero() || delay <= 0 {
-		b.outboxSendPaceLast[chatID] = now
-		b.outboxSendPaceMu.Unlock()
+	reserved := now
+	if !last.IsZero() {
+		reserved = last.Add(graphOutboxSendMinInterval)
+		if reserved.Before(now) {
+			reserved = now
+		}
+	}
+	// Reserve the slot before sleeping. The previous implementation released
+	// this mutex before reserving a slot, so concurrent global and targeted
+	// flushes could observe the same timestamp and issue two same-chat POSTs.
+	b.outboxSendPaceLast[chatID] = reserved
+	delay := reserved.Sub(now)
+	b.outboxSendPaceMu.Unlock()
+	if delay <= 0 {
 		return nil
 	}
-	b.outboxSendPaceMu.Unlock()
 	if err := b.graph.sleepFor(ctx, delay); err != nil {
 		return err
 	}
-	b.outboxSendPaceMu.Lock()
-	if b.outboxSendPaceLast == nil {
-		b.outboxSendPaceLast = make(map[string]time.Time)
-	}
-	b.outboxSendPaceLast[chatID] = time.Now()
-	b.outboxSendPaceMu.Unlock()
 	return nil
 }
 
@@ -17282,7 +17625,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
 	}
 	if !transcriptOutboxSourceProofMatches(outbox) {
-		_, markErr := b.store.MarkOutboxSkippedForAttempt(ctx, outbox.ID, outbox.SendAttemptToken, "transcript source provenance changed before Graph preparation")
+		// The row is already claimed, but no external POST has started.  Fence the
+		// canonical checkpoint before retiring it; a plain skipped CAS would let
+		// a concurrent scanner treat the rewritten source as a safe suffix.
+		markErr := b.retireTranscriptOutboxBeforePostSourceRewrite(ctx, outbox, "transcript source provenance changed before Graph preparation")
 		if markErr != nil {
 			return markErr
 		}
@@ -21545,6 +21891,22 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 	// a newly written legacy Interrupted turn and reopen transcript publishing
 	// before the next store revision.
 	ownershipProbes := executionSnapshot.Ownership
+	var firstErr error
+	recordSessionError := func(sessionID string, err error) bool {
+		if err == nil {
+			return false
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			firstErr = errors.Join(firstErr, ctxErr)
+			return true
+		}
+		firstErr = errors.Join(firstErr, fmt.Errorf("linked transcript session %q: %w", strings.TrimSpace(sessionID), err))
+		// A session-local scanner/source error is isolated and the next session
+		// still gets a chance in this cycle.  Lease/store failures are different:
+		// continuing would let later sessions perform durable writes after the
+		// process has lost its write capability or its state backend is unhealthy.
+		return teamstore.IsProcessWideStateError(err)
+	}
 	var needsDiscovery []Session
 	for _, session := range b.reg.Sessions {
 		if session.Status != "active" {
@@ -21552,6 +21914,9 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 		}
 		if session.CodexThreadID == "" {
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return errors.Join(firstErr, err)
 		}
 		if activeTeamsTurns[session.ID] {
 			continue
@@ -21567,7 +21932,9 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 				// boundary. They must not stop live request admission or create a
 				// visible recovery notice.
 				if err := b.deferLegacyTranscriptCheckpoint(ctx, session, local.FilePath, checkpoint); err != nil {
-					return err
+					if recordSessionError(session.ID, err) {
+						return firstErr
+					}
 				}
 				continue
 			}
@@ -21579,40 +21946,55 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 				if executionAnchorActive(checkpoint.UnresolvedExecution) {
 					state, stateErr := loadSessionState(session, checkpoint)
 					if stateErr != nil {
-						return stateErr
+						if recordSessionError(session.ID, stateErr) {
+							return firstErr
+						}
+						continue
 					}
 					if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint); err != nil {
-						return err
+						if recordSessionError(session.ID, err) {
+							return firstErr
+						}
 					}
 					continue
 				}
 				if ownershipProbes[session.ID] {
 					state, stateErr := loadSessionState(session, checkpoint)
 					if stateErr != nil {
-						return stateErr
+						if recordSessionError(session.ID, stateErr) {
+							return firstErr
+						}
+						continue
 					}
 					if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint); err != nil {
-						return err
+						if recordSessionError(session.ID, err) {
+							return firstErr
+						}
 					}
 				}
 				continue
 			}
 			state, stateErr := loadSessionState(session, checkpoint)
 			if stateErr != nil {
-				return stateErr
+				if recordSessionError(session.ID, stateErr) {
+					return firstErr
+				}
+				continue
 			}
 			if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, state, checkpoint, hasCheckpoint); err != nil {
-				return err
+				if recordSessionError(session.ID, err) {
+					return firstErr
+				}
 			}
 			continue
 		}
 		needsDiscovery = append(needsDiscovery, session)
 	}
 	if len(needsDiscovery) == 0 {
-		return nil
+		return firstErr
 	}
 	if !forceDiscovery && !b.linkedTranscriptDiscoveryDue(now) {
-		return nil
+		return firstErr
 	}
 	projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
 	if err != nil {
@@ -21642,13 +22024,20 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDi
 			continue
 		}
 		if info, err := os.Stat(local.FilePath); err != nil || info.IsDir() {
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				if recordSessionError(session.ID, err) {
+					return firstErr
+				}
+			}
 			continue
 		}
 		if err := b.syncSessionTranscriptFromSnapshot(ctx, session, local, teamstore.State{SchemaVersion: teamstore.SchemaVersion}, teamstore.ImportCheckpoint{}, false); err != nil {
-			return err
+			if recordSessionError(session.ID, err) {
+				return firstErr
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (b *Bridge) linkedTranscriptDiscoveryDue(now time.Time) bool {

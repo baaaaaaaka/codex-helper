@@ -79,11 +79,57 @@ var sqliteRuntimeMetadataConnectionTestHook func()
 // callers that own a liveness loop should retry the whole short transaction
 // from a fresh snapshot instead of terminating the service.
 func IsSQLiteBusyError(err error) bool {
+	return sqliteErrorHasCode(err, sqlite3.SQLITE_BUSY)
+}
+
+// IsSQLiteProcessWideError reports SQLite failures that make the store unsafe
+// to treat as a chat-local error.  In particular, FULL/READONLY/IOERR and
+// corruption errors mean that a phase must stop making further durable
+// mutations until the store becomes writable/healthy again.  The bridge uses
+// this at phase boundaries; it deliberately does not classify ordinary query
+// or decode errors as process-wide so one bad row can remain isolated.
+func IsSQLiteProcessWideError(err error) bool {
+	for _, code := range []int{
+		sqlite3.SQLITE_BUSY,
+		sqlite3.SQLITE_FULL,
+		sqlite3.SQLITE_READONLY,
+		sqlite3.SQLITE_IOERR,
+		sqlite3.SQLITE_CORRUPT,
+		sqlite3.SQLITE_NOTADB,
+	} {
+		if sqliteErrorHasCode(err, code) {
+			return true
+		}
+	}
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"database or disk is full",
+		"disk is full",
+		"no space left on device",
+		"disk quota exceeded",
+		"readonly database",
+		"read-only database",
+		"read-only file system",
+		"database disk image is malformed",
+		"input/output error",
+		"i/o error",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func sqliteErrorHasCode(err error, code int) bool {
 	var sqliteErr *sqlite.Error
 	if !errors.As(err, &sqliteErr) {
 		return false
 	}
-	return sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY
+	return sqliteErr.Code()&0xff == code
 }
 
 // SQLite defaults to 999 host parameters. Keep headroom for fixed query
@@ -1862,6 +1908,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS turns_session_status_idx ON turns(session_id, status, queued_at, id)`,
 		`CREATE TABLE IF NOT EXISTS outbox_messages (id TEXT PRIMARY KEY, session_id TEXT, turn_id TEXT, teams_chat_id TEXT, teams_message_id TEXT, status TEXT, sequence INTEGER, created_at INTEGER, deliver_after INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS outbox_pending_idx ON outbox_messages(status, teams_chat_id, created_at, id)`,
+		`CREATE INDEX IF NOT EXISTS outbox_pending_due_idx ON outbox_messages(status, deliver_after, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS outbox_session_idx ON outbox_messages(session_id, status, created_at, id)`,
 		`CREATE TABLE IF NOT EXISTS message_provenance (id TEXT PRIMARY KEY, teams_chat_id TEXT, teams_message_id TEXT, origin TEXT, session_id TEXT, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
@@ -2057,7 +2104,7 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	if err := writeSQLiteMap(ctx, tx, `INSERT INTO outbox_messages(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, state.OutboxMessages, func(v OutboxMessage) []any {
-		return []any{v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), int64(0)}
+		return []any{v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), sqliteTime(v.NextAttemptAt)}
 	}); err != nil {
 		return err
 	}
@@ -4831,7 +4878,7 @@ func upsertSQLiteOutboxTx(ctx context.Context, tx *sql.Tx, v OutboxMessage) erro
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO outbox_messages(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, turn_id = excluded.turn_id, teams_chat_id = excluded.teams_chat_id, teams_message_id = excluded.teams_message_id, status = excluded.status, sequence = excluded.sequence, created_at = excluded.created_at, deliver_after = excluded.deliver_after, json = excluded.json`,
-		v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), int64(0), data)
+		v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), sqliteTime(v.NextAttemptAt), data)
 	return err
 }
 
@@ -8835,6 +8882,10 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 			string(OutboxStatusAccepted),
 			string(OutboxStatusSending),
 		}
+		if !query.IgnoreRetryGate {
+			clauses = append(clauses, "(o.status <> ? OR o.deliver_after = 0 OR o.deliver_after <= ?)")
+			args = append(args, string(OutboxStatusQueued), sqliteTime(query.Now))
+		}
 		if !query.IgnoreRateLimit {
 			clauses = append(clauses, "(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
 			args = append(args, string(OutboxStatusAccepted), sqliteTime(query.Now))
@@ -8856,7 +8907,7 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 			after := sqliteTime(query.After.CreatedAt)
 			args = append(args, after, after, strings.TrimSpace(query.After.ID))
 		}
-		stmt := `SELECT o.json, o.created_at, o.id, COALESCE(r.blocked_until, 0)
+		stmt := `SELECT o.json, o.created_at, o.id, COALESCE(o.deliver_after, 0), COALESCE(r.blocked_until, 0)
 FROM outbox_messages o
 LEFT JOIN chat_rate_limits r ON r.chat_id = o.teams_chat_id
 WHERE ` + strings.Join(clauses, " AND ") + `
@@ -8877,8 +8928,9 @@ ORDER BY o.created_at, o.id`
 			var raw []byte
 			var createdAtNanos int64
 			var rowID string
+			var deliverAfterNanos int64
 			var blockedUntilNanos int64
-			if err := rows.Scan(&raw, &createdAtNanos, &rowID, &blockedUntilNanos); err != nil {
+			if err := rows.Scan(&raw, &createdAtNanos, &rowID, &deliverAfterNanos, &blockedUntilNanos); err != nil {
 				return err
 			}
 			rawRows++
@@ -8890,6 +8942,12 @@ ORDER BY o.created_at, o.id`
 			var msg OutboxMessage
 			if err := json.Unmarshal(raw, &msg); err != nil {
 				return err
+			}
+			// Older SQLite rows may have a populated compatibility column while
+			// their JSON predates NextAttemptAt. Hydrate the projection so the JSON
+			// and SQLite pending predicates agree.
+			if msg.NextAttemptAt.IsZero() && deliverAfterNanos > 0 {
+				msg.NextAttemptAt = time.Unix(0, deliverAfterNanos).UTC()
 			}
 			state := State{ChatRateLimits: map[string]ChatRateLimitState{}}
 			if blockedUntilNanos > 0 {
@@ -9536,7 +9594,52 @@ func (s *Store) clearChatRateLimitSQLite(ctx context.Context, chatID string) (bo
 		if err != nil {
 			return err
 		}
-		_, err = db.ExecContext(ctx, `DELETE FROM chat_rate_limits WHERE chat_id = ?`, chatID)
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chat_rate_limits WHERE chat_id = ?`, chatID); err != nil {
+			return err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT json, COALESCE(deliver_after, 0) FROM outbox_messages WHERE teams_chat_id = ? AND status = ?`, chatID, string(OutboxStatusQueued))
+		if err != nil {
+			return err
+		}
+		var queued []OutboxMessage
+		for rows.Next() {
+			var raw []byte
+			var deliverAfterNanos int64
+			if err := rows.Scan(&raw, &deliverAfterNanos); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			var msg OutboxMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			if msg.NextAttemptAt.IsZero() && deliverAfterNanos > 0 {
+				msg.NextAttemptAt = time.Unix(0, deliverAfterNanos).UTC()
+			}
+			if !msg.NextAttemptAt.IsZero() {
+				msg.NextAttemptAt = time.Time{}
+				queued = append(queued, msg)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, msg := range queued {
+			if err := upsertSQLiteOutboxTx(ctx, tx, msg); err != nil {
+				return err
+			}
+		}
+		err = tx.Commit()
 		handled = true
 		return err
 	})

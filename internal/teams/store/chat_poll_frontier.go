@@ -24,7 +24,14 @@ func (s *Store) UpdateChatPoll(ctx context.Context, chatID string, fn func(*Chat
 		return ChatPollState{}, false, fmt.Errorf("chat poll mutation is required")
 	}
 	mutate := func(poll *ChatPollState) error {
-		before := *poll
+		// ChatPollState contains pointers and slices. A shallow copy makes a
+		// callback that updates Attempt/Gap/PendingPage mutate the comparison
+		// snapshot as well, so the targeted writer can incorrectly report a
+		// real mutation as a no-op. Keep the receipt payload immutable and copy
+		// its slice headers only; this avoids copying potentially multi-megabyte
+		// raw Graph records on every poll-state write while still isolating all
+		// fields that the bridge is allowed to mutate.
+		before := cloneChatPollStateForComparison(*poll)
 		beforeRevision := poll.PollRevision
 		beforeUpdatedAt := poll.UpdatedAt
 		if err := fn(poll); err != nil {
@@ -65,6 +72,47 @@ func (s *Store) UpdateChatPoll(ctx context.Context, chatID string, fn func(*Chat
 		return nil
 	})
 	return out, changed, err
+}
+
+func cloneChatPollStateForComparison(poll ChatPollState) ChatPollState {
+	out := poll
+	out.PendingPage = cloneChatPollPendingPageForComparison(poll.PendingPage)
+	out.Gap = cloneChatPollGapForComparison(poll.Gap)
+	if poll.Attempt != nil {
+		attempt := *poll.Attempt
+		out.Attempt = &attempt
+	}
+	out.ContinuationPathHistory = append([]string(nil), poll.ContinuationPathHistory...)
+	out.ContinuationPageFingerprintHistory = append([]string(nil), poll.ContinuationPageFingerprintHistory...)
+	out.QuarantinedRecordIDs = append([]string(nil), poll.QuarantinedRecordIDs...)
+	return out
+}
+
+func cloneChatPollGapForComparison(gap *ChatPollGap) *ChatPollGap {
+	if gap == nil {
+		return nil
+	}
+	out := *gap
+	out.QuarantinedPage = cloneChatPollPendingPageForComparison(gap.QuarantinedPage)
+	return &out
+}
+
+func cloneChatPollPendingPageForComparison(page *ChatPollPendingPage) *ChatPollPendingPage {
+	if page == nil {
+		return nil
+	}
+	out := *page
+	// ChatPollPendingPage is an immutable transport receipt after it is
+	// staged. Keep the bounded raw-record slice shared: reflect.DeepEqual can
+	// compare a shared slice by identity, avoiding a multi-megabyte byte walk on
+	// every targeted poll-state write. All production callbacks replace the
+	// receipt or mutate only the small metadata slices below; they must not edit
+	// a raw record in place.
+	out.RecordIDs = append([]string(nil), page.RecordIDs...)
+	out.RecordHashes = append([]string(nil), page.RecordHashes...)
+	out.Dispositions = append([]string(nil), page.Dispositions...)
+	out.RefetchFailures = append([]int(nil), page.RefetchFailures...)
+	return &out
 }
 
 // BeginChatPollAttempt acquires the per-chat poll capability. An unexpired
@@ -123,6 +171,17 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 // capability. It is used to stage the immutable page receipt before invoking
 // any handler. A stale/expired caller becomes a no-op.
 func (s *Store) MutateChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.mutateChatPollAttempt(ctx, chatID, attemptID, expectedRevision, nil, fn)
+}
+
+// MutateChatPollAttemptWithCapability is the owner-fenced form used by the
+// live bridge. A stale callback is intentionally reported as applied=false;
+// it must not write a new error or retry schedule after a takeover.
+func (s *Store) MutateChatPollAttemptWithCapability(ctx context.Context, chatID string, capability ChatPollAttemptCapability, expectedRevision uint64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.mutateChatPollAttempt(ctx, chatID, capability.ID, expectedRevision, &capability, fn)
+}
+
+func (s *Store) mutateChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
 	chatID = strings.TrimSpace(chatID)
 	attemptID = strings.TrimSpace(attemptID)
 	if chatID == "" || attemptID == "" || fn == nil {
@@ -130,7 +189,7 @@ func (s *Store) MutateChatPollAttempt(ctx context.Context, chatID, attemptID str
 	}
 	var applied bool
 	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
-		if !chatPollAttemptMatches(poll, attemptID, expectedRevision, time.Now()) {
+		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
 		if err := fn(poll); err != nil {
@@ -149,6 +208,17 @@ func (s *Store) MutateChatPollAttempt(ctx context.Context, chatID, attemptID str
 // stale result; callers must not write an error, retry schedule, cursor, or
 // notice after that point.
 func (s *Store) CommitChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.commitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, nil, fn)
+}
+
+// CommitChatPollAttemptWithCapability is the owner-fenced final CAS used by
+// the live bridge. It prevents a result produced by an old process incarnation
+// from committing after the durable capability has been replaced.
+func (s *Store) CommitChatPollAttemptWithCapability(ctx context.Context, chatID string, capability ChatPollAttemptCapability, expectedRevision uint64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.commitChatPollAttempt(ctx, chatID, capability.ID, expectedRevision, &capability, fn)
+}
+
+func (s *Store) commitChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
 	chatID = strings.TrimSpace(chatID)
 	attemptID = strings.TrimSpace(attemptID)
 	if chatID == "" || attemptID == "" || fn == nil {
@@ -156,7 +226,7 @@ func (s *Store) CommitChatPollAttempt(ctx context.Context, chatID, attemptID str
 	}
 	var committed bool
 	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
-		if !chatPollAttemptMatches(poll, attemptID, expectedRevision, time.Now()) {
+		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
 		if err := fn(poll); err != nil {
@@ -175,6 +245,17 @@ func (s *Store) CommitChatPollAttempt(ctx context.Context, chatID, attemptID str
 // without issuing another Graph request. A stale or expired caller is a
 // no-op, just like CommitChatPollAttempt.
 func (s *Store) AbandonChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64) (ChatPollState, bool, error) {
+	return s.abandonChatPollAttempt(ctx, chatID, attemptID, expectedRevision, nil)
+}
+
+// AbandonChatPollAttemptWithCapability releases a poll attempt only for the
+// owner that acquired it. This keeps late lease-loss cleanup from clearing a
+// replacement owner's capability.
+func (s *Store) AbandonChatPollAttemptWithCapability(ctx context.Context, chatID string, capability ChatPollAttemptCapability, expectedRevision uint64) (ChatPollState, bool, error) {
+	return s.abandonChatPollAttempt(ctx, chatID, capability.ID, expectedRevision, &capability)
+}
+
+func (s *Store) abandonChatPollAttempt(ctx context.Context, chatID, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability) (ChatPollState, bool, error) {
 	chatID = strings.TrimSpace(chatID)
 	attemptID = strings.TrimSpace(attemptID)
 	if chatID == "" || attemptID == "" {
@@ -182,7 +263,7 @@ func (s *Store) AbandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 	}
 	var abandoned bool
 	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
-		if !chatPollAttemptMatches(poll, attemptID, expectedRevision, time.Now()) {
+		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
 		poll.Attempt = nil
@@ -193,6 +274,10 @@ func (s *Store) AbandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 }
 
 func chatPollAttemptMatches(poll *ChatPollState, attemptID string, expectedRevision uint64, now time.Time) bool {
+	return chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, nil, now)
+}
+
+func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, now time.Time) bool {
 	if poll == nil || poll.Attempt == nil || strings.TrimSpace(poll.Attempt.ID) != attemptID {
 		return false
 	}
@@ -214,6 +299,14 @@ func chatPollAttemptMatches(poll *ChatPollState, attemptID string, expectedRevis
 		// expiry. The old owner must remain stale even if it later learns the
 		// newer row revision.
 		return false
+	}
+	if capability != nil {
+		if strings.TrimSpace(capability.ID) == "" || strings.TrimSpace(capability.ID) != strings.TrimSpace(poll.Attempt.ID) ||
+			strings.TrimSpace(capability.Owner) != strings.TrimSpace(poll.Attempt.Owner) ||
+			strings.TrimSpace(capability.ProcessIncarnation) != strings.TrimSpace(poll.Attempt.ProcessIncarnation) ||
+			capability.LeaseGeneration != poll.Attempt.LeaseGeneration {
+			return false
+		}
 	}
 	return true
 }

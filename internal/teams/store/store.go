@@ -1324,6 +1324,19 @@ type ChatPollAttemptRequest struct {
 	TTL                     time.Duration
 }
 
+// ChatPollAttemptCapability is the immutable identity captured by a poll
+// owner. Attempt IDs alone are not sufficient: a delayed callback from an
+// older Bridge instance can still know the row ID and revision. Production
+// poll completion uses the capability-scoped methods so an owner or process
+// incarnation mismatch becomes a stale no-op rather than overwriting the
+// newer poll result.
+type ChatPollAttemptCapability struct {
+	ID                 string
+	Owner              string
+	ProcessIncarnation string
+	LeaseGeneration    int64
+}
+
 var (
 	ErrChatPollAttemptBusy  = errors.New("chat poll attempt is already owned")
 	ErrChatPollAttemptStale = errors.New("chat poll attempt is stale")
@@ -1617,8 +1630,13 @@ type OutboxMessage struct {
 	UpdatedAt                time.Time `json:"updated_at,omitempty"`
 	SentAt                   time.Time `json:"sent_at,omitempty"`
 	LastSendAttempt          time.Time `json:"last_send_attempt,omitempty"`
-	SendAttemptToken         string    `json:"send_attempt_token,omitempty"`
-	LastSendError            string    `json:"last_send_error,omitempty"`
+	// NextAttemptAt is a durable retry gate for rows that could not be sent in
+	// the current pass. It is separate from LastSendAttempt so a failed row is
+	// not rescanned on every main-loop tick, while Sending rows continue to use
+	// their lease and ambiguous-outcome fence. Zero means immediately eligible.
+	NextAttemptAt    time.Time `json:"next_attempt_at,omitempty"`
+	SendAttemptToken string    `json:"send_attempt_token,omitempty"`
+	LastSendError    string    `json:"last_send_error,omitempty"`
 }
 
 // OutboxReplayFence is a cold-path proof that an outbox message was already
@@ -1693,6 +1711,10 @@ type PendingOutboxQuery struct {
 	Limit                int
 	After                PendingOutboxCursor
 	IncludeActiveSending bool
+	// IgnoreRetryGate is reserved for an explicit, targeted wake-up (for
+	// example a new user request or operator recovery). The main-loop sender
+	// leaves it false so a failed row cannot become a hot loop.
+	IgnoreRetryGate bool
 	// IgnoreRateLimit is reserved for cold-path migration/reconciliation.  The
 	// normal outbox sender must continue to respect persisted Graph backoff, but
 	// a compatibility cleanup must be able to see an obsolete notice even while
@@ -1843,6 +1865,20 @@ var (
 )
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
+
+// IsProcessWideStateError identifies failures for which continuing a phase
+// with another chat would be unsafe or misleading.  It is intentionally
+// narrower than “any store error”: malformed optional data and a missing local
+// transcript remain object-scoped, while lease loss and an unavailable/corrupt
+// SQLite store require the current cycle to stop before another durable
+// mutation is attempted.
+func IsProcessWideStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrControlLeaseNotHeld) || IsSQLiteProcessWideError(err)
+}
+
 var ErrInboundMessageFromHelperOutbox = errors.New("Teams inbound message already recorded as helper outbox")
 
 type UnsupportedSchemaVersionError struct {
@@ -10601,6 +10637,33 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 	})
 }
 
+// DeferOutboxDeliveryUntil persists a retry gate without changing the
+// message's delivery disposition. It is deliberately a no-op for Sending,
+// Accepted, Sent, and Skipped rows: those states have their own lease or
+// external-outcome protocol and must not be made eligible/ineligible by a
+// stale sender observation.
+func (s *Store) DeferOutboxDeliveryUntil(ctx context.Context, outboxID string, until time.Time) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" {
+		return OutboxMessage{}, fmt.Errorf("outbox id is required")
+	}
+	if until.IsZero() {
+		return OutboxMessage{}, fmt.Errorf("outbox retry time is required")
+	}
+	until = until.UTC()
+	update := func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusQueued || !until.After(msg.NextAttemptAt) {
+			return msg, errStoreNoChange
+		}
+		msg.NextAttemptAt = until
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
 // MarkOutboxGraphRecoveryProgressForAttempt persists the continuation cursor
 // and the one exact-marker candidate found so far. It is deliberately
 // attempt-scoped: a later sender must never inherit a cursor from an older
@@ -10660,6 +10723,7 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	}
 	msg.Status = OutboxStatusSending
 	msg.LastSendAttempt = now
+	msg.NextAttemptAt = time.Time{}
 	msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now, msg.SendAttemptToken)
 	msg.LastSendError = ""
 	msg.GraphRecoveryNextPath = ""
@@ -12092,6 +12156,9 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 	if query.TeamsChatID != "" && msg.TeamsChatID != query.TeamsChatID {
 		return false
 	}
+	if !query.IgnoreRetryGate && msg.Status == OutboxStatusQueued && !msg.NextAttemptAt.IsZero() && query.Now.Before(msg.NextAttemptAt) {
+		return false
+	}
 	acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
 	if !query.IgnoreRateLimit && !acceptedWithTeamsID {
 		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(query.Now) {
@@ -12174,6 +12241,16 @@ func (s *Store) ClearChatRateLimit(ctx context.Context, chatID string) error {
 	}
 	return s.Update(ctx, func(state *State) error {
 		delete(state.ChatRateLimits, chatID)
+		// Clearing a chat's explicit Graph backoff is an operator/application
+		// wake-up signal. Remove the matching queued-row retry gates as well;
+		// otherwise the rate-limit record would be gone while the durable outbox
+		// gate continued to hide the work until its old timer expired.
+		for id, msg := range state.OutboxMessages {
+			if msg.TeamsChatID == chatID && msg.Status == OutboxStatusQueued && !msg.NextAttemptAt.IsZero() {
+				msg.NextAttemptAt = time.Time{}
+				state.OutboxMessages[id] = msg
+			}
+		}
 		return nil
 	})
 }
