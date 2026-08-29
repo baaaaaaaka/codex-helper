@@ -91,19 +91,31 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		}
 		return b.baselineCodexHistoryWatch(ctx, paths, now)
 	}
-	changes, err := historyWatchChangedPaths(paths, state, reconcile)
-	if err != nil {
-		return err
+	changes, scanErr := historyWatchChangedPaths(paths, state, reconcile)
+	var firstErr error
+	if scanErr != nil {
+		firstErr = scanErr
 	}
 	for _, path := range changes {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := b.syncCodexHistoryWatchPath(ctx, path, now); err != nil {
-			return err
+			if firstErr == nil {
+				firstErr = err
+			} else {
+				firstErr = errors.Join(firstErr, err)
+			}
+			// A path-local scanner failure is isolated.  A lease loss or
+			// unavailable/corrupt store is process-wide: later paths must not
+			// perform durable writes after this owner can no longer make an
+			// authoritative checkpoint decision.
+			if teamstore.IsProcessWideStateError(err) {
+				return firstErr
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func (b *Bridge) historyWatchReconcilePaths(ctx context.Context) ([]string, error) {
@@ -191,6 +203,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	// invisible until the next reconcile and an old source-less outbox may be
 	// flushed first.  Modern rows retain the cheap stat-only idle path.
 	legacyPaths := make(map[string]bool)
+	var firstErr error
 	for _, checkpoint := range state.HistoryWatch {
 		if path := cleanComparablePath(checkpoint.Path); path != "" {
 			fileState := historyTieredFileStateFromHistoryWatch(checkpoint)
@@ -246,7 +259,10 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			continue
 		}
 		if err != nil {
-			return nil, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		if info.IsDir() {
 			continue
@@ -259,7 +275,10 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			continue
 		}
 		if err != nil {
-			return nil, err
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		if info.IsDir() {
 			continue
@@ -287,7 +306,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		paths = append(paths, path)
 	}
 	if len(paths) == 0 {
-		return nil, nil
+		return nil, firstErr
 	}
 	if !verifyUnchanged && len(legacyPaths) > 0 {
 		// Keep modern sessions on the stat-only path while strictly checking
@@ -302,12 +321,12 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			}
 		}
 		legacyChanges, err := historyTieredDetectStatChanges(legacy, states, true)
-		if err != nil {
-			return nil, err
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 		modernChanges, err := historyTieredDetectStatChanges(modern, states, false)
-		if err != nil {
-			return nil, err
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 		legacyChanges = append(legacyChanges, modernChanges...)
 		changes := legacyChanges
@@ -324,11 +343,11 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		for path := range rebasePaths {
 			out = append(out, path)
 		}
-		return uniqueSortedCleanPaths(out), nil
+		return uniqueSortedCleanPaths(out), firstErr
 	}
 	changes, err := historyTieredDetectStatChanges(paths, states, verifyUnchanged)
-	if err != nil {
-		return nil, err
+	if err != nil && firstErr == nil {
+		firstErr = err
 	}
 	out := make([]string, 0, len(changes))
 	for _, change := range changes {
@@ -343,7 +362,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	for path := range rebasePaths {
 		out = append(out, path)
 	}
-	return uniqueSortedCleanPaths(out), nil
+	return uniqueSortedCleanPaths(out), firstErr
 }
 
 func uniqueSortedCleanPaths(paths []string) []string {

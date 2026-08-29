@@ -404,6 +404,7 @@ type historyTieredFinal struct {
 func historyTieredDetectStatChanges(paths []string, states map[string]historyTieredFileState, verifyUnchangedOpt ...bool) ([]historyTieredStatChange, error) {
 	verifyUnchanged := len(verifyUnchangedOpt) > 0 && verifyUnchangedOpt[0]
 	changes := make([]historyTieredStatChange, 0)
+	var firstErr error
 	for _, path := range paths {
 		path = strings.TrimSpace(path)
 		if path == "" {
@@ -412,9 +413,19 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 		info, err := os.Stat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
+				// A checkpointed path disappearing is a durable change, not an
+				// unchanged/no-op result.  Returning it lets the watcher perform its
+				// identity-aware delete CAS and remove the orphan checkpoint.
+				changes = append(changes, historyTieredStatChange{Path: path})
 				continue
 			}
-			return changes, err
+			// A bad/deleted/unreadable history path is local to that path. Keep
+			// scanning the rest of the candidate set so one stale TUI transcript
+			// cannot starve every other session in the watcher.
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
 		if info.IsDir() {
 			continue
@@ -454,7 +465,7 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 			Truncated: truncated,
 		})
 	}
-	return changes, nil
+	return changes, firstErr
 }
 
 func historyTieredListSessionFilesInDirs(dirs []string) ([]string, error) {
