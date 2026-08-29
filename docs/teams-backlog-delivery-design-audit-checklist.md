@@ -181,7 +181,7 @@
 | P0 presubmit | `internal/teams` | `TestTeamsTranscriptClaimSourceRewriteFence` | claim 后 rewrite barrier | 先 durable fence/hold，不能仅 `skipped` 越过 proof | 否 |
 | P0 presubmit | `internal/teams` | `TestTeamsTranscriptSourceIdentityReplacement` | delete/recreate、same size/mtime、rename | 普通 idle path 不把新 source 永久当 unchanged | 否 |
 | P0 presubmit | `internal/teams` | `TestTeamsExternalSideEffectRecovery` | sender/store fault hooks，JSON/SQLite | POST 后未知结果不盲发，ledger/provenance 失败可恢复 | 否 |
-| P0 presubmit | `internal/teams` | `TestTeamsHistoryWatchErrorIsolation` + `TestTeamsLinkedTranscriptErrorIsolation` | 首个坏 path/session + 后续健康对象 | local 首错不阻塞后续，process-wide 错误停止写入 | 否 |
+| P0 presubmit | `internal/teams` | `TestTeamsHistoryWatchErrorIsolation` + `TestTeamsLinkedTranscriptMissingSourceDoesNotStarveHealthySession` | 首个坏 path/session + 后续健康对象 | local 首错不阻塞后续，process-wide 错误停止写入 | 否 |
 | P1 Linux/Docker | `internal/teams` | `TestTeamsOutboxAttemptBudgetAndFairness` | 失败 row + 健康 chat，生产 2/8 lane | attempts/rows/pages/time 有界，健康 chat 在数值 SLA 内推进 | 否 |
 | P1 Linux/Docker | `internal/teams` | `TestTeamsHistoryWatchBackoffAndResume` | missing/bad/append path，重启 | `NextProbeAt`/cursor 持久，append/repair 可唤醒 | 否 |
 | P1 Linux/Docker | `internal/teams` | `TestTeamsOutboxPacingReservation` | global/targeted 并发，fake sleeper | 同 chat 实际 POST start 间隔满足契约，不串行化不同 chat | 否 |
@@ -271,7 +271,7 @@ P0 测试不允许因 Docker、平台或环境能力缺失而静默 skip；P1/P2
 ### 已新增并实际验证的回归测试
 
 - [x] `internal/teams`：`TestTeamsCyclePhaseScopeAndProgress`、`TestTeamsOwnerCapabilityTakeover`、`TestTeamsTranscriptSourceIdentityReplacement`、`TestTeamsTranscriptClaimSourceRewriteFence`、`TestTeamsExternalSideEffectRecovery`。
-- [x] `internal/teams`：`TestTeamsHistoryWatchErrorIsolation`、`TestTeamsLinkedTranscriptErrorIsolation`、`TestTeamsOutboxAttemptBudgetAndFairness`、`TestTeamsOutboxPacingReservation`。
+- [x] `internal/teams`：`TestTeamsHistoryWatchErrorIsolation`、`TestTeamsLinkedTranscriptMissingSourceDoesNotStarveHealthySession`、`TestTeamsOutboxAttemptBudgetAndFairness`、`TestTeamsOutboxPacingReservation`。
 - [x] `internal/teams`：`TestTeamsQueuedAdmissionBoundedStart`、`TestTeamsQueuedAdmissionPhaseDoesNotCancelStartedTurn`、既有 `TestBridgeQueuedTurnFollowUpStaysWithinCompletedSession`。
 - [x] `internal/teams`：`TestTeamsDuePollAndPhaseDeadline`、`TestTeamsBacklogScaleAndVirtualOutage`（当前为小规模/虚拟 outage smoke，不等价于 500+ chat 或 72h soak）。
 - [x] `internal/teams/store`：`TestStoreJSONSQLiteDispositionParity`、`TestStorePollFrontierAndScheduleRevisionRace`。
@@ -289,7 +289,7 @@ P0 测试不允许因 Docker、平台或环境能力缺失而静默 skip；P1/P2
 - [x] `s512` 的 pending root/扫描快照竞态：既有 `TestBridgeSyncLinkedTranscriptPublishesSafePrefixBeforePendingRootMarker` 验证安全前缀会发布、checkpoint 会推进、不会刷 `helper publish-history`，并且重复扫描不重发。
 - [x] `s514` 的单条超大记录：既有 `TestBridgeSyncLinkedTranscriptAdvancesPastOversizedRecord` 和 `TestHistoryTieredScanTailAdvancesPastOversizedRecord` 验证大记录被作为 opaque/quarantine 消费并推进物理 cursor，后面的 final 可在下一轮到达，不把整个 chat 永久 block。
 - [x] `s519` 的超大 tail/空可发布记录：既有 `TestBridgeSyncLinkedTranscriptAdvancesOversizedTailIncrementally` 与 `TestHistoryTieredScanTailDrainsOversizedPartialRecordAcrossPolls` 验证扫描按有界批次推进，后续 final 可达，不因本轮没有可发送记录而重复读取同一位置。
-- [x] 本轮新增的跨对象 liveness 问题：`TestTeamsLinkedTranscriptErrorIsolation` 固定“首个坏 session、后续健康 session”的顺序，验证前者的本地错误不会阻塞后者；`TestTeamsHistoryWatchErrorIsolation` 对应坏 path。
+- [x] 本轮新增的跨对象 liveness 问题：`TestTeamsLinkedTranscriptMissingSourceDoesNotStarveHealthySession` 固定“首个缺失 source、后续健康 session”的顺序，验证前者的本地 source 问题不会阻塞后者；`TestTeamsHistoryWatchErrorIsolation` 对应坏 path。
 - [x] 本轮新增的无进度/读放大风险：`TestTeamsOutboxAttemptBudgetAndFairness`、`TestTeamsBacklogScaleAndVirtualOutage`、`TestTeamsDuePollAndPhaseDeadline` 验证失败/门控 row 有扫描和时间边界、健康对象可继续、Graph 黑洞不会把 phase 变成无限等待；这些是确定性 smoke，不等价于完整多日 soak。
 - [x] 本轮新增的并发/恢复安全边界：`TestTeamsOwnerCapabilityTakeover`、`TestStorePollFrontierAndScheduleRevisionRace`、`TestTeamsTranscriptClaimSourceRewriteFence`、`TestTeamsExternalSideEffectRecovery` 和 `TestTeamsQueuedAdmissionPhaseDoesNotCancelStartedTurn` 分别保护旧 owner、source rewrite、未知 Graph 副作用和阶段 deadline 下的已启动 turn。
 

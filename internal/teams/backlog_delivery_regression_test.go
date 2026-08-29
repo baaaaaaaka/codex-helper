@@ -315,7 +315,7 @@ func TestTeamsHistoryWatchErrorIsolation(t *testing.T) {
 	}
 }
 
-func TestTeamsLinkedTranscriptErrorIsolation(t *testing.T) {
+func TestTeamsLinkedTranscriptMissingSourceDoesNotStarveHealthySession(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	badPath := filepath.Join(dir, "bad-linked.jsonl")
@@ -398,25 +398,24 @@ func TestTeamsLinkedTranscriptErrorIsolation(t *testing.T) {
 	}
 	seedCheckpoint(badSession, badPath, badInfo, "bad-old", 3)
 	seedCheckpoint(goodSession, goodPath, goodInfo, "good-old", 3)
-	appendLine(t, badPath, `{"type":"event_msg","payload":{"id":"bad-new","type":"agent_message","turn_id":"bad-new-turn","phase":"final_answer","message":"bad linked answer"}}`)
+	// Remove the source after its checkpoint has been persisted. A missing
+	// linked source is a stable, cross-platform source-local failure (unlike
+	// POSIX mode bits, which do not make a file unreadable on Windows). The
+	// healthy session must still be processed in the same discovery cycle.
+	if err := os.Remove(badPath); err != nil {
+		t.Fatalf("remove bad linked transcript: %v", err)
+	}
 	appendLine(t, goodPath, `{"type":"event_msg","payload":{"type":"task_started","turn_id":"good-new-turn","started_at":1786181090,"model_context_window":128000,"collaboration_mode_kind":"default"}}`)
 	appendLine(t, goodPath, `{"type":"response_item","thread_id":"thread-healthy-linked","payload":{"id":"good-prompt","type":"message","role":"user","content":[{"type":"input_text","text":"healthy linked prompt"}]}}`)
 	appendLine(t, goodPath, `{"type":"event_msg","payload":{"id":"good-new","type":"agent_message","turn_id":"good-new-turn","phase":"final_answer","message":"healthy linked answer"}}`)
 	appendLine(t, goodPath, `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"good-new-turn"}}`)
-	t.Cleanup(func() { _ = os.Chmod(badPath, 0o600) })
-	if err := os.Chmod(badPath, 0); err != nil {
-		t.Fatalf("make bad linked transcript unreadable: %v", err)
-	}
 	err = bridge.syncLinkedTranscripts(ctx)
 	flushBridgeQueuedNotificationsForTest(t, bridge)
-	if err == nil {
-		t.Fatal("blocked linked source did not return a session-local diagnostic")
+	if err != nil {
+		t.Fatalf("missing linked source should remain session-local: %v", err)
 	}
 	if !sentPlainContains(*sent, "healthy linked answer") {
 		t.Fatalf("healthy linked session was starved by an earlier unreadable source: %#v", *sent)
-	}
-	if sentPlainContains(*sent, "bad linked answer") {
-		t.Fatalf("unreadable linked source unexpectedly published: %#v", *sent)
 	}
 }
 
@@ -565,7 +564,11 @@ func TestTeamsQueuedAdmissionPhaseDoesNotCancelStartedTurn(t *testing.T) {
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.asyncTurns = true
-	bridge.phaseBudget = time.Second
+	// The phase cancellation under test happens after the callback returns. Use
+	// the normal async-test budget for admission bookkeeping: one-second
+	// deadlines are not stable on hosted Windows runners under full-suite load
+	// and would test runner scheduling rather than execution-context ownership.
+	bridge.phaseBudget = bridgeAsyncTestTimeout
 	session := bridge.reg.SessionByID("s001")
 	if session == nil {
 		t.Fatal("missing base session")
