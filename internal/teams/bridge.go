@@ -1984,6 +1984,17 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 			stopActiveOwner()
 			_, _ = b.store.ClearOwnerIfSame(context.Background(), claimedOwner)
 			return b.runStandbyLoop(ctx, opts)
+		} else {
+			// An external release can race the listener's maintenance refresh. If
+			// this same invocation successfully reclaims a new generation before
+			// another owner takes over, its deferred cleanup must release that
+			// generation too. Never read b.currentLease() unconditionally in the
+			// cleanup: after a real takeover it refers to the replacement owner.
+			lease := b.currentLease()
+			if lease.Generation > 0 && lease.HolderMachineID == claimedMachineID {
+				claimedLeaseGeneration = lease.Generation
+				claimedOwner.LeaseGeneration = lease.Generation
+			}
 		}
 		cycleCtx, cancelCycle := context.WithCancel(ownerWorkCtx)
 		cycleDegraded := false

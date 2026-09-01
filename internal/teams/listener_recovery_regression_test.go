@@ -2404,8 +2404,10 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 		t.Fatalf("release old owner lease: released=%v err=%v", released, err)
 	}
 	// As in the history-watch fixture, wait for the old generation to cancel its
-	// cooperative worker and stop it before claiming the replacement. Otherwise
-	// the old listener can enter standby and win the replacement claim itself.
+	// cooperative worker and stop it before claiming the replacement. The
+	// listener may briefly reclaim an externally released lease in this window;
+	// its generation-scoped cleanup must release that replacement before the
+	// test installs the new owner.
 	waitListenerRecovery(t, func() bool {
 		return bridge.activeAsyncTurnCount() == 0
 	}, 2*time.Second, "owner-loss cooperative turn cancellation")
