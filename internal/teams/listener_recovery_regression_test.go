@@ -3013,24 +3013,37 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 		return false
 	}, 8*time.Second, "slow inbound final delivery")
 
+	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
+	if err != nil {
+		t.Fatalf("parse slow inbound message timestamp: %v", err)
+	}
+	// The final POST can complete before the terminal poll CAS. Wait for the
+	// cursor itself, so a cleanup-context regression still fails here, then
+	// stop the listener before inspecting Attempt. Without stopping first, the
+	// healthy listener may already have claimed the next valid poll cycle and
+	// make a live attempt look like stale cleanup state.
+	waitListenerRecovery(t, func() bool {
+		state, loadErr := store.Load(context.Background())
+		if loadErr != nil {
+			return false
+		}
+		poll := state.ChatPolls["chat-1"]
+		return !poll.LastModifiedCursor.Before(messageModifiedAt)
+	}, listenerRecoveryExtendedProgressTimeout, "slow inbound durable poll cursor")
+	listener.stop(t)
 	state, err := store.Load(context.Background())
 	if err != nil {
-		listener.stop(t)
 		t.Fatalf("load slow inbound state: %v", err)
 	}
 	if poll := state.ChatPolls["chat-1"]; poll.Attempt != nil {
-		listener.stop(t)
 		t.Fatalf("slow inbound poll attempt remained after handler/cleanup: %#v", poll)
 	}
 	if got := countListenerRecoveryInbound(state, "s001", message.ID); got != 1 {
-		listener.stop(t)
 		t.Fatalf("slow inbound count = %d, want one; state=%#v", got, state.InboundEvents)
 	}
 	if got := countListenerRecoveryTranscriptFinals(graphState.sentSnapshot(), "LISTENER_RECOVERY_SLOW_INBOUND_FINAL"); got != 1 {
-		listener.stop(t)
 		t.Fatalf("slow inbound final POST count = %d, want one; sent=%#v", got, graphState.sentSnapshot())
 	}
-	listener.stop(t)
 }
 
 func mustListenerRecoveryState(t *testing.T, store *teamstore.Store) teamstore.State {
