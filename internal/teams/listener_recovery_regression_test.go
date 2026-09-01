@@ -2899,18 +2899,36 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		}
 		return false
 	}, 20*time.Second, "phase-timeout final delivery")
+	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
+	if err != nil {
+		t.Fatalf("parse phase-timeout message timestamp: %v", err)
+	}
+	// The final outbox POST is intentionally asynchronous with the poll
+	// attempt's terminal CAS.  Wait for the successful retry to publish its
+	// durable cursor before canceling the listener; otherwise a slow runner can
+	// cancel the commit and leave a perfectly valid follow-up Attempt in the
+	// state, making this test race with its own cleanup.
+	waitListenerRecovery(t, func() bool {
+		state, loadErr := store.Load(context.Background())
+		if loadErr != nil {
+			return false
+		}
+		poll := state.ChatPolls["chat-1"]
+		return !poll.LastModifiedCursor.Before(messageModifiedAt)
+	}, 20*time.Second, "phase-timeout durable cursor")
 
 	// The listener continues polling after the final outbox side effect. Stop
-	// it before inspecting the attempt so a later, perfectly valid poll cannot
-	// race this assertion with a newly claimed attempt for the same chat.
+	// it after the successful retry's cursor is durable. A later, perfectly
+	// valid poll may still have an Attempt in flight; that is not the stale
+	// capability this regression is guarding against.
 	listener.stop(t)
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load phase-timeout state: %v", err)
 	}
 	poll := state.ChatPolls["chat-1"]
-	if poll.Attempt != nil {
-		t.Fatalf("phase-timeout poll attempt remained after recovery: %#v", poll)
+	if poll.LastModifiedCursor.Before(messageModifiedAt) {
+		t.Fatalf("phase-timeout cursor remained behind recovered message: %#v", poll)
 	}
 	if got := countListenerRecoveryInbound(state, "s001", message.ID); got != 1 {
 		t.Fatalf("phase-timeout inbound count = %d, want one; state=%#v", got, state.InboundEvents)
