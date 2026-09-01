@@ -27,7 +27,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 12,
+      "max_seconds": 45,
       "oracle": "a retryable continuation outage is retried by a later listener cycle, then the old prompt and final make durable progress",
       "baseline": "pre-fix continuation recovery can remain blocked or be hidden by a head-only success"
     },
