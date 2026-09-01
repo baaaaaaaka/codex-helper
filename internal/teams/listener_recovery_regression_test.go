@@ -1377,6 +1377,14 @@ func TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage(t *testin
 	if finalPosts != 1 {
 		t.Fatalf("recovered final POST count = %d, want one; posts=%#v", finalPosts, gotPosts)
 	}
+	waitListenerRecovery(t, func() bool {
+		state, loadErr := store.Load(context.Background())
+		if loadErr != nil {
+			return false
+		}
+		poll := state.ChatPolls[chatID]
+		return poll.ContinuationPath == "" && poll.Gap == nil && poll.PendingPage == nil
+	}, 5*time.Second, "continuation frontier drain")
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load state after continuation recovery: %v", err)
