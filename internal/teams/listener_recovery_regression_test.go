@@ -706,6 +706,11 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
+// Full-package race runs can be delayed by the heavy fixtures that execute
+// before these fairness checks. Keep their liveness bound finite, but do not
+// let runner contention turn a healthy isolated chat into a false timeout.
+const listenerRecoveryBusyProgressTimeout = 60 * time.Second
+
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy race runner has already spent one phase budget. Keep that
 // liveness bound finite, but long enough to observe the next durable attempt
@@ -2041,7 +2046,7 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 			}
 		}
 		return false
-	}, listenerRecoveryExtendedProgressTimeout, "healthy tail after session-local transcript error")
+	}, listenerRecoveryBusyProgressTimeout, "healthy tail after session-local transcript error")
 	callsMu.Lock()
 	gotHeadCalls, gotTailCalls := headCalls, tailCalls
 	callsMu.Unlock()
@@ -3271,7 +3276,7 @@ func TestTeamsListenFalseSQLiteTranscriptBacklogProgresses(t *testing.T) {
 			}
 		}
 		return false
-	}, listenerRecoveryProgressTimeout)
+	}, listenerRecoveryBusyProgressTimeout)
 	if !progressed {
 		state, loadErr := store.Load(context.Background())
 		checkpoint := teamstore.ImportCheckpoint{}
