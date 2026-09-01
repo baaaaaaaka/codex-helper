@@ -12,7 +12,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.152.0-alpha.6 | pass | pass | pass | pass | pass | pass | 2026-08-31T03:47:55Z |
 | 0.152.0-alpha.4 | pass | pass | pass | pass | pass | pass | 2026-08-30T15:08:05Z |
 | 0.152.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-08-29T13:35:00Z |
-| 0.151.0 | pass | pass | pass | pass | pass | pass | 2026-08-29T13:35:00Z |
+| 0.151.0 | pass | pass | pass | pass | pass | pass | 2026-09-01T15:53:30Z |
 | 0.151.0-alpha.12 | pass | pass | pass | pass | pass | pass | 2026-08-29T07:59:13Z |
 | 0.151.0-alpha.11 | pass | pass | pass | pass | pass | pass | 2026-08-29T01:04:49Z |
 | 0.151.0-alpha.10 | pass | pass | pass | pass | pass | pass | 2026-08-28T17:23:51Z |
