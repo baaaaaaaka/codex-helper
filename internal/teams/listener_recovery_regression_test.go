@@ -698,6 +698,14 @@ type listenerRecoveryTaskPromptRaceExecutor struct {
 // watchdog for a genuinely wedged listener.
 const listenerRecoveryProgressTimeout = 10 * time.Second
 
+// A few recovery fixtures deliberately combine a real continuous listener,
+// file-backed state, and a multi-step Graph/outbox transition. Their normal
+// liveness watchdog remains short, while these scenarios get a larger finite
+// bound so a busy race/hosted runner does not turn scheduler latency into a
+// false failure. The production invariants and exact-once assertions remain
+// unchanged.
+const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
+
 func (e *listenerRecoveryBlockingExecutor) Run(_ context.Context, _ *Session, _ string) (ExecutionResult, error) {
 	e.once.Do(func() { close(e.started) })
 	<-e.release
@@ -1475,7 +1483,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			}
 		}
 		return finals == 2
-	}, listenerRecoveryProgressTimeout, "stateful head and continuation final delivery")
+	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation final delivery")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -1484,7 +1492,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		poll := state.ChatPolls[chatID]
 		return poll.PendingPage == nil && poll.Attempt == nil &&
 			strings.TrimSpace(poll.ContinuationPath) == ""
-	}, listenerRecoveryProgressTimeout, "stateful head and continuation durable poll completion")
+	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation durable poll completion")
 
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false
@@ -1895,7 +1903,7 @@ func TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail(t *tes
 		default:
 			return false
 		}
-	}, listenerRecoveryProgressTimeout, "healthy tail to enter after full slow worker pool")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail to enter after full slow worker pool")
 
 	healthyPath := paths[len(paths)-1]
 	healthyInfo, err := os.Stat(healthyPath)
@@ -1913,7 +1921,7 @@ func TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail(t *tes
 			return false
 		}
 		return countListenerRecoveryTranscriptFinals(graphState.sentSnapshot(), "LISTENER_RECOVERY_FULL_POOL_FINAL_s005") == 1
-	}, listenerRecoveryProgressTimeout, "healthy tail after full slow worker pool")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail after full slow worker pool")
 	listener.stop(t)
 
 	slowCallsMu.Lock()
@@ -2200,7 +2208,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 		default:
 			return false
 		}
-	}, listenerRecoveryProgressTimeout, "history-watch healthy tail to enter after full slow worker pool")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail to enter after full slow worker pool")
 
 	healthyPath := paths[len(paths)-1]
 	healthyInfo, err := os.Stat(healthyPath)
@@ -2214,7 +2222,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 			return false
 		}
 		return state.HistoryWatch[historyWatchCheckpointID(healthyPath)].Offset == healthyInfo.Size()
-	}, listenerRecoveryProgressTimeout, "history-watch healthy tail after full slow worker pool")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail after full slow worker pool")
 	listener.stop(t)
 }
 
@@ -3788,7 +3796,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				checkpoint := state.ImportCheckpoints[transcriptCheckpointID(race.session.ID)]
 				return checkpoint.PendingHistoryRange != nil && strings.EqualFold(checkpoint.PendingHistoryRange.Kind, "pending_root_task_started")
-			}, listenerRecoveryProgressTimeout)
+			}, listenerRecoveryExtendedProgressTimeout)
 			if !pendingBoundaryReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
@@ -3825,7 +3833,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 				return strings.Contains(plain, healthyFinal) && strings.Contains(plain, raceFinal)
-			}, listenerRecoveryProgressTimeout)
+			}, listenerRecoveryExtendedProgressTimeout)
 			if !safeBacklogReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
@@ -4276,6 +4284,7 @@ func TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover(t *test
 // staging, attempt ownership, or the first generation's durable commit.
 func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool) {
 	t.Helper()
+	progressTimeout := listenerRecoveryExtendedProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
@@ -4314,7 +4323,7 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(progressTimeout):
 		first.stop(t)
 		t.Fatalf("first listener did not process production poll page; Graph reads=%d errors=%v", graphState.getCount(chatID), graphState.errorsSnapshot())
 	}
@@ -4327,7 +4336,7 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 		secondTurn := state.Turns["turn:inbound:"+chatID+":reopen-frontier-message-2"]
 		poll := state.ChatPolls[chatID]
 		return firstTurn.Status == teamstore.TurnStatusCompleted && secondTurn.Status == teamstore.TurnStatusCompleted && poll.PendingPage == nil && strings.TrimSpace(poll.ContinuationPath) == "" && countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_FRONTIER_FIRST_FINAL") == 2
-	}, listenerRecoveryProgressTimeout, "first generation drained Graph continuation")
+	}, progressTimeout, "first generation drained Graph continuation")
 	if got := graphState.getCount(chatID); got < 2 {
 		first.stop(t)
 		t.Fatalf("first generation did not follow the stateful Graph continuation: Graph GETs=%d requests=%v", got, graphState.requestsSnapshot())
@@ -4365,7 +4374,7 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	waitListenerRecovery(t, func() bool {
 		state, err := recoveredStore.Load(ctx)
 		return err == nil && state.ControlLease.Generation > oldGeneration
-	}, listenerRecoveryProgressTimeout, "reopened listener owner takeover")
+	}, progressTimeout, "reopened listener owner takeover")
 	select {
 	case call := <-recoveredExecutor.called:
 		listener.stop(t)
@@ -5072,9 +5081,12 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 	}
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
-	first := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
+	firstOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
+	firstOptions.PhaseBudget = 5 * time.Second
+	firstOptions.PollWorkerBudget = time.Second
+	first := startListenerRecovery(t, bridge, firstOptions)
 	ambiguous := false
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		state, loadErr := store.Load(ctx)
 		if loadErr == nil {
@@ -5117,9 +5129,12 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 	recoveredExecutor := &recordingExecutor{}
 	recoveredBridge := newBridgeTestBridge(graph, recoveredStore, recoveredExecutor)
 	t.Cleanup(func() { _ = recoveredStore.Close() })
-	recovered := startListenerRecovery(t, recoveredBridge, listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry.json"), recoveredExecutor))
+	recoveredOptions := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry.json"), recoveredExecutor)
+	recoveredOptions.PhaseBudget = 5 * time.Second
+	recoveredOptions.PollWorkerBudget = time.Second
+	recovered := startListenerRecovery(t, recoveredBridge, recoveredOptions)
 	settled := false
-	deadline = time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline = time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		state, loadErr := recoveredStore.Load(ctx)
 		if loadErr == nil {

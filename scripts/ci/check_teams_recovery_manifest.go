@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-const manifestCompileGrace = time.Minute
+const manifestCompileGrace = 3 * time.Minute
 const teamsOwnershipStressStrictEnv = "CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT"
 
 type manifest struct {

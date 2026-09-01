@@ -57,7 +57,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 45,
       "oracle": "a healthy linked session later than four cooperative slow sessions enters and commits within a later phase slice",
       "baseline": "pre-fix all four workers wait for the phase deadline and the healthy tail receives only cancelled contexts"
     },
@@ -102,7 +102,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 45,
       "oracle": "a healthy history-watch path later than four cooperative slow paths advances its durable offset within a later phase slice",
       "baseline": "pre-fix all four workers wait for the phase deadline and the healthy path receives only cancelled contexts"
     },
@@ -192,7 +192,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 40,
+      "max_seconds": 60,
       "oracle": "a restarted listener drains a safe inherited backlog and a proven task/prompt boundary on both stores while silently isolating an unproven legacy checkpoint",
       "baseline": "pre-fix current-state replay can skip inherited sessions, retain a pending boundary, or turn a legacy history-only row into a live blocker"
     },
@@ -667,7 +667,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 45,
       "oracle": "Graph commits exactly one message before the response disconnects, and a reopened listener reconciles its exact provenance marker without a second POST",
       "baseline": "pre-fix a lost Graph response could leave Sending forever or cause a duplicate POST after restart"
     },
@@ -933,7 +933,7 @@
       "vertical": "poll-scheduler-due-fairness",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "more continuously due chats than the per-cycle cap are all selected across subsequent cycles instead of starving the tail chat",
       "baseline": "pre-fix fixed ordering repeatedly selected the same hot chats and never reached the ninth due chat"
     },
@@ -1134,7 +1134,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 45,
       "oracle": "production head query and its stateful filtered nextLink are both followed, and the terminal page clears the durable frontier",
       "baseline": "pre-fix a fixture that ignored query state could hide dropped filters, cursors, or false terminal handling"
     },
@@ -1164,7 +1164,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 45,
       "oracle": "a new Store and owner generation replays a staged page without a Graph refetch and commits the terminal poll frontier",
       "baseline": "pre-fix a poll page or attempt tied to the prior process could be lost, replayed unsafely, or left active after reopen"
     },

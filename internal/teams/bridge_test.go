@@ -909,11 +909,18 @@ func TestBridgeExplicitCancelDuringListenerLifecycleIsNotShutdownFailure(t *test
 				if got := strings.TrimSpace(turn.RecoveryReason); got != "canceled by user" {
 					t.Fatalf("explicit cancel recovery reason = %q", got)
 				}
-				joined := sentPlainJoined(*sent)
-				if !strings.Contains(joined, "Codex request canceled.") || strings.Contains(joined, "error: Teams async turn lifecycle stopped") {
-					t.Fatalf("explicit cancel produced wrong Teams output:\n%s", joined)
+				outputDeadline := time.Now().Add(bridgeAsyncTestTimeout)
+				for time.Now().Before(outputDeadline) {
+					joined := sentPlainJoined(*sent)
+					if strings.Contains(joined, "error: Teams async turn lifecycle stopped") {
+						t.Fatalf("explicit cancel produced shutdown failure:\n%s", joined)
+					}
+					if strings.Contains(joined, "Codex request canceled.") {
+						return
+					}
+					time.Sleep(time.Millisecond)
 				}
-				return
+				t.Fatalf("explicit cancel did not publish cancellation output:\n%s", sentPlainJoined(*sent))
 			}
 		}
 		time.Sleep(time.Millisecond)

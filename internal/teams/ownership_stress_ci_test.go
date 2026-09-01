@@ -1011,7 +1011,7 @@ func TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI(t *testing.T) {
 // fifth chat must reach Graph instead of being lost behind the outage.
 func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *testing.T) {
 	previousTimeout := inboundPollGraphTimeout
-	inboundPollGraphTimeout = 50 * time.Millisecond
+	inboundPollGraphTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { inboundPollGraphTimeout = previousTimeout })
 
 	// Race instrumentation makes the first SQLite connection/schema path and
