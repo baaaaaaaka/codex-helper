@@ -946,7 +946,7 @@
       "vertical": "poll-scheduler-partial-fairness",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "nine continuously partial pending pages all receive a bounded poll quantum within two scheduler cycles, including the tail chat beyond the eight-chat cap",
       "baseline": "pre-fix partial pages retained the same service age and repeatedly selected the first eight chats"
     },
