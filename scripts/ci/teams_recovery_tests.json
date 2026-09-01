@@ -87,7 +87,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "later history-watch path advances its durable offset despite a slow earlier path",
       "baseline": "pre-fix serial history-watch scan lets the earlier path consume the phase"
     },

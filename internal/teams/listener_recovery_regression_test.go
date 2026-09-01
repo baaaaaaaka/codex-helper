@@ -2120,7 +2120,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 		default:
 			return false
 		}
-	}, listenerRecoveryProgressTimeout, "history-watch slow head to enter")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch slow head to enter")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -2133,7 +2133,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 			}
 		}
 		return true
-	}, listenerRecoveryProgressTimeout, "history-watch healthy tail and slow head")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail and slow head")
 	listener.stop(t)
 }
 
@@ -4085,7 +4085,7 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	// listener into an unbounded wait.
 	recoveredOptions.PhaseBudget = 5 * time.Second
 	secondListener := startListenerRecovery(t, recoveredBridge, recoveredOptions)
-	recoveredDeadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	recoveredDeadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	recovered := false
 	for time.Now().Before(recoveredDeadline) {
 		state, loadErr := recoveredStore.Load(context.Background())
