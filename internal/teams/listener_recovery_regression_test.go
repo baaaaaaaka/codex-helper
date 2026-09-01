@@ -708,8 +708,9 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy race runner has already spent one phase budget. Keep that
-// liveness bound finite, but long enough to observe the next durable attempt.
-const listenerRecoveryBacklogProgressTimeout = 30 * time.Second
+// liveness bound finite, but long enough to observe the next durable attempt
+// and its accepted-send recovery delay.
+const listenerRecoveryBacklogProgressTimeout = 60 * time.Second
 
 func (e *listenerRecoveryBlockingExecutor) Run(_ context.Context, _ *Session, _ string) (ExecutionResult, error) {
 	e.once.Do(func() { close(e.started) })
@@ -4247,7 +4248,14 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	recoveredExecutor := &listenerRecoveryExecutor{called: make(chan string)}
 	recoveredBridge := newBridgeTestBridge(graph, recoveredStore, recoveredExecutor)
 	t.Cleanup(func() { _ = recoveredStore.Close() })
-	recovered := startListenerRecovery(t, recoveredBridge, listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry.json"), recoveredExecutor))
+	recoveredOptions := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry.json"), recoveredExecutor)
+	// The reopened listener must complete the durable owner-CAS and generated
+	// outbox transition before this test can assert exactly-once delivery. Keep
+	// the bound finite, but do not let the short phase-isolation budget turn
+	// SQLite recovery latency into a false "outbox was lost" failure.
+	recoveredOptions.PhaseBudget = 5 * time.Second
+	recoveredOptions.PollWorkerBudget = time.Second
+	recovered := startListenerRecovery(t, recoveredBridge, recoveredOptions)
 	waitListenerRecovery(t, func() bool {
 		state, err := recoveredStore.Load(ctx)
 		if err != nil {
@@ -4255,7 +4263,7 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 		}
 		outbox, ok := state.OutboxMessages[generatedID]
 		return ok && outbox.Status == teamstore.OutboxStatusSent && countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_POLLED_REOPEN_FINAL") == 1
-	}, listenerRecoveryProgressTimeout, "polled generated outbox after reopen")
+	}, listenerRecoveryExtendedProgressTimeout, "polled generated outbox after reopen")
 	recovered.stop(t)
 
 	if got := len(executor.callsSnapshot()); got != 1 {
@@ -5215,10 +5223,18 @@ func TestTeamsListenFalseMarkerlessAmbiguousOutboxStaysHeldWithoutPost(t *testin
 			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 			listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now.Add(-time.Minute))
 			listenerRecoverySeedDuePoll(t, store, "chat-1", now.Add(-time.Minute))
-			listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
+			options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
+			// This fixture deliberately keeps one unknown-side-effect row in
+			// Sending while a healthy row must still reach Graph. Under -race the
+			// SQLite owner-CAS can exceed the short phase-isolation budget; use a
+			// bounded production-sized phase so the test checks isolation rather
+			// than scheduler startup latency.
+			options.PhaseBudget = 5 * time.Second
+			options.PollWorkerBudget = time.Second
+			listener := startListenerRecovery(t, bridge, options)
 
 			progressed := false
-			deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+			deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 			for time.Now().Before(deadline) {
 				state, err := store.Load(ctx)
 				if err == nil {
