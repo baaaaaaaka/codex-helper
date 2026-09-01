@@ -4139,6 +4139,7 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	if err != nil {
 		t.Fatalf("open first store: %v", err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	now := time.Now().UTC().Add(-time.Minute)
 	message := bridgeTestMessageWithText("polled-reopen-inbound", "LISTENER_RECOVERY_POLLED_REOPEN_PROMPT")
 	message.ChatID = "chat-1"
@@ -4176,7 +4177,12 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	}
 	firstOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 3 * time.Second
+	// Windows hosted runners can spend several seconds in the first durable
+	// poll/store path even without -race. Keep this bounded, but do not let a
+	// 100ms worker budget turn a successful local Graph response into a false
+	// "never reached executor" failure.
+	firstOptions.PhaseBudget = 10 * time.Second
+	firstOptions.PollWorkerBudget = 5 * time.Second
 	first := startListenerRecovery(t, bridge, firstOptions)
 	select {
 	case <-executor.called:
