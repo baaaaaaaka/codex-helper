@@ -17,11 +17,24 @@ docker info >/dev/null 2>&1 || {
 
 cd "$repo_root"
 CGO_ENABLED=0 go test -c -o "$tmp_dir/teams-runtime-safety.test" ./internal/teams
+test_selector='^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI|TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI)$'
+for test_name in \
+  TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI \
+  TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI \
+  TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI \
+  TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI; do
+  if ! "$tmp_dir/teams-runtime-safety.test" -test.list "$test_selector" | grep -Fxq "$test_name"; then
+    echo "runtime takeover smoke selector did not find exact test: $test_name" >&2
+    exit 1
+  fi
+done
 docker build \
   --file scripts/ci/Dockerfile.teams-runtime-takeover \
   --tag "$image" \
   "$tmp_dir" >/dev/null
-docker run --rm \
+
+run_log="$tmp_dir/runtime-takeover.log"
+if ! timeout --foreground 180s docker run --rm \
   --network none \
   --cap-drop ALL \
   --security-opt no-new-privileges \
@@ -33,6 +46,26 @@ docker run --rm \
   --env CXP_TEAMS_BOUNDARY_DOCKER=1 \
   --env CXP_TEAMS_BOUNDARY_FS_ROOT=/state \
   "$image" \
-  -test.run '^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI|TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI)$' \
+  -test.run "$test_selector" \
   -test.count=1 \
-  -test.v
+  -test.timeout=120s \
+  -test.v >"$run_log" 2>&1; then
+  cat "$run_log" >&2
+  exit 1
+fi
+cat "$run_log"
+
+for test_name in \
+  TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI \
+  TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI \
+  TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI \
+  TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI; do
+  if ! grep -Eq -- "^--- PASS: ${test_name}([[:space:]]|$)" "$run_log"; then
+    echo "runtime takeover smoke test did not pass (or was skipped): $test_name" >&2
+    exit 1
+  fi
+  if grep -Eq -- "^--- SKIP: ${test_name}([[:space:]]|$)" "$run_log"; then
+    echo "runtime takeover smoke test was skipped: $test_name" >&2
+    exit 1
+  fi
+done

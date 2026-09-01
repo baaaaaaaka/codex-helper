@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -28,12 +29,13 @@ import (
 )
 
 const (
-	// SchemaVersion 9 is an intentional upgrade-only boundary. The durable
+	// SchemaVersion 10 is an intentional upgrade-only boundary. The durable
 	// Graph frontier, immutable pending-page receipt, poll attempt capability,
-	// and revision fields are safety data; helpers built against schema 8 do not
-	// know how to preserve them. A schema-9 store must therefore never be
-	// written by an older helper.
-	SchemaVersion = 9
+	// revision fields, and post-send side-effect replay marker are safety data;
+	// helpers built against schema 9 or earlier do not know how to preserve all
+	// of them. A schema-10 store must therefore never be written by an older
+	// helper.
+	SchemaVersion = 10
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -51,6 +53,13 @@ const (
 	// reading arbitrary source-file bytes.
 	maxSourceCheckpointProofRangeBytes int64 = 512 * 1024
 )
+
+// processOwnerInstanceID distinguishes two helper incarnations that happen to
+// reuse the same PID, host name, and executable path.  The value is generated
+// once when this process loads the store package and is persisted only in the
+// owner metadata; older rows without it continue to use the legacy identity
+// comparison until this process has written a fresh owner row.
+var processOwnerInstanceID = fmt.Sprintf("pid-%d-start-%d", os.Getpid(), time.Now().UnixNano())
 
 type SessionStatus string
 
@@ -173,6 +182,12 @@ var ErrCheckpointRepairConflict = errors.New("import checkpoint repair compare-a
 // remain strict and are not silently rewritten by this SQLite-only operation.
 var ErrSQLiteCheckpointRepairUnavailable = errors.New("opaque checkpoint repair requires SQLite storage")
 
+// ErrProofBackedCheckpointPromotionConflict means that a compatibility
+// checkpoint changed after its source proof was inspected.  The caller must
+// re-read the row and revalidate the source; it must never retry the old
+// replacement blindly.
+var ErrProofBackedCheckpointPromotionConflict = errors.New("proof-backed checkpoint promotion compare-and-swap conflict")
+
 // ErrHistoryWatchCheckpointConflict means that a history watcher tried to
 // publish a checkpoint based on a stale read.  A watcher must leave the newer
 // cursor intact and retry from a fresh snapshot on the next poll; treating
@@ -212,6 +227,69 @@ const (
 	importCheckpointStatusComplete  = "complete"
 	importCheckpointStatusBlocked   = "blocked"
 )
+
+// Persisted status strings are input data, not an open-ended extension point.
+// An unknown value must never silently take the inactive/default branch: for
+// sessions that would hide a chat, for turns it could hide an active writer,
+// and for outbox rows it could strand a message. Empty values remain accepted
+// for legacy rows whose zero value was historically normalized by the caller.
+func knownSessionStatus(status SessionStatus) bool {
+	switch SessionStatus(strings.TrimSpace(string(status))) {
+	case "", SessionStatusActive, SessionStatusArchived, SessionStatusClosed,
+		SessionStatusQuarantined, SessionStatusStaging, SessionStatusAwaitingHistory:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownTurnStatus(status TurnStatus) bool {
+	switch TurnStatus(strings.TrimSpace(string(status))) {
+	case "", TurnStatusQueued, TurnStatusRunning, TurnStatusCompleted,
+		TurnStatusFailed, TurnStatusInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownOutboxStatus(status OutboxStatus) bool {
+	switch OutboxStatus(strings.TrimSpace(string(status))) {
+	case "", OutboxStatusQueued, OutboxStatusSending, OutboxStatusAccepted,
+		OutboxStatusSent, OutboxStatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+func annotateUnknownLoadedSession(session *SessionContext) {
+	if session == nil || knownSessionStatus(session.Status) {
+		return
+	}
+	if strings.TrimSpace(session.QuarantineReason) == "" {
+		session.QuarantineReason = fmt.Sprintf("unknown persisted session status %q", strings.TrimSpace(string(session.Status)))
+	}
+	if strings.TrimSpace(session.QuarantineSource) == "" {
+		session.QuarantineSource = "store_decoder"
+	}
+}
+
+// normalizeLoadedTurnStatus turns an unknown non-empty persisted turn status
+// into a running safety fence.  We cannot prove that an unrecognized value is
+// terminal, so treating it as inactive could admit a second execution.  The
+// original value remains in RecoveryReason for diagnostics; explicit repair
+// can later choose the terminal disposition.
+func normalizeLoadedTurnStatus(turn *Turn) {
+	if turn == nil || knownTurnStatus(turn.Status) {
+		return
+	}
+	raw := strings.TrimSpace(string(turn.Status))
+	turn.Status = TurnStatusRunning
+	if strings.TrimSpace(turn.RecoveryReason) == "" {
+		turn.RecoveryReason = fmt.Sprintf("unknown persisted turn status %q; held as running", raw)
+	}
+}
 
 type State struct {
 	SchemaVersion          int                                 `json:"schema_version"`
@@ -254,7 +332,29 @@ type State struct {
 	// legacyUnresolvedSessions is populated only while a SQLite transaction is
 	// assembling the minimal callback state. It is intentionally not persisted.
 	legacyUnresolvedSessions map[string]bool
+	// opaqueOutboxLinkedRecords is populated only while a SQLite transaction is
+	// reconciling an outbox receipt. It prevents an optional malformed linked
+	// row from being replaced by a synthetic success projection in that same
+	// transaction; the raw SQL row remains available for explicit repair.
+	opaqueOutboxLinkedRecords map[string]struct{}
+	// legacyOpaqueJSONSections is populated only when the legacy JSON loader
+	// had to isolate a malformed per-row projection.  A normal legacy state
+	// must not reread and reparse the complete state file on every save merely
+	// to look for corruption that was not present when it was loaded.
+	legacyOpaqueJSONSections legacyOpaqueJSONSection
 }
+
+// legacyOpaqueJSONSection identifies the legacy JSON projection(s) whose raw
+// row bytes must survive an unrelated rewrite.  The bitset is process-local;
+// it is deliberately not part of the persisted schema.
+type legacyOpaqueJSONSection uint8
+
+const (
+	legacyOpaqueCheckpoints legacyOpaqueJSONSection = 1 << iota
+	legacyOpaqueChatPolls
+	legacyOpaqueOutbox
+	legacyOpaqueHistoryWatch
+)
 
 type ScopeIdentity struct {
 	ID            string    `json:"id,omitempty"`
@@ -320,6 +420,57 @@ type ControlLeaseStatus string
 const (
 	ControlLeaseStatusActive ControlLeaseStatus = "active"
 )
+
+func knownControlLeaseStatus(status ControlLeaseStatus) bool {
+	return status == "" || status == ControlLeaseStatusActive
+}
+
+func validateKnownControlLeaseStatus(lease ControlLease) error {
+	if !knownControlLeaseStatus(lease.Status) {
+		return fmt.Errorf("%w: %w: %q", ErrControlLeaseStateUntrusted, ErrControlLeaseStatusUnknown, lease.Status)
+	}
+	return nil
+}
+
+// validateControlLeaseShape rejects lease rows whose fields cannot establish
+// either a valid active lease or a deliberately released/never-claimed lease.
+// A complete holder/expiry tuple is retained as a legacy active
+// representation even when Status is active but Generation is zero: older
+// helpers introduced those fields in separate migrations. Partial tuples are
+// not an expiry proof and must never be used to claim over another writer.
+func validateControlLeaseShape(lease ControlLease) error {
+	if err := validateKnownControlLeaseStatus(lease); err != nil {
+		return err
+	}
+	if lease.Generation < 0 {
+		return fmt.Errorf("%w: control lease generation is negative", ErrControlLeaseStateUntrusted)
+	}
+	holder := strings.TrimSpace(lease.HolderMachineID)
+	hasExpiry := !lease.LeaseUntil.IsZero()
+	hasHeartbeat := !lease.LastHeartbeat.IsZero()
+	activeTuple := holder != "" || hasExpiry
+	if lease.Status == ControlLeaseStatusActive {
+		if holder == "" || !hasExpiry {
+			return fmt.Errorf("%w: control lease active fields are incomplete", ErrControlLeaseStateUntrusted)
+		}
+		return nil
+	}
+	if activeTuple {
+		// A pre-generation helper could still have a complete, live holder and
+		// expiry tuple. It is safe to honor that lease until expiry; the next
+		// claim assigns a positive generation before accepting new work.
+		if holder == "" || lease.Generation < 0 || !hasExpiry {
+			return fmt.Errorf("%w: control lease active fields are incomplete", ErrControlLeaseStateUntrusted)
+		}
+		return nil
+	}
+	// A released lease may retain its monotonic generation and audit timestamp,
+	// but it must not retain any field that could be mistaken for a live holder.
+	if hasHeartbeat || lease.HolderKind != "" || lease.Priority != 0 {
+		return fmt.Errorf("%w: control lease released fields are inconsistent", ErrControlLeaseStateUntrusted)
+	}
+	return nil
+}
 
 type ControlLease struct {
 	ScopeID         string             `json:"scope_id,omitempty"`
@@ -575,6 +726,11 @@ type ImportCheckpoint struct {
 	CompletionPending bool      `json:"completion_pending,omitempty"`
 	SourceSize        int64     `json:"source_size,omitempty"`
 	SourceModTime     time.Time `json:"source_mod_time,omitempty"`
+	// SourceChangeTime is a filesystem revision marker captured with the
+	// trusted cursor. It complements the bounded content fingerprint for the
+	// rare same-size, same-mtime in-place rewrite without adding a source read
+	// to the idle fast path.
+	SourceChangeTime int64 `json:"source_change_time,omitempty"`
 	// Partial* describe an unterminated JSONL record without storing its
 	// payload. LastOffset remains the last complete newline; PartialReadOffset
 	// is only a bounded read cursor used to avoid rereading an unchanged tail.
@@ -585,9 +741,32 @@ type ImportCheckpoint struct {
 	PartialLine            int       `json:"partial_line,omitempty"`
 	PartialStartedAt       time.Time `json:"partial_started_at,omitempty"`
 	PartialSourceIdentity  string    `json:"partial_source_identity,omitempty"`
-	ImportTurnID           string    `json:"import_turn_id,omitempty"`
-	KindPrefix             string    `json:"kind_prefix,omitempty"`
-	Status                 string    `json:"status,omitempty"`
+	// PartialSourceChangeTime is a cheap local revision marker for an
+	// unterminated record. It is separate from SourceGeneration because the
+	// latter must remain stable while an append-only transcript grows. On
+	// platforms that expose a change time, it catches an in-place rewrite even
+	// when size and mtime were restored; a normal append refreshes this marker
+	// when the partial read cursor advances.
+	PartialSourceChangeTime int64 `json:"partial_source_change_time,omitempty"`
+	// PartialReplay* identifies the durable replay origin for complete records
+	// observed before the unterminated line. It is separate from the physical
+	// partial line start: before a stale prefix is released, the cursor remains
+	// before any unpublished complete records so completion can replay them.
+	PartialReplayOffset   int64     `json:"partial_replay_offset,omitempty"`
+	PartialReplayLine     int       `json:"partial_replay_line,omitempty"`
+	PartialLastProgressAt time.Time `json:"partial_last_progress_at,omitempty"`
+	PartialPrefixReleased bool      `json:"partial_prefix_released,omitempty"`
+	// PendingOpaqueRecord* is used only while a previously unterminated record
+	// has become complete but exceeds the framing cap. It lets the scanner replay
+	// any safe prefix over bounded polls before consuming the known newline range
+	// as one opaque disposition.
+	PendingOpaqueRecordStartOffset int64  `json:"pending_opaque_record_start_offset,omitempty"`
+	PendingOpaqueRecordEndOffset   int64  `json:"pending_opaque_record_end_offset,omitempty"`
+	PendingOpaqueRecordLine        int    `json:"pending_opaque_record_line,omitempty"`
+	PendingOpaqueRecordID          string `json:"pending_opaque_record_id,omitempty"`
+	ImportTurnID                   string `json:"import_turn_id,omitempty"`
+	KindPrefix                     string `json:"kind_prefix,omitempty"`
+	Status                         string `json:"status,omitempty"`
 	// LegacyProbeRevision caches the negative SQLite compatibility probe for
 	// the interrupted-turn set. It is invalidated by a session revision change
 	// and avoids decoding every interrupted row on each hot-path transaction.
@@ -620,6 +799,14 @@ type ImportCheckpoint struct {
 	// history path treats it like LegacySourceUnverified until an explicit
 	// recovery operation replaces the proof.
 	RecoveryProofUnusable bool `json:"recovery_proof_unusable,omitempty"`
+	// SourceRewriteRecovery* is the stat snapshot taken when an automatic
+	// rebase was last attempted for SourceRewriteRecoveryIdentity. File
+	// identity alone is intentionally not enough here: a repaired or appended
+	// transcript can keep the same inode and must get another bounded recovery
+	// attempt without rescanning an unchanged source on every poll.
+	SourceRewriteRecoverySize       int64     `json:"source_rewrite_recovery_size,omitempty"`
+	SourceRewriteRecoveryModTime    time.Time `json:"source_rewrite_recovery_mod_time,omitempty"`
+	SourceRewriteRecoveryChangeTime int64     `json:"source_rewrite_recovery_change_time,omitempty"`
 	// ExecutionAnchorGeneration is retained after an anchor is cleared so a
 	// late callback cannot accidentally clear a subsequently recreated anchor
 	// with the same outer turn ID.
@@ -672,9 +859,14 @@ type LinkedTranscriptExecutionSnapshot struct {
 // CAS instead of having the bridge update the checkpoint in a separate
 // transaction from MarkTurnCompleted.
 type TranscriptCheckpointProgress struct {
-	ID                string
-	SessionID         string
-	SourcePath        string
+	ID         string
+	SessionID  string
+	SourcePath string
+	// SourceGeneration is the identity of the physical transcript observed by
+	// the completion callback.  A terminal callback may advance a growing file,
+	// but it must not silently switch a trusted checkpoint to another pathname or
+	// inode; an explicit history/rebase path is required for that transition.
+	SourceGeneration  string
 	SourceFingerprint string
 	// AnchorSourceFingerprint is the bounded source proof captured at the
 	// unresolved anchor cutoff.  SourceFingerprint below describes the cursor
@@ -689,6 +881,7 @@ type TranscriptCheckpointProgress struct {
 	LastOffsetKnown         bool
 	SourceSize              int64
 	SourceModTime           time.Time
+	SourceChangeTime        int64
 	// Final-boundary provenance is optional metadata for the generic cursor.
 	// It lets a later incremental scan distinguish an anonymous final from an
 	// arbitrary assistant/status record even when the cursor was committed by
@@ -712,6 +905,8 @@ type TranscriptCheckpointProgress struct {
 type CompleteTurnWithFinalRequest struct {
 	SessionID        string
 	TurnID           string
+	MachineID        string
+	LeaseGeneration  int64
 	CodexThreadID    string
 	CodexTurnID      string
 	AnchorGeneration int64
@@ -749,10 +944,12 @@ type ExecutionAnchorClearRequest struct {
 // transaction that changes the Turn, rather than accepting a bridge snapshot
 // of the anchor as authority.
 type ExecutionFailureIdentity struct {
-	SessionID   string
-	TurnID      string
-	ThreadID    string
-	CodexTurnID string
+	SessionID       string
+	TurnID          string
+	MachineID       string
+	LeaseGeneration int64
+	ThreadID        string
+	CodexTurnID     string
 	// AnchorGeneration is required whenever an unresolved anchor is active.
 	// The app-server IDs identify the execution, while the generation prevents
 	// a late callback from consuming a recreated anchor whose IDs happen to be
@@ -768,12 +965,22 @@ type ExecutionFailureIdentity struct {
 type PersistInterruptedTurnWithAnchorRequest struct {
 	SessionID          string
 	TurnID             string
+	MachineID          string
+	LeaseGeneration    int64
 	CheckpointID       string
 	CodexThreadID      string
 	CodexTurnID        string
 	RecoveryReason     string
 	Anchor             ExecutionAnchor
 	ConservativeCutoff bool
+	// AllowTakeover is used only by startup recovery after the caller has
+	// acquired a newer control lease. It atomically rebinds an old Running turn
+	// to that lease before interrupting it and creating the unresolved anchor.
+	// The expected previous capability prevents this maintenance path from
+	// overwriting a turn that another owner changed after the startup snapshot.
+	AllowTakeover              bool   `json:"-"`
+	ExpectedPreviousMachineID  string `json:"-"`
+	ExpectedPreviousGeneration int64  `json:"-"`
 }
 
 // PersistInterruptedTurnWithAnchorResult describes the result of the atomic
@@ -981,31 +1188,56 @@ type HistoryWatchCheckpoint struct {
 	// Offset.  It is optional for legacy checkpoints; a missing value forces a
 	// conservative migration/reconcile rather than proving an unchanged file.
 	SourceFingerprint             string `json:"source_fingerprint,omitempty"`
+	SourceChangeTime              int64  `json:"source_change_time,omitempty"`
 	SourceRewriteBlocked          bool   `json:"source_rewrite_blocked,omitempty"`
 	LegacySourceUnverified        bool   `json:"legacy_source_unverified,omitempty"`
 	RecoveryProofUnusable         bool   `json:"recovery_proof_unusable,omitempty"`
 	OversizedRecordBlocked        bool   `json:"oversized_record_blocked,omitempty"`
 	SourceRewriteRecoveryIdentity string `json:"source_rewrite_recovery_identity,omitempty"`
-	Offset                        int64  `json:"offset,omitempty"`
-	Line                          int    `json:"line,omitempty"`
+	// SourceRewriteRecovery* records the stat snapshot for the last automatic
+	// rebase attempt. It allows same-inode append/repair changes to invalidate
+	// the retry fence while keeping unchanged blocked sources quiet.
+	SourceRewriteRecoverySize       int64     `json:"source_rewrite_recovery_size,omitempty"`
+	SourceRewriteRecoveryModTime    time.Time `json:"source_rewrite_recovery_mod_time,omitempty"`
+	SourceRewriteRecoveryChangeTime int64     `json:"source_rewrite_recovery_change_time,omitempty"`
+	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for an
+	// incomplete bounded rebase pass. It is only a scan hint; the checkpoint
+	// remains blocked until the old anchor is proven and the cursor is replaced.
+	SourceRewriteRecoveryScanPending   bool   `json:"source_rewrite_recovery_scan_pending,omitempty"`
+	SourceRewriteRecoveryScanOffset    int64  `json:"source_rewrite_recovery_scan_offset,omitempty"`
+	SourceRewriteRecoveryScanLine      int    `json:"source_rewrite_recovery_scan_line,omitempty"`
+	SourceRewriteRecoveryScanSessionID string `json:"source_rewrite_recovery_scan_session_id,omitempty"`
+	SourceRewriteRecoveryScanThreadID  string `json:"source_rewrite_recovery_scan_thread_id,omitempty"`
+	SourceRewriteRecoveryScanTurnID    string `json:"source_rewrite_recovery_scan_turn_id,omitempty"`
+	Offset                             int64  `json:"offset,omitempty"`
+	Line                               int    `json:"line,omitempty"`
 	// Partial* mirror ImportCheckpoint's resumable unterminated-record state.
 	// They are intentionally not folded into Offset: only a newline may advance
 	// the durable history cursor.
-	PartialLineStartOffset int64     `json:"partial_line_start_offset,omitempty"`
-	PartialReadOffset      int64     `json:"partial_read_offset,omitempty"`
-	PartialObservedSize    int64     `json:"partial_observed_size,omitempty"`
-	PartialLine            int       `json:"partial_line,omitempty"`
-	PartialStartedAt       time.Time `json:"partial_started_at,omitempty"`
-	PartialSourceIdentity  string    `json:"partial_source_identity,omitempty"`
-	SessionID              string    `json:"session_id,omitempty"`
-	ThreadID               string    `json:"thread_id,omitempty"`
-	TeamsOriginThreadID    string    `json:"teams_origin_thread_id,omitempty"`
-	TurnID                 string    `json:"turn_id,omitempty"`
-	TeamsOriginTurnID      string    `json:"teams_origin_turn_id,omitempty"`
-	ExternalUserPromptSeen bool      `json:"external_user_prompt_seen,omitempty"`
-	LastFinalID            string    `json:"last_final_id,omitempty"`
-	LastFinalLine          int       `json:"last_final_line,omitempty"`
-	LastFinalStartOffset   int64     `json:"last_final_start_offset,omitempty"`
+	PartialLineStartOffset         int64     `json:"partial_line_start_offset,omitempty"`
+	PartialReadOffset              int64     `json:"partial_read_offset,omitempty"`
+	PartialObservedSize            int64     `json:"partial_observed_size,omitempty"`
+	PartialLine                    int       `json:"partial_line,omitempty"`
+	PartialStartedAt               time.Time `json:"partial_started_at,omitempty"`
+	PartialSourceIdentity          string    `json:"partial_source_identity,omitempty"`
+	PartialSourceChangeTime        int64     `json:"partial_source_change_time,omitempty"`
+	PartialReplayOffset            int64     `json:"partial_replay_offset,omitempty"`
+	PartialReplayLine              int       `json:"partial_replay_line,omitempty"`
+	PartialLastProgressAt          time.Time `json:"partial_last_progress_at,omitempty"`
+	PartialPrefixReleased          bool      `json:"partial_prefix_released,omitempty"`
+	PendingOpaqueRecordStartOffset int64     `json:"pending_opaque_record_start_offset,omitempty"`
+	PendingOpaqueRecordEndOffset   int64     `json:"pending_opaque_record_end_offset,omitempty"`
+	PendingOpaqueRecordLine        int       `json:"pending_opaque_record_line,omitempty"`
+	PendingOpaqueRecordID          string    `json:"pending_opaque_record_id,omitempty"`
+	SessionID                      string    `json:"session_id,omitempty"`
+	ThreadID                       string    `json:"thread_id,omitempty"`
+	TeamsOriginThreadID            string    `json:"teams_origin_thread_id,omitempty"`
+	TurnID                         string    `json:"turn_id,omitempty"`
+	TeamsOriginTurnID              string    `json:"teams_origin_turn_id,omitempty"`
+	ExternalUserPromptSeen         bool      `json:"external_user_prompt_seen,omitempty"`
+	LastFinalID                    string    `json:"last_final_id,omitempty"`
+	LastFinalLine                  int       `json:"last_final_line,omitempty"`
+	LastFinalStartOffset           int64     `json:"last_final_start_offset,omitempty"`
 	// LastFinalStartOffsetKnown distinguishes a valid zero-byte final start
 	// from an old checkpoint that never persisted the boundary position.
 	LastFinalStartOffsetKnown bool              `json:"last_final_start_offset_known,omitempty"`
@@ -1060,9 +1292,14 @@ type ArtifactRecord struct {
 }
 
 type NotificationRecord struct {
-	ID                 string    `json:"id"`
-	SessionID          string    `json:"session_id,omitempty"`
-	TurnID             string    `json:"turn_id,omitempty"`
+	ID        string `json:"id"`
+	SessionID string `json:"session_id,omitempty"`
+	TurnID    string `json:"turn_id,omitempty"`
+	// MachineID and LeaseGeneration fence asynchronous workflow callbacks. They
+	// are advisory provenance on the record; the authoritative check is the
+	// current control lease performed by UpdateNotificationForOwner.
+	MachineID          string    `json:"machine_id,omitempty"`
+	LeaseGeneration    int64     `json:"lease_generation,omitempty"`
 	Kind               string    `json:"kind,omitempty"`
 	OutboxID           string    `json:"outbox_id,omitempty"`
 	Status             string    `json:"status,omitempty"`
@@ -1189,8 +1426,18 @@ type AutoUpdateRecord struct {
 }
 
 type ChatPollState struct {
-	ChatID             string    `json:"chat_id"`
-	Seeded             bool      `json:"seeded,omitempty"`
+	ChatID string `json:"chat_id"`
+	Seeded bool   `json:"seeded,omitempty"`
+	// RecoveryRequired is a durable, chat-local admission marker created when
+	// the persisted poll projection cannot be decoded.  It deliberately seeds
+	// a bounded live recovery attempt instead of treating the missing row as a
+	// first observation and silently consuming the current Graph head.
+	RecoveryRequired bool   `json:"recovery_required,omitempty"`
+	RecoveryReason   string `json:"recovery_reason,omitempty"`
+	// RecoverySourceHash is bounded evidence of the opaque row that caused the
+	// recovery marker.  The raw row remains preserved by the JSON/SQLite
+	// projection writers until a successful poll clears the marker.
+	RecoverySourceHash string    `json:"recovery_source_hash,omitempty"`
 	PollState          string    `json:"state,omitempty"`
 	PreviousPollState  string    `json:"previous_state,omitempty"`
 	NextPollAt         time.Time `json:"next_poll_at,omitempty"`
@@ -1200,7 +1447,18 @@ type ChatPollState struct {
 	ParkedAt           time.Time `json:"parked_at,omitempty"`
 	ParkNoticeSentAt   time.Time `json:"park_notice_sent_at,omitempty"`
 	LastModifiedCursor time.Time `json:"last_modified_cursor,omitempty"`
-	ContinuationPath   string    `json:"continuation_path,omitempty"`
+	// ContinuationSafeCursor is the last cursor that was safe before the
+	// current head page opened an older Graph continuation lane.  LastModifiedCursor
+	// may already reflect the newest record in that head page; keeping the
+	// predecessor separately lets a failed continuation recover without skipping
+	// records from the page that could not be drained.
+	ContinuationSafeCursor time.Time `json:"continuation_safe_cursor,omitempty"`
+	// ContinuationSafeCursorKnown distinguishes a proven zero-time predecessor
+	// from old state that only happened to omit the predecessor. When a legacy
+	// row has an opaque continuation but no safe-cursor proof, recovery must use
+	// the conservative beginning of the chat rather than the newer head cursor.
+	ContinuationSafeCursorKnown bool   `json:"continuation_safe_cursor_known,omitempty"`
+	ContinuationPath            string `json:"continuation_path,omitempty"`
 	// DeferredContinuationPath holds one fresh head page while an older durable
 	// continuation is being drained. Keeping the two frontiers separate avoids
 	// losing the fresh page when a later head response is no longer truncated.
@@ -1234,6 +1492,11 @@ type ChatPollState struct {
 	ContinuationLastFailureAt   time.Time `json:"continuation_last_failure_at,omitempty"`
 	ContinuationLastPath        string    `json:"continuation_last_path,omitempty"`
 	ContinuationNoProgressCount int       `json:"continuation_no_progress_count,omitempty"`
+	// ContinuationPageCount is a durable total-page budget for one operational
+	// continuation lane. The bounded path/fingerprint history catches short
+	// cycles; this counter also catches a long or rotating nextLink cycle that
+	// spans multiple listener passes or restarts.
+	ContinuationPageCount int `json:"continuation_page_count,omitempty"`
 	// Continuation histories are bounded evidence for detecting a Graph cursor
 	// cycle. The nextLink is opaque and can change even when Graph keeps
 	// returning the same page, so the last failure alone is not enough to
@@ -1264,8 +1527,13 @@ type ChatPollPendingPage struct {
 	// BaselineOnly is true only for the first page used to seed a chat. It must
 	// survive a crash between page staging and the seed commit; otherwise a
 	// replay can silently discard a real user message as historical baseline.
-	BaselineOnly    bool              `json:"baseline_only,omitempty"`
-	NextPath        string            `json:"next_path,omitempty"`
+	BaselineOnly bool   `json:"baseline_only,omitempty"`
+	NextPath     string `json:"next_path,omitempty"`
+	// BoundaryReason is a bounded diagnostic for a page whose records were
+	// decoded but whose continuation could not be trusted. It is not an
+	// executable URL; the bridge uses it to reopen a directional gap after the
+	// page is handled, including after a crash between staging and replay.
+	BoundaryReason  string            `json:"boundary_reason,omitempty"`
 	Records         []json.RawMessage `json:"records,omitempty"`
 	RecordIDs       []string          `json:"record_ids,omitempty"`
 	RecordHashes    []string          `json:"record_hashes,omitempty"`
@@ -1275,8 +1543,11 @@ type ChatPollPendingPage struct {
 }
 
 // ChatPollGap represents a deliberate, directional recovery lane. SafeCursor
-// is the last normal cursor known safe; RecoveryCursor only permits bounded
-// newer progress while the unresolved range remains visible.
+// is the last normal cursor known safe. RecoveryCursor is the inclusive upper
+// time boundary for the next recovery page; it moves backwards toward
+// SafeCursor as descending Graph pages are fully consumed. Keeping both bounds
+// durable prevents a provider-supported descending fallback from repeatedly
+// returning the same newest page or skipping the older part of a broken lane.
 type ChatPollGap struct {
 	Epoch          uint64    `json:"epoch"`
 	Kind           string    `json:"kind"`
@@ -1288,7 +1559,13 @@ type ChatPollGap struct {
 	RecoveryCursor time.Time `json:"recovery_cursor,omitempty"`
 	OpenedAt       time.Time `json:"opened_at,omitempty"`
 	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
-	NoticeEpoch    uint64    `json:"notice_epoch,omitempty"`
+	// HeadProbePending asks the next recovery quantum to take one normal head
+	// sample after a terminal empty recovery page. The gap itself is retained,
+	// so an empty provider response never discards an unresolved older range;
+	// the head probe prevents a permanently open gap from shadowing messages
+	// that arrive after its upper boundary.
+	HeadProbePending bool   `json:"head_probe_pending,omitempty"`
+	NoticeEpoch      uint64 `json:"notice_epoch,omitempty"`
 	// QuarantinedPage retains the bounded receipt that could not be safely
 	// replayed. It is evidence for manual repair/reconciliation only; the
 	// normal scheduler never treats it as an executable pending page.
@@ -1335,6 +1612,12 @@ type ChatPollAttemptCapability struct {
 	Owner              string
 	ProcessIncarnation string
 	LeaseGeneration    int64
+	// RequireActiveLeaseForReclaim is an in-memory admission hint used only
+	// while acquiring a replacement attempt. It is never persisted in the
+	// ChatPollAttempt JSON. A higher generation may reclaim an unexpired attempt
+	// only when the current durable control lease independently proves that
+	// generation; legacy callers without that proof retain busy semantics.
+	RequireActiveLeaseForReclaim bool
 }
 
 var (
@@ -1369,6 +1652,56 @@ func chatPollParkedSkipEligible(poll ChatPollState) bool {
 		poll.LastErrorAt.IsZero()
 }
 
+// chatPollHasOperationalFrontier is the store-side projection of the
+// scheduler's actionable frontier predicate.  Keep this predicate independent
+// of the teams package so SQLite can maintain an indexed admission hint
+// without decoding every poll row on each listener tick.
+func chatPollHasOperationalFrontier(poll ChatPollState) bool {
+	return poll.PendingPage != nil ||
+		strings.TrimSpace(poll.ContinuationPath) != "" ||
+		strings.TrimSpace(poll.DeferredContinuationPath) != "" ||
+		poll.Gap != nil
+}
+
+// chatPollAdmissionValid separates a decoded poll row from an executable poll
+// row.  encoding/json accepts an empty nested struct such as pending_page:{},
+// but the bridge cannot replay it: there is no request path, receipt, or
+// record identity to fence.  Admission must classify that row as chat-local
+// recovery evidence before it consumes a normal lane quota.  Keep this check
+// deliberately structural and cheap; provider-specific receipt and message
+// validation remains in the teams package when a recovery slot is processed.
+func chatPollAdmissionValid(poll ChatPollState) bool {
+	if strings.TrimSpace(poll.ChatID) == "" {
+		return false
+	}
+	if poll.PendingPage != nil {
+		page := poll.PendingPage
+		if strings.TrimSpace(page.ChatID) == "" || strings.TrimSpace(page.ChatID) != strings.TrimSpace(poll.ChatID) ||
+			strings.TrimSpace(page.RequestPath) == "" || strings.TrimSpace(page.ReceiptID) == "" {
+			return false
+		}
+		if len(page.Records) != len(page.RecordIDs) || len(page.Records) != len(page.RecordHashes) ||
+			(len(page.Dispositions) != 0 && len(page.Dispositions) != len(page.Records)) ||
+			(len(page.RefetchFailures) != 0 && len(page.RefetchFailures) != len(page.Records)) {
+			return false
+		}
+		for i, raw := range page.Records {
+			// The enclosing json.Unmarshal already validates each
+			// json.RawMessage. Do not scan a potentially large image/base64
+			// record a second time on the hot admission path; its hash and
+			// identity are checked again by pendingPageToWindow when the page
+			// is actually executed.
+			if len(raw) == 0 || strings.TrimSpace(page.RecordIDs[i]) == "" || strings.TrimSpace(page.RecordHashes[i]) == "" {
+				return false
+			}
+		}
+	}
+	if poll.Attempt != nil && strings.TrimSpace(poll.Attempt.ID) == "" {
+		return false
+	}
+	return true
+}
+
 type ChatPollScheduleUpdate struct {
 	ChatID                        string
 	PollState                     string
@@ -1385,16 +1718,19 @@ type ChatPollScheduleUpdate struct {
 }
 
 type FinalAnswerPollBoostRequest struct {
-	SessionID      string
-	TeamsChatID    string
-	NextPollAt     time.Time
-	LastActivityAt time.Time
+	SessionID            string
+	TeamsChatID          string
+	NextPollAt           time.Time
+	LastActivityAt       time.Time
+	OwnerMachineID       string
+	OwnerLeaseGeneration int64
 }
 
 type OwnerMetadata struct {
 	PID             int       `json:"pid,omitempty"`
 	Hostname        string    `json:"hostname,omitempty"`
 	ExecutablePath  string    `json:"executable_path,omitempty"`
+	InstanceID      string    `json:"instance_id,omitempty"`
 	HelperVersion   string    `json:"helper_version,omitempty"`
 	ScopeID         string    `json:"scope_id,omitempty"`
 	MachineID       string    `json:"machine_id,omitempty"`
@@ -1434,12 +1770,19 @@ type SessionContext struct {
 	ReasoningEffortSource       string                `json:"reasoning_effort_source,omitempty"`
 	Sandbox                     string                `json:"sandbox,omitempty"`
 	ProxyMode                   string                `json:"proxy_mode,omitempty"`
-	QuarantinedAt               time.Time             `json:"quarantined_at,omitempty"`
-	QuarantineReason            string                `json:"quarantine_reason,omitempty"`
-	QuarantineSource            string                `json:"quarantine_source,omitempty"`
-	QuarantineMessageIDs        []string              `json:"quarantine_message_ids,omitempty"`
-	CreatedAt                   time.Time             `json:"created_at,omitempty"`
-	UpdatedAt                   time.Time             `json:"updated_at,omitempty"`
+	// PollFrontierInitialized records that at least one Graph poll for this
+	// session completed its durable frontier commit. It is an admission hint,
+	// not cursor authority: chat_polls remains authoritative whenever its row
+	// exists. The hint lets a missing poll projection after a partial migration
+	// or row-local repair enter recovery instead of silently treating an old
+	// chat's current Graph head as an initial baseline.
+	PollFrontierInitialized bool      `json:"poll_frontier_initialized,omitempty"`
+	QuarantinedAt           time.Time `json:"quarantined_at,omitempty"`
+	QuarantineReason        string    `json:"quarantine_reason,omitempty"`
+	QuarantineSource        string    `json:"quarantine_source,omitempty"`
+	QuarantineMessageIDs    []string  `json:"quarantine_message_ids,omitempty"`
+	CreatedAt               time.Time `json:"created_at,omitempty"`
+	UpdatedAt               time.Time `json:"updated_at,omitempty"`
 }
 
 // UnmarshalJSON applies the same compatibility rule as ImportCheckpoint:
@@ -1619,17 +1962,29 @@ type OutboxMessage struct {
 	// message ID is retained for reconciliation; this fence never permits a
 	// retry or transcript side effect.
 	BlockedBySourceRewrite bool `json:"blocked_by_source_rewrite,omitempty"`
+	// PostSendEffectsPending is set in the same durable CAS that changes an
+	// outbox row to Sent.  Workflow notification queueing, unread marking, and
+	// the poll boost are deliberately after that CAS; this marker makes those
+	// local/external follow-up effects replayable after a phase deadline or
+	// process crash without replaying the Graph message POST.
+	PostSendEffectsPending bool `json:"post_send_effects_pending,omitempty"`
 	// GraphRecoveryNextPath and GraphRecoveryCandidateID make ambiguous-send
 	// reconciliation resumable across polls and helper restarts. The path is
 	// only consumed through the Graph client's same-origin continuation
 	// validator; the candidate ID is accepted only after its marker/body proof
 	// has been checked during an earlier page scan.
-	GraphRecoveryNextPath    string    `json:"graph_recovery_next_path,omitempty"`
-	GraphRecoveryCandidateID string    `json:"graph_recovery_candidate_id,omitempty"`
-	CreatedAt                time.Time `json:"created_at,omitempty"`
-	UpdatedAt                time.Time `json:"updated_at,omitempty"`
-	SentAt                   time.Time `json:"sent_at,omitempty"`
-	LastSendAttempt          time.Time `json:"last_send_attempt,omitempty"`
+	GraphRecoveryNextPath    string `json:"graph_recovery_next_path,omitempty"`
+	GraphRecoveryCandidateID string `json:"graph_recovery_candidate_id,omitempty"`
+	// GraphRecoveryPageCount is diagnostic progress for continuation pages
+	// consumed across bounded recovery passes. It must not be used as a total
+	// reachability limit: a valid helper marker can be older than any fixed
+	// number of pages in a busy chat. Per-pass page budgets and same-pass cycle
+	// detection bound work without making a valid continuation unreachable.
+	GraphRecoveryPageCount int       `json:"graph_recovery_page_count,omitempty"`
+	CreatedAt              time.Time `json:"created_at,omitempty"`
+	UpdatedAt              time.Time `json:"updated_at,omitempty"`
+	SentAt                 time.Time `json:"sent_at,omitempty"`
+	LastSendAttempt        time.Time `json:"last_send_attempt,omitempty"`
 	// NextAttemptAt is a durable retry gate for rows that could not be sent in
 	// the current pass. It is separate from LastSendAttempt so a failed row is
 	// not rescanned on every main-loop tick, while Sending rows continue to use
@@ -1711,6 +2066,12 @@ type PendingOutboxQuery struct {
 	Limit                int
 	After                PendingOutboxCursor
 	IncludeActiveSending bool
+	// IncludeAmbiguous and AmbiguousOnly expose expired Sending rows whose
+	// external Graph outcome is unknown to the cold recovery sweep.  Ordinary
+	// sender queries leave these rows excluded so an unknown POST is never
+	// retried as a normal send.
+	IncludeAmbiguous bool
+	AmbiguousOnly    bool
 	// IgnoreRetryGate is reserved for an explicit, targeted wake-up (for
 	// example a new user request or operator recovery). The main-loop sender
 	// leaves it false so a failed row cannot become a hot loop.
@@ -1865,18 +2226,62 @@ var (
 )
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
+var ErrControlLeaseStatusUnknown = errors.New("Teams control lease status is unknown")
+
+// ErrControlLeaseStateUntrusted means the persisted lease cannot be safely
+// interpreted by this binary.  Callers must not claim over it: the row may
+// describe a live writer even when its current contents are malformed or use
+// a status introduced by a newer helper.
+var ErrControlLeaseStateUntrusted = errors.New("Teams control lease state is untrusted")
+var ErrStatePersistence = errors.New("Teams state persistence failed")
+
+type statePersistenceError struct {
+	err error
+}
+
+func (e *statePersistenceError) Error() string {
+	if e == nil || e.err == nil {
+		return ErrStatePersistence.Error()
+	}
+	return fmt.Sprintf("%s: %v", ErrStatePersistence, e.err)
+}
+
+func (e *statePersistenceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (e *statePersistenceError) Is(target error) bool {
+	return target == ErrStatePersistence
+}
+
+func wrapStatePersistenceError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var persistenceErr *statePersistenceError
+	if errors.As(err, &persistenceErr) {
+		return err
+	}
+	return &statePersistenceError{err: err}
+}
 
 // IsProcessWideStateError identifies failures for which continuing a phase
 // with another chat would be unsafe or misleading.  It is intentionally
 // narrower than “any store error”: malformed optional data and a missing local
 // transcript remain object-scoped, while lease loss and an unavailable/corrupt
-// SQLite store require the current cycle to stop before another durable
-// mutation is attempted.
+// SQLite store or a failed atomic JSON state write require the current cycle
+// to stop before another durable mutation is attempted.
 func IsProcessWideStateError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, ErrControlLeaseNotHeld) || IsSQLiteProcessWideError(err)
+	return errors.Is(err, ErrControlLeaseNotHeld) ||
+		errors.Is(err, ErrControlLeaseStateUntrusted) ||
+		errors.Is(err, ErrStatePersistence) ||
+		IsSQLiteProcessWideError(err)
 }
 
 var ErrInboundMessageFromHelperOutbox = errors.New("Teams inbound message already recorded as helper outbox")
@@ -2528,7 +2933,25 @@ func loadJSONWatchdogStateReadOnly(ctx context.Context, path string) (State, err
 		case "upgrade":
 			err = decoder.Decode(&state.Upgrade)
 		case "chat_polls":
-			err = decoder.Decode(&state.ChatPolls)
+			var rawPolls map[string]json.RawMessage
+			err = decoder.Decode(&rawPolls)
+			if err == nil {
+				for key, rawPoll := range rawPolls {
+					var poll ChatPollState
+					if unmarshalErr := json.Unmarshal(rawPoll, &poll); unmarshalErr != nil {
+						// Watchdog state is an operational hint.  One malformed chat
+						// projection must not hide owner/lifecycle evidence or make the
+						// watchdog fail closed for every other chat.
+						continue
+					}
+					if strings.TrimSpace(poll.ChatID) == "" {
+						poll.ChatID = strings.TrimSpace(key)
+					}
+					if strings.TrimSpace(poll.ChatID) != "" {
+						state.ChatPolls[poll.ChatID] = poll
+					}
+				}
+			}
 		default:
 			err = skipRuntimeMetadataJSONValue(decoder)
 		}
@@ -2788,9 +3211,8 @@ func filterActiveTurnQueueSnapshotForSession(state State, sessionID string) Stat
 		if strings.TrimSpace(turn.SessionID) != sessionID {
 			continue
 		}
-		switch turn.Status {
-		case TurnStatusQueued, TurnStatusRunning:
-		default:
+		normalizeLoadedTurnStatus(&turn)
+		if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
 			continue
 		}
 		out.Turns[id] = turn
@@ -2951,6 +3373,23 @@ func (s *Store) HotPollScheduleState(ctx context.Context) (State, error) {
 	return s.PollScheduleSnapshot(ctx)
 }
 
+// HotPollReadyScheduleState returns only the bounded set of SQLite rows that
+// can be admitted by the current listener quantum. The legacy full schedule
+// API remains available for diagnostics and maintenance callers; production
+// polling uses this method to avoid decoding every idle chat on every tick.
+func (s *Store) HotPollReadyScheduleState(ctx context.Context, controlChatID string, now time.Time) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if state, handled, err := s.hotPollReadyScheduleStateSQLite(ctx, controlChatID, now); handled || err != nil {
+		return state, err
+	}
+	return s.HotPollScheduleState(ctx)
+}
+
 func (s *Store) HotPollScheduleSnapshot(ctx context.Context) (State, map[string]bool, error) {
 	if state, parkedSkip, handled, err := s.hotPollScheduleSnapshotSQLite(ctx); handled || err != nil {
 		return state, parkedSkip, err
@@ -2972,14 +3411,27 @@ func (s *Store) HotPollWorkCandidates(ctx context.Context, controlChatID string)
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return s.HotPollWorkCandidatesExcludingIdle(ctx, controlChatID, time.Time{})
+	return s.HotPollWorkCandidatesExcludingIdleAt(ctx, controlChatID, time.Time{}, time.Now())
 }
 
 func (s *Store) HotPollWorkCandidatesExcludingIdle(ctx context.Context, controlChatID string, idleBefore time.Time) ([]SessionContext, bool, error) {
+	return s.HotPollWorkCandidatesExcludingIdleAt(ctx, controlChatID, idleBefore, time.Now())
+}
+
+// HotPollWorkCandidatesExcludingIdleAt evaluates the ready/blocked boundary
+// against one caller-supplied instant.  The listener evaluates the schedule
+// and work candidates as one admission decision; sharing the instant prevents
+// a row crossing a retry deadline between those two reads from producing a
+// misleading empty work set.  The old method remains for diagnostics and
+// callers that do not already own a scheduling timestamp.
+func (s *Store) HotPollWorkCandidatesExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) ([]SessionContext, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return s.hotPollWorkCandidatesSQLite(ctx, controlChatID, idleBefore)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return s.hotPollWorkCandidatesSQLite(ctx, controlChatID, idleBefore, now)
 }
 
 func (s *Store) IdleWorkChatParkCandidates(ctx context.Context, controlChatID string, idleBefore time.Time, limit int) ([]IdleWorkChatParkCandidate, bool, error) {
@@ -3137,6 +3589,23 @@ func isPendingWorkflowNotification(rec NotificationRecord) bool {
 }
 
 func (s *Store) UpdateNotification(ctx context.Context, id string, fn func(NotificationRecord, bool, time.Time) (NotificationRecord, bool, error)) (NotificationRecord, bool, error) {
+	return s.updateNotificationWithCapability(ctx, id, fn, storeOwnerCapability{})
+}
+
+// UpdateNotificationForOwner applies a workflow notification mutation only
+// while the supplied listener control-lease capability is current. Workflow
+// callbacks may finish after a phase deadline or process takeover; validating
+// the capability in the same transaction as the notification update prevents
+// a stale callback from overwriting a newer owner's sent/failed state.
+func (s *Store) UpdateNotificationForOwner(ctx context.Context, id string, machineID string, leaseGeneration int64, fn func(NotificationRecord, bool, time.Time) (NotificationRecord, bool, error)) (NotificationRecord, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return NotificationRecord{}, false, err
+	}
+	return s.updateNotificationWithCapability(ctx, id, fn, capability)
+}
+
+func (s *Store) updateNotificationWithCapability(ctx context.Context, id string, fn func(NotificationRecord, bool, time.Time) (NotificationRecord, bool, error), capability storeOwnerCapability) (NotificationRecord, bool, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return NotificationRecord{}, false, fmt.Errorf("notification id is required")
@@ -3144,12 +3613,15 @@ func (s *Store) UpdateNotification(ctx context.Context, id string, fn func(Notif
 	if fn == nil {
 		return NotificationRecord{}, false, fmt.Errorf("notification update function is required")
 	}
-	if out, changed, handled, err := s.updateNotificationSQLite(ctx, id, fn); handled || err != nil {
+	if out, changed, handled, err := s.updateNotificationSQLiteWithCapability(ctx, id, fn, capability); handled || err != nil {
 		return out, changed, err
 	}
 	var out NotificationRecord
 	changed := false
 	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return false, err
+		}
 		now := time.Now()
 		if state.Notifications == nil {
 			state.Notifications = make(map[string]NotificationRecord)
@@ -3164,6 +3636,10 @@ func (s *Store) UpdateNotification(ctx context.Context, id string, fn func(Notif
 			return false, nil
 		}
 		next.ID = id
+		if capability.bound() {
+			next.MachineID = capability.machineID
+			next.LeaseGeneration = capability.leaseGeneration
+		}
 		state.Notifications[next.ID] = next
 		out = next
 		changed = true
@@ -3305,6 +3781,10 @@ func (s *Store) LinkedTranscriptSessionSnapshot(ctx context.Context, sessionIDs 
 			case TurnStatusInterrupted:
 				if isLegacyUnresolvedTurn(turn) {
 					out.Ownership[sessionID] = true
+				}
+			default:
+				if strings.TrimSpace(string(turn.Status)) != "" && !knownTurnStatus(turn.Status) {
+					out.Running[sessionID] = true
 				}
 			}
 		}
@@ -3782,7 +4262,74 @@ func validateTranscriptCheckpointRecordProvenance(state *State, checkpoint Impor
 	if sessionID != "" && previousSessionID != "" && sessionID != previousSessionID {
 		return fmt.Errorf("%w: checkpoint %q belongs to session %q, requested %q", ErrSessionStateProvenanceMismatch, id, previousSessionID, sessionID)
 	}
+	if found && transcriptCheckpointSameCursorSourceConflict(previous, checkpoint) &&
+		!importCheckpointIsExplicitHistoryRun(previous) && !importCheckpointIsExplicitHistoryRun(checkpoint) {
+		return fmt.Errorf("%w: checkpoint %q source proof changed at the same cursor", ErrTranscriptObservationConflict, id)
+	}
+	if found && transcriptCheckpointSourceIdentityConflict(previous, checkpoint) &&
+		!importCheckpointIsExplicitHistoryRun(previous) && !importCheckpointIsExplicitHistoryRun(checkpoint) {
+		return fmt.Errorf("%w: checkpoint %q source identity changed during automatic delivery", ErrTranscriptObservationConflict, id)
+	}
 	return nil
+}
+
+func transcriptCheckpointSourceIdentityConflict(current ImportCheckpoint, next ImportCheckpoint) bool {
+	currentGeneration := strings.TrimSpace(current.SourceGeneration)
+	nextGeneration := strings.TrimSpace(next.SourceGeneration)
+	if currentGeneration != "" && nextGeneration != "" && currentGeneration != nextGeneration {
+		return true
+	}
+	// A source path is only authoritative once the checkpoint has modern source
+	// identity.  Keep proofless/legacy path rebinding compatible with old
+	// imports; a modern row must use its explicit rebase path instead of letting
+	// a delayed delivery callback swap the file underneath it.
+	return currentGeneration != "" && strings.TrimSpace(current.SourcePath) != "" && strings.TrimSpace(next.SourcePath) != "" &&
+		!sameCheckpointSourcePath(current.SourcePath, next.SourcePath)
+}
+
+// transcriptCheckpointSameCursorSourceConflict rejects an automatic update
+// that claims the exact same physical cursor but carries a different source
+// proof.  A file append legitimately changes the proof when the cursor moves;
+// a different proof at the same cursor means the trusted prefix identity
+// changed (or the callback is stale).  Silently accepting it would replace the
+// durable source fence and allow a delayed writer to hide a rewrite.
+func transcriptCheckpointSameCursorSourceConflict(current ImportCheckpoint, next ImportCheckpoint) bool {
+	if !sameCheckpointSourcePath(current.SourcePath, next.SourcePath) || strings.TrimSpace(current.SourcePath) == "" {
+		return false
+	}
+	currentProof := strings.TrimSpace(current.SourceFingerprint)
+	nextProof := strings.TrimSpace(next.SourceFingerprint)
+	if currentProof == "" || nextProof == "" || currentProof == nextProof {
+		return false
+	}
+	currentOffsetKnown := current.LastOffsetKnown || current.LastOffset != 0
+	nextOffsetKnown := next.LastOffsetKnown || next.LastOffset != 0
+	if currentOffsetKnown != nextOffsetKnown {
+		return false
+	}
+	if currentOffsetKnown {
+		return current.LastOffset == next.LastOffset
+	}
+	return current.LastOffset == next.LastOffset && current.LastSourceLine == next.LastSourceLine
+}
+
+// transcriptCheckpointProgressSourceConflict rejects a terminal callback that
+// tries to attribute its cursor to a different trusted source.  The generic
+// monotonicity check cannot order cursors from different files, so accepting
+// such a callback would let a stale completion replace the source fence and
+// make a later incremental scan read the wrong transcript suffix.
+func transcriptCheckpointProgressSourceConflict(current ImportCheckpoint, progress TranscriptCheckpointProgress) bool {
+	if strings.TrimSpace(current.LastRecordID) == "" {
+		return false
+	}
+	currentPath := strings.TrimSpace(current.SourcePath)
+	progressPath := strings.TrimSpace(progress.SourcePath)
+	if currentPath != "" && progressPath != "" && !sameCheckpointSourcePath(currentPath, progressPath) {
+		return true
+	}
+	currentGeneration := strings.TrimSpace(current.SourceGeneration)
+	progressGeneration := strings.TrimSpace(progress.SourceGeneration)
+	return currentGeneration != "" && progressGeneration != "" && currentGeneration != progressGeneration
 }
 
 func validateLoadedTranscriptCheckpointRow(checkpoint ImportCheckpoint, checkpointID string, sessionID string) error {
@@ -3929,7 +4476,7 @@ func (s *Store) ImportCheckpoint(ctx context.Context, id string) (ImportCheckpoi
 }
 
 func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
-	return s.updateImportCheckpoint(ctx, "", id, fn)
+	return s.updateImportCheckpoint(ctx, "", id, fn, storeOwnerCapability{})
 }
 
 // UpdateImportCheckpointIfParentUnfenced applies a checkpoint update only if
@@ -3937,10 +4484,135 @@ func (s *Store) UpdateImportCheckpoint(ctx context.Context, id string, fn func(I
 // intended for the background linked-transcript synchronizer; ordinary
 // checkpoint callers retain the legacy behavior through UpdateImportCheckpoint.
 func (s *Store) UpdateImportCheckpointIfParentUnfenced(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
-	return s.updateImportCheckpoint(ctx, parentSessionID, id, fn)
+	return s.updateImportCheckpoint(ctx, parentSessionID, id, fn, storeOwnerCapability{})
 }
 
-func (s *Store) updateImportCheckpoint(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+// UpdateImportCheckpointForOwner applies a checkpoint update only while the
+// supplied control-lease capability is still current.  Listener callbacks can
+// outlive a phase or a process takeover, so an in-memory lease check before
+// this call is not sufficient; the store validates the capability inside the
+// same JSON/SQLite write critical section as the checkpoint mutation.
+func (s *Store) UpdateImportCheckpointForOwner(ctx context.Context, id string, machineID string, leaseGeneration int64, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return ImportCheckpoint{}, false, err
+	}
+	return s.updateImportCheckpoint(ctx, "", id, fn, capability)
+}
+
+// PromoteProofBackedImportCheckpoint atomically clears only compatibility
+// markers from a checkpoint whose source proof was verified outside the store.
+// It is deliberately narrower than UpdateImportCheckpoint: a proof-backed
+// promotion cannot clear an execution/source-rewrite/opaque-record fence, and
+// it compares the complete typed row (apart from UpdatedAt) before replacing
+// it.  This keeps a concurrent scanner or operator repair from being silently
+// overwritten while allowing a valid legacy row to resume its suffix.
+func (s *Store) PromoteProofBackedImportCheckpoint(ctx context.Context, expected ImportCheckpoint, replacement ImportCheckpoint) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateProofBackedCheckpointPromotion(expected, replacement); err != nil {
+		return false, err
+	}
+	if changed, handled, err := s.promoteProofBackedImportCheckpointSQLite(ctx, expected, replacement); handled || err != nil {
+		return changed, err
+	}
+	changed := false
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		if state.ImportCheckpoints == nil {
+			state.ImportCheckpoints = make(map[string]ImportCheckpoint)
+		}
+		current, found := state.ImportCheckpoints[expected.ID]
+		if !found || !proofBackedCheckpointCASMatches(current, expected) {
+			return false, ErrProofBackedCheckpointPromotionConflict
+		}
+		if !current.LegacySourceUnverified && !current.RecoveryProofUnusable {
+			return false, ErrProofBackedCheckpointPromotionConflict
+		}
+		replacement.UpdatedAt = time.Now()
+		state.ImportCheckpoints[replacement.ID] = replacement
+		changed = true
+		return true, nil
+	})
+	return changed, err
+}
+
+// PromoteProofBackedImportCheckpointForOwner is the live-watcher variant of
+// PromoteProofBackedImportCheckpoint.  Source proof is computed outside the
+// store lock, so the proof CAS and the control-lease check must be performed
+// by the same durable update.  Otherwise a retired watcher could clear a
+// source-rewrite fence after a replacement owner has taken over.
+func (s *Store) PromoteProofBackedImportCheckpointForOwner(ctx context.Context, expected ImportCheckpoint, replacement ImportCheckpoint, machineID string, leaseGeneration int64) (bool, error) {
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" || leaseGeneration <= 0 {
+		return false, ErrControlLeaseNotHeld
+	}
+	if err := validateProofBackedCheckpointPromotion(expected, replacement); err != nil {
+		return false, err
+	}
+	_, changed, err := s.UpdateImportCheckpointForOwner(ctx, expected.ID, machineID, leaseGeneration, func(current ImportCheckpoint, found bool, now time.Time) (ImportCheckpoint, bool, error) {
+		if !found || !proofBackedCheckpointCASMatches(current, expected) {
+			return current, false, ErrProofBackedCheckpointPromotionConflict
+		}
+		if !current.LegacySourceUnverified && !current.RecoveryProofUnusable {
+			return current, false, ErrProofBackedCheckpointPromotionConflict
+		}
+		replacement.UpdatedAt = now
+		return replacement, true, nil
+	})
+	return changed, err
+}
+
+func validateProofBackedCheckpointPromotion(expected ImportCheckpoint, replacement ImportCheckpoint) error {
+	expected.ID = strings.TrimSpace(expected.ID)
+	replacement.ID = strings.TrimSpace(replacement.ID)
+	if expected.ID == "" || replacement.ID != expected.ID {
+		return fmt.Errorf("%w: checkpoint identity does not match", ErrSessionStateProvenanceMismatch)
+	}
+	expected.SessionID = strings.TrimSpace(expected.SessionID)
+	replacement.SessionID = strings.TrimSpace(replacement.SessionID)
+	if expected.SessionID == "" || replacement.SessionID != expected.SessionID {
+		return fmt.Errorf("%w: checkpoint session does not match", ErrSessionStateProvenanceMismatch)
+	}
+	if !expected.LegacySourceUnverified && !expected.RecoveryProofUnusable {
+		return fmt.Errorf("%w: checkpoint is not a compatibility row", ErrProofBackedCheckpointPromotionConflict)
+	}
+	if expected.SourceRewriteBlocked || expected.OversizedRecordBlocked || expected.UnresolvedExecution != nil || expected.ContextGap != nil || expected.PendingHistoryRange != nil {
+		return fmt.Errorf("%w: checkpoint has an active safety fence", ErrProofBackedCheckpointPromotionConflict)
+	}
+	if replacement.SourceRewriteBlocked || replacement.OversizedRecordBlocked || replacement.UnresolvedExecution != nil || replacement.ContextGap != nil || replacement.PendingHistoryRange != nil || replacement.LegacySourceUnverified || replacement.RecoveryProofUnusable {
+		return fmt.Errorf("%w: replacement is not an ordinary proof-backed checkpoint", ErrSessionStateProvenanceMismatch)
+	}
+	if strings.TrimSpace(replacement.SourcePath) == "" || strings.TrimSpace(replacement.SourceGeneration) == "" || strings.TrimSpace(replacement.SourceFingerprint) == "" ||
+		!replacement.LastOffsetKnown || replacement.LastOffset <= 0 || replacement.SourceSize < replacement.LastOffset || strings.TrimSpace(replacement.LastRecordID) == "" {
+		return fmt.Errorf("%w: replacement lacks a complete source cursor proof", ErrSessionStateProvenanceMismatch)
+	}
+	if replacement.TranscriptQuarantine != nil && !TranscriptQuarantineValid(replacement.TranscriptQuarantine) {
+		return fmt.Errorf("%w: replacement quarantine proof is invalid", ErrSessionStateProvenanceMismatch)
+	}
+	if err := validateImportCheckpointProvenance(replacement, replacement.SessionID, replacement.ID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func proofBackedCheckpointCASMatches(current ImportCheckpoint, expected ImportCheckpoint) bool {
+	current.UpdatedAt = time.Time{}
+	expected.UpdatedAt = time.Time{}
+	return reflect.DeepEqual(current, expected)
+}
+
+// UpdateImportCheckpointIfParentUnfencedForOwner combines the parent fork
+// fence and the current control-lease capability in one durable CAS.
+func (s *Store) UpdateImportCheckpointIfParentUnfencedForOwner(ctx context.Context, parentSessionID string, id string, machineID string, leaseGeneration int64, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error)) (ImportCheckpoint, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return ImportCheckpoint{}, false, err
+	}
+	return s.updateImportCheckpoint(ctx, parentSessionID, id, fn, capability)
+}
+
+func (s *Store) updateImportCheckpoint(ctx context.Context, parentSessionID string, id string, fn func(ImportCheckpoint, bool, time.Time) (ImportCheckpoint, bool, error), capability storeOwnerCapability) (ImportCheckpoint, bool, error) {
 	parentSessionID = strings.TrimSpace(parentSessionID)
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -3949,12 +4621,15 @@ func (s *Store) updateImportCheckpoint(ctx context.Context, parentSessionID stri
 	if fn == nil {
 		return ImportCheckpoint{}, false, fmt.Errorf("import checkpoint update function is required")
 	}
-	if out, changed, handled, err := s.updateImportCheckpointSQLite(ctx, parentSessionID, id, fn); handled || err != nil {
+	if out, changed, handled, err := s.updateImportCheckpointSQLite(ctx, parentSessionID, id, fn, capability); handled || err != nil {
 		return out, changed, err
 	}
 	var out ImportCheckpoint
 	changed := false
 	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return false, err
+		}
 		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
 			return false, err
 		}
@@ -3984,7 +4659,7 @@ func (s *Store) updateImportCheckpoint(ctx context.Context, parentSessionID stri
 }
 
 func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
-	return s.recordTranscriptCheckpoint(ctx, "", checkpoint, ledger)
+	return s.recordTranscriptCheckpoint(ctx, "", checkpoint, ledger, storeOwnerCapability{})
 }
 
 // RecordTranscriptCheckpointIfParentUnfenced atomically records the
@@ -3992,10 +4667,32 @@ func (s *Store) RecordTranscriptCheckpoint(ctx context.Context, checkpoint Impor
 // active fork. The fork fence is checked inside the same SQLite/JSON write
 // critical section as the publication state.
 func (s *Store) RecordTranscriptCheckpointIfParentUnfenced(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
-	return s.recordTranscriptCheckpoint(ctx, parentSessionID, checkpoint, ledger)
+	return s.recordTranscriptCheckpoint(ctx, parentSessionID, checkpoint, ledger, storeOwnerCapability{})
 }
 
-func (s *Store) recordTranscriptCheckpoint(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord) error {
+// RecordTranscriptCheckpointForOwner atomically records the transcript
+// checkpoint and ledger only while the supplied listener owner still holds
+// the control lease.
+func (s *Store) RecordTranscriptCheckpointForOwner(ctx context.Context, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord, machineID string, leaseGeneration int64) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.recordTranscriptCheckpoint(ctx, "", checkpoint, ledger, capability)
+}
+
+// RecordTranscriptCheckpointIfParentUnfencedForOwner combines the parent fork
+// fence, checkpoint/ledger write and control-lease capability in one durable
+// transaction.
+func (s *Store) RecordTranscriptCheckpointIfParentUnfencedForOwner(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord, machineID string, leaseGeneration int64) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.recordTranscriptCheckpoint(ctx, parentSessionID, checkpoint, ledger, capability)
+}
+
+func (s *Store) recordTranscriptCheckpoint(ctx context.Context, parentSessionID string, checkpoint ImportCheckpoint, ledger TranscriptLedgerRecord, capability storeOwnerCapability) error {
 	parentSessionID = strings.TrimSpace(parentSessionID)
 	checkpoint.ID = strings.TrimSpace(checkpoint.ID)
 	checkpoint.SessionID = strings.TrimSpace(checkpoint.SessionID)
@@ -4010,7 +4707,7 @@ func (s *Store) recordTranscriptCheckpoint(ctx context.Context, parentSessionID 
 	if ledger.ID == "" {
 		return fmt.Errorf("transcript ledger id is required")
 	}
-	if handled, err := s.recordTranscriptCheckpointSQLite(ctx, parentSessionID, checkpoint, ledger); handled || err != nil {
+	if handled, err := s.recordTranscriptCheckpointSQLite(ctx, parentSessionID, checkpoint, ledger, capability); handled || err != nil {
 		return err
 	}
 	update := s.Update
@@ -4020,6 +4717,9 @@ func (s *Store) recordTranscriptCheckpoint(ctx context.Context, parentSessionID 
 		}
 	}
 	return update(ctx, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
 		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
 			return err
 		}
@@ -4066,18 +4766,60 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 	if importCheckpointIsExplicitHistoryRun(previous) {
 		quarantine = checkpoint.TranscriptQuarantine
 	}
+	cursorProgress := TranscriptCheckpointProgress{
+		ID:                id,
+		SessionID:         checkpoint.SessionID,
+		SourcePath:        checkpoint.SourcePath,
+		SourceGeneration:  checkpoint.SourceGeneration,
+		LastRecordID:      checkpoint.LastRecordID,
+		LastSourceLine:    checkpoint.LastSourceLine,
+		LastOffset:        checkpoint.LastOffset,
+		LastOffsetKnown:   checkpoint.LastOffsetKnown,
+		SourceSize:        checkpoint.SourceSize,
+		SourceModTime:     checkpoint.SourceModTime,
+		SourceChangeTime:  checkpoint.SourceChangeTime,
+		SourceFingerprint: checkpoint.SourceFingerprint,
+	}
+	cursorAlreadyAhead := transcriptCheckpointProgressAlreadyAhead(previous, cursorProgress)
+	lastRecordID := strings.TrimSpace(checkpoint.LastRecordID)
+	lastSourceLine := firstStoreNonZeroInt(checkpoint.LastSourceLine, previous.LastSourceLine)
+	lastOffset := firstStoreNonZeroInt64(checkpoint.LastOffset, previous.LastOffset)
+	lastOffsetKnown := checkpoint.LastOffsetKnown || previous.LastOffsetKnown || checkpoint.LastOffset != 0 || previous.LastOffset != 0
+	sourcePath := firstStoreNonEmptyString(checkpoint.SourcePath, previous.SourcePath)
+	sourceGeneration := firstStoreNonEmptyString(checkpoint.SourceGeneration, previous.SourceGeneration)
+	sourceFingerprint := firstStoreNonEmptyString(checkpoint.SourceFingerprint, previous.SourceFingerprint)
+	sourceSize := firstStoreNonZeroInt64(checkpoint.SourceSize, previous.SourceSize)
+	sourceModTime := firstStoreNonZeroTime(checkpoint.SourceModTime, previous.SourceModTime)
+	sourceChangeTime := firstStoreNonZeroInt64(checkpoint.SourceChangeTime, previous.SourceChangeTime)
+	if cursorAlreadyAhead {
+		// RecordTranscriptCheckpoint is used by older/background paths that can
+		// report an item after a newer cursor was already committed. Keep the
+		// cursor tuple coherent instead of combining the old offset with a stale
+		// record ID or line.
+		lastRecordID = previous.LastRecordID
+		lastSourceLine = previous.LastSourceLine
+		lastOffset = previous.LastOffset
+		lastOffsetKnown = previous.LastOffsetKnown || previous.LastOffset != 0
+		sourcePath = firstStoreNonEmptyString(previous.SourcePath, checkpoint.SourcePath)
+		sourceGeneration = firstStoreNonEmptyString(previous.SourceGeneration, checkpoint.SourceGeneration)
+		sourceFingerprint = firstStoreNonEmptyString(previous.SourceFingerprint, checkpoint.SourceFingerprint)
+		sourceSize = firstStoreNonZeroInt64(previous.SourceSize, checkpoint.SourceSize)
+		sourceModTime = firstStoreNonZeroTime(previous.SourceModTime, checkpoint.SourceModTime)
+		sourceChangeTime = firstStoreNonZeroInt64(previous.SourceChangeTime, checkpoint.SourceChangeTime)
+	}
 	outCheckpoint := ImportCheckpoint{
 		ID:                   id,
 		SessionID:            firstStoreNonEmptyString(checkpoint.SessionID, previous.SessionID),
-		SourcePath:           firstStoreNonEmptyString(checkpoint.SourcePath, previous.SourcePath),
-		SourceGeneration:     firstStoreNonEmptyString(checkpoint.SourceGeneration, previous.SourceGeneration),
-		SourceFingerprint:    firstStoreNonEmptyString(checkpoint.SourceFingerprint, previous.SourceFingerprint),
-		LastRecordID:         strings.TrimSpace(checkpoint.LastRecordID),
-		LastSourceLine:       firstStoreNonZeroInt(checkpoint.LastSourceLine, previous.LastSourceLine),
-		LastOffset:           firstStoreNonZeroInt64(checkpoint.LastOffset, previous.LastOffset),
-		LastOffsetKnown:      checkpoint.LastOffsetKnown || previous.LastOffsetKnown || checkpoint.LastOffset != 0 || previous.LastOffset != 0,
-		SourceSize:           firstStoreNonZeroInt64(checkpoint.SourceSize, previous.SourceSize),
-		SourceModTime:        firstStoreNonZeroTime(checkpoint.SourceModTime, previous.SourceModTime),
+		SourcePath:           sourcePath,
+		SourceGeneration:     sourceGeneration,
+		SourceFingerprint:    sourceFingerprint,
+		LastRecordID:         lastRecordID,
+		LastSourceLine:       lastSourceLine,
+		LastOffset:           lastOffset,
+		LastOffsetKnown:      lastOffsetKnown,
+		SourceSize:           sourceSize,
+		SourceModTime:        sourceModTime,
+		SourceChangeTime:     sourceChangeTime,
 		ImportTurnID:         previous.ImportTurnID,
 		KindPrefix:           previous.KindPrefix,
 		Status:               status,
@@ -4088,39 +4830,70 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		// the explicit history path clears it; otherwise a late generic writer
 		// could silently turn an unverified checkpoint back into an automatic
 		// source-proof checkpoint.
-		LegacySourceUnverified:        previous.LegacySourceUnverified && !importCheckpointIsExplicitHistoryRun(previous),
-		RecoveryProofUnusable:         previous.RecoveryProofUnusable && !importCheckpointIsExplicitHistoryRun(previous),
-		LastFinalID:                   previous.LastFinalID,
-		LastFinalLine:                 previous.LastFinalLine,
-		LastFinalStartOffset:          previous.LastFinalStartOffset,
-		LastFinalStartOffsetKnown:     previous.LastFinalStartOffsetKnown,
-		LastFinalThreadID:             previous.LastFinalThreadID,
-		LastFinalTurnID:               previous.LastFinalTurnID,
-		LastFinalTextHash:             previous.LastFinalTextHash,
-		TerminalBoundarySeen:          previous.TerminalBoundarySeen,
-		TerminalBoundaryLine:          previous.TerminalBoundaryLine,
-		TerminalBoundary:              previous.TerminalBoundary,
-		ContextGap:                    previous.ContextGap,
-		PendingHistoryRange:           previous.PendingHistoryRange,
-		HistoryRootReleased:           previous.HistoryRootReleased || checkpoint.HistoryRootReleased,
-		SourceRewriteBlocked:          previous.SourceRewriteBlocked || checkpoint.SourceRewriteBlocked,
-		OversizedRecordBlocked:        previous.OversizedRecordBlocked || checkpoint.OversizedRecordBlocked,
-		SourceRewriteRecoveryIdentity: firstStoreNonEmptyString(checkpoint.SourceRewriteRecoveryIdentity, previous.SourceRewriteRecoveryIdentity),
-		CompletionPending:             previous.CompletionPending || checkpoint.CompletionPending,
-		LegacyProbeRevision:           firstStoreNonEmptyString(checkpoint.LegacyProbeRevision, previous.LegacyProbeRevision),
+		LegacySourceUnverified:          previous.LegacySourceUnverified && !importCheckpointIsExplicitHistoryRun(previous),
+		RecoveryProofUnusable:           previous.RecoveryProofUnusable && !importCheckpointIsExplicitHistoryRun(previous),
+		LastFinalID:                     previous.LastFinalID,
+		LastFinalLine:                   previous.LastFinalLine,
+		LastFinalStartOffset:            previous.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:       previous.LastFinalStartOffsetKnown,
+		LastFinalThreadID:               previous.LastFinalThreadID,
+		LastFinalTurnID:                 previous.LastFinalTurnID,
+		LastFinalTextHash:               previous.LastFinalTextHash,
+		TerminalBoundarySeen:            previous.TerminalBoundarySeen,
+		TerminalBoundaryLine:            previous.TerminalBoundaryLine,
+		TerminalBoundary:                previous.TerminalBoundary,
+		ContextGap:                      previous.ContextGap,
+		PendingHistoryRange:             previous.PendingHistoryRange,
+		HistoryRootReleased:             previous.HistoryRootReleased || checkpoint.HistoryRootReleased,
+		SourceRewriteBlocked:            previous.SourceRewriteBlocked || checkpoint.SourceRewriteBlocked,
+		OversizedRecordBlocked:          previous.OversizedRecordBlocked || checkpoint.OversizedRecordBlocked,
+		SourceRewriteRecoveryIdentity:   firstStoreNonEmptyString(checkpoint.SourceRewriteRecoveryIdentity, previous.SourceRewriteRecoveryIdentity),
+		SourceRewriteRecoverySize:       firstStoreNonZeroInt64(checkpoint.SourceRewriteRecoverySize, previous.SourceRewriteRecoverySize),
+		SourceRewriteRecoveryModTime:    firstStoreNonZeroTime(checkpoint.SourceRewriteRecoveryModTime, previous.SourceRewriteRecoveryModTime),
+		SourceRewriteRecoveryChangeTime: firstStoreNonZeroInt64(checkpoint.SourceRewriteRecoveryChangeTime, previous.SourceRewriteRecoveryChangeTime),
+		CompletionPending:               previous.CompletionPending || checkpoint.CompletionPending,
+		LegacyProbeRevision:             firstStoreNonEmptyString(checkpoint.LegacyProbeRevision, previous.LegacyProbeRevision),
 		// Preserve the monotonic generation even when a normal transcript
 		// checkpoint update does not carry an anchor.  A late callback must not
 		// be able to clear a recreated anchor after this reconstruction.
 		ExecutionAnchorGeneration: maxStoreInt64(previous.ExecutionAnchorGeneration, checkpoint.ExecutionAnchorGeneration),
 		UpdatedAt:                 now,
 	}
-	if previous.PartialReadOffset > previous.PartialLineStartOffset && outCheckpoint.LastOffset <= previous.PartialLineStartOffset {
+	if checkpoint.PartialReadOffset > checkpoint.PartialLineStartOffset {
+		outCheckpoint.PartialLineStartOffset = checkpoint.PartialLineStartOffset
+		outCheckpoint.PartialReadOffset = checkpoint.PartialReadOffset
+		outCheckpoint.PartialObservedSize = checkpoint.PartialObservedSize
+		outCheckpoint.PartialLine = checkpoint.PartialLine
+		outCheckpoint.PartialStartedAt = checkpoint.PartialStartedAt
+		outCheckpoint.PartialSourceIdentity = checkpoint.PartialSourceIdentity
+		outCheckpoint.PartialSourceChangeTime = checkpoint.PartialSourceChangeTime
+		outCheckpoint.PartialReplayOffset = checkpoint.PartialReplayOffset
+		outCheckpoint.PartialReplayLine = checkpoint.PartialReplayLine
+		outCheckpoint.PartialLastProgressAt = checkpoint.PartialLastProgressAt
+		outCheckpoint.PartialPrefixReleased = checkpoint.PartialPrefixReleased
+	} else if previous.PartialReadOffset > previous.PartialLineStartOffset && outCheckpoint.LastOffset <= previous.PartialLineStartOffset {
 		outCheckpoint.PartialLineStartOffset = previous.PartialLineStartOffset
 		outCheckpoint.PartialReadOffset = previous.PartialReadOffset
 		outCheckpoint.PartialObservedSize = previous.PartialObservedSize
 		outCheckpoint.PartialLine = previous.PartialLine
 		outCheckpoint.PartialStartedAt = previous.PartialStartedAt
 		outCheckpoint.PartialSourceIdentity = previous.PartialSourceIdentity
+		outCheckpoint.PartialSourceChangeTime = previous.PartialSourceChangeTime
+		outCheckpoint.PartialReplayOffset = previous.PartialReplayOffset
+		outCheckpoint.PartialReplayLine = previous.PartialReplayLine
+		outCheckpoint.PartialLastProgressAt = previous.PartialLastProgressAt
+		outCheckpoint.PartialPrefixReleased = previous.PartialPrefixReleased
+	}
+	if checkpoint.PendingOpaqueRecordEndOffset > checkpoint.PendingOpaqueRecordStartOffset {
+		outCheckpoint.PendingOpaqueRecordStartOffset = checkpoint.PendingOpaqueRecordStartOffset
+		outCheckpoint.PendingOpaqueRecordEndOffset = checkpoint.PendingOpaqueRecordEndOffset
+		outCheckpoint.PendingOpaqueRecordLine = checkpoint.PendingOpaqueRecordLine
+		outCheckpoint.PendingOpaqueRecordID = checkpoint.PendingOpaqueRecordID
+	} else if previous.PendingOpaqueRecordEndOffset > previous.PendingOpaqueRecordStartOffset && outCheckpoint.LastOffset <= previous.PendingOpaqueRecordStartOffset {
+		outCheckpoint.PendingOpaqueRecordStartOffset = previous.PendingOpaqueRecordStartOffset
+		outCheckpoint.PendingOpaqueRecordEndOffset = previous.PendingOpaqueRecordEndOffset
+		outCheckpoint.PendingOpaqueRecordLine = previous.PendingOpaqueRecordLine
+		outCheckpoint.PendingOpaqueRecordID = previous.PendingOpaqueRecordID
 	}
 	if checkpoint.UnresolvedExecution != nil {
 		outCheckpoint.UnresolvedExecution = checkpoint.UnresolvedExecution
@@ -4531,6 +5304,53 @@ func (s *Store) SentOutboxMessagesForChat(ctx context.Context, chatID string) ([
 	return messages, nil
 }
 
+// PendingSentOutboxSideEffects returns a bounded batch of already-delivered
+// outbox rows whose post-send bookkeeping still needs to run.  This is a
+// recovery-only view: it never makes a Sent row eligible for another Graph
+// POST.  A bounded batch keeps a broken side effect from turning the main
+// loop into an unbounded cold-state scan; successful rows are cleared by
+// MarkOutboxSideEffectsComplete and therefore drain over subsequent cycles.
+// NextAttemptAt is used as a retry gate for this Sent-only lane after a
+// follow-up side effect fails; it is never consulted by the normal Graph-send
+// query for Sent rows.
+func (s *Store) PendingSentOutboxSideEffects(ctx context.Context, limit int) ([]OutboxMessage, error) {
+	if limit <= 0 {
+		limit = 32
+	}
+	if limit > 128 {
+		limit = 128
+	}
+	if messages, handled, err := s.pendingSentOutboxSideEffectsSQLite(ctx, limit); handled || err != nil {
+		return messages, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]OutboxMessage, 0, limit)
+	now := time.Now()
+	for _, msg := range state.OutboxMessages {
+		if msg.Status != OutboxStatusSent || !msg.PostSendEffectsPending || !outboxRetryGateDue(msg, now) {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		if !messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+			return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+		}
+		return messages[i].ID < messages[j].ID
+	})
+	if len(messages) > limit {
+		messages = messages[:limit]
+	}
+	return messages, nil
+}
+
+func outboxRetryGateDue(msg OutboxMessage, now time.Time) bool {
+	return msg.NextAttemptAt.IsZero() || now.IsZero() || !now.Before(msg.NextAttemptAt)
+}
+
 func (s *Store) OutboxMessageByID(ctx context.Context, outboxID string) (OutboxMessage, error) {
 	outboxID = strings.TrimSpace(outboxID)
 	if outboxID == "" {
@@ -4552,7 +5372,52 @@ func (s *Store) OutboxMessageByID(ctx context.Context, outboxID string) (OutboxM
 // unrelated outbox and cold history tables; legacy JSON stores fall back to
 // the normal loader.
 func (s *Store) ForkPollingSnapshot(ctx context.Context) (State, error) {
+	if state, handled, err := s.forkPollingSnapshotSQLite(ctx); handled || err != nil {
+		return state, err
+	}
 	return s.loadStateFieldsOrFull(ctx, forkPollingStateFields)
+}
+
+// forkPollingSnapshotSQLite avoids decoding every session and chat poll on
+// every listener tick when no fork is staged. Forks are exceptional and have
+// their own indexed phase column; the common no-fork path therefore needs only
+// one existence query. When a staged operation exists, the SQLite loader reads
+// only the staged operation rows and their child session/poll rows. A single
+// fork must not turn an otherwise bounded listener tick into a full-state JSON
+// materialization.
+func (s *Store) forkPollingSnapshotSQLite(ctx context.Context) (State, bool, error) {
+	var state State
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var one int
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM fork_operations
+WHERE phase IN (?, ?, ?)
+LIMIT 1`,
+			string(ForkPhaseChildChatStaged),
+			string(ForkPhaseHistoryPublishing),
+			string(ForkPhaseHistoryVerified),
+		).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			state = newState()
+			state.ForkOperations = map[string]ForkOperation{}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		state, err = loadSQLiteForkPollingState(ctx, db)
+		return err
+	})
+	return state, handled, err
 }
 
 func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
@@ -4665,13 +5530,31 @@ func loadImportCheckpointsByIDsData(data []byte, requested map[string]string) (m
 				}
 				var checkpoint ImportCheckpoint
 				if err := json.Unmarshal(row, &checkpoint); err != nil {
-					return err
+					// This API is called for a batch of independent sessions. A
+					// malformed canonical row is a local history-only fence, not a
+					// reason to make every requested session unreadable.
+					out := opaqueCanonicalImportCheckpointFromJSON(id, expectedSession)
+					selected[id] = out
+					return nil
 				}
+				embeddedID := strings.TrimSpace(checkpoint.ID)
+				embeddedSession := strings.TrimSpace(checkpoint.SessionID)
 				if strings.TrimSpace(checkpoint.ID) == "" {
 					checkpoint.ID = id
 				}
 				if err := validateImportCheckpointProvenance(checkpoint, expectedSession, id); err != nil {
-					return err
+					// A syntactically valid row with a foreign embedded ID/session is
+					// not a recoverable history ambiguity. Returning the provenance
+					// error preserves the strict scoped-read contract and prevents a
+					// caller from silently treating a foreign cursor as this session's
+					// checkpoint. A missing identity is different: it is an opaque
+					// local row and may be represented by the deterministic fence used
+					// by the full-store fallback.
+					if embeddedID != "" && embeddedSession != "" {
+						return err
+					}
+					selected[id] = opaqueCanonicalImportCheckpointFromJSON(id, expectedSession)
+					return nil
 				}
 				selected[id] = checkpoint
 				return nil
@@ -4759,8 +5642,34 @@ func loadSelectedStateFieldsData(data []byte, wantedFields map[string]struct{}) 
 			}
 		default:
 			if fieldValue, wanted := fieldTargets[key]; wanted {
-				if err := json.Unmarshal(data[valueStart:valueEnd], fieldValue.Addr().Interface()); err != nil {
-					return State{}, false, err
+				rawValue := data[valueStart:valueEnd]
+				var decodeErr error
+				switch key {
+				case "import_checkpoints", "chat_polls", "sessions", "turns":
+					var rows map[string]json.RawMessage
+					if err := json.Unmarshal(rawValue, &rows); err != nil {
+						decodeErr = err
+						break
+					}
+					switch key {
+					case "import_checkpoints":
+						state.ImportCheckpoints = make(map[string]ImportCheckpoint, len(rows))
+						decodeErr = decodeJSONImportCheckpointRows(rows, state.ImportCheckpoints)
+					case "chat_polls":
+						state.ChatPolls = make(map[string]ChatPollState, len(rows))
+						decodeErr = decodeJSONChatPollRows(rows, state.ChatPolls)
+					case "sessions":
+						state.Sessions = make(map[string]SessionContext, len(rows))
+						decodeErr = decodeJSONSessionRows(rows, state.Sessions)
+					case "turns":
+						state.Turns = make(map[string]Turn, len(rows))
+						decodeErr = decodeJSONTurnRows(rows, state.Turns, true)
+					}
+				default:
+					decodeErr = json.Unmarshal(rawValue, fieldValue.Addr().Interface())
+				}
+				if decodeErr != nil {
+					return State{}, false, decodeErr
 				}
 			}
 		}
@@ -4817,10 +5726,16 @@ func loadSessionExecutionOwnershipProbeData(data []byte, sessionID string, check
 				}
 				var checkpoint ImportCheckpoint
 				if err := json.Unmarshal(row, &checkpoint); err != nil {
-					return err
+					// A corrupt optional checkpoint cannot prove that a Codex
+					// writer exists. Keep this chat's history local and allow the
+					// ownership probe for unrelated chats to continue.
+					return nil
 				}
 				if err := validateImportCheckpointSession(checkpoint, sessionID, id); err != nil {
-					return err
+					if strings.TrimSpace(checkpoint.ID) != "" && strings.TrimSpace(checkpoint.SessionID) != "" {
+						return err
+					}
+					return nil
 				}
 				unresolved = importCheckpointHasUnresolvedExecution(checkpoint)
 				return nil
@@ -4842,7 +5757,7 @@ func loadSessionExecutionOwnershipProbeData(data []byte, sessionID string, check
 					RecoveryReason string     `json:"recovery_reason"`
 				}
 				if err := json.Unmarshal(row, &meta); err != nil {
-					return err
+					return nil
 				}
 				if strings.TrimSpace(meta.SessionID) == sessionID && meta.Status == TurnStatusInterrupted && isLegacyUnresolvedTurn(Turn{Status: meta.Status, RecoveryReason: meta.RecoveryReason}) {
 					unresolved = true
@@ -4893,7 +5808,7 @@ func loadSessionExecutionOwnershipProbesData(data []byte, requested map[string]s
 			nestedOK, nestedErr := scanJSONObjectEntries(raw, func(id string, row []byte) error {
 				var checkpoint ImportCheckpoint
 				if err := json.Unmarshal(row, &checkpoint); err != nil {
-					return err
+					return nil
 				}
 				if strings.TrimSpace(checkpoint.ID) == "" {
 					checkpoint.ID = id
@@ -4901,14 +5816,20 @@ func loadSessionExecutionOwnershipProbesData(data []byte, requested map[string]s
 				sessionID := strings.TrimSpace(checkpoint.SessionID)
 				if expectedSession, canonical := checkpointOwners[id]; canonical {
 					if err := validateImportCheckpointProvenance(checkpoint, expectedSession, id); err != nil {
-						return err
+						if strings.TrimSpace(checkpoint.ID) != "" && strings.TrimSpace(checkpoint.SessionID) != "" {
+							return err
+						}
+						return nil
 					}
 				}
 				if _, wanted := requested[sessionID]; !wanted {
 					return nil
 				}
 				if err := validateImportCheckpointProvenance(checkpoint, sessionID, id); err != nil {
-					return err
+					if strings.TrimSpace(checkpoint.ID) != "" && strings.TrimSpace(checkpoint.SessionID) != "" {
+						return err
+					}
+					return nil
 				}
 				if importCheckpointHasUnresolvedExecution(checkpoint) {
 					out[sessionID] = true
@@ -4929,7 +5850,7 @@ func loadSessionExecutionOwnershipProbesData(data []byte, requested map[string]s
 					RecoveryReason string     `json:"recovery_reason"`
 				}
 				if err := json.Unmarshal(row, &meta); err != nil {
-					return err
+					return nil
 				}
 				sessionID := strings.TrimSpace(meta.SessionID)
 				if _, wanted := requested[sessionID]; wanted && isLegacyUnresolvedTurn(Turn{Status: meta.Status, RecoveryReason: meta.RecoveryReason}) {
@@ -5144,6 +6065,24 @@ func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, erro
 // retry an incomplete tail, but they must not rewrite the durable store on
 // every poll while the source file is unchanged.
 func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) error {
+	return s.updateHistoryWatchWithCapability(ctx, storeOwnerCapability{}, fn)
+}
+
+// UpdateHistoryWatchForOwner applies a history-watch projection update only
+// while the supplied control-lease capability is still current.  The history
+// watcher scans outside the store transaction, so checking the lease only when
+// a phase starts is insufficient: an old watcher can finish after a takeover.
+// JSON and SQLite both validate the capability at their durable mutation
+// boundary.
+func (s *Store) UpdateHistoryWatchForOwner(ctx context.Context, machineID string, leaseGeneration int64, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.updateHistoryWatchWithCapability(ctx, capability, fn)
+}
+
+func (s *Store) updateHistoryWatchWithCapability(ctx context.Context, capability storeOwnerCapability, fn func(map[string]HistoryWatchCheckpoint, *time.Time) error) error {
 	apply := func(history map[string]HistoryWatchCheckpoint, ready *time.Time) error {
 		if err := fn(history, ready); err != nil {
 			return err
@@ -5156,6 +6095,9 @@ func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]Histo
 		return nil
 	}
 	update := func(state *State) (bool, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return false, err
+		}
 		before := cloneHistoryWatchCheckpoints(state.HistoryWatch)
 		beforeReady := state.HistoryWatchReady
 		if state.HistoryWatch == nil {
@@ -5166,7 +6108,7 @@ func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]Histo
 		}
 		return !historyWatchCheckpointsEqual(before, state.HistoryWatch) || !beforeReady.Equal(state.HistoryWatchReady), nil
 	}
-	if handled, err := s.updateSQLiteHistoryWatchIfChanged(ctx, apply); handled || err != nil {
+	if handled, err := s.updateSQLiteHistoryWatchIfChangedWithCapability(ctx, apply, capability); handled || err != nil {
 		return err
 	}
 	return s.UpdateIfChanged(ctx, update)
@@ -5179,6 +6121,20 @@ func (s *Store) UpdateHistoryWatch(ctx context.Context, fn func(map[string]Histo
 // history watcher after scanning outside the store lock, so a slower watcher
 // cannot overwrite a newer source cursor.
 func (s *Store) UpdateHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *HistoryWatchCheckpoint, next HistoryWatchCheckpoint) error {
+	return s.updateHistoryWatchCheckpointIfCurrentWithCapability(ctx, id, expected, next, storeOwnerCapability{})
+}
+
+// UpdateHistoryWatchCheckpointIfCurrentForOwner is the owner-scoped variant
+// used by the live history watcher after an out-of-transaction scan.
+func (s *Store) UpdateHistoryWatchCheckpointIfCurrentForOwner(ctx context.Context, id string, expected *HistoryWatchCheckpoint, next HistoryWatchCheckpoint, machineID string, leaseGeneration int64) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.updateHistoryWatchCheckpointIfCurrentWithCapability(ctx, id, expected, next, capability)
+}
+
+func (s *Store) updateHistoryWatchCheckpointIfCurrentWithCapability(ctx context.Context, id string, expected *HistoryWatchCheckpoint, next HistoryWatchCheckpoint, capability storeOwnerCapability) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return ErrHistoryWatchCheckpointConflict
@@ -5199,16 +6155,31 @@ func (s *Store) UpdateHistoryWatchCheckpointIfCurrent(ctx context.Context, id st
 		history[id] = next
 		return nil
 	}
-	if handled, err := s.updateSQLiteHistoryWatchIfChanged(ctx, update); handled || err != nil {
+	if handled, err := s.updateSQLiteHistoryWatchIfChangedWithCapability(ctx, update, capability); handled || err != nil {
 		return err
 	}
-	return s.UpdateHistoryWatch(ctx, update)
+	return s.updateHistoryWatchWithCapability(ctx, capability, update)
 }
 
 // DeleteHistoryWatchCheckpointIfCurrent removes one checkpoint only when the
 // caller's scan still owns the expected cursor. A stale source-missing scan
 // must not delete a newer checkpoint written by another watcher.
 func (s *Store) DeleteHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *HistoryWatchCheckpoint) error {
+	return s.deleteHistoryWatchCheckpointIfCurrentWithCapability(ctx, id, expected, storeOwnerCapability{})
+}
+
+// DeleteHistoryWatchCheckpointIfCurrentForOwner is the owner-scoped variant
+// used when a live watcher observes a source disappear.  A stale watcher may
+// not delete a checkpoint written by the replacement owner.
+func (s *Store) DeleteHistoryWatchCheckpointIfCurrentForOwner(ctx context.Context, id string, expected *HistoryWatchCheckpoint, machineID string, leaseGeneration int64) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.deleteHistoryWatchCheckpointIfCurrentWithCapability(ctx, id, expected, capability)
+}
+
+func (s *Store) deleteHistoryWatchCheckpointIfCurrentWithCapability(ctx context.Context, id string, expected *HistoryWatchCheckpoint, capability storeOwnerCapability) error {
 	id = strings.TrimSpace(id)
 	if id == "" || expected == nil {
 		return ErrHistoryWatchCheckpointConflict
@@ -5221,10 +6192,10 @@ func (s *Store) DeleteHistoryWatchCheckpointIfCurrent(ctx context.Context, id st
 		delete(history, id)
 		return nil
 	}
-	if handled, err := s.updateSQLiteHistoryWatchIfChanged(ctx, update); handled || err != nil {
+	if handled, err := s.updateSQLiteHistoryWatchIfChangedWithCapability(ctx, update, capability); handled || err != nil {
 		return err
 	}
-	return s.UpdateHistoryWatch(ctx, update)
+	return s.updateHistoryWatchWithCapability(ctx, capability, update)
 }
 
 func cloneHistoryWatchCheckpoints(values map[string]HistoryWatchCheckpoint) map[string]HistoryWatchCheckpoint {
@@ -5617,22 +6588,77 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 	machine.UpdatedAt = now
 
 	existing := state.ControlLease
+	if err := validateControlLeaseShape(existing); err != nil {
+		return ControlLeaseDecision{}, err
+	}
+	if strings.TrimSpace(existing.ScopeID) != "" &&
+		strings.TrimSpace(existing.ScopeID) != strings.TrimSpace(claim.Scope.ID) {
+		return ControlLeaseDecision{}, fmt.Errorf("%w: control lease scope %q does not match state scope %q", ErrControlLeaseStateUntrusted, existing.ScopeID, claim.Scope.ID)
+	}
+	// A non-empty generation (or any other lease field) means this state has a
+	// durable lease history.  A replacement claim from that history is allowed
+	// to retire the previous owner projection: the new generation is the
+	// authority, and the old owner can no longer renew it.  Conversely, when a
+	// state has an owner row but no lease history at all, retain that owner row
+	// until the first heartbeat proves it is stale/dead.  This is an important
+	// corruption-safe boundary for partially written legacy state; blindly
+	// overwriting it would turn an inconsistent state into two simultaneous
+	// owners.
+	priorLeaseKnown := existing.Generation > 0 ||
+		strings.TrimSpace(existing.HolderMachineID) != "" ||
+		existing.Status != "" ||
+		!existing.LeaseUntil.IsZero() ||
+		!existing.LastHeartbeat.IsZero() ||
+		!existing.UpdatedAt.IsZero()
 	existingLive := existing.HolderMachineID != "" && existing.ScopeID == claim.Scope.ID && existing.LeaseUntil.After(now)
 	sameHolder := existingLive && existing.HolderMachineID == machine.ID
 	liveLeaseOwner := false
 	sameOwner := false
+	legacyOwnerLive := false
+	activeOwnerUntrusted := false
 	protectedActiveTurn := false
-	if owner, ok := state.readOwner(); ok {
+	owner, ownerFound := state.readOwner()
+	if existingLive {
+		// A live lease is authoritative.  When an owner projection is present,
+		// it must also be tied to that lease before a same-machine or priority
+		// claimant may replace it.  A syntactically valid `{}` (or a legacy
+		// process owner with no machine/generation) is not proof that the live
+		// writer stopped.  Keep the claimant in standby until the lease expires
+		// or an explicit owner clear removes the projection.
+		if leaseOwner, ok := state.readOwnerForControlLease(existing); ok {
+			owner = leaseOwner
+			ownerFound = true
+		} else if state.ownerProjectionPresent() {
+			activeOwnerUntrusted = true
+		}
+	}
+	if ownerFound {
 		sameOwner = sameOwnerProcess(owner, claim.Owner)
 		liveLeaseOwner = existingLive &&
-			owner.MachineID == existing.HolderMachineID &&
-			owner.LeaseGeneration == existing.Generation &&
+			ownerMatchesControlLease(owner, existing) &&
 			!IsStale(owner, claim.Duration, now) &&
 			!OwnerAppearsLocallyDead(owner)
 		protectedActiveTurn = liveLeaseOwner && owner.ActiveTurnID != ""
+		// Pre-generation stores can contain a live owner projection without
+		// any control-lease history.  Its missing lease is not evidence that
+		// the process stopped; a different claimant must wait for the owner
+		// heartbeat to become stale (or for an explicit same-owner adoption).
+		// Otherwise a restart during a torn legacy write can create two writers
+		// even though the compatibility owner row is fresh.
+		legacyOwnerLive = !priorLeaseKnown && !sameOwner &&
+			!IsStale(owner, claim.Duration, now) && !OwnerAppearsLocallyDead(owner)
 	}
-	canClaim := !existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn
+	canClaim := (!existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn) && !legacyOwnerLive && !activeOwnerUntrusted
 	if canClaim {
+		if priorLeaseKnown && !sameOwner {
+			// Claiming a replacement generation is the durable hand-off point.
+			// Clear both compatibility owner projections here so the subsequent
+			// owner heartbeat cannot be rejected by a row belonging to the
+			// retired generation.  If the state had no lease history, keep the
+			// row and let RecordOwnerHeartbeatForLease return OwnerConflictError.
+			state.ServiceOwner = nil
+			state.LockOwner = nil
+		}
 		if sameHolder && sameOwner && existing.Generation > 0 && existing.LeaseUntil.After(now.Add(claim.Duration/2)) &&
 			scopeClaimMatchesStored(storedScope, claim.Scope) &&
 			existingMachine.Status == MachineStatusActive &&
@@ -5645,6 +6671,20 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 			return ControlLeaseDecision{Mode: LeaseModeActive, Lease: existing, Holder: holder}, errStoreNoChange
 		}
 		if sameHolder {
+			// A machine ID identifies a host, not a process incarnation.  If the
+			// previous owner row is missing, stale, or belongs to a different
+			// process, a replacement on the same machine must receive a fresh
+			// generation; otherwise delayed callbacks from the old process can
+			// match the replacement lease.
+			// The owner field was optional in the original lease API.  A legacy
+			// caller that omits it cannot prove that it is a new process, so keep
+			// the historical same-machine refresh behavior for that compatibility
+			// path.  The listener always supplies a process identity; that path
+			// receives a new generation when the persisted owner is absent or
+			// belongs to another process.
+			if !sameOwner && ownerProcessIdentityPresent(claim.Owner) {
+				existing.Generation++
+			}
 			if existing.Generation <= 0 {
 				existing.Generation = 1
 			}
@@ -5677,6 +6717,13 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 	machine.Status = MachineStatusStandby
 	state.Machines[machine.ID] = machine
 	holder := state.Machines[existing.HolderMachineID]
+	if holder.ID == "" {
+		if owner, ok := state.readOwner(); ok {
+			holder.ID = owner.MachineID
+			holder.Kind = existing.HolderKind
+			holder.Status = MachineStatusActive
+		}
+	}
 	if holder.ID == "" {
 		holder.ID = existing.HolderMachineID
 		holder.Kind = existing.HolderKind
@@ -5730,6 +6777,9 @@ func (s *Store) ValidateControlLease(ctx context.Context, machineID string, gene
 		return ControlLease{}, err
 	}
 	lease := state.ControlLease
+	if err := validateControlLeaseShape(lease); err != nil {
+		return lease, err
+	}
 	if lease.HolderMachineID != machineID || lease.Generation != generation || !lease.LeaseUntil.After(now) {
 		return lease, ErrControlLeaseNotHeld
 	}
@@ -5747,6 +6797,9 @@ func (s *Store) ReleaseControlLeaseIfHolder(ctx context.Context, machineID strin
 	released := false
 	err := s.Update(ctx, func(state *State) error {
 		lease := state.ControlLease
+		if err := validateControlLeaseShape(lease); err != nil {
+			return err
+		}
 		if lease.HolderMachineID != machineID || lease.Generation != generation {
 			return nil
 		}
@@ -6336,6 +7389,7 @@ func CurrentOwner(helperVersion string, activeSessionID string, activeTurnID str
 		PID:             os.Getpid(),
 		Hostname:        hostname,
 		ExecutablePath:  executable,
+		InstanceID:      processOwnerInstanceID,
 		HelperVersion:   helperVersion,
 		StartedAt:       now,
 		LastHeartbeat:   now,
@@ -6362,7 +7416,83 @@ func (s *Store) RecordOwnerHeartbeat(ctx context.Context, owner OwnerMetadata, s
 	return out, err
 }
 
+// RecordOwnerHeartbeatForLease atomically renews the owner record and the
+// control lease represented by owner.  A listener callback may outlive the
+// in-memory Bridge lease during takeover; doing both updates in one durable
+// transaction means a late heartbeat cannot overwrite the replacement owner
+// or extend a generation it no longer owns.
+func (s *Store) RecordOwnerHeartbeatForLease(ctx context.Context, owner OwnerMetadata, staleAfter time.Duration, leaseDuration time.Duration, now time.Time) (OwnerMetadata, error) {
+	if strings.TrimSpace(owner.MachineID) == "" || owner.LeaseGeneration <= 0 {
+		return OwnerMetadata{}, ErrControlLeaseNotHeld
+	}
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+	if out, handled, err := s.recordOwnerHeartbeatForLeaseSQLite(ctx, owner, staleAfter, leaseDuration, now); handled || err != nil {
+		return out, err
+	}
+	var out OwnerMetadata
+	err := s.Update(ctx, func(state *State) error {
+		next, err := recordOwnerHeartbeatForLeaseInState(state, owner, staleAfter, leaseDuration, now)
+		out = next
+		return err
+	})
+	return out, err
+}
+
+func recordOwnerHeartbeatForLeaseInState(state *State, owner OwnerMetadata, staleAfter time.Duration, leaseDuration time.Duration, now time.Time) (OwnerMetadata, error) {
+	if state == nil {
+		return OwnerMetadata{}, ErrControlLeaseNotHeld
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+	if err := validateKnownControlLeaseStatus(state.ControlLease); err != nil {
+		return OwnerMetadata{}, err
+	}
+	if !controlLeaseMatchesCapabilityAt(state, owner.MachineID, owner.LeaseGeneration, now) {
+		return OwnerMetadata{}, ErrControlLeaseNotHeld
+	}
+	next, err := owner.withHeartbeat(now)
+	if err != nil {
+		return OwnerMetadata{}, err
+	}
+	// The lease generation is authoritative only after a valid hand-off.  A
+	// state with an owner row but no durable lease history may be a partially
+	// written legacy state; do not let a new claimant silently overwrite a
+	// fresh owner from that state.  Normal takeover claims retire the old row
+	// atomically before reaching this method, and stale/dead rows remain
+	// replaceable as in the legacy heartbeat path.
+	if existing, ok := state.readOwner(); ok && !sameOwnerProcess(existing, next) {
+		if !IsStale(existing, staleAfter, now) && !OwnerAppearsLocallyDead(existing) {
+			return OwnerMetadata{}, &OwnerConflictError{
+				Existing:   existing,
+				Now:        now,
+				StaleAfter: staleAfter,
+			}
+		}
+	} else if ok && !existing.StartedAt.IsZero() {
+		next.StartedAt = existing.StartedAt
+	}
+	state.writeOwner(next)
+	lease := state.ControlLease
+	lease.LeaseUntil = now.Add(leaseDuration)
+	lease.LastHeartbeat = now
+	lease.UpdatedAt = now
+	state.ControlLease = lease
+	return next, nil
+}
+
 func recordOwnerHeartbeatInState(state *State, owner OwnerMetadata, staleAfter time.Duration, now time.Time) (OwnerMetadata, error) {
+	if state == nil {
+		return OwnerMetadata{}, ErrControlLeaseNotHeld
+	}
+	if err := validateKnownControlLeaseStatus(state.ControlLease); err != nil {
+		return OwnerMetadata{}, err
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -6541,6 +7671,24 @@ func (s *Store) UpdateSession(ctx context.Context, sessionID string, fn func(*St
 }
 
 func (s *Store) UpdateSessionContext(ctx context.Context, sessionID string, fn func(SessionContext, bool, time.Time) (SessionContext, bool, error)) (SessionContext, bool, error) {
+	return s.updateSessionContextWithCapability(ctx, sessionID, fn, storeOwnerCapability{})
+}
+
+// UpdateSessionContextForOwner applies a session projection mutation only
+// while the supplied listener control-lease capability is current.  Session
+// metadata is normally cold-path state, but a few small admission hints are
+// written after an asynchronous Graph poll; fencing that write prevents a
+// delayed old listener from changing the recovery decision of a replacement
+// owner.
+func (s *Store) UpdateSessionContextForOwner(ctx context.Context, sessionID string, machineID string, leaseGeneration int64, fn func(SessionContext, bool, time.Time) (SessionContext, bool, error)) (SessionContext, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return SessionContext{}, false, err
+	}
+	return s.updateSessionContextWithCapability(ctx, sessionID, fn, capability)
+}
+
+func (s *Store) updateSessionContextWithCapability(ctx context.Context, sessionID string, fn func(SessionContext, bool, time.Time) (SessionContext, bool, error), capability storeOwnerCapability) (SessionContext, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return SessionContext{}, false, fmt.Errorf("session id is required")
@@ -6551,12 +7699,15 @@ func (s *Store) UpdateSessionContext(ctx context.Context, sessionID string, fn f
 	var out SessionContext
 	changed := false
 	err := s.withSessionLock(ctx, sessionID, func() error {
-		if next, updateChanged, handled, err := s.updateSessionContextSQLite(ctx, sessionID, fn); handled || err != nil {
+		if next, updateChanged, handled, err := s.updateSessionContextSQLiteWithCapability(ctx, sessionID, fn, capability); handled || err != nil {
 			out = next
 			changed = updateChanged
 			return err
 		}
 		return s.Update(ctx, func(state *State) error {
+			if err := validateStoreOwnerCapability(state, capability); err != nil {
+				return err
+			}
 			current, found := state.Sessions[sessionID]
 			now := time.Now()
 			next, updateChanged, err := fn(current, found, now)
@@ -6583,6 +7734,25 @@ func (s *Store) UpdateSessionContext(ctx context.Context, sessionID string, fn f
 }
 
 func (s *Store) UpdateInboundEvent(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, error) {
+	return s.updateInboundEventWithCapability(ctx, inboundID, fn, storeOwnerCapability{})
+}
+
+// UpdateInboundEventForOwner applies an inbound-event mutation only while the
+// supplied listener owner still holds the control lease.  Deferred inbound
+// work can outlive a poll phase and may be resumed after a process takeover;
+// checking the lease before invoking the callback is insufficient because the
+// replacement owner can claim the lease between that check and the write.
+// JSON and SQLite both validate the capability in the same write critical
+// section as the inbound mutation.
+func (s *Store) UpdateInboundEventForOwner(ctx context.Context, inboundID string, machineID string, leaseGeneration int64, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return InboundEvent{}, false, err
+	}
+	return s.updateInboundEventWithCapability(ctx, inboundID, fn, capability)
+}
+
+func (s *Store) updateInboundEventWithCapability(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error), capability storeOwnerCapability) (InboundEvent, bool, error) {
 	inboundID = strings.TrimSpace(inboundID)
 	if inboundID == "" {
 		return InboundEvent{}, false, fmt.Errorf("inbound id is required")
@@ -6590,21 +7760,27 @@ func (s *Store) UpdateInboundEvent(ctx context.Context, inboundID string, fn fun
 	if fn == nil {
 		return InboundEvent{}, false, fmt.Errorf("inbound update function is required")
 	}
-	if out, changed, handled, err := s.updateInboundEventSQLite(ctx, inboundID, fn); handled || err != nil {
+	if out, changed, handled, err := s.updateInboundEventSQLiteWithCapability(ctx, inboundID, fn, capability); handled || err != nil {
 		return out, changed, err
 	}
 	var out InboundEvent
 	changed := false
-	err := s.Update(ctx, func(state *State) error {
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return false, err
+		}
 		current, found := state.InboundEvents[inboundID]
+		if err := validateInboundOwnerCapability(state, current, found, capability); err != nil {
+			return false, err
+		}
 		now := time.Now()
 		next, updateChanged, err := fn(current, found, now)
 		if err != nil {
-			return err
+			return false, err
 		}
 		out = next
 		if !updateChanged {
-			return errStoreNoChange
+			return false, nil
 		}
 		if strings.TrimSpace(next.ID) == "" {
 			next.ID = inboundID
@@ -6612,10 +7788,14 @@ func (s *Store) UpdateInboundEvent(ctx context.Context, inboundID string, fn fun
 		if next.UpdatedAt.IsZero() {
 			next.UpdatedAt = now
 		}
+		if capability.bound() && (!found || strings.TrimSpace(current.MachineID) == "" && current.LeaseGeneration <= 0 || current.Status == InboundStatusDeferred && (strings.TrimSpace(current.MachineID) != capability.machineID || current.LeaseGeneration != capability.leaseGeneration)) {
+			next.MachineID = capability.machineID
+			next.LeaseGeneration = capability.leaseGeneration
+		}
 		state.InboundEvents[inboundID] = next
 		out = next
 		changed = true
-		return nil
+		return true, nil
 	})
 	return out, changed, err
 }
@@ -6920,6 +8100,9 @@ func (s *Store) PersistInbound(ctx context.Context, event InboundEvent) (Inbound
 			out = existing
 			return errStoreNoChange
 		}
+		if !storeOwnerCapabilityMatchesState(state, event.MachineID, event.LeaseGeneration) {
+			return ErrControlLeaseNotHeld
+		}
 		if helperOutboxMessageLocked(state, event.TeamsChatID, event.TeamsMessageID) {
 			return ErrInboundMessageFromHelperOutbox
 		}
@@ -7174,12 +8357,13 @@ func OutboxBlocksUpgrade(state State, msg OutboxMessage, now time.Time) bool {
 		return false
 	}
 	// rc16 and earlier could leave a transcript delivery without any source
-	// identity fields. A queued row has never acquired a send lease; a Sending
-	// row is eligible only after its lease expires and bounded reconciliation has
-	// failed. Retiring either stale shape keeps a compatible upgrade from
-	// depending on an operator-discovered history repair first. Fresh
-	// Sending/accepted rows remain conservative and are handled by the
-	// ambiguous recovery path.
+	// identity fields. A queued row has never acquired a send lease and is safe
+	// to retire during upgrade. A Sending row may already have crossed the Graph
+	// boundary, even when it has no attempt token (legacy state), so it must stay
+	// in ambiguous recovery until that external outcome is reconciled. Expiry
+	// only makes that row eligible for owner-bound cold recovery; it does not
+	// make it safe to skip or POST again. Fresh Sending/accepted rows remain
+	// conservative and are handled by the ambiguous recovery path.
 	if IsLegacyUnverifiableTranscriptOutbox(msg) {
 		return false
 	}
@@ -7336,7 +8520,13 @@ func IsLegacyUnverifiableTranscriptOutbox(msg OutboxMessage) bool {
 	if len(msg.ArtifactIDs) > 0 || strings.TrimSpace(msg.AttachmentPath) != "" || strings.TrimSpace(msg.DriveItemID) != "" {
 		return false
 	}
-	if msg.Status != OutboxStatusQueued && !(msg.Status == OutboxStatusSending && OutboxSendLeaseExpired(msg, time.Now())) {
+	// A queued row has never crossed the Graph send boundary and can be retired
+	// as stale pre-source-proof compatibility data. A Sending row, including a
+	// legacy row without an attempt token, may already have reached Graph; its
+	// outcome is unknown and must remain in the ambiguous recovery lane. Treating
+	// an expired Sending row as disposable can turn a lost response into a second
+	// POST after restart or explicit history recovery.
+	if msg.Status != OutboxStatusQueued {
 		return false
 	}
 	if !IsAutomaticTranscriptOutbox(msg) {
@@ -7437,6 +8627,38 @@ func OutboxSendIsAmbiguous(msg OutboxMessage) bool {
 	return msg.Status == OutboxStatusSending && strings.HasPrefix(strings.TrimSpace(msg.LastSendError), "ambiguous Graph send;")
 }
 
+// outboxSendUnknownOutcome is the common recovery predicate for every
+// Sending row whose Graph message ID is still absent after the short send
+// lease.  The attempt token and diagnostic are advisory metadata only: older
+// writers may have persisted either one incompletely, so neither can make a
+// stale external POST safe to replay.
+func outboxSendUnknownOutcome(msg OutboxMessage, now time.Time) bool {
+	return msg.Status == OutboxStatusSending &&
+		strings.TrimSpace(msg.TeamsMessageID) == "" &&
+		OutboxSendLeaseExpired(msg, now)
+}
+
+// outboxMessagesShareTurn identifies the ordering boundary that cannot be
+// crossed by an ambiguous predecessor.  A later distinct turn may use the
+// bridge's explicit liveness bypass, but chunks/status/final rows from the
+// same turn must remain FIFO or a later chunk could be visible before the
+// earlier chunk whose external outcome is unknown.
+func outboxMessagesShareTurn(left OutboxMessage, right OutboxMessage) bool {
+	leftTurnID := strings.TrimSpace(left.TurnID)
+	rightTurnID := strings.TrimSpace(right.TurnID)
+	return leftTurnID != "" && leftTurnID == rightTurnID
+}
+
+// OutboxSendRecoveryEligible identifies a Sending row whose external outcome
+// must be reconciled before it can ever be considered for another POST.  The
+// explicit ambiguous marker is the current representation.  Older releases
+// could persist a Sending row without an attempt token or marker; once its
+// short send lease has expired, that row is just as unsafe to replay and must
+// enter the same cold recovery lane instead of blocking the ordinary FIFO.
+func OutboxSendRecoveryEligible(msg OutboxMessage, now time.Time) bool {
+	return outboxSendUnknownOutcome(msg, now)
+}
+
 func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 	if strings.TrimSpace(turn.SessionID) == "" {
 		return Turn{}, false, fmt.Errorf("session id is required")
@@ -7466,6 +8688,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 					}
 				}
 			}
+		}
+		if !storeOwnerCapabilityMatchesState(state, turn.MachineID, turn.LeaseGeneration) {
+			return ErrControlLeaseNotHeld
 		}
 		session, ok := state.Sessions[turn.SessionID]
 		if !ok {
@@ -7536,7 +8761,33 @@ func (s *Store) MarkTurnRunning(ctx context.Context, turnID string, codexThreadI
 	})
 }
 
+// MarkTurnRunningForOwner is the live-listener variant of MarkTurnRunning.
+// The caller supplies the immutable control-lease capability captured when it
+// claimed the turn.  Checking only the turn's current owner is insufficient:
+// a takeover may rebind a legacy row before a stale worker returns, allowing
+// that worker to mutate the new owner's turn unless its original capability
+// is carried through this CAS.
+func (s *Store) MarkTurnRunningForOwner(ctx context.Context, turnID string, codexThreadID string, codexTurnID string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	apply := func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+		return markTurnRunningLocked(state, turn, codexThreadID, codexTurnID, now)
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), false, capability, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
+}
+
 func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexTurnID string, now time.Time) (Turn, error) {
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
 	if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
 		return turn, fmt.Errorf("turn %q with status %q cannot start", turn.ID, turn.Status)
 	}
@@ -7576,16 +8827,35 @@ func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexT
 }
 
 func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn, bool, error) {
+	return s.claimNextQueuedTurn(ctx, sessionID, storeOwnerCapability{})
+}
+
+// ClaimNextQueuedTurnForOwner claims and binds a queued live turn to the
+// current control lease in the same durable mutation.  A zero-capability
+// queued legacy row is bound here for upgrade compatibility; a row already
+// bound to another owner is rejected instead of being silently adopted.
+func (s *Store) ClaimNextQueuedTurnForOwner(ctx context.Context, sessionID string, machineID string, leaseGeneration int64) (Turn, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, false, err
+	}
+	return s.claimNextQueuedTurn(ctx, sessionID, capability)
+}
+
+func (s *Store) claimNextQueuedTurn(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return Turn{}, false, fmt.Errorf("session id is required")
 	}
-	if out, claimed, handled, err := s.claimNextQueuedTurnSQLite(ctx, sessionID); handled || err != nil {
+	if out, claimed, handled, err := s.claimNextQueuedTurnSQLiteWithOwner(ctx, sessionID, capability); handled || err != nil {
 		return out, claimed, err
 	}
 	var out Turn
 	claimed := false
 	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
 		if session, ok := state.Sessions[sessionID]; !ok || !sessionStatusIsActive(session.Status) {
 			return nil
 		}
@@ -7625,6 +8895,13 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 			// queued request into a running turn after an anchor was persisted.
 			return nil
 		}
+		if capability.bound() {
+			if err := validateQueuedTurnOwnerForClaim(turn, capability); err != nil {
+				return err
+			}
+			turn.MachineID = capability.machineID
+			turn.LeaseGeneration = capability.leaseGeneration
+		}
 		turn.Status = TurnStatusRunning
 		if turn.StartNewCodexThread {
 			turn.CodexThreadID = ""
@@ -7651,37 +8928,51 @@ func (s *Store) RequeueTurn(ctx context.Context, turnID string) (Turn, error) {
 		return Turn{}, fmt.Errorf("turn id is required")
 	}
 	if out, handled, err := s.updateTurnSQLite(ctx, turnID, false, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		if turn.Status != TurnStatusRunning {
-			return turn, nil
-		}
-		turn.Status = TurnStatusQueued
-		turn.StartedAt = time.Time{}
-		turn.UpdatedAt = now
-		if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
-			inbound.Status = InboundStatusQueued
-			inbound.UpdatedAt = now
-			state.InboundEvents[inbound.ID] = inbound
-		}
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
+		return requeueTurnLocked(state, turn, now)
 	}); handled || err != nil {
 		return out, err
 	}
 	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		if turn.Status != TurnStatusRunning {
-			return turn, nil
-		}
-		turn.Status = TurnStatusQueued
-		turn.StartedAt = time.Time{}
-		turn.UpdatedAt = now
-		if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
-			inbound.Status = InboundStatusQueued
-			inbound.UpdatedAt = now
-			state.InboundEvents[inbound.ID] = inbound
-		}
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
+		return requeueTurnLocked(state, turn, now)
 	})
+}
+
+// RequeueTurnForOwner is the owner-fenced counterpart used by an asynchronous
+// live worker when it gives a claimed turn back to the durable queue.
+func (s *Store) RequeueTurnForOwner(ctx context.Context, turnID string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	apply := func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+		return requeueTurnLocked(state, turn, now)
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), false, capability, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
+}
+
+func requeueTurnLocked(state *State, turn Turn, now time.Time) (Turn, error) {
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
+	if turn.Status != TurnStatusRunning {
+		return turn, nil
+	}
+	turn.Status = TurnStatusQueued
+	turn.StartedAt = time.Time{}
+	turn.UpdatedAt = now
+	if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
+		inbound.Status = InboundStatusQueued
+		inbound.UpdatedAt = now
+		state.InboundEvents[inbound.ID] = inbound
+	}
+	updateSessionFromTurn(state, turn, now)
+	return turn, nil
 }
 
 // MarkTurnForIsolatedCodexThread upgrades a legacy queued turn that was
@@ -7695,6 +8986,13 @@ func (s *Store) MarkTurnForIsolatedCodexThread(ctx context.Context, turnID strin
 		return Turn{}, fmt.Errorf("turn id is required")
 	}
 	apply := func(state *State, turn Turn, _ time.Time) (Turn, error) {
+		// This compatibility entry point is also callable by recovery code.  A
+		// stale process must not re-mark a queued turn after a replacement owner
+		// has taken the control lease.  Legacy rows (no positive generation)
+		// intentionally remain accepted by turnOwnerCapabilityMatchesState.
+		if !turnOwnerCapabilityMatchesState(state, turn) {
+			return turn, ErrControlLeaseNotHeld
+		}
 		if turn.Status != TurnStatusQueued {
 			return turn, nil
 		}
@@ -7708,6 +9006,37 @@ func (s *Store) MarkTurnForIsolatedCodexThread(ctx context.Context, turnID strin
 		return out, err
 	}
 	return s.updateTurn(ctx, turnID, apply)
+}
+
+// MarkTurnForIsolatedCodexThreadForOwner is the live-listener counterpart of
+// MarkTurnForIsolatedCodexThread. A queued turn written by an older helper may
+// have generation zero (and may retain only the old machine label), so the
+// current lease holder must be able to adopt it atomically before changing its
+// branch. A running turn is never adoptable, and a positive generation must
+// still match exactly.
+func (s *Store) MarkTurnForIsolatedCodexThreadForOwner(ctx context.Context, turnID string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	capability.allowLegacyQueuedIsolation = true
+	apply := func(state *State, turn Turn, _ time.Time) (Turn, error) {
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+		if turn.Status != TurnStatusQueued {
+			return turn, nil
+		}
+		if hasRunningTurnForSessionLocked(state, turn.SessionID) {
+			return turn, ErrUnresolvedExecution
+		}
+		prepared, _ := prepareTurnForIsolatedBranchLocked(state, turn)
+		return prepared, nil
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, turnID, false, capability, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
 }
 
 func sessionTranscriptCheckpointID(sessionID string) string {
@@ -8007,7 +9336,7 @@ func transcriptQuarantineBlocksAutomaticProgress(quarantine *TranscriptQuarantin
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(quarantine.Kind)) {
-	case "malformed_record", "opaque_record", "oversized_record":
+	case "malformed_record", "opaque_record", "oversized_record", "stale_partial_record":
 		return false
 	default:
 		return true
@@ -8213,6 +9542,9 @@ func completionIdentityMatches(turn Turn, codexThreadID string, codexTurnID stri
 }
 
 func markTurnCompletedLocked(state *State, turn Turn, codexThreadID string, codexTurnID string, now time.Time) (Turn, error) {
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
 	if turn.Status == TurnStatusInterrupted {
 		return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be completed", turn.ID)
 	}
@@ -8259,13 +9591,45 @@ func sameCheckpointSourcePath(left string, right string) bool {
 }
 
 func transcriptCheckpointProgressAlreadyAhead(current ImportCheckpoint, progress TranscriptCheckpointProgress) bool {
+	if strings.TrimSpace(current.SourcePath) != "" && strings.TrimSpace(progress.SourcePath) == "" {
+		// A report without a source path cannot prove that it belongs to the
+		// current source. Never let it replace a trusted cursor or its identity.
+		return current.LastOffsetKnown || current.LastOffset != 0 || current.LastSourceLine > 0 || strings.TrimSpace(current.LastRecordID) != ""
+	}
+	currentGeneration := strings.TrimSpace(current.SourceGeneration)
+	progressGeneration := strings.TrimSpace(progress.SourceGeneration)
+	if currentGeneration != "" && progressGeneration == "" {
+		// A callback without the source generation cannot prove that it belongs
+		// to the current physical file. Preserve a trusted modern cursor rather
+		// than allowing an older generation to overwrite its proof.
+		return current.LastOffsetKnown || current.LastOffset != 0 || current.LastSourceLine > 0 || strings.TrimSpace(current.LastRecordID) != ""
+	}
+	if currentGeneration != "" && progressGeneration != "" && currentGeneration != progressGeneration {
+		// Opaque source generations are not ordered values. A source switch is
+		// handled only by an explicit proof-backed rebase; generic delivery
+		// callbacks must not choose a winner by comparing offsets or lines.
+		return true
+	}
 	if !sameCheckpointSourcePath(current.SourcePath, progress.SourcePath) || strings.TrimSpace(current.SourcePath) == "" {
-		return false
+		// Source-path switches without a generation remain part of the legacy
+		// compatibility contract. A modern checkpoint carries the opaque
+		// generation above, so only that path is allowed to make a generic
+		// callback conservative without breaking old path-rebinding imports.
+		return currentGeneration != "" && strings.TrimSpace(current.SourcePath) != "" && strings.TrimSpace(progress.SourcePath) != ""
 	}
 	currentOffsetKnown := current.LastOffsetKnown || current.LastOffset > 0
 	progressOffsetKnown := progress.LastOffsetKnown || progress.LastOffset > 0
+	if currentOffsetKnown != progressOffsetKnown {
+		// A trusted physical cursor is always ahead of an update that does not
+		// carry physical-position proof.  Conversely, a newly proven offset is
+		// allowed to upgrade an old line-only checkpoint.
+		return currentOffsetKnown
+	}
 	if currentOffsetKnown && progressOffsetKnown {
-		return current.LastOffset > progress.LastOffset
+		if current.LastOffset != progress.LastOffset {
+			return current.LastOffset > progress.LastOffset
+		}
+		return current.LastSourceLine > progress.LastSourceLine
 	}
 	return !currentOffsetKnown && !progressOffsetKnown && current.LastOffset == 0 && progress.LastOffset == 0 && current.LastSourceLine > progress.LastSourceLine
 }
@@ -8274,6 +9638,27 @@ func importCheckpointEqualExceptUpdatedAt(left ImportCheckpoint, right ImportChe
 	left.UpdatedAt = time.Time{}
 	right.UpdatedAt = time.Time{}
 	return reflect.DeepEqual(left, right)
+}
+
+func transcriptCheckpointProgressSamePhysicalCursor(current ImportCheckpoint, progress TranscriptCheckpointProgress) bool {
+	if strings.TrimSpace(current.SourcePath) == "" || strings.TrimSpace(progress.SourcePath) == "" ||
+		!sameCheckpointSourcePath(current.SourcePath, progress.SourcePath) {
+		return false
+	}
+	currentGeneration := strings.TrimSpace(current.SourceGeneration)
+	progressGeneration := strings.TrimSpace(progress.SourceGeneration)
+	if currentGeneration == "" || progressGeneration == "" || currentGeneration != progressGeneration {
+		return false
+	}
+	currentKnown := current.LastOffsetKnown || current.LastOffset != 0
+	progressKnown := progress.LastOffsetKnown || progress.LastOffset != 0
+	if currentKnown != progressKnown {
+		return false
+	}
+	if currentKnown {
+		return current.LastOffset == progress.LastOffset && current.LastSourceLine == progress.LastSourceLine
+	}
+	return current.LastSourceLine == progress.LastSourceLine
 }
 
 func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, progress TranscriptCheckpointProgress, now time.Time) (ImportCheckpoint, bool, error) {
@@ -8287,6 +9672,25 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 	if progress.SessionID != "" && current.SessionID != "" && strings.TrimSpace(current.SessionID) != progress.SessionID {
 		return current, false, fmt.Errorf("%w: transcript checkpoint %q belongs to session %q, not %q", ErrSessionStateProvenanceMismatch, progress.ID, current.SessionID, progress.SessionID)
 	}
+	if found {
+		incoming := ImportCheckpoint{
+			ID:                progress.ID,
+			SessionID:         progress.SessionID,
+			SourcePath:        progress.SourcePath,
+			SourceGeneration:  progress.SourceGeneration,
+			SourceFingerprint: progress.SourceFingerprint,
+			LastRecordID:      progress.LastRecordID,
+			LastSourceLine:    progress.LastSourceLine,
+			LastOffset:        progress.LastOffset,
+			LastOffsetKnown:   progress.LastOffsetKnown,
+		}
+		if transcriptCheckpointProgressSourceConflict(current, progress) && !importCheckpointIsExplicitHistoryRun(current) {
+			return current, false, fmt.Errorf("%w: checkpoint %q source identity changed during terminal completion", ErrTranscriptObservationConflict, progress.ID)
+		}
+		if transcriptCheckpointSameCursorSourceConflict(current, incoming) && !importCheckpointIsExplicitHistoryRun(current) {
+			return current, false, fmt.Errorf("%w: checkpoint %q source proof changed at the same cursor", ErrTranscriptObservationConflict, progress.ID)
+		}
+	}
 	if found && transcriptCheckpointProgressAlreadyAhead(current, progress) {
 		return current, false, nil
 	}
@@ -8298,12 +9702,15 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 	if progress.SourcePath != "" {
 		next.SourcePath = progress.SourcePath
 	}
+	if progress.SourceGeneration != "" {
+		next.SourceGeneration = progress.SourceGeneration
+	}
 	if progress.SourceFingerprint != "" {
 		next.SourceFingerprint = progress.SourceFingerprint
 	}
 	next.LastRecordID = progress.LastRecordID
 	next.LastSourceLine = progress.LastSourceLine
-	if progress.LastOffset != 0 || current.LastOffset == 0 {
+	if progress.LastOffsetKnown || progress.LastOffset != 0 || current.LastOffset == 0 {
 		next.LastOffset = progress.LastOffset
 	}
 	next.LastOffsetKnown = progress.LastOffsetKnown || current.LastOffsetKnown || progress.LastOffset != 0 || current.LastOffset != 0
@@ -8313,7 +9720,20 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 	if progress.SourceSize != 0 || current.SourceSize == 0 {
 		next.SourceSize = progress.SourceSize
 	}
-	if strings.TrimSpace(progress.LastFinalID) != "" {
+	if progress.SourceChangeTime != 0 || current.SourceChangeTime == 0 {
+		next.SourceChangeTime = progress.SourceChangeTime
+	}
+	// A terminal callback may race with an importer that already committed the
+	// same physical cursor.  Cursor position is not enough to choose between
+	// two semantic boundary payloads: a stale callback carrying a different
+	// final ID must not erase the durable boundary that was already proven.
+	replaceFinal := strings.TrimSpace(progress.LastFinalID) != ""
+	if replaceFinal && strings.TrimSpace(current.LastFinalID) != "" &&
+		strings.TrimSpace(current.LastFinalID) != strings.TrimSpace(progress.LastFinalID) &&
+		transcriptCheckpointProgressSamePhysicalCursor(current, progress) {
+		replaceFinal = false
+	}
+	if replaceFinal {
 		next.LastFinalID = strings.TrimSpace(progress.LastFinalID)
 		next.LastFinalLine = progress.LastFinalLine
 		next.LastFinalStartOffset = progress.LastFinalStartOffset
@@ -8323,6 +9743,12 @@ func applyTranscriptCheckpointProgress(current ImportCheckpoint, found bool, pro
 		next.LastFinalTextHash = strings.TrimSpace(progress.LastFinalTextHash)
 		next.TerminalBoundarySeen = progress.TerminalBoundarySeen
 		next.TerminalBoundaryLine = progress.TerminalBoundaryLine
+	}
+	if transcriptCheckpointProgressSamePhysicalCursor(current, progress) && current.TerminalBoundarySeen {
+		next.TerminalBoundarySeen = true
+		if next.TerminalBoundaryLine < current.TerminalBoundaryLine {
+			next.TerminalBoundaryLine = current.TerminalBoundaryLine
+		}
 	}
 	if strings.TrimSpace(next.Status) == "" || next.Status == "blocked" {
 		next.Status = "complete"
@@ -8468,12 +9894,28 @@ func (s *Store) CompleteTurnWithFinal(ctx context.Context, req CompleteTurnWithF
 	return out, err
 }
 
+// CompleteTurnWithFinalForOwner is the live-worker entry point. The
+// capability is copied into the request before either backend enters its
+// terminal Turn/final-outbox transaction.
+func (s *Store) CompleteTurnWithFinalForOwner(ctx context.Context, req CompleteTurnWithFinalRequest, machineID string, leaseGeneration int64) (Turn, error) {
+	req.MachineID = strings.TrimSpace(machineID)
+	req.LeaseGeneration = leaseGeneration
+	return s.CompleteTurnWithFinal(ctx, req)
+}
+
 // ResolveInterruptedTurnWithCompletionProof is the only completion API that
 // may promote an Interrupted turn.  The request must carry the exact outer
 // and Codex execution IDs (and, when present, source proof); the backend
 // rechecks those values together with the anchor generation in one CAS.
 func (s *Store) ResolveInterruptedTurnWithCompletionProof(ctx context.Context, req CompleteTurnWithFinalRequest) (Turn, error) {
 	req.ResolveInterrupted = true
+	return s.CompleteTurnWithFinal(ctx, req)
+}
+
+func (s *Store) ResolveInterruptedTurnWithCompletionProofForOwner(ctx context.Context, req CompleteTurnWithFinalRequest, machineID string, leaseGeneration int64) (Turn, error) {
+	req.ResolveInterrupted = true
+	req.MachineID = strings.TrimSpace(machineID)
+	req.LeaseGeneration = leaseGeneration
 	return s.CompleteTurnWithFinal(ctx, req)
 }
 
@@ -8703,6 +10145,18 @@ func completeTurnWithFinalLocked(state *State, req CompleteTurnWithFinalRequest,
 	if strings.TrimSpace(current.SessionID) != req.SessionID {
 		return current, fmt.Errorf("%w: turn %q belongs to session %q, not %q", ErrSessionStateProvenanceMismatch, req.TurnID, current.SessionID, req.SessionID)
 	}
+	if req.LeaseGeneration != 0 {
+		capability, err := newStoreOwnerCapability(req.MachineID, req.LeaseGeneration)
+		if err != nil {
+			return current, ErrCompletionOwnerLost
+		}
+		if err := validateTurnOwnerCapability(state, current, capability); err != nil {
+			return current, ErrCompletionOwnerLost
+		}
+	}
+	if !turnOwnerCapabilityMatchesState(state, current) {
+		return current, ErrCompletionOwnerLost
+	}
 	if current.Status == TurnStatusCompleted || current.Status == TurnStatusFailed {
 		if current.Status == TurnStatusCompleted && completionIdentityMatches(current, req.CodexThreadID, req.CodexTurnID) && terminalFinalOutboxPlanMatches(state, req.FinalOutbox) {
 			return current, errStoreNoChange
@@ -8900,6 +10354,9 @@ func clearExecutionAnchorLocked(state *State, req ExecutionAnchorClearRequest) b
 	if !found || strings.TrimSpace(turn.SessionID) != strings.TrimSpace(req.SessionID) {
 		return false
 	}
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return false
+	}
 	if turn.Status != TurnStatusInterrupted && turn.Status != TurnStatusCompleted && turn.Status != TurnStatusFailed {
 		return false
 	}
@@ -8937,6 +10394,21 @@ func clearExecutionAnchorLocked(state *State, req ExecutionAnchorClearRequest) b
 // interrupted turn reason in one backend transaction. A mismatched or stale
 // request is a no-op; it must never modify a newer anchor generation.
 func (s *Store) ClearExecutionAnchorAndConfirmTurn(ctx context.Context, req ExecutionAnchorClearRequest) error {
+	return s.clearExecutionAnchorAndConfirmTurn(ctx, req, storeOwnerCapability{})
+}
+
+// ClearExecutionAnchorAndConfirmTurnForOwner is the live-listener variant.
+// An exact execution proof is necessary but not sufficient: the process that
+// observed it must still hold the lease that owns the durable Turn.
+func (s *Store) ClearExecutionAnchorAndConfirmTurnForOwner(ctx context.Context, req ExecutionAnchorClearRequest, machineID string, leaseGeneration int64) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.clearExecutionAnchorAndConfirmTurn(ctx, req, capability)
+}
+
+func (s *Store) clearExecutionAnchorAndConfirmTurn(ctx context.Context, req ExecutionAnchorClearRequest, capability storeOwnerCapability) error {
 	req.CheckpointID = strings.TrimSpace(req.CheckpointID)
 	req.SessionID = strings.TrimSpace(req.SessionID)
 	req.ThreadID = strings.TrimSpace(req.ThreadID)
@@ -8948,10 +10420,20 @@ func (s *Store) ClearExecutionAnchorAndConfirmTurn(ctx context.Context, req Exec
 	if req.CheckpointID == "" || req.SessionID == "" || req.OuterTurnID == "" {
 		return nil
 	}
-	if handled, err := s.clearExecutionAnchorAndConfirmTurnSQLite(ctx, req); handled || err != nil {
+	if handled, err := s.clearExecutionAnchorAndConfirmTurnSQLiteWithCapability(ctx, req, capability); handled || err != nil {
 		return err
 	}
 	return s.UpdateSession(ctx, req.SessionID, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
+		turn, found := state.Turns[req.OuterTurnID]
+		if !found {
+			return errStoreNoChange
+		}
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return err
+		}
 		if !clearExecutionAnchorLocked(state, req) {
 			return errStoreNoChange
 		}
@@ -8963,91 +10445,71 @@ func (s *Store) MarkTurnFailed(ctx context.Context, turnID string, message strin
 	return s.MarkTurnFailedWithCodexIDs(ctx, turnID, message, "", "")
 }
 
+func markTurnFailedWithCodexIDsLocked(state *State, turn Turn, message string, codexThreadID string, codexTurnID string, now time.Time) (Turn, error) {
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
+	if turn.Status == TurnStatusInterrupted {
+		// An exact app-server failure callback may arrive after the helper
+		// recorded an ambiguous interruption.  This legacy API must not consume
+		// an unresolved anchor based only on matching IDs.
+		if stateHasUnresolvedExecution(state, turn.SessionID) {
+			return turn, ErrUnresolvedExecution
+		}
+		return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
+	}
+	if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
+		if turn.Status == TurnStatusFailed {
+			if markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now) > 0 {
+				return turn, nil
+			}
+		}
+		return turn, errStoreNoChange
+	}
+	if !turnCompletionAllowedByUnresolvedExecutionLocked(state, turn, codexThreadID, codexTurnID) {
+		return turn, ErrUnresolvedExecution
+	}
+	if stateHasUnresolvedExecution(state, turn.SessionID) && !turnUsesIsolatedLiveBranchLocked(state, turn, codexThreadID) {
+		return turn, ErrUnresolvedExecution
+	}
+	turn.Status = TurnStatusFailed
+	turn.FailedAt = now
+	turn.FailureMessage = message
+	if codexThreadID != "" {
+		turn.CodexThreadID = codexThreadID
+	}
+	if codexTurnID != "" {
+		turn.CodexTurnID = codexTurnID
+	}
+	recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
+	markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now)
+	updateSessionFromTurn(state, turn, now)
+	return turn, nil
+}
+
 func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, message string, codexThreadID string, codexTurnID string) (Turn, error) {
-	if out, handled, err := s.updateTurnSQLite(ctx, strings.TrimSpace(turnID), true, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		if turn.Status == TurnStatusInterrupted {
-			// An exact app-server failure callback may arrive after the helper
-			// recorded an ambiguous interruption.  Route that narrow case through
-			// the same atomic failure+anchor-clear transition; an unqualified
-			// administrative failure must retain the historical rejection.
-			// This legacy API has no anchor generation/provenance field. It must
-			// not consume the current anchor based only on matching IDs; callers
-			// handling an unresolved app-server execution must use
-			// MarkTurnFailedForExecution instead.
-			if stateHasUnresolvedExecution(state, turn.SessionID) {
-				return turn, ErrUnresolvedExecution
-			}
-			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
+	return s.markTurnFailedWithCodexIDs(ctx, turnID, message, codexThreadID, codexTurnID, storeOwnerCapability{})
+}
+
+func (s *Store) MarkTurnFailedWithCodexIDsForOwner(ctx context.Context, turnID string, message string, codexThreadID string, codexTurnID string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	return s.markTurnFailedWithCodexIDs(ctx, turnID, message, codexThreadID, codexTurnID, capability)
+}
+
+func (s *Store) markTurnFailedWithCodexIDs(ctx context.Context, turnID string, message string, codexThreadID string, codexTurnID string, capability storeOwnerCapability) (Turn, error) {
+	apply := func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
 		}
-		if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
-			// A stale failure callback cannot replace a committed terminal result.
-			if turn.Status == TurnStatusFailed {
-				if markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now) > 0 {
-					return turn, nil
-				}
-			}
-			return turn, errStoreNoChange
-		}
-		if !turnCompletionAllowedByUnresolvedExecutionLocked(state, turn, codexThreadID, codexTurnID) {
-			// Failure callbacks carry the same execution identity as success
-			// callbacks.  A stale callback must not fail a newer owner merely
-			// because failure is less visible than an answer.
-			return turn, ErrUnresolvedExecution
-		}
-		if stateHasUnresolvedExecution(state, turn.SessionID) && !turnUsesIsolatedLiveBranchLocked(state, turn, codexThreadID) {
-			return turn, ErrUnresolvedExecution
-		}
-		turn.Status = TurnStatusFailed
-		turn.FailedAt = now
-		turn.FailureMessage = message
-		if codexThreadID != "" {
-			turn.CodexThreadID = codexThreadID
-		}
-		if codexTurnID != "" {
-			turn.CodexTurnID = codexTurnID
-		}
-		recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
-		markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now)
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
-	}); handled || err != nil {
+		return markTurnFailedWithCodexIDsLocked(state, turn, message, codexThreadID, codexTurnID, now)
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), true, capability, apply); handled || err != nil {
 		return out, err
 	}
-	return s.updateTurn(ctx, turnID, func(state *State, turn Turn, now time.Time) (Turn, error) {
-		if turn.Status == TurnStatusInterrupted {
-			if stateHasUnresolvedExecution(state, turn.SessionID) {
-				return turn, ErrUnresolvedExecution
-			}
-			return Turn{}, fmt.Errorf("turn %q is interrupted and cannot be failed", turn.ID)
-		}
-		if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
-			if turn.Status == TurnStatusFailed {
-				if markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now) > 0 {
-					return turn, nil
-				}
-			}
-			return turn, errStoreNoChange
-		}
-		if !turnCompletionAllowedByUnresolvedExecutionLocked(state, turn, codexThreadID, codexTurnID) {
-			return turn, ErrUnresolvedExecution
-		}
-		if stateHasUnresolvedExecution(state, turn.SessionID) && !turnUsesIsolatedLiveBranchLocked(state, turn, codexThreadID) {
-			return turn, ErrUnresolvedExecution
-		}
-		turn.Status = TurnStatusFailed
-		turn.FailedAt = now
-		turn.FailureMessage = message
-		if codexThreadID != "" {
-			turn.CodexThreadID = codexThreadID
-		}
-		if codexTurnID != "" {
-			turn.CodexTurnID = codexTurnID
-		}
-		recordLiveBranchThreadLocked(state, turn, codexThreadID, now)
-		markTerminalFailureOutboxFenceForTurnLocked(state, turn.ID, "superseded by failed turn", now)
-		updateSessionFromTurn(state, turn, now)
-		return turn, nil
-	})
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
 }
 
 // markTurnFailedWithExecutionProofLocked consumes an exact app-server failure
@@ -9058,6 +10520,9 @@ func (s *Store) MarkTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 func markTurnFailedWithExecutionProofLocked(state *State, turn Turn, req ExecutionAnchorClearRequest, message string, now time.Time) (Turn, error) {
 	if state == nil {
 		return turn, ErrUnresolvedExecution
+	}
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
 	}
 	if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
 		// A duplicate terminal callback is idempotent.  If an older state left
@@ -9083,6 +10548,9 @@ func markTurnFailedWithExecutionProofLocked(state *State, turn Turn, req Executi
 	}
 	if turn.Status != TurnStatusRunning && turn.Status != TurnStatusInterrupted {
 		return turn, ErrUnresolvedExecution
+	}
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
 	}
 	if strings.TrimSpace(req.SessionID) == "" || strings.TrimSpace(req.OuterTurnID) == "" ||
 		strings.TrimSpace(req.ThreadID) == "" || strings.TrimSpace(req.CodexTurnID) == "" {
@@ -9226,6 +10694,22 @@ func markTurnFailedForExecutionLocked(state *State, turn Turn, identity Executio
 	if strings.TrimSpace(turn.SessionID) != identity.SessionID || strings.TrimSpace(turn.ID) != identity.TurnID {
 		return turn, ErrStaleExecutionCallback
 	}
+	// A machine ID without a positive lease generation is the legacy row
+	// representation written by direct/once callers.  Only the pair is an
+	// owner capability; treating the machine label alone as one would make
+	// those callers look like they lost a lease and strand the turn as running.
+	if identity.LeaseGeneration != 0 {
+		capability, err := newStoreOwnerCapability(identity.MachineID, identity.LeaseGeneration)
+		if err != nil {
+			return turn, ErrControlLeaseNotHeld
+		}
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+	}
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
 	if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
 		if (strings.TrimSpace(turn.CodexThreadID) != "" && identity.ThreadID == "") ||
 			(strings.TrimSpace(turn.CodexThreadID) != "" && strings.TrimSpace(turn.CodexThreadID) != identity.ThreadID) ||
@@ -9342,6 +10826,16 @@ func (s *Store) MarkTurnFailedForExecution(ctx context.Context, identity Executi
 	return s.updateTurn(ctx, identity.TurnID, apply)
 }
 
+// MarkTurnFailedForExecutionForOwner carries the immutable live-worker
+// capability into the failure CAS. Without it, a legacy turn rebound during a
+// takeover could be failed by a callback from the previous worker merely
+// because its execution IDs still happened to match.
+func (s *Store) MarkTurnFailedForExecutionForOwner(ctx context.Context, identity ExecutionFailureIdentity, message string, machineID string, leaseGeneration int64) (Turn, error) {
+	identity.MachineID = strings.TrimSpace(machineID)
+	identity.LeaseGeneration = leaseGeneration
+	return s.MarkTurnFailedForExecution(ctx, identity, message)
+}
+
 // ValidateTurnCompletionOwnership performs the non-mutating preflight used by
 // the bridge before it creates a protected final outbox row.  MarkTurnCompleted
 // remains the authoritative CAS: an anchor can appear after this check and
@@ -9421,6 +10915,48 @@ func persistInterruptedTurnWithAnchorLocked(state *State, current Turn, req Pers
 	}
 	if strings.TrimSpace(current.SessionID) != req.SessionID {
 		return current, ErrStaleExecutionCallback
+	}
+	if req.AllowTakeover {
+		// Startup recovery is the one deliberate exception to the normal
+		// callback rule: the newly acquired control lease is allowed to adopt a
+		// still-Running turn left by an older process.  The current lease remains
+		// the authority, and the expected old capability prevents a stale startup
+		// snapshot from taking over a turn that changed in the meantime.
+		capability, err := newStoreOwnerTakeoverCapability(req.MachineID, req.LeaseGeneration)
+		if err != nil || !controlLeaseMatchesCapability(state, capability.machineID, capability.leaseGeneration) {
+			return current, ErrControlLeaseNotHeld
+		}
+		if current.Status == TurnStatusCompleted || current.Status == TurnStatusFailed {
+			return current, errStoreNoChange
+		}
+		if current.Status != TurnStatusRunning {
+			return current, ErrStaleExecutionCallback
+		}
+		if expected := strings.TrimSpace(req.ExpectedPreviousMachineID); expected != "" && strings.TrimSpace(current.MachineID) != expected {
+			return current, ErrStaleExecutionCallback
+		}
+		if req.ExpectedPreviousGeneration != 0 && current.LeaseGeneration != req.ExpectedPreviousGeneration {
+			return current, ErrStaleExecutionCallback
+		}
+		current.MachineID = capability.machineID
+		current.LeaseGeneration = capability.leaseGeneration
+		current.ScopeID = firstStoreNonEmptyString(current.ScopeID, state.Scope.ID)
+	} else {
+		// A machine ID without a positive lease generation is legacy provenance,
+		// not a live owner capability.  Preserve that compatibility path while
+		// still rejecting a malformed positive generation with no machine ID.
+		if req.LeaseGeneration != 0 {
+			capability, err := newStoreOwnerCapability(req.MachineID, req.LeaseGeneration)
+			if err != nil {
+				return current, ErrControlLeaseNotHeld
+			}
+			if err := validateTurnOwnerCapability(state, current, capability); err != nil {
+				return current, err
+			}
+		}
+		if !turnOwnerCapabilityMatchesState(state, current) {
+			return current, ErrControlLeaseNotHeld
+		}
 	}
 	// Terminal ownership wins.  In particular, do not create an anchor after a
 	// completion committed between a caller's snapshot and this transaction.
@@ -9623,7 +11159,15 @@ func (s *Store) PersistInterruptedTurnWithAnchor(ctx context.Context, req Persis
 		}
 		return next, err
 	}
-	if out, handled, err := s.updateTurnSQLite(ctx, req.TurnID, true, apply); handled || err != nil {
+	capability := storeOwnerCapability{}
+	if req.AllowTakeover {
+		var capabilityErr error
+		capability, capabilityErr = newStoreOwnerTakeoverCapability(req.MachineID, req.LeaseGeneration)
+		if capabilityErr != nil {
+			return result, capabilityErr
+		}
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, req.TurnID, true, capability, apply); handled || err != nil {
 		if out.ID != "" {
 			result.Turn = out
 		}
@@ -9632,7 +11176,7 @@ func (s *Store) PersistInterruptedTurnWithAnchor(ctx context.Context, req Persis
 		}
 		return result, err
 	}
-	out, err := s.updateTurn(ctx, req.TurnID, apply)
+	out, err := s.updateTurnWithCapability(ctx, req.TurnID, capability, apply)
 	if out.ID != "" {
 		result.Turn = out
 	}
@@ -9640,6 +11184,26 @@ func (s *Store) PersistInterruptedTurnWithAnchor(ctx context.Context, req Persis
 		result.Terminal = true
 	}
 	return result, err
+}
+
+func (s *Store) PersistInterruptedTurnWithAnchorForOwner(ctx context.Context, req PersistInterruptedTurnWithAnchorRequest, machineID string, leaseGeneration int64) (PersistInterruptedTurnWithAnchorResult, error) {
+	req.MachineID = strings.TrimSpace(machineID)
+	req.LeaseGeneration = leaseGeneration
+	return s.PersistInterruptedTurnWithAnchor(ctx, req)
+}
+
+// TakeOverRunningTurnWithAnchorForOwner is the startup recovery boundary for
+// a positive-generation Running turn left by an older listener process.  The
+// current control lease is checked in the same transaction as the turn,
+// checkpoint, and outbox transition; the old owner capability is used only as
+// an optimistic identity check.
+func (s *Store) TakeOverRunningTurnWithAnchorForOwner(ctx context.Context, req PersistInterruptedTurnWithAnchorRequest, machineID string, leaseGeneration int64, expectedPreviousMachineID string, expectedPreviousGeneration int64) (PersistInterruptedTurnWithAnchorResult, error) {
+	req.MachineID = strings.TrimSpace(machineID)
+	req.LeaseGeneration = leaseGeneration
+	req.AllowTakeover = true
+	req.ExpectedPreviousMachineID = strings.TrimSpace(expectedPreviousMachineID)
+	req.ExpectedPreviousGeneration = expectedPreviousGeneration
+	return s.PersistInterruptedTurnWithAnchor(ctx, req)
 }
 
 func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason string) (Turn, error) {
@@ -9653,6 +11217,26 @@ func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason s
 	})
 }
 
+// MarkTurnInterruptedForOwner prevents a delayed executor/cancellation
+// callback from interrupting a turn that a replacement control-lease owner
+// has already claimed.
+func (s *Store) MarkTurnInterruptedForOwner(ctx context.Context, turnID string, reason string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	apply := func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+		return markTurnInterruptedLocked(state, turn, reason, now)
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), true, capability, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
+}
+
 // markTurnInterruptedLocked is deliberately terminal-state preserving.  An
 // executor callback can arrive after the successful owner has committed a
 // completed/failed turn; allowing that stale callback to overwrite the
@@ -9660,6 +11244,9 @@ func (s *Store) MarkTurnInterrupted(ctx context.Context, turnID string, reason s
 // later retry.  Returning errStoreNoChange keeps this check in the same
 // durable mutation for both JSON and SQLite backends.
 func markTurnInterruptedLocked(state *State, turn Turn, reason string, now time.Time) (Turn, error) {
+	if !turnOwnerCapabilityMatchesState(state, turn) {
+		return turn, ErrControlLeaseNotHeld
+	}
 	if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed {
 		return turn, errStoreNoChange
 	}
@@ -9679,7 +11266,13 @@ func (s *Store) UpdateTurnRecoveryReasonIfMatches(ctx context.Context, turnID st
 	from = strings.TrimSpace(from)
 	to = strings.TrimSpace(to)
 	changed := false
-	apply := func(_ *State, turn Turn, _ time.Time) (Turn, error) {
+	apply := func(state *State, turn Turn, _ time.Time) (Turn, error) {
+		// Recovery notices can be emitted after a listener has been replaced.
+		// Do not let the old listener rewrite the durable reason belonging to
+		// the current owner.  The no-generation path keeps old state readable.
+		if !turnOwnerCapabilityMatchesState(state, turn) {
+			return turn, ErrControlLeaseNotHeld
+		}
 		if status != "" && turn.Status != status {
 			return turn, errStoreNoChange
 		}
@@ -9797,13 +11390,34 @@ func markTerminalFailureOutboxFenceForTurnLocked(state *State, turnID string, re
 }
 
 func (s *Store) QueueOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, error) {
+	return s.queueOutboxWithCapability(ctx, msg, storeOwnerCapability{})
+}
+
+// QueueOutboxForOwner is the live-listener admission boundary.  The current
+// control lease and the immutable owner capability are checked in the same
+// transaction that creates the outbox row.  A delayed callback from an older
+// listener generation may still return an idempotent existing row, but it can
+// never create a new stale notification after takeover.
+func (s *Store) QueueOutboxForOwner(ctx context.Context, msg OutboxMessage, machineID string, leaseGeneration int64) (OutboxMessage, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, false, err
+	}
+	return s.queueOutboxWithCapability(ctx, msg, capability)
+}
+
+func (s *Store) queueOutboxWithCapability(ctx context.Context, msg OutboxMessage, capability storeOwnerCapability) (OutboxMessage, bool, error) {
 	if strings.TrimSpace(msg.ID) == "" {
 		msg.ID = outboxID(msg)
 	}
 	if strings.TrimSpace(msg.ID) == "" {
 		return OutboxMessage{}, false, fmt.Errorf("outbox id is required")
 	}
-	if out, created, handled, err := s.queueOutboxSQLite(ctx, msg); handled || err != nil {
+	if capability.bound() {
+		msg.MachineID = capability.machineID
+		msg.LeaseGeneration = capability.leaseGeneration
+	}
+	if out, created, handled, err := s.queueOutboxSQLiteWithCapability(ctx, msg, capability); handled || err != nil {
 		return out, created, err
 	}
 	update := s.Update
@@ -9815,6 +11429,9 @@ func (s *Store) QueueOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessa
 	var out OutboxMessage
 	created := false
 	err := update(ctx, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
 		now := time.Now()
 		var err error
 		out, created, err = queueOutboxLocked(state, msg, now)
@@ -9891,6 +11508,14 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 	}
 	if msg.RenderedHash == "" {
 		msg.RenderedHash = bodyHash(msg.Body)
+	}
+	if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.AttachmentMessagePostState) == "" {
+		// Set the two-phase attachment boundary at admission time as well as
+		// during state normalization.  A caller can send the returned row in
+		// the same process without a Load/upgrade round-trip; leaving this blank
+		// would make a fresh upload indistinguishable from an old DriveItem whose
+		// later Teams POST state was lost.
+		msg.AttachmentMessagePostState = legacyAttachmentMessagePostState(msg)
 	}
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = now
@@ -9998,6 +11623,14 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	if state == nil {
 		return OutboxMessage{}, false, false, fmt.Errorf("state is required")
 	}
+	// Live listener-produced transcript rows carry the control-lease capability
+	// on the outbox message. Validate it in the same state transaction as the
+	// queue/checkpoint/delivery mutation so a callback from a replaced owner
+	// cannot enqueue a late record after takeover. Rows without a positive
+	// generation are legacy/offline maintenance rows and retain compatibility.
+	if err := validateOutboxOwnerCapability(state, msg); err != nil {
+		return OutboxMessage{}, false, false, err
+	}
 	if err := validateQueuedTranscriptCheckpointProvenance(state, msg, checkpoint); err != nil {
 		return OutboxMessage{}, false, false, err
 	}
@@ -10008,7 +11641,7 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 		// behind the same ownership fence.  A caller may not have supplied the
 		// checkpoint object (the session checkpoint is still authoritative), and
 		// an already-delivered record must not make the cursor appear safe.
-		return OutboxMessage{}, false, false, ErrUnresolvedExecution
+		return OutboxMessage{}, false, false, fmt.Errorf("%w: session=%q legacy=%v checkpoint=%#v turns=%d", ErrUnresolvedExecution, msg.SessionID, state.legacyUnresolvedSessions != nil && state.legacyUnresolvedSessions[strings.TrimSpace(msg.SessionID)], state.ImportCheckpoints[sessionTranscriptCheckpointID(msg.SessionID)], len(state.Turns))
 	}
 	if state.OutboxMessages == nil {
 		state.OutboxMessages = map[string]OutboxMessage{}
@@ -10188,6 +11821,7 @@ func requeueSkippedTranscriptOutboxLocked(state *State, existing OutboxMessage, 
 	requested.BlockedByTerminalFailure = false
 	requested.GraphRecoveryNextPath = ""
 	requested.GraphRecoveryCandidateID = ""
+	requested.GraphRecoveryPageCount = 0
 	if requested.PartCount <= 0 {
 		requested.PartCount = existing.PartCount
 		if requested.PartCount <= 0 {
@@ -10347,16 +11981,38 @@ func transcriptDeliverySuppressesQueue(record TranscriptDeliveryRecord) bool {
 }
 
 func (s *Store) RecordTranscriptDelivery(ctx context.Context, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
-	return s.recordTranscriptDelivery(ctx, "", delivery, checkpoint)
+	return s.recordTranscriptDelivery(ctx, "", delivery, checkpoint, storeOwnerCapability{})
 }
 
 // RecordTranscriptDeliveryIfParentUnfenced atomically records a transcript
 // delivery and its checkpoint only while the parent fork fence is open.
 func (s *Store) RecordTranscriptDeliveryIfParentUnfenced(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
-	return s.recordTranscriptDelivery(ctx, parentSessionID, delivery, checkpoint)
+	return s.recordTranscriptDelivery(ctx, parentSessionID, delivery, checkpoint, storeOwnerCapability{})
 }
 
-func (s *Store) recordTranscriptDelivery(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint) (TranscriptDeliveryRecord, bool, error) {
+// RecordTranscriptDeliveryForOwner applies the delivery/checkpoint projection
+// only while the supplied control-lease capability remains current. This is
+// used for opaque/quarantined transcript records, whose audit row is itself a
+// durable mutation and must not be written by a stale listener callback.
+func (s *Store) RecordTranscriptDeliveryForOwner(ctx context.Context, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint, machineID string, leaseGeneration int64) (TranscriptDeliveryRecord, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return TranscriptDeliveryRecord{}, false, err
+	}
+	return s.recordTranscriptDelivery(ctx, "", delivery, checkpoint, capability)
+}
+
+// RecordTranscriptDeliveryIfParentUnfencedForOwner combines the fork-parent
+// fence with the listener owner capability in the same durable write.
+func (s *Store) RecordTranscriptDeliveryIfParentUnfencedForOwner(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint, machineID string, leaseGeneration int64) (TranscriptDeliveryRecord, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return TranscriptDeliveryRecord{}, false, err
+	}
+	return s.recordTranscriptDelivery(ctx, parentSessionID, delivery, checkpoint, capability)
+}
+
+func (s *Store) recordTranscriptDelivery(ctx context.Context, parentSessionID string, delivery TranscriptDeliveryRecord, checkpoint ImportCheckpoint, capability storeOwnerCapability) (TranscriptDeliveryRecord, bool, error) {
 	parentSessionID = strings.TrimSpace(parentSessionID)
 	if strings.TrimSpace(delivery.ID) == "" {
 		return TranscriptDeliveryRecord{}, false, fmt.Errorf("transcript delivery id is required")
@@ -10364,7 +12020,7 @@ func (s *Store) recordTranscriptDelivery(ctx context.Context, parentSessionID st
 	if delivery.Status == "" {
 		delivery.Status = TranscriptDeliveryStatusSkipped
 	}
-	if out, created, handled, err := s.recordTranscriptDeliverySQLite(ctx, parentSessionID, delivery, checkpoint); handled || err != nil {
+	if out, created, handled, err := s.recordTranscriptDeliverySQLite(ctx, parentSessionID, delivery, checkpoint, capability); handled || err != nil {
 		return out, created, err
 	}
 	update := s.Update
@@ -10376,6 +12032,9 @@ func (s *Store) recordTranscriptDelivery(ctx context.Context, parentSessionID st
 	var out TranscriptDeliveryRecord
 	created := false
 	err := update(ctx, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
 		if err := ensureParentUnfencedLocked(state, parentSessionID); err != nil {
 			return err
 		}
@@ -10517,6 +12176,18 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 		return
 	}
 	previous := state.ImportCheckpoints[checkpoint.ID]
+	cursorAlreadyAhead := transcriptCheckpointProgressAlreadyAhead(previous, TranscriptCheckpointProgress{
+		SourcePath:        checkpoint.SourcePath,
+		SourceGeneration:  checkpoint.SourceGeneration,
+		SourceFingerprint: checkpoint.SourceFingerprint,
+		LastRecordID:      checkpoint.LastRecordID,
+		LastSourceLine:    checkpoint.LastSourceLine,
+		LastOffset:        checkpoint.LastOffset,
+		LastOffsetKnown:   checkpoint.LastOffsetKnown,
+		SourceSize:        checkpoint.SourceSize,
+		SourceModTime:     checkpoint.SourceModTime,
+		SourceChangeTime:  checkpoint.SourceChangeTime,
+	})
 	status := strings.TrimSpace(checkpoint.Status)
 	if status == "" {
 		status = previous.Status
@@ -10558,6 +12229,25 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if checkpoint.SourceModTime.IsZero() {
 		checkpoint.SourceModTime = previous.SourceModTime
 	}
+	if checkpoint.SourceChangeTime == 0 {
+		checkpoint.SourceChangeTime = previous.SourceChangeTime
+	}
+	if cursorAlreadyAhead {
+		// A delayed delivery callback may carry a complete but older checkpoint
+		// projection.  Keep the cursor tuple and its source proof coherent; a
+		// newer offset must never be rolled back to an older record/line or be
+		// mixed with stale size/fingerprint metadata.
+		checkpoint.SourcePath = previous.SourcePath
+		checkpoint.SourceGeneration = previous.SourceGeneration
+		checkpoint.SourceFingerprint = previous.SourceFingerprint
+		checkpoint.LastRecordID = previous.LastRecordID
+		checkpoint.LastSourceLine = previous.LastSourceLine
+		checkpoint.LastOffset = previous.LastOffset
+		checkpoint.LastOffsetKnown = previous.LastOffsetKnown || previous.LastOffset != 0
+		checkpoint.SourceSize = previous.SourceSize
+		checkpoint.SourceModTime = previous.SourceModTime
+		checkpoint.SourceChangeTime = previous.SourceChangeTime
+	}
 	if checkpoint.UnresolvedExecution == nil {
 		checkpoint.UnresolvedExecution = previous.UnresolvedExecution
 	}
@@ -10579,6 +12269,15 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) == "" {
 		checkpoint.SourceRewriteRecoveryIdentity = previous.SourceRewriteRecoveryIdentity
 	}
+	if checkpoint.SourceRewriteRecoverySize == 0 {
+		checkpoint.SourceRewriteRecoverySize = previous.SourceRewriteRecoverySize
+	}
+	if checkpoint.SourceRewriteRecoveryModTime.IsZero() {
+		checkpoint.SourceRewriteRecoveryModTime = previous.SourceRewriteRecoveryModTime
+	}
+	if checkpoint.SourceRewriteRecoveryChangeTime == 0 {
+		checkpoint.SourceRewriteRecoveryChangeTime = previous.SourceRewriteRecoveryChangeTime
+	}
 	if !importCheckpointIsExplicitHistoryRun(checkpoint) {
 		if checkpoint.TranscriptQuarantine == nil {
 			checkpoint.TranscriptQuarantine = previous.TranscriptQuarantine
@@ -10587,7 +12286,7 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 		checkpoint.RecoveryProofUnusable = checkpoint.RecoveryProofUnusable || previous.RecoveryProofUnusable
 	}
 	checkpoint.HistoryRootReleased = checkpoint.HistoryRootReleased || previous.HistoryRootReleased
-	if checkpoint.LastFinalID == "" {
+	if checkpoint.LastFinalID == "" || (cursorAlreadyAhead && previous.LastFinalID != "") {
 		checkpoint.LastFinalID = previous.LastFinalID
 		checkpoint.LastFinalLine = previous.LastFinalLine
 		checkpoint.LastFinalStartOffset = previous.LastFinalStartOffset
@@ -10605,6 +12304,17 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 		checkpoint.PartialLine = previous.PartialLine
 		checkpoint.PartialStartedAt = previous.PartialStartedAt
 		checkpoint.PartialSourceIdentity = previous.PartialSourceIdentity
+		checkpoint.PartialSourceChangeTime = previous.PartialSourceChangeTime
+		checkpoint.PartialReplayOffset = previous.PartialReplayOffset
+		checkpoint.PartialReplayLine = previous.PartialReplayLine
+		checkpoint.PartialLastProgressAt = previous.PartialLastProgressAt
+		checkpoint.PartialPrefixReleased = previous.PartialPrefixReleased
+	}
+	if checkpoint.PendingOpaqueRecordEndOffset == 0 && previous.PendingOpaqueRecordEndOffset > previous.PendingOpaqueRecordStartOffset {
+		checkpoint.PendingOpaqueRecordStartOffset = previous.PendingOpaqueRecordStartOffset
+		checkpoint.PendingOpaqueRecordEndOffset = previous.PendingOpaqueRecordEndOffset
+		checkpoint.PendingOpaqueRecordLine = previous.PendingOpaqueRecordLine
+		checkpoint.PendingOpaqueRecordID = previous.PendingOpaqueRecordID
 	}
 	// These fields are stateful fences/caches, not part of the abbreviated
 	// checkpoint projections carried by delivery records.  Never let a replay
@@ -10637,11 +12347,154 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 	})
 }
 
+// MarkOutboxSendAttemptForOwner claims a new Graph send and binds that attempt
+// to the control lease which is active in the same store transaction.  The
+// older MarkOutboxSendAttempt API remains available for offline/legacy callers
+// whose rows do not carry an owner capability.  Listener sends use this method
+// so a delayed callback from a replaced owner cannot commit Accepted/Sent
+// after a takeover.
+func (s *Store) MarkOutboxSendAttemptForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" || leaseGeneration <= 0 {
+		return OutboxMessage{}, ErrControlLeaseNotHeld
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapability(state, machineID, leaseGeneration) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		claimed, err := claimOutboxSendAttemptLocked(state, msg, now)
+		if err != nil {
+			return claimed, err
+		}
+		claimed.ScopeID = firstStoreNonEmptyString(claimed.ScopeID, state.Scope.ID)
+		claimed.MachineID = machineID
+		claimed.LeaseGeneration = leaseGeneration
+		return claimed, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// BindOutboxRecoveryAttemptForOwner transfers an expired/ambiguous Sending
+// row to the currently active control-lease owner and rotates its attempt
+// token. Recovery must bind the row before probing Graph: otherwise a stale
+// callback from the previous owner could still win an unscoped Accepted or
+// Sent transition while the replacement owner is reconciling the same POST.
+//
+// A few pre-lease versions could persist Sending without an attempt token.
+// Once that row's send lease has expired, adopting it here gives it the same
+// durable ambiguous disposition as newer rows. It is deliberately not
+// adopted while fresh: a live old sender may still be between POST and its
+// response, and the current owner must not race that sender merely because
+// the legacy row lacks metadata.
+func (s *Store) BindOutboxRecoveryAttemptForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" || leaseGeneration <= 0 {
+		return OutboxMessage{}, ErrControlLeaseNotHeld
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapability(state, machineID, leaseGeneration) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		if msg.Status != OutboxStatusSending {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if strings.TrimSpace(msg.SendAttemptToken) == "" && !OutboxSendLeaseExpired(msg, now) {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		msg.ScopeID = firstStoreNonEmptyString(msg.ScopeID, state.Scope.ID)
+		sameOwner := strings.TrimSpace(msg.MachineID) == machineID &&
+			msg.LeaseGeneration == leaseGeneration &&
+			strings.TrimSpace(msg.SendAttemptToken) != ""
+		if sameOwner {
+			return msg, nil
+		}
+		if strings.TrimSpace(msg.TeamsMessageID) == "" {
+			// A tokenful Sending row can be left behind by a process crash after
+			// the POST reached Graph but before its response was durable. The
+			// token proves local attempt identity, not the external outcome; a
+			// replacement owner must therefore hold it as ambiguous too.
+			msg.LastSendError = "ambiguous Graph send; previous owner stopped before durable Graph identity"
+		}
+		if strings.TrimSpace(msg.SendAttemptToken) == "" {
+			// Treat a legacy markerless Sending row as an unknown external
+			// outcome. This is a disposition change only; no POST is issued and
+			// the replacement owner still has to find an exact marker before it
+			// can settle the row.
+			msg.LastSendError = "ambiguous Graph send; legacy Sending row adopted after expired lease"
+		}
+		// The control lease is the cross-process authority.  Once this owner has
+		// taken over, the previous callback is stale even when its short outbox
+		// send lease has not elapsed yet.  Do not require a wall-clock guess here.
+		msg.MachineID = machineID
+		msg.LeaseGeneration = leaseGeneration
+		msg.SendAttemptToken = outboxSendAttemptToken(msg.ID, now, msg.SendAttemptToken)
+		// This operation only changes who may reconcile the existing external
+		// outcome; it does not issue a new Graph POST. Preserve the original
+		// attempt time so an already-accepted message remains inside its evidence
+		// window after restart. A recovery timestamp would need a separate durable
+		// field; reusing LastSendAttempt would make valid old Graph messages look
+		// stale solely because ownership changed.
+		msg.UpdatedAt = now
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// DeferOutboxDeliveryUntilForOwner is the owner-fenced counterpart of
+// DeferOutboxDeliveryUntil. A late callback from a retired listener must not
+// move the retry gate on a row that a replacement owner has already claimed.
+// Queued/legacy-unbound rows may be gated by the current owner; Sending and
+// ambiguous rows additionally require the exact attempt token.
+func (s *Store) DeferOutboxDeliveryUntilForOwner(ctx context.Context, outboxID string, until time.Time, machineID string, leaseGeneration int64, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	machineID = strings.TrimSpace(machineID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || machineID == "" || leaseGeneration <= 0 || until.IsZero() {
+		return OutboxMessage{}, ErrControlLeaseNotHeld
+	}
+	until = until.UTC()
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapabilityAt(state, machineID, leaseGeneration, now) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
+		ambiguous := OutboxSendIsAmbiguous(msg)
+		if msg.Status == OutboxStatusSending || ambiguous {
+			if attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
+				return msg, ErrOutboxSendNotClaimed
+			}
+			if err := validateOutboxOwnerCapability(state, msg); err != nil {
+				return msg, err
+			}
+		} else if msg.Status != OutboxStatusQueued && !acceptedWithTeamsID {
+			return msg, errStoreNoChange
+		} else if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		if (msg.Status != OutboxStatusQueued && !acceptedWithTeamsID && !ambiguous) || !until.After(msg.NextAttemptAt) {
+			return msg, errStoreNoChange
+		}
+		msg.NextAttemptAt = until
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
 // DeferOutboxDeliveryUntil persists a retry gate without changing the
-// message's delivery disposition. It is deliberately a no-op for Sending,
-// Accepted, Sent, and Skipped rows: those states have their own lease or
-// external-outcome protocol and must not be made eligible/ineligible by a
-// stale sender observation.
+// message's delivery disposition. Queued rows, Accepted rows with a durable
+// Teams message identity, and expired ambiguous Sending rows may be gated. The
+// latter are local Graph-reconciliation work and must not be probed on every
+// main-loop tick. Sending, Sent, and Skipped rows otherwise retain their
+// lease/external-outcome protocol.
 func (s *Store) DeferOutboxDeliveryUntil(ctx context.Context, outboxID string, until time.Time) (OutboxMessage, error) {
 	outboxID = strings.TrimSpace(outboxID)
 	if outboxID == "" {
@@ -10652,7 +12505,8 @@ func (s *Store) DeferOutboxDeliveryUntil(ctx context.Context, outboxID string, u
 	}
 	until = until.UTC()
 	update := func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
-		if msg.Status != OutboxStatusQueued || !until.After(msg.NextAttemptAt) {
+		acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
+		if (msg.Status != OutboxStatusQueued && !acceptedWithTeamsID && !OutboxSendIsAmbiguous(msg)) || !until.After(msg.NextAttemptAt) {
 			return msg, errStoreNoChange
 		}
 		msg.NextAttemptAt = until
@@ -10672,12 +12526,20 @@ func (s *Store) MarkOutboxGraphRecoveryProgressForAttempt(ctx context.Context, o
 	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
 		return OutboxMessage{}, ErrOutboxSendNotClaimed
 	}
-	update := func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
 		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken) {
 			return msg, ErrOutboxSendNotClaimed
 		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
 		msg.GraphRecoveryNextPath = strings.TrimSpace(nextPath)
 		msg.GraphRecoveryCandidateID = strings.TrimSpace(candidateID)
+		if msg.GraphRecoveryNextPath == "" {
+			msg.GraphRecoveryPageCount = 0
+		} else {
+			msg.GraphRecoveryPageCount++
+		}
 		return msg, nil
 	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
@@ -10728,6 +12590,7 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	msg.LastSendError = ""
 	msg.GraphRecoveryNextPath = ""
 	msg.GraphRecoveryCandidateID = ""
+	msg.GraphRecoveryPageCount = 0
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSending, now)
 	return msg, nil
 }
@@ -10790,6 +12653,24 @@ func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string)
 	})
 }
 
+// SuppressOutboxOwnerMentionForAttempt changes a claimed row only while the
+// caller still owns both its control lease and exact send attempt.  The
+// workflow mention decision is made after the claim; an old listener must not
+// rewrite the payload selected by a replacement owner.
+func (s *Store) SuppressOutboxOwnerMentionForAttempt(ctx context.Context, outboxID string, attemptToken string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if err := validateOutboxAttemptOwner(state, msg, attemptToken, machineID, leaseGeneration); err != nil {
+			return msg, err
+		}
+		msg.MentionOwner = false
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
 func (s *Store) MarkOutboxMathMediaFallback(ctx context.Context, outboxID string) (OutboxMessage, error) {
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, func(_ *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
 		msg.MathMediaFallback = true
@@ -10803,6 +12684,25 @@ func (s *Store) MarkOutboxMathMediaFallback(ctx context.Context, outboxID string
 		msg.LastSendError = ""
 		return msg, nil
 	})
+}
+
+// MarkOutboxMathMediaFallbackForAttempt records the one allowed payload
+// fallback under the same owner/attempt fence as the original Graph send.
+// Without this CAS a stale callback could change the payload after takeover
+// and cause the replacement owner to issue an untracked second POST.
+func (s *Store) MarkOutboxMathMediaFallbackForAttempt(ctx context.Context, outboxID string, attemptToken string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if err := validateOutboxAttemptOwner(state, msg, attemptToken, machineID, leaseGeneration); err != nil {
+			return msg, err
+		}
+		msg.MathMediaFallback = true
+		msg.LastSendError = ""
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, error) {
@@ -10829,9 +12729,18 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 			// reconciled separately, so it must not strand newer rows in FIFO.
 			continue
 		}
-		if OutboxSendIsAmbiguous(candidate) {
+		if OutboxSendIsAmbiguous(candidate) && !outboxMessagesShareTurn(candidate, msg) {
 			// An unknown external outcome is reconciled separately and must not
-			// hold newer live/control work behind a stale history send.
+			// hold newer distinct-turn live/control work behind a stale history
+			// send. Same-turn rows remain ordered so terminal chunks cannot pass
+			// an earlier chunk whose external outcome is unknown.
+			continue
+		}
+		if OutboxSendRecoveryEligible(candidate, time.Now()) && !outboxMessagesShareTurn(candidate, msg) {
+			// Markerless Sending rows from pre-attempt-token releases have the
+			// same unknown external outcome as explicit ambiguous rows. Once their
+			// lease expires, keep them in the cold recovery lane instead of letting
+			// one legacy row make a later distinct user turn permanently wait.
 			continue
 		}
 		switch candidate.Status {
@@ -10871,7 +12780,10 @@ func (s *Store) EarlierUnsentOutboxes(ctx context.Context, msg OutboxMessage) ([
 		if AcceptedSourceRewriteOutboxIsStable(candidate) {
 			continue
 		}
-		if OutboxSendIsAmbiguous(candidate) {
+		if OutboxSendIsAmbiguous(candidate) && !outboxMessagesShareTurn(candidate, msg) {
+			continue
+		}
+		if OutboxSendRecoveryEligible(candidate, time.Now()) && !outboxMessagesShareTurn(candidate, msg) {
 			continue
 		}
 		switch candidate.Status {
@@ -10903,14 +12815,29 @@ func AcceptedSourceRewriteOutboxIsStable(msg OutboxMessage) bool {
 }
 
 func (s *Store) MarkOutboxSendError(ctx context.Context, outboxID string, message string) (OutboxMessage, error) {
-	return s.markOutboxSendError(ctx, outboxID, "", message, false)
+	return s.markOutboxSendError(ctx, outboxID, "", message, false, false)
 }
 
 func (s *Store) MarkOutboxSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
 	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
 		return OutboxMessage{}, ErrOutboxSendNotClaimed
 	}
-	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true)
+	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true, false)
+}
+
+// MarkOutboxRetryableSendErrorForAttempt retains the ordinary queued/backoff
+// behavior for a provider response that explicitly rejected this request but
+// is safe to retry (for example 401/408/409/425/429). When a terminal turn
+// fence is already present, the response still belongs to an in-flight Graph
+// attempt; retain that attempt as ambiguous rather than converting it to a
+// second, unmarked retry. Callers that have no provider response and therefore
+// do not know whether an external side effect occurred must use the explicit
+// ambiguous method instead.
+func (s *Store) MarkOutboxRetryableSendErrorForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
+	if strings.TrimSpace(outboxID) == "" || strings.TrimSpace(attemptToken) == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true, true)
 }
 
 // MarkOutboxAmbiguousSendErrorForAttempt keeps an attempted message under its
@@ -10958,6 +12885,121 @@ func (s *Store) MarkOutboxSkipped(ctx context.Context, outboxID string, reason s
 	return s.updateOutbox(ctx, outboxID, update)
 }
 
+// MarkOutboxSkippedIfQueued retires an obsolete queued row only while the
+// row is still queued.  A sender may claim the row after a caller's source
+// proof check and before this CAS; in that case the send attempt owns the
+// row and this method must leave it untouched rather than converting a fresh
+// Sending row into Skipped.
+func (s *Store) MarkOutboxSkippedIfQueued(ctx context.Context, outboxID string, reason string) (OutboxMessage, bool, error) {
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusQueued {
+			return msg, errStoreNoChange
+		}
+		updated, err := markOutboxSkippedLocked(state, msg, reason, now)
+		if err == nil && updated.Status == OutboxStatusSkipped {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
+// MarkOutboxSkippedIfQueuedForOwner is the live-listener form of
+// MarkOutboxSkippedIfQueued. Any queued row may be adopted by the current
+// owner because it has not acquired a Graph send lease yet. A delayed callback
+// from the old owner is still rejected by the current control-lease CAS.
+func (s *Store) MarkOutboxSkippedIfQueuedForOwner(ctx context.Context, outboxID string, reason string, machineID string, leaseGeneration int64) (OutboxMessage, bool, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	machineID = strings.TrimSpace(machineID)
+	if outboxID == "" || machineID == "" || leaseGeneration <= 0 {
+		return OutboxMessage{}, false, ErrControlLeaseNotHeld
+	}
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusQueued {
+			return msg, errStoreNoChange
+		}
+		if err := validateQueuedOutboxOwnerForMutation(state, &msg, machineID, leaseGeneration, now); err != nil {
+			return msg, err
+		}
+		updated, err := markOutboxSkippedLocked(state, msg, reason, now)
+		if err == nil && updated.Status == OutboxStatusSkipped {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
+// MarkOutboxSourceRewriteFenceIfQueued installs a source-rewrite fence only
+// while the row is still queued.  If another sender has claimed the row, the
+// caller must let that attempt finish its own source-proof protocol; a stale
+// queued snapshot must not turn that Sending row into an Accepted fence.
+func (s *Store) MarkOutboxSourceRewriteFenceIfQueued(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, bool, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if outboxID == "" || teamsMessageID == "" {
+		return OutboxMessage{}, false, ErrOutboxSendNotClaimed
+	}
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusQueued {
+			return msg, errStoreNoChange
+		}
+		updated, err := markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
+		if err == nil && updated.Status == OutboxStatusAccepted && updated.BlockedBySourceRewrite {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
+// MarkOutboxSourceRewriteFenceIfQueuedForOwner is the owner-fenced variant of
+// MarkOutboxSourceRewriteFenceIfQueued. It is used by a live listener after a
+// source-proof check and therefore must not allow that check's stale snapshot
+// to mutate a row after a control-lease takeover.
+func (s *Store) MarkOutboxSourceRewriteFenceIfQueuedForOwner(ctx context.Context, outboxID string, teamsMessageID string, machineID string, leaseGeneration int64) (OutboxMessage, bool, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	machineID = strings.TrimSpace(machineID)
+	if outboxID == "" || teamsMessageID == "" || machineID == "" || leaseGeneration <= 0 {
+		return OutboxMessage{}, false, ErrControlLeaseNotHeld
+	}
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusQueued {
+			return msg, errStoreNoChange
+		}
+		if err := validateQueuedOutboxOwnerForMutation(state, &msg, machineID, leaseGeneration, now); err != nil {
+			return msg, err
+		}
+		updated, err := markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
+		if err == nil && updated.Status == OutboxStatusAccepted && updated.BlockedBySourceRewrite {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
 // RetireLegacyUnverifiableTranscriptOutboxIfStale performs the compatibility
 // retirement under the same JSON/SQLite outbox CAS as the sender. In
 // particular, a stale Sending snapshot must not use the unscoped skip method
@@ -10967,6 +13009,35 @@ func (s *Store) RetireLegacyUnverifiableTranscriptOutboxIfStale(ctx context.Cont
 	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if !IsLegacyUnverifiableTranscriptOutbox(msg) {
 			return msg, nil
+		}
+		updated, err := markOutboxSkippedLocked(state, msg, reason, now)
+		if err == nil && updated.Status == OutboxStatusSkipped && msg.Status != OutboxStatusSkipped {
+			changed = true
+		}
+		return updated, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, changed, err
+	}
+	out, err := s.updateOutbox(ctx, outboxID, update)
+	return out, changed, err
+}
+
+// RetireLegacyUnverifiableTranscriptOutboxIfStaleForOwner is the live sender
+// variant.  It may adopt a still-queued legacy row only under the current
+// control lease; a delayed callback from a previous listener cannot skip the
+// row after takeover.
+func (s *Store) RetireLegacyUnverifiableTranscriptOutboxIfStaleForOwner(ctx context.Context, outboxID string, reason string, machineID string, leaseGeneration int64) (OutboxMessage, bool, error) {
+	changed := false
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapabilityAt(state, strings.TrimSpace(machineID), leaseGeneration, now) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		if !IsLegacyUnverifiableTranscriptOutbox(msg) {
+			return msg, nil
+		}
+		if err := validateQueuedOutboxOwnerForMutation(state, &msg, machineID, leaseGeneration, now); err != nil {
+			return msg, err
 		}
 		updated, err := markOutboxSkippedLocked(state, msg, reason, now)
 		if err == nil && updated.Status == OutboxStatusSkipped && msg.Status != OutboxStatusSkipped {
@@ -11103,6 +13174,9 @@ func markOutboxSkippedForAttemptLocked(state *State, msg OutboxMessage, attemptT
 	if msg.Status != OutboxStatusSending || attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
 		return msg, ErrOutboxSendNotClaimed
 	}
+	if err := validateOutboxOwnerCapability(state, msg); err != nil {
+		return msg, err
+	}
 	msg.Status = OutboxStatusSkipped
 	msg.LastSendError = trimDiagnostic(firstStoreNonEmptyString(reason, "ambiguous transient output superseded"), 240)
 	msg.UpdatedAt = now
@@ -11117,11 +13191,14 @@ func markOutboxAmbiguousSendErrorLocked(state *State, msg OutboxMessage, attempt
 	if msg.Status != OutboxStatusSending || attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
 		return msg, ErrOutboxSendNotClaimed
 	}
+	if err := validateOutboxOwnerCapability(state, msg); err != nil {
+		return msg, err
+	}
 	if msg.BlockedByTerminalFailure {
 		// The request may already have reached Graph, so keep the in-flight
 		// attempt fenced instead of re-queueing it for a duplicate POST.  A late
 		// accepted callback can still persist the stable Teams message ID.
-		msg.LastSendError = trimDiagnostic("ambiguous Graph send after terminal failure: "+message, 240)
+		msg.LastSendError = trimDiagnostic("ambiguous Graph send; after terminal failure: "+message, 240)
 		msg.LastSendAttempt = now
 		msg.UpdatedAt = now
 		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
@@ -11129,11 +13206,16 @@ func markOutboxAmbiguousSendErrorLocked(state *State, msg OutboxMessage, attempt
 		return msg, nil
 	}
 	if sessionID := strings.TrimSpace(msg.SessionID); sessionID != "" && state.Sessions[sessionID].Status == SessionStatusQuarantined {
-		msg.Status = OutboxStatusSkipped
-		msg.LastSendError = trimDiagnostic("session quarantined after ambiguous send: "+message, 240)
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
-		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
-		updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+		// Quarantine is a lifecycle boundary, not proof that an in-flight
+		// request failed. Preserve the same ambiguous-send fence as the normal
+		// path so a late Graph response or exact marker can still settle the
+		// message. In particular, never turn this row into Skipped merely because
+		// the session was quarantined while the POST was in flight.
+		msg.LastSendError = trimDiagnostic("ambiguous Graph send; after session quarantine: "+message, 240)
+		msg.LastSendAttempt = now
+		msg.UpdatedAt = now
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "message_ambiguous", "session quarantine fence", msg.LastSendError)
 		msg.UpdatedAt = now
 		return msg, nil
 	}
@@ -11145,25 +13227,42 @@ func markOutboxAmbiguousSendErrorLocked(state *State, msg OutboxMessage, attempt
 	return msg, nil
 }
 
-func (s *Store) markOutboxSendError(ctx context.Context, outboxID string, attemptToken string, message string, requireClaim bool) (OutboxMessage, error) {
+func (s *Store) markOutboxSendError(ctx context.Context, outboxID string, attemptToken string, message string, requireClaim bool, preserveInFlightOnTerminal bool) (OutboxMessage, error) {
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim)
+		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim, preserveInFlightOnTerminal)
 	}); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim)
+		return markOutboxSendErrorLocked(state, msg, attemptToken, message, now, requireClaim, preserveInFlightOnTerminal)
 	})
 }
 
-func markOutboxSendErrorLocked(state *State, msg OutboxMessage, attemptToken string, message string, now time.Time, requireClaim bool) (OutboxMessage, error) {
+func markOutboxSendErrorLocked(state *State, msg OutboxMessage, attemptToken string, message string, now time.Time, requireClaim bool, preserveInFlightOnTerminal bool) (OutboxMessage, error) {
 	if requireClaim && (msg.Status != OutboxStatusSending || strings.TrimSpace(attemptToken) != "" && strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken)) {
 		return msg, ErrOutboxSendNotClaimed
+	}
+	if requireClaim {
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
 	}
 	if !requireClaim && msg.Status != OutboxStatusQueued && msg.Status != OutboxStatusSending {
 		return msg, ErrOutboxSendNotClaimed
 	}
 	if msg.BlockedByTerminalFailure {
+		if msg.Status == OutboxStatusSending && preserveInFlightOnTerminal && (requireClaim || strings.TrimSpace(attemptToken) != "") {
+			// A retryable Graph response (for example 408/429) still leaves the
+			// external outcome uncertain. The terminal execution fence may stop a
+			// later retry, but it must not erase the in-flight row before a marker or
+			// late response can settle it.
+			msg.LastSendError = trimDiagnostic("ambiguous Graph send; after terminal failure: "+message, 240)
+			msg.LastSendAttempt = now
+			msg.UpdatedAt = now
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, "message_ambiguous", "terminal failure fence", msg.LastSendError)
+			return msg, nil
+		}
 		msg.Status = OutboxStatusSkipped
 		msg.LastSendError = trimDiagnostic("terminal failure fence: "+message, 240)
 		msg.SendAttemptToken = ""
@@ -11178,10 +13277,21 @@ func markOutboxSendErrorLocked(state *State, msg OutboxMessage, attemptToken str
 		quarantined = state.Sessions[sessionID].Status == SessionStatusQuarantined
 	}
 	if quarantined {
-		msg.Status = OutboxStatusSkipped
-		msg.LastSendError = trimDiagnostic("session quarantined after send failure: "+message, 240)
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
-		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		if msg.Status == OutboxStatusSending {
+			// A send-attempt error can be returned after the request crossed the
+			// Graph boundary. Quarantine does not make that outcome known; retain a
+			// durable ambiguous row instead of permanently dropping a possibly
+			// accepted Teams message.
+			msg.Status = OutboxStatusSending
+			msg.LastSendError = trimDiagnostic("ambiguous Graph send; after session quarantine: "+message, 240)
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, "message_ambiguous", "session quarantine fence", msg.LastSendError)
+		} else {
+			msg.Status = OutboxStatusSkipped
+			msg.LastSendError = trimDiagnostic("session quarantined after send failure: "+message, 240)
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+			markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		}
 	} else {
 		msg.Status = OutboxStatusQueued
 		msg.LastSendError = trimDiagnostic(message, 240)
@@ -11209,6 +13319,74 @@ func (s *Store) MarkOutboxDriveItemForAttempt(ctx context.Context, outboxID stri
 	return s.markOutboxDriveItem(ctx, outboxID, attemptToken, itemID, name, eTag, webURL, webDavURL, true)
 }
 
+// MarkOutboxAttachmentMessagePostStartedForAttempt records the durable
+// boundary immediately before the Teams chat POST for an already-uploaded
+// attachment.  Uploading a DriveItem and posting the chat message are two
+// separate external operations: after this CAS, a crash or lost response must
+// go through exact marker recovery and must never fall through to a fresh POST.
+// The attempt and owner fences prevent a stale worker from manufacturing this
+// boundary for a replacement owner's row.
+func (s *Store) MarkOutboxAttachmentMessagePostStartedForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			strings.TrimSpace(msg.DriveItemID) == "" || strings.TrimSpace(msg.AttachmentPath) == "" {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		if strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") {
+			return msg, nil
+		}
+		if !strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "pending") &&
+			!strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "unknown") {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		msg.AttachmentMessagePostState = "started"
+		msg.UpdatedAt = now
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// ResetOutboxAttachmentMessagePostPendingForAttempt records that Graph
+// explicitly rejected a fresh attachment POST before accepting it (currently
+// limited by the bridge to authentication/throttling responses).  This is
+// intentionally narrower than a generic send-error transition: transport
+// failures and 5xx responses remain in the started/ambiguous lane because
+// they do not prove that the external side effect was absent.
+func (s *Store) ResetOutboxAttachmentMessagePostPendingForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			!strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		msg.AttachmentMessagePostState = "pending"
+		msg.UpdatedAt = now
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
 // ClearOutboxDriveItemForAttempt forgets a remote DriveItem that Graph has
 // conclusively reported as deleted. The caller must have an exact, definitive
 // missing-item error: before the Teams chat POST it is a normal replayable
@@ -11225,6 +13403,9 @@ func (s *Store) ClearOutboxDriveItemForAttempt(ctx context.Context, outboxID str
 		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
 			(msg.AttachmentMessagePostState != "pending" && msg.AttachmentMessagePostState != "started") {
 			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
 		}
 		clearOutboxDriveItemLocked(state, &msg, now)
 		return msg, nil
@@ -11277,6 +13458,11 @@ func (s *Store) markOutboxDriveItem(ctx context.Context, outboxID string, attemp
 		if requireAttempt && (msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken) {
 			return msg, ErrOutboxSendNotClaimed
 		}
+		if requireAttempt {
+			if err := validateOutboxOwnerCapability(state, msg); err != nil {
+				return msg, err
+			}
+		}
 		msg.DriveItemID = strings.TrimSpace(itemID)
 		msg.DriveItemName = strings.TrimSpace(name)
 		msg.DriveItemETag = strings.TrimSpace(eTag)
@@ -11306,9 +13492,12 @@ func (s *Store) MarkOutboxUploadSessionForAttempt(ctx context.Context, outboxID 
 	if offset < 0 {
 		return OutboxMessage{}, fmt.Errorf("upload session offset must not be negative")
 	}
-	update := func(_ *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
 			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
 		}
 		if strings.TrimSpace(uploadURL) == "" {
 			msg.AttachmentUploadURL = ""
@@ -11346,6 +13535,9 @@ func (s *Store) MarkOutboxAcceptedSourceRewriteForAttempt(ctx context.Context, o
 		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, false, true); err != nil {
 			return msg, err
 		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
 		msg.Status = OutboxStatusAccepted
 		if strings.TrimSpace(teamsMessageID) != "" {
 			msg.TeamsMessageID = strings.TrimSpace(teamsMessageID)
@@ -11377,31 +13569,7 @@ func (s *Store) MarkOutboxSourceRewriteFence(ctx context.Context, outboxID strin
 		return OutboxMessage{}, ErrOutboxSendNotClaimed
 	}
 	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		if msg.Status == OutboxStatusSkipped {
-			return msg, ErrOutboxSendNotClaimed
-		}
-		if existing := strings.TrimSpace(msg.TeamsMessageID); existing != "" && existing != teamsMessageID {
-			return msg, ErrOutboxSendNotClaimed
-		}
-		if AcceptedSourceRewriteOutboxIsStable(msg) && strings.TrimSpace(msg.TeamsMessageID) == teamsMessageID {
-			// Replay reconciliation is intentionally idempotent. Do not refresh
-			// UpdatedAt or rewrite provenance on every pending flush after a
-			// source-rewrite fence is already stable.
-			return msg, errStoreNoChange
-		}
-		// A source check can race with the final Sent CAS.  Demote that row back
-		// to Accepted and persist the fence instead of treating Sent as immutable;
-		// otherwise a post-CAS rewrite would still run transcript side effects or
-		// be replay-promoted after restart.
-		msg.Status = OutboxStatusAccepted
-		msg.TeamsMessageID = teamsMessageID
-		msg.BlockedBySourceRewrite = true
-		msg.LastSendError = ""
-		msg.SendAttemptToken = ""
-		recordOutboxProvenanceLocked(state, msg, now)
-		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusAccepted, now)
-		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusAccepted, now)
-		return msg, nil
+		return markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
 	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
 		return out, err
@@ -11409,14 +13577,151 @@ func (s *Store) MarkOutboxSourceRewriteFence(ctx context.Context, outboxID strin
 	return s.updateOutbox(ctx, outboxID, update)
 }
 
+// MarkOutboxSourceRewriteFenceForAttempt is the owner-scoped variant used by
+// an in-flight recovery callback.  The unscoped method above remains available
+// for offline replay maintenance after an attempt lease has been cleared.
+func (s *Store) MarkOutboxSourceRewriteFenceForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if outboxID == "" || attemptToken == "" || teamsMessageID == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, true, true); err != nil {
+			return msg, err
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		return markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// MarkOutboxSourceRewriteFenceForOwner is the owner-scoped variant used after
+// the attempt token has already been consumed by an Accepted/Sent projection.
+// The row keeps its machine/generation capability even after the token is
+// cleared, so a stale callback from a replaced listener cannot install a late
+// source-rewrite fence on behalf of a newer owner.
+func (s *Store) MarkOutboxSourceRewriteFenceForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64, teamsMessageID string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	machineID = strings.TrimSpace(machineID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if outboxID == "" || machineID == "" || leaseGeneration <= 0 || teamsMessageID == "" {
+		return OutboxMessage{}, ErrControlLeaseNotHeld
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapability(state, machineID, leaseGeneration) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		if strings.TrimSpace(msg.MachineID) != machineID || msg.LeaseGeneration != leaseGeneration {
+			return msg, ErrControlLeaseNotHeld
+		}
+		return markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// RebindOutboxSourceRewriteFenceForOwner adopts an already Graph-accepted
+// row after a control-lease takeover and installs the source-rewrite fence in
+// the same durable CAS.  Accepted/Sent rows have a stable external identity,
+// so rebinding them is safe; Sending rows remain on the ambiguous-send
+// recovery path and are intentionally rejected here.
+func (s *Store) RebindOutboxSourceRewriteFenceForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64, teamsMessageID string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	machineID = strings.TrimSpace(machineID)
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
+	if outboxID == "" || machineID == "" || leaseGeneration <= 0 || teamsMessageID == "" {
+		return OutboxMessage{}, ErrControlLeaseNotHeld
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if !controlLeaseMatchesCapability(state, machineID, leaseGeneration) {
+			return msg, ErrControlLeaseNotHeld
+		}
+		if msg.Status != OutboxStatusAccepted && msg.Status != OutboxStatusSent {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if existing := strings.TrimSpace(msg.TeamsMessageID); existing != "" && existing != teamsMessageID {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		// This is an explicit takeover boundary for a row whose external result
+		// is already known.  Clear any token left by older versions before the
+		// source-fence projection so no stale callback can be reused.
+		ownerChanged := strings.TrimSpace(msg.MachineID) != machineID || msg.LeaseGeneration != leaseGeneration || strings.TrimSpace(msg.SendAttemptToken) != ""
+		msg.MachineID = machineID
+		msg.LeaseGeneration = leaseGeneration
+		msg.SendAttemptToken = ""
+		fenced, err := markOutboxSourceRewriteFenceLocked(state, msg, teamsMessageID, now)
+		if errors.Is(err, errStoreNoChange) && ownerChanged {
+			// The fence itself was already stable, but rebinding the durable owner
+			// is still a real state change. Do not let the idempotence fast path
+			// discard the takeover capability.
+			return msg, nil
+		}
+		return fenced, err
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+func markOutboxSourceRewriteFenceLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time) (OutboxMessage, error) {
+	if msg.Status == OutboxStatusSkipped {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	if existing := strings.TrimSpace(msg.TeamsMessageID); existing != "" && existing != teamsMessageID {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	if AcceptedSourceRewriteOutboxIsStable(msg) && strings.TrimSpace(msg.TeamsMessageID) == teamsMessageID {
+		// Replay reconciliation is intentionally idempotent. Do not refresh
+		// UpdatedAt or rewrite provenance on every pending flush after a
+		// source-rewrite fence is already stable.
+		return msg, errStoreNoChange
+	}
+	// A source check can race with the final Sent CAS.  Demote that row back
+	// to Accepted and persist the fence instead of treating Sent as immutable;
+	// otherwise a post-CAS rewrite would still run transcript side effects or
+	// be replay-promoted after restart.
+	msg.Status = OutboxStatusAccepted
+	msg.TeamsMessageID = teamsMessageID
+	msg.BlockedBySourceRewrite = true
+	msg.LastSendError = ""
+	msg.SendAttemptToken = ""
+	recordOutboxProvenanceLocked(state, msg, now)
+	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusAccepted, now)
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusAccepted, now)
+	return msg, nil
+}
+
 func (s *Store) markOutboxAccepted(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, false, requireClaim, false); handled || err != nil {
+	return s.markOutboxAcceptedWithCapability(ctx, outboxID, attemptToken, teamsMessageID, requireClaim, storeOwnerCapability{})
+}
+
+func (s *Store) markOutboxAcceptedWithCapability(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool, capability storeOwnerCapability) (OutboxMessage, error) {
+	if out, handled, err := s.markOutboxDeliveredSQLiteWithCapability(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, false, requireClaim, false, capability); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
 		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, false, requireClaim); err != nil {
 			return msg, err
 		}
+		if requireClaim {
+			if err := validateOutboxOwnerCapability(state, msg); err != nil {
+				return msg, err
+			}
+		}
+		bindOutboxToOwnerCapability(state, &msg, capability)
 		if err := markOutboxDeliveryBlockedIfUnresolvedExecution(state, &msg, teamsMessageID); err != nil {
 			return msg, err
 		}
@@ -11436,6 +13741,19 @@ func (s *Store) markOutboxAccepted(ctx context.Context, outboxID string, attempt
 		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusAccepted, now)
 		return msg, nil
 	})
+}
+
+// MarkOutboxAcceptedForOwner is the live reconciliation path for an already
+// accepted Graph identity. It does not require the row to have been created by
+// the current owner, but it does require the supplied lease capability to be
+// current inside the same durable CAS. This lets a replacement owner recover
+// legacy accepted rows while making a stale callback harmless.
+func (s *Store) MarkOutboxAcceptedForOwner(ctx context.Context, outboxID string, teamsMessageID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	return s.markOutboxAcceptedWithCapability(ctx, outboxID, "", teamsMessageID, false, capability)
 }
 
 func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
@@ -11462,6 +13780,56 @@ func (s *Store) MarkOutboxSentAfterSourceProof(ctx context.Context, outboxID str
 // accidentally opting out of source validation.
 func (s *Store) MarkOutboxSentForAttemptAfterSourceProof(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
 	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true, true)
+}
+
+// MarkOutboxSuppressed records a local, intentionally non-delivered diagnostic
+// as complete.  It is deliberately separate from MarkOutboxSent: an empty
+// Teams message ID is not a valid proof of a Graph delivery and must never be
+// able to arm the post-send replay path.
+func (s *Store) MarkOutboxSuppressed(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	return s.markOutboxSuppressed(ctx, outboxID, storeOwnerCapability{})
+}
+
+// MarkOutboxSuppressedForOwner is the live-listener variant.  A current owner
+// may adopt a queued legacy diagnostic in the same durable CAS, while a stale
+// callback cannot turn a row into Sent after a control-lease takeover.
+func (s *Store) MarkOutboxSuppressedForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	return s.markOutboxSuppressed(ctx, outboxID, capability)
+}
+
+func (s *Store) markOutboxSuppressed(ctx context.Context, outboxID string, capability storeOwnerCapability) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" {
+		return OutboxMessage{}, fmt.Errorf("outbox id is required")
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
+		// This idempotent state is useful when a maintenance pass sees a
+		// diagnostic that was suppressed just before it was interrupted.  It is
+		// the only Sent state accepted without an external Teams identity.
+		if msg.Status == OutboxStatusSent && strings.TrimSpace(msg.TeamsMessageID) == "" && !msg.PostSendEffectsPending {
+			return msg, errStoreNoChange
+		}
+		if msg.Status != OutboxStatusQueued || strings.TrimSpace(msg.TeamsMessageID) != "" {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if capability.bound() {
+			if err := validateQueuedOutboxOwnerForMutation(state, &msg, capability.machineID, capability.leaseGeneration, now); err != nil {
+				return msg, err
+			}
+		}
+		return applyOutboxSuppressedProjectionLocked(state, msg, now), nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 // ApplyOutboxReplayFences promotes already-delivered canonical outbox rows in
@@ -11582,18 +13950,139 @@ func validateOutboxReplayFence(current OutboxMessage, fence OutboxReplayFence) e
 }
 
 func (s *Store) markOutboxSent(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool, sourceProofPrevalidated bool) (OutboxMessage, error) {
-	if out, handled, err := s.markOutboxDeliveredSQLite(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim, sourceProofPrevalidated); handled || err != nil {
+	return s.markOutboxSentWithCapability(ctx, outboxID, attemptToken, teamsMessageID, requireClaim, sourceProofPrevalidated, storeOwnerCapability{})
+}
+
+func (s *Store) markOutboxSentWithCapability(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string, requireClaim bool, sourceProofPrevalidated bool, capability storeOwnerCapability) (OutboxMessage, error) {
+	if strings.TrimSpace(teamsMessageID) == "" {
+		return OutboxMessage{}, fmt.Errorf("Teams message id is required for Sent outbox")
+	}
+	if out, handled, err := s.markOutboxDeliveredSQLiteWithCapability(ctx, strings.TrimSpace(outboxID), attemptToken, teamsMessageID, true, requireClaim, sourceProofPrevalidated, capability); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
 		if err := validateOutboxDeliveryAttempt(msg, attemptToken, teamsMessageID, true, requireClaim); err != nil {
 			return msg, err
 		}
+		if requireClaim {
+			if err := validateOutboxOwnerCapability(state, msg); err != nil {
+				return msg, err
+			}
+		}
+		bindOutboxToOwnerCapability(state, &msg, capability)
 		if err := markOutboxDeliveryBlockedIfUnresolvedExecution(state, &msg, teamsMessageID); err != nil {
 			return msg, err
 		}
 		return applyOutboxSentProjectionLocked(state, msg, teamsMessageID, now, sourceProofPrevalidated), nil
 	})
+}
+
+// MarkOutboxSentForOwner promotes an already-known Graph identity under the
+// current listener lease. It is used for queued/accepted recovery branches
+// that must not issue a second POST, while still preventing a stale worker
+// from changing the row after a takeover.
+func (s *Store) MarkOutboxSentForOwner(ctx context.Context, outboxID string, teamsMessageID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	return s.markOutboxSentWithCapability(ctx, outboxID, "", teamsMessageID, false, false, capability)
+}
+
+// MarkOutboxSideEffectsComplete clears the post-send replay marker after all
+// follow-up effects have succeeded.  It is retained for offline/legacy
+// callers; live listener paths should use MarkOutboxSideEffectsCompleteForOwner
+// so a delayed callback from a retired owner cannot settle a row for the new
+// owner.
+func (s *Store) MarkOutboxSideEffectsComplete(ctx context.Context, outboxID string) (OutboxMessage, error) {
+	return s.markOutboxSideEffectsComplete(ctx, outboxID, storeOwnerCapability{})
+}
+
+// MarkOutboxSideEffectsCompleteForOwner clears the replay marker only while
+// the supplied control-lease capability is current.  A replacement owner may
+// adopt a Sent row left by an older version; an old owner cannot clear the
+// marker after takeover because the lease generation check is in the same
+// durable mutation.
+func (s *Store) MarkOutboxSideEffectsCompleteForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	return s.markOutboxSideEffectsComplete(ctx, outboxID, capability)
+}
+
+// DeferOutboxSideEffectsUntil records a bounded retry gate for follow-up work
+// on a row whose Graph delivery is already Sent.  It does not change the
+// delivery status and therefore can never cause another Graph POST.
+func (s *Store) DeferOutboxSideEffectsUntil(ctx context.Context, outboxID string, until time.Time) (OutboxMessage, error) {
+	return s.deferOutboxSideEffectsUntil(ctx, outboxID, until, storeOwnerCapability{})
+}
+
+// DeferOutboxSideEffectsUntilForOwner is the live-listener variant.  A stale
+// owner may not postpone or otherwise mutate a replacement owner's replay
+// work; the current lease is checked in the same durable mutation.
+func (s *Store) DeferOutboxSideEffectsUntilForOwner(ctx context.Context, outboxID string, until time.Time, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	return s.deferOutboxSideEffectsUntil(ctx, outboxID, until, capability)
+}
+
+func (s *Store) deferOutboxSideEffectsUntil(ctx context.Context, outboxID string, until time.Time, capability storeOwnerCapability) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	if outboxID == "" || until.IsZero() {
+		return OutboxMessage{}, fmt.Errorf("outbox side-effect retry time and id are required")
+	}
+	until = until.UTC()
+	update := func(state *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSent || !msg.PostSendEffectsPending {
+			return msg, errStoreNoChange
+		}
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
+		if capability.bound() {
+			msg.MachineID = capability.machineID
+			msg.LeaseGeneration = capability.leaseGeneration
+		}
+		if !until.After(msg.NextAttemptAt) {
+			return msg, errStoreNoChange
+		}
+		msg.NextAttemptAt = until
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+func (s *Store) markOutboxSideEffectsComplete(ctx context.Context, outboxID string, capability storeOwnerCapability) (OutboxMessage, error) {
+	update := func(state *State, msg OutboxMessage, _ time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSent || !msg.PostSendEffectsPending {
+			return msg, errStoreNoChange
+		}
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
+		if capability.bound() {
+			// A Sent row may predate the current listener owner.  Adoption is safe
+			// here because the Graph identity is already durable and the current
+			// lease is the authority for the replayable local effects.
+			msg.MachineID = capability.machineID
+			msg.LeaseGeneration = capability.leaseGeneration
+		}
+		msg.PostSendEffectsPending = false
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessageID string, now time.Time, sourceProofPrevalidated ...bool) OutboxMessage {
@@ -11648,11 +14137,13 @@ func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessa
 		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusAccepted, now)
 		return msg
 	}
+	wasAlreadySent := msg.Status == OutboxStatusSent
+	teamsMessageID = strings.TrimSpace(teamsMessageID)
 	msg.Status = OutboxStatusSent
 	if msg.SentAt.IsZero() {
 		msg.SentAt = now
 	}
-	if teamsMessageID = strings.TrimSpace(teamsMessageID); teamsMessageID != "" {
+	if teamsMessageID != "" {
 		msg.TeamsMessageID = teamsMessageID
 	}
 	msg.UpdatedAt = now
@@ -11660,7 +14151,41 @@ func applyOutboxSentProjectionLocked(state *State, msg OutboxMessage, teamsMessa
 	msg.SendAttemptToken = ""
 	msg.BlockedByUnresolvedExecution = false
 	msg.BlockedByTerminalFailure = false
+	// A duplicate idempotent confirmation of an already-completed Sent row
+	// must not re-arm its post-send replay marker.  Only a transition into Sent
+	// creates new follow-up work; legacy Sent rows remain legacy-complete unless
+	// their marker was already durable.
+	if teamsMessageID == "" {
+		// An empty identity is reserved for locally suppressed diagnostic rows
+		// (for example codex-command-*). No Graph message exists for that
+		// transition, so there are no remote/local post-send effects to replay.
+		// Keep this decision in the same durable projection as Sent; a second
+		// cleanup transaction would leave a window where reconciliation observes
+		// a false-positive pending marker.
+		msg.PostSendEffectsPending = false
+	} else if !wasAlreadySent {
+		msg.PostSendEffectsPending = true
+	}
 	recordOutboxProvenanceLocked(state, msg, now)
+	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
+	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
+	updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
+	return msg
+}
+
+func applyOutboxSuppressedProjectionLocked(state *State, msg OutboxMessage, now time.Time) OutboxMessage {
+	msg.Status = OutboxStatusSent
+	msg.TeamsMessageID = ""
+	if msg.SentAt.IsZero() {
+		msg.SentAt = now
+	}
+	msg.UpdatedAt = now
+	msg.LastSendError = ""
+	msg.SendAttemptToken = ""
+	msg.BlockedByUnresolvedExecution = false
+	msg.BlockedByTerminalFailure = false
+	msg.BlockedBySourceRewrite = false
+	msg.PostSendEffectsPending = false
 	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSent, now)
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSent, now)
 	updateArtifactRecordsForOutboxLocked(state, msg, now, "uploaded", "", "")
@@ -11781,6 +14306,283 @@ func outboxSourceProofValid(msg OutboxMessage) bool {
 	return readErr == nil && strings.TrimSpace(readActual) == strings.TrimSpace(msg.TranscriptSourceReadProofFingerprint)
 }
 
+// controlLeaseMatchesCapability is the final durable owner fence for an
+// outbox send. Rows written before lease-bound outbox attempts may have only
+// the machine projection (older callers populated that field before a lease
+// existed), so a zero generation remains an unbound legacy capability. A
+// positive generation without a machine ID is invalid rather than guessed.
+// The check is performed inside the same JSON or
+// SQLite transaction as the receipt projection, so a takeover between the
+// Graph POST and Accepted/Sent cannot be hidden by an in-memory lease check.
+type storeOwnerCapability struct {
+	machineID       string
+	leaseGeneration int64
+	// allowTurnTakeover is set only by the startup recovery API. It relaxes
+	// validation of the old Turn capability while still requiring the current
+	// control lease; ordinary callbacks never receive this capability.
+	allowTurnTakeover bool
+	// allowLegacyQueuedIsolation is narrower than allowTurnTakeover: it only
+	// permits the current lease holder to adopt a generation-zero queued row.
+	// It never permits a running row or a callback from an old capability.
+	allowLegacyQueuedIsolation bool
+}
+
+func newStoreOwnerCapability(machineID string, leaseGeneration int64) (storeOwnerCapability, error) {
+	machineID = strings.TrimSpace(machineID)
+	if machineID == "" || leaseGeneration <= 0 {
+		return storeOwnerCapability{}, ErrControlLeaseNotHeld
+	}
+	return storeOwnerCapability{machineID: machineID, leaseGeneration: leaseGeneration}, nil
+}
+
+func newStoreOwnerTakeoverCapability(machineID string, leaseGeneration int64) (storeOwnerCapability, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return storeOwnerCapability{}, err
+	}
+	capability.allowTurnTakeover = true
+	return capability, nil
+}
+
+func (c storeOwnerCapability) bound() bool {
+	return strings.TrimSpace(c.machineID) != "" || c.leaseGeneration != 0
+}
+
+func validateStoreOwnerCapability(state *State, capability storeOwnerCapability) error {
+	if state != nil {
+		if err := validateControlLeaseShape(state.ControlLease); err != nil {
+			return err
+		}
+	}
+	if !capability.bound() || controlLeaseMatchesCapability(state, capability.machineID, capability.leaseGeneration) {
+		return nil
+	}
+	return ErrControlLeaseNotHeld
+}
+
+// validateTurnOwnerCapability is stricter than the legacy compatibility
+// predicate used by read/repair paths.  A live callback must match both the
+// control lease and the immutable capability recorded on the claimed Turn;
+// otherwise a takeover could rebind a legacy row and make an old callback
+// appear to be the new owner.
+func validateTurnOwnerCapability(state *State, turn Turn, capability storeOwnerCapability) error {
+	if err := validateStoreOwnerCapability(state, capability); err != nil {
+		return err
+	}
+	if !capability.bound() {
+		return nil
+	}
+	if capability.allowTurnTakeover {
+		return nil
+	}
+	if capability.allowLegacyQueuedIsolation && turn.Status == TurnStatusQueued && turn.LeaseGeneration <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(turn.MachineID) != capability.machineID || turn.LeaseGeneration != capability.leaseGeneration {
+		return ErrControlLeaseNotHeld
+	}
+	return nil
+}
+
+func validateQueuedTurnOwnerForClaim(turn Turn, capability storeOwnerCapability) error {
+	if !capability.bound() {
+		return nil
+	}
+	// A queued row carrying only a machine ID predates lease generations. It
+	// has no process-level proof and may be adopted atomically by the current
+	// lease holder; ClaimNextQueuedTurnForOwner binds the new capability before
+	// changing the status to running. A positive generation, however, is an
+	// explicit capability and must match exactly.
+	if turn.LeaseGeneration > 0 {
+		if strings.TrimSpace(turn.MachineID) != capability.machineID || turn.LeaseGeneration != capability.leaseGeneration {
+			return ErrControlLeaseNotHeld
+		}
+	}
+	return nil
+}
+
+func controlLeaseMatchesCapability(state *State, machineID string, leaseGeneration int64) bool {
+	return controlLeaseMatchesCapabilityAt(state, machineID, leaseGeneration, time.Now())
+}
+
+func controlLeaseMatchesCapabilityAt(state *State, machineID string, leaseGeneration int64, now time.Time) bool {
+	if state == nil {
+		return true
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	machineID = strings.TrimSpace(machineID)
+	if leaseGeneration <= 0 {
+		return true
+	}
+	if machineID == "" {
+		return false
+	}
+	lease := state.ControlLease
+	if !knownControlLeaseStatus(lease.Status) {
+		return false
+	}
+	return strings.TrimSpace(lease.HolderMachineID) == machineID &&
+		lease.Generation == leaseGeneration &&
+		lease.LeaseUntil.After(now)
+}
+
+// bindOutboxToOwnerCapability records the current listener capability on an
+// already-known delivery result. Recovery rows can predate lease-bound
+// attempts, and Accepted/Sent reconciliation is the point where the current
+// owner becomes the durable authority for any later source-rewrite fence.
+// Callers invoke this only after validating the capability against the
+// current control lease, so a stale callback cannot rebind a row.
+func bindOutboxToOwnerCapability(state *State, msg *OutboxMessage, capability storeOwnerCapability) {
+	if msg == nil || !capability.bound() {
+		return
+	}
+	msg.MachineID = capability.machineID
+	msg.LeaseGeneration = capability.leaseGeneration
+	if state != nil {
+		msg.ScopeID = firstStoreNonEmptyString(msg.ScopeID, state.Scope.ID)
+	}
+}
+
+// storeOwnerCapabilityMatchesState validates a durable operation captured by
+// the live listener. A missing lease is the legacy pre-ownership format and is
+// left unbound so migration/read-only repair can still operate; once a lease
+// exists, a positive generation must match its current holder and expiry.
+func storeOwnerCapabilityMatchesState(state *State, machineID string, leaseGeneration int64) bool {
+	if leaseGeneration <= 0 || state == nil {
+		return true
+	}
+	if strings.TrimSpace(state.ControlLease.HolderMachineID) == "" && state.ControlLease.Generation <= 0 {
+		return true
+	}
+	return controlLeaseMatchesCapability(state, machineID, leaseGeneration)
+}
+
+// storeOwnerCapabilityMatchesActiveLease is the strict variant used by
+// short-lived operational capabilities such as chat-poll attempts.  A poll
+// callback is allowed to mutate a frontier only while the control lease that
+// it captured is still present.  The compatibility predicate above is kept
+// for offline migration/repair paths, where an old state file may not have a
+// materialized lease at all; using that compatibility rule for a live poll
+// callback would let a delayed callback write in the gap after its lease was
+// released and before a replacement owner was recorded.
+func storeOwnerCapabilityMatchesActiveLease(state *State, machineID string, leaseGeneration int64) bool {
+	if leaseGeneration <= 0 {
+		return true
+	}
+	if state == nil {
+		return false
+	}
+	// A state created before control-lease persistence has no live owner to
+	// contradict this capability.  Keep the legacy row usable during the
+	// first migration/startup pass; as soon as lease history exists, require
+	// the exact current holder and generation below.  This is also important
+	// for a fresh test/installation: a poll attempt must not be lost merely
+	// because the first control-lease heartbeat has not materialized yet.
+	if state.ControlLease.Generation <= 0 &&
+		strings.TrimSpace(state.ControlLease.HolderMachineID) == "" &&
+		state.ControlLease.Status == "" &&
+		state.ControlLease.LeaseUntil.IsZero() &&
+		state.ControlLease.LastHeartbeat.IsZero() &&
+		state.ControlLease.UpdatedAt.IsZero() {
+		return true
+	}
+	return controlLeaseMatchesCapability(state, machineID, leaseGeneration)
+}
+
+// turnOwnerCapabilityMatchesState applies the compatibility rule for durable
+// turn callbacks. Rows created before lease binding may still be inspected and
+// explicitly recovered, but a queued/running row with no positive capability
+// has no process-level proof once any control lease exists. Refuse that
+// unscoped mutation rather than allowing a delayed legacy callback to race the
+// current owner. ClaimNextQueuedTurnForOwner is the explicit adoption path: it
+// binds the current capability in the same transaction before the queued row
+// becomes running.
+func turnOwnerCapabilityMatchesState(state *State, turn Turn) bool {
+	if state == nil {
+		return true
+	}
+	if turn.LeaseGeneration <= 0 &&
+		(turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning) &&
+		(state.ControlLease.Generation > 0 || strings.TrimSpace(state.ControlLease.HolderMachineID) != "") {
+		return false
+	}
+	return storeOwnerCapabilityMatchesState(state, turn.MachineID, turn.LeaseGeneration)
+}
+
+// validateInboundOwnerCapability applies the same compatibility rule to
+// deferred inbound callbacks that validateTurnOwnerCapability applies to
+// turns.  New listener rows carry a positive lease generation.  A legacy row
+// may have only a machine label (or no owner fields at all); an explicit
+// current-owner update may adopt that row in the same transaction, while an
+// unscoped update is rejected once a control lease exists.
+func validateInboundOwnerCapability(state *State, inbound InboundEvent, found bool, capability storeOwnerCapability) error {
+	if !found || state == nil {
+		return nil
+	}
+	legacyBound := strings.TrimSpace(inbound.MachineID) != "" && inbound.LeaseGeneration <= 0
+	if !capability.bound() {
+		if (strings.TrimSpace(inbound.MachineID) != "" || inbound.LeaseGeneration > 0) &&
+			(state.ControlLease.Generation > 0 || strings.TrimSpace(state.ControlLease.HolderMachineID) != "") {
+			return ErrControlLeaseNotHeld
+		}
+		return nil
+	}
+	if inbound.LeaseGeneration > 0 {
+		if strings.TrimSpace(inbound.MachineID) != capability.machineID || inbound.LeaseGeneration != capability.leaseGeneration {
+			// Deferred inbound is durable user input, not an execution result. A
+			// replacement owner may adopt it after takeover, but only while it is
+			// still deferred; the active lease check above already rejects a stale
+			// owner's capability.
+			if inbound.Status != InboundStatusDeferred {
+				return ErrControlLeaseNotHeld
+			}
+		}
+		return nil
+	}
+	if legacyBound && inbound.Status != InboundStatusDeferred {
+		return ErrControlLeaseNotHeld
+	}
+	return nil
+}
+
+func validateOutboxOwnerCapability(state *State, msg OutboxMessage) error {
+	if state == nil {
+		return nil
+	}
+	if msg.LeaseGeneration <= 0 && strings.TrimSpace(msg.SendAttemptToken) != "" &&
+		(state.ControlLease.Generation > 0 || strings.TrimSpace(state.ControlLease.HolderMachineID) != "") {
+		// A token without a generation is a pre-lease attempt. Once a live
+		// control lease exists, an old callback carrying that token has no
+		// attributable owner and must not settle, rewrite, or otherwise mutate
+		// the row. Startup recovery explicitly adopts such rows first and binds
+		// a fresh generation before probing Graph.
+		return ErrControlLeaseNotHeld
+	}
+	if controlLeaseMatchesCapability(state, msg.MachineID, msg.LeaseGeneration) {
+		return nil
+	}
+	return ErrControlLeaseNotHeld
+}
+
+// validateQueuedOutboxOwnerForMutation validates an owner-scoped mutation on
+// a row that has not acquired a Graph send lease. Because a queued row has no
+// external outcome yet, the current control-lease holder may atomically adopt
+// it even when its old generation is stale. The old owner cannot do the same:
+// the current control-lease check below rejects that delayed callback.
+func validateQueuedOutboxOwnerForMutation(state *State, msg *OutboxMessage, machineID string, leaseGeneration int64, now time.Time) error {
+	if state == nil || msg == nil || strings.TrimSpace(machineID) == "" || leaseGeneration <= 0 {
+		return ErrControlLeaseNotHeld
+	}
+	if !controlLeaseMatchesCapabilityAt(state, machineID, leaseGeneration, now) {
+		return ErrControlLeaseNotHeld
+	}
+	msg.MachineID = machineID
+	msg.LeaseGeneration = leaseGeneration
+	return nil
+}
+
 func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teamsMessageID string, sent bool, requireClaim bool) error {
 	attemptToken = strings.TrimSpace(attemptToken)
 	if requireClaim && (attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken) {
@@ -11802,6 +14604,19 @@ func validateOutboxDeliveryAttempt(msg OutboxMessage, attemptToken string, teams
 		return ErrOutboxSendNotClaimed
 	}
 	return nil
+}
+
+func validateOutboxAttemptOwner(state *State, msg OutboxMessage, attemptToken string, machineID string, leaseGeneration int64) error {
+	if state == nil || !controlLeaseMatchesCapabilityAt(state, machineID, leaseGeneration, time.Now()) {
+		return ErrControlLeaseNotHeld
+	}
+	if strings.TrimSpace(msg.MachineID) != strings.TrimSpace(machineID) || msg.LeaseGeneration != leaseGeneration {
+		return ErrControlLeaseNotHeld
+	}
+	if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) == "" || strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken) {
+		return ErrOutboxSendNotClaimed
+	}
+	return validateOutboxOwnerCapability(state, msg)
 }
 
 func markTranscriptDeliveryForOutboxLocked(state *State, msg OutboxMessage, status TranscriptDeliveryStatus, now time.Time) {
@@ -12006,6 +14821,12 @@ func updateArtifactRecordsForOutboxLocked(state *State, msg OutboxMessage, now t
 		if id == "" {
 			continue
 		}
+		if _, opaque := state.opaqueOutboxLinkedRecords["artifact_records:"+id]; opaque {
+			// The SQL row exists but its JSON cannot be trusted. Keep the exact raw
+			// row for repair instead of replacing it with a synthetic success record
+			// merely because the enclosing Graph POST was accepted.
+			continue
+		}
 		record := state.ArtifactRecords[id]
 		if record.ID == "" {
 			record.ID = id
@@ -12135,16 +14956,35 @@ func (s *Store) PendingOutboxPageAt(ctx context.Context, query PendingOutboxQuer
 }
 
 func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutboxQuery) bool {
+	// Unknown persisted statuses are held for explicit repair.  Do not let the
+	// default branch below reinterpret one as queued (which would risk an
+	// untracked duplicate POST), and do not silently report it as delivered.
+	if !knownOutboxStatus(msg.Status) {
+		return false
+	}
 	if AcceptedSourceRewriteOutboxIsStable(msg) {
 		// Graph already accepted the message and the durable source-rewrite fence
 		// makes it permanently non-retryable. Reconcile it only through explicit
 		// history recovery, not through the ordinary sender poll.
 		return false
 	}
-	if OutboxSendIsAmbiguous(msg) {
-		// Unknown external outcome is an explicit recovery item, not an
-		// automatically reclaimable pending send and not a FIFO blocker for live
-		// work in the same chat.
+	ambiguous := OutboxSendIsAmbiguous(msg)
+	unknownOutcome := outboxSendUnknownOutcome(msg, query.Now)
+	if query.AmbiguousOnly && !unknownOutcome {
+		return false
+	}
+	if unknownOutcome {
+		// Every expired Sending row without a durable Teams ID has an unknown
+		// external outcome, including rows written by versions that did not
+		// persist an attempt token or the explicit ambiguous diagnostic. Keep it
+		// out of the live FIFO and expose it only to cold recovery.
+		if !query.IncludeAmbiguous {
+			return false
+		}
+	} else if ambiguous {
+		// A fresh explicit ambiguous row is still in the crash window. An
+		// accepted row with a Teams ID is reconciled by its durable identity, not
+		// by this pending query.
 		return false
 	}
 	if query.SessionID != "" && msg.SessionID != query.SessionID {
@@ -12156,16 +14996,16 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 	if query.TeamsChatID != "" && msg.TeamsChatID != query.TeamsChatID {
 		return false
 	}
-	if !query.IgnoreRetryGate && msg.Status == OutboxStatusQueued && !msg.NextAttemptAt.IsZero() && query.Now.Before(msg.NextAttemptAt) {
+	acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
+	if !query.IgnoreRetryGate && (msg.Status == OutboxStatusQueued || acceptedWithTeamsID || unknownOutcome) && !msg.NextAttemptAt.IsZero() && query.Now.Before(msg.NextAttemptAt) {
 		return false
 	}
-	acceptedWithTeamsID := msg.Status == OutboxStatusAccepted && strings.TrimSpace(msg.TeamsMessageID) != ""
 	if !query.IgnoreRateLimit && !acceptedWithTeamsID {
 		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(query.Now) {
 			return false
 		}
 	}
-	return acceptedWithTeamsID ||
+	return unknownOutcome || acceptedWithTeamsID ||
 		msg.Status == OutboxStatusQueued ||
 		msg.Status == OutboxStatusSending && (query.IncludeActiveSending || msg.LastSendAttempt.IsZero() || query.Now.Sub(msg.LastSendAttempt) > outboxSendLease)
 }
@@ -12387,7 +15227,11 @@ func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor 
 	if chatPollSuccessIsTimestampOnlyNoop(poll, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now) {
 		return poll, false
 	}
+	previousCursor := poll.LastModifiedCursor
 	poll.ChatID = chatID
+	poll.RecoveryRequired = false
+	poll.RecoveryReason = ""
+	poll.RecoverySourceHash = ""
 	poll.Seeded = poll.Seeded || seeded
 	if lastModifiedCursor.After(poll.LastModifiedCursor) {
 		poll.LastModifiedCursor = lastModifiedCursor
@@ -12401,6 +15245,11 @@ func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor 
 	if strings.TrimSpace(continuationPath) == "" {
 		poll.ContinuationPathHistory = nil
 		poll.ContinuationPageFingerprintHistory = nil
+		poll.ContinuationSafeCursor = time.Time{}
+		poll.ContinuationSafeCursorKnown = false
+	} else {
+		poll.ContinuationSafeCursor = previousCursor
+		poll.ContinuationSafeCursorKnown = true
 	}
 	if windowFull {
 		poll.LastWindowFullAt = now
@@ -12415,6 +15264,9 @@ func applyChatPollSuccessLocked(state *State, chatID string, lastModifiedCursor 
 }
 
 func chatPollSuccessIsTimestampOnlyNoop(poll ChatPollState, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, now time.Time) bool {
+	if poll.RecoveryRequired {
+		return false
+	}
 	if poll.ChatID != chatID || fetched != 0 || windowFull {
 		return false
 	}
@@ -12552,12 +15404,23 @@ func (s *Store) BoostChatPollAfterFinalAnswer(ctx context.Context, req FinalAnsw
 	if req.NextPollAt.IsZero() {
 		req.NextPollAt = time.Now()
 	}
-	if out, changed, handled, err := s.boostChatPollAfterFinalAnswerSQLite(ctx, req); handled || err != nil {
+	capability := storeOwnerCapability{}
+	if strings.TrimSpace(req.OwnerMachineID) != "" || req.OwnerLeaseGeneration != 0 {
+		var err error
+		capability, err = newStoreOwnerCapability(req.OwnerMachineID, req.OwnerLeaseGeneration)
+		if err != nil {
+			return ChatPollState{}, false, err
+		}
+	}
+	if out, changed, handled, err := s.boostChatPollAfterFinalAnswerSQLite(ctx, req, capability); handled || err != nil {
 		return out, changed, err
 	}
 	var out ChatPollState
 	changed := false
 	err := s.Update(ctx, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
 		poll, ok := state.ChatPolls[req.TeamsChatID]
 		if !ok || !finalAnswerPollBoostGuardAllows(state, req, poll, req.NextPollAt) {
 			out = poll
@@ -12877,6 +15740,7 @@ func applySessionQuarantine(state *State, req SessionQuarantineRequest) (Session
 	report.Changed = true
 
 	for id, turn := range state.Turns {
+		normalizeLoadedTurnStatus(&turn)
 		if strings.TrimSpace(turn.SessionID) != req.SessionID || turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
 			continue
 		}
@@ -13052,6 +15916,10 @@ func markInboundIgnoredForInterruptedTurn(state *State, turn Turn, now time.Time
 }
 
 func (s *Store) updateTurn(ctx context.Context, turnID string, fn func(*State, Turn, time.Time) (Turn, error)) (Turn, error) {
+	return s.updateTurnWithCapability(ctx, turnID, storeOwnerCapability{}, fn)
+}
+
+func (s *Store) updateTurnWithCapability(ctx context.Context, turnID string, capability storeOwnerCapability, fn func(*State, Turn, time.Time) (Turn, error)) (Turn, error) {
 	if strings.TrimSpace(turnID) == "" {
 		return Turn{}, fmt.Errorf("turn id is required")
 	}
@@ -13068,6 +15936,9 @@ func (s *Store) updateTurn(ctx context.Context, turnID string, fn func(*State, T
 		current, ok := state.Turns[turnID]
 		if !ok {
 			return fmt.Errorf("turn %q not found", turnID)
+		}
+		if err := validateTurnOwnerCapability(state, current, capability); err != nil {
+			return err
 		}
 		now := time.Now()
 		next, err := fn(state, current, now)
@@ -13207,7 +16078,27 @@ func (s *Store) loadUnlocked(ctx context.Context) (State, error) {
 func loadStateData(data []byte) (State, error) {
 	var state State
 	if err := json.Unmarshal(data, &state); err != nil {
-		return State{}, err
+		// A legacy JSON store is one physical document, but an individual
+		// checkpoint is still a chat-local boundary.  A bad optional checkpoint
+		// field (for example the historical numeric 0/1 encoding of
+		// last_offset_known) must not make the whole listener unstartable.  Keep
+		// the normal decode as the hot path and use the slower field-isolation
+		// fallback only after the ordinary decode fails.  The fallback is strict:
+		// malformed non-canonical rows or any malformed top-level field still
+		// return the original error rather than guessing a cursor.
+		isolated, recovered, isolationErr := loadStateDataWithCheckpointIsolation(data)
+		if isolationErr != nil || !recovered {
+			return State{}, err
+		}
+		state = isolated
+	}
+	// json.Unmarshal maps a top-level null control_lease to the same zero value
+	// as an omitted legacy field.  The latter is a valid never-claimed store,
+	// while the former is an explicit, non-interpretable replacement of the
+	// ownership record.  Distinguish them on the cold load path so a claimant
+	// cannot silently treat corrupted ownership evidence as an available lease.
+	if state.ControlLease == (ControlLease{}) && jsonTopLevelFieldIsNull(data, "control_lease") {
+		return State{}, fmt.Errorf("%w: control_lease is null", ErrControlLeaseStateUntrusted)
 	}
 	if state.SchemaVersion >= 0 && state.SchemaVersion < SchemaVersion {
 		state = migrateStateToCurrent(state)
@@ -13220,6 +16111,441 @@ func loadStateData(data []byte) (State, error) {
 	return state, nil
 }
 
+func jsonTopLevelFieldIsNull(data []byte, field string) bool {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false
+	}
+	raw, ok := root[field]
+	return ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+// loadStateDataWithCheckpointIsolation is a cold compatibility fallback for a
+// legacy JSON store whose typed decode failed inside one of the two per-chat
+// projections that can be rebuilt independently. It first decodes every
+// other top-level field normally, then decodes checkpoint and chat-poll rows
+// independently. Only a canonical transcript:<session> checkpoint can be
+// represented as an opaque local fence when its payload is malformed. A bad
+// chat-poll row becomes a seeded, chat-local recovery placeholder: it carries
+// no untrusted cursor or retry metadata, but remains eligible for the next
+// inbound poll so the first visible user message cannot be mistaken for a
+// baseline and healthy chats remain usable.
+func loadStateDataWithCheckpointIsolation(data []byte) (State, bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return State{}, false, err
+	}
+	rawCheckpoints, ok := root["import_checkpoints"]
+	rawPolls, pollsOK := root["chat_polls"]
+	rawSessions, sessionsOK := root["sessions"]
+	rawTurns, turnsOK := root["turns"]
+	rawOutbox, outboxOK := root["outbox_messages"]
+	rawHistory, historyOK := root["history_watch"]
+	rawHistoryReady, historyReadyOK := root["history_watch_ready"]
+	if !ok && !pollsOK && !sessionsOK && !turnsOK && !outboxOK && !historyOK && !historyReadyOK {
+		return State{}, false, nil
+	}
+	var checkpointRows, pollRows, sessionRows, turnRows, outboxRows, historyRows map[string]json.RawMessage
+	if ok {
+		trimmed := bytes.TrimSpace(rawCheckpoints)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+			checkpointRows = map[string]json.RawMessage{}
+		} else if err := json.Unmarshal(rawCheckpoints, &checkpointRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	if pollsOK {
+		trimmed := bytes.TrimSpace(rawPolls)
+		if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+			pollRows = map[string]json.RawMessage{}
+		} else if err := json.Unmarshal(rawPolls, &pollRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	if sessionsOK {
+		if err := json.Unmarshal(rawSessions, &sessionRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	if turnsOK {
+		if err := json.Unmarshal(rawTurns, &turnRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	if outboxOK {
+		if err := json.Unmarshal(rawOutbox, &outboxRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	if historyOK {
+		if err := json.Unmarshal(rawHistory, &historyRows); err != nil {
+			return State{}, false, err
+		}
+	}
+	var historyReady time.Time
+	if historyReadyOK {
+		if err := json.Unmarshal(rawHistoryReady, &historyReady); err != nil {
+			// An invalid global readiness hint is safe to discard. The per-path
+			// checkpoints remain the authoritative history-watch state.
+			historyReady = time.Time{}
+		}
+	}
+	delete(root, "import_checkpoints")
+	delete(root, "chat_polls")
+	delete(root, "sessions")
+	delete(root, "turns")
+	delete(root, "outbox_messages")
+	delete(root, "history_watch")
+	delete(root, "history_watch_ready")
+	base, err := json.Marshal(root)
+	if err != nil {
+		return State{}, false, err
+	}
+	var state State
+	if err := json.Unmarshal(base, &state); err != nil {
+		return State{}, false, err
+	}
+	if ok {
+		state.ImportCheckpoints = make(map[string]ImportCheckpoint, len(checkpointRows))
+		if err := decodeJSONImportCheckpointRows(checkpointRows, state.ImportCheckpoints); err != nil {
+			return State{}, false, err
+		}
+	}
+	if pollsOK {
+		state.ChatPolls = make(map[string]ChatPollState, len(pollRows))
+		if err := decodeJSONChatPollRows(pollRows, state.ChatPolls); err != nil {
+			return State{}, false, err
+		}
+	}
+	if sessionsOK {
+		state.Sessions = make(map[string]SessionContext, len(sessionRows))
+		if err := decodeJSONSessionRows(sessionRows, state.Sessions); err != nil {
+			return State{}, false, err
+		}
+	}
+	if turnsOK {
+		state.Turns = make(map[string]Turn, len(turnRows))
+		if err := decodeJSONTurnRows(turnRows, state.Turns, true); err != nil {
+			return State{}, false, err
+		}
+	}
+	if outboxOK {
+		state.OutboxMessages = make(map[string]OutboxMessage, len(outboxRows))
+		if err := decodeJSONOutboxRows(outboxRows, state.OutboxMessages); err != nil {
+			return State{}, false, err
+		}
+	}
+	if historyOK {
+		state.HistoryWatch = make(map[string]HistoryWatchCheckpoint, len(historyRows))
+		if err := decodeJSONHistoryWatchRows(historyRows, state.HistoryWatch); err != nil {
+			return State{}, false, err
+		}
+	}
+	if historyReadyOK {
+		state.HistoryWatchReady = historyReady
+	}
+	state.legacyOpaqueJSONSections = legacyOpaqueJSONSectionsForRows(
+		checkpointRows, pollRows, outboxRows, historyRows,
+	)
+	return state, true, nil
+}
+
+func legacyOpaqueJSONSectionsForRows(
+	checkpoints, polls, outbox, history map[string]json.RawMessage,
+) legacyOpaqueJSONSection {
+	var sections legacyOpaqueJSONSection
+	for id, raw := range checkpoints {
+		if _, canonical := canonicalCheckpointSessionID(id); !canonical {
+			continue
+		}
+		var checkpoint ImportCheckpoint
+		if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			sections |= legacyOpaqueCheckpoints
+			break
+		}
+	}
+	for id, raw := range polls {
+		var poll ChatPollState
+		if err := json.Unmarshal(raw, &poll); err != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) {
+			sections |= legacyOpaqueChatPolls
+			break
+		}
+	}
+	for id, raw := range outbox {
+		var message OutboxMessage
+		if err := json.Unmarshal(raw, &message); err != nil || strings.TrimSpace(message.ID) != strings.TrimSpace(id) {
+			sections |= legacyOpaqueOutbox
+			break
+		}
+	}
+	for id, raw := range history {
+		var checkpoint HistoryWatchCheckpoint
+		if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			sections |= legacyOpaqueHistoryWatch
+			break
+		}
+		if embeddedID := strings.TrimSpace(checkpoint.ID); embeddedID != "" && embeddedID != strings.TrimSpace(id) {
+			sections |= legacyOpaqueHistoryWatch
+			break
+		}
+	}
+	return sections
+}
+
+// decodeJSONImportCheckpointRows applies the same identity boundary to the
+// legacy JSON map that the SQLite row loader applies to SQL identity columns.
+// A malformed canonical row becomes a silent, session-local fence; a malformed
+// operation row is omitted. In neither case may an untrusted cursor or source
+// path enter the live projection, and neither case may poison unrelated chats.
+func decodeJSONImportCheckpointRows(rows map[string]json.RawMessage, out map[string]ImportCheckpoint) error {
+	for id, raw := range rows {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		var checkpoint ImportCheckpoint
+		if err := json.Unmarshal(raw, &checkpoint); err != nil {
+			sessionID, canonical := canonicalCheckpointSessionID(id)
+			if canonical {
+				out[id] = opaqueCanonicalImportCheckpointFromJSON(id, sessionID)
+			}
+			continue
+		}
+		canonicalSessionID, canonical := canonicalCheckpointSessionID(id)
+		embeddedID := strings.TrimSpace(checkpoint.ID)
+		embeddedSessionID := strings.TrimSpace(checkpoint.SessionID)
+		if embeddedID != "" && embeddedID != id {
+			if canonical && embeddedSessionID != "" {
+				return fmt.Errorf("%w: checkpoint row id %q is keyed as %q", ErrSessionStateProvenanceMismatch, embeddedID, id)
+			}
+			continue
+		}
+		if embeddedID == "" || embeddedSessionID == "" {
+			if canonical {
+				out[id] = opaqueCanonicalImportCheckpointFromJSON(id, canonicalSessionID)
+			}
+			continue
+		}
+		if canonical && strings.TrimSpace(checkpoint.SessionID) != canonicalSessionID {
+			return fmt.Errorf("%w: checkpoint %q embeds session %q, key requires %q", ErrSessionStateProvenanceMismatch, id, checkpoint.SessionID, canonicalSessionID)
+		}
+		if err := validateImportCheckpointProvenance(checkpoint, checkpoint.SessionID, id); err != nil {
+			// A valid canonical row with a foreign identity is a hard provenance
+			// failure. Optional proof failures have already been downgraded by
+			// ImportCheckpoint.UnmarshalJSON and therefore do not reach this
+			// branch. Non-canonical operation rows remain row-local.
+			if canonical {
+				return err
+			}
+			continue
+		}
+		out[id] = checkpoint
+	}
+	return nil
+}
+
+func decodeJSONChatPollRows(rows map[string]json.RawMessage, out map[string]ChatPollState) error {
+	for id, raw := range rows {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		if poll, ok := decodeChatPollState(id, raw); ok {
+			// A typed JSON object can still be operationally unusable (for
+			// example, a scalar in a nested field).  Keep it as a durable,
+			// seeded recovery row so the listener does not mistake the next
+			// Graph page for a brand-new baseline.  This is the legacy-file
+			// equivalent of the SQLite row-local admission path.
+			markChatPollRecoveryEvidence(&poll, raw)
+			out[id] = poll
+		}
+	}
+	return nil
+}
+
+const chatPollRecoveryReason = "malformed persisted chat poll projection"
+const chatPollOpaqueRecoveryReason = "semantically malformed persisted chat poll projection"
+
+func chatPollRecoveryPlaceholder(chatID string, raw []byte) ChatPollState {
+	sum := sha256.Sum256(raw)
+	return ChatPollState{
+		ChatID:             strings.TrimSpace(chatID),
+		Seeded:             true,
+		RecoveryRequired:   true,
+		RecoveryReason:     chatPollRecoveryReason,
+		RecoverySourceHash: hex.EncodeToString(sum[:]),
+		PollState:          "warm",
+	}
+}
+
+// markChatPollRecoveryEvidence keeps a syntactically valid but unexecutable
+// poll row inspectable while preventing ordinary retry/schedule mutations from
+// replacing its original receipt. The caller may later clear the marker only
+// after it has converted the row into a canonical gap or successful frontier.
+func markChatPollRecoveryEvidence(poll *ChatPollState, raw []byte) {
+	if poll == nil || chatPollAdmissionValid(*poll) {
+		return
+	}
+	sum := sha256.Sum256(raw)
+	poll.Seeded = true
+	poll.RecoveryRequired = true
+	poll.RecoveryReason = chatPollOpaqueRecoveryReason
+	poll.RecoverySourceHash = hex.EncodeToString(sum[:])
+}
+
+func chatPollHasOpaqueRecoveryEvidence(poll ChatPollState) bool {
+	return poll.RecoveryRequired &&
+		strings.TrimSpace(poll.RecoverySourceHash) != "" &&
+		strings.TrimSpace(poll.RecoveryReason) == chatPollOpaqueRecoveryReason
+}
+
+func decodeChatPollState(chatID string, raw []byte) (ChatPollState, bool) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatPollState{}, false
+	}
+	var poll ChatPollState
+	if err := json.Unmarshal(raw, &poll); err == nil && strings.TrimSpace(poll.ChatID) == chatID {
+		return poll, true
+	}
+	return chatPollRecoveryPlaceholder(chatID, raw), true
+}
+
+// decodeChatPollStateForAdmission adds the small structural checks required by
+// the hot scheduler. Full state/migration readers intentionally use
+// decodeChatPollState so an invalid but decodable row remains inspectable and
+// byte/semantic parity is preserved across legacy upgrades.
+func decodeChatPollStateForAdmission(chatID string, raw []byte) (ChatPollState, bool) {
+	poll, ok := decodeChatPollState(chatID, raw)
+	if !ok {
+		return ChatPollState{}, false
+	}
+	if chatPollAdmissionValid(poll) {
+		return poll, true
+	}
+	return chatPollRecoveryPlaceholder(chatID, raw), true
+}
+
+func decodeJSONSessionRows(rows map[string]json.RawMessage, out map[string]SessionContext) error {
+	for id, raw := range rows {
+		var session SessionContext
+		if strings.TrimSpace(id) == "" || json.Unmarshal(raw, &session) != nil || strings.TrimSpace(session.ID) != strings.TrimSpace(id) {
+			continue
+		}
+		annotateUnknownLoadedSession(&session)
+		out[id] = session
+	}
+	return nil
+}
+
+func decodeJSONTurnRows(rows map[string]json.RawMessage, out map[string]Turn, holdMalformedActive bool) error {
+	for id, raw := range rows {
+		var turn Turn
+		if json.Unmarshal(raw, &turn) == nil && strings.TrimSpace(id) != "" &&
+			strings.TrimSpace(turn.ID) == strings.TrimSpace(id) && strings.TrimSpace(turn.SessionID) != "" {
+			normalizeLoadedTurnStatus(&turn)
+			out[id] = turn
+			continue
+		}
+		if holdMalformedActive {
+			if held, ok := opaqueActiveTurnFromJSON(id, raw); ok {
+				out[id] = held
+			}
+		}
+	}
+	return nil
+}
+
+func decodeJSONOutboxRows(rows map[string]json.RawMessage, out map[string]OutboxMessage) error {
+	for id, raw := range rows {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		var message OutboxMessage
+		if json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != id {
+			// A malformed outbox row is held out of the runnable projection. The
+			// exact bytes remain in the legacy JSON document through the opaque
+			// preservation pass in saveUnlocked.
+			continue
+		}
+		out[id] = message
+	}
+	return nil
+}
+
+func decodeJSONHistoryWatchRows(rows map[string]json.RawMessage, out map[string]HistoryWatchCheckpoint) error {
+	for id, raw := range rows {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		var checkpoint HistoryWatchCheckpoint
+		if json.Unmarshal(raw, &checkpoint) != nil {
+			// A path-local history row cannot be trusted as a cursor after a
+			// decode failure. Keep it out of the active watcher and preserve the
+			// exact raw row for explicit repair.
+			continue
+		}
+		if embeddedID := strings.TrimSpace(checkpoint.ID); embeddedID != "" && embeddedID != id {
+			continue
+		}
+		out[id] = checkpoint
+	}
+	return nil
+}
+
+func opaqueActiveTurnFromJSON(id string, raw []byte) (Turn, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return Turn{}, false
+	}
+	var sessionID, status string
+	if err := json.Unmarshal(fields["session_id"], &sessionID); err != nil || strings.TrimSpace(sessionID) == "" {
+		return Turn{}, false
+	}
+	if err := json.Unmarshal(fields["status"], &status); err != nil {
+		return Turn{}, false
+	}
+	if status == "" || (knownTurnStatus(TurnStatus(status)) && status != string(TurnStatusQueued) && status != string(TurnStatusRunning)) {
+		return Turn{}, false
+	}
+	if strings.TrimSpace(id) == "" {
+		return Turn{}, false
+	}
+	turn := Turn{ID: strings.TrimSpace(id), SessionID: strings.TrimSpace(sessionID), Status: TurnStatus(status)}
+	normalizeLoadedTurnStatus(&turn)
+	return turn, true
+}
+
+// opaqueCanonicalImportCheckpointFromJSON is the JSON-store equivalent of the
+// SQLite malformed-row fallback.  The map key is the only identity trusted
+// after decoding failed, so no cursor, source path, proof, or execution owner
+// is carried across.  The resulting row is a silent history-only fence and is
+// deliberately safe to replace only through an explicit recovery operation.
+func opaqueCanonicalImportCheckpointFromJSON(id, sessionID string) ImportCheckpoint {
+	return ImportCheckpoint{
+		ID:                     strings.TrimSpace(id),
+		SessionID:              strings.TrimSpace(sessionID),
+		Status:                 importCheckpointStatusComplete,
+		LegacySourceUnverified: true,
+		RecoveryProofUnusable:  true,
+		UnresolvedExecution: &ExecutionAnchor{
+			SessionID: strings.TrimSpace(sessionID),
+			Reason:    "malformed canonical transcript checkpoint",
+			// This fallback is a history-only diagnostic fence. It must not
+			// participate in live execution admission: there is no evidence that
+			// a Codex writer exists merely because an optional checkpoint field is
+			// corrupt.
+			Provenance: ExecutionAnchorProvenanceHistoryOnly,
+			State:      "unresolved",
+			Generation: 1,
+		},
+		TranscriptQuarantine: &TranscriptQuarantine{
+			Kind: malformedCanonicalCheckpointKind,
+		},
+	}
+}
+
 func (s *Store) saveUnlocked(state State) error {
 	state.ensure(time.Now())
 	pruneSentOutboxMessages(&state)
@@ -13230,7 +16556,7 @@ func (s *Store) saveUnlocked(state State) error {
 	if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil {
 		return err
 	} else if ok {
-		return s.saveSQLiteStateUnlocked(pointer, state)
+		return wrapStatePersistenceError(s.saveSQLiteStateUnlocked(pointer, state))
 	}
 	if backend, ok, err := s.currentUnsupportedStateStorageBackendUnlocked(); err != nil {
 		return err
@@ -13241,8 +16567,143 @@ func (s *Store) saveUnlocked(state State) error {
 	if err != nil {
 		return err
 	}
+	if state.legacyOpaqueJSONSections != 0 {
+		data, err = preserveOpaqueJSONSections(s.path, data, state.legacyOpaqueJSONSections)
+		if err != nil {
+			return err
+		}
+	}
 	data = append(data, '\n')
-	return atomicWriteFile(s.path, data, fileMode)
+	return wrapStatePersistenceError(atomicWriteFile(s.path, data, fileMode))
+}
+
+// preserveOpaqueJSONSections keeps the exact bytes of malformed legacy rows
+// while a legacy state is rewritten.  It is called only when the load that
+// produced the current State observed an opaque row; healthy legacy saves do
+// not reread the state file or run these decoders on the hot path.
+func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJSONSection) ([]byte, error) {
+	if sections == 0 {
+		return data, nil
+	}
+	oldData, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return data, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var oldRoot, newRoot map[string]json.RawMessage
+	if err := json.Unmarshal(oldData, &oldRoot); err != nil {
+		return data, nil
+	}
+	if err := json.Unmarshal(data, &newRoot); err != nil {
+		return nil, err
+	}
+	merge := func(field string, oldOpaque func(string, []byte) bool, newTyped func(string, []byte) bool) error {
+		oldRawRows, ok := oldRoot[field]
+		if !ok {
+			return nil
+		}
+		var oldRows map[string]json.RawMessage
+		if err := json.Unmarshal(oldRawRows, &oldRows); err != nil {
+			return nil
+		}
+		newRows := map[string]json.RawMessage{}
+		if newRawRows, exists := newRoot[field]; exists {
+			if err := json.Unmarshal(newRawRows, &newRows); err != nil {
+				return err
+			}
+		}
+		preserved := false
+		for id, oldRaw := range oldRows {
+			if !oldOpaque(id, oldRaw) {
+				continue
+			}
+			if newRaw, exists := newRows[id]; exists && newTyped(id, newRaw) {
+				continue
+			}
+			newRows[id] = oldRaw
+			preserved = true
+		}
+		if !preserved {
+			return nil
+		}
+		encodedRows, err := json.Marshal(newRows)
+		if err != nil {
+			return err
+		}
+		newRoot[field] = encodedRows
+		return nil
+	}
+	if sections&legacyOpaqueCheckpoints != 0 {
+		if err := merge("import_checkpoints", func(id string, raw []byte) bool {
+			var checkpoint ImportCheckpoint
+			_, canonical := canonicalCheckpointSessionID(id)
+			return canonical && json.Unmarshal(raw, &checkpoint) != nil
+		}, func(id string, raw []byte) bool {
+			var checkpoint ImportCheckpoint
+			sessionID, canonical := canonicalCheckpointSessionID(id)
+			if !canonical || json.Unmarshal(raw, &checkpoint) != nil {
+				return false
+			}
+			// The loader represents a malformed canonical row with this exact
+			// history-only placeholder.  It is not an explicit repair: keep the
+			// original bytes until a caller replaces the row with a real,
+			// provenance-bearing checkpoint.  Otherwise an unrelated JSON save
+			// would silently discard the only forensic copy of the bad row.
+			if checkpoint.LegacySourceUnverified && checkpoint.RecoveryProofUnusable &&
+				checkpoint.TranscriptQuarantine != nil &&
+				strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), malformedCanonicalCheckpointKind) {
+				return false
+			}
+			return strings.TrimSpace(checkpoint.ID) == strings.TrimSpace(id) &&
+				strings.TrimSpace(checkpoint.SessionID) == strings.TrimSpace(sessionID)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sections&legacyOpaqueChatPolls != 0 {
+		if err := merge("chat_polls", func(id string, raw []byte) bool {
+			var poll ChatPollState
+			return json.Unmarshal(raw, &poll) != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id)
+		}, func(id string, raw []byte) bool {
+			var poll ChatPollState
+			return json.Unmarshal(raw, &poll) == nil && strings.TrimSpace(poll.ChatID) == strings.TrimSpace(id) && !poll.RecoveryRequired
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sections&legacyOpaqueOutbox != 0 {
+		if err := merge("outbox_messages", func(id string, raw []byte) bool {
+			var message OutboxMessage
+			return json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != strings.TrimSpace(id)
+		}, func(id string, raw []byte) bool {
+			var message OutboxMessage
+			return json.Unmarshal(raw, &message) == nil && strings.TrimSpace(message.ID) == strings.TrimSpace(id)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sections&legacyOpaqueHistoryWatch != 0 {
+		if err := merge("history_watch", func(id string, raw []byte) bool {
+			var checkpoint HistoryWatchCheckpoint
+			if json.Unmarshal(raw, &checkpoint) != nil {
+				return true
+			}
+			embeddedID := strings.TrimSpace(checkpoint.ID)
+			return embeddedID != "" && embeddedID != strings.TrimSpace(id)
+		}, func(id string, raw []byte) bool {
+			var checkpoint HistoryWatchCheckpoint
+			if json.Unmarshal(raw, &checkpoint) != nil {
+				return false
+			}
+			embeddedID := strings.TrimSpace(checkpoint.ID)
+			return embeddedID == "" || embeddedID == strings.TrimSpace(id)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(newRoot)
 }
 
 func (s *Store) currentUnsupportedStateStorageBackendUnlocked() (string, bool, error) {
@@ -13284,6 +16745,14 @@ func normalizeLoadedState(state *State) {
 		return
 	}
 	state.ensure(time.Time{})
+	for id, session := range state.Sessions {
+		annotateUnknownLoadedSession(&session)
+		state.Sessions[id] = session
+	}
+	for id, turn := range state.Turns {
+		normalizeLoadedTurnStatus(&turn)
+		state.Turns[id] = turn
+	}
 	backfillMessageProvenance(state)
 	backfillHelperDeliveries(state)
 	normalizeArtifactRecords(state)
@@ -13491,7 +16960,9 @@ func (s *Store) withStateLock(ctx context.Context, fn func() error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.mu.Lock()
+	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		return err
+	}
 	defer s.mu.Unlock()
 	if err := ensurePrivateDir(filepath.Dir(s.path)); err != nil {
 		return err
@@ -13511,6 +16982,36 @@ func (s *Store) withStateLock(ctx context.Context, fn func() error) error {
 	}()
 	_ = os.Chmod(s.path+".lock", fileMode)
 	return fn()
+}
+
+// lockMutexContext keeps cancellation meaningful even for the in-process
+// mutexes that guard legacy state and the shared SQLite handle. The fast path
+// is one TryLock call; the timer loop is only used under contention, which is
+// important because these mutexes sit on the normal durable write path.
+func lockMutexContext(ctx context.Context, mu *sync.Mutex) error {
+	if mu == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if mu.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Store) withSessionLock(ctx context.Context, sessionID string, fn func() error) error {
@@ -13542,32 +17043,33 @@ func (s *Store) withSessionLock(ctx context.Context, sessionID string, fn func()
 func newState() State {
 	now := time.Now()
 	state := State{
-		SchemaVersion:          SchemaVersion,
-		CreatedAt:              now,
-		UpdatedAt:              now,
-		Machines:               make(map[string]MachineRecord),
-		Sessions:               make(map[string]SessionContext),
-		Turns:                  make(map[string]Turn),
-		InboundEvents:          make(map[string]InboundEvent),
-		OutboxMessages:         make(map[string]OutboxMessage),
-		MessageProvenance:      make(map[string]MessageProvenanceRecord),
-		ChatPolls:              make(map[string]ChatPollState),
-		Workspaces:             make(map[string]WorkspaceRecord),
-		DashboardViews:         make(map[string]DashboardViewRecord),
-		DashboardNumbers:       make(map[string]DashboardNumberRecord),
-		TranscriptLedger:       make(map[string]TranscriptLedgerRecord),
-		TranscriptDeliveries:   make(map[string]TranscriptDeliveryRecord),
-		HelperDeliveries:       make(map[string]HelperDeliveryRecord),
-		ImportCheckpoints:      make(map[string]ImportCheckpoint),
-		HistoryWatch:           make(map[string]HistoryWatchCheckpoint),
-		ChatSequences:          make(map[string]ChatSequenceState),
-		ChatRateLimits:         make(map[string]ChatRateLimitState),
-		ArtifactRecords:        make(map[string]ArtifactRecord),
-		Notifications:          make(map[string]NotificationRecord),
-		ForkOperations:         make(map[string]ForkOperation),
-		ForkHistoryItems:       make(map[string]ForkHistoryItem),
-		ModelProfileKeyIntakes: make(map[string]ModelProfileKeyIntake),
-		SkillPushReviews:       make(map[string]SkillPushReview),
+		SchemaVersion:             SchemaVersion,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
+		Machines:                  make(map[string]MachineRecord),
+		Sessions:                  make(map[string]SessionContext),
+		Turns:                     make(map[string]Turn),
+		InboundEvents:             make(map[string]InboundEvent),
+		OutboxMessages:            make(map[string]OutboxMessage),
+		MessageProvenance:         make(map[string]MessageProvenanceRecord),
+		ChatPolls:                 make(map[string]ChatPollState),
+		Workspaces:                make(map[string]WorkspaceRecord),
+		DashboardViews:            make(map[string]DashboardViewRecord),
+		DashboardNumbers:          make(map[string]DashboardNumberRecord),
+		TranscriptLedger:          make(map[string]TranscriptLedgerRecord),
+		TranscriptDeliveries:      make(map[string]TranscriptDeliveryRecord),
+		HelperDeliveries:          make(map[string]HelperDeliveryRecord),
+		ImportCheckpoints:         make(map[string]ImportCheckpoint),
+		HistoryWatch:              make(map[string]HistoryWatchCheckpoint),
+		ChatSequences:             make(map[string]ChatSequenceState),
+		ChatRateLimits:            make(map[string]ChatRateLimitState),
+		ArtifactRecords:           make(map[string]ArtifactRecord),
+		Notifications:             make(map[string]NotificationRecord),
+		ForkOperations:            make(map[string]ForkOperation),
+		ForkHistoryItems:          make(map[string]ForkHistoryItem),
+		ModelProfileKeyIntakes:    make(map[string]ModelProfileKeyIntake),
+		SkillPushReviews:          make(map[string]SkillPushReview),
+		opaqueOutboxLinkedRecords: make(map[string]struct{}),
 	}
 	return state
 }
@@ -13653,6 +17155,9 @@ func (s *State) ensure(now time.Time) {
 	}
 	if s.SkillPushReviews == nil {
 		s.SkillPushReviews = make(map[string]SkillPushReview)
+	}
+	if s.opaqueOutboxLinkedRecords == nil {
+		s.opaqueOutboxLinkedRecords = make(map[string]struct{})
 	}
 }
 
@@ -13988,13 +17493,68 @@ func upgradeID(reason string, now time.Time) string {
 }
 
 func (s *State) readOwner() (OwnerMetadata, bool) {
-	if s.ServiceOwner != nil {
-		return *s.ServiceOwner, true
+	if owner, ok := s.readOwnerForControlLease(s.ControlLease); ok {
+		return owner, true
 	}
-	if s.LockOwner != nil {
-		return *s.LockOwner, true
+	for _, owner := range []*OwnerMetadata{s.ServiceOwner, s.LockOwner} {
+		if owner != nil && ownerMetadataHasLivenessEvidence(*owner) {
+			return *owner, true
+		}
 	}
 	return OwnerMetadata{}, false
+}
+
+func (s *State) ownerProjectionPresent() bool {
+	return s != nil && (s.ServiceOwner != nil || s.LockOwner != nil)
+}
+
+// readOwnerForControlLease prefers the owner projection that proves the
+// current lease, even when the service-owner compatibility copy is stale or
+// semantically incomplete.  It deliberately falls back to the ordinary
+// owner only for diagnostics/legacy handling; callers deciding whether an
+// active lease may be replaced must inspect the boolean returned here.
+func (s *State) readOwnerForControlLease(lease ControlLease) (OwnerMetadata, bool) {
+	if s == nil {
+		return OwnerMetadata{}, false
+	}
+	for _, owner := range []*OwnerMetadata{s.ServiceOwner, s.LockOwner} {
+		if owner == nil || !ownerMetadataHasLivenessEvidence(*owner) {
+			continue
+		}
+		if ownerMatchesControlLease(*owner, lease) {
+			return *owner, true
+		}
+	}
+	return OwnerMetadata{}, false
+}
+
+// ownerMetadataHasLivenessEvidence accepts both current and pre-generation
+// owner rows, but rejects an allocated zero-value object such as `{}`.  The
+// latter is a persisted projection artifact, not a process identity.  Lease
+// binding is checked separately because older helpers legitimately omitted
+// machine_id and lease_generation.
+func ownerMetadataHasLivenessEvidence(owner OwnerMetadata) bool {
+	return owner.PID > 0 ||
+		strings.TrimSpace(owner.Hostname) != "" ||
+		strings.TrimSpace(owner.ExecutablePath) != "" ||
+		strings.TrimSpace(owner.InstanceID) != "" ||
+		strings.TrimSpace(owner.MachineID) != "" ||
+		owner.LeaseGeneration != 0 ||
+		!owner.StartedAt.IsZero() ||
+		!owner.LastHeartbeat.IsZero() ||
+		strings.TrimSpace(owner.ActiveSessionID) != "" ||
+		strings.TrimSpace(owner.ActiveTurnID) != ""
+}
+
+func ownerMatchesControlLease(owner OwnerMetadata, lease ControlLease) bool {
+	holder := strings.TrimSpace(lease.HolderMachineID)
+	if holder == "" || lease.LeaseUntil.IsZero() || strings.TrimSpace(owner.MachineID) == "" {
+		return false
+	}
+	if strings.TrimSpace(owner.MachineID) != holder {
+		return false
+	}
+	return owner.LeaseGeneration == lease.Generation
 }
 
 func (s *State) writeOwner(owner OwnerMetadata) {
@@ -14080,6 +17640,12 @@ func (owner OwnerMetadata) withHeartbeat(now time.Time) (OwnerMetadata, error) {
 }
 
 func sameOwnerProcess(a OwnerMetadata, b OwnerMetadata) bool {
+	if strings.TrimSpace(a.InstanceID) != "" || strings.TrimSpace(b.InstanceID) != "" {
+		return strings.TrimSpace(a.InstanceID) != "" &&
+			strings.TrimSpace(a.InstanceID) == strings.TrimSpace(b.InstanceID) &&
+			a.PID == b.PID &&
+			strings.EqualFold(strings.TrimSpace(a.Hostname), strings.TrimSpace(b.Hostname))
+	}
 	if a.PID != b.PID || a.Hostname != b.Hostname {
 		return false
 	}
@@ -14087,6 +17653,14 @@ func sameOwnerProcess(a OwnerMetadata, b OwnerMetadata) bool {
 		return true
 	}
 	return canonicalOwnerExecutablePath(a.ExecutablePath) == canonicalOwnerExecutablePath(b.ExecutablePath)
+}
+
+func ownerProcessIdentityPresent(owner OwnerMetadata) bool {
+	return strings.TrimSpace(owner.InstanceID) != "" ||
+		owner.PID > 0 ||
+		strings.TrimSpace(owner.Hostname) != "" ||
+		strings.TrimSpace(owner.ExecutablePath) != "" ||
+		!owner.StartedAt.IsZero()
 }
 
 func canonicalOwnerExecutablePath(path string) string {
@@ -14294,6 +17868,17 @@ func SourceFileIdentityFromFileInfo(path string, info os.FileInfo) (string, erro
 		return "", nil
 	}
 	return sourceFileIdentityFromRevision(revision), nil
+}
+
+// SourceFileChangeTimeFromFileInfo returns the native file change-time
+// revision when the platform exposes one. It is intentionally separate from
+// SourceFileIdentity: append-only transcript writers change ctime while
+// retaining the same inode, so ctime is useful for validating a paused
+// partial record but must not be used as the transcript generation identity.
+// A zero result means that this platform/filesystem does not expose a usable
+// change time and callers must retain their existing conservative proof.
+func SourceFileChangeTimeFromFileInfo(info os.FileInfo) int64 {
+	return fileInfoChangeTimeUnixNano(info)
 }
 
 func sourceFileIdentityFromRevision(revision stateFileRevision) string {

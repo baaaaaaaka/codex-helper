@@ -5379,6 +5379,9 @@ func (g *cxpPerfGraphTransport) roundTrip(req *http.Request) (*http.Response, er
 		}
 		chatID := cxpPerfChatIDFromGraphPath(req.URL.Path)
 		messages := g.nextMessages(chatID)
+		if messages == nil {
+			messages = []ChatMessage{}
+		}
 		return cxpPerfJSONResponse(http.StatusOK, map[string]any{"value": messages}, nil), nil
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/messages"):
 		if resp, err, ok := g.graphSendFault(); ok {

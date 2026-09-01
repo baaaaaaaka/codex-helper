@@ -28,7 +28,7 @@ func TestOSExecutableUsageIsCentralized(t *testing.T) {
 		name := entry.Name()
 		if entry.IsDir() {
 			switch name {
-			case ".git", "vendor":
+			case ".git", ".worktrees", "vendor":
 				return filepath.SkipDir
 			default:
 				return nil

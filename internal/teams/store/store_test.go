@@ -1066,6 +1066,78 @@ func TestLoadPathWatchdogStateReadOnlySQLiteSkipsBusinessRowsAndWritesNothing(t 
 	}
 }
 
+func TestLoadPathWatchdogStateReadOnlyJSONSkipsMalformedChatPoll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	now := time.Now().UTC()
+	raw, err := json.Marshal(map[string]any{
+		"control_chat":  ControlChatBinding{TeamsChatID: "control-chat"},
+		"service_owner": &OwnerMetadata{PID: 4321, LastHeartbeat: now},
+		"chat_polls": map[string]json.RawMessage{
+			"good-chat": mustJSONRaw(t, ChatPollState{ChatID: "good-chat", LastSuccessfulPollAt: now}),
+			"bad-chat":  json.RawMessage(`{"chat_id":"bad-chat","seeded":1}`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal watchdog fixture: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write watchdog fixture: %v", err)
+	}
+
+	state, err := LoadPathWatchdogStateReadOnly(context.Background(), path)
+	if err != nil {
+		t.Fatalf("LoadPathWatchdogStateReadOnly malformed JSON poll: %v", err)
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.PID != 4321 {
+		t.Fatalf("malformed JSON poll hid service owner: %#v", state.ServiceOwner)
+	}
+	if len(state.ChatPolls) != 1 || state.ChatPolls["good-chat"].ChatID != "good-chat" {
+		t.Fatalf("malformed JSON poll projection = %#v, want only good chat", state.ChatPolls)
+	}
+}
+
+func TestLoadPathWatchdogStateReadOnlySQLiteSkipsMalformedControlPoll(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-chat"}
+		state.ServiceOwner = &OwnerMetadata{PID: 9876, LastHeartbeat: now}
+		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", LastSuccessfulPollAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed watchdog SQLite fixture: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate watchdog SQLite fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close watchdog SQLite fixture: %v", err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), SQLiteFileName))
+	if err != nil {
+		t.Fatalf("open watchdog SQLite fixture: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE chat_polls SET json = '{"chat_id":"control-chat","seeded":1}' WHERE chat_id = 'control-chat'`); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt control poll: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close corrupted watchdog SQLite fixture: %v", err)
+	}
+
+	state, err := LoadPathWatchdogStateReadOnly(ctx, store.Path())
+	if err != nil {
+		t.Fatalf("LoadPathWatchdogStateReadOnly malformed SQLite poll: %v", err)
+	}
+	if state.ServiceOwner == nil || state.ServiceOwner.PID != 9876 {
+		t.Fatalf("malformed SQLite poll hid service owner: %#v", state.ServiceOwner)
+	}
+	if len(state.ChatPolls) != 0 {
+		t.Fatalf("malformed SQLite control poll = %#v, want poll omitted", state.ChatPolls)
+	}
+}
+
 func TestLoadPathWatchdogStateReadOnlyRejectsSQLiteFamilySymlinks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation requires privileges on many Windows runners")
@@ -3123,10 +3195,72 @@ func TestSchemaEightStoreIsUpgradeOnlyForLegacyWriters(t *testing.T) {
 	}
 	pointerData, err := os.ReadFile(sqliteStore.Path())
 	if err != nil {
-		t.Fatalf("read schema-9 SQLite pointer: %v", err)
+		t.Fatalf("read current SQLite pointer: %v", err)
 	}
 	if _, err := legacyV6LoadStateDataForTest(pointerData); !errors.Is(err, ErrUnsupportedSchemaVersion) || !strings.Contains(err.Error(), fmt.Sprint(storeSQLitePointerSchemaVersion)) {
 		t.Fatalf("legacy SQLite writer result = %v, want pointer schema-%d rejection", err, storeSQLitePointerSchemaVersion)
+	}
+}
+
+func TestSchemaNineJSONStateMigratesPostSendMarker(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	row, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:          "schema-nine-sent",
+		TeamsChatID: "schema-nine-chat",
+		Kind:        "helper",
+		Body:        "schema nine migration",
+	})
+	if err != nil {
+		t.Fatalf("queue schema-nine outbox: %v", err)
+	}
+	if _, err := store.MarkOutboxSent(ctx, row.ID, "teams-schema-nine"); err != nil {
+		t.Fatalf("mark schema-nine outbox sent: %v", err)
+	}
+	data, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read current JSON state: %v", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatalf("decode current JSON state: %v", err)
+	}
+	root["schema_version"] = json.RawMessage(`9`)
+	var outboxRows map[string]json.RawMessage
+	if err := json.Unmarshal(root["outbox_messages"], &outboxRows); err != nil {
+		t.Fatalf("decode outbox rows: %v", err)
+	}
+	var sentRow map[string]json.RawMessage
+	if err := json.Unmarshal(outboxRows[row.ID], &sentRow); err != nil {
+		t.Fatalf("decode sent outbox row: %v", err)
+	}
+	// Schema 9 predates the post-send replay marker. Its absence must mean
+	// legacy-complete, not pending follow-up work after the upgrade.
+	delete(sentRow, "post_send_effects_pending")
+	outboxRows[row.ID], err = json.Marshal(sentRow)
+	if err != nil {
+		t.Fatalf("encode sent outbox row: %v", err)
+	}
+	root["outbox_messages"], err = json.Marshal(outboxRows)
+	if err != nil {
+		t.Fatalf("encode outbox rows: %v", err)
+	}
+	legacyData, err := json.Marshal(root)
+	if err != nil {
+		t.Fatalf("encode schema-nine JSON state: %v", err)
+	}
+	writeRawStoreStateForTest(t, store, append(legacyData, '\n'))
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load schema-nine JSON state: %v", err)
+	}
+	if state.SchemaVersion != SchemaVersion {
+		t.Fatalf("migrated schema = %d, want %d", state.SchemaVersion, SchemaVersion)
+	}
+	got := state.OutboxMessages[row.ID]
+	if got.Status != OutboxStatusSent || got.TeamsMessageID != "teams-schema-nine" || got.PostSendEffectsPending {
+		t.Fatalf("migrated schema-nine sent row = %#v, want legacy-complete Sent row", got)
 	}
 }
 
@@ -3251,6 +3385,85 @@ func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
 			poll, ok, err := reopened.ChatPoll(ctx, "chat-attempt")
 			if err != nil || !ok || poll.Attempt != nil || poll.PendingPage == nil {
 				t.Fatalf("reopened attempt state = %#v ok=%v err=%v", poll, ok, err)
+			}
+		})
+	}
+}
+
+// A listener can lose its control lease while a Graph request is in flight.
+// Once a replacement owner has a strictly newer durable lease generation, it
+// must be able to reclaim that still-unexpired poll attempt without waiting
+// for the old attempt TTL.  The old callback remains fenced by its capability.
+func TestChatPollAttemptReclaimsAfterControlLeaseTakeover(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.ChatPolls["chat-takeover"] = ChatPollState{
+					ChatID: "chat-takeover", Seeded: true, PollState: chatPollStateWarm,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed poll state: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			now := time.Now().UTC()
+			scope := ScopeIdentity{ID: "scope-poll-takeover-" + name}
+			machineA := MachineRecord{ID: "machine-poll-takeover-a-" + name, ScopeID: scope.ID, Kind: MachineKindPrimary}
+			machineB := MachineRecord{ID: "machine-poll-takeover-b-" + name, ScopeID: scope.ID, Kind: MachineKindPrimary}
+			ownerA := testOwner("", "", now)
+			ownerA.MachineID = machineA.ID
+			ownerA.ScopeID = scope.ID
+			leaseA, err := store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: machineA, Owner: ownerA, Duration: time.Hour, Now: now,
+			})
+			if err != nil || leaseA.Mode != LeaseModeActive {
+				t.Fatalf("claim owner A: mode=%v err=%v", leaseA.Mode, err)
+			}
+			old, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: "chat-takeover", Owner: machineA.ID, ProcessIncarnation: "process-a-" + name,
+				LeaseGeneration: leaseA.Lease.Generation, Now: now, TTL: time.Minute,
+			})
+			if err != nil || !acquired || old.Attempt == nil {
+				t.Fatalf("begin owner A attempt: acquired=%v attempt=%#v err=%v", acquired, old.Attempt, err)
+			}
+			oldCapability := ChatPollAttemptCapability{
+				ID: old.Attempt.ID, Owner: old.Attempt.Owner,
+				ProcessIncarnation: old.Attempt.ProcessIncarnation,
+				LeaseGeneration:    old.Attempt.LeaseGeneration,
+			}
+			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
+				t.Fatalf("release owner A: released=%v err=%v", released, err)
+			}
+			ownerB := testOwner("", "", now.Add(time.Second))
+			ownerB.MachineID = machineB.ID
+			ownerB.ScopeID = scope.ID
+			leaseB, err := store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: machineB, Owner: ownerB, Duration: time.Hour, Now: now.Add(time.Second),
+			})
+			if err != nil || leaseB.Mode != LeaseModeActive || leaseB.Lease.Generation <= leaseA.Lease.Generation {
+				t.Fatalf("claim owner B: mode=%v generation=%d old=%d err=%v", leaseB.Mode, leaseB.Lease.Generation, leaseA.Lease.Generation, err)
+			}
+			replacement, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: "chat-takeover", Owner: machineB.ID, ProcessIncarnation: "process-b-" + name,
+				LeaseGeneration: leaseB.Lease.Generation, ExpectedPollRevision: old.PollRevision,
+				HasExpectedPollRevision: true, Now: now.Add(2 * time.Second), TTL: time.Minute,
+			})
+			if err != nil || !acquired || replacement.Attempt == nil || replacement.Attempt.ID == old.Attempt.ID {
+				t.Fatalf("replacement attempt: acquired=%v old=%#v replacement=%#v err=%v", acquired, old.Attempt, replacement.Attempt, err)
+			}
+			if _, committed, err := store.CommitChatPollAttemptWithCapability(ctx, "chat-takeover", oldCapability, old.PollRevision, func(poll *ChatPollState) error {
+				poll.LastError = "old callback must remain fenced"
+				return nil
+			}); err != nil || committed {
+				t.Fatalf("old callback after reclaim: committed=%v err=%v", committed, err)
 			}
 		})
 	}
@@ -5110,6 +5323,83 @@ func TestMarkOutboxDriveItemForAttemptPersistsAndFences(t *testing.T) {
 	}
 }
 
+func TestMarkOutboxAttachmentMessagePostStartedForAttemptPersistsAndFences(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if useSQLite {
+				if err := store.Update(ctx, func(state *State) error {
+					state.ControlChat = ControlChatBinding{TeamsChatID: "attachment-post-boundary-chat"}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed store before SQLite migration: %v", err)
+				}
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			pending, created, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:             "attachment-post-boundary-pending",
+				TeamsChatID:    "attachment-post-boundary-chat",
+				Kind:           "attachment",
+				AttachmentPath: "/private/new-attachment.bin",
+			})
+			if err != nil || !created || pending.AttachmentMessagePostState != "pending" {
+				t.Fatalf("QueueOutbox fresh attachment = %#v created=%v err=%v, want pending", pending, created, err)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, pending.ID)
+			if err != nil {
+				t.Fatalf("claim fresh attachment: %v", err)
+			}
+			if _, err := store.MarkOutboxDriveItemForAttempt(ctx, pending.ID, claimed.SendAttemptToken, "drive-fresh", "fresh.bin", "etag", "https://sharepoint/fresh", "dav://fresh"); err != nil {
+				t.Fatalf("record fresh DriveItem: %v", err)
+			}
+			started, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, pending.ID, claimed.SendAttemptToken)
+			if err != nil || started.AttachmentMessagePostState != "started" || started.Status != OutboxStatusSending {
+				t.Fatalf("mark fresh attachment POST boundary = %#v err=%v, want started/Sending", started, err)
+			}
+			idempotent, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, pending.ID, claimed.SendAttemptToken)
+			if err != nil || idempotent.AttachmentMessagePostState != "started" {
+				t.Fatalf("repeat attachment POST boundary = %#v err=%v, want idempotent started", idempotent, err)
+			}
+			reset, err := store.ResetOutboxAttachmentMessagePostPendingForAttempt(ctx, pending.ID, claimed.SendAttemptToken)
+			if err != nil || reset.AttachmentMessagePostState != "pending" || reset.Status != OutboxStatusSending {
+				t.Fatalf("reset explicit pre-POST rejection = %#v err=%v, want pending/Sending", reset, err)
+			}
+			startedAgain, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, pending.ID, claimed.SendAttemptToken)
+			if err != nil || startedAgain.AttachmentMessagePostState != "started" {
+				t.Fatalf("re-enter attachment POST boundary = %#v err=%v, want started", startedAgain, err)
+			}
+			if _, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, pending.ID, "stale-attempt-token"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("stale attachment POST boundary error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+
+			legacy, created, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:             "attachment-post-boundary-legacy",
+				TeamsChatID:    "attachment-post-boundary-chat",
+				Kind:           "attachment",
+				AttachmentPath: "/private/legacy-attachment.bin",
+				DriveItemID:    "drive-legacy",
+				DriveItemName:  "legacy.bin",
+			})
+			if err != nil || !created || legacy.AttachmentMessagePostState != "unknown" {
+				t.Fatalf("QueueOutbox legacy attachment = %#v created=%v err=%v, want unknown", legacy, created, err)
+			}
+			legacyClaim, err := store.MarkOutboxSendAttempt(ctx, legacy.ID)
+			if err != nil {
+				t.Fatalf("claim legacy attachment: %v", err)
+			}
+			legacyStarted, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, legacy.ID, legacyClaim.SendAttemptToken)
+			if err != nil || legacyStarted.AttachmentMessagePostState != "started" {
+				t.Fatalf("mark legacy attachment POST boundary = %#v err=%v, want started", legacyStarted, err)
+			}
+			if _, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, legacy.ID, legacyClaim.SendAttemptToken+"-stale"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("stale legacy attachment POST boundary error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+		})
+	}
+}
+
 func TestSQLiteSelectedSnapshotsMatchExpectedFields(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -5586,7 +5876,7 @@ func TestUpdateImportCheckpointSQLiteCreatesMissingRow(t *testing.T) {
 func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	now := time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["s-clean"] = SessionContext{ID: "s-clean", Status: SessionStatusActive, TeamsChatID: "chat-clean", UpdatedAt: now.Add(-time.Hour)}
 		state.Sessions["s-dirty"] = SessionContext{ID: "s-dirty", Status: SessionStatusActive, TeamsChatID: "chat-dirty", UpdatedAt: now.Add(-2 * time.Hour)}
@@ -5639,7 +5929,7 @@ func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *test
 func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	now := time.Date(2026, 6, 9, 11, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	oldActivity := now.Add(-49 * time.Hour)
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["s-idle"] = SessionContext{ID: "s-idle", Status: SessionStatusActive, TeamsChatID: "chat-idle", UpdatedAt: oldActivity}
@@ -5650,7 +5940,10 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 		state.Sessions["s-running"] = SessionContext{ID: "s-running", Status: SessionStatusActive, TeamsChatID: "chat-running", UpdatedAt: oldActivity}
 		state.Sessions["s-recent"] = SessionContext{ID: "s-recent", Status: SessionStatusActive, TeamsChatID: "chat-recent", UpdatedAt: now}
 		state.ChatPolls["chat-idle"] = ChatPollState{ChatID: "chat-idle", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
-		state.ChatPolls["chat-frontier"] = ChatPollState{ChatID: "chat-frontier", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), ContinuationPath: "/chats/chat-frontier/messages?$skiptoken=backlog", UpdatedAt: now}
+		// The continuation is actionable even when a stale retry deadline is in
+		// the future. Admission must respect the durable retry deadline even for
+		// operational frontiers; the next cycle must not hammer Graph early.
+		state.ChatPolls["chat-frontier"] = ChatPollState{ChatID: "chat-frontier", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(time.Hour), ContinuationPath: "/chats/chat-frontier/messages?$skiptoken=backlog", UpdatedAt: now}
 		state.ChatPolls["chat-pending"] = ChatPollState{ChatID: "chat-pending", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), PendingPage: &ChatPollPendingPage{ReceiptID: "receipt-pending", ChatID: "chat-pending", RequestPath: "/chats/chat-pending/messages?$top=1"}, UpdatedAt: now}
 		state.ChatPolls["chat-gap"] = ChatPollState{ChatID: "chat-gap", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Gap: &ChatPollGap{Epoch: 1, Kind: "unverified-continuation"}, UpdatedAt: now}
 		state.ChatPolls["chat-attempt"] = ChatPollState{ChatID: "chat-attempt", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Attempt: &ChatPollAttempt{ID: "attempt-1", ExpiresAt: now.Add(time.Hour)}, UpdatedAt: now}
@@ -5677,10 +5970,13 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 	if got["s-idle"] {
 		t.Fatalf("idle auto-park candidate stayed in hot poll candidates: %#v", got)
 	}
-	for _, id := range []string{"s-frontier", "s-pending", "s-gap", "s-attempt", "s-running", "s-recent"} {
+	for _, id := range []string{"s-pending", "s-gap", "s-attempt", "s-running", "s-recent"} {
 		if !got[id] {
 			t.Fatalf("candidate ids = %#v, missing %s", got, id)
 		}
+	}
+	if got["s-frontier"] {
+		t.Fatalf("future operational retry row was admitted before its deadline: %#v", got)
 	}
 
 	parkCandidates, handled, err := store.IdleWorkChatParkCandidates(ctx, "control-chat", now.Add(-48*time.Hour), 16)
@@ -5696,6 +5992,1126 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 	}
 	if len(parkIDs) != 5 || !parkIDs["s-idle"] || !parkIDs["s-frontier"] || !parkIDs["s-pending"] || !parkIDs["s-gap"] || !parkIDs["s-attempt"] {
 		t.Fatalf("park candidates = %#v, want clean idle plus operational recovery candidates", parkCandidates)
+	}
+}
+
+func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-2 * time.Hour)
+	// Keep this above the production admission limit by a useful margin.  The
+	// small-limit behavior is already exercised by the unit tests; this scale
+	// catches a SQL LIMIT/order regression at a workload closer to the observed
+	// machine state without turning presubmit into a long soak.
+	const total = 500
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < total; i++ {
+			chatID := fmt.Sprintf("chat-operational-%03d", i)
+			sessionID := fmt.Sprintf("session-operational-%03d", i)
+			updatedAt := base.Add(time.Duration(i) * time.Second)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				// The operational continuation must be admitted even though its
+				// ordinary retry deadline is in the future.
+				NextPollAt:       time.Now().UTC().Add(-time.Minute),
+				ContinuationPath: fmt.Sprintf("/chats/%s/messages?$skiptoken=continuation", chatID),
+				LastActivityAt:   updatedAt,
+				UpdatedAt:        updatedAt,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed operational rows: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	first, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("first hot-poll candidate load = handled:%v err:%v", handled, err)
+	}
+	if len(first) != sqliteHotPollReadyLimit {
+		t.Fatalf("first hot-poll candidate count = %d, want bounded limit %d", len(first), sqliteHotPollReadyLimit)
+	}
+	firstIDs := make(map[string]bool, len(first))
+	for _, session := range first {
+		firstIDs[session.ID] = true
+	}
+	if len(firstIDs) != len(first) {
+		t.Fatalf("first hot-poll candidates contain duplicate sessions: %#v", first)
+	}
+
+	// A successful/partial poll commit updates the durable service-age key. Use
+	// the public schedule CAS to model that commit without invoking Graph; the
+	// next bounded SQL admission must then select the previously omitted rows.
+	for _, session := range first {
+		if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+			ChatID:     session.TeamsChatID,
+			NextPollAt: time.Now().UTC().Add(-time.Minute),
+		}); err != nil {
+			t.Fatalf("age selected operational row %s: %v", session.ID, err)
+		}
+	}
+	seenIDs := firstIDs
+	current := first
+	maxRounds := total/sqliteHotPollReadyLimit + 3
+	for round := 0; len(seenIDs) < total && round < maxRounds; round++ {
+		for _, session := range current {
+			if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+				ChatID:     session.TeamsChatID,
+				NextPollAt: time.Now().UTC().Add(-time.Minute),
+			}); err != nil {
+				t.Fatalf("age selected operational row %s in round %d: %v", session.ID, round+1, err)
+			}
+		}
+		next, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+		if err != nil || !handled {
+			t.Fatalf("hot-poll candidate load round %d = handled:%v err:%v", round+1, handled, err)
+		}
+		newIDs := 0
+		for _, session := range next {
+			if !seenIDs[session.ID] {
+				seenIDs[session.ID] = true
+				newIDs++
+			}
+		}
+		if newIDs == 0 && len(seenIDs) < total {
+			t.Fatalf("hot-poll rotation made no progress in round %d: seen=%d/%d current=%#v next=%#v", round+1, len(seenIDs), total, current, next)
+		}
+		current = next
+	}
+	for i := 0; i < total; i++ {
+		sessionID := fmt.Sprintf("session-operational-%03d", i)
+		if !seenIDs[sessionID] {
+			t.Fatalf("operational row %s remained hidden behind SQL limit: seen=%d/%d first=%d current=%#v", sessionID, len(seenIDs), total, len(first), current)
+		}
+	}
+}
+
+func TestSQLiteHotPollAdmissionReservesDueOrdinaryLane(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const operational = 80
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < operational; i++ {
+			chatID := fmt.Sprintf("chat-fair-operational-%03d", i)
+			sessionID := fmt.Sprintf("session-fair-operational-%03d", i)
+			updatedAt := now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Second)
+			state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt: now.Add(-time.Minute), LastActivityAt: updatedAt,
+				ContinuationPath: "/chats/" + chatID + "/messages?$skiptoken=due",
+				UpdatedAt:        updatedAt,
+			}
+		}
+		state.Sessions["session-fair-ordinary"] = SessionContext{
+			ID: "session-fair-ordinary", Status: SessionStatusActive,
+			TeamsChatID: "chat-fair-ordinary", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-fair-ordinary"] = ChatPollState{
+			ChatID: "chat-fair-ordinary", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), LastActivityAt: now, UpdatedAt: now,
+		}
+		state.Sessions["session-fair-future"] = SessionContext{
+			ID: "session-fair-future", Status: SessionStatusActive,
+			TeamsChatID: "chat-fair-future", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-fair-future"] = ChatPollState{
+			ChatID: "chat-fair-future", Seeded: true, PollState: chatPollStateCold,
+			NextPollAt: now.Add(time.Hour), LastActivityAt: now,
+			ContinuationPath: "/chats/chat-fair-future/messages?$skiptoken=future",
+			UpdatedAt:        now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed fair admission state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("fair admission candidates: handled=%v err=%v", handled, err)
+	}
+	if len(candidates) != sqliteHotPollReadyLimit {
+		t.Fatalf("fair admission candidate count=%d, want %d", len(candidates), sqliteHotPollReadyLimit)
+	}
+	seen := make(map[string]bool, len(candidates))
+	operationalSeen := 0
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+		if strings.HasPrefix(candidate.ID, "session-fair-operational-") {
+			operationalSeen++
+		}
+	}
+	if !seen["session-fair-ordinary"] {
+		t.Fatalf("ordinary due chat was starved by operational prefix: %#v", seen)
+	}
+	if seen["session-fair-future"] {
+		t.Fatalf("future operational chat was admitted before retry deadline: %#v", seen)
+	}
+	if operationalSeen != len(candidates)-1 {
+		t.Fatalf("ordinary lane admission shape is inconsistent: operational=%d total=%d", operationalSeen, len(candidates))
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("fair admission schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-fair-ordinary"]; !ok {
+		t.Fatalf("ordinary due poll missing from schedule: %#v", schedule.ChatPolls)
+	}
+	if _, ok := schedule.ChatPolls["chat-fair-future"]; ok {
+		t.Fatalf("future operational poll missing retry gate in schedule: %#v", schedule.ChatPolls["chat-fair-future"])
+	}
+}
+
+func TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-malformed-poll"] = SessionContext{ID: "session-malformed-poll", Status: SessionStatusActive, TeamsChatID: "chat-malformed-poll", UpdatedAt: now}
+		state.Sessions["session-healthy-poll"] = SessionContext{ID: "session-healthy-poll", Status: SessionStatusActive, TeamsChatID: "chat-healthy-poll", UpdatedAt: now}
+		state.Sessions["session-cross-bound-poll"] = SessionContext{ID: "session-cross-bound-poll", Status: SessionStatusActive, TeamsChatID: "chat-cross-bound-poll", UpdatedAt: now}
+		// The SQL materialized deadline is deliberately in the future. A
+		// malformed active row has no trustworthy schedule, so admission must
+		// still select it for local recovery instead of silently waiting behind
+		// stale retry metadata.
+		state.ChatPolls["chat-malformed-poll"] = ChatPollState{ChatID: "chat-malformed-poll", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(time.Hour), BlockedUntil: now.Add(time.Hour), UpdatedAt: now}
+		state.ChatPolls["chat-healthy-poll"] = ChatPollState{ChatID: "chat-healthy-poll", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.ChatPolls["chat-cross-bound-poll"] = ChatPollState{ChatID: "chat-cross-bound-poll", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed malformed poll state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 0 WHERE chat_id = ?`, []byte(`{"chat_id":`), "chat-malformed-poll"); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE sessions SET json = ? WHERE id = ?`, []byte(`{"id":"session-cross-bound-poll","teams_chat_id":"chat-not-cross-bound","status":"active"}`), "session-cross-bound-poll")
+		return err
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("malformed poll candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		if seen[candidate.ID] {
+			t.Fatalf("malformed poll was admitted more than once: candidates=%#v", candidates)
+		}
+		seen[candidate.ID] = true
+	}
+	if !seen["session-healthy-poll"] || !seen["session-malformed-poll"] || seen["session-cross-bound-poll"] {
+		t.Fatalf("malformed poll affected healthy admission: %#v", seen)
+	}
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("malformed poll schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-healthy-poll"]; !ok {
+		t.Fatalf("healthy poll missing after malformed row: %#v", schedule.ChatPolls)
+	}
+	if poll, ok := schedule.ChatPolls["chat-malformed-poll"]; !ok || !poll.RecoveryRequired {
+		t.Fatalf("malformed poll should be admitted as a recovery placeholder: %#v found=%v", poll, ok)
+	}
+}
+
+func TestSQLiteHotPollAdmissionBoundsMalformedPollLaneAndPreservesHealthyChat(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const malformedCount = 80
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-healthy-poll-lane"] = SessionContext{
+			ID: "session-healthy-poll-lane", Status: SessionStatusActive,
+			TeamsChatID: "chat-healthy-poll-lane", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-healthy-poll-lane"] = ChatPollState{
+			ChatID: "chat-healthy-poll-lane", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-malformed-poll-lane-%03d", i)
+			sessionID := fmt.Sprintf("session-malformed-poll-lane-%03d", i)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID,
+				UpdatedAt: now.Add(-time.Duration(i+1) * time.Minute),
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+				NextPollAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Duration(i+1) * time.Minute),
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed malformed poll lane state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-malformed-poll-lane-%03d", i)
+			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 0 WHERE chat_id = ?`, []byte(`{"chat_id":`), chatID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("bounded malformed poll candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	malformedSeen := 0
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+		if strings.HasPrefix(candidate.ID, "session-malformed-poll-lane-") {
+			malformedSeen++
+		}
+	}
+	if !seen["session-healthy-poll-lane"] {
+		t.Fatalf("healthy chat was hidden behind malformed poll prefix: %#v", seen)
+	}
+	if malformedSeen != sqliteHotPollMalformedLimit {
+		t.Fatalf("malformed poll admission count=%d, want reserved limit %d", malformedSeen, sqliteHotPollMalformedLimit)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("bounded malformed poll schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-healthy-poll-lane"]; !ok {
+		t.Fatalf("healthy poll was hidden from ready schedule: %#v", schedule.ChatPolls)
+	}
+	malformedScheduled := 0
+	for chatID, poll := range schedule.ChatPolls {
+		if strings.HasPrefix(chatID, "chat-malformed-poll-lane-") {
+			malformedScheduled++
+			if !poll.RecoveryRequired {
+				t.Fatalf("malformed scheduled poll lost its recovery disposition: %#v", poll)
+			}
+		}
+	}
+	if malformedScheduled != sqliteHotPollMalformedLimit {
+		t.Fatalf("malformed poll schedule count=%d, want reserved limit %d", malformedScheduled, sqliteHotPollMalformedLimit)
+	}
+}
+
+func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	// More than eight 64-row pages is intentional. A fixed eight-page SQL
+	// budget used to leave the healthy row permanently hidden behind this
+	// semantically malformed prefix.
+	const malformedCount = 520
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-semantic-healthy-poll-lane"] = SessionContext{
+			ID: "session-semantic-healthy-poll-lane", Status: SessionStatusActive,
+			TeamsChatID: "chat-semantic-healthy-poll-lane", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-semantic-healthy-poll-lane"] = ChatPollState{
+			ChatID: "chat-semantic-healthy-poll-lane", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-semantic-malformed-poll-lane-%03d", i)
+			sessionID := fmt.Sprintf("session-semantic-malformed-poll-lane-%03d", i)
+			updatedAt := now.Add(-time.Duration(i+1) * time.Minute)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID,
+				UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+				NextPollAt: now.Add(-time.Minute), UpdatedAt: updatedAt,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed semantic malformed poll lane state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-semantic-malformed-poll-lane-%03d", i)
+			// This is valid JSON, but the time.Time decoder rejects the numeric
+			// next_poll_at value. It must enter the bounded local-recovery lane;
+			// otherwise 80 decodable-looking rows can consume the SQL LIMIT and
+			// hide the healthy ordinary chat.
+			raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","next_poll_at":17}`, chatID))
+			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 0 WHERE chat_id = ?`, raw, chatID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("semantic malformed poll candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	semanticMalformedSeen := 0
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+		if strings.HasPrefix(candidate.ID, "session-semantic-malformed-poll-lane-") {
+			semanticMalformedSeen++
+		}
+	}
+	if !seen["session-semantic-healthy-poll-lane"] {
+		t.Fatalf("healthy chat was hidden behind semantically malformed poll prefix: %#v", seen)
+	}
+	if semanticMalformedSeen != sqliteHotPollMalformedLimit {
+		t.Fatalf("semantic malformed poll admission count=%d, want reserved limit %d", semanticMalformedSeen, sqliteHotPollMalformedLimit)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("semantic malformed poll schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-semantic-healthy-poll-lane"]; !ok {
+		t.Fatalf("healthy poll was hidden from ready schedule: %#v", schedule.ChatPolls)
+	}
+	semanticMalformedScheduled := 0
+	for chatID, poll := range schedule.ChatPolls {
+		if strings.HasPrefix(chatID, "chat-semantic-malformed-poll-lane-") {
+			semanticMalformedScheduled++
+			if !poll.RecoveryRequired {
+				t.Fatalf("semantically malformed scheduled poll lost its recovery disposition: %#v", poll)
+			}
+		}
+	}
+	if semanticMalformedScheduled != sqliteHotPollMalformedLimit {
+		t.Fatalf("semantic malformed poll schedule count=%d, want reserved limit %d", semanticMalformedScheduled, sqliteHotPollMalformedLimit)
+	}
+}
+
+func TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const malformedCount = sqliteHotPollReadyLimit + 8
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-empty-pending-healthy"] = SessionContext{
+			ID: "session-empty-pending-healthy", Status: SessionStatusActive,
+			TeamsChatID: "chat-empty-pending-healthy", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-empty-pending-healthy"] = ChatPollState{
+			ChatID: "chat-empty-pending-healthy", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-empty-pending-malformed-%03d", i)
+			sessionID := fmt.Sprintf("session-empty-pending-malformed-%03d", i)
+			updatedAt := now.Add(-time.Duration(malformedCount-i+1) * time.Minute)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID,
+				UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+				NextPollAt: now.Add(-time.Minute), UpdatedAt: updatedAt,
+				PendingPage: &ChatPollPendingPage{
+					ChatID: chatID, RequestPath: "/chats/" + chatID + "/messages",
+					ReceiptID: "fixture-receipt", RecordIDs: []string{}, RecordHashes: []string{},
+				},
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed empty pending-page admission state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-empty-pending-malformed-%03d", i)
+			raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","pending_page":{}}`, chatID))
+			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 1 WHERE chat_id = ?`, raw, chatID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("empty pending-page candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	malformedSeen := 0
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+		if strings.HasPrefix(candidate.ID, "session-empty-pending-malformed-") {
+			malformedSeen++
+		}
+	}
+	if !seen["session-empty-pending-healthy"] {
+		t.Fatalf("healthy ordinary chat was hidden behind empty pending pages: %#v", seen)
+	}
+	if malformedSeen != sqliteHotPollMalformedLimit {
+		t.Fatalf("empty pending-page admission count=%d, want reserved limit %d", malformedSeen, sqliteHotPollMalformedLimit)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("empty pending-page schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-empty-pending-healthy"]; !ok {
+		t.Fatalf("healthy ordinary poll was hidden from schedule: %#v", schedule.ChatPolls)
+	}
+	malformedScheduled := 0
+	for chatID, poll := range schedule.ChatPolls {
+		if strings.HasPrefix(chatID, "chat-empty-pending-malformed-") {
+			malformedScheduled++
+			if !poll.RecoveryRequired {
+				t.Fatalf("empty pending-page row lost recovery disposition: %#v", poll)
+			}
+		}
+	}
+	if malformedScheduled != sqliteHotPollMalformedLimit {
+		t.Fatalf("empty pending-page schedule count=%d, want reserved limit %d", malformedScheduled, sqliteHotPollMalformedLimit)
+	}
+}
+
+func TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const malformedCount = sqliteHotPollReadyLimit + 8
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-ready-semantic-healthy"] = SessionContext{
+			ID: "session-ready-semantic-healthy", Status: SessionStatusActive,
+			TeamsChatID: "chat-ready-semantic-healthy", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-ready-semantic-healthy"] = ChatPollState{
+			ChatID: "chat-ready-semantic-healthy", Seeded: true, PollState: chatPollStateCold,
+			NextPollAt:       now.Add(-time.Minute),
+			ContinuationPath: "/chats/chat-ready-semantic-healthy/messages?$skiptoken=due",
+			UpdatedAt:        now,
+		}
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-ready-semantic-malformed-%03d", i)
+			sessionID := fmt.Sprintf("session-ready-semantic-malformed-%03d", i)
+			updatedAt := now.Add(-time.Duration(malformedCount-i+1) * time.Minute)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt:       now.Add(-time.Minute),
+				ContinuationPath: "/chats/" + chatID + "/messages?$skiptoken=malformed",
+				UpdatedAt:        updatedAt,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed ready-schedule semantic malformed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < malformedCount; i++ {
+			chatID := fmt.Sprintf("chat-ready-semantic-malformed-%03d", i)
+			raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"cold","continuation_path":"/chats/%s/messages?$skiptoken=malformed","pending_page":{}}`, chatID, chatID))
+			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 1 WHERE chat_id = ?`, raw, chatID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("ready schedule with semantic malformed prefix: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-ready-semantic-healthy"]; !ok {
+		t.Fatalf("healthy operational chat was hidden behind semantic malformed prefix: %#v", schedule.ChatPolls)
+	}
+	malformedScheduled := 0
+	for chatID, poll := range schedule.ChatPolls {
+		if strings.HasPrefix(chatID, "chat-ready-semantic-malformed-") {
+			malformedScheduled++
+			if !poll.RecoveryRequired {
+				t.Fatalf("semantic malformed ready row lost recovery disposition: %#v", poll)
+			}
+		}
+	}
+	if malformedScheduled != sqliteHotPollMalformedLimit {
+		t.Fatalf("semantic malformed ready rows=%d, want bounded limit %d", malformedScheduled, sqliteHotPollMalformedLimit)
+	}
+}
+
+func TestSQLiteSemanticMalformedPollMutationPreservesRawUntilExplicitRepair(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	chatID := "chat-semantic-mutation-preservation"
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatPolls[chatID] = ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed semantic malformed mutation state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","pending_page":{}}`, chatID))
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 1 WHERE chat_id = ?`, raw, chatID)
+		return err
+	})
+	readRaw := func() []byte {
+		t.Helper()
+		var got []byte
+		withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID).Scan(&got)
+		})
+		return got
+	}
+	if got := readRaw(); !bytes.Equal(got, raw) {
+		t.Fatalf("initial malformed poll raw changed: got %q want %q", got, raw)
+	}
+
+	if _, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+		ChatID: chatID, Owner: "owner", ProcessIncarnation: "process", LeaseGeneration: 0,
+		ExpectedPollRevision: 0, HasExpectedPollRevision: false, Now: now,
+	}); err != nil {
+		t.Fatalf("begin malformed poll attempt: %v", err)
+	} else if acquired {
+		t.Fatal("malformed poll must not report a durable attempt acquisition")
+	}
+	if err := store.RecordChatPollErrorWithBlock(ctx, chatID, "temporary Graph error", now.Add(time.Minute)); err != nil {
+		t.Fatalf("record malformed poll error: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
+		ChatID: chatID, PollState: chatPollStateBlocked, NextPollAt: now.Add(time.Minute),
+		BlockedUntil: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("schedule malformed poll: %v", err)
+	}
+	if got := readRaw(); !bytes.Equal(got, raw) {
+		t.Fatalf("ordinary malformed-poll mutations overwrote raw evidence: got %q want %q", got, raw)
+	}
+
+	_, changed, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+		poll.PendingPage = nil
+		poll.Gap = &ChatPollGap{Epoch: 1, Kind: "invalid-page", OpenedAt: now}
+		poll.RecoveryRequired = false
+		poll.RecoveryReason = ""
+		poll.RecoverySourceHash = ""
+		return nil
+	})
+	if err != nil || !changed {
+		t.Fatalf("explicit malformed-poll repair changed=%v err=%v", changed, err)
+	}
+	if got := readRaw(); bytes.Equal(got, raw) {
+		t.Fatal("explicit recovery repair did not replace raw poll evidence")
+	}
+	poll, ok, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !ok {
+		t.Fatalf("read repaired poll: ok=%v err=%v poll=%#v", ok, err, poll)
+	}
+	if poll.RecoveryRequired || poll.PendingPage != nil || poll.Gap == nil {
+		t.Fatalf("repaired poll retained malformed disposition: %#v", poll)
+	}
+}
+
+func TestChatPollRecoveryMarkerClearsAfterSuccessfulPoll(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.ChatPolls["chat-recovery"] = ChatPollState{
+					ChatID: "chat-recovery", Seeded: true, RecoveryRequired: true,
+					RecoveryReason: chatPollRecoveryReason, RecoverySourceHash: "opaque-hash",
+					PollState: chatPollStateWarm,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed recovery marker: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if _, err := store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, "chat-recovery", time.Now().UTC(), true, false, 1, "", nil); err != nil {
+				t.Fatalf("record successful poll: %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, "chat-recovery")
+			if err != nil || !ok {
+				t.Fatalf("load recovered poll: ok=%v err=%v poll=%#v", ok, err, poll)
+			}
+			if poll.RecoveryRequired || poll.RecoverySourceHash != "" || poll.RecoveryReason != "" {
+				t.Fatalf("successful poll retained recovery marker: %#v", poll)
+			}
+		})
+	}
+}
+
+func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-control"] = SessionContext{ID: "session-control", Status: SessionStatusActive, TeamsChatID: "control-chat", UpdatedAt: now}
+		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		for i := 0; i < 60; i++ {
+			chatID := fmt.Sprintf("chat-admission-operational-%03d", i)
+			sessionID := fmt.Sprintf("session-admission-operational-%03d", i)
+			state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now.Add(-time.Hour)}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt: now.Add(-time.Minute), ContinuationPath: "/chats/" + chatID + "/messages?$skiptoken=due", UpdatedAt: now.Add(-time.Hour),
+			}
+		}
+		state.Sessions["session-admission-ordinary"] = SessionContext{ID: "session-admission-ordinary", Status: SessionStatusActive, TeamsChatID: "chat-admission-ordinary", UpdatedAt: now}
+		state.ChatPolls["chat-admission-ordinary"] = ChatPollState{ChatID: "chat-admission-ordinary", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		state.Sessions["session-admission-blocked"] = SessionContext{ID: "session-admission-blocked", Status: SessionStatusActive, TeamsChatID: "chat-admission-blocked", UpdatedAt: now}
+		state.ChatPolls["chat-admission-blocked"] = ChatPollState{ChatID: "chat-admission-blocked", Seeded: true, PollState: chatPollStateCold, NextPollAt: now.Add(-time.Minute), BlockedUntil: now.Add(time.Hour), ContinuationPath: "/chats/chat-admission-blocked/messages?$skiptoken=blocked", UpdatedAt: now}
+		state.Sessions["session-admission-stale-operational"] = SessionContext{ID: "session-admission-stale-operational", Status: SessionStatusActive, TeamsChatID: "chat-admission-stale-operational", UpdatedAt: now}
+		state.ChatPolls["chat-admission-stale-operational"] = ChatPollState{ChatID: "chat-admission-stale-operational", Seeded: true, PollState: chatPollStateCold, NextPollAt: now.Add(-time.Minute), ContinuationPath: "/chats/chat-admission-stale-operational/messages?$skiptoken=stale", UpdatedAt: now}
+		state.Sessions["session-admission-stale-ordinary"] = SessionContext{ID: "session-admission-stale-ordinary", Status: SessionStatusActive, TeamsChatID: "chat-admission-stale-ordinary", UpdatedAt: now}
+		state.ChatPolls["chat-admission-stale-ordinary"] = ChatPollState{ChatID: "chat-admission-stale-ordinary", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed admission state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET frontier_active = 0 WHERE chat_id = ?`, "chat-admission-stale-operational"); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET frontier_active = 1 WHERE chat_id = ?`, "chat-admission-stale-ordinary")
+		return err
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("admission candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+	}
+	if seen["session-control"] {
+		t.Fatalf("control session leaked into work candidates: %#v", seen)
+	}
+	if !seen["session-admission-ordinary"] || !seen["session-admission-stale-operational"] || !seen["session-admission-stale-ordinary"] {
+		t.Fatalf("JSON frontier or lane admission hid a healthy chat: %#v", seen)
+	}
+	if seen["session-admission-blocked"] {
+		t.Fatalf("future BlockedUntil row was admitted before its retry deadline: %#v", seen)
+	}
+	if len(candidates) != sqliteHotPollReadyLimit-1 {
+		t.Fatalf("control reservation candidate count=%d, want %d", len(candidates), sqliteHotPollReadyLimit-1)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("admission schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["control-chat"]; !ok {
+		t.Fatal("control poll missing from ready schedule")
+	}
+	for _, chatID := range []string{"chat-admission-ordinary", "chat-admission-stale-operational", "chat-admission-stale-ordinary"} {
+		if _, ok := schedule.ChatPolls[chatID]; !ok {
+			t.Fatalf("healthy chat %q missing from ready schedule", chatID)
+		}
+	}
+	if _, ok := schedule.ChatPolls["chat-admission-blocked"]; ok {
+		t.Fatal("blocked chat was admitted to ready schedule before its retry deadline")
+	}
+}
+
+func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const staleOperational = 24
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < staleOperational; i++ {
+			chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
+			sessionID := fmt.Sprintf("session-stale-operational-hint-%03d", i)
+			updatedAt := now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Second)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt: now.Add(-time.Minute), ContinuationPath: "/chats/" + chatID + "/messages?$skiptoken=stale",
+				UpdatedAt: updatedAt,
+			}
+		}
+		state.Sessions["session-due-ordinary-after-stale-hints"] = SessionContext{
+			ID: "session-due-ordinary-after-stale-hints", Status: SessionStatusActive,
+			TeamsChatID: "chat-due-ordinary-after-stale-hints", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-due-ordinary-after-stale-hints"] = ChatPollState{
+			ChatID: "chat-due-ordinary-after-stale-hints", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed stale frontier hint state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < staleOperational; i++ {
+			chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
+			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET frontier_active = 0 WHERE chat_id = ?`, chatID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("stale frontier hint candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	staleSeen := 0
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+		if strings.HasPrefix(candidate.ID, "session-stale-operational-hint-") {
+			staleSeen++
+		}
+	}
+	if !seen["session-due-ordinary-after-stale-hints"] {
+		t.Fatalf("due ordinary chat was starved by stale operational hints: %#v", seen)
+	}
+	if staleSeen != staleOperational {
+		t.Fatalf("stale operational chats were dropped during hint reconciliation: got %d want %d", staleSeen, staleOperational)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("stale frontier hint schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-due-ordinary-after-stale-hints"]; !ok {
+		t.Fatalf("due ordinary chat was absent from ready schedule behind stale hints: %#v", schedule.ChatPolls)
+	}
+	for i := 0; i < staleOperational; i++ {
+		chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
+		if _, ok := schedule.ChatPolls[chatID]; !ok {
+			t.Fatalf("stale operational chat %q was dropped from ready schedule: %#v", chatID, schedule.ChatPolls)
+		}
+	}
+}
+
+func TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	const operationalCount = sqliteHotPollReadyLimit
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < operationalCount; i++ {
+			chatID := fmt.Sprintf("chat-operational-hint-prefix-%03d", i)
+			sessionID := fmt.Sprintf("session-operational-hint-prefix-%03d", i)
+			updatedAt := now.Add(-2 * time.Hour).Add(time.Duration(i) * time.Second)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt: now.Add(-time.Minute), LastActivityAt: updatedAt,
+				ContinuationPath: "/chats/" + chatID + "/messages?$skiptoken=operational",
+				UpdatedAt:        updatedAt,
+			}
+		}
+		state.Sessions["session-ordinary-hidden-by-hint"] = SessionContext{
+			ID: "session-ordinary-hidden-by-hint", Status: SessionStatusActive,
+			TeamsChatID: "chat-ordinary-hidden-by-hint", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-ordinary-hidden-by-hint"] = ChatPollState{
+			ChatID: "chat-ordinary-hidden-by-hint", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), LastActivityAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed operational-prefix admission state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		// Simulate a partial/older writer that left the ordinary canonical JSON
+		// with an operational scalar hint. It must still be discoverable; a
+		// stable prefix of operational rows cannot make it invisible forever.
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET frontier_active = 1 WHERE chat_id = ?`, "chat-ordinary-hidden-by-hint")
+		return err
+	})
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil || !handled {
+		t.Fatalf("operational-prefix admission candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		seen[candidate.ID] = true
+	}
+	if !seen["session-ordinary-hidden-by-hint"] {
+		t.Fatalf("due ordinary chat hidden behind operational hint prefix: candidates=%#v", candidates)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("operational-prefix admission schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls["chat-ordinary-hidden-by-hint"]; !ok {
+		t.Fatalf("due ordinary poll hidden behind operational hint prefix: %#v", schedule.ChatPolls)
+	}
+}
+
+func TestTranscriptCheckpointProgressNeverRegressesKnownCursor(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	base := ImportCheckpoint{
+		ID: "transcript:cursor", SessionID: "session:cursor", SourcePath: "/tmp/cursor.jsonl",
+		LastRecordID: "record-128", LastSourceLine: 12, LastOffset: 128, LastOffsetKnown: true,
+		Status: "complete", UpdatedAt: now.Add(-time.Minute),
+	}
+	cases := []struct {
+		name     string
+		progress TranscriptCheckpointProgress
+		wantID   string
+		wantLine int
+		wantOff  int64
+		changed  bool
+	}{
+		{
+			name:     "unknown offset cannot roll back trusted offset",
+			progress: TranscriptCheckpointProgress{ID: base.ID, SessionID: base.SessionID, SourcePath: base.SourcePath, LastRecordID: "record-2", LastSourceLine: 2},
+			wantID:   base.LastRecordID, wantLine: base.LastSourceLine, wantOff: base.LastOffset,
+		},
+		{
+			name:     "known offset can upgrade legacy line-only cursor",
+			progress: TranscriptCheckpointProgress{ID: base.ID, SessionID: base.SessionID, SourcePath: base.SourcePath, LastRecordID: "record-64", LastSourceLine: 6, LastOffset: 64, LastOffsetKnown: true},
+			wantID:   "record-64", wantLine: 6, wantOff: 64, changed: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			current := base
+			if tc.name == "known offset can upgrade legacy line-only cursor" {
+				current.LastOffset = 0
+				current.LastOffsetKnown = false
+				current.LastRecordID = "record-0"
+				current.LastSourceLine = 0
+			}
+			got, changed, err := applyTranscriptCheckpointProgress(current, true, tc.progress, now)
+			if err != nil {
+				t.Fatalf("applyTranscriptCheckpointProgress: %v", err)
+			}
+			if changed != tc.changed || got.LastRecordID != tc.wantID || got.LastSourceLine != tc.wantLine || got.LastOffset != tc.wantOff {
+				t.Fatalf("checkpoint=%#v changed=%v, want id=%q line=%d offset=%d changed=%v", got, changed, tc.wantID, tc.wantLine, tc.wantOff, tc.changed)
+			}
+		})
+	}
+}
+
+func TestTranscriptCheckpointProgressPreservesSourceIdentityAndKnownZeroOffset(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	base := ImportCheckpoint{
+		ID: "transcript:source", SessionID: "session:source", SourcePath: "/tmp/source.jsonl",
+		SourceGeneration: "generation-1", LastRecordID: "record-128", LastSourceLine: 12,
+		LastOffset: 128, LastOffsetKnown: true, Status: "complete", UpdatedAt: now,
+	}
+
+	for _, tc := range []struct {
+		name     string
+		progress TranscriptCheckpointProgress
+	}{
+		{
+			name: "different source path",
+			progress: TranscriptCheckpointProgress{
+				ID: base.ID, SessionID: base.SessionID, SourcePath: "/tmp/replacement.jsonl",
+				SourceGeneration: "generation-2", LastRecordID: "replacement-record", LastSourceLine: 3,
+				LastOffset: 32, LastOffsetKnown: true,
+			},
+		},
+		{
+			name: "different source generation",
+			progress: TranscriptCheckpointProgress{
+				ID: base.ID, SessionID: base.SessionID, SourcePath: base.SourcePath,
+				SourceGeneration: "generation-2", LastRecordID: "record-256", LastSourceLine: 24,
+				LastOffset: 256, LastOffsetKnown: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed, err := applyTranscriptCheckpointProgress(base, true, tc.progress, now)
+			if !errors.Is(err, ErrTranscriptObservationConflict) || changed || got != base {
+				t.Fatalf("source identity change got checkpoint=%#v changed=%v err=%v, want unchanged conflict", got, changed, err)
+			}
+		})
+	}
+
+	knownZero := base
+	knownZero.SourcePath = ""
+	knownZero.SourceGeneration = ""
+	knownZero.LastRecordID = ""
+	knownZero.LastSourceLine = 0
+	knownZero.LastOffset = 0
+	knownZero.LastOffsetKnown = false
+	got, changed, err := applyTranscriptCheckpointProgress(knownZero, true, TranscriptCheckpointProgress{
+		ID: knownZero.ID, SessionID: knownZero.SessionID, LastRecordID: "first-record",
+		LastSourceLine: 1, LastOffset: 0, LastOffsetKnown: true,
+	}, now)
+	if err != nil || !changed || !got.LastOffsetKnown || got.LastOffset != 0 || got.LastRecordID != "first-record" {
+		t.Fatalf("known zero offset progress = %#v changed=%v err=%v, want trusted zero cursor", got, changed, err)
+	}
+}
+
+func TestTranscriptCheckpointProgressMergesEqualCursorTerminalBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	current := ImportCheckpoint{
+		ID: "transcript:equal-cursor", SessionID: "session:equal-cursor",
+		SourcePath: "/tmp/equal-cursor.jsonl", SourceGeneration: "generation-1",
+		SourceFingerprint: "fingerprint-1", LastRecordID: "record-9", LastSourceLine: 9,
+		LastOffset: 128, LastOffsetKnown: true, LastFinalID: "final-proven",
+		LastFinalLine: 9, LastFinalStartOffset: 96, LastFinalStartOffsetKnown: true,
+		LastFinalThreadID: "thread-1", LastFinalTurnID: "turn-1",
+		LastFinalTextHash: "hash-proven", TerminalBoundarySeen: true,
+		TerminalBoundaryLine: 9, Status: "complete", UpdatedAt: now,
+	}
+	// This is a stale callback at the exact same physical cursor. Its semantic
+	// final identity is different and it no longer carries the terminal marker;
+	// neither fact is allowed to erase the already-proven boundary.
+	progress := TranscriptCheckpointProgress{
+		ID: current.ID, SessionID: current.SessionID, SourcePath: current.SourcePath,
+		SourceGeneration: current.SourceGeneration, SourceFingerprint: current.SourceFingerprint,
+		LastRecordID: current.LastRecordID, LastSourceLine: current.LastSourceLine,
+		LastOffset: current.LastOffset, LastOffsetKnown: true, LastFinalID: "final-stale",
+		LastFinalLine: 8, TerminalBoundarySeen: false,
+	}
+	got, changed, err := applyTranscriptCheckpointProgress(current, true, progress, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("apply equal-cursor progress: %v", err)
+	}
+	if changed {
+		t.Fatalf("equal-cursor stale semantic callback changed checkpoint: %#v", got)
+	}
+	if got.LastFinalID != current.LastFinalID || got.LastFinalLine != current.LastFinalLine ||
+		!got.TerminalBoundarySeen || got.TerminalBoundaryLine != current.TerminalBoundaryLine {
+		t.Fatalf("equal-cursor boundary was not preserved: got=%#v want=%#v", got, current)
+	}
+}
+
+func TestUpdateNotificationForOwnerRejectsStaleCallbackAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC()
+			scope := ScopeIdentity{ID: "scope:notification-owner", AccountID: "account:notification-owner", Profile: "default"}
+			machineA := MachineRecord{ID: "machine:notification-owner-a", ScopeID: scope.ID, Kind: MachineKindPrimary}
+			machineB := MachineRecord{ID: "machine:notification-owner-b", ScopeID: scope.ID, Kind: MachineKindPrimary}
+			leaseA, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineA, Duration: time.Hour, Now: now})
+			if err != nil || leaseA.Mode != LeaseModeActive {
+				t.Fatalf("claim notification owner A = %#v err=%v", leaseA, err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			const notificationID = "workflow:owner-fenced"
+			_, changed, err := store.UpdateNotificationForOwner(ctx, notificationID, machineA.ID, leaseA.Lease.Generation, func(rec NotificationRecord, found bool, updateNow time.Time) (NotificationRecord, bool, error) {
+				if found {
+					t.Fatalf("new notification unexpectedly found: %#v", rec)
+				}
+				return NotificationRecord{ID: notificationID, Status: NotificationStatusQueued, CreatedAt: updateNow}, true, nil
+			})
+			if err != nil || !changed {
+				t.Fatalf("create owner-bound notification changed=%v err=%v", changed, err)
+			}
+			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
+				t.Fatalf("release notification owner A released=%v err=%v", released, err)
+			}
+			leaseB, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineB, Duration: time.Hour, Now: now.Add(time.Second)})
+			if err != nil || leaseB.Mode != LeaseModeActive || leaseB.Lease.Generation <= leaseA.Lease.Generation {
+				t.Fatalf("claim notification owner B = %#v err=%v", leaseB, err)
+			}
+
+			_, changed, err = store.UpdateNotificationForOwner(ctx, notificationID, machineA.ID, leaseA.Lease.Generation, func(rec NotificationRecord, found bool, updateNow time.Time) (NotificationRecord, bool, error) {
+				t.Fatal("stale notification callback was invoked")
+				return rec, false, nil
+			})
+			if !errors.Is(err, ErrControlLeaseNotHeld) || changed {
+				t.Fatalf("stale notification callback changed=%v err=%v, want owner conflict", changed, err)
+			}
+
+			updated, changed, err := store.UpdateNotificationForOwner(ctx, notificationID, machineB.ID, leaseB.Lease.Generation, func(rec NotificationRecord, found bool, updateNow time.Time) (NotificationRecord, bool, error) {
+				if !found || rec.Status != NotificationStatusQueued {
+					t.Fatalf("current notification before update = %#v found=%v", rec, found)
+				}
+				rec.Status = NotificationStatusSent
+				return rec, true, nil
+			})
+			if err != nil || !changed || updated.Status != NotificationStatusSent || updated.MachineID != machineB.ID || updated.LeaseGeneration != leaseB.Lease.Generation {
+				t.Fatalf("current notification update = %#v changed=%v err=%v, want owner B", updated, changed, err)
+			}
+		})
+	}
+}
+
+func TestRecordTranscriptCheckpointRejectsSameCursorSourceProofConflict(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			const checkpointID = "checkpoint:s1"
+			if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/same-cursor.jsonl",
+					SourceFingerprint: "fingerprint-before", LastRecordID: "record-before",
+					LastSourceLine: 12, LastOffset: 128, LastOffsetKnown: true,
+					SourceSize: 256, Status: importCheckpointStatusComplete,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed checkpoint: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/same-cursor.jsonl",
+				SourceFingerprint: "fingerprint-after", LastRecordID: "record-after",
+				LastSourceLine: 12, LastOffset: 128, LastOffsetKnown: true,
+				SourceSize: 256,
+			}, TranscriptLedgerRecord{
+				ID: "ledger:same-cursor-conflict", SessionID: "s1",
+				SourcePath: "/tmp/same-cursor.jsonl", SourceLine: 12,
+				SourceRecordID: "record-after",
+			})
+			if !errors.Is(err, ErrTranscriptObservationConflict) {
+				t.Fatalf("same-cursor source proof update error = %v, want ErrTranscriptObservationConflict", err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load checkpoint after conflict: %v", err)
+			}
+			got := state.ImportCheckpoints[checkpointID]
+			if got.LastRecordID != "record-before" || got.SourceFingerprint != "fingerprint-before" || got.LastOffset != 128 {
+				t.Fatalf("same-cursor conflict changed checkpoint: %#v", got)
+			}
+			if _, found := state.TranscriptLedger["ledger:same-cursor-conflict"]; found {
+				t.Fatal("same-cursor conflict recorded a ledger row")
+			}
+		})
 	}
 }
 
@@ -6520,10 +7936,67 @@ func TestPendingOutboxStatusMatrix(t *testing.T) {
 	want := map[string]bool{
 		"queued":                 true,
 		"accepted-with-teams-id": true,
-		"stale-sending":          true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pending status matrix = %#v, want %#v; pending=%#v", got, want, pending)
+	}
+	recovery, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{
+		Now: now, Limit: 10, IncludeAmbiguous: true, AmbiguousOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("PendingOutboxPageAt recovery error: %v", err)
+	}
+	if got := outboxIDsForTest(recovery.Messages); !reflect.DeepEqual(got, []string{"stale-sending"}) {
+		t.Fatalf("recovery pending status matrix = %#v, want stale-sending only", got)
+	}
+}
+
+func TestPendingOutboxAcceptedLedgerRetryGateMatchesAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.UTC)
+			if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:             "outbox:accepted-ledger-gated",
+				TeamsChatID:    "chat-poison",
+				Kind:           "helper",
+				Body:           "accepted ledger retry",
+				Status:         OutboxStatusAccepted,
+				TeamsMessageID: "teams-accepted-ledger",
+				NextAttemptAt:  now.Add(time.Hour),
+				CreatedAt:      now,
+			}); err != nil {
+				t.Fatalf("queue accepted row: %v", err)
+			}
+			if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID:          "outbox:healthy-after-ledger",
+				TeamsChatID: "chat-healthy",
+				Kind:        "helper",
+				Body:        "healthy",
+				Status:      OutboxStatusQueued,
+				CreatedAt:   now.Add(time.Second),
+			}); err != nil {
+				t.Fatalf("queue healthy row: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			page, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 10})
+			if err != nil {
+				t.Fatalf("pending page before gate expiry: %v", err)
+			}
+			if got := outboxIDsForTest(page.Messages); !reflect.DeepEqual(got, []string{"outbox:healthy-after-ledger"}) {
+				t.Fatalf("pending before accepted gate expiry = %#v, want healthy row only", got)
+			}
+			page, err = store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now.Add(2 * time.Hour), Limit: 10})
+			if err != nil {
+				t.Fatalf("pending page after gate expiry: %v", err)
+			}
+			if got := outboxIDsForTest(page.Messages); !reflect.DeepEqual(got, []string{"outbox:accepted-ledger-gated", "outbox:healthy-after-ledger"}) {
+				t.Fatalf("pending after accepted gate expiry = %#v, want both rows", got)
+			}
+		})
 	}
 }
 
@@ -7803,9 +9276,21 @@ func TestPendingOutboxPageMatchesFullPendingAcrossBackends(t *testing.T) {
 				TeamsChatID: "chat-open",
 				Limit:       1,
 			})
-			wantFiltered := []string{"outbox:queued-a", "outbox:stale-sending"}
+			wantFiltered := []string{"outbox:queued-a"}
 			if !reflect.DeepEqual(filteredIDs, wantFiltered) {
 				t.Fatalf("filtered paged pending IDs = %#v, want %#v", filteredIDs, wantFiltered)
+			}
+			recoveryIDs := collectPendingOutboxPageIDsForTest(t, store, PendingOutboxQuery{
+				Now:              now,
+				SessionID:        "s1",
+				TurnID:           "turn-1",
+				TeamsChatID:      "chat-open",
+				IncludeAmbiguous: true,
+				AmbiguousOnly:    true,
+				Limit:            1,
+			})
+			if want := []string{"outbox:stale-sending"}; !reflect.DeepEqual(recoveryIDs, want) {
+				t.Fatalf("filtered recovery pending IDs = %#v, want %#v", recoveryIDs, want)
 			}
 		})
 	}
@@ -7963,7 +9448,7 @@ func TestEarlierUnsentOutboxPreservesSameChatOrdering(t *testing.T) {
 }
 
 func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
-	now := time.Date(2026, 4, 30, 12, 40, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	tests := []struct {
 		name      string
 		status    OutboxStatus
@@ -7990,6 +9475,14 @@ func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
 				Status:         tc.status,
 				CreatedAt:      now,
 			}
+			if tc.status == OutboxStatusSending {
+				// An active Sending row must remain an ordering blocker. A
+				// markerless row with no attempt timestamp represents the legacy
+				// unknown-outcome case and is covered by the dedicated recovery
+				// tests below.
+				earlier.SendAttemptToken = "active-attempt"
+				earlier.LastSendAttempt = now
+			}
 			later := OutboxMessage{
 				ID:          "outbox:later",
 				TeamsChatID: "chat-1",
@@ -8013,6 +9506,126 @@ func TestEarlierUnsentOutboxStatusMatrix(t *testing.T) {
 			}
 			if tc.wantBlock && got.ID != earlier.ID {
 				t.Fatalf("EarlierUnsentOutbox = %#v, want %#v", got, earlier)
+			}
+		})
+	}
+}
+
+func TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 31, 18, 0, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			ambiguous := OutboxMessage{
+				ID: "outbox:same-turn-ambiguous", TeamsChatID: "chat-same-turn", TurnID: "turn:same-turn",
+				Sequence: 1, Kind: "final-001", Status: OutboxStatusSending,
+				SendAttemptToken: "attempt-same-turn", LastSendAttempt: now.Add(-time.Hour),
+				LastSendError: "ambiguous Graph send; response lost", CreatedAt: now,
+			}
+			sameTurn := OutboxMessage{
+				ID: "outbox:same-turn-next", TeamsChatID: ambiguous.TeamsChatID, TurnID: ambiguous.TurnID,
+				Sequence: 2, Kind: "final-002", Status: OutboxStatusQueued, CreatedAt: now.Add(time.Second),
+			}
+			differentTurn := OutboxMessage{
+				ID: "outbox:different-turn-next", TeamsChatID: ambiguous.TeamsChatID, TurnID: "turn:different-turn",
+				Sequence: 3, Kind: "ack", Status: OutboxStatusQueued, CreatedAt: now.Add(2 * time.Second),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[ambiguous.ID] = ambiguous
+				state.OutboxMessages[sameTurn.ID] = sameTurn
+				state.OutboxMessages[differentTurn.ID] = differentTurn
+				return nil
+			}); err != nil {
+				t.Fatalf("seed outboxes: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+
+			got, ok, err := store.EarlierUnsentOutbox(ctx, sameTurn)
+			if err != nil || !ok || got.ID != ambiguous.ID {
+				t.Fatalf("same-turn predecessor = %#v ok=%v err=%v, want ambiguous blocker", got, ok, err)
+			}
+			all, err := store.EarlierUnsentOutboxes(ctx, sameTurn)
+			if err != nil || len(all) != 1 || all[0].ID != ambiguous.ID {
+				t.Fatalf("same-turn predecessor list = %#v err=%v, want ambiguous blocker", all, err)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				row := state.OutboxMessages[sameTurn.ID]
+				row.Status = OutboxStatusSent
+				row.TeamsMessageID = "teams-same-turn-next"
+				state.OutboxMessages[row.ID] = row
+				return nil
+			}); err != nil {
+				t.Fatalf("mark same-turn successor sent for distinct-turn check: %v", err)
+			}
+			got, ok, err = store.EarlierUnsentOutbox(ctx, differentTurn)
+			if err != nil || ok {
+				t.Fatalf("different-turn predecessor = %#v ok=%v err=%v, want ambiguous row skipped", got, ok, err)
+			}
+		})
+	}
+}
+
+func TestEarlierUnsentOutboxSkipsExpiredUnknownOutcomePredecessorAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			unknownOutcome := OutboxMessage{
+				ID: "outbox:markerless-predecessor", TeamsChatID: "chat:markerless-fifo", TurnID: "turn:old",
+				Sequence: 1, Kind: "final", Status: OutboxStatusSending,
+				// A legacy writer may have persisted an attempt token without a
+				// provider outcome.  The token is not proof that replay is safe.
+				SendAttemptToken: "legacy-attempt-token",
+				LastSendAttempt:  now.Add(-2 * time.Hour), CreatedAt: now,
+			}
+			sameTurn := OutboxMessage{
+				ID: "outbox:markerless-same-turn", TeamsChatID: unknownOutcome.TeamsChatID, TurnID: unknownOutcome.TurnID,
+				Sequence: 2, Kind: "final", Status: OutboxStatusQueued, CreatedAt: now.Add(time.Second),
+			}
+			differentTurn := OutboxMessage{
+				ID: "outbox:markerless-different-turn", TeamsChatID: unknownOutcome.TeamsChatID, TurnID: "turn:new",
+				Sequence: 3, Kind: "final", Status: OutboxStatusQueued, CreatedAt: now.Add(2 * time.Second),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[unknownOutcome.ID] = unknownOutcome
+				state.OutboxMessages[sameTurn.ID] = sameTurn
+				state.OutboxMessages[differentTurn.ID] = differentTurn
+				return nil
+			}); err != nil {
+				t.Fatalf("seed markerless FIFO rows: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+
+			got, ok, err := store.EarlierUnsentOutbox(ctx, sameTurn)
+			if err != nil || !ok || got.ID != unknownOutcome.ID {
+				t.Fatalf("same-turn unknown-outcome predecessor = %#v ok=%v err=%v, want blocker", got, ok, err)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				completed := state.OutboxMessages[sameTurn.ID]
+				completed.Status = OutboxStatusSent
+				completed.TeamsMessageID = "teams:markerless-same-turn"
+				state.OutboxMessages[sameTurn.ID] = completed
+				return nil
+			}); err != nil {
+				t.Fatalf("mark same-turn row sent before distinct-turn check: %v", err)
+			}
+			got, ok, err = store.EarlierUnsentOutbox(ctx, differentTurn)
+			if err != nil || ok {
+				t.Fatalf("different-turn unknown-outcome predecessor = %#v ok=%v err=%v, want expired legacy row skipped", got, ok, err)
+			}
+			all, err := store.EarlierUnsentOutboxes(ctx, differentTurn)
+			if err != nil || len(all) != 0 {
+				t.Fatalf("different-turn unknown-outcome predecessor list = %#v err=%v, want empty", all, err)
 			}
 		})
 	}
@@ -9366,7 +10979,7 @@ func TestSQLiteReadUpgradeFallsBackWhenRuntimeUpgradeRowIsMissing(t *testing.T) 
 	})
 }
 
-func TestSQLiteReadUpgradeFallsBackWhenRuntimeProjectionIsIncomplete(t *testing.T) {
+func TestSQLiteReadUpgradeFailsClosedWhenRuntimeProjectionIsIncomplete(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	coldUpgrade := &UpgradeRequest{
@@ -9398,12 +11011,8 @@ func TestSQLiteReadUpgradeFallsBackWhenRuntimeProjectionIsIncomplete(t *testing.
 		return err
 	})
 
-	read, ok, err := store.ReadUpgrade(ctx)
-	if err != nil {
-		t.Fatalf("ReadUpgrade incomplete projection fallback: %v", err)
-	}
-	if !ok || !reflect.DeepEqual(read, *coldUpgrade) {
-		t.Fatalf("ReadUpgrade incomplete projection = %#v ok=%v, want cold %#v", read, ok, *coldUpgrade)
+	if _, _, err := store.ReadUpgrade(ctx); !errors.Is(err, ErrSQLiteRuntimeProjectionIncomplete) {
+		t.Fatalf("ReadUpgrade incomplete projection error = %v, want ErrSQLiteRuntimeProjectionIncomplete", err)
 	}
 }
 
@@ -10343,6 +11952,39 @@ func TestRecordTranscriptDeliveryAdvancesCheckpointPosition(t *testing.T) {
 	}
 }
 
+func TestApplyTranscriptCheckpointDoesNotRegressDurableCursor(t *testing.T) {
+	checkpointID := "checkpoint:monotonic-delivery"
+	source := "/tmp/monotonic-delivery.jsonl"
+	newer := ImportCheckpoint{
+		ID: checkpointID, SessionID: "s1", SourcePath: source,
+		SourceGeneration: "generation-new", SourceFingerprint: "fingerprint-new",
+		LastRecordID: "record-new", LastSourceLine: 20, LastOffset: 200,
+		LastOffsetKnown: true, SourceSize: 200, SourceModTime: time.Unix(200, 0),
+		LastFinalID: "final-new", LastFinalLine: 19, Status: importCheckpointStatusComplete,
+	}
+	older := ImportCheckpoint{
+		ID: checkpointID, SessionID: "s1", SourcePath: source,
+		SourceGeneration: "generation-old", SourceFingerprint: "fingerprint-old",
+		LastRecordID: "record-old", LastSourceLine: 10, LastOffset: 100,
+		LastOffsetKnown: true, SourceSize: 100, SourceModTime: time.Unix(100, 0),
+		LastFinalID: "final-old", LastFinalLine: 9, Status: importCheckpointStatusComplete,
+	}
+	state := State{ImportCheckpoints: map[string]ImportCheckpoint{}}
+	applyTranscriptCheckpointLocked(&state, newer, time.Unix(300, 0))
+	applyTranscriptCheckpointLocked(&state, older, time.Unix(301, 0))
+
+	got := state.ImportCheckpoints[checkpointID]
+	if got.LastRecordID != newer.LastRecordID || got.LastSourceLine != newer.LastSourceLine || got.LastOffset != newer.LastOffset || !got.LastOffsetKnown {
+		t.Fatalf("delayed older delivery regressed cursor: %#v", got)
+	}
+	if got.SourceGeneration != newer.SourceGeneration || got.SourceFingerprint != newer.SourceFingerprint || got.SourceSize != newer.SourceSize || !got.SourceModTime.Equal(newer.SourceModTime) {
+		t.Fatalf("delayed older delivery regressed source proof: %#v", got)
+	}
+	if got.LastFinalID != newer.LastFinalID || got.LastFinalLine != newer.LastFinalLine {
+		t.Fatalf("delayed older delivery regressed final boundary: %#v", got)
+	}
+}
+
 func TestRecordTranscriptProvenanceRejectsForeignCheckpointAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []struct {
@@ -10607,6 +12249,132 @@ func TestRecordTranscriptCheckpointPreservesLegacySemantics(t *testing.T) {
 	}
 	if failed := state.ImportCheckpoints["checkpoint:failed"]; failed.Status != "failed" || failed.LastRecordID != "new-failed-record" {
 		t.Fatalf("failed checkpoint status should be preserved while advancing position: %#v", failed)
+	}
+}
+
+func TestRecordTranscriptCheckpointDoesNotMixStaleCursorFields(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
+				t.Fatalf("CreateSession error: %v", err)
+			}
+			checkpointID := "checkpoint:stale-cursor"
+			checkpointTime := time.Date(2026, 8, 31, 9, 0, 0, 0, time.UTC)
+			if err := store.UpdateSession(ctx, "s1", func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/stale-cursor.jsonl",
+					SourceGeneration: "generation-new", SourceFingerprint: "fingerprint-new",
+					LastRecordID: "record-new", LastSourceLine: 12, LastOffset: 128,
+					LastOffsetKnown: true, SourceSize: 256, SourceModTime: checkpointTime,
+					Status: importCheckpointStatusComplete, UpdatedAt: checkpointTime,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed checkpoint: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/stale-cursor.jsonl",
+				SourceGeneration: "generation-new", SourceFingerprint: "fingerprint-old",
+				LastRecordID: "record-stale", LastSourceLine: 2, LastOffsetKnown: false,
+				SourceSize: 64, SourceModTime: checkpointTime.Add(-time.Hour),
+			}, TranscriptLedgerRecord{ID: "ledger:stale-cursor", SessionID: "s1", SourceRecordID: "record-stale", SourceLine: 2}); err != nil {
+				t.Fatalf("RecordTranscriptCheckpoint stale update: %v", err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load checkpoint after stale update: %v", err)
+			}
+			got := state.ImportCheckpoints[checkpointID]
+			if got.LastRecordID != "record-new" || got.LastSourceLine != 12 || got.LastOffset != 128 || !got.LastOffsetKnown {
+				t.Fatalf("stale update regressed/mixed cursor: %#v", got)
+			}
+			if got.SourceGeneration != "generation-new" || got.SourceFingerprint != "fingerprint-new" || got.SourceSize != 256 || !got.SourceModTime.Equal(checkpointTime) {
+				t.Fatalf("stale update regressed source proof: %#v", got)
+			}
+
+			if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/stale-cursor.jsonl",
+				SourceGeneration: "generation-old", SourceFingerprint: "fingerprint-old",
+				LastRecordID: "record-old-generation-high-offset", LastSourceLine: 99, LastOffset: 4096, LastOffsetKnown: true,
+				SourceSize: 4096, SourceModTime: checkpointTime.Add(time.Hour),
+			}, TranscriptLedgerRecord{ID: "ledger:stale-generation-high-offset", SessionID: "s1", SourceRecordID: "record-old-generation-high-offset", SourceLine: 99}); !errors.Is(err, ErrTranscriptObservationConflict) {
+				t.Fatalf("RecordTranscriptCheckpoint old-generation update = %v, want ErrTranscriptObservationConflict", err)
+			}
+			state, err = store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load checkpoint after old-generation update: %v", err)
+			}
+			got = state.ImportCheckpoints[checkpointID]
+			if got.LastRecordID != "record-new" || got.LastSourceLine != 12 || got.LastOffset != 128 || !got.LastOffsetKnown || got.SourceGeneration != "generation-new" || got.SourceFingerprint != "fingerprint-new" {
+				t.Fatalf("old-generation callback regressed trusted cursor: %#v", got)
+			}
+
+			if err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", LastRecordID: "record-anonymous-stale", LastSourceLine: 1,
+			}, TranscriptLedgerRecord{ID: "ledger:anonymous-stale", SessionID: "s1", SourceRecordID: "record-anonymous-stale", SourceLine: 1}); err != nil {
+				t.Fatalf("RecordTranscriptCheckpoint anonymous stale update: %v", err)
+			}
+			state, err = store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load checkpoint after anonymous stale update: %v", err)
+			}
+			got = state.ImportCheckpoints[checkpointID]
+			if got.LastRecordID != "record-new" || got.LastSourceLine != 12 || got.LastOffset != 128 || !got.LastOffsetKnown {
+				t.Fatalf("anonymous stale update regressed cursor: %#v", got)
+			}
+		})
+	}
+}
+
+func TestRecordTranscriptCheckpointRejectsModernSourcePathSwapAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			const checkpointID = "checkpoint:modern-path-swap"
+			current := ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/current.jsonl",
+				SourceGeneration: "generation-current", SourceFingerprint: "fingerprint-current",
+				LastRecordID: "current-record", LastSourceLine: 10, LastOffset: 128, LastOffsetKnown: true,
+				SourceSize: 256, Status: importCheckpointStatusComplete,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.ImportCheckpoints[checkpointID] = current
+				return nil
+			}); err != nil {
+				t.Fatalf("seed modern checkpoint: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			err := store.RecordTranscriptCheckpoint(ctx, ImportCheckpoint{
+				ID: checkpointID, SessionID: "s1", SourcePath: "/tmp/replaced.jsonl",
+				SourceGeneration: "generation-replacement", SourceFingerprint: "fingerprint-replacement",
+				LastRecordID: "replacement-record", LastSourceLine: 99, LastOffset: 4096, LastOffsetKnown: true,
+				SourceSize: 4096,
+			}, TranscriptLedgerRecord{ID: "ledger:modern-path-swap", SessionID: "s1", SourcePath: "/tmp/replaced.jsonl", SourceRecordID: "replacement-record", SourceLine: 99})
+			if !errors.Is(err, ErrTranscriptObservationConflict) {
+				t.Fatalf("modern source swap error = %v, want ErrTranscriptObservationConflict", err)
+			}
+			got, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found {
+				t.Fatalf("load modern checkpoint after rejected swap: found=%v err=%v", found, err)
+			}
+			if got.SourcePath != current.SourcePath || got.SourceGeneration != current.SourceGeneration || got.LastRecordID != current.LastRecordID || got.LastOffset != current.LastOffset {
+				t.Fatalf("modern checkpoint changed after rejected swap: %#v", got)
+			}
+		})
 	}
 }
 
@@ -13396,6 +15164,20 @@ func TestMarkOutboxSentIsIdempotent(t *testing.T) {
 	if !ok || record.Origin != MessageOriginHelperOutbox || record.OutboxID != msg.ID {
 		t.Fatalf("message provenance = %#v, ok=%v", record, ok)
 	}
+	completed, err := store.MarkOutboxSideEffectsComplete(ctx, msg.ID)
+	if err != nil {
+		t.Fatalf("MarkOutboxSideEffectsComplete error: %v", err)
+	}
+	if completed.PostSendEffectsPending {
+		t.Fatal("MarkOutboxSideEffectsComplete should clear the replay marker")
+	}
+	repeated, err := store.MarkOutboxSent(ctx, msg.ID, "teams-message-1")
+	if err != nil {
+		t.Fatalf("repeated MarkOutboxSent error: %v", err)
+	}
+	if repeated.PostSendEffectsPending {
+		t.Fatal("repeated MarkOutboxSent must not re-arm completed post-send effects")
+	}
 	if err := store.Update(ctx, func(state *State) error {
 		delete(state.OutboxMessages, msg.ID)
 		return nil
@@ -13408,6 +15190,149 @@ func TestMarkOutboxSentIsIdempotent(t *testing.T) {
 	}
 	if !delivered {
 		t.Fatal("HasDeliveredOutboxMessage should use provenance after outbox pruning")
+	}
+}
+
+func TestMarkOutboxSentRequiresGraphIdentityAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID: "outbox:empty-identity", TeamsChatID: "chat-empty-identity", Kind: "final", Body: "answer",
+			})
+			if err != nil {
+				t.Fatalf("QueueOutbox: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if _, err := store.MarkOutboxSent(ctx, msg.ID, ""); err == nil {
+				t.Fatal("MarkOutboxSent accepted an empty Graph identity")
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after rejected empty identity: %v", err)
+			}
+			got := state.OutboxMessages[msg.ID]
+			if got.Status != OutboxStatusQueued || got.PostSendEffectsPending || got.TeamsMessageID != "" {
+				t.Fatalf("empty identity changed queued row: %#v", got)
+			}
+		})
+	}
+}
+
+func TestMarkOutboxSuppressedForOwnerFencesStaleCallbackAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC()
+			scope := ScopeIdentity{ID: "scope:suppressed-owner", AccountID: "account:suppressed-owner", Profile: "default"}
+			machineA := MachineRecord{ID: "machine:suppressed-a", ScopeID: scope.ID, Kind: MachineKindPrimary}
+			machineB := MachineRecord{ID: "machine:suppressed-b", ScopeID: scope.ID, Kind: MachineKindPrimary}
+			leaseA, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineA, Duration: time.Hour, Now: now})
+			if err != nil || leaseA.Mode != LeaseModeActive {
+				t.Fatalf("claim owner A: decision=%#v err=%v", leaseA, err)
+			}
+			msg, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID: "outbox:suppressed-owner", TeamsChatID: "chat-suppressed-owner", Kind: "codex-command-owner", Body: "diagnostic",
+			})
+			if err != nil {
+				t.Fatalf("QueueOutbox: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
+				t.Fatalf("release owner A: released=%v err=%v", released, err)
+			}
+			leaseB, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineB, Duration: time.Hour, Now: now.Add(time.Second)})
+			if err != nil || leaseB.Mode != LeaseModeActive || leaseB.Lease.Generation <= leaseA.Lease.Generation {
+				t.Fatalf("claim owner B: decision=%#v err=%v", leaseB, err)
+			}
+			if _, err := store.MarkOutboxSuppressedForOwner(ctx, msg.ID, machineA.ID, leaseA.Lease.Generation); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale suppression err=%v, want ErrControlLeaseNotHeld", err)
+			}
+			suppressed, err := store.MarkOutboxSuppressedForOwner(ctx, msg.ID, machineB.ID, leaseB.Lease.Generation)
+			if err != nil || suppressed.Status != OutboxStatusSent || suppressed.PostSendEffectsPending || suppressed.TeamsMessageID != "" {
+				t.Fatalf("current suppression: out=%#v err=%v", suppressed, err)
+			}
+		})
+	}
+}
+
+func TestPendingSentOutboxSideEffectsAreDueAndReplayableAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC()
+			due := OutboxMessage{
+				ID: "outbox:side-effects-due", TeamsChatID: "chat:side-effects", Status: OutboxStatusSent,
+				Kind: "ack", TeamsMessageID: "teams:side-effects-due", PostSendEffectsPending: true,
+				CreatedAt: now.Add(-time.Minute),
+			}
+			gated := due
+			gated.ID = "outbox:side-effects-gated"
+			gated.TeamsMessageID = "teams:side-effects-gated"
+			gated.NextAttemptAt = now.Add(time.Hour)
+			legacy := due
+			legacy.ID = "outbox:side-effects-legacy"
+			legacy.TeamsMessageID = "teams:side-effects-legacy"
+			legacy.PostSendEffectsPending = false
+			unrelated := due
+			unrelated.ID = "outbox:side-effects-queued"
+			unrelated.Status = OutboxStatusQueued
+			unrelated.TeamsMessageID = ""
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages[due.ID] = due
+				state.OutboxMessages[gated.ID] = gated
+				state.OutboxMessages[legacy.ID] = legacy
+				state.OutboxMessages[unrelated.ID] = unrelated
+				return nil
+			}); err != nil {
+				t.Fatalf("seed side-effect rows: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+
+			pending, err := store.PendingSentOutboxSideEffects(ctx, 16)
+			if err != nil {
+				t.Fatalf("PendingSentOutboxSideEffects: %v", err)
+			}
+			if len(pending) != 1 || pending[0].ID != due.ID {
+				t.Fatalf("due side-effect rows = %#v, want only %q", pending, due.ID)
+			}
+			deferredUntil := now.Add(time.Hour)
+			if _, err := store.DeferOutboxSideEffectsUntil(ctx, due.ID, deferredUntil); err != nil {
+				t.Fatalf("DeferOutboxSideEffectsUntil: %v", err)
+			}
+			pending, err = store.PendingSentOutboxSideEffects(ctx, 16)
+			if err != nil {
+				t.Fatalf("PendingSentOutboxSideEffects after defer: %v", err)
+			}
+			if len(pending) != 0 {
+				t.Fatalf("gated side-effect rows = %#v, want none", pending)
+			}
+			completed, err := store.MarkOutboxSideEffectsComplete(ctx, due.ID)
+			if err != nil {
+				t.Fatalf("MarkOutboxSideEffectsComplete: %v", err)
+			}
+			if completed.Status != OutboxStatusSent || completed.PostSendEffectsPending {
+				t.Fatalf("completed side-effect row = %#v, want Sent without marker", completed)
+			}
+			legacyPending, err := store.PendingSentOutboxSideEffects(ctx, 16)
+			if err != nil {
+				t.Fatalf("PendingSentOutboxSideEffects after completion: %v", err)
+			}
+			if len(legacyPending) != 0 {
+				t.Fatalf("legacy/completed side-effect rows = %#v, want none", legacyPending)
+			}
+		})
 	}
 }
 
@@ -13446,7 +15371,7 @@ func TestOutboxSendAttemptClaimsQueuedMessage(t *testing.T) {
 	}
 }
 
-func TestPendingOutboxIncludesStaleSendingMessage(t *testing.T) {
+func TestPendingOutboxMovesStaleSendingMessageToRecoveryLane(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
@@ -13477,8 +15402,17 @@ func TestPendingOutboxIncludesStaleSendingMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PendingOutbox error: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != msg.ID {
-		t.Fatalf("pending outbox = %#v, want stale sending message", pending)
+	if len(pending) != 0 {
+		t.Fatalf("ordinary pending outbox = %#v, want stale unknown-outcome row excluded", pending)
+	}
+	recovery, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{
+		Now: time.Now().UTC(), Limit: 10, IncludeAmbiguous: true, AmbiguousOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("recovery PendingOutboxPageAt error: %v", err)
+	}
+	if len(recovery.Messages) != 1 || recovery.Messages[0].ID != msg.ID {
+		t.Fatalf("recovery outbox = %#v, want stale sending message", recovery.Messages)
 	}
 }
 
@@ -13688,12 +15622,15 @@ func TestTeamsBackgroundKeepaliveClockSkewOutboxAndRateLimitCI(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("future send attempt should remain leased after backward clock skew: %#v", pending)
 	}
-	pending, err = store.PendingOutboxAt(ctx, now.Add(30*time.Second+outboxSendLease+time.Nanosecond))
+	recovery, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{
+		Now: now.Add(30*time.Second + outboxSendLease + time.Nanosecond), Limit: 10,
+		IncludeAmbiguous: true, AmbiguousOnly: true,
+	})
 	if err != nil {
-		t.Fatalf("PendingOutboxAt after future lease expiry error: %v", err)
+		t.Fatalf("recovery PendingOutboxPageAt after future lease expiry error: %v", err)
 	}
-	if len(pending) != 1 || pending[0].ID != "outbox:future-send" {
-		t.Fatalf("future send attempt should become pending after lease expiry: %#v", pending)
+	if len(recovery.Messages) != 1 || recovery.Messages[0].ID != "outbox:future-send" {
+		t.Fatalf("future send attempt should become recoverable after lease expiry: %#v", recovery.Messages)
 	}
 
 	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{ID: "outbox:rate-limited", TeamsChatID: "chat-2", Kind: "helper", Body: "blocked"}); err != nil {
@@ -13788,19 +15725,22 @@ func TestTeamsBackgroundKeepaliveLogoutResumePreservesQueuedOutboxCI(t *testing.
 		}
 	}
 
-	pending, err = store.PendingOutboxAt(ctx, blockedUntil.Add(time.Nanosecond))
+	recovery, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{
+		Now: blockedUntil.Add(time.Nanosecond), Limit: 10,
+		IncludeAmbiguous: true, AmbiguousOnly: true,
+	})
 	if err != nil {
-		t.Fatalf("PendingOutboxAt after Retry-After error: %v", err)
+		t.Fatalf("recovery PendingOutboxPageAt after Retry-After error: %v", err)
 	}
 	var found *OutboxMessage
-	for i := range pending {
-		if pending[i].ID == msg.ID {
-			found = &pending[i]
+	for i := range recovery.Messages {
+		if recovery.Messages[i].ID == msg.ID {
+			found = &recovery.Messages[i]
 			break
 		}
 	}
 	if found == nil {
-		t.Fatalf("outbox queued by stale owner should still be sendable after takeover and Retry-After: %#v", pending)
+		t.Fatalf("outbox queued by stale owner should still be recoverable after takeover and Retry-After: %#v", recovery.Messages)
 	}
 	if found.Body != "queued before helper takeover" || found.SessionID != "session-old" || found.TurnID != "turn-old" {
 		t.Fatalf("queued outbox mutated during recovery: %#v", *found)
@@ -13839,8 +15779,8 @@ func TestTeamsBackgroundKeepaliveLogoutResumePreservesQueuedOutboxCI(t *testing.
 	if err != nil {
 		t.Fatalf("EarlierUnsentOutbox error: %v", err)
 	}
-	if !ok || earlier.ID != msg.ID {
-		t.Fatalf("later outbox should be blocked behind unsent pre-takeover outbox; earlier=%#v ok=%v", earlier, ok)
+	if ok {
+		t.Fatalf("later distinct-turn outbox should not be blocked by expired unknown-outcome predecessor; earlier=%#v", earlier)
 	}
 }
 
@@ -14630,8 +16570,15 @@ func TestRecordChatPollErrorWithBlockSQLiteUsesNarrowRows(t *testing.T) {
 	if poll.PollState != chatPollStateBlocked || poll.PreviousPollState != chatPollStateHot || !poll.BlockedUntil.Equal(blockedUntil) || !poll.NextPollAt.Equal(blockedUntil) {
 		t.Fatalf("target poll block fields mismatch: %#v", poll)
 	}
-	if _, err := store.Load(ctx); err == nil {
-		t.Fatal("full Load unexpectedly succeeded with corrupt unrelated chat poll row")
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("full Load should isolate corrupt unrelated chat poll row: %v", err)
+	}
+	if poll, ok := loaded.ChatPolls["chat-unrelated"]; !ok || !poll.RecoveryRequired || poll.ChatID != "chat-unrelated" {
+		t.Fatalf("corrupt unrelated chat poll row should be an isolated recovery placeholder: %#v found=%v", poll, ok)
+	}
+	if got := sqliteRawChatPollJSONForTest(t, store, "chat-unrelated"); !bytes.Equal(got, corruptUnrelated) {
+		t.Fatalf("full Load changed opaque chat poll row: got=%q want=%q", got, corruptUnrelated)
 	}
 }
 
@@ -15688,6 +17635,177 @@ func TestControlLeaseClaimIgnoresUnrelatedCorruptRuntimeRow(t *testing.T) {
 	}
 }
 
+// A malformed required runtime projection row is recoverable after an
+// unambiguous lease expiry.  The claim must rebuild the projection from the
+// cold state, preserve the raw row for diagnosis, and establish a fresh
+// generation rather than leaving every restart in the same decode failure.
+func TestSQLiteControlLeaseClaimRepairsCorruptRequiredRuntimeRowAfterExpiry(t *testing.T) {
+	ctx := context.Background()
+	for _, key := range sqliteRuntimeRequiredKeys {
+		t.Run(key, func(t *testing.T) {
+			store := newTestStore(t)
+			now := testOwnerStart()
+			scope := ScopeIdentity{ID: "scope-required-runtime-repair"}
+			oldMachine := MachineRecord{
+				ID: "machine-required-runtime-old", ScopeID: scope.ID,
+				Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary),
+			}
+			newMachine := MachineRecord{
+				ID: "machine-required-runtime-new", ScopeID: scope.ID,
+				Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary),
+			}
+			oldOwner := testOwner("", "", now.Add(-time.Hour))
+			oldOwner.MachineID = oldMachine.ID
+			oldOwner.ScopeID = scope.ID
+			oldOwner.LeaseGeneration = 7
+			oldOwner.LastHeartbeat = now.Add(-time.Hour)
+			lease := ControlLease{
+				ScopeID: scope.ID, HolderMachineID: oldMachine.ID,
+				Generation: 7, Status: ControlLeaseStatusActive,
+				LeaseUntil: now.Add(-time.Minute), LastHeartbeat: now.Add(-time.Hour),
+				UpdatedAt: now.Add(-time.Hour),
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = scope
+				state.Machines[oldMachine.ID] = oldMachine
+				state.ServiceOwner = &oldOwner
+				state.LockOwner = &oldOwner
+				state.ControlLease = lease
+				return nil
+			}); err != nil {
+				t.Fatalf("seed expired lease: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			corruptRuntimeRow := []byte(`{"required-runtime-row-is-corrupt"`)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				result, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, corruptRuntimeRow, key)
+				if err != nil {
+					return err
+				}
+				affected, err := result.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if affected != 1 {
+					return fmt.Errorf("updated %d %s runtime rows, want one", affected, key)
+				}
+				return nil
+			})
+
+			path := store.Path()
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store: %v", err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen store: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+
+			newOwner, err := CurrentOwner("required-runtime-repair", "", "", now)
+			if err != nil {
+				t.Fatalf("CurrentOwner: %v", err)
+			}
+			newOwner.ScopeID = scope.ID
+			newOwner.MachineID = newMachine.ID
+			decision, err := reopened.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: newMachine, Owner: newOwner,
+				Duration: time.Minute, Now: now,
+			})
+			if err != nil {
+				t.Fatalf("ClaimControlLease with corrupt required %s row: %v", key, err)
+			}
+			if decision.Mode != LeaseModeActive || decision.Lease.HolderMachineID != newMachine.ID || decision.Lease.Generation <= lease.Generation {
+				t.Fatalf("repaired lease decision = %#v, want a fresh active generation", decision)
+			}
+
+			var opaque []byte
+			withSQLiteTxForTest(t, reopened, func(tx *sql.Tx) error {
+				var raw []byte
+				if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key LIKE ? ORDER BY key LIMIT 1`, sqliteRuntimeOpaqueMetaPrefix+key+":%").Scan(&raw); err != nil {
+					return fmt.Errorf("read opaque %s runtime row: %w", key, err)
+				}
+				opaque = append([]byte(nil), raw...)
+				return nil
+			})
+			if string(opaque) != string(corruptRuntimeRow) {
+				t.Fatalf("opaque %s runtime row = %q, want original bytes %q", key, opaque, corruptRuntimeRow)
+			}
+			if _, err := reopened.ValidateControlLease(ctx, newMachine.ID, decision.Lease.Generation, now); err != nil {
+				t.Fatalf("ValidateControlLease after repairing %s row: %v", key, err)
+			}
+		})
+	}
+}
+
+// The same malformed projection must remain fail-closed while the cold state
+// independently proves that a different owner still has a live lease.  A
+// recovery shortcut that only checks whether JSON decoding failed would split
+// ownership during restart.
+func TestSQLiteControlLeaseClaimRejectsCorruptRequiredRuntimeRowWithLiveLease(t *testing.T) {
+	ctx := context.Background()
+	for _, key := range sqliteRuntimeRequiredKeys {
+		t.Run(key, func(t *testing.T) {
+			store := newTestStore(t)
+			now := testOwnerStart()
+			scope := ScopeIdentity{ID: "scope-required-runtime-live"}
+			oldMachine := MachineRecord{ID: "machine-required-runtime-live-old", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			newMachine := MachineRecord{ID: "machine-required-runtime-live-new", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			oldOwner := testOwner("live-session", "live-turn", now)
+			oldOwner.MachineID = oldMachine.ID
+			oldOwner.ScopeID = scope.ID
+			oldOwner.LeaseGeneration = 11
+			oldOwner.LastHeartbeat = now
+			lease := ControlLease{
+				ScopeID: scope.ID, HolderMachineID: oldMachine.ID,
+				Generation: 11, Status: ControlLeaseStatusActive,
+				LeaseUntil: now.Add(time.Hour), LastHeartbeat: now,
+				UpdatedAt: now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = scope
+				state.Machines[oldMachine.ID] = oldMachine
+				state.ServiceOwner = &oldOwner
+				state.LockOwner = &oldOwner
+				state.ControlLease = lease
+				return nil
+			}); err != nil {
+				t.Fatalf("seed live lease: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			corruptRuntimeRow := []byte(`{"required-runtime-row-is-corrupt"`)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, corruptRuntimeRow, key)
+				return err
+			})
+
+			newOwner, err := CurrentOwner("required-runtime-live", "", "", now)
+			if err != nil {
+				t.Fatalf("CurrentOwner: %v", err)
+			}
+			newOwner.ScopeID = scope.ID
+			newOwner.MachineID = newMachine.ID
+			_, err = store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: newMachine, Owner: newOwner,
+				Duration: time.Minute, Now: now,
+			})
+			if err == nil {
+				t.Fatalf("ClaimControlLease with corrupt live %s row unexpectedly succeeded", key)
+			}
+			if !strings.Contains(err.Error(), "expiry is not provable") {
+				t.Fatalf("ClaimControlLease with corrupt live %s row error = %v, want fail-closed expiry diagnostic", key, err)
+			}
+			var persisted []byte
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				return tx.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, key).Scan(&persisted)
+			})
+			if string(persisted) != string(corruptRuntimeRow) {
+				t.Fatalf("failed live-lease claim rewrote corrupt %s row: got=%q want=%q", key, persisted, corruptRuntimeRow)
+			}
+		})
+	}
+}
+
 func TestDeferredInboundSortedByChatAndMessageTime(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -15946,6 +18064,70 @@ func TestSameOwnerProcessCanonicalizesNFSSillyRename(t *testing.T) {
 	b := OwnerMetadata{PID: 1234, Hostname: "host-a", ExecutablePath: filepath.Join(dir, ".nfs802014de01c482a800000492")}
 	if !sameOwnerProcess(a, b) {
 		t.Fatalf("sameOwnerProcess should canonicalize NFS silly rename: a=%#v b=%#v", a, b)
+	}
+}
+
+func TestSameOwnerProcessRejectsReusedPIDAcrossProcessInstances(t *testing.T) {
+	base := OwnerMetadata{
+		PID:            1234,
+		Hostname:       "host-a",
+		ExecutablePath: "/usr/local/bin/codex-helper",
+	}
+	first := base
+	first.InstanceID = "process-a"
+	second := base
+	second.InstanceID = "process-b"
+	if sameOwnerProcess(first, second) {
+		t.Fatalf("sameOwnerProcess treated distinct process instances as equal: first=%#v second=%#v", first, second)
+	}
+	second.InstanceID = first.InstanceID
+	if !sameOwnerProcess(first, second) {
+		t.Fatalf("sameOwnerProcess rejected the same process instance: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestCurrentOwnerUsesStableProcessInstanceID(t *testing.T) {
+	first, err := CurrentOwner("v-test", "", "", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("first CurrentOwner error: %v", err)
+	}
+	second, err := CurrentOwner("v-test", "", "", time.Date(2026, 5, 1, 12, 1, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("second CurrentOwner error: %v", err)
+	}
+	if strings.TrimSpace(first.InstanceID) == "" || first.InstanceID != second.InstanceID {
+		t.Fatalf("CurrentOwner instance IDs = %q and %q, want one stable non-empty process identity", first.InstanceID, second.InstanceID)
+	}
+}
+
+func TestClaimControlLeaseBumpsGenerationAfterSameMachineOwnerReplacement(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-reused-pid", AccountID: "user-1", OSUser: "alice", Profile: "default"}
+	machine := MachineRecord{ID: "machine-reused-pid", ScopeID: scope.ID, Kind: MachineKindPrimary}
+	ownerA := OwnerMetadata{PID: 4242, Hostname: "host-a", ExecutablePath: "/usr/local/bin/codex-helper", InstanceID: "process-a"}
+	first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: ownerA, Duration: time.Minute, Now: now})
+	if err != nil {
+		t.Fatalf("claim owner A: %v", err)
+	}
+	ownerA.ScopeID = scope.ID
+	ownerA.MachineID = machine.ID
+	ownerA.LeaseGeneration = first.Lease.Generation
+	if _, err := store.RecordOwnerHeartbeat(ctx, ownerA, time.Minute, now); err != nil {
+		t.Fatalf("record owner A heartbeat: %v", err)
+	}
+	if err := store.ClearOwner(ctx); err != nil {
+		t.Fatalf("clear owner A: %v", err)
+	}
+	ownerB := ownerA
+	ownerB.InstanceID = "process-b"
+	second, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Owner: ownerB, Duration: time.Minute, Now: now.Add(time.Second)})
+	if err != nil {
+		t.Fatalf("claim owner B: %v", err)
+	}
+	if second.Mode != LeaseModeActive || second.Lease.Generation <= first.Lease.Generation {
+		t.Fatalf("replacement lease = %#v, want active generation greater than %d", second, first.Lease.Generation)
 	}
 }
 
@@ -16595,6 +18777,81 @@ func TestSQLiteFullStateUpdateDoesNotResurrectClearedOwner(t *testing.T) {
 	}
 	if state.ServiceControl.Reason != "unrelated cold update" {
 		t.Fatalf("unrelated cold update was lost: %q", state.ServiceControl.Reason)
+	}
+}
+
+// Owner and lease projections are written together. If a damaged or manually
+// interrupted projection presents a newer owner from one generation alongside
+// an active lease from another, a cold writer must not merge them into a state
+// that claims the wrong owner. It fails closed and leaves the newer runtime
+// evidence untouched for recovery.
+func TestSQLiteFullStateUpdateRejectsMixedOwnerAndLeaseGenerations(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := testOwnerStart()
+	scope := ScopeIdentity{ID: "scope-mixed-liveness"}
+	oldOwner := testOwner("old-session", "old-turn", now)
+	oldOwner.ScopeID = scope.ID
+	oldOwner.MachineID = "machine-mixed-old"
+	oldOwner.LeaseGeneration = 3
+	oldLease := ControlLease{
+		ScopeID: scope.ID, HolderMachineID: oldOwner.MachineID,
+		Generation: oldOwner.LeaseGeneration, Status: ControlLeaseStatusActive,
+		LeaseUntil: now.Add(time.Hour), LastHeartbeat: now, UpdatedAt: now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = scope
+		state.ServiceOwner = &oldOwner
+		state.LockOwner = &oldOwner
+		state.ControlLease = oldLease
+		return nil
+	}); err != nil {
+		t.Fatalf("seed old liveness tuple: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	stale, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load stale state: %v", err)
+	}
+	newOwner := oldOwner
+	newOwner.MachineID = "machine-mixed-new"
+	newOwner.LeaseGeneration = oldOwner.LeaseGeneration + 1
+	newOwner.LastHeartbeat = now.Add(time.Minute)
+	newOwner.ActiveSessionID = "new-session"
+	newOwner.ActiveTurnID = "new-turn"
+	ownerRaw, err := json.Marshal(newOwner)
+	if err != nil {
+		t.Fatalf("marshal new owner: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+			if _, err := tx.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, ownerRaw, key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	stale.ServiceControl.Reason = "unrelated update must not merge mixed liveness"
+	err = store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		return store.saveSQLiteStateUnlocked(pointer, stale)
+	})
+	if !errors.Is(err, ErrControlLeaseStateUntrusted) {
+		t.Fatalf("mixed owner/lease cold write error = %v, want ErrControlLeaseStateUntrusted", err)
+	}
+	for _, key := range []string{sqliteRuntimeKeyServiceOwner, sqliteRuntimeKeyLockOwner} {
+		if got := sqliteRuntimeRawForTest(t, store, key); string(got) != string(ownerRaw) {
+			t.Fatalf("mixed liveness write changed %s: got=%q want=%q", key, got, ownerRaw)
+		}
+	}
+	if got := sqliteRuntimeRawForTest(t, store, sqliteRuntimeKeyControlLease); string(got) == "" {
+		t.Fatalf("mixed liveness write removed control lease row")
 	}
 }
 
@@ -17831,6 +20088,63 @@ func TestAtomicWriteFileUsesTempAndCleansFailedReplace(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("target should not exist after failed replace: stat err=%v", err)
+	}
+}
+
+// TestTeamsJSONPersistenceFailureStopsDurableMutation models a full/read-only
+// JSON state filesystem.  The failed atomic replacement must not expose the
+// in-memory callback mutation through a later load, and the caller must
+// classify the error as process-wide so the listener stops making more state
+// changes until persistence recovers.
+func TestTeamsJSONPersistenceFailureStopsDurableMutation(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "json-persistence-scope", Profile: "before"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed JSON state: %v", err)
+	}
+	original, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read original JSON state: %v", err)
+	}
+
+	previousReplace := durableReplaceFile
+	durableReplaceFile = func(string, string) error {
+		return errors.New("no space left on device")
+	}
+	t.Cleanup(func() { durableReplaceFile = previousReplace })
+
+	err = store.Update(ctx, func(state *State) error {
+		state.Scope.Profile = "must-not-be-durable"
+		state.Scope.UpdatedAt = time.Now()
+		return nil
+	})
+	if err == nil || !errors.Is(err, ErrStatePersistence) || !IsProcessWideStateError(err) {
+		t.Fatalf("JSON persistence error = %v, want process-wide ErrStatePersistence", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatalf("read JSON state after failed update: %v", err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatalf("failed JSON update changed durable bytes")
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load JSON state after failed update: %v", err)
+	}
+	if loaded.Scope.Profile != "before" {
+		t.Fatalf("loaded scope profile = %q, want original durable value", loaded.Scope.Profile)
+	}
+
+	durableReplaceFile = previousReplace
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope.Profile = "after-recovery"
+		return nil
+	}); err != nil {
+		t.Fatalf("JSON update after persistence recovery: %v", err)
 	}
 }
 
@@ -19834,8 +22148,11 @@ func TestQuarantineSessionIsTargetedAndFencesPendingWork(t *testing.T) {
 			if _, err := store.MarkOutboxSendAttempt(ctx, "out-q"); !errors.Is(err, ErrOutboxSendNotClaimed) {
 				t.Fatalf("skipped outbox claim error = %v, want ErrOutboxSendNotClaimed", err)
 			}
-			if out, err := store.MarkOutboxSendErrorForAttempt(ctx, "out-flight", "attempt-flight", "ambiguous failure"); err != nil || out.Status != OutboxStatusSkipped {
-				t.Fatalf("quarantined in-flight send error: out=%#v err=%v", out, err)
+			if out, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, "out-flight", "attempt-flight", "Graph response lost after quarantine"); err != nil || out.Status != OutboxStatusSending || !OutboxSendIsAmbiguous(out) {
+				t.Fatalf("quarantined ambiguous send: out=%#v err=%v, want durable ambiguous Sending", out, err)
+			}
+			if out, err := store.MarkOutboxSendErrorForAttempt(ctx, "out-flight", "attempt-flight", "ambiguous failure"); err != nil || out.Status != OutboxStatusSending || !OutboxSendIsAmbiguous(out) {
+				t.Fatalf("quarantined in-flight send error: out=%#v err=%v, want durable ambiguous Sending", out, err)
 			}
 			unquarantined, err := store.UnquarantineSession(ctx, SessionUnquarantineRequest{SessionID: "s1", Now: now.Add(2 * time.Minute)})
 			if err != nil || unquarantined.Session.Status != SessionStatusActive {
@@ -19875,6 +22192,116 @@ func TestOutboxAttemptTokenRejectsStaleCompletion(t *testing.T) {
 	}
 	if _, err := store.MarkOutboxSentForAttempt(ctx, "out-1", claimed.SendAttemptToken, "teams-other"); !errors.Is(err, ErrOutboxSendNotClaimed) {
 		t.Fatalf("conflicting message id error = %v, want ErrOutboxSendNotClaimed", err)
+	}
+}
+
+func TestOutboxQueuedCleanupCASDoesNotOverwriteConcurrentSendAcrossBackends(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages["outbox:queued-cleanup"] = OutboxMessage{
+					ID: "outbox:queued-cleanup", TeamsChatID: "chat-1", Kind: "final",
+					Status: OutboxStatusQueued, CreatedAt: time.Now(),
+				}
+				state.OutboxMessages["outbox:source-fence"] = OutboxMessage{
+					ID: "outbox:source-fence", TeamsChatID: "chat-1", Kind: "final",
+					Status: OutboxStatusQueued, TeamsMessageID: "teams-source-fence", CreatedAt: time.Now(),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed outbox rows: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			retired, changed, err := store.MarkOutboxSkippedIfQueued(ctx, "outbox:queued-cleanup", "source changed")
+			if err != nil || !changed || retired.Status != OutboxStatusSkipped {
+				t.Fatalf("queued cleanup = %#v changed=%v err=%v, want skipped/true", retired, changed, err)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, "outbox:source-fence")
+			if err != nil || claimed.Status != OutboxStatusSending || claimed.SendAttemptToken == "" {
+				t.Fatalf("claim source row = %#v err=%v, want Sending with token", claimed, err)
+			}
+			untouched, changed, err := store.MarkOutboxSkippedIfQueued(ctx, claimed.ID, "stale source cleanup")
+			if err != nil || changed || untouched.Status != OutboxStatusSending || untouched.SendAttemptToken != claimed.SendAttemptToken {
+				t.Fatalf("stale queued skip = %#v changed=%v err=%v, want unchanged Sending", untouched, changed, err)
+			}
+			fenced, changed, err := store.MarkOutboxSourceRewriteFenceIfQueued(ctx, claimed.ID, claimed.TeamsMessageID)
+			if err != nil || changed || fenced.Status != OutboxStatusSending || fenced.SendAttemptToken != claimed.SendAttemptToken {
+				t.Fatalf("stale queued source fence = %#v changed=%v err=%v, want unchanged Sending", fenced, changed, err)
+			}
+		})
+	}
+}
+
+func TestRebindOutboxSourceRewriteFenceAfterControlLeaseTakeoverAcrossBackends(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			now := time.Now().UTC()
+			scope := ScopeIdentity{ID: "scope-source-fence", AccountID: "user-1", OSUser: "tester", Profile: "default"}
+			ownerA := MachineRecord{ID: "machine-source-a", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			ownerB := MachineRecord{ID: "machine-source-b", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			first, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: ownerA, Duration: time.Hour, Now: now})
+			if err != nil || first.Mode != LeaseModeActive {
+				t.Fatalf("claim first owner = %#v err=%v", first, err)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.OutboxMessages["outbox:accepted-takeover"] = OutboxMessage{
+					ID: "outbox:accepted-takeover", TeamsChatID: "chat-1", Kind: "final",
+					Status: OutboxStatusAccepted, TeamsMessageID: "teams-accepted-takeover",
+					MachineID: ownerA.ID, LeaseGeneration: first.Lease.Generation,
+					SendAttemptToken: "legacy-attempt-token", CreatedAt: now,
+				}
+				state.OutboxMessages["outbox:stable-takeover"] = OutboxMessage{
+					ID: "outbox:stable-takeover", TeamsChatID: "chat-1", Kind: "final",
+					Status: OutboxStatusAccepted, TeamsMessageID: "teams-stable-takeover",
+					BlockedBySourceRewrite: true,
+					MachineID:              ownerA.ID, LeaseGeneration: first.Lease.Generation,
+					SendAttemptToken: "stale-token", CreatedAt: now,
+				}
+				state.OutboxMessages["outbox:sent-takeover"] = OutboxMessage{
+					ID: "outbox:sent-takeover", TeamsChatID: "chat-1", Kind: "final",
+					Status: OutboxStatusSent, TeamsMessageID: "teams-sent-takeover",
+					MachineID: ownerA.ID, LeaseGeneration: first.Lease.Generation,
+					CreatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed accepted takeover row: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			released, err := store.ReleaseControlLeaseIfHolder(ctx, ownerA.ID, first.Lease.Generation)
+			if err != nil || !released {
+				t.Fatalf("release first owner = %v err=%v", released, err)
+			}
+			second, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: ownerB, Duration: time.Hour, Now: now.Add(time.Second)})
+			if err != nil || second.Mode != LeaseModeActive || second.Lease.Generation <= first.Lease.Generation {
+				t.Fatalf("claim replacement owner = %#v err=%v", second, err)
+			}
+
+			fenced, err := store.RebindOutboxSourceRewriteFenceForOwner(ctx, "outbox:accepted-takeover", ownerB.ID, second.Lease.Generation, "teams-accepted-takeover")
+			if err != nil || fenced.Status != OutboxStatusAccepted || !fenced.BlockedBySourceRewrite || fenced.MachineID != ownerB.ID || fenced.LeaseGeneration != second.Lease.Generation || fenced.SendAttemptToken != "" {
+				t.Fatalf("rebound source fence = %#v err=%v, want accepted fenced under replacement owner", fenced, err)
+			}
+			stable, err := store.RebindOutboxSourceRewriteFenceForOwner(ctx, "outbox:stable-takeover", ownerB.ID, second.Lease.Generation, "teams-stable-takeover")
+			if err != nil || stable.Status != OutboxStatusAccepted || !stable.BlockedBySourceRewrite || stable.MachineID != ownerB.ID || stable.LeaseGeneration != second.Lease.Generation || stable.SendAttemptToken != "" {
+				t.Fatalf("rebind already-stable source fence = %#v err=%v, want owner capability persisted", stable, err)
+			}
+			sent, err := store.RebindOutboxSourceRewriteFenceForOwner(ctx, "outbox:sent-takeover", ownerB.ID, second.Lease.Generation, "teams-sent-takeover")
+			if err != nil || sent.Status != OutboxStatusAccepted || !sent.BlockedBySourceRewrite || sent.MachineID != ownerB.ID || sent.LeaseGeneration != second.Lease.Generation || sent.SendAttemptToken != "" {
+				t.Fatalf("rebind sent source fence = %#v err=%v, want accepted fenced under replacement owner", sent, err)
+			}
+			if _, err := store.MarkOutboxSourceRewriteFenceForOwner(ctx, fenced.ID, ownerA.ID, first.Lease.Generation, fenced.TeamsMessageID); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale owner source fence error = %v, want ErrControlLeaseNotHeld", err)
+			}
+		})
 	}
 }
 

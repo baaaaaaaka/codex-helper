@@ -43,6 +43,31 @@ type workflowNotificationConfigFile struct {
 	Workflow teamstore.WorkflowNotificationConfig `json:"workflow"`
 }
 
+// updateWorkflowNotification keeps notification mutations behind the same
+// owner fence as outbox/checkpoint callbacks. Direct CLI callers without a
+// listener lease retain the legacy unscoped path; listener contexts carry an
+// immutable capability so a later takeover cannot be overwritten by a stale
+// webhook completion.
+func (b *Bridge) updateWorkflowNotification(ctx context.Context, id string, fn func(teamstore.NotificationRecord, bool, time.Time) (teamstore.NotificationRecord, bool, error)) (teamstore.NotificationRecord, bool, error) {
+	if b == nil || b.store == nil {
+		return teamstore.NotificationRecord{}, false, nil
+	}
+	if capability, ok := teamsOwnerCapabilityFromContext(ctx); ok {
+		return b.store.UpdateNotificationForOwner(ctx, id, capability.Owner.MachineID, capability.Owner.LeaseGeneration, fn)
+	}
+	if leaseGeneration := b.currentLeaseGeneration(); leaseGeneration > 0 && strings.TrimSpace(b.machine.ID) != "" {
+		return b.store.UpdateNotificationForOwner(ctx, id, b.machine.ID, leaseGeneration, fn)
+	}
+	return b.store.UpdateNotification(ctx, id, fn)
+}
+
+func workflowNotificationDurableContext(ctx context.Context) context.Context {
+	if capability, ok := teamsOwnerCapabilityFromContext(ctx); ok {
+		return withTeamsOwnerCapability(context.Background(), capability.Owner)
+	}
+	return context.Background()
+}
+
 func (b *Bridge) SendWorkflowNotificationTest(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
@@ -145,29 +170,30 @@ func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLF
 	return out, nil
 }
 
-func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, outbox teamstore.OutboxMessage) {
+func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
 	if b == nil || b.store == nil {
-		return
+		return nil
 	}
 	event, ok, err := b.workflowNotificationEventForOutbox(ctx, outbox)
 	if err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification planning error: %v\n", err)
 		}
-		return
+		return err
 	}
 	if !ok {
-		return
+		return nil
 	}
 	if b.outboxAlreadyMentionedControlOwner(ctx, outbox) && !b.workflowCardAvailable(ctx) {
-		return
+		return nil
 	}
 	if err := b.queueUserAttentionNotification(ctx, event, ""); err != nil {
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
 		}
-		return
+		return err
 	}
+	return nil
 }
 
 func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Context, session *Session, sourceKey string) {
@@ -769,7 +795,7 @@ func (b *Bridge) queueWorkflowNotification(ctx context.Context, event WorkflowNo
 	if strings.TrimSpace(event.ID) == "" {
 		return fmt.Errorf("workflow notification event id is required")
 	}
-	_, _, err := b.store.UpdateNotification(ctx, event.ID, func(rec teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
+	_, _, err := b.updateWorkflowNotification(ctx, event.ID, func(rec teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
 		if found {
 			switch rec.Status {
 			case teamstore.NotificationStatusSending, teamstore.NotificationStatusSent, teamstore.NotificationStatusUnknown:
@@ -913,7 +939,7 @@ func (b *Bridge) claimWorkflowNotificationForSend(ctx context.Context, id string
 	if now.IsZero() {
 		now = time.Now()
 	}
-	updated, _, err := b.store.UpdateNotification(ctx, id, func(rec teamstore.NotificationRecord, found bool, _ time.Time) (teamstore.NotificationRecord, bool, error) {
+	updated, _, err := b.updateWorkflowNotification(ctx, id, func(rec teamstore.NotificationRecord, found bool, _ time.Time) (teamstore.NotificationRecord, bool, error) {
 		if !found {
 			return rec, false, nil
 		}
@@ -958,7 +984,7 @@ func (b *Bridge) claimWorkflowNotificationForSend(ctx context.Context, id string
 }
 
 func (b *Bridge) markStaleWorkflowNotificationUnknown(ctx context.Context, rec teamstore.NotificationRecord, now time.Time) error {
-	_, _, err := b.store.UpdateNotification(ctx, rec.ID, func(current teamstore.NotificationRecord, found bool, _ time.Time) (teamstore.NotificationRecord, bool, error) {
+	_, _, err := b.updateWorkflowNotification(ctx, rec.ID, func(current teamstore.NotificationRecord, found bool, _ time.Time) (teamstore.NotificationRecord, bool, error) {
 		if !found || current.Status != teamstore.NotificationStatusSending {
 			return current, false, nil
 		}
@@ -991,7 +1017,7 @@ func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL 
 	if err != nil {
 		retryable := workflowWebhookRetryable(err)
 		uncertain := workflowWebhookDeliveryUncertain(err)
-		_, _, _ = b.store.UpdateNotification(context.Background(), rec.ID, func(current teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
+		_, _, _ = b.updateWorkflowNotification(workflowNotificationDurableContext(ctx), rec.ID, func(current teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
 			if !found {
 				current = rec
 			}
@@ -1007,7 +1033,7 @@ func (b *Bridge) sendWorkflowNotificationRecord(ctx context.Context, webhookURL 
 		})
 		return err
 	}
-	_, _, updateErr := b.store.UpdateNotification(ctx, rec.ID, func(current teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
+	_, _, updateErr := b.updateWorkflowNotification(workflowNotificationDurableContext(ctx), rec.ID, func(current teamstore.NotificationRecord, found bool, now time.Time) (teamstore.NotificationRecord, bool, error) {
 		if !found {
 			current = rec
 		}

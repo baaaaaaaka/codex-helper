@@ -51,6 +51,7 @@ type Session struct {
 	PendingReasoningSource      string                `json:"pending_reasoning_source,omitempty"`
 	ReasoningEffort             string                `json:"reasoning_effort,omitempty"`
 	ReasoningEffortSource       string                `json:"reasoning_effort_source,omitempty"`
+	PollFrontierInitialized     bool                  `json:"poll_frontier_initialized,omitempty"`
 	CreatedAt                   time.Time             `json:"created_at"`
 	UpdatedAt                   time.Time             `json:"updated_at"`
 }
@@ -225,6 +226,13 @@ func mergeRegistrySessions(existing []Session, next []Session) []Session {
 			continue
 		}
 		if existingSession, ok := existingByID[id]; ok {
+			// PollFrontierInitialized is a durable admission hint.  A stale
+			// registry projection must not clear it after a successful poll and
+			// thereby turn a missing chat_polls row back into a destructive
+			// baseline on the next cycle.
+			if existingSession.PollFrontierInitialized {
+				session.PollFrontierInitialized = true
+			}
 			if session.ModelGeneration == 0 {
 				session.ModelGeneration = existingSession.ModelGeneration
 			}
@@ -261,6 +269,26 @@ func (r *Registry) ensureMaps() {
 	if r.Chats == nil {
 		r.Chats = make(map[string]ChatState)
 	}
+}
+
+// cloneRegistry returns a read-only snapshot suitable for work that may run
+// concurrently with registry projection updates.  Registry is intentionally a
+// small in-memory projection, but its maps and tracked-id slices must not be
+// shared with a listener worker: a shallow copy would still race while a
+// queued turn marks a message seen/sent or while a durable session projection
+// replaces a session.
+func cloneRegistry(r Registry) Registry {
+	out := r
+	out.Sessions = append([]Session(nil), r.Sessions...)
+	if r.Chats != nil {
+		out.Chats = make(map[string]ChatState, len(r.Chats))
+		for chatID, chat := range r.Chats {
+			chat.SeenMessageIDs = append([]string(nil), chat.SeenMessageIDs...)
+			chat.SentMessageIDs = append([]string(nil), chat.SentMessageIDs...)
+			out.Chats[chatID] = chat
+		}
+	}
+	return out
 }
 
 func (r *Registry) SessionByChatID(chatID string) *Session {

@@ -628,7 +628,7 @@ jobs:
           go test ./internal/teams -count=1 -run '^TestHistoryWatchChangedPaths(SkipsSourceRewriteBlockedRows|ChecksLegacyProofOnNormalPoll)$' -v
           go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscript(Quarantines(SourceIDChildEventMessageWithoutTurnID|NoIDChildEventMessage)|BlocksOversizedTail)|ReadLinkedTranscriptDelta(QuarantinesNoIDChildEventMessage|LegacyNoOffsetQuarantines(SourceIDChildEventMessage|DifferentTurn))|HistoryTieredScanTailQuarantines(SourceIDChildEventMessageWithoutTurnIDAfterTerminal|NoIDChildEventMessageAfterTerminal))$' -v
           go test ./internal/teams -count=1 -run 'Test(HistoryTieredLineSignalsRecognizesTaskTerminalVariants|ExecutionAnchorForRestartedRunningTurnDoesNotTrustNewerCheckpoint|Bridge(PendingTranscriptPauseKeepsCheckpointCursor|SyncExistingEmptyCheckpointUsesFailClosedScanner|HandleClaimedQueuedTurnErrorSkipsTerminalTurns))$' -v
-          go test ./internal/teams -count=1 -run 'Test(Bridge(HistoryWatchRetriesCompleteFinalBeforeIncompleteTail|SyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror)|ReadLinkedTranscriptDeltaLegacyCheckpoint(PreservesCompletePrefixBeforePartial|RefusesMissingKeyBeforePartial)|ReadLinkedTranscriptDeltaRejectsNonEOFPrefixedSourceRewrite|TranscriptCheckpointKnownZeroOffsetDoesNotMeanEOF|ExecutionAnchor(ProofRejectsMismatchedProvenance|GenerationIncreasesAfterClearAndRecreate)|LinkedCheckpointFileUnchangedRejectsSameSizeSameMtimeRewrite)$' -v
+          go test ./internal/teams -count=1 -run 'Test(Bridge(HistoryWatchRetriesCompleteFinalBeforeIncompleteTail|SyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror)|ReadLinkedTranscriptDeltaLegacyCheckpoint(PreservesCompletePrefixBeforePartial|RefusesMissingKeyBeforePartial)|ReadLinkedTranscriptDeltaRejectsNonEOFPrefixedSourceRewrite|TranscriptCheckpointKnownZeroOffsetDoesNotMeanEOF|ExecutionAnchor(ProofRejectsMismatchedProvenance|GenerationIncreasesAfterClearAndRecreate)|TeamsSourceProofDetectsSameSizeInPlaceRewrite)$' -v
           go test ./internal/teams -count=1 -run '^TestBridgeExactCompletionCommitsFinalCheckpointWithTurn$' -v
           go test ./internal/teams -count=1 -run '^Test(Bridge(StaleExecutionCallbackKeepsOwnerAndPublishesStableAttention|SyncLinkedTranscriptDoesNotPublishCompletePrefixBeforeOrdinaryIncompleteTail)|LinkedCheckpointPrefixTerminalProbeParsesTypedRecordsOnly|P1SyncLinkedTranscriptPausesBeforeHalfWrittenTail)$' -v
           go test ./internal/teams -count=1 -run '^TestBridgeSyncLinkedTranscriptsBlocksGrowingLegacyCursorWithoutFingerprintAcrossBackends$' -v
@@ -642,22 +642,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          recovery_pattern='^Test(BridgeSyncLinkedTranscript(ReleasesPendingRootAcross(Polls|SQLiteStoreReopen)|ReleasesPendingRootSeenInOnePoll|KeepsLiveTeamsTurnUsableAfterQuarantineRestart|RecordsSafePrefixDeliveryBeforeHistoryQuarantine|QuarantinesCrossPollMixedIDMirror)|ReadLinkedTranscriptDeltaUnusableRecoveryProofIsSilent|ExplicitHistoryRecoveryUsesStoredPendingRange|BridgePollRetains(OldContinuationWhenHeadWindowTimesOut|BothFrontiersWhenOldContinuationRateLimitsAfterFullHeadWindow)|BridgeLinkedTranscript(AppendsDuringDrainAndResumesAcrossRestart|ConcurrentSQLiteSyncPublishesExactlyOnce|Graph429RetainsCheckpointUntilOutboxDelivery)|HistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset|HistoryTieredOpaqueGapRemainsReachableAfterRestart|HistoryTieredScanTail(AdvancesPastOversizedRecord|CanRecoverAfterLargeTailCap|ConsumesCompleteMalformedLineAndResetsContext|DoesNotRetryStableMalformedLine))$'
-          store_recovery_pattern='^TestInvalidOptionalRecoveryProofLoadsAsHistoryOnlyAcrossBackends$'
-          teams_list="$(go test ./internal/teams -run '^$' -list "$recovery_pattern")"
-          if ! printf '%s\n' "$teams_list" | grep -q '^Test'; then
-            echo "Teams recovery selector matched zero tests" >&2
-            exit 1
-          fi
-          store_list="$(go test ./internal/teams/store -run '^$' -list "$store_recovery_pattern")"
-          if ! printf '%s\n' "$store_list" | grep -q '^Test'; then
-            echo "Teams store recovery selector matched zero tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams -count=1 -run "$recovery_pattern" -v
-          go test ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
-          go test -race ./internal/teams -count=1 -run "$recovery_pattern" -v
-          go test -race ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
+          # The machine-readable manifest is the single source of truth for
+          # recovery selectors. Running one exact selector per entry keeps a
+          # renamed or accidentally omitted regression from becoming a green
+          # no-op, and gives each real listener test its own watchdog budget.
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race
+
+      - name: Teams recovery mutation smoke
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Kill a few deliberately selected safety/liveness mutants in an
+          # isolated copy. This catches tests that only pass on the happy path
+          # while keeping mutation work out of the live checkout and state.
+          bash scripts/ci/teams_recovery_mutation_smoke.sh
 
       - name: Teams liveness regressions
         if: matrix.shard == 'core'
@@ -693,6 +694,18 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/ci/teams_ownership_stress_docker_smoke.sh
+
+      - name: Teams runtime takeover process regressions
+        if: matrix.shard == 'core' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a real compiled test-process boundary for the offline
+          # writer/takeover and SQLite-full scenarios. The listener vertical
+          # tests run separately in-process; keeping this lane required means
+          # SIGKILL/takeover and filesystem failures cannot be hidden behind
+          # those in-process ownership tests.
+          bash scripts/ci/teams_runtime_takeover_process_smoke.sh
 
       - name: Teams durable routing authority regressions
         if: matrix.shard == 'core'

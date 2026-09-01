@@ -134,6 +134,54 @@ func TestParentForkSQLiteLoadProfile(t *testing.T) {
 	}
 }
 
+func TestForkPollingSnapshotSQLiteLoadsOnlyStagedChildren(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < 300; i++ {
+			id := fmt.Sprintf("unrelated-session-%03d", i)
+			chatID := fmt.Sprintf("unrelated-chat-%03d", i)
+			state.Sessions[id] = SessionContext{
+				ID: id, Status: SessionStatusActive, TeamsChatID: chatID,
+				CodexThreadID: "thread-" + id, CreatedAt: now, UpdatedAt: now,
+			}
+			state.ChatPolls[chatID] = ChatPollState{ChatID: chatID, PollState: chatPollStateWarm, UpdatedAt: now}
+		}
+		state.Sessions["child"] = SessionContext{
+			ID: "child", Status: SessionStatusStaging, TeamsChatID: "child-chat",
+			CodexThreadID: "child-thread", CreatedAt: now, UpdatedAt: now,
+		}
+		state.ChatPolls["child-chat"] = ChatPollState{ChatID: "child-chat", PollState: chatPollStateWarm, UpdatedAt: now}
+		state.ForkOperations["staged"] = ForkOperation{
+			ID: "staged", ChildSessionID: "child", ChildChatID: "child-chat",
+			Phase: ForkPhaseChildChatStaged, CreatedAt: now, UpdatedAt: now,
+		}
+		state.ForkOperations["terminal"] = ForkOperation{
+			ID: "terminal", ChildSessionID: "unrelated-session-000",
+			Phase: ForkPhaseLinkSent, CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed fork polling state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	state, err := store.ForkPollingSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("ForkPollingSnapshot: %v", err)
+	}
+	if len(state.ForkOperations) != 1 || state.ForkOperations["staged"].ID != "staged" {
+		t.Fatalf("fork operations = %#v, want only staged operation", state.ForkOperations)
+	}
+	if len(state.Sessions) != 1 || state.Sessions["child"].TeamsChatID != "child-chat" {
+		t.Fatalf("sessions = %#v, want only staged child", state.Sessions)
+	}
+	if len(state.ChatPolls) != 1 || state.ChatPolls["child-chat"].ChatID != "child-chat" {
+		t.Fatalf("chat polls = %#v, want only staged child poll", state.ChatPolls)
+	}
+}
+
 func BenchmarkParentForkSQLiteScale(b *testing.B) {
 	for _, scale := range parentForkPerfScales {
 		scale := scale

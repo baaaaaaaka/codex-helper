@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,70 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestThreadRecoveryStaleOwnerCannotInterruptReboundTurn(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	const sessionID = "thread-recovery-owner-session"
+	const chatID = "thread-recovery-owner-chat"
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Sessions[sessionID] = teamstore.SessionContext{ID: sessionID, Status: teamstore.SessionStatusActive, TeamsChatID: chatID}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	now := time.Now().UTC()
+	scope := bridge.scope
+	machineA := bridge.machine
+	machineA.ID = "machine:thread-recovery-owner-a"
+	machineA.ScopeID = scope.ID
+	machineB := machineA
+	machineB.ID = "machine:thread-recovery-owner-b"
+	leaseA, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{Scope: scope, Machine: machineA, Duration: time.Hour, Now: now})
+	if err != nil || leaseA.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("claim owner A = %#v err=%v", leaseA, err)
+	}
+	queued, created, err := store.QueueTurn(ctx, teamstore.Turn{
+		ID: "turn:thread-recovery-owner", SessionID: sessionID, Status: teamstore.TurnStatusQueued,
+		MachineID: machineA.ID, LeaseGeneration: leaseA.Lease.Generation, QueuedAt: now, CreatedAt: now,
+	})
+	if err != nil || !created {
+		t.Fatalf("queue owner-A turn = %#v created=%v err=%v", queued, created, err)
+	}
+	running, err := store.MarkTurnRunningForOwner(ctx, queued.ID, "thread:owner-a", "codex:owner-a", machineA.ID, leaseA.Lease.Generation)
+	if err != nil || running.Status != teamstore.TurnStatusRunning {
+		t.Fatalf("start owner-A turn = %#v err=%v", running, err)
+	}
+	if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
+		t.Fatalf("release owner A = %v err=%v", released, err)
+	}
+	leaseB, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{Scope: scope, Machine: machineB, Duration: time.Hour, Now: now.Add(time.Second)})
+	if err != nil || leaseB.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("claim owner B = %#v err=%v", leaseB, err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		current := state.Turns[running.ID]
+		current.MachineID = machineB.ID
+		current.LeaseGeneration = leaseB.Lease.Generation
+		state.Turns[running.ID] = current
+		return nil
+	}); err != nil {
+		t.Fatalf("rebind running turn to owner B: %v", err)
+	}
+	// The bridge is now the replacement owner, while the value passed to the
+	// recovery callback is the stale snapshot captured by owner A.
+	bridge.machine = machineB
+	bridge.lease = leaseB.Lease
+	session := &Session{ID: sessionID, ChatID: chatID}
+	if err := bridge.interruptTurnForThreadRecovery(ctx, session, running, codexThreadMissingKind, "stale owner callback"); !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+		t.Fatalf("stale thread recovery interruption error = %v, want ErrControlLeaseNotHeld", err)
+	}
+	current, found, err := store.TurnByID(ctx, running.ID)
+	if err != nil || !found || current.Status != teamstore.TurnStatusRunning || current.MachineID != machineB.ID || current.LeaseGeneration != leaseB.Lease.Generation {
+		t.Fatalf("stale thread recovery changed rebound turn: found=%v err=%v turn=%#v", found, err, current)
+	}
+}
 
 func TestRunQueuedTurnBindsDurableThreadWhenRegistryIsStale(t *testing.T) {
 	ctx := context.Background()

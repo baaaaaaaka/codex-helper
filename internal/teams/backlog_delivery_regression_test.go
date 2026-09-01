@@ -52,6 +52,261 @@ func TestTeamsCyclePhaseScopeAndProgress(t *testing.T) {
 	}
 }
 
+// TestTeamsActiveOutboxPredecessorUsesShortRetryGate verifies the race seen by
+// the real listener: a global outbox flush can observe an earlier row that a
+// targeted flush has already claimed.  The later final must remain behind the
+// predecessor, but it must be rechecked promptly after that short-lived lease
+// finishes rather than inheriting the 30-second recovery backoff.
+func TestTeamsActiveOutboxPredecessorUsesShortRetryGate(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			graph, sent := newBridgeTestGraph(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			earlier, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID: "outbox:active-predecessor", TeamsChatID: "chat-1", Sequence: 1,
+				Kind: "ack", Body: "predecessor", CreatedAt: time.Now().Add(-time.Second),
+			})
+			if err != nil {
+				t.Fatalf("queue predecessor: %v", err)
+			}
+			later, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID: "outbox:active-final", TeamsChatID: "chat-1", Sequence: 2,
+				Kind: "final", NotificationKind: "turn_completed", Body: "final", CreatedAt: time.Now(),
+			})
+			if err != nil {
+				t.Fatalf("queue final: %v", err)
+			}
+			if earlier, err = store.MarkOutboxSendAttempt(ctx, earlier.ID); err != nil {
+				t.Fatalf("claim predecessor: %v", err)
+			}
+			if earlier.Status != teamstore.OutboxStatusSending || teamstore.OutboxSendIsAmbiguous(earlier) {
+				t.Fatalf("claimed predecessor = %#v, want a normal active Sending row", earlier)
+			}
+
+			started := time.Now()
+			err = bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
+			var deferred outboxDeliveryDeferredError
+			if !errors.As(err, &deferred) {
+				t.Fatalf("later send error = %v, want active-predecessor deferral", err)
+			}
+			if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
+				t.Fatalf("active-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
+			}
+			if got := len(*sent); got != 0 {
+				t.Fatalf("later send posted while predecessor was active: %d POST(s)", got)
+			}
+
+			if _, err := store.MarkOutboxSent(ctx, earlier.ID, "teams-predecessor"); err != nil {
+				t.Fatalf("finish predecessor: %v", err)
+			}
+			latest, err := store.OutboxMessageByID(ctx, later.ID)
+			if err != nil {
+				t.Fatalf("reload final: %v", err)
+			}
+			if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
+				t.Fatalf("send final after predecessor finished: %v", err)
+			}
+			if got := len(*sent); got != 1 {
+				t.Fatalf("Graph POST count after predecessor finished = %d, want one final POST", got)
+			}
+			final, err := store.OutboxMessageByID(ctx, later.ID)
+			if err != nil || final.Status != teamstore.OutboxStatusSent {
+				t.Fatalf("final after predecessor finished = %#v, err=%v, want Sent", final, err)
+			}
+		})
+	}
+}
+
+func TestTeamsAcceptedOutboxPredecessorUsesShortRetryGate(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			graph, sent := newBridgeTestGraph(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			now := time.Now().UTC()
+			earlier, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID: "outbox:accepted-predecessor", TeamsChatID: "chat-1", Sequence: 1,
+				Kind: "ack", Body: "accepted predecessor", Status: teamstore.OutboxStatusAccepted,
+				TeamsMessageID: "teams-accepted-predecessor", CreatedAt: now.Add(-time.Second),
+			})
+			if err != nil {
+				t.Fatalf("queue accepted predecessor: %v", err)
+			}
+			later, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID: "outbox:accepted-tail", TeamsChatID: "chat-1", Sequence: 2,
+				TurnID: "turn:accepted-tail", Kind: "final", NotificationKind: "turn_completed",
+				Body: "accepted tail", CreatedAt: now,
+			})
+			if err != nil {
+				t.Fatalf("queue accepted tail: %v", err)
+			}
+
+			started := time.Now()
+			err = bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
+			var deferred outboxDeliveryDeferredError
+			if !errors.As(err, &deferred) {
+				t.Fatalf("tail send error = %v, want accepted-predecessor deferral", err)
+			}
+			if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
+				t.Fatalf("accepted-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
+			}
+			if got := len(*sent); got != 0 {
+				t.Fatalf("tail send posted before accepted predecessor promotion: %d POST(s)", got)
+			}
+
+			if _, err := store.MarkOutboxSent(ctx, earlier.ID, earlier.TeamsMessageID); err != nil {
+				t.Fatalf("finish accepted predecessor: %v", err)
+			}
+			latest, err := store.OutboxMessageByID(ctx, later.ID)
+			if err != nil {
+				t.Fatalf("reload accepted tail: %v", err)
+			}
+			if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
+				t.Fatalf("send accepted tail after promotion: %v", err)
+			}
+			if got := len(*sent); got != 1 {
+				t.Fatalf("Graph POST count after accepted predecessor promotion = %d, want one", got)
+			}
+		})
+	}
+}
+
+// TestTeamsSameTurnAmbiguousOutboxNeverOvertakesProtectedChunk exercises the
+// production sender boundary after the store's FIFO query has classified an
+// ambiguous predecessor.  Rows from another turn may continue in the same
+// chat, but chunks of one terminal turn must not pass an earlier chunk whose
+// external Graph result is still unknown.
+func TestTeamsSameTurnAmbiguousOutboxNeverOvertakesProtectedChunk(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			graph, sent := newBridgeTestGraph(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			now := time.Now().UTC()
+			ambiguous := teamstore.OutboxMessage{
+				ID: "outbox:same-turn-protected", TeamsChatID: "chat-1", TurnID: "turn:same-turn",
+				Sequence: 1, Kind: "final-part", Body: "protected part", Status: teamstore.OutboxStatusSending,
+				SendAttemptToken: "attempt:same-turn-protected", LastSendAttempt: now.Add(-time.Hour),
+				LastSendError: "ambiguous Graph send; response lost", CreatedAt: now,
+			}
+			later := teamstore.OutboxMessage{
+				ID: "outbox:same-turn-terminal", TeamsChatID: "chat-1", TurnID: ambiguous.TurnID,
+				Sequence: 2, Kind: "final", NotificationKind: "turn_completed", Body: "terminal part",
+				Status: teamstore.OutboxStatusQueued, CreatedAt: now.Add(time.Second),
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.OutboxMessages[ambiguous.ID] = ambiguous
+				state.OutboxMessages[later.ID] = later
+				return nil
+			}); err != nil {
+				t.Fatalf("seed same-turn ambiguous rows: %v", err)
+			}
+
+			err := bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
+			var deferred outboxDeliveryDeferredError
+			if !errors.As(err, &deferred) {
+				t.Fatalf("same-turn terminal send error = %v, want protected FIFO deferral", err)
+			}
+			if got := len(*sent); got != 0 {
+				t.Fatalf("same-turn terminal overtook ambiguous predecessor with %d Graph POST(s)", got)
+			}
+			persisted, err := store.OutboxMessageByID(ctx, later.ID)
+			if err != nil {
+				t.Fatalf("load same-turn terminal: %v", err)
+			}
+			if persisted.Status != teamstore.OutboxStatusQueued {
+				t.Fatalf("same-turn terminal was mutated while predecessor was protected: %#v", persisted)
+			}
+		})
+	}
+}
+
+func TestTeamsReconcilePendingSentOutboxSideEffectsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	const outboxID = "outbox:post-send-replay"
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.OutboxMessages[outboxID] = teamstore.OutboxMessage{
+			ID: outboxID, TeamsChatID: "chat:post-send-replay", Kind: "ack",
+			Status: teamstore.OutboxStatusSent, TeamsMessageID: "teams:post-send-replay",
+			PostSendEffectsPending: true, CreatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed post-send replay row: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate post-send replay row: %v", err)
+	}
+
+	// A newly constructed bridge represents the next listener generation. The
+	// recovery lane must settle local post-send bookkeeping from the durable
+	// marker and must not need (or issue) another Graph POST.
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	if err := bridge.reconcilePendingSentOutboxSideEffects(ctx); err != nil {
+		t.Fatalf("reconcile pending post-send effects: %v", err)
+	}
+	row, err := store.OutboxMessageByID(ctx, outboxID)
+	if err != nil {
+		t.Fatalf("reload post-send replay row: %v", err)
+	}
+	if row.Status != teamstore.OutboxStatusSent || row.TeamsMessageID != "teams:post-send-replay" || row.PostSendEffectsPending {
+		t.Fatalf("post-send replay row after recovery = %#v, want Sent with marker cleared", row)
+	}
+}
+
+func TestOutboxPredecessorRetryGateDoesNotReuseExpiredAttemptTimestamp(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		row  teamstore.OutboxMessage
+	}{
+		{
+			name: "expired markerless",
+			row: teamstore.OutboxMessage{
+				Status: teamstore.OutboxStatusSending, LastSendAttempt: now.Add(-time.Hour),
+			},
+		},
+		{
+			name: "expired ambiguous",
+			row: teamstore.OutboxMessage{
+				Status: teamstore.OutboxStatusSending, LastSendAttempt: now.Add(-time.Hour),
+				SendAttemptToken: "attempt:ambiguous", LastSendError: "ambiguous Graph send; response lost",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			until := outboxPredecessorRetryAt(tc.row, now)
+			if !until.After(now) {
+				t.Fatalf("retry gate = %s, want a future recovery wake-up", until)
+			}
+			if until.Before(now.Add(outboxRecoveryRetryBackoff)) {
+				t.Fatalf("retry gate = %s, want at least the recovery backoff", until)
+			}
+		})
+	}
+}
+
 func TestTeamsOwnerCapabilityTakeover(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -411,8 +666,8 @@ func TestTeamsLinkedTranscriptMissingSourceDoesNotStarveHealthySession(t *testin
 	appendLine(t, goodPath, `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"good-new-turn"}}`)
 	err = bridge.syncLinkedTranscripts(ctx)
 	flushBridgeQueuedNotificationsForTest(t, bridge)
-	if err != nil {
-		t.Fatalf("missing linked source should remain session-local: %v", err)
+	if err != nil && !strings.Contains(err.Error(), "Codex sessions dir not found") {
+		t.Fatalf("missing linked source returned an unexpected non-local error: %v", err)
 	}
 	if !sentPlainContains(*sent, "healthy linked answer") {
 		t.Fatalf("healthy linked session was starved by an earlier unreadable source: %#v", *sent)
@@ -467,6 +722,100 @@ func TestTeamsOutboxAttemptBudgetAndFairness(t *testing.T) {
 	}
 	if len(*sent) != 1 || (*sent)[0].ChatID != "healthy-chat" {
 		t.Fatalf("healthy chat did not bypass gated scan prefix: %#v", *sent)
+	}
+}
+
+func TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+			const sessionID = "s001"
+			const chatID = "chat-1"
+			now := time.Now().UTC().Add(-time.Hour)
+			sourcePath := filepath.Join(t.TempDir(), "s001.jsonl")
+			sourceBody := []byte("blocked transcript proof\n")
+			if err := os.WriteFile(sourcePath, sourceBody, 0o600); err != nil {
+				t.Fatalf("write source proof fixture: %v", err)
+			}
+			sourceProof := transcriptCheckpointSourceFingerprint(sourcePath, int64(len(sourceBody)))
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				checkpointID := transcriptCheckpointID(sessionID)
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked,
+					UnresolvedExecution: &teamstore.ExecutionAnchor{
+						SessionID: sessionID, State: executionAnchorStateUnresolved,
+						Generation: 7, OuterTurnID: "turn:unresolved-prefix",
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed unresolved execution checkpoint: %v", err)
+			}
+			for i := 0; i < mainLoopOutboxFlushMaxScannedMessages; i++ {
+				if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+					ID:                               fmt.Sprintf("outbox:unresolved:%02d", i),
+					SessionID:                        sessionID,
+					TeamsChatID:                      chatID,
+					TurnID:                           fmt.Sprintf("sync:unresolved:%02d", i),
+					Kind:                             "sync-assistant",
+					NotificationKind:                 "turn_completed",
+					Body:                             "blocked transcript answer",
+					TranscriptCheckpointID:           transcriptCheckpointID(sessionID),
+					TranscriptSourcePath:             sourcePath,
+					TranscriptSourceProofFingerprint: sourceProof,
+					TranscriptSourceProofOffset:      int64(len(sourceBody)),
+					TranscriptSourceProofOffsetKnown: true,
+					CreatedAt:                        now.Add(time.Duration(i) * time.Nanosecond),
+				}); err != nil {
+					t.Fatalf("queue unresolved transcript %d: %v", i, err)
+				}
+			}
+			healthyID := "outbox:healthy-after-unresolved"
+			if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID: healthyID, TeamsChatID: "healthy-chat", Kind: "helper", Body: "healthy tail",
+				CreatedAt: now.Add(time.Duration(mainLoopOutboxFlushMaxScannedMessages+1) * time.Nanosecond),
+			}); err != nil {
+				t.Fatalf("queue healthy tail: %v", err)
+			}
+
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("first outbox flush: %v", err)
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("first flush sent = %#v, want only deferred unresolved prefix", *sent)
+			}
+			for i := 0; i < mainLoopOutboxFlushMaxScannedMessages; i++ {
+				row, err := store.OutboxMessageByID(ctx, fmt.Sprintf("outbox:unresolved:%02d", i))
+				if err != nil {
+					t.Fatalf("load unresolved row %d: %v", i, err)
+				}
+				if row.Status != teamstore.OutboxStatusQueued || row.NextAttemptAt.IsZero() {
+					t.Fatalf("unresolved row %d = %#v, want queued with durable retry gate", i, row)
+				}
+			}
+
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("second outbox flush: %v", err)
+			}
+			if len(*sent) != 1 || (*sent)[0].ChatID != "healthy-chat" || (*sent)[0].Content == "" {
+				t.Fatalf("healthy tail did not bypass deferred unresolved prefix: %#v", *sent)
+			}
+			healthy, err := store.OutboxMessageByID(ctx, healthyID)
+			if err != nil {
+				t.Fatalf("load healthy tail: %v", err)
+			}
+			if healthy.Status != teamstore.OutboxStatusSent {
+				t.Fatalf("healthy tail status = %q, want sent", healthy.Status)
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -428,4 +429,97 @@ func TestLimitInboundPollDecisionsReservesParkedProbeUnderHotLoad(t *testing.T) 
 	if !seenWarm {
 		t.Fatalf("per-cycle limit dropped every due non-hot chat: %#v", limited)
 	}
+}
+
+func TestLimitInboundPollDecisionsReservesHotTailBehindRunningTurns(t *testing.T) {
+	decisions := make([]inboundPollDecision, 0, 9)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID: "running-" + strconv.Itoa(i),
+			State:  inboundPollStateRunning,
+			Due:    true,
+		})
+	}
+	decisions = append(decisions, inboundPollDecision{
+		ChatID:     "hot-tail",
+		State:      inboundPollStateHot,
+		Due:        true,
+		NextPollAt: time.Unix(1, 0),
+	})
+
+	for cycle := 0; cycle < 3; cycle++ {
+		limited := limitInboundPollDecisions(decisions, 8)
+		found := false
+		for _, decision := range limited {
+			found = found || decision.ChatID == "hot-tail"
+		}
+		if !found {
+			t.Fatalf("cycle %d dropped due hot tail behind running turns: %#v", cycle, limited)
+		}
+	}
+}
+
+func TestLimitInboundPollDecisionsReservesOldestDueNonHotBacklog(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	decisions := make([]inboundPollDecision, 0, 10)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID: "running-" + strconv.Itoa(i),
+			State:  inboundPollStateRunning,
+			Due:    true,
+		})
+	}
+	decisions = append(decisions,
+		inboundPollDecision{
+			ChatID:     "warm-newer",
+			State:      inboundPollStateWarm,
+			Due:        true,
+			NextPollAt: now.Add(-time.Minute),
+		},
+		inboundPollDecision{
+			ChatID:     "cold-oldest",
+			State:      inboundPollStateCold,
+			Due:        true,
+			NextPollAt: now.Add(-time.Hour),
+		},
+	)
+
+	limited := limitInboundPollDecisions(decisions, 8)
+	for _, decision := range limited {
+		if decision.ChatID == "cold-oldest" {
+			return
+		}
+	}
+	t.Fatalf("oldest due non-hot backlog was dropped: %#v", limited)
+}
+
+func TestLimitInboundPollDecisionsReservesOrdinaryBehindOperationalFrontiers(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	decisions := make([]inboundPollDecision, 0, 9)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID:               fmt.Sprintf("operational-%02d", i),
+			State:                inboundPollStateHot,
+			Due:                  true,
+			NextPollAt:           now,
+			LastSuccessfulPollAt: now,
+			OperationalFrontier:  true,
+		})
+	}
+	decisions = append(decisions, inboundPollDecision{
+		ChatID:               "ordinary-tail",
+		State:                inboundPollStateHot,
+		Due:                  true,
+		NextPollAt:           now,
+		LastSuccessfulPollAt: now,
+		OperationalFrontier:  false,
+	})
+
+	limited := limitInboundPollDecisions(decisions, 8)
+	for _, decision := range limited {
+		if decision.ChatID == "ordinary-tail" {
+			return
+		}
+	}
+	t.Fatalf("ordinary chat was starved behind operational frontiers: %#v", limited)
 }

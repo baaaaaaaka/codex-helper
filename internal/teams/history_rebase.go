@@ -22,6 +22,13 @@ import (
 // allocate an unbounded buffer.
 const historyRebaseMaxLineBytes = 64 * 1024 * 1024
 
+// A source-rewrite recovery scan is cold work. Keep each listener pass
+// resumable so a large, otherwise valid rollout cannot monopolize the entire
+// history-watch phase. The durable checkpoint may retain the bounded scan
+// cursor, but it remains blocked until a complete, source-bound anchor is
+// found.
+const historyRebaseMaxScanBytesPerPass int64 = 4 * 1024 * 1024
+
 type codexHistoryHeader struct {
 	ThreadID    string
 	HistoryMode string
@@ -39,6 +46,41 @@ type historyWatchRebaseAnchor struct {
 	CursorOffset int64
 	Info         os.FileInfo
 	Identity     string
+}
+
+type historyWatchRebaseScanProgress struct {
+	SourceIdentity string
+	Offset         int64
+	Line           int
+	State          transcriptParseState
+}
+
+type historyWatchRebaseAnchorScanResult struct {
+	Anchor   historyWatchRebaseAnchor
+	Found    bool
+	Complete bool
+	Progress historyWatchRebaseScanProgress
+}
+
+// historyRewriteRecoverySnapshotMatches is the second half of the automatic
+// rebase retry key. SourceFileIdentity deliberately stays stable across
+// append-only writes (and can stay stable after an in-place repair), so a
+// recovery marker containing only the inode would permanently hide a newly
+// repairable source. Conversely, an unchanged marker must keep blocked legacy
+// rows out of the cold rebase scanner on every poll.
+func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, info os.FileInfo) bool {
+	if info == nil || info.IsDir() || strings.TrimSpace(state.SourceRewriteRecoveryIdentity) == "" {
+		return false
+	}
+	if state.SourceRewriteRecoverySize <= 0 || state.SourceRewriteRecoverySize != info.Size() ||
+		state.SourceRewriteRecoveryModTime.IsZero() || !state.SourceRewriteRecoveryModTime.Equal(info.ModTime()) {
+		return false
+	}
+	if state.SourceRewriteRecoveryChangeTime != 0 &&
+		teamstore.SourceFileChangeTimeFromFileInfo(info) != state.SourceRewriteRecoveryChangeTime {
+		return false
+	}
+	return true
 }
 
 // readCodexHistoryHeader only reads the first JSONL record. Invalid or
@@ -118,35 +160,79 @@ func codexPaginatedHistoryIdentity(path string, expectedThreadID string) (string
 // historyWatchRebaseAnchorScan locates the old HistoryWatch final without
 // parsing the complete file into memory. A stable file identity is required on
 // both sides of the scan so an atomic replacement racing this lookup fails
-// closed instead of producing a cursor for a different source.
-func historyWatchRebaseAnchorScan(path string, previous historyTieredFileState, source codexHistoryFile) (historyWatchRebaseAnchor, bool, error) {
+// closed instead of producing a cursor for a different source.  The scan is
+// resumable across listener cycles, and checks its context between complete
+// JSONL records; a slow source therefore yields the phase to other paths.
+func historyWatchRebaseAnchorScan(ctx context.Context, path string, previous historyTieredFileState, source codexHistoryFile, progress historyWatchRebaseScanProgress) (historyWatchRebaseAnchorScanResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(progress.SourceIdentity) != strings.TrimSpace(source.Identity) || progress.Offset < 0 {
+		progress = historyWatchRebaseScanProgress{
+			SourceIdentity: strings.TrimSpace(source.Identity),
+			State: transcriptParseState{
+				sessionID: strings.TrimSpace(previous.SessionID),
+				threadID:  strings.TrimSpace(previous.ThreadID),
+				turnID:    strings.TrimSpace(previous.TurnID),
+			},
+		}
+	}
+	result := historyWatchRebaseAnchorScanResult{Progress: progress}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
-		return historyWatchRebaseAnchor{}, false, err
+		return result, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return historyWatchRebaseAnchor{}, false, err
+		return result, err
 	}
 	if info.IsDir() || !os.SameFile(source.Info, info) {
-		return historyWatchRebaseAnchor{}, false, fmt.Errorf("history source %q changed before rebase scan", path)
+		return result, fmt.Errorf("history source %q changed before rebase scan", path)
+	}
+	if progress.Offset > info.Size() {
+		return result, fmt.Errorf("history source %q is shorter than its rebase scan cursor", path)
+	}
+	if progress.Offset > 0 {
+		if _, err := f.Seek(progress.Offset, io.SeekStart); err != nil {
+			return result, err
+		}
 	}
 	reader := bufio.NewReaderSize(f, 64*1024)
-	state := transcriptParseState{
-		sessionID: strings.TrimSpace(previous.SessionID),
-		threadID:  strings.TrimSpace(previous.ThreadID),
-		turnID:    strings.TrimSpace(previous.TurnID),
-	}
-	var offset int64
-	var lineNo int
+	state := progress.State
+	offset := progress.Offset
+	lineNo := progress.Line
+	scanStart := offset
 	for {
+		if err := ctx.Err(); err != nil {
+			result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
+			return result, err
+		}
+		if offset > scanStart && offset-scanStart >= historyRebaseMaxScanBytesPerPass {
+			if stableErr := historyRebaseStableSource(path, info, source.Identity); stableErr != nil {
+				return result, stableErr
+			}
+			result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
+			return result, nil
+		}
 		read, readErr := historyTieredReadJSONLRecord(reader, historyRebaseMaxLineBytes, historyRebaseMaxLineBytes)
+		if err := ctx.Err(); err != nil {
+			result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
+			return result, err
+		}
 		complete := read.Complete || (readErr == io.EOF && read.BytesRead > 0)
 		if read.BytesRead > 0 {
 			line := read.Line
 			if read.Oversized || !complete {
-				return historyWatchRebaseAnchor{}, false, historyRebaseStableSource(path, info, source.Identity)
+				if stableErr := historyRebaseStableSource(path, info, source.Identity); stableErr != nil {
+					return result, stableErr
+				}
+				result.Complete = true
+				result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
+				return result, nil
 			}
 			lineStart := offset
 			nextOffset := offset + read.BytesRead
@@ -155,7 +241,12 @@ func historyWatchRebaseAnchorScan(path string, previous historyTieredFileState, 
 			if len(trimmed) > 0 {
 				records, diagnostics := parseTranscriptLine(trimmed, lineNo, &state)
 				if len(diagnostics) > 0 {
-					return historyWatchRebaseAnchor{}, false, historyRebaseStableSource(path, info, source.Identity)
+					if stableErr := historyRebaseStableSource(path, info, source.Identity); stableErr != nil {
+						return result, stableErr
+					}
+					result.Complete = true
+					result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
+					return result, nil
 				}
 				for i := range records {
 					records[i].SourceStartOffset = lineStart
@@ -171,30 +262,38 @@ func historyWatchRebaseAnchorScan(path string, previous historyTieredFileState, 
 						cursorLine, cursorOffset = lineNo-1, lineStart
 					}
 					if historyRebaseStableSource(path, info, source.Identity) != nil {
-						return historyWatchRebaseAnchor{}, false, nil
+						return result, nil
 					}
-					return historyWatchRebaseAnchor{
+					result.Anchor = historyWatchRebaseAnchor{
 						Record:       records[i],
 						CursorLine:   cursorLine,
 						CursorOffset: cursorOffset,
 						Info:         info,
 						Identity:     source.Identity,
-					}, true, nil
+					}
+					result.Found = true
+					result.Complete = true
+					result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: nextOffset, Line: lineNo, State: state}
+					return result, nil
 				}
 			}
 			offset = nextOffset
+			result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
-				return historyWatchRebaseAnchor{}, false, readErr
+				return result, readErr
 			}
+			if stableErr := historyRebaseStableSource(path, info, source.Identity); stableErr != nil {
+				return result, stableErr
+			}
+			result.Complete = true
+			result.Progress = historyWatchRebaseScanProgress{SourceIdentity: strings.TrimSpace(source.Identity), Offset: offset, Line: lineNo, State: state}
 			break
 		}
 	}
-	if historyRebaseStableSource(path, info, source.Identity) != nil {
-		return historyWatchRebaseAnchor{}, false, nil
-	}
-	return historyWatchRebaseAnchor{Info: info, Identity: source.Identity}, false, nil
+	result.Anchor = historyWatchRebaseAnchor{Info: info, Identity: source.Identity}
+	return result, nil
 }
 
 func historyRebaseStableSource(path string, expected os.FileInfo, expectedIdentity string) error {
@@ -272,13 +371,105 @@ func historyRebaseSourceProof(path string, expected os.FileInfo, offset int64) (
 	return strings.TrimSpace(identity), fingerprint, info, true
 }
 
-func (b *Bridge) recordHistoryWatchRebaseAttempt(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, previous historyTieredFileState, path string, identity string, now time.Time) error {
-	if expected == nil || strings.TrimSpace(identity) == "" || strings.TrimSpace(identity) == strings.TrimSpace(previous.SourceRewriteRecoveryIdentity) {
+func (b *Bridge) recordHistoryWatchRebaseAttempt(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, previous historyTieredFileState, path string, source codexHistoryFile, now time.Time) error {
+	if expected == nil || strings.TrimSpace(source.Identity) == "" {
 		return nil
 	}
 	previous.Path = path
-	previous.SourceRewriteRecoveryIdentity = strings.TrimSpace(identity)
+	previous.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
+	previous.SourceRewriteRecoverySize = source.Info.Size()
+	previous.SourceRewriteRecoveryModTime = source.Info.ModTime()
+	previous.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+	previous.SourceRewriteRecoveryScanPending = false
+	previous.SourceRewriteRecoveryScanOffset = 0
+	previous.SourceRewriteRecoveryScanLine = 0
+	previous.SourceRewriteRecoveryScanSessionID = ""
+	previous.SourceRewriteRecoveryScanThreadID = ""
+	previous.SourceRewriteRecoveryScanTurnID = ""
 	return b.recordHistoryWatchCheckpointIfCurrent(ctx, id, expected, previous, now)
+}
+
+func (b *Bridge) historyWatchRebaseScanProgress(id string, identity string, previous historyTieredFileState) historyWatchRebaseScanProgress {
+	initial := historyWatchRebaseScanProgress{
+		SourceIdentity: strings.TrimSpace(identity),
+		State: transcriptParseState{
+			sessionID: strings.TrimSpace(previous.SessionID),
+			threadID:  strings.TrimSpace(previous.ThreadID),
+			turnID:    strings.TrimSpace(previous.TurnID),
+		},
+	}
+	if previous.SourceRewriteRecoveryScanPending &&
+		strings.TrimSpace(previous.SourceRewriteRecoveryIdentity) == strings.TrimSpace(identity) &&
+		previous.SourceRewriteRecoveryScanOffset >= 0 {
+		initial.Offset = previous.SourceRewriteRecoveryScanOffset
+		initial.Line = previous.SourceRewriteRecoveryScanLine
+		initial.State = transcriptParseState{
+			sessionID: firstNonEmptyString(previous.SourceRewriteRecoveryScanSessionID, previous.SessionID),
+			threadID:  firstNonEmptyString(previous.SourceRewriteRecoveryScanThreadID, previous.ThreadID),
+			turnID:    firstNonEmptyString(previous.SourceRewriteRecoveryScanTurnID, previous.TurnID),
+		}
+	}
+	if b == nil {
+		return initial
+	}
+	b.historyRebaseMu.Lock()
+	defer b.historyRebaseMu.Unlock()
+	progress, ok := b.historyRebaseScans[strings.TrimSpace(id)]
+	if !ok || strings.TrimSpace(progress.SourceIdentity) != strings.TrimSpace(identity) || progress.Offset < 0 {
+		return initial
+	}
+	return progress
+}
+
+func (b *Bridge) recordHistoryWatchRebaseScanProgress(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, previous historyTieredFileState, path string, source codexHistoryFile, progress historyWatchRebaseScanProgress, now time.Time) error {
+	if expected == nil || strings.TrimSpace(source.Identity) == "" {
+		return nil
+	}
+	next := previous
+	next.Path = path
+	next.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
+	next.SourceRewriteRecoverySize = source.Info.Size()
+	next.SourceRewriteRecoveryModTime = source.Info.ModTime()
+	next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+	next.SourceRewriteRecoveryScanPending = true
+	next.SourceRewriteRecoveryScanOffset = progress.Offset
+	next.SourceRewriteRecoveryScanLine = progress.Line
+	next.SourceRewriteRecoveryScanSessionID = strings.TrimSpace(progress.State.sessionID)
+	next.SourceRewriteRecoveryScanThreadID = strings.TrimSpace(progress.State.threadID)
+	next.SourceRewriteRecoveryScanTurnID = strings.TrimSpace(progress.State.turnID)
+	// The phase context may have expired because this cold scan used its whole
+	// budget. Use a short context that preserves owner values but not the
+	// cancellation, so the durable cursor can still be recorded for the next
+	// cycle without allowing a slow store write to hang the listener.
+	persistBase := ctx
+	if persistBase == nil {
+		persistBase = context.Background()
+	}
+	persistCtx := context.WithoutCancel(persistBase)
+	persistCtx, cancel := context.WithTimeout(persistCtx, 2*time.Second)
+	defer cancel()
+	return b.recordHistoryWatchCheckpointIfCurrent(persistCtx, id, expected, next, now)
+}
+
+func (b *Bridge) rememberHistoryWatchRebaseScanProgress(id string, progress historyWatchRebaseScanProgress) {
+	if b == nil || strings.TrimSpace(id) == "" || strings.TrimSpace(progress.SourceIdentity) == "" {
+		return
+	}
+	b.historyRebaseMu.Lock()
+	defer b.historyRebaseMu.Unlock()
+	if b.historyRebaseScans == nil {
+		b.historyRebaseScans = make(map[string]historyWatchRebaseScanProgress)
+	}
+	b.historyRebaseScans[strings.TrimSpace(id)] = progress
+}
+
+func (b *Bridge) forgetHistoryWatchRebaseScanProgress(id string) {
+	if b == nil {
+		return
+	}
+	b.historyRebaseMu.Lock()
+	defer b.historyRebaseMu.Unlock()
+	delete(b.historyRebaseScans, strings.TrimSpace(id))
 }
 
 func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, previous historyTieredFileState, path string, now time.Time) (bool, error) {
@@ -292,16 +483,53 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	if err != nil || !ok {
 		return false, err
 	}
-	if strings.TrimSpace(source.Identity) == strings.TrimSpace(previous.SourceRewriteRecoveryIdentity) {
+	sameIdentity := strings.TrimSpace(source.Identity) == strings.TrimSpace(previous.SourceRewriteRecoveryIdentity)
+	if sameIdentity && historyRewriteRecoverySnapshotMatches(previous, source.Info) && !previous.SourceRewriteRecoveryScanPending {
 		return false, nil
 	}
-	anchor, found, err := historyWatchRebaseAnchorScan(path, previous, source)
+	// A same-inode source may have been repaired in place. Do not resume a
+	// completed scan from the old EOF in that case; the repaired anchor can be
+	// anywhere in the source. Appends also reset the cold cursor harmlessly.
+	if sameIdentity && !historyRewriteRecoverySnapshotMatches(previous, source.Info) {
+		b.forgetHistoryWatchRebaseScanProgress(id)
+		previous.SourceRewriteRecoveryScanPending = false
+		previous.SourceRewriteRecoveryScanOffset = 0
+		previous.SourceRewriteRecoveryScanLine = 0
+		previous.SourceRewriteRecoveryScanSessionID = ""
+		previous.SourceRewriteRecoveryScanThreadID = ""
+		previous.SourceRewriteRecoveryScanTurnID = ""
+	}
+	progress := b.historyWatchRebaseScanProgress(id, source.Identity, previous)
+	scan, err := historyWatchRebaseAnchorScan(ctx, path, previous, source, progress)
 	if err != nil {
+		if scan.Progress.Offset >= progress.Offset && strings.TrimSpace(scan.Progress.SourceIdentity) == strings.TrimSpace(source.Identity) {
+			b.rememberHistoryWatchRebaseScanProgress(id, scan.Progress)
+		}
+		// Context cancellation is expected when the history phase budget expires;
+		// preserve the in-memory scan cursor and let a later cycle continue. Other
+		// source/read errors remain fail-closed and are retried only after the
+		// candidate identity changes or an explicit recovery is requested.
+		if ctx != nil && ctx.Err() != nil {
+			if persistErr := b.recordHistoryWatchRebaseScanProgress(ctx, id, expected, previous, path, source, scan.Progress, now); persistErr != nil {
+				return false, persistErr
+			}
+			return false, nil
+		}
+		b.forgetHistoryWatchRebaseScanProgress(id)
 		return false, nil
 	}
-	if !found {
-		return false, b.recordHistoryWatchRebaseAttempt(ctx, id, expected, previous, path, source.Identity, now)
+	if !scan.Complete {
+		b.rememberHistoryWatchRebaseScanProgress(id, scan.Progress)
+		if persistErr := b.recordHistoryWatchRebaseScanProgress(ctx, id, expected, previous, path, source, scan.Progress, now); persistErr != nil {
+			return false, persistErr
+		}
+		return false, nil
 	}
+	b.forgetHistoryWatchRebaseScanProgress(id)
+	if !scan.Found {
+		return false, b.recordHistoryWatchRebaseAttempt(ctx, id, expected, previous, path, source, now)
+	}
+	anchor := scan.Anchor
 	identity, fingerprint, info, ok := historyRebaseSourceProof(path, anchor.Info, anchor.CursorOffset)
 	if !ok || identity != source.Identity {
 		return false, nil
@@ -311,8 +539,18 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	next.Size = anchor.CursorOffset
 	next.ModTime = info.ModTime()
 	next.SourceFingerprint = fingerprint
+	next.SourceGeneration = source.Identity
 	next.SourceRewriteBlocked = false
 	next.SourceRewriteRecoveryIdentity = ""
+	next.SourceRewriteRecoverySize = 0
+	next.SourceRewriteRecoveryModTime = time.Time{}
+	next.SourceRewriteRecoveryChangeTime = 0
+	next.SourceRewriteRecoveryScanPending = false
+	next.SourceRewriteRecoveryScanOffset = 0
+	next.SourceRewriteRecoveryScanLine = 0
+	next.SourceRewriteRecoveryScanSessionID = ""
+	next.SourceRewriteRecoveryScanThreadID = ""
+	next.SourceRewriteRecoveryScanTurnID = ""
 	next.Offset = anchor.CursorOffset
 	next.Line = anchor.CursorLine
 	next.SessionID = firstNonEmptyString(source.Header.ThreadID, previous.SessionID)
@@ -358,10 +596,20 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	if os.IsNotExist(err) {
 		return false, nil
 	}
-	if err != nil || !ok || strings.TrimSpace(source.Identity) == strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) {
+	if err != nil || !ok {
 		return false, err
 	}
-	position, found, err := findTranscriptCheckpointPosition(path, checkpoint.LastRecordID)
+	recoverySnapshot := historyTieredFileState{
+		SourceRewriteRecoveryIdentity:   strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
+		SourceRewriteRecoverySize:       checkpoint.SourceRewriteRecoverySize,
+		SourceRewriteRecoveryModTime:    checkpoint.SourceRewriteRecoveryModTime,
+		SourceRewriteRecoveryChangeTime: checkpoint.SourceRewriteRecoveryChangeTime,
+	}
+	if strings.TrimSpace(source.Identity) == strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) &&
+		historyRewriteRecoverySnapshotMatches(recoverySnapshot, source.Info) {
+		return false, nil
+	}
+	position, found, err := findTranscriptCheckpointPositionWithContext(ctx, path, checkpoint.LastRecordID)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
@@ -369,11 +617,14 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		return false, err
 	}
 	if !found {
-		_, _, updateErr := b.store.UpdateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		_, _, updateErr := b.updateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 			if !found || !current.SourceRewriteBlocked || strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) {
 				return current, false, nil
 			}
 			current.SourceRewriteRecoveryIdentity = source.Identity
+			current.SourceRewriteRecoverySize = source.Info.Size()
+			current.SourceRewriteRecoveryModTime = source.Info.ModTime()
+			current.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
 			current.UpdatedAt = now
 			return current, true, nil
 		})
@@ -387,7 +638,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	if !ok || identity != source.Identity {
 		return false, nil
 	}
-	_, changed, err := b.store.UpdateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	_, changed, err := b.updateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if !found || !current.SourceRewriteBlocked || strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) ||
 			strings.TrimSpace(current.SourcePath) != "" && cleanComparablePath(current.SourcePath) != cleanComparablePath(path) {
 			return current, false, nil
@@ -395,6 +646,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		next := current
 		next.SourcePath = path
 		next.SourceFingerprint = fingerprint
+		next.SourceGeneration = identity
 		next.LastSourceLine = position.Line
 		next.LastOffset = position.Offset
 		next.LastOffsetKnown = true
@@ -402,6 +654,9 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		next.SourceModTime = info.ModTime()
 		next.SourceRewriteBlocked = false
 		next.SourceRewriteRecoveryIdentity = ""
+		next.SourceRewriteRecoverySize = 0
+		next.SourceRewriteRecoveryModTime = time.Time{}
+		next.SourceRewriteRecoveryChangeTime = 0
 		if next.CompletionPending {
 			next.Status = importCheckpointStatusImporting
 		} else if next.Status == importCheckpointStatusBlocked {

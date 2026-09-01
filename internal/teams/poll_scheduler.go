@@ -66,17 +66,29 @@ type inboundPollInput struct {
 }
 
 type inboundPollDecision struct {
-	ChatID           string
-	State            string
-	PreviousState    string
-	Due              bool
-	NextPollAt       time.Time
-	LastActivityAt   time.Time
-	BlockedUntil     time.Time
-	Interval         time.Duration
-	ShouldPark       bool
-	ShouldNotifyPark bool
-	ParkedProbe      bool
+	ChatID        string
+	State         string
+	PreviousState string
+	Due           bool
+	NextPollAt    time.Time
+	// LastSuccessfulPollAt is a durable tie-breaker for due chats. A chat
+	// with a continuously operational frontier may deliberately remain due
+	// immediately for catch-up, so NextPollAt alone would let the first
+	// max-work-chat-polls-per-cycle entries win forever. Older successful
+	// polls go first and therefore form a restart-safe aging queue.
+	LastSuccessfulPollAt time.Time
+	LastActivityAt       time.Time
+	BlockedUntil         time.Time
+	Interval             time.Duration
+	// OperationalFrontier marks a due chat whose next action is already a
+	// durable continuation, pending page, or recovery gap. Keep it on the
+	// decision so the cycle cap can reserve a slot for an ordinary chat after
+	// sorting; the SQLite admission lane alone is insufficient once the bridge
+	// applies its smaller per-cycle limit.
+	OperationalFrontier bool
+	ShouldPark          bool
+	ShouldNotifyPark    bool
+	ParkedProbe         bool
 }
 
 func decideInboundPoll(input inboundPollInput) inboundPollDecision {
@@ -95,8 +107,10 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 	}
 	lastActivity = latestTime(lastActivity, input.ForceActivityAt)
 	decision := inboundPollDecision{
-		ChatID:         strings.TrimSpace(input.ChatID),
-		LastActivityAt: lastActivity,
+		ChatID:               strings.TrimSpace(input.ChatID),
+		LastSuccessfulPollAt: poll.LastSuccessfulPollAt,
+		LastActivityAt:       lastActivity,
+		OperationalFrontier:  input.Role == inboundPollRoleWork && pollPageHasOperationalFrontier(poll),
 	}
 	if poll.BlockedUntil.After(now) && !pollPageHasOperationalFrontier(poll) {
 		previous := strings.TrimSpace(poll.PreviousPollState)
@@ -292,8 +306,29 @@ func sortInboundPollDecisions(decisions []inboundPollDecision) {
 		if inboundPollSortPriority(decisions[i].State) != inboundPollSortPriority(decisions[j].State) {
 			return inboundPollSortPriority(decisions[i].State) < inboundPollSortPriority(decisions[j].State)
 		}
+		if decisions[i].Due && decisions[j].Due && !decisions[i].LastSuccessfulPollAt.Equal(decisions[j].LastSuccessfulPollAt) {
+			// A continuously due catch-up frontier rewrites NextPollAt to the
+			// current instant after every page. Comparing that timestamp first
+			// would make the chat completed earliest win forever due to tiny clock
+			// differences. For the same priority lane, durable service age is the
+			// fair ordering key; NextPollAt remains the tie-breaker for ordinary
+			// scheduled work.
+			if decisions[i].LastSuccessfulPollAt.IsZero() != decisions[j].LastSuccessfulPollAt.IsZero() {
+				return decisions[i].LastSuccessfulPollAt.IsZero()
+			}
+			return decisions[i].LastSuccessfulPollAt.Before(decisions[j].LastSuccessfulPollAt)
+		}
 		if !decisions[i].NextPollAt.Equal(decisions[j].NextPollAt) {
 			return decisions[i].NextPollAt.Before(decisions[j].NextPollAt)
+		}
+		if !decisions[i].LastSuccessfulPollAt.Equal(decisions[j].LastSuccessfulPollAt) {
+			// Zero means never successfully served, so it is the oldest possible
+			// dispatch position. This gives newly discovered chats a fair first
+			// opportunity without requiring a separate durable round-robin cursor.
+			if decisions[i].LastSuccessfulPollAt.IsZero() != decisions[j].LastSuccessfulPollAt.IsZero() {
+				return decisions[i].LastSuccessfulPollAt.IsZero()
+			}
+			return decisions[i].LastSuccessfulPollAt.Before(decisions[j].LastSuccessfulPollAt)
 		}
 		return decisions[i].ChatID < decisions[j].ChatID
 	})

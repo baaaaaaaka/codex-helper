@@ -14,7 +14,11 @@ import (
 // be accepted from arbitrary prose or from an HTML comment in the middle of a
 // user message, otherwise a user can accidentally (or deliberately) make the
 // helper suppress a real inbound message.
-var helperOutboxProvenanceMarkerPattern = regexp.MustCompile(`(?i)<!--\s*codex-helper-outbox:([A-Za-z0-9._:-]{1,200})\s*-->\s*$`)
+// Outbox IDs may embed an opaque Teams chat ID such as
+// "19:...@thread.v2". Keep the marker grammar narrow, but include the
+// characters used by Graph's stable chat IDs so a real outbox never silently
+// loses its exact recovery proof.
+var helperOutboxProvenanceMarkerPattern = regexp.MustCompile(`(?i)<!--\s*codex-helper-outbox:([A-Za-z0-9._:@%+=~-]{1,200})\s*-->\s*$`)
 
 func helperOutboxProvenanceMarker(outboxID string) string {
 	outboxID = strings.TrimSpace(outboxID)
@@ -30,6 +34,10 @@ func helperOutboxProvenanceMarkerID(content string) string {
 		return ""
 	}
 	return strings.TrimSpace(match[1])
+}
+
+func stripHelperOutboxProvenanceMarker(content string) string {
+	return strings.TrimSpace(helperOutboxProvenanceMarkerPattern.ReplaceAllString(strings.TrimSpace(content), ""))
 }
 
 func (b *Bridge) recordHelperOutboxMarkerProvenance(ctx context.Context, chatID string, messageID string, outboxID string) error {

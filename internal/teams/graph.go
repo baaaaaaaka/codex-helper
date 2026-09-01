@@ -6,6 +6,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -18,6 +19,47 @@ import (
 	"sync"
 	"time"
 )
+
+// errGraphAttachmentPreflight identifies a locally detected attachment
+// payload problem.  It is distinct from transport/provider errors: no Graph
+// request has started for this class, so a durable attachment POST marker may
+// safely return to pending and be retried after metadata is repaired.
+var errGraphAttachmentPreflight = errors.New("Graph attachment preflight failed")
+
+// These errors describe a successful HTTP response that cannot be treated as
+// a message page.  The poller uses them to move the affected chat into its
+// bounded recovery lane rather than retrying the same malformed page forever.
+// They are deliberately separate from transport/JSON syntax errors: a
+// truncated response may be transient and should retain the normal retry
+// policy.
+var (
+	errGraphMessagePageInvalid = errors.New("Graph message page is invalid")
+	errGraphNextLinkInvalid    = errors.New("Graph message page nextLink is invalid")
+)
+
+// graphMessageWindowPartialError reports a page whose records were decoded
+// successfully but whose opaque continuation cannot be trusted.  The records
+// are still safe input: the poller can stage and handle them, then open a
+// directional gap from the predecessor cursor.  Dropping the whole page here
+// would turn an invalid nextLink into a user-visible message loss.
+type graphMessageWindowPartialError struct {
+	window MessageWindow
+	err    error
+}
+
+func (e *graphMessageWindowPartialError) Error() string {
+	if e == nil || e.err == nil {
+		return errGraphNextLinkInvalid.Error()
+	}
+	return e.err.Error()
+}
+
+func (e *graphMessageWindowPartialError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
 
 const (
 	graphBaseURL              = "https://graph.microsoft.com/v1.0"
@@ -137,8 +179,15 @@ type ChatMessage struct {
 	// serialized into Teams payloads; the durable poll receipt carries the
 	// corresponding disposition separately.
 	oversizedForPoll bool
+	// invalidForPoll is set when a list-page record has a stable identity but
+	// cannot be decoded into a complete ChatMessage. It is a retryable marker,
+	// not a terminal quarantine: the poller first re-fetches that one message
+	// through the bounded item endpoint. This keeps a provider-side shape glitch
+	// from silently discarding a real prompt while still allowing later records
+	// in the page to make progress after the bounded retry budget is exhausted.
+	invalidForPoll bool
 	// quarantinedForPoll is set by a durable pending-page disposition after the
-	// bounded oversized-record re-fetch budget is exhausted. It is not a
+	// bounded record re-fetch budget is exhausted. It is not a
 	// provider field and must never be sent back to Graph.
 	quarantinedForPoll bool
 }
@@ -184,6 +233,11 @@ type MessageWindow struct {
 	// boundary. It is carried by the durable receipt so a restart cannot
 	// accidentally reinterpret that page as a deliverable backlog.
 	baselineOnly bool
+	// boundaryReason is a bounded, non-replayable diagnostic attached to a
+	// page whose records are usable but whose continuation is not. The durable
+	// pending-page representation carries it across a crash; it is intentionally
+	// not an opaque URL or a new executable frontier.
+	boundaryReason string
 }
 
 type ChatMention struct {
@@ -883,7 +937,7 @@ func (g *GraphClient) SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry
 func (g *GraphClient) sendDriveItemAttachmentWithProvenanceAndOptions(ctx context.Context, chatID string, item DriveItem, message string, outboxID string, opts graphRequestOptions) (ChatMessage, error) {
 	contentURL := strings.TrimSpace(firstNonEmptyString(item.WebDavURL, item.WebURL))
 	if contentURL == "" {
-		return ChatMessage{}, fmt.Errorf("drive item %q has no webDavUrl or webUrl", item.ID)
+		return ChatMessage{}, fmt.Errorf("%w: drive item %q has no webDavUrl or webUrl", errGraphAttachmentPreflight, item.ID)
 	}
 	name := strings.TrimSpace(item.Name)
 	if name == "" {
@@ -891,7 +945,7 @@ func (g *GraphClient) sendDriveItemAttachmentWithProvenanceAndOptions(ctx contex
 	}
 	attachmentID := driveItemAttachmentID(item)
 	if attachmentID == "" {
-		return ChatMessage{}, fmt.Errorf("drive item %q has no eTag GUID for Teams attachment id", strings.TrimSpace(item.ID))
+		return ChatMessage{}, fmt.Errorf("%w: drive item %q has no eTag GUID for Teams attachment id", errGraphAttachmentPreflight, strings.TrimSpace(item.ID))
 	}
 	bodyText := html.EscapeString(helperAttachmentMessage(message))
 	if bodyText != "" {
@@ -1110,7 +1164,13 @@ func (g *GraphClient) listMessagesWindowFromPath(ctx context.Context, path strin
 	}
 	nextPath, err := g.relativeGraphPath(next)
 	if err != nil {
-		return MessageWindow{}, err
+		boundaryErr := fmt.Errorf("%w: %v", errGraphNextLinkInvalid, err)
+		// Preserve the valid page records while withholding the untrusted
+		// continuation. The bridge persists boundaryReason with the page, so a
+		// crash after staging still recovers the records and the same safe gap
+		// decision rather than silently treating this as a terminal page.
+		out.boundaryReason = trimPollDiagnostic(boundaryErr.Error())
+		return out, &graphMessageWindowPartialError{window: out, err: boundaryErr}
 	}
 	out.Truncated = true
 	out.NextPath = nextPath
@@ -1139,14 +1199,35 @@ type graphMessagePage struct {
 func (p *graphMessagePage) UnmarshalJSON(data []byte) error {
 	if len(data) <= maxGraphJSONResponseBytes {
 		type plainGraphMessagePage struct {
-			Value    []ChatMessage `json:"value"`
-			NextLink string        `json:"@odata.nextLink"`
+			// A pointer distinguishes a valid empty array from a missing/null
+			// value without first copying the page into RawMessage. The direct
+			// decoder remains the hot path for ordinary Graph pages.
+			Value    *[]ChatMessage `json:"value"`
+			NextLink string         `json:"@odata.nextLink"`
 		}
 		var plain plainGraphMessagePage
 		if err := json.Unmarshal(data, &plain); err != nil {
+			var typeErr *json.UnmarshalTypeError
+			var syntaxErr *json.SyntaxError
+			if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
+				// A syntactically valid page may contain one provider record whose
+				// optional field has an unexpected type. Recover the other records
+				// when each such record has a stable identity; the poller can then
+				// quarantine only the unclassifiable record instead of making all
+				// later messages wait behind it. A record without an ID still fails
+				// closed because advancing past it would guess a source boundary.
+				if recovered, recoverErr := recoverGraphMessagePageByRecord(data); recoverErr == nil {
+					*p = recovered
+					return nil
+				}
+				return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
+			}
 			return err
 		}
-		p.Value = plain.Value
+		if plain.Value == nil {
+			return fmt.Errorf("%w: response value is missing or null", errGraphMessagePageInvalid)
+		}
+		p.Value = *plain.Value
 		p.NextLink = plain.NextLink
 		return nil
 	}
@@ -1156,6 +1237,11 @@ func (p *graphMessagePage) UnmarshalJSON(data []byte) error {
 		NextLink string          `json:"@odata.nextLink"`
 	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
+			return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
+		}
 		return err
 	}
 	if len(envelope.Value) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Value), []byte("null")) {
@@ -1166,52 +1252,147 @@ func (p *graphMessagePage) UnmarshalJSON(data []byte) error {
 	}
 	var records []json.RawMessage
 	if err := json.Unmarshal(envelope.Value, &records); err != nil {
+		var typeErr *json.UnmarshalTypeError
+		var syntaxErr *json.SyntaxError
+		if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
+			return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
+		}
 		return err
 	}
-	messages := make([]ChatMessage, 0, len(records))
-	for index, raw := range records {
-		if len(raw) > maxGraphMessageRecordBytes {
-			message, err := compactOversizedGraphMessage(raw)
-			if err != nil {
-				return fmt.Errorf("Graph message %d is oversized and has no safe identity: %w", index, err)
-			}
-			messages = append(messages, message)
-			continue
-		}
-		var message ChatMessage
-		if err := json.Unmarshal(raw, &message); err != nil {
-			return fmt.Errorf("decode Graph message %d: %w", index, err)
-		}
-		messages = append(messages, message)
+	messages, err := decodeGraphMessageRecords(records)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
 	}
 	p.Value = messages
 	p.NextLink = envelope.NextLink
 	return nil
 }
 
-func compactOversizedGraphMessage(raw []byte) (ChatMessage, error) {
-	var metadata struct {
-		ID                   string `json:"id"`
-		ChatID               string `json:"chatId,omitempty"`
-		CreatedDateTime      string `json:"createdDateTime"`
-		LastModifiedDateTime string `json:"lastModifiedDateTime"`
-		DeletedDateTime      string `json:"deletedDateTime,omitempty"`
-		MessageType          string `json:"messageType"`
+// recoverGraphMessagePageByRecord is used only after the direct decoder has
+// rejected a page. It keeps valid pages on the allocation-light direct path,
+// while allowing a syntactically valid page with one semantically malformed
+// record to make progress. The fallback is deliberately conservative: a
+// malformed record must expose a stable string ID, otherwise the caller cannot
+// safely quarantine it or prove that a later cursor did not skip user input.
+func recoverGraphMessagePageByRecord(data []byte) (graphMessagePage, error) {
+	var envelope struct {
+		Value    json.RawMessage `json:"value"`
+		NextLink string          `json:"@odata.nextLink"`
 	}
-	if err := json.Unmarshal(raw, &metadata); err != nil {
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return graphMessagePage{}, err
+	}
+	if len(envelope.Value) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Value), []byte("null")) {
+		return graphMessagePage{}, fmt.Errorf("response value is missing or null")
+	}
+	var records []json.RawMessage
+	if err := json.Unmarshal(envelope.Value, &records); err != nil {
+		return graphMessagePage{}, err
+	}
+	messages, err := decodeGraphMessageRecords(records)
+	if err != nil {
+		return graphMessagePage{}, err
+	}
+	return graphMessagePage{Value: messages, NextLink: envelope.NextLink}, nil
+}
+
+func decodeGraphMessageRecords(records []json.RawMessage) ([]ChatMessage, error) {
+	messages := make([]ChatMessage, 0, len(records))
+	for index, raw := range records {
+		if len(raw) > maxGraphMessageRecordBytes {
+			message, err := compactOversizedGraphMessage(raw)
+			if err != nil {
+				return nil, fmt.Errorf("Graph message %d is oversized and has no safe identity: %w", index, err)
+			}
+			messages = append(messages, message)
+			continue
+		}
+		var message ChatMessage
+		if err := json.Unmarshal(raw, &message); err != nil {
+			message, compactErr := compactInvalidGraphMessage(raw)
+			if compactErr != nil {
+				return nil, fmt.Errorf("decode Graph message %d: %w", index, err)
+			}
+			messages = append(messages, message)
+			continue
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
+func compactInvalidGraphMessage(raw []byte) (ChatMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
 		return ChatMessage{}, err
 	}
-	if strings.TrimSpace(metadata.ID) == "" {
+	stringField := func(name string) string {
+		value, ok := fields[name]
+		if !ok {
+			return ""
+		}
+		var decoded string
+		if json.Unmarshal(value, &decoded) != nil {
+			return ""
+		}
+		return strings.TrimSpace(decoded)
+	}
+	id := stringField("id")
+	if id == "" {
 		return ChatMessage{}, fmt.Errorf("message id is missing")
 	}
 	return ChatMessage{
-		ID:                   metadata.ID,
-		ChatID:               metadata.ChatID,
-		CreatedDateTime:      metadata.CreatedDateTime,
-		LastModifiedDateTime: metadata.LastModifiedDateTime,
-		DeletedDateTime:      metadata.DeletedDateTime,
-		MessageType:          metadata.MessageType,
-		oversizedForPoll:     true,
+		ID:                   id,
+		ChatID:               stringField("chatId"),
+		CreatedDateTime:      stringField("createdDateTime"),
+		LastModifiedDateTime: stringField("lastModifiedDateTime"),
+		DeletedDateTime:      stringField("deletedDateTime"),
+		MessageType:          stringField("messageType"),
+		invalidForPoll:       true,
+	}, nil
+}
+
+func compactOversizedGraphMessage(raw []byte) (ChatMessage, error) {
+	message, err := compactGraphMessageIdentity(raw)
+	if err != nil {
+		return ChatMessage{}, err
+	}
+	message.oversizedForPoll = true
+	return message, nil
+}
+
+// compactGraphMessageIdentity extracts only fields needed to order, identify,
+// and individually re-fetch an exceptional list-page record. It intentionally
+// accepts malformed optional fields as empty strings: the item endpoint is the
+// authoritative retry path, and a malformed optional field must not make an
+// otherwise identifiable oversized record discard all following records.
+func compactGraphMessageIdentity(raw []byte) (ChatMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ChatMessage{}, err
+	}
+	stringField := func(name string) string {
+		value, ok := fields[name]
+		if !ok {
+			return ""
+		}
+		var decoded string
+		if json.Unmarshal(value, &decoded) != nil {
+			return ""
+		}
+		return strings.TrimSpace(decoded)
+	}
+	id := stringField("id")
+	if id == "" {
+		return ChatMessage{}, fmt.Errorf("message id is missing")
+	}
+	return ChatMessage{
+		ID:                   id,
+		ChatID:               stringField("chatId"),
+		CreatedDateTime:      stringField("createdDateTime"),
+		LastModifiedDateTime: stringField("lastModifiedDateTime"),
+		DeletedDateTime:      stringField("deletedDateTime"),
+		MessageType:          stringField("messageType"),
 	}, nil
 }
 
@@ -1226,11 +1407,49 @@ func chatMessagesExactTopPath(chatID string, top int, modifiedAfter time.Time) s
 }
 
 func chatMessagesPathWithTop(chatID string, top int, modifiedAfter time.Time) string {
+	orderBy := ""
+	if !modifiedAfter.IsZero() {
+		orderBy = "lastModifiedDateTime desc"
+	}
+	return chatMessagesPathWithTopAndOrder(chatID, top, modifiedAfter, orderBy)
+}
+
+func chatMessagesPathWithTopAndOrder(chatID string, top int, modifiedAfter time.Time, orderBy string) string {
 	values := url.Values{}
 	values.Set("$top", strconv.Itoa(top))
+	if strings.TrimSpace(orderBy) != "" {
+		values.Set("$orderby", orderBy)
+	}
 	if !modifiedAfter.IsZero() {
-		values.Set("$orderby", "lastModifiedDateTime desc")
 		values.Set("$filter", "lastModifiedDateTime gt "+modifiedAfter.UTC().Format(time.RFC3339Nano))
+	}
+	return "/chats/" + url.PathEscape(chatID) + "/messages?" + values.Encode()
+}
+
+// chatMessagesGapPath builds the provider-supported descending recovery query
+// for an expired continuation. The lower bound is the last normal-safe cursor;
+// the optional upper bound moves backwards after each complete page. Both
+// bounds are inclusive so messages sharing a timestamp with a cursor remain
+// recoverable. Graph
+// v1.0 does not support ascending lastModifiedDateTime ordering, so the
+// bridge must never construct that query.
+func chatMessagesGapPath(chatID string, top int, lower, upper time.Time) string {
+	top = normalizedGraphMessagesExactTop(top)
+	values := url.Values{}
+	values.Set("$top", strconv.Itoa(top))
+	values.Set("$orderby", "lastModifiedDateTime desc")
+	filter := ""
+	if !lower.IsZero() {
+		filter = "lastModifiedDateTime ge " + lower.UTC().Format(time.RFC3339Nano)
+	}
+	if !upper.IsZero() && (lower.IsZero() || !upper.Before(lower)) {
+		if filter != "" {
+			filter += " and "
+		}
+		filter += "lastModifiedDateTime le " + upper.UTC().Format(time.RFC3339Nano)
+	}
+	if filter != "" {
+		values.Set("$filter", filter)
 	}
 	return "/chats/" + url.PathEscape(chatID) + "/messages?" + values.Encode()
 }
@@ -1318,11 +1537,49 @@ func trimGraphBasePath(requestURI string, baseURL string) string {
 type graphRequestOptions struct {
 	returnRateLimitWithoutRetry bool
 	responseMaxBytes            int64
-	// noReplayAfterFirstRequest is used for non-idempotent outbox POSTs. Once
-	// the HTTP client has handed the request to the network, an auth refresh,
-	// 429/5xx retry, or fallback must not issue a second POST with unknown
-	// external outcome. The caller records the result as ambiguous instead.
+	// noReplayAfterFirstRequest is used for requests whose external outcome
+	// cannot safely be replayed. It is also implied for every method that is
+	// not in graphRequestMethodMayReplay, so a caller cannot accidentally make
+	// a non-idempotent POST retry after the request has reached the network.
 	noReplayAfterFirstRequest bool
+}
+
+// graphRequestMethodMayReplay is deliberately narrower than the set of HTTP
+// methods that a particular endpoint might happen to implement idempotently.
+// GET/HEAD/OPTIONS are read-only, and PUT is the one write method used here
+// for replace-style/upload chunk operations. POST/PATCH are never replayed
+// without an explicit provider idempotency contract; a 401/429/5xx response
+// does not prove that the first request was not accepted.
+func graphRequestMethodMayReplay(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut:
+		return true
+	default:
+		return false
+	}
+}
+
+func graphRequestNoReplay(method string, opts graphRequestOptions) bool {
+	return opts.noReplayAfterFirstRequest || !graphRequestMethodMayReplay(method)
+}
+
+type graphMessageResponseError struct {
+	Path string
+}
+
+func (e *graphMessageResponseError) Error() string {
+	if e == nil || strings.TrimSpace(e.Path) == "" {
+		return "Graph message response did not include message id"
+	}
+	return "Graph message response did not include message id for " + redactGraphPath(e.Path)
+}
+
+func validateGraphMessageResponse(out any, path string) error {
+	message, ok := out.(*ChatMessage)
+	if !ok || message == nil || strings.TrimSpace(message.ID) != "" {
+		return nil
+	}
+	return &graphMessageResponseError{Path: path}
 }
 
 func (g *GraphClient) do(ctx context.Context, method string, path string, body any, out any) error {
@@ -1348,6 +1605,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 
 	retries := 0
 	refreshedAfterUnauthorized := false
+	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
 	for {
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(payload))
 		if err != nil {
@@ -1361,7 +1619,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		if err != nil {
 			return err
 		}
-		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !opts.noReplayAfterFirstRequest {
+		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
 			token, err = g.auth.RefreshAccessToken(ctx)
 			if err != nil {
@@ -1370,7 +1628,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		retryable := !opts.noReplayAfterFirstRequest && shouldRetryGraphRequest(method, resp.StatusCode)
+		retryable := !noReplayAfterFirstRequest && shouldRetryGraphRequest(method, resp.StatusCode)
 		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
 			retryable = false
 		}
@@ -1402,10 +1660,30 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		if closeErr != nil {
 			return closeErr
 		}
-		if out == nil || len(bytes.TrimSpace(raw)) == 0 {
+		if out == nil {
 			return nil
 		}
-		return json.Unmarshal(raw, out)
+		if len(bytes.TrimSpace(raw)) == 0 {
+			if _, ok := out.(*graphMessagePage); ok {
+				return fmt.Errorf("%w: empty response body", errGraphMessagePageInvalid)
+			}
+			return validateGraphMessageResponse(out, path)
+		}
+		if err := json.Unmarshal(raw, out); err != nil {
+			// encoding/json validates the top-level JSON before invoking a
+			// custom UnmarshalJSON method. Classify a complete, malformed message
+			// page here as a deterministic source-boundary failure so the poller
+			// can enter its bounded recovery lane instead of retrying forever.
+			if _, ok := out.(*graphMessagePage); ok {
+				var typeErr *json.UnmarshalTypeError
+				var syntaxErr *json.SyntaxError
+				if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
+					return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
+				}
+			}
+			return err
+		}
+		return validateGraphMessageResponse(out, path)
 	}
 }
 
@@ -1424,6 +1702,7 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 
 	retries := 0
 	refreshedAfterUnauthorized := false
+	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
 	for {
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), nil)
 		if err != nil {
@@ -1434,7 +1713,7 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 		if err != nil {
 			return nil, "", err
 		}
-		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
 			token, err = g.auth.RefreshAccessToken(ctx)
 			if err != nil {
@@ -1443,7 +1722,7 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		retryable := !noReplayAfterFirstRequest && shouldRetryGraphRequest(method, resp.StatusCode)
 		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
 			retryable = false
 		}
@@ -1486,6 +1765,7 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 
 	retries := 0
 	refreshedAfterUnauthorized := false
+	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
 	for {
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(data))
 		if err != nil {
@@ -1499,7 +1779,7 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 		if err != nil {
 			return nil, err
 		}
-		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
 			token, err = g.auth.RefreshAccessToken(ctx)
 			if err != nil {
@@ -1508,7 +1788,7 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 			refreshedAfterUnauthorized = true
 			continue
 		}
-		retryable := shouldRetryGraphRequest(method, resp.StatusCode)
+		retryable := !noReplayAfterFirstRequest && shouldRetryGraphRequest(method, resp.StatusCode)
 		if opts.returnRateLimitWithoutRetry && resp.StatusCode == http.StatusTooManyRequests {
 			retryable = false
 		}
@@ -1798,17 +2078,9 @@ func shouldRetryGraphStatus(status int) bool {
 
 func shouldRetryGraphRequest(method string, status int) bool {
 	if status == http.StatusTooManyRequests {
-		return true
+		return graphRequestMethodMayReplay(method)
 	}
-	if status < 500 || status > 599 {
-		return false
-	}
-	switch strings.ToUpper(method) {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut:
-		return true
-	default:
-		return false
-	}
+	return status >= 500 && status <= 599 && graphRequestMethodMayReplay(method)
 }
 
 func discardAndClose(body io.ReadCloser) {
@@ -2003,16 +2275,57 @@ func allowedMessagesQuery(values url.Values) bool {
 
 func allowedLastModifiedFilter(value string) bool {
 	value = strings.TrimSpace(value)
-	const prefix = "lastModifiedDateTime gt "
-	if !strings.HasPrefix(value, prefix) {
+	if value == "" || strings.ContainsAny(value, "'\"()") {
 		return false
 	}
-	raw := strings.TrimSpace(strings.TrimPrefix(value, prefix))
-	if raw == "" || strings.ContainsAny(raw, "'\"()") {
+	parts := strings.Split(value, " and ")
+	if len(parts) > 2 {
 		return false
 	}
-	_, err := time.Parse(time.RFC3339Nano, raw)
-	return err == nil
+	parseBound := func(raw string, lower bool) (time.Time, string, bool) {
+		fields := strings.Fields(strings.TrimSpace(raw))
+		if len(fields) != 3 || fields[0] != "lastModifiedDateTime" {
+			return time.Time{}, "", false
+		}
+		if lower && fields[1] != "gt" && fields[1] != "ge" {
+			return time.Time{}, "", false
+		}
+		if !lower && fields[1] != "lt" && fields[1] != "le" {
+			return time.Time{}, "", false
+		}
+		stamp, err := time.Parse(time.RFC3339Nano, fields[2])
+		if err != nil || stamp.IsZero() {
+			return time.Time{}, "", false
+		}
+		return stamp, fields[1], true
+	}
+	if len(parts) == 1 {
+		if _, _, ok := parseBound(parts[0], true); ok {
+			return true
+		}
+		// Gap recovery may have no independently proven lower cursor (for
+		// example a legacy continuation opened before the safe-cursor field
+		// existed). In that case it deliberately uses an upper-only inclusive
+		// bound. The operator/value grammar is still fully constrained here, so
+		// accepting this form does not broaden the endpoint or query surface.
+		_, _, ok := parseBound(parts[0], false)
+		return ok
+	}
+	lower, _, ok := parseBound(parts[0], true)
+	if !ok {
+		return false
+	}
+	upper, _, ok := parseBound(parts[1], false)
+	if !ok {
+		return false
+	}
+	// Equal timestamps are intentional for the gap recovery bucket. A
+	// descending recovery query must not exclude a record merely because its
+	// timestamp equals the safe cursor.
+	if upper.Before(lower) {
+		return false
+	}
+	return true
 }
 
 func isChatMessagesPath(path string) bool {

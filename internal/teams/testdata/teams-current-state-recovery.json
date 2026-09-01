@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "source": "sanitized-current-state-category-sample",
+  "entries": [
+    {"id": "sample-healthy-backlog", "observed_shape": "healthy_backlog", "expected_disposition": "recovered", "safe_to_auto_advance": true},
+    {"id": "sample-pending-continuation", "observed_shape": "pending_continuation", "expected_disposition": "safe_held_then_recovered", "safe_to_auto_advance": false},
+    {"id": "sample-opaque-large-record", "observed_shape": "opaque_large_record", "expected_disposition": "quarantined_and_advanced", "safe_to_auto_advance": true},
+    {"id": "sample-ambiguous-outbox", "observed_shape": "ambiguous_outbox", "expected_disposition": "held_without_automatic_repost", "safe_to_auto_advance": false},
+    {"id": "sample-legacy-checkpoint", "observed_shape": "legacy_unverified_checkpoint", "expected_disposition": "silent_history_hold_live_chat_unblocked", "safe_to_auto_advance": false},
+    {"id": "sample-source-rewrite", "observed_shape": "source_rewrite", "expected_disposition": "held_until_source_proof", "safe_to_auto_advance": false}
+  ]
+}
