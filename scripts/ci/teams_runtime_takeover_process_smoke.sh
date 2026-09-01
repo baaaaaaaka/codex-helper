@@ -18,13 +18,15 @@ docker info >/dev/null 2>&1 || {
 cd "$repo_root"
 CGO_ENABLED=0 go test -c -o "$tmp_dir/teams-runtime-safety.test" ./internal/teams
 test_selector='^(TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI|TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI|TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI|TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI)$'
+available_tests="$("$tmp_dir/teams-runtime-safety.test" -test.list "$test_selector")"
 for test_name in \
   TestTeamsRuntimeSafetyOfflineTakeoverWaitsForRealWriterExitDockerCI \
   TestTeamsRuntimeSafetyOfflineTakeoverAfterSIGKILLDockerCI \
   TestTeamsRuntimeSafetySQLiteFullFilesystemDockerCI \
   TestTeamsRuntimeSafetyBridgeTranscriptGraphAcceptedThenSQLiteFullDockerCI; do
-  if ! "$tmp_dir/teams-runtime-safety.test" -test.list "$test_selector" | grep -Fxq "$test_name"; then
+  if ! grep -Fxq -- "$test_name" <<<"$available_tests"; then
     echo "runtime takeover smoke selector did not find exact test: $test_name" >&2
+    printf 'available tests:\n%s\n' "$available_tests" >&2
     exit 1
   fi
 done
