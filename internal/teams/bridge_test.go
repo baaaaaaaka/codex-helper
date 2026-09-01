@@ -816,6 +816,21 @@ func TestBridgeTreatsUnrequestedCanceledExecutionAsInterrupted(t *testing.T) {
 	cancel()
 
 	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	// The interrupted turn can become durable before its needs-attention
+	// outbox row is enqueued.  Wait for the observable notice itself instead
+	// of treating that short handoff window as a missing notification; a real
+	// failure to publish still fails at the bounded test deadline below.
+	deadline := time.Now().Add(bridgeAsyncTestTimeout)
+	for {
+		joined := sentPlainJoined(*sent)
+		if strings.Contains(joined, "Teams helper stopped, restarted, or lost its execution context") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("interruption notice was not published after canceled execution:\n%s", joined)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
