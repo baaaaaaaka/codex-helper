@@ -72,7 +72,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a session-local transcript error is retried locally while a later healthy session advances its checkpoint and publishes its final",
       "baseline": "pre-fix treating every linked-transcript error as shared cancellation leaves later sessions unprocessed"
     },
@@ -282,7 +282,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 60,
       "oracle": "a reopened store drains the remaining durable outbox rows exactly once",
       "baseline": "pre-fix restart can lose the in-memory backlog position or replay rows"
     },

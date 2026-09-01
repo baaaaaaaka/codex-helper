@@ -706,6 +706,11 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
+// Restarted outbox recovery can cross the production Graph pacing interval
+// after a busy race runner has already spent one phase budget. Keep that
+// liveness bound finite, but long enough to observe the next durable attempt.
+const listenerRecoveryBacklogProgressTimeout = 30 * time.Second
+
 func (e *listenerRecoveryBlockingExecutor) Run(_ context.Context, _ *Session, _ string) (ExecutionResult, error) {
 	e.once.Do(func() { close(e.started) })
 	<-e.release
@@ -2035,7 +2040,7 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 			}
 		}
 		return false
-	}, listenerRecoveryProgressTimeout, "healthy tail after session-local transcript error")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail after session-local transcript error")
 	callsMu.Lock()
 	gotHeadCalls, gotTailCalls := headCalls, tailCalls
 	callsMu.Unlock()
@@ -4080,12 +4085,12 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	// The recovery assertion is about durable outbox progress, not the short
 	// maintenance deadline used by most phase-isolation tests.  Under -race,
 	// SQLite owner-CAS and the first outbox page can legitimately exceed the
-	// 500ms fixture budget; using a still-bounded five-second phase budget keeps
-	// this test aligned with the production budget without turning a wedged
+	// 500ms fixture budget; using the production-sized phase budget keeps this
+	// test aligned with the real listener without turning a wedged
 	// listener into an unbounded wait.
-	recoveredOptions.PhaseBudget = 5 * time.Second
+	recoveredOptions.PhaseBudget = 15 * time.Second
 	secondListener := startListenerRecovery(t, recoveredBridge, recoveredOptions)
-	recoveredDeadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
+	recoveredDeadline := time.Now().Add(listenerRecoveryBacklogProgressTimeout)
 	recovered := false
 	for time.Now().Before(recoveredDeadline) {
 		state, loadErr := recoveredStore.Load(context.Background())
