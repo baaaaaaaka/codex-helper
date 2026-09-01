@@ -2294,19 +2294,10 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	if released, err := store.ReleaseControlLeaseIfHolder(context.Background(), bridge.machine.ID, oldGeneration); err != nil || !released {
 		t.Fatalf("release old owner: released=%v err=%v", released, err)
 	}
-	replacement := teamstore.MachineRecord{ID: "owner-loss-replacement", ScopeID: bridge.scope.ID, Kind: teamstore.MachineKindPrimary}
-	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
-		Scope: bridge.scope, Machine: replacement, Duration: time.Minute, Now: time.Now().UTC(),
-	})
-	if err != nil || decision.Mode != teamstore.LeaseModeActive {
-		t.Fatalf("claim replacement owner: mode=%v err=%v", decision.Mode, err)
-	}
-	// Losing the lease does not require the process to exit: the production
-	// listener is allowed to remain alive in standby and wait for a later
-	// takeover.  The invariant here is that the owner-bound scan is canceled
-	// and cannot commit; cancel the test listener explicitly after the
-	// replacement is durable so this test does not conflate standby with a
-	// failure to stop.
+	// Wait for the old generation to observe the released lease before asking a
+	// replacement owner to claim it. Claiming immediately is nondeterministic:
+	// the old listener can race into its standby loop and reclaim the lease,
+	// making the replacement look inactive without testing the history fence.
 	waitListenerRecovery(t, func() bool {
 		select {
 		case <-hookExited:
@@ -2321,6 +2312,9 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	if stats := bridge.mainLoopPhaseStatsSnapshot("history-watch"); stats.DeadlineExceeded != 0 {
 		t.Fatalf("history-watch phase reached its ordinary deadline during owner loss: %#v", stats)
 	}
+	// End the old listener before installing the replacement. This preserves
+	// the owner-loss cancellation proof while removing the unrelated standby
+	// re-claim race from the fixture.
 	cancel()
 	select {
 	case err := <-listenDone:
@@ -2329,6 +2323,13 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 		}
 	case <-time.After(listenerRecoveryProgressTimeout):
 		t.Fatal("listener did not stop after explicit owner-loss test cancellation")
+	}
+	replacement := teamstore.MachineRecord{ID: "owner-loss-replacement", ScopeID: bridge.scope.ID, Kind: teamstore.MachineKindPrimary}
+	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
+		Scope: bridge.scope, Machine: replacement, Duration: time.Minute, Now: time.Now().UTC(),
+	})
+	if err != nil || decision.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("claim replacement owner: mode=%v err=%v", decision.Mode, err)
 	}
 	state, err := store.HistoryWatchState(context.Background())
 	if err != nil {
@@ -2389,22 +2390,9 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	if released, err := store.ReleaseControlLeaseIfHolder(context.Background(), oldMachineID, oldGeneration); err != nil || !released {
 		t.Fatalf("release old owner lease: released=%v err=%v", released, err)
 	}
-	replacementMachine := teamstore.MachineRecord{ID: "owner-loss-turn-replacement", ScopeID: bridge.scope.ID, Kind: teamstore.MachineKindPrimary}
-	replacementOwner, err := teamstore.CurrentOwner("owner-loss-replacement", "", "", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("current replacement owner: %v", err)
-	}
-	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
-		Scope: bridge.scope, Machine: replacementMachine, Owner: replacementOwner, Duration: time.Minute, Now: time.Now().UTC(),
-	})
-	if err != nil || decision.Mode != teamstore.LeaseModeActive {
-		t.Fatalf("claim replacement owner: mode=%v err=%v", decision.Mode, err)
-	}
-
-	// A replaced owner may leave this process in the normal standby loop.  Do
-	// not make process exit part of the ownership-fencing assertion; wait for
-	// the cooperative worker to observe the owner cancellation, then close the
-	// test listener explicitly.
+	// As in the history-watch fixture, wait for the old generation to cancel its
+	// cooperative worker and stop it before claiming the replacement. Otherwise
+	// the old listener can enter standby and win the replacement claim itself.
 	waitListenerRecovery(t, func() bool {
 		return bridge.activeAsyncTurnCount() == 0
 	}, 2*time.Second, "owner-loss cooperative turn cancellation")
@@ -2419,6 +2407,17 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 		}
 	case <-time.After(listenerRecoveryProgressTimeout):
 		t.Fatal("listener did not stop after explicit owner-loss test cancellation")
+	}
+	replacementMachine := teamstore.MachineRecord{ID: "owner-loss-turn-replacement", ScopeID: bridge.scope.ID, Kind: teamstore.MachineKindPrimary}
+	replacementOwner, err := teamstore.CurrentOwner("owner-loss-replacement", "", "", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("current replacement owner: %v", err)
+	}
+	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
+		Scope: bridge.scope, Machine: replacementMachine, Owner: replacementOwner, Duration: time.Minute, Now: time.Now().UTC(),
+	})
+	if err != nil || decision.Mode != teamstore.LeaseModeActive {
+		t.Fatalf("claim replacement owner: mode=%v err=%v", decision.Mode, err)
 	}
 	waitListenerRecovery(t, func() bool { return bridge.activeAsyncTurnCount() == 0 }, time.Second, "owner-loss turn cancellation")
 
@@ -3772,10 +3771,10 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 			bridge.lastHistoryWatchReconcile = time.Now()
 			listenerOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
 			// The matrix exercises restart/current-state semantics, not the phase
-			// timeout itself.  Give the race-instrumented store enough room to finish
-			// its bounded linked-transcript pass; the progress watchdog below remains
-			// the liveness oracle.
-			listenerOptions.PhaseBudget = time.Second
+			// timeout itself. Give the bounded outbox and linked-transcript passes
+			// the same order of magnitude as the production phase budget; the
+			// progress watchdog below remains the liveness oracle.
+			listenerOptions.PhaseBudget = 5 * time.Second
 			listener := startListenerRecovery(t, bridge, listenerOptions)
 
 			pendingBoundaryReady := waitListenerRecoveryResult(func() bool {
