@@ -268,6 +268,73 @@ func TestRunCodexAppDirectLaunchesDesktopApp(t *testing.T) {
 	}
 }
 
+func TestRunCodexAppProxiedOfficialLaunchUsesModelGateway(t *testing.T) {
+	lockCLITestHooks(t)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	profile := config.Profile{ID: "p1", Name: "remote", Host: "host", Port: 22, User: "me"}
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	cfg := config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(true), Profiles: []config.Profile{profile}}
+	if err := store.Save(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	prevGOOS := codexAppGOOS
+	prevIsWSL := codexAppIsWSL
+	prevEnsureProxy := ensureProxyPreferenceFunc
+	prevEnsureProfile := ensureProfileFunc
+	prevEnsureProxyURL := codexAppEnsureProxyURLFn
+	prevEnsureModel := codexAppEnsureModelProfileLaunchFn
+	prevLaunch := codexAppLaunchDesktopFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppIsWSL = prevIsWSL
+		ensureProxyPreferenceFunc = prevEnsureProxy
+		ensureProfileFunc = prevEnsureProfile
+		codexAppEnsureProxyURLFn = prevEnsureProxyURL
+		codexAppEnsureModelProfileLaunchFn = prevEnsureModel
+		codexAppLaunchDesktopFn = prevLaunch
+	})
+
+	codexAppGOOS = func() string { return "windows" }
+	codexAppIsWSL = func() bool { return false }
+	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
+		return true, cfg, nil
+	}
+	ensureProfileFunc = func(context.Context, *config.Store, string, bool, io.Writer) (config.Profile, config.Config, error) {
+		return profile, cfg, nil
+	}
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		return "http://127.0.0.1:24567", nil
+	}
+	modelGatewayPrepared := false
+	codexAppEnsureModelProfileLaunchFn = func(_ context.Context, _ *config.Store, ref string, proxyRef string, _ io.Writer) (codexModelProfileLaunch, error) {
+		modelGatewayPrepared = true
+		if ref != "" {
+			t.Fatalf("model profile ref = %q, want official default", ref)
+		}
+		if proxyRef != profile.ID {
+			t.Fatalf("model gateway proxy ref = %q, want %q", proxyRef, profile.ID)
+		}
+		return codexModelProfileLaunch{}, nil
+	}
+	codexAppLaunchDesktopFn = func(context.Context, codexDesktopAppOptions) error { return nil }
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := runCodexApp(cmd, &rootOptions{configPath: cfgPath}, codexAppOptions{cwd: t.TempDir()}); err != nil {
+		t.Fatalf("runCodexApp error: %v", err)
+	}
+	if !modelGatewayPrepared {
+		t.Fatal("proxied official desktop launch did not prepare the model gateway")
+	}
+}
+
 func TestRunCodexAppModelProfileLaunchUsesIsolatedCodexHome(t *testing.T) {
 	lockCLITestHooks(t)
 
