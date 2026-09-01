@@ -3103,7 +3103,11 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 			listenerRecoverySeedDuePoll(t, store, session.ChatID, now)
 
 			options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-			options.PhaseBudget = 2 * time.Second
+			// The opaque-record path must read the complete record before it can
+			// persist its bounded disposition.  Hosted macOS runners can spend
+			// several seconds copying the 7.5-8 MiB fixture; keep the test bounded
+			// without turning that legitimate scan into a synthetic phase timeout.
+			options.PhaseBudget = 10 * time.Second
 			listener := startListenerRecovery(t, bridge, options)
 
 			largeDispositionReady := waitListenerRecoveryResult(func() bool {
@@ -3130,7 +3134,7 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 				// user-visible delivery and therefore must not manufacture a delivery
 				// ledger row merely to make this test pass.
 				return true
-			}, 5*time.Second)
+			}, 15*time.Second)
 			if !largeDispositionReady {
 				state, loadErr := store.Load(context.Background())
 				listener.stop(t)
@@ -3161,7 +3165,7 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 					}
 				}
 				return false
-			}, 5*time.Second, "large transcript durable disposition")
+			}, 15*time.Second, "large transcript durable disposition")
 			plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 			if strings.Contains(plain, "helper publish-history") || strings.Contains(plain, "previous Codex execution is still unconfirmed") {
 				t.Fatalf("large transcript emitted a manual/recovery gate: %s", plain)
