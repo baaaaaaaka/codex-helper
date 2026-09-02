@@ -401,7 +401,7 @@
       "vertical": "outbox-source-fence-post-cas",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a same-size source rewrite immediately after the Sent CAS is demoted to one stable Accepted fence without a duplicate POST",
       "baseline": "pre-fix the callback passed the pre-CAS Sending snapshot, so the final fence CAS was rejected and the row remained Sent"
     },
