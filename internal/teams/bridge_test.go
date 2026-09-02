@@ -37864,8 +37864,19 @@ func TestBridgeFlushPendingOutboxSQLiteDrainsMultiplePendingPages(t *testing.T) 
 func TestBridgeFlushPendingOutboxForChatSQLiteDoesNotScanUnrelatedPages(t *testing.T) {
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
-	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+	// An empty store has no legacy state file yet, so migration intentionally
+	// returns a new in-memory state without creating a SQLite pointer. Seed the
+	// file first; otherwise the writes below exercise the slow JSON fallback
+	// instead of the SQLite targeted-page path this test is meant to cover.
+	if err := store.Update(ctx, func(*teamstore.State) error { return nil }); err != nil {
+		t.Fatalf("seed state before SQLite migration: %v", err)
+	}
+	migration, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
 		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	if !migration.Migrated && !migration.AlreadyDB {
+		t.Fatalf("MigrateLargeStateToSQLite result = %#v, want migrated or already DB", migration)
 	}
 	var sent []bridgeSentMessage
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
