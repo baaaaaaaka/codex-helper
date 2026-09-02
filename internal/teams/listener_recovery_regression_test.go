@@ -4332,7 +4332,12 @@ func TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover(t *test
 // staging, attempt ownership, or the first generation's durable commit.
 func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool) {
 	t.Helper()
-	progressTimeout := listenerRecoveryExtendedProgressTimeout
+	// The SQLite-backed first generation performs a durable continuation
+	// transition while the full hosted package is under load. Keep this bound
+	// finite so a real liveness failure still fails, but give the complete
+	// Graph/outbox/state transition the same backlog budget as the other
+	// recovery fixtures.
+	progressTimeout := listenerRecoveryBacklogProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
