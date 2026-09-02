@@ -2412,6 +2412,12 @@ func TestBridgeAsyncQueuedLongMessageReferenceWritesFullTextFileForCodex(t *test
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, "s001", 2)
 	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	// Durable completion is committed before the async worker finishes its
+	// attachment cleanup and other follow-ups.  Wait for the worker reservation
+	// to be released before t.TempDir starts removing the referenced file tree.
+	waitListenerRecovery(t, func() bool {
+		return bridge.activeAsyncTurnCount() == 0
+	}, bridgeAsyncWaitTimeoutForTest(), "queued reference worker cleanup")
 	if got := sentPlainJoined(sent); !strings.Contains(got, "Your request is queued.") || !strings.Contains(got, "saw queued full reference file") {
 		t.Fatalf("queued long reference transcript missing queued ack or final answer:\n%s", got)
 	}

@@ -1023,6 +1023,19 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	graph, graphState := newListenerRecoveryGraph(t, delays, map[string][]ChatMessage{
 		"chat-5": {healthy},
 	}, 0)
+	// The scheduler admits four workers at once.  Hold the first four slow
+	// requests at a barrier so the assertion below deterministically observes a
+	// saturated worker wave instead of depending on goroutine start order.
+	graphState.mu.Lock()
+	graphState.slowGetChatIDs = map[string]bool{
+		"chat-1": true,
+		"chat-2": true,
+		"chat-3": true,
+		"chat-4": true,
+	}
+	graphState.slowGetBarrierTarget = 4
+	graphState.slowGetBarrierRelease = make(chan struct{})
+	graphState.mu.Unlock()
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
