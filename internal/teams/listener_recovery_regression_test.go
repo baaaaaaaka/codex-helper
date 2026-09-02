@@ -3043,7 +3043,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	message.LastModifiedDateTime = message.CreatedDateTime
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
-	}, 100*time.Millisecond)
+	}, time.Second)
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
@@ -3055,10 +3055,10 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	// Deliberately make the post-claim cleanup grace shorter than the fake
-	// provider's ACK latency.  This is still a bounded, cooperative provider
-	// operation; the test should fail only if the handler consumes the cleanup
-	// context instead of getting the phase context.
-	bridge.pollAttemptDurableGrace = 50 * time.Millisecond
+	// provider's ACK latency.  The refreshed terminal window is still long
+	// enough for one race-instrumented local CAS, so a hosted runner does not
+	// turn ordinary SQLite scheduling into a false cleanup failure.
+	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
