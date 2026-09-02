@@ -2888,7 +2888,12 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
 	}, 0)
-	graphState.delayOnce = map[string]time.Duration{"chat-1": 8 * time.Second}
+	// Keep the first read slower than the phase budget by a wide margin.  The
+	// fake request is cooperative, but a hosted Windows runner can take a few
+	// extra seconds to unwind the canceled HTTP/SQLite work while other package
+	// tests are active; a narrow 3s budget made the recovery assertion depend on
+	// that unrelated scheduler contention.
+	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
@@ -2910,16 +2915,17 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	// Leave enough time for the real SQLite admission path under -race, while
-	// keeping the phase deadline ahead of the deliberately slower Graph read.
-	// The worker budget must exceed the phase budget; otherwise the worker would
-	// cancel itself and this test would not exercise phase-owned cleanup.
-	options.PhaseBudget = 3 * time.Second
-	options.PollWorkerBudget = 5 * time.Second
+	// Leave enough time for the real SQLite admission path under full-package
+	// Windows load, while keeping the phase deadline ahead of the deliberately
+	// slower Graph read.  The worker budget must exceed the phase budget;
+	// otherwise the worker would cancel itself and this test would not exercise
+	// phase-owned cleanup.
+	options.PhaseBudget = 10 * time.Second
+	options.PollWorkerBudget = 12 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
 		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
-	}, listenerRecoveryProgressTimeout, "phase deadline after claiming chat poll")
+	}, listenerRecoveryBacklogProgressTimeout, "phase deadline after claiming chat poll")
 
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
