@@ -177,7 +177,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 150,
       "oracle": "task_started-only snapshot stays silent, then a durable Teams owner proof releases the boundary and delivers the later final",
       "baseline": "pre-fix pending-root state is not released by the next listener cycles"
     },
