@@ -1834,7 +1834,12 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 		}
 		return state.ImportCheckpoints[transcriptCheckpointID("s002")].LastOffset == healthyInfo.Size()
 	}
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	// The production phase may legitimately span multiple cycles while a
+	// hosted race runner is committing the healthy checkpoint.  Use the
+	// scenario's finite busy-listener watchdog here instead of the short
+	// admission watchdog above; otherwise the test can fail before the
+	// production-sized phase has a chance to complete durable progress.
+	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
 	for !linkedProgress() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
