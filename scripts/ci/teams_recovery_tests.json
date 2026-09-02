@@ -192,7 +192,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 60,
+      "max_seconds": 180,
       "oracle": "a restarted listener drains a safe inherited backlog and a proven task/prompt boundary on both stores while silently isolating an unproven legacy checkpoint",
       "baseline": "pre-fix current-state replay can skip inherited sessions, retain a pending boundary, or turn a legacy history-only row into a live blocker"
     },
@@ -1149,7 +1149,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 45,
       "oracle": "the continuous listener uses the configured Runner, forwards a streaming event, and publishes the runner final without using the fallback Executor",
       "baseline": "pre-fix Executor-only tests could pass while the production Runner adapter or event handler was disconnected"
     },

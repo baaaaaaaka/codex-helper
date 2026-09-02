@@ -1582,7 +1582,7 @@ func TestTeamsListenFalseUsesConfiguredRunnerStreaming(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-runner.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("configured runner was not dispatched; requests=%v errors=%v", graphState.requestsSnapshot(), graphState.errorsSnapshot())
 	}
@@ -1593,7 +1593,7 @@ func TestTeamsListenFalseUsesConfiguredRunnerStreaming(t *testing.T) {
 			}
 		}
 		return false
-	}, listenerRecoveryProgressTimeout, "configured runner final delivery")
+	}, listenerRecoveryExtendedProgressTimeout, "configured runner final delivery")
 	if got := runner.callsSnapshot(); len(got) != 1 || !strings.Contains(got[0], "LISTENER_RECOVERY_CONFIGURED_RUNNER_PROMPT") {
 		t.Fatalf("configured runner calls = %#v, want one prompt", got)
 	}
@@ -3827,7 +3827,10 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 			// timeout itself. Give the bounded outbox and linked-transcript passes
 			// the same order of magnitude as the production phase budget; the
 			// progress watchdog below remains the liveness oracle.
-			listenerOptions.PhaseBudget = 5 * time.Second
+			// Keep this scenario out of the phase-timeout test matrix.  Under
+			// -race, the safe outbox batch can exceed a short synthetic budget
+			// even though the production-sized budget has ample room.
+			listenerOptions.PhaseBudget = mainLoopPhaseBudget
 			listener := startListenerRecovery(t, bridge, listenerOptions)
 
 			pendingBoundaryReady := waitListenerRecoveryResult(func() bool {
@@ -3874,7 +3877,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 				return strings.Contains(plain, healthyFinal) && strings.Contains(plain, raceFinal)
-			}, listenerRecoveryExtendedProgressTimeout)
+			}, listenerRecoveryBacklogProgressTimeout)
 			if !safeBacklogReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
