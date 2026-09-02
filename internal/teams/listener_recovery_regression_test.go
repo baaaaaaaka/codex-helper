@@ -2131,7 +2131,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 		default:
 			return false
 		}
-	}, listenerRecoveryExtendedProgressTimeout, "history-watch slow head to enter")
+	}, listenerRecoveryBusyProgressTimeout, "history-watch slow head to enter")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -2144,7 +2144,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 			}
 		}
 		return true
-	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail and slow head")
+	}, listenerRecoveryBusyProgressTimeout, "history-watch healthy tail and slow head")
 	listener.stop(t)
 }
 
