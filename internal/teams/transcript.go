@@ -3,6 +3,7 @@ package teams
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -49,9 +50,10 @@ type TranscriptParseOptions struct {
 }
 
 type Transcript struct {
-	SourceName      string
-	FileFingerprint string
-	ThreadID        string
+	SourceName       string
+	FileFingerprint  string
+	SourceChangeTime int64
+	ThreadID         string
 	// SourceReadProof authenticates the bounded byte range consumed by an
 	// incremental scan.  The cursor proof above covers only the trusted prefix;
 	// keeping the read-range proof with the scan result lets the bridge reject a
@@ -104,6 +106,11 @@ type Transcript struct {
 	// newline boundary. It is persisted as a bounded read hint only; callers
 	// must not publish or advance LastOffset from it.
 	Partial *TranscriptPartialProgress
+	// PendingOpaqueRecord identifies a complete, previously partial record whose
+	// newline is proven but whose payload is intentionally not materialized. It
+	// is carried across bounded linked-transcript scans until the scanner can
+	// consume that exact range and install an opaque context gap.
+	PendingOpaqueRecord *TranscriptOpaqueRecordProgress
 	// Consumed records a complete, newline-bounded record that the scanner
 	// intentionally did not turn into a user-visible TranscriptRecord (for
 	// example task_started/session metadata or an opaque tool envelope). It is
@@ -139,12 +146,24 @@ type TranscriptRootReleaseWitness struct {
 }
 
 type TranscriptPartialProgress struct {
-	LineStartOffset int64
-	ReadOffset      int64
-	ObservedSize    int64
-	Line            int
-	StartedAt       time.Time
-	SourceIdentity  string
+	LineStartOffset  int64
+	ReadOffset       int64
+	ObservedSize     int64
+	Line             int
+	StartedAt        time.Time
+	SourceIdentity   string
+	SourceChangeTime int64
+	ReplayOffset     int64
+	ReplayLine       int
+	LastProgressAt   time.Time
+	PrefixReleased   bool
+}
+
+type TranscriptOpaqueRecordProgress struct {
+	StartOffset int64
+	EndOffset   int64
+	Line        int
+	RecordID    string
 }
 
 type TranscriptConsumedProgress struct {
@@ -203,7 +222,11 @@ func ReadSessionTranscript(filePath string) (Transcript, error) {
 	if abs, err := filepath.Abs(filePath); err == nil {
 		sourceName = abs
 	}
-	return ParseCodexTranscript(f, TranscriptParseOptions{SourceName: sourceName, RequireFinalNewline: true})
+	// A valid JSON value at a stable EOF is a complete logical JSONL record even
+	// when the producer stopped before writing the optional final delimiter. The
+	// incremental scanner applies the same rule; keeping the full-file path
+	// strict stranded small transcripts forever after a normal process exit.
+	return ParseCodexTranscript(f, TranscriptParseOptions{SourceName: sourceName, RequireFinalNewline: false})
 }
 
 // ReadSessionTranscriptFromOffset parses a suffix beginning at an already
@@ -321,7 +344,7 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 		InitialTurnID:       state.turnID,
 		InitialLineNo:       checkpointLine,
 		InitialOffset:       checkpointOffset,
-		RequireFinalNewline: true,
+		RequireFinalNewline: false,
 	})
 	if err != nil {
 		return transcript, false, err
@@ -377,6 +400,22 @@ type transcriptCheckpointPosition struct {
 }
 
 func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcriptCheckpointPosition, bool, error) {
+	return findTranscriptCheckpointPositionWithContext(context.Background(), filePath, afterKey)
+}
+
+// findTranscriptCheckpointPositionWithContext is the cancellation-aware form
+// used by automatic recovery.  Position reconstruction is a cold path, but it
+// must still yield at JSONL record boundaries when a listener phase expires;
+// otherwise a large inherited transcript can monopolize the phase.  The
+// context cannot interrupt a single kernel/file read, so callers that need a
+// hard process boundary must still use an external watchdog.
+func findTranscriptCheckpointPositionWithContext(ctx context.Context, filePath string, afterKey string) (transcriptCheckpointPosition, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return transcriptCheckpointPosition{}, false, err
+	}
 	afterKey = strings.TrimSpace(afterKey)
 	if strings.TrimSpace(filePath) == "" || afterKey == "" {
 		return transcriptCheckpointPosition{}, false, nil
@@ -404,7 +443,13 @@ func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcr
 	lineNo := 0
 	var offset int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return transcriptCheckpointPosition{}, false, err
+		}
 		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return transcriptCheckpointPosition{}, false, ctxErr
+		}
 		complete := read.Complete
 		if read.BytesRead > 0 {
 			line := read.Line

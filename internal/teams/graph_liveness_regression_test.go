@@ -68,6 +68,145 @@ func TestGraphOversizedErrorPreservesHTTPStatusAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestGraphMessagePageRejectsMissingOrNullValue(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "missing", raw: `{}`},
+		{name: "null", raw: `{"value":null}`},
+		{name: "top-level-null", raw: `null`},
+		{name: "wrong-type", raw: `{"value":{}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var page graphMessagePage
+			err := json.Unmarshal([]byte(tc.raw), &page)
+			if !errors.Is(err, errGraphMessagePageInvalid) {
+				t.Fatalf("page %s error = %v, want invalid-page classification", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestGraphMessagePageRejectsMalformedJSONAsInvalidPage(t *testing.T) {
+	for _, raw := range []string{"{", `{"value":[}`} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(raw))
+		}))
+		graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+		_, err := graph.ListMessagesWindowWithoutRateLimitRetry(context.Background(), "chat-malformed-page", 50, time.Time{})
+		server.Close()
+		if !errors.Is(err, errGraphMessagePageInvalid) {
+			t.Fatalf("malformed page %q error = %v, want invalid-page classification", raw, err)
+		}
+	}
+}
+
+func TestGraphMessagePageRejectsEmptySuccessBody(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	graph := newTestGraphClient(auth, server, nil)
+	_, err := graph.ListMessagesWindowWithoutRateLimitRetry(context.Background(), "chat-empty-page", 50, time.Time{})
+	if !errors.Is(err, errGraphMessagePageInvalid) {
+		t.Fatalf("empty success page error = %v, want invalid-page classification", err)
+	}
+}
+
+func TestGraphMessagePageQuarantinesOnlySemanticallyMalformedRecord(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	first := bridgePollMessage("valid-before-malformed", "2026-08-28T01:00:00Z", "first")
+	last := bridgePollMessage("valid-after-malformed", "2026-08-28T01:01:00Z", "last")
+	firstRaw, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first message: %v", err)
+	}
+	lastRaw, err := json.Marshal(last)
+	if err != nil {
+		t.Fatalf("marshal last message: %v", err)
+	}
+	// The page is valid JSON and the malformed record has a stable provider ID,
+	// but one optional object has an unexpected scalar type. The direct decoder
+	// must fall back to per-record recovery rather than rejecting both valid
+	// messages with the page.
+	payload, err := json.Marshal(map[string]any{
+		"value": []json.RawMessage{
+			firstRaw,
+			json.RawMessage(`{"id":"malformed-record","chatId":"chat-malformed-record","body":"not-an-object"}`),
+			lastRaw,
+		},
+		"@odata.nextLink": "/chats/chat-malformed-record/messages?$skiptoken=after-malformed",
+	})
+	if err != nil {
+		t.Fatalf("marshal malformed-record page: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	graph := newTestGraphClient(auth, server, nil)
+	window, err := graph.ListMessagesWindowWithoutRateLimitRetry(context.Background(), "chat-malformed-record", 50, time.Time{})
+	if err != nil {
+		t.Fatalf("malformed-record page: %v", err)
+	}
+	if len(window.Messages) != 3 || !window.Truncated || !strings.Contains(window.NextPath, "after-malformed") {
+		t.Fatalf("malformed-record page = %#v, want all three records and continuation", window)
+	}
+	if window.Messages[0].ID != first.ID || !strings.Contains(window.Messages[0].Body.Content, "first") {
+		t.Fatalf("valid record before malformed record = %#v", window.Messages[0])
+	}
+	if window.Messages[1].ID != "malformed-record" || !window.Messages[1].invalidForPoll || window.Messages[1].quarantinedForPoll || window.Messages[1].Body.Content != "" {
+		t.Fatalf("malformed record = %#v, want retryable invalid marker", window.Messages[1])
+	}
+	if window.Messages[2].ID != last.ID || !strings.Contains(window.Messages[2].Body.Content, "last") {
+		t.Fatalf("valid record after malformed record = %#v", window.Messages[2])
+	}
+}
+
+func TestGraphMessagePageCompactsOversizedRecordWithMalformedOptionalField(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	large := []byte(`{"id":"large-malformed","chatId":"chat-large-malformed","createdDateTime":"2026-08-28T01:00:00Z","lastModifiedDateTime":123,"messageType":"message","body":{"contentType":"html","content":"` + strings.Repeat("x", maxGraphMessageRecordBytes) + `"}}`)
+	later := bridgePollMessage("later-after-large-malformed", "2026-08-28T01:01:00Z", "later user message")
+	laterRaw, err := json.Marshal(later)
+	if err != nil {
+		t.Fatalf("marshal later message: %v", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"value":           []json.RawMessage{large, laterRaw},
+		"@odata.nextLink": "/chats/chat-large-malformed/messages?$skiptoken=after-large-malformed",
+	})
+	if err != nil {
+		t.Fatalf("marshal malformed oversized page: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	graph := newTestGraphClient(auth, server, nil)
+	window, err := graph.ListMessagesWindowWithoutRateLimitRetry(context.Background(), "chat-large-malformed", 50, time.Time{})
+	if err != nil {
+		t.Fatalf("malformed oversized page: %v", err)
+	}
+	if len(window.Messages) != 2 || !window.Truncated || !strings.Contains(window.NextPath, "after-large-malformed") {
+		t.Fatalf("malformed oversized page = %#v, want two records and continuation", window)
+	}
+	if window.Messages[0].ID != "large-malformed" || !window.Messages[0].oversizedForPoll || window.Messages[0].invalidForPoll {
+		t.Fatalf("malformed oversized record = %#v, want oversized retry marker", window.Messages[0])
+	}
+	if window.Messages[1].ID != later.ID || window.Messages[1].Body.Content == "" {
+		t.Fatalf("later message was lost after malformed oversized record: %#v", window.Messages[1])
+	}
+}
+
 func TestGraphMessagePageCompactsOversizedRecordAndKeepsLaterMessages(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	large := map[string]any{

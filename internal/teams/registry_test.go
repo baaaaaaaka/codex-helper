@@ -474,6 +474,20 @@ func TestMergeRegistrySessionsDoesNotResurrectThreadAcrossModelGeneration(t *tes
 	}
 }
 
+func TestMergeRegistrySessionsPreservesInitializedPollFrontier(t *testing.T) {
+	existing := []Session{{
+		ID:                      "s1",
+		ChatID:                  "chat-1",
+		PollFrontierInitialized: true,
+		CodexThreadID:           "thread-1",
+	}}
+	next := []Session{{ID: "s1", ChatID: "chat-1", CodexThreadID: "thread-1"}}
+	merged := mergeRegistrySessions(existing, next)
+	if len(merged) != 1 || !merged[0].PollFrontierInitialized {
+		t.Fatalf("merged session = %#v, want initialized poll frontier preserved", merged)
+	}
+}
+
 func assertTeamsFileContent(t *testing.T, path string, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)

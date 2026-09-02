@@ -198,6 +198,9 @@ func (state State) ownerForThreadBinding() *OwnerMetadata {
 }
 
 func validateCodexThreadStartBinding(session SessionContext, sessionOK bool, turn Turn, turnOK bool, lease ControlLease, owner *OwnerMetadata, request CodexThreadStartBindingRequest, now time.Time) error {
+	if err := validateKnownControlLeaseStatus(lease); err != nil {
+		return err
+	}
 	if !sessionOK || strings.TrimSpace(session.ID) == "" {
 		return &CodexThreadStartBindingFenceError{SessionID: request.SessionID, TurnID: request.TurnID, Reason: "session does not exist"}
 	}
@@ -259,7 +262,7 @@ func (s *Store) confirmCodexThreadForRunningTurnJSON(ctx context.Context, reques
 }
 
 func loadCodexThreadBindingRuntimeTx(ctx context.Context, tx *sql.Tx) (ControlLease, *OwnerMetadata, error) {
-	lease, _, err := loadSQLiteJSONRow[ControlLease](ctx, tx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyControlLease)
+	lease, err := loadSQLiteControlLease(ctx, tx)
 	if err != nil {
 		return ControlLease{}, nil, err
 	}

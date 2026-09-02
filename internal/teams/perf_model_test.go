@@ -4793,6 +4793,23 @@ func newCXPPerfLongTranscriptFinalArrivalFixture(tb testing.TB, index int) (*tea
 	if !active {
 		tb.Fatal("long final fixture control lease unexpectedly inactive")
 	}
+	leaseGeneration := bridge.currentLeaseGeneration()
+	if leaseGeneration <= 0 {
+		tb.Fatal("long final fixture did not receive a positive control-lease generation")
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		stored, ok := state.Turns[turn.ID]
+		if !ok {
+			return fmt.Errorf("long final fixture turn %q disappeared", turn.ID)
+		}
+		stored.ScopeID = bridge.scope.ID
+		stored.MachineID = bridge.machine.ID
+		stored.LeaseGeneration = leaseGeneration
+		state.Turns[turn.ID] = stored
+		return nil
+	}); err != nil {
+		tb.Fatalf("bind long final fixture turn to control lease: %v", err)
+	}
 	result := ExecutionResult{
 		Text:             finalText,
 		CodexThreadID:    threadID,
@@ -5379,6 +5396,9 @@ func (g *cxpPerfGraphTransport) roundTrip(req *http.Request) (*http.Response, er
 		}
 		chatID := cxpPerfChatIDFromGraphPath(req.URL.Path)
 		messages := g.nextMessages(chatID)
+		if messages == nil {
+			messages = []ChatMessage{}
+		}
 		return cxpPerfJSONResponse(http.StatusOK, map[string]any{"value": messages}, nil), nil
 	case req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/messages"):
 		if resp, err, ok := g.graphSendFault(); ok {

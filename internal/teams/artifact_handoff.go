@@ -440,6 +440,32 @@ func stripTeamsUserMessageEnvelope(text string) string {
 	return strings.TrimSpace(text[len(teamsUserMessageLead):])
 }
 
+// stripTeamsCodexPromptEnvelope extracts the user portion from a prompt that
+// the Teams adapter wrapped with its helper-local safety contract.  The
+// transcript can contain that complete prompt, while the durable inbound
+// record intentionally stores only the user's visible text.  Callers still
+// require an exact durable inbound hash match; this helper only supplies a
+// candidate and must never be used as an unconditional dedupe decision.
+func stripTeamsCodexPromptEnvelope(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	text = stripTeamsUserMessageEnvelope(text)
+	for _, marker := range []string{
+		"\n\nTeams helper safety:",
+		"\n\nIf you need to return generated files or images to the Teams user:",
+	} {
+		// The visible Teams prompt is the prefix before the helper contract.
+		// Use the last occurrence so a user who quotes one of these contract
+		// headings in their own message is not truncated at the quoted text.
+		if idx := strings.LastIndex(text, marker); idx >= 0 {
+			return strings.TrimSpace(text[:idx])
+		}
+	}
+	return text
+}
+
 func IsPlaceholderArtifactManifestBlock(block []byte) bool {
 	text := string(block)
 	return strings.Contains(text, `"relative/path.ext"`) && strings.Contains(text, `"display-name.ext"`)

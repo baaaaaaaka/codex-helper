@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -56,5 +57,51 @@ func TestBeforeFirstCodexTurnHookBindsDurableSessionAndTurn(t *testing.T) {
 	}
 	if journal[0].ObservedAt.Before(time.Now().Add(-time.Minute)) {
 		t.Fatalf("journal timestamp = %v", journal[0].ObservedAt)
+	}
+}
+
+func TestBeforeFirstCodexTurnHookHonorsOwnerCancellation(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, nil)
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("test session missing")
+	}
+	owner := teamstore.OwnerMetadata{
+		PID:             41003,
+		Hostname:        "owner-hook",
+		ExecutablePath:  "/opt/cxp-hook",
+		InstanceID:      "instance-hook",
+		ScopeID:         bridge.scope.ID,
+		MachineID:       "machine-hook",
+		LeaseGeneration: 7,
+	}
+	turn := teamstore.Turn{ID: "turn-owner-hook", SessionID: session.ID, Status: teamstore.TurnStatusRunning, ModelGeneration: 2, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, ModelGeneration: 2}
+		state.Turns[turn.ID] = turn
+		state.ControlLease = teamstore.ControlLease{ScopeID: bridge.scope.ID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration, LeaseUntil: time.Now().Add(time.Minute)}
+		state.ServiceOwner = &owner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner-bound hook state: %v", err)
+	}
+
+	hook := bridge.beforeFirstCodexTurnHook(session, &turn)
+	ownerCtx, cancel := context.WithCancel(withTeamsOwnerCapability(context.Background(), owner))
+	cancel()
+	err := hook(ownerCtx, codexrunner.ThreadStartInfo{ThreadID: "thread-owner-hook"})
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner-canceled hook error = %v, want context.Canceled", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after canceled hook: %v", err)
+	}
+	if got := state.Sessions[session.ID].CodexThreadID; got != "" {
+		t.Fatalf("canceled hook bound session thread = %q", got)
+	}
+	if got := state.Turns[turn.ID].CodexThreadID; got != "" {
+		t.Fatalf("canceled hook bound turn thread = %q", got)
 	}
 }

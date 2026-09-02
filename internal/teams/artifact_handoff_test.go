@@ -138,6 +138,26 @@ func TestTeamsCodexPromptIncludesSelfManagementGuard(t *testing.T) {
 	}
 }
 
+func TestTeamsOriginCandidatesRecognizeWrappedCodexPrompt(t *testing.T) {
+	for _, visible := range []string{
+		"LISTENER_RECOVERY_VERTICAL_TASK_PROMPT",
+		"user quoted\n\nTeams helper safety: this heading is part of the user's request",
+	} {
+		wrapped := TeamsCodexPrompt(visible)
+		candidates := teamsOriginTranscriptUserHashCandidates(wrapped)
+		found := false
+		for _, candidate := range candidates {
+			if candidate == visible {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("wrapped Teams prompt candidates did not contain the durable visible text %q: %#v", visible, candidates)
+		}
+	}
+}
+
 func TestControlFallbackPromptIncludesMathContract(t *testing.T) {
 	got := ControlFallbackCodexPrompt("explain attention")
 	for _, want := range []string{TeamsMathPromptContract} {

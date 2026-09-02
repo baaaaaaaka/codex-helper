@@ -129,14 +129,16 @@ func TestBindCodexThreadForRunningTurnRejectsLifecycleAndGenerationChanges(t *te
 }
 
 func TestBindCodexThreadForRunningTurnFencesOwnerTakeover(t *testing.T) {
-	started := time.Now().Add(-time.Minute).Truncate(time.Microsecond)
-	owner := OwnerMetadata{PID: os.Getpid(), Hostname: "binding-host", ExecutablePath: "/opt/codex-helper", StartedAt: started, MachineID: "machine-binding", LeaseGeneration: 9, ActiveSessionID: "session-binding", ActiveTurnID: "turn-binding"}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	owner := OwnerMetadata{PID: os.Getpid(), Hostname: "binding-host", ExecutablePath: "/opt/codex-helper", StartedAt: now.Add(-time.Minute), LastHeartbeat: now, MachineID: "machine-binding", LeaseGeneration: 9, ActiveSessionID: "session-binding", ActiveTurnID: "turn-binding"}
+	scope := ScopeIdentity{ID: "scope-thread-binding", AccountID: "account-thread-binding", OSUser: "tester", Profile: "default"}
 	for _, sqlite := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sqlite"}[sqlite], func(t *testing.T) {
 			store := newTestStore(t)
 			seedRunningThreadBindingState(t, store, false)
 			if err := store.Update(context.Background(), func(state *State) error {
-				state.ControlLease = ControlLease{HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration, LeaseUntil: time.Now().Add(time.Minute)}
+				state.Scope = scope
+				state.ControlLease = ControlLease{ScopeID: scope.ID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration, Status: ControlLeaseStatusActive, LeaseUntil: now.Add(time.Minute), LastHeartbeat: now, UpdatedAt: now}
 				state.ServiceOwner = &owner
 				turn := state.Turns["turn-binding"]
 				turn.MachineID = owner.MachineID
@@ -153,15 +155,22 @@ func TestBindCodexThreadForRunningTurnFencesOwnerTakeover(t *testing.T) {
 			if _, err := store.BindCodexThreadForRunningTurn(context.Background(), request); err != nil {
 				t.Fatalf("current owner bind: %v", err)
 			}
-			if err := store.Update(context.Background(), func(state *State) error {
-				taken := owner
-				taken.PID++
-				state.ServiceOwner = &taken
-				return nil
-			}); err != nil {
-				t.Fatalf("takeover fixture: %v", err)
+			replacementMachine := MachineRecord{ID: "machine-binding-replacement", ScopeID: scope.ID, Kind: MachineKindPrimary}
+			replacementOwner := owner
+			replacementOwner.PID++
+			replacementOwner.MachineID = replacementMachine.ID
+			replacementOwner.LeaseGeneration = 0
+			decision, err := store.ClaimControlLease(context.Background(), ControlLeaseClaim{
+				Scope: scope, Machine: replacementMachine, Owner: replacementOwner,
+				Duration: time.Minute, Now: now.Add(2 * time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("takeover fixture claim: %v", err)
 			}
-			_, err := store.BindCodexThreadForRunningTurn(context.Background(), CodexThreadStartBindingRequest{SessionID: "session-binding", TurnID: "turn-binding", ThreadID: "thread-owner", ModelGeneration: 4, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration, Owner: owner})
+			if decision.Mode != LeaseModeActive || decision.Lease.Generation <= owner.LeaseGeneration {
+				t.Fatalf("takeover fixture decision = %#v, want a new active generation", decision)
+			}
+			_, err = store.BindCodexThreadForRunningTurn(context.Background(), CodexThreadStartBindingRequest{SessionID: "session-binding", TurnID: "turn-binding", ThreadID: "thread-owner", ModelGeneration: 4, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration, Owner: owner})
 			if !errors.Is(err, ErrCodexThreadStartBindingOwnerFence) {
 				t.Fatalf("stale owner error = %v, want owner fence", err)
 			}

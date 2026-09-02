@@ -1955,6 +1955,85 @@ func TestClearExecutionAnchorAndConfirmTurnIsAtomicAcrossBackends(t *testing.T) 
 	}
 }
 
+func TestClearExecutionAnchorAndConfirmTurnForOwnerUsesDurableLeaseAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			defer store.Close()
+			const (
+				sessionID    = "owner-clear-session"
+				turnID       = "owner-clear-turn"
+				checkpointID = "transcript:owner-clear-session"
+				threadID     = "owner-clear-thread"
+				codexTurnID  = "owner-clear-codex"
+			)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Scope = ScopeIdentity{ID: "scope:owner-clear"}
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed owner-clear session: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			now := time.Now().UTC()
+			machine := MachineRecord{ID: "machine:owner-clear", ScopeID: "scope:owner-clear", Kind: MachineKindPrimary}
+			owner := testOwner("owner-clear", "", now)
+			decision, err := store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: ScopeIdentity{ID: "scope:owner-clear"}, Machine: machine, Owner: owner,
+				Duration: time.Minute, Now: now,
+			})
+			if err != nil || decision.Mode != LeaseModeActive {
+				t.Fatalf("claim owner-clear lease: mode=%v err=%v", decision.Mode, err)
+			}
+			anchor := ExecutionAnchor{
+				SessionID: sessionID, ThreadID: threadID, OuterTurnID: turnID, CodexTurnID: codexTurnID,
+				State: "unresolved", Generation: 3,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Turns[turnID] = Turn{
+					ID: turnID, SessionID: sessionID, Status: TurnStatusInterrupted,
+					MachineID: machine.ID, LeaseGeneration: decision.Lease.Generation,
+					CodexThreadID: threadID, CodexTurnID: codexTurnID,
+					RecoveryReason: "ambiguous Codex execution: cancellation unconfirmed", InterruptedAt: now,
+				}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, UnresolvedExecution: &anchor,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed owner-clear anchor: %v", err)
+			}
+			req := ExecutionAnchorClearRequest{
+				CheckpointID: checkpointID, SessionID: sessionID, ThreadID: threadID,
+				OuterTurnID: turnID, CodexTurnID: codexTurnID, Generation: anchor.Generation,
+				RecoveryReasonFrom: "ambiguous Codex execution: cancellation unconfirmed",
+				RecoveryReasonTo:   "Codex execution ownership confirmed",
+			}
+			if err := store.ClearExecutionAnchorAndConfirmTurnForOwner(ctx, req, "machine:stale", decision.Lease.Generation); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale owner clear error = %v, want ErrControlLeaseNotHeld", err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil {
+				t.Fatalf("stale owner changed anchor: checkpoint=%#v found=%v err=%v", checkpoint, found, err)
+			}
+			if err := store.ClearExecutionAnchorAndConfirmTurnForOwner(ctx, req, machine.ID, decision.Lease.Generation); err != nil {
+				t.Fatalf("current owner clear error: %v", err)
+			}
+			checkpoint, found, err = store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution != nil {
+				t.Fatalf("current owner did not clear anchor: checkpoint=%#v found=%v err=%v", checkpoint, found, err)
+			}
+			turn, found, err := store.TurnByID(ctx, turnID)
+			if err != nil || !found || turn.RecoveryReason != "Codex execution ownership confirmed" {
+				t.Fatalf("current owner did not confirm turn: turn=%#v found=%v err=%v", turn, found, err)
+			}
+		})
+	}
+}
+
 func TestQueueTranscriptDeliveryRequiresExplicitCodexTurnProofAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []string{"json", "sqlite"} {
@@ -2164,6 +2243,64 @@ func TestInFlightTerminalOutboxCanRecordAcceptedIDAfterQuarantineAcrossBackends(
 			}
 			if promoted.Status != OutboxStatusAccepted || promoted.TeamsMessageID != "teams-inflight" || !promoted.BlockedByUnresolvedExecution {
 				t.Fatalf("promoted outbox=%#v, want accepted blocked identity retained", promoted)
+			}
+		})
+	}
+}
+
+func TestOutboxDeliveryDoesNotRemainSendingWhenPollSawItsAcceptedMessageAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			const (
+				outboxID  = "outbox:poll-race-accepted"
+				chatID    = "poll-race-chat"
+				messageID = "teams-poll-race-message"
+				inboundID = "inbound:poll-race-message"
+			)
+			queued, created, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID: outboxID, TeamsChatID: chatID, Kind: "status-progress", Body: "already accepted by Graph",
+			})
+			if err != nil || !created {
+				t.Fatalf("QueueOutbox = %#v created=%v err=%v", queued, created, err)
+			}
+			if backend == "sqlite" {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, outboxID)
+			if err != nil || claimed.Status != OutboxStatusSending || claimed.SendAttemptToken == "" {
+				t.Fatalf("MarkOutboxSendAttempt = %#v err=%v", claimed, err)
+			}
+
+			// Model the poller seeing the helper's new Graph message before the
+			// POST callback has persisted the Accepted projection.  The outbound
+			// ledger is authoritative for this identity and must replace this
+			// provisional inbound observation rather than strand the row in Sending.
+			if _, err := store.RecordMessageProvenance(ctx, MessageProvenanceRecord{
+				TeamsChatID: chatID, TeamsMessageID: messageID, Origin: MessageOriginUserInbound, InboundID: inboundID,
+			}); err != nil {
+				t.Fatalf("RecordMessageProvenance(user_inbound): %v", err)
+			}
+			accepted, err := store.MarkOutboxAcceptedForAttempt(ctx, outboxID, claimed.SendAttemptToken, messageID)
+			if err != nil {
+				t.Fatalf("MarkOutboxAcceptedForAttempt: %v", err)
+			}
+			if accepted.Status != OutboxStatusAccepted || accepted.TeamsMessageID != messageID {
+				t.Fatalf("accepted outbox = %#v, want accepted identity", accepted)
+			}
+			provenance, ok, err := store.MessageProvenance(ctx, chatID, messageID)
+			if err != nil || !ok || provenance.Origin != MessageOriginHelperOutbox || provenance.OutboxID != outboxID {
+				t.Fatalf("accepted provenance = %#v ok=%v err=%v, want helper outbox", provenance, ok, err)
+			}
+			sent, err := store.MarkOutboxSentForAttempt(ctx, outboxID, claimed.SendAttemptToken, messageID)
+			if err != nil {
+				t.Fatalf("MarkOutboxSentForAttempt: %v", err)
+			}
+			if sent.Status != OutboxStatusSent || sent.TeamsMessageID != messageID {
+				t.Fatalf("sent outbox = %#v, want sent identity", sent)
 			}
 		})
 	}

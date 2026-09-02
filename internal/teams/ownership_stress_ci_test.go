@@ -76,14 +76,15 @@ func capOwnershipStressKnob(value int, max int) int {
 
 func ownershipStressTestTimeout(base time.Duration) time.Duration {
 	// These scenarios deliberately hold a Graph request open while the race
-	// detector and file-backed SQLite are active.  Five seconds is enough on an
-	// idle developer machine, but it can expire before the held request is
-	// released in a busy CI worker.  That turns a test-harness timeout into an
-	// ambiguous-send/deferred-delivery failure and can strand the test goroutine.
-	// Keep the bound finite while giving the deterministic scenario enough room
-	// to complete on every supported platform.
-	if base < 30*time.Second || runtime.GOOS == "windows" {
-		return 30 * time.Second
+	// detector and file-backed SQLite are active.  The short unit-test bound is
+	// enough on an idle developer machine, but it can expire before the held
+	// request is released in a busy full-suite CI worker.  That turns a
+	// test-harness timeout into an ambiguous-send/deferred-delivery failure and
+	// can strand the test goroutine. Keep the bound finite while giving the
+	// deterministic scenario enough room to complete on every supported
+	// platform.
+	if base < 90*time.Second || runtime.GOOS == "windows" {
+		return 90 * time.Second
 	}
 	return base
 }
@@ -847,6 +848,92 @@ func TestTeamsOwnershipStressWarmChatNotStarvedByHotCycleCI(t *testing.T) {
 	}
 }
 
+// TestTeamsOwnershipStressDueHotChatsRotateBeyondCycleCapCI catches the
+// opposite side of the warm-chat reservation: a continuously due operational
+// frontier must also age fairly when there are more hot chats than the per
+// cycle cap.  Each pass re-dueing all chats models a catch-up lane that keeps
+// its NextPollAt at now; durable LastSuccessfulPollAt must still rotate the
+// selected set.
+func TestTeamsOwnershipStressDueHotChatsRotateBeyondCycleCapCI(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	store := newBridgeTestStore(t)
+	writeGraph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	seedOwnershipStressControlIdle(t, store)
+	bridge.maxWorkChatPollsPerCycle = 8
+	const hotChats = 9
+	sessions := make([]Session, 0, hotChats)
+	for i := 1; i <= hotChats; i++ {
+		chatID := fmt.Sprintf("rotating-hot-chat-%02d", i)
+		sessionID := fmt.Sprintf("rotating-hot-session-%02d", i)
+		sessions = append(sessions, Session{ID: sessionID, ChatID: chatID, Status: "active", UpdatedAt: now})
+		if _, err := store.RecordChatPollSuccess(ctx, chatID, now.Add(-time.Duration(i)*time.Second), true, false, 0); err != nil {
+			t.Fatalf("seed hot poll %s: %v", chatID, err)
+		}
+		if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+			ChatID:         chatID,
+			PollState:      inboundPollStateHot,
+			NextPollAt:     now.Add(-time.Second),
+			LastActivityAt: now,
+		}); err != nil {
+			t.Fatalf("schedule hot poll %s: %v", chatID, err)
+		}
+	}
+	bridge.reg.Sessions = sessions
+	var mu sync.Mutex
+	reads := make(map[string]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) < 3 || parts[0] != "chats" || parts[2] != "messages" {
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		reads[parts[1]]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"value":[]}`)
+	}))
+	t.Cleanup(server.Close)
+	bridge.readGraph = &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	for cycle := 0; cycle < hotChats; cycle++ {
+		if cycle > 0 {
+			for _, session := range sessions {
+				if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+					ChatID:     session.ChatID,
+					NextPollAt: time.Now().Add(-time.Second),
+				}); err != nil {
+					t.Fatalf("re-due hot chat %s in cycle %d: %v", session.ChatID, cycle, err)
+				}
+			}
+		}
+		if err := bridge.pollOnce(ctx, 20); err != nil {
+			t.Fatalf("rotating hot cycle %d: %v", cycle, err)
+		}
+	}
+
+	mu.Lock()
+	gotReads := make(map[string]int, len(reads))
+	for chatID, count := range reads {
+		gotReads[chatID] = count
+	}
+	mu.Unlock()
+	for _, session := range sessions {
+		if gotReads[session.ChatID] == 0 {
+			t.Fatalf("due hot chat starved across cap cycles: chat=%s reads=%v", session.ChatID, gotReads)
+		}
+	}
+}
+
 // TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI verifies the
 // explicit worker-wave boundary. Four due chats may occupy the bounded Graph
 // workers until their per-request timeout, but a fifth due chat must remain
@@ -925,7 +1012,7 @@ func TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI(t *testing.T) {
 // fifth chat must reach Graph instead of being lost behind the outage.
 func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *testing.T) {
 	previousTimeout := inboundPollGraphTimeout
-	inboundPollGraphTimeout = 50 * time.Millisecond
+	inboundPollGraphTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { inboundPollGraphTimeout = previousTimeout })
 
 	// Race instrumentation makes the first SQLite connection/schema path and
@@ -2044,7 +2131,7 @@ func TestTeamsOwnershipStressAcceptedOutboxFallsOutsideRecoveryHeadCI(t *testing
 			lists++
 			if r.URL.Query().Get("$skiptoken") == "accepted" {
 				echo := ownershipStressAcceptedOutboxMessage("accepted-old-echo", "accepted response outside recovery head")
-				echo.Body.Content = renderOutboxHTML(queued)
+				echo.Body.Content = renderOutboxHTML(queued) + helperOutboxProvenanceMarker(queued.ID)
 				_ = json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{echo}})
 				return
 			}
@@ -2129,7 +2216,7 @@ func TestTeamsOwnershipStressExpiredAmbiguousOutboxDoesNotPostBeforeContinuation
 	retryOutbox := state.OutboxMessages[queued.ID]
 
 	accepted := ownershipStressAcceptedOutboxMessage("accepted-after-expiry", "accepted after expired lease")
-	accepted.Body.Content = renderOutboxHTML(queued)
+	accepted.Body.Content = renderOutboxHTML(queued) + helperOutboxProvenanceMarker(queued.ID)
 	posts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chats/chat-1/messages" {
@@ -2210,7 +2297,7 @@ func TestTeamsOwnershipStressRecoveryPageBudgetPreservesContinuationCI(t *testin
 	}
 	retryOutbox := state.OutboxMessages[queued.ID]
 	accepted := ownershipStressAcceptedOutboxMessage("accepted-recovery-budget", "accepted while recovery page budget was exhausted")
-	accepted.Body.Content = renderOutboxHTML(queued)
+	accepted.Body.Content = renderOutboxHTML(queued) + helperOutboxProvenanceMarker(queued.ID)
 	var lists, posts int
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2284,6 +2371,92 @@ func TestTeamsOwnershipStressRecoveryPageBudgetPreservesContinuationCI(t *testin
 	recovered := state.OutboxMessages[queued.ID]
 	if lists != 2 || posts != 0 || recovered.Status != teamstore.OutboxStatusSent || recovered.TeamsMessageID != accepted.ID {
 		teamsOwnershipStressFinding(t, "bounded recovery did not resume and reconcile safely: lists=%d posts=%d outbox=%#v", lists, posts, recovered)
+	}
+}
+
+// TestTeamsOwnershipStressExpiredOutboxContinuationFallsBackToHeadCI models a
+// listener that was offline long enough for its persisted Graph skiptoken to
+// expire. The recovery lane must discard only that transport cursor, probe the
+// safe head for the exact provenance marker, and settle the row without a new
+// POST.
+func TestTeamsOwnershipStressExpiredOutboxContinuationFallsBackToHeadCI(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:ownership-stress-expired-continuation",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "accepted before the continuation expired",
+	})
+	if err != nil {
+		t.Fatalf("queue expired-continuation outbox: %v", err)
+	}
+	claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("claim expired-continuation outbox: %v", err)
+	}
+	if _, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, claimed.ID, claimed.SendAttemptToken, "Graph continuation was persisted before restart"); err != nil {
+		t.Fatalf("mark expired-continuation outbox ambiguous: %v", err)
+	}
+	if _, err := store.MarkOutboxGraphRecoveryProgressForAttempt(ctx, claimed.ID, claimed.SendAttemptToken, "/chats/chat-1/messages?$skiptoken=expired", ""); err != nil {
+		t.Fatalf("persist expired continuation: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load expired-continuation state: %v", err)
+	}
+	retryOutbox := state.OutboxMessages[queued.ID]
+	accepted := ownershipStressAcceptedOutboxMessage("accepted-after-expired-continuation", "accepted before the continuation expired")
+	accepted.Body.Content = renderOutboxHTML(queued) + helperOutboxProvenanceMarker(queued.ID)
+	var heads, continuations, posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chats/chat-1/messages" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			posts++
+			_, _ = fmt.Fprint(w, `{"id":"duplicate-after-expired-continuation","messageType":"message"}`)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		switch r.URL.Query().Get("$skiptoken") {
+		case "expired":
+			continuations++
+			w.WriteHeader(http.StatusGone)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"InvalidSkipToken","message":"continuation expired"}}`)
+		case "":
+			heads++
+			_ = json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{accepted}})
+		default:
+			http.Error(w, "unexpected continuation", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	pageBudget := 4
+	handled, err := bridge.recoverAcceptedOutboxFromGraph(ctx, retryOutbox, outboxSendOptions{RecoveryPageBudget: &pageBudget})
+	if !handled || err != nil {
+		t.Fatalf("expired-continuation recovery = handled %v err %v, want head reconciliation", handled, err)
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load recovered expired-continuation state: %v", err)
+	}
+	recovered := state.OutboxMessages[queued.ID]
+	if continuations != 1 || heads != 1 || posts != 0 || recovered.Status != teamstore.OutboxStatusSent || recovered.TeamsMessageID != accepted.ID || recovered.GraphRecoveryNextPath != "" || recovered.GraphRecoveryPageCount != 0 {
+		teamsOwnershipStressFinding(t, "expired continuation did not fall back to exact head reconciliation: continuations=%d heads=%d posts=%d outbox=%#v", continuations, heads, posts, recovered)
 	}
 }
 
@@ -2403,6 +2576,109 @@ func ownershipStressAcceptedOutboxMessage(id string, text string) ChatMessage {
 	msg.CreatedDateTime = now
 	msg.LastModifiedDateTime = now
 	return msg
+}
+
+// TestTeamsOwnershipStressLongRecoveryContinuationRemainsReachableCI proves
+// that the durable per-pass page budget does not become a lifetime reachability
+// limit. A busy chat can put the exact helper marker behind more pages than a
+// fixed historical threshold; every pass must resume the opaque continuation
+// and reconcile the marker without issuing a replacement POST.
+func TestTeamsOwnershipStressLongRecoveryContinuationRemainsReachableCI(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:ownership-stress-long-recovery",
+		TeamsChatID: "chat-1",
+		Kind:        "final",
+		Body:        "accepted behind a long Graph continuation",
+	})
+	if err != nil {
+		t.Fatalf("queue long-recovery outbox: %v", err)
+	}
+	claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("claim long-recovery outbox: %v", err)
+	}
+	if _, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, queued.ID, claimed.SendAttemptToken, "Graph accepted before a long continuation scan"); err != nil {
+		t.Fatalf("mark long-recovery outbox ambiguous: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load long-recovery outbox: %v", err)
+	}
+	accepted := ownershipStressAcceptedOutboxMessage("long-recovery-exact-marker", queued.Body)
+	accepted.Body.Content = renderOutboxHTML(queued) + helperOutboxProvenanceMarker(queued.ID)
+	const targetPage = 65
+	var lists, posts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chats/chat-1/messages" {
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			posts++
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "duplicate-long-recovery", "messageType": "message"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		lists++
+		token := r.URL.Query().Get("$skiptoken")
+		page := 0
+		if token != "" {
+			if _, scanErr := fmt.Sscanf(token, "long-recovery-%d", &page); scanErr != nil {
+				http.Error(w, "unexpected continuation", http.StatusBadRequest)
+				return
+			}
+		}
+		if page == targetPage {
+			_ = json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{accepted}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"value":           []ChatMessage{},
+			"@odata.nextLink": fmt.Sprintf("%s/chats/chat-1/messages?$skiptoken=long-recovery-%d", server.URL, page+1),
+		})
+	}))
+	t.Cleanup(server.Close)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:   &fakeGraphAuth{token: "access"},
+		client: server.Client(), baseURL: server.URL, maxRetries: 0,
+		sleep: sleepContext, jitter: func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+	for pass := 0; pass <= targetPage+2; pass++ {
+		state, err = store.Load(ctx)
+		if err != nil {
+			t.Fatalf("load long-recovery pass %d: %v", pass, err)
+		}
+		current := state.OutboxMessages[queued.ID]
+		if current.Status == teamstore.OutboxStatusSent {
+			break
+		}
+		pageBudget := 1
+		handled, recoveryErr := bridge.recoverAcceptedOutboxFromGraph(ctx, current, outboxSendOptions{RecoveryPageBudget: &pageBudget})
+		if !handled {
+			t.Fatalf("long-recovery pass %d was not handled: err=%v row=%#v", pass, recoveryErr, current)
+		}
+	}
+	state, err = store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load final long-recovery state: %v", err)
+	}
+	recovered := state.OutboxMessages[queued.ID]
+	if recovered.Status != teamstore.OutboxStatusSent || recovered.TeamsMessageID != accepted.ID {
+		t.Fatalf("long continuation did not reach exact marker: lists=%d posts=%d row=%#v", lists, posts, recovered)
+	}
+	if posts != 0 {
+		t.Fatalf("long continuation issued %d replacement POST(s)", posts)
+	}
+	if lists < targetPage+1 {
+		t.Fatalf("long continuation stopped after %d Graph page(s), want at least %d", lists, targetPage+1)
+	}
 }
 
 // TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI simulates a helper
@@ -2870,6 +3146,68 @@ func TestTeamsOwnershipStressControlLeaseSameMachineReacquireGenerationCI(t *tes
 	}
 	if current.ControlLease.HolderMachineID != machine.ID || current.ControlLease.Generation != second.Lease.Generation {
 		teamsOwnershipStressFinding(t, "stale same-machine cleanup changed the replacement control lease: current=%#v replacement=%#v", current.ControlLease, second.Lease)
+	}
+}
+
+// TestTeamsOwnershipStressSameMachineLiveLeaseTakeoverIncrementsGenerationCI
+// covers the more dangerous restart shape than an explicit release: the old
+// owner row can disappear while its lease is still live. A replacement process
+// on the same host must not inherit the old process capability merely because
+// the durable machine ID is unchanged.
+func TestTeamsOwnershipStressSameMachineLiveLeaseTakeoverIncrementsGenerationCI(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+			now := time.Date(2026, 8, 24, 2, 0, 0, 0, time.UTC)
+			scope := teamstore.ScopeIdentity{ID: "same-machine-live-scope", AccountID: "user-1", OSUser: "tester", Profile: "default"}
+			machine := teamstore.MachineRecord{ID: "same-machine-live-machine", ScopeID: scope.ID, Kind: teamstore.MachineKindPrimary}
+			ownerA := teamstore.OwnerMetadata{
+				PID: 1111, Hostname: "same-machine-host", ExecutablePath: "/bin/cxp",
+				StartedAt: now, LastHeartbeat: now, ScopeID: scope.ID, MachineID: machine.ID,
+			}
+			first, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
+				Scope: scope, Machine: machine, Owner: ownerA, Duration: time.Minute, Now: now,
+			})
+			if err != nil || first.Mode != teamstore.LeaseModeActive {
+				t.Fatalf("initial claim: decision=%#v err=%v", first, err)
+			}
+			ownerA.LeaseGeneration = first.Lease.Generation
+			if _, err := store.RecordOwnerHeartbeat(ctx, ownerA, time.Minute, now); err != nil {
+				t.Fatalf("record initial owner: %v", err)
+			}
+			// Simulate a missing owner row after the old process disappears while
+			// the control lease has not yet expired.
+			if err := store.ClearOwner(ctx); err != nil {
+				t.Fatalf("clear stale owner row: %v", err)
+			}
+			ownerB := ownerA
+			ownerB.PID = 2222
+			ownerB.StartedAt = now.Add(time.Second)
+			ownerB.LastHeartbeat = ownerB.StartedAt
+			second, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
+				Scope: scope, Machine: machine, Owner: ownerB, Duration: time.Minute, Now: now.Add(time.Second),
+			})
+			if err != nil || second.Mode != teamstore.LeaseModeActive {
+				t.Fatalf("replacement claim: decision=%#v err=%v", second, err)
+			}
+			if second.Lease.Generation <= first.Lease.Generation {
+				t.Fatalf("same-machine live-lease takeover reused generation: first=%d second=%d", first.Lease.Generation, second.Lease.Generation)
+			}
+			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machine.ID, first.Lease.Generation); err != nil {
+				t.Fatalf("stale release: %v", err)
+			} else if released {
+				t.Fatal("stale same-machine release cleared replacement lease")
+			}
+			if _, err := store.ValidateControlLease(ctx, machine.ID, first.Lease.Generation, now.Add(time.Second)); !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+				t.Fatalf("stale generation validation error=%v, want ErrControlLeaseNotHeld", err)
+			}
+		})
 	}
 }
 
@@ -4009,7 +4347,57 @@ func teamsOwnershipStressFinding(t *testing.T, format string, args ...any) {
 	t.Helper()
 	message := fmt.Sprintf(format, args...)
 	t.Logf("OWNERSHIP_STRESS_FINDING: %s", message)
-	if strings.TrimSpace(os.Getenv(teamsOwnershipStressStrictEnv)) == "1" {
+	if teamsOwnershipStressStrict() {
 		t.Fatalf("%s=%s: %s", teamsOwnershipStressStrictEnv, "1", message)
+	}
+}
+
+// teamsOwnershipStressStrict makes a finding fail closed.  The stress tests
+// are part of the recovery gate, so an unset environment must not silently
+// turn an assertion into a diagnostic-only log.  An explicit false value is
+// retained for local exploratory pressure runs that intentionally continue
+// after collecting multiple findings; CI and the recovery manifest override
+// this with an explicit true value.
+func teamsOwnershipStressStrict() bool {
+	value, ok := os.LookupEnv(teamsOwnershipStressStrictEnv)
+	if !ok {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		// Unknown values fail closed instead of weakening a required test gate.
+		return true
+	}
+}
+
+func TestTeamsOwnershipStressStrictModeFailsClosed(t *testing.T) {
+	previous, wasSet := os.LookupEnv(teamsOwnershipStressStrictEnv)
+	t.Cleanup(func() {
+		if wasSet {
+			_ = os.Setenv(teamsOwnershipStressStrictEnv, previous)
+			return
+		}
+		_ = os.Unsetenv(teamsOwnershipStressStrictEnv)
+	})
+
+	if err := os.Unsetenv(teamsOwnershipStressStrictEnv); err != nil {
+		t.Fatalf("unset strict mode: %v", err)
+	}
+	if !teamsOwnershipStressStrict() {
+		t.Fatal("unset strict mode must fail closed")
+	}
+	if err := os.Setenv(teamsOwnershipStressStrictEnv, "0"); err != nil {
+		t.Fatalf("set exploratory strict mode: %v", err)
+	}
+	if teamsOwnershipStressStrict() {
+		t.Fatal("explicit false strict mode should remain available for exploratory pressure runs")
+	}
+	if err := os.Setenv(teamsOwnershipStressStrictEnv, "unexpected"); err != nil {
+		t.Fatalf("set invalid strict mode: %v", err)
+	}
+	if !teamsOwnershipStressStrict() {
+		t.Fatal("invalid strict mode must fail closed")
 	}
 }

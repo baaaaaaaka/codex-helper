@@ -16,6 +16,144 @@ const defaultChatPollAttemptTTL = 2 * time.Minute
 // legacy JSON stores retain the existing state-file lock semantics. The
 // callback must not perform I/O.
 func (s *Store) UpdateChatPoll(ctx context.Context, chatID string, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.updateChatPollWithCapability(ctx, chatID, nil, fn)
+}
+
+// UpdateChatPollForOwner applies a small poll-row mutation only for the
+// current control-lease holder. It is used by compatibility/normalization
+// paths that run before a per-chat poll attempt exists; an attempt capability
+// cannot fence those writes because there is no attempt ID yet.
+func (s *Store) UpdateChatPollForOwner(ctx context.Context, chatID, machineID string, leaseGeneration int64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	if strings.TrimSpace(machineID) == "" || leaseGeneration <= 0 {
+		return ChatPollState{}, false, ErrControlLeaseNotHeld
+	}
+	capability := &ChatPollAttemptCapability{Owner: strings.TrimSpace(machineID), LeaseGeneration: leaseGeneration}
+	return s.updateChatPollWithCapability(ctx, chatID, capability, fn)
+}
+
+// UpdateChatPollScheduleForOwner applies the same schedule reducer as
+// UpdateChatPollSchedule, but fences the mutation against the control lease
+// captured by the caller. Schedule updates are often performed after a
+// network request, so an old listener must not be able to block or park a
+// replacement owner's chat.
+func (s *Store) UpdateChatPollScheduleForOwner(ctx context.Context, update ChatPollScheduleUpdate, machineID string, leaseGeneration int64) (ChatPollState, error) {
+	chatID := strings.TrimSpace(update.ChatID)
+	if chatID == "" {
+		return ChatPollState{}, fmt.Errorf("chat id is required")
+	}
+	var out ChatPollState
+	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
+		next, changed, err := applyChatPollScheduleUpdateLocked(&state, update, time.Now())
+		if err != nil {
+			return err
+		}
+		out = next
+		if !changed {
+			return errStoreNoChange
+		}
+		invalidateChatPollAttempt(&next)
+		*poll = next
+		return nil
+	})
+	if out.ChatID == "" {
+		out, _, _ = s.ChatPoll(ctx, chatID)
+	}
+	return out, err
+}
+
+// MarkChatPollParkNoticeSentForOwner records the park-notice watermark under
+// the caller's lease. A delayed notice callback must not mutate a chat after
+// a replacement listener has taken ownership.
+func (s *Store) MarkChatPollParkNoticeSentForOwner(ctx context.Context, chatID string, at time.Time, machineID string, leaseGeneration int64) (ChatPollState, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatPollState{}, fmt.Errorf("chat id is required")
+	}
+	if at.IsZero() {
+		at = time.Now()
+	}
+	var out ChatPollState
+	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+		poll.ChatID = chatID
+		poll.ParkNoticeSentAt = at
+		poll.UpdatedAt = time.Now()
+		poll.PollRevision++
+		poll.ScheduleRevision++
+		invalidateChatPollAttempt(poll)
+		out = *poll
+		return nil
+	})
+	if out.ChatID == "" {
+		out, _, _ = s.ChatPoll(ctx, chatID)
+	}
+	return out, err
+}
+
+// RecordChatPollSuccessWithContinuationAndScheduleForOwner combines the
+// non-attempt poll success projection and its derived schedule under the
+// current control lease. It is used only by compatibility/parked paths that
+// do not have a ChatPollAttempt capability; a delayed old listener must still
+// be unable to advance a replacement owner's cursor.
+func (s *Store) RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, schedule func(ChatPollState) (ChatPollScheduleUpdate, error), machineID string, leaseGeneration int64) (ChatPollState, error) {
+	var out ChatPollState
+	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
+		now := time.Now()
+		next, changed := applyChatPollSuccessLocked(&state, chatID, lastModifiedCursor, seeded, windowFull, fetched, strings.TrimSpace(continuationPath), now)
+		if schedule != nil {
+			update, err := schedule(next)
+			if err != nil {
+				return err
+			}
+			update.ChatID = strings.TrimSpace(update.ChatID)
+			switch {
+			case update.ChatID == "":
+				update.ChatID = chatID
+			case update.ChatID != chatID:
+				return fmt.Errorf("chat poll schedule chat id %q does not match success chat id %q", update.ChatID, chatID)
+			}
+			scheduled, scheduleChanged, err := applyChatPollScheduleUpdateLocked(&state, update, time.Now())
+			if err != nil {
+				return err
+			}
+			next = scheduled
+			changed = changed || scheduleChanged
+		}
+		out = next
+		if !changed {
+			return errStoreNoChange
+		}
+		invalidateChatPollAttempt(&next)
+		*poll = next
+		return nil
+	})
+	if out.ChatID == "" {
+		out, _, _ = s.ChatPoll(ctx, chatID)
+	}
+	return out, err
+}
+
+// RecordChatPollErrorWithBlockForOwner records a chat-scoped retry/error
+// projection only for the current control-lease holder. A Graph error must
+// never let a stale listener block a new owner's poll lane.
+func (s *Store) RecordChatPollErrorWithBlockForOwner(ctx context.Context, chatID string, message string, blockedUntil time.Time, machineID string, leaseGeneration int64) error {
+	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
+		next := applyChatPollErrorWithBlockLocked(&state, strings.TrimSpace(chatID), trimDiagnostic(message, 240), blockedUntil, time.Now())
+		invalidateChatPollAttempt(&next)
+		*poll = next
+		return nil
+	})
+	return err
+}
+
+// updateChatPollWithCapability is the common poll-row mutation path. A live
+// listener passes the control-lease capability it captured before the Graph
+// request; the capability is checked inside the same JSON/SQLite mutation as
+// the frontier write. Stores without a materialized control lease retain the
+// legacy unbound behavior so an older state file can still be migrated.
+func (s *Store) updateChatPollWithCapability(ctx context.Context, chatID string, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatPollState{}, false, fmt.Errorf("chat id is required")
@@ -49,16 +187,25 @@ func (s *Store) UpdateChatPoll(ctx context.Context, chatID string, fn func(*Chat
 		poll.ChatID = chatID
 		return nil
 	}
-	if out, changed, handled, err := s.updateChatPollSQLite(ctx, chatID, mutate); handled || err != nil {
+	if out, changed, handled, err := s.updateChatPollSQLiteWithCapability(ctx, chatID, capability, mutate); handled || err != nil {
 		return out, changed, err
 	}
 	var out ChatPollState
 	changed := false
 	err := s.Update(ctx, func(state *State) error {
+		if !storeOwnerCapabilityMatchesActiveLease(state, capabilityOwner(capability), capabilityLeaseGeneration(capability)) {
+			out = state.ChatPolls[chatID]
+			return errStoreNoChange
+		}
 		if state.ChatPolls == nil {
 			state.ChatPolls = make(map[string]ChatPollState)
 		}
 		poll := state.ChatPolls[chatID]
+		if chatPollAttemptNeedsActiveLeaseForReclaim(&poll, capability) &&
+			!storeOwnerCapabilityMatchesMaterializedActiveLease(state, capabilityOwner(capability), capabilityLeaseGeneration(capability)) {
+			out = poll
+			return errStoreNoChange
+		}
 		if err := mutate(&poll); err != nil {
 			if err == errStoreNoChange {
 				out = poll
@@ -116,9 +263,11 @@ func cloneChatPollPendingPageForComparison(page *ChatPollPendingPage) *ChatPollP
 }
 
 // BeginChatPollAttempt acquires the per-chat poll capability. An unexpired
-// capability is never replaced, including when both callers are goroutines in
-// the same process. Expired capabilities are safely replaced with a new
-// process-incarnation/attempt identity.
+// capability is never replaced by another caller in the same lease
+// generation. A newer control-lease generation may reclaim an attempt left by
+// an owner that disappeared during a hand-off; the generation check is the
+// cross-process proof, while the exact attempt capability fences the old
+// callback. Expired capabilities are safely replaced as before.
 func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptRequest) (ChatPollState, bool, error) {
 	req.ChatID = strings.TrimSpace(req.ChatID)
 	if req.ChatID == "" {
@@ -137,8 +286,14 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 		req.ProcessIncarnation = fmt.Sprintf("pid:%d", os.Getpid())
 	}
 	attemptID := fmt.Sprintf("poll-%d-%d", req.Now.UnixNano(), chatPollAttemptSequence.Add(1))
+	ownerCapability := &ChatPollAttemptCapability{
+		Owner:                        strings.TrimSpace(req.Owner),
+		ProcessIncarnation:           strings.TrimSpace(req.ProcessIncarnation),
+		LeaseGeneration:              req.LeaseGeneration,
+		RequireActiveLeaseForReclaim: true,
+	}
 	var acquired bool
-	poll, _, err := s.UpdateChatPoll(ctx, req.ChatID, func(poll *ChatPollState) error {
+	poll, changed, err := s.updateChatPollWithCapability(ctx, req.ChatID, ownerCapability, func(poll *ChatPollState) error {
 		if req.HasExpectedPollRevision && poll.PollRevision != req.ExpectedPollRevision {
 			// The caller observed an older frontier. Do not acquire a capability
 			// against the newer row merely because the chat still has the same
@@ -146,7 +301,15 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 			return errStoreNoChange
 		}
 		if poll.Attempt != nil && poll.Attempt.ExpiresAt.After(req.Now) {
-			return errStoreNoChange
+			// A listener can lose its control lease after the Graph request has
+			// started. The old attempt is intentionally left durable so its late
+			// callback cannot commit, but the replacement owner must not wait for
+			// the full attempt TTL before making progress. A strictly newer lease
+			// generation is the only authority that can reclaim it; same-generation
+			// callers still observe the normal busy result.
+			if req.LeaseGeneration <= 0 || poll.Attempt.LeaseGeneration >= req.LeaseGeneration {
+				return errStoreNoChange
+			}
 		}
 		poll.FrontierEpoch = normalizeFrontierEpoch(poll.FrontierEpoch)
 		poll.Attempt = &ChatPollAttempt{
@@ -164,6 +327,9 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 		acquired = true
 		return nil
 	})
+	if !changed {
+		acquired = false
+	}
 	return poll, acquired, err
 }
 
@@ -188,7 +354,7 @@ func (s *Store) mutateChatPollAttempt(ctx context.Context, chatID, attemptID str
 		return ChatPollState{}, false, nil
 	}
 	var applied bool
-	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+	poll, _, err := s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
 		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
@@ -225,7 +391,7 @@ func (s *Store) commitChatPollAttempt(ctx context.Context, chatID, attemptID str
 		return ChatPollState{}, false, nil
 	}
 	var committed bool
-	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+	poll, _, err := s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
 		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
@@ -262,7 +428,7 @@ func (s *Store) abandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 		return ChatPollState{}, false, nil
 	}
 	var abandoned bool
-	poll, _, err := s.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+	poll, _, err := s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
 		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
@@ -309,6 +475,43 @@ func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, exp
 		}
 	}
 	return true
+}
+
+func capabilityOwner(capability *ChatPollAttemptCapability) string {
+	if capability == nil {
+		return ""
+	}
+	return capability.Owner
+}
+
+func capabilityLeaseGeneration(capability *ChatPollAttemptCapability) int64 {
+	if capability == nil {
+		return 0
+	}
+	return capability.LeaseGeneration
+}
+
+func chatPollAttemptNeedsActiveLeaseForReclaim(poll *ChatPollState, capability *ChatPollAttemptCapability) bool {
+	if poll == nil || poll.Attempt == nil || capability == nil || !capability.RequireActiveLeaseForReclaim ||
+		capability.LeaseGeneration <= 0 || poll.Attempt.LeaseGeneration >= capability.LeaseGeneration {
+		return false
+	}
+	return poll.Attempt.ExpiresAt.After(time.Now())
+}
+
+// storeOwnerCapabilityMatchesMaterializedActiveLease is deliberately stricter
+// than storeOwnerCapabilityMatchesActiveLease. The latter preserves legacy
+// no-lease compatibility for ordinary operations; reclaiming an unexpired
+// attempt is a takeover operation and must have a real current lease as proof.
+func storeOwnerCapabilityMatchesMaterializedActiveLease(state *State, machineID string, leaseGeneration int64) bool {
+	if state == nil || leaseGeneration <= 0 || strings.TrimSpace(machineID) == "" {
+		return false
+	}
+	lease := state.ControlLease
+	if lease.Generation <= 0 || strings.TrimSpace(lease.HolderMachineID) == "" || lease.LeaseUntil.IsZero() {
+		return false
+	}
+	return controlLeaseMatchesCapabilityAt(state, machineID, leaseGeneration, time.Now())
 }
 
 // invalidateChatPollAttempt retires a capability owned by a non-poll writer.

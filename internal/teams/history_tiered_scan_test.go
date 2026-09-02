@@ -281,6 +281,46 @@ func TestHistoryTieredStatReconcileDetectsSameSizeSameMtimeRewrite(t *testing.T)
 	}
 }
 
+func TestHistoryTieredStatFastModeDetectsSameSizeRewriteUsingChangeTime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	original := []byte("abcdef\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatalf("write original: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat original: %v", err)
+	}
+	changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	if changeTime == 0 {
+		t.Skip("platform does not expose a usable file change time")
+	}
+	state := historyTieredFileState{
+		Path: path, Size: info.Size(), ModTime: info.ModTime(),
+		SourceChangeTime: changeTime,
+	}
+	if err := os.WriteFile(path, []byte("uvwxyz\n"), 0o600); err != nil {
+		t.Fatalf("rewrite same-size file: %v", err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore mtime: %v", err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat rewritten file: %v", err)
+	}
+	if got := teamstore.SourceFileChangeTimeFromFileInfo(newInfo); got == changeTime {
+		t.Skip("filesystem did not expose a changed ctime for the rewrite")
+	}
+	changes, err := historyTieredDetectStatChanges([]string{path}, map[string]historyTieredFileState{path: state})
+	if err != nil {
+		t.Fatalf("historyTieredDetectStatChanges: %v", err)
+	}
+	if len(changes) != 1 || changes[0].Path != path {
+		t.Fatalf("fast-mode changes = %#v, want rewritten path", changes)
+	}
+}
+
 func TestHistoryTieredListSessionFilesInDirs(t *testing.T) {
 	dir := t.TempDir()
 	day1 := filepath.Join(dir, "2026", "05", "11")
@@ -634,6 +674,28 @@ func TestHistoryTieredScanTailCapsLargeTail(t *testing.T) {
 	}
 }
 
+func TestHistoryTieredScanTailDoesNotAcceptJSONPrefixAtBudgetBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "budget-malformed-record.jsonl")
+	line := `{"a":1}not-json` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatalf("write malformed budget fixture: %v", err)
+	}
+	// The first seven bytes are a valid JSON object, but they are only a
+	// prefix of the physical JSONL record. A bounded reader must drain to the
+	// newline and quarantine the whole malformed range rather than committing
+	// a cursor in the middle of a record.
+	result, err := historyTieredScanTail(path, historyTieredFileState{}, 7)
+	if err != nil {
+		t.Fatalf("historyTieredScanTail: %v", err)
+	}
+	if result.State.Offset != int64(len(line)) || result.State.Offset <= 7 {
+		t.Fatalf("state = %#v, want full malformed line consumed past budget boundary", result.State)
+	}
+	if len(result.Records) != 0 || result.State.TranscriptQuarantine == nil || result.State.TranscriptQuarantine.Kind != "malformed_record" {
+		t.Fatalf("result = %#v, want one row-local malformed quarantine without visible records", result)
+	}
+}
+
 func TestHistoryTieredScanTailCanRecoverAfterLargeTailCap(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	lines := []string{
@@ -713,6 +775,71 @@ func TestHistoryTieredScanTailPersistsPartialReadHintAndResumesAfterNewline(t *t
 	}
 	if resumed.Incomplete || resumed.State.Offset <= first.State.Offset || resumed.State.PartialLineStartOffset != 0 {
 		t.Fatalf("resumed partial result = %#v", resumed)
+	}
+}
+
+func TestHistoryTieredScanTailReplaysSameSizePartialRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "partial-rewrite.jsonl")
+	prefix := `{"type":"session_meta","payload":{"id":"partial-rewrite"}}` + "\n"
+	partialA := `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"` + strings.Repeat("a", 64) + `"}`
+	if err := os.WriteFile(path, []byte(prefix+partialA), 0o600); err != nil {
+		t.Fatalf("write partial rewrite fixture: %v", err)
+	}
+	first, err := historyTieredScanTail(path, historyTieredFileState{}, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("initial partial rewrite scan: %v", err)
+	}
+	if !first.Incomplete || first.State.PartialReadOffset <= first.State.PartialLineStartOffset {
+		t.Fatalf("initial partial rewrite result = %#v, want resumable partial state", first)
+	}
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat partial rewrite fixture: %v", err)
+	}
+	partialB := `{"type":"event_msg","payload":{"type":"agent_message","phase":"commentary","message":"` + strings.Repeat("b", 64) + `"}`
+	if len(partialA) != len(partialB) {
+		t.Fatalf("same-size partial fixtures differ: %d != %d", len(partialA), len(partialB))
+	}
+	if err := os.WriteFile(path, []byte(prefix+partialB), 0o600); err != nil {
+		t.Fatalf("rewrite partial fixture: %v", err)
+	}
+	if err := os.Chtimes(path, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatalf("restore partial fixture mtime: %v", err)
+	}
+	// Make the test deterministic on filesystems that do not expose ctime: a
+	// nonzero saved marker versus the current zero value is still an unknown
+	// revision and must force a replay from the last complete newline.
+	if first.State.PartialSourceChangeTime == 0 {
+		first.State.PartialSourceChangeTime = 1
+	}
+	rewritten, err := historyTieredScanTail(path, first.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("same-size partial rewrite scan: %v", err)
+	}
+	if rewritten.Truncated || !rewritten.Incomplete || rewritten.State.PartialReadOffset <= rewritten.State.PartialLineStartOffset {
+		t.Fatalf("same-size partial rewrite result = %#v, want replayed partial state", rewritten)
+	}
+	if rewritten.State.PartialSourceChangeTime == first.State.PartialSourceChangeTime && first.State.PartialSourceChangeTime != 1 {
+		t.Fatalf("partial source revision did not change: first=%d rewritten=%d", first.State.PartialSourceChangeTime, rewritten.State.PartialSourceChangeTime)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open rewritten partial fixture: %v", err)
+	}
+	if _, err := f.WriteString("}\n"); err != nil {
+		_ = f.Close()
+		t.Fatalf("complete rewritten partial record: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close rewritten partial fixture: %v", err)
+	}
+	appendLine(t, path, `{"type":"event_msg","payload":{"id":"partial-rewrite-final","type":"agent_message","phase":"final_answer","message":"partial rewrite final"}}`)
+	completed, err := historyTieredScanTail(path, rewritten.State, historyTieredMaxTailBytes)
+	if err != nil {
+		t.Fatalf("completed partial rewrite scan: %v", err)
+	}
+	if len(completed.Finals) != 1 || completed.Finals[0].Record.Text != "partial rewrite final" {
+		t.Fatalf("completed partial rewrite finals = %#v, want rewritten suffix final", completed.Finals)
 	}
 }
 

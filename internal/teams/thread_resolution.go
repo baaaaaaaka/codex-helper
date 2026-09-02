@@ -385,7 +385,18 @@ func (b *Bridge) interruptTurnForThreadRecovery(ctx context.Context, session *Se
 		message = "Codex thread recovery blocked this request."
 	}
 	if b.store != nil && strings.TrimSpace(turn.ID) != "" {
-		if _, err := b.store.MarkTurnInterrupted(ctx, turn.ID, kind+": "+message); err != nil {
+		var err error
+		if turn.LeaseGeneration > 0 && strings.TrimSpace(turn.MachineID) != "" {
+			_, err = b.store.MarkTurnInterruptedForOwner(ctx, turn.ID, kind+": "+message, turn.MachineID, turn.LeaseGeneration)
+		} else if b.currentLeaseGeneration() > 0 {
+			// A live listener cannot safely mutate a legacy/unbound turn: after
+			// takeover, an old snapshot with no capability could otherwise
+			// interrupt the replacement owner's rebound turn.
+			err = teamstore.ErrControlLeaseNotHeld
+		} else {
+			_, err = b.store.MarkTurnInterrupted(ctx, turn.ID, kind+": "+message)
+		}
+		if err != nil {
 			return err
 		}
 	}

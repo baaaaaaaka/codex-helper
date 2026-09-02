@@ -452,7 +452,7 @@ func TestTranscriptImportCompletionDoesNotReuseCursorAfterSameSizeRewrite(t *tes
 	}
 }
 
-func TestLinkedCheckpointFileUnchangedRejectsSameSizeSameMtimeRewrite(t *testing.T) {
+func TestTeamsSourceProofDetectsSameSizeInPlaceRewrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	oldLine := `{"id":"old","role":"assistant","text":"old"}` + "\n"
 	newLine := `{"id":"new","role":"assistant","text":"new"}` + "\n"

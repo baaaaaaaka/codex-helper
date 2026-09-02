@@ -33,6 +33,12 @@ const historyTieredMaxRecordBytes = 8 * 1024 * 1024
 // partial read cursor when this cap is reached and resumes only after growth.
 const historyTieredMaxRecordReadBytes int64 = 64 * 1024 * 1024
 
+// A partial JSONL record is allowed to settle for a while before it becomes
+// an opaque recovery boundary. Normal Codex writes complete their record well
+// within this window; the grace period is for a crashed/abandoned writer, so
+// one such tail cannot permanently strand complete records that precede it.
+const historyTieredStalePartialAfter = 5 * time.Minute
+
 // A complete oversized record is still a safe newline-bounded disposition.
 // Its read-range proof may therefore cover the per-pass budget plus the full
 // bounded record envelope, rather than the smaller decoded-record cap.  This
@@ -56,32 +62,54 @@ var (
 )
 
 type historyTieredFileState struct {
-	Path                          string
-	Size                          int64
-	ModTime                       time.Time
-	SourceGeneration              string
-	SourceFingerprint             string
-	SourceRewriteBlocked          bool
-	LegacySourceUnverified        bool
-	RecoveryProofUnusable         bool
-	OversizedRecordBlocked        bool
-	SourceRewriteRecoveryIdentity string
-	Offset                        int64
-	Line                          int
+	Path                            string
+	Size                            int64
+	ModTime                         time.Time
+	SourceGeneration                string
+	SourceFingerprint               string
+	SourceChangeTime                int64
+	SourceRewriteBlocked            bool
+	LegacySourceUnverified          bool
+	RecoveryProofUnusable           bool
+	OversizedRecordBlocked          bool
+	SourceRewriteRecoveryIdentity   string
+	SourceRewriteRecoverySize       int64
+	SourceRewriteRecoveryModTime    time.Time
+	SourceRewriteRecoveryChangeTime int64
+	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for a
+	// bounded rebase pass. It prevents a large same-inode repair from starting
+	// at byte zero after every listener cycle or process restart.
+	SourceRewriteRecoveryScanPending   bool
+	SourceRewriteRecoveryScanOffset    int64
+	SourceRewriteRecoveryScanLine      int
+	SourceRewriteRecoveryScanSessionID string
+	SourceRewriteRecoveryScanThreadID  string
+	SourceRewriteRecoveryScanTurnID    string
+	Offset                             int64
+	Line                               int
 	// Partial* represent a record that has not reached a newline. Offset and
 	// Line remain the last complete JSONL boundary; these fields are only a
 	// resumable read hint and never a publishable cursor.
-	PartialLineStartOffset int64
-	PartialReadOffset      int64
-	PartialObservedSize    int64
-	PartialLine            int
-	PartialStartedAt       time.Time
-	PartialSourceIdentity  string
-	SessionID              string
-	ThreadID               string
-	TeamsOriginThreadID    string
-	TurnID                 string
-	TeamsOriginTurnID      string
+	PartialLineStartOffset         int64
+	PartialReadOffset              int64
+	PartialObservedSize            int64
+	PartialLine                    int
+	PartialStartedAt               time.Time
+	PartialSourceIdentity          string
+	PartialSourceChangeTime        int64
+	PartialReplayOffset            int64
+	PartialReplayLine              int
+	PartialLastProgressAt          time.Time
+	PartialPrefixReleased          bool
+	PendingOpaqueRecordStartOffset int64
+	PendingOpaqueRecordEndOffset   int64
+	PendingOpaqueRecordLine        int
+	PendingOpaqueRecordID          string
+	SessionID                      string
+	ThreadID                       string
+	TeamsOriginThreadID            string
+	TurnID                         string
+	TeamsOriginTurnID              string
 	// ExternalUserPromptSeen is a positive ownership hint for a new root turn.
 	// It is set only by a visible, non-internal user record after the most recent
 	// terminal boundary and is consumed by the following task_started marker.
@@ -446,6 +474,21 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 			continue
 		}
 		if state.Size == info.Size() && state.ModTime.Equal(info.ModTime()) {
+			if info.Size() != 0 {
+				currentChangeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+				if state.SourceChangeTime != 0 && (currentChangeTime == 0 || currentChangeTime != state.SourceChangeTime) {
+					// ctime is a cheap change hint, not a generation identity. A
+					// mismatch forces the bounded proof path, which can still accept
+					// an append-only update without reading the whole source. This
+					// check is useful even in the normal fast mode: otherwise a
+					// same-size in-place rewrite whose mtime was restored would be
+					// invisible until a slower verification pass happened to run.
+					changes = append(changes, historyTieredStatChange{
+						Path: path, Size: info.Size(), ModTime: info.ModTime(), Truncated: truncated,
+					})
+					continue
+				}
+			}
 			if !verifyUnchanged || info.Size() == 0 {
 				continue
 			}
@@ -502,13 +545,14 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.Path = path
 	next.Size = info.Size()
 	next.ModTime = info.ModTime()
+	next.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
 	sourceGeneration := historyTieredSourceIdentity(path, info)
 	next.SourceGeneration = firstNonEmptyString(next.SourceGeneration, sourceGeneration)
 	if previous.Offset > info.Size() || (previous.Size > 0 && info.Size() < previous.Size) {
 		// The source was replaced or truncated. Do not carry an old final
 		// boundary, turn identity, or unresolved-continuation marker into the
 		// new file; the next pass reparses its fresh session metadata.
-		next = historyTieredFileState{Path: path}
+		next = historyTieredFileState{Path: path, SourceChangeTime: next.SourceChangeTime}
 		return historyTieredTailResult{State: next, Truncated: true}, nil
 	}
 	if strings.TrimSpace(previous.SourceGeneration) != "" && strings.TrimSpace(sourceGeneration) != "" &&
@@ -517,7 +561,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		// pending semantic range. The caller may explicitly rebase after a
 		// durable source-proof decision; automatic scanning only reports the
 		// generation transition.
-		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceGeneration: sourceGeneration, Size: info.Size(), ModTime: info.ModTime()}, Truncated: true}, nil
+		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceGeneration: sourceGeneration, Size: info.Size(), ModTime: info.ModTime(), SourceChangeTime: next.SourceChangeTime}, Truncated: true}, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -526,9 +570,11 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	defer f.Close()
 	fdInfo, err := f.Stat()
 	if err != nil || fdInfo.IsDir() || !os.SameFile(info, fdInfo) || fdInfo.Size() < previous.Offset {
-		return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
+		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceChangeTime: next.SourceChangeTime}, Truncated: true}, nil
 	}
 	fdIdentity, identityErr := teamstore.SourceFileIdentityFromFileInfo(path, fdInfo)
+	fdChangeTime := teamstore.SourceFileChangeTimeFromFileInfo(fdInfo)
+	next.SourceChangeTime = fdChangeTime
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && previous.Offset >= 0 && previous.Offset == previous.Size {
 		currentFingerprint := ""
 		if identityErr == nil && strings.TrimSpace(fdIdentity) != "" {
@@ -544,11 +590,13 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 				ModTime:              info.ModTime(),
 				SourceGeneration:     sourceGeneration,
 				SourceFingerprint:    currentFingerprint,
+				SourceChangeTime:     fdChangeTime,
 				SourceRewriteBlocked: true,
 			}
 			return historyTieredTailResult{State: next, Truncated: true}, nil
 		}
 	}
+	partialProbeConsumed := false
 	if previous.PartialLineStartOffset >= previous.Offset && previous.PartialReadOffset > previous.PartialLineStartOffset {
 		identity := strings.TrimSpace(fdIdentity)
 		if strings.TrimSpace(previous.PartialSourceIdentity) != "" && identity != "" && identity != strings.TrimSpace(previous.PartialSourceIdentity) {
@@ -556,6 +604,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			next.Path = path
 			next.Size = info.Size()
 			next.ModTime = info.ModTime()
+			next.SourceChangeTime = fdChangeTime
 			return historyTieredTailResult{State: next, Truncated: true}, nil
 		}
 		if previous.PartialReadOffset > info.Size() {
@@ -566,12 +615,19 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			return historyTieredTailResult{State: next, Truncated: true}, nil
 		}
 		if previous.PartialReadOffset == info.Size() && previous.PartialObservedSize == info.Size() && previous.ModTime.Equal(info.ModTime()) {
-			next := previous
-			next.Path = path
-			next.Size = info.Size()
-			next.ModTime = info.ModTime()
-			return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
+			if !historyTieredPartialSourceChanged(previous.PartialSourceChangeTime, fdChangeTime) {
+				next := previous
+				next.Path = path
+				next.Size = info.Size()
+				next.ModTime = info.ModTime()
+				return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
+			}
+			// A same-size partial rewrite must be reparsed from the last
+			// complete newline. Returning Incomplete here would resume at the
+			// old byte cursor and could silently skip the changed prefix.
+			previous = historyTieredClearPartial(previous)
 		}
+		partialProbeConsumed = true
 		newlineEnd, scannedThrough, hasNewline, err := historyTieredFindPartialNewlineFromReader(f, previous.PartialReadOffset, info.Size(), historyTieredMaxRecordReadBytes)
 		if err != nil {
 			return historyTieredTailResult{}, err
@@ -586,6 +642,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 			next.PartialReadOffset = scannedThrough
 			next.PartialObservedSize = info.Size()
 			next.PartialSourceIdentity = firstNonEmptyString(next.PartialSourceIdentity, identity)
+			next.PartialSourceChangeTime = fdChangeTime
 			return historyTieredTailResult{State: next, Incomplete: true, MaxTailBytes: maxTailBytes}, nil
 		}
 		// A partial line that was already larger than the independent framing cap
@@ -595,66 +652,48 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		// chunks across polls until it finds the newline, then this branch commits
 		// the complete byte range without decoding it.
 		if newlineEnd-previous.PartialLineStartOffset > historyTieredMaxRecordBytes {
-			lineNo := previous.PartialLine
-			if lineNo <= previous.Line {
-				lineNo = previous.Line + 1
+			// The line became complete, but complete records before it may not
+			// have been delivered while the line was partial. Rewind to the
+			// recorded replay origin and let the ordinary bounded scanner consume
+			// the whole prefix plus this opaque line. Directly committing the
+			// oversized line here would silently skip an earlier final.
+			replay := previous
+			replay.Offset, replay.Line = historyTieredPartialReplayBoundary(previous)
+			replay.PartialLineStartOffset = 0
+			replay.PartialReadOffset = 0
+			replay.PartialObservedSize = 0
+			replay.PartialLine = 0
+			replay.PartialStartedAt = time.Time{}
+			replay.PartialSourceIdentity = ""
+			replay.PartialSourceChangeTime = 0
+			replay.PartialReplayOffset = 0
+			replay.PartialReplayLine = 0
+			replay.PartialLastProgressAt = time.Time{}
+			replay.PartialPrefixReleased = false
+			replay.PendingOpaqueRecordStartOffset = previous.PartialLineStartOffset
+			replay.PendingOpaqueRecordEndOffset = newlineEnd
+			replay.PendingOpaqueRecordLine = previous.PartialLine
+			if replay.PendingOpaqueRecordLine <= replay.Line {
+				replay.PendingOpaqueRecordLine = replay.Line + 1
 			}
-			recordID := historyTieredConsumedRecordKey(path, lineNo, previous.PartialLineStartOffset, newlineEnd)
-			next = previous
-			next.Path = path
-			next.Size = info.Size()
-			next.ModTime = info.ModTime()
-			next.Offset = newlineEnd
-			next.Line = lineNo
-			next.PartialLineStartOffset = 0
-			next.PartialReadOffset = 0
-			next.PartialObservedSize = 0
-			next.PartialLine = 0
-			next.PartialStartedAt = time.Time{}
-			next.PartialSourceIdentity = ""
-			historyTieredResetOpaqueParserState(&next)
-			next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", recordID, lineNo, previous.PartialLineStartOffset, newlineEnd, nil, f, fdIdentity)
-			next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, newlineEnd)
-			result := historyTieredTailResult{
-				State:                next,
-				TooLarge:             true,
-				BudgetExhausted:      true,
-				OversizedRecord:      true,
-				BytesRead:            newlineEnd - previous.PartialReadOffset,
-				LinesRead:            1,
-				MaxTailBytes:         maxTailBytes,
-				LastConsumedRecordID: recordID,
-				LastConsumedLine:     lineNo,
-				LastConsumedOffset:   newlineEnd,
-			}
-			if record := historyTieredOversizedRecord(path, lineNo, previous.PartialLineStartOffset, newlineEnd, nil); record.ItemID != "" {
-				result.Records = []TranscriptRecord{record}
-			}
-			if fingerprint := transcriptSourceRangeFingerprintFromReader(f, path, fdIdentity, previous.Offset, newlineEnd); fingerprint != "" {
-				result.ReadProofFingerprint = fingerprint
-				result.ReadProofStartOffset = previous.Offset
-				result.ReadProofEndOffset = newlineEnd
-				result.ReadProofRangeKnown = true
-			}
-			if !historyTieredSourceObservationStable(f, info, path, newlineEnd) {
-				return historyTieredTailResult{State: historyTieredFileState{Path: path}, Truncated: true}, nil
-			}
-			return result, nil
+			replay.PendingOpaqueRecordID = historyTieredOversizedRecord(path, replay.PendingOpaqueRecordLine, replay.PendingOpaqueRecordStartOffset, replay.PendingOpaqueRecordEndOffset, nil).ItemID
+			return historyTieredScanTail(path, replay, maxTailBytes)
 		}
 		// The writer completed the record. Re-read only that record from its
 		// start with the normal bounded parser; this keeps the persisted state
 		// small and avoids a cross-poll JSON lexer.
-		previous.Offset = previous.PartialLineStartOffset
-		previous.Line = previous.PartialLine - 1
-		if previous.Line < 0 {
-			previous.Line = 0
-		}
+		previous.Offset, previous.Line = historyTieredPartialReplayBoundary(previous)
 		previous.PartialLineStartOffset = 0
 		previous.PartialReadOffset = 0
 		previous.PartialObservedSize = 0
 		previous.PartialLine = 0
 		previous.PartialStartedAt = time.Time{}
 		previous.PartialSourceIdentity = ""
+		previous.PartialSourceChangeTime = 0
+		previous.PartialReplayOffset = 0
+		previous.PartialReplayLine = 0
+		previous.PartialLastProgressAt = time.Time{}
+		previous.PartialPrefixReleased = false
 	}
 	// An opaque complete record is a parser-context gap.  Never carry the
 	// preceding turn/final state across it: doing so could attribute a later
@@ -700,6 +739,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.Path = path
 	next.Size = info.Size()
 	next.ModTime = info.ModTime()
+	next.SourceChangeTime = fdChangeTime
 
 	tailBytes := info.Size() - previous.Offset
 	scanEnd := info.Size()
@@ -707,12 +747,39 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	if budgeted {
 		scanEnd = previous.Offset + maxTailBytes
 	}
+	// A previously unterminated record may have become newline-complete while
+	// still exceeding the framing cap.  The completion probe records its exact
+	// byte range so the normal scanner can replay the safe prefix, then cross the
+	// known opaque range without trying to materialize its payload.  Do not widen
+	// a pass merely because the pending range is farther away; only extend the
+	// budget when this pass has actually reached the recorded start.
+	pendingOpaqueStart := previous.PendingOpaqueRecordStartOffset
+	pendingOpaqueEnd := previous.PendingOpaqueRecordEndOffset
+	pendingOpaqueLine := previous.PendingOpaqueRecordLine
+	pendingOpaqueID := strings.TrimSpace(previous.PendingOpaqueRecordID)
+	pendingOpaqueValid := pendingOpaqueStart >= previous.Offset && pendingOpaqueEnd > pendingOpaqueStart && pendingOpaqueEnd <= info.Size()
+	if pendingOpaqueValid && pendingOpaqueStart < scanEnd {
+		if pendingOpaqueEnd > scanEnd {
+			scanEnd = pendingOpaqueEnd
+		}
+	} else if !pendingOpaqueValid {
+		// A malformed pending range must never be used as a skip proof.  Clear it
+		// before scanning so a repaired/corrupt checkpoint cannot hide a suffix.
+		next.PendingOpaqueRecordStartOffset = 0
+		next.PendingOpaqueRecordEndOffset = 0
+		next.PendingOpaqueRecordLine = 0
+		next.PendingOpaqueRecordID = ""
+		pendingOpaqueValid = false
+	}
 
-	if previous.Offset > 0 {
+	if previous.Offset > 0 || partialProbeConsumed {
 		if _, err := f.Seek(previous.Offset, io.SeekStart); err != nil {
 			return historyTieredTailResult{}, err
 		}
 	}
+	// The completion probe above reads directly from f. The seek also handles
+	// the zero-offset replay case; without it the buffered reader would start
+	// after the probe's newline and could miss the rewritten prefix entirely.
 	// Hash the exact bounded suffix consumed by this scan while it is read.
 	// Limiting the reader to the initial file size makes an append racing the
 	// scan part of the next poll rather than silently widening this proof.
@@ -818,13 +885,62 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		TooLarge:     budgeted,
 	}
 	for {
+		if pendingOpaqueValid && offset == pendingOpaqueStart {
+			opaqueBytes := pendingOpaqueEnd - pendingOpaqueStart
+			if err := historyTieredDiscardReaderBytes(reader, opaqueBytes); err != nil {
+				return result, err
+			}
+			if pendingOpaqueLine <= lineNo {
+				pendingOpaqueLine = lineNo + 1
+			}
+			if pendingOpaqueID == "" {
+				pendingOpaqueID = historyTieredOversizedRecord(path, pendingOpaqueLine, pendingOpaqueStart, pendingOpaqueEnd, nil).ItemID
+			}
+			lineNo = pendingOpaqueLine
+			offset = pendingOpaqueEnd
+			result.BytesRead += opaqueBytes
+			result.LinesRead++
+			result.LastConsumedRecordID = pendingOpaqueID
+			result.LastConsumedLine = lineNo
+			result.LastConsumedOffset = offset
+			result.OversizedRecord = true
+			record := historyTieredOversizedRecord(path, lineNo, pendingOpaqueStart, pendingOpaqueEnd, nil)
+			if record.ItemID != "" {
+				result.Records = append(result.Records, record)
+				next.TranscriptQuarantine = historyTieredOpaqueRecordQuarantineFromReader(path, previous.SourceFingerprint, next.SourceGeneration, "oversized_record", record.ItemID, lineNo, pendingOpaqueStart, pendingOpaqueEnd, nil, f, fdIdentity)
+				next.ContextGap = historyTieredContextGapState(next.TranscriptQuarantine, next.SourceGeneration, pendingOpaqueEnd)
+			}
+			next.PendingOpaqueRecordStartOffset = 0
+			next.PendingOpaqueRecordEndOffset = 0
+			next.PendingOpaqueRecordLine = 0
+			next.PendingOpaqueRecordID = ""
+			historyTieredResetOpaqueParserState(&next)
+			parseState.turnID = ""
+			externalUserPromptSeen = false
+			pendingRootTaskStarted = false
+			pendingRootTaskStartedLine = 0
+			pendingRootTaskStartedOffset = 0
+			pendingRootTaskStartedEndOffset = 0
+			pendingRootTaskStartedRecordID = ""
+			pendingRootTaskStartedThreadID = ""
+			pendingRootTaskStartedTurnID = ""
+			pending = historyTieredAssistantCandidate{}
+			suppressFinalsAfterContinuation = false
+			pendingOpaqueValid = false
+			break
+		}
 		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
 		line := read.Line
 		if read.BytesRead > 0 {
 			lineStartOffset := offset
 			if !read.Complete {
 				trimmed := bytes.TrimSpace(line)
-				completeAtEOF := err == io.EOF && !read.Oversized && len(trimmed) > 0 && json.Valid(trimmed)
+				// EOF from the bounded reader is not the physical file EOF when
+				// this pass hit its byte budget. A JSON-valid prefix may still be
+				// followed by arbitrary bytes in the same record; only the
+				// unbudgeted physical EOF may be accepted without draining to a
+				// newline.
+				completeAtEOF := !budgeted && err == io.EOF && !read.Oversized && len(trimmed) > 0 && json.Valid(trimmed)
 				if completeAtEOF {
 					// A process can exit immediately after writing a valid JSON
 					// object and before its delimiter. Treat that EOF as a safe
@@ -881,6 +997,11 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 						next.PartialLine = lineNo + 1
 						next.PartialStartedAt = firstNonZeroTime(previous.PartialStartedAt, info.ModTime())
 						next.PartialSourceIdentity = firstNonEmptyString(previous.PartialSourceIdentity, historyTieredSourceIdentity(path, info))
+						next.PartialSourceChangeTime = fdChangeTime
+						if next.PartialReplayOffset == 0 && next.PartialReplayLine == 0 {
+							next.PartialReplayOffset = previous.Offset
+							next.PartialReplayLine = previous.Line
+						}
 						break
 					}
 				} else {
@@ -896,6 +1017,11 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 					next.PartialLine = lineNo + 1
 					next.PartialStartedAt = firstNonZeroTime(previous.PartialStartedAt, info.ModTime())
 					next.PartialSourceIdentity = firstNonEmptyString(previous.PartialSourceIdentity, historyTieredSourceIdentity(path, info))
+					next.PartialSourceChangeTime = fdChangeTime
+					if next.PartialReplayOffset == 0 && next.PartialReplayLine == 0 {
+						next.PartialReplayOffset = previous.Offset
+						next.PartialReplayLine = previous.Line
+					}
 					break
 				}
 			}
@@ -1584,6 +1710,32 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	return result, nil
 }
 
+// historyTieredPartialReplayBoundary returns the last durable boundary that
+// must be replayed when an unterminated record becomes complete. Older rows
+// used PartialLineStartOffset as this replay origin; newer rows keep the real
+// partial-line start there and store the replay origin separately. When the
+// new fields are absent, falling back to Offset is conservative and prevents
+// skipping complete records that were observed alongside the partial tail.
+func historyTieredPartialReplayBoundary(state historyTieredFileState) (int64, int) {
+	replayOffset := state.PartialReplayOffset
+	replayLine := state.PartialReplayLine
+	if replayOffset == 0 && replayLine == 0 && state.Offset > 0 && state.PartialLineStartOffset <= state.Offset {
+		// Compatibility with checkpoints written before PartialReplay* existed.
+		replayOffset = state.PartialLineStartOffset
+		replayLine = state.Line
+	}
+	if replayOffset < 0 || replayOffset > state.PartialLineStartOffset {
+		replayOffset = state.Offset
+	}
+	if replayLine < 0 {
+		replayLine = 0
+	}
+	if replayLine == 0 && replayOffset > 0 && state.PartialReplayLine == 0 {
+		replayLine = state.Line
+	}
+	return replayOffset, replayLine
+}
+
 // historyTieredCompleteBudgetedLine drains the remainder of one record after a
 // per-pass tail budget ended in its middle. It captures only ordinary-sized
 // records; once the independent record cap is crossed it keeps draining in
@@ -1653,7 +1805,7 @@ func historyTieredQuarantineIsContextGap(quarantine *teamstore.TranscriptQuarant
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(quarantine.Kind)) {
-	case "malformed_record", "opaque_record", "oversized_record":
+	case "malformed_record", "opaque_record", "oversized_record", "stale_partial_record":
 		return true
 	default:
 		return false
@@ -1800,6 +1952,34 @@ func historyTieredFindPartialNewlineFromReader(file *os.File, startOffset int64,
 	}
 }
 
+// historyTieredDiscardReaderBytes crosses a previously observed, complete
+// opaque JSONL record without retaining its payload. The caller must have
+// authenticated the range through the same file descriptor and a visible
+// newline; this helper is deliberately not a general EOF-skip primitive.
+func historyTieredDiscardReaderBytes(reader *bufio.Reader, count int64) error {
+	if reader == nil || count < 0 {
+		return fmt.Errorf("invalid opaque record discard length %d", count)
+	}
+	remaining := count
+	for remaining > 0 {
+		chunk := int64(1 << 20)
+		if chunk > remaining {
+			chunk = remaining
+		}
+		discarded, err := reader.Discard(int(chunk))
+		if discarded > 0 {
+			remaining -= int64(discarded)
+		}
+		if err != nil {
+			return err
+		}
+		if discarded == 0 {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	return nil
+}
+
 func minInt64(left, right int64) int {
 	if left < right {
 		return int(left)
@@ -1834,6 +2014,29 @@ func historyTieredSourceObservationStable(file *os.File, initial os.FileInfo, pa
 		return false
 	}
 	return fdInfo.Size() >= minimumSize && pathInfo.Size() >= minimumSize
+}
+
+func historyTieredPartialSourceChanged(previous, current int64) bool {
+	// A missing marker is not proof of a change by itself: old checkpoints and
+	// filesystems without a native ctime legitimately report zero.  Once either
+	// side has a marker, however, a mismatch means the saved read cursor cannot
+	// be trusted and the partial line must be replayed from the last newline.
+	return (previous != 0 || current != 0) && previous != current
+}
+
+func historyTieredClearPartial(state historyTieredFileState) historyTieredFileState {
+	state.PartialLineStartOffset = 0
+	state.PartialReadOffset = 0
+	state.PartialObservedSize = 0
+	state.PartialLine = 0
+	state.PartialStartedAt = time.Time{}
+	state.PartialSourceIdentity = ""
+	state.PartialSourceChangeTime = 0
+	state.PartialReplayOffset = 0
+	state.PartialReplayLine = 0
+	state.PartialLastProgressAt = time.Time{}
+	state.PartialPrefixReleased = false
+	return state
 }
 
 func historyTieredOversizedRecord(path string, lineNo int, startOffset int64, endOffset int64, prefix []byte) TranscriptRecord {

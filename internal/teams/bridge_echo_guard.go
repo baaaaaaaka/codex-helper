@@ -236,6 +236,56 @@ func definitiveGraphSendFailure(err error) bool {
 	return statusErr.StatusCode >= http.StatusBadRequest && statusErr.StatusCode < http.StatusInternalServerError
 }
 
+func graphUnauthorizedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *GraphStatusError
+	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized
+}
+
+// attachmentPostResponseAllowsPendingReset identifies an explicit provider
+// response that rejects a fresh attachment POST before it can be accepted.
+// It is deliberately not true for transport errors, 408/409/425, or 5xx:
+// those responses leave the external outcome uncertain and must remain behind
+// the exact-marker recovery fence.  A 401/429 can safely return a fresh row to
+// the pre-POST state, allowing credential refresh or throttling backoff to
+// make progress without forcing every normal attachment retry through an
+// inconclusive history scan.
+func attachmentPostResponseAllowsPendingReset(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusTooManyRequests
+}
+
+// permanentGraphSendFailure identifies a response that proves this payload
+// cannot succeed by retrying it unchanged.  Rate limiting and request races
+// are still definitive in the narrow sense that Graph rejected this POST, but
+// they are recoverable and must retain the existing queued/backoff behavior.
+// Keeping this distinction explicit prevents a malformed row from poisoning
+// same-chat FIFO forever without turning transient provider responses into a
+// silent skip.
+func permanentGraphSendFailure(err error) bool {
+	if !definitiveGraphSendFailure(err) {
+		return false
+	}
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.StatusCode {
+	case http.StatusUnauthorized, http.StatusRequestTimeout, http.StatusConflict, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	default:
+		return true
+	}
+}
+
 func (b *Bridge) shouldSuppressUnprovenancedHelperEcho(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole, legacy bool) (bool, error) {
 	if legacy || role == inboundPollRoleControl {
 		return true, nil

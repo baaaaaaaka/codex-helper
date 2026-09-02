@@ -202,7 +202,7 @@ func executionAnchorTurnOwnershipConfirmed(state teamstore.State, anchor teamsto
 
 func (b *Bridge) ensureUnresolvedExecutionAnchor(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint, turn teamstore.Turn) (teamstore.ImportCheckpoint, error) {
 	checkpointID := transcriptCheckpointID(session.ID)
-	updated, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	updated, _, err := b.updateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if executionAnchorActive(current.UnresolvedExecution) {
 			next := *current.UnresolvedExecution
 			changed := false
@@ -295,10 +295,48 @@ func (b *Bridge) persistUnresolvedExecutionAnchorForTurn(ctx context.Context, se
 	if b == nil || b.store == nil {
 		return teamstore.PersistInterruptedTurnWithAnchorResult{}, nil
 	}
+	request := unresolvedExecutionAnchorRequest(session, turn)
+	var result teamstore.PersistInterruptedTurnWithAnchorResult
+	var err error
+	if request.LeaseGeneration > 0 && strings.TrimSpace(request.MachineID) != "" {
+		result, err = b.store.PersistInterruptedTurnWithAnchorForOwner(ctx, request, request.MachineID, request.LeaseGeneration)
+	} else {
+		result, err = b.store.PersistInterruptedTurnWithAnchor(ctx, request)
+	}
+	if err != nil {
+		return result, err
+	}
+	// A durable terminal status alone is not app-server ownership proof.  The
+	// only automatic resolver is the typed outer-turn callback (or the
+	// app-server cancellation fence); ordinary callbacks must leave the anchor
+	// unresolved so an orphan continuation cannot be published.
+	return result, nil
+}
+
+// takeOverUnresolvedExecutionAnchorForTurn is used only during active-listener
+// startup. A new owner may safely adopt a still-Running turn left by an older
+// process, but normal execution callbacks must continue to require an exact
+// turn capability match. The store performs the adoption and anchor write as
+// one CAS transaction.
+func (b *Bridge) takeOverUnresolvedExecutionAnchorForTurn(ctx context.Context, session Session, turn teamstore.Turn) (teamstore.PersistInterruptedTurnWithAnchorResult, error) {
+	if b == nil || b.store == nil {
+		return teamstore.PersistInterruptedTurnWithAnchorResult{}, nil
+	}
+	request := unresolvedExecutionAnchorRequest(session, turn)
+	machineID, leaseGeneration, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx)
+	if !ownerBound || machineID == "" || leaseGeneration <= 0 {
+		return b.store.PersistInterruptedTurnWithAnchor(ctx, request)
+	}
+	return b.store.TakeOverRunningTurnWithAnchorForOwner(ctx, request, machineID, leaseGeneration, turn.MachineID, turn.LeaseGeneration)
+}
+
+func unresolvedExecutionAnchorRequest(session Session, turn teamstore.Turn) teamstore.PersistInterruptedTurnWithAnchorRequest {
 	threadID := firstNonEmptyString(turn.CodexThreadID, session.CodexThreadID)
-	request := teamstore.PersistInterruptedTurnWithAnchorRequest{
+	return teamstore.PersistInterruptedTurnWithAnchorRequest{
 		SessionID:          strings.TrimSpace(session.ID),
 		TurnID:             strings.TrimSpace(turn.ID),
+		MachineID:          strings.TrimSpace(turn.MachineID),
+		LeaseGeneration:    turn.LeaseGeneration,
 		CheckpointID:       transcriptCheckpointID(session.ID),
 		CodexThreadID:      threadID,
 		CodexTurnID:        strings.TrimSpace(turn.CodexTurnID),
@@ -314,15 +352,6 @@ func (b *Bridge) persistUnresolvedExecutionAnchorForTurn(ctx context.Context, se
 			State:       executionAnchorStateUnresolved,
 		},
 	}
-	result, err := b.store.PersistInterruptedTurnWithAnchor(ctx, request)
-	if err != nil {
-		return result, err
-	}
-	// A durable terminal status alone is not app-server ownership proof.  The
-	// only automatic resolver is the typed outer-turn callback (or the
-	// app-server cancellation fence); ordinary callbacks must leave the anchor
-	// unresolved so an orphan continuation cannot be published.
-	return result, nil
 }
 
 func (b *Bridge) clearUnresolvedExecutionAnchorWithProof(ctx context.Context, proof executionAnchorProof) error {
@@ -374,7 +403,7 @@ func (b *Bridge) clearUnresolvedExecutionAnchorWithProof(ctx context.Context, pr
 	if turn.Status == teamstore.TurnStatusInterrupted && strings.TrimSpace(turn.RecoveryReason) != recoveryReasonCodexExecutionConfirmed && !isUnresolvedAmbiguousCodexRecoveryReason(turn.RecoveryReason) {
 		return nil
 	}
-	return b.store.ClearExecutionAnchorAndConfirmTurn(ctx, teamstore.ExecutionAnchorClearRequest{
+	clearRequest := teamstore.ExecutionAnchorClearRequest{
 		CheckpointID:       checkpointID,
 		SessionID:          proof.SessionID,
 		ThreadID:           proof.ThreadID,
@@ -388,7 +417,11 @@ func (b *Bridge) clearUnresolvedExecutionAnchorWithProof(ctx context.Context, pr
 		CutoffOffset:       proof.CutoffOffset,
 		RecoveryReasonFrom: turn.RecoveryReason,
 		RecoveryReasonTo:   recoveryReasonCodexExecutionConfirmed,
-	})
+	}
+	if strings.TrimSpace(turn.MachineID) != "" && turn.LeaseGeneration > 0 {
+		return b.store.ClearExecutionAnchorAndConfirmTurnForOwner(ctx, clearRequest, turn.MachineID, turn.LeaseGeneration)
+	}
+	return b.store.ClearExecutionAnchorAndConfirmTurn(ctx, clearRequest)
 }
 
 func (b *Bridge) reconcileExecutionFence(ctx context.Context, session Session) (bool, error) {
@@ -615,7 +648,7 @@ func (b *Bridge) observeUnresolvedExecutionAnchor(ctx context.Context, sessionID
 		return nil
 	}
 	checkpointID := transcriptCheckpointID(sessionID)
-	_, _, err := b.store.UpdateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, _ time.Time) (teamstore.ImportCheckpoint, bool, error) {
+	_, _, err := b.updateImportCheckpoint(ctx, checkpointID, func(current teamstore.ImportCheckpoint, _ bool, _ time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if !executionAnchorActive(current.UnresolvedExecution) {
 			return current, false, nil
 		}

@@ -372,7 +372,7 @@ func TestGraphDoesNotRetryPostServerErrors(t *testing.T) {
 	}
 }
 
-func TestGraphRetriesPostTooManyRequestsAfterRetryAfter(t *testing.T) {
+func TestGraphDoesNotRetryPostTooManyRequestsAfterRetryAfter(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	var attempts int
 	var sleeps []time.Duration
@@ -381,28 +381,58 @@ func TestGraphRetriesPostTooManyRequestsAfterRetryAfter(t *testing.T) {
 		if req.Method != http.MethodPost || req.URL.String() != "/chats/chat-1/messages" {
 			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
 		}
-		if attempts == 1 {
-			w.Header().Set("Retry-After", "2")
-			http.Error(w, `{"error":{"code":"TooManyRequests","message":"slow down"}}`, http.StatusTooManyRequests)
-			return
-		}
-		_, _ = w.Write([]byte(`{"id":"m1","messageType":"message"}`))
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"slow down"}}`, http.StatusTooManyRequests)
 	}))
 	defer server.Close()
 
 	graph := newTestGraphClient(auth, server, &sleeps)
-	msg, err := graph.SendHTML(context.Background(), "chat-1", "hello")
-	if err != nil {
-		t.Fatalf("SendHTML error: %v", err)
+	_, err := graph.SendHTML(context.Background(), "chat-1", "hello")
+	if err == nil {
+		t.Fatal("expected rate-limit error")
 	}
-	if msg.ID != "m1" {
-		t.Fatalf("sent message id = %q, want m1", msg.ID)
+	if attempts != 1 {
+		t.Fatalf("POST 429 attempts = %d, want 1", attempts)
 	}
-	if attempts != 2 {
-		t.Fatalf("POST 429 attempts = %d, want 2", attempts)
+	if len(sleeps) != 0 {
+		t.Fatalf("POST 429 sleeps = %v, want none", sleeps)
 	}
-	if len(sleeps) != 1 || sleeps[0] != 2*time.Second {
-		t.Fatalf("POST 429 sleeps = %v, want 2s", sleeps)
+}
+
+func TestGraphRejectsSuccessfulChatMessageWithoutID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body string
+	}{
+		{name: "empty-201", code: http.StatusCreated},
+		{name: "empty-object-201", code: http.StatusCreated, body: `{}`},
+		{name: "missing-id-201", code: http.StatusCreated, body: `{"messageType":"message"}`},
+		{name: "empty-204", code: http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := &fakeGraphAuth{token: "access"}
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				attempts++
+				if req.Method != http.MethodPost || req.URL.String() != "/chats/chat-1/messages" {
+					t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
+				}
+				w.WriteHeader(tc.code)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
+			}))
+			defer server.Close()
+
+			graph := newTestGraphClient(auth, server, nil)
+			if _, err := graph.SendHTML(context.Background(), "chat-1", "hello"); err == nil {
+				t.Fatal("successful response without Graph message id was accepted")
+			}
+			if attempts != 1 {
+				t.Fatalf("missing-id response attempts = %d, want one non-replayed POST", attempts)
+			}
+		})
 	}
 }
 
@@ -550,6 +580,7 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPost, "/chats/a/messages?$top=1"},
 		{http.MethodGet, "/chats/a/messages?$filter=createdDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/a/messages?$orderby=createdDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/a/messages?$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20ge%202026-05-01T00%3A00%3A00Z%20and%20lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
 	}
 	for _, tc := range rejected {
 		if isAllowedGraphRequest(tc.method, tc.path) {
@@ -581,6 +612,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
 		{http.MethodGet, "/me/drive/items/item-id?$select=id,name,size,eTag,webUrl,webDavUrl"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20ge%202026-04-30T00%3A00%3A00Z%20and%20lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/chat-id/messages?$top=20&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$skiptoken=abc123"},
 		{http.MethodPost, "/chats/chat-id/messages"},
 		{http.MethodPost, "/chats/chat-id/messages/replyWithQuote"},
@@ -1110,6 +1143,7 @@ func TestLiveJasonWeiSingleMemberChatValidation(t *testing.T) {
 
 func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
+	outboxID := "outbox:attachment:19:abc@thread.v2:final"
 	var sawUpload, sawMetadata, sawMessage bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1147,7 +1181,7 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 			if !strings.Contains(payload.Body.Content, `<attachment id="1176c944-0cb9-4304-974c-5837185efd6a"></attachment>`) {
 				t.Fatalf("message body missing attachment tag: %q", payload.Body.Content)
 			}
-			if !strings.Contains(payload.Body.Content, "<!-- codex-helper-outbox:outbox:attachment-1 -->") {
+			if !strings.Contains(payload.Body.Content, helperOutboxProvenanceMarker(outboxID)) {
 				t.Fatalf("message body missing helper provenance marker: %q", payload.Body.Content)
 			}
 			if !strings.Contains(payload.Body.Content, "Codex: attached") {
@@ -1175,7 +1209,7 @@ func TestGraphUploadAndSendDriveItemAttachment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetDriveItemMetadata error: %v", err)
 	}
-	msg, err := graph.SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(context.Background(), "chat-1", meta, "attached", "outbox:attachment-1")
+	msg, err := graph.SendDriveItemAttachmentWithProvenanceWithoutRateLimitRetry(context.Background(), "chat-1", meta, "attached", outboxID)
 	if err != nil {
 		t.Fatalf("SendDriveItemAttachment error: %v", err)
 	}

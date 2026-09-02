@@ -32,6 +32,25 @@ func TestParseCodexTranscriptPreservesUserAssistantOrder(t *testing.T) {
 	assertTranscriptRecord(t, got.Records[1], "assistant-1", "source:assistant-1", TranscriptKindAssistant, "hi", 3)
 }
 
+func TestReadSessionTranscriptAcceptsValidRecordWithoutFinalNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "no-final-newline.jsonl")
+	body := `{"type":"session_meta","payload":{"id":"no-final-newline"}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"final","type":"agent_message","phase":"final_answer","message":"complete"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	transcript, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript: %v", err)
+	}
+	if len(transcript.Records) != 1 || transcript.Records[0].Text != "complete" {
+		t.Fatalf("records = %#v, want one complete final", transcript.Records)
+	}
+	if len(transcript.Diagnostics) != 0 {
+		t.Fatalf("diagnostics = %#v, want no incomplete-tail diagnostic", transcript.Diagnostics)
+	}
+}
+
 func TestParseCodexTranscriptSupportsExecJSONLItemCompleted(t *testing.T) {
 	input := strings.Join([]string{
 		"Reading additional input from stdin...",

@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,90 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestHistoryWatchRebaseScanYieldsAcrossLargeSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-rebase-rollout.jsonl")
+	paddingLine := `{"type":"noop","padding":"` + strings.Repeat("x", 128) + `"}` + "\n"
+	filler := strings.Repeat(paddingLine, int(historyRebaseMaxScanBytesPerPass/int64(len(paddingLine)))+1024)
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-large-rebase","history_mode":"paginated"}}`,
+		strings.TrimSuffix(filler, "\n"),
+		`{"type":"response_item","payload":{"id":"large-rebase-final","type":"message","role":"assistant","turn_id":"turn-large-rebase","phase":"final_answer","content":[{"type":"output_text","text":"large rebase answer"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-large-rebase"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write large paginated rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat large paginated rollout: %v", err)
+	}
+	if info.Size() <= historyRebaseMaxScanBytesPerPass {
+		t.Fatalf("large rebase fixture size = %d, want greater than per-pass budget %d", info.Size(), historyRebaseMaxScanBytesPerPass)
+	}
+	store := newBridgeTestStore(t)
+	id := historyWatchCheckpointID(path)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SessionID:            "thread-large-rebase",
+			ThreadID:             "thread-large-rebase",
+			SourceRewriteBlocked: true,
+			LastFinalID:          "codex-final:v1:thread-large-rebase:turn-large-rebase:large-rebase-final",
+			LastFinalThreadID:    "thread-large-rebase",
+			LastFinalTurnID:      "turn-large-rebase",
+			LastFinalTextHash:    normalizedTextHash("large rebase answer"),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed large rebase checkpoint: %v", err)
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		// Recreate the bridge on every pass to prove the bounded rebase cursor is
+		// durable, rather than relying on the process-local scan map.
+		bridge := &Bridge{store: store}
+		if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now().Add(time.Duration(attempt+1)*time.Second)); err != nil {
+			t.Fatalf("large rebase scan attempt %d: %v", attempt+1, err)
+		}
+		state, err := store.HistoryWatchState(context.Background())
+		if err != nil {
+			t.Fatalf("load large rebase checkpoint after attempt %d: %v", attempt+1, err)
+		}
+		if !state.HistoryWatch[id].SourceRewriteBlocked {
+			checkpoint := state.HistoryWatch[id]
+			if checkpoint.Offset <= 0 || checkpoint.Offset >= info.Size() {
+				t.Fatalf("large rebase cursor after attempt %d = %#v, want anchor before EOF", attempt+1, checkpoint)
+			}
+			return
+		}
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load final large rebase checkpoint: %v", err)
+	}
+	t.Fatalf("large rebase did not complete in bounded passes: %#v", state.HistoryWatch[id])
+}
+
+func TestHistoryWatchRebaseScanHonorsCanceledContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "canceled-rebase-rollout.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"thread-canceled-rebase","history_mode":"paginated"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write canceled rebase rollout: %v", err)
+	}
+	source, ok, err := codexPaginatedHistoryFile(path, "thread-canceled-rebase")
+	if err != nil || !ok {
+		t.Fatalf("load canceled rebase source: ok=%v err=%v", ok, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = historyWatchRebaseAnchorScan(ctx, path, historyTieredFileState{SessionID: "thread-canceled-rebase", ThreadID: "thread-canceled-rebase"}, source, historyWatchRebaseScanProgress{SourceIdentity: source.Identity})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled rebase scan error = %v, want context.Canceled", err)
+	}
+}
 
 func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
@@ -39,6 +124,7 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 			Offset:               info.Size(),
 			SessionID:            "thread-rebase",
 			ThreadID:             "thread-rebase",
+			SourceGeneration:     "old-source-generation",
 			SourceRewriteBlocked: true,
 			LastFinalID:          oldFinalID,
 			LastFinalThreadID:    "thread-rebase",
@@ -75,6 +161,9 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 	}
 	if checkpoint.SourceFingerprint == "" {
 		t.Fatalf("rebase did not establish source fingerprint")
+	}
+	if checkpoint.SourceGeneration == "" || checkpoint.SourceGeneration == "old-source-generation" {
+		t.Fatalf("rebase did not establish the new source generation: %#v", checkpoint)
 	}
 	if len(state.OutboxMessages) != 0 {
 		t.Fatalf("rebase created delivery rows: %#v", state.OutboxMessages)
@@ -129,13 +218,16 @@ func TestHistoryWatchChangedPathsRechecksOnlyNewPaginatedIdentity(t *testing.T) 
 		t.Fatalf("candidate rollout has no stable identity: %q %v", identity, ok)
 	}
 	state.HistoryWatch[id] = teamstore.HistoryWatchCheckpoint{
-		ID:                            id,
-		Path:                          path,
-		Size:                          info.Size(),
-		ModTime:                       info.ModTime(),
-		ThreadID:                      "thread-candidate",
-		SourceRewriteBlocked:          true,
-		SourceRewriteRecoveryIdentity: identity,
+		ID:                              id,
+		Path:                            path,
+		Size:                            info.Size(),
+		ModTime:                         info.ModTime(),
+		ThreadID:                        "thread-candidate",
+		SourceRewriteBlocked:            true,
+		SourceRewriteRecoveryIdentity:   identity,
+		SourceRewriteRecoverySize:       info.Size(),
+		SourceRewriteRecoveryModTime:    info.ModTime(),
+		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTimeFromFileInfo(info),
 	}
 	changes, err = historyWatchChangedPaths([]string{path}, state, false)
 	if err != nil {
@@ -170,6 +262,7 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 		ID:                   checkpointID,
 		SessionID:            "session-import",
 		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
 		LastRecordID:         "source:last-record",
 		LastOffsetKnown:      true,
 		SourceRewriteBlocked: true,
@@ -197,6 +290,9 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 	}
 	if updated.SourceRewriteBlocked || updated.SourceFingerprint == "" || !updated.LastOffsetKnown {
 		t.Fatalf("linked checkpoint did not regain source proof: %#v", updated)
+	}
+	if updated.SourceGeneration == "" || updated.SourceGeneration == "old-source-generation" {
+		t.Fatalf("linked rebase did not establish the new source generation: %#v", updated)
 	}
 	if updated.Status != importCheckpointStatusImporting || !updated.CompletionPending {
 		t.Fatalf("completion recovery phase changed unexpectedly: %#v", updated)
@@ -271,6 +367,111 @@ func TestSourceRewriteRebaseRecordsMissingAnchorOncePerFileIdentity(t *testing.T
 	second := state.HistoryWatch[id]
 	if second.SourceRewriteRecoveryIdentity != first.SourceRewriteRecoveryIdentity || !second.SourceRewriteBlocked {
 		t.Fatalf("repeat recovery changed durable fence: first=%#v second=%#v", first, second)
+	}
+}
+
+func TestSourceRewriteRebaseRetriesAfterSameInodeRepair(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "same-inode-repair.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-same-inode","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"old-final","type":"message","role":"assistant","turn_id":"turn-1","phase":"final_answer","content":[{"type":"output_text","text":"old answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write same-inode rollout: %v", err)
+	}
+	infoBefore, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat same-inode rollout: %v", err)
+	}
+	id := historyWatchCheckpointID(path)
+	store := newBridgeTestStore(t)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 infoBefore.Size(),
+			ModTime:              infoBefore.ModTime(),
+			Offset:               infoBefore.Size(),
+			SessionID:            "thread-same-inode",
+			ThreadID:             "thread-same-inode",
+			SourceRewriteBlocked: true,
+			LastFinalThreadID:    "thread-same-inode",
+			LastFinalTurnID:      "turn-1",
+			LastFinalTextHash:    normalizedTextHash("new answer"),
+			TerminalBoundarySeen: true,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed same-inode checkpoint: %v", err)
+	}
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("first same-inode recovery: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load first same-inode checkpoint: %v", err)
+	}
+	first := state.HistoryWatch[id]
+	if !first.SourceRewriteBlocked || first.SourceRewriteRecoveryIdentity == "" || first.SourceRewriteRecoverySize != infoBefore.Size() {
+		t.Fatalf("first same-inode recovery did not persist the retry snapshot: %#v", first)
+	}
+
+	oldText := []byte("old answer")
+	newText := []byte("new answer")
+	if len(oldText) != len(newText) {
+		t.Fatalf("same-inode fixture text lengths differ")
+	}
+	answerOffset := int64(strings.Index(content, string(oldText)))
+	if answerOffset < 0 {
+		t.Fatalf("find same-inode answer")
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open same-inode rollout for repair: %v", err)
+	}
+	if _, err := file.WriteAt(newText, answerOffset); err != nil {
+		_ = file.Close()
+		t.Fatalf("repair same-inode rollout: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("sync same-inode rollout repair: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close same-inode rollout repair: %v", err)
+	}
+	if err := os.Chtimes(path, infoBefore.ModTime().Add(time.Second), infoBefore.ModTime().Add(time.Second)); err != nil {
+		t.Fatalf("mark same-inode rollout changed: %v", err)
+	}
+	infoAfter, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat repaired same-inode rollout: %v", err)
+	}
+	if !os.SameFile(infoBefore, infoAfter) || infoAfter.Size() != infoBefore.Size() {
+		t.Fatalf("repair changed source identity or size: before=%#v after=%#v", infoBefore, infoAfter)
+	}
+
+	changed, err := historyWatchChangedPaths([]string{path}, state, false)
+	if err != nil {
+		t.Fatalf("detect same-inode repair: %v", err)
+	}
+	if len(changed) != 1 || cleanComparablePath(changed[0]) != cleanComparablePath(path) {
+		t.Fatalf("same-inode repair was not scheduled for rebase: %#v", changed)
+	}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("retry same-inode recovery: %v", err)
+	}
+	state, err = store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load repaired same-inode checkpoint: %v", err)
+	}
+	updated := state.HistoryWatch[id]
+	if updated.SourceRewriteBlocked || updated.SourceRewriteRecoveryIdentity != "" {
+		t.Fatalf("same-inode repair did not clear the rebase fence: %#v", updated)
+	}
+	if updated.LastFinalTextHash != normalizedTextHash("new answer") || updated.Offset <= 0 {
+		t.Fatalf("same-inode repair did not recover the expected final boundary: %#v", updated)
 	}
 }
 

@@ -2,7 +2,6 @@ package teams
 
 import (
 	"context"
-	"errors"
 	"os"
 	"testing"
 	"time"
@@ -10,10 +9,34 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
-// Listen claims the control lease before recording the first service owner
-// heartbeat.  A startup error at that boundary must not leave the lease held
-// by a process that never became an owner, or every later service will remain
-// in standby until the lease expires.
+func TestAsyncTurnLifecycleSignalDoesNotMisclassifyRequestCancellation(t *testing.T) {
+	bridge := &Bridge{}
+	generation := bridge.beginAsyncTurnLifecycle(time.Second)
+	bridge.asyncTurnStateMu.Lock()
+	stopSignal := bridge.asyncTurnLifecycleStop
+	bridge.asyncTurnStateMu.Unlock()
+	if stopSignal == nil {
+		t.Fatal("listener lifecycle did not create a stop signal")
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	workerCtx := withTeamsAsyncTurnLifecycleContext(requestCtx, stopSignal)
+	cancelRequest()
+	if bridge.asyncTurnLifecycleStoppedForContext(workerCtx) {
+		t.Fatal("request-scoped cancellation was classified as listener shutdown")
+	}
+
+	bridge.markAsyncTurnLifecycleStopping(generation)
+	if !bridge.asyncTurnLifecycleStoppedForContext(workerCtx) {
+		t.Fatal("listener generation stop was not visible to an admitted worker")
+	}
+	bridge.stopAsyncTurnLifecycle(generation)
+}
+
+// A pre-generation owner row without lease history is still a live ownership
+// witness.  Listen must remain in standby rather than claiming first and
+// relying on a later heartbeat conflict; neither path may leave a new lease
+// behind or overwrite the legacy owner.
 func TestBridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails(t *testing.T) {
 	isolateTeamsUserDirsForTest(t, t.TempDir())
 	store := newBridgeTestStore(t)
@@ -46,9 +69,8 @@ func TestBridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails(t *te
 		Executor:        EchoExecutor{},
 		HelperVersion:   "initial-heartbeat-failure",
 	})
-	var ownerConflict *teamstore.OwnerConflictError
-	if !errors.As(err, &ownerConflict) {
-		t.Fatalf("Listen error = %v, want initial owner heartbeat conflict", err)
+	if err != nil {
+		t.Fatalf("Listen with fresh legacy owner = %v, want clean Once standby return", err)
 	}
 	state, loadErr := store.Load(context.Background())
 	if loadErr != nil {
@@ -64,9 +86,9 @@ func TestBridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails(t *te
 		t.Fatalf("failed listener overwrote the previous lock owner: got=%#v want=%#v", state.LockOwner, previous)
 	}
 
-	// The failed listener must not leave the next legitimate owner waiting for
-	// the leaked lease to expire. Exercise the same store-level acquisition
-	// path used by a replacement bridge rather than only inspecting the row.
+	// A second process must also remain standby while the legacy owner is fresh.
+	// Once that owner is stale, the same store-level acquisition path must allow
+	// a legitimate replacement without waiting on a leaked lease.
 	replacementMachine := bridge.machine
 	replacementMachine.ID += "-replacement"
 	replacementOwner, ownerErr := teamstore.CurrentOwner("replacement-owner", "", "", now.Add(time.Second))
@@ -86,8 +108,21 @@ func TestBridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails(t *te
 	if claimErr != nil {
 		t.Fatalf("replacement control lease claim: %v", claimErr)
 	}
+	if decision.Mode != teamstore.LeaseModeStandby {
+		t.Fatalf("fresh-owner replacement decision = %#v, want standby", decision)
+	}
+	decision, claimErr = store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
+		Scope:    bridge.scope,
+		Machine:  replacementMachine,
+		Owner:    replacementOwner,
+		Duration: time.Minute,
+		Now:      now.Add(2 * time.Minute),
+	})
+	if claimErr != nil {
+		t.Fatalf("stale legacy owner replacement claim: %v", claimErr)
+	}
 	if decision.Mode != teamstore.LeaseModeActive || decision.Lease.HolderMachineID != replacementMachine.ID {
-		t.Fatalf("replacement control lease decision = %#v, want immediate active takeover", decision)
+		t.Fatalf("stale-owner replacement control lease decision = %#v, want active takeover", decision)
 	}
 	if released, releaseErr := store.ReleaseControlLeaseIfHolder(context.Background(), replacementMachine.ID, decision.Lease.Generation); releaseErr != nil || !released {
 		t.Fatalf("release replacement control lease: released=%v err=%v", released, releaseErr)

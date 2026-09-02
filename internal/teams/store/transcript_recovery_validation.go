@@ -181,8 +181,15 @@ func validateHistoryWatchCheckpointState(checkpoint HistoryWatchCheckpoint, id s
 		checkpoint.PartialLineStartOffset < 0 || checkpoint.PartialReadOffset < 0 ||
 		checkpoint.PartialObservedSize < 0 || checkpoint.PartialLine < 0 ||
 		checkpoint.PendingAssistantSourceLine < 0 || checkpoint.PendingAssistantStartOffset < 0 ||
-		checkpoint.PendingAssistantOffset < 0 {
+		checkpoint.PendingAssistantOffset < 0 || checkpoint.SourceRewriteRecoveryScanOffset < 0 ||
+		checkpoint.SourceRewriteRecoveryScanLine < 0 {
 		return fmt.Errorf("%w: history-watch row %q has a negative cursor", ErrSessionStateProvenanceMismatch, id)
+	}
+	if checkpoint.SourceRewriteRecoveryScanPending {
+		if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) == "" ||
+			checkpoint.SourceRewriteRecoverySize <= 0 || checkpoint.SourceRewriteRecoveryModTime.IsZero() {
+			return fmt.Errorf("%w: history-watch row %q has an unbound rebase scan cursor", ErrSessionStateProvenanceMismatch, id)
+		}
 	}
 	if checkpoint.PartialReadOffset > 0 && checkpoint.PartialReadOffset < checkpoint.PartialLineStartOffset {
 		return fmt.Errorf("%w: history-watch row %q partial cursor precedes line start", ErrSessionStateProvenanceMismatch, id)

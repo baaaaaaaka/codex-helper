@@ -21,9 +21,14 @@ const (
 	continuationFailureBudget         = 3
 	continuationFailureMaxAge         = 10 * time.Minute
 	continuationHistoryLimit          = 8
+	continuationPageBudget            = 64
 	maxOversizedRecordRefetchAttempts = 3
-	maxPendingPageBytes               = 16 << 20
-	maxPendingRecordBytes             = 12 << 20
+	// Graph message responses are bounded by maxGraphMessagesResponseBytes. Keep the durable
+	// page receipt at the same bound so a valid response containing several
+	// large (but individually recoverable) records is not turned into a
+	// permanent gap retry merely because the receipt used a smaller limit.
+	maxPendingPageBytes   = 64 << 20
+	maxPendingRecordBytes = 12 << 20
 )
 
 var (
@@ -142,6 +147,7 @@ func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, w
 		FrontierEpoch:      epoch,
 		BaselineOnly:       baselineOnly,
 		NextPath:           strings.TrimSpace(window.NextPath),
+		BoundaryReason:     trimPollDiagnostic(window.boundaryReason),
 		ReceivedAt:         time.Now().UTC(),
 	}
 	seen := make(map[string]string, len(window.Messages))
@@ -170,6 +176,10 @@ func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, w
 		disposition := "received"
 		if msg.oversizedForPoll {
 			disposition = "oversized_record"
+		} else if msg.invalidForPoll {
+			disposition = "invalid_record"
+		} else if msg.quarantinedForPoll {
+			disposition = "invalid_record_quarantined"
 		}
 		page.Dispositions = append(page.Dispositions, disposition)
 		total += int64(len(raw))
@@ -187,6 +197,9 @@ func pendingPageReceiptID(page *teamstore.ChatPollPendingPage) string {
 	}
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%t\x00%s", page.ChatID, page.RequestPath, page.Frontier, page.FrontierEpoch, page.BaselineOnly, page.NextPath)
+	if boundary := strings.TrimSpace(page.BoundaryReason); boundary != "" {
+		_, _ = fmt.Fprintf(h, "\x00boundary=%s", boundary)
+	}
 	for i := range page.RecordIDs {
 		if i < len(page.RecordHashes) {
 			disposition := "received"
@@ -318,7 +331,12 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 		(len(page.Dispositions) != 0 || legacyPendingPageReceiptID(page) != page.ReceiptID) {
 		return MessageWindow{}, fmt.Errorf("%w: receipt changed", errPendingPageIdentity)
 	}
-	window := MessageWindow{Truncated: strings.TrimSpace(page.NextPath) != "", NextPath: strings.TrimSpace(page.NextPath), baselineOnly: page.BaselineOnly}
+	window := MessageWindow{
+		Truncated:      strings.TrimSpace(page.NextPath) != "",
+		NextPath:       strings.TrimSpace(page.NextPath),
+		baselineOnly:   page.BaselineOnly,
+		boundaryReason: strings.TrimSpace(page.BoundaryReason),
+	}
 	for i, raw := range page.Records {
 		if len(raw) > maxPendingRecordBytes {
 			return MessageWindow{}, fmt.Errorf("%w: record %d is too large", errPendingPageTooLarge, i)
@@ -339,7 +357,9 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 			case "received":
 			case "oversized_record":
 				msg.oversizedForPoll = true
-			case "oversized_record_quarantined":
+			case "invalid_record":
+				msg.invalidForPoll = true
+			case "oversized_record_quarantined", "invalid_record_quarantined":
 				msg.quarantinedForPoll = true
 			default:
 				return MessageWindow{}, fmt.Errorf("%w: record %d has unknown disposition %q", errPendingPageInvalid, i, page.Dispositions[i])
@@ -351,12 +371,12 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 }
 
 // notePendingPageRefetchFailure records a failure for one already-identified
-// oversized record. It never changes a normal record into a skipped record.
+// exceptional record. It never changes a normal record into a skipped record.
 // Once the bounded recovery budget is exhausted, only that record is marked
 // quarantined; the rest of the immutable page remains replayable.
 func notePendingPageRefetchFailure(page *teamstore.ChatPollPendingPage, messageID string) (bool, error) {
 	if page == nil || strings.TrimSpace(messageID) == "" {
-		return false, fmt.Errorf("%w: oversized record identity is missing", errPendingPageInvalid)
+		return false, fmt.Errorf("%w: exceptional record identity is missing", errPendingPageInvalid)
 	}
 	index := -1
 	for i, id := range page.RecordIDs {
@@ -366,10 +386,14 @@ func notePendingPageRefetchFailure(page *teamstore.ChatPollPendingPage, messageI
 		}
 	}
 	if index < 0 || index >= len(page.Records) {
-		return false, fmt.Errorf("%w: oversized record %q is not in the pending page", errPendingPageIdentity, messageID)
+		return false, fmt.Errorf("%w: exceptional record %q is not in the pending page", errPendingPageIdentity, messageID)
 	}
-	if len(page.Dispositions) != len(page.Records) || strings.TrimSpace(page.Dispositions[index]) != "oversized_record" {
-		return false, fmt.Errorf("%w: record %q is not a retryable oversized record", errPendingPageIdentity, messageID)
+	if len(page.Dispositions) != len(page.Records) {
+		return false, fmt.Errorf("%w: refetch failure metadata length mismatch", errPendingPageInvalid)
+	}
+	disposition := strings.TrimSpace(page.Dispositions[index])
+	if disposition != "oversized_record" && disposition != "invalid_record" {
+		return false, fmt.Errorf("%w: record %q is not a retryable exceptional record", errPendingPageIdentity, messageID)
 	}
 	if len(page.RefetchFailures) == 0 {
 		page.RefetchFailures = make([]int, len(page.Records))
@@ -378,7 +402,11 @@ func notePendingPageRefetchFailure(page *teamstore.ChatPollPendingPage, messageI
 	}
 	page.RefetchFailures[index]++
 	if page.RefetchFailures[index] >= maxOversizedRecordRefetchAttempts {
-		page.Dispositions[index] = "oversized_record_quarantined"
+		if disposition == "invalid_record" {
+			page.Dispositions[index] = "invalid_record_quarantined"
+		} else {
+			page.Dispositions[index] = "oversized_record_quarantined"
+		}
 		page.ReceiptID = pendingPageReceiptID(page)
 	}
 	return true, nil
@@ -425,6 +453,16 @@ func pollPageRequestForState(chatID string, top int, role inboundPollRole, poll 
 			if strings.TrimSpace(poll.ContinuationPath) != "" {
 				return pollFrontierContinuation, strings.TrimSpace(poll.ContinuationPath), time.Time{}
 			}
+			if poll.Gap.HeadProbePending {
+				// A terminal empty recovery page does not prove that a newly
+				// appended message is absent. Take a bounded normal-head sample
+				// while retaining the old gap for later recovery.
+				modifiedAfter := poll.LastModifiedCursor
+				if !modifiedAfter.IsZero() {
+					modifiedAfter = modifiedAfter.Add(-pollCursorOverlap)
+				}
+				return pollFrontierHead, chatMessagesPath(chatID, top, modifiedAfter), modifiedAfter
+			}
 			// An open gap with no opaque recovery path still owns the
 			// next head request. It must use RecoveryCursor and remain
 			// labelled as gap recovery so SafeCursor is never advanced.
@@ -435,18 +473,20 @@ func pollPageRequestForState(chatID string, top int, role inboundPollRole, poll 
 	}
 	var modifiedAfter time.Time
 	if poll.Gap != nil {
-		modifiedAfter = poll.Gap.RecoveryCursor
+		modifiedAfter = poll.Gap.SafeCursor
 	} else {
 		modifiedAfter = poll.LastModifiedCursor
 	}
-	if !modifiedAfter.IsZero() {
+	if !modifiedAfter.IsZero() && poll.Gap == nil {
 		modifiedAfter = modifiedAfter.Add(-pollCursorOverlap)
 	}
 	if role == inboundPollRoleWork && poll.Gap != nil {
-		// Gap recovery is deliberately low-volume. A smaller head makes a
-		// single huge image/tool payload isolatable and lets later messages
-		// become visible without increasing the normal polling limit.
-		return pollFrontierGap, chatMessagesExactTopPath(chatID, 1, modifiedAfter), modifiedAfter
+		// Graph v1.0 supports descending lastModifiedDateTime ordering only. The
+		// durable RecoveryCursor is an inclusive upper bound that moves toward
+		// SafeCursor after a complete page, so an expired opaque continuation can
+		// still be recovered without an unsupported ascending request, repeated
+		// newest pages, or a skipped older suffix.
+		return pollFrontierGap, chatMessagesGapPath(chatID, ownerPollMessageTop, poll.Gap.SafeCursor, poll.Gap.RecoveryCursor), modifiedAfter
 	}
 	return pollFrontierHead, chatMessagesPath(chatID, top, modifiedAfter), modifiedAfter
 }
@@ -477,6 +517,15 @@ func reducePollFrontier(poll teamstore.ChatPollState) (teamstore.ChatPollState, 
 		poll.FrontierEpoch = normalizeFrontierEpochForPoll(poll) + 1
 		return poll, true
 	}
+	if strings.TrimSpace(poll.ContinuationPath) == "" && strings.TrimSpace(poll.DeferredContinuationPath) == "" && !poll.ContinuationSafeCursor.IsZero() {
+		poll.ContinuationSafeCursor = time.Time{}
+		poll.ContinuationSafeCursorKnown = false
+		return poll, true
+	}
+	if strings.TrimSpace(poll.ContinuationPath) == "" && strings.TrimSpace(poll.DeferredContinuationPath) == "" && poll.ContinuationSafeCursorKnown {
+		poll.ContinuationSafeCursorKnown = false
+		return poll, true
+	}
 	return poll, changed
 }
 
@@ -490,6 +539,10 @@ func trimContinuationHistory(values []string) []string {
 // normalizePollFrontier persists reducePollFrontier before any Graph request.
 // No network call occurs while the durable state has two operational lanes.
 func normalizePollFrontier(ctx context.Context, store *teamstore.Store, chatID string) (teamstore.ChatPollState, bool, error) {
+	return normalizePollFrontierForOwner(ctx, store, chatID, "", 0)
+}
+
+func normalizePollFrontierForOwner(ctx context.Context, store *teamstore.Store, chatID, machineID string, leaseGeneration int64) (teamstore.ChatPollState, bool, error) {
 	if store == nil {
 		return teamstore.ChatPollState{}, false, fmt.Errorf("teams store is required")
 	}
@@ -500,10 +553,24 @@ func normalizePollFrontier(ctx context.Context, store *teamstore.Store, chatID s
 	if !ok {
 		return poll, ok, nil
 	}
+	// Do not even start a compatibility rewrite while a poll attempt is live.
+	// The callback below repeats this check inside the store transaction for the
+	// read/modify race, but this fast path avoids an unnecessary durable-state
+	// round trip on the normal in-flight path.
+	if poll.Attempt != nil {
+		return poll, ok, nil
+	}
 	if _, changed := reducePollFrontier(poll); !changed {
 		return poll, ok, nil
 	}
-	updated, changed, err := store.UpdateChatPoll(ctx, chatID, func(current *teamstore.ChatPollState) error {
+	mutate := func(current *teamstore.ChatPollState) error {
+		// If another poller has already acquired the row, never retire its live
+		// attempt while reducing the legacy P/D representation. The next cycle
+		// will normalize after that attempt commits or is abandoned. Live callers
+		// additionally fence this mutation to their control lease.
+		if current.Attempt != nil {
+			return nil
+		}
 		normalized, changed := reducePollFrontier(*current)
 		if changed {
 			*current = normalized
@@ -514,7 +581,14 @@ func normalizePollFrontier(ctx context.Context, store *teamstore.Store, chatID s
 			current.Attempt = nil
 		}
 		return nil
-	})
+	}
+	var updated teamstore.ChatPollState
+	var changed bool
+	if strings.TrimSpace(machineID) != "" && leaseGeneration > 0 {
+		updated, changed, err = store.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, mutate)
+	} else {
+		updated, changed, err = store.UpdateChatPoll(ctx, chatID, mutate)
+	}
 	if err != nil {
 		return teamstore.ChatPollState{}, false, err
 	}
@@ -622,6 +696,14 @@ func (b *Bridge) commitPollAttemptFailureInternal(ctx context.Context, chatID, a
 				if source == pollFrontierContinuation {
 					openPollGap(poll, "unverified-continuation", message, path, now)
 				} else {
+					// The first failure of an opaque recovery link should fall back to
+					// the durable time-bounded gap query. That is a different,
+					// provider-supported frontier and makes records behind an expired
+					// nextLink reachable. Only a failure of that fallback, or an
+					// explicitly detected no-progress condition, should schedule a
+					// normal head probe; probing the head here could bypass the old
+					// suffix and leave the gap unrecovered.
+					hadOpaqueRecoveryPath := poll.Gap != nil && strings.TrimSpace(poll.Gap.RecoveryPath) != ""
 					// A recovery path can itself be stale or self-looping. Keep the
 					// gap and its SafeCursor, but discard only this bad recovery
 					// path so the next quantum can try the directional recovery
@@ -633,6 +715,12 @@ func (b *Bridge) commitPollAttemptFailureInternal(ctx context.Context, chatID, a
 					if poll.Gap != nil {
 						poll.Gap.RecoveryPath = ""
 						poll.Gap.LastProgressAt = now
+						// The opaque recovery cursor has been exhausted. Mark the
+						// next action explicitly as a bounded head probe; otherwise
+						// pollPageRequestForState reconstructs the same gap query on
+						// every retry and a provider that repeats that page can make
+						// the directional frontier permanently livelock.
+						poll.Gap.HeadProbePending = noProgress || !hadOpaqueRecoveryPath
 					}
 				}
 			}
@@ -684,6 +772,15 @@ func (b *Bridge) commitPollAttemptPartialInternal(ctx context.Context, chatID, a
 		return b.store.CommitChatPollAttempt(ctx, chatID, attemptID, expectedRevision, fn)
 	}
 	_, committed, err := commit(func(poll *teamstore.ChatPollState) error {
+		if err := persistPollRefetchedMessages(poll.PendingPage, result.RefetchedMessages); err != nil {
+			return err
+		}
+		// A partial commit is still a successfully serviced poll quantum. The
+		// page remains pending when the action budget is exhausted, but the
+		// durable service-age must advance so a continuously due chat cannot keep
+		// winning the same cycle cap and starve another chat behind it.
+		clearChatPollRecoveryMarker(poll)
+		poll.LastSuccessfulPollAt = now
 		if result.ActivityAt.After(poll.LastActivityAt) {
 			poll.LastActivityAt = result.ActivityAt
 		}
@@ -714,6 +811,60 @@ func (b *Bridge) commitPollAttemptPartialInternal(ctx context.Context, chatID, a
 	return committed, nil
 }
 
+// persistPollRefetchedMessages upgrades exceptional records in the durable
+// pending receipt after their individual item fetch succeeds. The list-page
+// marker remains the only fallback when a recovered item is too large for the
+// bounded receipt; in that exceptional case the next quantum will safely
+// re-fetch it rather than storing an incomplete user prompt.
+func persistPollRefetchedMessages(page *teamstore.ChatPollPendingPage, messages []ChatMessage) error {
+	if page == nil || len(messages) == 0 {
+		return nil
+	}
+	if len(page.Records) != len(page.RecordIDs) || len(page.Records) != len(page.RecordHashes) || len(page.Dispositions) != len(page.Records) {
+		return fmt.Errorf("%w: refetched receipt metadata length mismatch", errPendingPageInvalid)
+	}
+	changed := false
+	for _, message := range messages {
+		messageID := strings.TrimSpace(message.ID)
+		if messageID == "" {
+			return fmt.Errorf("%w: refetched message has no stable id", errPendingPageIdentity)
+		}
+		index := -1
+		for i, id := range page.RecordIDs {
+			if strings.TrimSpace(id) == messageID {
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return fmt.Errorf("%w: refetched message %q is not in the pending page", errPendingPageIdentity, messageID)
+		}
+		currentDisposition := strings.TrimSpace(page.Dispositions[index])
+		if currentDisposition != "oversized_record" && currentDisposition != "invalid_record" {
+			continue
+		}
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return fmt.Errorf("%w: marshal refetched message %q: %v", errPendingPageInvalid, messageID, err)
+		}
+		if len(raw) > maxPendingRecordBytes {
+			continue
+		}
+		hash := sha256.Sum256(raw)
+		page.Records[index] = json.RawMessage(raw)
+		page.RecordHashes[index] = hex.EncodeToString(hash[:])
+		page.Dispositions[index] = "received"
+		if len(page.RefetchFailures) == len(page.Records) {
+			page.RefetchFailures[index] = 0
+		}
+		changed = true
+	}
+	if changed {
+		page.ReceiptID = pendingPageReceiptID(page)
+	}
+	return nil
+}
+
 func (b *Bridge) commitPollAttemptSuccess(ctx context.Context, chatID, attemptID string, expectedRevision uint64, role inboundPollRole, running bool, source, path string, window MessageWindow, result pollMessageWindowResult, quarantine bool) (bool, error) {
 	return b.commitPollAttemptSuccessInternal(ctx, chatID, attemptID, nil, expectedRevision, role, running, source, path, window, result, quarantine)
 }
@@ -725,9 +876,14 @@ func (b *Bridge) commitPollAttemptSuccessWithCapability(ctx context.Context, cha
 func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, attemptID string, capability *teamstore.ChatPollAttemptCapability, expectedRevision uint64, role inboundPollRole, running bool, source, path string, window MessageWindow, result pollMessageWindowResult, quarantine bool) (bool, error) {
 	now := time.Now()
 	apply := func(poll *teamstore.ChatPollState) error {
+		clearChatPollRecoveryMarker(poll)
 		hadDeferredContinuation := strings.TrimSpace(poll.DeferredContinuationPath) != ""
+		previousSafeCursor := poll.LastModifiedCursor
 		pendingPage := poll.PendingPage
 		pageFingerprint := pendingPageContentFingerprint(pendingPage)
+		boundaryReason := strings.TrimSpace(window.boundaryReason)
+		continuationPage := (source == pollFrontierContinuation || source == pollFrontierGap) &&
+			window.Truncated && strings.TrimSpace(window.NextPath) != ""
 		poll.PendingPage = nil
 		poll.Seeded = true
 		poll.LastSuccessfulPollAt = now
@@ -740,6 +896,13 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 		poll.ContinuationLastFailureAt = time.Time{}
 		poll.ContinuationLastPath = ""
 		poll.ContinuationNoProgressCount = 0
+		if continuationPage {
+			poll.ContinuationPageCount++
+		} else {
+			// A head request starts a fresh lane, and a terminal page has drained
+			// the current lane. Do not carry an old budget into unrelated work.
+			poll.ContinuationPageCount = 0
+		}
 		if result.ActivityAt.After(poll.LastActivityAt) {
 			poll.LastActivityAt = result.ActivityAt
 		}
@@ -747,7 +910,11 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 		// A compatibility D frontier may contain newer work whose ownership is
 		// unresolved. Completing the older P page must not move SafeCursor past
 		// that frontier, or a subsequent head read could skip its claim.
-		if result.MaxModified.After(poll.LastModifiedCursor) && source != pollFrontierGap && !hadDeferredContinuation {
+		// A head probe taken while a directional gap is open is only a bounded
+		// sample.  It must not advance the normal cursor: doing so can skip the
+		// older continuation page when the probe itself is truncated.
+		headProbeWithGap := source == pollFrontierHead && poll.Gap != nil
+		if result.MaxModified.After(poll.LastModifiedCursor) && source != pollFrontierGap && !hadDeferredContinuation && !headProbeWithGap && boundaryReason == "" {
 			poll.LastModifiedCursor = result.MaxModified
 		}
 		if quarantine && role == inboundPollRoleWork {
@@ -762,23 +929,79 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 			poll.ContinuationPath = ""
 			poll.DeferredContinuationPath = ""
 			poll.Gap = nil
+		} else if boundaryReason != "" && !window.baselineOnly {
+			// The records in this page were usable, but its continuation was not.
+			// Keep the normal cursor at the predecessor boundary and put the page's
+			// observed upper bound in the directional gap. This may re-read the
+			// handled page during recovery, but the inbound ledger makes that safe;
+			// advancing past it would make the unknown older suffix unreachable.
+			if poll.Gap == nil {
+				poll.LastModifiedCursor = previousSafeCursor
+				openPollGap(poll, "invalid-next-link", boundaryReason, path, now)
+				if poll.Gap != nil && result.MaxModified.After(poll.Gap.RecoveryCursor) {
+					poll.Gap.RecoveryCursor = result.MaxModified
+				}
+			} else {
+				// A bounded head probe can encounter a new invalid continuation while
+				// an older gap is already open. Retain that gap and schedule another
+				// probe; do not replace its safe cursor with the new page.
+				poll.Gap.RecoveryPath = ""
+				poll.Gap.LastProgressAt = now
+				poll.Gap.HeadProbePending = true
+			}
 		} else if source == pollFrontierGap {
 			if poll.Gap == nil {
 				poll.Gap = &teamstore.ChatPollGap{Epoch: 1, SafeCursor: poll.LastModifiedCursor, RecoveryCursor: poll.LastModifiedCursor, OpenedAt: now}
 			}
-			if result.MaxModified.After(poll.Gap.RecoveryCursor) {
-				poll.Gap.RecoveryCursor = result.MaxModified
+			// Recovery pages are fetched newest-first because Graph does not
+			// support ascending order. Move the durable upper bound to the oldest
+			// record in a fully handled page; the next fallback query can then reach
+			// the older suffix instead of asking for the same newest page again.
+			if !result.MinModified.IsZero() &&
+				(poll.Gap.RecoveryCursor.IsZero() || result.MinModified.Before(poll.Gap.RecoveryCursor)) {
+				poll.Gap.RecoveryCursor = result.MinModified
 			}
 			if window.Truncated {
 				poll.Gap.RecoveryPath = strings.TrimSpace(window.NextPath)
-			} else {
+			} else if result.Progressed && !result.MinModified.IsZero() {
+				poll.Gap.HeadProbePending = false
 				poll.Gap.RecoveryPath = ""
 				if strings.TrimSpace(poll.DeferredContinuationPath) != "" {
 					poll.ContinuationPath = strings.TrimSpace(poll.DeferredContinuationPath)
 					poll.DeferredContinuationPath = ""
 					poll.FrontierEpoch = normalizeFrontierEpochForPoll(*poll) + 1
+					poll.Gap = nil
+				} else {
+					// A terminal bounded recovery page is proof that the current
+					// unresolved time range has been enumerated. Release only this
+					// directional gap; the normal cursor remains unchanged and the
+					// next head poll will still discover newer records.
+					poll.Gap = nil
 				}
+			} else {
+				// An empty/deduplicated page has no durable lower bound. Do not
+				// treat it as proof that the unresolved interval was enumerated:
+				// provider filtering, clock precision, or a transient empty page
+				// could otherwise make later records unreachable. Retain the gap,
+				// clear only the opaque path, and let the scheduler back off before
+				// taking another bounded recovery-head sample.
+				poll.Gap.RecoveryPath = ""
+				poll.Gap.LastProgressAt = now
+				poll.Gap.HeadProbePending = true
 			}
+		} else if source == pollFrontierHead && poll.Gap != nil {
+			// This is the bounded head sample scheduled after an empty gap
+			// response. Keep the older gap, but consume this one-shot probe so
+			// the next quantum returns to the directional recovery lane.
+			if window.Truncated && strings.TrimSpace(window.NextPath) != "" {
+				// The head response has an older page that belongs to the open
+				// gap. Preserve that opaque path as the next recovery request;
+				// dropping it here would make a deduplicated head sample look
+				// complete and permanently hide an actionable older message.
+				poll.Gap.RecoveryPath = strings.TrimSpace(window.NextPath)
+				poll.Gap.LastProgressAt = now
+			}
+			poll.Gap.HeadProbePending = false
 		} else if window.baselineOnly {
 			// Initial discovery establishes the boundary but must not walk older
 			// Graph pages. This matches the pre-receipt seed semantics and keeps a
@@ -788,6 +1011,14 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 		} else {
 			if window.Truncated {
 				poll.ContinuationPath = strings.TrimSpace(window.NextPath)
+				if source == pollFrontierHead && strings.TrimSpace(window.NextPath) != "" {
+					// The head response may have advanced LastModifiedCursor to its
+					// newest item while its older continuation is still pending. If
+					// that opaque path later expires, recovery must overlap from the
+					// cursor that preceded this page rather than skipping the failed
+					// page's older records.
+					poll.ContinuationSafeCursor = previousSafeCursor
+				}
 			} else {
 				poll.ContinuationPath = ""
 				if strings.TrimSpace(poll.DeferredContinuationPath) != "" {
@@ -797,11 +1028,38 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 				}
 			}
 		}
+		if continuationPage && poll.ContinuationPageCount >= continuationPageBudget {
+			if source == pollFrontierContinuation {
+				// A long/rotating nextLink cycle can evade the bounded in-memory
+				// history. Open the directional gap at the last safe cursor instead
+				// of retrying the same opaque lane forever. The current page has
+				// already been handled; only the unreachable continuation is held.
+				openPollGap(poll, "continuation-page-budget", "continuation page budget exhausted", path, now)
+			} else if poll.Gap != nil {
+				// Gap recovery has its own safe cursor. Drop only the opaque
+				// recovery path and let the next scheduled recovery-head sample
+				// continue independently.
+				poll.Gap.RecoveryPath = ""
+				poll.Gap.LastProgressAt = now
+				// Page-budget exhaustion has no opaque continuation that can be
+				// trusted further. The next recovery action must be a bounded
+				// head probe rather than another reconstruction of this gap.
+				poll.Gap.HeadProbePending = true
+				poll.ContinuationPageCount = 0
+			}
+		}
 		if role == inboundPollRoleControl {
 			// Control history is diagnostic input, not a work-chat backlog. Do not
 			// retain its nextLink as an operational continuation.
 			poll.ContinuationPath = ""
 			poll.DeferredContinuationPath = ""
+		}
+		if strings.TrimSpace(poll.ContinuationPath) == "" && strings.TrimSpace(poll.DeferredContinuationPath) == "" {
+			// Once the continuation lane is drained, the normal cursor is the
+			// authoritative frontier again. A gap has already copied the safe
+			// predecessor into Gap.SafeCursor before clearing this hint.
+			poll.ContinuationSafeCursor = time.Time{}
+			poll.ContinuationSafeCursorKnown = false
 		}
 		// A successful page starts or continues one directional lane. Keep only
 		// bounded path/content evidence while that lane has another page; once it
@@ -891,6 +1149,19 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 	return committed, nil
 }
 
+// clearChatPollRecoveryMarker retires only the admission marker created for a
+// malformed persisted poll projection.  It is safe to clear it after a page
+// has been fetched and durably committed: the canonical poll row then owns the
+// frontier, while any separate pending-page/gap evidence remains intact.
+func clearChatPollRecoveryMarker(poll *teamstore.ChatPollState) {
+	if poll == nil {
+		return
+	}
+	poll.RecoveryRequired = false
+	poll.RecoveryReason = ""
+	poll.RecoverySourceHash = ""
+}
+
 func openPollGap(poll *teamstore.ChatPollState, kind, reason, evidence string, now time.Time) {
 	if poll == nil {
 		return
@@ -910,14 +1181,35 @@ func openPollGap(poll *teamstore.ChatPollState, kind, reason, evidence string, n
 	if frontierPath == "" {
 		frontierPath = strings.TrimSpace(evidence)
 	}
+	safeCursor := poll.LastModifiedCursor
+	if poll.Gap != nil {
+		// An open gap owns its safe boundary, including an explicit zero value.
+		// Falling back to the normal cursor here would turn a conservative gap
+		// into a silent skip after a restart.
+		safeCursor = poll.Gap.SafeCursor
+	} else if strings.TrimSpace(poll.ContinuationPath) != "" || strings.TrimSpace(poll.DeferredContinuationPath) != "" {
+		if poll.ContinuationSafeCursorKnown || !poll.ContinuationSafeCursor.IsZero() {
+			safeCursor = poll.ContinuationSafeCursor
+		} else {
+			// Legacy rows can carry an opaque continuation without the predecessor
+			// proof introduced later. The only safe lower bound is the beginning
+			// of the chat; using LastModifiedCursor could skip the entire page that
+			// the opaque continuation was supposed to enumerate.
+			safeCursor = time.Time{}
+		}
+	}
+	recoveryCursor := poll.LastModifiedCursor
+	if recoveryCursor.IsZero() || !safeCursor.IsZero() && !recoveryCursor.After(safeCursor) {
+		recoveryCursor = time.Time{}
+	}
 	poll.Gap = &teamstore.ChatPollGap{
 		Epoch:           epoch,
 		Kind:            strings.TrimSpace(kind),
 		Reason:          trimPollDiagnostic(reason),
 		Evidence:        trimPollDiagnostic(evidence),
 		FrontierPath:    frontierPath,
-		SafeCursor:      poll.LastModifiedCursor,
-		RecoveryCursor:  poll.LastModifiedCursor,
+		SafeCursor:      safeCursor,
+		RecoveryCursor:  recoveryCursor,
 		OpenedAt:        now,
 		NoticeEpoch:     epoch,
 		QuarantinedPage: quarantinedPage,
@@ -927,12 +1219,22 @@ func openPollGap(poll *teamstore.ChatPollState, kind, reason, evidence string, n
 	// recovery/manual tooling the original receipt without letting a malformed
 	// page starve the directional recovery head.
 	poll.PendingPage = nil
+	if quarantinedPage != nil {
+		// A semantically malformed receipt has now been converted into bounded
+		// gap evidence. It is safe for the canonical gap/frontier to replace the
+		// raw row; syntax-only placeholders without a page retain their recovery
+		// marker until an explicit repair supplies canonical evidence.
+		clearChatPollRecoveryMarker(poll)
+	}
 	poll.ContinuationPath = ""
 	poll.ContinuationFailureCount = 0
 	poll.ContinuationFirstFailureAt = time.Time{}
 	poll.ContinuationLastFailureAt = time.Time{}
 	poll.ContinuationLastPath = ""
 	poll.ContinuationNoProgressCount = 0
+	poll.ContinuationPageCount = 0
+	poll.ContinuationSafeCursor = time.Time{}
+	poll.ContinuationSafeCursorKnown = false
 	clearContinuationHistory(poll)
 }
 
@@ -947,6 +1249,11 @@ func movePendingPageToGapEvidence(poll *teamstore.ChatPollState) {
 	}
 	poll.Gap.QuarantinedPage = poll.PendingPage
 	poll.PendingPage = nil
+	// The malformed receipt is now retained as bounded gap evidence.  The
+	// canonical gap may replace the original raw row; keeping the admission
+	// marker here would make the SQLite raw-preservation guard reject that
+	// durable transition and would leave the same receipt at the frontier.
+	clearChatPollRecoveryMarker(poll)
 }
 
 func trimPollDiagnostic(value string) string {
