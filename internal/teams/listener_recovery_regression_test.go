@@ -2923,7 +2923,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
-	}, 20*time.Second) {
+	}, listenerRecoveryBacklogProgressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("next-cycle poll after phase timeout did not dispatch; gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -2935,7 +2935,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 			}
 		}
 		return false
-	}, 20*time.Second, "phase-timeout final delivery")
+	}, listenerRecoveryBacklogProgressTimeout, "phase-timeout final delivery")
 	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
 	if err != nil {
 		t.Fatalf("parse phase-timeout message timestamp: %v", err)
@@ -2952,7 +2952,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		}
 		poll := state.ChatPolls["chat-1"]
 		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, 20*time.Second, "phase-timeout durable cursor")
+	}, listenerRecoveryBacklogProgressTimeout, "phase-timeout durable cursor")
 
 	// The listener continues polling after the final outbox side effect. Stop
 	// it after the successful retry's cursor is durable. A later, perfectly

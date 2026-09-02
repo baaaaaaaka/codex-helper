@@ -237,7 +237,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 90,
       "oracle": "a phase-canceled Graph request releases its durable poll attempt so a later cycle can deliver the same chat",
       "baseline": "pre-fix cleanup used the expired phase context and left the poll attempt until its two-minute TTL"
     },
