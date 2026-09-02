@@ -7672,14 +7672,31 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 	bridge.ownerMu.Unlock()
 
 	done := make(chan error, 1)
+	var releaseOnce sync.Once
+	releaseExecutor := func() {
+		releaseOnce.Do(func() { close(executor.release) })
+	}
+	turnFinished := make(chan struct{})
+	t.Cleanup(func() {
+		// If an admission assertion fails before the executor starts, release the
+		// blocking worker before Store.Close removes its temporary directory. The
+		// normal path also uses this cleanup safely through releaseOnce.
+		releaseExecutor()
+		select {
+		case <-turnFinished:
+		case <-time.After(bridgeAsyncWaitTimeoutForTest()):
+			t.Log("timed out waiting for long-running turn cleanup")
+		}
+	})
 	go func() {
+		defer close(turnFinished)
 		done <- bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("message-1"), "long task")
 	}()
 	select {
 	case <-executor.started:
 	case err := <-done:
 		t.Fatalf("handleSessionMessage returned before executor start: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(bridgeAsyncWaitTimeoutForTest()):
 		t.Fatal("executor did not start")
 	}
 
@@ -7748,13 +7765,13 @@ func TestBridgeLongRunningTurnKeepsOwnerHeartbeatActive(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	close(executor.release)
+	releaseExecutor()
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("handleSessionMessage error: %v", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(bridgeAsyncWaitTimeoutForTest()):
 		t.Fatal("handleSessionMessage did not finish")
 	}
 	read, ok, err = store.ReadOwner(context.Background())
