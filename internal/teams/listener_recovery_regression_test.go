@@ -3055,12 +3055,15 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// Match the production worker slice.  The assertion is about separating
+	// the post-claim cleanup grace from the phase context; a one-second worker
+	// budget makes SQLite admission itself flaky on a busy Windows runner.
+	options.PhaseBudget = 10 * time.Second
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
-	}, 8*time.Second) {
+	}, listenerRecoveryProgressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("slow inbound mutation did not dispatch: gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
