@@ -2606,7 +2606,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 			strings.EqualFold(checkpoint.PendingHistoryRange.Kind, "pending_root_task_started") &&
 			checkpoint.UnresolvedExecution == nil
 	}
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
 	for !pendingBoundary() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -2685,7 +2685,16 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	// Releasing the semantic frontier is a separate durable CAS from consuming
 	// the newly visible prompt/final.  The listener therefore needs one cycle
 	// to release the boundary and a subsequent cycle to deliver the records.
-	deadline = time.Now().Add(listenerRecoveryProgressTimeout)
+	progressTimeout := listenerRecoveryBusyProgressTimeout
+	if bridgeRaceDetectorEnabled {
+		// The final is durable before the outbox worker observes it. Under the
+		// full-package race job, unrelated packages can consume the hosted
+		// runner for longer than the ordinary busy-listener budget; retain a
+		// finite process-level bound without treating that scheduling delay as
+		// a missing delivery.
+		progressTimeout = bridgeAsyncWaitTimeoutForTest()
+	}
+	deadline = time.Now().Add(progressTimeout)
 	for !recovered() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
