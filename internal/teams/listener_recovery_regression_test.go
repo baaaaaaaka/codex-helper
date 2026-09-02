@@ -1807,7 +1807,12 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 	listenerRecoverySeedDuePoll(t, store, "chat-2", time.Now().UTC().Add(-time.Minute))
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	options.PhaseBudget = 2 * time.Second
+	// Match the production phase boundary.  The fairness assertion still has a
+	// finite watchdog and each worker receives a bounded slice, but a 2s phase
+	// leaves only 1s per worker under -race on Windows and can expire while the
+	// healthy session is committing its durable checkpoint.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
 		select {
@@ -1926,7 +1931,11 @@ func TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail(t *tes
 	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	options.PhaseBudget = 2 * time.Second
+	// Use the same bounded production phase as the listener.  A short synthetic
+	// phase can cancel the healthy worker during its SQLite checkpoint commit on
+	// a Windows race runner, obscuring the full-pool fairness invariant.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
 		select {
@@ -2046,7 +2055,8 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 	listenerRecoverySeedDuePoll(t, store, "chat-2", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	options.PhaseBudget = 2 * time.Second
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
@@ -2231,7 +2241,12 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	options.PhaseBudget = 2 * time.Second
+	// This path is intentionally cooperative and exercises the same worker
+	// isolation boundary as the linked-transcript fairness tests.  Keep its
+	// phase budget production-sized so Windows race-mode SQLite writes are not
+	// mistaken for a session-local error starving the healthy tail.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
 		select {
