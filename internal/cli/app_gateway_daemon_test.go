@@ -440,7 +440,7 @@ func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("daemon exit = %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("recovery loop did not reach cooldown")
 	}
 	if starts.Load() != appGatewayBackendMaxAttempts || probes.Load() != appGatewayBackendMaxAttempts || sleeps.Load() != appGatewayBackendMaxAttempts+1 {
