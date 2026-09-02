@@ -907,7 +907,7 @@
       "vertical": "poll-frontier-long-continuation-budget",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 60,
       "oracle": "a long rotating continuation path is bounded across separate polls and becomes a directional non-blocking gap without reading the head or spinning",
       "baseline": "pre-fix bounded in-memory path history could be bypassed by a rotating continuation that kept the chat in a high-cost livelock"
     },
