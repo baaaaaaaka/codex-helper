@@ -61,3 +61,25 @@ func TestWindowsAtomicWriteFileRetriesLockedTarget(t *testing.T) {
 		t.Fatalf("target data = %q, want new", data)
 	}
 }
+
+func TestWindowsRuntimeStateReaderSharesDeleteForAtomicReplace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	reader, err := openRuntimeStateFile(path)
+	if err != nil {
+		t.Fatalf("open runtime state reader: %v", err)
+	}
+	defer reader.Close()
+	if err := atomicWriteFile(path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("atomicWriteFile while runtime reader is open: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read replaced target: %v", err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("target data = %q, want new", data)
+	}
+}

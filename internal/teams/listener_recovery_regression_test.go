@@ -1338,8 +1338,12 @@ func TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage(t *testin
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = 3 * time.Second
+	// This fixture verifies continuation recovery, not the short-budget
+	// isolation path. Use the production budgets so a busy full-package runner
+	// cannot cancel the poll between the retryable page and the recovered
+	// prompt; the outer test/manifest watchdog still bounds a wedged listener.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	if !waitListenerRecoveryResult(func() bool {
 		state, err := store.Load(context.Background())

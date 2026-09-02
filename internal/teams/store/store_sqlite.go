@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -774,9 +775,17 @@ func (s *Store) currentSQLitePointerReadOnly() (storeSQLitePointer, bool, error)
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maxStatePointerSize {
 		return storeSQLitePointer{}, false, nil
 	}
-	data, err := os.ReadFile(s.path)
+	file, err := openRuntimeStateFile(s.path)
 	if err != nil {
 		return storeSQLitePointer{}, false, err
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return storeSQLitePointer{}, false, readErr
+	}
+	if closeErr != nil {
+		return storeSQLitePointer{}, false, closeErr
 	}
 	return storeSQLitePointerFromData(data)
 }
