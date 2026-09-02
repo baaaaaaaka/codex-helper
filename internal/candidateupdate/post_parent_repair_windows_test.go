@@ -263,13 +263,7 @@ func TestRepairPostParentEntryWaitsForLockedParentThenReplaces(t *testing.T) {
 	if got, err := fileSHA256(target); err != nil || !strings.EqualFold(got, sourceHash) {
 		t.Fatalf("target hash = %q, %v; want %q", got, err, sourceHash)
 	}
-	logData, err := os.ReadFile(target + ".update.log")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(logData), "post-parent entry repair completed") {
-		t.Fatalf("repair log did not record completion:\n%s", logData)
-	}
+	waitForPostParentTestLog(t, target+".update.log", "post-parent entry repair completed", 10*time.Second)
 }
 
 func writeManagedPostParentRecord(t *testing.T, dir string, managed string) {
@@ -347,6 +341,25 @@ func waitForPostParentTestHash(t *testing.T, path string, expected string, timeo
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s to reach hash %s", path, expected)
+}
+
+func waitForPostParentTestLog(t *testing.T, path string, expected string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var last string
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			last = string(data)
+			if strings.Contains(last, expected) {
+				return
+			}
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s to contain %q; last contents:\n%s", path, expected, last)
 }
 
 func clearPostParentRuntimeEnvironment(t *testing.T) {
