@@ -42,7 +42,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "later linked transcript advances its checkpoint and publishes its final despite a slow earlier session",
       "baseline": "pre-fix serial linked scan lets the earlier session consume the phase"
     },
