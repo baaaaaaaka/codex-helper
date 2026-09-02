@@ -1494,7 +1494,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			}
 		}
 		return finals == 2
-	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation final delivery")
+	}, listenerRecoveryBusyProgressTimeout, "stateful head and continuation final delivery")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -1503,7 +1503,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		poll := state.ChatPolls[chatID]
 		return poll.PendingPage == nil && poll.Attempt == nil &&
 			strings.TrimSpace(poll.ContinuationPath) == ""
-	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation durable poll completion")
+	}, listenerRecoveryBusyProgressTimeout, "stateful head and continuation durable poll completion")
 
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false

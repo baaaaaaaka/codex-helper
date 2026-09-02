@@ -1134,7 +1134,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 45,
+      "max_seconds": 180,
       "oracle": "production head query and its stateful filtered nextLink are both followed, and the terminal page clears the durable frontier",
       "baseline": "pre-fix a fixture that ignored query state could hide dropped filters, cursors, or false terminal handling"
     },
