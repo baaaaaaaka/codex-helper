@@ -4304,16 +4304,16 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	}
 	firstOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	firstOptions.Interval = time.Hour
-	// Windows hosted runners can spend several seconds in the first durable
-	// poll/store path even without -race. Keep this bounded, but do not let a
-	// 100ms worker budget turn a successful local Graph response into a false
-	// "never reached executor" failure.
-	firstOptions.PhaseBudget = 10 * time.Second
+	// Match the production phase budget. Windows hosted runners can spend
+	// several seconds in the first durable poll/store path even without -race;
+	// using a shorter fixture budget can let a successful local Graph response
+	// time out before the executor is reached.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
 	firstOptions.PollWorkerBudget = 5 * time.Second
 	first := startListenerRecovery(t, bridge, firstOptions)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		first.stop(t)
 		t.Fatalf("polled turn did not reach executor; gets=%d errors=%v", graphState.getCount("chat-1"), graphState.errorsSnapshot())
 	}
