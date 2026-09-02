@@ -4419,7 +4419,12 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	}
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 5 * time.Second
+	// This fixture verifies the durable Graph frontier, not short-budget phase
+	// isolation. Match the production worker budget so a race-instrumented
+	// runner cannot cancel the second page while it is committing the first
+	// generation's turn/checkpoint state.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
+	firstOptions.PollWorkerBudget = mainLoopPollWorkerBudget
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
@@ -4469,7 +4474,8 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	recoveredBridge.machine.ScopeID = recoveredBridge.scope.ID
 	recoveredBridge.machine.Kind = teamstore.MachineKindPrimary
 	options := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry-recovered.json"), recoveredExecutor)
-	options.PhaseBudget = 5 * time.Second
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, recoveredBridge, options)
 	waitListenerRecovery(t, func() bool {
 		state, err := recoveredStore.Load(ctx)
