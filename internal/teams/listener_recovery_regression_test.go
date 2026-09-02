@@ -322,6 +322,12 @@ func (s *listenerRecoveryGraphState) getCount(chatID string) int {
 	return s.gets[chatID]
 }
 
+func (s *listenerRecoveryGraphState) clearMessages(chatID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages[chatID] = nil
+}
+
 func (s *listenerRecoveryGraphState) maxGetConcurrency() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -3076,6 +3082,11 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 		}
 		return false
 	}, 8*time.Second, "slow inbound final delivery")
+	// The real Graph query would exclude this message after the durable cursor
+	// advances. Stop returning it from the mutable fake now so the 1ms listener
+	// interval cannot admit an unrelated second attempt while this test waits for
+	// the terminal CAS.
+	graphState.clearMessages("chat-1")
 
 	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
 	if err != nil {
@@ -3086,14 +3097,18 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	// stop the listener before inspecting Attempt. Without stopping first, the
 	// healthy listener may already have claimed the next valid poll cycle and
 	// make a live attempt look like stale cleanup state.
-	waitListenerRecovery(t, func() bool {
+	if !waitListenerRecoveryResult(func() bool {
 		state, loadErr := store.Load(context.Background())
 		if loadErr != nil {
 			return false
 		}
 		poll := state.ChatPolls["chat-1"]
 		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, listenerRecoveryExtendedProgressTimeout, "slow inbound durable poll cursor")
+	}, listenerRecoveryExtendedProgressTimeout) {
+		state, _ := store.Load(context.Background())
+		listener.stop(t)
+		t.Fatalf("slow inbound durable poll cursor did not advance; gets=%d calls=%#v state=%#v phase=%#v sent=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state.ChatPolls["chat-1"], bridge.mainLoopPhaseStatsSnapshot("poll"), graphState.sentSnapshot())
+	}
 	listener.stop(t)
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -3556,13 +3571,18 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	executor := &listenerRecoveryPerPromptExecutor{called: make(chan string)}
 	bridge := newBridgeTestBridge(graph, reopened, executor)
 	options := listenerRecoveryBaseOptions(reopened, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 2 * time.Second
-	options.PollWorkerBudget = 500 * time.Millisecond
+	// This test is about row-local malformed-state admission, not phase
+	// cancellation. Use the production listener budgets so a busy Windows
+	// full-suite runner cannot turn SQLite scheduling latency into a false
+	// admission failure.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	options.Interval = 25 * time.Millisecond
 	listener := startListenerRecovery(t, bridge, options)
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
 		return len(calls) == 1 && strings.Contains(calls[0], "LISTENER_RECOVERY_SQLITE_MALFORMED_POLL_PROMPT")
-	}, 3*time.Second) {
+	}, listenerRecoveryBusyProgressTimeout) {
 		state, _ := reopened.Load(ctx)
 		listener.stop(t)
 		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -3574,7 +3594,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 			}
 		}
 		return false
-	}, 3*time.Second, "SQLite malformed-poll final")
+	}, listenerRecoveryBusyProgressTimeout, "SQLite malformed-poll final")
 	waitListenerRecovery(t, func() bool {
 		state, err := reopened.Load(ctx)
 		if err != nil {
@@ -3582,7 +3602,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 		}
 		poll := state.ChatPolls[message.ChatID]
 		return !poll.RecoveryRequired && poll.RecoverySourceHash == "" && poll.PendingPage == nil && poll.Attempt == nil
-	}, 3*time.Second, "SQLite malformed-poll recovery marker retirement")
+	}, listenerRecoveryBusyProgressTimeout, "SQLite malformed-poll recovery marker retirement")
 	state, err := reopened.Load(ctx)
 	if err != nil {
 		listener.stop(t)
