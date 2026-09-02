@@ -1473,7 +1473,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	options.PhaseBudget = 5 * time.Second
 	options.PollWorkerBudget = time.Second
 	listener := startListenerRecovery(t, bridge, options)
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()
 		if len(calls) == 2 && strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_NEWEST") &&
