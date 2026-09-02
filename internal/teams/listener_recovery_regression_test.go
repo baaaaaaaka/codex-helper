@@ -718,10 +718,12 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 const listenerRecoveryBusyProgressTimeout = 60 * time.Second
 
 // Restarted outbox recovery can cross the production Graph pacing interval
-// after a busy race runner has already spent one phase budget. Keep that
-// liveness bound finite, but long enough to observe the next durable attempt
-// and its accepted-send recovery delay.
-const listenerRecoveryBacklogProgressTimeout = 60 * time.Second
+// after a busy runner has already spent one phase budget. A local ledger lock
+// miss can also leave a Graph-accepted row behind the bounded retry gate, so
+// allow one complete recovery backoff plus scheduling margin. Keep this finite
+// so a genuinely wedged listener still fails instead of becoming an unbounded
+// test wait.
+const listenerRecoveryBacklogProgressTimeout = 90 * time.Second
 
 func (e *listenerRecoveryBlockingExecutor) Run(_ context.Context, _ *Session, _ string) (ExecutionResult, error) {
 	e.once.Do(func() { close(e.started) })
@@ -4302,16 +4304,16 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	}
 	firstOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	firstOptions.Interval = time.Hour
-	// Windows hosted runners can spend several seconds in the first durable
-	// poll/store path even without -race. Keep this bounded, but do not let a
-	// 100ms worker budget turn a successful local Graph response into a false
-	// "never reached executor" failure.
-	firstOptions.PhaseBudget = 10 * time.Second
+	// Match the production phase budget. Windows hosted runners can spend
+	// several seconds in the first durable poll/store path even without -race;
+	// using a shorter fixture budget can let a successful local Graph response
+	// time out before the executor is reached.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
 	firstOptions.PollWorkerBudget = 5 * time.Second
 	first := startListenerRecovery(t, bridge, firstOptions)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		first.stop(t)
 		t.Fatalf("polled turn did not reach executor; gets=%d errors=%v", graphState.getCount("chat-1"), graphState.errorsSnapshot())
 	}

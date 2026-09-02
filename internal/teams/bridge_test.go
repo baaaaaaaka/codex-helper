@@ -3679,7 +3679,11 @@ func TestBridgeAsyncTurnsMentionsCoworkerQueuedBehindActiveTurn(t *testing.T) {
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, "s001", 2)
-	waitForNoActiveTurnsOrOutbox(t, store, "s001")
+	// The async worker can finish after Graph has accepted the final but before
+	// the listener's ordinary outbox-reconciliation phase promotes Accepted to
+	// Sent. Run that same local reconciliation boundary here instead of treating
+	// an already-identified Graph message as an unfinished network send.
+	waitForNoActiveTurnsOrOutboxAfterFlush(t, bridge, store, "s001", "chat-1")
 }
 
 func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T) {
@@ -3736,10 +3740,23 @@ func TestBridgeAsyncTurnsIgnoresPromptlessAdaptiveCardWhileRunning(t *testing.T)
 }
 
 func waitForNoActiveTurnsOrOutbox(t *testing.T, store *teamstore.Store, sessionID string) {
+	waitForNoActiveTurnsOrOutboxWithFlush(t, nil, store, sessionID, "")
+}
+
+func waitForNoActiveTurnsOrOutboxAfterFlush(t *testing.T, bridge *Bridge, store *teamstore.Store, sessionID string, chatID string) {
+	waitForNoActiveTurnsOrOutboxWithFlush(t, bridge, store, sessionID, chatID)
+}
+
+func waitForNoActiveTurnsOrOutboxWithFlush(t *testing.T, bridge *Bridge, store *teamstore.Store, sessionID string, chatID string) {
 	t.Helper()
 	deadline := time.Now().Add(bridgeIdleWaitTimeoutForTest())
 	stable := 0
 	for {
+		if bridge != nil && strings.TrimSpace(chatID) != "" {
+			if err := bridge.flushPendingOutboxForChat(context.Background(), chatID); err != nil && !isOutboxDeliveryDeferred(err) {
+				t.Fatalf("flush outbox while waiting for idle turn queue: %v", err)
+			}
+		}
 		state, err := store.Load(context.Background())
 		if err != nil {
 			t.Fatalf("load store while waiting for idle turn queue: %v", err)
