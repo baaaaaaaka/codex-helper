@@ -18296,5 +18296,5 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	cleanup = false
-	return os.Chmod(path, perm)
+	return finalizeAtomicWriteFile(path, perm)
 }

@@ -4,6 +4,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"syscall"
 	"unsafe"
 )
@@ -19,6 +20,15 @@ var (
 
 func defaultDurableReplaceFile(src string, dst string) error {
 	return replaceFileWithRetry(src, dst, moveFileExReplace, windowsReplaceRetryable)
+}
+
+// The temporary file receives the requested mode before MoveFileEx replaces
+// the target.  Do not reopen the new target for a second Chmod here: a
+// concurrent liveness reader may still hold the old target handle while
+// Windows is completing the replace, and the extra open can reintroduce the
+// sharing race that the explicit runtime reader avoids.
+func finalizeAtomicWriteFile(_ string, _ os.FileMode) error {
+	return nil
 }
 
 func moveFileExReplace(src string, dst string) error {

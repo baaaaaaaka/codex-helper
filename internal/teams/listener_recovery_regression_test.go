@@ -1072,7 +1072,11 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	if got := executor.callsSnapshot(); len(got) != 1 || !strings.Contains(got[0], "LISTENER_RECOVERY_HEALTHY_PROMPT") {
 		t.Fatalf("executor calls = %#v, want one healthy prompt", got)
 	}
-	deadline := time.Now().Add(time.Second)
+	// The healthy turn's ack is sent before its final, and production Graph
+	// pacing deliberately keeps successive sends at least 1.2s apart.  A
+	// one-second assertion is therefore shorter than a normal successful
+	// delivery, especially on a busy hosted runner.
+	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
 	healthyFinalSent := false
 	for time.Now().Before(deadline) {
 		for _, sent := range graphState.sentSnapshot() {

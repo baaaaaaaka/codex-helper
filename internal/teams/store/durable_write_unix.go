@@ -10,3 +10,7 @@ func defaultDurableReplaceFile(src string, dst string) error {
 	}
 	return syncParentDir(dst)
 }
+
+func finalizeAtomicWriteFile(path string, perm os.FileMode) error {
+	return os.Chmod(path, perm)
+}
