@@ -102,7 +102,10 @@ func TestRegistryLeaseIsIndependentFromStateWrites(t *testing.T) {
 	}
 	defer release()
 	reg.LastError = "written while daemon lease is held"
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	// The assertion is about lock independence, not sub-second filesystem
+	// latency. Windows CI may spend more than one second in the durable
+	// fsync/atomic-replace sequence while the full repository suite is active.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- r.Save(reg) }()

@@ -3125,7 +3125,12 @@ func waitListenerRecoveryResult(waitFor func() bool, timeout time.Duration) bool
 		if waitFor() {
 			return true
 		}
-		time.Sleep(time.Millisecond)
+		// This helper often observes SQLite state while the listener is
+		// committing its next durable frontier. A 1ms read loop can starve the
+		// writer on slower Windows SQLite runners and turn a healthy listener
+		// into a test-only timeout. Ten milliseconds is still responsive for
+		// these eventual assertions without creating an artificial read flood.
+		time.Sleep(10 * time.Millisecond)
 	}
 	return waitFor()
 }
