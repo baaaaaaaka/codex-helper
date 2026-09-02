@@ -9112,7 +9112,11 @@ func TestStoreConcurrentInboundTurnDedupAcrossHandles(t *testing.T) {
 }
 
 func storeConcurrentTestTimeout(base time.Duration) time.Duration {
-	if runtime.GOOS == "windows" {
+	// File-backed modernc SQLite and the race detector can be heavily delayed
+	// when the full repository suite is running. Keep the failure bound finite,
+	// but do not let hosted-runner scheduling turn a valid concurrent-write
+	// assertion into a context deadline.
+	if base < 90*time.Second || runtime.GOOS == "windows" {
 		return 90 * time.Second
 	}
 	return base

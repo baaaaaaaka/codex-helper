@@ -76,14 +76,15 @@ func capOwnershipStressKnob(value int, max int) int {
 
 func ownershipStressTestTimeout(base time.Duration) time.Duration {
 	// These scenarios deliberately hold a Graph request open while the race
-	// detector and file-backed SQLite are active.  Five seconds is enough on an
-	// idle developer machine, but it can expire before the held request is
-	// released in a busy CI worker.  That turns a test-harness timeout into an
-	// ambiguous-send/deferred-delivery failure and can strand the test goroutine.
-	// Keep the bound finite while giving the deterministic scenario enough room
-	// to complete on every supported platform.
-	if base < 30*time.Second || runtime.GOOS == "windows" {
-		return 30 * time.Second
+	// detector and file-backed SQLite are active.  The short unit-test bound is
+	// enough on an idle developer machine, but it can expire before the held
+	// request is released in a busy full-suite CI worker.  That turns a
+	// test-harness timeout into an ambiguous-send/deferred-delivery failure and
+	// can strand the test goroutine. Keep the bound finite while giving the
+	// deterministic scenario enough room to complete on every supported
+	// platform.
+	if base < 90*time.Second || runtime.GOOS == "windows" {
+		return 90 * time.Second
 	}
 	return base
 }

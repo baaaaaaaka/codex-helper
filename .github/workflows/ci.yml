@@ -2362,7 +2362,7 @@ jobs:
           cache: true
 
       - name: go test -race (Linux only)
-        run: go test -race ./... -timeout=20m
+        run: go test -race ./... -timeout=30m
 
   runtime-env-contract:
     name: Runtime environment contract (${{ matrix.os }})

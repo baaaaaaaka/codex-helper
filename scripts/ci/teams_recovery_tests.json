@@ -72,7 +72,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 90,
       "oracle": "a session-local transcript error is retried locally while a later healthy session advances its checkpoint and publishes its final",
       "baseline": "pre-fix treating every linked-transcript error as shared cancellation leaves later sessions unprocessed"
     },
