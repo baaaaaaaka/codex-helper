@@ -865,7 +865,7 @@ func TestBridgeTreatsUnrequestedCanceledExecutionAsInterrupted(t *testing.T) {
 }
 
 func TestBridgeExplicitCancelDuringListenerLifecycleIsNotShutdownFailure(t *testing.T) {
-	graph, sent := newBridgeAsyncQueueGraph(t)
+	graph, _ := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
 	executor := &blockingExecutor{
 		started: make(chan struct{}),
@@ -926,16 +926,32 @@ func TestBridgeExplicitCancelDuringListenerLifecycleIsNotShutdownFailure(t *test
 				}
 				outputDeadline := time.Now().Add(bridgeAsyncTestTimeout)
 				for time.Now().Before(outputDeadline) {
-					joined := sentPlainJoined(*sent)
-					if strings.Contains(joined, "error: Teams async turn lifecycle stopped") {
-						t.Fatalf("explicit cancel produced shutdown failure:\n%s", joined)
+					outputState, loadErr := store.Load(context.Background())
+					if loadErr != nil {
+						t.Fatalf("load state while waiting for explicit-cancel output: %v", loadErr)
 					}
-					if strings.Contains(joined, "Codex request canceled.") {
+					cancellationSent := false
+					for _, outbox := range outputState.OutboxMessages {
+						if outbox.SessionID != "s001" || outbox.TurnID != turnID {
+							continue
+						}
+						body := PlainTextFromTeamsHTML(outbox.Body)
+						if strings.Contains(body, "error: Teams async turn lifecycle stopped") {
+							t.Fatalf("explicit cancel produced shutdown failure: %s", body)
+						}
+						if outbox.Status == teamstore.OutboxStatusSent && strings.Contains(body, "Codex request canceled.") {
+							cancellationSent = true
+						}
+					}
+					// A Sent outbox row is written only after the fake Graph POST has
+					// completed. Waiting on this durable state avoids racing the
+					// asynchronous test server's in-memory sent slice.
+					if cancellationSent {
 						return
 					}
 					time.Sleep(time.Millisecond)
 				}
-				t.Fatalf("explicit cancel did not publish cancellation output:\n%s", sentPlainJoined(*sent))
+				t.Fatalf("explicit cancel did not publish cancellation output; outbox=%#v", state.OutboxMessages)
 			}
 		}
 		time.Sleep(time.Millisecond)
