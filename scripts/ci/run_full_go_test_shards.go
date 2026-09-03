@@ -1,5 +1,5 @@
 // Command run_full_go_test_shards runs the full Go test suite while isolating
-// the two largest packages into independently compiled test processes.  The
+// the two largest packages into independently compiled test processes. The
 // package test names are discovered from `go test -list`, partitioned by
 // disjoint name prefixes, and checked so every runnable Test/Example/Fuzz
 // entry is selected exactly once.
@@ -34,15 +34,17 @@ const (
 
 var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$`)
 
-// A small number of tests intentionally exercise long-lived listener state or
-// timing-sensitive error isolation. These tests are independently correct but
-// share process-global test plumbing with older package fixtures. Keep them in
-// their own test process rather than allowing unrelated tests to make their
-// timing assertions nondeterministic.
+// A small number of tests intentionally exercise long-lived listener state,
+// timing-sensitive error isolation, or process-wide performance fixtures. These
+// tests are independently correct but share process-global test plumbing with
+// older package fixtures. Keep them in their own test process rather than
+// allowing unrelated tests to make their timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
-		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":   true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":    true,
+		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":      true,
+		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI": true,
+		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                            true,
 	},
 }
 
@@ -85,6 +87,7 @@ func main() {
 	shards := flag.Int("shards", defaultShardCount, "maximum number of shards per large package")
 	parallel := flag.Int("parallel", 16, "go test -parallel value")
 	testTimeout := flag.Duration("timeout", 20*time.Minute, "per-shard go test timeout")
+	race := flag.Bool("race", false, "pass -race to go test")
 	listOnly := flag.Bool("list-only", false, "print the plan without executing tests")
 	var requestedPackages stringList
 	flag.Var(&requestedPackages, "package", "package to include; may be repeated (default: go list ./...)")
@@ -109,7 +112,7 @@ func main() {
 		}
 	}
 
-	jobs, err := makeJobs(packages, *shards, *parallel, *testTimeout)
+	jobs, err := makeJobs(packages, *shards, *parallel, *testTimeout, *race)
 	if err != nil {
 		fatal(err)
 	}
@@ -165,7 +168,7 @@ func listPackages() ([]string, error) {
 	return packages, nil
 }
 
-func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Duration) ([]testJob, error) {
+func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Duration, race bool) ([]testJob, error) {
 	var ordinary []string
 	var plans []shardPlan
 	for _, packageName := range packages {
@@ -173,7 +176,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 			ordinary = append(ordinary, packageName)
 			continue
 		}
-		names, err := listRunnableNames(packageName)
+		names, err := listRunnableNames(packageName, race)
 		if err != nil {
 			return nil, err
 		}
@@ -216,7 +219,11 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 
 	var jobs []testJob
 	if len(ordinary) != 0 {
-		args := []string{"test", fmt.Sprintf("-timeout=%s", testTimeout), fmt.Sprintf("-parallel=%d", parallel), "-count=1"}
+		args := []string{"test"}
+		if race {
+			args = append(args, "-race")
+		}
+		args = append(args, fmt.Sprintf("-timeout=%s", testTimeout), fmt.Sprintf("-parallel=%d", parallel), "-count=1")
 		args = append(args, ordinary...)
 		jobs = append(jobs, testJob{label: "ordinary packages", args: args})
 	}
@@ -229,15 +236,18 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 		planIndexes[plan.packageName]++
 		planIndex := planIndexes[plan.packageName]
 		pattern := planPattern(plan)
-		args := []string{
-			"test",
+		args := []string{"test"}
+		if race {
+			args = append(args, "-race")
+		}
+		args = append(args,
 			fmt.Sprintf("-timeout=%s", testTimeout),
 			fmt.Sprintf("-parallel=%d", parallel),
 			"-count=1",
 			plan.packageName,
 			"-run",
 			pattern,
-		}
+		)
 		jobs = append(jobs, testJob{
 			label: fmt.Sprintf("%s shard %d/%d (%d test names)", plan.packageName, planIndex, planTotals[plan.packageName], plan.count),
 			args:  args,
@@ -300,8 +310,13 @@ func validatePackagePlans(names []string, plans []shardPlan) error {
 	return nil
 }
 
-func listRunnableNames(packageName string) ([]string, error) {
-	output, err := commandOutput("go", "test", packageName, "-run", "^$", "-list", "^(Test|Example|Fuzz)")
+func listRunnableNames(packageName string, race bool) ([]string, error) {
+	args := []string{"test"}
+	if race {
+		args = append(args, "-race")
+	}
+	args = append(args, packageName, "-run", "^$", "-list", "^(Test|Example|Fuzz)")
+	output, err := commandOutput("go", args...)
 	if err != nil {
 		return nil, fmt.Errorf("list runnable names in %s: %w", packageName, err)
 	}

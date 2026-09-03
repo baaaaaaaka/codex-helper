@@ -132,7 +132,8 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	raceJob := workflowJobBlock(t, workflow, "race-test")
 	requireStepContains(t, raceJob,
 		"name: Race test (ubuntu-latest)",
-		"go test -race ./...",
+		"timeout-minutes: 45",
+		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8",
 	)
 
 	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")

@@ -2355,6 +2355,7 @@ jobs:
   race-test:
     name: Race test (ubuntu-latest)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -2367,7 +2368,7 @@ jobs:
           cache: true
 
       - name: go test -race (Linux only)
-        run: go test -race ./... -timeout=30m
+        run: go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8
 
   runtime-env-contract:
     name: Runtime environment contract (${{ matrix.os }})
