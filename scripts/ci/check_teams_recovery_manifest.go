@@ -233,9 +233,11 @@ func validateRealListenerSourceCached(item manifestTest, cache map[string]realLi
 // validateRealListenerSource prevents the manifest's real_listener bit from
 // becoming a self-declared label.  Required listener entries must call the
 // shared harness, and that harness must itself invoke production Bridge.Listen
-// rather than a phase helper or a test-only loop.  The runtime harness also
-// checks Once=false; this source check makes a renamed/empty selector fail
-// before CI can report a misleading green recovery job.
+// rather than a phase helper or a test-only loop.  A lifecycle test that must
+// stop after exactly one owner generation may instead call the production
+// listenOwnerGeneration entry directly; the runtime harness also checks
+// Once=false.  This source check makes a renamed/empty selector fail before CI
+// can report a misleading green recovery job.
 func validateRealListenerSource(item manifestTest) error {
 	packagePath, err := realListenerPackagePath(item)
 	if err != nil {
@@ -326,11 +328,11 @@ func (source realListenerSource) validate(item manifestTest) error {
 					queue = append(queue, ident.Name)
 				}
 			}
-			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel != nil && selector.Sel.Name == "Listen" {
+			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel != nil && (selector.Sel.Name == "Listen" || selector.Sel.Name == "listenOwnerGeneration") {
 				// A lifecycle test may need to control its own context/done channel
 				// (for example, to release the lease between two generations) and
-				// therefore call the production listener directly instead of using the
-				// shared goroutine helper.
+				// therefore call the production listener generation directly instead
+				// of using the shared goroutine helper.
 				calledHarness = true
 				return false
 			}

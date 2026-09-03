@@ -37758,23 +37758,23 @@ func TestBridgeMainLoopOutboxFlushUsesSmallBudget(t *testing.T) {
 			graph, sent := newBridgeTestGraph(t)
 			store := newBridgeTestStore(t)
 			ctx := context.Background()
+			rows := make([]teamstore.OutboxMessage, 0, mainLoopOutboxFlushMaxMessages+2)
+			for i := 1; i <= mainLoopOutboxFlushMaxMessages+2; i++ {
+				rows = append(rows, teamstore.OutboxMessage{
+					ID:          fmt.Sprintf("outbox:budget-%d", i),
+					TeamsChatID: "chat-1",
+					Kind:        "helper",
+					Body:        fmt.Sprintf("budgeted message %d", i),
+					Sequence:    int64(i),
+				})
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
 			if sqlite {
 				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
 					t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
 				}
 			}
 			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-			for i := 1; i <= mainLoopOutboxFlushMaxMessages+2; i++ {
-				msg := teamstore.OutboxMessage{
-					ID:          fmt.Sprintf("outbox:budget-%d", i),
-					TeamsChatID: "chat-1",
-					Kind:        "helper",
-					Body:        fmt.Sprintf("budgeted message %d", i),
-				}
-				if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
-					t.Fatalf("QueueOutbox %d error: %v", i, err)
-				}
-			}
 
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 				t.Fatalf("flushPendingOutboxMainLoop error: %v", err)

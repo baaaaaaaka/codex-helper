@@ -75,16 +75,12 @@ func capOwnershipStressKnob(value int, max int) int {
 }
 
 func ownershipStressTestTimeout(base time.Duration) time.Duration {
-	// These scenarios deliberately hold a Graph request open while the race
-	// detector and file-backed SQLite are active.  The short unit-test bound is
-	// enough on an idle developer machine, but it can expire before the held
-	// request is released in a busy full-suite CI worker.  That turns a
-	// test-harness timeout into an ambiguous-send/deferred-delivery failure and
-	// can strand the test goroutine. Keep the bound finite while giving the
-	// deterministic scenario enough room to complete on every supported
-	// platform.
-	if base < 90*time.Second || runtime.GOOS == "windows" {
-		return 90 * time.Second
+	// The scenario context is created only after its file/SQLite fixture is
+	// ready. Keep the original short operation budgets on Unix-like runners;
+	// Windows retains the previously established finite I/O margin, but no
+	// platform receives the old 90-second setup-inclusive bound.
+	if runtime.GOOS == "windows" && base < 30*time.Second {
+		return 30 * time.Second
 	}
 	return base
 }
@@ -94,9 +90,8 @@ func ownershipStressTestTimeout(base time.Duration) time.Duration {
 // Graph failure must not advance the Teams inbound cursor, and the later local
 // transcript sync must still publish every new visible TUI record exactly once.
 func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-	defer cancel()
 	scale := loadTeamsOwnershipStressScale()
+	setupCtx := context.Background()
 	transcriptPath := filepathForOwnershipStress(t)
 	initial := strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"thread-tui-catchup"}}`,
@@ -114,7 +109,7 @@ func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{result: ExecutionResult{Text: "teams answer", CodexThreadID: "thread-tui-catchup", CodexTurnID: "teams-turn"}})
 	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-tui-catchup")
 	seedOwnershipStressDuePoll(t, store, session.ChatID)
-	initialPoll, ok, err := store.ChatPoll(ctx, session.ChatID)
+	initialPoll, ok, err := store.ChatPoll(setupCtx, session.ChatID)
 	if err != nil || !ok {
 		t.Fatalf("read seeded poll: ok=%v err=%v", ok, err)
 	}
@@ -124,6 +119,8 @@ func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
 	readGraph := newOwnershipStressBlockingReadGraph(t, blocked, release)
 	bridge.readGraph = readGraph
 	seedOwnershipStressControlIdle(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	defer cancel()
 
 	pollDone := make(chan error, 1)
 	go func() {
@@ -361,8 +358,7 @@ func TestTeamsOwnershipStressHeadReadFailureRecoversWithoutCursorAdvanceCI(t *te
 // observed as a diagnostic here: a second chat should be allowed to reach its
 // own Graph request before the first request is released.
 func TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-	defer cancel()
+	setupCtx := context.Background()
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &teamsOwnershipStressExecutor{})
@@ -372,7 +368,7 @@ func TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI(t *testing.T) 
 	if first == nil {
 		t.Fatal("missing first work session")
 	}
-	if err := bridge.ensureDurableSession(ctx, first); err != nil {
+	if err := bridge.ensureDurableSession(setupCtx, first); err != nil {
 		t.Fatalf("ensure first durable session: %v", err)
 	}
 	second := appendBridgeTestSession(t, bridge, store, "s002", "chat-2")
@@ -420,6 +416,8 @@ func TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI(t *testing.T) 
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	defer cancel()
 
 	pollDone := make(chan error, 1)
 	go func() { pollDone <- bridge.pollOnce(ctx, 20) }()
@@ -1015,12 +1013,7 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	inboundPollGraphTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { inboundPollGraphTimeout = previousTimeout })
 
-	// Race instrumentation makes the first SQLite connection/schema path and
-	// the worker-wave setup materially slower. Keep the same bounded scenario,
-	// but leave enough time for the barrier to become observable on a busy CI
-	// runner.
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(10*time.Second))
-	defer cancel()
+	setupCtx := context.Background()
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
 	seedOwnershipStressControlIdle(t, store)
@@ -1030,7 +1023,7 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	if first == nil {
 		t.Fatal("missing first work session")
 	}
-	if err := bridge.ensureDurableSession(ctx, first); err != nil {
+	if err := bridge.ensureDurableSession(setupCtx, first); err != nil {
 		t.Fatalf("ensure first durable session: %v", err)
 	}
 	sessions = append(sessions, first)
@@ -1042,7 +1035,7 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	}
 	bridge.maxWorkChatPollsPerCycle = len(sessions)
 	bridge.leaseDuration = time.Minute
-	if active, err := bridge.claimControlLease(ctx); err != nil || !active {
+	if active, err := bridge.claimControlLease(setupCtx); err != nil || !active {
 		t.Fatalf("claim control lease: active=%t err=%v", active, err)
 	}
 	owner, err := teamstore.CurrentOwner("sqlite-worker-saturation", "", "", time.Now())
@@ -1054,14 +1047,14 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	owner.LeaseGeneration = bridge.currentLeaseGeneration()
 	bridge.setOwner(owner, time.Minute)
 	bridge.ownerHeartbeatInterval = 5 * time.Millisecond
-	if err := bridge.recordOwnerHeartbeat(ctx, "", ""); err != nil {
+	if err := bridge.recordOwnerHeartbeat(setupCtx, "", ""); err != nil {
 		t.Fatalf("initial owner heartbeat: %v", err)
 	}
-	initialOwner, ok, err := store.ReadOwner(ctx)
+	initialOwner, ok, err := store.ReadOwner(setupCtx)
 	if err != nil || !ok {
 		t.Fatalf("read initial owner: ok=%v err=%v", ok, err)
 	}
-	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+	if _, err := store.MigrateLargeStateToSQLite(setupCtx, 0); err != nil {
 		t.Fatalf("migrate saturated worker store to SQLite: %v", err)
 	}
 
@@ -1113,6 +1106,12 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 		sleep:      func(context.Context, time.Duration) error { return nil },
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+
+	// Start the scenario budget only after the file-backed store, lease, and
+	// SQLite migration are ready. Setup can be slow under -race, but it is not
+	// the liveness behavior this test is measuring.
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(10*time.Second))
+	defer cancel()
 
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := bridge.startOwnerHeartbeat(heartbeatCtx)
@@ -1560,8 +1559,7 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 		{name: "server-error", status: http.StatusServiceUnavailable},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-			defer cancel()
+			setupCtx := context.Background()
 			store := newBridgeTestStore(t)
 			executor := &recordingExecutor{result: ExecutionResult{
 				Text:          "continuation isolation answer",
@@ -1571,7 +1569,7 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 			bridge := newBridgeTestBridge(newOwnershipStressWriteGraph(t), store, executor)
 			seedOwnershipStressControlIdle(t, store)
 			first := bridge.reg.SessionByID("s001")
-			if err := bridge.ensureDurableSession(ctx, first); err != nil {
+			if err := bridge.ensureDurableSession(setupCtx, first); err != nil {
 				t.Fatalf("ensure first durable session: %v", err)
 			}
 			second := appendBridgeTestSession(t, bridge, store, "s002", "chat-2")
@@ -1580,10 +1578,10 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 			seedOwnershipStressDuePoll(t, store, first.ChatID)
 			seedOwnershipStressDuePoll(t, store, "chat-2")
 			oldContinuation := "/chats/chat-1/messages?$skiptoken=poll-once-failing-page"
-			if _, err := store.RecordChatPollSuccessWithContinuation(ctx, first.ChatID, time.Now().Add(-time.Minute), true, true, 20, oldContinuation); err != nil {
+			if _, err := store.RecordChatPollSuccessWithContinuation(setupCtx, first.ChatID, time.Now().Add(-time.Minute), true, true, 20, oldContinuation); err != nil {
 				t.Fatalf("seed first continuation: %v", err)
 			}
-			if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+			if _, err := store.UpdateChatPollSchedule(setupCtx, teamstore.ChatPollScheduleUpdate{
 				ChatID:         first.ChatID,
 				PollState:      inboundPollStateWarm,
 				NextPollAt:     time.Now().Add(-time.Minute),
@@ -1632,6 +1630,9 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 				jitter:     func(d time.Duration) time.Duration { return d },
 			}
 
+			ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+			defer cancel()
+
 			err := bridge.pollOnce(ctx, 20)
 			if err != nil {
 				t.Fatalf("pollOnce leaked continuation status %d to the listener: %v", testCase.status, err)
@@ -1671,8 +1672,6 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 // import is genuinely in flight; a later bounded sync must deliver both
 // batches exactly once.
 func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-	defer cancel()
 	transcriptPath := filepathForOwnershipStress(t)
 	initial := strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"thread-tui-live-catchup"}}`,
@@ -1694,8 +1693,13 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 	for i, marker := range firstBatch {
 		appendOwnershipStressTranscriptLine(t, transcriptPath, fmt.Sprintf(`{"id":"live-first-%03d","thread_id":"thread-tui-live-catchup","role":"assistant","text":%q}`, i, marker))
 	}
-	secondBatch := make([]string, 0, 24)
-	for i := 0; i < 24; i++ {
+	// Ten visible records cross the production eight-record per-cycle boundary,
+	// so the test still requires a later scan after the first send. Keeping the
+	// fixture just over that boundary avoids spending the scenario deadline on
+	// dozens of deliberately paced Graph sends; larger backlog throughput is
+	// covered by the dedicated backlog tests.
+	secondBatch := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
 		marker := fmt.Sprintf("OWNERSHIP_STRESS_TUI_LIVE_%03d", i+2)
 		secondBatch = append(secondBatch, marker)
 		appendOwnershipStressTranscriptLine(t, transcriptPath, fmt.Sprintf(`{"id":"live-second-%03d","thread_id":"thread-tui-live-catchup","role":"assistant","text":%q}`, i, marker))
@@ -1744,6 +1748,8 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	defer cancel()
 
 	syncDone := make(chan error, 1)
 	go func() { syncDone <- bridge.syncLinkedTranscripts(ctx) }()
@@ -1754,7 +1760,7 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 	}
 	// The second batch is appended while the first import is blocked in the
 	// outbound path, which is the timing a service outage/recovery can create.
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 2; i++ {
 		marker := fmt.Sprintf("OWNERSHIP_STRESS_TUI_LIVE_%03d", i+26)
 		secondBatch = append(secondBatch, marker)
 		appendOwnershipStressTranscriptLine(t, transcriptPath, fmt.Sprintf(`{"id":"live-third-%03d","thread_id":"thread-tui-live-catchup","role":"assistant","text":%q}`, i, marker))
@@ -1811,8 +1817,6 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 // be durably deferred, but it must not start a Codex writer until the import
 // has finished.
 func TestTeamsOwnershipStressTranscriptSyncDoesNotStartTeamsPromptBeforeCatchupCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-	defer cancel()
 	transcriptPath := filepathForOwnershipStress(t)
 	initial := strings.Join([]string{
 		`{"type":"session_meta","payload":{"id":"thread-tui-prompt-race"}}`,
@@ -1868,6 +1872,9 @@ func TestTeamsOwnershipStressTranscriptSyncDoesNotStartTeamsPromptBeforeCatchupC
 		sleep:      sleepContext,
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	defer cancel()
 
 	syncDone := make(chan error, 1)
 	go func() { syncDone <- bridge.syncLinkedTranscripts(ctx) }()
@@ -2766,8 +2773,7 @@ func TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI(t *testing.T) {
 // auto-park sweeper.  An old safety state may defer work, but it must not turn
 // into a permanent freeze that hides the new message.
 func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
-	defer cancel()
+	setupCtx := context.Background()
 	now := time.Now()
 	outageAt := now.Add(-72 * time.Hour)
 	oldContinuation := "/chats/chat-1/messages?$skiptoken=multi-day-old-backlog"
@@ -2829,7 +2835,7 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	seedOwnershipStressControlIdle(t, store)
 	session := first.reg.SessionByID("s001")
 	seedThreadRecoverySession(t, store, session, "thread-multi-day-outage", "")
-	if err := store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+	if err := store.UpdateSession(setupCtx, session.ID, func(state *teamstore.State) error {
 		current := state.Sessions[session.ID]
 		current.UpdatedAt = outageAt
 		state.Sessions[session.ID] = current
@@ -2837,10 +2843,10 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	}); err != nil {
 		t.Fatalf("age multi-day durable session: %v", err)
 	}
-	if _, err := store.RecordChatPollSuccessWithContinuation(ctx, session.ChatID, outageAt, true, true, 20, oldContinuation); err != nil {
+	if _, err := store.RecordChatPollSuccessWithContinuation(setupCtx, session.ChatID, outageAt, true, true, 20, oldContinuation); err != nil {
 		t.Fatalf("seed multi-day continuation: %v", err)
 	}
-	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+	if _, err := store.UpdateChatPollSchedule(setupCtx, teamstore.ChatPollScheduleUpdate{
 		ChatID:         session.ChatID,
 		PollState:      inboundPollStateCold,
 		NextPollAt:     outageAt,
@@ -2848,16 +2854,19 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	}); err != nil {
 		t.Fatalf("seed multi-day cold schedule: %v", err)
 	}
-	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+	if _, err := store.MigrateLargeStateToSQLite(setupCtx, 0); err != nil {
 		t.Fatalf("migrate multi-day outage state: %v", err)
 	}
-	candidates, handled, err := store.IdleWorkChatParkCandidates(ctx, first.reg.ControlChatID, now.Add(-inboundPollParkAfter), 8)
+	candidates, handled, err := store.IdleWorkChatParkCandidates(setupCtx, first.reg.ControlChatID, now.Add(-inboundPollParkAfter), 8)
 	if err != nil {
 		t.Fatalf("inspect multi-day auto-park candidates: %v", err)
 	}
 	if !handled || len(candidates) != 1 {
 		t.Fatalf("multi-day cold chat was not an auto-park candidate: handled=%v candidates=%#v", handled, candidates)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	defer cancel()
 
 	// The first owner comes back while Graph is still unavailable. The idle
 	// sweep deliberately contains this per-chat error so an unrelated idle chat

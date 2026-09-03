@@ -723,12 +723,6 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
-// Full-package runs can be delayed by the heavy fixtures and parallel tests
-// that execute before these fairness checks on hosted runners. Keep the
-// liveness bound finite, but do not let runner contention turn a healthy
-// isolated chat into a false timeout.
-const listenerRecoveryBusyProgressTimeout = 90 * time.Second
-
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 1ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
@@ -1529,7 +1523,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	options.PhaseBudget = 5 * time.Second
 	options.PollWorkerBudget = time.Second
 	listener := startListenerRecovery(t, bridge, options)
-	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()
 		if len(calls) == 2 && strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_NEWEST") &&
@@ -1550,7 +1544,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			}
 		}
 		return finals == 2
-	}, listenerRecoveryBusyProgressTimeout, "stateful head and continuation final delivery")
+	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation final delivery")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -1559,7 +1553,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		poll := state.ChatPolls[chatID]
 		return poll.PendingPage == nil && poll.Attempt == nil &&
 			strings.TrimSpace(poll.ContinuationPath) == ""
-	}, listenerRecoveryBusyProgressTimeout, "stateful head and continuation durable poll completion")
+	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation durable poll completion")
 
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false
@@ -1870,11 +1864,11 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 		return state.ImportCheckpoints[transcriptCheckpointID("s002")].LastOffset == healthyInfo.Size()
 	}
 	// The production phase may legitimately span multiple cycles while a
-	// hosted race runner is committing the healthy checkpoint.  Use the
-	// scenario's finite busy-listener watchdog here instead of the short
-	// admission watchdog above; otherwise the test can fail before the
-	// production-sized phase has a chance to complete durable progress.
-	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
+	// hosted race runner is committing the healthy checkpoint. Use the finite
+	// extended recovery watchdog here instead of the short admission watchdog
+	// above; otherwise the test can fail before the production-sized phase has
+	// a chance to complete durable progress.
+	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for !linkedProgress() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
 	}
@@ -2105,7 +2099,7 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 			}
 		}
 		return false
-	}, listenerRecoveryBusyProgressTimeout, "healthy tail final after session-local transcript error")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail final after session-local transcript error")
 	waitListenerRecovery(t, func() bool {
 		// The mutation gate deliberately tests a listener that returns a
 		// chat-local error as a global failure. Keep this durable probe
@@ -2125,7 +2119,7 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 		}
 		checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s002")]
 		return checkpoint.LastOffset == info.Size()
-	}, listenerRecoveryBusyProgressTimeout, "healthy tail checkpoint after session-local transcript error")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail checkpoint after session-local transcript error")
 	callsMu.Lock()
 	gotHeadCalls, gotTailCalls := headCalls, tailCalls
 	callsMu.Unlock()
@@ -2210,7 +2204,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 		default:
 			return false
 		}
-	}, listenerRecoveryBusyProgressTimeout, "history-watch slow head to enter")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch slow head to enter")
 	waitListenerRecovery(t, func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
@@ -2223,7 +2217,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 			}
 		}
 		return true
-	}, listenerRecoveryBusyProgressTimeout, "history-watch healthy tail and slow head")
+	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail and slow head")
 	listener.stop(t)
 }
 
@@ -2467,18 +2461,34 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	listenCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	listenDone := make(chan error, 1)
+	listenExited := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-listenExited:
+		case <-time.After(listenerRecoveryProgressTimeout):
+			t.Errorf("owner-loss listener generation did not stop during cleanup")
+		}
+	})
 	go func() {
+		// Test one owner generation in isolation. Listen deliberately starts a
+		// fresh generation after an owner-loss return; allowing that service-level
+		// retry here would run startup recovery and change the turn before the
+		// store-only replacement assertion, making the test depend on scheduler
+		// timing rather than the stale-worker fence it is meant to cover.
 		options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 		// The executor is intentionally cooperative; this larger phase budget
 		// makes the owner-loss assertion distinguish heartbeat cancellation from
 		// the normal phase deadline.
 		options.PhaseBudget = 5 * time.Second
 		options.PollWorkerBudget = time.Second
-		listenDone <- bridge.Listen(listenCtx, options)
+		listenDone <- bridge.listenOwnerGeneration(listenCtx, options)
+		close(listenExited)
 	}()
 	select {
 	case <-executor.started:
-	case err := <-listenDone:
+	case <-listenExited:
+		err := <-listenDone
 		t.Fatalf("listener exited before owner-loss turn: %v", err)
 	case <-time.After(listenerRecoveryProgressTimeout):
 		t.Fatalf("owner-loss turn was not dispatched; Graph reads=%d", graphState.getCount("chat-1"))
@@ -2493,11 +2503,10 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	if released, err := store.ReleaseControlLeaseIfHolder(context.Background(), oldMachineID, oldGeneration); err != nil || !released {
 		t.Fatalf("release old owner lease: released=%v err=%v", released, err)
 	}
-	// As in the history-watch fixture, wait for the old generation to cancel its
-	// cooperative worker and stop it before claiming the replacement. The
-	// listener may briefly reclaim an externally released lease in this window;
-	// its generation-scoped cleanup must release that replacement before the
-	// test installs the new owner.
+	// Wait for the old generation to cancel its cooperative worker before
+	// asserting the replacement hand-off. The single-generation harness above
+	// prevents an unrelated automatic startup-recovery pass from rewriting the
+	// running turn in this interval.
 	waitListenerRecovery(t, func() bool {
 		return bridge.activeAsyncTurnCount() == 0
 	}, 2*time.Second, "owner-loss cooperative turn cancellation")
@@ -2507,7 +2516,7 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	cancel()
 	select {
 	case err := <-listenDone:
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, teamstore.ErrControlLeaseNotHeld) && !errors.Is(err, errTeamsListenerOwnerTakeover) {
 			t.Fatalf("listener owner-loss shutdown error = %v", err)
 		}
 	case <-time.After(listenerRecoveryProgressTimeout):
@@ -2690,7 +2699,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 			strings.EqualFold(checkpoint.PendingHistoryRange.Kind, "pending_root_task_started") &&
 			checkpoint.UnresolvedExecution == nil
 	}
-	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for !pendingBoundary() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
 	}
@@ -2769,15 +2778,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	// Releasing the semantic frontier is a separate durable CAS from consuming
 	// the newly visible prompt/final.  The listener therefore needs one cycle
 	// to release the boundary and a subsequent cycle to deliver the records.
-	progressTimeout := listenerRecoveryBusyProgressTimeout
-	if bridgeRaceDetectorEnabled {
-		// The final is durable before the outbox worker observes it. Under the
-		// full-package race job, unrelated packages can consume the hosted
-		// runner for longer than the ordinary busy-listener budget; retain a
-		// finite process-level bound without treating that scheduling delay as
-		// a missing delivery.
-		progressTimeout = bridgeAsyncWaitTimeoutForTest()
-	}
+	progressTimeout := listenerRecoveryExtendedProgressTimeout
 	deadline = time.Now().Add(progressTimeout)
 	for !recovered() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
@@ -2866,7 +2867,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceFromPolledTeamsTurn(t *testing.T) 
 	finalID := "outbox:turn:inbound:chat-1:vertical-race-message:final"
 	select {
 	case <-executor.started:
-	case <-time.After(3 * listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("vertical race executor was not reached; Graph reads=%d state=%#v", graphState.getCount(session.ChatID), mustListenerRecoveryState(t, store))
 	}
@@ -2972,11 +2973,10 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
 	}, 0)
-	// Keep the first read slower than the phase budget by a wide margin. The
-	// fake request observes context cancellation, so the test does not need to
-	// sleep for the full delay; the long delay only proves that phase ownership,
-	// rather than a successful Graph response, caused the first cancellation.
-	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
+	// Keep the first read slower than the phase budget. The fake request observes
+	// context cancellation, so the test waits only for the bounded phase
+	// deadline rather than the full provider delay.
+	graphState.delayOnce = map[string]time.Duration{"chat-1": 4 * time.Second}
 	firstDelayCanceled := make(chan struct{})
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
@@ -2999,10 +2999,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	bridge.lastSQLiteWALCheckpoint = maintenanceSkipUntil
 	// Force the mutation grace to expire during the first canceled Graph read;
 	// the production refresh-after-I/O path must still leave enough time to
-	// abandon the attempt before the next listener cycle.  Keep the refreshed
-	// window comfortably above normal test scheduling noise: this test is
-	// checking the refresh boundary, not imposing an unrealistically tiny
-	// budget on the successful second-cycle handler/commit.
+	// abandon the attempt before the next listener cycle.
 	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
@@ -3010,25 +3007,49 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	// The worker budget must exceed the phase budget; otherwise the worker would
 	// cancel itself and this test would not exercise phase-owned cleanup. Keep
-	// the previously validated hosted-runner margin: SQLite admission and
-	// scheduler contention on Windows can exceed a short local deadline even
-	// when the production path is healthy.
-	options.PhaseBudget = 10 * time.Second
-	options.PollWorkerBudget = 12 * time.Second
+	// the synthetic boundary short because the fake request is cooperative and
+	// the follow-up schedule is made due explicitly below.
+	options.PhaseBudget = 2 * time.Second
+	options.PollWorkerBudget = 3 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-firstDelayCanceled:
-	case <-time.After(listenerRecoveryBacklogProgressTimeout):
+	case <-time.After(listenerRecoveryProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("phase-timeout Graph request did not observe cancellation; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	waitListenerRecovery(t, func() bool {
 		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
-	}, listenerRecoveryBacklogProgressTimeout, "phase deadline after claiming chat poll")
+	}, listenerRecoveryProgressTimeout, "phase deadline after claiming chat poll")
+	state, err := store.Load(context.Background())
+	if err != nil {
+		listener.stop(t)
+		t.Fatalf("load phase-timeout state after canceled poll: %v", err)
+	}
+	firstPoll := state.ChatPolls["chat-1"]
+	if firstPoll.Attempt != nil {
+		listener.stop(t)
+		t.Fatalf("phase-timeout poll attempt survived phase cancellation: %#v", firstPoll)
+	}
+	if firstPoll.LastError == "" || firstPoll.FailureCount == 0 {
+		listener.stop(t)
+		t.Fatalf("phase-timeout cancellation did not retain the failed poll receipt: %#v", firstPoll)
+	}
+	// A real Graph failure normally receives the chat-local exponential retry
+	// schedule. That policy is covered by poll backoff tests; this regression
+	// targets attempt cleanup and reacquisition, so make only this fixture due
+	// after asserting the failure receipt instead of sleeping through backoff.
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:     "chat-1",
+		NextPollAt: time.Now().UTC(),
+	}); err != nil {
+		listener.stop(t)
+		t.Fatalf("make phase-timeout retry due after cleanup: %v", err)
+	}
 
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
-	}, listenerRecoveryBacklogProgressTimeout) {
+	}, listenerRecoveryExtendedProgressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("next-cycle poll after phase timeout did not dispatch; gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -3040,7 +3061,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 			}
 		}
 		return false
-	}, listenerRecoveryBacklogProgressTimeout, "phase-timeout final delivery")
+	}, listenerRecoveryExtendedProgressTimeout, "phase-timeout final delivery")
 	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
 	if err != nil {
 		t.Fatalf("parse phase-timeout message timestamp: %v", err)
@@ -3057,14 +3078,14 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		}
 		poll := state.ChatPolls["chat-1"]
 		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, listenerRecoveryBacklogProgressTimeout, "phase-timeout durable cursor")
+	}, listenerRecoveryExtendedProgressTimeout, "phase-timeout durable cursor")
 
 	// The listener continues polling after the final outbox side effect. Stop
 	// it after the successful retry's cursor is durable. Keep the message in the
 	// fake so the production overlap query and durable deduplication path are
 	// exercised if another poll begins during cleanup.
 	listener.stop(t)
-	state, err := store.Load(context.Background())
+	state, err = store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load phase-timeout state: %v", err)
 	}
@@ -3410,7 +3431,7 @@ func TestTeamsListenFalseSQLiteTranscriptBacklogProgresses(t *testing.T) {
 			}
 		}
 		return false
-	}, listenerRecoveryBusyProgressTimeout)
+	}, listenerRecoveryExtendedProgressTimeout)
 	if !progressed {
 		state, loadErr := store.Load(context.Background())
 		checkpoint := teamstore.ImportCheckpoint{}
@@ -3516,7 +3537,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
-	case <-time.After(3 * listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		state, _ := reopened.Load(context.Background())
 		t.Fatalf("healthy chat was not dispatched after malformed poll reopen; gets=%d errors=%v state=%#v", graphState.getCount(session.ChatID), graphState.errorsSnapshot(), state)
@@ -3637,7 +3658,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
 		return len(calls) == 1 && strings.Contains(calls[0], "LISTENER_RECOVERY_SQLITE_MALFORMED_POLL_PROMPT")
-	}, listenerRecoveryBusyProgressTimeout) {
+	}, listenerRecoveryExtendedProgressTimeout) {
 		state, _ := reopened.Load(ctx)
 		listener.stop(t)
 		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -3649,7 +3670,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 			}
 		}
 		return false
-	}, listenerRecoveryBusyProgressTimeout, "SQLite malformed-poll final")
+	}, listenerRecoveryExtendedProgressTimeout, "SQLite malformed-poll final")
 	waitListenerRecovery(t, func() bool {
 		state, err := reopened.Load(ctx)
 		if err != nil {
@@ -3657,7 +3678,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 		}
 		poll := state.ChatPolls[message.ChatID]
 		return !poll.RecoveryRequired && poll.RecoverySourceHash == "" && poll.PendingPage == nil && poll.Attempt == nil
-	}, listenerRecoveryBusyProgressTimeout, "SQLite malformed-poll recovery marker retirement")
+	}, listenerRecoveryExtendedProgressTimeout, "SQLite malformed-poll recovery marker retirement")
 	state, err := reopened.Load(ctx)
 	if err != nil {
 		listener.stop(t)
@@ -4001,7 +4022,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 				return strings.Contains(plain, healthyFinal) && strings.Contains(plain, raceFinal)
-			}, listenerRecoveryBacklogProgressTimeout)
+			}, listenerRecoveryExtendedProgressTimeout)
 			if !safeBacklogReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
@@ -4478,7 +4499,7 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	// finite so a real liveness failure still fails, but give the complete
 	// Graph/outbox/state transition the same backlog budget as the other
 	// recovery fixtures.
-	progressTimeout := listenerRecoveryBacklogProgressTimeout
+	progressTimeout := listenerRecoveryExtendedProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
@@ -5607,43 +5628,45 @@ func TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail(t *testing.T) 
 			ctx := context.Background()
 			graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{}, 0)
 			store := newBridgeTestStore(t)
-			if useSQLite {
-				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-					t.Fatalf("migrate store to SQLite: %v", err)
-				}
-			}
-			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 			badParent := filepath.Join(t.TempDir(), "ledger-parent-file")
 			if err := os.WriteFile(badParent, []byte("not a directory"), 0o600); err != nil {
 				t.Fatalf("write invalid ledger parent: %v", err)
 			}
-			bridge.registryPath = filepath.Join(badParent, "registry.json")
 			now := time.Now().UTC().Add(-time.Minute)
 			const acceptedPrefix = 65
+			rows := make([]teamstore.OutboxMessage, 0, acceptedPrefix+1)
 			for index := 0; index < acceptedPrefix; index++ {
-				if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				createdAt := now.Add(time.Duration(index) * time.Millisecond)
+				rows = append(rows, teamstore.OutboxMessage{
 					ID:             fmt.Sprintf("outbox:ledger-prefix:%03d", index),
 					TeamsChatID:    "chat-ledger-poison",
 					Kind:           "helper",
 					Body:           fmt.Sprintf("LEDGER_POISON_%03d", index),
 					Status:         teamstore.OutboxStatusAccepted,
 					TeamsMessageID: fmt.Sprintf("teams-ledger-poison-%03d", index),
-					CreatedAt:      now.Add(time.Duration(index) * time.Millisecond),
-				}); err != nil {
-					t.Fatalf("queue accepted prefix %d: %v", index, err)
-				}
+					Sequence:       int64(index + 1),
+					CreatedAt:      createdAt,
+					UpdatedAt:      createdAt,
+				})
 			}
-			healthy, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
-				ID:          "outbox:ledger-healthy-tail",
+			healthyID := "outbox:ledger-healthy-tail"
+			healthy := teamstore.OutboxMessage{
+				ID:          healthyID,
 				TeamsChatID: "chat-ledger-healthy",
 				Kind:        "helper",
 				Body:        "LEDGER_HEALTHY_TAIL",
+				Sequence:    acceptedPrefix + 1,
 				CreatedAt:   now.Add(acceptedPrefix * time.Millisecond),
-			})
-			if err != nil {
-				t.Fatalf("queue healthy tail: %v", err)
 			}
-
+			rows = append(rows, healthy)
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			bridge.registryPath = filepath.Join(badParent, "registry.json")
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err == nil {
 				t.Fatal("first outbox flush unexpectedly succeeded with a broken ledger")
 			}

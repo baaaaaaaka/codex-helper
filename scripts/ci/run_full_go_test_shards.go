@@ -41,15 +41,29 @@ var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$
 // allowing unrelated tests to make their timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
-		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":     true,
-		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                      true,
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":    true,
-		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":           true,
-		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":              true,
-		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":      true,
-		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI": true,
-		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                true,
-		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                            true,
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":       true,
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                        true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
+		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail": true,
+		"TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail":     true,
+		"TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail":         true,
+		"TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle":          true,
+		"TestTeamsListenFalseCurrentStateReplayMatrix":                             true,
+		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
+		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":             true,
+		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
+		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
+		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":             true,
+		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
+		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
+		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
+		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
+		// This listener test starts a real continuous loop over a file-backed
+		// store.  Keep startup/recovery timing independent from unrelated
+		// package tests; the test's own Graph fixture already covers the
+		// concurrency boundary it needs.
+		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
 	},
 }
 
