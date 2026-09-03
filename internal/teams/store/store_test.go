@@ -5999,11 +5999,11 @@ func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.
 	store := newTestStore(t)
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-2 * time.Hour)
-	// Keep this above the production admission limit by a useful margin.  The
-	// small-limit behavior is already exercised by the unit tests; this scale
-	// catches a SQL LIMIT/order regression at a workload closer to the observed
-	// machine state without turning presubmit into a long soak.
-	const total = 500
+	// Two bounded pages plus one omitted row are enough to catch a fixed SQL
+	// LIMIT/order regression.  The smaller deterministic fixture keeps the
+	// repeated schedule-CAS portion fast on Windows and still proves that a row
+	// beyond the admission limit eventually rotates into the candidate set.
+	const total = sqliteHotPollReadyLimit*2 + 1
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < total; i++ {
 			chatID := fmt.Sprintf("chat-operational-%03d", i)
