@@ -73,7 +73,8 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
 	},
 	"./internal/teams/store": {
-		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit": true,
+		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 	},
 }
 
@@ -91,7 +92,8 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":            true,
 	},
 	"./internal/teams/store": {
-		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit": true,
+		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 	},
 }
 

@@ -856,6 +856,7 @@
       "vertical": "sqlite-semantic-malformed-poll-local-admission",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 10,
       "oracle": "valid JSON poll rows whose Go scalar or nested envelope types are invalid occupy only the bounded malformed lane and do not hide a healthy ordinary chat",
       "baseline": "pre-fix syntactically valid but undecodable poll rows could consume the SQL admission limit and make later healthy chats invisible"
