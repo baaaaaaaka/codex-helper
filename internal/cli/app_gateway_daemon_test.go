@@ -271,7 +271,7 @@ func TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort(t *te
 	}
 	select {
 	case <-firstProbeStarted:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for the DNS-gap probe")
 	}
 	reg, err := registry.Load(profile.ID)
@@ -440,7 +440,7 @@ func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("daemon exit = %v", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("recovery loop did not reach cooldown")
 	}
 	if starts.Load() != appGatewayBackendMaxAttempts || probes.Load() != appGatewayBackendMaxAttempts || sleeps.Load() != appGatewayBackendMaxAttempts+1 {

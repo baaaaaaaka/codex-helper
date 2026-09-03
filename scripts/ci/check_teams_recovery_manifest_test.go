@@ -96,3 +96,46 @@ func TestRunManifestTestsForcesOwnershipStressStrictMode(t *testing.T) {
 		t.Fatalf("manifest child environment contains %d strict entries, want exactly one", count)
 	}
 }
+
+func TestManifestTestWorkerCountForSerializesWindowsRaceOnly(t *testing.T) {
+	if got := manifestTestWorkerCountFor(true, "windows", 8); got != 1 {
+		t.Fatalf("Windows race manifest workers = %d, want 1", got)
+	}
+	if got := manifestTestWorkerCountFor(false, "windows", 8); got != maxManifestTestWorkers {
+		t.Fatalf("Windows normal manifest workers = %d, want %d", got, maxManifestTestWorkers)
+	}
+	if got := manifestTestWorkerCountFor(true, "linux", 8); got != maxManifestTestWorkers {
+		t.Fatalf("Linux race manifest workers = %d, want %d", got, maxManifestTestWorkers)
+	}
+	if got := manifestTestWorkerCountFor(true, "linux", 0); got != 1 {
+		t.Fatalf("zero-GOMAXPROCS manifest workers = %d, want 1", got)
+	}
+}
+
+func TestSplitManifestTestsKeepsExclusiveFixturesOutOfParallelPool(t *testing.T) {
+	tests := []manifestTest{
+		{Name: "parallel-a"},
+		{Name: "exclusive-a", Exclusive: true},
+		{Name: "parallel-b"},
+		{Name: "exclusive-b", Exclusive: true},
+	}
+	parallel, exclusive := splitManifestTests(tests)
+	if got, want := []string{parallel[0].Name, parallel[1].Name}, []string{"parallel-a", "parallel-b"}; !equalStrings(got, want) {
+		t.Fatalf("parallel tests = %v, want %v", got, want)
+	}
+	if got, want := []string{exclusive[0].Name, exclusive[1].Name}, []string{"exclusive-a", "exclusive-b"}; !equalStrings(got, want) {
+		t.Fatalf("exclusive tests = %v, want %v", got, want)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}

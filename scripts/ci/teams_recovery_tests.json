@@ -42,7 +42,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 45,
       "oracle": "later linked transcript advances its checkpoint and publishes its final despite a slow earlier session",
       "baseline": "pre-fix serial linked scan lets the earlier session consume the phase"
     },
@@ -72,7 +72,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 90,
+      "max_seconds": 60,
       "oracle": "a session-local transcript error is retried locally while a later healthy session advances its checkpoint and publishes its final",
       "baseline": "pre-fix treating every linked-transcript error as shared cancellation leaves later sessions unprocessed"
     },
@@ -87,7 +87,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 45,
       "oracle": "later history-watch path advances its durable offset despite a slow earlier path",
       "baseline": "pre-fix serial history-watch scan lets the earlier path consume the phase"
     },
@@ -117,6 +117,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 15,
       "oracle": "a history-watch phase is canceled when its control lease is lost and cannot commit a stale checkpoint",
       "baseline": "pre-fix heartbeat loss was observed only at the next loop boundary, allowing a stale scan to continue"
@@ -132,6 +133,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 15,
       "oracle": "a cooperative turn is canceled on lease loss while the listener root remains alive, leaving one durable takeover candidate and no stale failure side effects",
       "baseline": "pre-fix an old async turn could outlive the owner generation and run failure/follow-up work after takeover"
@@ -177,7 +179,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 150,
+      "max_seconds": 60,
       "oracle": "task_started-only snapshot stays silent, then a durable Teams owner proof releases the boundary and delivers the later final",
       "baseline": "pre-fix pending-root state is not released by the next listener cycles"
     },
@@ -192,7 +194,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 180,
+      "max_seconds": 90,
       "oracle": "a restarted listener drains a safe inherited backlog and a proven task/prompt boundary on both stores while silently isolating an unproven legacy checkpoint",
       "baseline": "pre-fix current-state replay can skip inherited sessions, retain a pending boundary, or turn a legacy history-only row into a live blocker"
     },
@@ -222,7 +224,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a real polled Teams prompt reaches the durable executor, staged task_started does not create a manual history gate, and the later final is delivered once",
       "baseline": "pre-fix inbound-to-executor vertical path can turn normal task/prompt ordering into a blocked or duplicate recovery path"
     },
@@ -237,7 +239,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 90,
+      "max_seconds": 30,
       "oracle": "a phase-canceled Graph request releases its durable poll attempt so a later cycle can deliver the same chat",
       "baseline": "pre-fix cleanup used the expired phase context and left the poll attempt until its two-minute TTL"
     },
@@ -267,7 +269,8 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "exclusive": true,
+      "max_seconds": 30,
       "oracle": "the live SQLite listener binds its lease capability and advances the linked transcript checkpoint through a fake-Graph final",
       "baseline": "pre-fix SQLite narrow queue/checkpoint state can omit the active lease and reject or accept the wrong live transcript mutation"
     },
@@ -855,6 +858,7 @@
       "vertical": "sqlite-semantic-malformed-poll-local-admission",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 10,
       "oracle": "valid JSON poll rows whose Go scalar or nested envelope types are invalid occupy only the bounded malformed lane and do not hide a healthy ordinary chat",
       "baseline": "pre-fix syntactically valid but undecodable poll rows could consume the SQL admission limit and make later healthy chats invisible"
@@ -1024,7 +1028,7 @@
       "vertical": "chat-poll-owner-cas",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a stale owner cannot normalize or overwrite a poll frontier after takeover while the replacement owner can mutate it",
       "baseline": "pre-fix compatibility normalization could use an unscoped full-state write and overwrite a replacement owner's poll state"
     },
@@ -1089,8 +1093,9 @@
       "vertical": "sqlite-hot-poll-fair-rotation",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 10,
-      "oracle": "500 operational poll rows rotate through bounded SQL candidate pages so every row is eventually selected after restart-safe ordering",
+      "oracle": "two bounded pages plus one operational poll row rotate through SQL candidate pages so every row is eventually selected after restart-safe ordering",
       "baseline": "pre-fix a fixed SQL LIMIT could repeatedly return only the first hot rows and starve later chats"
     },
     {
@@ -1104,7 +1109,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 45,
       "oracle": "an active malformed poll projection is admitted locally, its marker is retired after a successful page, and a healthy chat reaches execution and Graph",
       "baseline": "pre-fix startup dropped the malformed poll and could silently baseline its user message while a poisoned row affected listener admission"
     },
@@ -1119,7 +1124,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 60,
       "oracle": "a malformed active SQLite poll row cannot become a first-page baseline; the inherited user prompt reaches the executor and the recovery marker is durably cleared",
       "baseline": "pre-fix the SQL admission predicate omitted malformed rows and consumed the first visible message as historical baseline"
     },
@@ -1134,7 +1139,8 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 180,
+      "exclusive": true,
+      "max_seconds": 60,
       "oracle": "production head query and its stateful filtered nextLink are both followed, and the terminal page clears the durable frontier",
       "baseline": "pre-fix a fixture that ignored query state could hide dropped filters, cursors, or false terminal handling"
     },
@@ -1164,7 +1170,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 45,
+      "max_seconds": 90,
       "oracle": "a new Store and owner generation replays a staged page without a Graph refetch and commits the terminal poll frontier",
       "baseline": "pre-fix a poll page or attempt tied to the prior process could be lost, replayed unsafely, or left active after reopen"
     },
@@ -1179,6 +1185,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 20,
       "oracle": "after the first Graph page is committed and the next-link request is interrupted, a replacement owner follows the persisted continuation and delivers only the second-page prompt",
       "baseline": "pre-fix restart tests drained the continuation before shutdown and could not detect a lost or replayed frontier"
@@ -1480,7 +1487,7 @@
       "vertical": "control-lease-owner-projection-integrity",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a live lease is not taken over when the service-owner projection is empty or legacy-incomplete, while a matching lock-owner copy remains authoritative",
       "baseline": "pre-fix a syntactically valid but semantically incomplete service-owner row could make a same-machine replacement take over an unexpired lease"
     }

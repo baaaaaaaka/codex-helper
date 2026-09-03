@@ -285,13 +285,27 @@ func schedulePostParentRepair(source string, request postParentRepairRequest) er
 			}
 			break
 		}
-		if !os.IsNotExist(readErr) {
+		// A same-directory atomic rename makes the marker visible only after
+		// the worker closes its writer, but Windows security/indexing filters
+		// can still briefly hold the newly visible file. Keep the existing
+		// bounded handshake window for those transient sharing errors; treating
+		// the first one as fatal turns a successful worker launch into a false
+		// update failure.
+		if !os.IsNotExist(readErr) &&
+			!errors.Is(readErr, windows.ERROR_SHARING_VIOLATION) &&
+			!errors.Is(readErr, windows.ERROR_LOCK_VIOLATION) {
 			_ = cmd.Process.Kill()
 			_, _ = cmd.Process.Wait()
 			_ = logFile.Close()
 			return fmt.Errorf("read post-parent repair readiness marker: %w", readErr)
 		}
 		if time.Now().After(deadline) {
+			if !os.IsNotExist(readErr) {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+				_ = logFile.Close()
+				return fmt.Errorf("read post-parent repair readiness marker: %w", readErr)
+			}
 			_ = cmd.Process.Kill()
 			_, _ = cmd.Process.Wait()
 			_ = logFile.Close()

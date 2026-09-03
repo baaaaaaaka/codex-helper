@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -31,7 +32,8 @@ func newTestScreen(t *testing.T, w, h int) tcell.Screen {
 
 type sizedScreen struct {
 	tcell.Screen
-	initDone chan struct{}
+	initDone       chan struct{}
+	observedEvents chan<- tcell.Event
 }
 
 func (s *sizedScreen) Init() error {
@@ -43,6 +45,17 @@ func (s *sizedScreen) Init() error {
 		close(s.initDone)
 	}
 	return nil
+}
+
+func (s *sizedScreen) PollEvent() tcell.Event {
+	ev := s.Screen.PollEvent()
+	if s.observedEvents != nil {
+		select {
+		case s.observedEvents <- ev:
+		default:
+		}
+	}
+	return ev
 }
 
 type failLoadPostEventOnceScreen struct {
@@ -95,6 +108,19 @@ func newSelectSessionTestScreen(t *testing.T) (tcell.Screen, <-chan struct{}) {
 	return screen, initDone
 }
 
+func newObservedSelectSessionTestScreen(t *testing.T) (tcell.Screen, <-chan struct{}, <-chan tcell.Event) {
+	t.Helper()
+	screen := tcell.NewSimulationScreen("UTF-8")
+	initDone := make(chan struct{})
+	observedEvents := make(chan tcell.Event, 64)
+	prevNewScreen := newScreen
+	newScreen = func() (tcell.Screen, error) {
+		return &sizedScreen{Screen: screen, initDone: initDone, observedEvents: observedEvents}, nil
+	}
+	t.Cleanup(func() { newScreen = prevNewScreen })
+	return screen, initDone, observedEvents
+}
+
 func waitForScreenInit(t *testing.T, initDone <-chan struct{}) {
 	t.Helper()
 	select {
@@ -117,8 +143,12 @@ func waitForScreenLineContains(t *testing.T, screen tcell.Screen, y int, want st
 }
 
 func waitForScreenContains(t *testing.T, screen tcell.Screen, want string) {
+	waitForScreenContainsWithin(t, screen, want, 500*time.Millisecond)
+}
+
+func waitForScreenContainsWithin(t *testing.T, screen tcell.Screen, want string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, h := screen.Size()
 		for y := 0; y < h; y++ {
@@ -129,6 +159,34 @@ func waitForScreenContains(t *testing.T, screen tcell.Screen, want string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting for screen to contain %q", want)
+}
+
+func waitForSelectSessionUIEvent(ctx context.Context, events <-chan tcell.Event, want string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-events:
+			uiEv, ok := ev.(*uiEvent)
+			if ok && uiEv.kind == want {
+				return nil
+			}
+		}
+	}
+}
+
+func waitForSelectSessionKey(ctx context.Context, events <-chan tcell.Event, want tcell.Key, wantRune rune) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case ev := <-events:
+			key, ok := ev.(*tcell.EventKey)
+			if ok && key.Key() == want && key.Rune() == wantRune {
+				return nil
+			}
+		}
+	}
 }
 
 func postEventsAfterInit(initDone <-chan struct{}, screen tcell.Screen, events ...tcell.Event) {
@@ -2314,7 +2372,7 @@ func TestSelectSessionRefreshInterval(t *testing.T) {
 }
 
 func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
-	screen, initDone := newSelectSessionTestScreen(t)
+	screen, initDone, observedEvents := newObservedSelectSessionTestScreen(t)
 
 	projectPath1 := t.TempDir()
 	projectPath2 := t.TempDir()
@@ -2361,21 +2419,67 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 	refreshEnabled := make(chan struct{})
 	refreshCh := make(chan struct{})
 	var once sync.Once
-
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	driverErr := make(chan error, 1)
 	go func() {
 		<-initDone
-		waitForScreenContains(t, screen, "sess-1")
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'j', 0))
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
-		waitForScreenContains(t, screen, "ID: sess-2")
+		if err := waitForSelectSessionUIEvent(ctx, observedEvents, "load"); err != nil {
+			driverErr <- fmt.Errorf("wait for initial load event: %w", err)
+			cancel()
+			return
+		}
+		for _, event := range []tcell.Event{
+			tcell.NewEventKey(tcell.KeyRune, 'j', 0),
+			tcell.NewEventKey(tcell.KeyRune, 'l', 0),
+			tcell.NewEventKey(tcell.KeyDown, 0, 0),
+		} {
+			if err := screen.PostEvent(event); err != nil {
+				driverErr <- fmt.Errorf("post navigation event: %w", err)
+				cancel()
+				return
+			}
+		}
+		for _, key := range []struct {
+			want        tcell.Key
+			wantRune    rune
+			description string
+		}{
+			{want: tcell.KeyRune, wantRune: 'j', description: "project navigation"},
+			{want: tcell.KeyRune, wantRune: 'l', description: "session focus"},
+			{want: tcell.KeyDown, description: "session selection"},
+		} {
+			if err := waitForSelectSessionKey(ctx, observedEvents, key.want, key.wantRune); err != nil {
+				driverErr <- fmt.Errorf("wait for %s event: %w", key.description, err)
+				cancel()
+				return
+			}
+		}
 		close(refreshEnabled)
-
-		<-refreshCh
-		screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+		if err := screen.PostEvent(&uiEvent{when: time.Now(), kind: "refresh"}); err != nil {
+			driverErr <- fmt.Errorf("post refresh event: %w", err)
+			cancel()
+			return
+		}
+		if err := waitForSelectSessionUIEvent(ctx, observedEvents, "refresh"); err != nil {
+			driverErr <- fmt.Errorf("wait for refresh event: %w", err)
+			cancel()
+			return
+		}
+		select {
+		case <-refreshCh:
+		case <-ctx.Done():
+			driverErr <- fmt.Errorf("wait for refreshed project data: %w", ctx.Err())
+			cancel()
+			return
+		}
+		if err := screen.PostEvent(tcell.NewEventKey(tcell.KeyEnter, 0, 0)); err != nil {
+			driverErr <- fmt.Errorf("post enter event: %w", err)
+			cancel()
+			return
+		}
+		driverErr <- nil
 	}()
 
 	selection, err := SelectSession(ctx, Options{
@@ -2388,8 +2492,15 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 				return projects, nil
 			}
 		},
-		RefreshInterval: 10 * time.Millisecond,
+		// Drive the refresh event after the navigation events have been
+		// observed. The ticker itself is covered by TestSelectSessionRefreshInterval;
+		// making this event explicit keeps this identity-remapping test focused on
+		// ordering rather than wall-clock scheduling.
+		RefreshInterval: 0,
 	})
+	if driveErr := <-driverErr; driveErr != nil {
+		t.Fatalf("drive SelectSession: %v", driveErr)
+	}
 	if err != nil {
 		t.Fatalf("SelectSession error: %v", err)
 	}

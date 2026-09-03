@@ -522,19 +522,25 @@ func TestStartRetriesWithAutoPort(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	if _, err := os.Stat("/usr/bin/sleep"); err != nil {
-		t.Skip("skip: /usr/bin/sleep not available")
-	}
 
 	dir := t.TempDir()
 	counterFile := filepath.Join(dir, "counter")
 	script := filepath.Join(dir, "ssh")
-	if err := os.WriteFile(script, []byte(fakeSSHScript(counterFile)), 0o700); err != nil {
+	// This test checks only the auto-port retry decision. Use an immediate
+	// failure so process-group signal timing cannot make the invocation count
+	// nondeterministic; the blocking/descendant cleanup contract is covered by
+	// the SSH package's process-tree tests.
+	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	t.Setenv("PATH", dir)
 
-	profile := config.Profile{Host: "example.com", Port: 22, User: "alice"}
+	profile := config.Profile{
+		Host:    "example.com",
+		Port:    22,
+		User:    "alice",
+		SSHArgs: []string{"-o", "StrictHostKeyChecking=accept-new"},
+	}
 	st, err := Start(profile, "inst-retry-auto", Options{
 		SocksPort:         0,
 		SocksReadyTimeout: 50 * time.Millisecond,
@@ -581,7 +587,12 @@ func TestStartExplicitPortDoesNotRetry(t *testing.T) {
 	explicitPort := tmpLn.Addr().(*net.TCPAddr).Port
 	tmpLn.Close()
 
-	profile := config.Profile{Host: "example.com", Port: 22, User: "alice"}
+	profile := config.Profile{
+		Host:    "example.com",
+		Port:    22,
+		User:    "alice",
+		SSHArgs: []string{"-o", "StrictHostKeyChecking=accept-new"},
+	}
 	st, err := Start(profile, "inst-retry-explicit", Options{
 		SocksPort:         explicitPort,
 		SocksReadyTimeout: 50 * time.Millisecond,

@@ -511,7 +511,12 @@ func TestBridgeLinkedTranscriptAppendsDuringDrainAndResumesAcrossRestart(t *test
 // outbox claiming and transcript delivery CAS must avoid a duplicate Graph POST
 // or a regressed checkpoint.
 func TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// This test deliberately contends on a shared SQLite store while the race
+	// detector is active. The 3s bound was enough on an idle workstation but
+	// allowed scheduler/SQLite startup latency to turn a completed handoff into
+	// a false delivery failure in a busy CI worker. Keep the same blocked-send
+	// ordering and exact-once assertions, but give the fixture a finite margin.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	threadID := "thread-concurrent-owner-sync"

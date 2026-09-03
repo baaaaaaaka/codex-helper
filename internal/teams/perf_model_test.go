@@ -509,10 +509,14 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 
 func TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths(t *testing.T) {
 	cxpPerfWithImmediateHelperService(t)
+	// The matrix is a set of independent behavior scenarios, not a concurrency
+	// test. Each case migrates a file-backed SQLite store and runs a listener;
+	// running all cases in parallel creates avoidable disk/SQLite scheduler
+	// contention (especially under -race) and can turn a healthy Listen result
+	// into an owner-takeover timeout in a busy CI worker.
 	for _, scenario := range cxpPerfExternalScenarios {
 		scenario := scenario
 		t.Run(scenario.Name, func(t *testing.T) {
-			t.Parallel()
 			store, bridge, harness := newCXPPerfExternalBridge(t, scenario)
 			cxpPerfMigrateStoreToSQLite(t, store)
 			if err := cxpPerfRunListenOnce(context.Background(), bridge, store, scenario, harness); err != nil && !cxpPerfExpectedListenError(err, scenario) {
