@@ -3127,7 +3127,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	message.LastModifiedDateTime = message.CreatedDateTime
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
-	}, 250*time.Millisecond)
+	}, 600*time.Millisecond)
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
@@ -3139,10 +3139,9 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	// Deliberately make the post-claim cleanup grace shorter than the fake
-	// provider's ACK latency. Keep both values small: the test needs to prove
-	// that the handler does not inherit the cleanup context, not spend a full
-	// second in every fake Graph POST while other platform tests share a runner.
-	bridge.pollAttemptDurableGrace = 50 * time.Millisecond
+	// provider's ACK latency. Keep the delay below the old one-second fixture,
+	// but leave enough durable grace for the terminal SQLite CAS under -race.
+	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
