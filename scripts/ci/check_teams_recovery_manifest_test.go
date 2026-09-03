@@ -111,3 +111,31 @@ func TestManifestTestWorkerCountForSerializesWindowsRaceOnly(t *testing.T) {
 		t.Fatalf("zero-GOMAXPROCS manifest workers = %d, want 1", got)
 	}
 }
+
+func TestSplitManifestTestsKeepsExclusiveFixturesOutOfParallelPool(t *testing.T) {
+	tests := []manifestTest{
+		{Name: "parallel-a"},
+		{Name: "exclusive-a", Exclusive: true},
+		{Name: "parallel-b"},
+		{Name: "exclusive-b", Exclusive: true},
+	}
+	parallel, exclusive := splitManifestTests(tests)
+	if got, want := []string{parallel[0].Name, parallel[1].Name}, []string{"parallel-a", "parallel-b"}; !equalStrings(got, want) {
+		t.Fatalf("parallel tests = %v, want %v", got, want)
+	}
+	if got, want := []string{exclusive[0].Name, exclusive[1].Name}, []string{"exclusive-a", "exclusive-b"}; !equalStrings(got, want) {
+		t.Fatalf("exclusive tests = %v, want %v", got, want)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}

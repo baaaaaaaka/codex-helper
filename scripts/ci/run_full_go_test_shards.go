@@ -73,6 +73,17 @@ var isolatedRunnableNames = map[string]map[string]bool{
 	},
 }
 
+// A small subset of the isolated fixtures also needs host-level resource
+// isolation. A separate test process prevents package globals from leaking,
+// but it does not prevent other shard processes from consuming the hosted
+// runner's scheduler and filesystem while a finite liveness observation is in
+// progress.
+var exclusiveRunnableNames = map[string]map[string]bool{
+	"./internal/teams": {
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
+	},
+}
+
 type stringList []string
 
 func (s *stringList) String() string { return strings.Join(*s, ",") }
@@ -96,11 +107,13 @@ type shardPlan struct {
 	packageName string
 	prefixes    []string
 	count       int
+	exclusive   bool
 }
 
 type testJob struct {
-	label string
-	args  []string
+	label     string
+	args      []string
+	exclusive bool
 }
 
 type jobResult struct {
@@ -213,6 +226,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 		}
 		var isolatedNames []string
 		isolated := isolatedRunnableNamesForPackage(packageName)
+		exclusive := exclusiveRunnableNamesForPackage(packageName)
 		for _, name := range names {
 			if isolated[name] {
 				isolatedNames = append(isolatedNames, name)
@@ -228,6 +242,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 				packageName: packageName,
 				prefixes:    []string{regexp.QuoteMeta(name) + "$"},
 				count:       1,
+				exclusive:   exclusive[name],
 			})
 		}
 		if err := validatePackagePlans(names, plansForPackage(plans, packageName)); err != nil {
@@ -274,8 +289,9 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 			pattern,
 		)
 		jobs = append(jobs, testJob{
-			label: fmt.Sprintf("%s shard %d/%d (%d test names)", plan.packageName, planIndex, planTotals[plan.packageName], plan.count),
-			args:  args,
+			label:     fmt.Sprintf("%s shard %d/%d (%d test names)", plan.packageName, planIndex, planTotals[plan.packageName], plan.count),
+			args:      args,
+			exclusive: plan.exclusive,
 		})
 	}
 	return jobs, nil
@@ -298,6 +314,19 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	}
 	if strings.HasSuffix(packageName, "/internal/teams") {
 		return isolatedRunnableNames["./internal/teams"]
+	}
+	return nil
+}
+
+func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
+	if names, ok := exclusiveRunnableNames[packageName]; ok {
+		return names
+	}
+	if strings.HasSuffix(packageName, "/internal/teams/store") {
+		return exclusiveRunnableNames["./internal/teams/store"]
+	}
+	if strings.HasSuffix(packageName, "/internal/teams") {
+		return exclusiveRunnableNames["./internal/teams"]
 	}
 	return nil
 }
@@ -533,6 +562,38 @@ func commandOutput(name string, args ...string) ([]byte, error) {
 }
 
 func runJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
+	parallel, exclusive := splitTestJobs(jobs)
+	collected := runParallelJobs(parallel, testTimeout)
+	for _, job := range exclusive {
+		fmt.Printf("starting %s\n", job.label)
+		result := executeJob(job, testTimeout)
+		if result.err == nil {
+			fmt.Printf("passed %s\n", result.label)
+		} else {
+			fmt.Printf("failed %s\n%s\n", result.label, result.err)
+		}
+		collected = append(collected, result)
+	}
+	return collected
+}
+
+func splitTestJobs(jobs []testJob) (parallel, exclusive []testJob) {
+	parallel = make([]testJob, 0, len(jobs))
+	exclusive = make([]testJob, 0)
+	for _, job := range jobs {
+		if job.exclusive {
+			exclusive = append(exclusive, job)
+			continue
+		}
+		parallel = append(parallel, job)
+	}
+	return parallel, exclusive
+}
+
+func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
+	if len(jobs) == 0 {
+		return nil
+	}
 	workerCount := maxConcurrentJobs
 	if len(jobs) < workerCount {
 		workerCount = len(jobs)

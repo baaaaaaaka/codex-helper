@@ -52,6 +52,7 @@ type manifestTest struct {
 	ListenerMode string   `json:"listener_mode"`
 	Once         *bool    `json:"once"`
 	FakeGraph    bool     `json:"fake_graph"`
+	Exclusive    bool     `json:"exclusive"`
 	MaxSeconds   int      `json:"max_seconds"`
 	Oracle       string   `json:"oracle"`
 	Baseline     string   `json:"baseline"`
@@ -397,6 +398,40 @@ func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 		packageDirs[packageName] = packageDir
 	}
 
+	parallel, exclusive := splitManifestTests(ordered)
+	var outputMu sync.Mutex
+	if err := runManifestTestPool(parallel, binaries, packageDirs, race, &outputMu); err != nil {
+		return err
+	}
+	// Some real-listener fixtures have a finite progress observation whose
+	// result depends on the host scheduler and filesystem.  They still run in
+	// their own test process, but must also run without sibling recovery
+	// processes competing for hosted-runner resources.
+	for _, item := range exclusive {
+		if err := runManifestTest(item, binaries[item.Package], packageDirs[item.Package], &outputMu); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitManifestTests(tests []manifestTest) (parallel, exclusive []manifestTest) {
+	parallel = make([]manifestTest, 0, len(tests))
+	exclusive = make([]manifestTest, 0)
+	for _, item := range tests {
+		if item.Exclusive {
+			exclusive = append(exclusive, item)
+			continue
+		}
+		parallel = append(parallel, item)
+	}
+	return parallel, exclusive
+}
+
+func runManifestTestPool(ordered []manifestTest, binaries map[string]string, packageDirs map[string]string, race bool, outputMu *sync.Mutex) error {
+	if len(ordered) == 0 {
+		return nil
+	}
 	// Each manifest entry remains in its own test process, so running several
 	// entries concurrently does not share test globals or weaken per-entry
 	// watchdog isolation.  Bound the pool by the runner's available CPUs: the
@@ -405,14 +440,13 @@ func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 	workerCount := manifestTestWorkerCount(race)
 	jobs := make(chan manifestTestJob)
 	results := make(chan manifestTestResult, len(ordered))
-	var outputMu sync.Mutex
 	var workers sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
-				err := runManifestTest(job.item, binaries[job.item.Package], packageDirs[job.item.Package], &outputMu)
+				err := runManifestTest(job.item, binaries[job.item.Package], packageDirs[job.item.Package], outputMu)
 				results <- manifestTestResult{index: job.index, err: err}
 			}
 		}()
