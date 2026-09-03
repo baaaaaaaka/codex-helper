@@ -3127,7 +3127,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	message.LastModifiedDateTime = message.CreatedDateTime
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
-	}, time.Second)
+	}, 250*time.Millisecond)
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
@@ -3139,17 +3139,17 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	// Deliberately make the post-claim cleanup grace shorter than the fake
-	// provider's ACK latency.  The refreshed terminal window is still long
-	// enough for one race-instrumented local CAS, so a hosted runner does not
-	// turn ordinary SQLite scheduling into a false cleanup failure.
-	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
+	// provider's ACK latency. Keep both values small: the test needs to prove
+	// that the handler does not inherit the cleanup context, not spend a full
+	// second in every fake Graph POST while other platform tests share a runner.
+	bridge.pollAttemptDurableGrace = 50 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	// Match the production worker slice.  The assertion is about separating
-	// the post-claim cleanup grace from the phase context; a one-second worker
-	// budget makes SQLite admission itself flaky on a busy Windows runner.
+	// Match the production worker slice. The assertion is about separating the
+	// post-claim cleanup grace from the phase context; keep the finite worker
+	// budget large enough for SQLite admission on a busy Windows runner.
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
