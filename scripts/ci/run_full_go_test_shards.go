@@ -60,7 +60,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
 		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
-		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                true,
+		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                 true,
 		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
