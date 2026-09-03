@@ -11,6 +11,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cxp-teams-mutation.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 base="$tmp_dir/base"
+mutation_test_timeout=120s
 mkdir -p "$base"
 rsync -a --exclude '.git' --exclude '.codex' --exclude '.agents' --exclude 'dist' --exclude 'bin' \
 	"$repo_root/" "$base/"
@@ -67,7 +68,7 @@ PY
 	set +e
 	(
 		cd "$mutant_dir" &&
-		go test "$package" -count=1 -run "^${test_name}$" -timeout=90s -v
+		go test "$package" -count=1 -run "^${test_name}$" -timeout="$mutation_test_timeout" -v
 	) >"$output" 2>&1
 	local status=$?
 	set -e
@@ -91,7 +92,7 @@ run_baseline() {
 
 	if ! (
 		cd "$base" &&
-		go test "$package" -count=1 -run "^${test_name}$" -timeout=90s -v
+		go test "$package" -count=1 -run "^${test_name}$" -timeout="$mutation_test_timeout" -v
 	) >"$output" 2>&1; then
 		echo "unmutated baseline failed: $package/$test_name" >&2
 		cat "$output" >&2

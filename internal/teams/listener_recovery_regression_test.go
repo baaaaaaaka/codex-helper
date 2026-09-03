@@ -2073,7 +2073,23 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
-		state, err := store.Load(context.Background())
+		for _, sent := range graphState.sentSnapshot() {
+			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_LINKED_ERROR_TAIL_FINAL") {
+				return true
+			}
+		}
+		return false
+	}, listenerRecoveryBusyProgressTimeout, "healthy tail final after session-local transcript error")
+	waitListenerRecovery(t, func() bool {
+		// The mutation gate deliberately tests a listener that returns a
+		// chat-local error as a global failure. Keep this durable probe
+		// cancellable so a saturated SQLite read becomes a normal assertion
+		// failure rather than the Go test process timeout. The final is checked
+		// separately above so a broken listener cannot hold this predicate's
+		// store lock while the mutation harness is trying to classify the fail.
+		probeCtx, cancelProbe := context.WithTimeout(context.Background(), time.Second)
+		state, err := store.Load(probeCtx)
+		cancelProbe()
 		if err != nil {
 			return false
 		}
@@ -2082,16 +2098,8 @@ func TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail(t 
 			return false
 		}
 		checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s002")]
-		if checkpoint.LastOffset != info.Size() {
-			return false
-		}
-		for _, sent := range graphState.sentSnapshot() {
-			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_LINKED_ERROR_TAIL_FINAL") {
-				return true
-			}
-		}
-		return false
-	}, listenerRecoveryBusyProgressTimeout, "healthy tail after session-local transcript error")
+		return checkpoint.LastOffset == info.Size()
+	}, listenerRecoveryBusyProgressTimeout, "healthy tail checkpoint after session-local transcript error")
 	callsMu.Lock()
 	gotHeadCalls, gotTailCalls := headCalls, tailCalls
 	callsMu.Unlock()
