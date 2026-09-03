@@ -1804,7 +1804,10 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 		listenerRecoverySeedLinkedCheckpoint(t, store, session, path, true)
 		tail := listenerRecoveryTranscriptLine("tail-"+sessionID, "tail-status-"+sessionID)
 		if sessionID == "s002" {
-			tail += listenerRecoveryTranscriptFinalLine("tail-final-"+sessionID, "LISTENER_RECOVERY_LINKED_TAIL_FINAL")
+			// The fairness assertion only needs one healthy visible record. Keep
+			// the tail to its final so this fixture stays within the production
+			// two-message outbox budget; outbox throughput is covered separately.
+			tail = listenerRecoveryTranscriptFinalLine("tail-final-"+sessionID, "LISTENER_RECOVERY_LINKED_TAIL_FINAL")
 		}
 		if err := appendListenerRecoveryTranscript(path, tail); err != nil {
 			t.Fatalf("append %s transcript: %v", sessionID, err)
