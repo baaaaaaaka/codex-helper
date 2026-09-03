@@ -267,6 +267,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 30,
       "oracle": "the live SQLite listener binds its lease capability and advances the linked transcript checkpoint through a fake-Graph final",
       "baseline": "pre-fix SQLite narrow queue/checkpoint state can omit the active lease and reject or accept the wrong live transcript mutation"

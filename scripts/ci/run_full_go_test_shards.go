@@ -81,6 +81,8 @@ var isolatedRunnableNames = map[string]map[string]bool{
 var exclusiveRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
+		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":               true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
 	},
 }
 
