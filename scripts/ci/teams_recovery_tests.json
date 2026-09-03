@@ -1090,6 +1090,7 @@
       "vertical": "sqlite-hot-poll-fair-rotation",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 10,
       "oracle": "500 operational poll rows rotate through bounded SQL candidate pages so every row is eventually selected after restart-safe ordering",
       "baseline": "pre-fix a fixed SQL LIMIT could repeatedly return only the first hot rows and starve later chats"

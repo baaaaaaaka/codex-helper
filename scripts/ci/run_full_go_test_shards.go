@@ -71,6 +71,9 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// concurrency boundary it needs.
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
 	},
+	"./internal/teams/store": {
+		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit": true,
+	},
 }
 
 // A small subset of the isolated fixtures also needs host-level resource
@@ -83,6 +86,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":               true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
+	},
+	"./internal/teams/store": {
+		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit": true,
 	},
 }
 
