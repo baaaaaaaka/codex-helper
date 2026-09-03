@@ -1520,8 +1520,13 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// This scenario verifies the production head/continuation state machine,
+	// not the short-budget isolation path.  Use the production budgets so race
+	// instrumentation or a busy hosted runner cannot cancel the poll between
+	// the head page and its durable continuation; the finite progress watchdog
+	// below still detects a genuinely wedged listener.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {

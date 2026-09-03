@@ -402,7 +402,7 @@ func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 	// watchdog isolation.  Bound the pool by the runner's available CPUs: the
 	// recovery corpus is deliberately expensive, but an unbounded process burst
 	// would trade wall time for memory pressure and scheduler contention.
-	workerCount := manifestTestWorkerCount()
+	workerCount := manifestTestWorkerCount(race)
 	jobs := make(chan manifestTestJob)
 	results := make(chan manifestTestResult, len(ordered))
 	var outputMu sync.Mutex
@@ -449,8 +449,21 @@ type manifestTestResult struct {
 	err   error
 }
 
-func manifestTestWorkerCount() int {
-	workerCount := runtime.GOMAXPROCS(0)
+func manifestTestWorkerCount(race bool) int {
+	return manifestTestWorkerCountFor(race, runtime.GOOS, runtime.GOMAXPROCS(0))
+}
+
+func manifestTestWorkerCountFor(race bool, goos string, gomaxprocs int) int {
+	// The Windows race runner uses file-backed modernc SQLite for many
+	// independent manifest entries.  Concurrent processes contend on the
+	// hosted runner's filesystem flush path and can make a healthy migration
+	// exceed its deliberately small per-test watchdog.  Serialize only this
+	// test configuration; normal and non-Windows race runs retain the bounded
+	// parallel pool.
+	if race && strings.EqualFold(strings.TrimSpace(goos), "windows") {
+		return 1
+	}
+	workerCount := gomaxprocs
 	if workerCount < 1 {
 		workerCount = 1
 	}

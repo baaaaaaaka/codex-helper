@@ -96,3 +96,18 @@ func TestRunManifestTestsForcesOwnershipStressStrictMode(t *testing.T) {
 		t.Fatalf("manifest child environment contains %d strict entries, want exactly one", count)
 	}
 }
+
+func TestManifestTestWorkerCountForSerializesWindowsRaceOnly(t *testing.T) {
+	if got := manifestTestWorkerCountFor(true, "windows", 8); got != 1 {
+		t.Fatalf("Windows race manifest workers = %d, want 1", got)
+	}
+	if got := manifestTestWorkerCountFor(false, "windows", 8); got != maxManifestTestWorkers {
+		t.Fatalf("Windows normal manifest workers = %d, want %d", got, maxManifestTestWorkers)
+	}
+	if got := manifestTestWorkerCountFor(true, "linux", 8); got != maxManifestTestWorkers {
+		t.Fatalf("Linux race manifest workers = %d, want %d", got, maxManifestTestWorkers)
+	}
+	if got := manifestTestWorkerCountFor(true, "linux", 0); got != 1 {
+		t.Fatalf("zero-GOMAXPROCS manifest workers = %d, want 1", got)
+	}
+}

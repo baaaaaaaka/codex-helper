@@ -55,10 +55,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
 		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":             true,
 		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
 		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
 		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":            true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the

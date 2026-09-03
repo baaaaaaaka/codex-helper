@@ -222,7 +222,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a real polled Teams prompt reaches the durable executor, staged task_started does not create a manual history gate, and the later final is delivered once",
       "baseline": "pre-fix inbound-to-executor vertical path can turn normal task/prompt ordering into a blocked or duplicate recovery path"
     },

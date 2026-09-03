@@ -38,7 +38,11 @@ type teamsOwnershipStressScale struct {
 }
 
 func loadTeamsOwnershipStressScale() teamsOwnershipStressScale {
-	scale := teamsOwnershipStressScale{Burst: 12, Backlog: 24, PollRounds: 12, Transcript: 24}
+	// The default live-catchup fixture only needs to cross the production
+	// eight-record batch boundary.  Keep the ordinary CI case just above that
+	// boundary; the stress environment and the explicit knob still exercise a
+	// materially larger transcript backlog.
+	scale := teamsOwnershipStressScale{Burst: 12, Backlog: 24, PollRounds: 12, Transcript: 10}
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_OWNERSHIP_STRESS")) == "1" {
 		scale = teamsOwnershipStressScale{Burst: 64, Backlog: 240, PollRounds: 80, Transcript: 160}
 	}
