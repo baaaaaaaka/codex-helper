@@ -34,14 +34,15 @@ const (
 
 var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$`)
 
-// A small number of tests intentionally exercise long-lived listener state.
-// The stateful Graph page regression is independently correct but shares
-// process-global test plumbing with older package fixtures. Keep it in its
-// own test process rather than allowing unrelated tests to make its timing
-// assertion nondeterministic.
+// A small number of tests intentionally exercise long-lived listener state or
+// timing-sensitive error isolation. These tests are independently correct but
+// share process-global test plumbing with older package fixtures. Keep them in
+// their own test process rather than allowing unrelated tests to make their
+// timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
+		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":   true,
 	},
 }
 
