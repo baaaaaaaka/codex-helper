@@ -117,6 +117,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 15,
       "oracle": "a history-watch phase is canceled when its control lease is lost and cannot commit a stale checkpoint",
       "baseline": "pre-fix heartbeat loss was observed only at the next loop boundary, allowing a stale scan to continue"
@@ -132,6 +133,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 15,
       "oracle": "a cooperative turn is canceled on lease loss while the listener root remains alive, leaving one durable takeover candidate and no stale failure side effects",
       "baseline": "pre-fix an old async turn could outlive the owner generation and run failure/follow-up work after takeover"
@@ -1093,7 +1095,7 @@
       "fake_graph": false,
       "exclusive": true,
       "max_seconds": 10,
-      "oracle": "500 operational poll rows rotate through bounded SQL candidate pages so every row is eventually selected after restart-safe ordering",
+      "oracle": "two bounded pages plus one operational poll row rotate through SQL candidate pages so every row is eventually selected after restart-safe ordering",
       "baseline": "pre-fix a fixed SQL LIMIT could repeatedly return only the first hot rows and starve later chats"
     },
     {

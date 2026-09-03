@@ -90,6 +90,8 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":               true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover": true,
 		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":       true,
+		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":   true,
+		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                  true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":            true,
 	},
