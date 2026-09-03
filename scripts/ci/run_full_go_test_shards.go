@@ -578,8 +578,20 @@ func commandOutput(name string, args ...string) ([]byte, error) {
 
 func runJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 	parallel, exclusive := splitTestJobs(jobs)
-	collected := runParallelJobs(parallel, testTimeout)
-	for _, job := range exclusive {
+	// Run host-sensitive fixtures before the broad shard pool.  Exclusive means
+	// that no sibling shard runs at the same time, but running those fixtures
+	// only after the pool would still make their finite liveness observations
+	// inherit the hosted runner's accumulated CPU, filesystem, and process
+	// pressure.  Keeping the exclusive phase first preserves the same total
+	// work and makes its isolation boundary start from a clean runner state.
+	collected := runExclusiveJobs(exclusive, testTimeout)
+	collected = append(collected, runParallelJobs(parallel, testTimeout)...)
+	return collected
+}
+
+func runExclusiveJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
+	collected := make([]jobResult, 0, len(jobs))
+	for _, job := range jobs {
 		fmt.Printf("starting %s\n", job.label)
 		result := executeJob(job, testTimeout)
 		if result.err == nil {

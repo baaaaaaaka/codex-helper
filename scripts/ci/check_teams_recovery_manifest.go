@@ -400,15 +400,23 @@ func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 
 	parallel, exclusive := splitManifestTests(ordered)
 	var outputMu sync.Mutex
+	// Start host-sensitive fixtures before the broad recovery pool.  A separate
+	// test binary prevents package-global state from leaking, but an exclusive
+	// fixture run after the pool would still inherit the runner's accumulated
+	// CPU, filesystem, and process pressure.  The ordering keeps the same
+	// isolation guarantee without relaxing any fixture assertion or watchdog.
+	if err := runExclusiveManifestTests(exclusive, binaries, packageDirs, &outputMu); err != nil {
+		return err
+	}
 	if err := runManifestTestPool(parallel, binaries, packageDirs, race, &outputMu); err != nil {
 		return err
 	}
-	// Some real-listener fixtures have a finite progress observation whose
-	// result depends on the host scheduler and filesystem.  They still run in
-	// their own test process, but must also run without sibling recovery
-	// processes competing for hosted-runner resources.
-	for _, item := range exclusive {
-		if err := runManifestTest(item, binaries[item.Package], packageDirs[item.Package], &outputMu); err != nil {
+	return nil
+}
+
+func runExclusiveManifestTests(ordered []manifestTest, binaries map[string]string, packageDirs map[string]string, outputMu *sync.Mutex) error {
+	for _, item := range ordered {
+		if err := runManifestTest(item, binaries[item.Package], packageDirs[item.Package], outputMu); err != nil {
 			return err
 		}
 	}
