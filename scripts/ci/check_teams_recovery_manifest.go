@@ -19,14 +19,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/scripts/ci/manifestprocess"
 )
 
-const manifestCompileGrace = 3 * time.Minute
-const teamsOwnershipStressStrictEnv = "CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT"
+const (
+	manifestSelectorTimeout       = 10 * time.Minute
+	manifestBuildTimeout          = 10 * time.Minute
+	manifestRuntimeGrace          = 30 * time.Second
+	teamsOwnershipStressStrictEnv = "CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT"
+)
 
 type manifest struct {
 	Version int            `json:"version"`
@@ -125,6 +132,7 @@ func selectTests(m manifest, job string) ([]manifestTest, error) {
 
 func validateSelectors(tests []manifestTest) error {
 	byPackage := make(map[string][]manifestTest)
+	realListenerSources := make(map[string]realListenerSource)
 	for _, item := range tests {
 		if !testNamePattern.MatchString(item.Name) {
 			return fmt.Errorf("invalid exact test name %q", item.Name)
@@ -152,7 +160,7 @@ func validateSelectors(tests []manifestTest) error {
 			return fmt.Errorf("real listener test %q must have a positive watchdog budget", item.Name)
 		}
 		if item.RealListener {
-			if err := validateRealListenerSource(item); err != nil {
+			if err := validateRealListenerSourceCached(item, realListenerSources); err != nil {
 				return err
 			}
 		}
@@ -166,18 +174,59 @@ func validateSelectors(tests []manifestTest) error {
 	sort.Strings(packages)
 	for _, pkg := range packages {
 		items := byPackage[pkg]
+		names := make([]string, 0, len(items))
 		for _, item := range items {
-			selector := "^" + regexp.QuoteMeta(item.Name) + "$"
-			listed, err := runCommandOutput("go", "test", pkg, "-run", "^$", "-list", selector)
-			if err != nil {
-				return fmt.Errorf("list recovery test %q in %s: %w", item.Name, pkg, err)
-			}
+			names = append(names, item.Name)
+		}
+		sort.Strings(names)
+		alternatives := make([]string, 0, len(names))
+		for _, name := range names {
+			alternatives = append(alternatives, regexp.QuoteMeta(name))
+		}
+		selector := "^(?:" + strings.Join(alternatives, "|") + ")$"
+		listed, err := runCommandOutputWithTimeout(manifestSelectorTimeout, "go", "test", pkg, "-run", "^$", "-list", selector)
+		if err != nil {
+			return fmt.Errorf("list recovery tests in %s: %w", pkg, err)
+		}
+		for _, item := range items {
 			if !hasExactListedTest(listed, item.Name) {
 				return fmt.Errorf("recovery test %q is not present in %s (go test -list output: %s)", item.Name, pkg, strings.TrimSpace(listed))
 			}
 		}
 	}
 	return nil
+}
+
+type realListenerSource struct {
+	functions        map[string]*ast.FuncDecl
+	harnessHasListen bool
+}
+
+func realListenerPackagePath(item manifestTest) (string, error) {
+	packagePath := filepath.Clean(filepath.FromSlash(strings.TrimSpace(item.Package)))
+	if packagePath == "." || packagePath == ".." || strings.Contains(packagePath, "...") {
+		return "", fmt.Errorf("real listener test %q must use a local concrete package for source validation", item.Name)
+	}
+	if strings.HasPrefix(packagePath, "."+string(filepath.Separator)) {
+		packagePath = strings.TrimPrefix(packagePath, "."+string(filepath.Separator))
+	}
+	return packagePath, nil
+}
+
+func validateRealListenerSourceCached(item manifestTest, cache map[string]realListenerSource) error {
+	packagePath, err := realListenerPackagePath(item)
+	if err != nil {
+		return err
+	}
+	source, ok := cache[packagePath]
+	if !ok {
+		source, err = loadRealListenerSource(item, packagePath)
+		if err != nil {
+			return err
+		}
+		cache[packagePath] = source
+	}
+	return source.validate(item)
 }
 
 // validateRealListenerSource prevents the manifest's real_listener bit from
@@ -187,17 +236,22 @@ func validateSelectors(tests []manifestTest) error {
 // checks Once=false; this source check makes a renamed/empty selector fail
 // before CI can report a misleading green recovery job.
 func validateRealListenerSource(item manifestTest) error {
-	packagePath := filepath.Clean(filepath.FromSlash(strings.TrimSpace(item.Package)))
-	if packagePath == "." || packagePath == ".." || strings.Contains(packagePath, "...") {
-		return fmt.Errorf("real listener test %q must use a local concrete package for source validation", item.Name)
+	packagePath, err := realListenerPackagePath(item)
+	if err != nil {
+		return err
 	}
-	if strings.HasPrefix(packagePath, "."+string(filepath.Separator)) {
-		packagePath = strings.TrimPrefix(packagePath, "."+string(filepath.Separator))
+	source, err := loadRealListenerSource(item, packagePath)
+	if err != nil {
+		return err
 	}
+	return source.validate(item)
+}
+
+func loadRealListenerSource(item manifestTest, packagePath string) (realListenerSource, error) {
 	harness := "startListenerRecovery"
 	entries, err := os.ReadDir(packagePath)
 	if err != nil {
-		return fmt.Errorf("read source package for real listener test %q: %w", item.Name, err)
+		return realListenerSource{}, fmt.Errorf("read source package for real listener test %q: %w", item.Name, err)
 	}
 	functions := make(map[string]*ast.FuncDecl)
 	harnessHasListen := false
@@ -209,7 +263,7 @@ func validateRealListenerSource(item manifestTest) error {
 		path := filepath.Join(packagePath, entry.Name())
 		file, parseErr := parser.ParseFile(fset, path, nil, 0)
 		if parseErr != nil {
-			return fmt.Errorf("parse source package for real listener test %q: %w", item.Name, parseErr)
+			return realListenerSource{}, fmt.Errorf("parse source package for real listener test %q: %w", item.Name, parseErr)
 		}
 		for _, decl := range file.Decls {
 			function, ok := decl.(*ast.FuncDecl)
@@ -231,10 +285,16 @@ func validateRealListenerSource(item manifestTest) error {
 			}
 		}
 	}
+	return realListenerSource{functions: functions, harnessHasListen: harnessHasListen}, nil
+}
+
+func (source realListenerSource) validate(item manifestTest) error {
+	functions := source.functions
+	harness := "startListenerRecovery"
 	if functions[item.Name] == nil {
 		return fmt.Errorf("real listener test %q is not present in source package %s", item.Name, item.Package)
 	}
-	if !harnessHasListen {
+	if !source.harnessHasListen {
 		return fmt.Errorf("real listener harness %q in %s does not call Bridge.Listen", harness, item.Package)
 	}
 	calledHarness := false
@@ -282,7 +342,7 @@ func validateRealListenerSource(item manifestTest) error {
 	return nil
 }
 
-func runManifestTests(tests []manifestTest, race bool) error {
+func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 	ordered := append([]manifestTest(nil), tests...)
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].Package != ordered[j].Package {
@@ -290,32 +350,88 @@ func runManifestTests(tests []manifestTest, race bool) error {
 		}
 		return ordered[i].Name < ordered[j].Name
 	})
+	testDir, err := os.MkdirTemp("", "codex-helper-teams-recovery-")
+	if err != nil {
+		return fmt.Errorf("create recovery test binary directory: %w", err)
+	}
+	defer func() {
+		if cleanupErr := os.RemoveAll(testDir); cleanupErr != nil {
+			cleanupErr = fmt.Errorf("remove recovery test binary directory %q: %w", testDir, cleanupErr)
+			if runErr == nil {
+				runErr = cleanupErr
+			} else {
+				runErr = errors.Join(runErr, cleanupErr)
+			}
+		}
+	}()
+
+	packages := make([]string, 0)
+	seenPackages := make(map[string]bool)
+	for _, item := range ordered {
+		if seenPackages[item.Package] {
+			continue
+		}
+		seenPackages[item.Package] = true
+		packages = append(packages, item.Package)
+	}
+	sort.Strings(packages)
+	binaries := make(map[string]string, len(packages))
+	packageDirs := make(map[string]string, len(packages))
+	for index, packageName := range packages {
+		binaryName := fmt.Sprintf("recovery-%d.test", index)
+		if runtime.GOOS == "windows" {
+			binaryName += ".exe"
+		}
+		binaryPath := filepath.Join(testDir, binaryName)
+		if err := buildManifestTestBinary(packageName, race, binaryPath); err != nil {
+			return err
+		}
+		packageDir, err := resolveManifestPackageDir(packageName)
+		if err != nil {
+			return err
+		}
+		binaries[packageName] = binaryPath
+		packageDirs[packageName] = packageDir
+	}
+
 	for _, item := range ordered {
 		selector := "^" + regexp.QuoteMeta(item.Name) + "$"
-		args := []string{"test"}
-		if race {
-			args = append(args, "-race")
+		args := []string{
+			"tool",
+			"test2json",
+			"-p",
+			item.Package,
+			"-t",
+			binaries[item.Package],
+			"-test.v",
+			"-test.timeout",
+			strconv.Itoa(item.MaxSeconds) + "s",
+			"-test.run",
+			selector,
 		}
-		args = append(args, item.Package, "-count=1", "-timeout", strconv.Itoa(item.MaxSeconds)+"s", "-run", selector, "-json")
-		// Run each manifest entry in its own process.  A grouped `go test` only
-		// has one package-wide timeout, so one wedged test can consume another
-		// test's budget while still producing an overall green result.  The
-		// extra grace covers first-time compilation; the test binary itself has
+		// Compile each package once, then run every manifest entry in its own
+		// process.  This preserves process isolation and each test's watchdog
+		// without paying the large package compile/link cost 109 times.  The
+		// small runtime grace covers process startup; the test binary itself has
 		// the exact manifest timeout and therefore still reports a useful stack
 		// if it fails to return.
-		watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestCompileGrace
+		watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestRuntimeGrace
 		ctx, cancel := context.WithTimeout(context.Background(), watchdog)
 		var output bytes.Buffer
-		cmd := exec.CommandContext(ctx, "go", args...)
+		cmd := exec.Command("go", args...)
+		// `go test` runs the test binary with the package directory as its
+		// working directory.  Preserve that contract because recovery fixtures
+		// and a few tests intentionally use package-relative testdata paths.
+		cmd.Dir = packageDirs[item.Package]
 		// Required recovery tests must fail on a semantic finding in every
 		// runner environment.  Do not inherit a developer's exploratory
 		// diagnostic setting into the CI manifest.
 		cmd.Env = manifestChildEnvironment()
 		cmd.Stdout = io.MultiWriter(os.Stdout, &output)
 		cmd.Stderr = os.Stderr
-		err := cmd.Run()
+		err := manifestprocess.Run(ctx, cmd)
 		cancel()
-		if ctx.Err() == context.DeadlineExceeded {
+		if err != nil && ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("recovery test %s (%s) exceeded external watchdog %s; output:\n%s", item.Name, item.Package, watchdog, strings.TrimSpace(output.String()))
 		}
 		if err != nil {
@@ -324,6 +440,61 @@ func runManifestTests(tests []manifestTest, race bool) error {
 		if err := validateTestJSONOutput(output.Bytes(), item.Name, item.Backends); err != nil {
 			return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
 		}
+	}
+	return nil
+}
+
+func resolveManifestPackageDir(packageName string) (string, error) {
+	packageName = strings.TrimSpace(packageName)
+	if packageName == "" {
+		return "", errors.New("recovery test package is empty")
+	}
+	if packageName == "." || strings.HasPrefix(packageName, "."+string(filepath.Separator)) {
+		dir, err := filepath.Abs(filepath.FromSlash(packageName))
+		if err != nil {
+			return "", fmt.Errorf("resolve recovery test package %s: %w", packageName, err)
+		}
+		if info, err := os.Stat(dir); err != nil {
+			return "", fmt.Errorf("stat recovery test package %s: %w", packageName, err)
+		} else if !info.IsDir() {
+			return "", fmt.Errorf("recovery test package %s is not a directory", packageName)
+		}
+		return dir, nil
+	}
+	listed, err := runCommandOutputWithTimeout(manifestSelectorTimeout, "go", "list", "-f", "{{.Dir}}", packageName)
+	if err != nil {
+		return "", fmt.Errorf("resolve recovery test package %s: %w", packageName, err)
+	}
+	dir := strings.TrimSpace(listed)
+	if dir == "" || strings.ContainsRune(dir, '\n') {
+		return "", fmt.Errorf("resolve recovery test package %s returned invalid directory %q", packageName, dir)
+	}
+	if info, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("stat recovery test package %s directory %s: %w", packageName, dir, err)
+	} else if !info.IsDir() {
+		return "", fmt.Errorf("recovery test package %s directory %s is not a directory", packageName, dir)
+	}
+	return dir, nil
+}
+
+func buildManifestTestBinary(packageName string, race bool, binaryPath string) error {
+	args := []string{"test"}
+	if race {
+		args = append(args, "-race")
+	}
+	args = append(args, "-c", "-o", binaryPath, packageName)
+	ctx, cancel := context.WithTimeout(context.Background(), manifestBuildTimeout)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("go", args...)
+	cmd.Env = manifestChildEnvironment()
+	cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	if err := manifestprocess.Run(ctx, cmd); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("build recovery test binary for %s exceeded %s; output:\n%s", packageName, manifestBuildTimeout, strings.TrimSpace(string(combineManifestCommandOutput(stdout.Bytes(), stderr.Bytes()))))
+		}
+		return fmt.Errorf("build recovery test binary for %s: %w; output:\n%s", packageName, err, strings.TrimSpace(string(combineManifestCommandOutput(stdout.Bytes(), stderr.Bytes()))))
 	}
 	return nil
 }
@@ -453,18 +624,33 @@ func backendSubtestSuffixMatches(backend, suffix string) bool {
 	}
 }
 
-func runCommandOutput(name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func runCommandOutputWithTimeout(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() == context.DeadlineExceeded {
+	cmd := exec.Command(name, args...)
+	output, err := runManifestCommandOutput(ctx, cmd)
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
 		return string(output), fmt.Errorf("%s %s exceeded selector watchdog", name, strings.Join(args, " "))
 	}
 	if err != nil {
 		return string(output), fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return string(output), nil
+}
+
+func runManifestCommandOutput(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := manifestprocess.Run(ctx, cmd)
+	return combineManifestCommandOutput(stdout.Bytes(), stderr.Bytes()), err
+}
+
+func combineManifestCommandOutput(stdout, stderr []byte) []byte {
+	output := make([]byte, 0, len(stdout)+len(stderr))
+	output = append(output, stdout...)
+	output = append(output, stderr...)
+	return output
 }
 
 func hasExactListedTest(output, want string) bool {

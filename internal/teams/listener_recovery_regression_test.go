@@ -64,6 +64,8 @@ type listenerRecoveryGraphState struct {
 	continuationEntered     chan struct{}
 	continuationRelease     chan struct{}
 	continuationOnce        sync.Once
+	delayOnceCanceled       chan struct{}
+	delayOnceCancelOnce     sync.Once
 }
 
 type listenerRecoverySentMessage struct {
@@ -166,8 +168,10 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 				state.gets[chatID]++
 				requestNumber := state.gets[chatID]
 				delay := state.delays[chatID]
+				firstDelay := time.Duration(0)
 				if requestNumber == 1 {
-					if firstDelay := state.delayOnce[chatID]; firstDelay > 0 {
+					firstDelay = state.delayOnce[chatID]
+					if firstDelay > 0 {
 						delay = firstDelay
 					}
 				}
@@ -205,6 +209,13 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 					select {
 					case <-timer.C:
 					case <-r.Context().Done():
+						if requestNumber == 1 && firstDelay > 0 {
+							state.delayOnceCancelOnce.Do(func() {
+								if state.delayOnceCanceled != nil {
+									close(state.delayOnceCanceled)
+								}
+							})
+						}
 						if !timer.Stop() {
 							<-timer.C
 						}
@@ -718,6 +729,18 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 // isolated chat into a false timeout.
 const listenerRecoveryBusyProgressTimeout = 90 * time.Second
 
+// State-based eventual assertions should not poll SQLite at scheduler
+// granularity. A 1ms loop creates a read flood that can compete with the
+// listener's durable writes on slower runners without improving the tested
+// liveness guarantee.
+const listenerRecoveryPollInterval = 10 * time.Millisecond
+
+// The recovery harness uses a continuous listener to prove that a later cycle
+// can make progress. A 1ms cycle interval needlessly reruns every maintenance
+// phase while an assertion is waiting and amplifies SQLite contention; the
+// production listener's correctness is independent of this test-only tick.
+const listenerRecoveryCycleInterval = 10 * time.Millisecond
+
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy runner has already spent one phase budget. A local ledger lock
 // miss can also leave a Graph-accepted row behind the bounded retry gate, so
@@ -830,7 +853,10 @@ func waitListenerRecovery(t *testing.T, waitFor func() bool, timeout time.Durati
 		if waitFor() {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
+	}
+	if waitFor() {
+		return
 	}
 	t.Fatalf("timed out waiting for %s", description)
 }
@@ -892,7 +918,7 @@ func listenerRecoveryBaseOptions(store *teamstore.Store, registryPath string, ex
 	return BridgeOptions{
 		Store:        store,
 		RegistryPath: registryPath,
-		Interval:     time.Millisecond,
+		Interval:     listenerRecoveryCycleInterval,
 		// The listener's production worker budget is a fraction of its phase
 		// budget.  Keep this test budget bounded but large enough for SQLite
 		// transactions under -race; a 100ms phase would leave only 50ms for the
@@ -900,7 +926,7 @@ func listenerRecoveryBaseOptions(store *teamstore.Store, registryPath string, ex
 		// timeout rather than exercising recovery.
 		PhaseBudget:              500 * time.Millisecond,
 		PollWorkerBudget:         100 * time.Millisecond,
-		TranscriptSyncInterval:   time.Millisecond,
+		TranscriptSyncInterval:   listenerRecoveryCycleInterval,
 		OwnerStaleAfter:          time.Second,
 		Executor:                 executor,
 		HelperVersion:            "listener-recovery-test",
@@ -1097,7 +1123,7 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 		if healthyFinalSent {
 			break
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !healthyFinalSent {
 		state, _ := store.Load(context.Background())
@@ -1184,7 +1210,7 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 				break
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if badPoll.LastError == "" || badPoll.FailureCount == 0 || !badPoll.NextPollAt.After(time.Now()) {
 		listener.stop(t)
@@ -1510,7 +1536,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_OLDER") {
 			break
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if calls := executor.callsSnapshot(); len(calls) != 2 || !strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_NEWEST") || !strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_OLDER") {
 		state, _ := store.Load(context.Background())
@@ -1850,7 +1876,7 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 	// production-sized phase has a chance to complete durable progress.
 	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
 	for !linkedProgress() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !linkedProgress() {
 		state, _ := store.Load(context.Background())
@@ -2666,7 +2692,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	}
 	deadline := time.Now().Add(listenerRecoveryBusyProgressTimeout)
 	for !pendingBoundary() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !pendingBoundary() {
 		state, _ := store.Load(context.Background())
@@ -2754,7 +2780,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	}
 	deadline = time.Now().Add(progressTimeout)
 	for !recovered() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !recovered() {
 		state, _ := store.Load(context.Background())
@@ -2946,12 +2972,13 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	graph, graphState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{
 		"chat-1": {message},
 	}, 0)
-	// Keep the first read slower than the phase budget by a wide margin.  The
-	// fake request is cooperative, but a hosted Windows runner can take a few
-	// extra seconds to unwind the canceled HTTP/SQLite work while other package
-	// tests are active; a narrow 3s budget made the recovery assertion depend on
-	// that unrelated scheduler contention.
+	// Keep the first read slower than the phase budget by a wide margin. The
+	// fake request observes context cancellation, so the test does not need to
+	// sleep for the full delay; the long delay only proves that phase ownership,
+	// rather than a successful Graph response, caused the first cancellation.
 	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
+	firstDelayCanceled := make(chan struct{})
+	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
 		called: make(chan string),
@@ -2962,6 +2989,14 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		},
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	// This regression targets the poll phase only. Keep linked-transcript and
+	// history-watch phases out of the fixture so they cannot scan the developer
+	// machine's real Codex home and consume unrelated phase budgets.
+	maintenanceSkipUntil := time.Now().Add(time.Hour)
+	bridge.lastTranscriptSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchReconcile = maintenanceSkipUntil
+	bridge.lastSQLiteWALCheckpoint = maintenanceSkipUntil
 	// Force the mutation grace to expire during the first canceled Graph read;
 	// the production refresh-after-I/O path must still leave enough time to
 	// abandon the attempt before the next listener cycle.  Keep the refreshed
@@ -2973,14 +3008,20 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	// Leave enough time for the real SQLite admission path under full-package
-	// Windows load, while keeping the phase deadline ahead of the deliberately
-	// slower Graph read.  The worker budget must exceed the phase budget;
-	// otherwise the worker would cancel itself and this test would not exercise
-	// phase-owned cleanup.
+	// The worker budget must exceed the phase budget; otherwise the worker would
+	// cancel itself and this test would not exercise phase-owned cleanup. Keep
+	// the previously validated hosted-runner margin: SQLite admission and
+	// scheduler contention on Windows can exceed a short local deadline even
+	// when the production path is healthy.
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = 12 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
+	select {
+	case <-firstDelayCanceled:
+	case <-time.After(listenerRecoveryBacklogProgressTimeout):
+		listener.stop(t)
+		t.Fatalf("phase-timeout Graph request did not observe cancellation; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
+	}
 	waitListenerRecovery(t, func() bool {
 		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
 	}, listenerRecoveryBacklogProgressTimeout, "phase deadline after claiming chat poll")
@@ -3019,9 +3060,9 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	}, listenerRecoveryBacklogProgressTimeout, "phase-timeout durable cursor")
 
 	// The listener continues polling after the final outbox side effect. Stop
-	// it after the successful retry's cursor is durable. A later, perfectly
-	// valid poll may still have an Attempt in flight; that is not the stale
-	// capability this regression is guarding against.
+	// it after the successful retry's cursor is durable. Keep the message in the
+	// fake so the production overlap query and durable deduplication path are
+	// exercised if another poll begins during cleanup.
 	listener.stop(t)
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -3033,6 +3074,9 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	}
 	if got := countListenerRecoveryInbound(state, "s001", message.ID); got != 1 {
 		t.Fatalf("phase-timeout inbound count = %d, want one; state=%#v", got, state.InboundEvents)
+	}
+	if graphState.getCount("chat-1") < 2 {
+		t.Fatalf("phase-timeout Graph reads = %d, want canceled first read followed by a retry", graphState.getCount("chat-1"))
 	}
 }
 
@@ -4217,7 +4261,7 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 			recovered = true
 			break
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !recovered {
 		state, loadErr := recoveredStore.Load(context.Background())
@@ -4621,7 +4665,7 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 				break
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	firstTurn := lastState.Turns["turn:inbound:"+chatID+":reopen-before-drain-message-2"]
 	if firstTurn.Status != teamstore.TurnStatusCompleted || lastState.ChatPolls[chatID].PendingPage != nil || strings.TrimSpace(lastState.ChatPolls[chatID].ContinuationPath) == "" {
@@ -5108,7 +5152,7 @@ func TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost(t *testing.T)
 				break
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !settled {
 		state, err := store.Load(ctx)
@@ -5238,7 +5282,7 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 				break
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !ambiguous {
 		first.stop(t)
@@ -5286,7 +5330,7 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 				break
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(listenerRecoveryPollInterval)
 	}
 	if !settled {
 		state, _ := recoveredStore.Load(ctx)
@@ -5376,7 +5420,7 @@ func TestTeamsListenFalseMarkerlessAmbiguousOutboxStaysHeldWithoutPost(t *testin
 						break
 					}
 				}
-				time.Sleep(time.Millisecond)
+				time.Sleep(listenerRecoveryPollInterval)
 			}
 			if !progressed {
 				state, err := store.Load(ctx)

@@ -122,6 +122,10 @@ Scope: fix the linked-transcript pending-root race and the safe-prefix/quarantin
 - [x] Verify unchanged trusted-EOF and unchanged pending-frontier polls perform zero checkpoint/revision/outbox/Graph writes through the existing no-op assertions and stress cases.
 - [x] Verify bounded proof reads and O(1) frontier lookup.
 - [x] Measure allocations/write counts rather than relying only on wall-clock thresholds.
+- [x] Apply an Amdahl-law review to the recovery job: the dominant avoidable serial fraction was repeated package compile/link and process startup, not the test assertions themselves.
+- [x] Compile each manifest package once per mode and retain one isolated process/watchdog per test entry; this removes repeated build work without grouping tests or weakening failure isolation.
+- [x] Cache package source parsing during selector validation and combine package selectors into one `go test -list` call per package; retain exact-name validation for every manifest entry.
+- [x] Bound manifest process-tree cancellation and cleanup on Unix, Windows, and unsupported targets; test the descendant-kill path without changing production listener timing or race-detector settings.
 - [x] Do not introduce full transcript scans/hashes, new ownership leases, new outbox systems, or Cartesian test duplication.
 
 ## 10. Final acceptance
@@ -151,3 +155,5 @@ Scope: fix the linked-transcript pending-root race and the safe-prefix/quarantin
   - focused benchmark runs for warm no-change scans and checkpoint reads
 - The benchmark comparison showed no meaningful hot-path regression: warm no-change allocations remained unchanged, the linked read stayed within measurement noise, and the tiered scan was slightly faster in the repeated run. `actionlint`/`yamllint` were unavailable locally; the CI selector was validated with `go test -list` and matched 19 recovery tests.
 - The Windows source-identity path now relies only on the mandatory `GetFileInformationByHandle` result. It uses the handle's creation and last-write times, avoiding an optional `FileBasicInfo` query that can fail under the Windows race-test environment and incorrectly erase source proof. `state_file_stamp_windows_test.go` guards the non-empty, stable identity contract.
+- The manifest runner optimization preserves the semantic test contract: normal mode passed all 109 entries in about 64 seconds locally and race mode passed all 109 in about 3 minutes 48 seconds after one package build per mode. The race-detector exit delay was intentionally not disabled because doing so would change test-effect guarantees.
+- Amdahl's analysis also bounds whole-workflow gains: even removing the Windows recovery step entirely would leave the Ubuntu core path as the critical path (about a 1.27x workflow ceiling in the measured run). Therefore the selected optimization targets the largest safe serial fraction inside the recovery step while leaving the expensive correctness scenarios intact.
