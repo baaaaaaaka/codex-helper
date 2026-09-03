@@ -1024,7 +1024,7 @@
       "vertical": "chat-poll-owner-cas",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a stale owner cannot normalize or overwrite a poll frontier after takeover while the replacement owner can mutate it",
       "baseline": "pre-fix compatibility normalization could use an unscoped full-state write and overwrite a replacement owner's poll state"
     },

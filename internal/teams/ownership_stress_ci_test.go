@@ -170,7 +170,13 @@ func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
 		t.Fatalf("Graph stall changed the durable inbound cursor: before=%#v after=%#v", initialPoll, poll)
 	}
 
-	if err := bridge.syncLinkedTranscripts(ctx); err != nil {
+	// The Graph-stall context is deliberately short and is only for the failed
+	// inbound read. Transcript catch-up is a separate finite phase; reusing the
+	// nearly-expired poll context would turn successful local recovery into a
+	// deadline failure on slower hosted filesystems.
+	transcriptCtx, cancelTranscript := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelTranscript()
+	if err := bridge.syncLinkedTranscripts(transcriptCtx); err != nil {
 		t.Fatalf("sync TUI transcript after Graph recovery: %v", err)
 	}
 	// Transcript delivery is intentionally budgeted.  A pressure test must
@@ -188,7 +194,7 @@ func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
 		if allPresent {
 			break
 		}
-		if err := bridge.syncLinkedTranscripts(ctx); err != nil {
+		if err := bridge.syncLinkedTranscripts(transcriptCtx); err != nil {
 			t.Fatalf("resume TUI transcript sync attempt %d: %v", attempt+1, err)
 		}
 	}

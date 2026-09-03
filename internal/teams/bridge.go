@@ -47,6 +47,11 @@ const (
 	outboxRecoveryMaxPages         = 32
 	outboxRecoveryMaxPagesPerFlush = 8
 	outboxRecoveryRetryBackoff     = 30 * time.Second
+	// An unresolved transcript anchor can fence an entire bounded outbox page.
+	// Its retry gate must outlive a slow SQLite pass, otherwise rows can become
+	// due again while that same pass is still scanning them and livelock the
+	// healthy tail. Keep this separate from ordinary transient-send retries.
+	outboxUnresolvedAnchorRetryBackoff = 2 * time.Minute
 	// A later row may observe a normal predecessor while another flush is
 	// finishing its send lease.  Keep FIFO ordering, but do not convert that
 	// short-lived in-process race into the general recovery backoff.
@@ -19443,7 +19448,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 	}
 	anchorBlocked := transcriptOutboxBlockedByUnresolvedAnchor(ctx, b.store, outbox, anchorCache, anchorKnown)
 	if opts.SkipUnresolvedTranscript && anchorBlocked {
-		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: firstNonZeroTime(outbox.LastSendAttempt, outbox.CreatedAt)}
+		return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(outboxUnresolvedAnchorRetryBackoff)}
 	}
 	if anchorBlocked && outbox.Status == teamstore.OutboxStatusSending && strings.TrimSpace(outbox.SendAttemptToken) != "" {
 		if _, err := b.store.MarkOutboxSendErrorForAttempt(context.Background(), outbox.ID, outbox.SendAttemptToken, "execution ownership became unresolved before Graph preparation"); err != nil {

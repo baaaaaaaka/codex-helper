@@ -845,6 +845,78 @@ func TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail(t *testing.T)
 	}
 }
 
+// TestTeamsUnresolvedTranscriptOutboxUsesFutureRetryGate protects the sender
+// boundary directly. A legacy row may have an old CreatedAt/LastSendAttempt,
+// but an unresolved execution fence must still return a future gate; otherwise
+// the flusher falls back to its generic short retry and can revisit a slow
+// unresolved prefix before the current pass has finished.
+func TestTeamsUnresolvedTranscriptOutboxUsesFutureRetryGate(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			const sessionID = "s001"
+			const chatID = "chat-1"
+			sourcePath := filepath.Join(t.TempDir(), "s001.jsonl")
+			sourceBody := []byte("blocked transcript proof\n")
+			if err := os.WriteFile(sourcePath, sourceBody, 0o600); err != nil {
+				t.Fatalf("write source proof fixture: %v", err)
+			}
+			sourceProof := transcriptCheckpointSourceFingerprint(sourcePath, int64(len(sourceBody)))
+			checkpointID := transcriptCheckpointID(sessionID)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, Status: importCheckpointStatusBlocked,
+					UnresolvedExecution: &teamstore.ExecutionAnchor{
+						SessionID: sessionID, State: executionAnchorStateUnresolved,
+						Generation: 7, OuterTurnID: "turn:unresolved-prefix",
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed unresolved execution checkpoint: %v", err)
+			}
+			row := teamstore.OutboxMessage{
+				ID:                               "outbox:unresolved-future-gate",
+				SessionID:                        sessionID,
+				TeamsChatID:                      chatID,
+				TurnID:                           "sync:unresolved-future-gate",
+				Kind:                             "sync-assistant",
+				NotificationKind:                 "turn_completed",
+				Body:                             "blocked transcript answer",
+				TranscriptCheckpointID:           checkpointID,
+				TranscriptSourcePath:             sourcePath,
+				TranscriptSourceProofFingerprint: sourceProof,
+				TranscriptSourceProofOffset:      int64(len(sourceBody)),
+				TranscriptSourceProofOffsetKnown: true,
+				CreatedAt:                        time.Now().Add(-time.Hour),
+				LastSendAttempt:                  time.Now().Add(-time.Hour),
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, row)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			started := time.Now()
+			err := bridge.sendQueuedOutboxWithOptions(ctx, row, outboxSendOptions{SkipUnresolvedTranscript: true})
+			var deferred outboxDeliveryDeferredError
+			if !errors.As(err, &deferred) {
+				t.Fatalf("send error = %v, want unresolved-transcript deferral", err)
+			}
+			if !deferred.Until.After(started.Add(outboxUnresolvedAnchorRetryBackoff - time.Second)) {
+				t.Fatalf("unresolved-transcript retry gate = %s, want a future %s gate", deferred.Until, outboxUnresolvedAnchorRetryBackoff)
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("unresolved transcript row posted %d Graph message(s)", len(*sent))
+			}
+		})
+	}
+}
+
 func TestTeamsOutboxPacingReservation(t *testing.T) {
 	var mu sync.Mutex
 	var sleeps []time.Duration
