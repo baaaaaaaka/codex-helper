@@ -1183,6 +1183,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 20,
       "oracle": "after the first Graph page is committed and the next-link request is interrupted, a replacement owner follows the persisted continuation and delivers only the second-page prompt",
       "baseline": "pre-fix restart tests drained the continuation before shutdown and could not detect a lost or replayed frontier"
