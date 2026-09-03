@@ -60,6 +60,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
 		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
 		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                 true,
 		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
@@ -87,6 +88,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":               true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover": true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":            true,
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit": true,
