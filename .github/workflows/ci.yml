@@ -2274,6 +2274,7 @@ jobs:
   full-go-test:
     name: Full go test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -2310,7 +2311,11 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
-          if ! go test -timeout=20m -parallel=16 ./... 2>&1 | tee "$log"; then
+          # The Teams packages contain the largest and most independent test
+          # corpus. Run every discovered Test/Example/Fuzz entry exactly once,
+          # but in bounded prefix shards so one package test process cannot
+          # spend the entire 20-minute watchdog behind unrelated fixtures.
+          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"

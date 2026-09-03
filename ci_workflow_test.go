@@ -99,6 +99,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, fullJob,
 		"name: Full go test (${{ matrix.os }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
+		"timeout-minutes: 45",
 	)
 
 	linuxCoverage := workflowStepBlock(t, fullJob, "go test (with coverage, Linux only)")
@@ -112,8 +113,12 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, nonLinuxTest,
 		"if: runner.os != 'Linux'",
 		"shell: bash",
-		"go test -timeout=20m -parallel=16 ./...",
+		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8",
+		"Test/Example/Fuzz",
 	)
+	if strings.Contains(nonLinuxTest, "go test -timeout=20m -parallel=16 ./...") {
+		t.Fatal("non-Linux full test step should use validated package shards")
+	}
 	if strings.Contains(nonLinuxTest, "coverprofile") {
 		t.Fatal("non-Linux full test step should not generate coverage.out")
 	}
