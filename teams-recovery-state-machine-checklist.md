@@ -128,6 +128,7 @@ Scope: fix the linked-transcript pending-root race and the safe-prefix/quarantin
 - [x] Bound manifest process-tree cancellation and cleanup on Unix, Windows, and unsupported targets; test the descendant-kill path without changing production listener timing or race-detector settings.
 - [x] Run the already-isolated manifest processes through a CPU-bounded worker pool (maximum four workers); keep one binary, watchdog, JSON validation, and process tree per entry, and serialize only console writes.
 - [x] Isolate the SQLite/Graph stress fixtures that are intentionally timing-sensitive from unrelated full-package tests, and add finite test-only scheduling margins/cleanup for hosted Windows and race runners without changing assertions or production timeouts.
+- [x] Give the SQLite ledger-fairness manifest entry a finite 60-second fixture budget after hosted Windows evidence showed that its 65-row durable setup can exceed 15 seconds; retain the same bounded page, no-poison-POST, and healthy-tail assertions.
 - [x] Do not introduce full transcript scans/hashes, new ownership leases, new outbox systems, or Cartesian test duplication.
 
 ## 10. Final acceptance
