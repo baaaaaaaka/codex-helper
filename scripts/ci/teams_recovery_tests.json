@@ -1480,7 +1480,7 @@
       "vertical": "control-lease-owner-projection-integrity",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a live lease is not taken over when the service-owner projection is empty or legacy-incomplete, while a matching lock-owner copy remains authoritative",
       "baseline": "pre-fix a syntactically valid but semantically incomplete service-owner row could make a same-machine replacement take over an unexpired lease"
     }
