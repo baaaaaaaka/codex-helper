@@ -712,10 +712,11 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
-// Full-package race runs can be delayed by the heavy fixtures that execute
-// before these fairness checks. Keep their liveness bound finite, but do not
-// let runner contention turn a healthy isolated chat into a false timeout.
-const listenerRecoveryBusyProgressTimeout = 60 * time.Second
+// Full-package runs can be delayed by the heavy fixtures and parallel tests
+// that execute before these fairness checks on hosted runners. Keep the
+// liveness bound finite, but do not let runner contention turn a healthy
+// isolated chat into a false timeout.
+const listenerRecoveryBusyProgressTimeout = 90 * time.Second
 
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy runner has already spent one phase budget. A local ledger lock
