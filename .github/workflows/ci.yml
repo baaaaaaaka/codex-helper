@@ -2296,12 +2296,25 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
-          if ! go test -timeout=20m -parallel=16 -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
+          # This fixture is intentionally isolated from the package-wide
+          # coverage process.  It exercises a real listener/store reopen and
+          # owner takeover; running it beside the full Teams test corpus can
+          # make the SQLite fsync path miss its finite progress watchdog.
+          # Run it separately below so the regression remains mandatory while
+          # the coverage profile still covers every other package test.
+          frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'
+          if ! go test -timeout=20m -parallel=16 -skip "$frontier_recovery_pattern" -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
             echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
+            exit 1
+          fi
+          isolated_log="$RUNNER_TEMP/frontier-recovery-isolated.log"
+          if ! go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run "$frontier_recovery_pattern" -v 2>&1 | tee "$isolated_log"; then
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$isolated_log" | tail -80 | tr '\n' ' ' || true)"
+            echo "::error title=Isolated frontier recovery failure::${summary:-isolated recovery test failed; inspect the retained step log}"
             exit 1
           fi
 
