@@ -128,9 +128,14 @@ func TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI(t *testing.T) {
 
 	pollDone := make(chan error, 1)
 	go func() {
-		pollCtx, pollCancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		defer pollCancel()
-		_, err := bridge.pollChatWithRole(pollCtx, session.ChatID, 20, inboundPollRoleWork, false, func(context.Context, ChatMessage, string) error {
+		// Keep the scenario context available for durable state admission and
+		// cleanup. Only the synthetic Graph read should have the short stall
+		// budget; wrapping the whole poll in 100ms makes Windows persistence
+		// scheduling race with the Graph request and can fail before the blocker
+		// is reached.
+		_, err := bridge.pollChatWithRoleStateOptions(ctx, session.ChatID, 20, inboundPollRoleWork, false, initialPoll, true, pollChatWithRoleOptions{
+			GraphBudget: 100 * time.Millisecond,
+		}, func(context.Context, ChatMessage, string) error {
 			return nil
 		})
 		pollDone <- err

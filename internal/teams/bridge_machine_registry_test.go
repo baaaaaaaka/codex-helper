@@ -298,6 +298,9 @@ func TestBridgeMachineDelegationWorkerClaimsExecutesAndPublishesResult(t *testin
 	if state.WinningClaim == nil || state.WinningClaim.MachineID != "machine-a" {
 		t.Fatalf("winning claim = %#v", state.WinningClaim)
 	}
+	if !waitPublishersIdle(time.Second, publisher) {
+		t.Fatal("delegation worker did not finish before temporary directory cleanup")
+	}
 }
 
 func TestBridgeMachineDelegationWorkerUsesRemoteThreadSessionID(t *testing.T) {

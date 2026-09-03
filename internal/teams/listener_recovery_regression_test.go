@@ -2376,8 +2376,11 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 		options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
 		// Leave enough room that the hook can only exit because the owner
 		// heartbeat cancels the phase, not because the ordinary phase budget
-		// expires first.
-		options.PhaseBudget = 5 * time.Second
+		// expires first. The wait below is a finite observation bound rather
+		// than a sub-second performance assertion; hosted Windows runners can
+		// spend that long in a durable SQLite probe while cancellation is in
+		// flight.
+		options.PhaseBudget = 10 * time.Second
 		options.PollWorkerBudget = time.Second
 		listenDone <- bridge.Listen(listenCtx, options)
 	}()
@@ -2392,7 +2395,6 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	if oldGeneration <= 0 {
 		t.Fatal("listener did not acquire a control-lease generation")
 	}
-	ownerLossAt := time.Now()
 	if released, err := store.ReleaseControlLeaseIfHolder(context.Background(), bridge.machine.ID, oldGeneration); err != nil || !released {
 		t.Fatalf("release old owner: released=%v err=%v", released, err)
 	}
@@ -2407,10 +2409,7 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 		default:
 			return false
 		}
-	}, 2*time.Second, "owner-loss history-watch cancellation")
-	if elapsed := time.Since(ownerLossAt); elapsed >= 2*time.Second {
-		t.Fatalf("history-watch cancellation took %s; phase timeout may have masked owner loss", elapsed)
-	}
+	}, 5*time.Second, "owner-loss history-watch cancellation")
 	if stats := bridge.mainLoopPhaseStatsSnapshot("history-watch"); stats.DeadlineExceeded != 0 {
 		t.Fatalf("history-watch phase reached its ordinary deadline during owner loss: %#v", stats)
 	}
@@ -2980,8 +2979,10 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	}, 0)
 	// Keep the first read slower than the phase budget. The fake request observes
 	// context cancellation, so the test waits only for the bounded phase
-	// deadline rather than the full provider delay.
-	graphState.delayOnce = map[string]time.Duration{"chat-1": 4 * time.Second}
+	// deadline rather than the full provider delay. The phase budget below is
+	// intentionally large enough for Windows race SQLite admission; the delay
+	// remains larger so the first cycle still reaches the phase deadline.
+	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
 	firstDelayCanceled := make(chan struct{})
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
@@ -3011,21 +3012,25 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	// The worker budget must exceed the phase budget; otherwise the worker would
-	// cancel itself and this test would not exercise phase-owned cleanup. Keep
-	// the synthetic boundary short because the fake request is cooperative and
-	// the follow-up schedule is made due explicitly below.
-	options.PhaseBudget = 2 * time.Second
-	options.PollWorkerBudget = 3 * time.Second
+	// cancel itself and this test would not exercise phase-owned cleanup. The
+	// phase includes durable state admission as well as the Graph read, so a
+	// two-second boundary is below the observed Windows race-runner setup cost
+	// and can cancel the *second* recovery cycle before it reaches the handler.
+	// Keep a finite ten-second phase boundary and a larger worker budget: the
+	// fake read is still guaranteed to hit the phase deadline, while a healthy
+	// follow-up cycle has enough room to commit its durable receipt.
+	options.PhaseBudget = 10 * time.Second
+	options.PollWorkerBudget = 12 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-firstDelayCanceled:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("phase-timeout Graph request did not observe cancellation; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	waitListenerRecovery(t, func() bool {
 		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
-	}, listenerRecoveryProgressTimeout, "phase deadline after claiming chat poll")
+	}, listenerRecoveryExtendedProgressTimeout, "phase deadline after claiming chat poll")
 	state, err := store.Load(context.Background())
 	if err != nil {
 		listener.stop(t)
