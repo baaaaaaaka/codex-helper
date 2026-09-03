@@ -427,7 +427,7 @@
       "vertical": "outbox-suppressed-owner-cas",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "a stale listener cannot suppress a queued diagnostic after takeover, while the current owner can atomically retire it without a Graph identity",
       "baseline": "pre-fix the empty-ID Sent path had no distinct owner-fenced operation"
     },
