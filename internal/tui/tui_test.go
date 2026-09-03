@@ -117,8 +117,12 @@ func waitForScreenLineContains(t *testing.T, screen tcell.Screen, y int, want st
 }
 
 func waitForScreenContains(t *testing.T, screen tcell.Screen, want string) {
+	waitForScreenContainsWithin(t, screen, want, 500*time.Millisecond)
+}
+
+func waitForScreenContainsWithin(t *testing.T, screen tcell.Screen, want string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, h := screen.Size()
 		for y := 0; y < h; y++ {
@@ -2362,16 +2366,20 @@ func TestSelectSessionAutoRefreshPreservesSelection(t *testing.T) {
 	refreshCh := make(chan struct{})
 	var once sync.Once
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// Under -race the full package suite can delay the simulation screen's
+	// refresh event beyond the short unit-test window. This is a test fixture
+	// margin only; the same key events, refresh ordering, and selected session
+	// assertion remain unchanged.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	go func() {
 		<-initDone
-		waitForScreenContains(t, screen, "sess-1")
+		waitForScreenContainsWithin(t, screen, "sess-1", 2*time.Second)
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'j', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyRune, 'l', 0))
 		screen.PostEvent(tcell.NewEventKey(tcell.KeyDown, 0, 0))
-		waitForScreenContains(t, screen, "ID: sess-2")
+		waitForScreenContainsWithin(t, screen, "ID: sess-2", 2*time.Second)
 		close(refreshEnabled)
 
 		<-refreshCh

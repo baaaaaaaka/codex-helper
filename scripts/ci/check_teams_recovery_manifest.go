@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/scripts/ci/manifestprocess"
@@ -394,52 +395,127 @@ func runManifestTests(tests []manifestTest, race bool) (runErr error) {
 		packageDirs[packageName] = packageDir
 	}
 
-	for _, item := range ordered {
-		selector := "^" + regexp.QuoteMeta(item.Name) + "$"
-		args := []string{
-			"tool",
-			"test2json",
-			"-p",
-			item.Package,
-			"-t",
-			binaries[item.Package],
-			"-test.v",
-			"-test.timeout",
-			strconv.Itoa(item.MaxSeconds) + "s",
-			"-test.run",
-			selector,
+	// Each manifest entry remains in its own test process, so running several
+	// entries concurrently does not share test globals or weaken per-entry
+	// watchdog isolation.  Bound the pool by the runner's available CPUs: the
+	// recovery corpus is deliberately expensive, but an unbounded process burst
+	// would trade wall time for memory pressure and scheduler contention.
+	workerCount := manifestTestWorkerCount()
+	jobs := make(chan manifestTestJob)
+	results := make(chan manifestTestResult, len(ordered))
+	var outputMu sync.Mutex
+	var workers sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				err := runManifestTest(job.item, binaries[job.item.Package], packageDirs[job.item.Package], &outputMu)
+				results <- manifestTestResult{index: job.index, err: err}
+			}
+		}()
+	}
+	go func() {
+		for index, item := range ordered {
+			jobs <- manifestTestJob{index: index, item: item}
 		}
-		// Compile each package once, then run every manifest entry in its own
-		// process.  This preserves process isolation and each test's watchdog
-		// without paying the large package compile/link cost 109 times.  The
-		// small runtime grace covers process startup; the test binary itself has
-		// the exact manifest timeout and therefore still reports a useful stack
-		// if it fails to return.
-		watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestRuntimeGrace
-		ctx, cancel := context.WithTimeout(context.Background(), watchdog)
-		var output bytes.Buffer
-		cmd := exec.Command("go", args...)
-		// `go test` runs the test binary with the package directory as its
-		// working directory.  Preserve that contract because recovery fixtures
-		// and a few tests intentionally use package-relative testdata paths.
-		cmd.Dir = packageDirs[item.Package]
-		// Required recovery tests must fail on a semantic finding in every
-		// runner environment.  Do not inherit a developer's exploratory
-		// diagnostic setting into the CI manifest.
-		cmd.Env = manifestChildEnvironment()
-		cmd.Stdout = io.MultiWriter(os.Stdout, &output)
-		cmd.Stderr = os.Stderr
-		err := manifestprocess.Run(ctx, cmd)
-		cancel()
-		if err != nil && ctx.Err() == context.DeadlineExceeded {
-			return fmt.Errorf("recovery test %s (%s) exceeded external watchdog %s; output:\n%s", item.Name, item.Package, watchdog, strings.TrimSpace(output.String()))
-		}
+		close(jobs)
+		workers.Wait()
+		close(results)
+	}()
+	errs := make([]error, len(ordered))
+	for result := range results {
+		errs[result.index] = result.err
+	}
+	for _, err := range errs {
 		if err != nil {
-			return fmt.Errorf("run recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
+			return err
 		}
-		if err := validateTestJSONOutput(output.Bytes(), item.Name, item.Backends); err != nil {
-			return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
-		}
+	}
+	return nil
+}
+
+const maxManifestTestWorkers = 4
+
+type manifestTestJob struct {
+	index int
+	item  manifestTest
+}
+
+type manifestTestResult struct {
+	index int
+	err   error
+}
+
+func manifestTestWorkerCount() int {
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > maxManifestTestWorkers {
+		workerCount = maxManifestTestWorkers
+	}
+	return workerCount
+}
+
+type synchronizedManifestWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (w synchronizedManifestWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(data)
+}
+
+func runManifestTest(item manifestTest, binaryPath string, packageDir string, outputMu *sync.Mutex) error {
+	selector := "^" + regexp.QuoteMeta(item.Name) + "$"
+	args := []string{
+		"tool",
+		"test2json",
+		"-p",
+		item.Package,
+		"-t",
+		binaryPath,
+		"-test.v",
+		"-test.timeout",
+		strconv.Itoa(item.MaxSeconds) + "s",
+		"-test.run",
+		selector,
+	}
+	// Compile each package once, then run every manifest entry in its own
+	// process. This preserves process isolation and each test's watchdog
+	// without paying the large package compile/link cost 109 times. The small
+	// runtime grace covers process startup; the test binary itself has the
+	// exact manifest timeout and therefore still reports a useful stack if it
+	// fails to return.
+	watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestRuntimeGrace
+	ctx, cancel := context.WithTimeout(context.Background(), watchdog)
+	defer cancel()
+	var output bytes.Buffer
+	cmd := exec.Command("go", args...)
+	// `go test` runs the test binary with the package directory as its working
+	// directory. Preserve that contract because recovery fixtures and a few
+	// tests intentionally use package-relative testdata paths.
+	cmd.Dir = packageDir
+	// Required recovery tests must fail on a semantic finding in every runner
+	// environment. Do not inherit a developer's exploratory diagnostic setting
+	// into the CI manifest.
+	cmd.Env = manifestChildEnvironment()
+	stdout := synchronizedManifestWriter{mu: outputMu, w: os.Stdout}
+	stderr := synchronizedManifestWriter{mu: outputMu, w: os.Stderr}
+	cmd.Stdout = io.MultiWriter(stdout, &output)
+	cmd.Stderr = stderr
+	err := manifestprocess.Run(ctx, cmd)
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("recovery test %s (%s) exceeded external watchdog %s; output:\n%s", item.Name, item.Package, watchdog, strings.TrimSpace(output.String()))
+	}
+	if err != nil {
+		return fmt.Errorf("run recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
+	}
+	if err := validateTestJSONOutput(output.Bytes(), item.Name, item.Backends); err != nil {
+		return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
 	}
 	return nil
 }

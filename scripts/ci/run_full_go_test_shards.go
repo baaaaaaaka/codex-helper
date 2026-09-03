@@ -41,9 +41,13 @@ var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$
 // allowing unrelated tests to make their timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":     true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":    true,
+		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":           true,
+		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":              true,
 		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":      true,
 		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI": true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                true,
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                            true,
 	},
 }

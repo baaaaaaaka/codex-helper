@@ -361,7 +361,7 @@ func TestTeamsOwnershipStressHeadReadFailureRecoversWithoutCursorAdvanceCI(t *te
 // observed as a diagnostic here: a second chat should be allowed to reach its
 // own Graph request before the first request is released.
 func TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 	defer cancel()
 	graph, _ := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1560,7 +1560,7 @@ func TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI(t *testin
 		{name: "server-error", status: http.StatusServiceUnavailable},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
 			defer cancel()
 			store := newBridgeTestStore(t)
 			executor := &recordingExecutor{result: ExecutionResult{

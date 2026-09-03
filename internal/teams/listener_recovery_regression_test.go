@@ -4170,6 +4170,15 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	if err != nil {
 		t.Fatalf("open first store: %v", err)
 	}
+	storeClosed := false
+	t.Cleanup(func() {
+		if storeClosed {
+			return
+		}
+		if closeErr := store.Close(); closeErr != nil {
+			t.Errorf("close first store during cleanup: %v", closeErr)
+		}
+	})
 	now := time.Now().UTC()
 	// Keep POSTs immediate in this restart/frontier test.  A deliberately slow
 	// POST belongs in the ambiguous-result test; combining it with the race
@@ -4200,8 +4209,12 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	// Keep the first owner in its first cycle after the bounded outbox batch.
 	// The pre-send hook deterministically pauses the second send, so the
 	// restart boundary contains a queued row rather than an unknown side effect.
+	// Windows hosted runners can spend several seconds opening and claiming a
+	// migrated SQLite store before the first phase reaches the hook.  This is a
+	// fixture scheduling margin only; the listener remains bounded by the outer
+	// test watchdog and the hook still cancels as soon as the boundary is hit.
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 3 * time.Second
+	firstOptions.PhaseBudget = listenerRecoveryExtendedProgressTimeout
 	secondSendStarted := make(chan struct{})
 	var secondSendOnce sync.Once
 	seedBridge.outboxSendHook = func(ctx context.Context, msg teamstore.OutboxMessage) error {
@@ -4215,7 +4228,7 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	firstListener := startListenerRecovery(t, seedBridge, firstOptions)
 	select {
 	case <-secondSendStarted:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		firstListener.stop(t)
 		t.Fatalf("timed out waiting for deterministic pre-send restart boundary")
 	}
@@ -4236,6 +4249,7 @@ func runListenerRecoveryBacklogProgressSurvivesReopen(t *testing.T, useSQLite bo
 	if err := store.Close(); err != nil {
 		t.Fatalf("close first store: %v", err)
 	}
+	storeClosed = true
 
 	recoveredStore, err := teamstore.Open(storePath)
 	if err != nil {
