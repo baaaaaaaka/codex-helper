@@ -67,6 +67,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":            true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
@@ -96,6 +97,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":       true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":            true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":           true,
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,

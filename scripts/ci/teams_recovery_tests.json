@@ -1241,6 +1241,7 @@
       "vertical": "outbox-post-response-durable-grace",
       "real_listener": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 10,
       "oracle": "a Graph-accepted helper row settles Sent with the exact remote ID even when the phase context is canceled while the response body is read",
       "baseline": "pre-fix final local CAS inherited the expired phase context and left the accepted row behind a retry gate"
