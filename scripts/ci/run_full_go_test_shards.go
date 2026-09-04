@@ -93,6 +93,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":       true,
 		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":   true,
 		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                  true,
+		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":       true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":        true,
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":            true,
 	},
