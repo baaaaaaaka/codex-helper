@@ -745,6 +745,11 @@ const listenerRecoveryPollInterval = 50 * time.Millisecond
 // production listener's correctness is independent of this test-only tick.
 const listenerRecoveryCycleInterval = 100 * time.Millisecond
 
+// Owner-loss fixtures need a heartbeat that observes the explicit lease
+// release promptly, but a 5ms interval creates a synthetic durable-write hot
+// loop and can starve the poll under hosted Windows file scheduling.
+const listenerRecoveryOwnerHeartbeatInterval = 50 * time.Millisecond
+
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy runner has already spent one phase budget. A local ledger lock
 // miss can also leave a Graph-accepted row behind the bounded retry gate, so
@@ -2392,7 +2397,7 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	store := newBridgeTestStore(t)
 	graph, _ := newListenerRecoveryGraph(t, nil, nil, 0)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	bridge.ownerHeartbeatInterval = 5 * time.Millisecond
+	bridge.ownerHeartbeatInterval = listenerRecoveryOwnerHeartbeatInterval
 	root := filepath.Join(t.TempDir(), "codex")
 	path := filepath.Join(root, "sessions", "owner-loss.jsonl")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -2522,7 +2527,7 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryCooperativeCancellationExecutor{started: make(chan struct{})}
 	bridge := newBridgeTestBridge(graph, store, executor)
-	bridge.ownerHeartbeatInterval = 5 * time.Millisecond
+	bridge.ownerHeartbeatInterval = listenerRecoveryOwnerHeartbeatInterval
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
