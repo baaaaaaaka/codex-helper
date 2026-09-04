@@ -3354,6 +3354,14 @@ func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	bridge.controlFallbackExecutor = executor
 	bridge.asyncTurns = true
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(executor.release) })
+	}
+	t.Cleanup(func() {
+		release()
+		waitForBridgeAsyncTurns(t, bridge)
+	})
 	ctx := context.Background()
 
 	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-running", "2026-04-30T01:00:00Z", "first control question"), "first control question"); err != nil {
@@ -3362,15 +3370,15 @@ func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
 	select {
 	case <-executor.started:
 	case <-time.After(bridgeAsyncTestTimeout):
-		close(executor.release)
+		release()
 		t.Fatal("first control fallback did not start")
 	}
 	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-queued", "2026-04-30T01:00:01Z", "second control question"), "second control question"); err != nil {
-		close(executor.release)
+		release()
 		t.Fatalf("handle second control fallback error: %v", err)
 	}
 	if err := bridge.handleControlMessage(ctx, bridgePollMessage("control-cancel-all-command", "2026-04-30T01:00:02Z", "helper cancel all"), "helper cancel all"); err != nil {
-		close(executor.release)
+		release()
 		t.Fatalf("handle control cancel all error: %v", err)
 	}
 
@@ -3378,7 +3386,7 @@ func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
 	for {
 		state, err := store.Load(ctx)
 		if err != nil {
-			close(executor.release)
+			release()
 			t.Fatalf("Load after control cancel all error: %v", err)
 		}
 		interrupted := 0
@@ -3391,7 +3399,7 @@ func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			close(executor.release)
+			release()
 			t.Fatalf("timed out waiting for both control fallback turns to cancel; turns=%#v", state.Turns)
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -3400,15 +3408,15 @@ func TestBridgeControlCancelAllFallbackCancelsRunningAndQueued(t *testing.T) {
 	joined := sentPlainJoined(*sent)
 	for _, want := range []string{"cancel all requested for this Control chat.", "Running requests cancel requested", "Queued requests canceled", "Codex request canceled."} {
 		if !strings.Contains(joined, want) {
-			close(executor.release)
+			release()
 			t.Fatalf("control cancel all transcript missing %q in:\n%s", want, joined)
 		}
 	}
 	if strings.Contains(joined, "should not finish") || strings.Contains(joined, "error: context canceled") {
-		close(executor.release)
+		release()
 		t.Fatalf("control cancel all should not finish or surface context cancellation:\n%s", joined)
 	}
-	close(executor.release)
+	release()
 }
 
 func TestBridgeControlCancelLastWithoutFallbackSaysControlChat(t *testing.T) {
@@ -37182,6 +37190,7 @@ func TestBridgeStartsTeamsPromptWithoutForegroundTranscriptSync(t *testing.T) {
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForBridgeAsyncTurns(t, bridge)
 	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
 
 	var plain []string
