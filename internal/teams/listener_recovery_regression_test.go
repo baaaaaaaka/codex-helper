@@ -153,6 +153,15 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		// The listener annotates each inbound message after handling it.  The
+		// production path deliberately treats an annotation failure as
+		// message-local, but the shared fake should still model a successful
+		// Graph annotation so recovery tests do not carry a spurious 404 into
+		// the next poll cycle.
+		if len(parts) == 4 && parts[0] == "chats" && parts[2] == "messages" && r.Method == http.MethodPatch {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if len(parts) == 3 && parts[0] == "chats" && parts[2] == "messages" {
 			chatID := parts[1]
 			switch r.Method {
@@ -724,16 +733,17 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
 // State-based eventual assertions should not poll SQLite at scheduler
-// granularity. A 1ms loop creates a read flood that can compete with the
+// granularity. A 10ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
-// liveness guarantee.
-const listenerRecoveryPollInterval = 10 * time.Millisecond
+// liveness guarantee. 50ms is still much faster than the production polling
+// interval while keeping assertions responsive.
+const listenerRecoveryPollInterval = 50 * time.Millisecond
 
 // The recovery harness uses a continuous listener to prove that a later cycle
-// can make progress. A 1ms cycle interval needlessly reruns every maintenance
+// can make progress. A 10ms cycle interval needlessly reruns every maintenance
 // phase while an assertion is waiting and amplifies SQLite contention; the
 // production listener's correctness is independent of this test-only tick.
-const listenerRecoveryCycleInterval = 10 * time.Millisecond
+const listenerRecoveryCycleInterval = 100 * time.Millisecond
 
 // Restarted outbox recovery can cross the production Graph pacing interval
 // after a busy runner has already spent one phase budget. A local ledger lock
@@ -1182,8 +1192,14 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 	listenerRecoverySeedDuePoll(t, store, "chat-2", now)
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// Match the production phase and worker budgets.  This test proves that a
+	// retryable error is isolated to one chat; a one-second worker budget can
+	// expire while the healthy chat is completing its durable SQLite admission
+	// and handler path on a busy Windows race runner, after Graph has already
+	// returned the healthy page.  That would test runner timing instead of
+	// failure isolation.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
@@ -1513,6 +1529,19 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	bridge.reg.Sessions = nil
 	appendBridgeTestSession(t, bridge, store, "s-stateful", chatID)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
+	// This test exercises the work-chat head/continuation frontier only. Keep
+	// the already-materialized control row warm but out of the current poll
+	// cycle; repeatedly polling an unrelated empty control chat adds durable
+	// writes and SQLite scheduling noise, especially under -race, without
+	// strengthening the frontier assertion.
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         bridge.reg.ControlChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("defer stateful control poll: %v", err)
+	}
 	listenerRecoverySeedDuePoll(t, store, chatID, now)
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		poll := state.ChatPolls[chatID]
@@ -1545,9 +1574,14 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	}
 	if calls := executor.callsSnapshot(); len(calls) != 2 || !strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_NEWEST") || !strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_STATEFUL_OLDER") {
 		state, _ := store.Load(context.Background())
-		t.Fatalf("stateful page prompts = %#v; requests=%v errors=%v polls=%#v", calls, graphState.requestsSnapshot(), graphState.errorsSnapshot(), state.ChatPolls[chatID])
+		poll := state.ChatPolls[chatID]
+		attempt := "<nil>"
+		if poll.Attempt != nil {
+			attempt = fmt.Sprintf("%+v", *poll.Attempt)
+		}
+		t.Fatalf("stateful page prompts = %#v; requests=%v errors=%v poll=%+v attempt=%s turns=%+v phases={outbox:%#v poll:%#v}", calls, graphState.requestsSnapshot(), graphState.errorsSnapshot(), poll, attempt, state.Turns, bridge.mainLoopPhaseStatsSnapshot("outbox"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
-	waitListenerRecovery(t, func() bool {
+	if !waitListenerRecoveryResult(func() bool {
 		finals := 0
 		for _, sent := range graphState.sentSnapshot() {
 			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_STATEFUL_FINAL") {
@@ -1555,8 +1589,10 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			}
 		}
 		return finals == 2
-	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation final delivery")
-	waitListenerRecovery(t, func() bool {
+	}, listenerRecoveryExtendedProgressTimeout) {
+		t.Fatalf("stateful final delivery did not complete; calls=%#v; sent=%#v; requests=%v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("poll"))
+	}
+	if !waitListenerRecoveryResult(func() bool {
 		state, err := store.Load(context.Background())
 		if err != nil {
 			return false
@@ -1564,7 +1600,15 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		poll := state.ChatPolls[chatID]
 		return poll.PendingPage == nil && poll.Attempt == nil &&
 			strings.TrimSpace(poll.ContinuationPath) == ""
-	}, listenerRecoveryExtendedProgressTimeout, "stateful head and continuation durable poll completion")
+	}, listenerRecoveryExtendedProgressTimeout) {
+		state, _ := store.Load(context.Background())
+		poll := state.ChatPolls[chatID]
+		attempt := "<nil>"
+		if poll.Attempt != nil {
+			attempt = fmt.Sprintf("%+v", *poll.Attempt)
+		}
+		t.Fatalf("stateful durable poll completion did not complete; calls=%#v; sent=%#v; requests=%v; poll=%+v; attempt=%s; turns=%+v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot(), poll, attempt, state.Turns, bridge.mainLoopPhaseStatsSnapshot("poll"))
+	}
 
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false

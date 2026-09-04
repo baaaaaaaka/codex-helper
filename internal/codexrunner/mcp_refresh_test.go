@@ -18,6 +18,7 @@ import (
 func TestMCPRefreshCoordinatorCoalescesChangesWhileReloadIsInFlight(t *testing.T) {
 	configPath := writeMCPRefreshTestConfigAt(t, t.TempDir(), "initial")
 	started := make(chan int, 4)
+	observed := make(chan mcpConfigFileState, 16)
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
@@ -33,6 +34,9 @@ func TestMCPRefreshCoordinatorCoalescesChangesWhileReloadIsInFlight(t *testing.T
 			return ctx.Err()
 		}
 	})
+	coordinator.observed = func(state mcpConfigFileState) {
+		observed <- state
+	}
 	coordinator.start(context.Background())
 	defer func() {
 		releaseAll()
@@ -44,9 +48,26 @@ func TestMCPRefreshCoordinatorCoalescesChangesWhileReloadIsInFlight(t *testing.T
 	for i := 0; i < 8; i++ {
 		writeMCPRefreshTestConfig(t, configPath, fmt.Sprintf("change-%02d-with-a-distinct-size", i))
 	}
-	// Give the watcher time to observe the final state while the first reload
-	// remains blocked. The trigger channel must still contain only one item.
-	time.Sleep(30 * time.Millisecond)
+	// Wait for the watcher to observe the final state while the first reload
+	// remains blocked. This proves that all changes have reached the bounded
+	// trigger queue before release; a fixed sleep would race with the watcher
+	// under -race or a busy CI runner and could legitimately produce a third
+	// refresh for a state that was observed too late.
+	wantState := readMCPConfigFileState(configPath)
+	deadline := time.NewTimer(500 * time.Millisecond)
+	defer deadline.Stop()
+	for {
+		select {
+		case got := <-observed:
+			if got.equal(wantState) {
+				goto finalStateObserved
+			}
+		case <-deadline.C:
+			t.Fatal("timed out waiting for watcher to observe final config state")
+		}
+	}
+
+finalStateObserved:
 
 	// All changes observed while the first reload is blocked collapse into one
 	// pending trigger rather than one request per file event.
