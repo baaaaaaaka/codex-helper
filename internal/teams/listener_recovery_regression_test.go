@@ -4749,6 +4749,11 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
 	firstOptions.PhaseBudget = 5 * time.Second
+	// This fixture intentionally suppresses the next cycle until the
+	// continuation is interrupted. Keep the worker budget at the production
+	// value so a slow Windows durable transition cannot cancel the only first
+	// page before the executor sees it.
+	firstOptions.PollWorkerBudget = mainLoopPollWorkerBudget
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
@@ -4826,6 +4831,7 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	recoveredBridge.machine.Kind = teamstore.MachineKindPrimary
 	options := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry-recovered.json"), recoveredExecutor)
 	options.PhaseBudget = 5 * time.Second
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, recoveredBridge, options)
 	defer listener.stop(t)
 	select {
