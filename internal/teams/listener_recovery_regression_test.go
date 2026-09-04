@@ -3052,6 +3052,11 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	// intentionally large enough for Windows race SQLite admission; the delay
 	// remains larger so the first cycle still reaches the phase deadline.
 	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
+	// Keep later attempts failed until the test has observed the first
+	// cancellation and its durable failure receipt. Without this gate, the
+	// next 100ms listener cycle can succeed before the assertion reads the
+	// failure state, erasing the boundary this test is meant to verify.
+	graphState.getFailures = map[string]int{"chat-1": 1000}
 	firstDelayCanceled := make(chan struct{})
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
@@ -3114,6 +3119,9 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		listener.stop(t)
 		t.Fatalf("phase-timeout cancellation did not retain the failed poll receipt: %#v", firstPoll)
 	}
+	graphState.mu.Lock()
+	graphState.getFailures["chat-1"] = 0
+	graphState.mu.Unlock()
 	// A real Graph failure normally receives the chat-local exponential retry
 	// schedule. That policy is covered by poll backoff tests; this regression
 	// targets attempt cleanup and reacquisition, so make only this fixture due

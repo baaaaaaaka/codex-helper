@@ -2672,6 +2672,11 @@ func TestTeamsOwnershipStressLongRecoveryContinuationRemainsReachableCI(t *testi
 		client: server.Client(), baseURL: server.URL, maxRetries: 0,
 		sleep: sleepContext, jitter: func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
+	// The long-continuation assertion targets page reachability, not first-use
+	// WAL initialization. Pre-create the ledger schema so a hosted Windows
+	// FlushFileBuffers during the final exact-marker promotion cannot consume
+	// the 10-second manifest budget; dedicated ledger tests cover new-DB setup.
+	prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
 	for pass := 0; pass <= targetPage+2; pass++ {
 		state, err = store.Load(ctx)
 		if err != nil {
