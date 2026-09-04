@@ -2681,7 +2681,11 @@ func TestTeamsOwnershipStressLongRecoveryContinuationRemainsReachableCI(t *testi
 		if current.Status == teamstore.OutboxStatusSent {
 			break
 		}
-		pageBudget := 1
+		// Use the same per-pass budget as production.  Keeping this at one would
+		// preserve the assertion, but would turn a 66-page reachability check
+		// into 66 durable JSON rewrites (and Windows file flushes) without
+		// exercising a different production behavior.
+		pageBudget := outboxRecoveryMaxPagesPerFlush
 		handled, recoveryErr := bridge.recoverAcceptedOutboxFromGraph(ctx, current, outboxSendOptions{RecoveryPageBudget: &pageBudget})
 		if !handled {
 			t.Fatalf("long-recovery pass %d was not handled: err=%v row=%#v", pass, recoveryErr, current)
