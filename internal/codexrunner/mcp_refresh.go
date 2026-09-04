@@ -71,6 +71,10 @@ type mcpRefreshCoordinator struct {
 	path         string
 	pollInterval time.Duration
 	refresh      func(context.Context) error
+	// observed is a test-only synchronization hook.  It lets tests wait until
+	// the polling watcher has consumed a specific file state instead of using a
+	// wall-clock sleep that is sensitive to race instrumentation and CI load.
+	observed func(mcpConfigFileState)
 
 	trigger chan struct{}
 	ctx     context.Context
@@ -177,6 +181,9 @@ func (c *mcpRefreshCoordinator) watch(lastState mcpConfigFileState) {
 				continue
 			}
 			lastState = state
+			if c.observed != nil {
+				c.observed(state)
+			}
 			select {
 			case c.trigger <- struct{}{}:
 			default:

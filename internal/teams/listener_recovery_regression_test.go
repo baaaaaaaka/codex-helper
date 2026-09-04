@@ -1529,6 +1529,19 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	bridge.reg.Sessions = nil
 	appendBridgeTestSession(t, bridge, store, "s-stateful", chatID)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
+	// This test exercises the work-chat head/continuation frontier only. Keep
+	// the already-materialized control row warm but out of the current poll
+	// cycle; repeatedly polling an unrelated empty control chat adds durable
+	// writes and SQLite scheduling noise, especially under -race, without
+	// strengthening the frontier assertion.
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         bridge.reg.ControlChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("defer stateful control poll: %v", err)
+	}
 	listenerRecoverySeedDuePoll(t, store, chatID, now)
 	if err := store.Update(context.Background(), func(state *teamstore.State) error {
 		poll := state.ChatPolls[chatID]
