@@ -361,6 +361,9 @@ func TestCXPPerfModelProfilesCanSeedStoreAndPoll(t *testing.T) {
 			}
 			listenStore := newCXPPerfStore(t, profile)
 			listenBridge := newCXPPerfBridge(listenStore, newCXPPerfGraph(profile), profile)
+			// This smoke test covers seed/poll behavior, not lease expiry. Keep
+			// the production default so a slow hosted runner cannot turn
+			// startup/reconciliation latency into a false takeover.
 			if err := listenBridge.Listen(ctx, BridgeOptions{
 				Store:                      listenStore,
 				RegistryPath:               listenBridge.registryPath,
@@ -368,7 +371,6 @@ func TestCXPPerfModelProfilesCanSeedStoreAndPoll(t *testing.T) {
 				Once:                       true,
 				Top:                        ownerPollMessageTop,
 				MaxWorkChatPollsPerCycle:   DefaultMaxWorkChatPollsPerCycle,
-				OwnerStaleAfter:            30 * time.Second,
 				Executor:                   EchoExecutor{},
 				ControlFallbackExecutor:    EchoExecutor{},
 				ControlFallbackHelpContext: "perf",
@@ -3675,7 +3677,6 @@ func BenchmarkCXPPerfModelListenOnceProfiles(b *testing.B) {
 					Once:                       true,
 					Top:                        ownerPollMessageTop,
 					MaxWorkChatPollsPerCycle:   DefaultMaxWorkChatPollsPerCycle,
-					OwnerStaleAfter:            30 * time.Second,
 					Executor:                   EchoExecutor{},
 					ControlFallbackExecutor:    EchoExecutor{},
 					ControlFallbackHelpContext: "perf",
@@ -3776,6 +3777,9 @@ func cxpPerfRunListenOnce(ctx context.Context, bridge *Bridge, store *teamstore.
 
 func cxpPerfBridgeOptions(bridge *Bridge, store *teamstore.Store, scenario cxpPerfExternalScenario, harness *cxpPerfServiceHarness) BridgeOptions {
 	executor := cxpPerfExecutor{mode: scenario.CodexMode}
+	// These scenarios exercise Graph/Codex behavior, not lease expiry. Use the
+	// production default rather than a synthetic short owner window that can
+	// fail on a busy hosted runner during listener initialization.
 	return BridgeOptions{
 		Store:                      store,
 		RegistryPath:               bridge.registryPath,
@@ -3783,7 +3787,6 @@ func cxpPerfBridgeOptions(bridge *Bridge, store *teamstore.Store, scenario cxpPe
 		Once:                       true,
 		Top:                        ownerPollMessageTop,
 		MaxWorkChatPollsPerCycle:   DefaultMaxWorkChatPollsPerCycle,
-		OwnerStaleAfter:            30 * time.Second,
 		Executor:                   executor,
 		ControlFallbackExecutor:    executor,
 		ControlFallbackHelpContext: "perf",
