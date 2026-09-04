@@ -51,6 +51,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
 		"TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle":          true,
 		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
+		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
 		"TestTeamsListenFalseCurrentStateReplayMatrix":                             true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
 		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":             true,
