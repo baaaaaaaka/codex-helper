@@ -1522,6 +1522,16 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		},
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	// Keep the real listener's history-watch phase out of the host user's
+	// Codex directory.  This test is about a stateful Graph frontier; inheriting
+	// CODEX_HOME (or the default user home) can make an unrelated session scan
+	// consume the finite phase budget and turn a healthy continuation into a
+	// Windows full-suite scheduling failure.
+	historyRoot := filepath.Join(t.TempDir(), "codex-home")
+	if err := os.MkdirAll(filepath.Join(historyRoot, "sessions"), 0o700); err != nil {
+		t.Fatalf("mkdir isolated history root: %v", err)
+	}
+	bridge.scope.CodexHome = historyRoot
 	// Keep this frontier test focused on the single stateful chat under test.
 	// newBridgeTestBridge supplies a generic chat-1 session for most vertical
 	// fixtures; retaining it here adds an unrelated poll worker and durable
