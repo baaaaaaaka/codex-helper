@@ -578,6 +578,37 @@ type listenerRecoveryExecutor struct {
 	callOnce sync.Once
 }
 
+// listenerRecoveryStatefulExecutor returns a distinct Codex turn identity for
+// each inbound prompt.  A stateful paging fixture can dispatch two independent
+// messages in one chat; reusing one callback turn ID would make the fixture
+// model an impossible duplicate execution and can race the durable completion
+// records on slower filesystems.
+type listenerRecoveryStatefulExecutor struct {
+	mu       sync.Mutex
+	calls    []string
+	called   chan string
+	callOnce sync.Once
+}
+
+func (e *listenerRecoveryStatefulExecutor) Run(_ context.Context, _ *Session, prompt string) (ExecutionResult, error) {
+	e.mu.Lock()
+	e.calls = append(e.calls, prompt)
+	callNumber := len(e.calls)
+	e.mu.Unlock()
+	e.callOnce.Do(func() { close(e.called) })
+	return ExecutionResult{
+		Text:          "LISTENER_RECOVERY_STATEFUL_FINAL",
+		CodexThreadID: "thread-listener-stateful",
+		CodexTurnID:   fmt.Sprintf("turn-listener-stateful-%d", callNumber),
+	}, nil
+}
+
+func (e *listenerRecoveryStatefulExecutor) callsSnapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.calls...)
+}
+
 type listenerRecoveryPerPromptExecutor struct {
 	mu     sync.Mutex
 	calls  []string
@@ -1518,13 +1549,8 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	graphState.mu.Unlock()
 
 	store := newBridgeTestStore(t)
-	executor := &listenerRecoveryExecutor{
+	executor := &listenerRecoveryStatefulExecutor{
 		called: make(chan string),
-		result: ExecutionResult{
-			Text:          "LISTENER_RECOVERY_STATEFUL_FINAL",
-			CodexThreadID: "thread-listener-stateful",
-			CodexTurnID:   "turn-listener-stateful",
-		},
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	// Keep the real listener's history-watch phase out of the host user's
