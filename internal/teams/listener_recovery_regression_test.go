@@ -3052,6 +3052,11 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	// intentionally large enough for Windows race SQLite admission; the delay
 	// remains larger so the first cycle still reaches the phase deadline.
 	graphState.delayOnce = map[string]time.Duration{"chat-1": 20 * time.Second}
+	// Keep later attempts failed until the test has observed the first
+	// cancellation and its durable failure receipt. Without this gate, the
+	// next 100ms listener cycle can succeed before the assertion reads the
+	// failure state, erasing the boundary this test is meant to verify.
+	graphState.getFailures = map[string]int{"chat-1": 1000}
 	firstDelayCanceled := make(chan struct{})
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
@@ -3114,6 +3119,9 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		listener.stop(t)
 		t.Fatalf("phase-timeout cancellation did not retain the failed poll receipt: %#v", firstPoll)
 	}
+	graphState.mu.Lock()
+	graphState.getFailures["chat-1"] = 0
+	graphState.mu.Unlock()
 	// A real Graph failure normally receives the chat-local exponential retry
 	// schedule. That policy is covered by poll backoff tests; this regression
 	// targets attempt cleanup and reacquisition, so make only this fixture due
@@ -4749,6 +4757,11 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
 	firstOptions.PhaseBudget = 5 * time.Second
+	// This fixture intentionally suppresses the next cycle until the
+	// continuation is interrupted. Keep the worker budget at the production
+	// value so a slow Windows durable transition cannot cancel the only first
+	// page before the executor sees it.
+	firstOptions.PollWorkerBudget = mainLoopPollWorkerBudget
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
@@ -4826,6 +4839,7 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	recoveredBridge.machine.Kind = teamstore.MachineKindPrimary
 	options := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry-recovered.json"), recoveredExecutor)
 	options.PhaseBudget = 5 * time.Second
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, recoveredBridge, options)
 	defer listener.stop(t)
 	select {
