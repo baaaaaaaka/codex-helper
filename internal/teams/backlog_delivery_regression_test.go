@@ -2,9 +2,11 @@ package teams
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -86,6 +88,35 @@ func seedBridgeTestOutboxRows(t testing.TB, ctx context.Context, store *teamstor
 	}
 }
 
+// prepareBridgeTestGlobalOutboundLedger creates the ledger schema without
+// changing its journal mode. The sender still exercises the production ledger
+// write, but the ordering test does not spend its bounded budget on the
+// first-use WAL switch (which can block in Windows-hosted FlushFileBuffers).
+// Ledger creation and WAL behavior have dedicated coverage elsewhere.
+func prepareBridgeTestGlobalOutboundLedger(t *testing.T, ctx context.Context, bridge *Bridge) {
+	t.Helper()
+	path, ok := bridge.globalOutboundLedgerPath()
+	if !ok {
+		t.Fatal("bridge test has no global outbound ledger path")
+	}
+	query := url.Values{}
+	query.Set("mode", "rwc")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(teamsLedgerSQLitePath(path), query))
+	if err != nil {
+		t.Fatalf("open global outbound ledger fixture: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("close global outbound ledger fixture: %v", err)
+		}
+	}()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := ensureGlobalOutboundSQLite(ctx, db); err != nil {
+		t.Fatalf("create global outbound ledger fixture: %v", err)
+	}
+}
+
 // TestTeamsActiveOutboxPredecessorUsesShortRetryGate verifies the race seen by
 // the real listener: a global outbox flush can observe an earlier row that a
 // targeted flush has already claimed.  The later final must remain behind the
@@ -112,6 +143,7 @@ func TestTeamsActiveOutboxPredecessorUsesShortRetryGate(t *testing.T) {
 				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
 					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
 				}
+				prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
 			}
 			var err error
 			if earlier, err = store.MarkOutboxSendAttempt(ctx, earlier.ID); err != nil {
