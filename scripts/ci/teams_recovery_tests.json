@@ -254,6 +254,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 60,
       "oracle": "a cooperative ACK/handler Graph mutation slower than poll cleanup grace still commits the poll attempt and delivers the final once",
       "baseline": "pre-fix the handler reused the short cleanup context, leaving the claimed attempt and preventing the chat from completing"
