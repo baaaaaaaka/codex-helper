@@ -1192,8 +1192,14 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 	listenerRecoverySeedDuePoll(t, store, "chat-2", now)
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// Match the production phase and worker budgets.  This test proves that a
+	// retryable error is isolated to one chat; a one-second worker budget can
+	// expire while the healthy chat is completing its durable SQLite admission
+	// and handler path on a busy Windows race runner, after Graph has already
+	// returned the healthy page.  That would test runner timing instead of
+	// failure isolation.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
