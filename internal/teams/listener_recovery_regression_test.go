@@ -1095,11 +1095,12 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
-	// Race instrumentation makes the initial JSON/store admission materially
-	// slower.  Keep the worker wave bounded, but do not turn this liveness test
-	// into a phase-startup timing test.
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// Use the production phase and per-request budgets. The fixture is about
+	// fair worker scheduling, not startup latency; a short test-only phase can
+	// expire while four empty-chat completions contend on the Windows JSON
+	// store, before the healthy fifth worker gets to its durable handler.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
