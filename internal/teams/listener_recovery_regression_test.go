@@ -1505,6 +1505,12 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		},
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	// Keep this frontier test focused on the single stateful chat under test.
+	// newBridgeTestBridge supplies a generic chat-1 session for most vertical
+	// fixtures; retaining it here adds an unrelated poll worker and durable
+	// writes, which can make the continuation assertion depend on local
+	// filesystem scheduling (especially under -race).
+	bridge.reg.Sessions = nil
 	appendBridgeTestSession(t, bridge, store, "s-stateful", chatID)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, chatID, now)
@@ -5108,6 +5114,15 @@ func TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline(t *testing.T) {
 	}
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	// This test targets the boundary between Graph acceptance and phase
+	// cancellation, not the production duration of a local file-backed CAS.
+	// Hosted Windows runners can pause a JSON-store mutation for longer than the
+	// five-second production grace while other package processes are exiting.
+	// Keep the test's own 10-second watchdog intact, but give the durable phase a
+	// generous test-only budget so that filesystem latency cannot turn the
+	// boundary assertion into a false failure. A real deadlock still fails at
+	// the test watchdog.
+	bridge.pollAttemptDurableGrace = 30 * time.Second
 	row, _, err := store.QueueOutbox(phaseCtx, teamstore.OutboxMessage{
 		ID:          "outbox:phase-deadline-after-graph",
 		TeamsChatID: "chat-1",
