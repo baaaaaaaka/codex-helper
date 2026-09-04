@@ -3501,7 +3501,14 @@ func TestTeamsListenFalseSQLiteTranscriptBacklogProgresses(t *testing.T) {
 	now := time.Now().UTC().Add(-time.Minute)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 
-	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
+	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
+	// This fixture verifies ordinary SQLite transcript progress, not the
+	// short-budget timeout path. Use the production phase and worker budgets so
+	// hosted macOS filesystem latency cannot cancel the outbox before it flushes;
+	// the manifest's finite watchdog still detects a genuinely wedged listener.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	listener := startListenerRecovery(t, bridge, options)
 	progressed := waitListenerRecoveryResult(func() bool {
 		state, loadErr := store.Load(context.Background())
 		if loadErr != nil {
