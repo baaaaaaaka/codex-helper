@@ -565,14 +565,15 @@ func TestStartExplicitPortDoesNotRetry(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip on windows")
 	}
-	if _, err := os.Stat("/usr/bin/sleep"); err != nil {
-		t.Skip("skip: /usr/bin/sleep not available")
-	}
 
 	dir := t.TempDir()
 	counterFile := filepath.Join(dir, "counter")
 	script := filepath.Join(dir, "ssh")
-	if err := os.WriteFile(script, []byte(fakeSSHScript(counterFile)), 0o700); err != nil {
+	// Use an immediate failure so the invocation is recorded before Start
+	// returns.  A blocking helper plus a short readiness/stop window makes this
+	// assertion depend on child-process scheduling under -race and hosted CI,
+	// even though it tests only the explicit-port retry decision.
+	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
 		t.Fatalf("write script: %v", err)
 	}
 	t.Setenv("PATH", dir)
