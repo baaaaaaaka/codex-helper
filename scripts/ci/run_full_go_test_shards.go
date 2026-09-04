@@ -75,6 +75,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 	},
 }
@@ -97,6 +98,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 	},
 }

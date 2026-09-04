@@ -767,6 +767,7 @@
       "vertical": "sqlite-semantic-outbox-isolation",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 10,
       "oracle": "valid JSON rows with damaged types or mismatched indexed chat identity are excluded from runnable work while healthy rows remain visible and damaged bytes survive a rewrite",
       "baseline": "pre-fix a semantically malformed outbox row could abort a pending page or hide later healthy work"
