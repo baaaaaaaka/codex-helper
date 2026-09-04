@@ -496,13 +496,12 @@ func manifestTestWorkerCount(race bool) int {
 }
 
 func manifestTestWorkerCountFor(race bool, goos string, gomaxprocs int) int {
-	// The Windows race runner uses file-backed modernc SQLite for many
-	// independent manifest entries.  Concurrent processes contend on the
-	// hosted runner's filesystem flush path and can make a healthy migration
-	// exceed its deliberately small per-test watchdog.  Serialize only this
-	// test configuration; normal and non-Windows race runs retain the bounded
-	// parallel pool.
-	if race && strings.EqualFold(strings.TrimSpace(goos), "windows") {
+	// Windows hosted runners use file-backed modernc SQLite for many independent
+	// manifest entries.  Concurrent processes contend on the filesystem flush
+	// path even without -race and can make a healthy listener exceed its finite
+	// per-test watchdog.  Serialize only this host configuration; Unix runners
+	// retain the bounded parallel pool.
+	if strings.EqualFold(strings.TrimSpace(goos), "windows") {
 		return 1
 	}
 	workerCount := gomaxprocs
