@@ -1730,7 +1730,13 @@ func TestTeamsListenFalseUsesConfiguredRunnerStreaming(t *testing.T) {
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, wrongExecutor)
-	options.PhaseBudget = 2 * time.Second
+	// This test crosses the durable inbound claim, queued-turn, and outbox
+	// boundaries.  Keep the listener phase at the production budget instead of
+	// the small default harness budget: on Windows under -race, a normal
+	// SQLite/file-backed write can otherwise be canceled before the configured
+	// Runner is reached.  The test still has its finite liveness watchdog.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	options.Runner = runner
 	listener := startListenerRecovery(t, bridge, options)
 	select {
@@ -3657,8 +3663,13 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 	executor := &listenerRecoveryPerPromptExecutor{called: make(chan string)}
 	bridge := newBridgeTestBridge(graph, reopened, executor)
 	options := listenerRecoveryBaseOptions(reopened, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = 500 * time.Millisecond
+	// The malformed projection is intentionally recovered through the same
+	// durable poll/claim path as a normal chat.  Use the production phase and
+	// worker budgets so Windows race instrumentation does not turn transient
+	// SQLite scheduling latency into a synthetic chat-local failure; the outer
+	// assertion watchdog remains bounded.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
