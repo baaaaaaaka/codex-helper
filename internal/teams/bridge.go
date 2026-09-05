@@ -3646,16 +3646,39 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 				return false, pollLeaseFailure(leaseErr)
 			}
 		}
-		stagedPoll, staged, stageErr := b.store.MutateChatPollAttemptWithCapability(durableCtx, chatID, attemptCapability, expectedRevision, func(current *teamstore.ChatPollState) error {
-			if current.PendingPage != nil {
+		var stagedPoll teamstore.ChatPollState
+		var staged bool
+		var stageErr error
+		for stageRetry := 0; stageRetry < 3; stageRetry++ {
+			stagedPoll, staged, stageErr = b.store.MutateChatPollAttemptWithCapability(durableCtx, chatID, attemptCapability, expectedRevision, func(current *teamstore.ChatPollState) error {
+				if current.PendingPage != nil {
+					return nil
+				}
+				current.PendingPage = page
+				if current.FrontierEpoch == 0 {
+					current.FrontierEpoch = page.FrontierEpoch
+				}
 				return nil
+			})
+			if stageErr != nil || staged {
+				break
 			}
-			current.PendingPage = page
-			if current.FrontierEpoch == 0 {
-				current.FrontierEpoch = page.FrontierEpoch
+			// A completion/outbox side effect may safely advance the poll row
+			// while the Graph request is in flight. Store paths deliberately merge
+			// that revision into the same live attempt; adopt it and retry the
+			// bounded page staging instead of treating the attempt as stale. An
+			// identity or owner change does not satisfy this condition and remains
+			// fenced as before.
+			attempt := stagedPoll.Attempt
+			if attempt == nil || strings.TrimSpace(attempt.ID) != strings.TrimSpace(attemptCapability.ID) ||
+				strings.TrimSpace(attempt.Owner) != strings.TrimSpace(attemptCapability.Owner) ||
+				strings.TrimSpace(attempt.ProcessIncarnation) != strings.TrimSpace(attemptCapability.ProcessIncarnation) ||
+				attempt.LeaseGeneration != attemptCapability.LeaseGeneration ||
+				stagedPoll.PollRevision == 0 || attempt.ExpectedPollRevision != stagedPoll.PollRevision {
+				break
 			}
-			return nil
-		})
+			expectedRevision = stagedPoll.PollRevision
+		}
 		if stageErr != nil {
 			return false, pollStoreFailure(stageErr)
 		}
