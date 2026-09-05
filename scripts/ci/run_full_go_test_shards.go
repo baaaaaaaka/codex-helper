@@ -90,6 +90,11 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		// This cross-backend owner-fencing test migrates a file-backed store to
+		// SQLite. On Windows, modernc SQLite may block in FlushFileBuffers when
+		// unrelated store shards share the hosted runner. Keep the migration
+		// observation isolated instead of weakening its finite assertions.
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends": true,
 	},
 }
 
@@ -123,6 +128,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
 	},
 }
 
