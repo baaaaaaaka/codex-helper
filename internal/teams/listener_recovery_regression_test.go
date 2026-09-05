@@ -5882,6 +5882,18 @@ func TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail(t *testing.T) 
 			if err := os.WriteFile(badParent, []byte("not a directory"), 0o600); err != nil {
 				t.Fatalf("write invalid ledger parent: %v", err)
 			}
+			if useSQLite {
+				// This test targets bounded outbox admission and per-chat
+				// fairness, not the cost of migrating a large JSON snapshot.
+				// Migrating the 65-row poison prefix on hosted Windows can spend
+				// the entire race watchdog in FlushFileBuffers before the
+				// outbox code runs.  Establish the SQLite backend while the
+				// store is empty, then seed the exact same rows through one
+				// durable update.  Migration itself has dedicated coverage.
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate empty store to SQLite: %v", err)
+				}
+			}
 			now := time.Now().UTC().Add(-time.Minute)
 			const acceptedPrefix = 65
 			rows := make([]teamstore.OutboxMessage, 0, acceptedPrefix+1)
@@ -5910,11 +5922,6 @@ func TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail(t *testing.T) 
 			}
 			rows = append(rows, healthy)
 			seedBridgeTestOutboxRows(t, ctx, store, rows...)
-			if useSQLite {
-				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-					t.Fatalf("migrate store to SQLite: %v", err)
-				}
-			}
 			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 			bridge.registryPath = filepath.Join(badParent, "registry.json")
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err == nil {
