@@ -5145,7 +5145,7 @@ func TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace(t *testin
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.started:
-	case <-time.After(3 * listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryProgressTimeout):
 		close(executor.release)
 		listener.stop(t)
 		t.Fatalf("listener never dispatched the blocking executor; Graph reads=%d", graphState.getCount("chat-1"))
@@ -5206,7 +5206,7 @@ func TestTeamsListenFalseShutdownFencesCooperativeExecutorError(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.started:
-	case <-time.After(3 * listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("listener never dispatched the cooperative executor; Graph reads=%d", graphState.getCount("chat-1"))
 	}
