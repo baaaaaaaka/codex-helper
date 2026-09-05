@@ -121,124 +121,137 @@ func prepareBridgeTestGlobalOutboundLedger(t *testing.T, ctx context.Context, br
 // the real listener: a global outbox flush can observe an earlier row that a
 // targeted flush has already claimed.  The later final must remain behind the
 // predecessor, but it must be rechecked promptly after that short-lived lease
-// finishes rather than inheriting the 30-second recovery backoff.
-func TestTeamsActiveOutboxPredecessorUsesShortRetryGate(t *testing.T) {
-	for _, useSQLite := range []bool{false, true} {
-		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
-			ctx := context.Background()
-			store := newBridgeTestStore(t)
-			graph, sent := newBridgeTestGraph(t)
-			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-			earlier := teamstore.OutboxMessage{
-				ID: "outbox:active-predecessor", TeamsChatID: "chat-1", Sequence: 1,
-				Kind: "ack", Body: "predecessor", Status: teamstore.OutboxStatusQueued,
-				CreatedAt: time.Now().Add(-time.Second),
-			}
-			later := teamstore.OutboxMessage{
-				ID: "outbox:active-final", TeamsChatID: "chat-1", Sequence: 2,
-				Kind: "final", NotificationKind: "turn_completed", Body: "final", CreatedAt: time.Now(),
-			}
-			seedBridgeTestOutboxRows(t, ctx, store, earlier, later)
-			if useSQLite {
-				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
-				}
-				prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
-			}
-			var err error
-			if earlier, err = store.MarkOutboxSendAttempt(ctx, earlier.ID); err != nil {
-				t.Fatalf("claim predecessor: %v", err)
-			}
-			if earlier.Status != teamstore.OutboxStatusSending || teamstore.OutboxSendIsAmbiguous(earlier) {
-				t.Fatalf("claimed predecessor = %#v, want a normal active Sending row", earlier)
-			}
+// finishes rather than inheriting the 30-second recovery backoff.  Keep the
+// JSON and SQLite variants as separate top-level tests: SQLite migration can
+// spend several seconds flushing on hosted Windows, and a parent test budget
+// must not be shared by two independent backend checks.
+func TestTeamsActiveOutboxPredecessorUsesShortRetryGateJSON(t *testing.T) {
+	runTeamsActiveOutboxPredecessorUsesShortRetryGate(t, false)
+}
 
-			started := time.Now()
-			err = bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
-			var deferred outboxDeliveryDeferredError
-			if !errors.As(err, &deferred) {
-				t.Fatalf("later send error = %v, want active-predecessor deferral", err)
-			}
-			if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
-				t.Fatalf("active-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
-			}
-			if got := len(*sent); got != 0 {
-				t.Fatalf("later send posted while predecessor was active: %d POST(s)", got)
-			}
+func TestTeamsActiveOutboxPredecessorUsesShortRetryGateSQLite(t *testing.T) {
+	runTeamsActiveOutboxPredecessorUsesShortRetryGate(t, true)
+}
 
-			if _, err := store.MarkOutboxSent(ctx, earlier.ID, "teams-predecessor"); err != nil {
-				t.Fatalf("finish predecessor: %v", err)
-			}
-			latest, err := store.OutboxMessageByID(ctx, later.ID)
-			if err != nil {
-				t.Fatalf("reload final: %v", err)
-			}
-			if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
-				t.Fatalf("send final after predecessor finished: %v", err)
-			}
-			if got := len(*sent); got != 1 {
-				t.Fatalf("Graph POST count after predecessor finished = %d, want one final POST", got)
-			}
-			final, err := store.OutboxMessageByID(ctx, later.ID)
-			if err != nil || final.Status != teamstore.OutboxStatusSent {
-				t.Fatalf("final after predecessor finished = %#v, err=%v, want Sent", final, err)
-			}
-		})
+func runTeamsActiveOutboxPredecessorUsesShortRetryGate(t *testing.T, useSQLite bool) {
+	t.Helper()
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	earlier := teamstore.OutboxMessage{
+		ID: "outbox:active-predecessor", TeamsChatID: "chat-1", Sequence: 1,
+		Kind: "ack", Body: "predecessor", Status: teamstore.OutboxStatusQueued,
+		CreatedAt: time.Now().Add(-time.Second),
+	}
+	later := teamstore.OutboxMessage{
+		ID: "outbox:active-final", TeamsChatID: "chat-1", Sequence: 2,
+		Kind: "final", NotificationKind: "turn_completed", Body: "final", CreatedAt: time.Now(),
+	}
+	seedBridgeTestOutboxRows(t, ctx, store, earlier, later)
+	if useSQLite {
+		if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+			t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+		}
+		prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
+	}
+	var err error
+	if earlier, err = store.MarkOutboxSendAttempt(ctx, earlier.ID); err != nil {
+		t.Fatalf("claim predecessor: %v", err)
+	}
+	if earlier.Status != teamstore.OutboxStatusSending || teamstore.OutboxSendIsAmbiguous(earlier) {
+		t.Fatalf("claimed predecessor = %#v, want a normal active Sending row", earlier)
+	}
+
+	started := time.Now()
+	err = bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
+	var deferred outboxDeliveryDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("later send error = %v, want active-predecessor deferral", err)
+	}
+	if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
+		t.Fatalf("active-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
+	}
+	if got := len(*sent); got != 0 {
+		t.Fatalf("later send posted while predecessor was active: %d POST(s)", got)
+	}
+
+	if _, err := store.MarkOutboxSent(ctx, earlier.ID, "teams-predecessor"); err != nil {
+		t.Fatalf("finish predecessor: %v", err)
+	}
+	latest, err := store.OutboxMessageByID(ctx, later.ID)
+	if err != nil {
+		t.Fatalf("reload final: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
+		t.Fatalf("send final after predecessor finished: %v", err)
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("Graph POST count after predecessor finished = %d, want one final POST", got)
+	}
+	final, err := store.OutboxMessageByID(ctx, later.ID)
+	if err != nil || final.Status != teamstore.OutboxStatusSent {
+		t.Fatalf("final after predecessor finished = %#v, err=%v, want Sent", final, err)
 	}
 }
 
-func TestTeamsAcceptedOutboxPredecessorUsesShortRetryGate(t *testing.T) {
-	for _, useSQLite := range []bool{false, true} {
-		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
-			ctx := context.Background()
-			store := newBridgeTestStore(t)
-			graph, sent := newBridgeTestGraph(t)
-			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-			now := time.Now().UTC()
-			earlier := teamstore.OutboxMessage{
-				ID: "outbox:accepted-predecessor", TeamsChatID: "chat-1", Sequence: 1,
-				Kind: "ack", Body: "accepted predecessor", Status: teamstore.OutboxStatusAccepted,
-				TeamsMessageID: "teams-accepted-predecessor", CreatedAt: now.Add(-time.Second),
-			}
-			later := teamstore.OutboxMessage{
-				ID: "outbox:accepted-tail", TeamsChatID: "chat-1", Sequence: 2,
-				TurnID: "turn:accepted-tail", Kind: "final", NotificationKind: "turn_completed",
-				Body: "accepted tail", CreatedAt: now,
-			}
-			seedBridgeTestOutboxRows(t, ctx, store, earlier, later)
-			if useSQLite {
-				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
-				}
-			}
+func TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateJSON(t *testing.T) {
+	runTeamsAcceptedOutboxPredecessorUsesShortRetryGate(t, false)
+}
 
-			started := time.Now()
-			err := bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
-			var deferred outboxDeliveryDeferredError
-			if !errors.As(err, &deferred) {
-				t.Fatalf("tail send error = %v, want accepted-predecessor deferral", err)
-			}
-			if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
-				t.Fatalf("accepted-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
-			}
-			if got := len(*sent); got != 0 {
-				t.Fatalf("tail send posted before accepted predecessor promotion: %d POST(s)", got)
-			}
+func TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateSQLite(t *testing.T) {
+	runTeamsAcceptedOutboxPredecessorUsesShortRetryGate(t, true)
+}
 
-			if _, err := store.MarkOutboxSent(ctx, earlier.ID, earlier.TeamsMessageID); err != nil {
-				t.Fatalf("finish accepted predecessor: %v", err)
-			}
-			latest, err := store.OutboxMessageByID(ctx, later.ID)
-			if err != nil {
-				t.Fatalf("reload accepted tail: %v", err)
-			}
-			if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
-				t.Fatalf("send accepted tail after promotion: %v", err)
-			}
-			if got := len(*sent); got != 1 {
-				t.Fatalf("Graph POST count after accepted predecessor promotion = %d, want one", got)
-			}
-		})
+func runTeamsAcceptedOutboxPredecessorUsesShortRetryGate(t *testing.T, useSQLite bool) {
+	t.Helper()
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Now().UTC()
+	earlier := teamstore.OutboxMessage{
+		ID: "outbox:accepted-predecessor", TeamsChatID: "chat-1", Sequence: 1,
+		Kind: "ack", Body: "accepted predecessor", Status: teamstore.OutboxStatusAccepted,
+		TeamsMessageID: "teams-accepted-predecessor", CreatedAt: now.Add(-time.Second),
+	}
+	later := teamstore.OutboxMessage{
+		ID: "outbox:accepted-tail", TeamsChatID: "chat-1", Sequence: 2,
+		TurnID: "turn:accepted-tail", Kind: "final", NotificationKind: "turn_completed",
+		Body: "accepted tail", CreatedAt: now,
+	}
+	seedBridgeTestOutboxRows(t, ctx, store, earlier, later)
+	if useSQLite {
+		if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+			t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+		}
+	}
+
+	started := time.Now()
+	err := bridge.sendQueuedOutboxWithOptions(ctx, later, outboxSendOptions{})
+	var deferred outboxDeliveryDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("tail send error = %v, want accepted-predecessor deferral", err)
+	}
+	if deferred.Until.Before(started) || deferred.Until.After(started.Add(5*time.Second)) {
+		t.Fatalf("accepted-predecessor retry gate = %s, want a short gate near %s", deferred.Until, started.Add(outboxActivePredecessorRetryBackoff))
+	}
+	if got := len(*sent); got != 0 {
+		t.Fatalf("tail send posted before accepted predecessor promotion: %d POST(s)", got)
+	}
+
+	if _, err := store.MarkOutboxSent(ctx, earlier.ID, earlier.TeamsMessageID); err != nil {
+		t.Fatalf("finish accepted predecessor: %v", err)
+	}
+	latest, err := store.OutboxMessageByID(ctx, later.ID)
+	if err != nil {
+		t.Fatalf("reload accepted tail: %v", err)
+	}
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, latest, outboxSendOptions{}); err != nil {
+		t.Fatalf("send accepted tail after promotion: %v", err)
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("Graph POST count after accepted predecessor promotion = %d, want one", got)
 	}
 }
 
