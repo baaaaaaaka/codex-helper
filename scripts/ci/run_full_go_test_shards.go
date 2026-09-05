@@ -115,6 +115,11 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		// These tests already run in their own process, but their first listener
+		// cycle is itself the assertion.  Do not start them beside other shard
+		// processes that can consume the hosted runner before Graph admission.
+		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
+		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
 		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":            true,
 		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
