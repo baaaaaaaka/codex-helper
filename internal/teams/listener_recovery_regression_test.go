@@ -1130,6 +1130,12 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// This test measures fair admission when several Graph workers are slow.
+	// Warm the unrelated global outbound SQLite schema first; otherwise the
+	// healthy message's first self-echo check can spend the bounded assertion
+	// window in Windows FlushFileBuffers/WAL initialization.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// Use the production phase and per-request budgets. The fixture is about
 	// fair worker scheduling, not startup latency; a short test-only phase can

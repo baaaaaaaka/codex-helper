@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -48,6 +49,17 @@ func TestGlobalInboundSQLiteWriterReopensReplacedDatabase(t *testing.T) {
 	}
 	if _, err := first.ExecContext(context.Background(), `CREATE TABLE writer_probe (value TEXT NOT NULL)`); err != nil {
 		t.Fatalf("seed writer database: %v", err)
+	}
+	// Unix permits replacing an open SQLite file, which is the production
+	// recovery shape this test exercises. Windows holds the database handle
+	// without delete sharing, so the same rename is rejected by the OS before
+	// globalInboundSQLiteWriter can observe a new file identity. Close the
+	// fixture connection there and keep the rest of the reopen/claim contract
+	// covered on every platform.
+	if runtime.GOOS == "windows" {
+		if err := writer.close(); err != nil {
+			t.Fatalf("close writer database before Windows replacement: %v", err)
+		}
 	}
 	oldPath := sqlitePath + ".old"
 	if err := os.Rename(sqlitePath, oldPath); err != nil {
