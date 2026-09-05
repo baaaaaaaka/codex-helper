@@ -1132,9 +1132,15 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 		appendBridgeTestSession(t, bridge, store, fmt.Sprintf("s00%d", i), fmt.Sprintf("chat-%d", i))
 	}
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
-	for i := 1; i <= 5; i++ {
-		listenerRecoverySeedDuePoll(t, store, fmt.Sprintf("chat-%d", i), now)
+	// Make the four intentionally slow chats older than the healthy tail in the
+	// durable ordering key.  Without this, equal timestamps leave the first
+	// worker wave dependent on map/store enumeration order; if chat-5 enters
+	// that wave, only three slow handlers reach the four-request barrier and the
+	// fixture deadlocks before it can exercise worker saturation.
+	for i := 1; i <= 4; i++ {
+		listenerRecoverySeedDuePoll(t, store, fmt.Sprintf("chat-%d", i), now.Add(-time.Second))
 	}
+	listenerRecoverySeedDuePoll(t, store, "chat-5", now)
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	// This test measures fair admission when several Graph workers are slow.
