@@ -56,8 +56,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
     def test_declares_parallel_shards_and_limits_platform_only_shards(self):
         job = targeted_job()
         self.assertIn(
-            "shard: [core, platform-integration, state-perf, ubuntu-stress, "
-            "windows-skills-desktop, windows-codex-e2e]",
+            "shard: [core, core-b, platform-integration, state-perf, ubuntu-stress, "
+            "windows-skills-desktop, windows-skills-desktop-b, windows-codex-e2e]",
             job,
         )
         for os_name in ("macos-latest", "windows-latest"):
@@ -71,10 +71,32 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 job,
             )
             self.assertIn(
+                f"- os: {os_name}\n            shard: windows-skills-desktop-b",
+                job,
+            )
+            self.assertIn(
                 f"- os: {os_name}\n            shard: windows-codex-e2e",
                 job,
             )
         self.assertNotIn("needs:", job)
+
+    def test_state_perf_partitions_only_the_expensive_sequence(self):
+        job = targeted_job()
+        self.assertIn("partition: [0]", job)
+        for os_name in ("ubuntu-latest", "macos-latest", "windows-latest"):
+            self.assertIn(
+                f"- os: {os_name}\n            shard: state-perf\n            partition: 1",
+                job,
+            )
+        blocks = step_blocks(job)
+        expensive = blocks["Teams SQLite store migration and perf regressions"]
+        self.assertIn("if: matrix.shard == 'state-perf'", expensive)
+        self.assertNotIn("matrix.partition == 0", expensive)
+        for name, block in blocks.items():
+            if name == "Teams SQLite store migration and perf regressions":
+                continue
+            if "matrix.shard == 'state-perf'" in block:
+                self.assertIn("matrix.partition == 0", block, name)
 
     def test_recovery_manifest_runs_in_parallel_platform_mode_jobs(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -82,21 +104,28 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         end = workflow.index("  codex-runtime-contract:\n", start)
         job = workflow[start:end]
         self.assertIn(
-            "name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }})",
+            "name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
             job,
         )
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", job)
         self.assertIn("mode: [normal, race]", job)
+        self.assertIn("partition: [0, 1]", job)
+        self.assertIn("- os: ubuntu-latest\n            partition: 1", job)
+        self.assertIn("- os: macos-latest\n            partition: 1", job)
         self.assertIn(
             "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only",
             job,
         )
         self.assertIn(
-            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery",
+            "partition_flags=(\"-partition-count=2\" \"-partition-index=${{ matrix.partition }}\")",
             job,
         )
         self.assertIn(
-            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race",
+            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery \"${partition_flags[@]}\"",
+            job,
+        )
+        self.assertIn(
+            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race \"${partition_flags[@]}\"",
             job,
         )
         self.assertNotIn("Teams transcript recovery state-machine regressions", targeted_job())
@@ -107,6 +136,48 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             'check teams-recovery-test "${{ needs.teams-recovery-test.result }}"',
             aggregate,
         )
+
+    def test_long_full_suite_jobs_use_independent_runner_partitions(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        full_start = workflow.index("  full-go-test:\n")
+        full_end = workflow.index("  race-test:\n", full_start)
+        full = workflow[full_start:full_end]
+        self.assertIn(
+            "name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})",
+            full,
+        )
+        self.assertIn("partition: [0, 1]", full)
+        self.assertIn("- os: ubuntu-latest\n            partition: 1", full)
+        self.assertIn(
+            "-partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+            full,
+        )
+
+        race_start = workflow.index("  race-test:\n")
+        race_end = workflow.index("  runtime-env-contract:\n", race_start)
+        race = workflow[race_start:race_end]
+        self.assertIn(
+            "name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
+            race,
+        )
+        self.assertIn("partition: [0, 1]", race)
+        self.assertIn(
+            "-partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+            race,
+        )
+
+    def test_partition_flags_have_exactly_once_runner_selection_support(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn('flag.Int("partition-count", 1', runner)
+        self.assertIn('flag.Int("partition-index", 0', runner)
+        self.assertIn("jobs = partitionTestJobs(jobs, *partitionCount, *partitionIndex)", runner)
+        self.assertIn("func partitionTestJobs", runner)
+
+        manifest = (ROOT / "scripts" / "ci" / "check_teams_recovery_manifest.go").read_text(encoding="utf-8")
+        self.assertIn('flag.Int("partition-count", 1', manifest)
+        self.assertIn('flag.Int("partition-index", 0', manifest)
+        self.assertIn("selected = partitionManifestTests(selected, *partitionCount, *partitionIndex)", manifest)
+        self.assertIn("func partitionManifestTests", manifest)
 
     def test_full_go_runner_isolates_listener_liveness_fixture_from_shard_pool(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
@@ -130,8 +201,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 continue
             matches = re.findall(
                 r"^        if: (?:always\(\) && )?matrix\.shard == '("
-                r"core|platform-integration|state-perf|ubuntu-stress|"
-                r"windows-skills-desktop|windows-codex-e2e"
+                r"core|core-b|platform-integration|state-perf|ubuntu-stress|"
+                r"windows-skills-desktop|windows-skills-desktop-b|windows-codex-e2e"
                 r")'(?: && .+)?$",
                 block,
                 re.MULTILINE,
@@ -141,6 +212,14 @@ class TargetedShardWorkflowTests(unittest.TestCase):
     def test_heavy_steps_are_assigned_to_expected_shards(self):
         blocks = step_blocks(targeted_job())
         expected = {
+            "CXP TUI preview, navigation, refresh, and thread-name regressions": "core-b",
+            "Codex streaming transcript visibility regressions": "core-b",
+            "Teams Codex runner classification regressions": "core-b",
+            "Teams metadata-only resume and final integrity regressions": "core-b",
+            "Teams user-marker compact and fallback regressions": "core-b",
+            "Teams thread recovery and self-echo regressions": "core-b",
+            "Teams frontier recovery and fenced-page regressions": "core-b",
+            "Teams bridge scheduling and history sync regressions": "core-b",
             "Teams recreate and full-history race regressions (Linux only)": "ubuntu-stress",
             "Cross-compile check (Linux only)": "ubuntu-stress",
             "Teams Graph 429 stress (Linux only)": "ubuntu-stress",
@@ -153,7 +232,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "Teams SQLite store migration and perf regressions": "state-perf",
             "Teams perf benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
-            "Codex desktop app network install smoke (Windows)": "windows-skills-desktop",
+            "Codex desktop app network install smoke (Windows)": "windows-skills-desktop-b",
+            "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
             "Install Codex for integration (Windows)": "windows-codex-e2e",
             "Teams app-server probe (Windows)": "windows-codex-e2e",
             "Codex upgrade integration (system npm, Windows)": "windows-codex-e2e",

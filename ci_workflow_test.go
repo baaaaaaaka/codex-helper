@@ -18,14 +18,16 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 
 	targetedJob := workflowJobBlock(t, workflow, "targeted-test")
 	requireStepContains(t, targetedJob,
-		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})",
+		"name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }} / partition ${{ matrix.partition }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
-		"shard: [core, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]",
+		"shard: [core, core-b, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-skills-desktop-b, windows-codex-e2e]",
 		"- os: macos-latest\n            shard: ubuntu-stress",
 		"- os: windows-latest\n            shard: ubuntu-stress",
 		"- os: ubuntu-latest\n            shard: windows-skills-desktop",
 		"- os: ubuntu-latest\n            shard: windows-codex-e2e",
 		"- os: macos-latest\n            shard: windows-skills-desktop",
+		"- os: ubuntu-latest\n            shard: windows-skills-desktop-b",
+		"- os: macos-latest\n            shard: windows-skills-desktop-b",
 		"- os: macos-latest\n            shard: windows-codex-e2e",
 	)
 	requireStepNotContains(t, targetedJob,
@@ -56,7 +58,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	)
 	windowsDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app network install smoke (Windows)")
 	requireStepContains(t, windowsDesktop,
-		"if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'",
+		"if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'",
 		`.\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper`,
 	)
 	for _, name := range []string{
@@ -95,10 +97,18 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)
 
+	recoveryJob := workflowJobBlock(t, workflow, "teams-recovery-test")
+	requireStepContains(t, recoveryJob,
+		"name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
+		`partition_flags=("-partition-count=1" "-partition-index=0")`,
+		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
+	)
+
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
 	requireStepContains(t, fullJob,
-		"name: Full go test (${{ matrix.os }})",
+		"name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})",
 		"os: [ubuntu-latest, macos-latest, windows-latest]",
+		"partition: [0, 1]",
 		"timeout-minutes: 45",
 	)
 
@@ -115,7 +125,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, nonLinuxTest,
 		"if: runner.os != 'Linux'",
 		"shell: bash",
-		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8",
+		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
 		"Test/Example/Fuzz",
 	)
 	if strings.Contains(nonLinuxTest, "go test -timeout=20m -parallel=16 ./...") {
@@ -133,9 +143,10 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 
 	raceJob := workflowJobBlock(t, workflow, "race-test")
 	requireStepContains(t, raceJob,
-		"name: Race test (ubuntu-latest)",
+		"name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
+		"partition: [0, 1]",
 		"timeout-minutes: 45",
-		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8",
+		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
 	)
 
 	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")

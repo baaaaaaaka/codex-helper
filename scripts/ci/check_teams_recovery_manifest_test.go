@@ -128,6 +128,30 @@ func TestSplitManifestTestsKeepsExclusiveFixturesOutOfParallelPool(t *testing.T)
 	}
 }
 
+func TestPartitionManifestTestsCoversEachEntryExactlyOnce(t *testing.T) {
+	tests := []manifestTest{
+		{Name: "test-0"},
+		{Name: "test-1"},
+		{Name: "test-2"},
+		{Name: "test-3"},
+		{Name: "test-4"},
+	}
+	seen := make(map[string]int)
+	for partition := 0; partition < 2; partition++ {
+		for _, item := range partitionManifestTests(tests, 2, partition) {
+			seen[item.Name]++
+		}
+	}
+	if len(seen) != len(tests) {
+		t.Fatalf("partition union contains %d entries, want %d: %#v", len(seen), len(tests), seen)
+	}
+	for _, item := range tests {
+		if seen[item.Name] != 1 {
+			t.Fatalf("manifest entry %q appears %d times across partitions, want once", item.Name, seen[item.Name])
+		}
+	}
+}
+
 func equalStrings(got, want []string) bool {
 	if len(got) != len(want) {
 		return false

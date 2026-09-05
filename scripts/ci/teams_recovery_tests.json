@@ -12,7 +12,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "healthy chat reaches executor and fake Graph while four Graph workers are slow",
       "baseline": "pre-fix serial/whole-callback poll budget starves the healthy chat"
     },

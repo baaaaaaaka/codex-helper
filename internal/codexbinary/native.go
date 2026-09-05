@@ -253,12 +253,16 @@ func missingBinaryErrorForVendorRoot(triple string, vendorRoot string) error {
 // ErrNativeBinaryNotFound (the transient npm-reinstall window). Hard errors
 // (unsupported platform, unresolvable wrapper) return immediately.
 func FindNativeBinaryWithRetry(codexWrapperPath string) (nativeBin string, pathDir string, err error) {
+	return findNativeBinaryWithRetry(FindNativeBinary, codexWrapperPath)
+}
+
+func findNativeBinaryWithRetry(resolve func(string) (string, string, error), codexWrapperPath string) (nativeBin string, pathDir string, err error) {
 	attempts := nativeBinaryResolveAttempts
 	if attempts < 1 {
 		attempts = 1
 	}
 	for i := 0; i < attempts; i++ {
-		nativeBin, pathDir, err = FindNativeBinary(codexWrapperPath)
+		nativeBin, pathDir, err = resolve(codexWrapperPath)
 		if err == nil {
 			return nativeBin, pathDir, nil
 		}

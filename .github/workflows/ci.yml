@@ -228,13 +228,14 @@ jobs:
           go test -p=1 ./internal/cli -count=1 -run '^Test(CodexAppDefaultProxyEnsurer|EnsureAppGateway|RunAppGateway|DesktopProxy|ParseWindows|ParseDarwin|DiscoverDesktop|ParseProxy|AppendUnique)' -v -timeout=3m
 
   targeted-test:
-    name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }})
+    name: Targeted test (${{ matrix.os }} / ${{ matrix.shard }} / partition ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        shard: [core, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-codex-e2e]
+        shard: [core, core-b, platform-integration, state-perf, ubuntu-stress, windows-skills-desktop, windows-skills-desktop-b, windows-codex-e2e]
+        partition: [0]
         exclude:
           - os: macos-latest
             shard: ubuntu-stress
@@ -243,11 +244,29 @@ jobs:
           - os: ubuntu-latest
             shard: windows-skills-desktop
           - os: ubuntu-latest
+            shard: windows-skills-desktop-b
+          - os: ubuntu-latest
             shard: windows-codex-e2e
           - os: macos-latest
             shard: windows-skills-desktop
           - os: macos-latest
+            shard: windows-skills-desktop-b
+          - os: macos-latest
             shard: windows-codex-e2e
+        # The state/performance shard contains a long, independent sequence of
+        # SQLite migration and benchmark processes.  Keep the normal targeted
+        # matrix intact and add only a second state/perf runner for that
+        # sequence; the other state/perf checks remain single-runner tests.
+        include:
+          - os: ubuntu-latest
+            shard: state-perf
+            partition: 1
+          - os: macos-latest
+            shard: state-perf
+            partition: 1
+          - os: windows-latest
+            shard: state-perf
+            partition: 1
 
     steps:
       - name: Checkout
@@ -397,7 +416,7 @@ jobs:
           fi
 
       - name: CXP TUI preview, navigation, refresh, and thread-name regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -613,7 +632,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(ModelListShowsDisplayNamesAndCustomDefaultModel|TeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels|TeamsDefaultManagerUsesRegistryAndAtomicallyReconcilesModelEffort|TeamsDefaultManagerLegacyConfigKeepsRuntimeEffortFallback)$' -v
 
       - name: Codex streaming transcript visibility regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -733,12 +752,12 @@ jobs:
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
 
       - name: Teams runtime safety resolver syscall budget
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
 
       - name: Teams runtime safety real-process, SIGKILL, and disk-full boundaries
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
 
@@ -802,7 +821,7 @@ jobs:
           go test -race ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases|TeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags)$' -v
 
       - name: Teams SQLite row-level migration regressions
-        if: matrix.shard == 'state-perf'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0
         shell: bash
         run: |
           set -euo pipefail
@@ -810,21 +829,21 @@ jobs:
           go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
       - name: CXP preview SQLite correctness, concurrency, and write budgets
-        if: matrix.shard == 'state-perf'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
 
       - name: CXP preview SQLite actual syscall write budget (Linux only)
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/session_preview_sqlite_io_smoke.sh
 
       - name: CXP cache v2 real NFS concurrency smoke (Linux only)
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1073,7 +1092,7 @@ jobs:
           go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
 
       - name: Teams recovery safety behavior regressions (Linux)
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -1410,6 +1429,11 @@ jobs:
           sqlite_store_pattern='Test(SQLiteFull(UpdateIsAtomicAndRecoversAfterCapacityReturns|AcceptedOutboxCASRecoversAfterCapacityReturns|InboundRetryAfterReopenIsExactlyOnce|DeferredContinuationWriteRemainsRetryable)|SQLite(DeferredInboundFiltersAndSortsLargeTable|HistoryWatch(ColdUpdatePreservesSplitTables|ProjectionDoesNotOverrideMixedVersionStateJSON|MissingProjectionMaterializesCurrentRevision|OriginState(SkipsOutboxDeliveryAndUnrelatedInboundRows|CoversSessionAndTurnMatches))|OwnerLeaseColdUpdatesPreserveHotTables|ColdSaveBackfillsSplitTablesFromLegacyStateJSON)|Migration(RoundTripAndHotPaths|UpgradesLegacySchemaWithRecoverableBackup|ThresholdSkipLeavesLegacyStateUntouched|MissingStateDoesNotCreatePointerOrDB|UnsupportedFutureSchemaFailsClosed|RetryReplacesStaleDBAndSidecars|FailureLeavesLegacyStateLoadableAndRetryable|CrashStageMatrixLeavesLegacyStateRetryable|FailureOnStaleSidecarLeavesLegacyState|ProcessBoundaryStressAfterUpgrade)|Pointer(MissingDBFailsClosedAndDoesNotCreateEmptyStore|UninitializedOrCorruptDBFailsClosed|PathValidationFailsClosed|SchemaRejectsLegacyV5Loaders|LegacySchema(LoadsAllEntryPoints|UnsupportedStorageVersionFailsClosed)|UnsupportedSchemaFailsClosed)|ReadUpgrade(SkipsLargeColdState|FallsBackWhenRuntime(UpgradeRowIsMissing|ProjectionIsIncomplete)|MalformedRuntimeRowFailsClosed|AcceptsNilContextAndWhitespaceID|ConcurrentRuntimeUpdate)|ExistingDBMissingHotTablesFailsClosed|OpenMigratesLegacyChatPollColumns|OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)|RecordTranscriptCheckpointPrunesSplitTranscriptLedger|TranscriptDeliveryPruneKeepsNewestRows|StoreUsesNormalSynchronousModeAndManualWALCheckpoint|SchemaEightStoreIsUpgradeOnlyForLegacyWriters)$'
           sqlite_bridge_pattern='Test(Bridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending|MigrateRegistryProjectionSkips(SaveWhenAlreadyMigrated|SentOnlyRegistryHistoryStoreWrite)|HistoryWatchSQLiteNarrowOriginLookupSkipsCorruptExcludedRows)|ProbeScopeMetadataReadOnlyAcceptsLegacySQLitePointerSchema)$'
           sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths|HistoryWatchActiveAppendExercisesTeamsOriginLookup)$'
+          # Partition only the long independent process sequence.  The
+          # correctness gates remain single-runner checks above, while the two
+          # hosted runners split the expensive migration/benchmark work
+          # without running any test twice.
+          if [[ "${{ matrix.partition }}" == "0" ]]; then
           go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
           go test ./internal/teams/store -count=1 -run '^TestReadUpgradeJSONBackendPreservesSemantics$' -v
           go test ./internal/teams/store -run '^$' -bench 'BenchmarkSQLiteManualWALCheckpointHotWrite$' -benchtime=1x -count=1 -benchmem
@@ -1437,6 +1461,8 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/light-user/pending-workflow-notifications$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles/many-long-chats$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
+          else
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUser(ChatPollError|OutboxSendError|OutboxDriveItem|ArtifactUpsert|TranscriptDelivery|TranscriptCheckpoint|TranscriptQueue)StageWrites$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn$' -benchtime=1x -count=1 -benchmem
@@ -1445,10 +1471,10 @@ jobs:
           go test ./internal/appdirs -count=1 -run 'Test(StateDir(ExpandsHomeAndPreservesSpacesCI|UsesConfigFallbackOnWindowsAndDarwinCI)|ResolveMigratedFile(Refreshes(StaleExistingNewCI|EqualMTimeDifferentExistingNewCI)|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|ResolveMigratedDirWithRequired(RefreshesEqualMTimeDifferentRequiredFileCI|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|CopyFileReplacingActiveTempDoesNotInheritOldSourceMTimeCI)$' -v
           go test ./internal/beacon ./internal/cli ./internal/teams -count=1 -run 'Test(DefaultStorePath(RefreshesEqualMTimeDivergentStateCI|SubprocessMigrationStressCI)|DefaultResponsesStorePath(FallsBackWhenNewSidecarIsNonRegularCI|SubprocessMigrationStressCI)|DefaultOutboundRootFallsBackWhenLegacyContainsSymlinkCI|DefaultAuthConfigRefreshes(CorruptProfileScopedCacheFromLegacyScopedCI|EqualMTimeProfileScopedCacheFromLegacyScopedCI)|DefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI|TeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateCI|CleanupMigratedFileFamilyRemoveFailureIsRetryableCI)$' -v
           go test ./internal/teams/store -count=1 -run 'TestDefaultPathRefreshes(CorruptNewStateBeforePromotionCI|StaleLoadableNewStateBeforePromotionCI|EqualMTimeDivergentStateBeforePromotionCI)$' -v
-          go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
+          fi
 
       - name: Teams Codex runner classification regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1475,7 +1501,7 @@ jobs:
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
       - name: Teams metadata-only resume and final integrity regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1495,7 +1521,7 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfileAllowsLegacyDeepSeekContextFingerprintCI|ModelListShows(NeedsSetupWhenFamilyCredentialExistsWithoutProfile|DisplayNamesAndCustomDefaultModel)|ModelDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice)|TeamsModelProfileDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice))$' -v
 
       - name: Teams user-marker compact and fallback regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1518,7 +1544,7 @@ jobs:
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
 
       - name: Teams thread recovery and self-echo regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1530,7 +1556,7 @@ jobs:
           go test ./internal/teams -count=1 -run "$outbound_ledger_pattern" -v
 
       - name: Teams frontier recovery and fenced-page regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1559,7 +1585,7 @@ jobs:
           fi
 
       - name: Teams bridge scheduling and history sync regressions
-        if: matrix.shard == 'core'
+        if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
@@ -1729,7 +1755,7 @@ jobs:
         run: go vet ./...
 
       - name: Teams perf benchmark smoke
-        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
@@ -1818,7 +1844,7 @@ jobs:
           bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy chatgpt
 
       - name: Codex desktop app network install smoke (Windows)
-        if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1844,7 +1870,7 @@ jobs:
           }
 
       - name: Codex desktop app managed runtime smoke (Windows)
-        if: matrix.shard == 'windows-skills-desktop' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -2178,13 +2204,22 @@ jobs:
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
   teams-recovery-test:
-    name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }})
+    name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         mode: [normal, race]
+        partition: [0, 1]
+        exclude:
+          # Unix recovery is already short. Windows serializes manifest
+          # entries for file-backed SQLite safety; split only that host across
+          # independent runners instead of introducing same-host contention.
+          - os: ubuntu-latest
+            partition: 1
+          - os: macos-latest
+            partition: 1
 
     steps:
       - name: Checkout
@@ -2210,14 +2245,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery
+          partition_flags=("-partition-count=1" "-partition-index=0")
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
+          fi
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery "${partition_flags[@]}"
 
       - name: Run Teams recovery manifest (race)
         if: matrix.mode == 'race'
         shell: bash
         run: |
           set -euo pipefail
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race
+          partition_flags=("-partition-count=1" "-partition-index=0")
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
+          fi
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
 
   codex-runtime-contract:
     name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})
@@ -2306,13 +2349,20 @@ jobs:
           path: ${{ runner.temp }}/codex-runtime-contract.json
 
   full-go-test:
-    name: Full go test (${{ matrix.os }})
+    name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        partition: [0, 1]
+        exclude:
+          # Linux owns the combined coverage profile and is already the
+          # shortest full-suite job. Split only the non-Linux suites, whose
+          # local shard pool is intentionally capped for SQLite safety.
+          - os: ubuntu-latest
+            partition: 1
 
     steps:
       - name: Checkout
@@ -2362,7 +2412,7 @@ jobs:
           # corpus. Run every discovered Test/Example/Fuzz entry exactly once,
           # but in bounded prefix shards so one package test process cannot
           # spend the entire 20-minute watchdog behind unrelated fixtures.
-          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 2>&1 | tee "$log"; then
+          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
@@ -2400,9 +2450,13 @@ jobs:
           path: coverage.out
 
   race-test:
-    name: Race test (ubuntu-latest)
+    name: Race test (ubuntu-latest / partition ${{ matrix.partition }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1]
 
     steps:
       - name: Checkout
@@ -2415,7 +2469,7 @@ jobs:
           cache: true
 
       - name: go test -race (Linux only)
-        run: go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8
+        run: go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}"
 
   runtime-env-contract:
     name: Runtime environment contract (${{ matrix.os }})

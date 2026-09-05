@@ -19,14 +19,21 @@ func TestMCPRefreshCoordinatorCoalescesChangesWhileReloadIsInFlight(t *testing.T
 	configPath := writeMCPRefreshTestConfigAt(t, t.TempDir(), "initial")
 	started := make(chan int, 4)
 	observed := make(chan mcpConfigFileState, 16)
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	firstRelease := make(chan struct{})
+	secondRelease := make(chan struct{})
+	var firstReleaseOnce sync.Once
+	var secondReleaseOnce sync.Once
+	releaseFirst := func() { firstReleaseOnce.Do(func() { close(firstRelease) }) }
+	releaseSecond := func() { secondReleaseOnce.Do(func() { close(secondRelease) }) }
 	var calls atomic.Int32
 
 	coordinator := newMCPRefreshCoordinator(configPath, 5*time.Millisecond, func(ctx context.Context) error {
 		call := int(calls.Add(1))
 		started <- call
+		release := firstRelease
+		if call == 2 {
+			release = secondRelease
+		}
 		select {
 		case <-release:
 			return nil
@@ -39,7 +46,8 @@ func TestMCPRefreshCoordinatorCoalescesChangesWhileReloadIsInFlight(t *testing.T
 	}
 	coordinator.start(context.Background())
 	defer func() {
-		releaseAll()
+		releaseFirst()
+		releaseSecond()
 		coordinator.stopAndWait()
 	}()
 
@@ -71,13 +79,14 @@ finalStateObserved:
 
 	// All changes observed while the first reload is blocked collapse into one
 	// pending trigger rather than one request per file event.
-	releaseAll()
+	releaseFirst()
 	waitForMCPRefreshCall(t, started, 2)
 	select {
 	case call := <-started:
 		t.Fatalf("unexpected third reload call %d", call)
-	case <-time.After(40 * time.Millisecond):
+	default:
 	}
+	releaseSecond()
 }
 
 func TestMCPRefreshCoordinatorDoesNotRefreshStableConfig(t *testing.T) {
