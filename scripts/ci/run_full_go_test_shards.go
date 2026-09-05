@@ -48,19 +48,26 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
-		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":       true,
-		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                        true,
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce": true,
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                  true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":      true,
+		// This liveness fixture must observe an actual listener scheduling
+		// window. Keep it out of the broad shard pool, where unrelated race and
+		// SQLite processes can consume the hosted runner before its first poll.
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
 		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail": true,
 		"TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail":     true,
+		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":     true,
 		"TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail":         true,
 		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
 		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
 		"TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle":          true,
 		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
 		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
+		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":           true,
 		"TestTeamsListenFalseCurrentStateReplayMatrix":                             true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
 		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":             true,
@@ -90,6 +97,11 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		// This cross-backend owner-fencing test migrates a file-backed store to
+		// SQLite. On Windows, modernc SQLite may block in FlushFileBuffers when
+		// unrelated store shards share the hosted runner. Keep the migration
+		// observation isolated instead of weakening its finite assertions.
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends": true,
 	},
 }
 
@@ -103,8 +115,11 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":            true,
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
+		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":     true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
@@ -113,6 +128,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
 		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":            true,
+		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":           true,
 		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
 		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
@@ -123,6 +139,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
 	},
 }
 
