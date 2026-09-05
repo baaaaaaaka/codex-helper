@@ -637,19 +637,6 @@ jobs:
           go test ./internal/teams -count=1 -run '^Test(Bridge(ActiveTurnLegacyCheckpointBlocksBeforeSourceScanAcrossBackends|ReadLinkedTranscriptDeltaBlocksOversizedTail|SyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint)|HistoryTieredStatReconcileDetectsSameSizeSameMtimeRewrite|StoreSourceRewriteFenceDemotesSentAcrossBackends|TranscriptOutboxAnchorBlocksOnlyUnprovenTail)$' -v
           go test ./internal/teams -count=1 -run '^Test(Bridge(ExactCompletionResolvesInterruptedTurnWithProof|TerminalFailureAfterFirstChunkFencesRemainingChunks|LinkedTranscriptOutboxSourceRewriteDoesNotPostAcrossBackends|LegacyTranscriptOutboxWithoutSourceProofDoesNotPostAcrossBackends|LegacySourceLessTranscriptOutboxIsFencedAfterSourceRewriteAcrossBackends|SourceRewriteAttentionNoticeRemainsDeliverableAcrossBackends|ActiveTurnCheckpointProvenanceMismatchHasNoSideEffectsAcrossBackends)|HistoryTieredScanTailQuarantines(AnonymousFinalPairBeforeTerminal|TwoAnonymousFinalsAfterTerminal|AnonymousFinalPairAcrossPolls)|ExecutionFenceProbeCacheIsBounded)$' -v
 
-      - name: Teams transcript recovery state-machine regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # The machine-readable manifest is the single source of truth for
-          # recovery selectors. Running one exact selector per entry keeps a
-          # renamed or accidentally omitted regression from becoming a green
-          # no-op, and gives each real listener test its own watchdog budget.
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race
-
       - name: Teams recovery mutation smoke
         if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
@@ -2190,6 +2177,48 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
 
+  teams-recovery-test:
+    name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        mode: [normal, race]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Validate Teams recovery manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep selector validation mandatory in both modes. The manifest
+          # runner still builds once per package and runs each entry in its own
+          # process with its declared watchdog.
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only
+
+      - name: Run Teams recovery manifest (normal)
+        if: matrix.mode == 'normal'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery
+
+      - name: Run Teams recovery manifest (race)
+        if: matrix.mode == 'race'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race
+
   codex-runtime-contract:
     name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})
     runs-on: ${{ matrix.os }}
@@ -2948,6 +2977,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - targeted-test
+      - teams-recovery-test
       - proxy-recovery-loopback
       - windows-proxy-lifecycle
       - proxy-recovery-docker
@@ -2979,6 +3009,7 @@ jobs:
             fi
           }
           check targeted-test "${{ needs.targeted-test.result }}"
+          check teams-recovery-test "${{ needs.teams-recovery-test.result }}"
           check proxy-recovery-loopback "${{ needs.proxy-recovery-loopback.result }}"
           check windows-proxy-lifecycle "${{ needs.windows-proxy-lifecycle.result }}"
           check proxy-recovery-docker "${{ needs.proxy-recovery-docker.result }}"

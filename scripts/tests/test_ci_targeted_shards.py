@@ -8,12 +8,13 @@ WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
 OWNERSHIP_STRESS_TESTS = ROOT / "internal" / "teams" / "ownership_stress_ci_test.go"
+FULL_GO_TEST_SHARDS = ROOT / "scripts" / "ci" / "run_full_go_test_shards.go"
 
 
 def targeted_job() -> str:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     start = workflow.index("  targeted-test:\n")
-    end = workflow.index("  codex-runtime-contract:\n", start)
+    end = workflow.index("  teams-recovery-test:\n", start)
     return workflow[start:end]
 
 
@@ -74,6 +75,54 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 job,
             )
         self.assertNotIn("needs:", job)
+
+    def test_recovery_manifest_runs_in_parallel_platform_mode_jobs(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  teams-recovery-test:\n")
+        end = workflow.index("  codex-runtime-contract:\n", start)
+        job = workflow[start:end]
+        self.assertIn(
+            "name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }})",
+            job,
+        )
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", job)
+        self.assertIn("mode: [normal, race]", job)
+        self.assertIn(
+            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only",
+            job,
+        )
+        self.assertIn(
+            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery",
+            job,
+        )
+        self.assertIn(
+            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race",
+            job,
+        )
+        self.assertNotIn("Teams transcript recovery state-machine regressions", targeted_job())
+        aggregate_start = workflow.index("  test:\n")
+        aggregate = workflow[aggregate_start:]
+        self.assertIn("      - teams-recovery-test\n", aggregate)
+        self.assertIn(
+            'check teams-recovery-test "${{ needs.teams-recovery-test.result }}"',
+            aggregate,
+        )
+
+    def test_full_go_runner_isolates_listener_liveness_fixture_from_shard_pool(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixtures = (
+            "TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll",
+            "TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail",
+            "TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail",
+            "TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization",
+        )
+        for fixture_name in fixtures:
+            fixture = f'"{fixture_name}"'
+            self.assertEqual(
+                runner.count(fixture),
+                2,
+                f"{fixture_name} must be both process-isolated and host-exclusive",
+            )
 
     def test_every_non_setup_step_selects_exactly_one_shard(self):
         for name, block in step_blocks(targeted_job()).items():
