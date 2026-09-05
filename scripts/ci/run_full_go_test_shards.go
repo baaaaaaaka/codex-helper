@@ -1,5 +1,5 @@
 // Command run_full_go_test_shards runs the full Go test suite while isolating
-// the two largest packages into independently compiled test processes. The
+// large or host-sensitive packages into independently compiled test processes. The
 // package test names are discovered from `go test -list`, partitioned by
 // disjoint name prefixes, and checked so every runnable Test/Example/Fuzz
 // entry is selected exactly once.
@@ -40,6 +40,13 @@ var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$
 // older package fixtures. Keep them in their own test process rather than
 // allowing unrelated tests to make their timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
+	"./internal/tui": {
+		// This test drives a real refresh ticker and has a short semantic
+		// context. Keep its scheduler observation independent from the large
+		// race-test shard pool; changing the deadline would hide the CI
+		// scheduling problem rather than make the test more reliable.
+		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
+	},
 	"./internal/teams": {
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":       true,
 		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                        true,
@@ -59,6 +66,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":             true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
 		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,
+		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
 		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
 		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
 		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":             true,
@@ -91,6 +99,9 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // runner's scheduler and filesystem while a finite liveness observation is in
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
+	"./internal/tui": {
+		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
+	},
 	"./internal/teams": {
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
@@ -98,6 +109,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
 		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,
+		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
 		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
 		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":            true,
@@ -329,6 +341,9 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 
 func isLargePackage(packageName string) bool {
 	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	if packageName == "./internal/tui" || strings.HasSuffix(packageName, "/internal/tui") {
+		return true
+	}
 	return packageName == "./internal/teams" ||
 		strings.HasSuffix(packageName, "/internal/teams") ||
 		packageName == "./internal/teams/store" ||
@@ -338,6 +353,9 @@ func isLargePackage(packageName string) bool {
 func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	if names, ok := isolatedRunnableNames[packageName]; ok {
 		return names
+	}
+	if strings.HasSuffix(packageName, "/internal/tui") {
+		return isolatedRunnableNames["./internal/tui"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return isolatedRunnableNames["./internal/teams/store"]
@@ -351,6 +369,9 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	if names, ok := exclusiveRunnableNames[packageName]; ok {
 		return names
+	}
+	if strings.HasSuffix(packageName, "/internal/tui") {
+		return exclusiveRunnableNames["./internal/tui"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return exclusiveRunnableNames["./internal/teams/store"]
