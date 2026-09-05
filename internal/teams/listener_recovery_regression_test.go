@@ -1602,6 +1602,16 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// The inbound classifier checks the global outbound ledger for helper
+	// echoes before admitting each page. Warm that unrelated ledger setup
+	// outside the frontier assertion: on Windows, the first WAL activation can
+	// spend the poll worker's useful interval in FlushFileBuffers even though
+	// the stateful Graph continuation itself is healthy. Ledger initialization
+	// and lock/retry behavior have dedicated tests; this vertical test should
+	// measure head -> continuation progress with the production ledger already
+	// materialized.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// This scenario verifies the production head/continuation state machine,
 	// not the short-budget isolation path.  Use the production budgets so race
