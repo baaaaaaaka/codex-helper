@@ -719,6 +719,9 @@ type Bridge struct {
 	lastHistoryWatchReconcileAttempt  time.Time
 	historyWatchProbeMu               sync.Mutex
 	historyWatchDeletedProbeAt        map[string]time.Time
+	historyWatchEventsMu              sync.Mutex
+	historyWatchEvents                historyWatchEventSource
+	historyWatchPendingDirty          map[string]struct{}
 	historyRebaseMu                   sync.Mutex
 	historyRebaseScans                map[string]historyWatchRebaseScanProgress
 	lastBeaconReconcile               time.Time
@@ -1592,6 +1595,11 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer func() {
+		if err := b.closeHistoryWatchEvents(); err != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams history watcher close skipped: %v\n", err)
+		}
+	}()
 	// codexhistory keeps SQLite handles open so repeated history discovery and
 	// preview reads stay cheap. A Teams listener is the lifetime owner of those
 	// process-global handles in service mode, so release them only when the
@@ -3889,6 +3897,29 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			return result, nil
 		}
 	}
+	var inboundWriter *globalInboundSQLiteWriter
+	if _, ok := globalInboundLedgerPathForRegistry(b.registryPath); ok {
+		inboundWriter = &globalInboundSQLiteWriter{}
+		defer func() { _ = inboundWriter.close() }()
+	}
+	lookupCtx := ctx
+	if b.store != nil && len(msgs) > 0 {
+		messageIDs := make([]string, 0, len(msgs))
+		for _, msg := range msgs {
+			if messageID := strings.TrimSpace(msg.ID); messageID != "" {
+				messageIDs = append(messageIDs, messageID)
+			}
+		}
+		if lookups, lookupErr := b.store.MessageLookupBatch(ctx, chatID, messageIDs); lookupErr == nil {
+			// A batch read is advisory. The normal scalar lookup remains the
+			// fallback for malformed/legacy rows so a performance optimization
+			// cannot change the current poll error boundary or dedupe authority.
+			lookupCtx = context.WithValue(ctx, pollMessageLookupBatchContextKey{}, pollMessageLookupBatchContext{
+				ChatID: chatID,
+				Lookup: lookups,
+			})
+		}
+	}
 	result.MaxModified = time.Time{}
 	recordMessageProgress := func(msg ChatMessage) {
 		if modified := messageModifiedTime(msg); modified.After(result.MaxModified) {
@@ -3909,7 +3940,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			// helper records; leave the first non-ignorable record in PendingPage
 			// for replay after explicit unquarantine.
 			legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
-			ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
+			ignore, err := b.shouldIgnoreMessage(lookupCtx, chatID, msg, role, legacyFallback)
 			if err != nil {
 				return result, err
 			}
@@ -3965,7 +3996,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			result.RefetchedMessages = append(result.RefetchedMessages, fullMessage)
 		}
 		legacyFallback := legacyGeneratedMessageFallbackAllowed(msg, poll, hasPoll)
-		ignore, err := b.shouldIgnoreMessage(ctx, chatID, msg, role, legacyFallback)
+		ignore, err := b.shouldIgnoreMessage(lookupCtx, chatID, msg, role, legacyFallback)
 		if err != nil {
 			return result, err
 		}
@@ -4005,7 +4036,7 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 				continue
 			}
 		}
-		globalClaim, claimed, err := b.tryClaimGlobalInbound(ctx, chatID, msg.ID)
+		globalClaim, claimed, err := b.tryClaimGlobalInboundWithWriter(ctx, chatID, msg.ID, inboundWriter)
 		if err != nil {
 			return result, err
 		}
@@ -4033,11 +4064,19 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		}
 		if err := handle(ctx, msg, text); err != nil {
 			if errors.Is(err, teamstore.ErrInboundMessageFromHelperOutbox) {
-				b.markRegistrySent(chatID, msg.ID)
-				b.markRegistrySeen(chatID, msg.ID)
-				if completeErr := completeGlobalInbound(ctx, globalClaim); completeErr != nil {
+				completed, completeErr := completeGlobalInboundClaim(ctx, globalClaim)
+				if completeErr != nil {
 					return result, completeErr
 				}
+				if !completed {
+					return result, fmt.Errorf("global inbound claim %q was lost before completion", globalClaim.Key)
+				}
+				// The in-memory registry is only a fast-path projection. Publish its
+				// terminal disposition after the durable global claim completes; if
+				// completion fails, the next poll must still be able to recover the
+				// claim instead of being short-circuited as already seen.
+				b.markRegistrySent(chatID, msg.ID)
+				b.markRegistrySeen(chatID, msg.ID)
 				recordMessageProgress(msg)
 				result.Progressed = true
 				continue
@@ -4045,10 +4084,17 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 			releaseGlobalInbound(ctx, globalClaim)
 			return result, err
 		}
-		b.markRegistrySeen(chatID, msg.ID)
-		if err := completeGlobalInbound(ctx, globalClaim); err != nil {
+		completed, err := completeGlobalInboundClaim(ctx, globalClaim)
+		if err != nil {
 			return result, err
 		}
+		if !completed {
+			return result, fmt.Errorf("global inbound claim %q was lost before completion", globalClaim.Key)
+		}
+		// Keep the local seen projection behind the durable claim. A ledger
+		// completion error is retryable; marking first would make a later poll
+		// skip the message before it can recover the claim.
+		b.markRegistrySeen(chatID, msg.ID)
 		recordMessageProgress(msg)
 		result.Progressed = true
 		b.annotateIncomingUserMessage(ctx, chatID, msg)
@@ -5539,6 +5585,23 @@ func parseGraphTime(value string) time.Time {
 	return t
 }
 
+type pollMessageLookupBatchContextKey struct{}
+
+type pollMessageLookupBatchContext struct {
+	ChatID string
+	Lookup map[string]teamstore.MessageLookup
+}
+
+func (b *Bridge) messageLookupForPoll(ctx context.Context, chatID string, messageID string) (teamstore.MessageLookup, error) {
+	if batch, ok := ctx.Value(pollMessageLookupBatchContextKey{}).(pollMessageLookupBatchContext); ok &&
+		strings.TrimSpace(batch.ChatID) == strings.TrimSpace(chatID) {
+		if lookup, found := batch.Lookup[strings.TrimSpace(messageID)]; found {
+			return lookup, nil
+		}
+	}
+	return b.store.MessageLookup(ctx, chatID, messageID)
+}
+
 func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg ChatMessage, role inboundPollRole, legacyGeneratedOutputFallback bool) (bool, error) {
 	if msg.ID == "" || b.registryHasSeenOrSentForPoll(chatID, msg.ID) {
 		return true, nil
@@ -5565,7 +5628,7 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 			looksLikeRenderedHelperOutputMessage(msg, plainText)
 	}
 	if b.store != nil {
-		lookup, err := b.store.MessageLookup(ctx, chatID, msg.ID)
+		lookup, err := b.messageLookupForPoll(ctx, chatID, msg.ID)
 		if err != nil {
 			return false, err
 		}

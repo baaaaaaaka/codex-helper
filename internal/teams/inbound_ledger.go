@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -49,6 +50,74 @@ type globalInboundClaim struct {
 	// message.  Callers must not mark such a message as locally seen: the
 	// claim may be released after that poll and the message remains retryable.
 	ExistingStatus string
+	writer         *globalInboundSQLiteWriter
+}
+
+// globalInboundSQLiteWriter is scoped to one poll window. It reuses the
+// already-open sidecar and its schema setup, while retaining the existing
+// per-message transaction, file lock, claim token, and owner fencing rules.
+// A physical identity check prevents a replaced sidecar from being mistaken
+// for the file that the previous connection opened.
+type globalInboundSQLiteWriter struct {
+	mu            sync.Mutex
+	path          string
+	db            *sql.DB
+	identity      os.FileInfo
+	schemaReady   bool
+	schemaVersion int64
+}
+
+func (w *globalInboundSQLiteWriter) open(path string) (*sql.DB, error) {
+	if w == nil {
+		return openTeamsLedgerSQLite(path)
+	}
+	path = filepath.Clean(strings.TrimSpace(path))
+	info, statErr := os.Stat(path)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
+	if w.db != nil && w.path == path && w.identity != nil && info != nil && os.SameFile(w.identity, info) {
+		return w.db, nil
+	}
+	if w.db != nil {
+		_ = w.db.Close()
+	}
+	w.db = nil
+	w.path = ""
+	w.identity = nil
+	w.schemaReady = false
+	w.schemaVersion = 0
+	db, err := openTeamsLedgerSQLite(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	w.path = path
+	w.db = db
+	w.identity = info
+	return db, nil
+}
+
+func (w *globalInboundSQLiteWriter) close() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.db == nil {
+		return nil
+	}
+	err := w.db.Close()
+	w.db = nil
+	w.path = ""
+	w.identity = nil
+	w.schemaReady = false
+	w.schemaVersion = 0
+	return err
 }
 
 func globalInboundLedgerPathForRegistry(registryPath string) (string, bool) {
@@ -65,6 +134,10 @@ func globalInboundLedgerPathForRegistry(registryPath string) (string, bool) {
 }
 
 func (b *Bridge) tryClaimGlobalInbound(ctx context.Context, chatID string, messageID string) (globalInboundClaim, bool, error) {
+	return b.tryClaimGlobalInboundWithWriter(ctx, chatID, messageID, nil)
+}
+
+func (b *Bridge) tryClaimGlobalInboundWithWriter(ctx context.Context, chatID string, messageID string, writer *globalInboundSQLiteWriter) (globalInboundClaim, bool, error) {
 	if b == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(messageID) == "" {
 		return globalInboundClaim{}, true, nil
 	}
@@ -79,14 +152,20 @@ func (b *Bridge) tryClaimGlobalInbound(ctx context.Context, chatID string, messa
 	if owner == "" {
 		owner = "unknown"
 	}
-	return claimGlobalInbound(ctx, path, chatID, messageID, owner, time.Now())
+	return claimGlobalInboundWithWriter(ctx, path, chatID, messageID, owner, time.Now(), writer)
 }
 
 func completeGlobalInbound(ctx context.Context, claim globalInboundClaim) error {
+	_, err := completeGlobalInboundClaim(ctx, claim)
+	return err
+}
+
+func completeGlobalInboundClaim(ctx context.Context, claim globalInboundClaim) (bool, error) {
 	if strings.TrimSpace(claim.Path) == "" || strings.TrimSpace(claim.Key) == "" {
-		return nil
+		return true, nil
 	}
-	return updateGlobalInboundSQLite(ctx, claim.Path, func(tx *sql.Tx, now time.Time) error {
+	completed := false
+	err := updateGlobalInboundSQLiteWithWriter(ctx, claim.Path, claim.writer, func(tx *sql.Tx, now time.Time) error {
 		item, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, claim.Key)
 		if err != nil {
 			return err
@@ -103,15 +182,20 @@ func completeGlobalInbound(ctx context.Context, claim globalInboundClaim) error 
 		item.MessageID = claim.MessageID
 		item.Status = "done"
 		item.UpdatedAt = now
-		return upsertGlobalInboundSQLiteTx(ctx, tx, claim.Key, item)
+		if err := upsertGlobalInboundSQLiteTx(ctx, tx, claim.Key, item); err != nil {
+			return err
+		}
+		completed = true
+		return nil
 	})
+	return completed, err
 }
 
 func releaseGlobalInbound(ctx context.Context, claim globalInboundClaim) {
 	if strings.TrimSpace(claim.Path) == "" || strings.TrimSpace(claim.Key) == "" {
 		return
 	}
-	_ = updateGlobalInboundSQLite(ctx, claim.Path, func(tx *sql.Tx, _ time.Time) error {
+	_ = updateGlobalInboundSQLiteWithWriter(ctx, claim.Path, claim.writer, func(tx *sql.Tx, _ time.Time) error {
 		item, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, claim.Key)
 		if err != nil {
 			return err
@@ -126,15 +210,20 @@ func releaseGlobalInbound(ctx context.Context, claim globalInboundClaim) {
 }
 
 func claimGlobalInbound(ctx context.Context, path string, chatID string, messageID string, owner string, now time.Time) (globalInboundClaim, bool, error) {
+	return claimGlobalInboundWithWriter(ctx, path, chatID, messageID, owner, now, nil)
+}
+
+func claimGlobalInboundWithWriter(ctx context.Context, path string, chatID string, messageID string, owner string, now time.Time, writer *globalInboundSQLiteWriter) (globalInboundClaim, bool, error) {
 	claim := globalInboundClaim{
 		Path:      path,
 		Key:       globalInboundKey(chatID, messageID),
 		ChatID:    chatID,
 		MessageID: messageID,
 		Owner:     owner,
+		writer:    writer,
 	}
 	claimed := false
-	err := updateGlobalInboundSQLite(ctx, path, func(tx *sql.Tx, _ time.Time) error {
+	err := updateGlobalInboundSQLiteWithWriter(ctx, path, writer, func(tx *sql.Tx, _ time.Time) error {
 		item, ok, err := loadGlobalInboundSQLiteItem(ctx, tx, claim.Key)
 		if err != nil {
 			return err
@@ -176,28 +265,67 @@ func globalInboundClaimToken(key string, owner string, now time.Time, previous s
 }
 
 func updateGlobalInboundSQLite(ctx context.Context, path string, fn func(*sql.Tx, time.Time) error) error {
+	return updateGlobalInboundSQLiteWithWriter(ctx, path, nil, fn)
+}
+
+func updateGlobalInboundSQLiteWithWriter(ctx context.Context, path string, writer *globalInboundSQLiteWriter, fn func(*sql.Tx, time.Time) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	lock := flock.New(path + ".lock")
-	ok, err := lock.TryLockContext(ctx, globalInboundLockTimeout)
+	// TryLockContext's duration is only its retry interval; it does not bound
+	// how long an otherwise-live context may wait. Use a child deadline so a
+	// stuck or slow sibling owner cannot pin a poll worker until the outer
+	// listener phase expires.
+	lockCtx, cancelLock := context.WithTimeout(ctx, globalInboundLockTimeout)
+	defer cancelLock()
+	ok, err := lock.TryLockContext(lockCtx, globalInboundLockTimeout)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := lockCtx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return fmt.Errorf("global Teams inbound ledger is locked: %s", path)
 	}
 	defer func() { _ = lock.Unlock() }()
-	db, err := openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if writer != nil {
+		writer.mu.Lock()
+		defer writer.mu.Unlock()
+	}
+	var db *sql.DB
+	if writer != nil {
+		db, err = writer.open(teamsLedgerSQLitePath(path))
+	} else {
+		db, err = openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	}
 	if err != nil {
 		return err
 	}
-	defer func() { _ = db.Close() }()
-	if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
-		return err
+	if writer == nil {
+		defer func() { _ = db.Close() }()
+		if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
+			return err
+		}
+	} else {
+		var schemaVersion int64
+		if err := db.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&schemaVersion); err != nil {
+			return err
+		}
+		if !writer.schemaReady || writer.schemaVersion != schemaVersion {
+			if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
+				return err
+			}
+			if err := db.QueryRowContext(ctx, `PRAGMA schema_version`).Scan(&schemaVersion); err != nil {
+				return err
+			}
+			writer.schemaReady = true
+			writer.schemaVersion = schemaVersion
+		}
 	}
 	if err := importLegacyGlobalInboundJSON(ctx, db, path, time.Now()); err != nil {
 		return err
@@ -307,6 +435,19 @@ func ensureGlobalInboundSQLite(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+func legacyGlobalInboundItemWins(existing, incoming globalInboundItem) bool {
+	if incoming.UpdatedAt.After(existing.UpdatedAt) {
+		return true
+	}
+	if incoming.UpdatedAt.Before(existing.UpdatedAt) {
+		return false
+	}
+	// Equal timestamps are possible when a legacy writer copies a row without
+	// preserving subsecond precision. A terminal durable disposition must not
+	// be regressed to a live claim at that boundary.
+	return incoming.Status == "done" && existing.Status != "done"
+}
+
 func importLegacyGlobalInboundJSON(ctx context.Context, db *sql.DB, path string, now time.Time) error {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
@@ -335,6 +476,13 @@ func importLegacyGlobalInboundJSON(ctx context.Context, db *sql.DB, path string,
 	}
 	defer tx.Rollback()
 	for key, item := range legacy.Items {
+		existing, exists, err := loadGlobalInboundSQLiteItem(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if exists && !legacyGlobalInboundItemWins(existing, item) {
+			continue
+		}
 		if err := upsertGlobalInboundSQLiteTx(ctx, tx, key, item); err != nil {
 			return err
 		}
