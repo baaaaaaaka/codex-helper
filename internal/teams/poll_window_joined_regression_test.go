@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -205,6 +206,13 @@ func TestBridgePollWindowCompletionFailureDoesNotMarkRegistrySeen(t *testing.T) 
 }
 
 func TestBridgePollWindowSidecarReplacementBeforeCompletionRetriesMessage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// Windows opens SQLite without delete sharing, so the handler cannot
+		// rename the sidecar while the production poll window still owns it.
+		// The writer reopen/claim contract is covered by the portable fixture;
+		// this exact open-file replacement scenario is Unix-only.
+		t.Skip("Windows does not permit replacing an open SQLite sidecar")
+	}
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
