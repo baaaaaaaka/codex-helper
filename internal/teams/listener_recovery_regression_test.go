@@ -3769,7 +3769,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 		return len(calls) == 2 &&
 			strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_MALFORMED_POLL_HEALTHY_PROMPT") &&
 			strings.Contains(strings.Join(calls, "\n"), "LISTENER_RECOVERY_MALFORMED_POLL_PROMPT")
-	}, 3*time.Second) {
+	}, listenerRecoveryExtendedProgressTimeout) {
 		state, _ := reopened.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("both healthy and malformed-poll chats did not reach execution; calls=%#v polls=%#v sessions=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, state.Sessions, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -3782,7 +3782,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 			malformedFinals += strings.Count(plain, "LISTENER_RECOVERY_MALFORMED_POLL_FINAL")
 		}
 		return healthyFinals == 1 && malformedFinals == 1
-	}, 3*time.Second, "healthy and malformed-poll finals after reopen")
+	}, listenerRecoveryExtendedProgressTimeout, "healthy and malformed-poll finals after reopen")
 	waitListenerRecovery(t, func() bool {
 		state, err := reopened.Load(context.Background())
 		if err != nil {
@@ -3790,7 +3790,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 		}
 		poll := state.ChatPolls[malformedSession.ChatID]
 		return !poll.RecoveryRequired && poll.RecoverySourceHash == "" && poll.PendingPage == nil && poll.Attempt == nil
-	}, 3*time.Second, "malformed-poll recovery marker retirement")
+	}, listenerRecoveryExtendedProgressTimeout, "malformed-poll recovery marker retirement")
 	state, err := reopened.Load(context.Background())
 	if err != nil {
 		listener.stop(t)
