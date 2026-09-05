@@ -4325,7 +4325,11 @@ func sentPlainJoinedListenerRecovery(items []listenerRecoverySentMessage) string
 func countListenerRecoveryTranscriptFinals(items []listenerRecoverySentMessage, marker string) int {
 	count := 0
 	for _, item := range items {
-		if strings.Contains(PlainTextFromTeamsHTML(item.Body), marker) {
+		// Recovery markers are ASCII-safe and are inserted verbatim into the
+		// fake Graph payload.  Do not run the general Teams HTML parser here:
+		// these helpers are called from race-enabled liveness loops, and parsing
+		// every unrelated status body can dominate the test on Windows.
+		if strings.Contains(item.Body, marker) {
 			count++
 		}
 	}
@@ -4335,7 +4339,7 @@ func countListenerRecoveryTranscriptFinals(items []listenerRecoverySentMessage, 
 func countListenerRecoverySentBodies(items []listenerRecoverySentMessage, marker string) int {
 	count := 0
 	for _, item := range items {
-		if strings.Contains(PlainTextFromTeamsHTML(item.Body), marker) {
+		if strings.Contains(item.Body, marker) {
 			count++
 		}
 	}
