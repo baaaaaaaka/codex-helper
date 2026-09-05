@@ -1159,7 +1159,7 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		state, _ := store.Load(context.Background())
 		t.Fatalf("healthy chat never dispatched to executor; Graph reads: chat-1=%d chat-2=%d chat-3=%d chat-4=%d chat-5=%d; state=%#v", graphState.getCount("chat-1"), graphState.getCount("chat-2"), graphState.getCount("chat-3"), graphState.getCount("chat-4"), graphState.getCount("chat-5"), state)
@@ -1168,10 +1168,10 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 		t.Fatalf("executor calls = %#v, want one healthy prompt", got)
 	}
 	// The healthy turn's ack is sent before its final, and production Graph
-	// pacing deliberately keeps successive sends at least 1.2s apart.  A
-	// one-second assertion is therefore shorter than a normal successful
-	// delivery, especially on a busy hosted runner.
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	// pacing deliberately keeps successive sends at least 1.2s apart.  The
+	// extended bound also covers the production 15s phase budget when a race
+	// Windows runner spends several seconds in modernc SQLite initialization.
+	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	healthyFinalSent := false
 	for time.Now().Before(deadline) {
 		for _, sent := range graphState.sentSnapshot() {

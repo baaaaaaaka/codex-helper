@@ -186,6 +186,8 @@ func main() {
 	testTimeout := flag.Duration("timeout", 20*time.Minute, "per-shard go test timeout")
 	race := flag.Bool("race", false, "pass -race to go test")
 	listOnly := flag.Bool("list-only", false, "print the plan without executing tests")
+	partitionCount := flag.Int("partition-count", 1, "number of independent hosted-runner partitions")
+	partitionIndex := flag.Int("partition-index", 0, "zero-based hosted-runner partition index")
 	var requestedPackages stringList
 	flag.Var(&requestedPackages, "package", "package to include; may be repeated (default: go list ./...)")
 	flag.Parse()
@@ -198,6 +200,12 @@ func main() {
 	}
 	if *testTimeout <= 0 {
 		fatal(errors.New("timeout must be positive"))
+	}
+	if *partitionCount <= 0 {
+		fatal(errors.New("partition-count must be positive"))
+	}
+	if *partitionIndex < 0 || *partitionIndex >= *partitionCount {
+		fatal(fmt.Errorf("partition-index %d is outside partition-count %d", *partitionIndex, *partitionCount))
 	}
 
 	packages := []string(requestedPackages)
@@ -213,8 +221,9 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	jobs = partitionTestJobs(jobs, *partitionCount, *partitionIndex)
 	if len(jobs) == 0 {
-		fatal(errors.New("no test jobs were planned"))
+		fatal(fmt.Errorf("partition %d/%d selected no test jobs", *partitionIndex+1, *partitionCount))
 	}
 	if *listOnly {
 		for _, job := range jobs {
@@ -241,6 +250,27 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("full test shards passed: %d job(s)\n", len(jobs))
+}
+
+// partitionTestJobs assigns complete test processes to independent hosted
+// runners.  This is deliberately done after makeJobs has established the
+// exact-once name coverage and after host-sensitive tests have been marked
+// exclusive.  A partition therefore never runs half of a test, and the
+// existing exclusive-before-parallel ordering is retained within each runner.
+// The runners have independent filesystems, so this increases wall-clock
+// parallelism without introducing the same-runner SQLite contention that
+// prevents increasing maxConcurrentJobs safely.
+func partitionTestJobs(jobs []testJob, partitionCount, partitionIndex int) []testJob {
+	if partitionCount <= 1 {
+		return jobs
+	}
+	selected := make([]testJob, 0, (len(jobs)+partitionCount-1)/partitionCount)
+	for index, job := range jobs {
+		if index%partitionCount == partitionIndex {
+			selected = append(selected, job)
+		}
+	}
+	return selected
 }
 
 func fatal(err error) {
