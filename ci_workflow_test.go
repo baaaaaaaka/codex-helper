@@ -97,6 +97,13 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)
 
+	recoveryJob := workflowJobBlock(t, workflow, "teams-recovery-test")
+	requireStepContains(t, recoveryJob,
+		"name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
+		`partition_flags=("-partition-count=1" "-partition-index=0")`,
+		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
+	)
+
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
 	requireStepContains(t, fullJob,
 		"name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})",

@@ -2245,7 +2245,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          partition_flags=()
+          partition_flags=("-partition-count=1" "-partition-index=0")
           if [ "${{ runner.os }}" = "Windows" ]; then
             partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           fi
@@ -2256,7 +2256,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          partition_flags=()
+          partition_flags=("-partition-count=1" "-partition-index=0")
           if [ "${{ runner.os }}" = "Windows" ]; then
             partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           fi
