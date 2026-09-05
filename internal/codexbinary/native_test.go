@@ -190,55 +190,36 @@ func TestPackageRootForWrapper(t *testing.T) {
 	}
 }
 
-// TestFindNativeBinaryWithRetrySucceedsWhenBinaryAppears simulates the npm
-// reinstall race: the vendor binary is briefly absent, then appears. The retry
-// wrapper must ride out the gap instead of failing the launch.
-func TestFindNativeBinaryWithRetrySucceedsWhenBinaryAppears(t *testing.T) {
-	triple := targetTriple()
-	if triple == "" {
-		t.Skip("unsupported platform for this test")
-	}
-
-	dir := t.TempDir()
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = resolved
-	}
-	binDir := filepath.Join(dir, "bin")
-	nativeDir := filepath.Join(dir, "vendor", triple, "codex")
-	for _, d := range []string{binDir, nativeDir} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", d, err)
-		}
-	}
-	wrapperPath := filepath.Join(binDir, "codex.js")
-	if err := os.WriteFile(wrapperPath, []byte("#!/usr/bin/env node\n"), 0o755); err != nil {
-		t.Fatalf("write wrapper: %v", err)
-	}
-	nativePath := filepath.Join(nativeDir, nativeBinaryName())
-
-	// Tighten the retry budget for the test and restore afterward.
+// TestFindNativeBinaryWithRetrySucceedsAfterTransientNotFound tests the npm
+// reinstall race with a deterministic resolver. The old version used a
+// wall-clock goroutine and a 100ms retry window, which made the test fail on a
+// busy CI runner even though the retry state machine was correct.
+func TestFindNativeBinaryWithRetrySucceedsAfterTransientNotFound(t *testing.T) {
 	prevAttempts, prevDelay := nativeBinaryResolveAttempts, nativeBinaryResolveDelay
 	t.Cleanup(func() {
 		nativeBinaryResolveAttempts, nativeBinaryResolveDelay = prevAttempts, prevDelay
 	})
-	nativeBinaryResolveAttempts = 10
-	nativeBinaryResolveDelay = 10 * time.Millisecond
-
-	// The binary appears after a couple of retry intervals.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		time.Sleep(25 * time.Millisecond)
-		_ = os.WriteFile(nativePath, []byte("native binary"), 0o755)
-	}()
-	t.Cleanup(func() { <-done })
-
-	gotBin, _, err := FindNativeBinaryWithRetry(wrapperPath)
+	nativeBinaryResolveAttempts = 3
+	nativeBinaryResolveDelay = 0
+	resolveCalls := 0
+	gotBin, gotPathDir, err := findNativeBinaryWithRetry(func(string) (string, string, error) {
+		resolveCalls++
+		if resolveCalls < 3 {
+			return "", "", ErrNativeBinaryNotFound
+		}
+		return "/fixture/vendor/codex", "/fixture/vendor/path", nil
+	}, "fixture/bin/codex.js")
 	if err != nil {
-		t.Fatalf("FindNativeBinaryWithRetry: %v", err)
+		t.Fatalf("findNativeBinaryWithRetry: %v", err)
 	}
-	if gotBin != nativePath {
-		t.Errorf("expected native binary %q, got %q", nativePath, gotBin)
+	if gotBin != "/fixture/vendor/codex" {
+		t.Errorf("native binary = %q, want /fixture/vendor/codex", gotBin)
+	}
+	if gotPathDir != "/fixture/vendor/path" {
+		t.Errorf("native path directory = %q, want /fixture/vendor/path", gotPathDir)
+	}
+	if resolveCalls != 3 {
+		t.Errorf("resolver calls = %d, want 3", resolveCalls)
 	}
 }
 
