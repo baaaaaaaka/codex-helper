@@ -66,6 +66,8 @@ type listenerRecoveryGraphState struct {
 	continuationOnce        sync.Once
 	delayOnceCanceled       chan struct{}
 	delayOnceCancelOnce     sync.Once
+	delayOnceStarted        chan struct{}
+	delayOnceStartOnce      sync.Once
 }
 
 type listenerRecoverySentMessage struct {
@@ -182,6 +184,11 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 					firstDelay = state.delayOnce[chatID]
 					if firstDelay > 0 {
 						delay = firstDelay
+						state.delayOnceStartOnce.Do(func() {
+							if state.delayOnceStarted != nil {
+								close(state.delayOnceStarted)
+							}
+						})
 					}
 				}
 				items := append([]ChatMessage(nil), state.messages[chatID]...)
@@ -3105,6 +3112,8 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	// next 100ms listener cycle can succeed before the assertion reads the
 	// failure state, erasing the boundary this test is meant to verify.
 	graphState.getFailures = map[string]int{"chat-1": 1000}
+	firstDelayStarted := make(chan struct{})
+	graphState.delayOnceStarted = firstDelayStarted
 	firstDelayCanceled := make(chan struct{})
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
@@ -3132,7 +3141,10 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
-	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
+	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// The worker budget must exceed the phase budget; otherwise the worker would
 	// cancel itself and this test would not exercise phase-owned cleanup. The
 	// phase includes durable state admission as well as the Graph read, so a
@@ -3145,10 +3157,16 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	options.PollWorkerBudget = 12 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
 	select {
-	case <-firstDelayCanceled:
-	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+	case <-firstDelayStarted:
+	case <-time.After(listenerRecoveryProgressTimeout):
 		listener.stop(t)
-		t.Fatalf("phase-timeout Graph request did not observe cancellation; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
+		t.Fatalf("phase-timeout Graph request did not start; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
+	}
+	select {
+	case <-firstDelayCanceled:
+	case <-time.After(options.PhaseBudget + 2*time.Second):
+		listener.stop(t)
+		t.Fatalf("phase-timeout Graph request did not observe cancellation after admission; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	waitListenerRecovery(t, func() bool {
 		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
@@ -4518,6 +4536,9 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 		},
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 	if useSQLite {
@@ -4536,7 +4557,7 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 		<-hookCtx.Done()
 		return hookCtx.Err()
 	}
-	firstOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+	firstOptions := listenerRecoveryBaseOptions(store, registryPath, executor)
 	firstOptions.Interval = time.Hour
 	// Match the production phase budget. Windows hosted runners can spend
 	// several seconds in the first durable poll/store path even without -race;
@@ -4589,7 +4610,10 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	recoveredExecutor := &listenerRecoveryExecutor{called: make(chan string)}
 	recoveredBridge := newBridgeTestBridge(graph, recoveredStore, recoveredExecutor)
 	t.Cleanup(func() { _ = recoveredStore.Close() })
-	recoveredOptions := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry.json"), recoveredExecutor)
+	recoveredRegistryPath := filepath.Join(t.TempDir(), "registry.json")
+	recoveredBridge.registryPath = recoveredRegistryPath
+	prepareBridgeTestGlobalOutboundLedger(t, ctx, recoveredBridge)
+	recoveredOptions := listenerRecoveryBaseOptions(recoveredStore, recoveredRegistryPath, recoveredExecutor)
 	// The reopened listener must complete the durable owner-CAS and generated
 	// outbox transition before this test can assert exactly-once delivery. Keep
 	// the bound finite, but do not let the short phase-isolation budget turn
@@ -5333,10 +5357,13 @@ func TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost(t *testing.T)
 	}, bridge.user, incomingKey) {
 		t.Fatalf("recovery fixture body mismatch: rendered=%q stripped=%q key=%q", rendered, incomingContent, incomingKey)
 	}
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now.Add(-time.Minute))
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now.Add(-time.Minute))
 
-	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
+	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, registryPath, bridge.executor))
 	settled := false
 	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
 	for time.Now().Before(deadline) {
