@@ -1565,7 +1565,21 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	}, 0)
 	graphState.mu.Lock()
 	graphState.pageSize = 1
+	// Hold the second Graph page after its attempt is acquired. This keeps the
+	// frontier assertion deterministic while the explicit revision-adoption race
+	// below exercises the completion side effect that used to strand the attempt.
+	graphState.blockContinuationChatID = chatID
+	graphState.continuationEntered = make(chan struct{})
+	graphState.continuationRelease = make(chan struct{})
+	continuationRelease := graphState.continuationRelease
 	graphState.mu.Unlock()
+	t.Cleanup(func() {
+		select {
+		case <-continuationRelease:
+		default:
+			close(continuationRelease)
+		}
+	})
 
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryStatefulExecutor{
@@ -1634,6 +1648,51 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	options.PhaseBudget = mainLoopPhaseBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
+	select {
+	case <-executor.called:
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+		state, _ := store.Load(context.Background())
+		t.Fatalf("stateful head prompt did not reach executor: calls=%#v; state=%+v; requests=%v", executor.callsSnapshot(), state, graphState.requestsSnapshot())
+	}
+	waitListenerRecovery(t, func() bool {
+		if bridge.activeAsyncTurnCount() != 0 {
+			return false
+		}
+		finals := 0
+		for _, sent := range graphState.sentSnapshot() {
+			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_STATEFUL_FINAL") {
+				finals++
+			}
+		}
+		// The executor's active count reaches zero before the outbox's final
+		// delivery/boost side effects necessarily finish. Release the second
+		// Graph page only after the first final is durable at the fake provider;
+		// otherwise the fixture permits the two independent poll revisions to
+		// overlap and makes the assertion depend on filesystem scheduling.
+		return finals >= 1
+	}, listenerRecoveryExtendedProgressTimeout, "stateful head turn and final delivery")
+	select {
+	case <-graphState.continuationEntered:
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+		t.Fatal("stateful continuation request did not start")
+	}
+	// Deliberately advance the same poll attempt while its Graph request is
+	// blocked. This is the durable side-effect race that used to strand the
+	// attempt at the old revision and is now handled by bounded staging retry.
+	boosted, changed, err := store.BoostChatPollAfterFinalAnswer(context.Background(), teamstore.FinalAnswerPollBoostRequest{
+		SessionID:      "s-stateful",
+		TeamsChatID:    chatID,
+		NextPollAt:     time.Now(),
+		LastActivityAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("advance stateful poll attempt revision: %v", err)
+	} else if !changed {
+		t.Fatal("stateful poll attempt revision was not advanced")
+	} else if boosted.Attempt == nil || boosted.Attempt.ExpectedPollRevision != boosted.PollRevision {
+		t.Fatalf("stateful poll boost did not merge the live attempt revision: %#v", boosted)
+	}
+	close(continuationRelease)
 	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()
@@ -1664,23 +1723,16 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		t.Fatalf("stateful final delivery did not complete; calls=%#v; sent=%#v; requests=%v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	if !waitListenerRecoveryResult(func() bool {
-		state, err := store.Load(context.Background())
-		if err != nil {
+		poll, found, err := store.ChatPoll(context.Background(), chatID)
+		if err != nil || !found {
 			return false
 		}
-		poll := state.ChatPolls[chatID]
-		return poll.PendingPage == nil && poll.Attempt == nil &&
-			strings.TrimSpace(poll.ContinuationPath) == ""
+		return poll.PendingPage == nil && poll.Attempt == nil && strings.TrimSpace(poll.ContinuationPath) == ""
 	}, listenerRecoveryExtendedProgressTimeout) {
 		state, _ := store.Load(context.Background())
 		poll := state.ChatPolls[chatID]
-		attempt := "<nil>"
-		if poll.Attempt != nil {
-			attempt = fmt.Sprintf("%+v", *poll.Attempt)
-		}
-		t.Fatalf("stateful durable poll completion did not complete; calls=%#v; sent=%#v; requests=%v; poll=%+v; attempt=%s; turns=%+v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot(), poll, attempt, state.Turns, bridge.mainLoopPhaseStatsSnapshot("poll"))
+		t.Fatalf("stateful durable poll completion did not complete; calls=%#v; sent=%#v; poll=%+v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), poll, bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
-
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false
 	continuationSeen := false
