@@ -1130,6 +1130,12 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// This test measures fair admission when several Graph workers are slow.
+	// Warm the unrelated global outbound SQLite schema first; otherwise the
+	// healthy message's first self-echo check can spend the bounded assertion
+	// window in Windows FlushFileBuffers/WAL initialization.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// Use the production phase and per-request budgets. The fixture is about
 	// fair worker scheduling, not startup latency; a short test-only phase can
@@ -1596,6 +1602,16 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// The inbound classifier checks the global outbound ledger for helper
+	// echoes before admitting each page. Warm that unrelated ledger setup
+	// outside the frontier assertion: on Windows, the first WAL activation can
+	// spend the poll worker's useful interval in FlushFileBuffers even though
+	// the stateful Graph continuation itself is healthy. Ledger initialization
+	// and lock/retry behavior have dedicated tests; this vertical test should
+	// measure head -> continuation progress with the production ledger already
+	// materialized.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// This scenario verifies the production head/continuation state machine,
 	// not the short-budget isolation path.  Use the production budgets so race
@@ -1724,7 +1740,13 @@ func TestTeamsListenFalseUsesConfiguredRunnerStreaming(t *testing.T) {
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, wrongExecutor)
-	options.PhaseBudget = 2 * time.Second
+	// This test crosses the durable inbound claim, queued-turn, and outbox
+	// boundaries.  Keep the listener phase at the production budget instead of
+	// the small default harness budget: on Windows under -race, a normal
+	// SQLite/file-backed write can otherwise be canceled before the configured
+	// Runner is reached.  The test still has its finite liveness watchdog.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	options.Runner = runner
 	listener := startListenerRecovery(t, bridge, options)
 	select {
@@ -3651,8 +3673,13 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 	executor := &listenerRecoveryPerPromptExecutor{called: make(chan string)}
 	bridge := newBridgeTestBridge(graph, reopened, executor)
 	options := listenerRecoveryBaseOptions(reopened, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = 500 * time.Millisecond
+	// The malformed projection is intentionally recovered through the same
+	// durable poll/claim path as a normal chat.  Use the production phase and
+	// worker budgets so Windows race instrumentation does not turn transient
+	// SQLite scheduling latency into a synthetic chat-local failure; the outer
+	// assertion watchdog remains bounded.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:

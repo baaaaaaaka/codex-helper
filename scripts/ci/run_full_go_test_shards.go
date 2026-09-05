@@ -44,6 +44,8 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":       true,
 		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                        true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
+		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
+		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
 		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail": true,
 		"TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail":     true,
 		"TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail":         true,
@@ -91,6 +93,8 @@ var isolatedRunnableNames = map[string]map[string]bool{
 var exclusiveRunnableNames = map[string]map[string]bool{
 	"./internal/teams": {
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
+		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
+		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
 		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,

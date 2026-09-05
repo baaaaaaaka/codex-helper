@@ -111,6 +111,105 @@ func (b *Bridge) deleteHistoryWatchCheckpointIfCurrent(ctx context.Context, id s
 	return b.store.DeleteHistoryWatchCheckpointIfCurrent(ctx, id, expected)
 }
 
+func (b *Bridge) historyWatchDirtyPaths(fullPaths, incrementalPaths []string, prune bool) ([]string, bool) {
+	if b == nil {
+		return nil, true
+	}
+	b.historyWatchEventsMu.Lock()
+	defer b.historyWatchEventsMu.Unlock()
+	if b.historyWatchEvents == nil {
+		b.historyWatchEvents = newHistoryWatchEventSource()
+		// A newly created watcher has no state to retain. It must receive the
+		// complete indexed set even during an otherwise incremental cycle.
+		prune = true
+		incrementalPaths = fullPaths
+	}
+	if b.historyWatchPendingDirty == nil {
+		b.historyWatchPendingDirty = make(map[string]struct{})
+	}
+	paths := incrementalPaths
+	if prune {
+		paths = fullPaths
+	}
+	dirty, uncertain, err := b.historyWatchEvents.Update(paths, prune)
+	if err != nil {
+		_ = b.historyWatchEvents.Close()
+		b.historyWatchEvents = nil
+		return nil, true
+	}
+	for _, path := range dirty {
+		if path = cleanComparablePath(path); path != "" {
+			b.historyWatchPendingDirty[path] = struct{}{}
+		}
+	}
+	if len(b.historyWatchPendingDirty) == 0 {
+		return nil, uncertain
+	}
+	allDirty := make([]string, 0, len(b.historyWatchPendingDirty))
+	for path := range b.historyWatchPendingDirty {
+		allDirty = append(allDirty, path)
+	}
+	sort.Strings(allDirty)
+	return allDirty, uncertain
+}
+
+func (b *Bridge) closeHistoryWatchEvents() error {
+	if b == nil {
+		return nil
+	}
+	b.historyWatchEventsMu.Lock()
+	defer b.historyWatchEventsMu.Unlock()
+	if b.historyWatchEvents == nil {
+		b.historyWatchPendingDirty = nil
+		return nil
+	}
+	err := b.historyWatchEvents.Close()
+	b.historyWatchEvents = nil
+	b.historyWatchPendingDirty = nil
+	return err
+}
+
+func (b *Bridge) historyWatchAckDirtyPath(path string) {
+	if b == nil {
+		return
+	}
+	path = cleanComparablePath(path)
+	if path == "" {
+		return
+	}
+	b.historyWatchEventsMu.Lock()
+	defer b.historyWatchEventsMu.Unlock()
+	delete(b.historyWatchPendingDirty, path)
+}
+
+func (b *Bridge) historyWatchAckDirtyPaths(paths []string) {
+	for _, path := range paths {
+		b.historyWatchAckDirtyPath(path)
+	}
+}
+
+func (b *Bridge) historyWatchRetryDirtyPath(path string) {
+	if b == nil {
+		return
+	}
+	path = cleanComparablePath(path)
+	if path == "" {
+		return
+	}
+	b.historyWatchEventsMu.Lock()
+	defer b.historyWatchEventsMu.Unlock()
+	if b.historyWatchPendingDirty == nil {
+		b.historyWatchPendingDirty = make(map[string]struct{})
+	}
+	b.historyWatchPendingDirty[path] = struct{}{}
+}
+
+func (b *Bridge) historyWatchRetryDirtyPaths(paths []string) {
+	for _, path := range paths {
+		b.historyWatchRetryDirtyPath(path)
+	}
+}
+
 func (b *Bridge) syncCodexHistoryFinalsIfDue(ctx context.Context, now time.Time) error {
 	if b == nil {
 		return nil
@@ -150,6 +249,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	}
 	initialized := !state.HistoryWatchReady.IsZero()
 	paths := historyWatchPathsFromState(state)
+	var recent []string
 	sessionsRootMissing := false
 	var firstErr error
 	root, rootErr := codexhistory.ResolveCodexDir(b.scope.CodexHome)
@@ -159,7 +259,8 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		// success here makes the listener look healthy while it performs no work.
 		firstErr = fmt.Errorf("resolve Codex history directory: %w", rootErr)
 	} else {
-		recent, recentErr := historyTieredListSessionFilesInDirs(historyWatchRecentSessionDirs(root, now, historyWatchRecentDays))
+		var recentErr error
+		recent, recentErr = historyTieredListSessionFilesInDirs(historyWatchRecentSessionDirs(root, now, historyWatchRecentDays))
 		if recentErr != nil {
 			firstErr = fmt.Errorf("list recent Codex history sessions: %w", recentErr)
 		} else {
@@ -208,18 +309,100 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		}
 		return b.baselineCodexHistoryWatch(ctx, paths, now)
 	}
-	changes, scanErr := historyWatchChangedPaths(paths, state, reconcile)
+	// The event stream is only a dirty hint. A trusted stream lets the normal
+	// cycle inspect dirty paths (plus recent files that have not received a
+	// durable checkpoint); startup, reconciliation, watch registration, queue
+	// overflow, and recreated directories all force the complete indexed set.
+	dirtyPaths, watchUncertain := b.historyWatchDirtyPaths(paths, recent, reconcile)
+	scanPaths := historyWatchScanPaths(paths, recent, dirtyPaths, state, reconcile, watchUncertain)
+	verifyUnchanged := reconcile || watchUncertain || len(dirtyPaths) > 0
+	changes, scanErr := historyWatchChangedPaths(scanPaths, state, verifyUnchanged)
 	if scanErr != nil {
 		firstErr = joinHistoryWatchErrors(firstErr, scanErr)
 	}
-	if err := b.runHistoryWatchSyncJobs(ctx, changes, now); err != nil {
+	if scanErr == nil {
+		changed := make(map[string]struct{}, len(changes))
+		for _, path := range changes {
+			changed[cleanComparablePath(path)] = struct{}{}
+		}
+		for _, path := range dirtyPaths {
+			if _, ok := changed[cleanComparablePath(path)]; !ok {
+				b.historyWatchAckDirtyPath(path)
+			}
+		}
+	}
+	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
+	if syncErr != nil {
+		b.historyWatchRetryDirtyPaths(dirtyPaths)
+		if watchUncertain {
+			// A full scan caused by an uncertain watcher may discover a changed
+			// path without a corresponding event. Keep that path selected until
+			// its existing worker/CAS path succeeds.
+			b.historyWatchRetryDirtyPaths(changes)
+		}
+	}
+	if scanErr == nil && syncErr == nil {
+		b.historyWatchAckDirtyPaths(dirtyPaths)
+	}
+	if syncErr != nil {
 		if firstErr == nil {
-			firstErr = err
+			firstErr = syncErr
 		} else {
-			firstErr = errors.Join(firstErr, err)
+			firstErr = errors.Join(firstErr, syncErr)
 		}
 	}
 	return firstErr
+}
+
+func historyWatchScanPaths(fullPaths, recentPaths, dirtyPaths []string, state teamstore.State, reconcile, uncertain bool) []string {
+	selected := make([]string, 0, len(fullPaths)+len(dirtyPaths))
+	if reconcile || uncertain {
+		selected = append(selected, fullPaths...)
+	} else {
+		selected = append(selected, dirtyPaths...)
+	}
+	// A bounded or partial scan may have durably retained a physical cursor
+	// before EOF even though its event was already consumed. Keep such a path in
+	// the next scan quantum without requiring another filesystem event; otherwise
+	// a quiet writer can leave the checkpoint permanently stranded at the same
+	// offset. historyWatchChangedPaths still applies the source-proof and
+	// blocked/deferred filters before the worker runs.
+	selected = append(selected, historyWatchResumablePaths(state)...)
+	selected = append(selected, historyWatchUnindexedPaths(recentPaths, state)...)
+	return uniqueSortedCleanPaths(selected)
+}
+
+func historyWatchResumablePaths(state teamstore.State) []string {
+	out := make([]string, 0)
+	for _, checkpoint := range state.HistoryWatch {
+		path := cleanComparablePath(checkpoint.Path)
+		if path == "" {
+			continue
+		}
+		if checkpoint.SourceRewriteBlocked || checkpoint.LegacySourceUnverified || checkpoint.RecoveryProofUnusable {
+			continue
+		}
+		if checkpoint.Offset >= 0 && checkpoint.Offset < checkpoint.Size {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+func historyWatchUnindexedPaths(paths []string, state teamstore.State) []string {
+	known := make(map[string]struct{}, len(state.HistoryWatch))
+	for _, checkpoint := range state.HistoryWatch {
+		if path := cleanComparablePath(checkpoint.Path); path != "" {
+			known[path] = struct{}{}
+		}
+	}
+	var out []string
+	for _, path := range uniqueSortedCleanPaths(paths) {
+		if _, ok := known[path]; !ok {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 func joinHistoryWatchErrors(first error, next error) error {
@@ -317,6 +500,13 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	// invisible until the next reconcile and an old source-less outbox may be
 	// flushed first.  Modern rows retain the cheap stat-only idle path.
 	legacyPaths := make(map[string]bool)
+	selectedOnly := paths != nil
+	selectedPaths := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path = cleanComparablePath(path); path != "" {
+			selectedPaths[path] = struct{}{}
+		}
+	}
 	var firstErr error
 	for _, checkpoint := range state.HistoryWatch {
 		if path := cleanComparablePath(checkpoint.Path); path != "" {
@@ -367,6 +557,11 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 	// does not become an unbounded orphan.  This is the only filesystem probe we
 	// perform for an explicitly blocked row.
 	for path := range blockedPaths {
+		if selectedOnly {
+			if _, selected := selectedPaths[path]; !selected {
+				continue
+			}
+		}
 		info, err := os.Stat(path)
 		if errors.Is(err, os.ErrNotExist) {
 			missingBlockedPaths[path] = true
@@ -397,6 +592,11 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 		}
 	}
 	for path := range deferredPaths {
+		if selectedOnly {
+			if _, selected := selectedPaths[path]; !selected {
+				continue
+			}
+		}
 		info, err := os.Stat(path)
 		if errors.Is(err, os.ErrNotExist) {
 			missingDeferredPaths[path] = true

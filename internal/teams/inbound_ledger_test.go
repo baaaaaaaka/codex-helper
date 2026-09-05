@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -34,6 +35,74 @@ func TestGlobalInboundLedgerPathForRegistry(t *testing.T) {
 
 	if got, ok := globalInboundLedgerPathForRegistry(""); ok || got != "" {
 		t.Fatalf("empty registry should disable global inbound ledger, got path=%q ok=%v", got, ok)
+	}
+}
+
+func TestGlobalInboundSQLiteWriterReopensReplacedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	sqlitePath := teamsLedgerSQLitePath(path)
+	writer := &globalInboundSQLiteWriter{}
+	t.Cleanup(func() { _ = writer.close() })
+	first, err := writer.open(sqlitePath)
+	if err != nil {
+		t.Fatalf("open writer database: %v", err)
+	}
+	if _, err := first.ExecContext(context.Background(), `CREATE TABLE writer_probe (value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("seed writer database: %v", err)
+	}
+	// Unix permits replacing an open SQLite file, which is the production
+	// recovery shape this test exercises. Windows holds the database handle
+	// without delete sharing, so the same rename is rejected by the OS before
+	// globalInboundSQLiteWriter can observe a new file identity. Close the
+	// fixture connection there and keep the rest of the reopen/claim contract
+	// covered on every platform.
+	if runtime.GOOS == "windows" {
+		if err := writer.close(); err != nil {
+			t.Fatalf("close writer database before Windows replacement: %v", err)
+		}
+	}
+	oldPath := sqlitePath + ".old"
+	if err := os.Rename(sqlitePath, oldPath); err != nil {
+		t.Fatalf("rename writer database: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Rename(sqlitePath+suffix, oldPath+suffix); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("rename writer database %s: %v", suffix, err)
+		}
+	}
+	replacement, err := openTeamsLedgerSQLite(sqlitePath)
+	if err != nil {
+		t.Fatalf("create replacement writer database: %v", err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatalf("close replacement writer database: %v", err)
+	}
+	second, err := writer.open(sqlitePath)
+	if err != nil {
+		t.Fatalf("reopen replaced writer database: %v", err)
+	}
+	if second == first {
+		t.Fatal("writer reused a connection to the replaced database")
+	}
+	if _, err := second.ExecContext(context.Background(), `SELECT 1`); err != nil {
+		t.Fatalf("query replacement writer database: %v", err)
+	}
+	claim, claimed, err := claimGlobalInboundWithWriter(context.Background(), path, "chat-replaced", "message-replaced", "owner-reopened", time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC), writer)
+	if err != nil {
+		t.Fatalf("claim through reopened writer: %v", err)
+	}
+	if !claimed {
+		t.Fatal("claim through reopened writer should win")
+	}
+	if err := completeGlobalInbound(context.Background(), claim); err != nil {
+		t.Fatalf("complete through reopened writer: %v", err)
+	}
+	ledger, err := readGlobalInboundLedger(path)
+	if err != nil {
+		t.Fatalf("read reopened writer ledger: %v", err)
+	}
+	if item := ledger.Items[globalInboundKey("chat-replaced", "message-replaced")]; item.Status != "done" {
+		t.Fatalf("reopened writer ledger item = %#v, want done", item)
 	}
 }
 
@@ -79,6 +148,39 @@ func TestGlobalInboundLedgerClaimLifecycle(t *testing.T) {
 	item := ledger.Items[globalInboundKey("chat-1", "message-1")]
 	if item.Status != "done" || item.Owner != "owner-b" {
 		t.Fatalf("completed ledger item = %#v, want done owner-b", item)
+	}
+}
+
+func TestGlobalInboundLedgerWriterClaimLifecycle(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "teams", "global-inbound-ledger.json")
+	writer := &globalInboundSQLiteWriter{}
+	t.Cleanup(func() { _ = writer.close() })
+	now := time.Date(2026, 5, 11, 13, 0, 0, 0, time.UTC)
+
+	claim, claimed, err := claimGlobalInboundWithWriter(ctx, path, "chat-writer", "message-1", "owner-a", now, writer)
+	if err != nil {
+		t.Fatalf("writer first claim error: %v", err)
+	}
+	if !claimed {
+		t.Fatal("writer first claim should win")
+	}
+	if err := completeGlobalInbound(ctx, claim); err != nil {
+		t.Fatalf("writer completion error: %v", err)
+	}
+	if _, claimed, err := claimGlobalInboundWithWriter(ctx, path, "chat-writer", "message-1", "owner-b", now.Add(time.Second), writer); err != nil {
+		t.Fatalf("writer duplicate claim error: %v", err)
+	} else if claimed {
+		t.Fatal("writer completed entry should suppress duplicate claim")
+	}
+
+	ledger, err := readGlobalInboundLedger(path)
+	if err != nil {
+		t.Fatalf("read writer ledger: %v", err)
+	}
+	item := ledger.Items[globalInboundKey("chat-writer", "message-1")]
+	if item.Status != "done" || item.Owner != "owner-a" {
+		t.Fatalf("writer completed ledger item = %#v, want done owner-a", item)
 	}
 }
 
@@ -137,6 +239,79 @@ func TestGlobalInboundLedgerMigratesLegacyJSONWithoutRewrite(t *testing.T) {
 	}
 	if item := got.Items[globalInboundKey("chat-1", "new-message")]; item.Status != "claimed" || item.Owner != "owner-b" {
 		t.Fatalf("migrated ledger new item = %#v, want claimed owner-b", item)
+	}
+}
+
+func TestGlobalInboundLedgerMigrationDoesNotRegressNewerSQLiteState(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "teams", "global-inbound-ledger.json")
+	key := globalInboundKey("chat-1", "migration-race")
+	staleAt := time.Now().UTC().Add(-2 * time.Hour)
+	legacy := globalInboundLedger{
+		Version: 1,
+		Items: map[string]globalInboundItem{
+			key: {
+				ChatID:     "chat-1",
+				MessageID:  "migration-race",
+				Owner:      "legacy-owner",
+				ClaimToken: "legacy-token",
+				Status:     "claimed",
+				ClaimedAt:  staleAt,
+				UpdatedAt:  staleAt,
+			},
+		},
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir legacy inbound ledger: %v", err)
+	}
+	writeLegacy := func(owner string) {
+		t.Helper()
+		legacy.Items[key] = globalInboundItem{
+			ChatID:     "chat-1",
+			MessageID:  "migration-race",
+			Owner:      owner,
+			ClaimToken: "legacy-token",
+			Status:     "claimed",
+			ClaimedAt:  staleAt,
+			UpdatedAt:  staleAt,
+		}
+		raw, err := json.MarshalIndent(legacy, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal legacy inbound ledger: %v", err)
+		}
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatalf("write legacy inbound ledger: %v", err)
+		}
+	}
+	writeLegacy("legacy-owner")
+
+	claim, claimed, err := claimGlobalInbound(ctx, path, "chat-1", "migration-race", "new-owner", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("seed SQLite claim from legacy ledger: %v", err)
+	}
+	if !claimed {
+		t.Fatal("seed SQLite claim should win stale legacy claim")
+	}
+	if err := completeGlobalInbound(ctx, claim); err != nil {
+		t.Fatalf("complete newer SQLite claim: %v", err)
+	}
+
+	// A legacy writer may still rewrite its old JSON snapshot after the sidecar
+	// has reached done. Importing that snapshot must not reopen the message for
+	// another owner merely because the JSON file mtime changed.
+	writeLegacy("stale-legacy-writer")
+	if _, claimed, err := claimGlobalInbound(ctx, path, "chat-1", "migration-race", "replay-owner", time.Now().UTC().Add(time.Second)); err != nil {
+		t.Fatalf("claim after stale legacy rewrite: %v", err)
+	} else if claimed {
+		t.Fatal("stale legacy rewrite regressed newer SQLite done state into a claim")
+	}
+
+	got, err := readGlobalInboundLedger(path)
+	if err != nil {
+		t.Fatalf("read merged inbound ledger: %v", err)
+	}
+	if item := got.Items[key]; item.Status != "done" || item.Owner != "new-owner" {
+		t.Fatalf("merged inbound item = %#v, want newer SQLite done state", item)
 	}
 }
 
