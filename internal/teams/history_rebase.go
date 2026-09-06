@@ -371,6 +371,20 @@ func historyRebaseSourceProof(path string, expected os.FileInfo, offset int64) (
 	return strings.TrimSpace(identity), fingerprint, info, true
 }
 
+func historyWatchRebaseNeedsProofHold(previous historyTieredFileState, sourceGeneration string) bool {
+	sourceGeneration = strings.TrimSpace(sourceGeneration)
+	if sourceGeneration == "" {
+		return true
+	}
+	if previous.ContextGap != nil && strings.TrimSpace(previous.ContextGap.SourceGeneration) != sourceGeneration {
+		return true
+	}
+	if previous.PendingHistoryRange != nil && strings.TrimSpace(previous.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return true
+	}
+	return false
+}
+
 func (b *Bridge) recordHistoryWatchRebaseAttempt(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, previous historyTieredFileState, path string, source codexHistoryFile, now time.Time) error {
 	if expected == nil || strings.TrimSpace(source.Identity) == "" {
 		return nil
@@ -534,6 +548,16 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	if !ok || identity != source.Identity {
 		return false, nil
 	}
+	// Context gaps and pending history ranges describe bytes whose semantic
+	// disposition was not proven.  They are bound to the old source identity;
+	// an anchor for the last visible final does not prove that those ranges mean
+	// the same thing after replacement.  Keep the rewrite fence and record the
+	// candidate identity, but do not advance the physical cursor or surface a
+	// phase error on every poll.  Explicit history recovery remains the only
+	// operation allowed to choose a new boundary.
+	if historyWatchRebaseNeedsProofHold(previous, identity) {
+		return false, b.recordHistoryWatchRebaseAttempt(ctx, id, expected, previous, path, source, now)
+	}
 	next := previous
 	next.Path = path
 	next.Size = anchor.CursorOffset
@@ -562,6 +586,14 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	next.LastFinalThreadID = strings.TrimSpace(anchor.Record.ThreadID)
 	next.LastFinalTurnID = strings.TrimSpace(anchor.Record.TurnID)
 	next.LastFinalTextHash = normalizedTextHash(strings.TrimSpace(anchor.Record.Text))
+	// The old terminal boundary is a byte-range proof for the replaced source.
+	// The anchor above establishes the prior final again, while the next normal
+	// scan will parse and persist a fresh terminal boundary from the new source.
+	// Retain the seen bit so the scanner remains conservative, but never carry
+	// the stale range object into the new generation.
+	if next.TerminalBoundary != nil && strings.TrimSpace(next.TerminalBoundary.SourceGeneration) != identity {
+		next.TerminalBoundary = nil
+	}
 	if strings.TrimSpace(anchor.Record.SourceItemID) != "" {
 		next.LastFinalID = historyTieredCompletionKey(anchor.Record, 0, "")
 	}
@@ -638,6 +670,21 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	if !ok || identity != source.Identity {
 		return false, nil
 	}
+	if linkedTranscriptRebaseNeedsProofHold(checkpoint, identity) {
+		_, _, updateErr := b.updateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+			if !found || !current.SourceRewriteBlocked || strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) ||
+				strings.TrimSpace(current.SourcePath) != "" && cleanComparablePath(current.SourcePath) != cleanComparablePath(path) {
+				return current, false, nil
+			}
+			current.SourceRewriteRecoveryIdentity = source.Identity
+			current.SourceRewriteRecoverySize = source.Info.Size()
+			current.SourceRewriteRecoveryModTime = source.Info.ModTime()
+			current.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+			current.UpdatedAt = now
+			return current, true, nil
+		})
+		return false, updateErr
+	}
 	_, changed, err := b.updateImportCheckpoint(ctx, checkpoint.ID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		if !found || !current.SourceRewriteBlocked || strings.TrimSpace(current.LastRecordID) != strings.TrimSpace(checkpoint.LastRecordID) ||
 			strings.TrimSpace(current.SourcePath) != "" && cleanComparablePath(current.SourcePath) != cleanComparablePath(path) {
@@ -657,6 +704,12 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		next.SourceRewriteRecoverySize = 0
 		next.SourceRewriteRecoveryModTime = time.Time{}
 		next.SourceRewriteRecoveryChangeTime = 0
+		if next.TerminalBoundary != nil && strings.TrimSpace(next.TerminalBoundary.SourceGeneration) != identity {
+			// The rebase anchor restores the old durable record position, while a
+			// later incremental scan will re-observe the terminal event in this
+			// source. Do not carry a byte proof from the replaced generation.
+			next.TerminalBoundary = nil
+		}
 		if next.CompletionPending {
 			next.Status = importCheckpointStatusImporting
 		} else if next.Status == importCheckpointStatusBlocked {
@@ -666,4 +719,22 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		return next, true, nil
 	})
 	return changed, err
+}
+
+func linkedTranscriptRebaseNeedsProofHold(checkpoint teamstore.ImportCheckpoint, sourceGeneration string) bool {
+	sourceGeneration = strings.TrimSpace(sourceGeneration)
+	if sourceGeneration == "" {
+		return true
+	}
+	if checkpoint.ContextGap != nil && strings.TrimSpace(checkpoint.ContextGap.SourceGeneration) != sourceGeneration {
+		return true
+	}
+	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
+		return true
+	}
+	if checkpoint.TranscriptQuarantine != nil && strings.TrimSpace(checkpoint.TranscriptQuarantine.SourceGeneration) != "" &&
+		strings.TrimSpace(checkpoint.TranscriptQuarantine.SourceGeneration) != sourceGeneration {
+		return true
+	}
+	return false
 }

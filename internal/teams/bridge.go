@@ -70,11 +70,21 @@ const (
 	pendingCodexUpgradeStateRefreshInterval = time.Minute
 	pendingUpgradeBlockedRetryInterval      = 5 * time.Second
 	registryProjectionSaveMinInterval       = time.Minute
-	dashboardProjectsCacheTTL               = 30 * time.Second
-	subagentProjectsCacheTTL                = 30 * time.Second
-	persistentPollFailureRestartAfter       = 10 * time.Minute
-	persistentPollFailureRestartMinCount    = 3
-	recentDuplicateSessionPromptWindow      = 3 * time.Minute
+	// Optional history/transcript discovery is cold maintenance. A short
+	// durable probe deadline lets a restarted owner wake it after a Teams
+	// backlog drains without re-entering the expensive path on every poll tick.
+	optionalMaintenanceBacklogDeferInterval = 2 * time.Second
+	// Mandatory recovery remains eligible during a Teams backlog, but a copied
+	// store can contain thousands of old source-rewrite fences. Process a small
+	// fair quantum per wake so one cold recovery sweep cannot consume the whole
+	// poll/owner budget.
+	maxBacklogHistoryRecoveryJobs        = 4
+	maxBacklogLinkedRecoveryJobs         = 4
+	dashboardProjectsCacheTTL            = 30 * time.Second
+	subagentProjectsCacheTTL             = 30 * time.Second
+	persistentPollFailureRestartAfter    = 10 * time.Minute
+	persistentPollFailureRestartMinCount = 3
+	recentDuplicateSessionPromptWindow   = 3 * time.Minute
 	// A maintenance phase may be slow because it is reading a large local
 	// backlog or waiting on Graph, but it must not hold the listener loop
 	// indefinitely. The budget is per phase, not per chat.
@@ -724,6 +734,9 @@ type Bridge struct {
 	historyWatchPendingDirty          map[string]struct{}
 	historyRebaseMu                   sync.Mutex
 	historyRebaseScans                map[string]historyWatchRebaseScanProgress
+	backlogMaintenanceMu              sync.Mutex
+	backlogHistoryRecoveryCursor      int
+	backlogLinkedRecoveryCursor       int
 	lastBeaconReconcile               time.Time
 	lastBeaconLeaseMaintenance        time.Time
 	lastSQLiteWALCheckpoint           time.Time
@@ -734,6 +747,19 @@ type Bridge struct {
 	transcriptSyncWorkerCount         int
 	linkedTranscriptSessionHook       func(context.Context, Session) error
 	historyWatchPathHook              func(context.Context, string) error
+	// mainLoopCycleDoneHook is a test-only lifecycle seam. Production bridges
+	// leave it nil; deterministic listener experiments use it to stop between
+	// completed phases instead of canceling an in-flight phase and mistaking
+	// shutdown context cancellation for a recovery error.
+	mainLoopCycleDoneHook func()
+	// controlLeaseClaimHook is a test-only lease diagnostic seam. Production
+	// bridges leave it nil; lifecycle experiments use it to distinguish a real
+	// takeover from an intentional teardown race without changing lease logic.
+	controlLeaseClaimHook func(teamstore.ControlLeaseDecision, error)
+	// ownerFailureHook is a test-only diagnostic seam for the lease heartbeat.
+	// Production bridges leave it nil; real-data experiments use it to retain
+	// the exact bounded heartbeat failure that caused an owner handoff.
+	ownerFailureHook func(error)
 	// outboxSendHook is a narrow test seam used to stop immediately before a
 	// Graph side effect. Production bridges leave it nil; recovery tests use it
 	// to make a durable restart boundary deterministic without manufacturing an
@@ -1826,6 +1852,9 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 	var ownerFailureMu sync.Mutex
 	var ownerFailure error
 	ownerHeartbeatDone := b.startOwnerHeartbeatWithFailureCallback(ownerWorkCtx, func(err error) {
+		if b.ownerFailureHook != nil {
+			b.ownerFailureHook(err)
+		}
 		ownerFailureMu.Lock()
 		ownerFailure = err
 		ownerFailureMu.Unlock()
@@ -2117,15 +2146,51 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 				cancelCycle()
 			}
 		}
-		if err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
-			return b.syncLinkedTranscriptsIfDue(phaseCtx, time.Now())
-		}); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
+		optionalMaintenance := optionalMaintenancePlan{runNormal: true}
+		if !cycleDegraded {
+			var gateErr error
+			gateErr = runPhase("optional-maintenance-gate", func(phaseCtx context.Context) error {
+				optionalMaintenance, gateErr = b.optionalMaintenancePlanForOwner(phaseCtx, time.Now())
+				return gateErr
+			})
+			if gateErr != nil {
+				// A failed gate must not fall back to the expensive path. The next
+				// cycle gets a fresh probe; process-wide/lease errors are already
+				// classified by runPhase.
+				optionalMaintenance = optionalMaintenancePlan{}
+				if b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams optional maintenance gate error: %v\n", gateErr)
+				}
+			}
 		}
-		if err := runPhase("history-watch", func(phaseCtx context.Context) error {
-			return b.syncCodexHistoryFinalsIfDue(phaseCtx, time.Now())
-		}); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams history watch error: %v\n", err)
+		if !cycleDegraded {
+			switch {
+			case optionalMaintenance.runNormal:
+				if err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
+					return b.syncLinkedTranscriptsIfDue(phaseCtx, time.Now())
+				}); err != nil && b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\n", err)
+				}
+				if err := runPhase("history-watch", func(phaseCtx context.Context) error {
+					return b.syncCodexHistoryFinalsIfDue(phaseCtx, time.Now())
+				}); err != nil && b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams history watch error: %v\n", err)
+				}
+			case optionalMaintenance.runMandatory:
+				// A durable Teams backlog suppresses only optional discovery and
+				// unchanged-tail work. Source-proof, rewrite/delete, and other
+				// explicit recovery fences still get their bounded path here.
+				if err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
+					return b.syncLinkedTranscriptsIfDueForBacklog(phaseCtx, time.Now())
+				}); err != nil && b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams mandatory transcript recovery error: %v\n", err)
+				}
+				if err := runPhase("history-watch", func(phaseCtx context.Context) error {
+					return b.syncCodexHistoryFinalsForBacklog(phaseCtx, time.Now())
+				}); err != nil && b.out != nil {
+					_, _ = fmt.Fprintf(b.out, "Teams mandatory history recovery error: %v\n", err)
+				}
+			}
 		}
 		if err := runPhase("helper-auto-update", func(phaseCtx context.Context) error {
 			return b.maybeRunHelperAutoUpdate(phaseCtx, opts)
@@ -2241,6 +2306,9 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 				continue
 			}
 		}
+		if b.mainLoopCycleDoneHook != nil {
+			b.mainLoopCycleDoneHook()
+		}
 		cancelCycle()
 		if opts.Once {
 			return nil
@@ -2331,6 +2399,121 @@ func (b *Bridge) nextPollInterval(base time.Duration, now time.Time) time.Durati
 		return fastPollInterval
 	}
 	return base
+}
+
+type optionalMaintenancePlan struct {
+	runNormal    bool
+	runMandatory bool
+}
+
+// optionalMaintenancePlanForOwner is the single admission point for the two
+// cold maintenance phases in the listener. The durable deadline is only a
+// wake hint; the Teams backlog probe is still checked so a drained queue can
+// wake immediately after a restart or a long executor completion.
+func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.Time) (optionalMaintenancePlan, error) {
+	if b == nil || b.store == nil {
+		return optionalMaintenancePlan{runNormal: true}, nil
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	control, err := b.store.ReadControl(ctx)
+	if err != nil {
+		return optionalMaintenancePlan{}, err
+	}
+	backlog, err := b.store.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		return optionalMaintenancePlan{}, err
+	}
+	if !backlog.Active() {
+		if !control.OptionalMaintenanceDeferredUntil.IsZero() || control.OptionalMaintenanceDeferredReason != "" {
+			if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+				if _, err := b.store.ClearOptionalMaintenanceDeferredForOwner(ctx, machineID, generation); err != nil {
+					return optionalMaintenancePlan{}, err
+				}
+			}
+		}
+		// A previous deferred deadline may have kept the normal interval gate
+		// recent. Clearing the in-memory timers makes the first post-backlog
+		// cycle the wake edge rather than waiting another ten minutes.
+		b.lastTranscriptSync = time.Time{}
+		b.lastTranscriptDiscovery = time.Time{}
+		b.lastHistoryWatchSync = time.Time{}
+		b.lastHistoryWatchReconcile = time.Time{}
+		b.lastHistoryWatchReconcileAttempt = time.Time{}
+		return optionalMaintenancePlan{runNormal: true}, nil
+	}
+
+	if !control.OptionalMaintenanceDeferredUntil.IsZero() && now.Before(control.OptionalMaintenanceDeferredUntil) {
+		// The durable wake deadline is intentionally short. Mandatory work is
+		// checked on the next probe rather than turning every listener tick into
+		// a checkpoint/history projection read.
+		return optionalMaintenancePlan{}, nil
+	}
+
+	until := now.Add(optionalMaintenanceBacklogDeferInterval)
+	reason := optionalMaintenanceBacklogReason(backlog)
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		if _, err := b.store.SetOptionalMaintenanceDeferredForOwner(ctx, until, reason, machineID, generation); err != nil {
+			return optionalMaintenancePlan{}, err
+		}
+	}
+	mandatory, err := b.optionalMaintenanceNeedsMandatory(ctx)
+	if err != nil {
+		return optionalMaintenancePlan{}, err
+	}
+	return optionalMaintenancePlan{runMandatory: mandatory}, nil
+}
+
+func optionalMaintenanceBacklogReason(backlog teamstore.TeamsOperationalBacklog) string {
+	reasons := make([]string, 0, 3)
+	if backlog.ActiveTurns {
+		reasons = append(reasons, "active-turns")
+	}
+	if backlog.PendingInbound {
+		reasons = append(reasons, "pending-inbound")
+	}
+	if backlog.OperationalPollFrontier {
+		reasons = append(reasons, "poll-frontier")
+	}
+	return "Teams backlog: " + strings.Join(reasons, ",")
+}
+
+func (b *Bridge) optionalMaintenanceNeedsMandatory(ctx context.Context) (bool, error) {
+	if b == nil || b.store == nil {
+		return false, nil
+	}
+	if len(b.historyWatchPendingDirtyPaths()) > 0 {
+		return true, nil
+	}
+	registry := b.registrySnapshot()
+	sessionIDs := make([]string, 0, len(registry.Sessions))
+	for _, session := range registry.Sessions {
+		if session.Status == "active" && strings.TrimSpace(session.CodexThreadID) != "" {
+			sessionIDs = append(sessionIDs, session.ID)
+		}
+	}
+	if len(sessionIDs) > 0 {
+		checkpoints, err := b.store.ImportCheckpointsForSessions(ctx, sessionIDs)
+		if err != nil {
+			return false, err
+		}
+		for _, checkpoint := range checkpoints {
+			if linkedTranscriptCheckpointNeedsMandatoryMaintenance(checkpoint) {
+				return true, nil
+			}
+		}
+	}
+	history, err := b.store.HistoryWatchState(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, checkpoint := range history.HistoryWatch {
+		if historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (b *Bridge) maybeCheckpointSQLiteWAL(ctx context.Context, now time.Time) error {
@@ -16064,7 +16247,14 @@ func (b *Bridge) startOwnerHeartbeatWithFailureCallback(ctx context.Context, onF
 }
 
 const ownerHeartbeatBusyRetryDelay = 25 * time.Millisecond
-const ownerHeartbeatBusyRetryWindow = 2 * time.Second
+
+// A slow SQLite writer can legitimately occupy the projection lock for the
+// duration of one bounded listener phase.  Two seconds was shorter than the
+// observed real-data poll/commit window and caused the owner to hand itself
+// off while all durable work was otherwise healthy.  Keep the retry finite,
+// but leave enough room for a phase to finish; the control lease and CAS still
+// fence every writer while this heartbeat waits.
+const ownerHeartbeatBusyRetryWindow = 30 * time.Second
 
 var errOwnerHeartbeatBusyWindowExceeded = errors.New("owner heartbeat remained blocked by SQLite busy")
 
@@ -16442,6 +16632,9 @@ func (b *Bridge) claimControlLease(ctx context.Context) (bool, error) {
 		Owner:    owner,
 		Duration: duration,
 	})
+	if b.controlLeaseClaimHook != nil {
+		b.controlLeaseClaimHook(decision, err)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -24381,6 +24574,16 @@ func (b *Bridge) syncLinkedTranscriptsIfDue(ctx context.Context, now time.Time) 
 	return b.syncLinkedTranscriptsWithDiscoveryOptions(ctx, false, now, true)
 }
 
+// syncLinkedTranscriptsIfDueForBacklog runs only the mandatory recovery subset
+// while the Teams queue is active. It intentionally does not update the normal
+// interval gate: the short backlog probe deadline is the wake mechanism.
+func (b *Bridge) syncLinkedTranscriptsIfDueForBacklog(ctx context.Context, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return b.syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx, false, now, true, true)
+}
+
 func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	return b.syncLinkedTranscriptsWithDiscoveryOptions(ctx, true, time.Time{}, false)
 }
@@ -24473,6 +24676,10 @@ func (b *Bridge) runLinkedTranscriptSyncJobs(ctx context.Context, jobs []linkedT
 }
 
 func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptions(ctx context.Context, forceDiscovery bool, now time.Time, queueOnly bool) error {
+	return b.syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx, forceDiscovery, now, queueOnly, false)
+}
+
+func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx context.Context, forceDiscovery bool, now time.Time, queueOnly bool, deferOptional bool) error {
 	registry := b.registrySnapshot()
 	if len(registry.Sessions) == 0 {
 		return nil
@@ -24587,10 +24794,10 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptions(ctx context.Context, 
 		if err := ctx.Err(); err != nil {
 			return errors.Join(preErrorsWithContext(preErrors, err)...)
 		}
-		if activeTeamsTurns[session.ID] {
+		checkpoint, hasCheckpoint := checkpoints[transcriptCheckpointID(session.ID)]
+		if activeTeamsTurns[session.ID] && (!deferOptional || !linkedTranscriptCheckpointNeedsMandatoryMaintenance(checkpoint)) {
 			continue
 		}
-		checkpoint, hasCheckpoint := checkpoints[transcriptCheckpointID(session.ID)]
 		local, ok := localsBySession[session.ID]
 		if !localKnown[session.ID] {
 			local, ok = linkedTranscriptLocalFromCheckpoint(session, checkpoint)
@@ -24617,6 +24824,9 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptions(ctx context.Context, 
 				}
 				continue
 			}
+			if deferOptional && !linkedTranscriptCheckpointNeedsMandatoryMaintenance(checkpoint) {
+				continue
+			}
 			if b.linkedTranscriptCheckpointIdleUnchanged(local.FilePath, checkpoint) {
 				// The file-size fast path must not hide a newly persisted anchor or
 				// a legacy interrupted Turn that has not been migrated to one yet.
@@ -24634,7 +24844,12 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptions(ctx context.Context, 
 			jobs = append(jobs, linkedTranscriptSyncJob{session: session, local: local, checkpoint: checkpoint, hasCheckpoint: hasCheckpoint, queueOnly: queueOnly})
 			continue
 		}
-		needsDiscovery = append(needsDiscovery, session)
+		if !deferOptional {
+			needsDiscovery = append(needsDiscovery, session)
+		}
+	}
+	if deferOptional {
+		jobs = b.selectBacklogLinkedRecoveryJobs(jobs)
 	}
 	if err := b.runLinkedTranscriptSyncJobs(ctx, jobs, loadSessionState); err != nil {
 		preErrors = append(preErrors, err)
@@ -24642,7 +24857,7 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptions(ctx context.Context, 
 			return errors.Join(preErrors...)
 		}
 	}
-	if len(needsDiscovery) == 0 {
+	if len(needsDiscovery) == 0 || deferOptional {
 		return errors.Join(preErrors...)
 	}
 	if !forceDiscovery && !b.linkedTranscriptDiscoveryDue(now) {
@@ -24719,6 +24934,48 @@ func (b *Bridge) linkedTranscriptDiscoveryDue(now time.Time) bool {
 		return true
 	}
 	return false
+}
+
+// linkedTranscriptCheckpointNeedsMandatoryMaintenance identifies durable
+// recovery/proof fences that cannot be hidden behind a normal Teams backlog.
+// A checkpoint with only an ordinary trusted cursor is optional; its new tail
+// can wait for the backlog wake edge.
+func linkedTranscriptCheckpointNeedsMandatoryMaintenance(checkpoint teamstore.ImportCheckpoint) bool {
+	if checkpoint.Status == importCheckpointStatusImporting || checkpoint.Status == importCheckpointStatusFailed || checkpoint.CompletionPending {
+		return true
+	}
+	if checkpoint.SourceRewriteBlocked || checkpoint.OversizedRecordBlocked || checkpoint.LegacySourceUnverified || checkpoint.RecoveryProofUnusable {
+		return true
+	}
+	if checkpoint.UnresolvedExecution != nil || checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil {
+		return true
+	}
+	if checkpoint.TranscriptQuarantine != nil && !checkpoint.HistoryRootReleased {
+		return true
+	}
+	if checkpoint.PartialLineStartOffset > 0 || checkpoint.PartialReadOffset > 0 || checkpoint.PendingOpaqueRecordStartOffset > 0 {
+		return true
+	}
+	// These are the legacy shapes for which the automatic path must establish
+	// source identity before it may advance a cursor. Keep them in the
+	// mandatory lane instead of allowing a backlog to hide the proof check.
+	return strings.TrimSpace(checkpoint.LastRecordID) != "" &&
+		(strings.TrimSpace(checkpoint.SourcePath) == "" || strings.TrimSpace(checkpoint.SourceFingerprint) == "" || !checkpoint.LastOffsetKnown)
+}
+
+func (b *Bridge) selectBacklogLinkedRecoveryJobs(jobs []linkedTranscriptSyncJob) []linkedTranscriptSyncJob {
+	if len(jobs) <= maxBacklogLinkedRecoveryJobs || b == nil {
+		return jobs
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.backlogLinkedRecoveryCursor % len(jobs)
+	b.backlogLinkedRecoveryCursor = (start + maxBacklogLinkedRecoveryJobs) % len(jobs)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]linkedTranscriptSyncJob, 0, maxBacklogLinkedRecoveryJobs)
+	for i := 0; i < maxBacklogLinkedRecoveryJobs; i++ {
+		selected = append(selected, jobs[(start+i)%len(jobs)])
+	}
+	return selected
 }
 
 func (b *Bridge) recordLinkedTranscriptDiscoverySuccess(now time.Time) {

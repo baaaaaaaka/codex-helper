@@ -47,6 +47,34 @@
       "baseline": "pre-fix serial linked scan lets the earlier session consume the phase"
     },
     {
+      "name": "TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceJSON",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": ["json"],
+      "vertical": "listener-backlog-optional-maintenance",
+      "real_listener": true,
+      "listener_mode": "continuous",
+      "fake_graph": true,
+      "max_seconds": 30,
+      "oracle": "a durable Teams turn backlog keeps optional history maintenance out of the active listener cycle while the owner-bound executor is still occupied",
+      "baseline": "pre-fix the history worker starts in the same cycle as a durable queued turn and can consume the owner heartbeat/SQLite budget"
+    },
+    {
+      "name": "TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceSQLite",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": ["sqlite"],
+      "vertical": "listener-backlog-optional-maintenance",
+      "real_listener": true,
+      "listener_mode": "continuous",
+      "fake_graph": true,
+      "max_seconds": 30,
+      "oracle": "the SQLite listener keeps optional history maintenance out of the cycle while a durable queued turn remains behind the running turn",
+      "baseline": "pre-fix SQLite durable backlog and history maintenance contend in one listener cycle"
+    },
+    {
       "name": "TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail",
       "package": "./internal/teams",
       "job": "teams-recovery",

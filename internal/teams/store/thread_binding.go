@@ -235,9 +235,14 @@ func validateCodexThreadStartBinding(session SessionContext, sessionOK bool, tur
 		if owner == nil || !sameOwnerInstance(*owner, request.Owner) || strings.TrimSpace(owner.MachineID) != request.MachineID || owner.LeaseGeneration != request.LeaseGeneration {
 			return &CodexThreadStartBindingFenceError{SessionID: request.SessionID, TurnID: request.TurnID, Reason: "service owner instance changed", Owner: true}
 		}
-		if strings.TrimSpace(owner.ActiveSessionID) != request.SessionID || strings.TrimSpace(owner.ActiveTurnID) != request.TurnID {
-			return &CodexThreadStartBindingFenceError{SessionID: request.SessionID, TurnID: request.TurnID, Reason: "service owner is serving another turn", Owner: true}
-		}
+		// ActiveSessionID/ActiveTurnID is a diagnostic singleton, not an
+		// ownership capability.  The listener may have several async workers
+		// under one process/lease, and each worker heartbeat can legitimately
+		// replace those fields.  The immutable owner identity, control-lease
+		// generation, and running turn's machine/lease capability above are the
+		// actual fences for this bind.  Treating the diagnostic slot as an
+		// exclusive lock would reject a valid concurrent worker and could turn a
+		// completed Codex result into a durable Interrupted turn.
 	}
 	if existing := strings.TrimSpace(session.CodexThreadID); existing != "" && existing != request.ThreadID && !turn.StartNewCodexThread {
 		return CodexThreadBindingConflictError{SessionID: request.SessionID, Existing: existing, Observed: request.ThreadID}

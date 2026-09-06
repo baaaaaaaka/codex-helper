@@ -269,6 +269,42 @@ func TestHistoryWatchChangedPathsSkipsSourceRewriteBlockedRows(t *testing.T) {
 	}
 }
 
+func TestHistoryWatchChangedPathsSelectedRecoveryQuantumDoesNotExpand(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{
+		filepath.Join(dir, "blocked-a.jsonl"),
+		filepath.Join(dir, "blocked-b.jsonl"),
+	}
+	watch := make(map[string]teamstore.HistoryWatchCheckpoint, len(paths))
+	for _, path := range paths {
+		contents := []byte(`{"type":"session_meta","payload":{"id":"thread-quantum","history_mode":"paginated"}}` + "\n")
+		if err := os.WriteFile(path, contents, 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		watch[historyWatchCheckpointID(path)] = teamstore.HistoryWatchCheckpoint{
+			ID:                   historyWatchCheckpointID(path),
+			Path:                 path,
+			ThreadID:             "thread-quantum",
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SourceRewriteBlocked: true,
+		}
+	}
+
+	changes, err := historyWatchChangedPaths([]string{paths[0]}, teamstore.State{HistoryWatch: watch}, false)
+	if err != nil {
+		t.Fatalf("historyWatchChangedPaths: %v", err)
+	}
+	if len(changes) != 1 || changes[0] != paths[0] {
+		t.Fatalf("selected recovery changes = %#v, want only %q", changes, paths[0])
+	}
+}
+
 func TestHistoryTieredScanTailQuarantinesNoIDChildEventMessageAfterTerminal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	transcript := []byte(`{"type":"session_meta","payload":{"id":"thread-s462-no-id"}}

@@ -2542,13 +2542,14 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	entered := make(chan struct{})
 	hookExited := make(chan struct{})
 	var enteredOnce sync.Once
+	var exitedOnce sync.Once
 	bridge.historyWatchPathHook = func(ctx context.Context, candidate string) error {
 		if filepath.Clean(candidate) != filepath.Clean(path) {
 			return nil
 		}
 		enteredOnce.Do(func() { close(entered) })
 		<-ctx.Done()
-		close(hookExited)
+		exitedOnce.Do(func() { close(hookExited) })
 		return ctx.Err()
 	}
 	listenCtx, cancel := context.WithCancel(context.Background())
@@ -2914,6 +2915,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 			SessionID:   session.ID,
 			TeamsChatID: session.ChatID,
 			Source:      "teams",
+			TurnID:      "turn-task-prompt-race",
 			Status:      teamstore.InboundStatusPersisted,
 			CreatedAt:   time.Now().UTC(),
 			UpdatedAt:   time.Now().UTC(),
@@ -3058,13 +3060,13 @@ func TestTeamsListenFalseTaskStartedPromptRaceFromPolledTeamsTurn(t *testing.T) 
 		t.Fatalf("vertical race executor was not reached; Graph reads=%d state=%#v", graphState.getCount(session.ChatID), mustListenerRecoveryState(t, store))
 	}
 	// A live Teams turn is intentionally excluded from the independent linked
-	// transcript worker while its owner is running. Observe completed linked
-	// transcript cycles at this boundary rather than sleeping for a guessed
-	// duration: the scanner must not manufacture a history gate or a second
-	// answer merely because task_started is already visible.
-	waitListenerRecovery(t, func() bool {
-		return bridge.mainLoopPhaseStatsSnapshot("linked-transcript").Runs >= 2
-	}, listenerRecoveryProgressTimeout, "linked transcript cycles while task_started is visible")
+	// transcript worker while its owner is running.  The backlog gate now also
+	// suppresses the optional phase itself, so this boundary must not require
+	// synthetic linked cycles just to prove that task_started is harmless.
+	if linkedStats := bridge.mainLoopPhaseStatsSnapshot("linked-transcript"); linkedStats.Runs != 0 {
+		listener.stop(t)
+		t.Fatalf("linked transcript phase entered while the live Teams turn was blocked: %#v", linkedStats)
+	}
 	if plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot()); strings.Contains(plain, "publish-history") || strings.Contains(plain, "previous Codex execution is still unconfirmed") {
 		listener.stop(t)
 		t.Fatalf("active vertical turn emitted a premature history/recovery gate: %s", plain)
@@ -4189,6 +4191,13 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 			bridge.lastTranscriptSync = time.Time{}
 			bridge.lastHistoryWatchSync = time.Now()
 			bridge.lastHistoryWatchReconcile = time.Now()
+			backlog, backlogErr := store.TeamsOperationalBacklog(ctx)
+			if backlogErr != nil {
+				t.Fatalf("probe inherited terminal Teams proof: %v", backlogErr)
+			}
+			if backlog.Active() {
+				t.Fatalf("terminal Teams proof kept optional-maintenance backlog active: %#v", backlog)
+			}
 			listenerOptions := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
 			// The matrix exercises restart/current-state semantics, not the phase
 			// timeout itself. Give the bounded outbox and linked-transcript passes

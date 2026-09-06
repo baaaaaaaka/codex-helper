@@ -19,7 +19,7 @@ func TestUpdateChatPollSchedulesForOwnerFencesAndAppliesAtomicallyAcrossBackends
 	for _, backend := range []string{"json", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			store := newTestStore(t)
-			now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+			now := time.Now().UTC()
 			if err := store.Update(ctx, func(state *State) error {
 				state.ControlLease = ControlLease{
 					HolderMachineID: "machine-a",
@@ -214,7 +214,7 @@ func TestUpdateChatPollSchedulesForOwnerConcurrentCASAcrossBackends(t *testing.T
 	for _, backend := range []string{"json", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
 			store := newTestStore(t)
-			now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+			now := time.Now().UTC()
 			if err := store.Update(ctx, func(state *State) error {
 				state.ControlLease = ControlLease{
 					HolderMachineID: "machine-concurrent",
