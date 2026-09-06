@@ -114,6 +114,18 @@ func sqliteChatPollOperationalFrontierSQL(column string) string {
   ), 0) ELSE 0 END)`
 }
 
+// sqliteChatPollOperationalBacklogSQL extends the durable frontier predicate
+// with recovery-required and in-flight-attempt state. A malformed poll row is
+// conservatively treated as operational so optional maintenance cannot race a
+// row that still needs the bounded poll recovery path.
+func sqliteChatPollOperationalBacklogSQL(column string) string {
+	return `(CASE WHEN json_valid(` + column + `) THEN CASE WHEN
+  COALESCE(json_extract(` + column + `, '$.recovery_required'), 0) = 1
+  OR json_type(` + column + `, '$.attempt') = 'object'
+  OR ` + sqliteChatPollOperationalFrontierSQL(column) + ` != 0
+THEN 1 ELSE 0 END ELSE 1 END)`
+}
+
 func sqliteChatPollValidJSONSQL(jsonColumn, chatIDColumn string) string {
 	return `json_valid(` + jsonColumn + `)
   AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.chat_id') END) = 'text'
@@ -8449,6 +8461,78 @@ func (s *Store) hasQueuedTurnsSQLite(ctx context.Context) (bool, bool, error) {
 		return nil
 	})
 	return hasQueued, handled, err
+}
+
+func (s *Store) teamsOperationalBacklogSQLite(ctx context.Context) (TeamsOperationalBacklog, bool, error) {
+	backlog := TeamsOperationalBacklog{}
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var exists int
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL("status")+` LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		} else if err == nil {
+			backlog.ActiveTurns = exists == 1
+		}
+		exists = 0
+		queuedTurnID := sqliteSafeJSONExtract("i.json", "$.turn_id")
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i
+WHERE (
+        status IN (?, ?, ?) AND (
+        trim(COALESCE(`+queuedTurnID+`, '')) = ''
+        OR NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE trim(t.id) = trim(`+queuedTurnID+`)
+              AND t.status IN (?, ?, ?)
+              AND json_valid(t.json)
+              AND `+sqliteSafeJSONType("t.json", "$.id")+` = 'text'
+              AND trim(COALESCE(`+sqliteSafeJSONExtract("t.json", "$.id")+`, '')) = trim(t.id)
+              AND `+sqliteSafeJSONType("t.json", "$.status")+` = 'text'
+              AND `+sqliteSafeJSONExtract("t.json", "$.status")+` IN (?, ?, ?)
+        )
+        )
+   )
+   OR (status <> '' AND status NOT IN (?, ?, ?, ?))
+LIMIT 1`,
+			string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued),
+			string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
+			string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
+			string(InboundStatusIgnored), string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued)).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		} else if err == nil {
+			backlog.PendingInbound = exists == 1
+		}
+		// The materialized hint gives the common path an indexed lookup. The
+		// canonical JSON expression is checked only when the hint lane is empty,
+		// so a stale false hint cannot make a durable pending page invisible.
+		exists = 0
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
+WHERE COALESCE(frontier_active, 0) != 0 OR json_valid(json) = 0
+LIMIT 1`).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		} else if err == nil {
+			backlog.OperationalPollFrontier = true
+		} else {
+			var canonical int
+			if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
+WHERE `+sqliteChatPollOperationalBacklogSQL("json")+` != 0
+LIMIT 1`).Scan(&canonical); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			} else if err == nil {
+				backlog.OperationalPollFrontier = true
+			}
+		}
+		return nil
+	})
+	return backlog, handled, err
 }
 
 func (s *Store) hasUnfinishedTurnsSQLite(ctx context.Context) (bool, bool, error) {

@@ -1,0 +1,6 @@
+FROM scratch
+
+COPY teams-sqlite-history-fixture.test /teams-sqlite-history-fixture.test
+# The directory exists in the image before Docker applies the nested
+# read-only bind mount for the real session tree.
+COPY docker-mountpoints/ /home/baka/.codex/

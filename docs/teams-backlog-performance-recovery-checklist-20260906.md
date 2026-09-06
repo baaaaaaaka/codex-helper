@@ -137,6 +137,8 @@ whole because it is a large mixed WIP based on an older commit.
 - [x] Cross-scope outbound backfill reads only the bounded SQLite projection and still suppresses a sibling-scope helper message.
 - [ ] Backlog ACK/marker queue-only produces no Graph POST in the poll handler and sends exactly once during outbox recovery.
 - [ ] Same-chat ACK/marker/final FIFO and ambiguous-POST behavior remain intact.
+- [x] Add JSON/SQLite vertical guards for a durable queued turn plus a live history tail; the current implementation is intentionally red because it starts `history-watch` before the Teams backlog drains.
+- [x] Add an opt-in real-data Docker experiment with read-only snapshot, local Graph/executor, owner-generation tracing, durable turn accounting, phase deadlines, and unknown-route assertions.
 - [ ] Benchmark/observation counters close all dispositions and distinguish durable completion from executor start.
 
 ### Candidate tests from the older performance worktree
@@ -178,7 +180,7 @@ Carry or adapt only after checking current-main APIs:
 - [x] Run the repository-wide `go test ./... -count=1` gate; all packages passed.
 - [x] Run `git diff --check` and inspect the complete unpublished diff.
 - [x] Do not run the live helper or use the real Teams token; use isolated fake Graph/temporary SQLite fixtures.
-- [x] Report changed files, carried tests, test commands/results, measured throughput, and residual uncertainty.
+- [x] Report changed files, carried tests, test commands/results, measured throughput, and residual uncertainty; the newly added backlog guard is expected to fail until the production phase gate is implemented.
 
 ## Execution log
 
@@ -194,4 +196,7 @@ Carry or adapt only after checking current-main APIs:
 - 2026-09-06: Added the bounded SQLite global-outbound projection and skipped the current scope during compatibility backfill. The read retains accepted/sent outbox identities and helper provenance, preserves sibling-scope self-echo suppression, ignores queued/unrelated business rows, and has no full-loader invocation in regression tests.
 - 2026-09-06: The second isolated real-data Docker run reached readiness in `14.722s`, began its first execution in `16.195s`, and reported `replayed_inbound=16`, `completed=16`, `failed=0`, `executor_runs=16`, `wall_inbound_per_sec=0.177`, `steady_executor_per_sec=0.216`, `poll_last_duration=3.340s`, and `history_watch_last_duration=14.103s`. This proves the first-poll full-load stall is removed and progress resumes, but it is not a complete-drain acceptance result: the `7,457`-message snapshot ran for `90s` with only two poll cycles, while history/linked-transcript maintenance still consumed roughly `14s` phases and emitted timeout/cancel errors.
 - 2026-09-06: After the bounded global-outbound change, focused tests, both package gates, race-focused tests, repository-wide `go test ./... -count=1`, and `git diff --check` all passed. The Docker experiment used a disposable read-only snapshot, fake Graph/local executor, `--network none`, and no Teams token; the live helper and live database were not modified by the experiment.
+- 2026-09-06: Added `listener_backlog_optional_maintenance_regression_test.go` in JSON and SQLite variants. Both reproduce the current bug deterministically: with one blocked running turn and one durable queued turn, the listener enters `history-watch`; the test fails before any lease-timeout timing is needed.
+- 2026-09-06: Added `docker_real_data_experiment_test.go`, fixture support, and `teams_real_data_docker_experiment.sh`. A 90-second run against a fresh snapshot of the current environment replayed 7,457 ordinary queued messages across 357 chats, reached 16 durable inbound rows at `0.178 inbound/s` and `0.230 executor/s`, then failed the new hard gates because owner generations changed `5291 -> 5292`; it also recorded history/linked-transcript cancellation/deadline errors. No unknown Graph route was observed, and no Teams token/network was used.
+- 2026-09-06: Repeated the same 90-second run after fixing the shell runner's failure-path integrity check. It reached 16 inbound / 15 completed / 1 interrupted (`0.178 inbound/s`, `0.218 executor/s`), changed owner generations `5298 -> 5299`, recorded a 15.407s history-watch deadline and a 14.626s linked-transcript cancellation window, and failed the durable-completion gate. The post-run source hash check reported that the live source pointer/database changed while the real helper was concurrently active; the experiment itself only read the source into a disposable `.backup`/runtime copy, so the hash delta cannot be attributed to the container. The corrected runner now always reports this condition before returning the test failure.
 - Not implemented in this execution: durable linked/history deferral, pace/quote/marker send-path changes, queue-only backlog ACK/marker, full phase/disposition observation harness, and scheduler cap/worker/action tuning. These remain gated on measurements and the safety tests listed above.

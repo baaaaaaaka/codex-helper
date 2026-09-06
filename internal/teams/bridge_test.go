@@ -8295,6 +8295,12 @@ func TestRunOwnerHeartbeatWithRetryBoundsPersistentBusy(t *testing.T) {
 	}
 }
 
+func TestOwnerHeartbeatBusyRetryWindowCoversOnePhaseBudget(t *testing.T) {
+	if ownerHeartbeatBusyRetryWindow < 2*mainLoopPhaseBudget {
+		t.Fatalf("owner heartbeat busy retry window = %s, want at least two phase budgets (%s)", ownerHeartbeatBusyRetryWindow, 2*mainLoopPhaseBudget)
+	}
+}
+
 func TestRunOwnerHeartbeatWithRetryBoundsBlockedCallback(t *testing.T) {
 	started := make(chan struct{})
 	var once sync.Once

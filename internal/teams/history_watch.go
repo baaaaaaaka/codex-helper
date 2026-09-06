@@ -210,6 +210,87 @@ func (b *Bridge) historyWatchRetryDirtyPaths(paths []string) {
 	}
 }
 
+func (b *Bridge) historyWatchPendingDirtyPaths() []string {
+	if b == nil {
+		return nil
+	}
+	b.historyWatchEventsMu.Lock()
+	defer b.historyWatchEventsMu.Unlock()
+	paths := make([]string, 0, len(b.historyWatchPendingDirty))
+	for path := range b.historyWatchPendingDirty {
+		if path = cleanComparablePath(path); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint teamstore.HistoryWatchCheckpoint) bool {
+	if checkpoint.SourceRewriteBlocked || checkpoint.LegacySourceUnverified || checkpoint.RecoveryProofUnusable {
+		return true
+	}
+	if checkpoint.PartialLineStartOffset > 0 || checkpoint.PartialReadOffset > 0 || checkpoint.PartialObservedSize > 0 {
+		return true
+	}
+	return checkpoint.Offset > checkpoint.Size
+}
+
+func (b *Bridge) selectBacklogHistoryRecoveryPaths(paths []string) []string {
+	paths = uniqueSortedCleanPaths(paths)
+	if len(paths) <= maxBacklogHistoryRecoveryJobs || b == nil {
+		return paths
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.backlogHistoryRecoveryCursor % len(paths)
+	b.backlogHistoryRecoveryCursor = (start + maxBacklogHistoryRecoveryJobs) % len(paths)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]string, 0, maxBacklogHistoryRecoveryJobs)
+	for i := 0; i < maxBacklogHistoryRecoveryJobs; i++ {
+		selected = append(selected, paths[(start+i)%len(paths)])
+	}
+	return uniqueSortedCleanPaths(selected)
+}
+
+// syncCodexHistoryFinalsForBacklog keeps only explicit recovery/delete/proof
+// paths alive while Teams work is durable. It deliberately does not discover
+// new projects, establish a baseline, or scan an ordinary appended tail; the
+// normal history watcher performs those operations immediately after the
+// backlog probe wakes it.
+func (b *Bridge) syncCodexHistoryFinalsForBacklog(ctx context.Context, now time.Time) error {
+	if err := b.ensureStore(); err != nil {
+		return err
+	}
+	state, err := b.store.HistoryWatchState(ctx)
+	if err != nil {
+		return err
+	}
+	paths := b.historyWatchPendingDirtyPaths()
+	for _, checkpoint := range state.HistoryWatch {
+		if historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
+			paths = append(paths, checkpoint.Path)
+		}
+	}
+	paths = b.selectBacklogHistoryRecoveryPaths(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	changes, scanErr := historyWatchChangedPaths(paths, state, true)
+	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
+	if syncErr != nil {
+		b.historyWatchRetryDirtyPaths(paths)
+	} else if scanErr == nil {
+		b.historyWatchAckDirtyPaths(paths)
+	}
+	if scanErr != nil && syncErr != nil {
+		return errors.Join(scanErr, syncErr)
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+	return syncErr
+}
+
 func (b *Bridge) syncCodexHistoryFinalsIfDue(ctx context.Context, now time.Time) error {
 	if b == nil {
 		return nil
@@ -237,6 +318,13 @@ func (b *Bridge) syncCodexHistoryFinalsIfDue(ctx context.Context, now time.Time)
 		b.lastHistoryWatchReconcile = now
 	}
 	return err
+}
+
+func (b *Bridge) syncCodexHistoryFinalsIfDueForBacklog(ctx context.Context, now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return b.syncCodexHistoryFinalsForBacklog(ctx, now)
 }
 
 func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reconcile bool) error {
@@ -524,7 +612,11 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 				// same path. Only a new paginated file identity is an automatic
 				// recovery candidate; legacy files retain the explicit recovery
 				// boundary and are not repeatedly scanned.
-				if fileState.SourceRewriteBlocked {
+				selected := true
+				if selectedOnly {
+					_, selected = selectedPaths[path]
+				}
+				if fileState.SourceRewriteBlocked && selected {
 					if identity, ok := codexPaginatedHistoryIdentity(path, firstNonEmptyString(fileState.ThreadID, fileState.SessionID)); ok &&
 						identity != strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) {
 						rebasePaths[path] = true

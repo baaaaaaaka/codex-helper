@@ -1341,7 +1341,28 @@ type ServiceControl struct {
 	DrainOperationID     string    `json:"drain_operation_id,omitempty"`
 	LastDrainOperationID string    `json:"last_drain_operation_id,omitempty"`
 	LastDrainOperationAt time.Time `json:"last_drain_operation_at,omitempty"`
-	UpdatedAt            time.Time `json:"updated_at,omitempty"`
+	// OptionalMaintenanceDeferredUntil is a restart-safe wake deadline for
+	// history/transcript discovery. It is deliberately separate from Paused and
+	// Draining: a Teams backlog may defer cold maintenance without changing
+	// admission or service-control semantics.
+	OptionalMaintenanceDeferredUntil  time.Time `json:"optional_maintenance_deferred_until,omitempty"`
+	OptionalMaintenanceDeferredReason string    `json:"optional_maintenance_deferred_reason,omitempty"`
+	UpdatedAt                         time.Time `json:"updated_at,omitempty"`
+}
+
+// TeamsOperationalBacklog is the bounded admission view used by the listener
+// before optional history/transcript maintenance. It intentionally reports
+// only durable work that can contend with the Teams recovery loop; it is not a
+// business-state snapshot and must not be used to advance a cursor or claim a
+// message.
+type TeamsOperationalBacklog struct {
+	ActiveTurns             bool
+	PendingInbound          bool
+	OperationalPollFrontier bool
+}
+
+func (b TeamsOperationalBacklog) Active() bool {
+	return b.ActiveTurns || b.PendingInbound || b.OperationalPollFrontier
 }
 
 var ErrDrainOperationConflict = errors.New("teams drain is owned by another operation")
@@ -3588,6 +3609,80 @@ func (s *Store) HasQueuedTurns(ctx context.Context) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// TeamsOperationalBacklog returns the small durable work predicate used to
+// decide whether cold history/transcript discovery may run. SQLite answers it
+// from indexed projections and a bounded poll-frontier check; legacy JSON uses
+// the compatibility field loader. Callers must treat this as an admission
+// hint only: all actual claims, frontier writes, and completion transitions
+// retain their existing owner/CAS fences.
+func (s *Store) TeamsOperationalBacklog(ctx context.Context) (TeamsOperationalBacklog, error) {
+	if backlog, handled, err := s.teamsOperationalBacklogSQLite(ctx); handled || err != nil {
+		return backlog, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns", "inbound_events", "chat_polls"))
+	if err != nil {
+		return TeamsOperationalBacklog{}, err
+	}
+	backlog := TeamsOperationalBacklog{}
+	for _, turn := range state.Turns {
+		if turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning ||
+			(strings.TrimSpace(string(turn.Status)) != "" && !knownTurnStatus(turn.Status)) {
+			backlog.ActiveTurns = true
+			break
+		}
+	}
+	for _, event := range state.InboundEvents {
+		if inboundEventHasOperationalBacklog(event, state.Turns) {
+			backlog.PendingInbound = true
+			break
+		}
+	}
+	if !backlog.OperationalPollFrontier {
+		for _, poll := range state.ChatPolls {
+			if poll.RecoveryRequired || poll.Attempt != nil || chatPollHasOperationalFrontier(poll) {
+				backlog.OperationalPollFrontier = true
+				break
+			}
+		}
+	}
+	return backlog, nil
+}
+
+// inboundEventHasOperationalBacklog distinguishes the durable inbound ledger
+// from work that can still be admitted.  QueueTurn intentionally leaves an
+// inbound row in InboundStatusQueued after its turn reaches a terminal state;
+// that row is historical provenance, not another Teams item to process.  An
+// orphaned or malformed queued row remains operational so a compatibility
+// repair/recovery path cannot be hidden by this fast probe.
+func inboundEventHasOperationalBacklog(event InboundEvent, turns map[string]Turn) bool {
+	// PersistInbound records provenance before QueueTurn links the event to a
+	// turn.  A later recovery/compatibility path can also leave a persisted or
+	// deferred row linked to a terminal turn.  Once that terminal durable turn
+	// exists, the inbound row is historical provenance rather than work that
+	// should hold the cold-maintenance gate open.  Missing or non-terminal turn
+	// links remain conservative and operational.
+	if turnID := strings.TrimSpace(event.TurnID); turnID != "" {
+		turn, ok := turns[turnID]
+		if !ok {
+			return true
+		}
+		if turn.Status == TurnStatusCompleted || turn.Status == TurnStatusFailed || turn.Status == TurnStatusInterrupted {
+			return false
+		}
+		return true
+	}
+	switch event.Status {
+	case InboundStatusPersisted, InboundStatusDeferred:
+		return true
+	case InboundStatusQueued:
+		return true
+	default:
+		// Unknown non-empty inbound states are conservatively operational.  The
+		// only known terminal inbound state is ignored.
+		return strings.TrimSpace(string(event.Status)) != "" && event.Status != InboundStatusIgnored
+	}
 }
 
 // HasUnfinishedTurns reports whether startup recovery has any queued, running,
@@ -6510,6 +6605,63 @@ func (s *Store) ReadControl(ctx context.Context) (ServiceControl, error) {
 		return ServiceControl{}, err
 	}
 	return state.ServiceControl, nil
+}
+
+// SetOptionalMaintenanceDeferredForOwner records a bounded wake deadline for
+// cold history/transcript maintenance. It is intentionally owner-fenced: a
+// listener that lost its control lease must not leave a newer owner with a
+// stale maintenance schedule. SQLite updates only the runtime projection;
+// legacy JSON retains its compatibility full-state mutation.
+func (s *Store) SetOptionalMaintenanceDeferredForOwner(ctx context.Context, until time.Time, reason string, machineID string, leaseGeneration int64) (ServiceControl, error) {
+	return s.updateOptionalMaintenanceDeferral(ctx, until, reason, machineID, leaseGeneration)
+}
+
+// ClearOptionalMaintenanceDeferredForOwner removes the durable cold-path
+// deferral after the Teams backlog probe is clear. The same lease fence applies
+// so a stale listener cannot wake or rewrite maintenance for its successor.
+func (s *Store) ClearOptionalMaintenanceDeferredForOwner(ctx context.Context, machineID string, leaseGeneration int64) (ServiceControl, error) {
+	return s.updateOptionalMaintenanceDeferral(ctx, time.Time{}, "", machineID, leaseGeneration)
+}
+
+func (s *Store) updateOptionalMaintenanceDeferral(ctx context.Context, until time.Time, reason string, machineID string, leaseGeneration int64) (ServiceControl, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return ServiceControl{}, err
+	}
+	if !until.IsZero() {
+		until = until.UTC()
+	}
+	reason = trimDiagnostic(strings.TrimSpace(reason), 160)
+	var out ServiceControl
+	apply := func(state *State) (bool, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return false, err
+		}
+		next := state.ServiceControl
+		if next.OptionalMaintenanceDeferredUntil.Equal(until) && next.OptionalMaintenanceDeferredReason == reason {
+			out = next
+			return false, nil
+		}
+		next.OptionalMaintenanceDeferredUntil = until
+		next.OptionalMaintenanceDeferredReason = reason
+		state.ServiceControl = next
+		out = next
+		return true, nil
+	}
+	update := func(state *State) error {
+		changed, err := apply(state)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errStoreNoChange
+		}
+		return nil
+	}
+	if handled, err := s.updateSQLiteRuntimeState(ctx, update); handled || err != nil {
+		return out, err
+	}
+	return out, s.UpdateIfChanged(ctx, apply)
 }
 
 // ReadScope returns the bounded scope identity used by listener startup.

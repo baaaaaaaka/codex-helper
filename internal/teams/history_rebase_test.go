@@ -131,6 +131,15 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 			LastFinalTurnID:      "turn-1",
 			LastFinalTextHash:    normalizedTextHash("old answer"),
 			TerminalBoundarySeen: true,
+			TerminalBoundary: &teamstore.TerminalBoundary{
+				SourceGeneration:   "old-source-generation",
+				RecordID:           "old-terminal",
+				Line:               3,
+				StartOffset:        info.Size() - int64(len(`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}`)) - 1,
+				ExclusiveEndOffset: info.Size(),
+				RangeFingerprint:   "old-terminal-proof",
+				Kind:               "task_complete",
+			},
 		}
 		return nil
 	}); err != nil {
@@ -164,6 +173,9 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 	}
 	if checkpoint.SourceGeneration == "" || checkpoint.SourceGeneration == "old-source-generation" {
 		t.Fatalf("rebase did not establish the new source generation: %#v", checkpoint)
+	}
+	if checkpoint.TerminalBoundary != nil {
+		t.Fatalf("rebase carried a terminal proof from the replaced source: %#v", checkpoint.TerminalBoundary)
 	}
 	if len(state.OutboxMessages) != 0 {
 		t.Fatalf("rebase created delivery rows: %#v", state.OutboxMessages)
@@ -269,6 +281,15 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 		Status:               importCheckpointStatusBlocked,
 		CompletionPending:    true,
 		UnresolvedExecution:  anchor,
+		TerminalBoundary: &teamstore.TerminalBoundary{
+			SourceGeneration:   "old-source-generation",
+			RecordID:           "old-terminal",
+			Line:               4,
+			StartOffset:        1,
+			ExclusiveEndOffset: 2,
+			RangeFingerprint:   "old-terminal-proof",
+			Kind:               "task_complete",
+		},
 	}
 	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
 		checkpoint.UpdatedAt = now
@@ -300,6 +321,9 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 	if !reflect.DeepEqual(updated.UnresolvedExecution, anchor) {
 		t.Fatalf("execution anchor changed during rebase: got=%#v want=%#v", updated.UnresolvedExecution, anchor)
 	}
+	if updated.TerminalBoundary != nil {
+		t.Fatalf("linked rebase carried a terminal proof from the replaced source: %#v", updated.TerminalBoundary)
+	}
 	state, err := store.Load(context.Background())
 	if err != nil {
 		t.Fatalf("load linked state: %v", err)
@@ -311,6 +335,140 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 		t.Fatalf("repeat linked rebase: %v", err)
 	} else if rebased {
 		t.Fatal("repeat linked rebase should be a no-op")
+	}
+}
+
+func TestHistoryWatchRebaseHoldsSourceBoundContextGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history-context-gap-rollout.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-context-gap","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"context-final","type":"message","role":"assistant","turn_id":"turn-context","phase":"final_answer","content":[{"type":"output_text","text":"context answer"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-context"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write context-gap rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat context-gap rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	id := historyWatchCheckpointID(path)
+	gap := &teamstore.ContextGapState{
+		SourceGeneration:   "old-source-generation",
+		GapID:              "gap-old",
+		Kind:               "opaque-record",
+		FrontierKnown:      true,
+		StartRecordID:      "gap-start",
+		StartLine:          2,
+		StartOffset:        1,
+		ExclusiveEndOffset: 2,
+		ConsumedThrough:    2,
+		RangeFingerprint:   "gap-proof",
+		Phase:              teamstore.ContextGapPhaseDetected,
+	}
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SourceGeneration:     "old-source-generation",
+			SessionID:            "thread-context-gap",
+			ThreadID:             "thread-context-gap",
+			SourceRewriteBlocked: true,
+			LastFinalID:          "codex-final:v1:thread-context-gap:turn-context:context-final",
+			LastFinalThreadID:    "thread-context-gap",
+			LastFinalTurnID:      "turn-context",
+			LastFinalTextHash:    normalizedTextHash("context answer"),
+			ContextGap:           gap,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed context-gap checkpoint: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("hold history context-gap rebase: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load held context-gap checkpoint: %v", err)
+	}
+	checkpoint := state.HistoryWatch[id]
+	if !checkpoint.SourceRewriteBlocked || checkpoint.SourceGeneration != "old-source-generation" {
+		t.Fatalf("context-gap rebase crossed the source fence: %#v", checkpoint)
+	}
+	if checkpoint.Offset != info.Size() || checkpoint.ContextGap == nil || checkpoint.ContextGap.SourceGeneration != "old-source-generation" {
+		t.Fatalf("context-gap rebase changed the physical or semantic frontier: %#v", checkpoint)
+	}
+	if checkpoint.SourceRewriteRecoveryIdentity == "" {
+		t.Fatalf("context-gap rebase did not record the candidate source identity: %#v", checkpoint)
+	}
+}
+
+func TestLinkedTranscriptRebaseHoldsSourceBoundPendingRange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-pending-range-rollout.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-pending-range","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"pending-last","type":"message","role":"user","turn_id":"turn-pending","content":[{"type":"input_text","text":"prompt"}]}}`,
+		`{"type":"response_item","payload":{"id":"pending-final","type":"message","role":"assistant","turn_id":"turn-pending","phase":"final_answer","content":[{"type":"output_text","text":"answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write pending-range rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-pending-range")
+	rng := &teamstore.HistoryPendingRange{
+		SourcePath:       path,
+		SourceGeneration: "old-source-generation",
+		RangeID:          "range-old",
+		Kind:             "pending_root_task_started",
+		StartRecordID:    "pending-marker",
+		StartLine:        2,
+		StartOffset:      1,
+		StartOffsetKnown: true,
+		ExclusiveEnd:     2,
+		MarkerThreadID:   "thread-pending-range",
+		MarkerTurnID:     "turn-pending",
+		RangeFingerprint: "range-proof",
+	}
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-pending-range",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:pending-last",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+		PendingHistoryRange:  rng,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed pending-range checkpoint: %v", err)
+	}
+	bridge := &Bridge{store: store}
+	session := Session{ID: "session-pending-range", CodexThreadID: "thread-pending-range"}
+	local := codexhistory.Session{SessionID: "thread-pending-range", FilePath: path}
+	if rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, checkpoint); err != nil {
+		t.Fatalf("hold linked pending-range rebase: %v", err)
+	} else if rebased {
+		t.Fatal("linked pending-range rebase crossed an unportable semantic proof")
+	}
+	updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load held pending-range checkpoint: found=%v err=%v", found, err)
+	}
+	if !updated.SourceRewriteBlocked || updated.SourceGeneration != "old-source-generation" || updated.PendingHistoryRange == nil || updated.PendingHistoryRange.SourceGeneration != "old-source-generation" {
+		t.Fatalf("pending-range rebase changed the source fence: %#v", updated)
+	}
+	if updated.SourceRewriteRecoveryIdentity == "" {
+		t.Fatalf("pending-range rebase did not record the candidate source identity: %#v", updated)
 	}
 }
 

@@ -178,6 +178,51 @@ func TestBindCodexThreadForRunningTurnFencesOwnerTakeover(t *testing.T) {
 	}
 }
 
+func TestBindCodexThreadForRunningTurnAllowsConcurrentTurnsUnderSameOwner(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	owner := OwnerMetadata{PID: os.Getpid(), Hostname: "binding-host", ExecutablePath: "/opt/codex-helper", StartedAt: now.Add(-time.Minute), LastHeartbeat: now, MachineID: "machine-binding", LeaseGeneration: 9, ActiveSessionID: "session-binding", ActiveTurnID: "turn-binding"}
+	scope := ScopeIdentity{ID: "scope-thread-binding-concurrent", AccountID: "account-thread-binding", OSUser: "tester", Profile: "default"}
+	for _, sqlite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[sqlite], func(t *testing.T) {
+			store := newTestStore(t)
+			seedRunningThreadBindingState(t, store, false)
+			if err := store.Update(context.Background(), func(state *State) error {
+				state.Scope = scope
+				state.ControlLease = ControlLease{ScopeID: scope.ID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration, Status: ControlLeaseStatusActive, LeaseUntil: now.Add(time.Minute), LastHeartbeat: now, UpdatedAt: now}
+				state.ServiceOwner = &owner
+				second := SessionContext{ID: "session-binding-second", Status: SessionStatusActive, ModelGeneration: 4, TeamsChatID: "chat-binding-second"}
+				state.Sessions[second.ID] = second
+				state.Turns["turn-binding-second"] = Turn{
+					ID: "turn-binding-second", SessionID: second.ID, Status: TurnStatusRunning,
+					ModelGeneration: 4, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration,
+					CreatedAt: now,
+				}
+				turn := state.Turns["turn-binding"]
+				turn.MachineID = owner.MachineID
+				turn.LeaseGeneration = owner.LeaseGeneration
+				state.Turns[turn.ID] = turn
+				return nil
+			}); err != nil {
+				t.Fatalf("seed concurrent owner fixture: %v", err)
+			}
+			if sqlite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			request := CodexThreadStartBindingRequest{
+				SessionID: "session-binding-second", TurnID: "turn-binding-second", ThreadID: "thread-binding-second",
+				ModelGeneration: 4, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration, Owner: owner,
+			}
+			result, err := store.BindCodexThreadForRunningTurn(context.Background(), request)
+			if err != nil {
+				t.Fatalf("concurrent same-owner bind = %v, want success despite diagnostic active turn %q/%q", err, owner.ActiveSessionID, owner.ActiveTurnID)
+			}
+			if !result.Changed || result.Session.CodexThreadID != request.ThreadID || result.Turn.CodexThreadID != request.ThreadID {
+				t.Fatalf("concurrent same-owner bind result = %#v", result)
+			}
+		})
+	}
+}
+
 func TestBindCodexThreadForRunningTurnConcurrentCallsAreIdempotent(t *testing.T) {
 	store := newTestStore(t)
 	seedRunningThreadBindingState(t, store, false)

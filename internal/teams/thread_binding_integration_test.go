@@ -105,3 +105,55 @@ func TestBeforeFirstCodexTurnHookHonorsOwnerCancellation(t *testing.T) {
 		t.Fatalf("canceled hook bound turn thread = %q", got)
 	}
 }
+
+func TestBeforeFirstCodexTurnHookAllowsConcurrentOwnerWorker(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, nil)
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("test session missing")
+	}
+	owner := teamstore.OwnerMetadata{
+		PID:             41004,
+		Hostname:        "owner-hook-concurrent",
+		ExecutablePath:  "/opt/cxp-hook",
+		InstanceID:      "instance-hook-concurrent",
+		ScopeID:         bridge.scope.ID,
+		MachineID:       "machine-hook-concurrent",
+		LeaseGeneration: 8,
+		ActiveSessionID: "another-session",
+		ActiveTurnID:    "another-turn",
+	}
+	turn := teamstore.Turn{
+		ID: "turn-owner-hook-concurrent", SessionID: session.ID, Status: teamstore.TurnStatusRunning,
+		ModelGeneration: 2, MachineID: owner.MachineID, LeaseGeneration: owner.LeaseGeneration,
+	}
+	if err := store.Update(context.Background(), func(state *teamstore.State) error {
+		state.Sessions[session.ID] = teamstore.SessionContext{ID: session.ID, Status: teamstore.SessionStatusActive, TeamsChatID: session.ChatID, ModelGeneration: 2}
+		state.Turns[turn.ID] = turn
+		state.ControlLease = teamstore.ControlLease{
+			ScopeID: bridge.scope.ID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration,
+			Status: teamstore.ControlLeaseStatusActive, LeaseUntil: time.Now().Add(time.Minute), LastHeartbeat: time.Now(), UpdatedAt: time.Now(),
+		}
+		state.ServiceOwner = &owner
+		return nil
+	}); err != nil {
+		t.Fatalf("seed concurrent owner hook state: %v", err)
+	}
+
+	hook := bridge.beforeFirstCodexTurnHook(session, &turn)
+	err := hook(withTeamsOwnerCapability(context.Background(), owner), codexrunner.ThreadStartInfo{ThreadID: "thread-owner-hook-concurrent"})
+	if err != nil {
+		t.Fatalf("concurrent owner hook error = %v, want success despite diagnostic active turn %q/%q", err, owner.ActiveSessionID, owner.ActiveTurnID)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after concurrent owner hook: %v", err)
+	}
+	if got := state.Sessions[session.ID].CodexThreadID; got != "thread-owner-hook-concurrent" {
+		t.Fatalf("session thread = %q, want concurrent worker thread", got)
+	}
+	if got := state.Turns[turn.ID].CodexThreadID; got != "thread-owner-hook-concurrent" {
+		t.Fatalf("turn thread = %q, want concurrent worker thread", got)
+	}
+}
