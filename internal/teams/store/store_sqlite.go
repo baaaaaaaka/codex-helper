@@ -324,6 +324,11 @@ var sqliteMigrationTestHook func(stage string) error
 // verify that one metadata attempt acquires exactly one physical connection.
 var sqliteRuntimeMetadataConnectionTestHook func()
 
+// sqliteStateLoadTestHook is nil in production. Tests use it to make an
+// accidental full SQLite state load observable without requiring a large
+// fixture.
+var sqliteStateLoadTestHook func()
+
 // IsSQLiteBusyError reports both SQLITE_BUSY and its extended variants (for
 // example SQLITE_BUSY_SNAPSHOT). A deferred SQLite transaction can observe a
 // stale WAL snapshot and fail immediately while upgrading a read to a write;
@@ -413,17 +418,6 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 	}
 	var out StoreSQLiteMigrationResult
 	err := s.withStateLock(ctx, func() error {
-		// A runtime heartbeat may use the shared SQLite handle without the
-		// business state-file lock. Quiesce and close it before a migration can
-		// replace the SQLite inode or rewrite the pointer; the next liveness
-		// operation will reopen the validated current database.
-		if err := lockMutexContext(ctx, &s.sqliteRuntimeMu); err != nil {
-			return err
-		}
-		defer s.sqliteRuntimeMu.Unlock()
-		if err := s.closeSQLiteDBLocked(); err != nil {
-			return err
-		}
 		source, err := os.ReadFile(s.path)
 		if errors.Is(err, os.ErrNotExist) {
 			out.State = newState()
@@ -435,7 +429,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		if pointer, ok, err := storeSQLitePointerFromData(source); err != nil {
 			return err
 		} else if ok {
-			state, err := s.loadSQLiteStateWithSQLiteLock(ctx, pointer)
+			dbPath, err := s.validateSQLiteStoreForMigration(ctx, pointer)
 			if err != nil {
 				return err
 			}
@@ -450,15 +444,23 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 				}
 				pointer.SchemaVersion = storeSQLitePointerSchemaVersion
 			}
-			dbPath, err := s.storeSQLitePath(pointer)
-			if err != nil {
-				return err
-			}
-			out = StoreSQLiteMigrationResult{Path: dbPath, MigrationID: pointer.MigrationID, AlreadyDB: true, State: state}
+			out = StoreSQLiteMigrationResult{Path: dbPath, MigrationID: pointer.MigrationID, AlreadyDB: true}
 			return nil
 		}
 		if minSourceSize > 0 && int64(len(source)) < minSourceSize {
 			return nil
+		}
+		// A runtime heartbeat may use the shared SQLite handle without the
+		// business state-file lock. Quiesce and close it only before a legacy
+		// migration can replace the SQLite inode or rewrite the pointer; the
+		// already-DB path above deliberately never enters this long critical
+		// section.
+		if err := lockMutexContext(ctx, &s.sqliteRuntimeMu); err != nil {
+			return err
+		}
+		defer s.sqliteRuntimeMu.Unlock()
+		if err := s.closeSQLiteDBLocked(); err != nil {
+			return err
 		}
 		sourceSchemaVersion := SchemaVersion
 		if parsed, ok := stateSchemaVersionFromData(source); ok {
@@ -538,6 +540,44 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 		return nil
 	})
 	return out, err
+}
+
+// validateSQLiteStoreForMigration performs the bounded validation required by
+// the idempotent already-DB migration path. It never loads business rows and
+// never changes the Store's shared handle: an existing matching handle is
+// checked in place, while a store that has not opened the target yet is
+// checked through a short-lived runtime handle.
+func (s *Store) validateSQLiteStoreForMigration(ctx context.Context, pointer storeSQLitePointer) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dbPath, err := s.storeSQLitePath(pointer)
+	if err != nil {
+		return "", err
+	}
+	if err := validateExistingSQLiteStorePath(dbPath); err != nil {
+		return "", err
+	}
+	if err := lockMutexContext(ctx, &s.sqliteRuntimeMu); err != nil {
+		return "", err
+	}
+	defer s.sqliteRuntimeMu.Unlock()
+
+	if s.sqliteDB != nil && s.sqliteDBPath == dbPath {
+		if err := validateSQLiteStoreInitialized(s.sqliteDB); err != nil {
+			return "", err
+		}
+		if err := validateSQLiteRequiredTables(s.sqliteDB); err != nil {
+			return "", err
+		}
+		return dbPath, nil
+	}
+	db, err := openExistingSQLiteRuntimeStore(dbPath)
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	return dbPath, nil
 }
 
 func runSQLiteMigrationTestHook(stage string) error {
@@ -1587,6 +1627,62 @@ func (s *Store) sqliteDBUnlockedLocked(pointer storeSQLitePointer) (*sql.DB, err
 	return db, nil
 }
 
+func (s *Store) readScopeSQLite(ctx context.Context) (ScopeIdentity, bool, error) {
+	var out ScopeIdentity
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		var raw []byte
+		err = db.QueryRowContext(ctx, `SELECT json FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyScope).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			// A missing runtime scope row is an incomplete projection. Keep the
+			// compatibility fallback for stores produced by older migrations; the
+			// normal published SQLite path always has this bounded row.
+			state, loadErr := loadSQLiteColdState(ctx, db)
+			if loadErr != nil {
+				return loadErr
+			}
+			out = state.Scope
+			handled = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	return out, handled, err
+}
+
+func (s *Store) sessionContextsSQLite(ctx context.Context) (map[string]SessionContext, bool, error) {
+	out := make(map[string]SessionContext)
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		return loadSQLiteSessionMap(ctx, db, `SELECT id, teams_chat_id, status, updated_at, json FROM sessions`, out)
+	})
+	return out, handled, err
+}
+
 // withSQLiteRuntimeDB runs a liveness-only operation without acquiring
 // Store.mu. Full Store operations serialize on Store.mu and the state file
 // lock while they execute user callbacks; heartbeats must not inherit either
@@ -1815,8 +1911,10 @@ func loadSQLiteRuntimeMetadataConn(ctx context.Context, conn *sql.Conn) (Runtime
 		return RuntimeMetadata{}, err
 	}
 
-	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?)`,
+	rows, err := conn.QueryContext(ctx, `SELECT key, json FROM runtime_state WHERE key IN (?, ?, ?, ?, ?, ?, ?)`,
 		sqliteRuntimeKeyScope,
+		sqliteRuntimeKeyMachineIdentity,
+		sqliteRuntimeKeyControlChat,
 		sqliteRuntimeKeyControlLease,
 		sqliteRuntimeKeyServiceOwner,
 		sqliteRuntimeKeyLockOwner,
@@ -1835,6 +1933,14 @@ func loadSQLiteRuntimeMetadataConn(ctx context.Context, conn *sql.Conn) (Runtime
 		switch key {
 		case sqliteRuntimeKeyScope:
 			if err := json.Unmarshal(raw, &metadata.Scope); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyMachineIdentity:
+			if err := json.Unmarshal(raw, &metadata.MachineIdentity); err != nil {
+				return RuntimeMetadata{}, err
+			}
+		case sqliteRuntimeKeyControlChat:
+			if err := json.Unmarshal(raw, &metadata.ControlChat); err != nil {
 				return RuntimeMetadata{}, err
 			}
 		case sqliteRuntimeKeyControlLease:
@@ -1859,6 +1965,223 @@ func loadSQLiteRuntimeMetadataConn(ctx context.Context, conn *sql.Conn) (Runtime
 		return RuntimeMetadata{}, err
 	}
 	return metadata, nil
+}
+
+func loadSQLiteGlobalOutboundSnapshotReadOnly(ctx context.Context, path string) (GlobalOutboundSnapshot, error) {
+	const maxAttempts = 3
+	var changedErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		dbBefore, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		if !dbBefore.Exists {
+			return GlobalOutboundSnapshot{}, os.ErrNotExist
+		}
+		walBefore, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		immutable := !walBefore.Exists || walBefore.Size == 0
+		if !immutable {
+			if err := requireSQLiteReadOnlySHM(path); err != nil {
+				return GlobalOutboundSnapshot{}, err
+			}
+		}
+		snapshot, err := loadSQLiteGlobalOutboundSnapshotReadOnlyAttempt(ctx, path, immutable)
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		// A live WAL already provides SQLite's read snapshot semantics and must
+		// not be reopened with immutable=1. The immutable path has no WAL writer
+		// to pin, so compare file identities before accepting the result.
+		if !immutable {
+			return snapshot, nil
+		}
+		dbAfter, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		walAfter, err := sqliteReadOnlyFileIdentityForPath(path + "-wal")
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		if dbBefore == dbAfter && walBefore == walAfter {
+			return snapshot, nil
+		}
+		changedErr = fmt.Errorf("database or WAL changed during outbound snapshot attempt %d", attempt+1)
+	}
+	return GlobalOutboundSnapshot{}, fmt.Errorf("read stable sqlite outbound snapshot after %d attempts: %w", maxAttempts, changedErr)
+}
+
+func loadSQLiteGlobalOutboundSnapshotReadOnlyAttempt(ctx context.Context, path string, immutable bool) (GlobalOutboundSnapshot, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	if immutable {
+		query.Set("immutable", "1")
+	}
+	db, err := sql.Open("sqlite", sqliteFileURI(path, query))
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `PRAGMA query_only = ON`); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	if err := validateSQLiteRequiredTablesContext(ctx, db); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+
+	runtimeReady, err := sqliteGlobalOutboundRuntimeProjectionReady(ctx, db)
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	if !runtimeReady {
+		// Older SQLite stores do not have enough typed runtime identity to prove
+		// that a filtered projection is complete. Keep the compatibility path
+		// explicit: state_json is cold metadata, and only eligible outbound /
+		// provenance rows are decoded. We still never call loadSQLiteStateRows.
+		cold, err := loadSQLiteColdState(ctx, db)
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		snapshot := GlobalOutboundSnapshot{
+			Scope:             cold.Scope,
+			MachineIdentity:   cold.MachineIdentity,
+			ControlChat:       cold.ControlChat,
+			OutboxMessages:    make(map[string]OutboxMessage),
+			MessageProvenance: make(map[string]MessageProvenanceRecord),
+		}
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM outbox_messages WHERE status IN (?, ?) AND teams_chat_id <> '' AND teams_message_id <> ''`, snapshot.OutboxMessages, func(v OutboxMessage) string { return v.ID }, string(OutboxStatusAccepted), string(OutboxStatusSent)); err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM message_provenance WHERE origin = ? AND teams_chat_id <> '' AND teams_message_id <> ''`, snapshot.MessageProvenance, func(v MessageProvenanceRecord) string { return v.ID }, MessageOriginHelperOutbox); err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		return snapshot, nil
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	metadata, metadataErr := loadSQLiteRuntimeMetadataConn(ctx, conn)
+	closeErr := conn.Close()
+	if metadataErr != nil {
+		return GlobalOutboundSnapshot{}, metadataErr
+	}
+	if closeErr != nil {
+		return GlobalOutboundSnapshot{}, closeErr
+	}
+	snapshot := GlobalOutboundSnapshot{
+		Scope:             metadata.Scope,
+		MachineIdentity:   metadata.MachineIdentity,
+		ControlChat:       metadata.ControlChat,
+		OutboxMessages:    make(map[string]OutboxMessage),
+		MessageProvenance: make(map[string]MessageProvenanceRecord),
+	}
+
+	rows, err := db.QueryContext(ctx, `
+SELECT id,
+       session_id,
+       turn_id,
+       teams_chat_id,
+       teams_message_id,
+       status,
+       created_at,
+       COALESCE(json_extract(json, '$.scope_id'), ''),
+       COALESCE(json_extract(json, '$.machine_id'), ''),
+       COALESCE(json_extract(json, '$.kind'), '')
+FROM outbox_messages
+WHERE status IN (?, ?) AND teams_chat_id <> '' AND teams_message_id <> ''`, string(OutboxStatusAccepted), string(OutboxStatusSent))
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	for rows.Next() {
+		var (
+			id, sessionID, turnID, chatID, messageID, status string
+			createdAt                                        int64
+			scopeID, machineID, kind                         sql.NullString
+		)
+		if err := rows.Scan(&id, &sessionID, &turnID, &chatID, &messageID, &status, &createdAt, &scopeID, &machineID, &kind); err != nil {
+			_ = rows.Close()
+			return GlobalOutboundSnapshot{}, err
+		}
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		created := sqliteGlobalOutboundTime(createdAt)
+		snapshot.OutboxMessages[id] = OutboxMessage{
+			ID:             id,
+			SessionID:      sessionID,
+			TurnID:         turnID,
+			TeamsChatID:    chatID,
+			TeamsMessageID: messageID,
+			ScopeID:        scopeID.String,
+			MachineID:      machineID.String,
+			Kind:           kind.String,
+			Status:         OutboxStatus(status),
+			CreatedAt:      created,
+			UpdatedAt:      created,
+			SentAt:         created,
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return GlobalOutboundSnapshot{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+
+	rows, err = db.QueryContext(ctx, `SELECT id, json FROM message_provenance WHERE origin = ? AND teams_chat_id <> '' AND teams_message_id <> ''`, MessageOriginHelperOutbox)
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return GlobalOutboundSnapshot{}, err
+		}
+		var record MessageProvenanceRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			_ = rows.Close()
+			return GlobalOutboundSnapshot{}, err
+		}
+		if strings.TrimSpace(record.ID) == "" {
+			record.ID = id
+		}
+		if strings.TrimSpace(record.ID) != "" {
+			snapshot.MessageProvenance[record.ID] = record
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return GlobalOutboundSnapshot{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func sqliteGlobalOutboundRuntimeProjectionReady(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (bool, error) {
+	var count int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_state WHERE key IN (?, ?, ?)`, sqliteRuntimeKeyScope, sqliteRuntimeKeyMachineIdentity, sqliteRuntimeKeyControlChat).Scan(&count)
+	return count == 3, err
+}
+
+func sqliteGlobalOutboundTime(value int64) time.Time {
+	if value == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, value).UTC()
 }
 
 func loadSQLiteWatchdogStateFileReadOnly(ctx context.Context, path string) (State, error) {
@@ -3721,6 +4044,9 @@ func loadSQLiteStateRows(ctx context.Context, db interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }) (State, error) {
+	if sqliteStateLoadTestHook != nil {
+		sqliteStateLoadTestHook()
+	}
 	state, err := loadSQLiteColdState(ctx, db)
 	if err != nil {
 		return State{}, err
@@ -8123,6 +8449,33 @@ func (s *Store) hasQueuedTurnsSQLite(ctx context.Context) (bool, bool, error) {
 		return nil
 	})
 	return hasQueued, handled, err
+}
+
+func (s *Store) hasUnfinishedTurnsSQLite(ctx context.Context) (bool, bool, error) {
+	hasUnfinished := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var exists int
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL("status")+` LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		hasUnfinished = exists == 1
+		return nil
+	})
+	return hasUnfinished, handled, err
 }
 
 func (s *Store) runningTurnSessionIDsSQLite(ctx context.Context) (map[string]bool, bool, error) {
@@ -12627,6 +12980,10 @@ func (s *Store) chatRateLimitSQLite(ctx context.Context, chatID string) (ChatRat
 }
 
 func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []ChatPollScheduleUpdate) (map[string]ChatPollState, bool, error) {
+	return s.updateChatPollSchedulesSQLiteWithCapability(ctx, updates, storeOwnerCapability{})
+}
+
+func (s *Store) updateChatPollSchedulesSQLiteWithCapability(ctx context.Context, updates []ChatPollScheduleUpdate, capability storeOwnerCapability) (map[string]ChatPollState, bool, error) {
 	out := make(map[string]ChatPollState, len(updates))
 	handled := false
 	err := s.withStateLock(ctx, func() error {
@@ -12644,6 +13001,16 @@ func (s *Store) updateChatPollSchedulesSQLite(ctx context.Context, updates []Cha
 		}
 		defer tx.Rollback()
 		state := State{SchemaVersion: SchemaVersion, ChatPolls: map[string]ChatPollState{}}
+		if capability.bound() {
+			lease, err := loadSQLiteControlLease(ctx, tx)
+			if err != nil {
+				return err
+			}
+			state.ControlLease = lease
+			if err := validateStoreOwnerCapability(&state, capability); err != nil {
+				return err
+			}
+		}
 		for _, update := range updates {
 			chatID := strings.TrimSpace(update.ChatID)
 			if chatID == "" {

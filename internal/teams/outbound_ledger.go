@@ -187,22 +187,26 @@ func (b *Bridge) globalOutboundBackfillItems(ctx context.Context) ([]globalOutbo
 	}
 	var out []globalOutboundItem
 	for _, path := range paths {
-		st, err := teamstore.Open(path)
+		// The current scope is already covered by the local MessageLookup and
+		// records every new accepted/sent message at the Graph boundary. The
+		// compatibility backfill exists for sibling scopes; excluding the current
+		// store avoids reopening its large state during the first poll.
+		if filepath.Clean(path) == filepath.Clean(b.store.Path()) {
+			continue
+		}
+		snapshot, err := teamstore.LoadPathGlobalOutboundReadOnly(ctx, path)
 		if err != nil {
 			return nil, err
 		}
-		state, loadErr := st.Load(ctx)
-		closeErr := st.Close()
-		if loadErr != nil {
-			return nil, loadErr
-		}
-		if closeErr != nil {
-			return nil, closeErr
+		state := teamstore.State{
+			Scope:           snapshot.Scope,
+			MachineIdentity: snapshot.MachineIdentity,
+			ControlChat:     snapshot.ControlChat,
 		}
 		if !b.globalOutboundBackfillStateMatches(state) {
 			continue
 		}
-		for _, msg := range state.OutboxMessages {
+		for _, msg := range snapshot.OutboxMessages {
 			switch msg.Status {
 			case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
 			default:
@@ -224,7 +228,7 @@ func (b *Bridge) globalOutboundBackfillItems(ctx context.Context) ([]globalOutbo
 				RecordedAt: firstNonZeroTime(msg.SentAt, msg.UpdatedAt, msg.CreatedAt),
 			})
 		}
-		for _, record := range state.MessageProvenance {
+		for _, record := range snapshot.MessageProvenance {
 			if strings.TrimSpace(record.Origin) != teamstore.MessageOriginHelperOutbox {
 				continue
 			}

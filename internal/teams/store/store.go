@@ -1715,6 +1715,11 @@ type ChatPollScheduleUpdate struct {
 	SetDeferredContinuationPath   bool
 	ClearDeferredContinuationPath bool
 	ResetFailures                 bool
+	// ExpectedPollRevision is an optional CAS fence for a schedule update
+	// assembled from a durable poll snapshot. It is not persisted as part of
+	// the schedule update; it only rejects a stale batch before any row changes.
+	ExpectedPollRevision    uint64 `json:"-"`
+	HasExpectedPollRevision bool   `json:"-"`
 }
 
 type FinalAnswerPollBoostRequest struct {
@@ -2226,6 +2231,7 @@ var (
 )
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
+var ErrChatPollRevisionChanged = errors.New("Teams chat poll revision changed")
 var ErrControlLeaseStatusUnknown = errors.New("Teams control lease status is unknown")
 
 // ErrControlLeaseStateUntrusted means the persisted lease cannot be safely
@@ -2637,6 +2643,76 @@ func LoadPathReadOnly(ctx context.Context, path string) (State, error) {
 	return loadStateData(data)
 }
 
+// GlobalOutboundSnapshot is the bounded subset of a scope store needed to
+// rebuild the cross-scope helper-outbound barrier. SQLite callers receive only
+// accepted/sent outbox identity rows and helper provenance rows; they do not
+// materialize inbound events, turns, sessions, or message bodies.
+//
+// JSON and older/incomplete SQLite stores retain the compatibility fallback
+// because they do not have enough durable indexed metadata to prove that a
+// narrow projection is complete.
+type GlobalOutboundSnapshot struct {
+	Scope             ScopeIdentity
+	MachineIdentity   MachineIdentity
+	ControlChat       ControlChatBinding
+	OutboxMessages    map[string]OutboxMessage
+	MessageProvenance map[string]MessageProvenanceRecord
+}
+
+// LoadPathGlobalOutboundReadOnly loads only the durable rows needed by the
+// cross-scope helper-outbound barrier. It is intentionally separate from
+// LoadPathReadOnly: callers rebuilding a compatibility ledger must not turn a
+// first poll into a full-state decode of a large SQLite store.
+func LoadPathGlobalOutboundReadOnly(ctx context.Context, path string) (GlobalOutboundSnapshot, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		var err error
+		path, err = DefaultPathReadOnly()
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return GlobalOutboundSnapshot{
+			OutboxMessages:    map[string]OutboxMessage{},
+			MessageProvenance: map[string]MessageProvenanceRecord{},
+		}, nil
+	}
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	if pointer, ok, err := storeSQLitePointerFromData(data); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	} else if ok {
+		store := &Store{path: path}
+		dbPath, err := store.storeSQLitePath(pointer)
+		if err != nil {
+			return GlobalOutboundSnapshot{}, err
+		}
+		return loadSQLiteGlobalOutboundSnapshotReadOnly(ctx, dbPath)
+	}
+	if backend, ok, err := unsupportedStateStorageBackendFromData(data); err != nil {
+		return GlobalOutboundSnapshot{}, err
+	} else if ok {
+		return GlobalOutboundSnapshot{}, fmt.Errorf("unsupported teams store backend %q", backend)
+	}
+	state, err := loadStateData(data)
+	if err != nil {
+		return GlobalOutboundSnapshot{}, err
+	}
+	return GlobalOutboundSnapshot{
+		Scope:             state.Scope,
+		MachineIdentity:   state.MachineIdentity,
+		ControlChat:       state.ControlChat,
+		OutboxMessages:    state.OutboxMessages,
+		MessageProvenance: state.MessageProvenance,
+	}, nil
+}
+
 // LoadPathOfflineRecoveryReadOnly loads a store after the caller has fenced
 // every writer and acquired the store-family locks. Unlike LoadPathReadOnly,
 // its SQLite connection uses mode=rw so SQLite may rebuild a missing SHM index
@@ -2683,12 +2759,13 @@ func LoadPathOfflineRecoveryReadOnly(ctx context.Context, path string) (State, e
 // It deliberately excludes sessions, turns, inbound events, outbox messages,
 // and every other unbounded business-data collection.
 type RuntimeMetadata struct {
-	Scope          ScopeIdentity      `json:"scope"`
-	ControlChat    ControlChatBinding `json:"control_chat"`
-	ServiceOwner   *OwnerMetadata     `json:"service_owner,omitempty"`
-	LockOwner      *OwnerMetadata     `json:"lock_owner,omitempty"`
-	ControlLease   ControlLease       `json:"control_lease"`
-	ServiceControl ServiceControl     `json:"service_control"`
+	Scope           ScopeIdentity      `json:"scope"`
+	MachineIdentity MachineIdentity    `json:"machine_identity"`
+	ControlChat     ControlChatBinding `json:"control_chat"`
+	ServiceOwner    *OwnerMetadata     `json:"service_owner,omitempty"`
+	LockOwner       *OwnerMetadata     `json:"lock_owner,omitempty"`
+	ControlLease    ControlLease       `json:"control_lease"`
+	ServiceControl  ServiceControl     `json:"service_control"`
 }
 
 // LoadPathRuntimeMetadataReadOnly reads only the bounded runtime metadata from
@@ -2872,6 +2949,8 @@ func loadJSONRuntimeMetadataReadOnly(ctx context.Context, path string) (RuntimeM
 		switch key {
 		case "scope":
 			err = decoder.Decode(&metadata.Scope)
+		case "machine_identity":
+			err = decoder.Decode(&metadata.MachineIdentity)
 		case "control_chat":
 			err = decoder.Decode(&metadata.ControlChat)
 		case "service_owner":
@@ -3505,6 +3584,27 @@ func (s *Store) HasQueuedTurns(ctx context.Context) (bool, error) {
 	}
 	for _, turn := range state.Turns {
 		if turn.Status == TurnStatusQueued {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// HasUnfinishedTurns reports whether startup recovery has any queued, running,
+// or otherwise non-terminal turn to inspect. SQLite answers this from the
+// indexed status column so a clean restart does not decode every historical
+// turn and inbound event just to discover that there is nothing to recover.
+func (s *Store) HasUnfinishedTurns(ctx context.Context) (bool, error) {
+	if hasUnfinished, handled, err := s.hasUnfinishedTurnsSQLite(ctx); handled || err != nil {
+		return hasUnfinished, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns"))
+	if err != nil {
+		return false, err
+	}
+	for _, turn := range state.Turns {
+		if turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning ||
+			(strings.TrimSpace(string(turn.Status)) != "" && !knownTurnStatus(turn.Status)) {
 			return true, nil
 		}
 	}
@@ -6412,12 +6512,66 @@ func (s *Store) ReadControl(ctx context.Context) (ServiceControl, error) {
 	return state.ServiceControl, nil
 }
 
+// ReadScope returns the bounded scope identity used by listener startup.
+// SQLite reads the runtime projection instead of decoding business tables;
+// legacy JSON keeps the compatibility loader.
+func (s *Store) ReadScope(ctx context.Context) (ScopeIdentity, error) {
+	if scope, handled, err := s.readScopeSQLite(ctx); handled || err != nil {
+		return scope, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet())
+	if err != nil {
+		return ScopeIdentity{}, err
+	}
+	return state.Scope, nil
+}
+
+// IsSQLite reports the current storage backend without loading business data.
+// It selects bounded SQLite startup paths while retaining legacy JSON behavior.
+func (s *Store) IsSQLite(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var sqlite bool
+	err := s.withStateLock(ctx, func() error {
+		_, ok, err := s.currentSQLitePointerUnlocked()
+		sqlite = ok
+		return err
+	})
+	return sqlite, err
+}
+
+// SessionContexts returns the durable session projection without materializing
+// turns, inbound events, outbox rows, or other unbounded tables. SQLite uses
+// its session table; legacy JSON keeps the compatibility loader.
+func (s *Store) SessionContexts(ctx context.Context) (map[string]SessionContext, error) {
+	if sessions, handled, err := s.sessionContextsSQLite(ctx); handled || err != nil {
+		return sessions, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("sessions"))
+	if err != nil {
+		return nil, err
+	}
+	return state.Sessions, nil
+}
+
 func (s *Store) RecordScope(ctx context.Context, scope ScopeIdentity) (ScopeIdentity, error) {
 	scope = normalizeScope(scope)
 	if scope.ID == "" {
 		return ScopeIdentity{}, fmt.Errorf("scope id is required")
 	}
 	var out ScopeIdentity
+	if current, handled, err := s.readScopeSQLite(ctx); handled || err != nil {
+		if err != nil {
+			return out, err
+		}
+		if current.ID != "" && current.ID != scope.ID {
+			return out, fmt.Errorf("Teams state belongs to scope %q, not %q", current.ID, scope.ID)
+		}
+		if current.ID != "" && scopeClaimMatchesStored(current, scope) && !current.CreatedAt.IsZero() && !current.UpdatedAt.IsZero() {
+			return current, nil
+		}
+	}
 	err := s.Update(ctx, func(state *State) error {
 		now := time.Now()
 		current := state.Scope
@@ -15395,6 +15549,54 @@ func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollS
 	return out, nil
 }
 
+// UpdateChatPollSchedulesForOwner applies a bounded schedule batch under one
+// control-lease fence. Each update may also carry an expected poll revision;
+// if any row is stale the whole batch is rejected before a row is committed.
+// The callback-free API keeps external I/O out of the transaction and gives
+// JSON and SQLite stores the same all-or-nothing semantics.
+func (s *Store) UpdateChatPollSchedulesForOwner(ctx context.Context, updates []ChatPollScheduleUpdate, machineID string, leaseGeneration int64) (map[string]ChatPollState, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return nil, err
+	}
+	if len(updates) == 0 {
+		return map[string]ChatPollState{}, nil
+	}
+	if out, handled, err := s.updateChatPollSchedulesSQLiteWithCapability(ctx, updates, capability); handled || err != nil {
+		return out, err
+	}
+	out := make(map[string]ChatPollState, len(updates))
+	err = s.Update(ctx, func(state *State) error {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return err
+		}
+		now := time.Now()
+		nextOut := make(map[string]ChatPollState, len(updates))
+		changed := false
+		for _, update := range updates {
+			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(state, update, now)
+			if err != nil {
+				return err
+			}
+			if updateChanged {
+				invalidateChatPollAttempt(&poll)
+				state.ChatPolls[poll.ChatID] = poll
+			}
+			nextOut[poll.ChatID] = poll
+			changed = changed || updateChanged
+		}
+		out = nextOut
+		if !changed {
+			return errStoreNoChange
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) BoostChatPollAfterFinalAnswer(ctx context.Context, req FinalAnswerPollBoostRequest) (ChatPollState, bool, error) {
 	req.SessionID = strings.TrimSpace(req.SessionID)
 	req.TeamsChatID = strings.TrimSpace(req.TeamsChatID)
@@ -15512,6 +15714,9 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 		return ChatPollState{}, false, fmt.Errorf("chat id is required")
 	}
 	poll := state.ChatPolls[chatID]
+	if update.HasExpectedPollRevision && poll.PollRevision != update.ExpectedPollRevision {
+		return poll, false, ErrChatPollRevisionChanged
+	}
 	changed := false
 	if poll.ChatID != chatID {
 		poll.ChatID = chatID
