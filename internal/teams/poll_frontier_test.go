@@ -1781,7 +1781,7 @@ func TestPollFrontierInvalidContinuationPageOpensGapWithoutAdvancingCursor(t *te
 		t.Fatalf("load continuation poll: ok=%v err=%v", ok, err)
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	if _, err := bridge.pollChatWithRoleStateOptions(ctx, chatID, 20, inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{}, nil); !errors.Is(err, errGraphMessagePageInvalid) {
+	if _, err := bridge.pollChatWithRoleStateOptions(ctx, chatID, 20, inboundPollRoleWork, false, poll, true, pollChatWithRoleOptions{AllowBacklogDrain: true}, nil); !errors.Is(err, errGraphMessagePageInvalid) {
 		t.Fatalf("invalid continuation poll error = %v, want invalid-page classification", err)
 	}
 	got, ok, err := store.ChatPoll(ctx, chatID)

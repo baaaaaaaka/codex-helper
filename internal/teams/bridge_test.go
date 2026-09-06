@@ -20320,6 +20320,31 @@ func TestBridgePollDropsGlobalOutboundFromSiblingScope(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Queue old sent outbox: %v", err)
 	}
+	if _, _, err := oldStore.PersistInbound(ctx, teamstore.InboundEvent{
+		ID:             "inbound:unrelated-corrupt",
+		TeamsChatID:    "chat-1",
+		TeamsMessageID: "unrelated-user-message",
+		Status:         teamstore.InboundStatusPersisted,
+	}); err != nil {
+		t.Fatalf("Persist unrelated old inbound: %v", err)
+	}
+	if _, err := oldStore.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("Migrate old store to SQLite: %v", err)
+	}
+	if err := oldStore.Close(); err != nil {
+		t.Fatalf("Close old store before bounded backfill: %v", err)
+	}
+	oldDB, err := sql.Open("sqlite", filepath.Join(filepath.Dir(oldStore.Path()), teamstore.SQLiteFileName))
+	if err != nil {
+		t.Fatalf("Open old SQLite projection: %v", err)
+	}
+	if _, err := oldDB.ExecContext(ctx, `UPDATE inbound_events SET json = '{broken-inbound' WHERE id = ?`, "inbound:unrelated-corrupt"); err != nil {
+		_ = oldDB.Close()
+		t.Fatalf("Corrupt unrelated old inbound: %v", err)
+	}
+	if err := oldDB.Close(); err != nil {
+		t.Fatalf("Close old SQLite projection: %v", err)
+	}
 	if _, err := currentStore.RecordChatPollSuccess(ctx, "chat-1", time.Date(2026, 5, 22, 11, 0, 0, 0, time.UTC), true, false, 1); err != nil {
 		t.Fatalf("Record current poll: %v", err)
 	}
@@ -40609,6 +40634,77 @@ func TestBridgeMigrateRegistryProjectionSkipsSentOnlyRegistryHistoryStoreWrite(t
 	}
 	if !bridge.reg.HasSent("legacy-sent-chat-00", "legacy-sent-00-000") {
 		t.Fatalf("registry sent history was not retained for local dedupe: %#v", bridge.reg.Chats["legacy-sent-chat-00"])
+	}
+}
+
+func TestBridgeExistingSQLiteStartupPathsSkipCorruptBusinessHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+
+	// The first registry projection is intentionally performed on the legacy
+	// JSON backend. This preserves the real cutover order: registry state is
+	// included before the SQLite pointer becomes authoritative.
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("legacy migrateRegistryProjectionToStore: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		now := time.Now()
+		state.InboundEvents["startup-corrupt-inbound"] = teamstore.InboundEvent{
+			ID:             "startup-corrupt-inbound",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "startup-corrupt-message",
+			Status:         teamstore.InboundStatusPersisted,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.OutboxMessages["startup-corrupt-outbox"] = teamstore.OutboxMessage{
+			ID:             "startup-corrupt-outbox",
+			SessionID:      "s001",
+			TeamsChatID:    "chat-1",
+			TeamsMessageID: "startup-corrupt-sent",
+			Kind:           "final",
+			Status:         teamstore.OutboxStatusSent,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed startup business history: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate startup fixture to SQLite: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName))
+	if err != nil {
+		t.Fatalf("open SQLite startup fixture: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE inbound_events SET json = '{broken-inbound' WHERE id = ?`, "startup-corrupt-inbound"); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt inbound history: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = ?`, "startup-corrupt-outbox"); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt outbox history: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close SQLite startup fixture: %v", err)
+	}
+
+	if err := bridge.restoreRegistryFromStore(ctx); err != nil {
+		t.Fatalf("restoreRegistryFromStore should use bounded SQLite projections: %v", err)
+	}
+	if err := bridge.migrateRegistryProjectionToStore(ctx); err != nil {
+		t.Fatalf("migrateRegistryProjectionToStore should skip authoritative SQLite: %v", err)
+	}
+	if err := bridge.completeExpiredHelperUpgradeDrainOnStart(ctx); err != nil {
+		t.Fatalf("completeExpiredHelperUpgradeDrainOnStart should not load business history: %v", err)
+	}
+	if bridge.reg.SessionByID("s001") == nil {
+		t.Fatalf("bounded registry restore lost durable session: %#v", bridge.reg.Sessions)
 	}
 }
 

@@ -2573,7 +2573,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		if hasPoll && strings.TrimSpace(poll.PollState) == inboundPollStateParked &&
 			!poll.ParkNoticeSentAt.IsZero() && poll.ParkedAt.IsZero() {
 			if update, ok := explicitParkedWorkPollMaintenanceUpdate(session.ChatID, poll); ok {
-				pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+				pendingScheduleUpdates = append(pendingScheduleUpdates, bindInboundPollScheduleRevision(update, poll, hasPoll))
 				poll = applyLocalParkedPollMaintenance(poll)
 				pollsByChat[session.ChatID] = poll
 			}
@@ -2590,7 +2590,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		if decision.ShouldPark {
 			if durableCandidatesHandled {
 				if update, ok := durableAutoParkHandoffScheduleUpdate(decision); ok {
-					pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+					pendingScheduleUpdates = append(pendingScheduleUpdates, bindInboundPollScheduleRevision(update, poll, hasPoll))
 				}
 				continue
 			}
@@ -2614,7 +2614,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 		if !decision.Due {
 			if !inboundPollDecisionAlreadyPersisted(poll, hasPoll, decision) {
 				if update, ok := inboundPollDecisionScheduleUpdate(decision); ok {
-					pendingScheduleUpdates = append(pendingScheduleUpdates, update)
+					pendingScheduleUpdates = append(pendingScheduleUpdates, bindInboundPollScheduleRevision(update, poll, hasPoll))
 				}
 			}
 			continue
@@ -2655,8 +2655,18 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 				}
 				s := session
 				turns := queueStateBySession[s.ID]
+				allowBacklogDrain := decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0
+				// An old operational frontier is real work even when the idle
+				// scheduler classifies the chat as cold/parkable.  Let the normal
+				// poll quantum reconcile it before auto-park; otherwise a cold chat
+				// can retain an executable continuation forever.  Active or queued
+				// work still keeps the plain continuation deferred, while pending
+				// pages and gaps remain recoverable in the poll path itself.
+				if !allowBacklogDrain && pollPageHasOperationalFrontier(pollsByChat[s.ChatID]) && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0 {
+					allowBacklogDrain = true
+				}
 				pollOptions := pollChatWithRoleOptions{
-					AllowBacklogDrain:        decision.State != inboundPollStateCold && !runningBySession[s.ID] && !turns.Running && turns.Queued == 0,
+					AllowBacklogDrain:        allowBacklogDrain,
 					MaxBacklogActions:        1,
 					RecoverStaleContinuation: true,
 					ParkedProbe:              decision.ParkedProbe,
@@ -3405,6 +3415,36 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 	}
 	poll = fresh
 	hasPoll = freshHasPoll
+	if role == inboundPollRoleWork && !opts.AllowBacklogDrain && poll.Attempt == nil && poll.PendingPage == nil && poll.Gap == nil && strings.TrimSpace(poll.ContinuationPath) != "" {
+		// A cold/queued/running chat must not consume an old opaque
+		// continuation merely because the scheduler selected it. Pending pages
+		// and directional gaps remain safety-critical and are deliberately not
+		// deferred here. Keep the continuation durable and schedule a bounded
+		// retry so this path cannot spin once per main-loop cycle.
+		deferInterval := inboundPollWarmInterval
+		switch {
+		case running || poll.PollState == inboundPollStateRunning:
+			deferInterval = inboundPollRunningInterval
+		case poll.PollState == inboundPollStateCold:
+			deferInterval = inboundPollColdInterval
+		case poll.PollState == inboundPollStateCool:
+			deferInterval = inboundPollCoolInterval
+		}
+		deferUpdate := teamstore.ChatPollScheduleUpdate{
+			ChatID:                  strings.TrimSpace(chatID),
+			PollState:               strings.TrimSpace(poll.PollState),
+			NextPollAt:              time.Now().Add(deferInterval),
+			ExpectedPollRevision:    poll.PollRevision,
+			HasExpectedPollRevision: true,
+		}
+		if err := b.updateChatPollScheduleForCurrentOwner(ctx, deferUpdate); err != nil {
+			if errors.Is(err, teamstore.ErrChatPollRevisionChanged) {
+				return false, nil
+			}
+			return false, pollStoreFailure(err)
+		}
+		return false, nil
+	}
 	frontier, requestPath, modifiedAfter := pollPageRequestForState(chatID, top, role, poll)
 	if poll.PendingPage != nil {
 		frontier = strings.TrimSpace(poll.PendingPage.Frontier)
@@ -4808,28 +4848,20 @@ func (b *Bridge) persistInboundPollScheduleUpdates(ctx context.Context, updates 
 		return nil
 	}
 	if capability, ok := teamsOwnerCapabilityFromContext(ctx); ok {
-		for _, update := range updates {
-			if err := func() error {
-				_, err := b.store.UpdateChatPollScheduleForOwner(ctx, update, capability.Owner.MachineID, capability.Owner.LeaseGeneration)
-				return err
-			}(); err != nil {
-				return err
-			}
+		_, err := b.store.UpdateChatPollSchedulesForOwner(ctx, updates, capability.Owner.MachineID, capability.Owner.LeaseGeneration)
+		if errors.Is(err, teamstore.ErrChatPollRevisionChanged) {
+			return nil
 		}
-		return nil
+		return err
 	}
 	if b.currentLeaseGeneration() > 0 {
 		machineID := b.machine.ID
 		leaseGeneration := b.currentLeaseGeneration()
-		for _, update := range updates {
-			if err := func() error {
-				_, err := b.store.UpdateChatPollScheduleForOwner(ctx, update, machineID, leaseGeneration)
-				return err
-			}(); err != nil {
-				return err
-			}
+		_, err := b.store.UpdateChatPollSchedulesForOwner(ctx, updates, machineID, leaseGeneration)
+		if errors.Is(err, teamstore.ErrChatPollRevisionChanged) {
+			return nil
 		}
-		return nil
+		return err
 	}
 	_, err := b.store.UpdateChatPollSchedules(ctx, updates)
 	return err
@@ -4849,6 +4881,14 @@ func inboundPollDecisionScheduleUpdate(decision inboundPollDecision) (teamstore.
 		ClearBlockedUntil: decision.State != inboundPollStateBlocked && decision.BlockedUntil.IsZero(),
 		ResetFailures:     decision.State == inboundPollStateParked,
 	}, true
+}
+
+func bindInboundPollScheduleRevision(update teamstore.ChatPollScheduleUpdate, poll teamstore.ChatPollState, hasPoll bool) teamstore.ChatPollScheduleUpdate {
+	if hasPoll {
+		update.ExpectedPollRevision = poll.PollRevision
+		update.HasExpectedPollRevision = true
+	}
+	return update
 }
 
 func durableAutoParkHandoffScheduleUpdate(decision inboundPollDecision) (teamstore.ChatPollScheduleUpdate, bool) {
@@ -8486,6 +8526,18 @@ func (b *Bridge) completeExpiredHelperUpgradeDrainOnStart(ctx context.Context) e
 	if b == nil || b.store == nil {
 		return nil
 	}
+	// The common startup path has no upgrade to repair. Read only the durable
+	// upgrade projection first so an already-migrated SQLite store does not
+	// decode turns, inbound history, or outbox history just to discover that.
+	upgrade, found, err := b.store.ReadUpgrade(ctx)
+	if err != nil {
+		return err
+	}
+	if !found || upgrade.Reason != teamstore.HelperUpgradeReason ||
+		upgrade.Phase == teamstore.UpgradePhaseCompleted ||
+		upgrade.Phase == teamstore.UpgradePhaseAborted {
+		return nil
+	}
 	state, err := b.store.UpgradeBlockingStateSnapshot(ctx)
 	if err != nil {
 		return err
@@ -10571,14 +10623,24 @@ func (b *Bridge) restoreMachineHostnameOverrideFromStore(ctx context.Context) er
 	if sanitizeMachineHostnameOverride(os.Getenv(envTeamsMachineLabel)) != "" {
 		return nil
 	}
-	state, err := b.store.Load(ctx)
+	metadata, err := teamstore.LoadPathRuntimeMetadataReadOnly(ctx, b.store.Path())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(state.MachineIdentity.ID) == "" || strings.TrimSpace(state.MachineIdentity.ID) != strings.TrimSpace(b.machine.ID) {
+	if strings.TrimSpace(metadata.MachineIdentity.ID) == "" || strings.TrimSpace(metadata.MachineIdentity.ID) != strings.TrimSpace(b.machine.ID) {
 		return nil
 	}
-	storedLabel := sanitizeMachineHostnameOverride(state.MachineIdentity.Label)
+	// Older stores and focused fixtures may have a durable machine identity
+	// before the top-level scope projection was written. The machine binding is
+	// the original restore guard; only enforce ScopeID when both sides carry it,
+	// preserving compatibility without accepting a foreign machine identity.
+	if storedScopeID := strings.TrimSpace(metadata.MachineIdentity.ScopeID); storedScopeID != "" && strings.TrimSpace(b.scope.ID) != "" && storedScopeID != strings.TrimSpace(b.scope.ID) {
+		return nil
+	}
+	storedLabel := sanitizeMachineHostnameOverride(metadata.MachineIdentity.Label)
 	currentLabel := sanitizeMachineHostnameOverride(b.machine.Label)
 	if storedLabel == "" || storedLabel == currentLabel {
 		return nil
@@ -11303,6 +11365,20 @@ func (b *Bridge) appendModelProfileRuntimeWarning(ctx context.Context, body stri
 func (b *Bridge) recoverUnfinishedTurns(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
+	}
+	if sqlite, err := b.store.IsSQLite(ctx); err != nil {
+		return err
+	} else if sqlite {
+		hasUnfinished, err := b.store.HasUnfinishedTurns(ctx)
+		if err != nil {
+			return err
+		}
+		if !hasUnfinished {
+			// The interrupted-notice pass checks its own durable marker. It does
+			// not need the large inbound projection when there is no queued,
+			// running, or unknown-status turn to recover.
+			return b.sendDeferredInterruptedTurnNoticesNow(ctx)
+		}
 	}
 	// Startup recovery needs the session projection to resolve durable turns
 	// that are not present in the in-memory registry, plus inbound events for
@@ -16221,21 +16297,25 @@ func (b *Bridge) shouldDeferTeamsStoreSQLiteMigration(ctx context.Context) (bool
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	state, err := b.store.Load(ctx)
+	control, err := b.store.ReadControl(ctx)
 	if err != nil {
 		return false, err
 	}
-	if state.ServiceControl.Draining {
-		switch strings.TrimSpace(state.ServiceControl.Reason) {
+	if control.Draining {
+		switch strings.TrimSpace(control.Reason) {
 		case teamstore.HelperUpgradeReason, teamstore.HelperReloadReason:
 			return true, nil
 		}
 	}
-	if state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
-		switch state.Upgrade.Phase {
+	upgrade, found, err := b.store.ReadUpgrade(ctx)
+	if err != nil {
+		return false, err
+	}
+	if found && strings.TrimSpace(upgrade.ID) != "" {
+		switch upgrade.Phase {
 		case teamstore.UpgradePhaseCompleted, teamstore.UpgradePhaseAborted:
 		default:
-			if strings.TrimSpace(state.Upgrade.Reason) == teamstore.HelperUpgradeReason {
+			if strings.TrimSpace(upgrade.Reason) == teamstore.HelperUpgradeReason {
 				return true, nil
 			}
 		}
@@ -16752,9 +16832,31 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
-	state, err := b.store.Load(ctx)
+	var state teamstore.State
+	sqlite, err := b.store.IsSQLite(ctx)
 	if err != nil {
 		return err
+	}
+	if sqlite {
+		// Once the SQLite pointer is published, SQLite is authoritative. The
+		// registry is a bounded compatibility/cache projection; rebuilding its
+		// seen/sent ledgers from every durable inbound/outbox row would turn
+		// listener startup back into an O(history) decode. Poll classification
+		// consults durable MessageLookup for a registry miss.
+		metadata, err := teamstore.LoadPathRuntimeMetadataReadOnly(ctx, b.store.Path())
+		if err != nil {
+			return err
+		}
+		state.ControlChat = metadata.ControlChat
+		state.Sessions, err = b.store.SessionContexts(ctx)
+		if err != nil {
+			return err
+		}
+	} else {
+		state, err = b.store.Load(ctx)
+		if err != nil {
+			return err
+		}
 	}
 	changed := false
 	if b.reg.UserID == "" && b.user.ID != "" {
@@ -16787,16 +16889,18 @@ func (b *Bridge) restoreRegistryFromStore(ctx context.Context) error {
 	if reconcileRegistrySessionsFromStore(&b.reg, state) {
 		changed = true
 	}
-	for _, inbound := range state.InboundEvents {
-		if inbound.TeamsChatID != "" && inbound.TeamsMessageID != "" && !b.reg.HasSeen(inbound.TeamsChatID, inbound.TeamsMessageID) {
-			b.markRegistrySeen(inbound.TeamsChatID, inbound.TeamsMessageID)
-			changed = true
+	if !sqlite {
+		for _, inbound := range state.InboundEvents {
+			if inbound.TeamsChatID != "" && inbound.TeamsMessageID != "" && !b.reg.HasSeen(inbound.TeamsChatID, inbound.TeamsMessageID) {
+				b.markRegistrySeen(inbound.TeamsChatID, inbound.TeamsMessageID)
+				changed = true
+			}
 		}
-	}
-	for _, outbox := range state.OutboxMessages {
-		if outbox.TeamsChatID != "" && outbox.TeamsMessageID != "" && outbox.Status == teamstore.OutboxStatusSent && !b.reg.HasSent(outbox.TeamsChatID, outbox.TeamsMessageID) {
-			b.markRegistrySent(outbox.TeamsChatID, outbox.TeamsMessageID)
-			changed = true
+		for _, outbox := range state.OutboxMessages {
+			if outbox.TeamsChatID != "" && outbox.TeamsMessageID != "" && outbox.Status == teamstore.OutboxStatusSent && !b.reg.HasSent(outbox.TeamsChatID, outbox.TeamsMessageID) {
+				b.markRegistrySent(outbox.TeamsChatID, outbox.TeamsMessageID)
+				changed = true
+			}
 		}
 	}
 	if changed {
@@ -16933,6 +17037,18 @@ func (b *Bridge) migrateRegistryProjectionToStore(ctx context.Context) error {
 	}
 	if err := b.restoreMachineHostnameOverrideFromStore(ctx); err != nil {
 		return err
+	}
+	// The registry-to-store projection runs before the legacy JSON state is
+	// published as the authoritative SQLite pointer during first migration.
+	// Once that pointer exists, SQLite already contains the projection and is
+	// authoritative; replaying the registry would only turn every restart into
+	// a full-state write and could reintroduce the startup O(history) scan.
+	sqlite, err := b.store.IsSQLite(ctx)
+	if err != nil {
+		return err
+	}
+	if sqlite {
+		return nil
 	}
 	if b.reg.ControlChatID == "" && len(b.reg.Sessions) == 0 && len(b.reg.Chats) == 0 {
 		return nil
