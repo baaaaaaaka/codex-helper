@@ -1651,7 +1651,37 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	// below still detects a genuinely wedged listener.
 	options.PhaseBudget = mainLoopPhaseBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	// The listener deliberately remains continuous, and final-answer delivery
+	// enables the production fast-poll interval.  On a slow Windows race
+	// runner, the next legitimate head attempt can therefore be staged between
+	// the terminal-state wait below and the final diagnostic Load, making a
+	// clean frontier look like a stranded continuation.  Pause only at a
+	// completed cycle after both finals and the clean durable frontier are
+	// observed; this preserves the real listener lifecycle while making the
+	// terminal assertion independent of the next-cycle scheduling window.
+	cycleBoundary := make(chan struct{})
+	cycleRelease := make(chan struct{})
+	var cycleBoundaryOnce sync.Once
+	var cycleReleaseOnce sync.Once
+	releaseCycle := func() {
+		cycleReleaseOnce.Do(func() { close(cycleRelease) })
+	}
+	bridge.mainLoopCycleDoneHook = func() {
+		if countListenerRecoveryTranscriptFinals(graphState.sentSnapshot(), "LISTENER_RECOVERY_STATEFUL_FINAL") < 2 {
+			return
+		}
+		poll, found, err := store.ChatPoll(context.Background(), chatID)
+		if err != nil || !found || poll.PendingPage != nil || poll.Attempt != nil ||
+			strings.TrimSpace(poll.ContinuationPath) != "" || poll.Gap != nil {
+			return
+		}
+		cycleBoundaryOnce.Do(func() { close(cycleBoundary) })
+		<-cycleRelease
+	}
 	listener := startListenerRecovery(t, bridge, options)
+	// Register this after startListenerRecovery so cleanup releases the hook
+	// before the listener's own stop cleanup waits for the goroutine.
+	t.Cleanup(releaseCycle)
 	select {
 	case <-executor.called:
 	case <-time.After(listenerRecoveryExtendedProgressTimeout):
@@ -1737,6 +1767,11 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		poll := state.ChatPolls[chatID]
 		t.Fatalf("stateful durable poll completion did not complete; calls=%#v; sent=%#v; poll=%+v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), poll, bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
+	select {
+	case <-cycleBoundary:
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+		t.Fatalf("stateful listener did not reach a completed-cycle terminal boundary; calls=%#v; sent=%#v; requests=%v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot())
+	}
 	requests := graphState.requestsSnapshot()
 	headQuerySeen := false
 	continuationSeen := false
@@ -1779,6 +1814,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	if errs := graphState.errorsSnapshot(); len(errs) > 0 {
 		t.Fatalf("stateful fake Graph errors: %v", errs)
 	}
+	releaseCycle()
 	listener.stop(t)
 }
 
