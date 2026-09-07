@@ -3027,7 +3027,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 		teamsProof := linkedTranscriptRootReleaseTeamsProof(context.Background(), store, *session, probe.RootReleaseWitness)
 		sourceProof := transcriptRootReleaseWitnessMatchesSource(path, checkpoint, probe.RootReleaseWitness)
 		listener.stop(t)
-		t.Fatalf("task_started/prompt race did not recover; checkpoint=%#v pending=%+v probe=%#v probeErr=%v teamsProof=%t sourceProof=%t turns=%#v sent=%#v phase=%#v", checkpoint, checkpoint.PendingHistoryRange, probe, probeErr, teamsProof, sourceProof, state.Turns, graphState.sentSnapshot(), bridge.mainLoopPhaseStatsSnapshot("linked-transcript"))
+		t.Fatalf("task_started/prompt race did not recover; checkpoint=%#v pending=%+v probe=%#v probeErr=%v teamsProof=%t sourceProof=%t turns=%#v outbox=%#v transcriptDeliveries=%#v sent=%#v phase=%#v", checkpoint, checkpoint.PendingHistoryRange, probe, probeErr, teamsProof, sourceProof, state.Turns, state.OutboxMessages, state.TranscriptDeliveries, graphState.sentSnapshot(), bridge.mainLoopPhaseStatsSnapshot("linked-transcript"))
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {
