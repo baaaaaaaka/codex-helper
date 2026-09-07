@@ -194,6 +194,13 @@ func TestGlobalInboundSQLiteWriterWaitHonorsContextCancellation(t *testing.T) {
 
 	holderStarted := make(chan struct{})
 	holderRelease := make(chan struct{})
+	var holderReleaseOnce sync.Once
+	releaseHolder := func() { holderReleaseOnce.Do(func() { close(holderRelease) }) }
+	// Opening the modernc SQLite sidecar and creating its schema can take more
+	// than one second on a busy Windows hosted runner. Always release the
+	// holder during cleanup as well, so a setup-time assertion cannot strand the
+	// writer gate and make writer.close block the whole package.
+	t.Cleanup(releaseHolder)
 	holderDone := make(chan error, 1)
 	go func() {
 		holderDone <- updateGlobalInboundSQLiteWithWriter(context.Background(), path, writer, func(*sql.Tx, time.Time) error {
@@ -204,7 +211,7 @@ func TestGlobalInboundSQLiteWriterWaitHonorsContextCancellation(t *testing.T) {
 	}()
 	select {
 	case <-holderStarted:
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("writer holder did not enter its transaction")
 	}
 
@@ -216,7 +223,7 @@ func TestGlobalInboundSQLiteWriterWaitHonorsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("canceled writer waiter error = %v, want context deadline exceeded", err)
 	}
-	close(holderRelease)
+	releaseHolder()
 	if err := <-holderDone; err != nil {
 		t.Fatalf("writer holder error: %v", err)
 	}

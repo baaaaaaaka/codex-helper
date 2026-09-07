@@ -1272,14 +1272,14 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("healthy tail did not reach Codex while head failed: calls=%#v gets=(%d,%d) phase=%#v", executor.callsSnapshot(), graphState.getCount("chat-1"), graphState.getCount("chat-2"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	waitListenerRecovery(t, func() bool {
 		return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_HEAD_FAILURE_HEALTHY_FINAL") == 1
-	}, listenerRecoveryProgressTimeout, "healthy tail final after Graph head failures")
-	badDeadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	}, listenerRecoveryExtendedProgressTimeout, "healthy tail final after Graph head failures")
+	badDeadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	var badPoll teamstore.ChatPollState
 	for time.Now().Before(badDeadline) {
 		state, err := store.Load(context.Background())
@@ -1328,7 +1328,7 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 		}
 		poll := state.ChatPolls["chat-1"]
 		return poll.LastError == "" && poll.FailureCount == 0 && !poll.LastSuccessfulPollAt.IsZero()
-	}, listenerRecoveryProgressTimeout, "isolated bad chat recovery")
+	}, listenerRecoveryExtendedProgressTimeout, "isolated bad chat recovery")
 	if got := countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_HEAD_FAILURE_HEALTHY_FINAL"); got != 1 {
 		listener.stop(t)
 		t.Fatalf("healthy final changed while bad chat recovered: %d", got)

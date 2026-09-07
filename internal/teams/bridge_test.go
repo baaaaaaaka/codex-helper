@@ -36874,7 +36874,11 @@ func TestBridgeStartsTeamsPromptWhenOnlyRecentTeamsTranscriptTailLooksActive(t *
 	}
 	executor.release <- struct{}{}
 	waitForCompletedTurnCount(t, store, session.ID, 1)
-	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+	// The async worker may return after Graph has durably accepted the final but
+	// before the listener's ordinary outbox phase promotes Accepted to Sent.
+	// Reconcile that local-only boundary explicitly; this never issues another
+	// POST because the Graph identity is already durable.
+	waitForNoActiveTurnsOrOutboxAfterFlush(t, bridge, store, session.ID, session.ChatID)
 	waitForBridgeAsyncTurns(t, bridge)
 }
 
