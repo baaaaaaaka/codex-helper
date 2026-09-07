@@ -3310,6 +3310,7 @@ func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
 				poll.Seeded = true
 				poll.PollState = chatPollStateWarm
 				poll.NextPollAt = time.Now()
+				poll.ContinuationPath = "/chats/chat-attempt/messages?$skiptoken=one"
 				return nil
 			}); err != nil || !changed {
 				t.Fatalf("seed attempt poll: changed=%v err=%v", changed, err)
@@ -3345,6 +3346,7 @@ func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
 					ReceiptID:   "receipt-attempt",
 					ChatID:      "chat-attempt",
 					RequestPath: "/chats/chat-attempt/messages?$skiptoken=one",
+					Frontier:    "continuation",
 				}
 				return nil
 			})
@@ -3385,6 +3387,208 @@ func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
 			poll, ok, err := reopened.ChatPoll(ctx, "chat-attempt")
 			if err != nil || !ok || poll.Attempt != nil || poll.PendingPage == nil {
 				t.Fatalf("reopened attempt state = %#v ok=%v err=%v", poll, ok, err)
+			}
+		})
+	}
+}
+
+func TestChatPollAttemptRejectsExpectedFrontierMismatch(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			const chatID = "chat-expected-frontier"
+			const path = "/chats/chat-expected-frontier/messages?$skiptoken=durable"
+			if _, _, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.ContinuationPath = path
+				return nil
+			}); err != nil {
+				t.Fatalf("seed durable continuation: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			poll, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "owner-frontier", ProcessIncarnation: "process-frontier",
+				ExpectedFrontier: "continuation:/chats/chat-expected-frontier/messages?$skiptoken=other",
+				Now:              time.Now().UTC(),
+			})
+			if err != nil {
+				t.Fatalf("begin with mismatched frontier: %v", err)
+			}
+			if acquired || poll.Attempt != nil {
+				t.Fatalf("mismatched frontier acquired attempt: acquired=%v poll=%#v", acquired, poll)
+			}
+		})
+	}
+}
+
+func TestChatPollAttemptRejectsExpectedReceiptMismatch(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			const chatID = "chat-expected-receipt"
+			const path = "/chats/chat-expected-receipt/messages?$skiptoken=durable"
+			if _, _, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.PendingPage = &ChatPollPendingPage{
+					ReceiptID:   "receipt-durable",
+					ChatID:      chatID,
+					RequestPath: path,
+					Frontier:    "continuation",
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed durable receipt: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			poll, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "owner-receipt", ProcessIncarnation: "process-receipt",
+				ExpectedFrontier: "continuation:" + path, ExpectedReceiptID: "receipt-other",
+				Now: time.Now().UTC(),
+			})
+			if err != nil {
+				t.Fatalf("begin with mismatched receipt: %v", err)
+			}
+			if acquired || poll.Attempt != nil {
+				t.Fatalf("mismatched receipt acquired attempt: acquired=%v poll=%#v", acquired, poll)
+			}
+		})
+	}
+}
+
+func TestChatPollControlAttemptMayReplaceContinuationOnly(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			const chatID = "chat-control-frontier"
+			const continuation = "/chats/chat-control-frontier/messages?$skiptoken=old"
+			if _, _, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.ContinuationPath = continuation
+				return nil
+			}); err != nil {
+				t.Fatalf("seed control continuation: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			control, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "owner-control", ProcessIncarnation: "process-control",
+				ExpectedPollRole: ChatPollAttemptRoleControl,
+				ExpectedFrontier: "head:/chats/chat-control-frontier/messages?$top=20",
+				Now:              time.Now().UTC(),
+			})
+			if err != nil || !acquired || control.Attempt == nil {
+				t.Fatalf("control head replacement: acquired=%v attempt=%#v err=%v", acquired, control.Attempt, err)
+			}
+			if control.Attempt.ExpectedPollRole != ChatPollAttemptRoleControl {
+				t.Fatalf("control role was not durable: %#v", control.Attempt)
+			}
+			if _, committed, err := store.CommitChatPollAttempt(ctx, chatID, control.Attempt.ID, control.PollRevision, func(*ChatPollState) error {
+				return nil
+			}); err != nil || !committed {
+				t.Fatalf("commit control head replacement: committed=%v err=%v", committed, err)
+			}
+			work, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "owner-work", ProcessIncarnation: "process-work",
+				ExpectedPollRole: "work",
+				ExpectedFrontier: "head:/chats/chat-control-frontier/messages?$top=20",
+				Now:              time.Now().UTC().Add(time.Second),
+			})
+			if err != nil || acquired || work.Attempt != nil {
+				t.Fatalf("work head replacement bypassed continuation fence: acquired=%v work=%#v err=%v", acquired, work, err)
+			}
+		})
+	}
+}
+
+func TestChatPollControlAttemptDoesNotBypassPendingOrEmptyFrontier(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			const chatID = "chat-control-frontier-fence"
+			const continuation = "/chats/chat-control-frontier-fence/messages?$skiptoken=old"
+			store := newTestStore(t)
+			if _, _, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+				poll.ChatID = chatID
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.ContinuationPath = continuation
+				poll.PendingPage = &ChatPollPendingPage{
+					ReceiptID:   "receipt-control-fence",
+					ChatID:      chatID,
+					RequestPath: continuation,
+					Frontier:    "continuation",
+					PollRole:    "work",
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed pending continuation: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			poll, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:                  chatID,
+				Owner:                   "owner-control-fence",
+				ProcessIncarnation:      "process-control-fence",
+				ExpectedPollRole:        ChatPollAttemptRoleControl,
+				ExpectedFrontier:        "head:/chats/chat-control-frontier-fence/messages?$top=20",
+				ExpectedReceiptID:       "receipt-control-fence",
+				HasExpectedPollRevision: false,
+				Now:                     time.Now().UTC(),
+			})
+			if err != nil {
+				t.Fatalf("begin control attempt against pending page: %v", err)
+			}
+			if acquired || poll.Attempt != nil {
+				t.Fatalf("control attempt bypassed pending continuation: acquired=%v poll=%#v", acquired, poll)
+			}
+
+			if _, _, err := store.UpdateChatPoll(ctx, chatID, func(current *ChatPollState) error {
+				current.PendingPage = nil
+				return nil
+			}); err != nil {
+				t.Fatalf("clear pending page: %v", err)
+			}
+			poll, acquired, err = store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:             chatID,
+				Owner:              "owner-control-empty",
+				ProcessIncarnation: "process-control-empty",
+				ExpectedPollRole:   ChatPollAttemptRoleControl,
+				ExpectedFrontier:   "head:",
+				Now:                time.Now().UTC().Add(time.Second),
+			})
+			if err != nil {
+				t.Fatalf("begin control attempt with empty head path: %v", err)
+			}
+			if acquired || poll.Attempt != nil {
+				t.Fatalf("control attempt accepted empty head path: acquired=%v poll=%#v", acquired, poll)
 			}
 		})
 	}
@@ -6391,6 +6595,57 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	}
 	if semanticMalformedScheduled != sqliteHotPollMalformedLimit {
 		t.Fatalf("semantic malformed poll schedule count=%d, want reserved limit %d", semanticMalformedScheduled, sqliteHotPollMalformedLimit)
+	}
+}
+
+func TestSQLiteHotPollAdmissionDoesNotLoseUnparseableCanonicalScheduleTime(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	session := SessionContext{
+		ID: "session-invalid-schedule-time", Status: SessionStatusActive,
+		TeamsChatID: "chat-invalid-schedule-time", UpdatedAt: now,
+	}
+	poll := ChatPollState{
+		ChatID: session.TeamsChatID, Seeded: true, PollState: chatPollStateHot,
+		NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions[session.ID] = session
+		state.ChatPolls[poll.ChatID] = poll
+		return nil
+	}); err != nil {
+		t.Fatalf("seed invalid-schedule-time state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		raw, err := json.Marshal(poll)
+		if err != nil {
+			return err
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil {
+			return err
+		}
+		object["next_poll_at"] = json.RawMessage(`"not-a-time"`)
+		raw, err = json.Marshal(object)
+		if err != nil {
+			return err
+		}
+		// The compatibility deadline is deliberately due. A type-only SQL
+		// predicate would admit this row and then silently lose it when the
+		// canonical time becomes NULL in julianday().
+		_, err = tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, next_poll_at = ? WHERE chat_id = ?`, raw, sqliteTime(poll.NextPollAt), poll.ChatID)
+		return err
+	})
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("HotPollReadyScheduleState with invalid canonical schedule time: %v", err)
+	}
+	recovered, ok := schedule.ChatPolls[poll.ChatID]
+	if !ok || !recovered.RecoveryRequired {
+		t.Fatalf("invalid canonical schedule time disappeared from recovery lane: %#v present=%v", recovered, ok)
 	}
 }
 
@@ -12958,12 +13213,8 @@ func TestOutboxGraphRecoveryProgressPersistsAndResetsAcrossBackends(t *testing.T
 			}); err != nil {
 				t.Fatalf("age send lease: %v", err)
 			}
-			reclaimed, err := store.MarkOutboxSendAttempt(ctx, claimed.ID)
-			if err != nil {
-				t.Fatalf("reclaim send lease: %v", err)
-			}
-			if reclaimed.GraphRecoveryNextPath != "" || reclaimed.GraphRecoveryCandidateID != "" || reclaimed.SendAttemptToken == claimed.SendAttemptToken {
-				t.Fatalf("reclaimed attempt retained stale Graph recovery state: %#v", reclaimed)
+			if _, err := store.MarkOutboxSendAttempt(ctx, claimed.ID); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("expired Sending row was re-claimed: err=%v, want ErrOutboxSendNotClaimed", err)
 			}
 		})
 	}
@@ -18762,7 +19013,7 @@ func TestSQLiteFullStateUpdateDoesNotResurrectClearedOwner(t *testing.T) {
 		if !ok {
 			return errors.New("store is not backed by sqlite")
 		}
-		return store.saveSQLiteStateUnlocked(pointer, stale)
+		return store.saveSQLiteStateUnlocked(context.Background(), pointer, stale)
 	}); err != nil {
 		t.Fatalf("save stale full state: %v", err)
 	}
@@ -18844,7 +19095,7 @@ func TestSQLiteFullStateUpdateRejectsMixedOwnerAndLeaseGenerations(t *testing.T)
 		if !ok {
 			return errors.New("store is not backed by sqlite")
 		}
-		return store.saveSQLiteStateUnlocked(pointer, stale)
+		return store.saveSQLiteStateUnlocked(context.Background(), pointer, stale)
 	})
 	if !errors.Is(err, ErrControlLeaseStateUntrusted) {
 		t.Fatalf("mixed owner/lease cold write error = %v, want ErrControlLeaseStateUntrusted", err)
@@ -18913,7 +19164,7 @@ func TestSQLiteFullStateUpdatePreservesNewerChatPollFrontier(t *testing.T) {
 		if !ok {
 			return errors.New("store is not backed by sqlite")
 		}
-		return store.saveSQLiteStateUnlocked(pointer, stale)
+		return store.saveSQLiteStateUnlocked(context.Background(), pointer, stale)
 	}); err != nil {
 		t.Fatalf("save stale full state: %v", err)
 	}

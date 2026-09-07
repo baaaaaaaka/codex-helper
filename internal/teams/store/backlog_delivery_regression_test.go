@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -404,6 +405,64 @@ func TestPendingOutboxRecoveryAdoptsExpiredMarkerlessSendingAcrossBackends(t *te
 				t.Fatalf("ordinary query admitted adopted ambiguous row: %v", got)
 			}
 		})
+	}
+}
+
+func TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["outbox:nullable-message-id"] = OutboxMessage{
+			ID:              "outbox:nullable-message-id",
+			TeamsChatID:     "chat:nullable-message-id",
+			TurnID:          "turn:nullable-message-id",
+			Sequence:        1,
+			Kind:            "final",
+			Body:            "legacy row with nullable projection",
+			Status:          OutboxStatusSending,
+			LastSendAttempt: now.Add(-outboxSendLease - time.Minute),
+			CreatedAt:       now.Add(-time.Minute),
+		}
+		state.OutboxMessages["outbox:nullable-message-id-later"] = OutboxMessage{
+			ID:          "outbox:nullable-message-id-later",
+			TeamsChatID: "chat:nullable-message-id",
+			TurnID:      "turn:nullable-message-id",
+			Sequence:    2,
+			Kind:        "ack",
+			Body:        "later row",
+			Status:      OutboxStatusQueued,
+			CreatedAt:   now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed nullable projection rows: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET teams_message_id = NULL WHERE id = ?`, "outbox:nullable-message-id")
+		return err
+	})
+
+	ordinary, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 10})
+	if err != nil {
+		t.Fatalf("ordinary nullable-projection query: %v", err)
+	}
+	if len(ordinary.Messages) != 1 || ordinary.Messages[0].ID != "outbox:nullable-message-id-later" {
+		t.Fatalf("ordinary query projection result = %#v, want only later queued row", ordinary.Messages)
+	}
+	recovery, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{
+		Now: now.Add(time.Hour), Limit: 10, IncludeAmbiguous: true, AmbiguousOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("ambiguous nullable-projection query: %v", err)
+	}
+	if len(recovery.Messages) != 1 || recovery.Messages[0].ID != "outbox:nullable-message-id" {
+		t.Fatalf("ambiguous query hid nullable-projection row: %#v", recovery.Messages)
+	}
+	predecessor, found, err := store.EarlierUnsentOutbox(ctx, ordinary.Messages[0])
+	if err != nil || !found || predecessor.ID != recovery.Messages[0].ID {
+		t.Fatalf("nullable-projection FIFO predecessor = %#v found=%v err=%v, want unknown predecessor", predecessor, found, err)
 	}
 }
 

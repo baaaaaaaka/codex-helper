@@ -427,10 +427,10 @@ func listenerRecoveryLastModifiedFilterAllowed(value string) bool {
 		if len(fields) != 3 || fields[0] != "lastModifiedDateTime" {
 			return time.Time{}, false
 		}
-		if lower && fields[1] != "gt" && fields[1] != "ge" {
+		if lower && fields[1] != "gt" {
 			return time.Time{}, false
 		}
-		if !lower && fields[1] != "lt" && fields[1] != "le" {
+		if !lower && fields[1] != "lt" {
 			return time.Time{}, false
 		}
 		stamp, err := time.Parse(time.RFC3339Nano, fields[2])
@@ -469,14 +469,14 @@ func listenerRecoveryGraphPage(values url.Values, messages []ChatMessage, pageSi
 			if len(fields) != 3 || fields[0] != "lastModifiedDateTime" {
 				return time.Time{}, false, false
 			}
-			if lower && fields[1] != "gt" && fields[1] != "ge" {
+			if lower && fields[1] != "gt" {
 				return time.Time{}, false, false
 			}
-			if !lower && fields[1] != "lt" && fields[1] != "le" {
+			if !lower && fields[1] != "lt" {
 				return time.Time{}, false, false
 			}
 			stamp, err := time.Parse(time.RFC3339Nano, fields[2])
-			return stamp, err == nil && !stamp.IsZero(), fields[1] == "ge" || fields[1] == "le"
+			return stamp, err == nil && !stamp.IsZero(), false
 		}
 		lower, ok, lowerInclusive := parseBound(parts[0], true)
 		if !ok {
@@ -549,7 +549,7 @@ func listenerRecoveryGraphPage(values url.Values, messages []ChatMessage, pageSi
 	return filtered[start:end], nextLink, nil
 }
 
-func TestListenerRecoveryGraphPageHonorsInclusiveTimeBounds(t *testing.T) {
+func TestListenerRecoveryGraphPageUsesExclusiveBoundsWithSafeOverlap(t *testing.T) {
 	stamp := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	messages := []ChatMessage{
 		bridgePollMessage("equal-a", stamp.Format(time.RFC3339Nano), "equal a"),
@@ -559,13 +559,13 @@ func TestListenerRecoveryGraphPageHonorsInclusiveTimeBounds(t *testing.T) {
 	values := url.Values{}
 	values.Set("$top", "10")
 	values.Set("$orderby", "lastModifiedDateTime desc")
-	values.Set("$filter", "lastModifiedDateTime ge "+stamp.Format(time.RFC3339Nano))
+	values.Set("$filter", "lastModifiedDateTime gt "+stamp.Add(-time.Nanosecond).Format(time.RFC3339Nano)+" and lastModifiedDateTime lt "+stamp.Add(time.Second+time.Nanosecond).Format(time.RFC3339Nano))
 	page, next, err := listenerRecoveryGraphPage(values, messages, 10)
 	if err != nil {
-		t.Fatalf("inclusive fake Graph page: %v", err)
+		t.Fatalf("overlap fake Graph page: %v", err)
 	}
 	if next != "" || len(page) != len(messages) {
-		t.Fatalf("inclusive fake Graph page = %v next=%q, want all %d records", page, next, len(messages))
+		t.Fatalf("overlap fake Graph page = %v next=%q, want all %d records", page, next, len(messages))
 	}
 	values.Set("$filter", "lastModifiedDateTime gt "+stamp.Format(time.RFC3339Nano))
 	page, next, err = listenerRecoveryGraphPage(values, messages, 10)
@@ -574,6 +574,10 @@ func TestListenerRecoveryGraphPageHonorsInclusiveTimeBounds(t *testing.T) {
 	}
 	if next != "" || len(page) != 1 || page[0].ID != "newer" {
 		t.Fatalf("strict fake Graph page = %v next=%q, want newer only", page, next)
+	}
+	values.Set("$filter", "lastModifiedDateTime ge "+stamp.Format(time.RFC3339Nano))
+	if listenerRecoveryMessagesQueryAllowed(values) {
+		t.Fatal("fake Graph accepted unsupported ge recovery bound")
 	}
 }
 
@@ -3205,14 +3209,10 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	bridge.registryPath = registryPath
 	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
-	// The worker budget must exceed the phase budget; otherwise the worker would
-	// cancel itself and this test would not exercise phase-owned cleanup. The
-	// phase includes durable state admission as well as the Graph read, so a
-	// two-second boundary is below the observed Windows race-runner setup cost
-	// and can cancel the *second* recovery cycle before it reaches the handler.
-	// Keep a finite ten-second phase boundary and a larger worker budget: the
-	// fake read is still guaranteed to hit the phase deadline, while a healthy
-	// follow-up cycle has enough room to commit its durable receipt.
+	// The poll worker derives a bounded slice from the phase deadline. Keep the
+	// configured Graph budget larger than that slice so this test verifies the
+	// worker's cooperative cutoff and durable attempt cleanup, rather than
+	// relying on the phase itself to wait for a canceled worker.
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = 12 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
@@ -3229,8 +3229,13 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		t.Fatalf("phase-timeout Graph request did not observe cancellation after admission; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	waitListenerRecovery(t, func() bool {
-		return graphState.getCount("chat-1") >= 1 && bridge.mainLoopPhaseStatsSnapshot("poll").DeadlineExceeded > 0
-	}, listenerRecoveryExtendedProgressTimeout, "phase deadline after claiming chat poll")
+		state, loadErr := store.Load(context.Background())
+		if loadErr != nil {
+			return false
+		}
+		poll := state.ChatPolls["chat-1"]
+		return graphState.getCount("chat-1") >= 1 && poll.Attempt == nil && poll.LastError != "" && poll.FailureCount > 0
+	}, listenerRecoveryExtendedProgressTimeout, "bounded worker cleanup after canceled poll")
 	state, err := store.Load(context.Background())
 	if err != nil {
 		listener.stop(t)
@@ -5879,8 +5884,8 @@ func TestTeamsOutboxDoesNotMarkSentBeforeOutboundLedgerIsDurable(t *testing.T) {
 // TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail ensures that
 // a large prefix of Graph-accepted rows whose local outbound-ledger write is
 // temporarily failing is both cooled down durably and isolated from a
-// healthy row behind the scan budget.  The accepted rows must never be POSTed
-// again; the healthy row must become visible on the next main-loop pass.
+// healthy row. The accepted rows must never be POSTed again; the healthy row
+// may be delivered in the same bounded pass through the distinct-chat path.
 func TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail(t *testing.T) {
 	for _, useSQLite := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
@@ -5944,13 +5949,26 @@ func TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail(t *testing.T) 
 			if firstPoison.Status != teamstore.OutboxStatusAccepted || firstPoison.NextAttemptAt.IsZero() {
 				t.Fatalf("accepted prefix after first flush = %#v, want gated Accepted row", firstPoison)
 			}
-			if state.OutboxMessages[healthy.ID].Status != teamstore.OutboxStatusQueued {
-				t.Fatalf("healthy tail after first flush = %#v, want queued behind bounded poison scan", state.OutboxMessages[healthy.ID])
+			healthyAfterFirst := state.OutboxMessages[healthy.ID]
+			if healthyAfterFirst.Status != teamstore.OutboxStatusAccepted || strings.TrimSpace(healthyAfterFirst.TeamsMessageID) == "" || healthyAfterFirst.NextAttemptAt.IsZero() {
+				t.Fatalf("healthy tail after first flush = %#v, want Graph-accepted durable retry state despite deferred poison prefix", healthyAfterFirst)
 			}
-			if got := len(graphState.sentSnapshot()); got != 0 {
-				t.Fatalf("broken-ledger flush issued %d Graph POST(s), want none", got)
+			if got := len(graphState.sentSnapshot()); got != 1 {
+				t.Fatalf("broken-ledger flush issued %d Graph POST(s), want only healthy tail", got)
 			}
 
+			// The first pass intentionally leaves the accepted healthy row behind
+			// the same durable ledger retry gate as the poison prefix. Move only this
+			// test row past that gate to model the next scheduled retry without
+			// waiting two minutes.
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				row := state.OutboxMessages[healthy.ID]
+				row.NextAttemptAt = time.Now().UTC().Add(-time.Second)
+				state.OutboxMessages[healthy.ID] = row
+				return nil
+			}); err != nil {
+				t.Fatalf("advance healthy retry gate: %v", err)
+			}
 			bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
 			// The 65th poison row was outside the first bounded page and may
 			// still fail before the healthy row. Either outcome must leave the

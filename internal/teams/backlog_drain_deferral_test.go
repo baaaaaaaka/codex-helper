@@ -337,9 +337,10 @@ func TestPollDeferredContinuationRecoversAfterTransientGraphFailure(t *testing.T
 		failureRequests int
 	}{
 		{name: "429", statusCode: http.StatusTooManyRequests, failureRequests: 1},
-		// The poll Graph path deliberately disables 429 replay but retains
-		// bounded 5xx retries. Return the full retry budget before surfacing the
-		// transient failure to the durable frontier.
+		// A 429 keeps its provider Retry-After schedule, while still consuming
+		// the finite continuation-failure budget so a persistent throttle cannot
+		// hold one opaque frontier forever. Return the full retry budget for 5xx
+		// failures before surfacing the transient failure to the durable frontier.
 		{name: "503", statusCode: http.StatusServiceUnavailable, failureRequests: defaultGraphRetries + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -414,6 +415,9 @@ func TestPollDeferredContinuationRecoversAfterTransientGraphFailure(t *testing.T
 			}
 			if failed.ContinuationPath != continuation || failed.Attempt != nil || failed.LastError == "" || !failed.NextPollAt.After(now) {
 				t.Fatalf("transient failure lost retryable frontier: %#v", failed)
+			}
+			if tc.statusCode == http.StatusTooManyRequests && failed.ContinuationFailureCount != 1 {
+				t.Fatalf("429 continuation failure budget = %d, want one recorded failure: %#v", failed.ContinuationFailureCount, failed)
 			}
 
 			if _, err := bridge.pollChatWithRoleStateOptions(ctx, chatID, 20, inboundPollRoleWork, false, teamstore.ChatPollState{}, false, pollChatWithRoleOptions{

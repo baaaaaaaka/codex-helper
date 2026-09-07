@@ -2,16 +2,52 @@ package teams
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestHistoryTieredListSessionFilesHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	files, err := historyTieredListSessionFilesInDirsContext(ctx, []string{t.TempDir()})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled history listing error = %v, want context.Canceled", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("canceled history listing returned files = %v", files)
+	}
+}
+
+func TestHistoryTieredListSessionFilesReadsDirectoryInBoundedBatches(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < historyTieredDirectoryBatchSize*2+7; i++ {
+		writeSmallFile(t, filepath.Join(dir, fmt.Sprintf("session-%04d.jsonl", i)))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignore.txt"), []byte("not a session\n"), 0o600); err != nil {
+		t.Fatalf("write non-session file: %v", err)
+	}
+	files, err := historyTieredListSessionFilesInDirsContext(context.Background(), []string{dir})
+	if err != nil {
+		t.Fatalf("batched history listing: %v", err)
+	}
+	want := historyTieredDirectoryBatchSize*2 + 7
+	if len(files) != want {
+		t.Fatalf("batched history listing returned %d files, want %d", len(files), want)
+	}
+	if !sort.StringsAreSorted(files) {
+		t.Fatalf("batched history listing is not sorted: first=%q last=%q", files[0], files[len(files)-1])
+	}
+}
 
 func TestHistoryTieredFrontierSelectsEarliestAndAcceptsZeroOffset(t *testing.T) {
 	state := historyTieredFileState{

@@ -175,6 +175,13 @@ func (s *Store) updateChatPollWithCapability(ctx context.Context, chatID string,
 		if err := fn(poll); err != nil {
 			return err
 		}
+		if poll.Attempt != nil && poll.PendingPage != nil && strings.TrimSpace(poll.PendingPage.ReceiptID) != "" {
+			// Staging/repair callbacks may replace the immutable page receipt. Keep
+			// the capability's receipt expectation in lockstep inside this same
+			// mutation, so the next CAS checks the newly durable page rather than
+			// the pre-fetch empty receipt.
+			poll.Attempt.ExpectedReceiptID = strings.TrimSpace(poll.PendingPage.ReceiptID)
+		}
 		if reflect.DeepEqual(before, *poll) {
 			return errStoreNoChange
 		}
@@ -300,6 +307,13 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 			// opaque path; the caller must re-read durable state first.
 			return errStoreNoChange
 		}
+		if !chatPollAttemptExpectedStateMatches(poll, req.ExpectedFrontier, req.ExpectedReceiptID, req.ExpectedPollRole) {
+			// PollRevision is the broad row CAS. These narrower expectations fence
+			// the exact opaque frontier/receipt that the caller is about to use;
+			// otherwise a same-revision or legacy mixed-write could acquire an
+			// attempt for a different Graph request and replay the wrong page.
+			return errStoreNoChange
+		}
 		if poll.Attempt != nil && poll.Attempt.ExpiresAt.After(req.Now) {
 			// A listener can lose its control lease after the Graph request has
 			// started. The old attempt is intentionally left durable so its late
@@ -317,6 +331,7 @@ func (s *Store) BeginChatPollAttempt(ctx context.Context, req ChatPollAttemptReq
 			Owner:                    strings.TrimSpace(req.Owner),
 			ProcessIncarnation:       strings.TrimSpace(req.ProcessIncarnation),
 			LeaseGeneration:          req.LeaseGeneration,
+			ExpectedPollRole:         strings.TrimSpace(req.ExpectedPollRole),
 			ExpectedPollRevision:     poll.PollRevision + 1,
 			ExpectedScheduleRevision: poll.ScheduleRevision,
 			ExpectedFrontier:         strings.TrimSpace(req.ExpectedFrontier),
@@ -466,6 +481,10 @@ func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, exp
 		// newer row revision.
 		return false
 	}
+	if poll.Attempt.ExpectedScheduleRevision != poll.ScheduleRevision ||
+		!chatPollAttemptExpectedStateMatches(poll, poll.Attempt.ExpectedFrontier, poll.Attempt.ExpectedReceiptID, poll.Attempt.ExpectedPollRole) {
+		return false
+	}
 	if capability != nil {
 		if strings.TrimSpace(capability.ID) == "" || strings.TrimSpace(capability.ID) != strings.TrimSpace(poll.Attempt.ID) ||
 			strings.TrimSpace(capability.Owner) != strings.TrimSpace(poll.Attempt.Owner) ||
@@ -475,6 +494,107 @@ func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, exp
 		}
 	}
 	return true
+}
+
+// chatPollDurableFrontierIdentity returns the exact frontier that is already
+// represented by durable state. A normal head request is intentionally not
+// returned: its modified-after path is derived from LastModifiedCursor and
+// is not itself a durable opaque cursor. Callers still get the row revision
+// CAS for that derived request, while explicit continuation/page state gets a
+// second, field-level identity check.
+func chatPollDurableFrontierIdentity(poll *ChatPollState) (string, bool) {
+	if poll == nil {
+		return "", false
+	}
+	if page := poll.PendingPage; page != nil {
+		frontier := strings.TrimSpace(page.Frontier)
+		path := strings.TrimSpace(page.RequestPath)
+		if frontier == "" || path == "" || !ChatPollFrontierKindValid(frontier) {
+			return "", false
+		}
+		return frontier + ":" + path, true
+	}
+	if poll.Gap != nil {
+		if path := strings.TrimSpace(poll.Gap.RecoveryPath); path != "" {
+			return "gap-recovery:" + path, true
+		}
+	}
+	if path := strings.TrimSpace(poll.ContinuationPath); path != "" {
+		return "continuation:" + path, true
+	}
+	if poll.Gap != nil {
+		if path := strings.TrimSpace(poll.Gap.HeadProbeContinuationPath); path != "" {
+			return "head-continuation:" + path, true
+		}
+	}
+	return "", false
+}
+
+func chatPollAttemptExpectedStateMatches(poll *ChatPollState, expectedFrontier, expectedReceiptID, expectedPollRole string) bool {
+	if poll == nil {
+		return false
+	}
+	expectedFrontier = strings.TrimSpace(expectedFrontier)
+	expectedReceiptID = strings.TrimSpace(expectedReceiptID)
+	if poll.PendingPage != nil {
+		// A pending page is an immutable transport receipt.  Without both its
+		// frontier and request path, the store cannot prove which Graph lane the
+		// receipt belongs to.  Do not let a normal-head expectation make such a
+		// malformed receipt look claimable; the bridge will retire it into a
+		// bounded gap with diagnostic evidence before retrying.
+		if strings.TrimSpace(poll.PendingPage.Frontier) == "" || strings.TrimSpace(poll.PendingPage.RequestPath) == "" ||
+			!ChatPollFrontierKindValid(poll.PendingPage.Frontier) || !ChatPollRoleValid(poll.PendingPage.PollRole) {
+			return false
+		}
+		if expectedReceiptID == "" || strings.TrimSpace(poll.PendingPage.ReceiptID) != expectedReceiptID {
+			return false
+		}
+		if pageRole := strings.TrimSpace(poll.PendingPage.PollRole); pageRole != "" && pageRole != strings.TrimSpace(expectedPollRole) {
+			return false
+		}
+	} else if expectedReceiptID != "" {
+		return false
+	}
+	if expectedFrontier != "" {
+		kind, path, ok := strings.Cut(expectedFrontier, ":")
+		if !ok || !ChatPollFrontierKindValid(kind) || strings.TrimSpace(path) == "" {
+			return false
+		}
+	}
+	current, durable := chatPollDurableFrontierIdentity(poll)
+	if durable {
+		// The control chat is a diagnostic lane. Its historical continuation is
+		// deliberately discarded after the bounded head read, so allow only an
+		// explicitly marked control attempt to replace a continuation-only state.
+		// Never grant this exception to a work attempt or to a gap/pending receipt.
+		if strings.TrimSpace(expectedPollRole) == ChatPollAttemptRoleControl &&
+			poll.PendingPage == nil && strings.TrimSpace(poll.ContinuationPath) != "" && poll.Gap == nil &&
+			strings.HasPrefix(expectedFrontier, "head:") && strings.TrimPrefix(expectedFrontier, "head:") != "" {
+			return true
+		}
+		return expectedFrontier != "" && current == expectedFrontier
+	}
+	if poll.Gap != nil && strings.TrimSpace(poll.Gap.RecoveryPath) == "" &&
+		strings.TrimSpace(poll.Gap.HeadProbeContinuationPath) == "" &&
+		strings.TrimSpace(poll.ContinuationPath) == "" &&
+		strings.TrimSpace(poll.DeferredContinuationPath) == "" {
+		if poll.Gap.HeadProbePending {
+			// A dormant gap deliberately alternates with one bounded normal-head
+			// sample. That request is derived from LastModifiedCursor and is
+			// fenced by PollRevision, but it is still a normal head lane.
+			return strings.HasPrefix(expectedFrontier, "head:")
+		}
+		// The bounded gap-head request is derived from the durable SafeCursor /
+		// RecoveryCursor pair, so its complete URL is intentionally not stored as
+		// another executable frontier. PollRevision still fences the exact pair
+		// that produced this derived request; require the lane marker so a caller
+		// cannot turn a gap row into a normal head attempt.
+		return strings.HasPrefix(expectedFrontier, "gap-recovery:")
+	}
+	// The live bridge derives normal head paths locally. There is no durable
+	// opaque value to compare in that case, but a non-head identity would be an
+	// unsafe attempt to turn an absent frontier into a continuation.
+	return expectedFrontier == "" || strings.HasPrefix(expectedFrontier, "head:")
 }
 
 func capabilityOwner(capability *ChatPollAttemptCapability) string {

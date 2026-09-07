@@ -2,6 +2,8 @@ package teams
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,45 @@ import (
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestChatMessagesGapPathUsesSupportedExclusiveDateOperators(t *testing.T) {
+	lower := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+	upper := lower.Add(37 * time.Minute)
+	path := chatMessagesGapPath("chat-filter-contract", 20, lower, upper)
+	parsed, err := url.Parse(path)
+	if err != nil {
+		t.Fatalf("parse gap path %q: %v", path, err)
+	}
+	filter := parsed.Query().Get("$filter")
+	if strings.Contains(filter, " ge ") || strings.Contains(filter, " le ") {
+		t.Fatalf("gap filter uses unsupported inclusive operator: %q", filter)
+	}
+	wantLower := "lastModifiedDateTime gt " + formatGraphDateTimeBound(lower.Add(-pollCursorOverlap))
+	wantUpper := "lastModifiedDateTime lt " + formatGraphDateTimeExclusiveUpper(upper)
+	if !strings.Contains(filter, wantLower) || !strings.Contains(filter, wantUpper) {
+		t.Fatalf("gap filter = %q, want lower=%q upper=%q", filter, wantLower, wantUpper)
+	}
+	if parsed.Query().Get("$orderby") != "lastModifiedDateTime desc" {
+		t.Fatalf("gap order = %q, want descending lastModifiedDateTime", parsed.Query().Get("$orderby"))
+	}
+	// A crossed RecoveryCursor/SafeCursor interval must remain bounded. In
+	// particular, it must not silently become a lower-only descending query
+	// that lets newer messages occupy every recovery page.
+	crossed := chatMessagesGapPath("chat-filter-contract", 20, upper, lower)
+	crossedFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(lower) + " and lastModifiedDateTime lt " + formatGraphDateTimeBound(lower)
+	if got := mustParseTestURL(t, crossed).Query().Get("$filter"); got != crossedFilter {
+		t.Fatalf("crossed gap filter = %q, want impossible bounded interval %q", got, crossedFilter)
+	}
+}
+
+func mustParseTestURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse test URL %q: %v", raw, err)
+	}
+	return parsed
+}
 
 func TestPollFrontierFailureScopePreservesProcessBoundary(t *testing.T) {
 	underlying := errors.New("durable poll write failed")
@@ -145,8 +186,8 @@ func TestPollFrontierHeadPageThenContinuationFailureRecoversFromPreHeadCursor(t 
 				mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				if r.URL.Query().Get("$skiptoken") == "" && r.URL.Query().Get("$orderby") == "lastModifiedDateTime desc" &&
-					strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime ge ") &&
-					strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime le ") {
+					strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime gt ") &&
+					strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime lt ") {
 					// Recovery may return the already-seen head record together
 					// with the older record. The delivery ledger must suppress
 					// that duplicate while still making the old record reachable.
@@ -514,6 +555,110 @@ func TestPollFrontierInvalidRecordRefetchesBeforeQuarantine(t *testing.T) {
 	}
 }
 
+// A stable Graph ID without either timestamp cannot establish a durable
+// modified-time frontier. It must be retried through the bounded individual
+// lookup lane and, if the provider never returns a usable timestamp, isolated
+// so the same record cannot keep the whole chat at the same cursor forever.
+func TestPollFrontierTimestamplessRecordIsBoundedAndDoesNotBecomeBaseline(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	missing := bridgePollMessage("timestampless-record", "", "needs timestamp recovery")
+	missing.CreatedDateTime = ""
+	later := bridgePollMessage("timestampless-later", now.Add(time.Minute).Format(time.RFC3339Nano), "later prompt")
+	listPayload, err := json.Marshal(map[string]any{"value": []ChatMessage{missing, later}})
+	if err != nil {
+		t.Fatalf("marshal timestampless page: %v", err)
+	}
+	var listRequests, refetchRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/chats/chat-timestampless/messages/timestampless-record" {
+			refetchRequests++
+			if err := json.NewEncoder(w).Encode(missing); err != nil {
+				t.Fatalf("encode timestampless refetch: %v", err)
+			}
+			return
+		}
+		if r.URL.Path == "/chats/chat-timestampless/messages" {
+			listRequests++
+			_, _ = w.Write(listPayload)
+			return
+		}
+		t.Fatalf("unexpected timestampless Graph request: %s %s", r.Method, r.URL.String())
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, "chat-timestampless", now.Add(-time.Hour), true, false, 0); err != nil {
+		t.Fatalf("seed timestampless poll: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	handle := func(_ context.Context, msg ChatMessage, _ string) error {
+		handled = append(handled, msg.ID)
+		return nil
+	}
+	for attempt := 0; attempt < maxOversizedRecordRefetchAttempts; attempt++ {
+		if _, err := bridge.pollChat(ctx, "chat-timestampless", 20, handle); err == nil {
+			t.Fatalf("timestampless refetch attempt %d unexpectedly succeeded", attempt+1)
+		}
+	}
+	poll, ok, err := store.ChatPoll(ctx, "chat-timestampless")
+	if err != nil || !ok || poll.PendingPage == nil || len(poll.PendingPage.Dispositions) != 2 || poll.PendingPage.Dispositions[0] != "invalid_record_quarantined" {
+		t.Fatalf("timestampless page was not durably bounded: poll=%#v ok=%v err=%v", poll, ok, err)
+	}
+	if bridge.registryHasSeenOrSentForPoll("chat-timestampless", missing.ID) {
+		t.Fatal("timestampless record became seen before quarantine")
+	}
+	if _, err := bridge.pollChat(ctx, "chat-timestampless", 20, handle); err != nil {
+		t.Fatalf("consume timestampless quarantine and later record: %v", err)
+	}
+	if got := strings.Join(handled, ","); got != later.ID {
+		t.Fatalf("timestampless handled IDs = %q, want only %s", got, later.ID)
+	}
+	if listRequests != 1 || refetchRequests != maxOversizedRecordRefetchAttempts {
+		t.Fatalf("timestampless Graph requests = list %d/refetch %d, want list 1/refetch %d", listRequests, refetchRequests, maxOversizedRecordRefetchAttempts)
+	}
+}
+
+func TestPollFrontierBaselineRejectsTimestamplessRecord(t *testing.T) {
+	missing := bridgePollMessage("baseline-timestampless", "", "historical-looking but unbounded")
+	missing.CreatedDateTime = ""
+	if _, err := pendingPageFromWindow("chat-baseline-timestampless", "/chats/chat-baseline-timestampless/messages?$top=20", pollFrontierHead, 1, MessageWindow{Messages: []ChatMessage{missing}}, true); err == nil {
+		t.Fatal("timestampless baseline page was accepted")
+	}
+
+	// A pre-disposition legacy receipt must fail closed too, rather than panic
+	// on an absent Dispositions slice or silently mark the record historical.
+	raw, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatalf("marshal legacy timestampless record: %v", err)
+	}
+	page := &teamstore.ChatPollPendingPage{
+		ChatID:        "chat-baseline-timestampless",
+		RequestPath:   "/chats/chat-baseline-timestampless/messages?$top=20",
+		Frontier:      pollFrontierHead,
+		FrontierEpoch: 1,
+		Records:       []json.RawMessage{raw},
+		RecordIDs:     []string{missing.ID},
+		RecordHashes: func() []string {
+			hash := sha256.Sum256(raw)
+			return []string{hex.EncodeToString(hash[:])}
+		}(),
+	}
+	page.ReceiptID = legacyPendingPageReceiptID(page)
+	if _, err := pendingPageToWindow(page); err == nil {
+		t.Fatal("timestampless legacy receipt was accepted")
+	}
+}
+
 func TestPollFrontierBaselineReceiptReplayRemainsHistorical(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -618,6 +763,111 @@ func TestPollFrontierValidatesPendingReceiptPathAndFingerprint(t *testing.T) {
 	}
 	if pollRequestPathBelongsToChat("chat-path", "/chats/another-chat/messages?$skiptoken=opaque") {
 		t.Fatal("cross-chat continuation was accepted")
+	}
+}
+
+func TestPendingHeadReceiptAcceptsEquivalentTimestampPrecisionAndQueryOrder(t *testing.T) {
+	chatID := "chat-head-semantic-receipt"
+	lastCursor := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+	poll := teamstore.ChatPollState{
+		ChatID:             chatID,
+		Seeded:             true,
+		PollState:          inboundPollStateWarm,
+		LastModifiedCursor: lastCursor,
+		FrontierEpoch:      4,
+	}
+	_, expectedPath, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, poll)
+	expectedURL := mustParseTestURL(t, expectedPath)
+	oldBound := lastCursor.Add(-pollCursorOverlap).UTC().Format(time.RFC3339Nano)
+	oldFilter := "lastModifiedDateTime gt " + oldBound
+	// Keep the same stable collection path and query semantics, but emulate a
+	// receipt written by the pre-millisecond formatter with a different query
+	// order. This must survive a restart/upgrade without becoming a gap.
+	oldPath := expectedURL.Path + "?$filter=" + url.QueryEscape(oldFilter) + "&$orderby=" + url.QueryEscape("lastModifiedDateTime desc") + "&$top=20"
+	page := &teamstore.ChatPollPendingPage{
+		ChatID:        chatID,
+		RequestPath:   oldPath,
+		Frontier:      pollFrontierHead,
+		FrontierEpoch: poll.FrontierEpoch,
+		PollRole:      string(inboundPollRoleWork),
+	}
+	if err := pendingPageMatchesPollFrontier(chatID, 20, inboundPollRoleWork, poll, page); err != nil {
+		t.Fatalf("semantically equivalent head receipt rejected: %v\nexpected=%s\nactual=%s", err, expectedPath, oldPath)
+	}
+	badTop := *page
+	badTop.RequestPath = expectedURL.Path + "?$top=21&$orderby=" + url.QueryEscape("lastModifiedDateTime desc") + "&$filter=" + url.QueryEscape(oldFilter)
+	if err := pendingPageMatchesPollFrontier(chatID, 20, inboundPollRoleWork, poll, &badTop); err == nil {
+		t.Fatal("head receipt with a different page size was accepted")
+	}
+}
+
+func TestPendingPageRepairIdentityIncludesDurableSemantics(t *testing.T) {
+	base := &teamstore.ChatPollPendingPage{
+		ChatID:          "chat-repair-identity",
+		RequestPath:     "/chats/chat-repair-identity/messages?$skiptoken=opaque",
+		Frontier:        pollFrontierContinuation,
+		FrontierEpoch:   9,
+		NextPath:        "/chats/chat-repair-identity/messages?$skiptoken=next",
+		PollRole:        string(inboundPollRoleWork),
+		BoundaryReason:  "provider-boundary",
+		RecordIDs:       []string{"record-1"},
+		RecordHashes:    []string{"hash-1"},
+		Dispositions:    []string{"received"},
+		RefetchFailures: []int{0},
+	}
+	for name, mutate := range map[string]func(*teamstore.ChatPollPendingPage){
+		"poll role": func(page *teamstore.ChatPollPendingPage) { page.PollRole = string(inboundPollRoleControl) },
+		"baseline":  func(page *teamstore.ChatPollPendingPage) { page.BaselineOnly = true },
+		"boundary":  func(page *teamstore.ChatPollPendingPage) { page.BoundaryReason = "different-boundary" },
+		"refetch":   func(page *teamstore.ChatPollPendingPage) { page.RefetchFailures[0] = 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			current := *base
+			current.RecordIDs = append([]string(nil), base.RecordIDs...)
+			current.RecordHashes = append([]string(nil), base.RecordHashes...)
+			current.Dispositions = append([]string(nil), base.Dispositions...)
+			current.RefetchFailures = append([]int(nil), base.RefetchFailures...)
+			mutate(&current)
+			if pendingPageMatchesRepairTarget(&current, base, nil, nil) {
+				t.Fatalf("repair treated changed %s as the same receipt: current=%#v", name, current)
+			}
+		})
+	}
+	baseState := teamstore.ChatPollState{
+		ChatID:           base.ChatID,
+		PollRevision:     17,
+		ScheduleRevision: 4,
+		FrontierEpoch:    base.FrontierEpoch,
+		PendingPage:      base,
+		Attempt: &teamstore.ChatPollAttempt{
+			ID: "attempt-repair", Owner: "owner-repair", ProcessIncarnation: "process-repair",
+			LeaseGeneration: 8, ExpectedPollRevision: 17, ExpectedScheduleRevision: 4,
+			ExpectedFrontier: "continuation:" + base.RequestPath, ExpectedReceiptID: base.ReceiptID,
+			StartedAt: time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC),
+			ExpiresAt: time.Date(2026, 9, 7, 12, 2, 0, 0, time.UTC),
+		},
+	}
+	for name, mutate := range map[string]func(*teamstore.ChatPollState){
+		"poll revision":     func(state *teamstore.ChatPollState) { state.PollRevision++ },
+		"schedule revision": func(state *teamstore.ChatPollState) { state.ScheduleRevision++ },
+		"frontier epoch":    func(state *teamstore.ChatPollState) { state.FrontierEpoch++ },
+		"attempt expiry": func(state *teamstore.ChatPollState) {
+			state.Attempt.ExpiresAt = state.Attempt.ExpiresAt.Add(time.Minute)
+		},
+		"attempt expected frontier": func(state *teamstore.ChatPollState) {
+			state.Attempt.ExpectedFrontier = "continuation:/different"
+		},
+	} {
+		t.Run("row "+name, func(t *testing.T) {
+			current := baseState
+			current.PendingPage = base
+			attempt := *baseState.Attempt
+			current.Attempt = &attempt
+			mutate(&current)
+			if chatPollMatchesPendingRepairTarget(current, baseState) {
+				t.Fatalf("repair treated changed %s as the same full poll row: current=%#v", name, current)
+			}
+		})
 	}
 }
 
@@ -1099,7 +1349,7 @@ func TestPollFrontierOversizedRefetchIdentityMismatchIsBounded(t *testing.T) {
 			store := newBridgeTestStore(t)
 			requested := bridgePollMessage("oversized-mismatch", "2026-08-30T00:00:00Z", "")
 			requested.oversizedForPoll = true
-			page, err := pendingPageFromWindow("chat-oversized-mismatch", "/chats/chat-oversized-mismatch/messages?$top=1", pollFrontierHead, 1, MessageWindow{
+			page, err := pendingPageFromWindow("chat-oversized-mismatch", "/chats/chat-oversized-mismatch/messages?$top=20", pollFrontierHead, 1, MessageWindow{
 				Messages: []ChatMessage{requested},
 			}, false)
 			if err != nil {
@@ -1301,15 +1551,15 @@ func TestPollFrontierGapRecoveryWalksOldestBacklogWithoutSkipping(t *testing.T) 
 				t.Errorf("gap recovery order = %q, want provider-supported descending", r.URL.Query().Get("$orderby"))
 			}
 			filter := r.URL.Query().Get("$filter")
-			if strings.Contains(filter, "lastModifiedDateTime le ") {
-				if !strings.Contains(filter, "lastModifiedDateTime ge "+now.Add(-time.Hour).Format(time.RFC3339Nano)) ||
-					!strings.Contains(filter, "lastModifiedDateTime le "+messageModifiedTime(middle).Format(time.RFC3339Nano)) {
+			if strings.Contains(filter, "lastModifiedDateTime lt ") {
+				if !strings.Contains(filter, "lastModifiedDateTime gt "+formatGraphDateTimeBound(now.Add(-time.Hour-pollCursorOverlap))) ||
+					!strings.Contains(filter, "lastModifiedDateTime lt "+formatGraphDateTimeExclusiveUpper(messageModifiedTime(middle))) {
 					t.Errorf("bounded gap filter = %q, want the remaining range", filter)
 				}
 				writePollFrontierPage(t, w, []ChatMessage{oldest}, "")
 				return
 			}
-			if !strings.Contains(filter, "lastModifiedDateTime ge "+now.Add(-time.Hour).Format(time.RFC3339Nano)) {
+			if !strings.Contains(filter, "lastModifiedDateTime gt "+formatGraphDateTimeBound(now.Add(-time.Hour-pollCursorOverlap))) {
 				t.Errorf("initial gap filter = %q, want safe lower bound", filter)
 			}
 			// Graph returns descending pages. The bridge sorts each bounded page
@@ -1418,8 +1668,8 @@ func TestPollFrontierGapRecoveryKeepsEqualTimestampBucket(t *testing.T) {
 			t.Errorf("equal-time gap order = %q, want provider-supported descending", got)
 		}
 		filter := r.URL.Query().Get("$filter")
-		if !strings.Contains(filter, "lastModifiedDateTime ge "+now.Add(-time.Hour).Format(time.RFC3339Nano)) ||
-			!strings.Contains(filter, "lastModifiedDateTime le "+equalTime) {
+		if !strings.Contains(filter, "lastModifiedDateTime gt "+formatGraphDateTimeBound(now.Add(-time.Hour-pollCursorOverlap))) ||
+			!strings.Contains(filter, "lastModifiedDateTime lt "+formatGraphDateTimeExclusiveUpper(messageModifiedTime(messages[0]))) {
 			// A pre-fix strict-bounds request cannot include the equal-time
 			// bucket. Model Graph's empty result so the regression fails by
 			// leaving the bucket undelivered rather than accepting a fixture
@@ -1474,6 +1724,144 @@ func TestPollFrontierGapRecoveryKeepsEqualTimestampBucket(t *testing.T) {
 	recovered, ok, err := store.ChatPoll(ctx, chatID)
 	if err != nil || !ok || recovered.PendingPage != nil || recovered.Gap != nil {
 		t.Fatalf("equal-time recovery state = %#v ok=%v err=%v, want terminal gap release", recovered, ok, err)
+	}
+}
+
+func TestPollFrontierFullEqualTimestampRecoveryDoesNotCloseGap(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate equal-timestamp gap: %v", err)
+				}
+			}
+			now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+			const chatID = "chat-full-equal-timestamp"
+			recoveryCursor := now.Add(-time.Hour)
+			recoveryPath := "/chats/" + chatID + "/messages?$skiptoken=equal-timestamp"
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+					LastModifiedCursor: recoveryCursor,
+					Gap: &teamstore.ChatPollGap{
+						Epoch: 1, Kind: "unverified-continuation", SafeCursor: now.Add(-2 * time.Hour),
+						RecoveryCursor: recoveryCursor, RecoveryPath: recoveryPath, OpenedAt: now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed full equal-timestamp gap: %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read full equal-timestamp gap: ok=%v err=%v", ok, err)
+			}
+			_, path, _ := pollPageRequestForState(chatID, ownerPollMessageTop, inboundPollRoleWork, poll)
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID:                  chatID,
+				Owner:                   "machine-equal",
+				ProcessIncarnation:      "process-equal",
+				ExpectedPollRevision:    poll.PollRevision,
+				HasExpectedPollRevision: true,
+				ExpectedFrontier:        pollFrontierIdentity(pollFrontierGap, path),
+				Now:                     time.Now().UTC(),
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin full equal-timestamp gap: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			fullPage := make([]ChatMessage, ownerPollMessageTop)
+			result := pollMessageWindowResult{
+				Progressed:   true,
+				PageComplete: true,
+				Fetched:      len(fullPage),
+				MinModified:  recoveryCursor,
+				MaxModified:  recoveryCursor,
+			}
+			committed, err := bridge.commitPollAttemptSuccess(ctx, chatID, attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, path, MessageWindow{Messages: fullPage}, result, false)
+			if err != nil || !committed {
+				t.Fatalf("commit full equal-timestamp gap: committed=%v err=%v", committed, err)
+			}
+			poll, ok, err = store.ChatPoll(ctx, chatID)
+			if err != nil || !ok || poll.Gap == nil {
+				t.Fatalf("full equal-timestamp recovery closed gap: %#v ok=%v err=%v", poll, ok, err)
+			}
+			if poll.Gap.RecoveryPath != "" || !poll.Gap.HeadProbePending || !strings.Contains(poll.Gap.Reason, "equal-modified-time-page") {
+				t.Fatalf("full equal-timestamp recovery evidence = %#v, want dormant explicit quarantine", poll.Gap)
+			}
+		})
+	}
+}
+
+func TestPollFrontierFullTerminalOlderPageClosesGapAfterCursorMoves(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate older-page gap: %v", err)
+				}
+			}
+			now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+			const chatID = "chat-full-older-page"
+			recoveryCursor := now.Add(-time.Hour)
+			older := recoveryCursor.Add(-time.Minute)
+			recoveryPath := "/chats/" + chatID + "/messages?$skiptoken=older-page"
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+					LastModifiedCursor: recoveryCursor,
+					Gap: &teamstore.ChatPollGap{
+						Epoch: 1, Kind: "unverified-continuation", SafeCursor: now.Add(-2 * time.Hour),
+						RecoveryCursor: recoveryCursor, RecoveryPath: recoveryPath, OpenedAt: now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed older-page gap: %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read older-page gap: ok=%v err=%v", ok, err)
+			}
+			_, path, _ := pollPageRequestForState(chatID, ownerPollMessageTop, inboundPollRoleWork, poll)
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "machine-older", ProcessIncarnation: "process-older",
+				ExpectedPollRevision: poll.PollRevision, HasExpectedPollRevision: true,
+				ExpectedFrontier: pollFrontierIdentity(pollFrontierGap, path), Now: time.Now().UTC(),
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin older-page gap: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			fullPage := make([]ChatMessage, ownerPollMessageTop)
+			result := pollMessageWindowResult{
+				Progressed: true, PageComplete: true, Fetched: len(fullPage),
+				MinModified: older, MaxModified: recoveryCursor,
+			}
+			committed, err := bridge.commitPollAttemptSuccess(ctx, chatID, attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, path, MessageWindow{Messages: fullPage}, result, false)
+			if err != nil || !committed {
+				t.Fatalf("commit older-page gap: committed=%v err=%v", committed, err)
+			}
+			poll, ok, err = store.ChatPoll(ctx, chatID)
+			if err != nil || !ok || poll.Gap != nil {
+				t.Fatalf("full terminal older recovery page left gap open: %#v ok=%v err=%v", poll, ok, err)
+			}
+			if !poll.LastModifiedCursor.Equal(recoveryCursor) {
+				t.Fatalf("normal cursor changed across older gap recovery: %s, want %s", poll.LastModifiedCursor, recoveryCursor)
+			}
+		})
 	}
 }
 
@@ -1580,7 +1968,7 @@ func TestPollSchedulerContinuousPartialChatsRotateBeyondCycleCap(t *testing.T) {
 		}
 		page, err := pendingPageFromWindow(
 			session.ChatID,
-			"/chats/"+session.ChatID+"/messages",
+			chatMessagesPath(session.ChatID, 20, time.Time{}),
 			pollFrontierHead,
 			1,
 			MessageWindow{Messages: messages},
@@ -2033,6 +2421,58 @@ func TestPollFrontierGenericContinuationFailureUsesBoundedGap(t *testing.T) {
 	}
 }
 
+func TestPollFrontierRepeated429UsesBoundedGapWithoutDroppingContinuation(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	continuation := "/chats/chat-429-frontier/messages?$skiptoken=rate-limited"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("$skiptoken") != "rate-limited" {
+			t.Fatalf("unexpected Graph request: %s", r.URL.String())
+		}
+		requests++
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"persistent test throttle"}}`)
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ChatPolls["chat-429-frontier"] = teamstore.ChatPollState{
+			ChatID: "chat-429-frontier", Seeded: true, PollState: inboundPollStateWarm,
+			NextPollAt: now, LastActivityAt: now, LastModifiedCursor: now.Add(-time.Hour),
+			ContinuationPath: continuation, FrontierEpoch: 1,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed repeated-429 continuation: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	for attempt := 0; attempt < continuationFailureBudget; attempt++ {
+		if _, err := bridge.pollChat(ctx, "chat-429-frontier", 20, func(context.Context, ChatMessage, string) error { return nil }); err == nil || !isGraphRateLimitError(err) {
+			t.Fatalf("repeated-429 continuation attempt %d error = %v, want Graph 429", attempt+1, err)
+		}
+	}
+	poll, ok, err := store.ChatPoll(ctx, "chat-429-frontier")
+	if err != nil || !ok {
+		t.Fatalf("read repeated-429 frontier: ok=%v err=%v", ok, err)
+	}
+	if requests != continuationFailureBudget {
+		t.Fatalf("repeated-429 Graph requests = %d, want %d without in-call replay", requests, continuationFailureBudget)
+	}
+	if poll.ContinuationPath != "" || poll.Gap == nil || poll.PollState == inboundPollStateBlocked || !poll.NextPollAt.After(time.Now()) {
+		t.Fatalf("repeated-429 continuation did not enter a bounded non-blocking gap: %#v", poll)
+	}
+}
+
 func TestPollFrontierChangingNextLinkWithSamePageOpensGapWithoutFollowingCycle(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -2276,73 +2716,86 @@ func TestPollFrontierGapPageBudgetSchedulesHeadProbe(t *testing.T) {
 	}
 }
 
-func TestPollFrontierEmptyGapRecoveryBacksOffInsteadOfSpinning(t *testing.T) {
-	ctx := context.Background()
-	store := newBridgeTestStore(t)
-	now := time.Now().UTC()
-	if err := store.Update(ctx, func(state *teamstore.State) error {
-		state.ChatPolls["chat-empty-gap"] = teamstore.ChatPollState{
-			ChatID:             "chat-empty-gap",
-			Seeded:             true,
-			PollState:          inboundPollStateWarm,
-			NextPollAt:         now,
-			LastActivityAt:     now,
-			LastModifiedCursor: now.Add(-time.Hour),
-			FrontierEpoch:      1,
-			Gap: &teamstore.ChatPollGap{
-				Epoch:          1,
-				Kind:           "unverified-continuation",
-				SafeCursor:     now.Add(-time.Hour),
-				RecoveryCursor: now.Add(-time.Hour),
-				OpenedAt:       now,
-			},
+func TestPollFrontierEmptyGapRecoveryRetainsEvidenceWithoutSpinning(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
 		}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed empty recovery gap: %v", err)
-	}
-	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
-	_, expectedPath, _ := pollPageRequestForState("chat-empty-gap", 20, inboundPollRoleWork, teamstore.ChatPollState{
-		ChatID: "chat-empty-gap", Gap: &teamstore.ChatPollGap{SafeCursor: now.Add(-time.Hour), RecoveryCursor: now.Add(-time.Hour)},
-	})
-	attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
-		ChatID:             "chat-empty-gap",
-		Owner:              "machine-a",
-		ProcessIncarnation: "process-a",
-		LeaseGeneration:    0,
-		ExpectedFrontier:   pollFrontierIdentity(pollFrontierGap, expectedPath),
-		Now:                now,
-	})
-	if err != nil || !acquired || attempt.Attempt == nil {
-		t.Fatalf("begin empty recovery attempt: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
-	}
-	path := expectedPath
-	committed, err := bridge.commitPollAttemptSuccess(ctx, "chat-empty-gap", attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, path, MessageWindow{}, pollMessageWindowResult{PageComplete: true}, false)
-	if err != nil || !committed {
-		t.Fatalf("commit empty recovery page: committed=%v err=%v", committed, err)
-	}
-	poll, ok, err := store.ChatPoll(ctx, "chat-empty-gap")
-	if err != nil || !ok {
-		t.Fatalf("read empty recovery state: ok=%v err=%v", ok, err)
-	}
-	if poll.Gap == nil || poll.Gap.RecoveryPath != "" || !poll.Gap.HeadProbePending {
-		t.Fatalf("empty recovery page changed gap unexpectedly: %#v", poll)
-	}
-	if !poll.NextPollAt.After(now) {
-		t.Fatalf("empty recovery page scheduled a hot loop: next=%s start=%s", poll.NextPollAt, now)
-	}
-	if poll.NextPollAt.Sub(now) < inboundPollColdInterval/2 {
-		t.Fatalf("empty recovery page backoff=%s, want approximately cold interval %s", poll.NextPollAt.Sub(now), inboundPollColdInterval)
-	}
-	decision := decideInboundPoll(inboundPollInput{
-		ChatID: "chat-empty-gap", Role: inboundPollRoleWork, Poll: poll, HasPoll: true, Now: now.Add(time.Second),
-	})
-	if decision.Due {
-		t.Fatalf("empty recovery gap was due again immediately: %#v", decision)
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls["chat-empty-gap"] = teamstore.ChatPollState{
+					ChatID:             "chat-empty-gap",
+					Seeded:             true,
+					PollState:          inboundPollStateWarm,
+					NextPollAt:         now,
+					LastActivityAt:     now,
+					LastModifiedCursor: now.Add(-time.Hour),
+					FrontierEpoch:      1,
+					Gap: &teamstore.ChatPollGap{
+						Epoch:          1,
+						Kind:           "unverified-continuation",
+						SafeCursor:     now.Add(-time.Hour),
+						RecoveryCursor: now.Add(-time.Hour),
+						OpenedAt:       now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed empty recovery gap: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate empty recovery gap: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			_, expectedPath, _ := pollPageRequestForState("chat-empty-gap", 20, inboundPollRoleWork, teamstore.ChatPollState{
+				ChatID: "chat-empty-gap", Gap: &teamstore.ChatPollGap{SafeCursor: now.Add(-time.Hour), RecoveryCursor: now.Add(-time.Hour)},
+			})
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID:             "chat-empty-gap",
+				Owner:              "machine-a",
+				ProcessIncarnation: "process-a",
+				LeaseGeneration:    0,
+				ExpectedFrontier:   pollFrontierIdentity(pollFrontierGap, expectedPath),
+				Now:                now,
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin empty recovery attempt: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+			}
+			path := expectedPath
+			committed, err := bridge.commitPollAttemptSuccess(ctx, "chat-empty-gap", attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, path, MessageWindow{}, pollMessageWindowResult{PageComplete: true}, false)
+			if err != nil || !committed {
+				t.Fatalf("commit empty recovery page: committed=%v err=%v", committed, err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, "chat-empty-gap")
+			if err != nil || !ok {
+				t.Fatalf("read empty recovery state: ok=%v err=%v", ok, err)
+			}
+			if poll.Gap == nil || !poll.Gap.HeadProbePending || poll.Gap.RecoveryPath != "" {
+				t.Fatalf("empty recovery page did not retain dormant gap evidence: %#v", poll)
+			}
+			if !poll.NextPollAt.After(now) {
+				t.Fatalf("empty recovery page scheduled a hot loop: next=%s start=%s", poll.NextPollAt, now)
+			}
+			if poll.NextPollAt.Sub(now) < fastPollInterval/2 {
+				t.Fatalf("empty recovery page backoff=%s, want a bounded non-zero retry delay", poll.NextPollAt.Sub(now))
+			}
+			decision := decideInboundPoll(inboundPollInput{
+				ChatID: "chat-empty-gap", Role: inboundPollRoleWork, Poll: poll, HasPoll: true, Now: now.Add(fastPollInterval / 2),
+			})
+			if decision.Due {
+				t.Fatalf("empty recovery gap was due again immediately: %#v", decision)
+			}
+		})
 	}
 }
 
-func TestPollFrontierDeduplicatedGapPageDoesNotClearGap(t *testing.T) {
+func TestPollFrontierDeduplicatedGapPageRetainsEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	now := time.Date(2026, 8, 31, 6, 0, 0, 0, time.UTC)
@@ -2372,7 +2825,14 @@ func TestPollFrontierDeduplicatedGapPageDoesNotClearGap(t *testing.T) {
 		ChatID:             chatID,
 		Owner:              "machine-a",
 		ProcessIncarnation: "process-a",
-		Now:                time.Now(),
+		ExpectedFrontier: func() string {
+			_, path, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, teamstore.ChatPollState{
+				ChatID: chatID,
+				Gap:    &teamstore.ChatPollGap{SafeCursor: safe, RecoveryCursor: seen, RecoveryPath: "/chats/" + chatID + "/messages?$skiptoken=deduplicated"},
+			})
+			return pollFrontierIdentity(pollFrontierGap, path)
+		}(),
+		Now: time.Now(),
 	})
 	if err != nil || !acquired || attempt.Attempt == nil {
 		t.Fatalf("begin deduplicated gap attempt: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
@@ -2387,15 +2847,93 @@ func TestPollFrontierDeduplicatedGapPageDoesNotClearGap(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("read deduplicated gap: ok=%v err=%v", ok, err)
 	}
-	if poll.Gap == nil || !poll.Gap.HeadProbePending {
-		t.Fatalf("deduplicated gap page closed recovery gap: %#v", poll)
+	if poll.Gap == nil || !poll.Gap.HeadProbePending || poll.Gap.RecoveryPath != "" {
+		t.Fatalf("deduplicated bounded page did not retain dormant recovery evidence: %#v", poll)
 	}
 	if poll.Attempt != nil {
 		t.Fatalf("deduplicated gap attempt was not released: %#v", poll.Attempt)
 	}
 }
 
-func TestPollFrontierEmptyGapRecoveryTakesHeadProbeWithoutDroppingGap(t *testing.T) {
+// Recovery queries intentionally overlap the safe cursor. A page containing
+// only records from that overlap must not move RecoveryCursor below
+// SafeCursor, because the next bounded query would otherwise be an impossible
+// interval and the gap could never be retried meaningfully.
+func TestPollFrontierOverlapOnlyRecoveryClampsAtSafeCursor(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate overlap-only gap: %v", err)
+				}
+			}
+			now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+			const chatID = "chat-overlap-only-gap"
+			safe := now.Add(-2 * time.Hour)
+			upper := now.Add(-time.Hour)
+			path := "/chats/" + chatID + "/messages?$skiptoken=overlap-only"
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+					LastModifiedCursor: safe,
+					Gap: &teamstore.ChatPollGap{
+						Epoch: 1, Kind: "unverified-continuation", SafeCursor: safe,
+						RecoveryCursor: upper, RecoveryPath: path, OpenedAt: now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed overlap-only gap: %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read overlap-only gap: ok=%v err=%v", ok, err)
+			}
+			frontier, requestPath, _ := pollPageRequestForState(chatID, ownerPollMessageTop, inboundPollRoleWork, poll)
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "overlap-owner", ProcessIncarnation: "overlap-process",
+				ExpectedPollRevision: poll.PollRevision, HasExpectedPollRevision: true,
+				ExpectedFrontier: pollFrontierIdentity(frontier, requestPath), Now: time.Now().UTC(),
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin overlap-only gap: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			committed, err := bridge.commitPollAttemptSuccess(ctx, chatID, attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, attempt.Attempt.ExpectedFrontier, MessageWindow{}, pollMessageWindowResult{
+				PageComplete: true, Progressed: false, Fetched: 1,
+				MinModified: safe.Add(-pollCursorOverlap / 2), MaxModified: safe,
+			}, false)
+			if err != nil || !committed {
+				t.Fatalf("commit overlap-only gap: committed=%v err=%v", committed, err)
+			}
+			got, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok || got.Gap == nil {
+				t.Fatalf("read clamped overlap-only gap: ok=%v err=%v state=%#v", ok, err, got)
+			}
+			if got.Gap.RecoveryCursor.Before(got.Gap.SafeCursor) {
+				t.Fatalf("overlap-only recovery crossed safe cursor: safe=%s recovery=%s", got.Gap.SafeCursor, got.Gap.RecoveryCursor)
+			}
+			if !got.Gap.RecoveryCursor.Equal(safe) || !got.Gap.HeadProbePending || got.Gap.RecoveryPath != "" {
+				t.Fatalf("overlap-only recovery state = %#v, want clamped dormant gap", got.Gap)
+			}
+			nextFrontier, nextPath, _ := pollPageRequestForState(chatID, ownerPollMessageTop, inboundPollRoleWork, got)
+			if nextFrontier != pollFrontierHead {
+				t.Fatalf("overlap-only next frontier = %q, want bounded head probe", nextFrontier)
+			}
+			if strings.Contains(mustParseTestURL(t, nextPath).Query().Get("$filter"), "lastModifiedDateTime lt ") {
+				t.Fatalf("overlap-only head probe unexpectedly retained crossed gap filter: %q", nextPath)
+			}
+		})
+	}
+}
+
+func TestPollFrontierEmptyGapRecoveryRetainsGapAfterTerminalHeadProbe(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	now := time.Now().UTC()
@@ -2413,7 +2951,7 @@ func TestPollFrontierEmptyGapRecoveryTakesHeadProbeWithoutDroppingGap(t *testing
 		case r.URL.Query().Get("$skiptoken") == "expired":
 			w.WriteHeader(http.StatusGone)
 			_, _ = fmt.Fprint(w, `{"error":{"code":"Gone","message":"expired continuation"}}`)
-		case strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime ge "):
+		case len(requests) == 2 && strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime gt "):
 			// The directional gap is still empty. The next quantum must not
 			// remain trapped here forever.
 			writePollFrontierPage(t, w, nil, "")
@@ -2455,23 +2993,169 @@ func TestPollFrontierEmptyGapRecoveryTakesHeadProbeWithoutDroppingGap(t *testing
 	}
 	poll, ok, err := store.ChatPoll(ctx, chatID)
 	if err != nil || !ok || poll.Gap == nil || !poll.Gap.HeadProbePending {
-		t.Fatalf("empty gap did not retain one-shot head probe: %#v ok=%v err=%v", poll, ok, err)
+		t.Fatalf("empty gap did not retain dormant evidence for head probe: %#v ok=%v err=%v", poll, ok, err)
 	}
 	if _, err := bridge.pollChat(ctx, chatID, 20, handle); err != nil {
 		t.Fatalf("head probe after empty gap: %v", err)
 	}
 	if got := strings.Join(handled, ","); got != newMessage.ID {
-		t.Fatalf("head probe handled = %q, want %q", got, newMessage.ID)
+		mu.Lock()
+		gotRequests := append([]string(nil), requests...)
+		mu.Unlock()
+		t.Fatalf("head probe handled = %q, want %q; requests=%v", got, newMessage.ID, gotRequests)
 	}
 	poll, ok, err = store.ChatPoll(ctx, chatID)
 	if err != nil || !ok || poll.Gap == nil || poll.Gap.HeadProbePending {
-		t.Fatalf("head probe dropped gap or remained pending: %#v ok=%v err=%v", poll, ok, err)
+		t.Fatalf("terminal head probe did not hand the dormant gap back to bounded recovery: %#v ok=%v err=%v", poll, ok, err)
+	}
+	if !poll.LastModifiedCursor.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("terminal head probe advanced normal cursor = %s, want %s", poll.LastModifiedCursor, now.Add(-time.Hour))
 	}
 	mu.Lock()
 	gotRequests := append([]string(nil), requests...)
 	mu.Unlock()
 	if len(gotRequests) != 3 {
 		t.Fatalf("head probe request count = %d, want expired continuation, empty gap, and head probe: %v", len(gotRequests), gotRequests)
+	}
+	frontier, nextPath, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, poll)
+	filter, err := url.Parse(nextPath)
+	if err != nil {
+		t.Fatalf("parse dormant-gap recovery path %q: %v", nextPath, err)
+	}
+	if frontier != pollFrontierGap || !strings.Contains(filter.Query().Get("$filter"), "lastModifiedDateTime gt ") {
+		t.Fatalf("terminal head probe next action = %q %q, want dormant-gap recovery", frontier, nextPath)
+	}
+}
+
+func TestPollFrontierTerminalHeadProbeCanReachDelayedGapMessage(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	const chatID = "chat-delayed-dormant-gap"
+	base := now.Add(-30 * time.Minute)
+	delayed := bridgePollMessage("delayed-gap-message", now.Add(-time.Hour).Format(time.RFC3339Nano), "arrived behind a dormant gap")
+	var requests []string
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.String())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime lt ") {
+			writePollFrontierPage(t, w, []ChatMessage{delayed}, "")
+			return
+		}
+		// The first head probe is intentionally empty. The delayed message is
+		// only made reachable by the following bounded recovery request.
+		writePollFrontierPage(t, w, nil, "")
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ChatPolls[chatID] = teamstore.ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+			NextPollAt: now, LastActivityAt: now, LastModifiedCursor: base,
+			Gap: &teamstore.ChatPollGap{
+				Epoch: 1, Kind: "unverified-continuation", SafeCursor: now.Add(-2 * time.Hour),
+				RecoveryCursor: base, HeadProbePending: true, OpenedAt: now,
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed delayed dormant gap: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	var handled []string
+	handle := func(_ context.Context, msg ChatMessage, _ string) error {
+		handled = append(handled, msg.ID)
+		return nil
+	}
+	if _, err := bridge.pollChat(ctx, chatID, 20, handle); err != nil {
+		t.Fatalf("terminal head probe: %v", err)
+	}
+	poll, ok, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !ok || poll.Gap == nil || poll.Gap.HeadProbePending {
+		t.Fatalf("terminal head probe state = %#v ok=%v err=%v, want dormant gap armed for bounded recovery", poll, ok, err)
+	}
+	if _, err := bridge.pollChat(ctx, chatID, 20, handle); err != nil {
+		t.Fatalf("bounded recovery after terminal head probe: %v", err)
+	}
+	if got := strings.Join(handled, ","); got != delayed.ID {
+		mu.Lock()
+		gotRequests := append([]string(nil), requests...)
+		mu.Unlock()
+		t.Fatalf("delayed gap message handled = %q, want %q; requests=%v", got, delayed.ID, gotRequests)
+	}
+	mu.Lock()
+	gotRequests := append([]string(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != 2 {
+		t.Fatalf("dormant gap request count = %d, want head then bounded gap: %v", len(gotRequests), gotRequests)
+	}
+	secondURL, err := url.Parse(gotRequests[1])
+	if err != nil {
+		t.Fatalf("parse dormant gap request %q: %v", gotRequests[1], err)
+	}
+	if !strings.Contains(secondURL.Query().Get("$filter"), "lastModifiedDateTime lt ") {
+		t.Fatalf("dormant gap request sequence = %v, want head then bounded gap", gotRequests)
+	}
+}
+
+func TestPollFrontierDuplicateOnlyHeadProbeRetainsGapEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	const chatID = "chat-duplicate-head-probe"
+	base := now.Add(-time.Hour)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ChatPolls[chatID] = teamstore.ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+			LastModifiedCursor: base,
+			Gap: &teamstore.ChatPollGap{
+				Epoch: 1, Kind: "unverified-continuation", SafeCursor: base,
+				RecoveryCursor: base, HeadProbePending: true, OpenedAt: now,
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed duplicate-only head probe: %v", err)
+	}
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	poll, ok, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !ok {
+		t.Fatalf("load duplicate-only head probe: ok=%v err=%v", ok, err)
+	}
+	source, path, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, poll)
+	if source != pollFrontierHead {
+		t.Fatalf("head probe source=%q, want %q", source, pollFrontierHead)
+	}
+	attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+		ChatID: chatID, Owner: "machine-a", ProcessIncarnation: "process-a",
+		ExpectedFrontier: pollFrontierIdentity(source, path), Now: now,
+	})
+	if err != nil || !acquired || attempt.Attempt == nil {
+		t.Fatalf("begin duplicate-only head probe: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+	}
+	committed, err := bridge.commitPollAttemptSuccess(ctx, chatID, attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, source, path, MessageWindow{}, pollMessageWindowResult{
+		PageComplete: true,
+		Progressed:   false,
+	}, false)
+	if err != nil || !committed {
+		t.Fatalf("commit duplicate-only head probe: committed=%v err=%v", committed, err)
+	}
+	got, ok, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !ok {
+		t.Fatalf("read duplicate-only head probe: ok=%v err=%v", ok, err)
+	}
+	if got.Gap == nil || got.Gap.HeadProbePending || !got.LastModifiedCursor.Equal(base) {
+		t.Fatalf("duplicate-only head probe dropped gap evidence, recovery turn, or cursor boundary: %#v", got)
 	}
 }
 
@@ -2499,7 +3183,7 @@ func TestPollFrontierHeadProbeRetainsTruncatedPageForGapRecovery(t *testing.T) {
 		case "older":
 			writePollFrontierPage(t, w, []ChatMessage{old}, "")
 		default:
-			if strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime ge ") {
+			if len(requests) == 2 && strings.Contains(r.URL.Query().Get("$filter"), "lastModifiedDateTime gt ") {
 				// Empty recovery opens a one-shot head probe. The probe sees only
 				// an already-known message, but Graph also gives it an opaque older
 				// page containing the actionable record. That link belongs to the
@@ -2556,8 +3240,8 @@ func TestPollFrontierHeadProbeRetainsTruncatedPageForGapRecovery(t *testing.T) {
 		t.Fatalf("truncated head probe: %v", err)
 	}
 	poll, ok, err := store.ChatPoll(ctx, chatID)
-	if err != nil || !ok || poll.Gap == nil || poll.Gap.RecoveryPath == "" || poll.Gap.HeadProbePending {
-		t.Fatalf("head probe did not preserve recovery path: %#v ok=%v err=%v", poll, ok, err)
+	if err != nil || !ok || poll.Gap == nil || poll.Gap.HeadProbeContinuationPath == "" || poll.Gap.RecoveryPath != "" || poll.Gap.HeadProbePending {
+		t.Fatalf("head probe did not preserve head-continuation provenance: %#v ok=%v err=%v", poll, ok, err)
 	}
 	if _, err := bridge.pollChat(ctx, chatID, 20, func(_ context.Context, msg ChatMessage, _ string) error {
 		handled = append(handled, msg.ID)
@@ -2567,6 +3251,10 @@ func TestPollFrontierHeadProbeRetainsTruncatedPageForGapRecovery(t *testing.T) {
 	}
 	if strings.Join(handled, ",") != old.ID {
 		t.Fatalf("handled records = %q, want only recovered actionable %q", strings.Join(handled, ","), old.ID)
+	}
+	poll, ok, err = store.ChatPoll(ctx, chatID)
+	if err != nil || !ok || poll.Gap == nil || poll.Gap.HeadProbeContinuationPath != "" || !poll.LastModifiedCursor.Equal(now.Add(-time.Hour)) {
+		t.Fatalf("head continuation incorrectly closed or advanced the directional gap: %#v ok=%v err=%v", poll, ok, err)
 	}
 	mu.Lock()
 	gotRequests := append([]string(nil), requests...)

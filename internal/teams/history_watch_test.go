@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -110,6 +111,72 @@ func TestHistoryWatchTrustedIdleCycleReselectsCheckpointedUnfinishedTail(t *test
 	}
 }
 
+func TestHistoryWatchMandatoryRecoveryIncludesUnprovedAndRecoveryFlags(t *testing.T) {
+	base := teamstore.HistoryWatchCheckpoint{Path: "/sessions/quiet.jsonl", Size: 100, Offset: 100}
+	tests := []struct {
+		name string
+		edit func(*teamstore.HistoryWatchCheckpoint)
+	}{
+		{
+			name: "missing source proof at caught up cursor",
+		},
+		{
+			name: "oversized record",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) { checkpoint.OversizedRecordBlocked = true },
+		},
+		{
+			name: "incomplete source rewrite scan",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) { checkpoint.SourceRewriteRecoveryScanPending = true },
+		},
+		{
+			name: "unresolved continuation",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) { checkpoint.UnresolvedContinuation = true },
+		},
+		{
+			name: "pending root task",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) { checkpoint.PendingRootTaskStarted = true },
+		},
+		{
+			name: "pending assistant",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) {
+				checkpoint.PendingAssistantSourceID = "assistant-record"
+			},
+		},
+		{
+			name: "context gap",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) {
+				checkpoint.ContextGap = &teamstore.ContextGapState{}
+			},
+		},
+		{
+			name: "pending history range",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) {
+				checkpoint.PendingHistoryRange = &teamstore.HistoryPendingRange{}
+			},
+		},
+		{
+			name: "quarantined frontier",
+			edit: func(checkpoint *teamstore.HistoryWatchCheckpoint) {
+				checkpoint.TranscriptQuarantine = &teamstore.TranscriptQuarantine{Kind: "test", FrontierRecordID: "record"}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			checkpoint := base
+			if test.edit != nil {
+				test.edit(&checkpoint)
+			}
+			if !historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
+				t.Fatalf("checkpoint %#v was not selected for mandatory maintenance", checkpoint)
+			}
+		})
+	}
+	if historyWatchCheckpointNeedsMandatoryMaintenance(teamstore.HistoryWatchCheckpoint{Path: "/sessions/clean.jsonl", Size: 100, Offset: 100, SourceFingerprint: "trusted"}) {
+		t.Fatal("trusted caught-up checkpoint was selected for mandatory maintenance")
+	}
+}
+
 func TestHistoryWatchDirtyPathsRetainsFailedPathUntilAcknowledged(t *testing.T) {
 	changedPath := filepath.Join(t.TempDir(), "changed.jsonl")
 	recentPath := filepath.Join(t.TempDir(), "recent.jsonl")
@@ -175,6 +242,106 @@ func TestHistoryWatchDirtyHintWorkerFailureRetainsRetryBoundary(t *testing.T) {
 	bridge.historyWatchAckDirtyPaths(retained)
 	if retained, uncertain := bridge.historyWatchDirtyPaths(nil, nil, false); uncertain || len(retained) != 0 {
 		t.Fatalf("acknowledged retry boundary = %#v uncertain=%t, want empty", retained, uncertain)
+	}
+}
+
+func TestHistoryWatchWorkerStopsQueuedJobsAfterProcessWideFailure(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	paths := make([]string, 8)
+	for i := range paths {
+		paths[i] = filepath.Join(t.TempDir(), "queued", fmt.Sprintf("%d.jsonl", i))
+	}
+	attempts := 0
+	bridge.historyWatchPathHook = func(context.Context, string) error {
+		attempts++
+		return teamstore.ErrControlLeaseNotHeld
+	}
+	err := bridge.runHistoryWatchSyncJobs(context.Background(), paths, time.Now())
+	if !teamstore.IsProcessWideStateError(err) {
+		t.Fatalf("history worker error = %v, want process-wide lease error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("history workers started %d queued jobs after lease loss, want 1", attempts)
+	}
+}
+
+func TestBacklogHistoryFairCursorPersistsAfterOrdinaryFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	root := t.TempDir()
+	now := time.Now().UTC()
+	paths := make([]string, 5)
+	for i := range paths {
+		paths[i] = filepath.Join(root, fmt.Sprintf("recovery-%d.jsonl", i))
+		if err := os.WriteFile(paths[i], []byte("history tail\n"), 0o600); err != nil {
+			t.Fatalf("write recovery path %d: %v", i, err)
+		}
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlLease = teamstore.ControlLease{
+			HolderMachineID: "history-fair-owner", Generation: 12,
+			Status: teamstore.ControlLeaseStatusActive, LeaseUntil: now.Add(time.Hour),
+		}
+		for _, path := range paths {
+			state.HistoryWatch[historyWatchCheckpointID(path)] = teamstore.HistoryWatchCheckpoint{
+				ID: historyWatchCheckpointID(path), Path: path, Size: 0, Offset: 0,
+				PendingRootTaskStarted: true, UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed backlog history recovery state: %v", err)
+	}
+	bridge := &Bridge{store: store, transcriptSyncWorkerCount: 1}
+	wantErr := errors.New("ordinary history recovery failure")
+	attempts := 0
+	bridge.historyWatchPathHook = func(context.Context, string) error {
+		attempts++
+		return wantErr
+	}
+	ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{
+		MachineID: "history-fair-owner", LeaseGeneration: 12,
+	})
+
+	if err := bridge.syncCodexHistoryFinalsForBacklogWithDiscovery(ownerCtx, now, false); !errors.Is(err, wantErr) {
+		t.Fatalf("backlog recovery error = %v, want ordinary worker error", err)
+	}
+	if attempts != maxBacklogHistoryRecoveryJobs {
+		t.Fatalf("backlog recovery attempted %d paths, want bounded quantum %d", attempts, maxBacklogHistoryRecoveryJobs)
+	}
+	control, err := store.ReadControl(ctx)
+	if err != nil {
+		t.Fatalf("read persisted backlog fairness cursor: %v", err)
+	}
+	wantCursor := uniqueSortedCleanPaths(paths)[maxBacklogHistoryRecoveryJobs-1]
+	if control.BacklogHistoryRecoveryFairCursor != wantCursor {
+		t.Fatalf("persisted history recovery cursor = %q, want %q", control.BacklogHistoryRecoveryFairCursor, wantCursor)
+	}
+	if dirty := bridge.historyWatchPendingDirtyPaths(); len(dirty) != maxBacklogHistoryRecoveryJobs {
+		t.Fatalf("ordinary failure retained %d selected dirty paths, want %d: %v", len(dirty), maxBacklogHistoryRecoveryJobs, dirty)
+	}
+}
+
+func TestLinkedTranscriptWorkerStopsQueuedJobsAfterProcessWideFailure(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	jobs := make([]linkedTranscriptSyncJob, 8)
+	for i := range jobs {
+		jobs[i].session = Session{ID: fmt.Sprintf("linked-queued-%d", i)}
+	}
+	attempts := 0
+	bridge.linkedTranscriptSessionHook = func(context.Context, Session) error {
+		attempts++
+		return teamstore.ErrControlLeaseNotHeld
+	}
+	err := bridge.runLinkedTranscriptSyncJobs(context.Background(), jobs, func(context.Context, Session, teamstore.ImportCheckpoint) (teamstore.State, error) {
+		t.Fatal("loadState ran after process-wide linked worker failure")
+		return teamstore.State{}, nil
+	})
+	if !teamstore.IsProcessWideStateError(err) {
+		t.Fatalf("linked worker error = %v, want process-wide lease error", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("linked workers started %d queued jobs after lease loss, want 1", attempts)
 	}
 }
 

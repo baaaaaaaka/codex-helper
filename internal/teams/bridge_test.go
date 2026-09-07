@@ -18201,6 +18201,64 @@ func TestBridgePollSeedsThenUsesDurableModifiedCursor(t *testing.T) {
 	}
 }
 
+func TestBridgePollPromotesLegacyUnseededDurableRowBeforeHead(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, 4, 30, 1, 0, 0, 123456789, time.UTC)
+	newTime := base.Add(5 * time.Minute)
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			if _, err := store.RecordChatPollSuccess(ctx, "chat-1", base, true, false, 1); err != nil {
+				t.Fatalf("seed durable poll row: %v", err)
+			}
+			if _, changed, err := store.UpdateChatPoll(ctx, "chat-1", func(poll *teamstore.ChatPollState) error {
+				// This is the shape written by an older version where Seeded was
+				// absent/false, despite the durable cursor and success timestamp.
+				poll.Seeded = false
+				return nil
+			}); err != nil || !changed {
+				t.Fatalf("make legacy unseeded poll row: changed=%v err=%v", changed, err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate legacy poll row: %v", err)
+				}
+			}
+			graph := newBridgePollGraph(t, []bridgePollPage{
+				{
+					messages: []ChatMessage{bridgePollMessage("legacy-live", newTime.Format(time.RFC3339Nano), "must be handled")},
+					assert: func(t *testing.T, r *http.Request) {
+						t.Helper()
+						filter := r.URL.Query().Get("$filter")
+						if !strings.Contains(filter, "lastModifiedDateTime gt ") {
+							t.Fatalf("legacy durable row fell back to baseline head request: %s", r.URL.String())
+						}
+					},
+				},
+			})
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			var handled []string
+			if _, err := bridge.pollChat(ctx, "chat-1", 20, func(_ context.Context, _ ChatMessage, text string) error {
+				handled = append(handled, text)
+				return nil
+			}); err != nil {
+				t.Fatalf("poll legacy unseeded durable row: %v", err)
+			}
+			if len(handled) != 1 || handled[0] != "must be handled" {
+				t.Fatalf("legacy durable row handled = %#v, want live message", handled)
+			}
+			poll, ok, err := store.ChatPoll(ctx, "chat-1")
+			if err != nil || !ok || !poll.Seeded {
+				t.Fatalf("legacy row was not promoted durably: poll=%#v ok=%v err=%v", poll, ok, err)
+			}
+		})
+	}
+}
+
 func TestBridgePollUsesReadGraphAndSendsWithWriteGraph(t *testing.T) {
 	readGraph := newBridgePollGraph(t, []bridgePollPage{{
 		messages: []ChatMessage{bridgePollMessage("new-1", "2026-04-30T01:05:00Z", "run split-client check")},
@@ -21189,7 +21247,7 @@ func TestBridgePollUsesConservativeCursorOverlapForDelayedMessages(t *testing.T)
 		messages: []ChatMessage{bridgePollMessage("new-1", "2026-04-30T01:05:10Z", "after delay")},
 		assert: func(t *testing.T, r *http.Request) {
 			t.Helper()
-			want := cursor.Add(-pollCursorOverlap).Format(time.RFC3339Nano)
+			want := formatGraphDateTimeBound(cursor.Add(-pollCursorOverlap))
 			if filter := r.URL.Query().Get("$filter"); !strings.Contains(filter, want) {
 				t.Fatalf("poll filter = %q, want cursor minus conservative overlap %s", filter, want)
 			}
@@ -37724,6 +37782,27 @@ func TestBridgeFlushPendingOutboxSerializesConcurrentFlushes(t *testing.T) {
 	sentMu.Unlock()
 	if len(got) != 2 || !strings.Contains(PlainTextFromTeamsHTML(got[0]), "first message") || !strings.Contains(PlainTextFromTeamsHTML(got[1]), "second message") {
 		t.Fatalf("sent outbox order = %#v, want first then second", got)
+	}
+}
+
+func TestBridgeFlushPendingOutboxChatLockHonorsContext(t *testing.T) {
+	bridge := &Bridge{}
+	unlock, err := bridge.lockOutboxChatFlush(context.Background(), "chat-held")
+	if err != nil {
+		t.Fatalf("acquire initial chat lock: %v", err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	secondUnlock, err := bridge.lockOutboxChatFlush(ctx, "chat-held")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second chat lock error = %v, want context deadline", err)
+	}
+	secondUnlock()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context-aware chat lock waited too long: %s", elapsed)
 	}
 }
 

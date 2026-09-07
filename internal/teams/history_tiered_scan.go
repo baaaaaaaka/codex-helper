@@ -3,9 +3,11 @@ package teams
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +21,12 @@ import (
 )
 
 const historyTieredTailReaderSize = 4 * 1024
+
+// Read directories in bounded batches. os.ReadDir(name) materializes the
+// entire directory before the caller can observe cancellation, which turns a
+// supposedly bounded backlog-discovery phase into an uninterruptible full
+// directory walk on a large sessions root.
+const historyTieredDirectoryBatchSize = 128
 
 // A tail budget may end in the middle of one JSONL record. Allow that single
 // record to finish without widening the normal scan to the rest of the file;
@@ -512,25 +520,58 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 }
 
 func historyTieredListSessionFilesInDirs(dirs []string) ([]string, error) {
+	return historyTieredListSessionFilesInDirsContext(context.Background(), dirs)
+}
+
+func historyTieredListSessionFilesInDirsContext(ctx context.Context, dirs []string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	files := make([]string, 0)
 	for _, dir := range dirs {
+		if err := ctx.Err(); err != nil {
+			return files, err
+		}
 		dir = strings.TrimSpace(dir)
 		if dir == "" {
 			continue
 		}
-		entries, err := os.ReadDir(dir)
+		directory, err := os.Open(dir)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return files, err
 		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
-				continue
+		for {
+			entries, readErr := directory.ReadDir(historyTieredDirectoryBatchSize)
+			for _, entry := range entries {
+				if err := ctx.Err(); err != nil {
+					_ = directory.Close()
+					return files, err
+				}
+				if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+					continue
+				}
+				files = append(files, filepath.Join(dir, entry.Name()))
 			}
-			files = append(files, filepath.Join(dir, entry.Name()))
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					_ = directory.Close()
+					return files, readErr
+				}
+				break
+			}
+			if len(entries) == 0 {
+				break
+			}
 		}
+		if closeErr := directory.Close(); closeErr != nil {
+			return files, closeErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return files, err
 	}
 	sort.Strings(files)
 	return files, nil

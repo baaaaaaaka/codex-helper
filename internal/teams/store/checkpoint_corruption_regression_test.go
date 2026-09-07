@@ -757,6 +757,91 @@ func TestSQLiteMalformedSessionAndActiveTurnAreIsolatedAtFullLoad(t *testing.T) 
 	}
 }
 
+// A terminal turn whose canonical identity conflicts with the SQLite row
+// identity is intentionally omitted from typed State. An unrelated full-state
+// rewrite must nevertheless keep its exact bytes for explicit repair and
+// forensic ownership analysis.
+func TestSQLiteTerminalIdentityConflictingTurnSurvivesFullStateRewrite(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	session := testSession()
+	session.ID = "sqlite-turn-opaque-session"
+	session.TeamsChatID = "sqlite-turn-opaque-chat"
+	if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+		t.Fatalf("CreateSession created=%v err=%v", created, err)
+	}
+	turnID := "sqlite-turn-opaque-row"
+	createdAt := time.Date(2026, 9, 7, 10, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Turns[turnID] = Turn{ID: turnID, SessionID: session.ID, Status: TurnStatusCompleted, CreatedAt: createdAt, UpdatedAt: createdAt}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed turn: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	opaque := []byte(`{"id":"foreign-turn","session_id":"foreign-session","status":"completed","opaque_marker":"preserve-terminal-turn"}`)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE turns SET json = ? WHERE id = ?`, opaque, turnID)
+		return err
+	})
+
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat.TeamsChatID = "unrelated-turn-rewrite"
+		return nil
+	}); err != nil {
+		t.Fatalf("unrelated full-state rewrite: %v", err)
+	}
+	var got []byte
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT json FROM turns WHERE id = ?`, turnID).Scan(&got)
+	})
+	if string(got) != string(opaque) {
+		t.Fatalf("opaque terminal turn changed across full rewrite: got=%q want=%q", got, opaque)
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load after opaque turn rewrite: %v", err)
+	}
+	if _, ok := loaded.Turns[turnID]; ok {
+		t.Fatalf("identity-conflicting terminal turn became runnable typed state: %#v", loaded.Turns[turnID])
+	}
+}
+
+// Full-state SQLite rewrites use the caller's context for both opaque-row
+// capture and the write transaction. A canceled caller must fail before any
+// durable table is deleted.
+func TestSQLiteFullStateRewriteHonorsCanceledContext(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "sqlite-cancelled-rewrite"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	pointer, ok, err := store.currentSQLitePointerUnlocked()
+	if err != nil || !ok {
+		t.Fatalf("current SQLite pointer = %#v ok=%v err=%v", pointer, ok, err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load before canceled rewrite: %v", err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := store.saveSQLiteStateUnlocked(canceled, pointer, state); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled full rewrite error = %v, want context.Canceled", err)
+	}
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after canceled rewrite: %v", err)
+	}
+	if loaded.Scope.ID != "sqlite-cancelled-rewrite" {
+		t.Fatalf("state changed after canceled rewrite: %#v", loaded.Scope)
+	}
+}
+
 func TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -858,7 +943,6 @@ func TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus(t *testing.T) {
 		_, err := tx.ExecContext(ctx, `UPDATE sessions SET status = ? WHERE id = ?`, "closed", session.ID)
 		return err
 	})
-
 	candidates, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "unrelated-control-chat", time.Time{}, now)
 	if err != nil {
 		t.Fatalf("HotPollWorkCandidates with stale SQL status: %v", err)

@@ -169,7 +169,7 @@ func (s *Store) bindCodexThreadForRunningTurnJSON(ctx context.Context, request C
 			result.Turn = turn
 			result.Changed = true
 			state.ensure(now)
-			if err := s.saveUnlocked(state); err != nil {
+			if err := s.saveUnlocked(ctx, state); err != nil {
 				s.invalidateMessageLookupCacheLocked()
 				return &codexThreadStartBindingCommitError{Err: err}
 			}
