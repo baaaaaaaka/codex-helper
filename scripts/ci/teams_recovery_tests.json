@@ -864,7 +864,7 @@
       "vertical": "sqlite-hot-poll-lane-fairness",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 90,
       "oracle": "due ordinary chats are admitted alongside a large operational prefix while future retry rows remain gated",
       "baseline": "pre-fix a bounded operational SQL prefix could starve newly active ordinary chats or bypass Retry-After"
     },
@@ -1233,7 +1233,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 90,
       "oracle": "a healthy ordinary chat reaches Graph, Codex, and the outbox despite more due operational continuation rows than one SQLite admission quantum",
       "baseline": "pre-fix the real listener could materialize an operational prefix and starve ordinary chats even though a store-only candidate query appeared bounded"
     },

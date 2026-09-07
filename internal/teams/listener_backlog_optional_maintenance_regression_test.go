@@ -601,9 +601,15 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 500 * time.Millisecond
-	options.PollWorkerBudget = 100 * time.Millisecond
-	options.OwnerStaleAfter = 2 * time.Second
+	// This vertical test is about the durable backlog gate and the mandatory
+	// versus optional lanes.  A 500ms synthetic phase budget makes the SQLite
+	// assertion depend on race-instrumented JSON1/query startup rather than on
+	// that gate; use the production budgets and keep lease expiry out of the
+	// fairness assertion.  Short phase cancellation remains covered by the
+	// dedicated poll/cleanup regression tests.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	options.OwnerStaleAfter = 2 * time.Minute
 	listener := startListenerRecovery(t, bridge, options)
 	var releaseOnce sync.Once
 	releaseExecutor := func() {

@@ -774,6 +774,14 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
+// The task_started-only and current-state replay fixtures intentionally cross
+// several durable CAS boundaries.  Their hosted race failures have shown that
+// a busy runner can make the final observation arrive just after the ordinary
+// extended watchdog, even when the checkpoint and outbox are already correct.
+// Keep this larger bound local to those multi-step tests; the other recovery
+// tests retain their shorter liveness windows.
+const listenerRecoveryMultiStepProgressTimeout = 45 * time.Second
+
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 10ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
@@ -2926,7 +2934,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 			strings.EqualFold(checkpoint.PendingHistoryRange.Kind, "pending_root_task_started") &&
 			checkpoint.UnresolvedExecution == nil
 	}
-	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryMultiStepProgressTimeout)
 	for !pendingBoundary() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
 	}
@@ -3006,7 +3014,7 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	// Releasing the semantic frontier is a separate durable CAS from consuming
 	// the newly visible prompt/final.  The listener therefore needs one cycle
 	// to release the boundary and a subsequent cycle to deliver the records.
-	progressTimeout := listenerRecoveryExtendedProgressTimeout
+	progressTimeout := listenerRecoveryMultiStepProgressTimeout
 	deadline = time.Now().Add(progressTimeout)
 	for !recovered() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
@@ -4257,7 +4265,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				checkpoint := state.ImportCheckpoints[transcriptCheckpointID(race.session.ID)]
 				return checkpoint.PendingHistoryRange != nil && strings.EqualFold(checkpoint.PendingHistoryRange.Kind, "pending_root_task_started")
-			}, listenerRecoveryExtendedProgressTimeout)
+			}, listenerRecoveryMultiStepProgressTimeout)
 			if !pendingBoundaryReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
@@ -4294,7 +4302,7 @@ func TestTeamsListenFalseCurrentStateReplayMatrix(t *testing.T) {
 				}
 				plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 				return strings.Contains(plain, healthyFinal) && strings.Contains(plain, raceFinal)
-			}, listenerRecoveryExtendedProgressTimeout)
+			}, listenerRecoveryMultiStepProgressTimeout)
 			if !safeBacklogReady {
 				state, loadErr := store.Load(ctx)
 				if loadErr != nil {
