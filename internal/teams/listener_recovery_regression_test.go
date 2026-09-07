@@ -2930,7 +2930,13 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	options.PhaseBudget = 2 * time.Second
+	// This scenario crosses the durable transcript boundary, Teams turn proof,
+	// and outbox delivery in separate listener cycles.  Use the production phase
+	// and worker budgets so race instrumentation or a contended SQLite flush
+	// cannot cancel the recovery outbox before it is admitted.  The finite
+	// multi-step watchdog below still bounds a genuinely wedged listener.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	pendingBoundary := func() bool {
 		state, err := store.Load(context.Background())
@@ -3108,8 +3114,13 @@ func TestTeamsListenFalseTaskStartedPromptRaceFromPolledTeamsTurn(t *testing.T) 
 	listenerRecoverySeedDuePoll(t, store, session.ChatID, now)
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 5 * time.Second
-	options.PollWorkerBudget = time.Second
+	// This vertical path crosses real inbound claim, executor, transcript, and
+	// outbox durable boundaries.  Match the production budgets so a contended
+	// SQLite flush under race cannot turn the test into a synthetic phase-timeout
+	// failure before the later final is admitted.  The multi-step watchdog still
+	// bounds a genuinely wedged listener.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	finalID := "outbox:turn:inbound:chat-1:vertical-race-message:final"
 	select {
