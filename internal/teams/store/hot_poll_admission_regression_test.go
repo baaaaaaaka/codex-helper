@@ -56,7 +56,7 @@ func TestSQLiteHotPollAdmissionFiltersDeferredChatsAndPreservesDueFences(t *test
 			PollRevision: 17, ScheduleRevision: 23, FrontierEpoch: 5, UpdatedAt: now,
 			PendingPage: &ChatPollPendingPage{
 				ReceiptID: "receipt-hot-poll-due", ChatID: chatID,
-				RequestPath: "/chats/" + chatID + "/messages?$top=1",
+				RequestPath: "/chats/" + chatID + "/messages?$top=1", Frontier: "head",
 			},
 			Gap: &ChatPollGap{
 				Epoch: 5, Kind: "test-gap", SafeCursor: now.Add(-time.Hour),
@@ -65,7 +65,7 @@ func TestSQLiteHotPollAdmissionFiltersDeferredChatsAndPreservesDueFences(t *test
 			Attempt: &ChatPollAttempt{
 				ID: "attempt-hot-poll-due", Owner: "owner-a", ProcessIncarnation: "process-a",
 				LeaseGeneration: 9, ExpectedPollRevision: 17, ExpectedScheduleRevision: 23,
-				ExpectedFrontier: "frontier-a", ExpectedReceiptID: "receipt-hot-poll-due",
+				ExpectedFrontier: "head:/chats/" + chatID + "/messages?$top=1", ExpectedReceiptID: "receipt-hot-poll-due",
 				StartedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
 			},
 		}
@@ -124,13 +124,13 @@ func TestSQLiteChatPollScheduleNoopPreservesHotPollFencesAndDoesNotRewrite(t *te
 		PollRevision: 31, ScheduleRevision: 37, FrontierEpoch: 11, UpdatedAt: now,
 		PendingPage: &ChatPollPendingPage{
 			ReceiptID: "receipt-hot-poll-noop", ChatID: chatID,
-			RequestPath: "/chats/" + chatID + "/messages?$top=1",
+			RequestPath: "/chats/" + chatID + "/messages?$top=1", Frontier: "head",
 		},
 		Gap: &ChatPollGap{Epoch: 11, Kind: "test-gap", SafeCursor: now.Add(-time.Hour)},
 		Attempt: &ChatPollAttempt{
 			ID: "attempt-hot-poll-noop", Owner: "owner-b", ProcessIncarnation: "process-b",
 			LeaseGeneration: 12, ExpectedPollRevision: 31, ExpectedScheduleRevision: 37,
-			ExpectedFrontier: "frontier-b", ExpectedReceiptID: "receipt-hot-poll-noop",
+			ExpectedFrontier: "head:/chats/" + chatID + "/messages?$top=1", ExpectedReceiptID: "receipt-hot-poll-noop",
 			StartedAt: now.Add(-time.Second), ExpiresAt: now.Add(time.Minute),
 		},
 	}

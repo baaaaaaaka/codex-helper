@@ -24,6 +24,8 @@ type teamsGraph429StressScale struct {
 
 const teamsGraph429StressRetryAfterSeconds = "600"
 
+const teamsGraph429StressPromptWait = 30 * time.Second
+
 func loadTeamsGraph429StressScale() teamsGraph429StressScale {
 	scale := teamsGraph429StressScale{Chats: 12, Messages: 3, Rounds: 3}
 	if os.Getenv("CODEX_HELPER_TEAMS_GRAPH_429_STRESS") != "" {
@@ -179,6 +181,7 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 		requests       = map[string]int{}
 		messageVersion = map[string]int{}
 		blockedMode    = true
+		pollTrace      = map[string][]string{}
 	)
 	readServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
@@ -226,7 +229,24 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 	bridge := newBridgeTestBridge(writeGraph, store, executor)
 	bridge.readGraph = readGraph
 	bridge.reg.Sessions = nil
-	bridge.maxWorkChatPollsPerCycle = scale.Chats
+	bridge.maxWorkChatPollsPerCycle = teamsGraph429StressPollLimit(scale.Chats)
+	// This test stresses 32 chats in one synthetic cycle while the real listener
+	// normally admits only the configured per-cycle slice. Keep the Graph page
+	// deadline generous so a race-instrumented or heavily loaded test runner
+	// does not turn local scheduling delay into a false 429 availability failure.
+	bridge.pollWorkerBudget = 30 * time.Second
+	// The synthetic high-scale run intentionally keeps the synchronous test
+	// executor so each prompt has a durable terminal state before the next wave
+	// is admitted. Under -race with two hosted CPUs, that fixture can spend more
+	// than the production 5s cleanup grace waiting for SQLite writers. Cleanup
+	// timing is covered by dedicated tests; this test is about Graph 429
+	// isolation, so give its synthetic durable tail a finite, test-only margin.
+	bridge.pollAttemptDurableGrace = 30 * time.Second
+	bridge.pollChatTraceHook = func(chatID string, duration time.Duration, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		pollTrace[chatID] = append(pollTrace[chatID], fmt.Sprintf("%s err=%v", duration, err))
+	}
 	seedTeamsGraph429ControlPoll(t, store, now)
 	for chatNum := 1; chatNum <= scale.Chats; chatNum++ {
 		chatID := teamsGraph429StressChatID(chatNum)
@@ -246,14 +266,8 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 		messageVersion[chatID] = 1
 	}
 
-	err := bridge.pollOnce(ctx, 20)
-	if err != nil {
-		t.Fatalf("initial pollOnce leaked a chat-local Graph 429: %v", err)
-	}
 	openChats := scale.Chats - len(blockedChats)
-	if got := len(executor.prompts); got != openChats {
-		t.Fatalf("prompts after initial poll = %d, want %d open chats", got, openChats)
-	}
+	pollTeamsGraph429StressUntilPromptCount(t, ctx, bridge, store, executor, scale, pollTrace, &mu, openChats, "initial poll")
 	if got := len(*sent); got < openChats*2 {
 		t.Fatalf("sent Teams messages after initial poll = %d, want at least ack+final for %d chats", got, openChats)
 	}
@@ -273,14 +287,9 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 			messageVersion[chatID] = round + 1
 			scheduleTeamsGraph429PollDue(t, store, chatID, now.Add(time.Duration(round)*time.Second))
 		}
-		if err := bridge.pollOnce(ctx, 20); err != nil {
-			t.Fatalf("round %d pollOnce while blocked chats are parked: %v", round, err)
-		}
 		assertBlockedRequestCountsUnchanged(t, blockedChats, blockedRequestsAfterInitial, requests)
 		wantPrompts := openChats * (round + 1)
-		if got := len(executor.prompts); got != wantPrompts {
-			t.Fatalf("round %d prompts = %d, want %d open-chat prompts", round, got, wantPrompts)
-		}
+		pollTeamsGraph429StressUntilPromptCount(t, ctx, bridge, store, executor, scale, pollTrace, &mu, wantPrompts, fmt.Sprintf("round %d poll", round))
 	}
 
 	mu.Lock()
@@ -297,25 +306,104 @@ func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *tes
 		messageVersion[chatID] = scale.Rounds + 2
 		scheduleTeamsGraph429PollUnblocked(t, store, chatID, now.Add(time.Duration(scale.Rounds+2)*time.Second))
 	}
-	if err := bridge.pollOnce(ctx, 20); err != nil {
-		t.Fatalf("pollOnce after clearing read rate limits: %v", err)
-	}
 	wantPrompts := openChats*(scale.Rounds+1) + len(blockedChats)
-	if got := len(executor.prompts); got != wantPrompts {
-		t.Fatalf("prompts after unblocking = %d, want %d", got, wantPrompts)
-	}
+	pollTeamsGraph429StressUntilPromptCount(t, ctx, bridge, store, executor, scale, pollTrace, &mu, wantPrompts, "unblocked poll")
 	for chatID := range blockedChats {
 		if requests[chatID] != 2 {
 			t.Fatalf("blocked chat %s read requests after unblock = %d, want one 429 plus one successful retry", chatID, requests[chatID])
 		}
 		poll, ok, err := store.ChatPoll(ctx, chatID)
 		if err != nil || !ok {
-			t.Fatalf("ChatPoll %s ok=%v err=%v", chatID, ok, err)
+			t.Fatalf("ChatPoll %s ok=%v err=%v; diagnostics=%s", chatID, ok, err, teamsGraph429StressPollDiagnostics(store, scale, pollTrace, &mu))
 		}
 		if poll.PollState == inboundPollStateBlocked || !poll.BlockedUntil.IsZero() || poll.LastError != "" {
-			t.Fatalf("blocked chat %s poll state after successful retry = %#v, want unblocked clean poll", chatID, poll)
+			t.Fatalf("blocked chat %s poll state after successful retry = %#v, want unblocked clean poll; diagnostics=%s", chatID, poll, teamsGraph429StressPollDiagnostics(store, scale, pollTrace, &mu))
 		}
 	}
+}
+
+func teamsGraph429StressPollLimit(chatCount int) int {
+	limit := DefaultMaxWorkChatPollsPerCycle
+	if limit <= 0 || limit > chatCount {
+		limit = chatCount
+	}
+	if limit <= 0 {
+		return 1
+	}
+	return limit
+}
+
+func pollTeamsGraph429StressUntilPromptCount(t *testing.T, ctx context.Context, bridge *Bridge, store *teamstore.Store, executor *recordingExecutor, scale teamsGraph429StressScale, trace map[string][]string, mu *sync.Mutex, want int, phase string) {
+	t.Helper()
+	limit := teamsGraph429StressPollLimit(scale.Chats)
+	maxPasses := (scale.Chats+limit-1)/limit + 2
+	for pass := 0; pass < maxPasses && executor.promptCount() < want; pass++ {
+		if err := bridge.pollOnce(ctx, 20); err != nil {
+			t.Fatalf("%s pass %d pollOnce failed: %v; diagnostics=%s", phase, pass+1, err, teamsGraph429StressPollDiagnostics(store, scale, trace, mu))
+		}
+	}
+	waitTeamsGraph429StressPromptCount(t, executor, want, phase, func() string {
+		return teamsGraph429StressPollDiagnostics(store, scale, trace, mu)
+	})
+}
+
+func waitTeamsGraph429StressPromptCount(t *testing.T, executor *recordingExecutor, want int, phase string, diagnostics func() string) {
+	t.Helper()
+	deadline := time.Now().Add(teamsGraph429StressPromptWait)
+	for {
+		got := executor.promptCount()
+		if got >= want {
+			if got != want {
+				t.Fatalf("%s prompts = %d, want exactly %d open-chat prompts; prompts=%v; diagnostics=%s", phase, got, want, teamsGraph429StressPromptLabels(executor), diagnostics())
+			}
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("%s prompts = %d after %s, want %d open-chat prompts; prompts=%v; diagnostics=%s", phase, got, teamsGraph429StressPromptWait, want, teamsGraph429StressPromptLabels(executor), diagnostics())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func teamsGraph429StressPollDiagnostics(store *teamstore.Store, scale teamsGraph429StressScale, trace map[string][]string, mu *sync.Mutex) string {
+	if store == nil {
+		return "store=nil"
+	}
+	mu.Lock()
+	traceCopy := make(map[string][]string, len(trace))
+	for chatID, entries := range trace {
+		traceCopy[chatID] = append([]string(nil), entries...)
+	}
+	mu.Unlock()
+	parts := make([]string, 0, scale.Chats)
+	for chatNum := 1; chatNum <= scale.Chats; chatNum++ {
+		chatID := teamsGraph429StressChatID(chatNum)
+		poll, ok, err := store.ChatPoll(context.Background(), chatID)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("%s load=%v trace=%v", chatID, err, traceCopy[chatID]))
+			continue
+		}
+		if !ok {
+			parts = append(parts, fmt.Sprintf("%s missing trace=%v", chatID, traceCopy[chatID]))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s state=%s next=%s cursor=%s err=%q trace=%v", chatID, poll.PollState, poll.NextPollAt.Format(time.RFC3339Nano), poll.LastModifiedCursor.Format(time.RFC3339Nano), poll.LastError, traceCopy[chatID]))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func teamsGraph429StressPromptLabels(executor *recordingExecutor) []string {
+	labels := make([]string, 0)
+	for _, prompt := range executor.promptSnapshot() {
+		for _, line := range strings.Split(prompt, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "poll ") {
+				labels = append(labels, line)
+				break
+			}
+		}
+	}
+	return labels
 }
 
 func teamsGraph429StressChatID(n int) string {

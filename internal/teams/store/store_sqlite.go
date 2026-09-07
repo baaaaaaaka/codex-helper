@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +47,26 @@ const (
 // JSON without repeatedly rewriting the large cold document.
 const (
 	sqliteHistoryWatchProjectionKey = "history_watch_projection"
+	// This marker makes the canonical frontier-hint repair an open/migration
+	// action rather than a full chat_polls rewrite on every compatibility save.
+	// Bump the value whenever the canonical frontier predicate changes.
+	sqliteChatPollFrontierHintVersionKey = "chat_poll_frontier_hint_version"
+	sqliteChatPollFrontierHintVersion    = "2"
+	// These markers gate one-time, narrow reconciliation of indexed columns from
+	// their canonical JSON rows. They repair stores written by mixed-version
+	// helpers without loading the cold State document on every listener tick.
+	sqliteSessionProjectionVersionKey  = "session_projection_version"
+	sqliteSessionProjectionVersion     = "1"
+	sqliteChatPollProjectionVersionKey = "chat_poll_projection_version"
+	// Includes the structural admission bit used to quarantine semantically
+	// malformed JSON before it can consume a hot-poll keyset page.
+	sqliteChatPollProjectionVersion        = "2"
+	sqliteInboundProjectionVersionKey      = "inbound_projection_version"
+	sqliteInboundProjectionVersion         = "1"
+	sqliteChatSequenceProjectionVersionKey = "chat_sequence_projection_version"
+	sqliteChatSequenceProjectionVersion    = "1"
+	sqliteSQLiteBackfillCursorSuffix       = "_backfill_cursor"
+	sqliteProjectionBackfillBatchSize      = 256
 	// stateJSONRevisionKey is incremented by a durable SQLite trigger whenever
 	// any writer (including an older helper) replaces state_json.  The history
 	// watch projection records the revision it was based on, so a mixed-version
@@ -62,12 +84,6 @@ const (
 	// for it, but never let an unbounded collection of corrupt rows fill the
 	// admission quantum and starve healthy chats.
 	sqliteHotPollMalformedLimit = 1
-	// Echo recovery is an exceptional path used only when a provider accepted
-	// a rendered message before its local receipt was persisted. Page through a
-	// bounded number of rows so one malformed canonical row cannot hide the next
-	// usable candidate, while a pathological pile of opaque rows cannot turn
-	// this lookup into an unbounded scan.
-	sqliteOutboxEchoMaxPages = 8
 )
 
 // Keep a small ordinary lane in every hot-poll admission quantum.  A large
@@ -110,7 +126,11 @@ func sqliteChatPollOperationalFrontierSQL(column string) string {
     json_type(` + column + `, '$.pending_page') IN ('object', 'array')
     OR (json_type(` + column + `, '$.continuation_path') = 'text' AND COALESCE(json_extract(` + column + `, '$.continuation_path'), '') <> '')
     OR (json_type(` + column + `, '$.deferred_continuation_path') = 'text' AND COALESCE(json_extract(` + column + `, '$.deferred_continuation_path'), '') <> '')
-    OR json_type(` + column + `, '$.gap') IN ('object', 'array')
+    OR (json_type(` + column + `, '$.gap') IN ('object', 'array') AND NOT (
+      COALESCE(json_extract(` + column + `, '$.gap.head_probe_pending'), 0) = 1
+      AND trim(COALESCE(json_extract(` + column + `, '$.gap.recovery_path'), '')) = ''
+    ))
+    OR (json_type(` + column + `, '$.gap.head_probe_continuation_path') = 'text' AND trim(COALESCE(json_extract(` + column + `, '$.gap.head_probe_continuation_path'), '')) <> '')
   ), 0) ELSE 0 END)`
 }
 
@@ -152,6 +172,15 @@ func sqliteChatPollAdmissionValidJSONSQL(jsonColumn, chatIDColumn string) string
 			parts = append(parts, typeExpr+" = '"+typ+"'")
 		}
 		return "(" + strings.Join(parts, " OR ") + ")"
+	}
+	enumAllowed := func(path string, allowed ...string) string {
+		typeExpr := sqliteSafeJSONType(jsonColumn, path)
+		valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+		values := make([]string, 0, len(allowed))
+		for _, value := range allowed {
+			values = append(values, "trim(COALESCE("+valueExpr+", '')) = '"+value+"'")
+		}
+		return "(" + typeExpr + " IS NULL OR " + typeExpr + " = 'null' OR (" + typeExpr + " = 'text' AND (" + strings.Join(values, " OR ") + ")))"
 	}
 	arrayElementsAllowed := func(path, elementType string) string {
 		typeExpr := sqliteSafeJSONType(jsonColumn, path)
@@ -198,13 +227,17 @@ func sqliteChatPollAdmissionValidJSONSQL(jsonColumn, chatIDColumn string) string
 	// before it consumes an operational or ordinary slot.
 	for _, path := range []string{
 		"$.pending_page.receipt_id", "$.pending_page.chat_id", "$.pending_page.request_path",
-		"$.pending_page.request_fingerprint", "$.pending_page.frontier", "$.pending_page.next_path", "$.pending_page.boundary_reason",
-		"$.gap.kind", "$.gap.reason", "$.gap.evidence", "$.gap.frontier_path", "$.gap.recovery_path",
+		"$.pending_page.request_fingerprint", "$.pending_page.frontier", "$.pending_page.next_path", "$.pending_page.boundary_reason", "$.pending_page.poll_role",
+		"$.gap.kind", "$.gap.reason", "$.gap.evidence", "$.gap.frontier_path", "$.gap.recovery_path", "$.gap.head_probe_continuation_path",
 		"$.attempt.id", "$.attempt.owner", "$.attempt.process_incarnation", "$.attempt.expected_frontier",
 		"$.attempt.expected_receipt_id",
 	} {
 		parts = append(parts, typeAllowed(path, "text"))
 	}
+	parts = append(parts,
+		enumAllowed("$.pending_page.frontier", "head", "continuation", "head-continuation", "gap-recovery"),
+		enumAllowed("$.pending_page.poll_role", "", "control", "work"),
+	)
 	for _, path := range []string{
 		"$.pending_page.frontier_epoch", "$.gap.epoch", "$.gap.notice_epoch",
 		"$.attempt.expected_poll_revision", "$.attempt.expected_schedule_revision",
@@ -227,6 +260,62 @@ func sqliteChatPollAdmissionValidJSONSQL(jsonColumn, chatIDColumn string) string
 	return strings.Join(parts, "\n  AND ")
 }
 
+// sqliteChatPollScheduleValidJSONSQL covers the top-level JSON types that can
+// otherwise make a malformed poll disappear before the Go admission decoder
+// sees it.  Keep this projection smaller than
+// sqliteChatPollAdmissionValidJSONSQL: nested provenance/receipt validation is
+// still performed after the bounded row is decoded, while schedule-critical
+// fields must be classified as a local recovery row even when their scalar
+// compatibility columns look due.
+func sqliteChatPollScheduleValidJSONSQL(jsonColumn, chatIDColumn string) string {
+	base := sqliteChatPollValidJSONSQL(jsonColumn, chatIDColumn)
+	typeAllowed := func(path string, allowed ...string) string {
+		typeExpr := sqliteSafeJSONType(jsonColumn, path)
+		parts := []string{typeExpr + " IS NULL", typeExpr + " = 'null'"}
+		for _, typ := range allowed {
+			parts = append(parts, typeExpr+" = '"+typ+"'")
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+	}
+	timeAllowed := func(path string) string {
+		typeExpr := sqliteSafeJSONType(jsonColumn, path)
+		valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+		// A missing/null time is the zero value accepted by the Go model. A
+		// present string must still be parseable by SQLite's RFC3339-compatible
+		// date parser; otherwise julianday() returns NULL and the row can vanish
+		// from every due query while its scalar compatibility deadline looks fine.
+		zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+		return "(" + typeExpr + " IS NULL OR " + typeExpr + " = 'null' OR (" + typeExpr + " = 'text' AND (trim(COALESCE(" + valueExpr + ", '')) = '" + zeroTime + "' OR julianday(" + valueExpr + ") IS NOT NULL)))"
+	}
+	parts := []string{base}
+	for _, path := range []string{
+		"$.state", "$.continuation_path", "$.deferred_continuation_path",
+	} {
+		parts = append(parts, typeAllowed(path, "text"))
+	}
+	for _, path := range []string{
+		"$.next_poll_at", "$.last_activity_at", "$.blocked_until", "$.parked_at",
+		"$.park_notice_sent_at", "$.last_modified_cursor", "$.continuation_safe_cursor",
+		"$.last_successful_poll_at", "$.last_error_at", "$.last_window_full_at",
+		"$.continuation_first_failure_at", "$.continuation_last_failure_at", "$.updated_at",
+	} {
+		parts = append(parts, timeAllowed(path))
+	}
+	for _, path := range []string{"$.seeded", "$.recovery_required", "$.head_probe_pending"} {
+		parts = append(parts, typeAllowed(path, "true", "false"))
+	}
+	for _, path := range []string{
+		"$.failure_count", "$.continuation_failure_count", "$.continuation_no_progress_count",
+		"$.continuation_page_count", "$.poll_revision", "$.schedule_revision", "$.frontier_epoch",
+	} {
+		parts = append(parts, typeAllowed(path, "integer"))
+	}
+	for _, path := range []string{"$.pending_page", "$.gap", "$.attempt"} {
+		parts = append(parts, typeAllowed(path, "object"))
+	}
+	return strings.Join(parts, "\n  AND ")
+}
+
 func sqliteSessionValidJSONSQL(jsonColumn, idColumn, chatIDColumn string) string {
 	return `json_valid(` + jsonColumn + `)
   AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.id') END) = 'text'
@@ -234,7 +323,20 @@ func sqliteSessionValidJSONSQL(jsonColumn, idColumn, chatIDColumn string) string
   AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.teams_chat_id') END) = 'text'
   AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_extract(` + jsonColumn + `, '$.teams_chat_id') END) = ` + chatIDColumn + `
   AND ((CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.status') END) IS NULL OR
-       (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.status') END) IN ('null', 'text'))`
+	       (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.status') END) IN ('null', 'text'))`
+}
+
+// sqliteSessionCanonicalValidJSONSQL validates only the canonical session
+// identity. The scalar chat binding remains useful for indexed ordering and
+// legacy fallback, but it must not make a valid JSON session disappear after a
+// same-process partial projection write.
+func sqliteSessionCanonicalValidJSONSQL(jsonColumn, idColumn string) string {
+	return `json_valid(` + jsonColumn + `)
+  AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.id') END) = 'text'
+  AND trim((CASE WHEN json_valid(` + jsonColumn + `) THEN json_extract(` + jsonColumn + `, '$.id') END)) <> ''
+  AND trim((CASE WHEN json_valid(` + jsonColumn + `) THEN json_extract(` + jsonColumn + `, '$.id') END)) = trim(` + idColumn + `)
+  AND (CASE WHEN json_valid(` + jsonColumn + `) THEN json_type(` + jsonColumn + `, '$.teams_chat_id') END) = 'text'
+  AND trim((CASE WHEN json_valid(` + jsonColumn + `) THEN json_extract(` + jsonColumn + `, '$.teams_chat_id') END)) <> ''`
 }
 
 // sqliteSessionActiveJSONSQL treats the canonical JSON session status as the
@@ -246,6 +348,107 @@ func sqliteSessionActiveJSONSQL(jsonColumn, sqlStatusColumn string) string {
 	status := sqliteSafeJSONExtract(jsonColumn, "$.status")
 	return "(((" + statusType + " IN ('null') OR " + statusType + " IS NULL) AND (" + sqlStatusColumn + " IS NULL OR " + sqlStatusColumn + " = '' OR " + sqlStatusColumn + " = '" + string(SessionStatusActive) + "'))" +
 		" OR (" + statusType + " = 'text' AND (trim(COALESCE(" + status + ", '')) = '' OR trim(" + status + ") = '" + string(SessionStatusActive) + "')))"
+}
+
+// sqliteCanonicalTextProjectionSQL makes a scalar column a compatibility
+// fallback instead of an authority. Current writers update JSON and indexed
+// columns in one transaction, but old helpers and interrupted/manual repairs
+// can publish the JSON envelope first. Hot admission must still find the row in
+// the same open process; waiting for a restart-only backfill would leave the
+// chat hidden indefinitely.
+func sqliteCanonicalTextProjectionSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+	return "(CASE WHEN " + typeExpr + " = 'text' THEN trim(COALESCE(" + valueExpr + ", '')) WHEN " + typeExpr + " = 'null' THEN '' ELSE trim(COALESCE(" + legacyColumn + ", '')) END)"
+}
+
+// sqliteCanonicalTimeProjectionSQL converts a canonical RFC3339 timestamp to
+// the nanosecond epoch used by the SQLite compatibility columns. SQLite's
+// julianday conversion is millisecond-accurate, which is sufficient for poll
+// due/idle admission; the typed Go decode remains the final exact timestamp
+// check. The zero time has a deliberately explicit branch because its year is
+// outside the useful Unix-nanosecond range.
+func sqliteCanonicalTimeProjectionSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+	legacyExpr := sqliteStoredInt64SQL(legacyColumn)
+	zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN COALESCE(" + legacyExpr + ", 0)" +
+		" WHEN " + typeExpr + " = 'null' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' AND trim(COALESCE(" + valueExpr + ", '')) = '' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' AND trim(COALESCE(" + valueExpr + ", '')) = '" + zeroTime + "' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' AND julianday(" + valueExpr + ") IS NOT NULL THEN CAST((julianday(" + valueExpr + ") - 2440587.5) * 86400000000000.0 AS INTEGER)" +
+		" ELSE 0 END)"
+}
+
+// sqliteCanonicalTimeDueSQL is the due-comparison form of the canonical time
+// projection.  julianday() is a floating-point conversion and can round a
+// nanosecond timestamp a few hundred microseconds into the future when it is
+// converted back to Unix nanoseconds.  Comparing that result with an exact Go
+// nanosecond value can therefore hide a row whose retry deadline is exactly
+// now.  Keep the ordering projection above for keyset sorting, but compare
+// both sides in SQLite's own Julian-day domain for due gates.
+func sqliteCanonicalTimeDueSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+	legacyExpr := sqliteStoredInt64SQL(legacyColumn)
+	zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN 2440587.5 + COALESCE(" + legacyExpr + ", 0) / 86400000000000.0" +
+		" WHEN " + typeExpr + " = 'null' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' AND trim(COALESCE(" + valueExpr + ", '')) = '' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' AND trim(COALESCE(" + valueExpr + ", '')) = '" + zeroTime + "' THEN 0" +
+		" WHEN " + typeExpr + " = 'text' THEN julianday(" + valueExpr + ")" +
+		" ELSE NULL END)"
+}
+
+// sqliteCanonicalBoolProjectionSQL follows the same JSON-first rule for a
+// boolean compatibility column. Invalid present JSON is conservative false;
+// the surrounding admission predicate routes such a row through its malformed
+// recovery lane rather than treating the scalar as a second source of truth.
+func sqliteCanonicalBoolProjectionSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	legacyExpr := sqliteStoredInt64SQL(legacyColumn)
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN COALESCE(" + legacyExpr + ", 0) WHEN " + typeExpr + " = 'true' THEN 1 WHEN " + typeExpr + " = 'false' OR " + typeExpr + " = 'null' THEN 0 ELSE 0 END)"
+}
+
+// sqliteCanonicalParkedSkipProjectionSQL recomputes the derived parked notice
+// hint when the JSON row contains any of its defining fields. Legacy rows that
+// predate those fields retain the indexed hint. This is only an admission hint;
+// the selected JSON poll is decoded and checked again before a park mutation.
+func sqliteCanonicalParkedSkipProjectionSQL(jsonColumn, legacyColumn, legacyStateColumn string) string {
+	stateType := sqliteSafeJSONType(jsonColumn, "$.state")
+	state := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.state", legacyStateColumn)
+	noticeType := sqliteSafeJSONType(jsonColumn, "$.park_notice_sent_at")
+	parkedType := sqliteSafeJSONType(jsonColumn, "$.parked_at")
+	blockedType := sqliteSafeJSONType(jsonColumn, "$.blocked_until")
+	continuationType := sqliteSafeJSONType(jsonColumn, "$.continuation_path")
+	deferredType := sqliteSafeJSONType(jsonColumn, "$.deferred_continuation_path")
+	pendingType := sqliteSafeJSONType(jsonColumn, "$.pending_page")
+	gapType := sqliteSafeJSONType(jsonColumn, "$.gap")
+	attemptType := sqliteSafeJSONType(jsonColumn, "$.attempt")
+	failureType := sqliteSafeJSONType(jsonColumn, "$.failure_count")
+	failure := "(CASE WHEN " + failureType + " IS NULL OR " + failureType + " = 'null' THEN 0 WHEN " + failureType + " = 'integer' THEN COALESCE(CAST(" + sqliteSafeJSONExtract(jsonColumn, "$.failure_count") + " AS INTEGER), 0) ELSE 1 END)"
+	lastErrorType := sqliteSafeJSONType(jsonColumn, "$.last_error")
+	lastError := "(CASE WHEN " + lastErrorType + " = 'text' THEN trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.last_error") + ", '')) WHEN " + lastErrorType + " IS NULL OR " + lastErrorType + " = 'null' THEN '' ELSE '__invalid__' END)"
+	notice := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.park_notice_sent_at", "0")
+	parkedAt := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.parked_at", "0")
+	blocked := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.blocked_until", "0")
+	continuation := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.continuation_path", "''")
+	deferred := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.deferred_continuation_path", "''")
+	hasCanonical := "(" + strings.Join([]string{
+		stateType + " IS NOT NULL", noticeType + " IS NOT NULL", parkedType + " IS NOT NULL",
+		blockedType + " IS NOT NULL", continuationType + " IS NOT NULL", deferredType + " IS NOT NULL",
+		pendingType + " IS NOT NULL", gapType + " IS NOT NULL", attemptType + " IS NOT NULL",
+		failureType + " IS NOT NULL", lastErrorType + " IS NOT NULL",
+	}, " OR ") + ")"
+	derived := "(CASE WHEN " + state + " = 'parked' AND " + notice + " > 0 AND " + parkedAt + " > 0 AND " + blocked + " = 0" +
+		" AND trim(" + continuation + ") = '' AND trim(" + deferred + ") = ''" +
+		" AND (" + pendingType + " IS NULL OR " + pendingType + " = 'null')" +
+		" AND (" + gapType + " IS NULL OR " + gapType + " = 'null')" +
+		" AND (" + attemptType + " IS NULL OR " + attemptType + " = 'null')" +
+		" AND " + failure + " = 0 AND " + lastError + " = '' THEN 1 ELSE 0 END)"
+	legacyExpr := sqliteStoredInt64SQL(legacyColumn)
+	return "(CASE WHEN json_valid(" + jsonColumn + ") AND " + hasCanonical + " THEN " + derived + " ELSE COALESCE(" + legacyExpr + ", 0) END)"
 }
 
 // sqliteSafeJSONExtract must be used for JSON1 expressions over a persisted
@@ -268,6 +471,9 @@ func sqliteSafeJSONType(column, path string) string {
 // work: filtering it before LIMIT keeps one damaged row from hiding healthy
 // rows, while the raw row remains available to the opaque-row diagnostics.
 //
+// TeamsChatID is allowed to be empty for helper/internal outbox rows that have
+// not yet been bound to a Teams destination.  It still must be a JSON string,
+// and a non-empty scalar projection must agree with a non-empty JSON value.
 // Optional JSON fields are absent in older rows, so their absent/null forms
 // match the zero-valued compatibility columns.  Fields with a non-zero value
 // must have the type that encoding/json expects; otherwise a type error would
@@ -278,40 +484,506 @@ func sqliteOutboxProjectionValidSQL(alias string) string {
 	chatID := sqliteSafeJSONExtract(jsonColumn, "$.teams_chat_id")
 	messageID := sqliteSafeJSONExtract(jsonColumn, "$.teams_message_id")
 	status := sqliteSafeJSONExtract(jsonColumn, "$.status")
-	sequence := sqliteSafeJSONExtract(jsonColumn, "$.sequence")
-	pending := sqliteSafeJSONExtract(jsonColumn, "$.post_send_effects_pending")
+	sequenceType := sqliteSafeJSONType(jsonColumn, "$.sequence")
+	sequenceValue := sqliteSafeJSONExtract(jsonColumn, "$.sequence")
+	postPendingType := sqliteSafeJSONType(jsonColumn, "$.post_send_effects_pending")
+	createdAtType := sqliteSafeJSONType(jsonColumn, "$.created_at")
 	optionalText := func(path, column string) string {
 		typeExpr := sqliteSafeJSONType(jsonColumn, path)
 		valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
-		// A NULL indexed column is an unknown value on an older SQLite schema
-		// (or on a row written before that projection existed), not evidence of
-		// an identity mismatch. The JSON payload remains canonical in that case.
-		return "(" + column + " IS NULL OR ((" + typeExpr + " IS NULL OR " + typeExpr + " = 'text') AND trim(COALESCE(" + valueExpr + ", '')) = trim(COALESCE(" + column + ", ''))))"
+		// An absent JSON field means that this is an older row and the indexed
+		// column is the compatibility source.  Once JSON contains the field,
+		// JSON is canonical: a NULL/empty projection is tolerated, while a
+		// contradictory non-empty projection keeps the row opaque.  This is
+		// important for both legacy nullable columns and fail-closed identity
+		// admission.
+		return "((" + typeExpr + " IS NULL) OR (" + typeExpr + " IN ('null', 'text') AND (" + column + " IS NULL OR trim(COALESCE(" + column + ", '')) = '' OR trim(COALESCE(" + valueExpr + ", '')) = trim(COALESCE(" + column + ", '')))))"
 	}
 	optionalTime := func(path string) string {
 		typeExpr := sqliteSafeJSONType(jsonColumn, path)
-		return "(" + typeExpr + " IS NULL OR " + typeExpr + " = 'text')"
+		valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+		return "(" + typeExpr + " IS NULL OR " + typeExpr + " = 'null' OR (" + typeExpr + " = 'text' AND (trim(" + valueExpr + ") = '' OR julianday(" + valueExpr + ") IS NOT NULL)))"
 	}
+	sequenceProjection := "(" +
+		"(" + sequenceType + " IS NULL AND (" + alias + ".sequence IS NULL OR (typeof(" + alias + ".sequence) IN ('integer', 'real') AND " + alias + ".sequence >= 0)))" +
+		" OR (" + sequenceType + " = 'null' AND (" + alias + ".sequence IS NULL OR typeof(" + alias + ".sequence) NOT IN ('integer', 'real') OR " + alias + ".sequence = 0))" +
+		" OR (" + sequenceType + " = 'integer' AND (" + alias + ".sequence IS NULL OR typeof(" + alias + ".sequence) NOT IN ('integer', 'real') OR " + alias + ".sequence = CAST(" + sequenceValue + " AS INTEGER)))" +
+		")"
+	postPendingProjection := "(" +
+		"(" + postPendingType + " IS NULL AND (" + alias + ".post_send_effects_pending IS NULL OR (typeof(" + alias + ".post_send_effects_pending) IN ('integer', 'real') AND " + alias + ".post_send_effects_pending IN (0, 1))))" +
+		" OR (" + postPendingType + " = 'null' AND (" + alias + ".post_send_effects_pending IS NULL OR typeof(" + alias + ".post_send_effects_pending) NOT IN ('integer', 'real') OR " + alias + ".post_send_effects_pending = 0))" +
+		" OR (" + postPendingType + " IN ('true', 'false') AND (" + alias + ".post_send_effects_pending IS NULL OR typeof(" + alias + ".post_send_effects_pending) NOT IN ('integer', 'real') OR " + alias + ".post_send_effects_pending = CASE WHEN " + postPendingType + " = 'true' THEN 1 ELSE 0 END))" +
+		")"
 	return "json_valid(" + jsonColumn + ")" +
 		" AND " + sqliteSafeJSONType(jsonColumn, "$.id") + " = 'text'" +
+		" AND trim(" + id + ") <> ''" +
+		// id and created_at are the durable keyset identity.  Unlike optional
+		// compatibility fields, a NULL scalar here cannot be reconstructed safely
+		// for FIFO/recovery ordering, so keep the row opaque until explicit repair.
+		" AND " + alias + ".id IS NOT NULL AND trim(" + alias + ".id) <> ''" +
 		" AND trim(" + id + ") = trim(" + alias + ".id)" +
-		" AND " + sqliteSafeJSONType(jsonColumn, "$.teams_chat_id") + " = 'text'" +
-		" AND trim(" + chatID + ") = trim(COALESCE(" + alias + ".teams_chat_id, ''))" +
-		" AND (" + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " = 'text')" +
-		" AND (" + alias + ".teams_message_id IS NULL OR trim(COALESCE(" + messageID + ", '')) = trim(COALESCE(" + alias + ".teams_message_id, '')))" +
-		" AND " + sqliteSafeJSONType(jsonColumn, "$.status") + " = 'text'" +
-		" AND " + status + " = COALESCE(" + alias + ".status, '')" +
-		" AND (" + sqliteSafeJSONType(jsonColumn, "$.sequence") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.sequence") + " = 'integer')" +
-		" AND COALESCE(" + sequence + ", 0) = COALESCE(" + alias + ".sequence, 0)" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.teams_chat_id") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.teams_chat_id") + " = 'text')" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.teams_chat_id") + " IS NULL OR " + alias + ".teams_chat_id IS NULL OR trim(" + alias + ".teams_chat_id) = '' OR trim(" + chatID + ") = trim(" + alias + ".teams_chat_id))" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " IN ('null', 'text'))" +
+		" AND ((" + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " IS NULL) OR (" + alias + ".teams_message_id IS NULL OR trim(" + alias + ".teams_message_id) = '' OR (" + sqliteSafeJSONType(jsonColumn, "$.teams_message_id") + " = 'text' AND trim(COALESCE(" + messageID + ", '')) = trim(" + alias + ".teams_message_id))))" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.status") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.status") + " = 'text')" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.status") + " IS NULL OR " + alias + ".status IS NULL OR trim(" + alias + ".status) = '' OR " + status + " = " + alias + ".status)" +
+		// Sequence and post-send pending are indexed compatibility projections,
+		// not independent sources of truth. If the canonical JSON field is
+		// present, a missing or contradictory scalar would make FIFO ordering or
+		// side-effect admission depend on which query happened to run first.
+		" AND " + sequenceProjection +
 		" AND " + optionalText("$.session_id", alias+".session_id") +
 		" AND " + optionalText("$.turn_id", alias+".turn_id") +
-		" AND (" + sqliteSafeJSONType(jsonColumn, "$.post_send_effects_pending") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.post_send_effects_pending") + " IN ('true', 'false'))" +
-		" AND COALESCE(" + pending + ", 0) = COALESCE(" + alias + ".post_send_effects_pending, 0)" +
-		" AND " + optionalTime("$.created_at") +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.last_send_error") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.last_send_error") + " IN ('null', 'text'))" +
+		" AND " + postPendingProjection +
+		// created_at is the durable keyset identity. Unlike optional projections,
+		// a non-numeric scalar cannot be safely reconstructed from a timestamp
+		// without changing FIFO order, so keep that row out of every hot lane.
+		" AND typeof(" + alias + ".created_at) IN ('integer', 'real') AND " + alias + ".created_at >= 0" +
+		" AND (" + createdAtType + " IS NULL OR (" + createdAtType + " = 'text' AND julianday(" + sqliteSafeJSONExtract(jsonColumn, "$.created_at") + ") IS NOT NULL) OR (" + createdAtType + " = 'null' AND COALESCE(" + alias + ".created_at, 0) = 0))" +
 		" AND " + optionalTime("$.updated_at") +
 		" AND " + optionalTime("$.sent_at") +
 		" AND " + optionalTime("$.last_send_attempt") +
-		" AND " + optionalTime("$.next_attempt_at")
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.next_attempt_at") + " IS NOT NULL OR " + alias + ".deliver_after IS NULL OR (typeof(" + alias + ".deliver_after) IN ('integer', 'real') AND " + alias + ".deliver_after >= 0))" +
+		" AND (" + sqliteSafeJSONType(jsonColumn, "$.next_attempt_at") + " IS NULL OR " + sqliteSafeJSONType(jsonColumn, "$.next_attempt_at") + " = 'null' OR (" + sqliteSafeJSONType(jsonColumn, "$.next_attempt_at") + " = 'text' AND (trim(" + sqliteSafeJSONExtract(jsonColumn, "$.next_attempt_at") + ") = '' OR julianday(" + sqliteSafeJSONExtract(jsonColumn, "$.next_attempt_at") + ") IS NOT NULL)))"
+}
+
+// sqliteOutboxJSONDecodeAdmissionSQL is used by the two bounded selection
+// helpers that must not spend their entire budget decoding rows that SQLite
+// can reject cheaply. The regular projection predicate deliberately remains
+// smaller because it is on the normal delivery path; these extra primitive
+// type checks keep a JSON-valid row such as {"body":17} or
+// {"last_send_error":17} from consuming a fairness/echo candidate slot.
+// Missing and null fields have the same zero-value behavior as encoding/json.
+func sqliteOutboxJSONDecodeAdmissionSQL(alias string) string {
+	jsonColumn := alias + ".json"
+	typeAllowed := func(path string, allowed ...string) string {
+		typeExpr := sqliteSafeJSONType(jsonColumn, path)
+		parts := []string{typeExpr + " IS NULL", typeExpr + " = 'null'"}
+		for _, typ := range allowed {
+			parts = append(parts, typeExpr+" = '"+typ+"'")
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+	}
+	parts := []string{`json_valid(` + jsonColumn + `)`}
+	for _, path := range []string{
+		"$.id", "$.session_id", "$.parent_fence_session_id", "$.turn_id", "$.codex_thread_id",
+		"$.teams_chat_id", "$.scope_id", "$.machine_id", "$.kind", "$.body", "$.terminal_group_id",
+		"$.transcript_checkpoint_id", "$.transcript_source_path", "$.transcript_source_proof_fingerprint",
+		"$.source_text_hash", "$.rendered_hash", "$.attachment_path", "$.attachment_name",
+		"$.attachment_upload_name", "$.attachment_content_type", "$.attachment_upload_folder",
+		"$.attachment_hash", "$.attachment_upload_url", "$.drive_item_id", "$.drive_item_name",
+		"$.drive_item_etag", "$.drive_item_web_url", "$.drive_item_web_dav", "$.attachment_message_post_state",
+		"$.ack_kind", "$.quote_reply_to_message_id", "$.notification_kind", "$.fork_operation_id",
+		"$.fork_history_namespace", "$.fork_body_hash", "$.fork_role", "$.mention_user_id",
+		"$.mention_user_name", "$.status", "$.teams_message_id", "$.graph_recovery_next_path",
+		"$.graph_recovery_candidate_id", "$.last_send_error",
+	} {
+		parts = append(parts, typeAllowed(path, "text"))
+	}
+	for _, path := range []string{
+		"$.lease_generation", "$.sequence", "$.part_index", "$.part_count", "$.transcript_source_offset",
+		"$.transcript_source_proof_offset", "$.transcript_source_read_proof_start_offset",
+		"$.transcript_source_read_proof_end_offset", "$.rendered_bytes", "$.attachment_size",
+		"$.attachment_upload_offset", "$.fork_ordinal", "$.math_plan_version", "$.graph_recovery_page_count",
+	} {
+		parts = append(parts, typeAllowed(path, "integer"))
+	}
+	for _, path := range []string{
+		"$.transcript_source_offset_known", "$.transcript_source_proof_offset_known",
+		"$.transcript_source_read_proof_range_known", "$.mention_owner", "$.trusted_math",
+		"$.math_media_fallback", "$.upgrade_non_blocking", "$.blocked_by_unresolved_execution",
+		"$.blocked_by_terminal_failure", "$.blocked_by_source_rewrite", "$.post_send_effects_pending",
+	} {
+		parts = append(parts, typeAllowed(path, "true", "false"))
+	}
+	for _, path := range []string{"$.attachment_upload_expiry", "$.created_at", "$.updated_at", "$.sent_at", "$.last_send_attempt", "$.next_attempt_at"} {
+		parts = append(parts, typeAllowed(path, "text"))
+	}
+	for _, path := range []string{"$.artifact_ids", "$.math_spans"} {
+		parts = append(parts, typeAllowed(path, "array"))
+	}
+	// The two slice element types are the only nested collection shapes whose
+	// primitive mismatch is commonly produced by a truncated/manual row. Keep
+	// the check safe even when the enclosing JSON is malformed.
+	safeJSON := "CASE WHEN json_valid(" + jsonColumn + ") THEN " + jsonColumn + " ELSE 'null' END"
+	for path, elementType := range map[string]string{"$.artifact_ids": "text", "$.math_spans": "object"} {
+		parts = append(parts, "(NOT EXISTS (SELECT 1 FROM json_each("+safeJSON+", '"+path+"') WHERE type <> '"+elementType+"'))")
+	}
+	return strings.Join(parts, "\n  AND ")
+}
+
+// sqliteOutboxNextAttemptDueSQL reads the canonical JSON schedule whenever it
+// is present. Rows written by an older schema may have no next_attempt_at in
+// JSON, though, while their compatibility deliver_after column still carries
+// the real retry gate. Use that scalar only for the absent/blank legacy case;
+// never let a stale scalar override a canonical JSON value. The placeholders
+// are, in order, the canonical zero time, the caller's current time, and the
+// scalar current time in nanoseconds.
+func sqliteOutboxNextAttemptDueSQL(jsonColumn string, deliverAfterColumn string) string {
+	value := sqliteSafeJSONExtract(jsonColumn, "$.next_attempt_at")
+	typeExpr := sqliteSafeJSONType(jsonColumn, "$.next_attempt_at")
+	canonicalDue := "(" + typeExpr + " = 'text' AND trim(" + value + ") <> '' AND (trim(" + value + ") = ? OR (julianday(" + value + ") IS NOT NULL AND julianday(" + value + ") <= julianday(?))))"
+	emptyCanonicalDue := "(" + typeExpr + " = 'text' AND trim(" + value + ") = '')"
+	// An explicit JSON null is the canonical zero schedule. It must not fall
+	// through to the legacy scalar gate: a stale deliver_after projection can
+	// otherwise strand a row forever even though the canonical payload says it
+	// is immediately runnable.
+	explicitNullDue := "(" + typeExpr + " = 'null')"
+	legacyDue := "((" + typeExpr + " IS NULL OR (" + typeExpr + " = 'text' AND trim(COALESCE(" + value + ", '')) = '')) AND (COALESCE(" + deliverAfterColumn + ", 0) = 0 OR COALESCE(" + deliverAfterColumn + ", 0) <= ?))"
+	return "(" + canonicalDue + " OR " + emptyCanonicalDue + " OR " + explicitNullDue + " OR " + legacyDue + ")"
+}
+
+// sqliteOutboxCanonicalTextSQL selects a text field from the canonical JSON
+// payload, falling back to the compatibility column only when the JSON field
+// is absent. An explicit JSON null/empty value is still authoritative; a stale
+// scalar projection must not resurrect an old turn/chat/message ID.
+func sqliteOutboxCanonicalTextSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, path)
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN trim(COALESCE(" + legacyColumn + ", '')) ELSE trim(COALESCE(" + valueExpr + ", '')) END)"
+}
+
+// sqliteOutboxCanonicalSequenceSQL follows the same legacy rule for the FIFO
+// sequence as the text projections above. Invalid present JSON values become
+// NULL so a caller can keep the row in an uncertainty path instead of silently
+// treating the compatibility column as authoritative.
+func sqliteOutboxCanonicalSequenceSQL(jsonColumn, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, "$.sequence")
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, "$.sequence")
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN COALESCE(" + legacyColumn + ", 0) WHEN " + typeExpr + " = 'integer' THEN CAST(" + valueExpr + " AS INTEGER) ELSE NULL END)"
+}
+
+// sqliteOutboxCanonicalBoolSQL follows the same legacy rule for boolean
+// projections.  A field omitted by an old writer may use the compatibility
+// column; an explicitly present JSON value, including null, is authoritative.
+func sqliteOutboxCanonicalBoolSQL(jsonColumn, path, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, path)
+	return "(CASE WHEN " + typeExpr + " IS NULL THEN COALESCE(" + legacyColumn + ", 0) WHEN " + typeExpr + " = 'true' THEN 1 ELSE 0 END)"
+}
+
+// sqliteJSONFieldPresent distinguishes an omitted legacy field from an
+// explicitly persisted zero/null value.  A zero time is meaningful in the
+// canonical outbox schedule, so using the decoded Go zero value as an
+// "absent" marker would let a stale compatibility column re-open a gated row.
+func sqliteJSONFieldPresent(raw []byte, field string) bool {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return false
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return false
+	}
+	_, ok := object[field]
+	return ok
+}
+
+// sqliteCanonicalTimeProjectionMatches verifies the one outbox timestamp that
+// is also used as the SQLite keyset order. SQL can safely reject non-text JSON
+// values, but julianday() is millisecond-oriented and cannot prove exact
+// nanosecond equality with the scalar column. Do the final equality check
+// after decoding so a torn created_at projection cannot reorder or hide FIFO
+// work.
+func sqliteCanonicalTimeProjectionMatches(raw []byte, field string, scalar int64) bool {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return false
+	}
+	value, present := object[strings.TrimSpace(field)]
+	if !present {
+		return true
+	}
+	if len(value) == 0 || string(value) == "null" {
+		return scalar == 0
+	}
+	var timestamp time.Time
+	if err := json.Unmarshal(value, &timestamp); err != nil {
+		return false
+	}
+	return sqliteTime(timestamp) == scalar
+}
+
+// sqliteOutboxProjectionRow is the canonical JSON plus the indexed legacy
+// projection columns.  Older SQLite writers omitted several fields from JSON;
+// the columns are a compatibility source only when the corresponding JSON
+// field is absent.  Reading just json loses those values and can make a queued
+// row look terminal, detach it from its session/turn, or skip post-send work.
+type sqliteOutboxProjectionRow struct {
+	raw                    []byte
+	id                     sql.NullString
+	sessionID              sql.NullString
+	turnID                 sql.NullString
+	teamsChatID            sql.NullString
+	teamsMessageID         sql.NullString
+	status                 sql.NullString
+	sequence               sql.NullInt64
+	createdAt              sql.NullInt64
+	deliverAfter           sql.NullInt64
+	postSendEffectsPending sql.NullInt64
+}
+
+type sqliteRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanSQLiteOutboxProjectionRow(scanner sqliteRowScanner, row *sqliteOutboxProjectionRow, extra ...any) error {
+	if row == nil {
+		return fmt.Errorf("sqlite outbox projection row is nil")
+	}
+	dest := []any{
+		&row.raw, &row.id, &row.sessionID, &row.turnID, &row.teamsChatID,
+		&row.teamsMessageID, &row.status, &row.sequence, &row.createdAt,
+		&row.deliverAfter, &row.postSendEffectsPending,
+	}
+	dest = append(dest, extra...)
+	return scanner.Scan(dest...)
+}
+
+func sqliteOutboxProjectionSelect(alias string) string {
+	prefix := ""
+	if strings.TrimSpace(alias) != "" {
+		prefix = strings.TrimSpace(alias) + "."
+	}
+	return prefix + "json, " + prefix + "id, " + prefix + "session_id, " + prefix + "turn_id, " + prefix + "teams_chat_id, " + prefix + "teams_message_id, " + prefix + "status, " +
+		sqliteStoredInt64SQL(prefix+"sequence") + ", " + sqliteStoredInt64SQL(prefix+"created_at") + ", " + sqliteStoredInt64SQL(prefix+"deliver_after") + ", " + sqliteStoredInt64SQL(prefix+"post_send_effects_pending")
+}
+
+// sqliteStoredInt64SQL prevents a malformed numeric compatibility value (for
+// example TEXT ”) from aborting an otherwise healthy hot query while still
+// allowing the canonical JSON value to be used when the scalar is absent or
+// stale. Integer-affinity SQLite columns normally arrive as INTEGER; the REAL
+// branch is retained for old files that were populated through a generic SQL
+// client. NULL is a genuinely absent compatibility value. A non-NULL value of
+// another type becomes -1, a reserved impossible value for these non-negative
+// projections; decodeSQLiteOutboxProjection then accepts it only when the
+// canonical JSON field is present and can replace it. This keeps point reads
+// and opaque-row preservation fail-closed without allowing a legacy malformed
+// scalar to turn into a synthetic zero.
+func sqliteStoredInt64SQL(column string) string {
+	return "(CASE WHEN " + column + " IS NULL THEN NULL WHEN typeof(" + column + ") IN ('integer', 'real') THEN CAST(" + column + " AS INTEGER) ELSE -1 END)"
+}
+
+// sqliteLooseInt64 is used only while capturing opaque rows for a full-state
+// rewrite. SQLite's normal NullInt64 scanner returns a conversion error for a
+// legacy value such as TEXT ”, which would make an unrelated state update
+// fail before the row could be quarantined. Keep the row readable and map an
+// invalid non-NULL scalar to the same impossible sentinel used by
+// sqliteStoredInt64SQL; the raw JSON remains byte-for-byte preserved.
+type sqliteLooseInt64 struct{ sql.NullInt64 }
+
+func (value *sqliteLooseInt64) Scan(src any) error {
+	if value == nil {
+		return errors.New("sqlite loose integer scanner is nil")
+	}
+	value.NullInt64 = sql.NullInt64{}
+	if src == nil {
+		return nil
+	}
+	setInvalid := func() {
+		value.NullInt64 = sql.NullInt64{Int64: -1, Valid: true}
+	}
+	switch typed := src.(type) {
+	case int64:
+		value.Int64, value.Valid = typed, true
+	case int:
+		value.Int64, value.Valid = int64(typed), true
+	case int32:
+		value.Int64, value.Valid = int64(typed), true
+	case int16:
+		value.Int64, value.Valid = int64(typed), true
+	case int8:
+		value.Int64, value.Valid = int64(typed), true
+	case uint64:
+		if typed > uint64(^uint64(0)>>1) {
+			setInvalid()
+		} else {
+			value.Int64, value.Valid = int64(typed), true
+		}
+	case uint:
+		if uint64(typed) > uint64(^uint64(0)>>1) {
+			setInvalid()
+		} else {
+			value.Int64, value.Valid = int64(typed), true
+		}
+	case float64:
+		// Avoid converting NaN, infinities, fractions, or values outside the
+		// signed 64-bit range before validation. The direct conversion is
+		// implementation-dependent for those inputs and can turn corruption
+		// into a plausible-looking timestamp/sequence.
+		if math.IsNaN(typed) || math.IsInf(typed, 0) ||
+			typed < float64(math.MinInt64) || typed >= 9223372036854775808.0 ||
+			typed != math.Trunc(typed) {
+			setInvalid()
+		} else {
+			value.Int64, value.Valid = int64(typed), true
+		}
+	case []byte:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(string(typed)), 10, 64)
+		if err != nil {
+			setInvalid()
+		} else {
+			value.Int64, value.Valid = parsed, true
+		}
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		if err != nil {
+			setInvalid()
+		} else {
+			value.Int64, value.Valid = parsed, true
+		}
+	default:
+		setInvalid()
+	}
+	return nil
+}
+
+func sqliteOutboxScalarTime(value sql.NullInt64) time.Time {
+	if !value.Valid || value.Int64 == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, value.Int64).UTC()
+}
+
+func sqliteOutboxFieldPresent(object map[string]json.RawMessage, field string) bool {
+	_, ok := object[strings.TrimSpace(field)]
+	return ok
+}
+
+// decodeSQLiteOutboxProjection hydrates one legacy-compatible row and returns
+// false for a row that cannot be trusted.  The caller decides whether an
+// untrusted row is skipped in a bounded hot snapshot or returned as a hard
+// error for a point update/FIFO proof.  Explicit JSON values always win over
+// scalar columns; only omitted fields use the indexed compatibility values.
+func decodeSQLiteOutboxProjection(row sqliteOutboxProjectionRow) (OutboxMessage, bool) {
+	var object map[string]json.RawMessage
+	if len(bytes.TrimSpace(row.raw)) == 0 || json.Unmarshal(row.raw, &object) != nil || object == nil {
+		return OutboxMessage{}, false
+	}
+	// sqliteStoredInt64SQL uses -1 as the on-disk representation of a non-NULL
+	// scalar with an unsafe type. Such a value may be ignored only when the
+	// corresponding canonical JSON field is present and therefore authoritative.
+	// A legacy row that omitted the field has no safe source to reconstruct it
+	// from, so keep it opaque instead of silently turning corruption into zero.
+	if row.createdAt.Valid && row.createdAt.Int64 < 0 {
+		return OutboxMessage{}, false
+	}
+	if row.sequence.Valid && row.sequence.Int64 < 0 {
+		if sqliteOutboxFieldPresent(object, "sequence") {
+			row.sequence = sql.NullInt64{}
+		} else {
+			return OutboxMessage{}, false
+		}
+	}
+	if row.deliverAfter.Valid && row.deliverAfter.Int64 < 0 {
+		if sqliteOutboxFieldPresent(object, "next_attempt_at") {
+			row.deliverAfter = sql.NullInt64{}
+		} else {
+			return OutboxMessage{}, false
+		}
+	}
+	if row.postSendEffectsPending.Valid && row.postSendEffectsPending.Int64 < 0 {
+		if sqliteOutboxFieldPresent(object, "post_send_effects_pending") {
+			row.postSendEffectsPending = sql.NullInt64{}
+		} else {
+			return OutboxMessage{}, false
+		}
+	}
+	decodeRaw := row.raw
+	// encoding/json rejects an empty string for time.Time.  Legacy writers used
+	// that spelling for an unset optional timestamp; normalize empty values to
+	// explicit null while keeping the field present so a stale scalar projection
+	// cannot resurrect it as a retry gate.
+	for _, field := range []string{"created_at", "updated_at", "sent_at", "last_send_attempt", "next_attempt_at"} {
+		value, present := object[field]
+		if !present || string(value) == "null" {
+			continue
+		}
+		var text string
+		if json.Unmarshal(value, &text) == nil && strings.TrimSpace(text) == "" {
+			object[field] = json.RawMessage("null")
+		}
+	}
+	var marshalErr error
+	decodeRaw, marshalErr = json.Marshal(object)
+	if marshalErr != nil {
+		return OutboxMessage{}, false
+	}
+	var message OutboxMessage
+	if err := json.Unmarshal(decodeRaw, &message); err != nil {
+		return OutboxMessage{}, false
+	}
+	if !sqliteOutboxFieldPresent(object, "id") && row.id.Valid {
+		message.ID = strings.TrimSpace(row.id.String)
+	}
+	if !sqliteOutboxFieldPresent(object, "session_id") && row.sessionID.Valid {
+		message.SessionID = strings.TrimSpace(row.sessionID.String)
+	}
+	if !sqliteOutboxFieldPresent(object, "turn_id") && row.turnID.Valid {
+		message.TurnID = strings.TrimSpace(row.turnID.String)
+	}
+	if !sqliteOutboxFieldPresent(object, "teams_chat_id") && row.teamsChatID.Valid {
+		message.TeamsChatID = strings.TrimSpace(row.teamsChatID.String)
+	}
+	if !sqliteOutboxFieldPresent(object, "teams_message_id") && row.teamsMessageID.Valid {
+		message.TeamsMessageID = strings.TrimSpace(row.teamsMessageID.String)
+	}
+	if !sqliteOutboxFieldPresent(object, "status") && row.status.Valid {
+		message.Status = OutboxStatus(strings.TrimSpace(row.status.String))
+	}
+	if !sqliteOutboxFieldPresent(object, "sequence") && row.sequence.Valid {
+		message.Sequence = row.sequence.Int64
+	}
+	if !sqliteOutboxFieldPresent(object, "created_at") {
+		message.CreatedAt = sqliteOutboxScalarTime(row.createdAt)
+	}
+	if !sqliteOutboxFieldPresent(object, "next_attempt_at") {
+		message.NextAttemptAt = sqliteOutboxScalarTime(row.deliverAfter)
+	}
+	if !sqliteOutboxFieldPresent(object, "post_send_effects_pending") && row.postSendEffectsPending.Valid {
+		message.PostSendEffectsPending = row.postSendEffectsPending.Int64 != 0
+	}
+	if strings.TrimSpace(message.ID) == "" || !row.id.Valid || strings.TrimSpace(row.id.String) != strings.TrimSpace(message.ID) || !row.createdAt.Valid {
+		return OutboxMessage{}, false
+	}
+	if !sqliteCanonicalTimeProjectionMatches(row.raw, "created_at", row.createdAt.Int64) {
+		return OutboxMessage{}, false
+	}
+	// The indexed columns are not merely a read optimization: every durable
+	// writer is expected to maintain the JSON/scalar projection together.  A
+	// syntactically valid JSON object with a contradictory status, chat, turn,
+	// sequence, retry gate, or post-send flag is still unsafe to hydrate.  Keep
+	// point reads fail-closed as well as bounded hot-lane scans; otherwise a
+	// malformed row could be updated from the point path and later reappear with
+	// a different meaning after the next full-state rewrite.
+	if !sqliteOutboxProjectionMatches(opaqueSQLiteOutboxRow{
+		ID: row.id, SessionID: row.sessionID, TurnID: row.turnID,
+		TeamsChatID: row.teamsChatID, TeamsMessageID: row.teamsMessageID,
+		Status: row.status, Sequence: row.sequence, CreatedAt: row.createdAt,
+		DeliverAfter:           row.deliverAfter,
+		PostSendEffectsPending: row.postSendEffectsPending, Raw: row.raw,
+	}, message) {
+		return OutboxMessage{}, false
+	}
+	return message, true
+}
+
+func loadSQLiteOutboxProjectionRow(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, query string, args ...any) (OutboxMessage, bool, error) {
+	var row sqliteOutboxProjectionRow
+	if err := scanSQLiteOutboxProjectionRow(q.QueryRowContext(ctx, query, args...), &row); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return OutboxMessage{}, false, nil
+		}
+		return OutboxMessage{}, false, err
+	}
+	message, ok := decodeSQLiteOutboxProjection(row)
+	if !ok {
+		return OutboxMessage{}, false, fmt.Errorf("%w: outbox row %q", ErrSQLiteOutboxProjectionUntrusted, strings.TrimSpace(row.id.String))
+	}
+	return message, true, nil
 }
 
 type sqliteHistoryWatchProjection struct {
@@ -1016,7 +1688,10 @@ func (s *Store) loadSQLiteStateWithSQLiteLock(ctx context.Context, pointer store
 	return loadSQLiteState(ctx, db)
 }
 
-func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State) error {
+func (s *Store) saveSQLiteStateUnlocked(ctx context.Context, pointer storeSQLitePointer, state State) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	db, err := s.sqliteDBUnlocked(pointer)
 	if err != nil {
 		return err
@@ -1024,7 +1699,7 @@ func (s *Store) saveSQLiteStateUnlocked(pointer storeSQLitePointer, state State)
 	if err := ensureSQLiteSchema(db); err != nil {
 		return err
 	}
-	return writeSQLiteState(context.Background(), db, state)
+	return writeSQLiteState(ctx, db, state)
 }
 
 func (s *Store) loadSQLiteSelectedStateFieldsUnlocked(ctx context.Context, pointer storeSQLitePointer, wanted map[string]struct{}) (State, error) {
@@ -1085,6 +1760,15 @@ func loadSQLiteHotPollReadyChatIDs(ctx context.Context, db *sql.DB, controlChatI
 	ids := make([]string, 0, limit)
 	seen := make(map[string]struct{}, limit)
 	malformed := 0
+	frontier := sqliteChatPollOperationalFrontierSQL("json")
+	nextPoll := sqliteCanonicalTimeProjectionSQL("json", "$.next_poll_at", "next_poll_at")
+	nextPollDue := sqliteCanonicalTimeDueSQL("json", "$.next_poll_at", "next_poll_at")
+	blockedUntilDue := sqliteCanonicalTimeDueSQL("json", "$.blocked_until", "blocked_until")
+	updatedAt := sqliteCanonicalTimeProjectionSQL("json", "$.updated_at", "updated_at")
+	lastActivityAt := sqliteCanonicalTimeProjectionSQL("json", "$.last_activity_at", "last_activity_at")
+	pollState := sqliteCanonicalTextProjectionSQL("json", "$.state", "poll_state")
+	parkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("json", "parked_skip_eligible", "poll_state")
+	scheduleValidPoll := sqliteChatPollScheduleValidJSONSQL("json", "chat_id")
 	// frontier_active is a materialized admission hint.  It is normally kept
 	// in the same transaction as json, but an older writer or a partial repair
 	// can leave it stale.  Keep a small reconciliation lane for rows whose
@@ -1093,6 +1777,41 @@ func loadSQLiteHotPollReadyChatIDs(ctx context.Context, db *sql.DB, controlChatI
 	deferredOperational := make([]string, 0, limit)
 	deferredOrdinary := make([]string, 0, limit)
 	deferredSeen := make(map[string]struct{}, limit)
+	quarantineAdmission := func(chatID string, raw []byte) error {
+		// This is a cache/quarantine bit, not a cursor or execution state. The
+		// raw JSON equality guard prevents a stale admission read from marking a
+		// newer replacement row, and the surrounding state lock keeps it out of
+		// the Graph/SQLite transaction boundary.
+		_, err := db.ExecContext(ctx, `UPDATE chat_polls SET admission_valid = 0 WHERE chat_id = ? AND json = ?`, chatID, raw)
+		return err
+	}
+	type malformedPollRow struct {
+		chatID string
+		raw    []byte
+	}
+	loadMalformedPollRows := func(query string, args ...any) ([]malformedPollRow, error) {
+		rows, err := db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]malformedPollRow, 0, sqliteHotPollMalformedLimit)
+		for rows.Next() {
+			var row malformedPollRow
+			if err := rows.Scan(&row.chatID, &row.raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out = append(out, row)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
 	appendRow := func(chatID string, valid bool) {
 		chatID = strings.TrimSpace(chatID)
 		if chatID == "" || len(ids) >= limit {
@@ -1127,28 +1846,57 @@ func loadSQLiteHotPollReadyChatIDs(ctx context.Context, db *sql.DB, controlChatI
 	// Syntax-corrupt rows have no trustworthy schedule and must be surfaced for
 	// local recovery even if stale derived deadlines happen to be in the future.
 	if len(ids) < limit && malformed < sqliteHotPollMalformedLimit {
-		rows, err := db.QueryContext(ctx, `SELECT chat_id, json FROM chat_polls
+		rows, err := loadMalformedPollRows(`SELECT chat_id, json FROM chat_polls
 WHERE (? = '' OR chat_id != ?) AND json_valid(json) = 0
 ORDER BY updated_at, next_poll_at, last_activity_at, chat_id
 LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var chatID string
-			var raw []byte
-			if err := rows.Scan(&chatID, &raw); err != nil {
-				_ = rows.Close()
+		for _, row := range rows {
+			if err := quarantineAdmission(row.chatID, row.raw); err != nil {
 				return nil, err
 			}
-			appendRow(chatID, false)
+			appendRow(row.chatID, false)
 		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
+	}
+	// A syntactically valid poll can still have a schedule-critical field with
+	// the wrong JSON type. Its indexed compatibility deadline may look due, but
+	// the canonical projection must not be used to admit it as ordinary work.
+	// Reserve the same single recovery slot used for syntax-corrupt rows.
+	if len(ids) < limit && malformed < sqliteHotPollMalformedLimit {
+		rows, err := loadMalformedPollRows(`SELECT chat_id, json FROM chat_polls
+WHERE (? = '' OR chat_id != ?) AND json_valid(json) = 1
+  AND NOT (`+scheduleValidPoll+`)
+ORDER BY updated_at, next_poll_at, last_activity_at, chat_id
+LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
+		if err != nil {
 			return nil, err
 		}
-		if err := rows.Close(); err != nil {
+		for _, row := range rows {
+			if err := quarantineAdmission(row.chatID, row.raw); err != nil {
+				return nil, err
+			}
+			appendRow(row.chatID, false)
+		}
+	}
+	// Structural admission is a Go-level invariant (nested receipt identity,
+	// disposition lengths, and so on), so it is maintained as a small indexed
+	// bit. Rows quarantined by the bounded projection walk get one recovery
+	// slot here instead of re-entering the ordinary keyset page on every cycle.
+	if len(ids) < limit && malformed < sqliteHotPollMalformedLimit {
+		rows, err := loadMalformedPollRows(`SELECT chat_id, json FROM chat_polls
+WHERE (? = '' OR chat_id != ?) AND admission_valid = 0
+ORDER BY updated_at, next_poll_at, last_activity_at, chat_id
+LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
+		if err != nil {
 			return nil, err
+		}
+		for _, row := range rows {
+			if err := quarantineAdmission(row.chatID, row.raw); err != nil {
+				return nil, err
+			}
+			appendRow(row.chatID, false)
 		}
 	}
 
@@ -1163,29 +1911,31 @@ LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
 		updated, next, activity int64
 	}
 	queryLane := func(operational bool, after cursor, pageSize int) ([]readyRow, error) {
-		where := `(? = '' OR chat_id != ?) AND json_valid(json) = 1`
+		where := `(? = '' OR chat_id != ?) AND json_valid(json) = 1
+  AND COALESCE(admission_valid, 1) != 0
+  AND (` + scheduleValidPoll + `)`
 		args := []any{controlChatID, controlChatID}
 		if operational {
 			where += `
-  AND COALESCE(frontier_active, 0) != 0
-  AND COALESCE(next_poll_at, 0) <= ?
-  AND COALESCE(blocked_until, 0) <= ?`
-			args = append(args, sqliteTime(now), sqliteTime(now))
+	  AND ` + frontier + ` != 0
+	  AND ` + nextPollDue + ` <= julianday(?)
+	  AND ` + blockedUntilDue + ` <= julianday(?)`
+			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
 		} else {
 			where += `
-  AND COALESCE(frontier_active, 0) = 0
-  AND COALESCE(next_poll_at, 0) <= ?
-  AND COALESCE(blocked_until, 0) <= ?
-  AND (COALESCE(parked_skip_eligible, 0) = 0
-       OR (poll_state = ? AND COALESCE(next_poll_at, 0) <= ?))`
-			args = append(args, sqliteTime(now), sqliteTime(now), chatPollStateParked, sqliteTime(now))
+	  AND ` + frontier + ` = 0
+	  AND ` + nextPollDue + ` <= julianday(?)
+	  AND ` + blockedUntilDue + ` <= julianday(?)
+	  AND (` + parkedSkipEligible + ` = 0
+	       OR (` + pollState + ` = ? AND ` + nextPollDue + ` <= julianday(?)))`
+			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano), chatPollStateParked, now.UTC().Format(time.RFC3339Nano))
 		}
 		if after.set {
 			where += `
-  AND (COALESCE(updated_at, 0) > ?
-       OR (COALESCE(updated_at, 0) = ? AND COALESCE(next_poll_at, 0) > ?)
-       OR (COALESCE(updated_at, 0) = ? AND COALESCE(next_poll_at, 0) = ? AND COALESCE(last_activity_at, 0) > ?)
-       OR (COALESCE(updated_at, 0) = ? AND COALESCE(next_poll_at, 0) = ? AND COALESCE(last_activity_at, 0) = ? AND chat_id > ?))`
+	  AND (` + updatedAt + ` > ?
+	       OR (` + updatedAt + ` = ? AND ` + nextPoll + ` > ?)
+	       OR (` + updatedAt + ` = ? AND ` + nextPoll + ` = ? AND ` + lastActivityAt + ` > ?)
+	       OR (` + updatedAt + ` = ? AND ` + nextPoll + ` = ? AND ` + lastActivityAt + ` = ? AND chat_id > ?))`
 			args = append(args,
 				after.updated, after.updated, after.next,
 				after.updated, after.next, after.activity,
@@ -1193,10 +1943,10 @@ LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
 		}
 		args = append(args, pageSize)
 		rows, err := db.QueryContext(ctx, `SELECT chat_id, json,
-       COALESCE(updated_at, 0), COALESCE(next_poll_at, 0), COALESCE(last_activity_at, 0)
+       `+updatedAt+`, `+nextPoll+`, `+lastActivityAt+`
 FROM chat_polls
 WHERE `+where+`
-ORDER BY COALESCE(updated_at, 0), COALESCE(next_poll_at, 0), COALESCE(last_activity_at, 0), chat_id
+ORDER BY `+updatedAt+`, `+nextPoll+`, `+lastActivityAt+`, chat_id
 LIMIT ?`, args...)
 		if err != nil {
 			return nil, err
@@ -1240,6 +1990,9 @@ LIMIT ?`, args...)
 				before := len(ids)
 				var typed ChatPollState
 				if json.Unmarshal(row.raw, &typed) != nil || strings.TrimSpace(typed.ChatID) != strings.TrimSpace(row.chatID) {
+					if err := quarantineAdmission(row.chatID, row.raw); err != nil {
+						return err
+					}
 					appendRow(row.chatID, false)
 					continue
 				}
@@ -1249,6 +2002,9 @@ LIMIT ?`, args...)
 				// malformed operational prefix can hide a healthy chat from the
 				// ready-schedule fast path indefinitely.
 				if !chatPollAdmissionValid(typed) {
+					if err := quarantineAdmission(row.chatID, row.raw); err != nil {
+						return err
+					}
 					appendRow(row.chatID, false)
 					continue
 				}
@@ -1391,6 +2147,9 @@ func (s *Store) hotPollScheduleSQLiteWithOptions(ctx context.Context, includePar
 		parkProbeDueAt := sqliteTime(now)
 		validPoll := sqliteChatPollValidJSONSQL("json", "chat_id")
 		frontier := sqliteChatPollOperationalFrontierSQL("json")
+		pollState := sqliteCanonicalTextProjectionSQL("json", "$.state", "poll_state")
+		nextPoll := sqliteCanonicalTimeProjectionSQL("json", "$.next_poll_at", "next_poll_at")
+		parkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("json", "parked_skip_eligible", "poll_state")
 		validPollAlias := sqliteChatPollValidJSONSQL("p.json", "p.chat_id")
 		if readyOnly {
 			validPoll = sqliteChatPollAdmissionValidJSONSQL("json", "chat_id")
@@ -1399,9 +2158,9 @@ func (s *Store) hotPollScheduleSQLiteWithOptions(ctx context.Context, includePar
 		malformedPoll := `NOT (` + validPoll + `)`
 		malformedPollAlias := `NOT (` + validPollAlias + `)`
 		chatPollQuery := `SELECT chat_id, json FROM chat_polls
-WHERE (` + validPoll + ` OR ` + malformedPoll + `)
-  AND (` + malformedPoll + ` OR COALESCE(parked_skip_eligible, 0) = 0
-   OR (poll_state = ? AND COALESCE(next_poll_at, 0) <= ?))`
+	WHERE (` + validPoll + ` OR ` + malformedPoll + `)
+	  AND (` + malformedPoll + ` OR ` + parkedSkipEligible + ` = 0
+	   OR (` + pollState + ` = ? AND ` + nextPoll + ` <= ?))`
 		chatPollArgs := []any{chatPollStateParked, parkProbeDueAt}
 		if readyOnly {
 			controlChatID = strings.TrimSpace(controlChatID)
@@ -1583,6 +2342,54 @@ func (s *Store) sessionsByIDSQLite(ctx context.Context, ids []string) (map[strin
 		return nil
 	})
 	return out, handled, err
+}
+
+func (s *Store) sessionHasTeamsManagedTurnsSQLite(ctx context.Context, sessionID string) (bool, bool, error) {
+	hasTurns := false
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		var raw []byte
+		err = db.QueryRowContext(ctx, `SELECT json FROM sessions WHERE id = ?`, sessionID).Scan(&raw)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			var session SessionContext
+			if err := json.Unmarshal(raw, &session); err != nil {
+				return err
+			}
+			if strings.TrimSpace(session.ID) != "" && strings.TrimSpace(session.ID) != sessionID {
+				return fmt.Errorf("session row %q has mismatched JSON identity %q", sessionID, session.ID)
+			}
+			if strings.TrimSpace(session.LatestTurnID) != "" {
+				hasTurns = true
+				return nil
+			}
+		}
+		// session_id is a compatibility projection. The JSON value is
+		// authoritative for rows written by newer helpers, while the scalar
+		// column remains the fallback for old rows.
+		canonicalSessionID := sqliteOutboxCanonicalTextSQL("t.json", "$.session_id", "t.session_id")
+		var exists int
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns t WHERE `+canonicalSessionID+` = ? LIMIT 1`, sessionID).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		hasTurns = exists == 1
+		return nil
+	})
+	return hasTurns, handled, err
 }
 
 func (s *Store) hasSessionsSQLite(ctx context.Context) (bool, bool, error) {
@@ -2909,10 +3716,6 @@ func sqliteChatSequencesEmpty(db *sql.DB) (bool, error) {
 }
 
 func ensureSQLiteSchema(db *sql.DB) error {
-	chatSequencesExisted, err := sqliteTableExists(db, "chat_sequences")
-	if err != nil {
-		return err
-	}
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
@@ -2931,7 +3734,7 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS outbox_session_idx ON outbox_messages(session_id, status, created_at, id)`,
 		`CREATE TABLE IF NOT EXISTS message_provenance (id TEXT PRIMARY KEY, teams_chat_id TEXT, teams_message_id TEXT, origin TEXT, session_id TEXT, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS message_provenance_lookup_idx ON message_provenance(teams_chat_id, teams_message_id, origin)`,
-		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, blocked_until INTEGER, poll_state TEXT, last_activity_at INTEGER, park_notice_sent_at INTEGER, parked_skip_eligible INTEGER, frontier_active INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS chat_polls (chat_id TEXT PRIMARY KEY, next_poll_at INTEGER, blocked_until INTEGER, poll_state TEXT, last_activity_at INTEGER, park_notice_sent_at INTEGER, parked_skip_eligible INTEGER, frontier_active INTEGER, admission_valid INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS chat_sequences (chat_id TEXT PRIMARY KEY, next_sequence INTEGER, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS chat_rate_limits (chat_id TEXT PRIMARY KEY, blocked_until INTEGER, json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS import_checkpoints (id TEXT PRIMARY KEY, session_id TEXT, status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
@@ -2982,39 +3785,6 @@ END`,
 			return err
 		}
 	}
-	// frontier_active is an indexed admission hint, never an independent
-	// source of truth.  Current writers update it atomically with the canonical
-	// poll JSON, but older helpers and narrow repair tools may update only one
-	// side.  Repair the hint at the SQLite boundary so a stale value cannot hide
-	// a due ordinary chat behind the operational lane.  The trigger is inert for
-	// a coherent write and therefore does not add JSON work to the listener's
-	// read path; it only runs when a row is inserted or one of these two columns
-	// is directly changed.
-	frontierHint := sqliteChatPollOperationalFrontierSQL("NEW.json")
-	for _, stmt := range []string{
-		`CREATE TRIGGER IF NOT EXISTS chat_polls_frontier_hint_repair_insert
-AFTER INSERT ON chat_polls
-WHEN json_valid(NEW.json)
- AND COALESCE(NEW.frontier_active, 0) != ` + frontierHint + `
-BEGIN
-  UPDATE chat_polls
-  SET frontier_active = ` + frontierHint + `
-  WHERE chat_id = NEW.chat_id;
-END`,
-		`CREATE TRIGGER IF NOT EXISTS chat_polls_frontier_hint_repair_update
-AFTER UPDATE OF json, frontier_active ON chat_polls
-WHEN json_valid(NEW.json)
- AND COALESCE(NEW.frontier_active, 0) != ` + frontierHint + `
-BEGIN
-  UPDATE chat_polls
-  SET frontier_active = ` + frontierHint + `
-  WHERE chat_id = NEW.chat_id;
-END`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			return err
-		}
-	}
 	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN teams_message_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
@@ -3050,6 +3820,15 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN blocked_until INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
+	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN admission_valid INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if err := ensureSQLiteChatPollFrontierHintTriggers(db); err != nil {
+		return err
+	}
+	if err := backfillSQLiteSessionDerivedColumns(db); err != nil {
+		return err
+	}
 	if err := backfillSQLiteChatPollDerivedColumns(db); err != nil {
 		return err
 	}
@@ -3059,18 +3838,8 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 	if err := backfillSQLiteInboundDerivedColumns(db); err != nil {
 		return err
 	}
-	shouldBackfillChatSequences := !chatSequencesExisted
-	if !shouldBackfillChatSequences {
-		chatSequencesEmpty, err := sqliteChatSequencesEmpty(db)
-		if err != nil {
-			return err
-		}
-		shouldBackfillChatSequences = chatSequencesEmpty
-	}
-	if shouldBackfillChatSequences {
-		if err := backfillSQLiteChatSequences(db); err != nil {
-			return err
-		}
+	if err := backfillSQLiteChatSequences(db); err != nil {
+		return err
 	}
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS inbound_session_created_idx ON inbound_events(session_id, created_at, id)`,
@@ -3084,6 +3853,7 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 		`CREATE INDEX IF NOT EXISTS chat_polls_auto_park_idx ON chat_polls(last_activity_at, chat_id) WHERE parked_skip_eligible = 0 AND last_activity_at > 0 AND poll_state IN ('cold', 'parked')`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_frontier_due_idx ON chat_polls(frontier_active, next_poll_at, blocked_until, updated_at, chat_id)`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_ordinary_due_idx ON chat_polls(parked_skip_eligible, next_poll_at, updated_at, chat_id) WHERE frontier_active = 0`,
+		`CREATE INDEX IF NOT EXISTS chat_polls_admission_idx ON chat_polls(admission_valid, frontier_active, next_poll_at, blocked_until, updated_at, chat_id)`,
 		`CREATE INDEX IF NOT EXISTS transcript_deliveries_outbox_idx ON transcript_deliveries(outbox_id)`,
 		`CREATE INDEX IF NOT EXISTS helper_deliveries_outbox_idx ON helper_deliveries(outbox_id)`,
 		`CREATE INDEX IF NOT EXISTS artifact_records_outbox_idx ON artifact_records(outbox_id)`,
@@ -3093,6 +3863,86 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 		}
 	}
 	return nil
+}
+
+// ensureSQLiteChatPollFrontierHintTriggers installs the current repair
+// triggers after all chat_polls columns exist.  CREATE TRIGGER IF NOT EXISTS
+// is not sufficient for a schema upgrade: SQLite keeps the old trigger body,
+// even after the canonical JSON predicate changes.  Recreate only these
+// helper-owned triggers so an old helper cannot turn a dormant gap back into
+// an operational frontier after the migration backfill.
+func ensureSQLiteChatPollFrontierHintTriggers(db *sql.DB) error {
+	current, err := sqliteChatPollFrontierHintTriggersCurrent(db)
+	if err != nil {
+		return err
+	}
+	if current {
+		// ensureSQLiteSchema is also called by ordinary state saves. Avoid
+		// DROP/CREATE on every save; repeated DDL causes schema churn and can
+		// briefly invalidate readers of chat_polls.
+		return nil
+	}
+	frontierHint := sqliteChatPollOperationalFrontierSQL("NEW.json")
+	for _, stmt := range []string{
+		`DROP TRIGGER IF EXISTS chat_polls_frontier_hint_repair_insert`,
+		`DROP TRIGGER IF EXISTS chat_polls_frontier_hint_repair_update`,
+		`CREATE TRIGGER chat_polls_frontier_hint_repair_insert
+AFTER INSERT ON chat_polls
+WHEN json_valid(NEW.json)
+ AND COALESCE(NEW.frontier_active, 0) != ` + frontierHint + `
+BEGIN
+  UPDATE chat_polls
+  SET frontier_active = ` + frontierHint + `
+  WHERE chat_id = NEW.chat_id;
+END`,
+		`CREATE TRIGGER chat_polls_frontier_hint_repair_update
+AFTER UPDATE OF json, frontier_active ON chat_polls
+WHEN json_valid(NEW.json)
+ AND COALESCE(NEW.frontier_active, 0) != ` + frontierHint + `
+BEGIN
+  UPDATE chat_polls
+  SET frontier_active = ` + frontierHint + `
+  WHERE chat_id = NEW.chat_id;
+END`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sqliteChatPollFrontierHintTriggersCurrent(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`SELECT name, COALESCE(sql, '') FROM sqlite_master
+WHERE type = 'trigger' AND name IN (?, ?)
+ORDER BY name`, "chat_polls_frontier_hint_repair_insert", "chat_polls_frontier_hint_repair_update")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	seen := make(map[string]string, 2)
+	for rows.Next() {
+		var name, definition string
+		if err := rows.Scan(&name, &definition); err != nil {
+			return false, err
+		}
+		seen[name] = definition
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(seen) != 2 {
+		return false, nil
+	}
+	for _, definition := range seen {
+		// These fields distinguish the dormant-gap-safe predicate from the
+		// legacy trigger. The repair path still generates the complete current
+		// expression whenever either trigger is absent or old.
+		if !strings.Contains(definition, "head_probe_pending") || !strings.Contains(definition, "recovery_path") {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func coldSQLiteState(state State) State {
@@ -3116,6 +3966,36 @@ func coldSQLiteState(state State) State {
 	return cold
 }
 
+func sqliteBackfillMetaKeys() []string {
+	return []string{
+		sqliteChatPollFrontierHintVersionKey,
+		sqliteSessionProjectionVersionKey,
+		sqliteChatPollProjectionVersionKey,
+		sqliteInboundProjectionVersionKey,
+		sqliteChatSequenceProjectionVersionKey,
+		sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey),
+		sqliteBackfillCursorKey(sqliteChatPollFrontierHintVersionKey),
+		sqliteBackfillCursorKey(sqliteInboundProjectionVersionKey),
+		sqliteBackfillCursorKey(sqliteChatSequenceProjectionVersionKey),
+	}
+}
+
+func captureSQLiteBackfillMeta(ctx context.Context, tx *sql.Tx) (map[string][]byte, error) {
+	meta := make(map[string][]byte)
+	for _, key := range sqliteBackfillMetaKeys() {
+		var value []byte
+		err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, key).Scan(&value)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		meta[key] = append([]byte(nil), value...)
+	}
+	return meta, nil
+}
+
 func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	state.ensure(time.Time{})
 	for key, checkpoint := range state.ImportCheckpoints {
@@ -3135,6 +4015,14 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 		return err
 	}
 	opaqueOutbox, err := captureOpaqueSQLiteOutboxRows(ctx, tx)
+	if err != nil {
+		return err
+	}
+	opaqueTurns, err := captureOpaqueSQLiteTurnRows(ctx, tx)
+	if err != nil {
+		return err
+	}
+	maintenanceMeta, err := captureSQLiteBackfillMeta(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -3166,6 +4054,15 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, cold); err != nil {
 		return err
 	}
+	// Generic full-state writes replace state_meta. Restore projection markers
+	// and any in-progress keyset cursors in the same transaction so an
+	// unrelated cold update cannot restart an O(number-of-rows) migration pass
+	// or mark an incomplete pass as finished.
+	for key, value := range maintenanceMeta {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)`, key, value); err != nil {
+			return err
+		}
+	}
 	stateJSONRevision, err := sqliteStateJSONRevision(ctx, tx)
 	if err != nil {
 		return err
@@ -3184,9 +4081,7 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}); err != nil {
 		return err
 	}
-	if err := writeSQLiteMap(ctx, tx, `INSERT INTO turns(id, session_id, status, queued_at, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`, state.Turns, func(v Turn) []any {
-		return []any{v.ID, v.SessionID, string(v.Status), sqliteTime(queuedTurnSortTime(v)), sqliteTime(v.CreatedAt), sqliteTime(v.UpdatedAt)}
-	}); err != nil {
+	if err := writeSQLiteTurnsPreservingOpaque(ctx, tx, state.Turns, opaqueTurns); err != nil {
 		return err
 	}
 	if err := writeSQLiteOutboxPreservingOpaque(ctx, tx, state.OutboxMessages, opaqueOutbox); err != nil {
@@ -3197,8 +4092,8 @@ func writeSQLiteState(ctx context.Context, db *sql.DB, state State) error {
 	}); err != nil {
 		return err
 	}
-	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
-		return []any{v.ChatID, sqliteTime(v.NextPollAt), sqliteTime(v.BlockedUntil), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteBool(chatPollHasOperationalFrontier(v)), sqliteTime(v.UpdatedAt)}
+	if err := writeSQLiteMap(ctx, tx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, admission_valid, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, state.ChatPolls, func(v ChatPollState) []any {
+		return []any{v.ChatID, sqliteTime(v.NextPollAt), sqliteTime(v.BlockedUntil), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteBool(chatPollHasOperationalFrontier(v)), sqliteBool(chatPollAdmissionValid(v)), sqliteTime(v.UpdatedAt)}
 	}); err != nil {
 		return err
 	}
@@ -3520,7 +4415,7 @@ type opaqueSQLiteSessionRow struct {
 }
 
 func captureOpaqueSQLiteSessionRows(ctx context.Context, tx *sql.Tx) ([]opaqueSQLiteSessionRow, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id, teams_chat_id, status, updated_at, json FROM sessions`)
+	rows, err := tx.QueryContext(ctx, `SELECT id, teams_chat_id, status, `+sqliteStoredInt64SQL("updated_at")+`, json FROM sessions`)
 	if err != nil {
 		return nil, err
 	}
@@ -3555,13 +4450,133 @@ func sqliteSessionProjectionMatches(row opaqueSQLiteSessionRow, session SessionC
 	return true
 }
 
+// A turn row can be syntactically malformed or carry an identity that does
+// not match its SQL primary-key/session columns.  loadSQLiteTurnMap keeps an
+// active malformed row as a minimal safety fence, but it cannot represent a
+// terminal identity-conflicting row in State.  Preserve every such row across
+// an unrelated full-state rewrite instead of silently deleting the only
+// durable evidence of the interrupted execution.
+type opaqueSQLiteTurnRow struct {
+	ID        sql.NullString
+	SessionID sql.NullString
+	Status    sql.NullString
+	QueuedAt  sql.NullInt64
+	CreatedAt sql.NullInt64
+	UpdatedAt sql.NullInt64
+	Raw       []byte
+}
+
+func captureOpaqueSQLiteTurnRows(ctx context.Context, tx *sql.Tx) ([]opaqueSQLiteTurnRow, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, session_id, status, `+
+		sqliteStoredInt64SQL("queued_at")+`, `+sqliteStoredInt64SQL("created_at")+`, `+
+		sqliteStoredInt64SQL("updated_at")+`, json FROM turns`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]opaqueSQLiteTurnRow, 0)
+	for rows.Next() {
+		var row opaqueSQLiteTurnRow
+		if err := rows.Scan(&row.ID, &row.SessionID, &row.Status, &row.QueuedAt, &row.CreatedAt, &row.UpdatedAt, &row.Raw); err != nil {
+			return nil, err
+		}
+		var turn Turn
+		opaque := json.Unmarshal(row.Raw, &turn) != nil
+		if !opaque {
+			opaque = !row.ID.Valid || strings.TrimSpace(turn.ID) == "" ||
+				strings.TrimSpace(turn.ID) != strings.TrimSpace(row.ID.String) ||
+				!row.SessionID.Valid || strings.TrimSpace(turn.SessionID) == "" ||
+				strings.TrimSpace(turn.SessionID) != strings.TrimSpace(row.SessionID.String) ||
+				!knownTurnStatus(turn.Status)
+		}
+		// A legacy scalar status can be the only safety evidence for an active
+		// row when the canonical JSON omitted status. Keep an unknown scalar
+		// opaque too; otherwise the loader's fail-closed running fence would be
+		// normalized and the original diagnostic value would be lost on save.
+		if !opaque && row.Status.Valid && sqliteTurnStatusIsUnknown(TurnStatus(row.Status.String)) {
+			opaque = true
+		}
+		if opaque {
+			out = append(out, row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, rows.Close()
+}
+
+// opaqueSQLiteTurnReplacement reports whether a caller has supplied a
+// deliberate terminal/status replacement for an opaque row.  A normal full
+// state save reloads malformed active rows as the same indexed safety status;
+// retaining those rows is what makes the save non-destructive.  A repair that
+// changes the status away from that fence may replace the row explicitly.
+func opaqueSQLiteTurnReplacement(row opaqueSQLiteTurnRow, turn Turn) bool {
+	if !row.ID.Valid || strings.TrimSpace(row.ID.String) != strings.TrimSpace(turn.ID) {
+		return false
+	}
+	if row.Status.Valid {
+		indexed := TurnStatus(strings.TrimSpace(row.Status.String))
+		if sqliteTurnStatusIsUnknown(indexed) {
+			return turn.Status != TurnStatusRunning
+		}
+		if indexed == TurnStatusQueued || indexed == TurnStatusRunning {
+			return turn.Status != indexed
+		}
+	}
+	// Terminal identity-conflicting rows are not materialized by the loader;
+	// any typed row with the same primary key is therefore an explicit repair.
+	return true
+}
+
+func writeSQLiteTurnsPreservingOpaque(ctx context.Context, tx *sql.Tx, values map[string]Turn, opaque []opaqueSQLiteTurnRow) error {
+	opaqueByID := make(map[string]opaqueSQLiteTurnRow, len(opaque))
+	for _, row := range opaque {
+		if row.ID.Valid && strings.TrimSpace(row.ID.String) != "" {
+			opaqueByID[strings.TrimSpace(row.ID.String)] = row
+		}
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO turns(id, session_id, status, queued_at, created_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, value := range values {
+		id := strings.TrimSpace(value.ID)
+		if id == "" {
+			continue
+		}
+		if row, keep := opaqueByID[id]; keep && !opaqueSQLiteTurnReplacement(row, value) {
+			continue
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.ExecContext(ctx, value.ID, value.SessionID, string(value.Status), sqliteTime(queuedTurnSortTime(value)), sqliteTime(value.CreatedAt), sqliteTime(value.UpdatedAt), data); err != nil {
+			return err
+		}
+	}
+	for _, row := range opaque {
+		if row.ID.Valid {
+			if value, replace := values[strings.TrimSpace(row.ID.String)]; replace && opaqueSQLiteTurnReplacement(row, value) {
+				continue
+			}
+		}
+		if _, err := stmt.ExecContext(ctx, nullableSQLiteString(row.ID), nullableSQLiteString(row.SessionID), nullableSQLiteString(row.Status), nullableSQLiteInt64(row.QueuedAt), nullableSQLiteInt64(row.CreatedAt), nullableSQLiteInt64(row.UpdatedAt), row.Raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // An outbox row with invalid JSON cannot be represented in State, but it must
 // not make the store unreadable or disappear during an unrelated full-state
 // rewrite. Keep its SQL projection and exact payload as opaque evidence. Hot
 // outbox queries explicitly exclude invalid rows, so they are isolated while
 // healthy rows in the same chat remain eligible for delivery.
 type opaqueSQLiteOutboxRow struct {
-	ID                     string
+	ID                     sql.NullString
 	SessionID              sql.NullString
 	TurnID                 sql.NullString
 	TeamsChatID            sql.NullString
@@ -3575,7 +4590,8 @@ type opaqueSQLiteOutboxRow struct {
 }
 
 func captureOpaqueSQLiteOutboxRows(ctx context.Context, tx *sql.Tx) ([]opaqueSQLiteOutboxRow, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json FROM outbox_messages`)
+	rows, err := tx.QueryContext(ctx, `SELECT id, session_id, turn_id, teams_chat_id, teams_message_id, status, `+
+		sqliteStoredInt64SQL("sequence")+`, `+sqliteStoredInt64SQL("created_at")+`, `+sqliteStoredInt64SQL("deliver_after")+`, `+sqliteStoredInt64SQL("post_send_effects_pending")+`, json FROM outbox_messages`)
 	if err != nil {
 		return nil, err
 	}
@@ -3583,11 +4599,21 @@ func captureOpaqueSQLiteOutboxRows(ctx context.Context, tx *sql.Tx) ([]opaqueSQL
 	out := make([]opaqueSQLiteOutboxRow, 0)
 	for rows.Next() {
 		var row opaqueSQLiteOutboxRow
-		if err := rows.Scan(&row.ID, &row.SessionID, &row.TurnID, &row.TeamsChatID, &row.TeamsMessageID, &row.Status, &row.Sequence, &row.CreatedAt, &row.DeliverAfter, &row.PostSendEffectsPending, &row.Raw); err != nil {
+		var sequence, createdAt, deliverAfter, postSendEffectsPending sqliteLooseInt64
+		if err := rows.Scan(&row.ID, &row.SessionID, &row.TurnID, &row.TeamsChatID, &row.TeamsMessageID, &row.Status, &sequence, &createdAt, &deliverAfter, &postSendEffectsPending, &row.Raw); err != nil {
 			return nil, err
 		}
-		var message OutboxMessage
-		if json.Unmarshal(row.Raw, &message) == nil && sqliteOutboxProjectionMatches(row, message) {
+		row.Sequence = sequence.NullInt64
+		row.CreatedAt = createdAt.NullInt64
+		row.DeliverAfter = deliverAfter.NullInt64
+		row.PostSendEffectsPending = postSendEffectsPending.NullInt64
+		message, hydrated := decodeSQLiteOutboxProjection(sqliteOutboxProjectionRow{
+			raw: row.Raw, id: row.ID, sessionID: row.SessionID, turnID: row.TurnID,
+			teamsChatID: row.TeamsChatID, teamsMessageID: row.TeamsMessageID,
+			status: row.Status, sequence: row.Sequence, createdAt: row.CreatedAt,
+			deliverAfter: row.DeliverAfter, postSendEffectsPending: row.PostSendEffectsPending,
+		})
+		if hydrated && sqliteOutboxProjectionMatches(row, message) {
 			continue
 		}
 		out = append(out, row)
@@ -3635,32 +4661,45 @@ func writeSQLiteSessionsPreservingOpaque(ctx context.Context, tx *sql.Tx, values
 }
 
 func sqliteOutboxProjectionMatches(row opaqueSQLiteOutboxRow, message OutboxMessage) bool {
-	if strings.TrimSpace(message.ID) != strings.TrimSpace(row.ID) ||
+	if !row.ID.Valid || strings.TrimSpace(message.ID) != strings.TrimSpace(row.ID.String) ||
 		!sqliteNullableStringMatches(row.SessionID, message.SessionID) ||
 		!sqliteNullableStringMatches(row.TurnID, message.TurnID) ||
 		!sqliteNullableStringMatches(row.TeamsChatID, message.TeamsChatID) ||
 		!sqliteNullableStringMatches(row.TeamsMessageID, message.TeamsMessageID) ||
 		!sqliteNullableStringMatches(row.Status, string(message.Status)) ||
 		!sqliteNullableInt64Matches(row.Sequence, message.Sequence) ||
-		!sqliteNullableTimeMatches(row.CreatedAt, message.CreatedAt) ||
-		!sqliteNullableTimeMatches(row.DeliverAfter, message.NextAttemptAt) {
+		!sqliteNullableTimeMatches(row.CreatedAt, message.CreatedAt) {
 		return false
 	}
-	pending := int64(0)
-	if row.PostSendEffectsPending.Valid {
-		pending = row.PostSendEffectsPending.Int64
-	}
-	if pending != boolInt64(message.PostSendEffectsPending) {
+	// next_attempt_at is an intentional canonical override.  A newer JSON
+	// writer can clear or replace the retry gate before the indexed legacy
+	// deliver_after projection is refreshed; treating that stale scalar as a
+	// contradiction would quarantine a row that the durable JSON explicitly
+	// made runnable.  Only use the scalar as a consistency check for rows whose
+	// JSON predates this field.
+	if !sqliteJSONFieldPresent(row.Raw, "next_attempt_at") && !sqliteNullableTimeMatches(row.DeliverAfter, message.NextAttemptAt) {
 		return false
+	}
+	if !sqliteJSONFieldPresent(row.Raw, "post_send_effects_pending") {
+		pending := int64(0)
+		if row.PostSendEffectsPending.Valid {
+			pending = row.PostSendEffectsPending.Int64
+		}
+		if pending != boolInt64(message.PostSendEffectsPending) {
+			return false
+		}
 	}
 	return true
 }
 
 func sqliteNullableStringMatches(column sql.NullString, value string) bool {
-	if !column.Valid {
-		// A nullable projection may be absent on a legacy SQLite schema.  The
-		// canonical JSON value is still authoritative; absence is not a
-		// contradiction that should quarantine an otherwise valid row.
+	if !column.Valid || strings.TrimSpace(column.String) == "" {
+		// A nullable or blank projection may be absent on a legacy SQLite schema,
+		// or may have been written by a mixed-version writer before the indexed
+		// column was refreshed. The canonical JSON value is authoritative; a
+		// missing compatibility value is not a contradiction that should hide an
+		// otherwise valid row. A non-empty projection remains a strict identity
+		// fence, so a real cross-row value is still quarantined.
 		return true
 	}
 	return strings.TrimSpace(column.String) == strings.TrimSpace(value)
@@ -3698,7 +4737,8 @@ func boolInt64(value bool) int64 {
 func writeSQLiteOutboxPreservingOpaque(ctx context.Context, tx *sql.Tx, values map[string]OutboxMessage, opaque []opaqueSQLiteOutboxRow) error {
 	keepOpaque := make(map[string]struct{}, len(opaque))
 	for _, row := range opaque {
-		if id := strings.TrimSpace(row.ID); id != "" {
+		if row.ID.Valid && strings.TrimSpace(row.ID.String) != "" {
+			id := strings.TrimSpace(row.ID.String)
 			keepOpaque[id] = struct{}{}
 		}
 	}
@@ -3720,10 +4760,7 @@ func writeSQLiteOutboxPreservingOpaque(ctx context.Context, tx *sql.Tx, values m
 		}
 	}
 	for _, row := range opaque {
-		if strings.TrimSpace(row.ID) == "" {
-			continue
-		}
-		if _, err := stmt.ExecContext(ctx, row.ID, nullableSQLiteString(row.SessionID), nullableSQLiteString(row.TurnID), nullableSQLiteString(row.TeamsChatID), nullableSQLiteString(row.TeamsMessageID), nullableSQLiteString(row.Status), nullableSQLiteInt64(row.Sequence), nullableSQLiteInt64(row.CreatedAt), nullableSQLiteInt64(row.DeliverAfter), nullableSQLiteInt64(row.PostSendEffectsPending), row.Raw); err != nil {
+		if _, err := stmt.ExecContext(ctx, nullableSQLiteString(row.ID), nullableSQLiteString(row.SessionID), nullableSQLiteString(row.TurnID), nullableSQLiteString(row.TeamsChatID), nullableSQLiteString(row.TeamsMessageID), nullableSQLiteString(row.Status), nullableSQLiteInt64(row.Sequence), nullableSQLiteInt64(row.CreatedAt), nullableSQLiteInt64(row.DeliverAfter), nullableSQLiteInt64(row.PostSendEffectsPending), row.Raw); err != nil {
 			return err
 		}
 	}
@@ -3771,7 +4808,7 @@ func writeSQLiteChatPollsPreservingOpaque(ctx context.Context, tx *sql.Tx, value
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, updated_at, json) VALUES (?, 0, 0, '', 0, 0, 0, 0, 0, ?)`, chatID, row.Raw); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, admission_valid, updated_at, json) VALUES (?, 0, 0, '', 0, 0, 0, 0, 0, 0, ?)`, chatID, row.Raw); err != nil {
 			return err
 		}
 	}
@@ -3888,54 +4925,414 @@ func writeSQLiteMap[T any](ctx context.Context, tx *sql.Tx, stmtText string, val
 	return nil
 }
 
+func sqliteBackfillCursorKey(versionKey string) string {
+	return strings.TrimSpace(versionKey) + sqliteSQLiteBackfillCursorSuffix
+}
+
+func sqliteReadMetaValue(db *sql.DB, key string) (string, error) {
+	var value []byte
+	err := db.QueryRow(`SELECT value FROM state_meta WHERE key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+
+func sqliteWriteMetaValue(exec interface {
+	Exec(string, ...any) (sql.Result, error)
+}, key string, value string) error {
+	_, err := exec.Exec(`INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	return err
+}
+
+func sqliteDeleteMetaValue(exec interface {
+	Exec(string, ...any) (sql.Result, error)
+}, key string) error {
+	_, err := exec.Exec(`DELETE FROM state_meta WHERE key = ?`, key)
+	return err
+}
+
+func sqliteBackfillCursorValue(version string, id string) string {
+	return version + "\x00" + id
+}
+
+func sqliteBackfillCursorID(value string, version string) (string, bool) {
+	prefix := version + "\x00"
+	if !strings.HasPrefix(value, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(value, prefix), true
+}
+
+// backfillSQLiteSessionDerivedColumns repairs the small indexed session
+// projection from canonical JSON. It is deliberately a durable keyset walk:
+// opening a large legacy database performs only one bounded chunk and resumes
+// from the saved cursor on the next operation/restart. Invalid or
+// identity-conflicting JSON is left untouched and remains fail-closed.
+func backfillSQLiteSessionDerivedColumns(db *sql.DB) error {
+	version, err := sqliteReadMetaValue(db, sqliteSessionProjectionVersionKey)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(version) == sqliteSessionProjectionVersion {
+		return nil
+	}
+	cursorValue, err := sqliteReadMetaValue(db, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey))
+	if err != nil {
+		return err
+	}
+	cursor, _ := sqliteBackfillCursorID(cursorValue, sqliteSessionProjectionVersion)
+	rows, err := db.Query(`SELECT id, teams_chat_id, status, `+sqliteStoredInt64SQL("updated_at")+`, json FROM sessions WHERE id > ? ORDER BY id LIMIT ?`, cursor, sqliteProjectionBackfillBatchSize)
+	if err != nil {
+		return err
+	}
+	type sessionProjectionUpdate struct {
+		id      string
+		chatID  string
+		status  string
+		updated int64
+	}
+	updates := make([]sessionProjectionUpdate, 0, sqliteProjectionBackfillBatchSize)
+	lastID := cursor
+	rowCount := 0
+	for rows.Next() {
+		var id string
+		var scalarChatID, scalarStatus sql.NullString
+		var scalarUpdated sql.NullInt64
+		var raw []byte
+		if err := rows.Scan(&id, &scalarChatID, &scalarStatus, &scalarUpdated, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		rowCount++
+		lastID = id
+		var object map[string]json.RawMessage
+		var session SessionContext
+		if json.Unmarshal(raw, &object) != nil || object == nil || json.Unmarshal(raw, &session) != nil {
+			continue
+		}
+		id = strings.TrimSpace(id)
+		if id == "" || strings.TrimSpace(session.ID) != id || strings.TrimSpace(session.TeamsChatID) == "" {
+			continue
+		}
+		update := sessionProjectionUpdate{
+			id:      id,
+			chatID:  strings.TrimSpace(session.TeamsChatID),
+			status:  nullableStringValue(scalarStatus),
+			updated: nullableInt64Value(scalarUpdated),
+		}
+		if _, present := object["status"]; present {
+			update.status = string(session.Status)
+		}
+		if _, present := object["updated_at"]; present {
+			update.updated = sqliteTime(session.UpdatedAt)
+		}
+		_ = scalarChatID
+		updates = append(updates, update)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	complete := rowCount < sqliteProjectionBackfillBatchSize
+	// A page can contain only invalid rows, so use the number actually read
+	// rather than the number eligible for repair to decide whether the table is
+	// exhausted.
+	// lastID remains the previous cursor when the query returned no rows.
+	if lastID == cursor {
+		complete = true
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE sessions SET teams_chat_id = ?, status = ?, updated_at = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := stmt.Exec(update.chatID, update.status, update.updated, update.id); err != nil {
+			_ = stmt.Close()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	if complete {
+		if err := sqliteWriteMetaValue(tx, sqliteSessionProjectionVersionKey, sqliteSessionProjectionVersion); err != nil {
+			return err
+		}
+		if err := sqliteDeleteMetaValue(tx, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey)); err != nil {
+			return err
+		}
+	} else if err := sqliteWriteMetaValue(tx, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey), sqliteBackfillCursorValue(sqliteSessionProjectionVersion, lastID)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func nullableStringValue(value sql.NullString) string {
+	if !value.Valid {
+		return ""
+	}
+	return value.String
+}
+
+func nullableInt64Value(value sql.NullInt64) int64 {
+	if !value.Valid {
+		return 0
+	}
+	return value.Int64
+}
+
 func backfillSQLiteChatPollDerivedColumns(db *sql.DB) error {
-	rows, err := db.Query(`SELECT chat_id, json FROM chat_polls WHERE park_notice_sent_at IS NULL OR parked_skip_eligible IS NULL OR frontier_active IS NULL OR last_activity_at IS NULL OR blocked_until IS NULL`)
+	frontierVersion, err := sqliteReadMetaValue(db, sqliteChatPollFrontierHintVersionKey)
+	if err != nil {
+		return err
+	}
+	projectionVersion, err := sqliteReadMetaValue(db, sqliteChatPollProjectionVersionKey)
+	if err != nil {
+		return err
+	}
+	frontierHintNeedsRepair := strings.TrimSpace(frontierVersion) != sqliteChatPollFrontierHintVersion
+	chatPollProjectionNeedsRepair := strings.TrimSpace(projectionVersion) != sqliteChatPollProjectionVersion
+	if !frontierHintNeedsRepair && !chatPollProjectionNeedsRepair {
+		// Older stores can still contain a narrow NULL-only compatibility gap
+		// created by an interrupted projection write. Repair only a bounded page;
+		// do not resurrect the old unbounded full-table scan on every open.
+		return backfillSQLiteChatPollNullableColumns(db)
+	}
+	cursorVersion := sqliteChatPollFrontierHintVersion + "|" + sqliteChatPollProjectionVersion
+	cursorValue, err := sqliteReadMetaValue(db, sqliteBackfillCursorKey(sqliteChatPollFrontierHintVersionKey))
+	if err != nil {
+		return err
+	}
+	cursor, _ := sqliteBackfillCursorID(cursorValue, cursorVersion)
+	rows, err := db.Query(`SELECT chat_id, `+sqliteStoredInt64SQL("next_poll_at")+`, `+sqliteStoredInt64SQL("blocked_until")+`, poll_state, `+
+		sqliteStoredInt64SQL("last_activity_at")+`, `+sqliteStoredInt64SQL("park_notice_sent_at")+`, `+
+		sqliteStoredInt64SQL("parked_skip_eligible")+`, `+sqliteStoredInt64SQL("frontier_active")+`, `+
+		sqliteStoredInt64SQL("admission_valid")+`, `+sqliteStoredInt64SQL("updated_at")+`, json
+FROM chat_polls WHERE chat_id > ? ORDER BY chat_id LIMIT ?`, cursor, sqliteProjectionBackfillBatchSize)
 	if err != nil {
 		return err
 	}
 	type chatPollDerivedUpdate struct {
 		ChatID             string
+		NextPollAt         int64
 		BlockedUntil       int64
+		PollState          string
 		LastActivityAt     int64
 		ParkNoticeSentAt   int64
 		ParkedSkipEligible int64
 		FrontierActive     int64
+		AdmissionValid     int64
+		UpdatedAt          int64
 	}
-	var updates []chatPollDerivedUpdate
+	updates := make([]chatPollDerivedUpdate, 0, sqliteProjectionBackfillBatchSize)
+	lastChatID := cursor
+	rowCount := 0
 	for rows.Next() {
 		var chatID string
+		var nextPollAt, blockedUntil, lastActivityAt, parkNoticeSentAt, parkedSkipEligible, frontierActive, admissionValid, updatedAt sql.NullInt64
+		var pollState sql.NullString
 		var raw []byte
-		if err := rows.Scan(&chatID, &raw); err != nil {
+		if err := rows.Scan(&chatID, &nextPollAt, &blockedUntil, &pollState, &lastActivityAt, &parkNoticeSentAt, &parkedSkipEligible, &frontierActive, &admissionValid, &updatedAt, &raw); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		var poll ChatPollState
-		if err := json.Unmarshal(raw, &poll); err != nil {
-			// A malformed poll projection is a chat-local corruption. Leave the
-			// raw bytes for explicit repair, but make sure its derived row cannot
-			// be admitted as an operational frontier or abort startup for every
-			// other chat.
-			chatID = strings.TrimSpace(chatID)
-			if chatID != "" {
-				updates = append(updates, chatPollDerivedUpdate{ChatID: chatID})
-			}
+		rowCount++
+		chatID = strings.TrimSpace(chatID)
+		lastChatID = chatID
+		if chatID == "" {
 			continue
+		}
+		update := chatPollDerivedUpdate{
+			ChatID:             chatID,
+			NextPollAt:         nullableInt64Value(nextPollAt),
+			BlockedUntil:       nullableInt64Value(blockedUntil),
+			PollState:          nullableStringValue(pollState),
+			LastActivityAt:     nullableInt64Value(lastActivityAt),
+			ParkNoticeSentAt:   nullableInt64Value(parkNoticeSentAt),
+			ParkedSkipEligible: nullableInt64Value(parkedSkipEligible),
+			FrontierActive:     nullableInt64Value(frontierActive),
+			AdmissionValid:     nullableInt64Value(admissionValid),
+			UpdatedAt:          nullableInt64Value(updatedAt),
+		}
+		var object map[string]json.RawMessage
+		var poll ChatPollState
+		valid := json.Unmarshal(raw, &object) == nil && object != nil &&
+			json.Unmarshal(raw, &poll) == nil && strings.TrimSpace(poll.ChatID) == chatID && chatPollAdmissionValid(poll)
+		if !valid {
+			// A malformed or semantically unusable poll is a chat-local recovery
+			// candidate. Clear only the gates that can hide it behind a retry;
+			// retain the row and its raw JSON for explicit repair.
+			update.NextPollAt = 0
+			update.BlockedUntil = 0
+			update.FrontierActive = 0
+			if chatPollProjectionNeedsRepair {
+				update.AdmissionValid = 0
+			}
+		} else {
+			if chatPollProjectionNeedsRepair {
+				update.AdmissionValid = 1
+				if sqliteJSONFieldPresent(raw, "next_poll_at") {
+					update.NextPollAt = sqliteTime(poll.NextPollAt)
+				}
+				if sqliteJSONFieldPresent(raw, "blocked_until") {
+					update.BlockedUntil = sqliteTime(poll.BlockedUntil)
+				}
+				if sqliteJSONFieldPresent(raw, "state") {
+					update.PollState = poll.PollState
+				}
+				if sqliteJSONFieldPresent(raw, "last_activity_at") {
+					update.LastActivityAt = sqliteTime(poll.LastActivityAt)
+				}
+				if sqliteJSONFieldPresent(raw, "park_notice_sent_at") {
+					update.ParkNoticeSentAt = sqliteTime(poll.ParkNoticeSentAt)
+				}
+				if sqliteJSONFieldPresent(raw, "updated_at") {
+					update.UpdatedAt = sqliteTime(poll.UpdatedAt)
+				}
+				// These are derived from the complete canonical poll object and
+				// do not have a useful legacy source when omitted from old JSON.
+				update.ParkedSkipEligible = sqliteBool(chatPollParkedSkipEligible(poll))
+			}
+			if frontierHintNeedsRepair {
+				update.FrontierActive = sqliteBool(chatPollHasOperationalFrontier(poll))
+			}
+		}
+		updates = append(updates, update)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	complete := rowCount < sqliteProjectionBackfillBatchSize
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE chat_polls SET next_poll_at = ?, blocked_until = ?, poll_state = ?, last_activity_at = ?, park_notice_sent_at = ?, parked_skip_eligible = ?, frontier_active = ?, admission_valid = ?, updated_at = ? WHERE chat_id = ?`)
+	if err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := stmt.Exec(update.NextPollAt, update.BlockedUntil, update.PollState, update.LastActivityAt, update.ParkNoticeSentAt, update.ParkedSkipEligible, update.FrontierActive, update.AdmissionValid, update.UpdatedAt, update.ChatID); err != nil {
+			_ = stmt.Close()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	if complete {
+		if frontierHintNeedsRepair {
+			if err := sqliteWriteMetaValue(tx, sqliteChatPollFrontierHintVersionKey, sqliteChatPollFrontierHintVersion); err != nil {
+				return err
+			}
+		}
+		if chatPollProjectionNeedsRepair {
+			if err := sqliteWriteMetaValue(tx, sqliteChatPollProjectionVersionKey, sqliteChatPollProjectionVersion); err != nil {
+				return err
+			}
+		}
+		if err := sqliteDeleteMetaValue(tx, sqliteBackfillCursorKey(sqliteChatPollFrontierHintVersionKey)); err != nil {
+			return err
+		}
+	} else if err := sqliteWriteMetaValue(tx, sqliteBackfillCursorKey(sqliteChatPollFrontierHintVersionKey), sqliteBackfillCursorValue(cursorVersion, lastChatID)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// backfillSQLiteChatPollNullableColumns repairs legacy rows whose optional
+// scalar projection is still NULL even though the versioned full pass has
+// completed. The query is intentionally bounded and the update clears every
+// nullable field for an invalid row so one opaque row cannot trigger the same
+// scan forever.
+func backfillSQLiteChatPollNullableColumns(db *sql.DB) error {
+	rows, err := db.Query(`SELECT chat_id, `+sqliteStoredInt64SQL("next_poll_at")+`, `+sqliteStoredInt64SQL("blocked_until")+`, poll_state, `+
+		sqliteStoredInt64SQL("last_activity_at")+`, `+sqliteStoredInt64SQL("park_notice_sent_at")+`, `+
+		sqliteStoredInt64SQL("parked_skip_eligible")+`, `+sqliteStoredInt64SQL("frontier_active")+`, `+
+		sqliteStoredInt64SQL("admission_valid")+`, `+sqliteStoredInt64SQL("updated_at")+`, json
+FROM chat_polls
+WHERE next_poll_at IS NULL OR blocked_until IS NULL OR poll_state IS NULL OR last_activity_at IS NULL OR
+      park_notice_sent_at IS NULL OR parked_skip_eligible IS NULL OR frontier_active IS NULL OR
+      admission_valid IS NULL OR updated_at IS NULL
+ORDER BY chat_id LIMIT ?`, sqliteProjectionBackfillBatchSize)
+	if err != nil {
+		return err
+	}
+	type updateRow struct {
+		chatID, pollState                                                 string
+		next, blocked, activity, notice, parked, frontier, valid, updated int64
+	}
+	updates := make([]updateRow, 0, sqliteProjectionBackfillBatchSize)
+	for rows.Next() {
+		var chatID string
+		var next, blocked, activity, notice, parked, frontier, valid, updated sql.NullInt64
+		var pollState sql.NullString
+		var raw []byte
+		if err := rows.Scan(&chatID, &next, &blocked, &pollState, &activity, &notice, &parked, &frontier, &valid, &updated, &raw); err != nil {
+			_ = rows.Close()
+			return err
 		}
 		chatID = strings.TrimSpace(chatID)
 		if chatID == "" {
-			chatID = strings.TrimSpace(poll.ChatID)
-		}
-		if chatID == "" {
 			continue
 		}
-		updates = append(updates, chatPollDerivedUpdate{
-			ChatID:             chatID,
-			BlockedUntil:       sqliteTime(poll.BlockedUntil),
-			LastActivityAt:     sqliteTime(poll.LastActivityAt),
-			ParkNoticeSentAt:   sqliteTime(poll.ParkNoticeSentAt),
-			ParkedSkipEligible: sqliteBool(chatPollParkedSkipEligible(poll)),
-			FrontierActive:     sqliteBool(chatPollHasOperationalFrontier(poll)),
-		})
+		row := updateRow{
+			chatID:    chatID,
+			pollState: nullableStringValue(pollState),
+			next:      nullableInt64Value(next), blocked: nullableInt64Value(blocked),
+			activity: nullableInt64Value(activity), notice: nullableInt64Value(notice),
+			parked: nullableInt64Value(parked), frontier: nullableInt64Value(frontier),
+			valid: nullableInt64Value(valid), updated: nullableInt64Value(updated),
+		}
+		var object map[string]json.RawMessage
+		var poll ChatPollState
+		admissionOK := json.Unmarshal(raw, &object) == nil && object != nil &&
+			json.Unmarshal(raw, &poll) == nil && strings.TrimSpace(poll.ChatID) == chatID && chatPollAdmissionValid(poll)
+		if !admissionOK {
+			row.next, row.blocked, row.activity, row.notice, row.parked, row.frontier, row.valid, row.updated = 0, 0, 0, 0, 0, 0, 0, 0
+		} else {
+			if sqliteJSONFieldPresent(raw, "next_poll_at") {
+				row.next = sqliteTime(poll.NextPollAt)
+			}
+			if sqliteJSONFieldPresent(raw, "blocked_until") {
+				row.blocked = sqliteTime(poll.BlockedUntil)
+			}
+			if sqliteJSONFieldPresent(raw, "state") {
+				row.pollState = poll.PollState
+			}
+			if sqliteJSONFieldPresent(raw, "last_activity_at") {
+				row.activity = sqliteTime(poll.LastActivityAt)
+			}
+			if sqliteJSONFieldPresent(raw, "park_notice_sent_at") {
+				row.notice = sqliteTime(poll.ParkNoticeSentAt)
+			}
+			if sqliteJSONFieldPresent(raw, "updated_at") {
+				row.updated = sqliteTime(poll.UpdatedAt)
+			}
+			row.parked = sqliteBool(chatPollParkedSkipEligible(poll))
+			row.frontier = sqliteBool(chatPollHasOperationalFrontier(poll))
+			row.valid = 1
+		}
+		updates = append(updates, row)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -3952,33 +5349,107 @@ func backfillSQLiteChatPollDerivedColumns(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.Prepare(`UPDATE chat_polls SET blocked_until = ?, last_activity_at = ?, park_notice_sent_at = ?, parked_skip_eligible = ?, frontier_active = ? WHERE chat_id = ?`)
+	stmt, err := tx.Prepare(`UPDATE chat_polls SET next_poll_at = ?, blocked_until = ?, poll_state = ?, last_activity_at = ?, park_notice_sent_at = ?, parked_skip_eligible = ?, frontier_active = ?, admission_valid = ?, updated_at = ? WHERE chat_id = ?`)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
-	for _, update := range updates {
-		if _, err := stmt.Exec(update.BlockedUntil, update.LastActivityAt, update.ParkNoticeSentAt, update.ParkedSkipEligible, update.FrontierActive, update.ChatID); err != nil {
+	for _, row := range updates {
+		if _, err := stmt.Exec(row.next, row.blocked, row.pollState, row.activity, row.notice, row.parked, row.frontier, row.valid, row.updated, row.chatID); err != nil {
+			_ = stmt.Close()
 			return err
 		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
 
 func backfillSQLiteInboundDerivedColumns(db *sql.DB) error {
-	_, err := db.Exec(`UPDATE inbound_events
-SET received_at = CASE WHEN json_valid(json) THEN COALESCE(CAST(strftime('%s', json_extract(json, '$.received_at')) AS INTEGER) * 1000000000, 0) ELSE 0 END
-WHERE received_at IS NULL`)
-	return err
+	version, err := sqliteReadMetaValue(db, sqliteInboundProjectionVersionKey)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(version) == sqliteInboundProjectionVersion {
+		return nil
+	}
+	cursorValue, err := sqliteReadMetaValue(db, sqliteBackfillCursorKey(sqliteInboundProjectionVersionKey))
+	if err != nil {
+		return err
+	}
+	cursor, _ := sqliteBackfillCursorID(cursorValue, sqliteInboundProjectionVersion)
+	rows, err := db.Query(`SELECT id, json FROM inbound_events WHERE id > ? AND received_at IS NULL ORDER BY id LIMIT ?`, cursor, sqliteProjectionBackfillBatchSize)
+	if err != nil {
+		return err
+	}
+	type inboundProjectionUpdate struct {
+		id         string
+		receivedAt int64
+	}
+	updates := make([]inboundProjectionUpdate, 0, sqliteProjectionBackfillBatchSize)
+	lastID := cursor
+	rowCount := 0
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		rowCount++
+		lastID = id
+		var event InboundEvent
+		receivedAt := int64(0)
+		if json.Unmarshal(raw, &event) == nil && !event.ReceivedAt.IsZero() {
+			receivedAt = sqliteTime(event.ReceivedAt)
+		}
+		updates = append(updates, inboundProjectionUpdate{id: id, receivedAt: receivedAt})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	complete := rowCount < sqliteProjectionBackfillBatchSize
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE inbound_events SET received_at = ? WHERE id = ? AND received_at IS NULL`)
+	if err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := stmt.Exec(update.receivedAt, update.id); err != nil {
+			_ = stmt.Close()
+			return err
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	if complete {
+		if err := sqliteWriteMetaValue(tx, sqliteInboundProjectionVersionKey, sqliteInboundProjectionVersion); err != nil {
+			return err
+		}
+		if err := sqliteDeleteMetaValue(tx, sqliteBackfillCursorKey(sqliteInboundProjectionVersionKey)); err != nil {
+			return err
+		}
+	} else if err := sqliteWriteMetaValue(tx, sqliteBackfillCursorKey(sqliteInboundProjectionVersionKey), sqliteBackfillCursorValue(sqliteInboundProjectionVersion, lastID)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ensureSQLiteRuntimeProjectionMarker distinguishes a genuinely legacy
 // SQLite store (no runtime rows yet) from a store whose runtime projection was
 // started by an older helper but is now partial. The latter must not silently
 // fall back to state_json, because that cold snapshot may predate a newer
-// owner/lease write. New full runtime writes record the same marker explicitly
-// in their transaction; this one-time compatibility step covers old stores
-// opened after the marker was introduced.
+// owner/lease write. A genuinely legacy store is materialized once from its
+// cold snapshot so the hot path does not repeat a full decode on every poll.
 func ensureSQLiteRuntimeProjectionMarker(db *sql.DB) error {
 	var marker []byte
 	err := db.QueryRow(`SELECT value FROM state_meta WHERE key = ?`, sqliteRuntimeProjectionMaterializedKey).Scan(&marker)
@@ -3990,35 +5461,149 @@ func ensureSQLiteRuntimeProjectionMarker(db *sql.DB) error {
 	}
 	var one int
 	err = db.QueryRow(`SELECT 1 FROM runtime_state LIMIT 1`).Scan(&one)
+	if err == nil {
+		_, err = db.Exec(`INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO NOTHING`, sqliteRuntimeProjectionMaterializedKey, sqliteRuntimeProjectionMaterializedValue)
+		return err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	// This is the only compatibility path that decodes state_json for runtime
+	// projection bootstrap. It runs while the database is first opened and the
+	// successful transaction below installs the marker, so subsequent hot reads
+	// never return to the cold document. If the legacy cold snapshot is corrupt,
+	// fail closed rather than inventing an owner/lease binding.
+	var raw []byte
+	err = db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO state_meta(key, value) VALUES (?, ?)
-ON CONFLICT(key) DO NOTHING`, sqliteRuntimeProjectionMaterializedKey, sqliteRuntimeProjectionMaterializedValue)
-	return err
-}
-
-func backfillSQLiteChatSequences(db *sql.DB) error {
-	var raw []byte
-	if err := db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return err
-	}
-	if len(raw) == 0 {
-		return nil
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return errors.New("sqlite teams store has empty state metadata")
 	}
 	state, err := loadStateData(raw)
 	if err != nil {
+		return fmt.Errorf("bootstrap sqlite runtime projection: %w", err)
+	}
+	state.ensure(time.Time{})
+
+	tx, err := db.Begin()
+	if err != nil {
 		return err
 	}
-	if len(state.ChatSequences) == 0 {
+	defer tx.Rollback()
+	// Recheck after acquiring the write transaction. This keeps the bootstrap
+	// idempotent if two open paths race before sharing the database handle.
+	if err := tx.QueryRow(`SELECT value FROM state_meta WHERE key = ?`, sqliteRuntimeProjectionMaterializedKey).Scan(&marker); err == nil {
+		return tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := tx.QueryRow(`SELECT 1 FROM runtime_state LIMIT 1`).Scan(&one); err == nil {
+		if _, err := tx.Exec(`INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO NOTHING`, sqliteRuntimeProjectionMaterializedKey, sqliteRuntimeProjectionMaterializedValue); err != nil {
+			return err
+		}
+		return tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := saveSQLiteRuntimeStateTx(context.Background(), tx, state); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func backfillSQLiteChatSequences(db *sql.DB) error {
+	version, err := sqliteReadMetaValue(db, sqliteChatSequenceProjectionVersionKey)
+	if err != nil {
+		return err
+	}
+	var existing int
+	existingErr := db.QueryRow(`SELECT 1 FROM chat_sequences LIMIT 1`).Scan(&existing)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return existingErr
+	}
+	if strings.TrimSpace(version) == sqliteChatSequenceProjectionVersion && existingErr == nil {
 		return nil
 	}
+	if existingErr == nil {
+		// A legacy database may already have a complete sequence table but no
+		// marker. Do not rebuild or overwrite it from the cold JSON snapshot.
+		tx, txErr := db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback()
+		if err := sqliteWriteMetaValue(tx, sqliteChatSequenceProjectionVersionKey, sqliteChatSequenceProjectionVersion); err != nil {
+			return err
+		}
+		if err := sqliteDeleteMetaValue(tx, sqliteBackfillCursorKey(sqliteChatSequenceProjectionVersionKey)); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	cursorValue, err := sqliteReadMetaValue(db, sqliteBackfillCursorKey(sqliteChatSequenceProjectionVersionKey))
+	if err != nil {
+		return err
+	}
+	cursor, _ := sqliteBackfillCursorID(cursorValue, sqliteChatSequenceProjectionVersion)
+	// json_each walks only the chat_sequences object in the cold document. It
+	// avoids decoding the entire State in Go and, unlike the old implementation,
+	// persists a keyset cursor after every bounded page.
+	rows, err := db.Query(`SELECT entries.key, entries.value
+FROM state_meta AS meta,
+     json_each(CASE WHEN json_valid(meta.value)
+                    THEN COALESCE(json_extract(meta.value, '$.chat_sequences'), '{}')
+                    ELSE '{}' END) AS entries
+WHERE meta.key = 'state_json' AND entries.key > ?
+ORDER BY entries.key LIMIT ?`, cursor, sqliteProjectionBackfillBatchSize)
+	if err != nil {
+		return err
+	}
+	type sequenceProjectionUpdate struct {
+		chatID string
+		seq    ChatSequenceState
+		raw    []byte
+	}
+	updates := make([]sequenceProjectionUpdate, 0, sqliteProjectionBackfillBatchSize)
+	lastID := cursor
+	rowCount := 0
+	for rows.Next() {
+		var chatID string
+		var raw []byte
+		if err := rows.Scan(&chatID, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		rowCount++
+		lastID = chatID
+		var seq ChatSequenceState
+		if json.Unmarshal(raw, &seq) != nil {
+			continue
+		}
+		seq.ChatID = strings.TrimSpace(seq.ChatID)
+		if seq.ChatID == "" {
+			seq.ChatID = strings.TrimSpace(chatID)
+		}
+		if seq.ChatID == "" || seq.ChatID != strings.TrimSpace(chatID) {
+			continue
+		}
+		updates = append(updates, sequenceProjectionUpdate{chatID: seq.ChatID, seq: seq, raw: raw})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	complete := rowCount < sqliteProjectionBackfillBatchSize
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -4028,19 +5613,24 @@ func backfillSQLiteChatSequences(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
-	for _, seq := range state.ChatSequences {
-		seq.ChatID = strings.TrimSpace(seq.ChatID)
-		if seq.ChatID == "" {
-			continue
-		}
-		data, err := json.Marshal(seq)
-		if err != nil {
+	for _, update := range updates {
+		if _, err := stmt.Exec(update.chatID, update.seq.Next, sqliteTime(update.seq.UpdatedAt), update.raw); err != nil {
+			_ = stmt.Close()
 			return err
 		}
-		if _, err := stmt.Exec(seq.ChatID, seq.Next, sqliteTime(seq.UpdatedAt), data); err != nil {
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+	if complete {
+		if err := sqliteWriteMetaValue(tx, sqliteChatSequenceProjectionVersionKey, sqliteChatSequenceProjectionVersion); err != nil {
 			return err
 		}
+		if err := sqliteDeleteMetaValue(tx, sqliteBackfillCursorKey(sqliteChatSequenceProjectionVersionKey)); err != nil {
+			return err
+		}
+	} else if err := sqliteWriteMetaValue(tx, sqliteBackfillCursorKey(sqliteChatSequenceProjectionVersionKey), sqliteBackfillCursorValue(sqliteChatSequenceProjectionVersion, lastID)); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -4075,7 +5665,7 @@ func loadSQLiteStateRows(ctx context.Context, db interface {
 	if err := loadSQLiteTurnMap(ctx, db, `SELECT id, session_id, status, json FROM turns`, state.Turns, true); err != nil {
 		return State{}, err
 	}
-	if err := loadSQLiteOutboxMap(ctx, db, `SELECT o.json FROM outbox_messages o WHERE `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+	if err := loadSQLiteOutboxMap(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 		return State{}, err
 	}
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM message_provenance`, state.MessageProvenance, func(v MessageProvenanceRecord) string { return v.ID }); err != nil {
@@ -4172,7 +5762,7 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 		}
 	}
 	if _, ok := wanted["outbox_messages"]; ok {
-		if err := loadSQLiteOutboxMap(ctx, db, `SELECT o.json FROM outbox_messages o WHERE `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+		if err := loadSQLiteOutboxMap(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 			return State{}, err
 		}
 	}
@@ -4321,9 +5911,10 @@ func hotPollSelectedChatIDs(state State) []string {
 // of limiting chat_polls because those maps are decoded before the scheduler
 // has selected a work quantum.
 func loadSQLiteHotPollActiveTurns(ctx context.Context, db *sql.DB, state State, readyOnly bool) error {
+	canonicalStatus := sqliteTurnSafetyStatusSQL("json", "status")
 	if !readyOnly {
 		args := sqliteTurnActiveStatusArgs()
-		return loadSQLiteTurnMap(ctx, db, `SELECT id, session_id, status, json FROM turns WHERE `+sqliteTurnActiveStatusSQL("status"), state.Turns, true, args...)
+		return loadSQLiteTurnMap(ctx, db, `SELECT id, session_id, `+canonicalStatus+`, json FROM turns WHERE `+sqliteTurnActiveStatusSQL(canonicalStatus), state.Turns, true, args...)
 	}
 	chatIDs := hotPollSelectedChatIDs(state)
 	if len(chatIDs) == 0 {
@@ -4335,18 +5926,21 @@ func loadSQLiteHotPollActiveTurns(ctx context.Context, db *sql.DB, state State, 
 	for _, chatID := range chatIDs {
 		args = append(args, chatID)
 	}
+	canonicalSessionChat := sqliteCanonicalTextProjectionSQL("s.json", "$.teams_chat_id", "s.teams_chat_id")
 	return loadSQLiteTurnMap(ctx, db,
-		`SELECT t.id, t.session_id, t.status, t.json
-FROM turns t
-JOIN sessions s ON s.id = t.session_id
-WHERE `+sqliteTurnActiveStatusSQL("t.status")+`
-  AND s.teams_chat_id IN (`+placeholders+`)`,
+		`SELECT t.id, t.session_id, `+sqliteTurnSafetyStatusSQL("t.json", "t.status")+`, t.json
+	FROM turns t
+	JOIN sessions s ON s.id = t.session_id
+	WHERE `+sqliteTurnActiveSafetyStatusSQL("t.json", "t.status")+`
+	  AND `+canonicalSessionChat+` IN (`+placeholders+`)`,
 		state.Turns, true, args...)
 }
 
 func loadSQLiteHotPollImportingCheckpoints(ctx context.Context, db *sql.DB, state State, readyOnly bool) error {
+	checkpointStatus := sqliteCanonicalTextProjectionSQL("json", "$.status", "status")
+	checkpointSessionID := sqliteCanonicalTextProjectionSQL("json", "$.session_id", "session_id")
 	if !readyOnly {
-		return loadSQLiteCheckpointMap(ctx, db, `SELECT id, session_id, status, updated_at, json FROM import_checkpoints WHERE status = ?`, state.ImportCheckpoints, sqliteImportCheckpointImporting)
+		return loadSQLiteCheckpointMap(ctx, db, `SELECT id, `+checkpointSessionID+`, `+checkpointStatus+`, updated_at, json FROM import_checkpoints WHERE `+checkpointStatus+` = ?`, state.ImportCheckpoints, sqliteImportCheckpointImporting)
 	}
 	chatIDs := hotPollSelectedChatIDs(state)
 	if len(chatIDs) == 0 {
@@ -4358,17 +5952,21 @@ func loadSQLiteHotPollImportingCheckpoints(ctx context.Context, db *sql.DB, stat
 	for _, chatID := range chatIDs {
 		args = append(args, chatID)
 	}
+	checkpointStatus = sqliteCanonicalTextProjectionSQL("i.json", "$.status", "i.status")
+	checkpointSessionID = sqliteCanonicalTextProjectionSQL("i.json", "$.session_id", "i.session_id")
+	canonicalSessionChat := sqliteCanonicalTextProjectionSQL("s.json", "$.teams_chat_id", "s.teams_chat_id")
 	return loadSQLiteCheckpointMap(ctx, db,
-		`SELECT i.id, i.session_id, i.status, i.updated_at, i.json
+		`SELECT i.id, `+checkpointSessionID+`, `+checkpointStatus+`, i.updated_at, i.json
 FROM import_checkpoints i
-JOIN sessions s ON s.id = i.session_id
-WHERE i.status = ?
-  AND s.teams_chat_id IN (`+placeholders+`)`,
+JOIN sessions s ON s.id = `+checkpointSessionID+`
+WHERE `+checkpointStatus+` = ?
+  AND `+canonicalSessionChat+` IN (`+placeholders+`)`,
 		state.ImportCheckpoints, args...)
 }
 
 func loadSQLiteParkedNoticeChatIDs(ctx context.Context, db *sql.DB) (map[string]bool, error) {
-	rows, err := db.QueryContext(ctx, `SELECT chat_id FROM chat_polls WHERE COALESCE(parked_skip_eligible, 0) != 0`)
+	parkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("json", "parked_skip_eligible", "poll_state")
+	rows, err := db.QueryContext(ctx, `SELECT chat_id FROM chat_polls WHERE `+parkedSkipEligible+` != 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -4400,7 +5998,7 @@ func loadSQLiteHasSessions(ctx context.Context, db *sql.DB) (bool, error) {
 
 func loadSQLiteHasValidSessions(ctx context.Context, db *sql.DB) (bool, error) {
 	var one int
-	validSession := sqliteSessionValidJSONSQL("json", "id", "teams_chat_id")
+	validSession := sqliteSessionCanonicalValidJSONSQL("json", "id")
 	if err := db.QueryRowContext(ctx, `SELECT 1 FROM sessions WHERE `+validSession+` LIMIT 1`).Scan(&one); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
@@ -4419,6 +6017,21 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
 	if now.IsZero() {
 		now = time.Now()
 	}
+	sessionChatID := sqliteCanonicalTextProjectionSQL("s.json", "$.teams_chat_id", "s.teams_chat_id")
+	sessionUpdatedAt := sqliteCanonicalTimeProjectionSQL("s.json", "$.updated_at", "s.updated_at")
+	sessionUpdatedDue := sqliteCanonicalTimeDueSQL("s.json", "$.updated_at", "s.updated_at")
+	pollUpdatedAt := sqliteCanonicalTimeProjectionSQL("p.json", "$.updated_at", "p.updated_at")
+	pollNextAt := sqliteCanonicalTimeProjectionSQL("p.json", "$.next_poll_at", "p.next_poll_at")
+	pollNextDue := sqliteCanonicalTimeDueSQL("p.json", "$.next_poll_at", "p.next_poll_at")
+	pollActivityAt := sqliteCanonicalTimeProjectionSQL("p.json", "$.last_activity_at", "p.last_activity_at")
+	pollActivityDue := sqliteCanonicalTimeDueSQL("p.json", "$.last_activity_at", "p.last_activity_at")
+	pollBlockedDue := sqliteCanonicalTimeDueSQL("p.json", "$.blocked_until", "p.blocked_until")
+	pollState := sqliteCanonicalTextProjectionSQL("p.json", "$.state", "p.poll_state")
+	pollFrontier := sqliteChatPollOperationalFrontierSQL("p.json")
+	pollParkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("p.json", "p.parked_skip_eligible", "p.poll_state")
+	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("t.json", "t.status")
+	scheduleValidPoll := sqliteChatPollScheduleValidJSONSQL("p.json", "p.chat_id")
+	malformedPoll := `(p.chat_id IS NOT NULL AND (json_valid(p.json) = 0 OR NOT (` + scheduleValidPoll + `)))`
 
 	// The SQL projection supplies only cheap, indexed scheduling predicates.
 	// Canonical session/poll JSON is decoded once per admitted page in Go. The
@@ -4439,77 +6052,81 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
 		sessionUpdated                int64
 	}
 	queryRows := func(operational bool, after cursor, pageSize int) ([]candidateRow, error) {
-		where := `COALESCE(s.teams_chat_id, '') != ''
-  AND (? = '' OR s.teams_chat_id != ?)`
+		where := sessionChatID + ` != ''
+	  AND (? = '' OR ` + sessionChatID + ` != ?)
+	  AND (COALESCE(s.teams_chat_id, '') = '' OR trim(s.teams_chat_id) = trim(` + sessionChatID + `) OR p.chat_id IS NOT NULL OR legacy_p.chat_id IS NULL)`
 		args := []any{controlChatID, controlChatID}
 		if operational {
 			where += `
-  AND p.chat_id IS NOT NULL
-  AND COALESCE(p.frontier_active, 0) != 0
-  AND COALESCE(p.next_poll_at, 0) <= ?
-  AND COALESCE(p.blocked_until, 0) <= ?`
+	  AND p.chat_id IS NOT NULL
+	  AND (` + malformedPoll + ` OR (
+	    ` + pollFrontier + ` != 0
+	    AND ` + pollNextDue + ` <= julianday(?)
+	    AND ` + pollBlockedDue + ` <= julianday(?)))`
 		} else {
 			where += `
-  AND (p.chat_id IS NULL OR json_valid(p.json) = 0 OR (
-    COALESCE(p.frontier_active, 0) = 0
-    AND COALESCE(p.next_poll_at, 0) <= ?
-    AND COALESCE(p.blocked_until, 0) <= ?
-    AND (COALESCE(p.parked_skip_eligible, 0) = 0
-         OR (p.poll_state = ? AND COALESCE(p.next_poll_at, 0) <= ?))
-  ))`
-			args = append(args, sqliteTime(now), sqliteTime(now), chatPollStateParked, sqliteTime(now))
+	  AND (p.chat_id IS NULL OR ` + malformedPoll + ` OR (
+	    ` + pollFrontier + ` = 0
+	    AND ` + pollNextDue + ` <= julianday(?)
+	    AND ` + pollBlockedDue + ` <= julianday(?)
+	    AND (` + pollParkedSkipEligible + ` = 0
+	         OR (` + pollState + ` = ? AND ` + pollNextDue + ` <= julianday(?)))
+	  ))`
+			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano), chatPollStateParked, now.UTC().Format(time.RFC3339Nano))
 		}
 		if operational {
-			args = append(args, sqliteTime(now), sqliteTime(now))
+			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
 		}
 		if !idleBefore.IsZero() {
 			idle := `
-    COALESCE(p.last_activity_at, 0) > 0
-    AND COALESCE(p.last_activity_at, 0) <= ?
-    AND COALESCE(s.updated_at, 0) <= ?
-    AND COALESCE(p.parked_skip_eligible, 0) = 0
-    AND p.poll_state IN (?)
-    AND COALESCE(p.frontier_active, 0) = 0
+	    ` + pollActivityAt + ` > 0
+	    AND ` + pollActivityDue + ` <= julianday(?)
+	    AND ` + sessionUpdatedDue + ` <= julianday(?)
+	    AND ` + pollParkedSkipEligible + ` = 0
+	    AND ` + pollState + ` IN (?)
+	    AND ` + pollFrontier + ` = 0
     AND CASE WHEN json_valid(p.json) THEN
       CASE WHEN json_type(p.json, '$.attempt') IS NULL THEN 1 ELSE 0 END
       ELSE 0 END = 1
     AND NOT EXISTS (
-      SELECT 1 FROM turns t
+    SELECT 1 FROM turns t
       WHERE t.session_id = s.id
-        AND ` + sqliteTurnActiveStatusSQL("t.status") + `
+        AND ` + sqliteTurnActiveStatusSQL(canonicalTurnStatus) + `
     )
   `
-			// Syntax-corrupt rows are recovery candidates regardless of stale
-			// schedule columns. A malformed row must not be parked by the idle
-			// optimization before the listener has a chance to isolate it.
+			// Syntax- or schedule-corrupt rows are recovery candidates regardless
+			// of stale compatibility columns. A malformed row must not be parked
+			// by the idle optimization before the listener can isolate it.
 			where += `
-  AND (p.chat_id IS NULL OR json_valid(p.json) = 0 OR NOT (` + idle + `))`
-			idleBeforeUnix := sqliteTime(idleBefore)
-			args = append(args, idleBeforeUnix, idleBeforeUnix, chatPollStateCold)
+	  AND (p.chat_id IS NULL OR ` + malformedPoll + ` OR NOT (` + idle + `))`
+			idleBeforeText := idleBefore.UTC().Format(time.RFC3339Nano)
+			args = append(args, idleBeforeText, idleBeforeText, chatPollStateCold)
 			args = append(args, sqliteTurnActiveStatusArgs()...)
 		}
 		if after.set {
 			where += `
-  AND (COALESCE(p.updated_at, 0) > ?
-       OR (COALESCE(p.updated_at, 0) = ? AND COALESCE(p.next_poll_at, 0) > ?)
-       OR (COALESCE(p.updated_at, 0) = ? AND COALESCE(p.next_poll_at, 0) = ? AND COALESCE(p.last_activity_at, 0) > ?)
-       OR (COALESCE(p.updated_at, 0) = ? AND COALESCE(p.next_poll_at, 0) = ? AND COALESCE(p.last_activity_at, 0) = ? AND COALESCE(s.updated_at, 0) > ?)
-       OR (COALESCE(p.updated_at, 0) = ? AND COALESCE(p.next_poll_at, 0) = ? AND COALESCE(p.last_activity_at, 0) = ? AND COALESCE(s.updated_at, 0) = ? AND s.id > ?))`
+	  AND (` + pollUpdatedAt + ` > ?
+	       OR (` + pollUpdatedAt + ` = ? AND ` + pollNextAt + ` > ?)
+	       OR (` + pollUpdatedAt + ` = ? AND ` + pollNextAt + ` = ? AND ` + pollActivityAt + ` > ?)
+	       OR (` + pollUpdatedAt + ` = ? AND ` + pollNextAt + ` = ? AND ` + pollActivityAt + ` = ? AND ` + sessionUpdatedAt + ` > ?)
+	       OR (` + pollUpdatedAt + ` = ? AND ` + pollNextAt + ` = ? AND ` + pollActivityAt + ` = ? AND ` + sessionUpdatedAt + ` = ? AND s.id > ?))`
 			args = append(args,
 				after.updated, after.updated, after.next,
 				after.updated, after.next, after.activity,
 				after.updated, after.next, after.activity, after.sessionUpdated,
 				after.updated, after.next, after.activity, after.sessionUpdated, after.id)
 		}
-		query := `SELECT s.id, s.json, s.teams_chat_id,
-       COALESCE(p.json, ''), COALESCE(p.updated_at, 0),
-       COALESCE(p.next_poll_at, 0), COALESCE(p.last_activity_at, 0),
-       COALESCE(s.updated_at, 0)
+		query := `SELECT s.id, s.json, ` + sessionChatID + `,
+       COALESCE(p.json, ''), ` + pollUpdatedAt + `,
+       ` + pollNextAt + `, ` + pollActivityAt + `,
+       ` + sessionUpdatedAt + `
 FROM sessions s
-LEFT JOIN chat_polls p ON p.chat_id = s.teams_chat_id
+LEFT JOIN chat_polls p ON p.chat_id = ` + sessionChatID + `
+LEFT JOIN chat_polls legacy_p ON legacy_p.chat_id = trim(s.teams_chat_id)
+  AND trim(s.teams_chat_id) != trim(` + sessionChatID + `)
 WHERE ` + where + `
-ORDER BY COALESCE(p.updated_at, 0), COALESCE(p.next_poll_at, 0),
-         COALESCE(p.last_activity_at, 0), COALESCE(s.updated_at, 0), s.id
+ORDER BY ` + pollUpdatedAt + `, ` + pollNextAt + `,
+         ` + pollActivityAt + `, ` + sessionUpdatedAt + `, s.id
 LIMIT ?`
 		args = append(args, pageSize)
 		rows, err := db.QueryContext(ctx, query, args...)
@@ -4651,13 +6268,14 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
 	}
 	validSession := sqliteSessionValidJSONSQL("s.json", "s.id", "s.teams_chat_id")
 	activeSession := sqliteSessionActiveJSONSQL("s.json", "s.status")
-	// The bounded candidate query performs the final typed decode in Go.  Keep
-	// SQL admission to the cheap identity/syntax projection here; the full
-	// semantic validator expands into dozens of JSON1 calls per row and made a
-	// large but healthy operational backlog dominate the listener hot path.
-	validPoll := sqliteChatPollValidJSONSQL("p.json", "p.chat_id")
+	// The legacy CTE path is only used when the indexed hot-poll projection is
+	// unavailable. It therefore keeps the stricter semantic validator here so a
+	// valid-looking row with a bad schedule type cannot consume the ordinary
+	// LIMIT and hide the reserved malformed lane.
+	validPoll := sqliteChatPollAdmissionValidJSONSQL("p.json", "p.chat_id")
 	malformedPoll := `NOT (` + validPoll + `)`
 	frontier := sqliteChatPollOperationalFrontierSQL("p.json")
+	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("t.json", "t.status")
 	excludeIdle := ""
 	operationalIdle := ""
 	ordinaryIdle := ""
@@ -4673,7 +6291,7 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
 	if !idleBefore.IsZero() {
 		// A malformed poll is admitted as a chat-local recovery candidate and
 		// therefore bypasses schedule/idle predicates that depend on untrusted
-		// JSON.  For valid rows the derived frontier flag replaces the previous
+		// JSON. For valid rows the derived frontier flag replaces the previous
 		// JSON1 probes; an attempt is still checked with a guarded CASE because
 		// it is a short-lived field that is not worth another column.
 		excludeIdle = `  AND NOT (
@@ -4682,7 +6300,7 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
     AND COALESCE(s.updated_at, 0) <= ?
     AND COALESCE(p.parked_skip_eligible, 0) = 0
     AND p.poll_state IN (?)
-    AND ` + validPoll + `
+			AND ` + validPoll + `
     AND NOT ` + frontier + `
     AND CASE WHEN json_valid(p.json) THEN
       CASE WHEN json_type(p.json, '$.attempt') IS NULL THEN 1 ELSE 0 END
@@ -4690,7 +6308,7 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
     AND NOT EXISTS (
       SELECT 1 FROM turns t
       WHERE t.session_id = s.id
-        AND ` + sqliteTurnActiveStatusSQL("t.status") + `
+        AND ` + sqliteTurnActiveStatusSQL(canonicalTurnStatus) + `
     )
   )
 		`
@@ -4822,28 +6440,36 @@ func loadSQLiteIdleWorkChatParkCandidates(ctx context.Context, db *sql.DB, contr
 	if idleBefore.IsZero() || limit <= 0 {
 		return nil, nil
 	}
-	validSession := sqliteSessionValidJSONSQL("s.json", "s.id", "s.teams_chat_id")
+	validSession := sqliteSessionCanonicalValidJSONSQL("s.json", "s.id")
 	validPoll := sqliteChatPollValidJSONSQL("p.json", "p.chat_id")
+	canonicalSessionChat := sqliteCanonicalTextProjectionSQL("s.json", "$.teams_chat_id", "s.teams_chat_id")
+	canonicalSessionStatus := sqliteCanonicalTextProjectionSQL("s.json", "$.status", "s.status")
+	canonicalSessionUpdated := sqliteCanonicalTimeProjectionSQL("s.json", "$.updated_at", "s.updated_at")
+	canonicalPollActivity := sqliteCanonicalTimeProjectionSQL("p.json", "$.last_activity_at", "p.last_activity_at")
+	canonicalPollBlocked := sqliteCanonicalTimeProjectionSQL("p.json", "$.blocked_until", "p.blocked_until")
+	canonicalPollState := sqliteCanonicalTextProjectionSQL("p.json", "$.state", "p.poll_state")
+	canonicalPollParked := sqliteCanonicalParkedSkipProjectionSQL("p.json", "p.parked_skip_eligible", "p.poll_state")
+	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("t.json", "t.status")
 	rows, err := db.QueryContext(ctx, `SELECT s.json, p.json
 FROM chat_polls p
-JOIN sessions s ON s.teams_chat_id = p.chat_id
-WHERE p.last_activity_at > 0
-  AND p.last_activity_at <= ?
-  AND COALESCE(s.updated_at, 0) <= ?
-  AND (s.status IS NULL OR s.status = '' OR s.status = ?)
-  AND COALESCE(s.teams_chat_id, '') != ''
-  AND (? = '' OR s.teams_chat_id != ?)
+JOIN sessions s ON `+canonicalSessionChat+` = p.chat_id
+WHERE `+canonicalPollActivity+` > 0
+  AND `+canonicalPollActivity+` <= ?
+  AND `+canonicalSessionUpdated+` <= ?
+  AND (`+canonicalSessionStatus+` IS NULL OR `+canonicalSessionStatus+` = '' OR `+canonicalSessionStatus+` = ?)
+  AND `+canonicalSessionChat+` != ''
+  AND (? = '' OR `+canonicalSessionChat+` != ?)
   AND `+validSession+`
   AND `+validPoll+`
-  AND COALESCE(p.blocked_until, 0) <= ?
-  AND COALESCE(p.parked_skip_eligible, 0) = 0
-  AND p.poll_state IN (?, ?)
+  AND `+canonicalPollBlocked+` <= ?
+  AND `+canonicalPollParked+` = 0
+  AND `+canonicalPollState+` IN (?, ?)
   AND NOT EXISTS (
     SELECT 1 FROM turns t
     WHERE t.session_id = s.id
-      AND `+sqliteTurnActiveStatusSQL("t.status")+`
+      AND `+sqliteTurnActiveStatusSQL(canonicalTurnStatus)+`
   )
-ORDER BY p.last_activity_at ASC, s.updated_at ASC, s.id
+ORDER BY `+canonicalPollActivity+` ASC, `+canonicalSessionUpdated+` ASC, s.id
 LIMIT ?`, append([]any{sqliteTime(idleBefore), sqliteTime(idleBefore), string(SessionStatusActive), controlChatID, controlChatID, sqliteTime(time.Now()), chatPollStateCold, chatPollStateParked}, append(sqliteTurnActiveStatusArgs(), limit)...)...)
 	if err != nil {
 		return nil, err
@@ -5047,10 +6673,28 @@ func loadSQLiteJSONMapBestEffort[T any](ctx context.Context, q interface {
 // Outbox JSON is an independently persisted delivery record. A single
 // truncated/corrupt row must be held out of a hot snapshot so healthy rows can
 // continue, while full-state writes preserve the raw row as opaque evidence.
-func loadSQLiteOutboxMap[T any](ctx context.Context, q interface {
+// The indexed compatibility columns are selected together with JSON so legacy
+// rows are hydrated consistently in every typed snapshot.
+func loadSQLiteOutboxMap(ctx context.Context, q interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}, query string, out map[string]T, key func(T) string, args ...any) error {
-	return loadSQLiteJSONMapBestEffort(ctx, q, query, out, key, args...)
+}, query string, out map[string]OutboxMessage, key func(OutboxMessage) string, args ...any) error {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row sqliteOutboxProjectionRow
+		if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
+			return err
+		}
+		message, ok := decodeSQLiteOutboxProjection(row)
+		if !ok || strings.TrimSpace(key(message)) == "" {
+			continue
+		}
+		out[key(message)] = message
+	}
+	return rows.Err()
 }
 
 func loadSQLiteSessionMap(ctx context.Context, q interface {
@@ -5064,9 +6708,12 @@ func loadSQLiteSessionMap(ctx context.Context, q interface {
 	for rows.Next() {
 		var sqlID string
 		var chatID, status sql.NullString
-		var updatedAt sql.NullInt64
+		// This compatibility timestamp is not used by the typed loader. Scan it
+		// into an interface so a legacy TEXT/BLOB value cannot abort the whole
+		// session snapshot before the canonical JSON has been inspected.
+		var ignoredUpdatedAt any
 		var raw []byte
-		if err := rows.Scan(&sqlID, &chatID, &status, &updatedAt, &raw); err != nil {
+		if err := rows.Scan(&sqlID, &chatID, &status, &ignoredUpdatedAt, &raw); err != nil {
 			return err
 		}
 		var session SessionContext
@@ -5119,6 +6766,16 @@ func loadSQLiteTurnMap(ctx context.Context, q interface {
 		if err := json.Unmarshal(raw, &turn); err == nil &&
 			strings.TrimSpace(turn.ID) == strings.TrimSpace(sqlID) &&
 			strings.TrimSpace(turn.SessionID) == strings.TrimSpace(sqlSessionID) {
+			if holdMalformedActive && sqliteTurnStatusIsUnknown(TurnStatus(sqlStatus)) {
+				// The canonical payload is readable, but an unknown indexed
+				// status is still an unresolved mixed-version projection. Preserve
+				// the indexed safety disposition instead of letting the payload's
+				// terminal value release a possible owner.
+				held := Turn{ID: sqlID, SessionID: sqlSessionID, Status: TurnStatus(sqlStatus)}
+				normalizeLoadedTurnStatus(&held)
+				out[sqlID] = held
+				continue
+			}
 			normalizeLoadedTurnStatus(&turn)
 			out[turn.ID] = turn
 			continue
@@ -5142,7 +6799,48 @@ func sqliteTurnStatusIsSafetyActive(status TurnStatus) bool {
 	if trimmed == TurnStatusQueued || trimmed == TurnStatusRunning {
 		return true
 	}
+	return sqliteTurnStatusIsUnknown(trimmed)
+}
+
+func sqliteTurnStatusIsUnknown(status TurnStatus) bool {
+	trimmed := TurnStatus(strings.TrimSpace(string(status)))
 	return strings.TrimSpace(string(trimmed)) != "" && !knownTurnStatus(trimmed)
+}
+
+// sqliteCanonicalTurnStatusSQL makes the JSON turn status authoritative when
+// it is present.  The scalar column is a compatibility fallback for rows
+// written before the status field was added, but it must not hide a live turn
+// after a mixed-version/partial write.  An invalid present JSON type is a
+// conservative unresolved value: active-status predicates retain the row as a
+// safety fence, while queued-only predicates will not claim it.
+func sqliteCanonicalTurnStatusSQL(jsonColumn, legacyColumn string) string {
+	typeExpr := sqliteSafeJSONType(jsonColumn, "$.status")
+	valueExpr := sqliteSafeJSONExtract(jsonColumn, "$.status")
+	return "(CASE WHEN " + typeExpr + " = 'text' THEN trim(COALESCE(" + valueExpr + ", ''))" +
+		" WHEN " + typeExpr + " IS NULL OR " + typeExpr + " = 'null' THEN trim(COALESCE(" + legacyColumn + ", ''))" +
+		" ELSE '__invalid__' END)"
+}
+
+// sqliteTurnUnknownStatusSQL identifies a non-empty indexed status that the
+// current decoder does not know.  A mixed-version/partial write can leave a
+// terminal JSON status beside such a scalar projection; treating that row as
+// terminal would be an unsafe claim that no execution is still in flight.
+func sqliteTurnUnknownStatusSQL(column string) string {
+	return "(" + column + " <> '' AND " + column + " NOT IN ('queued', 'running', 'completed', 'failed', 'interrupted'))"
+}
+
+// sqliteTurnSafetyStatusSQL preserves the canonical JSON status for normal
+// rows, but exposes an unknown non-empty compatibility status to the callers
+// that must fail closed.  This is intentionally not used by queued-only
+// admission: unknown rows may fence work, but they must never become claimable
+// merely because their JSON projection is stale.
+func sqliteTurnSafetyStatusSQL(jsonColumn, legacyColumn string) string {
+	canonical := sqliteCanonicalTurnStatusSQL(jsonColumn, legacyColumn)
+	return "(CASE WHEN " + sqliteTurnUnknownStatusSQL(legacyColumn) + " THEN trim(COALESCE(" + legacyColumn + ", '')) ELSE " + canonical + " END)"
+}
+
+func sqliteTurnActiveSafetyStatusSQL(jsonColumn, legacyColumn string) string {
+	return sqliteTurnActiveStatusSQL(sqliteTurnSafetyStatusSQL(jsonColumn, legacyColumn))
 }
 
 func sqliteTurnActiveStatusSQL(column string) string {
@@ -5731,7 +7429,7 @@ func loadSQLiteJSONMapTx[T any](ctx context.Context, tx *sql.Tx, query string, a
 }
 
 func loadSQLiteOutboxMapTx(ctx context.Context, tx *sql.Tx, query string, args []any, out map[string]OutboxMessage, key func(OutboxMessage) string) error {
-	return loadSQLiteJSONMapBestEffort(ctx, tx, query, out, key, args...)
+	return loadSQLiteOutboxMap(ctx, tx, query, out, key, args...)
 }
 
 func loadSQLiteJSONRow[T any](ctx context.Context, q interface {
@@ -6949,6 +8647,24 @@ func (s *Store) historyWatchStateSQLite(ctx context.Context) (State, bool, error
 		if err != nil {
 			return err
 		}
+		history, ready, projectionRevision, stateJSONRevision, found, projectionErr := loadSQLiteHistoryWatchProjection(ctx, db)
+		if projectionErr != nil {
+			return projectionErr
+		}
+		if found && projectionRevision > 0 && stateJSONRevision > 0 && projectionRevision == stateJSONRevision {
+			// The history projection is maintained in the same durable state
+			// transaction as its revision. Reading only this row avoids decoding
+			// the potentially hundreds-of-megabytes state_json document on every
+			// backlog wake. The full cold fallback below remains necessary for a
+			// first migration or a mixed-version/stale projection.
+			state = State{
+				SchemaVersion:     SchemaVersion,
+				HistoryWatch:      history,
+				HistoryWatchReady: ready,
+			}
+			handled = true
+			return nil
+		}
 		state, err = loadSQLiteColdState(ctx, db)
 		handled = true
 		return err
@@ -8005,9 +9721,9 @@ func upsertSQLiteChatPollTx(ctx context.Context, tx *sql.Tx, v ChatPollState) er
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(chat_id) DO UPDATE SET next_poll_at = excluded.next_poll_at, blocked_until = excluded.blocked_until, poll_state = excluded.poll_state, last_activity_at = excluded.last_activity_at, park_notice_sent_at = excluded.park_notice_sent_at, parked_skip_eligible = excluded.parked_skip_eligible, frontier_active = excluded.frontier_active, updated_at = excluded.updated_at, json = excluded.json`,
-		v.ChatID, sqliteTime(v.NextPollAt), sqliteTime(v.BlockedUntil), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteBool(chatPollHasOperationalFrontier(v)), sqliteTime(v.UpdatedAt), data)
+	_, err = tx.ExecContext(ctx, `INSERT INTO chat_polls(chat_id, next_poll_at, blocked_until, poll_state, last_activity_at, park_notice_sent_at, parked_skip_eligible, frontier_active, admission_valid, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(chat_id) DO UPDATE SET next_poll_at = excluded.next_poll_at, blocked_until = excluded.blocked_until, poll_state = excluded.poll_state, last_activity_at = excluded.last_activity_at, park_notice_sent_at = excluded.park_notice_sent_at, parked_skip_eligible = excluded.parked_skip_eligible, frontier_active = excluded.frontier_active, admission_valid = excluded.admission_valid, updated_at = excluded.updated_at, json = excluded.json`,
+		v.ChatID, sqliteTime(v.NextPollAt), sqliteTime(v.BlockedUntil), v.PollState, sqliteTime(v.LastActivityAt), sqliteTime(v.ParkNoticeSentAt), sqliteBool(chatPollParkedSkipEligible(v)), sqliteBool(chatPollHasOperationalFrontier(v)), sqliteBool(chatPollAdmissionValid(v)), sqliteTime(v.UpdatedAt), data)
 	return err
 }
 
@@ -8450,7 +10166,8 @@ func (s *Store) hasQueuedTurnsSQLite(ctx context.Context) (bool, bool, error) {
 		}
 		handled = true
 		var exists int
-		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE status = ? LIMIT 1`, string(TurnStatusQueued)).Scan(&exists)
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+turnStatus+` = ? AND trim(COALESCE(session_id, '')) != '' LIMIT 1`, string(TurnStatusQueued)).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -8477,7 +10194,8 @@ func (s *Store) teamsOperationalBacklogSQLite(ctx context.Context) (TeamsOperati
 		}
 		handled = true
 		var exists int
-		if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL("status")+` LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL(turnStatus)+` AND trim(COALESCE(session_id, '')) != '' LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		} else if err == nil {
 			backlog.ActiveTurns = exists == 1
@@ -8510,21 +10228,32 @@ LIMIT 1`,
 		} else if err == nil {
 			backlog.PendingInbound = exists == 1
 		}
-		// The materialized hint gives the common path an indexed lookup. The
-		// canonical JSON expression is checked only when the hint lane is empty,
-		// so a stale false hint cannot make a durable pending page invisible.
-		exists = 0
+		// The materialized hint gives the common path an indexed lookup, but the
+		// JSON row remains authoritative. Keep recovery_required and an in-flight
+		// attempt visible even while a future 429 retry deadline is pending; only
+		// an otherwise ordinary frontier may release the optional-maintenance gate
+		// during that wait. Invalid-but-parseable poll JSON is also conservative:
+		// the Go loader turns it into a recovery placeholder, so SQL must not hide
+		// it merely because its shallow JSON shape looks harmless.
+		rateLimitedDeferred := "(json_valid(json) AND trim(COALESCE(" + sqliteSafeJSONExtract("json", "$.last_error") + ", '')) LIKE '%429%' AND COALESCE(next_poll_at, 0) > ?)"
+		recoveryRequired := "(COALESCE(" + sqliteSafeJSONExtract("json", "$.recovery_required") + ", 0) = 1 OR " + sqliteSafeJSONType("json", "$.attempt") + " = 'object')"
+		validPoll := sqliteChatPollAdmissionValidJSONSQL("json", "chat_id")
+		nowSQLite := sqliteTime(time.Now())
 		if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
-WHERE COALESCE(frontier_active, 0) != 0 OR json_valid(json) = 0
-LIMIT 1`).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+WHERE NOT (`+validPoll+`)
+   OR `+recoveryRequired+`
+   OR (COALESCE(frontier_active, 0) != 0 AND NOT `+rateLimitedDeferred+`)
+LIMIT 1`, nowSQLite).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		} else if err == nil {
 			backlog.OperationalPollFrontier = true
 		} else {
 			var canonical int
+			frontier := sqliteChatPollOperationalFrontierSQL("json")
 			if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
-WHERE `+sqliteChatPollOperationalBacklogSQL("json")+` != 0
-LIMIT 1`).Scan(&canonical); err != nil && !errors.Is(err, sql.ErrNoRows) {
+WHERE `+validPoll+`
+  AND (`+recoveryRequired+` OR (`+frontier+` != 0 AND NOT `+rateLimitedDeferred+`))
+LIMIT 1`, nowSQLite).Scan(&canonical); err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			} else if err == nil {
 				backlog.OperationalPollFrontier = true
@@ -8549,7 +10278,8 @@ func (s *Store) hasUnfinishedTurnsSQLite(ctx context.Context) (bool, bool, error
 		}
 		handled = true
 		var exists int
-		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL("status")+` LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists)
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		err = db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL(turnStatus)+` AND trim(COALESCE(session_id, '')) != '' LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -8575,7 +10305,8 @@ func (s *Store) runningTurnSessionIDsSQLite(ctx context.Context) (map[string]boo
 			return err
 		}
 		handled = true
-		rows, err := db.QueryContext(ctx, `SELECT DISTINCT session_id FROM turns WHERE status = ? AND session_id != ''`, string(TurnStatusRunning))
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		rows, err := db.QueryContext(ctx, `SELECT DISTINCT session_id FROM turns WHERE `+turnStatus+` = ? AND session_id != ''`, string(TurnStatusRunning))
 		if err != nil {
 			return err
 		}
@@ -9077,23 +10808,26 @@ func (s *Store) quarantineSessionSQLite(ctx context.Context, req SessionQuaranti
 		state.Sessions[session.ID] = session
 		turnArgs := []any{req.SessionID}
 		turnArgs = append(turnArgs, sqliteTurnActiveStatusArgs()...)
-		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM turns WHERE session_id = ? AND `+sqliteTurnActiveStatusSQL("status"), turnArgs, state.Turns, func(v Turn) string { return v.ID }); err != nil {
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM turns WHERE session_id = ? AND `+sqliteTurnActiveStatusSQL(turnStatus), turnArgs, state.Turns, func(v Turn) string { return v.ID }); err != nil {
 			return err
 		}
 		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM inbound_events WHERE session_id = ? AND status IN (?, ?, ?)`, []any{req.SessionID, string(InboundStatusPersisted), string(InboundStatusQueued), string(InboundStatusDeferred)}, state.InboundEvents, func(v InboundEvent) string { return v.ID }); err != nil {
 			return err
 		}
-		if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT o.json FROM outbox_messages o WHERE o.session_id = ? AND o.status IN (?, ?) AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.SessionID, string(OutboxStatusQueued), string(OutboxStatusSending)}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+		outboxSessionID := sqliteOutboxCanonicalTextSQL("o.json", "$.session_id", "o.session_id")
+		outboxStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+outboxSessionID+` = ? AND `+outboxStatus+` IN (?, ?) AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.SessionID, string(OutboxStatusQueued), string(OutboxStatusSending)}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 			return err
 		}
 		linkedArgs := []any{req.SessionID, string(OutboxStatusQueued), string(OutboxStatusSending)}
-		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM transcript_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM transcript_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE `+outboxSessionID+` = ? AND `+outboxStatus+` IN (?, ?)`, linkedArgs, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }); err != nil {
 			return err
 		}
-		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM helper_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM helper_deliveries d JOIN outbox_messages o ON o.id = d.outbox_id WHERE `+outboxSessionID+` = ? AND `+outboxStatus+` IN (?, ?)`, linkedArgs, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }); err != nil {
 			return err
 		}
-		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM artifact_records d JOIN outbox_messages o ON o.id = d.outbox_id WHERE o.session_id = ? AND o.status IN (?, ?)`, linkedArgs, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
+		if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT d.json FROM artifact_records d JOIN outbox_messages o ON o.id = d.outbox_id WHERE `+outboxSessionID+` = ? AND `+outboxStatus+` IN (?, ?)`, linkedArgs, state.ArtifactRecords, func(v ArtifactRecord) string { return v.ID }); err != nil {
 			return err
 		}
 		if chatID := strings.TrimSpace(session.TeamsChatID); chatID != "" {
@@ -9734,7 +11468,8 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM inbound_events WHERE session_id = ?`, state.InboundEvents, func(v InboundEvent) string { return v.ID }, sessionID); err != nil {
 		return State{}, err
 	}
-	if err := loadSQLiteOutboxMap(ctx, db, `SELECT o.json FROM outbox_messages o WHERE o.session_id = ? AND `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }, sessionID); err != nil {
+	outboxSessionID := sqliteOutboxCanonicalTextSQL("o.json", "$.session_id", "o.session_id")
+	if err := loadSQLiteOutboxMap(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+outboxSessionID+` = ? AND `+sqliteOutboxProjectionValidSQL("o"), state.OutboxMessages, func(v OutboxMessage) string { return v.ID }, sessionID); err != nil {
 		return State{}, err
 	}
 	if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM transcript_deliveries WHERE session_id = ?`, state.TranscriptDeliveries, func(v TranscriptDeliveryRecord) string { return v.ID }, sessionID); err != nil {
@@ -9764,7 +11499,7 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 		if _, ok := state.OutboxMessages[outboxID]; ok {
 			continue
 		}
-		if outbox, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+		if outbox, ok, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
 			return State{}, err
 		} else if ok {
 			state.OutboxMessages[outbox.ID] = outbox
@@ -9778,7 +11513,7 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer storeSQLi
 		if _, ok := state.OutboxMessages[outboxID]; ok {
 			continue
 		}
-		if outbox, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+		if outbox, ok, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
 			return State{}, err
 		} else if ok {
 			state.OutboxMessages[outbox.ID] = outbox
@@ -9838,16 +11573,25 @@ func (s *Store) loadSQLiteSessionExecutionOwnershipProbeUnlocked(ctx context.Con
 			}
 		}
 	}
-	rows, err := db.QueryContext(ctx, `SELECT session_id, json FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted))
+	turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+	turnArgs := append(sqliteTurnUnresolvedStatusArgs(), sessionID)
+	rows, err := db.QueryContext(ctx, `SELECT session_id, `+turnStatus+`, json FROM turns WHERE `+sqliteTurnUnresolvedStatusSQL(turnStatus)+` AND session_id = ?`, turnArgs...)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var indexedSessionID string
+		var indexedStatus string
 		var raw []byte
-		if err := rows.Scan(&indexedSessionID, &raw); err != nil {
+		if err := rows.Scan(&indexedSessionID, &indexedStatus, &raw); err != nil {
 			return false, err
+		}
+		if TurnStatus(strings.TrimSpace(indexedStatus)) != TurnStatusInterrupted {
+			// Running and unknown statuses cannot prove that the old execution
+			// ended. They cannot be materialized as an interrupted-turn anchor,
+			// but they must still fence replacement execution for this session.
+			return true, nil
 		}
 		meta, valid := decodeSQLiteTurnExecutionMetadata(raw, indexedSessionID, TurnStatusInterrupted)
 		if !valid {
@@ -9938,24 +11682,30 @@ func (s *Store) loadSQLiteSessionExecutionOwnershipProbesUnlocked(ctx context.Co
 			end = len(ids)
 		}
 		batch := ids[start:end]
-		turnArgs := make([]any, 0, len(batch)+1)
-		turnArgs = append(turnArgs, string(TurnStatusInterrupted))
+		turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+		turnArgs := make([]any, 0, len(batch)+len(sqliteTurnUnresolvedStatusArgs()))
+		turnArgs = append(turnArgs, sqliteTurnUnresolvedStatusArgs()...)
 		for _, id := range batch {
 			turnArgs = append(turnArgs, id)
 		}
 		turnPlaceholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
-		rows, err := db.QueryContext(ctx, `SELECT session_id, json FROM turns WHERE status = ? AND session_id IN (`+turnPlaceholders+`)`, turnArgs...)
+		rows, err := db.QueryContext(ctx, `SELECT session_id, `+turnStatus+`, json FROM turns WHERE `+sqliteTurnUnresolvedStatusSQL(turnStatus)+` AND session_id IN (`+turnPlaceholders+`)`, turnArgs...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
 			var sessionID string
+			var indexedStatus string
 			var raw []byte
-			if err := rows.Scan(&sessionID, &raw); err != nil {
+			if err := rows.Scan(&sessionID, &indexedStatus, &raw); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
 			if out[sessionID] {
+				continue
+			}
+			if TurnStatus(strings.TrimSpace(indexedStatus)) != TurnStatusInterrupted {
+				out[sessionID] = true
 				continue
 			}
 			meta, valid := decodeSQLiteTurnExecutionMetadata(raw, sessionID, TurnStatusInterrupted)
@@ -10008,6 +11758,7 @@ func (s *Store) loadSQLiteLinkedTranscriptExecutionSnapshotUnlocked(ctx context.
 	// statuses are included as unresolved safety fences rather than being
 	// silently omitted from the ownership probe.
 	const statusArgs = 6
+	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("json", "status")
 	for start := 0; start < len(sessionIDs); start += sqliteQueryParameterBatchSize - statusArgs {
 		end := start + sqliteQueryParameterBatchSize - statusArgs
 		if end > len(sessionIDs) {
@@ -10020,7 +11771,7 @@ func (s *Store) loadSQLiteLinkedTranscriptExecutionSnapshotUnlocked(ctx context.
 		for _, sessionID := range batch {
 			args = append(args, sessionID)
 		}
-		rows, err := db.QueryContext(ctx, `SELECT session_id, status, json FROM turns WHERE `+sqliteTurnUnresolvedStatusSQL("status")+` AND session_id IN (`+placeholders+`)`, args...)
+		rows, err := db.QueryContext(ctx, `SELECT session_id, `+canonicalTurnStatus+`, json FROM turns WHERE `+sqliteTurnUnresolvedStatusSQL(canonicalTurnStatus)+` AND session_id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			return LinkedTranscriptExecutionSnapshot{}, err
 		}
@@ -10154,7 +11905,8 @@ func (s *Store) loadSQLiteSessionActiveTurnQueueStateUnlocked(ctx context.Contex
 	}
 	turnArgs := []any{sessionID}
 	turnArgs = append(turnArgs, sqliteTurnActiveStatusArgs()...)
-	if err := loadSQLiteTurnMap(ctx, db, `SELECT id, session_id, status, json FROM turns WHERE session_id = ? AND `+sqliteTurnActiveStatusSQL("status"), state.Turns, true, turnArgs...); err != nil {
+	turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+	if err := loadSQLiteTurnMap(ctx, db, `SELECT id, session_id, `+turnStatus+`, json FROM turns WHERE session_id = ? AND `+sqliteTurnActiveStatusSQL(turnStatus), state.Turns, true, turnArgs...); err != nil {
 		return State{}, err
 	}
 	for _, turn := range state.Turns {
@@ -10506,21 +12258,42 @@ func markSQLiteLegacyUnresolvedSessionTx(ctx context.Context, tx *sql.Tx, state 
 	}
 	// This is a compatibility probe for pre-anchor state. It intentionally
 	// checks only the interrupted record itself: a later durable terminal is
-	// not app-server ownership proof and must never discharge the fence. Keep
-	// the SQL predicate limited to the indexed session/status columns, then
+	// not app-server ownership proof and must never discharge the fence. An
+	// unknown non-empty compatibility status is also a local safety fence; it
+	// must invalidate the negative probe even when the canonical JSON happens
+	// to look terminal. Keep the SQL predicate limited to indexed columns, then
 	// decode the small candidate rows in Go. SQLite's json_extract on every
 	// candidate was a measurable polling regression and could not use the
 	// existing turns indexes.
-	rows, err := tx.QueryContext(ctx, `SELECT json FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted))
+	unknownLegacyStatus := sqliteTurnUnknownStatusSQL("status")
+	canonicalStatus := sqliteCanonicalTurnStatusSQL("json", "status")
+	rows, err := tx.QueryContext(ctx, `SELECT json, status, `+canonicalStatus+` FROM turns WHERE session_id = ? AND (status = ? OR `+unknownLegacyStatus+` OR `+canonicalStatus+` = ?)`, sessionID, string(TurnStatusInterrupted), string(TurnStatusInterrupted))
 	if err != nil {
 		return err
 	}
 	legacyCandidates := make([]Turn, 0)
+	unknownLegacy := false
 	for rows.Next() {
 		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		var indexedStatus string
+		var decodedStatus string
+		if err := rows.Scan(&raw, &indexedStatus, &decodedStatus); err != nil {
 			_ = rows.Close()
 			return err
+		}
+		if TurnStatus(strings.TrimSpace(decodedStatus)) != TurnStatusInterrupted {
+			// An unknown scalar beside a non-interrupted canonical row is still
+			// unsafe evidence, even though it cannot produce an interrupted
+			// execution anchor.
+			if sqliteTurnStatusIsUnknown(TurnStatus(indexedStatus)) {
+				unknownLegacy = true
+			}
+			continue
+		}
+		if sqliteTurnStatusIsUnknown(TurnStatus(indexedStatus)) {
+			// The canonical JSON status is the interrupted evidence; the unknown
+			// scalar is recorded as a safety condition but must not hide it.
+			unknownLegacy = true
 		}
 		var turn Turn
 		if err := json.Unmarshal(raw, &turn); err != nil {
@@ -10533,6 +12306,10 @@ func markSQLiteLegacyUnresolvedSessionTx(ctx context.Context, tx *sql.Tx, state 
 	}
 	if err := rows.Close(); err != nil {
 		return err
+	}
+	if unknownLegacy {
+		state.legacyUnresolvedSessions[sessionID] = true
+		return nil
 	}
 	sort.SliceStable(legacyCandidates, func(i, j int) bool {
 		leftTime := firstStoreNonZeroTime(legacyCandidates[i].InterruptedAt, legacyCandidates[i].UpdatedAt, legacyCandidates[i].CreatedAt)
@@ -10573,7 +12350,8 @@ func sqliteLegacyInterruptedRevisionTx(ctx context.Context, tx *sql.Tx, sessionI
 	}
 	var maxUpdated int64
 	var count int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at), 0), COUNT(*) FROM turns WHERE session_id = ? AND status = ?`, sessionID, string(TurnStatusInterrupted)).Scan(&maxUpdated, &count); err != nil {
+	canonicalStatus := sqliteCanonicalTurnStatusSQL("json", "status")
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at), 0), COUNT(*) FROM turns WHERE session_id = ? AND (status = ? OR `+sqliteTurnUnknownStatusSQL("status")+` OR `+canonicalStatus+` = ?)`, sessionID, string(TurnStatusInterrupted), string(TurnStatusInterrupted)).Scan(&maxUpdated, &count); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%d:%d", maxUpdated, count), nil
@@ -10794,18 +12572,28 @@ func (s *Store) claimNextQueuedTurnSQLiteWithOwner(ctx context.Context, sessionI
 			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &legacyState, sessionID); err != nil {
 				return err
 			}
+			turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
 			var running int
-			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE session_id = ? AND status = ? LIMIT 1`, sessionID, string(TurnStatusRunning)).Scan(&running); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			if err := tx.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE session_id = ? AND `+turnStatus+` = ? LIMIT 1`, sessionID, string(TurnStatusRunning)).Scan(&running); err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
 			if running == 1 {
 				return tx.Commit()
 			}
-			turn, ok, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE session_id = ? AND status = ? ORDER BY queued_at, id LIMIT 1`, sessionID, string(TurnStatusQueued))
+			turn, ok, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE session_id = ? AND `+turnStatus+` = ? ORDER BY queued_at, id LIMIT 1`, sessionID, string(TurnStatusQueued))
 			if err != nil || !ok {
 				if err != nil {
 					return err
 				}
+				return tx.Commit()
+			}
+			if !capability.bound() && turn.LeaseGeneration > 0 {
+				// The public unscoped claim has no proof that it owns a durable
+				// generation.  Do not advance past the FIFO head to find a row that
+				// might belong to another listener; the owner-bound claim API is the
+				// explicit adoption path. A machine ID without a positive generation
+				// is the legacy pre-lease marker and must remain claimable by direct
+				// callers.
 				return tx.Commit()
 			}
 			state := State{
@@ -10963,7 +12751,7 @@ func (s *Store) updateTurnSQLiteWithCapability(ctx context.Context, turnID strin
 				}
 			}
 			if includeOutbox {
-				if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT o.json FROM outbox_messages o WHERE o.turn_id = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{turnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+				if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")+` = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{turnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 					return err
 				}
 				for outboxID := range state.OutboxMessages {
@@ -11258,7 +13046,7 @@ func (s *Store) completeTurnWithFinalSQLite(ctx context.Context, req CompleteTur
 			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, req.SessionID); err != nil {
 				return err
 			}
-			if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT o.json FROM outbox_messages o WHERE o.turn_id = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.TurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+			if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")+` = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.TurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 				return err
 			}
 			// The planned IDs are part of the ownership CAS.  Loading only rows
@@ -11273,7 +13061,7 @@ func (s *Store) completeTurnWithFinalSQLite(ctx context.Context, req CompleteTur
 				if _, exists := state.OutboxMessages[id]; exists {
 					continue
 				}
-				existing, exists, loadErr := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, id)
+				existing, exists, loadErr := loadSQLiteOutboxProjectionRow(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, id)
 				if loadErr != nil {
 					return loadErr
 				}
@@ -11408,7 +13196,7 @@ func (s *Store) clearExecutionAnchorAndConfirmTurnSQLiteWithCapability(ctx conte
 			if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, req.SessionID); err != nil {
 				return err
 			}
-			if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT o.json FROM outbox_messages o WHERE o.turn_id = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.OuterTurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
+			if err := loadSQLiteOutboxMapTx(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE `+sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")+` = ? AND `+sqliteOutboxProjectionValidSQL("o"), []any{req.OuterTurnID}, state.OutboxMessages, func(v OutboxMessage) string { return v.ID }); err != nil {
 				return err
 			}
 			if !clearExecutionAnchorLocked(&state, req) {
@@ -11459,7 +13247,7 @@ func (s *Store) queueOutboxSQLiteWithCapability(ctx context.Context, msg OutboxM
 				return err
 			}
 			defer tx.Rollback()
-			if existing, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, msg.ID); err != nil {
+			if existing, ok, err := loadSQLiteOutboxProjectionRow(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, msg.ID); err != nil {
 				return err
 			} else if ok {
 				out = existing
@@ -11604,7 +13392,7 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 			if deliveryFound {
 				state.TranscriptDeliveries[existingDelivery.ID] = existingDelivery
 				if outboxID := strings.TrimSpace(existingDelivery.OutboxID); outboxID != "" {
-					if existing, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
+					if existing, ok, err := loadSQLiteOutboxProjectionRow(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID); err != nil {
 						return err
 					} else if ok {
 						state.OutboxMessages[existing.ID] = existing
@@ -11615,7 +13403,7 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 				}
 			}
 			if msgID := strings.TrimSpace(msg.ID); msgID != "" {
-				if existing, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, tx, `SELECT json FROM outbox_messages WHERE id = ?`, msgID); err != nil {
+				if existing, ok, err := loadSQLiteOutboxProjectionRow(ctx, tx, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, msgID); err != nil {
 					return err
 				} else if ok {
 					state.OutboxMessages[existing.ID] = existing
@@ -11735,12 +13523,14 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 			return err
 		}
 		handled = true
-		if err := db.QueryRowContext(ctx, `SELECT session_id FROM outbox_messages WHERE id = ?`, outboxID).Scan(&sessionID); errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("outbox message %q not found", outboxID)
-		} else if err != nil {
+		current, found, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID)
+		if err != nil {
 			return err
 		}
-		sessionID = strings.TrimSpace(sessionID)
+		if !found {
+			return fmt.Errorf("outbox message %q not found", outboxID)
+		}
+		sessionID = strings.TrimSpace(current.SessionID)
 		return nil
 	})
 	if err != nil || !handled {
@@ -11756,7 +13546,7 @@ func (s *Store) updateOutboxSQLite(ctx context.Context, outboxID string, loadCol
 			if err != nil {
 				return err
 			}
-			current, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID)
+			current, ok, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID)
 			if err != nil {
 				return err
 			}
@@ -11886,12 +13676,14 @@ func (s *Store) markOutboxDeliveredSQLiteWithCapability(ctx context.Context, out
 			return err
 		}
 		handled = true
-		if err := db.QueryRowContext(ctx, `SELECT session_id FROM outbox_messages WHERE id = ?`, outboxID).Scan(&sessionID); errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("outbox message %q not found", outboxID)
-		} else if err != nil {
+		current, found, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID)
+		if err != nil {
 			return err
 		}
-		sessionID = strings.TrimSpace(sessionID)
+		if !found {
+			return fmt.Errorf("outbox message %q not found", outboxID)
+		}
+		sessionID = strings.TrimSpace(current.SessionID)
 		return nil
 	})
 	if err != nil || !handled {
@@ -11907,7 +13699,7 @@ func (s *Store) markOutboxDeliveredSQLiteWithCapability(ctx context.Context, out
 			if err != nil {
 				return err
 			}
-			current, ok, err := loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT json FROM outbox_messages WHERE id = ?`, outboxID)
+			current, ok, err := loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID)
 			if err != nil {
 				return err
 			}
@@ -12280,20 +14072,20 @@ func querySQLiteOutboxReplayFenceMessages(ctx context.Context, q interface {
 			placeholders = append(placeholders, "?")
 			args = append(args, fence.OutboxID)
 		}
-		rows, err := q.QueryContext(ctx, `SELECT json FROM outbox_messages WHERE json_valid(json) AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+		rows, err := q.QueryContext(ctx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o WHERE json_valid(o.json) AND o.id IN (`+strings.Join(placeholders, ",")+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
-			var raw []byte
-			if err := rows.Scan(&raw); err != nil {
+			var row sqliteOutboxProjectionRow
+			if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
 				_ = rows.Close()
 				return nil, err
 			}
-			var msg OutboxMessage
-			if err := json.Unmarshal(raw, &msg); err != nil {
+			msg, ok := decodeSQLiteOutboxProjection(row)
+			if !ok {
 				_ = rows.Close()
-				return nil, err
+				return nil, fmt.Errorf("%w: replay fence row %q", ErrSQLiteOutboxProjectionUntrusted, strings.TrimSpace(row.id.String))
 			}
 			fence := fencesByID[msg.ID]
 			if err := validateOutboxReplayFence(msg, fence); err != nil {
@@ -12313,6 +14105,139 @@ func querySQLiteOutboxReplayFenceMessages(ctx context.Context, q interface {
 	return current, nil
 }
 
+func (s *Store) pendingOutboxChatIDsAtSQLite(ctx context.Context, query PendingOutboxQuery, limit int) ([]string, bool, error) {
+	var out []string
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		status := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		chatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
+		sessionID := sqliteOutboxCanonicalTextSQL("o.json", "$.session_id", "o.session_id")
+		messageID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_message_id", "o.teams_message_id")
+		clauses := []string{
+			status + " IN (?, ?, ?)",
+			sqliteOutboxProjectionValidSQL("o"),
+			"trim(" + chatID + ") <> ''",
+			"(" + status + " <> ? OR " + messageID + " <> '')",
+			"NOT (" + status + " = ? AND " + messageID + " <> '' AND COALESCE(" + sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite") + ", 0) = 1)",
+		}
+		args := []any{
+			string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted),
+			string(OutboxStatusAccepted), string(OutboxStatusAccepted),
+		}
+		lastSendAttemptJSON := sqliteSafeJSONExtract("o.json", "$.last_send_attempt")
+		lastSendAttempt := "julianday(" + lastSendAttemptJSON + ")"
+		expiryCutoff := query.Now.Add(-outboxSendLease).UTC().Format(time.RFC3339Nano)
+		expiredAttempt := "(" + lastSendAttempt + " IS NULL OR " + lastSendAttempt + " <= julianday(?))"
+		unknownOutcome := "(" + status + " = ? AND " + messageID + " = '' AND " + expiredAttempt + ")"
+		if !query.IncludeActiveSending {
+			clauses = append(clauses, "("+status+" <> ? OR "+expiredAttempt+")")
+			args = append(args, string(OutboxStatusSending), expiryCutoff)
+		}
+		if query.AmbiguousOnly {
+			clauses = append(clauses, status+" = ?", messageID+" = ''")
+			args = append(args, string(OutboxStatusSending))
+			if query.IncludeAmbiguous {
+				clauses = append(clauses, unknownOutcome)
+				args = append(args, string(OutboxStatusSending), expiryCutoff)
+			} else {
+				clauses = append(clauses, "0 = 1")
+			}
+		} else if !query.IncludeAmbiguous {
+			clauses = append(clauses, "NOT "+unknownOutcome)
+			args = append(args, string(OutboxStatusSending), expiryCutoff)
+		} else {
+			lastSendError := sqliteSafeJSONExtract("o.json", "$.last_send_error")
+			clauses = append(clauses, "("+status+" <> ? OR "+messageID+" <> '' OR COALESCE("+lastSendError+", '') NOT LIKE 'ambiguous Graph send;%' OR "+unknownOutcome+")")
+			args = append(args, string(OutboxStatusSending), string(OutboxStatusSending), expiryCutoff)
+		}
+		if !query.IgnoreRetryGate {
+			nextAttemptDue := sqliteOutboxNextAttemptDueSQL("o.json", "o.deliver_after")
+			zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+			nowTime := query.Now.UTC().Format(time.RFC3339Nano)
+			nowNanos := query.Now.UnixNano()
+			if query.IncludeAmbiguous || query.AmbiguousOnly {
+				clauses = append(clauses, "("+status+" NOT IN (?, ?, ?) OR "+nextAttemptDue+")")
+				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), string(OutboxStatusSending), zeroTime, nowTime, nowNanos)
+			} else {
+				clauses = append(clauses, "("+status+" NOT IN (?, ?) OR "+nextAttemptDue+")")
+				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), zeroTime, nowTime, nowNanos)
+			}
+		}
+		if !query.IgnoreRateLimit {
+			clauses = append(clauses, "("+status+" = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
+			args = append(args, string(OutboxStatusAccepted), sqliteTime(query.Now))
+		}
+		if query.SessionID != "" {
+			clauses = append(clauses, sessionID+" = ?")
+			args = append(args, query.SessionID)
+		}
+		if query.TurnID != "" {
+			clauses = append(clauses, sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")+" = ?")
+			args = append(args, query.TurnID)
+		}
+		if query.TeamsChatID != "" {
+			clauses = append(clauses, chatID+" = ?")
+			args = append(args, query.TeamsChatID)
+		}
+		if query.AfterChatID != "" {
+			clauses = append(clauses, "trim("+chatID+") > ?")
+			args = append(args, query.AfterChatID)
+		}
+		if !query.After.IsZero() {
+			clauses = append(clauses, "(o.created_at > ? OR (o.created_at = ? AND o.id > ?))")
+			after := sqliteTime(query.After.CreatedAt)
+			args = append(args, after, after, query.After.ID)
+		}
+		// AfterChatID is a lexical keyset cursor, so the initial page must use
+		// the same order as every continuation. Group at the database boundary,
+		// rather than fetching every row from a chat before counting it as one
+		// candidate: a pathological malformed prefix must not consume the phase
+		// deadline before a later chat is even visible. The selected chat is only
+		// a hint; the targeted sender re-reads its canonical page and repeats all
+		// owner/lease/attempt/FIFO/CAS checks before any Graph POST.
+		clauses = append(clauses, sqliteOutboxJSONDecodeAdmissionSQL("o"))
+		stmt := `SELECT trim(` + chatID + `)
+FROM outbox_messages o
+LEFT JOIN chat_rate_limits r ON r.chat_id = ` + chatID + `
+WHERE ` + strings.Join(clauses, " AND ") + `
+
+GROUP BY trim(` + chatID + `)
+ORDER BY trim(` + chatID + `)`
+		args = append(args, limit)
+		stmt += ` LIMIT ?`
+		rows, err := db.QueryContext(ctx, stmt, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var chatID string
+			if err := rows.Scan(&chatID); err != nil {
+				return err
+			}
+			chatID = strings.TrimSpace(chatID)
+			if chatID == "" {
+				continue
+			}
+			out = append(out, chatID)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		handled = true
+		return nil
+	})
+	return out, handled, err
+}
+
 func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutboxQuery) (PendingOutboxPage, bool, error) {
 	var out PendingOutboxPage
 	handled := false
@@ -12325,11 +14250,15 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 		if err != nil {
 			return err
 		}
+		status := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		chatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
+		sessionID := sqliteOutboxCanonicalTextSQL("o.json", "$.session_id", "o.session_id")
+		messageID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_message_id", "o.teams_message_id")
 		clauses := []string{
-			"o.status IN (?, ?, ?)",
+			status + " IN (?, ?, ?)",
 			sqliteOutboxProjectionValidSQL("o"),
-			"(o.status <> ? OR o.teams_message_id <> '')",
-			"NOT (o.status = ? AND o.teams_message_id <> '' AND COALESCE(" + sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite") + ", 0) = 1)",
+			"(" + status + " <> ? OR " + messageID + " <> '')",
+			"NOT (" + status + " = ? AND " + messageID + " <> '' AND COALESCE(" + sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite") + ", 0) = 1)",
 		}
 		args := []any{
 			string(OutboxStatusQueued), string(OutboxStatusSending), string(OutboxStatusAccepted),
@@ -12345,9 +14274,9 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 		lastSendAttempt := "julianday(" + lastSendAttemptJSON + ")"
 		expiryCutoff := query.Now.Add(-outboxSendLease).UTC().Format(time.RFC3339Nano)
 		expiredAttempt := "(" + lastSendAttempt + " IS NULL OR " + lastSendAttempt + " <= julianday(?))"
-		unknownOutcome := "(o.status = ? AND o.teams_message_id = '' AND " + expiredAttempt + ")"
+		unknownOutcome := "(" + status + " = ? AND " + messageID + " = '' AND " + expiredAttempt + ")"
 		if query.AmbiguousOnly {
-			clauses = append(clauses, "o.status = ?", "o.teams_message_id = ''")
+			clauses = append(clauses, status+" = ?", messageID+" = ''")
 			args = append(args, string(OutboxStatusSending))
 			if query.IncludeAmbiguous {
 				clauses = append(clauses, unknownOutcome)
@@ -12363,32 +14292,36 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 			// work and expired unknown outcomes, but keep a fresh explicit
 			// ambiguous row out until its lease expires.
 			lastSendError := sqliteSafeJSONExtract("o.json", "$.last_send_error")
-			clauses = append(clauses, "(o.status <> ? OR o.teams_message_id <> '' OR COALESCE("+lastSendError+", '') NOT LIKE 'ambiguous Graph send;%' OR "+unknownOutcome+")")
+			clauses = append(clauses, "("+status+" <> ? OR "+messageID+" <> '' OR COALESCE("+lastSendError+", '') NOT LIKE 'ambiguous Graph send;%' OR "+unknownOutcome+")")
 			args = append(args, string(OutboxStatusSending), string(OutboxStatusSending), expiryCutoff)
 		}
 		if !query.IgnoreRetryGate {
+			nextAttemptDue := sqliteOutboxNextAttemptDueSQL("o.json", "o.deliver_after")
+			zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+			nowTime := query.Now.UTC().Format(time.RFC3339Nano)
+			nowNanos := query.Now.UnixNano()
 			if query.IncludeAmbiguous || query.AmbiguousOnly {
-				clauses = append(clauses, "(o.status NOT IN (?, ?, ?) OR o.deliver_after = 0 OR o.deliver_after <= ?)")
-				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), string(OutboxStatusSending), sqliteTime(query.Now))
+				clauses = append(clauses, "("+status+" NOT IN (?, ?, ?) OR "+nextAttemptDue+")")
+				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), string(OutboxStatusSending), zeroTime, nowTime, nowNanos)
 			} else {
-				clauses = append(clauses, "(o.status NOT IN (?, ?) OR o.deliver_after = 0 OR o.deliver_after <= ?)")
-				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), sqliteTime(query.Now))
+				clauses = append(clauses, "("+status+" NOT IN (?, ?) OR "+nextAttemptDue+")")
+				args = append(args, string(OutboxStatusQueued), string(OutboxStatusAccepted), zeroTime, nowTime, nowNanos)
 			}
 		}
 		if !query.IgnoreRateLimit {
-			clauses = append(clauses, "(o.status = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
+			clauses = append(clauses, "("+status+" = ? OR COALESCE(r.blocked_until, 0) = 0 OR COALESCE(r.blocked_until, 0) <= ?)")
 			args = append(args, string(OutboxStatusAccepted), sqliteTime(query.Now))
 		}
 		if query.SessionID = strings.TrimSpace(query.SessionID); query.SessionID != "" {
-			clauses = append(clauses, "o.session_id = ?")
+			clauses = append(clauses, sessionID+" = ?")
 			args = append(args, query.SessionID)
 		}
 		if query.TurnID = strings.TrimSpace(query.TurnID); query.TurnID != "" {
-			clauses = append(clauses, "o.turn_id = ?")
+			clauses = append(clauses, sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")+" = ?")
 			args = append(args, query.TurnID)
 		}
 		if query.TeamsChatID = strings.TrimSpace(query.TeamsChatID); query.TeamsChatID != "" {
-			clauses = append(clauses, "o.teams_chat_id = ?")
+			clauses = append(clauses, chatID+" = ?")
 			args = append(args, query.TeamsChatID)
 		}
 		if !query.After.IsZero() {
@@ -12396,9 +14329,9 @@ func (s *Store) pendingOutboxPageAtSQLite(ctx context.Context, query PendingOutb
 			after := sqliteTime(query.After.CreatedAt)
 			args = append(args, after, after, strings.TrimSpace(query.After.ID))
 		}
-		stmt := `SELECT o.json, o.created_at, o.id, COALESCE(o.deliver_after, 0), COALESCE(r.blocked_until, 0)
+		stmt := `SELECT ` + sqliteOutboxProjectionSelect("o") + `, COALESCE(r.blocked_until, 0)
 FROM outbox_messages o
-LEFT JOIN chat_rate_limits r ON r.chat_id = o.teams_chat_id
+LEFT JOIN chat_rate_limits r ON r.chat_id = ` + chatID + `
 WHERE ` + strings.Join(clauses, " AND ") + `
 ORDER BY o.created_at, o.id`
 		rawLimit := query.Limit
@@ -12414,12 +14347,9 @@ ORDER BY o.created_at, o.id`
 		defer rows.Close()
 		rawRows := 0
 		for rows.Next() {
-			var raw []byte
-			var createdAtNanos int64
-			var rowID string
-			var deliverAfterNanos int64
 			var blockedUntilNanos int64
-			if err := rows.Scan(&raw, &createdAtNanos, &rowID, &deliverAfterNanos, &blockedUntilNanos); err != nil {
+			var row sqliteOutboxProjectionRow
+			if err := scanSQLiteOutboxProjectionRow(rows, &row, &blockedUntilNanos); err != nil {
 				return err
 			}
 			rawRows++
@@ -12427,9 +14357,9 @@ ORDER BY o.created_at, o.id`
 				out.More = true
 				break
 			}
-			out.NextCursor = PendingOutboxCursor{CreatedAt: time.Unix(0, createdAtNanos), ID: rowID}
-			var msg OutboxMessage
-			if err := json.Unmarshal(raw, &msg); err != nil {
+			out.NextCursor = PendingOutboxCursor{CreatedAt: sqliteOutboxScalarTime(row.createdAt), ID: strings.TrimSpace(row.id.String)}
+			msg, ok := decodeSQLiteOutboxProjection(row)
+			if !ok {
 				// A syntactically valid but semantically damaged row must not
 				// hide healthy work behind a whole-page decode error.  Keep the
 				// cursor on this row and ask the caller for another page so the
@@ -12437,12 +14367,6 @@ ORDER BY o.created_at, o.id`
 				// raw bytes remain available to opaque-row repair diagnostics.
 				out.More = true
 				continue
-			}
-			// Older SQLite rows may have a populated compatibility column while
-			// their JSON predates NextAttemptAt. Hydrate the projection so the JSON
-			// and SQLite pending predicates agree.
-			if msg.NextAttemptAt.IsZero() && deliverAfterNanos > 0 {
-				msg.NextAttemptAt = time.Unix(0, deliverAfterNanos).UTC()
 			}
 			state := State{ChatRateLimits: map[string]ChatRateLimitState{}}
 			if blockedUntilNanos > 0 {
@@ -12475,23 +14399,25 @@ func (s *Store) sentOutboxMessagesForChatSQLite(ctx context.Context, chatID stri
 			return err
 		}
 		handled = true
-		rows, err := db.QueryContext(ctx, `SELECT o.json FROM outbox_messages o
+		canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
+		canonicalStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		rows, err := db.QueryContext(ctx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o
 WHERE `+sqliteOutboxProjectionValidSQL("o")+`
-  AND o.teams_chat_id = ?
-  AND status = ?
+  AND `+canonicalChatID+` = ?
+  AND `+canonicalStatus+` = ?
 ORDER BY o.created_at, o.id`, chatID, string(OutboxStatusSent))
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var raw []byte
-			if err := rows.Scan(&raw); err != nil {
+			var row sqliteOutboxProjectionRow
+			if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
 				return err
 			}
-			var msg OutboxMessage
-			if err := json.Unmarshal(raw, &msg); err != nil {
-				return err
+			msg, ok := decodeSQLiteOutboxProjection(row)
+			if !ok {
+				continue
 			}
 			if msg.TeamsChatID == chatID && msg.Status == OutboxStatusSent {
 				out = append(out, msg)
@@ -12524,15 +14450,24 @@ func (s *Store) pendingSentOutboxSideEffectsSQLite(ctx context.Context, limit in
 		// reads another bounded page when a malformed candidate was encountered,
 		// so it does not add a scan to the successful-send hot path.
 		pageSize := limit
+		if pageSize <= 0 {
+			pageSize = 1
+		}
+		canonicalStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		canonicalPending := sqliteOutboxCanonicalBoolSQL("o.json", "$.post_send_effects_pending", "o.post_send_effects_pending")
+		nextAttemptDue := sqliteOutboxNextAttemptDueSQL("o.json", "o.deliver_after")
+		zeroTime := time.Time{}.UTC().Format(time.RFC3339Nano)
+		nowTime := now.UTC().Format(time.RFC3339Nano)
+		nowNanos := now.UnixNano()
 		var cursorCreatedAt int64
 		var cursorID string
 		hasCursor := false
 		for len(out) < limit {
-			query := `SELECT o.json, o.created_at, o.id FROM outbox_messages o
-WHERE ` + sqliteOutboxProjectionValidSQL("o") + `
-  AND o.status = ? AND o.post_send_effects_pending = 1
-  AND (o.deliver_after = 0 OR o.deliver_after <= ?)`
-			args := []any{string(OutboxStatusSent), sqliteTime(now)}
+			query := `SELECT ` + sqliteOutboxProjectionSelect("o") + ` FROM outbox_messages o
+	WHERE ` + sqliteOutboxProjectionValidSQL("o") + `
+	  AND ` + canonicalStatus + ` = ? AND ` + canonicalPending + ` = 1
+	  AND ` + nextAttemptDue
+			args := []any{string(OutboxStatusSent), zeroTime, nowTime, nowNanos}
 			if hasCursor {
 				query += `
   AND (o.created_at > ? OR (o.created_at = ? AND o.id > ?))`
@@ -12548,15 +14483,17 @@ LIMIT ?`
 			}
 			pageRows := 0
 			for rows.Next() {
-				var raw []byte
-				if err := rows.Scan(&raw, &cursorCreatedAt, &cursorID); err != nil {
+				var row sqliteOutboxProjectionRow
+				if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
 					_ = rows.Close()
 					return err
 				}
+				cursorCreatedAt = row.createdAt.Int64
+				cursorID = row.id.String
 				hasCursor = true
 				pageRows++
-				var msg OutboxMessage
-				if err := json.Unmarshal(raw, &msg); err != nil {
+				msg, ok := decodeSQLiteOutboxProjection(row)
+				if !ok {
 					// The raw row remains available to the opaque-row repair path.
 					// It is not safe to manufacture a Sent message from a partial
 					// decode, but it is also not safe to let it abort this lane.
@@ -12598,6 +14535,8 @@ func (s *Store) recentOutboxEchoCandidatesSQLite(ctx context.Context, query Outb
 			return err
 		}
 		handled = true
+		canonicalStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
 		for _, item := range []struct {
 			status    OutboxStatus
 			ascending bool
@@ -12610,11 +14549,17 @@ func (s *Store) recentOutboxEchoCandidatesSQLite(ctx context.Context, query Outb
 			var cursorCreatedAt int64
 			var cursorID string
 			hasCursor := false
-			for page := 0; page < sqliteOutboxEchoMaxPages && len(out)-statusStart < query.LimitPerStatus; page++ {
-				querySQL := `SELECT o.json, COALESCE(o.created_at, 0), o.id
-FROM outbox_messages o
+			// The keyset cursor makes this scan finite for the finite SQLite table.
+			// Do not impose an arbitrary page cap: a pile of locally malformed rows
+			// must not permanently hide a usable Sending receipt behind page eight.
+			// This lane is exceptional and its phase context remains the resource
+			// boundary for a pathological opaque prefix.
+			for len(out)-statusStart < query.LimitPerStatus {
+				querySQL := `SELECT ` + sqliteOutboxProjectionSelect("o") + ` FROM outbox_messages o
 WHERE ` + sqliteOutboxProjectionValidSQL("o") + `
-  AND o.status = ? AND o.teams_chat_id = ?`
+  AND ` + sqliteOutboxJSONDecodeAdmissionSQL("o") + `
+
+  AND ` + canonicalStatus + ` = ? AND ` + canonicalChatID + ` = ?`
 				args := []any{string(item.status), query.TeamsChatID}
 				if hasCursor {
 					if item.ascending {
@@ -12642,15 +14587,17 @@ LIMIT ?`
 				}
 				pageRows := 0
 				for rows.Next() {
-					var raw []byte
-					if err := rows.Scan(&raw, &cursorCreatedAt, &cursorID); err != nil {
+					var row sqliteOutboxProjectionRow
+					if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
 						_ = rows.Close()
 						return err
 					}
+					cursorCreatedAt = row.createdAt.Int64
+					cursorID = row.id.String
 					hasCursor = true
 					pageRows++
-					var msg OutboxMessage
-					if err := json.Unmarshal(raw, &msg); err != nil {
+					msg, ok := decodeSQLiteOutboxProjection(row)
+					if !ok {
 						// A semantically malformed row is local quarantine evidence,
 						// not a reason to abort echo recovery for this chat.
 						continue
@@ -12696,24 +14643,44 @@ func (s *Store) earlierUnsentOutboxSQLite(ctx context.Context, msg OutboxMessage
 		if err != nil {
 			return err
 		}
+		handled = true
 		turnID := strings.TrimSpace(msg.TurnID)
+		canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
+		canonicalStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		messageID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_message_id", "o.teams_message_id")
+		candidateTurnID := sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")
+		canonicalSequence := sqliteOutboxCanonicalSequenceSQL("o.json", "o.sequence")
 		expiryCutoff := time.Now().UTC().Add(-outboxSendLease).Format(time.RFC3339Nano)
-		out, found, err = loadSQLiteJSONRow[OutboxMessage](ctx, db, `SELECT o.json FROM outbox_messages o
-WHERE `+sqliteOutboxProjectionValidSQL("o")+`
-  AND o.teams_chat_id = ?
+		rows, err := db.QueryContext(ctx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o
+WHERE (`+canonicalChatID+` = ? OR trim(COALESCE(o.teams_chat_id, '')) = ?)
   AND o.id <> ?
-  AND o.sequence > 0
-	AND o.sequence < ?
-	AND o.status NOT IN (?, ?)
-	AND NOT (o.status = ? AND o.teams_message_id <> '' AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite")+`, 0) = 1)
-	AND NOT (o.status = ? AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.last_send_error")+`, '') LIKE 'ambiguous Graph send;%' AND (TRIM(COALESCE(o.turn_id, '')) <> ? OR ? = ''))
-	AND NOT (o.status = ? AND o.teams_message_id = '' AND (`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+` IS NULL OR julianday(`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+`) <= julianday(?)) AND (TRIM(COALESCE(o.turn_id, '')) <> ? OR ? = ''))
-ORDER BY o.sequence, o.created_at, o.id
-LIMIT 1`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending), turnID, turnID, string(OutboxStatusSending), expiryCutoff, turnID, turnID)
+	  AND ((o.sequence > 0 AND o.sequence < ?) OR (`+canonicalSequence+` > 0 AND `+canonicalSequence+` < ?))
+  AND `+canonicalStatus+` NOT IN (?, ?)
+  AND NOT (`+canonicalStatus+` = ? AND `+messageID+` <> '' AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite")+`, 0) = 1)
+  AND NOT (`+canonicalStatus+` = ? AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.last_send_error")+`, '') LIKE 'ambiguous Graph send;%' AND (`+candidateTurnID+` <> ? OR ? = ''))
+  AND NOT (`+canonicalStatus+` = ? AND `+messageID+` = '' AND (`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+` IS NULL OR julianday(`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+`) <= julianday(?)) AND (`+candidateTurnID+` <> ? OR ? = ''))
+ORDER BY `+canonicalSequence+`, o.created_at, o.id
+LIMIT 64`, chatID, chatID, strings.TrimSpace(msg.ID), msg.Sequence, msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending), turnID, turnID, string(OutboxStatusSending), expiryCutoff, turnID, turnID)
 		if err != nil {
 			return err
 		}
-		handled = true
+		defer rows.Close()
+		for rows.Next() {
+			var row sqliteOutboxProjectionRow
+			if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
+				return err
+			}
+			candidate, ok := decodeSQLiteOutboxProjection(row)
+			if !ok {
+				return fmt.Errorf("%w: predecessor row %q", ErrOutboxPredecessorIndeterminate, strings.TrimSpace(row.id.String))
+			}
+			out = candidate
+			found = true
+			break
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		return nil
 	})
 	return out, found, handled, err
@@ -12732,38 +14699,41 @@ func (s *Store) earlierUnsentOutboxesSQLite(ctx context.Context, msg OutboxMessa
 		if err != nil {
 			return err
 		}
+		handled = true
 		turnID := strings.TrimSpace(msg.TurnID)
+		canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
+		canonicalStatus := sqliteOutboxCanonicalTextSQL("o.json", "$.status", "o.status")
+		messageID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_message_id", "o.teams_message_id")
+		candidateTurnID := sqliteOutboxCanonicalTextSQL("o.json", "$.turn_id", "o.turn_id")
+		canonicalSequence := sqliteOutboxCanonicalSequenceSQL("o.json", "o.sequence")
 		expiryCutoff := time.Now().UTC().Add(-outboxSendLease).Format(time.RFC3339Nano)
-		rows, err := db.QueryContext(ctx, `SELECT o.json FROM outbox_messages o
-WHERE `+sqliteOutboxProjectionValidSQL("o")+`
-  AND o.teams_chat_id = ?
+		rows, err := db.QueryContext(ctx, `SELECT `+sqliteOutboxProjectionSelect("o")+` FROM outbox_messages o
+WHERE (`+canonicalChatID+` = ? OR trim(COALESCE(o.teams_chat_id, '')) = ?)
   AND o.id <> ?
-  AND o.sequence > 0
-	AND o.sequence < ?
-	AND o.status NOT IN (?, ?)
-	AND NOT (o.status = ? AND o.teams_message_id <> '' AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite")+`, 0) = 1)
-	AND NOT (o.status = ? AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.last_send_error")+`, '') LIKE 'ambiguous Graph send;%' AND (TRIM(COALESCE(o.turn_id, '')) <> ? OR ? = ''))
-	AND NOT (o.status = ? AND o.teams_message_id = '' AND (`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+` IS NULL OR julianday(`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+`) <= julianday(?)) AND (TRIM(COALESCE(o.turn_id, '')) <> ? OR ? = ''))
-			ORDER BY o.sequence, o.created_at, o.id`, chatID, strings.TrimSpace(msg.ID), msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending), turnID, turnID, string(OutboxStatusSending), expiryCutoff, turnID, turnID)
+	  AND ((o.sequence > 0 AND o.sequence < ?) OR (`+canonicalSequence+` > 0 AND `+canonicalSequence+` < ?))
+  AND `+canonicalStatus+` NOT IN (?, ?)
+  AND NOT (`+canonicalStatus+` = ? AND `+messageID+` <> '' AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.blocked_by_source_rewrite")+`, 0) = 1)
+  AND NOT (`+canonicalStatus+` = ? AND COALESCE(`+sqliteSafeJSONExtract("o.json", "$.last_send_error")+`, '') LIKE 'ambiguous Graph send;%' AND (`+candidateTurnID+` <> ? OR ? = ''))
+  AND NOT (`+canonicalStatus+` = ? AND `+messageID+` = '' AND (`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+` IS NULL OR julianday(`+sqliteSafeJSONExtract("o.json", "$.last_send_attempt")+`) <= julianday(?)) AND (`+candidateTurnID+` <> ? OR ? = ''))
+ORDER BY `+canonicalSequence+`, o.created_at, o.id`, chatID, chatID, strings.TrimSpace(msg.ID), msg.Sequence, msg.Sequence, string(OutboxStatusSent), string(OutboxStatusSkipped), string(OutboxStatusAccepted), string(OutboxStatusSending), turnID, turnID, string(OutboxStatusSending), expiryCutoff, turnID, turnID)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var raw []byte
-			if err := rows.Scan(&raw); err != nil {
+			var row sqliteOutboxProjectionRow
+			if err := scanSQLiteOutboxProjectionRow(rows, &row); err != nil {
 				return err
 			}
-			var candidate OutboxMessage
-			if err := json.Unmarshal(raw, &candidate); err != nil {
-				return err
+			candidate, ok := decodeSQLiteOutboxProjection(row)
+			if !ok {
+				return fmt.Errorf("%w: predecessor row %q", ErrOutboxPredecessorIndeterminate, strings.TrimSpace(row.id.String))
 			}
 			out = append(out, candidate)
 		}
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		handled = true
 		return nil
 	})
 	return out, handled, err
@@ -13298,7 +15268,7 @@ func (s *Store) clearChatRateLimitSQLite(ctx context.Context, chatID string) (bo
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chat_rate_limits WHERE chat_id = ?`, chatID); err != nil {
 			return err
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT json, COALESCE(deliver_after, 0) FROM outbox_messages WHERE teams_chat_id = ? AND status = ?`, chatID, string(OutboxStatusQueued))
+		rows, err := tx.QueryContext(ctx, `SELECT json, `+sqliteStoredInt64SQL("deliver_after")+` FROM outbox_messages WHERE teams_chat_id = ? AND status = ?`, chatID, string(OutboxStatusQueued))
 		if err != nil {
 			return err
 		}

@@ -269,3 +269,47 @@ func TestHasUnfinishedTurnsSQLiteTreatsUnknownIndexedStatusAsActive(t *testing.T
 		t.Fatalf("HasUnfinishedTurns invoked full SQLite loader %d time(s)", fullLoads)
 	}
 }
+
+func TestSessionHasTeamsManagedTurnsSQLiteIsTargeted(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-latest-turn"] = SessionContext{
+			ID:           "session-latest-turn",
+			LatestTurnID: "turn-latest-turn",
+		}
+		state.Sessions["session-json-turn"] = SessionContext{ID: "session-json-turn"}
+		state.Sessions["session-clean"] = SessionContext{ID: "session-clean"}
+		state.Turns["turn-json-session"] = Turn{ID: "turn-json-session", SessionID: "session-json-turn", Status: TurnStatusCompleted}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed targeted session-turn state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		// Keep the canonical JSON session ID while removing its legacy scalar
+		// projection; the targeted query must not lose this old/mixed-version row.
+		_, err := tx.ExecContext(ctx, `UPDATE turns SET session_id = NULL WHERE id = ?`, "turn-json-session")
+		return err
+	})
+
+	fullLoads := 0
+	sqliteStateLoadTestHook = func() { fullLoads++ }
+	t.Cleanup(func() { sqliteStateLoadTestHook = nil })
+	for sessionID, want := range map[string]bool{
+		"session-latest-turn": true,
+		"session-json-turn":   true,
+		"session-clean":       false,
+	} {
+		got, err := store.SessionHasTeamsManagedTurns(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("SessionHasTeamsManagedTurns(%q): %v", sessionID, err)
+		}
+		if got != want {
+			t.Fatalf("SessionHasTeamsManagedTurns(%q) = %t, want %t", sessionID, got, want)
+		}
+	}
+	if fullLoads != 0 {
+		t.Fatalf("SessionHasTeamsManagedTurns invoked full SQLite loader %d time(s)", fullLoads)
+	}
+}

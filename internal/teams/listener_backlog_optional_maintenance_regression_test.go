@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +26,409 @@ func TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceJSON(t *testing.T
 
 func TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceSQLite(t *testing.T) {
 	runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t, true)
+}
+
+func TestTeamsBacklogFairQuantumDelaysInitialRunAndReservesOptionalSlots(t *testing.T) {
+	bridge := &Bridge{}
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	if bridge.backlogOptionalMaintenanceDue(now) {
+		t.Fatal("first backlog probe consumed the optional fairness quantum immediately")
+	}
+	if bridge.backlogOptionalMaintenanceDue(now.Add(optionalMaintenanceBacklogFairInterval - time.Nanosecond)) {
+		t.Fatal("optional fairness quantum became due before its interval")
+	}
+	if !bridge.backlogOptionalMaintenanceDue(now.Add(optionalMaintenanceBacklogFairInterval)) {
+		t.Fatal("optional fairness quantum did not become due after its interval")
+	}
+	if !bridge.backlogOptionalMaintenanceDue(now.Add(2 * optionalMaintenanceBacklogFairInterval)) {
+		t.Fatal("failed fairness quantum was silently consumed without completion")
+	}
+	bridge.backlogOptionalMaintenanceFailed(now.Add(2 * optionalMaintenanceBacklogFairInterval))
+	if bridge.backlogOptionalMaintenanceDue(now.Add(2*optionalMaintenanceBacklogFairInterval + optionalMaintenanceBacklogFairRetryInterval - time.Nanosecond)) {
+		t.Fatal("failed fairness quantum became due during its retry backoff")
+	}
+	if !bridge.backlogOptionalMaintenanceDue(now.Add(2*optionalMaintenanceBacklogFairInterval + optionalMaintenanceBacklogFairRetryInterval)) {
+		t.Fatal("failed fairness quantum did not become due after its retry backoff")
+	}
+	bridge.backlogOptionalMaintenanceCompleted(now.Add(2 * optionalMaintenanceBacklogFairInterval))
+	if bridge.backlogOptionalMaintenanceDue(now.Add(2*optionalMaintenanceBacklogFairInterval + time.Second)) {
+		t.Fatal("completed fairness quantum was not delayed")
+	}
+
+	mandatoryPaths := []string{"mandatory-a", "mandatory-b", "mandatory-c", "mandatory-d"}
+	optionalPaths := []string{"optional-a", "optional-b"}
+	if got := bridge.selectBacklogHistoryRecoveryPathsWithLimit(mandatoryPaths, maxBacklogHistoryRecoveryJobs-1); len(got) != maxBacklogHistoryRecoveryJobs-1 {
+		t.Fatalf("mandatory history fairness batch = %v, want %d rows", got, maxBacklogHistoryRecoveryJobs-1)
+	}
+	if got := bridge.selectBacklogHistoryDiscoveryPaths(optionalPaths, 1); len(got) != 1 {
+		t.Fatalf("optional history fairness batch = %v, want one reserved row", got)
+	}
+	mandatoryJobs := make([]linkedTranscriptSyncJob, 0, maxBacklogLinkedRecoveryJobs)
+	for _, id := range mandatoryPaths {
+		mandatoryJobs = append(mandatoryJobs, linkedTranscriptSyncJob{session: Session{ID: id}, mandatory: true})
+	}
+	optionalJobs := []linkedTranscriptSyncJob{{session: Session{ID: "optional-linked"}}}
+	if got := append(
+		bridge.selectBacklogLinkedRecoveryJobsWithLimit(mandatoryJobs, maxBacklogLinkedRecoveryJobs-1),
+		bridge.selectBacklogLinkedRecoveryJobsWithLimit(optionalJobs, 1)...,
+	); len(got) != maxBacklogLinkedRecoveryJobs {
+		t.Fatalf("linked history fairness batch = %d, want %d total jobs", len(got), maxBacklogLinkedRecoveryJobs)
+	}
+}
+
+func TestBacklogFairCursorDoesNotPersistAfterPhaseCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if backlogFairCursorPersistAllowed(ctx, nil) {
+		t.Fatal("canceled backlog phase was allowed to persist a fairness cursor")
+	}
+	if !backlogFairCursorPersistAllowed(context.Background(), nil) {
+		t.Fatal("live backlog phase was rejected from fairness cursor persistence")
+	}
+}
+
+func TestTeamsLinkedRecoveryCombinedQuantumReachesBothLanes(t *testing.T) {
+	bridge := &Bridge{}
+	jobs := make([]linkedTranscriptSyncJob, 0, 20)
+	for i := 0; i < 10; i++ {
+		jobs = append(jobs, linkedTranscriptSyncJob{
+			session:   Session{ID: fmt.Sprintf("mandatory-linked-%02d", i)},
+			mandatory: true,
+		})
+	}
+	for i := 0; i < 10; i++ {
+		jobs = append(jobs, linkedTranscriptSyncJob{
+			session: Session{ID: fmt.Sprintf("optional-linked-%02d", i)},
+		})
+	}
+	seenMandatory := make(map[string]bool)
+	seenOptional := make(map[string]bool)
+	for quantum := 0; quantum < 8; quantum++ {
+		selected := bridge.selectBacklogLinkedRecoveryJobsWithOptionalReserve(jobs, 4)
+		if len(selected) != 4 {
+			t.Fatalf("combined linked quantum %d selected %d jobs, want 4", quantum, len(selected))
+		}
+		optional := 0
+		for _, job := range selected {
+			if job.mandatory {
+				seenMandatory[linkedTranscriptFairJobKey(job)] = true
+			} else {
+				optional++
+				seenOptional[linkedTranscriptFairJobKey(job)] = true
+			}
+		}
+		if optional == 0 {
+			t.Fatalf("combined linked quantum %d starved optional lane: %#v", quantum, selected)
+		}
+	}
+	if len(seenMandatory) != 10 || len(seenOptional) != 10 {
+		t.Fatalf("combined linked quanta did not reach both tails: mandatory=%v optional=%v", seenMandatory, seenOptional)
+	}
+}
+
+func TestTeamsLinkedRecoveryCombinedQuantumSurvivesRestart(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					HolderMachineID: "combined-owner", Generation: 12, Status: teamstore.ControlLeaseStatusActive,
+					LeaseUntil: time.Now().Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed combined owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate combined fairness store: %v", err)
+				}
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{MachineID: "combined-owner", LeaseGeneration: 12})
+			jobs := make([]linkedTranscriptSyncJob, 0, 20)
+			keys := make([]string, 0, 20)
+			for i := 0; i < 10; i++ {
+				job := linkedTranscriptSyncJob{session: Session{ID: fmt.Sprintf("restart-mandatory-%02d", i)}, mandatory: true}
+				jobs = append(jobs, job)
+				keys = append(keys, linkedTranscriptFairJobKey(job))
+			}
+			for i := 0; i < 10; i++ {
+				job := linkedTranscriptSyncJob{session: Session{ID: fmt.Sprintf("restart-optional-%02d", i)}}
+				jobs = append(jobs, job)
+				keys = append(keys, linkedTranscriptFairJobKey(job))
+			}
+			seen := make(map[string]bool)
+			for quantum := 0; quantum < 12; quantum++ {
+				// Recreate the bridge every quantum. The only state allowed to
+				// survive is the owner-fenced durable scheduling hint.
+				bridge := &Bridge{store: store}
+				if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinked, keys); err != nil {
+					t.Fatalf("restore combined fairness quantum %d: %v", quantum, err)
+				}
+				selected := bridge.selectBacklogLinkedRecoveryJobsWithOptionalReserve(jobs, 4)
+				if len(selected) != 4 {
+					t.Fatalf("restart combined fairness quantum %d selected %d jobs, want 4", quantum, len(selected))
+				}
+				optional := 0
+				for _, job := range selected {
+					seen[linkedTranscriptFairJobKey(job)] = true
+					if !job.mandatory {
+						optional++
+					}
+				}
+				if optional == 0 {
+					t.Fatalf("restart combined fairness quantum %d starved optional lane", quantum)
+				}
+				if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinked); err != nil {
+					t.Fatalf("persist combined fairness quantum %d: %v", quantum, err)
+				}
+			}
+			if len(seen) != len(jobs) {
+				t.Fatalf("restart combined fairness did not reach every job: seen=%v", seen)
+			}
+		})
+	}
+}
+
+func TestTeamsBacklogHistoryAndLinkedDiscoveryCursorsAreIndependent(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					HolderMachineID: "discovery-owner", Generation: 11, Status: teamstore.ControlLeaseStatusActive,
+					LeaseUntil: time.Now().Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed discovery cursor owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate discovery cursor store: %v", err)
+				}
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{MachineID: "discovery-owner", LeaseGeneration: 11})
+			bridge := &Bridge{store: store}
+			root := t.TempDir()
+			history := []string{filepath.Join(root, "history-a"), filepath.Join(root, "history-b"), filepath.Join(root, "history-c"), filepath.Join(root, "history-d"), filepath.Join(root, "history-e")}
+			linked := []string{filepath.Join(root, "linked-a"), filepath.Join(root, "linked-b"), filepath.Join(root, "linked-c"), filepath.Join(root, "linked-d"), filepath.Join(root, "linked-e")}
+			if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneHistoryDiscovery, history); err != nil {
+				t.Fatalf("restore history discovery cursor: %v", err)
+			}
+			historySelected := bridge.selectBacklogHistoryDiscoveryPaths(history, 2)
+			if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneHistoryDiscovery); err != nil {
+				t.Fatalf("persist history discovery cursor: %v", err)
+			}
+			if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinkedDiscovery, linked); err != nil {
+				t.Fatalf("restore linked discovery cursor: %v", err)
+			}
+			linkedSelected := bridge.selectBacklogLinkedDiscoveryPaths(linked, 2)
+			if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinkedDiscovery); err != nil {
+				t.Fatalf("persist linked discovery cursor: %v", err)
+			}
+			control, err := store.ReadControl(ctx)
+			if err != nil {
+				t.Fatalf("read discovery cursors: %v", err)
+			}
+			if control.BacklogHistoryDiscoveryFairCursor != historySelected[len(historySelected)-1] {
+				t.Fatalf("history discovery cursor = %q, want %q", control.BacklogHistoryDiscoveryFairCursor, historySelected[len(historySelected)-1])
+			}
+			if control.BacklogLinkedDiscoveryFairCursor != linkedSelected[len(linkedSelected)-1] {
+				t.Fatalf("linked discovery cursor = %q, want %q", control.BacklogLinkedDiscoveryFairCursor, linkedSelected[len(linkedSelected)-1])
+			}
+			if control.BacklogHistoryDiscoveryFairCursor == control.BacklogLinkedDiscoveryFairCursor {
+				t.Fatal("history and linked discovery cursors unexpectedly share durable state")
+			}
+			restarted := &Bridge{store: store}
+			if err := restarted.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneHistoryDiscovery, history); err != nil {
+				t.Fatalf("restore history discovery cursor after restart: %v", err)
+			}
+			if got := restarted.selectBacklogHistoryDiscoveryPaths(history, 2); !reflect.DeepEqual(got, history[2:4]) {
+				t.Fatalf("history discovery after restart = %v, want %v", got, history[2:4])
+			}
+			if err := restarted.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinkedDiscovery, linked); err != nil {
+				t.Fatalf("restore linked discovery cursor after restart: %v", err)
+			}
+			if got := restarted.selectBacklogLinkedDiscoveryPaths(linked, 2); !reflect.DeepEqual(got, linked[2:4]) {
+				t.Fatalf("linked discovery after restart = %v, want %v", got, linked[2:4])
+			}
+		})
+	}
+}
+
+func TestTeamsLinkedDiscoveryQuantumAdvancesPastFailingPrefix(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					HolderMachineID: "linked-discovery-owner", Generation: 13,
+					Status: teamstore.ControlLeaseStatusActive, LeaseUntil: time.Now().Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed linked discovery owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate linked discovery store: %v", err)
+				}
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{MachineID: "linked-discovery-owner", LeaseGeneration: 13})
+			root := t.TempDir()
+			paths := make([]string, 16)
+			for i := range paths {
+				paths[i] = filepath.Join(root, fmt.Sprintf("session-%02d.jsonl", i))
+			}
+			seen := make(map[string]bool, len(paths))
+			for quantum := 0; quantum < 4; quantum++ {
+				// Recreate the bridge just as a listener restart would. The first
+				// four files are a deliberately failing prefix; even when every
+				// selected job fails, the discovery cursor must move to the next
+				// bounded window so the tail is eventually examined.
+				bridge := &Bridge{store: store}
+				if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinkedDiscovery, paths); err != nil {
+					t.Fatalf("restore linked discovery quantum %d: %v", quantum, err)
+				}
+				selected := bridge.selectBacklogLinkedDiscoveryPaths(paths, maxBacklogLinkedRecoveryJobs)
+				want := paths[quantum*maxBacklogLinkedRecoveryJobs : (quantum+1)*maxBacklogLinkedRecoveryJobs]
+				if !reflect.DeepEqual(selected, want) {
+					t.Fatalf("linked discovery quantum %d = %v, want %v", quantum, selected, want)
+				}
+				for _, path := range selected {
+					seen[path] = true
+				}
+				if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinkedDiscovery); err != nil {
+					t.Fatalf("persist linked discovery quantum %d: %v", quantum, err)
+				}
+			}
+			if len(seen) != len(paths) {
+				t.Fatalf("linked discovery cursor did not reach the tail after failing prefix: seen=%v", seen)
+			}
+		})
+	}
+}
+
+func TestTeamsBacklogFairQuantumDiscoversRecentLinkedSessionWithoutCheckpoint(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			runTeamsBacklogFairQuantumDiscoversRecentLinkedSessionWithoutCheckpoint(t, useSQLite)
+		})
+	}
+}
+
+func runTeamsBacklogFairQuantumDiscoversRecentLinkedSessionWithoutCheckpoint(t *testing.T, useSQLite bool) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	root := newBridgeTestCodexRoot(t)
+	now := time.Now().UTC()
+	path := filepath.Join(root, "sessions", now.Format("2006"), now.Format("01"), now.Format("02"), "fair-linked.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create fair linked history directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"type":"session_meta","payload":{"id":"thread-fair-linked","history_mode":"paginated"}}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write fair linked history file: %v", err)
+	}
+	session := appendBridgeTestSession(t, bridge, store, "s-fair-linked", "chat-fair-linked")
+	session.CodexThreadID = "thread-fair-linked"
+	if err := store.UpdateSession(ctx, session.ID, func(state *teamstore.State) error {
+		current := state.Sessions[session.ID]
+		current.CodexThreadID = session.CodexThreadID
+		state.Sessions[session.ID] = current
+		return nil
+	}); err != nil {
+		t.Fatalf("persist fair linked thread: %v", err)
+	}
+	bridge.regMu.Lock()
+	for i := range bridge.reg.Sessions {
+		if bridge.reg.Sessions[i].ID == session.ID {
+			bridge.reg.Sessions[i].CodexThreadID = session.CodexThreadID
+		}
+	}
+	bridge.regMu.Unlock()
+	if useSQLite {
+		if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+			t.Fatalf("migrate fair linked discovery store: %v", err)
+		}
+	}
+	bridge.scope.CodexHome = root
+	var discovered string
+	bridge.linkedTranscriptSessionHook = func(_ context.Context, got Session) error {
+		discovered = got.ID
+		return context.Canceled
+	}
+	err := bridge.syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx, false, now, true, true, true)
+	if discovered != session.ID {
+		t.Fatalf("fair linked discovery selected %q, want %q; err=%v", discovered, session.ID, err)
+	}
+	if err == nil {
+		t.Fatal("fair linked discovery hook cancellation was swallowed")
+	}
+}
+
+func TestTeamsLinkedBacklogFairCursorPersistsAfterSuccessfulQuanta(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%t", useSQLite), func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					HolderMachineID: "fair-owner", Generation: 9, Status: teamstore.ControlLeaseStatusActive,
+					LeaseUntil: time.Now().Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed fairness owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate fairness cursor store: %v", err)
+				}
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{MachineID: "fair-owner", LeaseGeneration: 9})
+			bridge := &Bridge{store: store}
+			jobs := make([]linkedTranscriptSyncJob, 0, maxBacklogLinkedRecoveryJobs+1)
+			keys := make([]string, 0, maxBacklogLinkedRecoveryJobs+1)
+			for i := 0; i < maxBacklogLinkedRecoveryJobs+1; i++ {
+				job := linkedTranscriptSyncJob{session: Session{ID: fmt.Sprintf("linked-fair-%d", i)}}
+				jobs = append(jobs, job)
+				keys = append(keys, linkedTranscriptFairJobKey(job))
+			}
+			seen := make(map[string]bool)
+			for quantum := 0; quantum < 3; quantum++ {
+				if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinked, keys); err != nil {
+					t.Fatalf("restore linked fairness cursor quantum %d: %v", quantum, err)
+				}
+				selected := bridge.selectBacklogLinkedRecoveryJobsWithLimit(jobs, 2)
+				if len(selected) != 2 {
+					t.Fatalf("linked fairness quantum %d selected %d jobs, want 2", quantum, len(selected))
+				}
+				for _, job := range selected {
+					seen[linkedTranscriptFairJobKey(job)] = true
+				}
+				if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.BacklogFairLaneLinked); err != nil {
+					t.Fatalf("persist linked fairness cursor quantum %d: %v", quantum, err)
+				}
+				control, err := store.ReadControl(ctx)
+				if err != nil {
+					t.Fatalf("read linked fairness cursor quantum %d: %v", quantum, err)
+				}
+				want := linkedTranscriptFairJobKey(selected[len(selected)-1])
+				if control.BacklogLinkedFairCursor != want {
+					t.Fatalf("durable linked fairness cursor quantum %d = %q, want %q", quantum, control.BacklogLinkedFairCursor, want)
+				}
+			}
+			if !seen["linked-fair-4"] {
+				t.Fatalf("successful linked fairness quanta never reached tail job: seen=%v", seen)
+			}
+		})
+	}
 }
 
 func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, useSQLite bool) {
@@ -197,9 +601,15 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
-	options.PhaseBudget = 500 * time.Millisecond
-	options.PollWorkerBudget = 100 * time.Millisecond
-	options.OwnerStaleAfter = 2 * time.Second
+	// This vertical test is about the durable backlog gate and the mandatory
+	// versus optional lanes.  A 500ms synthetic phase budget makes the SQLite
+	// assertion depend on race-instrumented JSON1/query startup rather than on
+	// that gate; use the production budgets and keep lease expiry out of the
+	// fairness assertion.  Short phase cancellation remains covered by the
+	// dedicated poll/cleanup regression tests.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	options.OwnerStaleAfter = 2 * time.Minute
 	listener := startListenerRecovery(t, bridge, options)
 	var releaseOnce sync.Once
 	releaseExecutor := func() {
@@ -258,7 +668,11 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	}
 
 	releaseExecutor()
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	// After the blocked turn is released, the second durable turn still has to
+	// pass claim, execution, completion, and outbox delivery before the
+	// optional lane may wake.  Under -race that multi-step tail can exceed the
+	// ordinary 10-second assertion window even though it is making progress.
+	deadline := time.Now().Add(listenerRecoveryMultiStepProgressTimeout)
 	for time.Now().Before(deadline) {
 		queued, err = store.HasQueuedTurns(ctx)
 		if err != nil {
@@ -279,7 +693,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 		// Teams queue is no longer active.
 	case err := <-listener.done:
 		t.Fatalf("listener exited before optional maintenance woke: %v; output=%s", err, listenerOutput.String())
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryMultiStepProgressTimeout):
 		t.Fatalf("optional history maintenance did not wake after backlog drain; control=%#v phase=%#v output=%s", func() teamstore.ServiceControl {
 			control, _ := store.ReadControl(ctx)
 			return control

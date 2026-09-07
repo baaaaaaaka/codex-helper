@@ -180,7 +180,7 @@ func (b *Bridge) deferForkChildMessage(ctx context.Context, session *Session, ms
 // pollStagedForkChildren gives a child chat a durable input path before the
 // child session enters the normal active registry projection. Messages are
 // persisted as deferred input and are replayed only after ActivateFork.
-func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int) error {
+func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int, graphBudget time.Duration) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -220,11 +220,16 @@ func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int) error {
 		if !decision.Due {
 			continue
 		}
+		// The per-cycle cap bounds attempts, not only successful polls. A
+		// provider outage on every staged child must not turn this phase into an
+		// unbounded scan that delays normal work-chat admission.
+		polled++
 		childSession := registrySessionFromDurable(child)
 		if _, err := b.pollChatWithRoleStateOptions(ctx, child.TeamsChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, false, poll, hasPoll, pollChatWithRoleOptions{
 			AllowBacklogDrain:        true,
 			MaxBacklogActions:        1,
 			RecoverStaleContinuation: true,
+			GraphBudget:              graphBudget,
 		}, func(ctx context.Context, msg ChatMessage, text string) error {
 			return b.deferForkChildMessage(ctx, &childSession, msg, text)
 		}); err != nil {
@@ -233,7 +238,6 @@ func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int) error {
 			}
 			continue
 		}
-		polled++
 	}
 	return firstErr
 }

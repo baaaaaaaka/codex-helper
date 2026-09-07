@@ -581,6 +581,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodGet, "/chats/a/messages?$filter=createdDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/a/messages?$orderby=createdDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/a/messages?$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20ge%202026-05-01T00%3A00%3A00Z%20and%20lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/a/messages?$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20ge%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/a/messages?$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20lt%202026-05-01T00%3A00%3A00Z%20and%20lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
 	}
 	for _, tc := range rejected {
 		if isAllowedGraphRequest(tc.method, tc.path) {
@@ -612,8 +614,8 @@ func TestGraphAllowlistRejectsUnexpectedEndpoints(t *testing.T) {
 		{http.MethodPut, "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/file.txt:/content"},
 		{http.MethodGet, "/me/drive/items/item-id?$select=id,name,size,eTag,webUrl,webDavUrl"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z"},
-		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20ge%202026-04-30T00%3A00%3A00Z%20and%20lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
-		{http.MethodGet, "/chats/chat-id/messages?$top=20&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20le%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/chat-id/messages?$top=50&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20gt%202026-04-30T00%3A00%3A00Z%20and%20lastModifiedDateTime%20lt%202026-04-30T00%3A00%3A00Z"},
+		{http.MethodGet, "/chats/chat-id/messages?$top=20&$orderby=lastModifiedDateTime%20desc&$filter=lastModifiedDateTime%20lt%202026-04-30T00%3A00%3A00Z"},
 		{http.MethodGet, "/chats/chat-id/messages?$top=50&$skiptoken=abc123"},
 		{http.MethodPost, "/chats/chat-id/messages"},
 		{http.MethodPost, "/chats/chat-id/messages/replyWithQuote"},

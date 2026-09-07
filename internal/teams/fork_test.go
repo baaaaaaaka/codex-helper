@@ -2,16 +2,67 @@ package teams
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+func TestPollStagedForkChildrenBoundsFailedAttemptsPerCycle(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	const stagedChildren = 9
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for i := 0; i < stagedChildren; i++ {
+			childID := fmt.Sprintf("staged-child-%02d", i)
+			chatID := fmt.Sprintf("staged-chat-%02d", i)
+			state.Sessions[childID] = teamstore.SessionContext{
+				ID: childID, Status: teamstore.SessionStatusStaging, TeamsChatID: chatID,
+				CodexThreadID: "thread-" + childID, UpdatedAt: now,
+			}
+			state.ChatPolls[chatID] = teamstore.ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+				NextPollAt: now.Add(-time.Second), LastActivityAt: now,
+			}
+			state.ForkOperations[fmt.Sprintf("staged-operation-%02d", i)] = teamstore.ForkOperation{
+				ID: fmt.Sprintf("staged-operation-%02d", i), ChildSessionID: childID,
+				ChildChatID: chatID, Phase: teamstore.ForkPhaseChildChatStaged, UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed staged fork children: %v", err)
+	}
+	var requests atomic.Int64
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return nil, errors.New("synthetic staged-child Graph outage")
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.maxWorkChatPollsPerCycle = 2
+	if err := bridge.pollStagedForkChildren(ctx, 20, time.Second); err == nil {
+		t.Fatal("staged child outage unexpectedly returned nil")
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("failed staged-child attempts = %d, want the per-cycle cap 2", got)
+	}
+}
 
 func TestSplitForkHistoryBodyUsesTeamsChunkLimit(t *testing.T) {
 	text := strings.Repeat("<&> history line\n", 6000)

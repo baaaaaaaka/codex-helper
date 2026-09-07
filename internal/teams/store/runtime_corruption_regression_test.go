@@ -460,6 +460,70 @@ func TestSQLiteEmptyMaterializedRuntimeProjectionDoesNotFallbackToStaleColdState
 	}
 }
 
+// A pre-projection SQLite database has only the cold state_json row. Opening it
+// must materialize the small runtime binding once; otherwise every hot poll
+// falls back to decoding the entire cold document and large Teams backlogs can
+// make the listener appear stalled again.
+func TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "legacy-runtime-control-chat"}
+		state.ChatPolls["legacy-runtime-poll"] = ChatPollState{
+			ChatID: "legacy-runtime-poll", Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy runtime state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM runtime_state`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM state_meta WHERE key = ?`, sqliteRuntimeProjectionMaterializedKey)
+		return err
+	})
+	store.sqliteRuntimeMu.Lock()
+	if err := store.closeSQLiteDBLocked(); err != nil {
+		store.sqliteRuntimeMu.Unlock()
+		t.Fatalf("close sqlite handle: %v", err)
+	}
+	store.sqliteRuntimeMu.Unlock()
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "legacy-runtime-control-chat", now)
+	if err != nil {
+		t.Fatalf("hot poll after legacy runtime bootstrap: %v", err)
+	}
+	if got := schedule.ControlChat.TeamsChatID; got != "legacy-runtime-control-chat" {
+		t.Fatalf("bootstrapped control chat = %q, want legacy-runtime-control-chat", got)
+	}
+	if _, ok := schedule.ChatPolls["legacy-runtime-poll"]; !ok {
+		t.Fatalf("bootstrapped hot poll omitted due chat: %#v", schedule.ChatPolls)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_state WHERE key IN (?, ?, ?, ?, ?, ?)`,
+			sqliteRuntimeRequiredKeys[0], sqliteRuntimeRequiredKeys[1], sqliteRuntimeRequiredKeys[2],
+			sqliteRuntimeRequiredKeys[3], sqliteRuntimeRequiredKeys[4], sqliteRuntimeRequiredKeys[5]).Scan(&count); err != nil {
+			return err
+		}
+		if count != len(sqliteRuntimeRequiredKeys) {
+			return fmt.Errorf("bootstrapped runtime required rows = %d, want %d", count, len(sqliteRuntimeRequiredKeys))
+		}
+		var marker string
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteRuntimeProjectionMaterializedKey).Scan(&marker); err != nil {
+			return err
+		}
+		if marker != sqliteRuntimeProjectionMaterializedValue {
+			return fmt.Errorf("runtime bootstrap marker = %q, want %q", marker, sqliteRuntimeProjectionMaterializedValue)
+		}
+		return nil
+	})
+}
+
 // A full runtime-state mutation must not use a stale cold snapshot to fill a
 // missing required projection row after the runtime projection has already
 // been materialized.  The safe result is a fenced error; targeted liveness

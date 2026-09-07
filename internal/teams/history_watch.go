@@ -39,18 +39,32 @@ func (b *Bridge) runHistoryWatchSyncJobs(ctx context.Context, paths []string, no
 	}
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	jobs := make(chan int, len(paths))
 	results := make(chan result, len(paths))
-	for index := range paths {
-		jobs <- index
+	var nextJobMu sync.Mutex
+	nextJob := 0
+	takeJob := func() (int, bool) {
+		// Reservation and cancellation are one fence. A buffered jobs channel
+		// leaves a race where a ready receive wins alongside Done and starts
+		// another durable checkpoint after a process-wide store failure.
+		nextJobMu.Lock()
+		defer nextJobMu.Unlock()
+		if workCtx.Err() != nil || nextJob >= len(paths) {
+			return 0, false
+		}
+		index := nextJob
+		nextJob++
+		return index, true
 	}
-	close(jobs)
 	var workers sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for index := range jobs {
+			for {
+				index, ok := takeJob()
+				if !ok {
+					return
+				}
 				path := paths[index]
 				jobCtx, jobCancel := boundedTeamsPhaseJobContext(workCtx)
 				var err error
@@ -227,29 +241,120 @@ func (b *Bridge) historyWatchPendingDirtyPaths() []string {
 }
 
 func historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint teamstore.HistoryWatchCheckpoint) bool {
-	if checkpoint.SourceRewriteBlocked || checkpoint.LegacySourceUnverified || checkpoint.RecoveryProofUnusable {
+	if checkpoint.SourceRewriteBlocked || checkpoint.LegacySourceUnverified || checkpoint.RecoveryProofUnusable ||
+		checkpoint.OversizedRecordBlocked || checkpoint.SourceRewriteRecoveryScanPending {
 		return true
 	}
 	if checkpoint.PartialLineStartOffset > 0 || checkpoint.PartialReadOffset > 0 || checkpoint.PartialObservedSize > 0 {
+		return true
+	}
+	// A legacy row with a non-empty physical cursor but no bounded prefix proof
+	// must be selected by the mandatory lane even when it currently appears
+	// caught up.  The sync path will migrate it to the explicit
+	// LegacySourceUnverified boundary; otherwise a quiet, equal-size source can
+	// remain invisible forever because neither the dirty hint nor recent-file
+	// discovery is required to select it.
+	if checkpoint.Size > 0 && checkpoint.Offset > 0 && strings.TrimSpace(checkpoint.SourceFingerprint) == "" {
+		return true
+	}
+	if checkpoint.UnresolvedContinuation || checkpoint.PendingRootTaskStarted ||
+		strings.TrimSpace(checkpoint.PendingAssistantSourceID) != "" ||
+		strings.TrimSpace(checkpoint.PendingAssistantThreadID) != "" ||
+		strings.TrimSpace(checkpoint.PendingAssistantTurnID) != "" ||
+		strings.TrimSpace(checkpoint.PendingAssistantText) != "" ||
+		checkpoint.ContextGap != nil || checkpoint.PendingHistoryRange != nil {
+		return true
+	}
+	if checkpoint.TranscriptQuarantine != nil && teamstore.TranscriptQuarantineHasFrontier(checkpoint.TranscriptQuarantine) {
 		return true
 	}
 	return checkpoint.Offset > checkpoint.Size
 }
 
 func (b *Bridge) selectBacklogHistoryRecoveryPaths(paths []string) []string {
+	return b.selectBacklogHistoryRecoveryPathsWithLimit(paths, maxBacklogHistoryRecoveryJobs)
+}
+
+func (b *Bridge) selectBacklogHistoryRecoveryPathsWithLimit(paths []string, limit int) []string {
 	paths = uniqueSortedCleanPaths(paths)
-	if len(paths) <= maxBacklogHistoryRecoveryJobs || b == nil {
+	if limit <= 0 || len(paths) <= limit || b == nil {
 		return paths
 	}
 	b.backlogMaintenanceMu.Lock()
 	start := b.backlogHistoryRecoveryCursor % len(paths)
-	b.backlogHistoryRecoveryCursor = (start + maxBacklogHistoryRecoveryJobs) % len(paths)
+	b.backlogHistoryRecoveryCursor = (start + limit) % len(paths)
 	b.backlogMaintenanceMu.Unlock()
-	selected := make([]string, 0, maxBacklogHistoryRecoveryJobs)
-	for i := 0; i < maxBacklogHistoryRecoveryJobs; i++ {
+	selected := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
 		selected = append(selected, paths[(start+i)%len(paths)])
 	}
+	b.backlogMaintenanceMu.Lock()
+	b.backlogHistoryRecoveryCursorKey = selected[len(selected)-1]
+	b.backlogMaintenanceMu.Unlock()
 	return uniqueSortedCleanPaths(selected)
+}
+
+func (b *Bridge) selectBacklogHistoryDiscoveryPaths(paths []string, limit int) []string {
+	paths = uniqueSortedCleanPaths(paths)
+	if limit <= 0 || len(paths) == 0 || b == nil {
+		return nil
+	}
+	if len(paths) <= limit {
+		return paths
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.backlogHistoryDiscoveryCursor % len(paths)
+	b.backlogHistoryDiscoveryCursor = (start + limit) % len(paths)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		selected = append(selected, paths[(start+i)%len(paths)])
+	}
+	b.backlogMaintenanceMu.Lock()
+	b.backlogHistoryDiscoveryCursorKey = selected[len(selected)-1]
+	b.backlogMaintenanceMu.Unlock()
+	return uniqueSortedCleanPaths(selected)
+}
+
+func (b *Bridge) selectBacklogLinkedDiscoveryPaths(paths []string, limit int) []string {
+	paths = uniqueSortedCleanPaths(paths)
+	if limit <= 0 || len(paths) == 0 || b == nil {
+		return nil
+	}
+	if len(paths) <= limit {
+		return paths
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.backlogLinkedDiscoveryCursor % len(paths)
+	b.backlogLinkedDiscoveryCursor = (start + limit) % len(paths)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		selected = append(selected, paths[(start+i)%len(paths)])
+	}
+	b.backlogMaintenanceMu.Lock()
+	b.backlogLinkedDiscoveryCursorKey = selected[len(selected)-1]
+	b.backlogMaintenanceMu.Unlock()
+	return uniqueSortedCleanPaths(selected)
+}
+
+func removeHistoryWatchPaths(paths, excluded []string) []string {
+	if len(paths) == 0 || len(excluded) == 0 {
+		return uniqueSortedCleanPaths(paths)
+	}
+	blocked := make(map[string]struct{}, len(excluded))
+	for _, path := range excluded {
+		if path = cleanComparablePath(path); path != "" {
+			blocked[path] = struct{}{}
+		}
+	}
+	filtered := make([]string, 0, len(paths))
+	for _, path := range uniqueSortedCleanPaths(paths) {
+		if _, ok := blocked[path]; !ok {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
 }
 
 // syncCodexHistoryFinalsForBacklog keeps only explicit recovery/delete/proof
@@ -258,6 +363,18 @@ func (b *Bridge) selectBacklogHistoryRecoveryPaths(paths []string) []string {
 // normal history watcher performs those operations immediately after the
 // backlog probe wakes it.
 func (b *Bridge) syncCodexHistoryFinalsForBacklog(ctx context.Context, now time.Time) error {
+	return b.syncCodexHistoryFinalsForBacklogWithDiscovery(ctx, now, false)
+}
+
+// syncCodexHistoryFinalsForBacklogFair adds one bounded recent-file discovery
+// quantum to the mandatory recovery lane. It never reconciles the full project
+// tree or establishes a partial baseline, so Teams recovery retains priority
+// while a new local conversation still has a bounded route to publication.
+func (b *Bridge) syncCodexHistoryFinalsForBacklogFair(ctx context.Context, now time.Time) error {
+	return b.syncCodexHistoryFinalsForBacklogWithDiscovery(ctx, now, true)
+}
+
+func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Context, now time.Time, allowDiscovery bool) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
@@ -265,22 +382,96 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklog(ctx context.Context, now time.
 	if err != nil {
 		return err
 	}
-	paths := b.historyWatchPendingDirtyPaths()
+	recoveryPaths := b.historyWatchPendingDirtyPaths()
 	for _, checkpoint := range state.HistoryWatch {
 		if historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
-			paths = append(paths, checkpoint.Path)
+			recoveryPaths = append(recoveryPaths, checkpoint.Path)
 		}
 	}
-	paths = b.selectBacklogHistoryRecoveryPaths(paths)
+	recoveryPaths = uniqueSortedCleanPaths(recoveryPaths)
+	recoveryLimit := maxBacklogHistoryRecoveryJobs
+	var firstErr error
+	var optional []string
+	if allowDiscovery && !state.HistoryWatchReady.IsZero() {
+		root, rootErr := codexhistory.ResolveCodexDir(b.scope.CodexHome)
+		if rootErr != nil {
+			firstErr = fmt.Errorf("resolve Codex history directory for backlog fairness: %w", rootErr)
+		} else if recent, recentErr := historyTieredListSessionFilesInDirsContext(ctx, historyWatchRecentSessionDirs(root, now, historyWatchRecentDays)); recentErr != nil {
+			firstErr = fmt.Errorf("list recent Codex history sessions for backlog fairness: %w", recentErr)
+		} else {
+			optional = removeHistoryWatchPaths(recent, recoveryPaths)
+		}
+	}
+	if allowDiscovery && len(optional) > 0 && len(recoveryPaths) > 0 {
+		// Keep one bounded slot for recent discovery during a fairness quantum.
+		// Mandatory source-proof/rewrite recovery remains the majority of the
+		// batch and is still selected on every backlog wake.
+		recoveryLimit--
+		if recoveryLimit < 1 {
+			recoveryLimit = 1
+		}
+	}
+	if len(recoveryPaths) > recoveryLimit {
+		if err := b.restoreBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryRecovery, recoveryPaths); err != nil {
+			return errors.Join(firstErr, err)
+		}
+	}
+	if len(optional) > 0 {
+		usedRecovery := len(recoveryPaths)
+		if usedRecovery > recoveryLimit {
+			usedRecovery = recoveryLimit
+		}
+		slots := maxBacklogHistoryRecoveryJobs - usedRecovery
+		if slots > 0 && len(optional) > slots {
+			if err := b.restoreBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery, optional); err != nil {
+				return errors.Join(firstErr, err)
+			}
+		}
+	}
+	paths := b.selectBacklogHistoryRecoveryPathsWithLimit(recoveryPaths, recoveryLimit)
+	if allowDiscovery && len(optional) > 0 {
+		slots := maxBacklogHistoryRecoveryJobs - len(paths)
+		if slots > 0 {
+			paths = append(paths, b.selectBacklogHistoryDiscoveryPaths(optional, slots)...)
+		}
+	}
+	paths = uniqueSortedCleanPaths(paths)
 	if len(paths) == 0 {
-		return nil
+		return firstErr
 	}
 	changes, scanErr := historyWatchChangedPaths(paths, state, true)
 	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
-	if syncErr != nil {
+	// The selection cursor is a scheduling fact, not a success marker. Once a
+	// bounded quantum has been selected, ordinary path/scan/handler failures
+	// must still persist the consumed prefix while the dirty path remains queued;
+	// otherwise every restart retries the same failing prefix and the tail can be
+	// starved indefinitely. A process-wide/lease/persistence failure is different:
+	// do not advance durable fairness state when the owner no longer has a safe
+	// write capability or the store cannot prove the write.
+	canPersistFairCursor := backlogFairCursorPersistAllowed(ctx, firstErr, scanErr, syncErr)
+	if canPersistFairCursor {
+		if err := b.persistBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryRecovery); err != nil {
+			syncErr = errors.Join(syncErr, err)
+			canPersistFairCursor = false
+		}
+		if err := b.persistBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery); err != nil {
+			syncErr = errors.Join(syncErr, err)
+			canPersistFairCursor = false
+		}
+	}
+	if syncErr != nil || scanErr != nil || firstErr != nil {
 		b.historyWatchRetryDirtyPaths(paths)
-	} else if scanErr == nil {
+	} else if canPersistFairCursor {
 		b.historyWatchAckDirtyPaths(paths)
+	}
+	if firstErr != nil {
+		if scanErr != nil {
+			firstErr = errors.Join(firstErr, scanErr)
+		}
+		if syncErr != nil {
+			firstErr = errors.Join(firstErr, syncErr)
+		}
+		return firstErr
 	}
 	if scanErr != nil && syncErr != nil {
 		return errors.Join(scanErr, syncErr)
@@ -348,7 +539,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		firstErr = fmt.Errorf("resolve Codex history directory: %w", rootErr)
 	} else {
 		var recentErr error
-		recent, recentErr = historyTieredListSessionFilesInDirs(historyWatchRecentSessionDirs(root, now, historyWatchRecentDays))
+		recent, recentErr = historyTieredListSessionFilesInDirsContext(ctx, historyWatchRecentSessionDirs(root, now, historyWatchRecentDays))
 		if recentErr != nil {
 			firstErr = fmt.Errorf("list recent Codex history sessions: %w", recentErr)
 		} else {
@@ -1762,19 +1953,11 @@ func (b *Bridge) sessionHasTeamsManagedTurns(ctx context.Context, sessionID stri
 	if sessionID == "" {
 		return true
 	}
-	state, err := b.store.Load(ctx)
+	hasTurns, err := b.store.SessionHasTeamsManagedTurns(ctx, sessionID)
 	if err != nil {
 		return true
 	}
-	if durable, ok := state.Sessions[sessionID]; ok && strings.TrimSpace(durable.LatestTurnID) != "" {
-		return true
-	}
-	for _, turn := range state.Turns {
-		if strings.TrimSpace(turn.SessionID) == sessionID {
-			return true
-		}
-	}
-	return false
+	return hasTurns
 }
 
 func (b *Bridge) findHistoryWatchCodexSession(ctx context.Context, path string, threadID string) (codexhistory.Session, codexhistory.Project, bool, error) {

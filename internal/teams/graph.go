@@ -78,6 +78,11 @@ const (
 	maxHostedContentBytes         = 20 << 20
 	maxSharedFileBytes            = 20 << 20
 	maxDriveItemJSONBytes         = 2 << 20
+	// Graph chat-message datetime filters are provider timestamps rather than
+	// arbitrary nanosecond-precision database comparisons. Widening bounds to a
+	// millisecond bucket keeps equal-timestamp records reachable on tenants
+	// that truncate filter literals before evaluating them.
+	graphDateTimePrecision = time.Millisecond
 	// Use Graph's documented resumable-upload path above 10 MiB. This is a
 	// protocol boundary, not an application file-size limit: larger files are
 	// still accepted up to maxTeamsTransferBytes and are sent in sessions.
@@ -1421,17 +1426,21 @@ func chatMessagesPathWithTopAndOrder(chatID string, top int, modifiedAfter time.
 		values.Set("$orderby", orderBy)
 	}
 	if !modifiedAfter.IsZero() {
-		values.Set("$filter", "lastModifiedDateTime gt "+modifiedAfter.UTC().Format(time.RFC3339Nano))
+		values.Set("$filter", "lastModifiedDateTime gt "+formatGraphDateTimeBound(modifiedAfter))
 	}
 	return "/chats/" + url.PathEscape(chatID) + "/messages?" + values.Encode()
 }
 
 // chatMessagesGapPath builds the provider-supported descending recovery query
-// for an expired continuation. The lower bound is the last normal-safe cursor;
-// the optional upper bound moves backwards after each complete page. Both
-// bounds are inclusive so messages sharing a timestamp with a cursor remain
-// recoverable. Graph
-// v1.0 does not support ascending lastModifiedDateTime ordering, so the
+// for an expired continuation. Graph chat-message list filtering supports only
+// the gt/lt operators for lastModifiedDateTime; it does not accept the more
+// natural inclusive ge/le spellings. Expand the lower bound by the same
+// overlap used by the normal head poll and move the upper bound by one Graph
+// timestamp precision tick before expressing the inclusive interval as gt/lt.
+// The overlap keeps equal-timestamp records reachable without advancing the
+// cursor or relying on an unsupported provider operator.
+//
+// Graph v1.0 does not support ascending lastModifiedDateTime ordering, so the
 // bridge must never construct that query.
 func chatMessagesGapPath(chatID string, top int, lower, upper time.Time) string {
 	top = normalizedGraphMessagesExactTop(top)
@@ -1439,19 +1448,37 @@ func chatMessagesGapPath(chatID string, top int, lower, upper time.Time) string 
 	values.Set("$top", strconv.Itoa(top))
 	values.Set("$orderby", "lastModifiedDateTime desc")
 	filter := ""
-	if !lower.IsZero() {
-		filter = "lastModifiedDateTime ge " + lower.UTC().Format(time.RFC3339Nano)
-	}
-	if !upper.IsZero() && (lower.IsZero() || !upper.Before(lower)) {
-		if filter != "" {
-			filter += " and "
+	if !lower.IsZero() && !upper.IsZero() && upper.Before(lower) {
+		// RecoveryCursor has crossed SafeCursor. There is no valid interval to
+		// enumerate; never silently drop the upper bound and turn this into an
+		// unbounded descending stream. An equal exclusive interval is provider
+		// compatible and deliberately returns no records until the durable gap
+		// reducer decides how to retire or re-probe the evidence.
+		boundary := formatGraphDateTimeBound(upper)
+		filter = "lastModifiedDateTime gt " + boundary + " and lastModifiedDateTime lt " + boundary
+	} else {
+		if !lower.IsZero() {
+			filter = "lastModifiedDateTime gt " + formatGraphDateTimeBound(lower.Add(-pollCursorOverlap))
 		}
-		filter += "lastModifiedDateTime le " + upper.UTC().Format(time.RFC3339Nano)
+		if !upper.IsZero() {
+			if filter != "" {
+				filter += " and "
+			}
+			filter += "lastModifiedDateTime lt " + formatGraphDateTimeExclusiveUpper(upper)
+		}
 	}
 	if filter != "" {
 		values.Set("$filter", filter)
 	}
 	return "/chats/" + url.PathEscape(chatID) + "/messages?" + values.Encode()
+}
+
+func formatGraphDateTimeBound(value time.Time) string {
+	return value.UTC().Truncate(graphDateTimePrecision).Format(time.RFC3339Nano)
+}
+
+func formatGraphDateTimeExclusiveUpper(value time.Time) string {
+	return value.UTC().Truncate(graphDateTimePrecision).Add(graphDateTimePrecision).Format(time.RFC3339Nano)
 }
 
 func normalizedGraphMessagesTop(top int) int {
@@ -2287,10 +2314,14 @@ func allowedLastModifiedFilter(value string) bool {
 		if len(fields) != 3 || fields[0] != "lastModifiedDateTime" {
 			return time.Time{}, "", false
 		}
-		if lower && fields[1] != "gt" && fields[1] != "ge" {
+		// Microsoft Graph's chat-message endpoint only documents exclusive
+		// gt/lt bounds. Keep the local request allow-list exactly as strict as
+		// the production builder; accepting ge/le here would let a fake or a
+		// future caller mask a provider-incompatible recovery request.
+		if lower && fields[1] != "gt" {
 			return time.Time{}, "", false
 		}
-		if !lower && fields[1] != "lt" && fields[1] != "le" {
+		if !lower && fields[1] != "lt" {
 			return time.Time{}, "", false
 		}
 		stamp, err := time.Parse(time.RFC3339Nano, fields[2])
