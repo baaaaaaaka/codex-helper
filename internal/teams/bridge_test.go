@@ -126,6 +126,24 @@ func (e *recordingExecutor) Run(_ context.Context, session *Session, prompt stri
 	return result, err
 }
 
+func (e *recordingExecutor) promptCount() int {
+	if e == nil {
+		return 0
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.prompts)
+}
+
+func (e *recordingExecutor) promptSnapshot() []string {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.prompts...)
+}
+
 type bridgeCodexLauncher struct {
 	result codexrunner.LaunchResult
 	err    error

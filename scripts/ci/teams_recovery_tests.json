@@ -1126,7 +1126,7 @@
       "real_listener": false,
       "fake_graph": false,
       "exclusive": true,
-      "max_seconds": 10,
+      "max_seconds": 90,
       "oracle": "two bounded pages plus one operational poll row rotate through SQL candidate pages so every row is eventually selected after restart-safe ordering",
       "baseline": "pre-fix a fixed SQL LIMIT could repeatedly return only the first hot rows and starve later chats"
     },

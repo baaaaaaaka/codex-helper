@@ -390,19 +390,28 @@ func dockerFixtureSanitizeRegistryWorkspacePaths(registry *Registry) {
 }
 
 func dockerFixtureSourcePath(fixtureRoot string, persistedPath string) string {
-	persistedPath = strings.TrimSpace(persistedPath)
-	if persistedPath == "" {
+	rawPersistedPath := strings.TrimSpace(persistedPath)
+	if rawPersistedPath == "" {
 		return ""
 	}
+	// Persisted Codex paths use the host's native separator, while this test
+	// also exercises the stable slash form used by the Docker fixture. Normalize
+	// both before prefix matching so the containment rule behaves identically on
+	// Unix and Windows.
+	persistedPath = filepath.Clean(filepath.FromSlash(rawPersistedPath))
 	sourcePrefix := strings.TrimSpace(os.Getenv(dockerCodexSourceEnv))
 	if sourcePrefix == "" {
 		sourcePrefix = dockerFixtureCodexDir
 	}
+	sourcePrefix = filepath.Clean(filepath.FromSlash(sourcePrefix))
 	if !strings.HasSuffix(sourcePrefix, string(filepath.Separator)) {
 		sourcePrefix += string(filepath.Separator)
 	}
 	prefixes := []string{sourcePrefix}
-	canonicalPrefix := filepath.FromSlash(dockerFixtureCodexDir)
+	canonicalPrefix := filepath.Clean(filepath.FromSlash(dockerFixtureCodexDir))
+	if !strings.HasSuffix(canonicalPrefix, string(filepath.Separator)) {
+		canonicalPrefix += string(filepath.Separator)
+	}
 	if canonicalPrefix != sourcePrefix {
 		prefixes = append(prefixes, canonicalPrefix)
 	}
@@ -430,7 +439,7 @@ func dockerFixtureSourcePath(fixtureRoot string, persistedPath string) string {
 		// bypassing that check.
 		return ""
 	}
-	return persistedPath
+	return rawPersistedPath
 }
 
 func dockerFixtureContainedRegularPath(root string, candidate string) string {
