@@ -668,7 +668,11 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	}
 
 	releaseExecutor()
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	// After the blocked turn is released, the second durable turn still has to
+	// pass claim, execution, completion, and outbox delivery before the
+	// optional lane may wake.  Under -race that multi-step tail can exceed the
+	// ordinary 10-second assertion window even though it is making progress.
+	deadline := time.Now().Add(listenerRecoveryMultiStepProgressTimeout)
 	for time.Now().Before(deadline) {
 		queued, err = store.HasQueuedTurns(ctx)
 		if err != nil {
@@ -689,7 +693,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 		// Teams queue is no longer active.
 	case err := <-listener.done:
 		t.Fatalf("listener exited before optional maintenance woke: %v; output=%s", err, listenerOutput.String())
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryMultiStepProgressTimeout):
 		t.Fatalf("optional history maintenance did not wake after backlog drain; control=%#v phase=%#v output=%s", func() teamstore.ServiceControl {
 			control, _ := store.ReadControl(ctx)
 			return control
