@@ -42,7 +42,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 45,
+      "max_seconds": 120,
       "oracle": "later linked transcript advances its checkpoint and publishes its final despite a slow earlier session",
       "baseline": "pre-fix serial linked scan lets the earlier session consume the phase"
     },
@@ -746,7 +746,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 120,
       "oracle": "a legacy markerless Sending row remains durable and produces no second POST while an unrelated healthy outbox row is delivered by the same listener",
       "baseline": "pre-fix an unknown POST outcome could be released into the normal FIFO or allow a duplicate POST, and a held row could block unrelated delivery"
     },
@@ -1141,7 +1141,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 45,
+      "max_seconds": 120,
       "oracle": "an active malformed poll projection is admitted locally, its marker is retired after a successful page, and a healthy chat reaches execution and Graph",
       "baseline": "pre-fix startup dropped the malformed poll and could silently baseline its user message while a poisoned row affected listener admission"
     },

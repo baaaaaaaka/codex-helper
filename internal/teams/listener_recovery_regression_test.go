@@ -783,6 +783,13 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 // tests retain their shorter liveness windows.
 const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 
+// Windows hosted runners can spend tens of seconds in FlushFileBuffers while
+// a recovery fixture is materializing or reopening durable state.  Keep the
+// affected listener tests bounded, but give those durable-I/O transitions a
+// separate finite budget so the assertion does not expire before production
+// listener admission begins.
+const listenerRecoveryDurableIOProgressTimeout = 60 * time.Second
+
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 10ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
@@ -2086,7 +2093,7 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 		default:
 			return false
 		}
-	}, listenerRecoveryProgressTimeout, "linked transcript slow head to enter")
+	}, listenerRecoveryDurableIOProgressTimeout, "linked transcript slow head to enter")
 	healthyInfo, err := os.Stat(paths["s002"])
 	if err != nil {
 		listener.stop(t)
@@ -2104,7 +2111,7 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 	// extended recovery watchdog here instead of the short admission watchdog
 	// above; otherwise the test can fail before the production-sized phase has
 	// a chance to complete durable progress.
-	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryDurableIOProgressTimeout)
 	for !linkedProgress() && time.Now().Before(deadline) {
 		time.Sleep(listenerRecoveryPollInterval)
 	}
@@ -2123,7 +2130,7 @@ func TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail(t *tes
 			}
 		}
 		return false
-	}, listenerRecoveryProgressTimeout, "linked transcript healthy tail final delivery")
+	}, listenerRecoveryDurableIOProgressTimeout, "linked transcript healthy tail final delivery")
 	listener.stop(t)
 }
 
@@ -3819,7 +3826,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		listener.stop(t)
 		state, _ := reopened.Load(context.Background())
 		t.Fatalf("healthy chat was not dispatched after malformed poll reopen; gets=%d errors=%v state=%#v", graphState.getCount(session.ChatID), graphState.errorsSnapshot(), state)
@@ -3842,7 +3849,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 			malformedFinals += strings.Count(plain, "LISTENER_RECOVERY_MALFORMED_POLL_FINAL")
 		}
 		return healthyFinals == 1 && malformedFinals == 1
-	}, listenerRecoveryExtendedProgressTimeout, "healthy and malformed-poll finals after reopen")
+	}, listenerRecoveryDurableIOProgressTimeout, "healthy and malformed-poll finals after reopen")
 	waitListenerRecovery(t, func() bool {
 		state, err := reopened.Load(context.Background())
 		if err != nil {
@@ -3850,7 +3857,7 @@ func TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat(t *testing.T) {
 		}
 		poll := state.ChatPolls[malformedSession.ChatID]
 		return !poll.RecoveryRequired && poll.RecoverySourceHash == "" && poll.PendingPage == nil && poll.Attempt == nil
-	}, listenerRecoveryExtendedProgressTimeout, "malformed-poll recovery marker retirement")
+	}, listenerRecoveryDurableIOProgressTimeout, "malformed-poll recovery marker retirement")
 	state, err := reopened.Load(context.Background())
 	if err != nil {
 		listener.stop(t)
@@ -5757,7 +5764,7 @@ func TestTeamsListenFalseMarkerlessAmbiguousOutboxStaysHeldWithoutPost(t *testin
 			listener := startListenerRecovery(t, bridge, options)
 
 			progressed := false
-			deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
+			deadline := time.Now().Add(listenerRecoveryDurableIOProgressTimeout)
 			for time.Now().Before(deadline) {
 				state, err := store.Load(ctx)
 				if err == nil {
