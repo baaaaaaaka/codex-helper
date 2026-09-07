@@ -3026,8 +3026,11 @@ func TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle(t *testing.
 		probe, probeErr := bridge.readLinkedTranscriptDelta(path, checkpoint, session.CodexThreadID, session.CodexThreadID)
 		teamsProof := linkedTranscriptRootReleaseTeamsProof(context.Background(), store, *session, probe.RootReleaseWitness)
 		sourceProof := transcriptRootReleaseWitnessMatchesSource(path, checkpoint, probe.RootReleaseWitness)
+		outboxPhase := bridge.mainLoopPhaseStatsSnapshot("outbox")
+		pendingChatIDs, pendingChatErr := store.PendingOutboxChatIDsAt(context.Background(), teamstore.PendingOutboxQuery{Now: time.Now()}, 4)
+		control, controlErr := store.ReadControl(context.Background())
 		listener.stop(t)
-		t.Fatalf("task_started/prompt race did not recover; checkpoint=%#v pending=%+v probe=%#v probeErr=%v teamsProof=%t sourceProof=%t turns=%#v outbox=%#v transcriptDeliveries=%#v sent=%#v phase=%#v", checkpoint, checkpoint.PendingHistoryRange, probe, probeErr, teamsProof, sourceProof, state.Turns, state.OutboxMessages, state.TranscriptDeliveries, graphState.sentSnapshot(), bridge.mainLoopPhaseStatsSnapshot("linked-transcript"))
+		t.Fatalf("task_started/prompt race did not recover; checkpoint=%#v pending=%+v probe=%#v probeErr=%v teamsProof=%t sourceProof=%t turns=%#v outbox=%#v transcriptDeliveries=%#v rateLimits=%#v control=%#v controlErr=%v pendingChatIDs=%#v pendingChatErr=%v phases={outbox:%#v linked:%#v} sent=%#v", checkpoint, checkpoint.PendingHistoryRange, probe, probeErr, teamsProof, sourceProof, state.Turns, state.OutboxMessages, state.TranscriptDeliveries, state.ChatRateLimits, control, controlErr, pendingChatIDs, pendingChatErr, outboxPhase, bridge.mainLoopPhaseStatsSnapshot("linked-transcript"), graphState.sentSnapshot())
 	}
 	state, err = store.Load(context.Background())
 	if err != nil {
