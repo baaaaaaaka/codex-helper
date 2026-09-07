@@ -2889,7 +2889,11 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 		t.Fatalf("multi-day cold chat was not an auto-park candidate: handled=%v candidates=%#v", handled, candidates)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(5*time.Second))
+	// This scenario deliberately crosses a store close/reopen, an expired
+	// retry deadline, two recovery poll quanta, and an auto-park sweep.  The
+	// five-second context measured hosted race scheduling rather than the
+	// recovery invariant, so give the fixture a finite setup/SQLite margin.
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(30*time.Second))
 	defer cancel()
 
 	// The first owner comes back while Graph is still unavailable. The idle

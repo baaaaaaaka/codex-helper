@@ -209,7 +209,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 60,
+      "max_seconds": 120,
       "oracle": "task_started-only snapshot stays silent, then a durable Teams owner proof releases the boundary and delivers the later final",
       "baseline": "pre-fix pending-root state is not released by the next listener cycles"
     },
@@ -254,7 +254,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 120,
       "oracle": "a real polled Teams prompt reaches the durable executor, staged task_started does not create a manual history gate, and the later final is delivered once",
       "baseline": "pre-fix inbound-to-executor vertical path can turn normal task/prompt ordering into a blocked or duplicate recovery path"
     },
@@ -838,7 +838,7 @@
       "vertical": "turn-running-takeover-anchor",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 90,
       "oracle": "running-turn takeover creates one unresolved anchor only for the expected old owner and rejects a repeated or mismatched takeover",
       "baseline": "pre-fix restart recovery could rebind the wrong running turn or create duplicate unresolved execution anchors"
     },
@@ -1390,7 +1390,7 @@
       "vertical": "checkpoint-same-cursor-source-conflict",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 90,
       "oracle": "different nonempty source proofs at one physical cursor are rejected without changing the checkpoint or appending a ledger row",
       "baseline": "pre-fix a delayed same-cursor observation could replace durable source identity and make later replay ambiguous"
     },

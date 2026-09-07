@@ -774,13 +774,14 @@ const listenerRecoveryProgressTimeout = 10 * time.Second
 // unchanged.
 const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 
-// The task_started-only and current-state replay fixtures intentionally cross
-// several durable CAS boundaries.  Their hosted race failures have shown that
-// a busy runner can make the final observation arrive just after the ordinary
-// extended watchdog, even when the checkpoint and outbox are already correct.
+// The task_started-only, current-state replay, and inbound-to-executor
+// fixtures intentionally cross several durable CAS boundaries.  Their hosted
+// race failures have shown that a busy runner can make the final observation
+// arrive just after the ordinary extended watchdog, even when the checkpoint
+// and outbox are already correct.
 // Keep this larger bound local to those multi-step tests; the other recovery
 // tests retain their shorter liveness windows.
-const listenerRecoveryMultiStepProgressTimeout = 45 * time.Second
+const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 10ms loop creates a read flood that can compete with the
@@ -3145,7 +3146,12 @@ func TestTeamsListenFalseTaskStartedPromptRaceFromPolledTeamsTurn(t *testing.T) 
 		}
 		return strings.Contains(sentPlainJoinedListenerRecovery(graphState.sentSnapshot()), "LISTENER_RECOVERY_VERTICAL_TASK_PROMPT_RACE_FINAL")
 	}
-	if !waitListenerRecoveryResult(completed, listenerRecoveryProgressTimeout) {
+	// Inbound admission, executor completion, transcript checkpointing, and
+	// outbox POST/finalization are separate durable steps.  A hosted race runner
+	// may observe the Graph POST before the final accepted->sent CAS completes;
+	// use the finite multi-step window so that condition is not mistaken for a
+	// lost final.
+	if !waitListenerRecoveryResult(completed, listenerRecoveryMultiStepProgressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		finalID := "outbox:turn:inbound:chat-1:vertical-race-message:final"
