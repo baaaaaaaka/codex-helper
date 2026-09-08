@@ -112,6 +112,12 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		LastActivityAt:       lastActivity,
 		OperationalFrontier:  input.Role == inboundPollRoleWork && pollPageHasOperationalFrontier(poll),
 	}
+	// A pending page is already a durable, immutable Graph receipt. Replaying
+	// it performs no Graph request, so a provider 429 recorded after staging the
+	// page must not hide it behind either the provider deadline or the ordinary
+	// poll schedule. Keep the retry block for frontiers that still need Graph
+	// (continuations/gaps) and for chats with no durable local action.
+	localReplay := poll.PendingPage != nil
 	if poll.BlockedUntil.After(now) && !pollPageHasOperationalFrontier(poll) {
 		previous := strings.TrimSpace(poll.PreviousPollState)
 		if previous == "" && poll.PollState != "" && poll.PollState != inboundPollStateBlocked {
@@ -135,7 +141,7 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		// durable retry deadline authoritative in that state too; otherwise the
 		// catch-up branch would immediately retry a 429/network failure and turn
 		// an isolated chat error into a tight Graph loop.
-		if poll.FailureCount > 0 && poll.NextPollAt.After(now) {
+		if !localReplay && poll.FailureCount > 0 && poll.NextPollAt.After(now) {
 			state := strings.TrimSpace(poll.PollState)
 			if state == "" || state == inboundPollStateBlocked {
 				state = inboundPollStateWarm
@@ -152,6 +158,19 @@ func decideInboundPoll(input inboundPollInput) inboundPollDecision {
 		return decision
 	}
 	state, interval, parked := classifyInboundPollState(input.Role, input.Running, lastActivity, now)
+	if localReplay {
+		if parked {
+			state = inboundPollStateCold
+			interval = inboundPollColdInterval
+		}
+		decision.State = state
+		decision.Interval = interval
+		decision.NextPollAt = now
+		decision.BlockedUntil = time.Time{}
+		decision.Due = true
+		decision.ShouldPark = false
+		return decision
+	}
 	if poll.BlockedUntil.After(now) && pollPageHasOperationalFrontier(poll) {
 		// An operational frontier must remain visible to the scheduler, but a
 		// transient retry deadline still applies. Keep this as ordinary due

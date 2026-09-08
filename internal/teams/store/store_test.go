@@ -44,6 +44,47 @@ func TestLoadMissingReturnsEmptyState(t *testing.T) {
 	}
 }
 
+func TestSQLiteOutboxMessageByIDAvoidsFullStateLoad(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	want := OutboxMessage{
+		ID:          "outbox:point-read",
+		TeamsChatID: "chat:point-read",
+		Kind:        "helper-final",
+		Body:        "rate-limit recovery marker",
+		Status:      OutboxStatusQueued,
+		Sequence:    7,
+		CreatedAt:   time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages[want.ID] = want
+		return nil
+	}); err != nil {
+		t.Fatalf("seed outbox point-read row: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	fullLoads := 0
+	previousHook := sqliteStateLoadTestHook
+	sqliteStateLoadTestHook = func() { fullLoads++ }
+	t.Cleanup(func() { sqliteStateLoadTestHook = previousHook })
+
+	got, err := store.OutboxMessageByID(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("OutboxMessageByID: %v", err)
+	}
+	if got.ID != want.ID || got.TeamsChatID != want.TeamsChatID || got.Body != want.Body || got.Status != want.Status || got.Sequence != want.Sequence {
+		t.Fatalf("point-read outbox = %#v, want %#v", got, want)
+	}
+	if fullLoads != 0 {
+		t.Fatalf("SQLite OutboxMessageByID invoked full state loader %d time(s)", fullLoads)
+	}
+
+	if _, err := store.OutboxMessageByID(ctx, "outbox:missing-point-read"); !errors.Is(err, ErrOutboxNotFound) {
+		t.Fatalf("missing OutboxMessageByID error = %v, want ErrOutboxNotFound", err)
+	}
+}
+
 // TestInvalidOptionalRecoveryProofLoadsAsHistoryOnlyAcrossBackends protects
 // the upgrade boundary for old checkpoints.  A partially written or otherwise
 // inconsistent semantic range must remain readable so one bad chat cannot
@@ -6983,6 +7024,78 @@ func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesCont
 	}
 	if _, ok := schedule.ChatPolls["chat-admission-blocked"]; ok {
 		t.Fatal("blocked chat was admitted to ready schedule before its retry deadline")
+	}
+}
+
+func TestSQLiteHotPollAdmissionReplaysPendingPageThrough429Deadline(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	const pendingChat = "chat-pending-page-429"
+	const blockedChat = "chat-continuation-429"
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-pending-page-429"] = SessionContext{
+			ID: "session-pending-page-429", Status: SessionStatusActive,
+			TeamsChatID: pendingChat, UpdatedAt: now,
+		}
+		state.ChatPolls[pendingChat] = ChatPollState{
+			ChatID: pendingChat, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(time.Hour), BlockedUntil: now.Add(time.Hour),
+			FailureCount: 3, LastError: "Graph messages failed: HTTP 429 Too Many Requests",
+			LastErrorAt: now, UpdatedAt: now,
+			PendingPage: &ChatPollPendingPage{
+				ChatID:      pendingChat,
+				RequestPath: "/chats/" + pendingChat + "/messages?$top=20",
+				ReceiptID:   "receipt-pending-page-429",
+				Frontier:    "head",
+				PollRole:    "work",
+				RecordIDs:   []string{}, RecordHashes: []string{},
+			},
+		}
+		state.Sessions["session-continuation-429"] = SessionContext{
+			ID: "session-continuation-429", Status: SessionStatusActive,
+			TeamsChatID: blockedChat, UpdatedAt: now,
+		}
+		state.ChatPolls[blockedChat] = ChatPollState{
+			ChatID: blockedChat, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now, BlockedUntil: now.Add(time.Hour),
+			ContinuationPath: "/chats/" + blockedChat + "/messages?$skiptoken=opaque",
+			LastError:        "Graph messages failed: HTTP 429 Too Many Requests",
+			LastErrorAt:      now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed pending-page 429 admission state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	candidates, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, now)
+	if err != nil || !handled {
+		t.Fatalf("pending-page 429 candidates: handled=%v err=%v", handled, err)
+	}
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		seen[candidate.TeamsChatID] = true
+	}
+	if !seen[pendingChat] {
+		t.Fatalf("durable pending page hidden behind future 429 schedule: %#v", seen)
+	}
+	if seen[blockedChat] {
+		t.Fatalf("Graph continuation was admitted before its 429 deadline: %#v", seen)
+	}
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("pending-page 429 ready schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls[pendingChat]; !ok {
+		t.Fatalf("pending page missing from ready schedule: %#v", schedule.ChatPolls)
+	}
+	if _, ok := schedule.ChatPolls[blockedChat]; ok {
+		t.Fatalf("blocked continuation present in ready schedule before deadline: %#v", schedule.ChatPolls)
+	}
+	if chatPollRateLimitedDeferred(schedule.ChatPolls[pendingChat], now) {
+		t.Fatal("pending page was still classified as optional rate-limited maintenance")
 	}
 }
 

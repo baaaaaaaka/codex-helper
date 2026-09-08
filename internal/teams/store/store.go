@@ -1774,7 +1774,11 @@ func chatPollRateLimitedDeferred(poll ChatPollState, now time.Time) bool {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	return poll.NextPollAt.After(now) && strings.Contains(strings.ToLower(strings.TrimSpace(poll.LastError)), "429")
+	// A pending page is a local durable receipt, not another Graph request. It
+	// must remain visible to the operational lane even when the preceding page
+	// attempt recorded a provider throttle; otherwise a 429 can also defer the
+	// no-network replay that would complete the receipt and clear the error.
+	return poll.PendingPage == nil && poll.NextPollAt.After(now) && strings.Contains(strings.ToLower(strings.TrimSpace(poll.LastError)), "429")
 }
 
 // chatPollAdmissionValid separates a decoded poll row from an executable poll
@@ -5696,6 +5700,15 @@ func (s *Store) OutboxMessageByID(ctx context.Context, outboxID string) (OutboxM
 	outboxID = strings.TrimSpace(outboxID)
 	if outboxID == "" {
 		return OutboxMessage{}, fmt.Errorf("outbox id is required")
+	}
+	if message, ok, handled, err := s.outboxMessageByIDSQLite(ctx, outboxID); handled || err != nil {
+		if err != nil {
+			return OutboxMessage{}, err
+		}
+		if !ok {
+			return OutboxMessage{}, fmt.Errorf("%w: %q", ErrOutboxNotFound, outboxID)
+		}
+		return message, nil
 	}
 	state, err := s.OutboxStateSnapshot(ctx)
 	if err != nil {

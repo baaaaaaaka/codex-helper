@@ -370,6 +370,37 @@ func TestInboundPollParkNoticeRetriesUntilRecorded(t *testing.T) {
 	}
 }
 
+func TestInboundPollPendingPageBypassesGraph429Deadline(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	blockedUntil := now.Add(10 * time.Minute)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-pending-429",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:         "chat-pending-429",
+			Seeded:         true,
+			PollState:      inboundPollStateBlocked,
+			LastActivityAt: now.Add(-time.Minute),
+			NextPollAt:     blockedUntil,
+			BlockedUntil:   blockedUntil,
+			FailureCount:   4,
+			LastError:      "Graph messages failed: HTTP 429 Too Many Requests",
+			PendingPage: &teamstore.ChatPollPendingPage{
+				ChatID:      "chat-pending-429",
+				RequestPath: "/chats/chat-pending-429/messages?$top=20",
+				ReceiptID:   "receipt-pending-429",
+				Frontier:    "head",
+				PollRole:    "work",
+			},
+		},
+		Now: now,
+	})
+	if !decision.Due || !decision.NextPollAt.Equal(now) || !decision.BlockedUntil.IsZero() || decision.ShouldPark || decision.State == inboundPollStateBlocked {
+		t.Fatalf("pending page behind 429 deadline must be immediately locally replayable: %#v", decision)
+	}
+}
+
 func TestInboundPollParkProbeRespectsNextPollAt(t *testing.T) {
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
 	future := now.Add(time.Minute)

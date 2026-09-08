@@ -26,6 +26,8 @@ const teamsGraph429StressRetryAfterSeconds = "600"
 
 const teamsGraph429StressPromptWait = 30 * time.Second
 
+const teamsGraph429AutomaticRecoveryFailures = 4
+
 func loadTeamsGraph429StressScale() teamsGraph429StressScale {
 	scale := teamsGraph429StressScale{Chats: 12, Messages: 3, Rounds: 3}
 	if os.Getenv("CODEX_HELPER_TEAMS_GRAPH_429_STRESS") != "" {
@@ -167,6 +169,126 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 	}
 
 	requireTeamsGraph429OutboxFinalState(t, store, blockedChats, requests, sentPlain, scale)
+}
+
+func TestTeamsGraph429PollAutomaticallyRecoversWithoutManualUnblock(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	store := newBridgeTestStore(t)
+	blockedChat := "automatic-429-blocked"
+	healthyChat := "automatic-429-healthy"
+	var (
+		mu              sync.Mutex
+		requests        = map[string]int{}
+		remaining429    = teamsGraph429AutomaticRecoveryFailures
+		messageVersions = map[string]int{}
+	)
+	readServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+			t.Fatalf("unexpected Graph read request: %s %s", r.Method, r.URL.String())
+		}
+		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
+		mu.Lock()
+		requests[chatID]++
+		if chatID == blockedChat && remaining429 > 0 {
+			remaining429--
+			mu.Unlock()
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"automatic recovery test throttle"}}`, http.StatusTooManyRequests)
+			return
+		}
+		messageVersions[chatID]++
+		version := messageVersions[chatID]
+		mu.Unlock()
+		message := bridgePollMessage(
+			fmt.Sprintf("%s-message-%02d", chatID, version),
+			now.Add(time.Duration(version)*time.Second).UTC().Format(time.RFC3339),
+			fmt.Sprintf("@codex automatic recovery prompt %s %02d", chatID, version),
+		)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{"value": []ChatMessage{message}}); err != nil {
+			t.Fatalf("encode automatic recovery poll response: %v", err)
+		}
+	}))
+	t.Cleanup(readServer.Close)
+	readGraph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     readServer.Client(),
+		baseURL:    readServer.URL,
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("poll 429 path attempted hidden Graph sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:          "automatic recovery final",
+		CodexThreadID: "automatic-recovery-thread",
+		CodexTurnID:   "automatic-recovery-turn",
+	}}
+	bridge := newBridgeTestBridge(writeGraph, store, executor)
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = nil
+	bridge.maxWorkChatPollsPerCycle = 2
+	bridge.pollWorkerBudget = 5 * time.Second
+	seedTeamsGraph429ControlPoll(t, store, now)
+	for index, chatID := range []string{blockedChat, healthyChat} {
+		session := Session{
+			ID:        fmt.Sprintf("automatic-429-session-%d", index),
+			ChatID:    chatID,
+			ChatURL:   "https://teams.example/" + chatID,
+			Topic:     chatID,
+			Status:    "active",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		bridge.reg.Sessions = append(bridge.reg.Sessions, session)
+		if err := bridge.ensureDurableSession(ctx, &bridge.reg.Sessions[len(bridge.reg.Sessions)-1]); err != nil {
+			t.Fatalf("ensure durable session %s: %v", chatID, err)
+		}
+		seedTeamsGraph429WorkPoll(t, store, chatID, now)
+	}
+
+	for attempt := 0; attempt < teamsGraph429AutomaticRecoveryFailures; attempt++ {
+		if err := bridge.pollOnce(ctx, 20); err != nil {
+			t.Fatalf("poll pass %d returned error: %v", attempt+1, err)
+		}
+		poll, ok, err := store.ChatPoll(ctx, blockedChat)
+		if err != nil || !ok {
+			t.Fatalf("blocked chat poll after pass %d: ok=%v err=%v poll=%#v", attempt+1, ok, err, poll)
+		}
+		if !poll.NextPollAt.After(time.Now()) {
+			t.Fatalf("blocked chat pass %d did not persist a future Retry-After gate: %#v", attempt+1, poll)
+		}
+		wait := time.Until(poll.NextPollAt) + 20*time.Millisecond
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	if err := bridge.pollOnce(ctx, 20); err != nil {
+		t.Fatalf("poll pass after automatic 429 recovery returned error: %v", err)
+	}
+
+	mu.Lock()
+	blockedRequests := requests[blockedChat]
+	healthyRequests := requests[healthyChat]
+	remaining := remaining429
+	mu.Unlock()
+	if blockedRequests != teamsGraph429AutomaticRecoveryFailures+1 || remaining != 0 {
+		t.Fatalf("automatic 429 chat requests=%d remaining_429=%d, want %d requests and no remaining failures", blockedRequests, remaining, teamsGraph429AutomaticRecoveryFailures+1)
+	}
+	if healthyRequests == 0 || executor.promptCount() == 0 {
+		t.Fatalf("healthy chat made no progress while sibling was rate-limited: healthy_requests=%d executor_prompts=%d", healthyRequests, executor.promptCount())
+	}
+	blockedPoll, ok, err := store.ChatPoll(ctx, blockedChat)
+	if err != nil || !ok {
+		t.Fatalf("read recovered blocked chat poll: ok=%v err=%v poll=%#v", ok, err, blockedPoll)
+	}
+	if blockedPoll.PollState == inboundPollStateBlocked || !blockedPoll.BlockedUntil.IsZero() || strings.TrimSpace(blockedPoll.LastError) != "" || blockedPoll.FailureCount != 0 {
+		t.Fatalf("blocked chat did not automatically recover after finite 429 sequence: %#v", blockedPoll)
+	}
 }
 
 func TestTeamsGraph429StressPollMaintainsAvailabilityAndSuppressesLoopsCI(t *testing.T) {

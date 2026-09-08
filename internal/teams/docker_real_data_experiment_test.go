@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,19 +26,31 @@ import (
 )
 
 const (
-	dockerRealDataExperimentEnv   = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
-	dockerRealDataModeEnv         = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
-	dockerRealDataDurationEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
-	dockerRealDataResumeEnv       = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
-	dockerRealDataPageSize        = 20
-	dockerRealDataMessageIDPrefix = "docker-real-data:"
-	dockerRealDataDefaultDuration = 5 * time.Minute
-	dockerRealDataMinimumDuration = time.Minute
-	dockerRealDataDefaultTop      = ownerPollMessageTop
-	dockerRealDataMinimumReplay   = 100
-	dockerRealDataModeThroughput  = "throughput"
-	dockerRealDataModeComplete    = "complete"
-	dockerRealDataExecutionPrefix = "docker real-data execution result #"
+	dockerRealDataExperimentEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
+	dockerRealDataModeEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
+	dockerRealDataDurationEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
+	dockerRealDataResumeEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
+	dockerRealData429ExperimentEnv   = "CXP_TEAMS_DOCKER_REAL_DATA_429"
+	dockerRealData429ScopeEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
+	dockerRealDataPollIntervalEnv    = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
+	dockerRealDataPageSize           = 20
+	dockerRealDataMessageIDPrefix    = "docker-real-data:"
+	dockerRealDataDefaultDuration    = 5 * time.Minute
+	dockerRealDataMinimumDuration    = time.Minute
+	dockerRealData429DefaultDuration = 12 * time.Second
+	dockerRealData429MinimumDuration = 2 * time.Second
+	dockerRealData429DefaultInterval = 100 * time.Millisecond
+	dockerRealData429MinimumInterval = 10 * time.Millisecond
+	dockerRealData429Failures        = 4
+	dockerRealData429Chats           = 1
+	dockerRealData429HealthyChats    = 1
+	dockerRealData429ScopeChat       = "chat"
+	dockerRealData429ScopeAccount    = "account"
+	dockerRealDataDefaultTop         = ownerPollMessageTop
+	dockerRealDataMinimumReplay      = 100
+	dockerRealDataModeThroughput     = "throughput"
+	dockerRealDataModeComplete       = "complete"
+	dockerRealDataExecutionPrefix    = "docker real-data execution result #"
 )
 
 func dockerRealDataProductionPhaseNames() []string {
@@ -869,19 +882,24 @@ type dockerRealDataGraphServer struct {
 	replay        map[string][]ChatMessage
 	knownChats    map[string]struct{}
 
-	mu                   sync.Mutex
-	listPaths            []string
-	unknownPath          []string
-	postAttempts         map[string]int
-	acceptedPostKeys     map[string]int
-	pollServedMessageIDs map[string]int
-	providerTokens       map[string]dockerRealDataProviderContinuation
-	expiredTokens        map[string]struct{}
-	unknownPostKey       string
-	unknownPostChat      string
-	unknownPostMarker    string
-	faultChatID          string
-	faultSequence        []int
+	mu                        sync.Mutex
+	listPaths                 []string
+	unknownPath               []string
+	postAttempts              map[string]int
+	acceptedPostKeys          map[string]int
+	pollServedMessageIDs      map[string]int
+	providerTokens            map[string]dockerRealDataProviderContinuation
+	expiredTokens             map[string]struct{}
+	unknownPostKey            string
+	unknownPostChat           string
+	unknownPostMarker         string
+	faultChatID               string
+	faultSequence             []int
+	rateLimitListFailures     map[string]int
+	rateLimitBindRemaining    int
+	rateLimitFailureBudget    int
+	rateLimitGlobalRemaining  int
+	rateLimitGlobalConfigured bool
 
 	listGETs             atomic.Int64
 	itemGETs             atomic.Int64
@@ -917,17 +935,18 @@ func newDockerRealDataGraphServer(token string, user User, replay map[string][]C
 		knownChats[strings.TrimSpace(chatID)] = struct{}{}
 	}
 	return &dockerRealDataGraphServer{
-		token:                token,
-		user:                 user,
-		base:                 time.Now().UTC().Add(2 * time.Second),
-		replay:               replay,
-		knownChats:           knownChats,
-		postAttempts:         make(map[string]int),
-		acceptedPostKeys:     make(map[string]int),
-		pollServedMessageIDs: make(map[string]int),
-		providerTokens:       make(map[string]dockerRealDataProviderContinuation),
-		expiredTokens:        make(map[string]struct{}),
-		pageCounts:           make(map[string]int),
+		token:                 token,
+		user:                  user,
+		base:                  time.Now().UTC().Add(2 * time.Second),
+		replay:                replay,
+		knownChats:            knownChats,
+		postAttempts:          make(map[string]int),
+		acceptedPostKeys:      make(map[string]int),
+		pollServedMessageIDs:  make(map[string]int),
+		providerTokens:        make(map[string]dockerRealDataProviderContinuation),
+		expiredTokens:         make(map[string]struct{}),
+		rateLimitListFailures: make(map[string]int),
+		pageCounts:            make(map[string]int),
 	}
 }
 
@@ -1100,6 +1119,115 @@ func (g *dockerRealDataGraphServer) consumeListFault(chatID string) int {
 	status := g.faultSequence[0]
 	g.faultSequence = g.faultSequence[1:]
 	return status
+}
+
+// setPersistentList429 arms a deterministic, chat-local provider throttle for
+// the real-data Docker experiment. An empty chat list binds the fault to the
+// first selected replay chats at the Graph poll boundary, which avoids a
+// false-green run where the injected chat never reaches the production
+// scheduler. Each bound chat fails a finite number of requests and then
+// recovers automatically; no test-side schedule or block clearing is allowed.
+func (g *dockerRealDataGraphServer) setPersistentList429(chatIDs []string, chats, failures int) {
+	if g == nil || chats <= 0 || failures <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.rateLimitListFailures = make(map[string]int)
+	g.rateLimitBindRemaining = 0
+	g.rateLimitFailureBudget = failures
+	g.rateLimitGlobalRemaining = 0
+	g.rateLimitGlobalConfigured = false
+	for _, chatID := range chatIDs {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" || chatID == strings.TrimSpace(g.controlChatID) {
+			continue
+		}
+		g.rateLimitListFailures[chatID] = failures
+	}
+	if len(g.rateLimitListFailures) == 0 {
+		g.rateLimitBindRemaining = chats
+	}
+}
+
+// setPersistentGlobalList429 arms an account-level message-read throttle. The
+// counter is global to the fake Graph server rather than keyed by chat, so a
+// request for any known chat consumes the same provider budget. The caller
+// supplies the exact number of requests that should be throttled; keeping the
+// window finite makes the Docker experiment fast while still exercising a
+// tenant-wide outage followed by automatic recovery.
+func (g *dockerRealDataGraphServer) setPersistentGlobalList429(requests int) {
+	if g == nil || requests <= 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.rateLimitListFailures = make(map[string]int)
+	g.rateLimitBindRemaining = 0
+	g.rateLimitFailureBudget = 0
+	g.rateLimitGlobalRemaining = requests
+	g.rateLimitGlobalConfigured = true
+}
+
+func (g *dockerRealDataGraphServer) consumePersistentGlobalList429() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.rateLimitGlobalRemaining <= 0 {
+		return false
+	}
+	g.rateLimitGlobalRemaining--
+	return true
+}
+
+func (g *dockerRealDataGraphServer) persistentGlobalList429Configured() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.rateLimitGlobalConfigured
+}
+
+func (g *dockerRealDataGraphServer) consumePersistentList429(chatID string, pollRequest bool) bool {
+	if g == nil || !pollRequest {
+		return false
+	}
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" || chatID == strings.TrimSpace(g.controlChatID) {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if remaining, ok := g.rateLimitListFailures[chatID]; ok {
+		if remaining <= 0 {
+			return false
+		}
+		g.rateLimitListFailures[chatID] = remaining - 1
+		return true
+	}
+	if g.rateLimitBindRemaining <= 0 || len(g.replay[chatID]) == 0 || g.rateLimitFailureBudget <= 0 {
+		return false
+	}
+	g.rateLimitBindRemaining--
+	g.rateLimitListFailures[chatID] = g.rateLimitFailureBudget - 1
+	return true
+}
+
+func (g *dockerRealDataGraphServer) persistentRateLimitChats() []string {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	chats := make([]string, 0, len(g.rateLimitListFailures))
+	for chatID := range g.rateLimitListFailures {
+		chats = append(chats, chatID)
+	}
+	sort.Strings(chats)
+	return chats
 }
 
 func (g *dockerRealDataGraphServer) setUnknownPostMarker(marker string) {
@@ -1444,12 +1572,23 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, "unknown replay chat", http.StatusNotFound)
 			return
 		}
+		// Account-level throttling is applied before the control/work distinction:
+		// every message-list read shares the same provider budget. It is still
+		// limited to this deterministic fake Graph boundary and never touches the
+		// live Teams account.
+		if g.consumePersistentGlobalList429() {
+			g.status429.Add(1)
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 		if chatID == strings.TrimSpace(g.controlChatID) {
 			writeDockerRealDataJSON(w, struct {
 				Value []ChatMessage `json:"value"`
 			}{Value: []ChatMessage{}})
 			return
 		}
+		values := req.URL.Query()
 		if status := g.consumeListFault(chatID); status != 0 {
 			w.Header().Set("Retry-After", "1")
 			if status == http.StatusTooManyRequests {
@@ -1460,7 +1599,12 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			w.WriteHeader(status)
 			return
 		}
-		values := req.URL.Query()
+		if g.consumePersistentList429(chatID, dockerRealDataPollListRequest(values)) {
+			g.status429.Add(1)
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
 		if rawToken := strings.TrimSpace(values.Get("$skiptoken")); rawToken != "" && !strings.HasPrefix(rawToken, "docker-real-data-page:") {
 			g.opaqueContinuations.Add(1)
 		}
@@ -1930,6 +2074,179 @@ func dockerRealDataPollHasRecovery(poll teamstore.ChatPollState) bool {
 		(poll.Gap != nil && !(poll.Gap.HeadProbePending && strings.TrimSpace(poll.Gap.RecoveryPath) == ""))
 }
 
+// dockerRealDataPostStateFromSQLite reconstructs only the synthetic rows that
+// the post-run assertions need. Calling Store.Load here would decode every
+// historical inbound/turn/outbox body again after the listener has stopped;
+// on a real fixture that can dominate the experiment and look like a hung
+// 429 retry. The query is read-only and keeps the same typed JSON validation
+// as the assertions, while unrelated historical rows remain untouched.
+func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus map[string][]ChatMessage) (teamstore.State, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
+		return teamstore.State{}, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	state := teamstore.State{
+		InboundEvents:  make(map[string]teamstore.InboundEvent),
+		Turns:          make(map[string]teamstore.Turn),
+		OutboxMessages: make(map[string]teamstore.OutboxMessage),
+		ChatPolls:      make(map[string]teamstore.ChatPollState),
+	}
+	turnIDs := make(map[string]struct{})
+	inboundRows, err := db.QueryContext(ctx, `SELECT id, json FROM inbound_events WHERE teams_message_id LIKE ?`, dockerRealDataMessageIDPrefix+"%")
+	if err != nil {
+		return teamstore.State{}, err
+	}
+	for inboundRows.Next() {
+		var rowID string
+		var raw []byte
+		if err := inboundRows.Scan(&rowID, &raw); err != nil {
+			_ = inboundRows.Close()
+			return teamstore.State{}, err
+		}
+		var inbound teamstore.InboundEvent
+		if err := json.Unmarshal(raw, &inbound); err != nil {
+			_ = inboundRows.Close()
+			return teamstore.State{}, fmt.Errorf("decode synthetic inbound %q: %w", rowID, err)
+		}
+		if strings.TrimSpace(inbound.ID) == "" || strings.TrimSpace(inbound.ID) != strings.TrimSpace(rowID) {
+			_ = inboundRows.Close()
+			return teamstore.State{}, fmt.Errorf("synthetic inbound identity mismatch: sql=%q json=%q", rowID, inbound.ID)
+		}
+		state.InboundEvents[inbound.ID] = inbound
+		if turnID := strings.TrimSpace(inbound.TurnID); turnID != "" {
+			turnIDs[turnID] = struct{}{}
+		}
+	}
+	if err := inboundRows.Err(); err != nil {
+		_ = inboundRows.Close()
+		return teamstore.State{}, err
+	}
+	if err := inboundRows.Close(); err != nil {
+		return teamstore.State{}, err
+	}
+
+	turnIDList := make([]string, 0, len(turnIDs))
+	for turnID := range turnIDs {
+		turnIDList = append(turnIDList, turnID)
+	}
+	sort.Strings(turnIDList)
+	for start := 0; start < len(turnIDList); start += 500 {
+		end := start + 500
+		if end > len(turnIDList) {
+			end = len(turnIDList)
+		}
+		placeholders := make([]string, end-start)
+		args := make([]any, end-start)
+		for index, turnID := range turnIDList[start:end] {
+			placeholders[index] = "?"
+			args[index] = turnID
+		}
+		rows, err := db.QueryContext(ctx, `SELECT id, json FROM turns WHERE id IN (`+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return teamstore.State{}, err
+		}
+		for rows.Next() {
+			var rowID string
+			var raw []byte
+			if err := rows.Scan(&rowID, &raw); err != nil {
+				_ = rows.Close()
+				return teamstore.State{}, err
+			}
+			var turn teamstore.Turn
+			if err := json.Unmarshal(raw, &turn); err != nil {
+				_ = rows.Close()
+				return teamstore.State{}, fmt.Errorf("decode synthetic turn %q: %w", rowID, err)
+			}
+			if strings.TrimSpace(turn.ID) == "" || strings.TrimSpace(turn.ID) != strings.TrimSpace(rowID) {
+				_ = rows.Close()
+				return teamstore.State{}, fmt.Errorf("synthetic turn identity mismatch: sql=%q json=%q", rowID, turn.ID)
+			}
+			state.Turns[turn.ID] = turn
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return teamstore.State{}, err
+		}
+		if err := rows.Close(); err != nil {
+			return teamstore.State{}, err
+		}
+	}
+
+	outboxRows, err := db.QueryContext(ctx, `SELECT id, json FROM outbox_messages WHERE turn_id LIKE ? OR json LIKE ?`, "docker-real-data-turn-%", "%"+dockerRealDataExecutionPrefix+"%")
+	if err != nil {
+		return teamstore.State{}, err
+	}
+	for outboxRows.Next() {
+		var rowID string
+		var raw []byte
+		if err := outboxRows.Scan(&rowID, &raw); err != nil {
+			_ = outboxRows.Close()
+			return teamstore.State{}, err
+		}
+		var outbox teamstore.OutboxMessage
+		if err := json.Unmarshal(raw, &outbox); err != nil {
+			_ = outboxRows.Close()
+			return teamstore.State{}, fmt.Errorf("decode synthetic outbox %q: %w", rowID, err)
+		}
+		if strings.TrimSpace(outbox.ID) == "" || strings.TrimSpace(outbox.ID) != strings.TrimSpace(rowID) {
+			_ = outboxRows.Close()
+			return teamstore.State{}, fmt.Errorf("synthetic outbox identity mismatch: sql=%q json=%q", rowID, outbox.ID)
+		}
+		if strings.HasPrefix(strings.TrimSpace(outbox.TurnID), "docker-real-data-turn-") || strings.HasPrefix(strings.TrimSpace(outbox.Body), dockerRealDataExecutionPrefix) {
+			state.OutboxMessages[outbox.ID] = outbox
+		}
+	}
+	if err := outboxRows.Err(); err != nil {
+		_ = outboxRows.Close()
+		return teamstore.State{}, err
+	}
+	if err := outboxRows.Close(); err != nil {
+		return teamstore.State{}, err
+	}
+
+	for chatID := range corpus {
+		pollRows, err := db.QueryContext(ctx, `SELECT chat_id, json FROM chat_polls WHERE chat_id = ?`, strings.TrimSpace(chatID))
+		if err != nil {
+			return teamstore.State{}, err
+		}
+		for pollRows.Next() {
+			var rowChatID string
+			var raw []byte
+			if err := pollRows.Scan(&rowChatID, &raw); err != nil {
+				_ = pollRows.Close()
+				return teamstore.State{}, err
+			}
+			var poll teamstore.ChatPollState
+			if err := json.Unmarshal(raw, &poll); err != nil {
+				_ = pollRows.Close()
+				return teamstore.State{}, fmt.Errorf("decode replay chat poll %q: %w", rowChatID, err)
+			}
+			if strings.TrimSpace(poll.ChatID) == "" {
+				poll.ChatID = rowChatID
+			}
+			if strings.TrimSpace(poll.ChatID) != strings.TrimSpace(rowChatID) {
+				_ = pollRows.Close()
+				return teamstore.State{}, fmt.Errorf("replay chat poll identity mismatch: sql=%q json=%q", rowChatID, poll.ChatID)
+			}
+			state.ChatPolls[poll.ChatID] = poll
+		}
+		if err := pollRows.Err(); err != nil {
+			_ = pollRows.Close()
+			return teamstore.State{}, err
+		}
+		if err := pollRows.Close(); err != nil {
+			return teamstore.State{}, err
+		}
+	}
+	return state, nil
+}
+
 // dockerRealDataSyntheticResiduals is the complete-mode drain gate. It is
 // deliberately scoped to the replay corpus: inherited terminal provenance in
 // the copied production store is valid history and must not make a successful
@@ -2100,14 +2417,48 @@ func dockerRealDataHistoryOffsetSum(state teamstore.State) int64 {
 func dockerRealDataDuration(t *testing.T) time.Duration {
 	t.Helper()
 	raw := strings.TrimSpace(os.Getenv(dockerRealDataDurationEnv))
+	minimum := dockerRealDataMinimumDuration
+	defaultDuration := dockerRealDataDefaultDuration
+	if os.Getenv(dockerRealData429ExperimentEnv) == "1" {
+		minimum = dockerRealData429MinimumDuration
+		defaultDuration = dockerRealData429DefaultDuration
+	}
 	if raw == "" {
-		return dockerRealDataDefaultDuration
+		return defaultDuration
 	}
 	duration, err := time.ParseDuration(raw)
-	if err != nil || duration < dockerRealDataMinimumDuration {
-		t.Fatalf("invalid %s=%q; want a duration of at least %s", dockerRealDataDurationEnv, raw, dockerRealDataMinimumDuration)
+	if err != nil || duration < minimum {
+		t.Fatalf("invalid %s=%q; want a duration of at least %s", dockerRealDataDurationEnv, raw, minimum)
 	}
 	return duration
+}
+
+func dockerRealDataPollInterval(t *testing.T, rateLimitExperiment bool) time.Duration {
+	t.Helper()
+	if !rateLimitExperiment {
+		return 5 * time.Second
+	}
+	raw := strings.TrimSpace(os.Getenv(dockerRealDataPollIntervalEnv))
+	if raw == "" {
+		return dockerRealData429DefaultInterval
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil || interval < dockerRealData429MinimumInterval {
+		t.Fatalf("invalid %s=%q; want an interval of at least %s", dockerRealDataPollIntervalEnv, raw, dockerRealData429MinimumInterval)
+	}
+	return interval
+}
+
+func dockerRealData429Scope(t *testing.T) string {
+	t.Helper()
+	scope := strings.ToLower(strings.TrimSpace(os.Getenv(dockerRealData429ScopeEnv)))
+	if scope == "" {
+		return dockerRealData429ScopeChat
+	}
+	if scope != dockerRealData429ScopeChat && scope != dockerRealData429ScopeAccount {
+		t.Fatalf("invalid %s=%q; want %q or %q", dockerRealData429ScopeEnv, scope, dockerRealData429ScopeChat, dockerRealData429ScopeAccount)
+	}
+	return scope
 }
 
 func dockerRealDataMode(t *testing.T) string {
@@ -2177,6 +2528,168 @@ func prepareDockerRealDataPollSchedules(t *testing.T, store *teamstore.Store, st
 		t.Fatalf("prepare disposable replay schedules: %v", err)
 	}
 	return replayChats, emptyChats
+}
+
+// prioritizeDockerRealDataReplaySchedules changes only the disposable
+// experiment's due times. A real-data 429 run has a deliberately short
+// measured window, so letting hundreds of empty active chats compete with the
+// copied backlog could finish the window without exercising a single replay
+// page. Durable frontier fields, leases, and failure state are left intact;
+// only the scheduler's ordinary due-time ordering is made representative of
+// the workload being measured.
+func prioritizeDockerRealDataReplaySchedules(t *testing.T, store *teamstore.Store, state teamstore.State, replay map[string][]ChatMessage, controlChatID string, now time.Time) {
+	t.Helper()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	controlChatID = strings.TrimSpace(controlChatID)
+	seenChats := make(map[string]struct{}, len(state.Sessions))
+	updates := make([]teamstore.ChatPollScheduleUpdate, 0, len(state.Sessions))
+	for _, session := range state.Sessions {
+		chatID := strings.TrimSpace(session.TeamsChatID)
+		if chatID == "" || chatID == controlChatID || !isActiveSessionStatus(string(session.Status)) {
+			continue
+		}
+		if _, seen := seenChats[chatID]; seen {
+			continue
+		}
+		seenChats[chatID] = struct{}{}
+		poll := state.ChatPolls[chatID]
+		pollState := strings.TrimSpace(poll.PollState)
+		if pollState == "" {
+			pollState = inboundPollStateWarm
+		}
+		nextPollAt := now.Add(24 * time.Hour)
+		lastActivityAt := poll.LastActivityAt
+		if len(replay[chatID]) > 0 {
+			nextPollAt = now.Add(-time.Second)
+			// The copied queue is intentionally replayed as fresh Graph input.
+			// Marking its chat active in the disposable schedule is the narrow
+			// equivalent of the user having sent that backlog now; otherwise the
+			// production idle-admission rule correctly parks old chats before the
+			// experiment can measure message delivery.
+			lastActivityAt = now
+		}
+		updates = append(updates, teamstore.ChatPollScheduleUpdate{
+			ChatID:         chatID,
+			PollState:      pollState,
+			NextPollAt:     nextPollAt,
+			LastActivityAt: lastActivityAt,
+		})
+	}
+	if _, err := store.UpdateChatPollSchedules(context.Background(), updates); err != nil {
+		t.Fatalf("prioritize disposable replay schedules: %v", err)
+	}
+}
+
+// dockerRealData429PollSessions selects a small, real-data subset for the
+// high-intensity 429 experiment. The selection is deliberately limited to
+// seeded chats with no existing continuation/receipt/gap/attempt, so the test
+// invokes the same production poll frontier and handler with an ordinary head
+// page instead of accidentally measuring unrelated recovery work from the
+// copied snapshot. The rest of the copied SQLite state is retained untouched.
+func dockerRealData429PollSessions(reg Registry, state teamstore.State, replay map[string][]ChatMessage, controlChatID string, rateLimited int, healthy int) ([]Session, error) {
+	if rateLimited <= 0 || healthy < 0 {
+		return nil, fmt.Errorf("invalid Docker 429 session selection: rate_limited=%d healthy=%d", rateLimited, healthy)
+	}
+	controlChatID = strings.TrimSpace(controlChatID)
+	sessions := append([]Session(nil), reg.Sessions...)
+	sort.SliceStable(sessions, func(i, j int) bool {
+		return strings.TrimSpace(sessions[i].ChatID) < strings.TrimSpace(sessions[j].ChatID)
+	})
+	want := rateLimited + healthy
+	selected := make([]Session, 0, want)
+	seen := make(map[string]struct{}, want)
+	for _, session := range sessions {
+		chatID := strings.TrimSpace(session.ChatID)
+		if chatID == "" || chatID == controlChatID || !isActiveSessionStatus(session.Status) {
+			continue
+		}
+		if _, ok := seen[chatID]; ok || len(replay[chatID]) == 0 {
+			continue
+		}
+		poll, ok := state.ChatPolls[chatID]
+		if !ok || !poll.Seeded || poll.LastModifiedCursor.IsZero() || poll.Attempt != nil || poll.PendingPage != nil || poll.Gap != nil ||
+			strings.TrimSpace(poll.ContinuationPath) != "" || strings.TrimSpace(poll.DeferredContinuationPath) != "" {
+			continue
+		}
+		seen[chatID] = struct{}{}
+		selected = append(selected, session)
+		if len(selected) == want {
+			break
+		}
+	}
+	if len(selected) != want {
+		return nil, fmt.Errorf("copied real-data snapshot has only %d clean seeded replay chats; want %d (rate_limited=%d healthy=%d)", len(selected), want, rateLimited, healthy)
+	}
+	return selected, nil
+}
+
+func TestDockerRealData429PollSessionsSelectsOnlyCleanSeededReplayChats(t *testing.T) {
+	cursor := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
+	reg := Registry{Sessions: []Session{
+		{ID: "s-control", ChatID: "control-chat", Status: "active"},
+		{ID: "s-rate", ChatID: "z-rate-chat", Status: "active"},
+		{ID: "s-healthy", ChatID: "a-healthy-chat", Status: "active"},
+		{ID: "s-duplicate", ChatID: "z-rate-chat", Status: "active"},
+		{ID: "s-attempt", ChatID: "b-attempt-chat", Status: "active"},
+		{ID: "s-pending", ChatID: "c-pending-chat", Status: "active"},
+		{ID: "s-gap", ChatID: "d-gap-chat", Status: "active"},
+		{ID: "s-continuation", ChatID: "e-continuation-chat", Status: "active"},
+		{ID: "s-deferred", ChatID: "f-deferred-chat", Status: "active"},
+		{ID: "s-unseeded", ChatID: "g-unseeded-chat", Status: "active"},
+		{ID: "s-no-cursor", ChatID: "h-no-cursor-chat", Status: "active"},
+		{ID: "s-closed", ChatID: "i-closed-chat", Status: "closed"},
+	}}
+	replay := make(map[string][]ChatMessage)
+	for _, session := range reg.Sessions {
+		replay[session.ChatID] = []ChatMessage{{}}
+	}
+	state := teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{
+		"z-rate-chat": {
+			ChatID: "z-rate-chat", Seeded: true, LastModifiedCursor: cursor,
+		},
+		"a-healthy-chat": {
+			ChatID: "a-healthy-chat", Seeded: true, LastModifiedCursor: cursor,
+		},
+		"b-attempt-chat": {
+			ChatID: "b-attempt-chat", Seeded: true, LastModifiedCursor: cursor,
+			Attempt: &teamstore.ChatPollAttempt{ID: "attempt"},
+		},
+		"c-pending-chat": {
+			ChatID: "c-pending-chat", Seeded: true, LastModifiedCursor: cursor,
+			PendingPage: &teamstore.ChatPollPendingPage{ReceiptID: "receipt"},
+		},
+		"d-gap-chat": {
+			ChatID: "d-gap-chat", Seeded: true, LastModifiedCursor: cursor,
+			Gap: &teamstore.ChatPollGap{Kind: "gap-recovery"},
+		},
+		"e-continuation-chat": {
+			ChatID: "e-continuation-chat", Seeded: true, LastModifiedCursor: cursor,
+			ContinuationPath: "/chats/e-continuation-chat/messages?$skiptoken=next",
+		},
+		"f-deferred-chat": {
+			ChatID: "f-deferred-chat", Seeded: true, LastModifiedCursor: cursor,
+			DeferredContinuationPath: "/chats/f-deferred-chat/messages?$skiptoken=next",
+		},
+		"g-unseeded-chat": {
+			ChatID: "g-unseeded-chat", LastModifiedCursor: cursor,
+		},
+		"h-no-cursor-chat": {
+			ChatID: "h-no-cursor-chat", Seeded: true,
+		},
+		"i-closed-chat": {
+			ChatID: "i-closed-chat", Seeded: true, LastModifiedCursor: cursor,
+		},
+	}}
+
+	selected, err := dockerRealData429PollSessions(reg, state, replay, "control-chat", 1, 1)
+	if err != nil {
+		t.Fatalf("select clean replay chats: %v", err)
+	}
+	if got := []string{selected[0].ChatID, selected[1].ChatID}; !reflect.DeepEqual(got, []string{"a-healthy-chat", "z-rate-chat"}) {
+		t.Fatalf("selected chats = %v, want deterministic clean subset [a-healthy-chat z-rate-chat]", got)
+	}
 }
 
 func TestDockerRealDataPollListRequestExcludesMaintenanceLookups(t *testing.T) {
@@ -2405,6 +2918,47 @@ func TestDockerRealDataGraphServerPaginatesEqualTimestampBucket(t *testing.T) {
 	}
 }
 
+func TestDockerRealDataGraphServerAccount429SharesBudgetAcrossChats(t *testing.T) {
+	replay := map[string][]ChatMessage{
+		"account-429-chat-a": {dockerRealDataMessage("account-429-chat-a", 0, 0, time.Now().UTC())},
+		"account-429-chat-b": {dockerRealDataMessage("account-429-chat-b", 0, 0, time.Now().UTC())},
+	}
+	serverState := newDockerRealDataGraphServer("account-429-token", User{ID: "account-429-user"}, replay)
+	serverState.setPersistentGlobalList429(4)
+	server := httptest.NewServer(serverState)
+	t.Cleanup(server.Close)
+
+	request := func(chatID string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/chats/"+url.PathEscape(chatID)+"/messages?$top=20", nil)
+		if err != nil {
+			t.Fatalf("create account 429 request: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer account-429-token")
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatalf("account 429 request for %s: %v", chatID, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for index, chatID := range []string{"account-429-chat-a", "account-429-chat-b", "account-429-chat-a", "account-429-chat-b"} {
+		if got := request(chatID); got != http.StatusTooManyRequests {
+			t.Fatalf("account 429 request %d for %s status = %d, want 429", index+1, chatID, got)
+		}
+	}
+	if got := request("account-429-chat-a"); got != http.StatusOK {
+		t.Fatalf("first request after account 429 budget status = %d, want 200", got)
+	}
+	if got := serverState.status429.Load(); got != 4 {
+		t.Fatalf("account 429 responses = %d, want shared budget of 4 across both chats", got)
+	}
+	if !serverState.persistentGlobalList429Configured() {
+		t.Fatal("account 429 server did not retain global-scope configuration")
+	}
+}
+
 func TestDockerRealDataGraphServerParsesMessagePostRoutes(t *testing.T) {
 	chatID := "19:docker-post-chat@thread.v2"
 	for _, test := range []struct {
@@ -2550,10 +3104,14 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	mode := dockerRealDataMode(t)
 	resume := dockerRealDataResume(t)
+	rateLimitExperiment := os.Getenv(dockerRealData429ExperimentEnv) == "1"
+	rateLimitScope := dockerRealData429Scope(t)
+	duration := dockerRealDataDuration(t)
+	pollInterval := dockerRealDataPollInterval(t, rateLimitExperiment)
 	fixtureRoot := dockerTeamsFixtureRoot(t)
 	store, statePath := prepareDockerFixtureStore(t, fixtureRoot)
 	dockerFixtureRemapCodexPaths(t, store)
-	ctx, cancel := context.WithTimeout(context.Background(), dockerRealDataDuration(t)+10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), duration+10*time.Minute)
 	defer cancel()
 
 	loadStarted := time.Now()
@@ -2635,8 +3193,14 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		t.Fatalf("copied real-data snapshot produced only %d ordinary queued Teams messages for replay; refusing a smoke-sized workload", replayCount)
 	}
 	t.Logf("real-data replay corpus: queued Teams payloads=%d chats=%d; bodies/authors/order copied from durable rows, only IDs/timestamps remapped", replayCount, len(replayCorpus))
-	replayChats, emptyChats := prepareDockerRealDataPollSchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, time.Now())
-	t.Logf("real-data disposable schedule: replay chats due=%d active chats with empty fake corpus also due=%d; no active chat is held for 24h; source schedule/database is untouched", replayChats, emptyChats)
+	scheduleNow := time.Now()
+	replayChats, emptyChats := prepareDockerRealDataPollSchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
+	if rateLimitExperiment {
+		prioritizeDockerRealDataReplaySchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
+		t.Logf("real-data disposable schedule: replay chats prioritized=%d active chats with empty fake corpus deferred=%d; only copied due-time ordering changed; source schedule/database is untouched", replayChats, emptyChats)
+	} else {
+		t.Logf("real-data disposable schedule: replay chats due=%d active chats with empty fake corpus also due=%d; no active chat is held for 24h; source schedule/database is untouched", replayChats, emptyChats)
+	}
 
 	const graphToken = "docker-real-data-deterministic-token"
 	graphServerState := newDockerRealDataGraphServer(graphToken, user, replayCorpus)
@@ -2648,7 +3212,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// Match only the first synthetic executor result by exact rendered body.
 	// A substring match could let an inherited/terminal outbox row consume the
 	// fault before the replay lane reaches its own unknown POST boundary.
-	unknownFaultEnabled := !resume && mode != dockerRealDataModeComplete
+	// The high-intensity 429 mode isolates inbound poll liveness. Keep the
+	// ambiguous-POST scenario in the ordinary real-data experiment, where it is
+	// measured independently; combining both faults would make a short 429
+	// recovery run depend on outbox recovery and hide which lane stalled.
+	unknownFaultEnabled := !resume && mode != dockerRealDataModeComplete && !rateLimitExperiment
 	if !unknownFaultEnabled {
 		// A process restart must not replay the first process's unknown POST.  A
 		// non-empty impossible marker is used because an empty marker means
@@ -2679,7 +3247,36 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// scheduler actually selects. Picking an arbitrary corpus entry can leave
 	// the fault unobserved when the real schedule does not reach that chat in
 	// the measured window.
-	graphServerState.setFaultChat("")
+	var docker429PollSessions []Session
+	var docker429ThrottledSessions []Session
+	var docker429RateLimitedChats []string
+	if rateLimitExperiment {
+		var selectionErr error
+		docker429PollSessions, selectionErr = dockerRealData429PollSessions(registry, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, dockerRealData429Chats, dockerRealData429HealthyChats)
+		if selectionErr != nil {
+			t.Fatalf("select real-data 429 poll sessions: %v", selectionErr)
+		}
+		docker429ThrottledSessions = docker429PollSessions[:dockerRealData429Chats]
+		if rateLimitScope == dockerRealData429ScopeAccount {
+			// An account-level throttle affects every selected chat. Keep both
+			// sessions in the throttled set so every round must observe the same
+			// tenant-wide 429 before the final recovery round.
+			docker429ThrottledSessions = docker429PollSessions
+		}
+		for _, session := range docker429ThrottledSessions {
+			docker429RateLimitedChats = append(docker429RateLimitedChats, session.ChatID)
+		}
+		// The high-intensity path invokes these exact copied real chats, so the
+		// fault cannot silently bind to an unrelated schedule row. Account scope
+		// uses one shared request budget; chat scope keeps independent budgets.
+		if rateLimitScope == dockerRealData429ScopeAccount {
+			graphServerState.setPersistentGlobalList429(len(docker429ThrottledSessions) * dockerRealData429Failures)
+		} else {
+			graphServerState.setPersistentList429(docker429RateLimitedChats, dockerRealData429Chats, dockerRealData429Failures)
+		}
+	} else {
+		graphServerState.setFaultChat("")
+	}
 	graphServer := httptest.NewServer(graphServerState)
 	defer graphServer.Close()
 	graph := &GraphClient{
@@ -2690,7 +3287,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		sleep:      sleepContext,
 		jitter:     func(delay time.Duration) time.Duration { return delay },
 	}
-	executor := &dockerRealDataExecutor{holdFirst: 3 * time.Second}
+	executorHoldFirst := 3 * time.Second
+	if rateLimitExperiment {
+		// The 429 experiment measures poll recovery, not executor latency. A
+		// synchronous no-network executor keeps each successful real message at
+		// the same durable inbound -> turn -> completion boundary without adding a
+		// teardown-sized delay to the four retry rounds.
+		executorHoldFirst = 0
+	}
+	executor := &dockerRealDataExecutor{holdFirst: executorHoldFirst}
 	traceWriter := &dockerRealDataTraceWriter{}
 	historyMandatory := make(map[string]bool)
 	for _, checkpoint := range beforeState.HistoryWatch {
@@ -2729,7 +3334,6 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		},
 	}
 	t.Logf("real-data linked discovery candidates: unindexed_active_sessions=%d", len(linkedUnindexed))
-	duration := dockerRealDataDuration(t)
 	runStarted := time.Now()
 	var bridges []*Bridge
 	var ownerGenerations []int64
@@ -2741,6 +3345,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	var measuredExecutorRuns int64
 	var measuredWindowInbound []int64
 	var measuredWindowCompletedDeltas []int64
+	var measuredElapsed time.Duration
 	var lastListenerErr error
 	phaseErrorsAtMeasureStart := make(map[string]uint64)
 	phaseErrorsAtStop := make(map[string]uint64)
@@ -2935,7 +3540,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			listenErr = bridge.Listen(listenCtx, BridgeOptions{
 				Store:                      activeStore,
 				RegistryPath:               registryPath,
-				Interval:                   5 * time.Second,
+				Interval:                   pollInterval,
 				Once:                       false,
 				Top:                        dockerRealDataDefaultTop,
 				MaxWorkChatPollsPerCycle:   DefaultMaxWorkChatPollsPerCycle,
@@ -2965,6 +3570,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		ownerChanges += changes
 		if measuredWindowCompleted.Load() {
 			measuredWindows++
+			measuredElapsed += duration
 			if measuredWindow.beforeCountsReadError != nil {
 				return fmt.Errorf("read measured Docker window baseline counters: %w", measuredWindow.beforeCountsReadError)
 			}
@@ -3014,7 +3620,207 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		return nil
 	}
 
-	if err := runListener(store); err != nil {
+	// A full production listener cycle also runs inherited outbox, history, and
+	// linked-transcript work. On a copied multi-gigabyte state those phases can
+	// legitimately consume the entire phase budget before a second poll wave is
+	// reached. That is useful diagnostic information, but it is an inefficient
+	// way to answer the narrower 429 question. In high-intensity mode, keep the
+	// same copied SQLite/registry/Codex corpus, fake Graph boundary, owner lease,
+	// per-chat poll frontier, and real message handler, then drive only the
+	// selected poll quantum directly. No schedule clearing or failure reset is
+	// performed between rounds; the loop waits for each durable Retry-After gate.
+	run429PollOnly := func(activeStore *teamstore.Store) error {
+		if len(docker429PollSessions) != dockerRealData429Chats+dockerRealData429HealthyChats {
+			return fmt.Errorf("429 poll-only selection has %d sessions; want %d", len(docker429PollSessions), dockerRealData429Chats+dockerRealData429HealthyChats)
+		}
+		runRegistry, err := LoadRegistry(registryPath)
+		if err != nil {
+			return fmt.Errorf("reload copied registry projection for 429 poll-only run: %w", err)
+		}
+		dockerFixtureSanitizeRegistryWorkspacePaths(&runRegistry)
+		if strings.TrimSpace(runRegistry.ControlChatID) == "" {
+			runRegistry.ControlChatID = beforeState.ControlChat.TeamsChatID
+		}
+		runRegistry.UserID = user.ID
+		runRegistry.UserPrincipal = user.UserPrincipalName
+		bridge := &Bridge{
+			graph:                    graph,
+			readGraph:                graph,
+			registryPath:             registryPath,
+			reg:                      runRegistry,
+			user:                     user,
+			scope:                    beforeState.Scope,
+			machine:                  machine,
+			leaseDuration:            5 * time.Minute,
+			out:                      traceWriter,
+			executor:                 executor,
+			controlFallbackExecutor:  executor,
+			store:                    activeStore,
+			markAnswerChatsUnread:    true,
+			groupChatGuardEnabled:    true,
+			maxWorkChatPollsPerCycle: len(docker429PollSessions),
+			pollWorkerBudget:         mainLoopPollWorkerBudget,
+		}
+		bridge.controlLeaseClaimHook = traceWriter.recordLeaseClaim
+		bridge.ownerFailureHook = traceWriter.recordOwnerFailure
+		bridge.pollChatTraceHook = traceWriter.recordPollChat
+		active, err := bridge.claimControlLease(ctx)
+		if err != nil {
+			return fmt.Errorf("claim disposable owner lease for 429 poll-only run: %w", err)
+		}
+		if !active {
+			return fmt.Errorf("429 poll-only run entered standby instead of acquiring the disposable owner lease")
+		}
+		leaseMachineID := bridge.machine.ID
+		leaseGeneration := bridge.currentLeaseGeneration()
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cleanupCancel()
+			_, _ = activeStore.ReleaseControlLeaseIfHolder(cleanupCtx, leaseMachineID, leaseGeneration)
+		}()
+		ownerTrace := startDockerRealDataOwnerTrace(bridge)
+		defer ownerTrace.stopTrace()
+
+		var pollInboundWriter *globalInboundSQLiteWriter
+		if _, ok := globalInboundLedgerPathForRegistry(bridge.registryPath); ok {
+			pollInboundWriter = &globalInboundSQLiteWriter{}
+			defer func() { _ = pollInboundWriter.close() }()
+		}
+		measureStarted := time.Now()
+		measureBefore, err := dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+		if err != nil {
+			return fmt.Errorf("read 429 poll-only baseline counters: %w", err)
+		}
+		type pollResult struct {
+			chatID string
+			err    error
+		}
+		rateLimitedSet := make(map[string]struct{}, len(docker429RateLimitedChats))
+		for _, chatID := range docker429RateLimitedChats {
+			rateLimitedSet[chatID] = struct{}{}
+		}
+		for round := 0; round <= dockerRealData429Failures; round++ {
+			roundTimeout := 30 * time.Second
+			if round == 0 || round == dockerRealData429Failures {
+				// These rounds execute one real copied message through the normal
+				// durable handler. The intermediate 429 rounds contain no handler
+				// work and retain the short watchdog.
+				roundTimeout = 2 * time.Minute
+			}
+			roundCtx, roundCancel := context.WithTimeout(ctx, roundTimeout)
+			if pollInboundWriter != nil {
+				roundCtx = context.WithValue(roundCtx, pollInboundLedgerWriterContextKey{}, pollInboundWriter)
+			}
+			results := make(chan pollResult, len(docker429PollSessions))
+			var workers sync.WaitGroup
+			roundSessions := docker429ThrottledSessions
+			if round == 0 || rateLimitScope == dockerRealData429ScopeAccount {
+				// Exercise sibling availability once while the selected real chat is
+				// rate-limited. In account scope every selected chat is throttled on
+				// every pre-recovery round; in chat scope repeating the healthy handler
+				// would only add unrelated full-state queue preparation cost.
+				roundSessions = docker429PollSessions
+			}
+			for _, selected := range roundSessions {
+				selected := selected
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					poll, hasPoll, pollErr := activeStore.ChatPoll(roundCtx, selected.ChatID)
+					if pollErr == nil {
+						_, pollErr = bridge.pollChatWithRoleStateOptions(roundCtx, selected.ChatID, dockerRealDataDefaultTop, inboundPollRoleWork, false, poll, hasPoll, pollChatWithRoleOptions{
+							AllowBacklogDrain:        true,
+							MaxBacklogActions:        1,
+							RecoverStaleContinuation: true,
+							GraphBudget:              bridge.pollWorkerBudget,
+						}, func(handleCtx context.Context, msg ChatMessage, text string) error {
+							return bridge.handleResolvedSessionMessageWithQueueState(handleCtx, &selected, selected.ChatID, msg, text, nil, nil)
+						})
+					}
+					results <- pollResult{chatID: selected.ChatID, err: pollErr}
+				}()
+			}
+			workers.Wait()
+			close(results)
+			var roundErrors []string
+			for result := range results {
+				_, rateLimited := rateLimitedSet[result.chatID]
+				if round < dockerRealData429Failures && rateLimited {
+					if result.err == nil || !isGraphRateLimitError(result.err) {
+						roundErrors = append(roundErrors, fmt.Sprintf("%s: %v", result.chatID, result.err))
+					}
+				} else if result.err != nil {
+					roundErrors = append(roundErrors, fmt.Sprintf("%s: %v", result.chatID, result.err))
+				}
+			}
+			roundCancel()
+			if len(roundErrors) > 0 {
+				return fmt.Errorf("429 poll-only round %d errors: %s", round+1, strings.Join(roundErrors, "; "))
+			}
+			if round == dockerRealData429Failures {
+				break
+			}
+			var retryAt time.Time
+			for _, selected := range docker429ThrottledSessions {
+				poll, found, pollErr := activeStore.ChatPoll(ctx, selected.ChatID)
+				if pollErr != nil {
+					return fmt.Errorf("read durable 429 gate for %s after round %d: %w", selected.ChatID, round+1, pollErr)
+				}
+				if !found || poll.LastErrorAt.IsZero() || !poll.NextPollAt.After(poll.LastErrorAt) {
+					return fmt.Errorf("chat %s did not persist a Retry-After gate after round %d: %#v", selected.ChatID, round+1, poll)
+				}
+				if poll.NextPollAt.After(retryAt) {
+					retryAt = poll.NextPollAt
+				}
+			}
+			wait := time.Until(retryAt) + 20*time.Millisecond
+			if wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return ctx.Err()
+				}
+			}
+		}
+		measureAfter, err := dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+		if err != nil {
+			return fmt.Errorf("read 429 poll-only final counters: %w", err)
+		}
+		measuredWindows++
+		measuredElapsed += time.Since(measureStarted)
+		measuredInbound += measureAfter.inbound - measureBefore.inbound
+		measuredCompleted += measureAfter.completed - measureBefore.completed
+		measuredExecutorRuns += executor.runs.Load()
+		measuredWindowInbound = append(measuredWindowInbound, measureAfter.inbound-measureBefore.inbound)
+		measuredWindowCompletedDeltas = append(measuredWindowCompletedDeltas, measureAfter.completed-measureBefore.completed)
+		ownerTrace.stopTrace()
+		generations, changes := ownerTrace.snapshot()
+		ownerGenerations = append(ownerGenerations, generations...)
+		ownerChangesByRun = append(ownerChangesByRun, changes)
+		ownerChanges += changes
+		bridges = append(bridges, bridge)
+		t.Logf("real-data 429 poll-only run: chats=%v rate_limited=%v rounds=%d elapsed=%s inbound_delta=%d completed_delta=%d graph_429=%d", func() []string {
+			ids := make([]string, 0, len(docker429PollSessions))
+			for _, session := range docker429PollSessions {
+				ids = append(ids, session.ChatID)
+			}
+			return ids
+		}(), docker429RateLimitedChats, dockerRealData429Failures+1, time.Since(measureStarted), measureAfter.inbound-measureBefore.inbound, measureAfter.completed-measureBefore.completed, graphServerState.status429.Load())
+		return nil
+	}
+
+	if rateLimitExperiment {
+		if err := run429PollOnly(store); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := runListener(store); err != nil {
 		t.Fatal(err)
 	}
 	if measuredWindows != 1 {
@@ -3029,10 +3835,16 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied real-data result counters: %v", err)
 	}
-	afterState, err := store.Load(postCtx)
+	afterState, err := dockerRealDataPostStateFromSQLite(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), replayCorpus)
 	if err != nil {
-		t.Fatalf("load copied real-data state after listener experiment: %v", err)
+		t.Fatalf("read copied real-data synthetic state after listener experiment: %v", err)
 	}
+	afterHistoryState, err := store.HistoryWatchState(postCtx)
+	if err != nil {
+		t.Fatalf("read copied real-data history state after listener experiment: %v", err)
+	}
+	afterState.HistoryWatch = afterHistoryState.HistoryWatch
+	afterState.HistoryWatchReady = afterHistoryState.HistoryWatchReady
 	residuals := dockerRealDataSyntheticResiduals(afterState, replayCorpus)
 	if mode == dockerRealDataModeComplete && residuals != (dockerRealDataResiduals{}) {
 		t.Fatalf("complete real-data drain left synthetic durable work: %+v", residuals)
@@ -3056,7 +3868,10 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// Exclude startup and teardown from the throughput denominator. The measured
 	// listener window is explicitly bounded by the coordinator timer above; the
 	// full wall clock remains useful as a separate diagnostic for startup cost.
-	steadyElapsed := duration * time.Duration(measuredWindows)
+	steadyElapsed := measuredElapsed
+	if steadyElapsed <= 0 {
+		steadyElapsed = duration * time.Duration(measuredWindows)
+	}
 	if steadyElapsed <= 0 {
 		steadyElapsed = runElapsed
 	}
@@ -3068,7 +3883,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	protectedPollMessageIDs := dockerRealDataProtectedPollMessageIDs(afterState)
 	if len(servedMessages) == 0 && (!resume || resumeWorkExpected) {
-		t.Fatalf("real-data fake Graph served no replay messages; throughput would be an unmeasured scheduler result")
+		t.Fatalf("real-data fake Graph served no replay messages; throughput would be an unmeasured scheduler result: list_gets=%d status429=%d invalid_queries=%d unsupported_filters=%d poll_traces=%v requests=%v", graphServerState.listGETs.Load(), graphServerState.status429.Load(), graphServerState.invalidListQueries.Load(), graphServerState.unsupportedFilters.Load(), traceWriter.pollChatsSnapshot(), graphServerState.listRequests())
 	}
 	missingDurableInbound := make([]string, 0)
 	protectedServedMessages := 0
@@ -3151,6 +3966,13 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	minimumCompleted := int64(replayCount)
 	if minimumCompleted > dockerRealDataMinimumReplay {
 		minimumCompleted = dockerRealDataMinimumReplay
+	}
+	if rateLimitExperiment {
+		// The 429 mode is a bounded liveness/recovery experiment. Its wall clock
+		// is intentionally short and the executor keeps its first call open to
+		// exercise graceful durable completion, so requiring a 100-message drain
+		// would turn the test back into a throughput smoke test.
+		minimumCompleted = 1
 	}
 	if (!resume && completedDelta <= 0) || (resume && resumeWorkExpected && completedDelta <= 0) || (!resume && inboundDelta <= 0) || (!resume && runs <= 0) {
 		t.Fatalf("real copied Teams workload did not make durable execution progress: before=%#v after=%#v executor_runs=%d listener_err=%v", beforeCounts, afterCounts, runs, lastListenerErr)
@@ -3246,23 +4068,53 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 	}
 	t.Logf("real-data pagination coverage: observed_paginated_chats=%d large_replay_chats=%d unobserved_large_replay_chats=%d", observedPaginatedChats, largeReplayChats, unobservedLargeReplayChats)
-	if requireGraphWork && observedPaginatedChats == 0 {
+	if requireGraphWork && !rateLimitExperiment && observedPaginatedChats == 0 {
 		t.Fatalf("real-data listener observed no multi-page chat; large_replay_chats=%d unobserved_large_replay_chats=%d", largeReplayChats, unobservedLargeReplayChats)
 	}
-	if requireGraphWork && (graphServerState.status429.Load() == 0 || graphServerState.status503.Load() == 0) {
+	if rateLimitExperiment {
+		if rateLimitScope == dockerRealData429ScopeChat {
+			rateLimitedChats := graphServerState.persistentRateLimitChats()
+			if len(rateLimitedChats) != dockerRealData429Chats {
+				t.Fatalf("real-data chat-scoped 429 experiment bound %d chats, want %d selected replay chats: %v", len(rateLimitedChats), dockerRealData429Chats, rateLimitedChats)
+			}
+		} else if !graphServerState.persistentGlobalList429Configured() {
+			t.Fatal("real-data account-scoped 429 experiment did not arm the shared Graph request budget")
+		}
+		want429 := int64(len(docker429RateLimitedChats) * dockerRealData429Failures)
+		if graphServerState.status429.Load() < want429 {
+			t.Fatalf("real-data %s-scoped 429 experiment did not exercise the finite high-intensity throttle: 429=%d want_at_least=%d chats=%v", rateLimitScope, graphServerState.status429.Load(), want429, docker429RateLimitedChats)
+		}
+		for _, chatID := range docker429RateLimitedChats {
+			if graphServerState.listPageCount(chatID) == 0 {
+				t.Fatalf("real-data 429 chat never recovered to a successful page: chat=%q", chatID)
+			}
+			if poll, found := afterState.ChatPolls[chatID]; !found {
+				t.Fatalf("real-data 429 chat has no durable poll state after recovery: chat=%q", chatID)
+			} else if strings.Contains(poll.LastError, "429") {
+				// The production quantum intentionally handles only one action from a
+				// large durable page. A successful Graph head therefore clears the
+				// provider gate but may retain the old diagnostic until the local receipt
+				// is fully drained. That is not a terminal block: the pending page is
+				// immediately executable without another Graph request.
+				if poll.PendingPage == nil || poll.LastSuccessfulPollAt.IsZero() || !poll.LastSuccessfulPollAt.After(poll.LastErrorAt) {
+					t.Fatalf("real-data 429 chat retained a terminal rate-limit error after automatic recovery: chat=%q poll=%#v", chatID, poll)
+				}
+				t.Logf("real-data 429 chat completed a successful Graph recovery and retained only a non-terminal diagnostic while its durable page drains: chat=%q", chatID)
+			}
+		}
+	} else if requireGraphWork && (graphServerState.status429.Load() == 0 || graphServerState.status503.Load() == 0) {
 		t.Fatalf("real-data replay did not exercise both retryable Graph failures: 429=%d 503=%d", graphServerState.status429.Load(), graphServerState.status503.Load())
-	}
-	if requireGraphWork && graphServerState.status503.Load() < int64(defaultGraphRetries+1) {
+	} else if requireGraphWork && graphServerState.status503.Load() < int64(defaultGraphRetries+1) {
 		t.Fatalf("real-data replay did not exhaust the in-process 503 retry budget: 503=%d retry_budget=%d", graphServerState.status503.Load(), defaultGraphRetries)
 	}
-	if requireGraphWork && expiredProviderTokens > 0 && graphServerState.expiredContinuationCount() == 0 {
+	if requireGraphWork && !rateLimitExperiment && expiredProviderTokens > 0 && graphServerState.expiredContinuationCount() == 0 {
 		t.Fatalf("real-data replay copied %d opaque provider continuations but never exercised an expired continuation response", expiredProviderTokens)
 	}
 	faultChatID := graphServerState.faultChatSnapshot()
-	if requireGraphWork && (faultChatID == "" || graphServerState.listPageCount(faultChatID) == 0) {
+	if requireGraphWork && !rateLimitExperiment && (faultChatID == "" || graphServerState.listPageCount(faultChatID) == 0) {
 		t.Fatalf("retryable Graph fault never recovered to a successful page: fault_chat=%q successful_pages=%d", faultChatID, graphServerState.listPageCount(faultChatID))
 	}
-	if requireGraphWork {
+	if requireGraphWork && !rateLimitExperiment {
 		if faultPoll, found := afterState.ChatPolls[faultChatID]; !found {
 			t.Fatalf("retryable Graph fault chat has no durable poll state after recovery: chat=%q", faultChatID)
 		} else if strings.Contains(faultPoll.LastError, "429") || strings.Contains(faultPoll.LastError, "503") {
@@ -3288,31 +4140,36 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	} else if graphServerState.unknownPosts.Load() != 0 || len(ambiguousUnknownRows) != 0 {
 		t.Fatalf("complete real-data mode unexpectedly left an ambiguous Graph POST: unknown=%d rows=%#v", graphServerState.unknownPosts.Load(), ambiguousUnknownRows)
 	}
-	replayBacklogObserved := maintenanceTrace.syntheticBacklogObserved()
-	if !replayBacklogObserved {
-		t.Fatalf("real-data replay never observed its synthetic Teams backlog while optional maintenance was running; backlog_samples=%d ordinary_history=%d ordinary_linked=%d", backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog)
-	}
-	// Fairness is intentionally allowed during a long-lived backlog, but it
-	// must be measured by durable history progress. A callback can return
-	// without advancing its checkpoint, so callback counts alone must not make
-	// this experiment pass.
-	if replayBacklogObserved && afterHistoryOffsets <= beforeHistoryOffsets {
-		t.Fatalf("optional history maintenance made no durable progress while Teams backlog remained: history_callbacks=%d linked_callbacks=%d offsets_before=%d offsets_after=%d", ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, beforeHistoryOffsets, afterHistoryOffsets)
-	}
-	if replayBacklogObserved && len(linkedUnindexed) == 0 {
-		t.Logf("real-data replay has no unindexed active linked session candidate; fairness is not observable in this snapshot: ordinary_sessions=%v", ordinaryLinkedSessions)
-	}
-	if replayBacklogObserved && len(linkedUnindexed) > 0 {
-		missingUnindexed := make([]string, 0)
-		for sessionID := range linkedUnindexed {
-			if ordinaryUnindexedLinkedIDs[sessionID] == 0 {
-				missingUnindexed = append(missingUnindexed, sessionID)
+	replayBacklogObserved := false
+	if !rateLimitExperiment {
+		replayBacklogObserved = maintenanceTrace.syntheticBacklogObserved()
+		if !replayBacklogObserved {
+			t.Fatalf("real-data replay never observed its synthetic Teams backlog while optional maintenance was running; backlog_samples=%d ordinary_history=%d ordinary_linked=%d", backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog)
+		}
+		// Fairness is intentionally allowed during a long-lived backlog, but it
+		// must be measured by durable history progress. A callback can return
+		// without advancing its checkpoint, so callback counts alone must not make
+		// this experiment pass.
+		if afterHistoryOffsets <= beforeHistoryOffsets {
+			t.Fatalf("optional history maintenance made no durable progress while Teams backlog remained: history_callbacks=%d linked_callbacks=%d offsets_before=%d offsets_after=%d", ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, beforeHistoryOffsets, afterHistoryOffsets)
+		}
+		if len(linkedUnindexed) == 0 {
+			t.Logf("real-data replay has no unindexed active linked session candidate; fairness is not observable in this snapshot: ordinary_sessions=%v", ordinaryLinkedSessions)
+		}
+		if len(linkedUnindexed) > 0 {
+			missingUnindexed := make([]string, 0)
+			for sessionID := range linkedUnindexed {
+				if ordinaryUnindexedLinkedIDs[sessionID] == 0 {
+					missingUnindexed = append(missingUnindexed, sessionID)
+				}
+			}
+			sort.Strings(missingUnindexed)
+			if len(missingUnindexed) > 0 {
+				t.Fatalf("backlog fairness did not reach every unindexed active linked session: missing=%v candidates=%d ordinary_unindexed_linked=%d observed=%v", missingUnindexed, len(linkedUnindexed), ordinaryUnindexedLinked, ordinaryUnindexedLinkedIDs)
 			}
 		}
-		sort.Strings(missingUnindexed)
-		if len(missingUnindexed) > 0 {
-			t.Fatalf("backlog fairness did not reach every unindexed active linked session: missing=%v candidates=%d ordinary_unindexed_linked=%d observed=%v", missingUnindexed, len(linkedUnindexed), ordinaryUnindexedLinked, ordinaryUnindexedLinkedIDs)
-		}
+	} else {
+		t.Logf("real-data 429 experiment used targeted poll-only mode; optional maintenance fairness assertions are not applicable")
 	}
 	latestGracefulStop := time.Time{}
 	for _, stoppedAt := range gracefulStopAt {
@@ -3321,7 +4178,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 	}
 	for phaseName, stats := range phaseStatsByName {
-		if startupPhaseErrors[phaseName] != 0 {
+		allow429PollErrors := rateLimitExperiment && phaseName == "poll"
+		if startupPhaseErrors[phaseName] != 0 && !allow429PollErrors {
 			t.Fatalf("%s phase produced %d error(s) during startup/first cycle before the measured window: stats=%#v", phaseName, startupPhaseErrors[phaseName], stats)
 		}
 		if startupPhaseDeadlines[phaseName] != 0 {
@@ -3329,7 +4187,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 		beforeStop := phaseErrorsAtStop[phaseName]
 		atMeasureStart := phaseErrorsAtMeasureStart[phaseName]
-		if beforeStop > atMeasureStart {
+		if beforeStop > atMeasureStart && !allow429PollErrors {
 			t.Fatalf("%s phase produced an error during the measured listener window: start_errors=%d stop_errors=%d stats=%#v", phaseName, atMeasureStart, beforeStop, stats)
 		}
 		if stats.Errors < beforeStop {

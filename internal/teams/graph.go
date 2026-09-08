@@ -528,10 +528,23 @@ func (g *GraphClient) GetChat(ctx context.Context, chatID string) (Chat, error) 
 }
 
 func (g *GraphClient) ListChatMembers(ctx context.Context, chatID string) ([]ChatMember, error) {
+	return g.listChatMembersWithOptions(ctx, chatID, graphRequestOptions{})
+}
+
+// ListChatMembersWithoutRateLimitRetry is for inbound admission checks that
+// run inside the bounded poll worker. A member lookup is advisory: a 429
+// must be returned to the caller so it can conservatively require @codex,
+// rather than occupying a poll worker while the generic Graph retry loop
+// sleeps. The caller still gets the typed Retry-After value for diagnostics.
+func (g *GraphClient) ListChatMembersWithoutRateLimitRetry(ctx context.Context, chatID string) ([]ChatMember, error) {
+	return g.listChatMembersWithOptions(ctx, chatID, graphRequestOptions{returnRateLimitWithoutRetry: true})
+}
+
+func (g *GraphClient) listChatMembersWithOptions(ctx context.Context, chatID string, opts graphRequestOptions) ([]ChatMember, error) {
 	var payload struct {
 		Value []ChatMember `json:"value"`
 	}
-	err := g.do(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/members", nil, &payload)
+	err := g.doWithOptions(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/members", nil, &payload, opts)
 	return payload.Value, err
 }
 
