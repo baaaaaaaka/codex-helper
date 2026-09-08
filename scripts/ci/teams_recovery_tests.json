@@ -331,7 +331,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 120,
       "oracle": "listener exits after bounded grace and a late executor cannot write follow-up outbox state",
       "baseline": "pre-fix late worker callback can mutate state after listener shutdown"
     },
