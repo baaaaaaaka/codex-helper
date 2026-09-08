@@ -5291,7 +5291,7 @@ func TestTeamsListenFalseShutdownFencesCooperativeExecutorError(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-executor.started:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("listener never dispatched the cooperative executor; Graph reads=%d", graphState.getCount("chat-1"))
 	}
