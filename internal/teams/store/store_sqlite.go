@@ -134,6 +134,15 @@ func sqliteChatPollOperationalFrontierSQL(column string) string {
   ), 0) ELSE 0 END)`
 }
 
+// sqliteChatPollPendingPageSQL identifies the one operational frontier that
+// can be executed without another Graph request. Keep this separate from the
+// broader frontier predicate: continuation and gap frontiers still have to
+// respect their provider retry deadline, while a durable pending receipt can
+// be replayed locally immediately.
+func sqliteChatPollPendingPageSQL(column string) string {
+	return "(CASE WHEN " + sqliteSafeJSONType(column, "$.pending_page") + " = 'object' THEN 1 ELSE 0 END)"
+}
+
 // sqliteChatPollOperationalBacklogSQL extends the durable frontier predicate
 // with recovery-required and in-flight-attempt state. A malformed poll row is
 // conservatively treated as operational so optional maintenance cannot race a
@@ -1761,6 +1770,7 @@ func loadSQLiteHotPollReadyChatIDs(ctx context.Context, db *sql.DB, controlChatI
 	seen := make(map[string]struct{}, limit)
 	malformed := 0
 	frontier := sqliteChatPollOperationalFrontierSQL("json")
+	pendingPage := sqliteChatPollPendingPageSQL("json")
 	nextPoll := sqliteCanonicalTimeProjectionSQL("json", "$.next_poll_at", "next_poll_at")
 	nextPollDue := sqliteCanonicalTimeDueSQL("json", "$.next_poll_at", "next_poll_at")
 	blockedUntilDue := sqliteCanonicalTimeDueSQL("json", "$.blocked_until", "blocked_until")
@@ -1918,8 +1928,8 @@ LIMIT ?`, controlChatID, controlChatID, sqliteHotPollMalformedLimit-malformed)
 		if operational {
 			where += `
 	  AND ` + frontier + ` != 0
-	  AND ` + nextPollDue + ` <= julianday(?)
-	  AND ` + blockedUntilDue + ` <= julianday(?)`
+	  AND (` + pendingPage + ` = 1 OR (` + nextPollDue + ` <= julianday(?)
+	       AND ` + blockedUntilDue + ` <= julianday(?)))`
 			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
 		} else {
 			where += `
@@ -2147,6 +2157,7 @@ func (s *Store) hotPollScheduleSQLiteWithOptions(ctx context.Context, includePar
 		parkProbeDueAt := sqliteTime(now)
 		validPoll := sqliteChatPollValidJSONSQL("json", "chat_id")
 		frontier := sqliteChatPollOperationalFrontierSQL("json")
+		pendingPage := sqliteChatPollPendingPageSQL("json")
 		pollState := sqliteCanonicalTextProjectionSQL("json", "$.state", "poll_state")
 		nextPoll := sqliteCanonicalTimeProjectionSQL("json", "$.next_poll_at", "next_poll_at")
 		parkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("json", "parked_skip_eligible", "poll_state")
@@ -2185,8 +2196,9 @@ func (s *Store) hotPollScheduleSQLiteWithOptions(ctx context.Context, includePar
     WHERE chat_id != ?
       AND ((` + validPoll + `
         AND ` + frontier + `
-        AND COALESCE(next_poll_at, 0) <= ?
-        AND COALESCE(blocked_until, 0) <= ?)
+        AND (` + pendingPage + ` = 1
+             OR (COALESCE(next_poll_at, 0) <= ?
+                 AND COALESCE(blocked_until, 0) <= ?)))
       )
     ORDER BY sort_updated, sort_next, sort_activity, chat_id
     LIMIT ?
@@ -6028,6 +6040,7 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
 	pollBlockedDue := sqliteCanonicalTimeDueSQL("p.json", "$.blocked_until", "p.blocked_until")
 	pollState := sqliteCanonicalTextProjectionSQL("p.json", "$.state", "p.poll_state")
 	pollFrontier := sqliteChatPollOperationalFrontierSQL("p.json")
+	pollPendingPage := sqliteChatPollPendingPageSQL("p.json")
 	pollParkedSkipEligible := sqliteCanonicalParkedSkipProjectionSQL("p.json", "p.parked_skip_eligible", "p.poll_state")
 	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("t.json", "t.status")
 	scheduleValidPoll := sqliteChatPollScheduleValidJSONSQL("p.json", "p.chat_id")
@@ -6061,8 +6074,8 @@ func loadSQLiteHotPollWorkCandidates(ctx context.Context, db *sql.DB, controlCha
 	  AND p.chat_id IS NOT NULL
 	  AND (` + malformedPoll + ` OR (
 	    ` + pollFrontier + ` != 0
-	    AND ` + pollNextDue + ` <= julianday(?)
-	    AND ` + pollBlockedDue + ` <= julianday(?)))`
+	    AND (` + pollPendingPage + ` = 1 OR (` + pollNextDue + ` <= julianday(?)
+	         AND ` + pollBlockedDue + ` <= julianday(?)))))`
 		} else {
 			where += `
 	  AND (p.chat_id IS NULL OR ` + malformedPoll + ` OR (
@@ -6275,6 +6288,7 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
 	validPoll := sqliteChatPollAdmissionValidJSONSQL("p.json", "p.chat_id")
 	malformedPoll := `NOT (` + validPoll + `)`
 	frontier := sqliteChatPollOperationalFrontierSQL("p.json")
+	pendingPage := sqliteChatPollPendingPageSQL("p.json")
 	canonicalTurnStatus := sqliteTurnSafetyStatusSQL("t.json", "t.status")
 	excludeIdle := ""
 	operationalIdle := ""
@@ -6353,8 +6367,9 @@ func loadSQLiteHotPollWorkCandidatesLegacy(ctx context.Context, db *sql.DB, cont
       AND p.chat_id IS NOT NULL
       AND ((` + validPoll + `
         AND ` + frontier + `
-        AND COALESCE(p.next_poll_at, 0) <= ?
-        AND COALESCE(p.blocked_until, 0) <= ?)
+        AND (` + pendingPage + ` = 1
+             OR (COALESCE(p.next_poll_at, 0) <= ?
+                 AND COALESCE(p.blocked_until, 0) <= ?))))
       )
 ` + operationalIdle + `
     ORDER BY sort_updated, sort_next, sort_activity, s.updated_at, s.id
@@ -10076,6 +10091,42 @@ func (s *Store) turnByIDSQLite(ctx context.Context, turnID string) (Turn, bool, 
 			return err
 		}
 		out, found, err = loadSQLiteJSONRow[Turn](ctx, db, `SELECT json FROM turns WHERE id = ?`, turnID)
+		handled = true
+		return err
+	})
+	return out, found, handled, err
+}
+
+// outboxMessageByIDSQLite is the point-read counterpart to TurnByID.  The
+// outbox recovery path frequently checks the row it just deferred; loading the
+// whole outbox projection for that check turns a large SQLite store into an
+// O(N) JSON decode on every listener cycle.  Keep the exact projection
+// validation used by the existing SQLite writers so this optimization cannot
+// make a malformed or cross-row outbox row executable.
+func (s *Store) outboxMessageByIDSQLite(ctx context.Context, outboxID string) (OutboxMessage, bool, bool, error) {
+	var out OutboxMessage
+	var found bool
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		out, found, err = loadSQLiteOutboxProjectionRow(ctx, db, `SELECT `+sqliteOutboxProjectionSelect("")+` FROM outbox_messages WHERE id = ?`, outboxID)
+		if errors.Is(err, ErrSQLiteOutboxProjectionUntrusted) {
+			// OutboxMessageByID historically exposed the filtered, trusted
+			// projection and therefore reported a contradictory row as not found.
+			// Preserve that quarantine semantics on the point-read fast path: an
+			// untrusted row must not become runnable, but it also must not turn a
+			// local bad row into a retry loop for the caller.
+			out = OutboxMessage{}
+			found = false
+			err = nil
+		}
 		handled = true
 		return err
 	})

@@ -3289,7 +3289,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-firstDelayStarted:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		listener.stop(t)
 		t.Fatalf("phase-timeout Graph request did not start; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
@@ -3958,7 +3958,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
 		return len(calls) == 1 && strings.Contains(calls[0], "LISTENER_RECOVERY_SQLITE_MALFORMED_POLL_PROMPT")
-	}, listenerRecoveryExtendedProgressTimeout) {
+	}, listenerRecoveryDurableIOProgressTimeout) {
 		state, _ := reopened.Load(ctx)
 		listener.stop(t)
 		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"))

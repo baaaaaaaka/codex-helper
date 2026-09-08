@@ -1039,6 +1039,34 @@ func TestGraphGetChatAndListMembers(t *testing.T) {
 	}
 }
 
+func TestGraphListChatMembersWithoutRateLimitRetryReturns429Immediately(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	var requests int
+	var sleeps []time.Duration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/chat-429/members" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "600")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"slow down"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, &sleeps)
+	_, err := graph.ListChatMembersWithoutRateLimitRetry(context.Background(), "chat-429")
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("429 member lookup error = %v, want typed HTTP 429", err)
+	}
+	if requests != 1 {
+		t.Fatalf("429 member lookup requests = %d, want one no-retry request", requests)
+	}
+	if len(sleeps) != 0 {
+		t.Fatalf("429 member lookup sleeps = %v, want no Retry-After sleep", sleeps)
+	}
+}
+
 func TestGraphListMessagesAvoidsSlowTinyTop(t *testing.T) {
 	auth := &fakeGraphAuth{token: "access"}
 	var gotTop []string

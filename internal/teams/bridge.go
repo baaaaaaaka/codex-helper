@@ -6778,7 +6778,7 @@ func (b *Bridge) workChatRequiresCodexMention(ctx context.Context, chatID string
 	// otherwise hold a worker after its message page has returned, consume the
 	// whole phase, and force the attempt cleanup path to wait behind SQLite.
 	membersCtx, cancelMembers := withInboundPollGraphBudget(ctx, b.pollWorkerBudget)
-	members, err := graph.ListChatMembers(membersCtx, chatID)
+	members, err := graph.ListChatMembersWithoutRateLimitRetry(membersCtx, chatID)
 	cancelMembers()
 	if err != nil {
 		if b.out != nil {
@@ -20082,6 +20082,15 @@ func outboxRetryGateUntil(err error, now time.Time) time.Time {
 	var deferred outboxDeliveryDeferredError
 	if errors.As(err, &deferred) && deferred.Until.After(now) {
 		return deferred.Until.UTC()
+	}
+	// A 429 is a known provider rejection, so the outbox remains safely queued
+	// and may be retried. Honor its explicit short Retry-After instead of
+	// replacing it with the generic 30-second recovery gate; this keeps a
+	// rate-limited chat from becoming needlessly cold while preserving the
+	// existing no-replay rule for ambiguous POST outcomes.
+	var graphErr *GraphStatusError
+	if errors.As(err, &graphErr) && graphErr.StatusCode == http.StatusTooManyRequests && graphErr.RetryAfter > 0 {
+		return now.Add(graphErr.RetryAfter).UTC()
 	}
 	return now.Add(outboxRecoveryRetryBackoff).UTC()
 }

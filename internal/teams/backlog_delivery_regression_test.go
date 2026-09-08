@@ -143,6 +143,69 @@ func TestTeamsWorkChatAudienceLookupUsesPollBudget(t *testing.T) {
 	}
 }
 
+func TestTeamsWorkChatAudienceLookupDoesNotRetry429InsidePollWorker(t *testing.T) {
+	var requests int
+	var sleeps []time.Duration
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/chat-audience-429/members" {
+			t.Fatalf("unexpected audience request: %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Retry-After", "600")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"slow down"}}`, http.StatusTooManyRequests)
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "audience-429-token"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 3,
+		sleep: func(_ context.Context, delay time.Duration) error {
+			sleeps = append(sleeps, delay)
+			return nil
+		},
+		jitter: func(delay time.Duration) time.Duration { return delay },
+	}
+	bridge := &Bridge{
+		readGraph:             graph,
+		groupChatGuardEnabled: true,
+		pollWorkerBudget:      5 * time.Second,
+	}
+	if !bridge.workChatRequiresCodexMention(context.Background(), "chat-audience-429") {
+		t.Fatal("429 audience lookup must conservatively require @codex")
+	}
+	if requests != 1 {
+		t.Fatalf("429 audience lookup requests = %d, want one request", requests)
+	}
+	if len(sleeps) != 0 {
+		t.Fatalf("429 audience lookup sleeps = %v, want no provider Retry-After sleep", sleeps)
+	}
+}
+
+func TestOutboxRetryGateHonorsGraph429RetryAfter(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	err := &GraphStatusError{
+		StatusCode: http.StatusTooManyRequests,
+		RetryAfter: 750 * time.Millisecond,
+	}
+	got := outboxRetryGateUntil(err, now)
+	want := now.Add(750 * time.Millisecond)
+	if !got.Equal(want) {
+		t.Fatalf("429 outbox retry gate = %s, want explicit Retry-After %s", got, want)
+	}
+
+	fallback := outboxRetryGateUntil(&GraphStatusError{StatusCode: http.StatusTooManyRequests}, now)
+	if !fallback.Equal(now.Add(outboxRecoveryRetryBackoff)) {
+		t.Fatalf("429 without Retry-After gate = %s, want generic recovery gate %s", fallback, now.Add(outboxRecoveryRetryBackoff))
+	}
+
+	deferredUntil := now.Add(3 * time.Second)
+	deferred := outboxRetryGateUntil(outboxDeliveryDeferredError{ChatID: "chat-1", Until: deferredUntil}, now)
+	if !deferred.Equal(deferredUntil) {
+		t.Fatalf("explicit durable deferral gate = %s, want %s", deferred, deferredUntil)
+	}
+}
+
 // seedBridgeTestOutboxRows persists sender/recovery fixtures in one state
 // transaction. These tests exercise outbox ordering and delivery, not the
 // QueueOutbox admission path. Seeding after SQLite migration (or calling

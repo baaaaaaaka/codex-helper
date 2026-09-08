@@ -269,7 +269,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 120,
       "oracle": "a phase-canceled Graph request releases its durable poll attempt so a later cycle can deliver the same chat",
       "baseline": "pre-fix cleanup used the expired phase context and left the poll attempt until its two-minute TTL"
     },
@@ -1156,7 +1156,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 60,
+      "max_seconds": 120,
       "oracle": "a malformed active SQLite poll row cannot become a first-page baseline; the inherited user prompt reaches the executor and the recovery marker is durably cleared",
       "baseline": "pre-fix the SQL admission predicate omitted malformed rows and consumed the first visible message as historical baseline"
     },

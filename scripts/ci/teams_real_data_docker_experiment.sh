@@ -30,6 +30,9 @@ docker_watchdog_timeout="${CXP_TEAMS_DOCKER_WATCHDOG_TIMEOUT:-35m}"
 allow_source_drift="${CXP_TEAMS_DOCKER_ALLOW_SOURCE_DRIFT:-0}"
 experiment_mode="${CXP_TEAMS_DOCKER_REAL_DATA_MODE:-throughput}"
 experiment_duration="${CXP_TEAMS_DOCKER_REAL_DATA_DURATION:-5m}"
+rate_limit_experiment="${CXP_TEAMS_DOCKER_REAL_DATA_429:-0}"
+rate_limit_scope="${CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE:-chat}"
+poll_interval="${CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL:-}"
 if [[ -n "${CXP_TEAMS_DOCKER_PROCESS_RESTART+x}" ]]; then
 	process_restart="$CXP_TEAMS_DOCKER_PROCESS_RESTART"
 elif [[ "$experiment_mode" == "complete" ]]; then
@@ -53,6 +56,22 @@ case "$process_restart" in
 	0|1) ;;
 	*)
 		echo "CXP_TEAMS_DOCKER_PROCESS_RESTART must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+
+case "$rate_limit_experiment" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_REAL_DATA_429 must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+
+case "$rate_limit_scope" in
+	chat|account) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE must be chat or account" >&2
 		exit 2
 		;;
 esac
@@ -413,6 +432,9 @@ run_experiment_process() {
 		--env CXP_TEAMS_DOCKER_REAL_DATA_RESUME="$resume" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_MODE="$experiment_mode" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_DURATION="$experiment_duration" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_429="$rate_limit_experiment" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE="$rate_limit_scope" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL="$poll_interval" \
 		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
 		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
 		--mount "type=bind,src=$fixture_dir/codex,dst=/home/baka/.codex,readonly" \
