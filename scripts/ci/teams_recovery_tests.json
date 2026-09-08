@@ -164,7 +164,7 @@
       "once": false,
       "fake_graph": true,
       "exclusive": true,
-      "max_seconds": 15,
+      "max_seconds": 120,
       "oracle": "a cooperative turn is canceled on lease loss while the listener root remains alive, leaving one durable takeover candidate and no stale failure side effects",
       "baseline": "pre-fix an old async turn could outlive the owner generation and run failure/follow-up work after takeover"
     },

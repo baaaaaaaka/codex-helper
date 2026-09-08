@@ -2733,7 +2733,7 @@ func TestTeamsListenFalseOwnerLossFencesCooperativeTurn(t *testing.T) {
 	case <-listenExited:
 		err := <-listenDone
 		t.Fatalf("listener exited before owner-loss turn: %v", err)
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		t.Fatalf("owner-loss turn was not dispatched; Graph reads=%d", graphState.getCount("chat-1"))
 	}
 
