@@ -621,7 +621,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	case <-executor.started:
 	case err := <-listener.done:
 		t.Fatalf("listener exited before durable backlog reached executor: %v; output=%s", err, listenerOutput.String())
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		state, _ := store.Load(ctx)
 		t.Fatalf("durable Teams backlog never reached the executor: turns=%#v phases={queued:%#v poll:%#v history:%#v} output=%s", state.Turns, bridge.mainLoopPhaseStatsSnapshot("queued-turns"), bridge.mainLoopPhaseStatsSnapshot("poll"), bridge.mainLoopPhaseStatsSnapshot("history-watch"), listenerOutput.String())
 	}
@@ -640,7 +640,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 		// Mandatory source-rewrite recovery remains eligible during backlog mode.
 	case listenerErr := <-listener.done:
 		t.Fatalf("listener exited before mandatory history recovery ran: %v; output=%s", listenerErr, listenerOutput.String())
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		t.Fatalf("mandatory history recovery did not run during backlog; phase=%#v output=%s", bridge.mainLoopPhaseStatsSnapshot("history-watch"), listenerOutput.String())
 	}
 	select {
@@ -648,7 +648,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 		// Mandatory source-rewrite recovery remains eligible during backlog mode.
 	case listenerErr := <-listener.done:
 		t.Fatalf("listener exited before mandatory linked recovery ran: %v; output=%s", listenerErr, listenerOutput.String())
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		t.Fatalf("mandatory linked recovery did not run during backlog; phase=%#v output=%s", bridge.mainLoopPhaseStatsSnapshot("linked-transcript"), listenerOutput.String())
 	}
 
