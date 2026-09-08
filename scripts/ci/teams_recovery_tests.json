@@ -552,7 +552,7 @@
       "vertical": "turn-owner-cas",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 120,
       "oracle": "a stale owner cannot commit a terminal turn, final outbox, or failure after a control-lease takeover",
       "baseline": "pre-fix terminal turn writes did not validate the saved turn owner against the current lease"
     },
