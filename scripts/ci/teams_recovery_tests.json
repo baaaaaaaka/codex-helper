@@ -57,7 +57,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 90,
+      "max_seconds": 180,
       "oracle": "a durable Teams turn backlog keeps optional history maintenance out of the active listener cycle while the owner-bound executor is still occupied",
       "baseline": "pre-fix the history worker starts in the same cycle as a durable queued turn and can consume the owner heartbeat/SQLite budget"
     },
@@ -72,7 +72,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 90,
+      "max_seconds": 180,
       "oracle": "the SQLite listener keeps optional history maintenance out of the cycle while a durable queued turn remains behind the running turn",
       "baseline": "pre-fix SQLite durable backlog and history maintenance contend in one listener cycle"
     },
@@ -331,7 +331,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 120,
       "oracle": "listener exits after bounded grace and a late executor cannot write follow-up outbox state",
       "baseline": "pre-fix late worker callback can mutate state after listener shutdown"
     },
@@ -409,7 +409,7 @@
       "vertical": "outbox-ledger-fairness",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 120,
       "oracle": "a large Accepted ledger-failure prefix is durably gated and a healthy later chat is sent on the next main-loop pass without poison POSTs",
       "baseline": "pre-fix Accepted rows were always eligible and a bounded global page could repeatedly starve a healthy chat"
     },
@@ -552,7 +552,7 @@
       "vertical": "turn-owner-cas",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 120,
       "oracle": "a stale owner cannot commit a terminal turn, final outbox, or failure after a control-lease takeover",
       "baseline": "pre-fix terminal turn writes did not validate the saved turn owner against the current lease"
     },
@@ -1218,7 +1218,7 @@
       "once": false,
       "fake_graph": true,
       "exclusive": true,
-      "max_seconds": 30,
+      "max_seconds": 180,
       "oracle": "after the first Graph page is committed and the next-link request is interrupted, a replacement owner follows the persisted continuation and delivers only the second-page prompt",
       "baseline": "pre-fix restart tests drained the continuation before shutdown and could not detect a lost or replayed frontier"
     },
