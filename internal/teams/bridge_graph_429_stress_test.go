@@ -259,8 +259,14 @@ func TestTeamsGraph429PollAutomaticallyRecoversWithoutManualUnblock(t *testing.T
 		if err != nil || !ok {
 			t.Fatalf("blocked chat poll after pass %d: ok=%v err=%v poll=%#v", attempt+1, ok, err, poll)
 		}
-		if !poll.NextPollAt.After(time.Now()) {
-			t.Fatalf("blocked chat pass %d did not persist a future Retry-After gate: %#v", attempt+1, poll)
+		// A slow hosted runner may finish the whole poll pass after the
+		// one-second provider gate has already expired.  Compare the durable
+		// schedule with the durable error timestamp instead of wall-clock time;
+		// this still proves that the explicit Retry-After was persisted and does
+		// not turn filesystem latency into a false failure.
+		gateDelay := poll.NextPollAt.Sub(poll.LastErrorAt)
+		if gateDelay < 900*time.Millisecond || gateDelay > 1500*time.Millisecond {
+			t.Fatalf("blocked chat pass %d persisted Retry-After gate with delay %s, want about 1s: %#v", attempt+1, gateDelay, poll)
 		}
 		wait := time.Until(poll.NextPollAt) + 20*time.Millisecond
 		if wait > 0 {
