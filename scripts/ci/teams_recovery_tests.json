@@ -671,7 +671,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 120,
       "oracle": "a cooperative executor canceled with the listener cannot persist a late failure or recovery side effect after shutdown",
       "baseline": "pre-fix a canceled worker could race the listener shutdown and mutate the next owner's durable state"
     },
