@@ -4996,18 +4996,18 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		first.stop(t)
 		t.Fatalf("first page did not reach executor; Graph reads=%d requests=%v", graphState.getCount(chatID), graphState.requestsSnapshot())
 	}
 	select {
 	case <-graphState.continuationEntered:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		first.stop(t)
 		t.Fatalf("first listener never opened the durable continuation; Graph reads=%d requests=%v", graphState.getCount(chatID), graphState.requestsSnapshot())
 	}
 
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryDurableIOProgressTimeout)
 	var lastState teamstore.State
 	for time.Now().Before(deadline) {
 		state, loadErr := firstStore.Load(ctx)
@@ -5075,13 +5075,13 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	defer listener.stop(t)
 	select {
 	case <-recoveredExecutor.called:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		state, _ := recoveredStore.Load(ctx)
 		t.Fatalf("replacement owner did not execute the persisted continuation page; state=%#v requests=%v", state, graphState.requestsSnapshot())
 	}
 	waitListenerRecovery(t, func() bool {
 		return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_BEFORE_DRAIN_FINAL_2") == 1
-	}, listenerRecoveryProgressTimeout, "replacement continuation final")
+	}, listenerRecoveryDurableIOProgressTimeout, "replacement continuation final")
 
 	firstCalls := firstExecutor.callsSnapshot()
 	if len(firstCalls) != 1 || !strings.Contains(firstCalls[0], "REOPEN_BEFORE_DRAIN_PROMPT_2") {
