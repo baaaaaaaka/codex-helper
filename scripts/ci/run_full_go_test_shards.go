@@ -46,6 +46,16 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// package pool, where unrelated test processes can make the PID and
 		// signal observation nondeterministic.
 		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+		// App Gateway daemon tests observe short registration, cooldown, and
+		// restart windows. Running the package beside Teams/store shards can
+		// delay those observations on hosted Windows runners even though the
+		// daemon fixture itself is isolated in a temporary directory.
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
 	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
@@ -119,7 +129,13 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
 	"./internal/cli": {
-		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup":     true,
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
 	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,

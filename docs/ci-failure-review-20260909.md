@@ -63,3 +63,7 @@ Windows 原生 runner 和远端完整矩阵尚未在本地执行，因此不能�
 runner 为每个 manifest test 生成独立 JSONL phase trace 和汇总报告，记录启动、fixture、owner admission、listener stop 等已埋点事件。诊断文件缺失或损坏会进入报告，但不会把语义通过改成重试或跳过；因此首个失败仍是权威结果，同时可以区分测试失败、夹具未就绪、子进程未退出和诊断路径本身异常。
 
 本地验证包括完整 `go test ./... -count=1`、恢复 manifest selector、脚本和 workflow 静态检查，以及 owner-admission 回归 50 次重复；Linux 不能证明 Windows 的 `FlushFileBuffers` 行为，最终验收必须看同一提交的 Windows normal/race 首轮矩阵和保留的 phase artifact。若出现新的红灯，继续按报告建立对应回归，不通过增加重跑次数掩盖未知竞态。
+
+PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery normal 的两个 partition 都通过，包含此前失败的 owner-admission SQLite 条目；同一首轮的 Windows full-suite partition 0 却在 `TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown` 和 `TestRunAppGatewayDaemonRestartReusesStablePort` 中失败。它们不是 Teams 业务断言，而是 `go test` 多包调度把短 registration/cooldown/restart 观察与大量 Teams/store 子进程放在同一 hosted runner 上，导致临时 registration 文件仍被占用、daemon stop 观察超时。
+
+这次首轮红灯没有通过重跑掩盖。`run_full_go_test_shards.go` 现将全部六个 App Gateway daemon timing fixtures 从普通 `internal/cli` 包池拆成独立 test process，并标为 host-exclusive；普通 CLI 测试仍 exact-once 执行，六个 fixture 的所有断言和 timeout 保持不变。该补强把同一类“跨包 runner 压力污染有限 liveness 观察”的根因纳入通用调度边界，随后必须重新跑完整首轮矩阵确认没有新的资源类别遗漏。

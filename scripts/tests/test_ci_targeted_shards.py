@@ -256,6 +256,23 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             2,
             f"{fixture_name} must be both process-isolated and host-exclusive",
         )
+
+    def test_full_go_runner_isolates_app_gateway_daemon_fixtures(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_names = (
+            "TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns",
+            "TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget",
+            "TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort",
+            "TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown",
+            "TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort",
+            "TestRunAppGatewayDaemonRestartReusesStablePort",
+        )
+        for fixture_name in fixture_names:
+            self.assertEqual(
+                runner.count(f'"{fixture_name}"'),
+                2,
+                f"{fixture_name} must be both process-isolated and host-exclusive",
+            )
         self.assertIn('strings.HasSuffix(packageName, "/internal/cli")', runner)
         self.assertIn('"-skip"', runner)
 
