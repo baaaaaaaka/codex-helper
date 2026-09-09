@@ -332,14 +332,22 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 	var plans []shardPlan
 	for _, packageName := range packages {
 		if !isLargePackage(packageName) {
-			isolated := isolatedRunnableNamesForPackage(packageName)
-			if len(isolated) == 0 {
+			if len(isolatedRunnableNamesForPackage(packageName)) == 0 && !isCodexRunnerPackage(packageName) {
 				ordinary = append(ordinary, packageName)
 				continue
 			}
+			// Ordinary packages may still contain a small, reviewed family of
+			// host-sensitive tests. Discover the names before constructing the
+			// ordinary job so semantic families receive the same exact-once
+			// process/resource boundary as large packages.
 			names, err := listRunnableNames(packageName, race)
 			if err != nil {
 				return nil, err
+			}
+			isolated := runnableIsolationMap(packageName, names)
+			if len(isolated) == 0 {
+				ordinary = append(ordinary, packageName)
+				continue
 			}
 			var isolatedNames []string
 			var regularNames []string
@@ -375,7 +383,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 					args:  args,
 				})
 			}
-			exclusive := exclusiveRunnableNamesForPackage(packageName)
+			exclusive := runnableExclusivityMap(packageName, names)
 			for _, name := range isolatedNames {
 				args := []string{"test"}
 				if race {
@@ -532,17 +540,30 @@ func runnableIsolationMap(packageName string, names []string) map[string]bool {
 }
 
 func autoIsolatedRunnableName(packageName, name string) bool {
-	if !isTeamsRecoveryPackage(packageName) {
-		return false
+	if isTeamsRecoveryPackage(packageName) {
+		// Every TestTeamsListenFalse case drives the continuous listener through
+		// a finite readiness/recovery window. Keeping the family rule broad
+		// prevents a newly-added listener regression (for example a SQLite
+		// admission flood) from silently joining a shard with unrelated test
+		// processes. The outbox family has the same bounded scheduler observation
+		// even without a real listener.
+		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
+			strings.HasPrefix(name, "TestTeamsMainLoopOutbox")
 	}
-	// Every TestTeamsListenFalse case drives the continuous listener through a
-	// finite readiness/recovery window. Keeping the family rule broad prevents
-	// a newly-added listener regression (for example a SQLite admission flood)
-	// from silently joining a shard with unrelated test processes. The outbox
-	// family has the same bounded scheduler observation even without a real
-	// listener.
-	return strings.HasPrefix(name, "TestTeamsListenFalse") ||
-		strings.HasPrefix(name, "TestTeamsMainLoopOutbox")
+	if isCodexRunnerPackage(packageName) {
+		// These fixtures start an OS wrapper and a long-lived descendant, then
+		// assert that Close tears down the whole tree. Their short PID/readiness
+		// and cleanup windows are real host observations; unrelated full-suite
+		// processes can delay PowerShell/tasklist without changing the product
+		// behavior under test.
+		return strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")
+	}
+	return false
+}
+
+func isCodexRunnerPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/codexrunner" || strings.HasSuffix(packageName, "/internal/codexrunner")
 }
 
 func isTeamsRecoveryPackage(packageName string) bool {

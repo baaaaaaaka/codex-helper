@@ -81,3 +81,7 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 第二轮首轮矩阵（commit `2a84f04`）验证了 Windows 迁移修复：Windows normal/race 的八个 recovery job 全部通过，phase trace 中 legacy migration 为约 0.15–0.52 秒；此前 60 秒卡死的 JSON listener 路径已恢复。与此同时，Ubuntu race 的 full-suite partition 1 暴露出同一调度根因的另一个成员：`TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat` 被放进包含 254 个测试名的普通 shard，在 28 秒 phase 后被 context cancel，Graph 只有 control-chat 一次读取。该失败不是业务断言回归，而是尚未纳入隔离族的 continuous listener liveness fixture，说明只补两个具体测试仍会继续“打地鼠”。
 
 因此 runner 的语义族规则扩大为所有 `TestTeamsListenFalse*` 以及 `TestTeamsMainLoopOutbox*`：每个测试仍执行一次、保留原始 race/timeout/断言，但在独立 test process 中运行，并在 full runner 的 host-exclusive phase 中避开同机 shard 压力。这样新增同类 listener 回归会自动获得相同资源边界；未知类别仍不会被静默跳过，首轮失败继续阻断验收。该补强之后需要重新跑完整首轮矩阵，不能用第二轮中已通过的 Windows 结果替代第三轮验收。
+
+第三轮的恢复矩阵和 Linux/macOS full/race 分片均通过；Windows full-suite partition 0 又暴露了同一调度类别的遗漏：`TestAppServerProcessCloseTerminatesWindowsDescendants` 在普通 `internal/codexrunner` 包进程中启动 PowerShell 和 `ping.exe`，与 Teams 分片并发时在 10 秒内没有读到第一个 descendant PID 行。日志没有显示产品断言或进程树清理失败，而是 fixture readiness 超时。这是一个跨平台进程树生命周期族，不能靠增加全局重试或延长断言隐藏。
+
+当前补强让普通包也经过候选测试名发现和语义族映射；`TestAppServerProcessCloseTerminates*`（Unix wrapper 和 Windows PowerShell 两个 build-tag 变体）会各自执行一次独立且 host-exclusive 的 test process，普通 `internal/codexrunner` 测试以精确 `-skip` 执行。这样把有限的 PID/readiness 和 tasklist 清理观察从全量包池的无关进程压力中隔离，同时保留原始 10 秒读取边界、5 秒 descendant 清理边界和全部断言。Linux 本地重复与 Windows amd64 交叉编译通过；修复提交后的完整 Windows 矩阵仍是最终验收条件。

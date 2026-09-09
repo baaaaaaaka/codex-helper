@@ -198,6 +198,22 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn("runnableIsolationMap(packageName, names)", runner)
         self.assertIn("runnableExclusivityMap(packageName, names)", runner)
 
+    def test_full_runner_isolates_process_tree_lifecycle_family(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn("isCodexRunnerPackage(packageName)", runner)
+        self.assertIn(
+            'strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")',
+            runner,
+        )
+        self.assertIn(
+            "Ordinary packages may still contain a small, reviewed family",
+            runner,
+        )
+        self.assertIn(
+            "exclusive := runnableExclusivityMap(packageName, names)",
+            runner,
+        )
+
     def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
