@@ -109,3 +109,13 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 该修复针对已观测的 Windows durable-I/O 尾延，并把内部等待与外层 watchdog 对齐；它不能由 Linux 单独证明。提交后必须重新查看同一提交的 Windows normal/race、macOS 和 Ubuntu full/race 首轮结果及 phase artifact；若仍出现红灯，按新的首次 trace 判断是另一种资源类别、生产边界还是诊断问题。
 
 本轮新增的 manifest 元数据护栏要求该测试继续声明 JSON/SQLite 双 backend、`sqlite_fsync`、exclusive phase 和至少 180 秒外层窗口；本地脚本检查共 33 项（2 项按环境跳过）通过。
+
+## 第六轮失败复盘与修复
+
+提交 `22e5ca0` 的首轮矩阵（run `34376359413`）中，Teams recovery、listener frontier 和其他平台的 full/race job 均通过；唯一实际失败来自 Windows targeted shard 的 `Codex upgrade integration (system npm, Windows)`。第二次 npm 安装报告成功后，CXP 在显式 `--upgrade-codex-path C:\npm\prefix\codex.cmd` 的单次 `--version` 前置探测处收到 `codex-cli 0.153.4` 和 exit status 1。此前同一 Windows 镜像和版本在 run `34339737261`、`34338051354` 也出现过相同错误，而 run `34325457353` 成功；因此这是安装后外部 CLI 状态/启动时序的间歇性失败，不是某个 Teams 断言或一个固定坏版本可以解释的。
+
+这里的逻辑问题是把“升级”当成了“先证明旧文件健康再允许修复”。显式路径只要存在且能识别出 npm source，就足以安全选择更新目标；旧文件可能正是需要被 npm 替换的损坏或短暂不可用状态。现在 root explicit upgrade 不再以旧文件的 `--version` 作为前置闸门，仍会拒绝不存在或无法识别 source 的路径；npm 完成后 `upgradeCodexInstalledWithOptions` 继续通过 `resolveUpgradedCodexPath` 对替换结果做功能探测，结果不健康仍返回 `codex upgrade finished but installed binary is not functional`。这保留了最终测试质量，同时让升级真正具备修复损坏安装的语义。
+
+候选发现、安装重检和 root upgrade 结果探测另外采用 5 秒总上下文内最多三次、每次间隔 250ms 的有限重试。任何一次成功才算通过，三次失败仍返回最后一次原始错误；新增跨平台真实子进程 fixture 覆盖“首次失败后恢复”和“永久失败仍失败”，并把这些测试加入 Windows targeted root regression。该重试只吸收外部 CLI 发布后的短暂启动尾延，不改变断言、跳过测试或无限重试策略。
+
+本地验证包含 CLI root/探测回归、完整 `internal/cli`、Windows amd64 交叉编译、workflow 静态检查和 `git diff --check`。旧提交的失败 job 在同一 run 的第二次尝试（job `102564026305`）成功，确认该错误确实具有间歇性；这次 rerun 只用于建立根因证据，不能替代新修复提交的首次结果。新提交仍需观察 Windows system npm job 和完整 normal/race 矩阵。Linux 测试不能证明 Windows npm/批处理 shim 和文件系统行为，最终验收继续以 Windows artifact 为准。

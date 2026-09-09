@@ -1665,6 +1665,52 @@ func TestUpgradeCodexInstalledWithOptionsManagedUsesManagedPrefix(t *testing.T) 
 	}
 }
 
+func TestUpgradeCodexInstalledWithOptionsRepairsNonfunctionalCodex(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip shell-based upgrade test on windows")
+	}
+
+	root := t.TempDir()
+	globalPrefix := filepath.Join(root, "system-global")
+	globalBin := filepath.Join(globalPrefix, "bin")
+	if err := os.MkdirAll(globalBin, 0o755); err != nil {
+		t.Fatalf("mkdir global bin: %v", err)
+	}
+	codexPath := writeProbeableCodex(t, globalBin, false)
+	marker := filepath.Join(root, "npm-install-hit")
+
+	binDir := t.TempDir()
+	npmPath := filepath.Join(binDir, "npm")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"prefix\" ] && [ \"$2\" = \"-g\" ]; then\n" +
+		"  echo \"" + globalPrefix + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-g\" ] && [ \"$3\" = \"--include=optional\" ] && [ \"$4\" = \"@openai/codex\" ]; then\n" +
+		"  printf '%s\\n' '#!/bin/sh' \"echo 'codex-cli 0.153.4'\" 'exit 0' > \"" + codexPath + "\"\n" +
+		"  chmod 700 \"" + codexPath + "\"\n" +
+		"  echo hit > \"" + marker + "\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exit 1\n"
+	writeExecutable(t, npmPath, script)
+
+	t.Setenv("PATH", strings.Join([]string{globalBin, binDir}, string(os.PathListSeparator)))
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	got, err := upgradeCodexInstalledWithOptions(context.Background(), io.Discard, codexInstallOptions{upgradeCodex: true})
+	if err != nil {
+		t.Fatalf("upgradeCodexInstalledWithOptions error: %v", err)
+	}
+	if got != codexPath {
+		t.Fatalf("expected codex path %q, got %q", codexPath, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("expected npm install marker: %v", err)
+	}
+}
+
 func TestUpgradeCodexInstalledWithOptionsRemovesStaleSystemRetiredPaths(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("skip shell-based upgrade test on windows")

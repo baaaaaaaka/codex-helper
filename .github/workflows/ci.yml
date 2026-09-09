@@ -1310,7 +1310,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|ProbeManagedCodexUpgradeCandidate.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run "$pattern"
 
       - name: Root/home/identity regressions (Windows)
@@ -1319,7 +1319,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|ProbeManagedCodexUpgradeCandidate.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run $pattern
 
       - name: Config and standard runtime resilience regressions (Linux/macOS)

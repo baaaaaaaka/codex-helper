@@ -1496,8 +1496,9 @@ Behavior:
 - Uses current proxy preference: proxy on -> upgrade through proxy; proxy off -> direct.
 - Installs the CXP-managed Codex CLI when it is missing and upgrades it when present.
 - Ignores unrelated `codex` executables earlier in `PATH` for the default managed operation.
-- `--upgrade-codex-path` requires an absolute, functional executable path and keeps
-  that installation's recognized npm source.
+- `--upgrade-codex-path` requires an absolute executable path and keeps that
+  installation's recognized npm source. The command may repair a present but
+  nonfunctional executable; it verifies the replacement after npm completes.
 - Explicit external upgrades fail fast when the source cannot be determined.
 
 Manually refresh the CXP-managed Codex desktop app copy on native Windows or

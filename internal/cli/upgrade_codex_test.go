@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -282,6 +284,45 @@ func TestRootUpgradeCodexExplicitPathPreservesExternalUpgrade(t *testing.T) {
 	}
 }
 
+func TestRootUpgradeCodexExplicitPathCanRepairNonfunctionalExecutable(t *testing.T) {
+	lockCLITestHooks(t)
+	home := t.TempDir()
+	external := writeProbeableCodex(t, t.TempDir(), false)
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv(envUserHomeHint, "")
+	t.Setenv("SUDO_UID", "")
+	t.Setenv("SUDO_USER", "")
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+
+	previousUpgrade := upgradeCodexInstalledForTargetRun
+	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = previousUpgrade })
+	var got codexInstallOptions
+	upgradeCodexInstalledForTargetRun = func(_ context.Context, _ io.Writer, opts codexInstallOptions) (string, error) {
+		got = opts
+		return opts.upgradeCodexPath, nil
+	}
+
+	cmd := newRootCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--config", cfgPath, "--upgrade-codex", "--upgrade-codex-path", external})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got.upgradeCodexPath != external || got.requireManaged {
+		t.Fatalf("repair upgrade options = %#v", got)
+	}
+}
+
 func TestRootUpgradeCodexPathValidation(t *testing.T) {
 	t.Run("requires upgrade flag", func(t *testing.T) {
 		cmd := newRootCmd()
@@ -299,6 +340,63 @@ func TestRootUpgradeCodexPathValidation(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+}
+
+func TestProbeManagedCodexUpgradeCandidateRetriesTransientFailure(t *testing.T) {
+	previousDelay := managedCodexProbeRetryDelay
+	managedCodexProbeRetryDelay = time.Millisecond
+	t.Cleanup(func() { managedCodexProbeRetryDelay = previousDelay })
+
+	path, counter := writeTransientProbeCodex(t)
+	if err := probeManagedCodexUpgradeCandidate(context.Background(), path, nil, nil); err != nil {
+		t.Fatalf("transient probe should recover: %v", err)
+	}
+	if _, err := os.Stat(counter); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProbeManagedCodexUpgradeCandidatePreservesPermanentFailure(t *testing.T) {
+	previousDelay := managedCodexProbeRetryDelay
+	managedCodexProbeRetryDelay = time.Millisecond
+	t.Cleanup(func() { managedCodexProbeRetryDelay = previousDelay })
+
+	path, counter := writePermanentProbeCodex(t)
+	err := probeManagedCodexUpgradeCandidate(context.Background(), path, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "not functional") {
+		t.Fatalf("permanent probe error = %v", err)
+	}
+	attempts, readErr := os.ReadFile(counter)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(attempts) != managedCodexProbeAttempts {
+		t.Fatalf("probe attempts = %d, want %d", len(attempts), managedCodexProbeAttempts)
+	}
+}
+
+func writeTransientProbeCodex(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "probe-attempt")
+	if runtime.GOOS == "windows" {
+		path := writeProbeScript(t, dir, "codex.cmd", "@echo off\r\nset \"marker=%~dp0probe-attempt\"\r\nif exist \"%marker%\" goto success\r\ntype nul > \"%marker%\"\r\necho codex-cli transient failure\r\nexit /b 1\r\n:success\r\necho codex-cli 0.153.4\r\nexit /b 0\r\n")
+		return path, marker
+	}
+	path := writeProbeScript(t, dir, "codex", fmt.Sprintf("#!/bin/sh\nif [ ! -f %q ]; then\n  printf x > %q\n  echo 'codex-cli transient failure'\n  exit 1\nfi\necho 'codex-cli 0.153.4'\nexit 0\n", marker, marker))
+	return path, marker
+}
+
+func writePermanentProbeCodex(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "probe-attempts")
+	if runtime.GOOS == "windows" {
+		path := writeProbeScript(t, dir, "codex.cmd", "@echo off\r\necho x>>\"%~dp0probe-attempts\"\r\necho codex-cli permanently broken\r\nexit /b 1\r\n")
+		return path, counter
+	}
+	path := writeProbeScript(t, dir, "codex", fmt.Sprintf("#!/bin/sh\nprintf x >> %q\necho 'codex-cli permanently broken'\nexit 1\n", counter))
+	return path, counter
 }
 
 func TestCodexUpgradeTargetInstallOptionsUsesTargetIdentity(t *testing.T) {
