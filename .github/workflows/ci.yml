@@ -2218,8 +2218,6 @@ jobs:
   teams-recovery-test:
     name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
-    env:
-      CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
     strategy:
       fail-fast: false
       matrix:
@@ -2257,6 +2255,8 @@ jobs:
       - name: Run Teams recovery manifest (normal)
         if: matrix.mode == 'normal'
         shell: bash
+        env:
+          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
@@ -2268,6 +2268,8 @@ jobs:
       - name: Run Teams recovery manifest (race)
         if: matrix.mode == 'race'
         shell: bash
+        env:
+          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
