@@ -122,8 +122,10 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"if: runner.os == 'Linux'",
 		"shell: bash",
 		"frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'",
-		"go test -timeout=20m -parallel=16 -skip \"$frontier_recovery_pattern\" -coverprofile=coverage.out ./...",
+		"migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'",
+		"go test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=coverage.out ./...",
 		"go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\" -coverprofile=\"$isolated_profile\" -v",
+		"go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run \"$migration_process_pattern\" -coverprofile=\"$migration_profile\" -v",
 	)
 
 	nonLinuxTest := workflowStepBlock(t, fullJob, "go test (without coverage, non-Linux)")

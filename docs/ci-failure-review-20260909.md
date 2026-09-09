@@ -36,6 +36,20 @@ Windows 子进程原先直接创建并写入 ready 文件，父进程一看到�
 
 Windows 原生 runner 和远端完整矩阵尚未在本地执行，因此不能把本地结果表述成跨平台 CI 已经全部通过。提交后应以同一 commit 的首次矩阵结果验收；若仍有红灯，按上传日志区分 admission、durable terminal、worker exit、outbox publication 和外部依赖，不用自动重跑覆盖首次证据。
 
+## 提交后 CI 复盘与补强
+
+首个远端矩阵继续暴露了两个此前没有被本地 Linux 测试覆盖的边界：Windows targeted shard 在发布真实固定 FFmpeg 目录时遇到 `Access is denied`，Linux race shard 的迁移进程组回归在普通包并发池中报告子进程仍存活。前者是 Windows `MoveFileEx` 在目录仍被短暂占用时的实际重命名竞态；后者的测试只保存 PID，且与大量其他子进程共享 runner，不能区分原始进程和同 PID 的后续进程，也让有限 liveness 观察受到无关进程压力影响。
+
+后续修改保持生产和测试边界都严格：
+
+- `internal/teams/asr_managed.go` 的默认目录发布改用现有 durable replacement（含 Windows 重试/替换语义），并保留可注入 seam；新增测试确认真实发布路径使用该替换。
+- `internal/cli/process_group_unix.go` 在初次进程组 `SIGINT` 返回错误时仍执行进程组 `SIGKILL`，同时保留 leader fallback，避免首个信号的 ESRCH/EPERM 竞态留下 descendant。
+- 迁移进程测试在 Linux 记录并核对 `/proc` 启动时间，失败时输出启动时间、PGID 和命令行，避免 PID 复用造成误报，同时不放宽真实存活断言。
+- `scripts/ci/run_full_go_test_shards.go` 将该测试从普通包池拆成独立且 host-exclusive 的 test process；普通 `internal/cli` 测试用 `-skip` 排除它，再由独立 job 执行一次，分片仍保持 exact-once。
+- Linux coverage job 也跳过后单独执行该进程树测试，并把独立 profile 合并回 `coverage.out`；独立日志纳入失败 artifact，首次失败证据不被重跑覆盖。
+
+这些调整没有删除测试、降低 timeout 或把失败改成 skip；它们分别修复了真实 Windows 发布竞态、补足 Unix 清理兜底，并使测试只观察自己创建的进程且在可控的调度边界运行。
+
 ## 验收边界
 
 测试覆盖没有删除：大套件的精确 test-name 分片和 race 参数保留，隔离 frontier 测试补回 coverage；汇总 job 只减少重复观察，不减少依赖的实际执行。修复保证的是已定位竞态和夹具协议不再把合法时序误判为失败；未知失败仍需按日志建立新的回归和修复。

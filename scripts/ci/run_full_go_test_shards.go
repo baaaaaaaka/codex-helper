@@ -40,6 +40,13 @@ var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$
 // older package fixtures. Keep them in their own test process rather than
 // allowing unrelated tests to make their timing assertions nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
+	"./internal/cli": {
+		// This fixture starts a real Codex-shaped process tree and asserts
+		// bounded process-group cancellation. Keep it out of the ordinary
+		// package pool, where unrelated test processes can make the PID and
+		// signal observation nondeterministic.
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
 		// context. Keep its scheduler observation independent from the large
@@ -111,6 +118,9 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // runner's scheduler and filesystem while a finite liveness observation is in
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
+	"./internal/cli": {
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
@@ -302,10 +312,73 @@ func listPackages() ([]string, error) {
 
 func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Duration, race bool) ([]testJob, error) {
 	var ordinary []string
+	var ordinaryIsolated []testJob
 	var plans []shardPlan
 	for _, packageName := range packages {
 		if !isLargePackage(packageName) {
-			ordinary = append(ordinary, packageName)
+			isolated := isolatedRunnableNamesForPackage(packageName)
+			if len(isolated) == 0 {
+				ordinary = append(ordinary, packageName)
+				continue
+			}
+			names, err := listRunnableNames(packageName, race)
+			if err != nil {
+				return nil, err
+			}
+			var isolatedNames []string
+			var regularNames []string
+			for _, name := range names {
+				if isolated[name] {
+					isolatedNames = append(isolatedNames, name)
+				} else {
+					regularNames = append(regularNames, name)
+				}
+			}
+			if len(isolatedNames) == 0 {
+				// A platform-specific isolated test may not be compiled on this
+				// runner. Keep the package in the ordinary invocation in that case.
+				ordinary = append(ordinary, packageName)
+				continue
+			}
+			sort.Strings(isolatedNames)
+			if len(regularNames) != 0 {
+				args := []string{"test"}
+				if race {
+					args = append(args, "-race")
+				}
+				args = append(args,
+					fmt.Sprintf("-timeout=%s", testTimeout),
+					fmt.Sprintf("-parallel=%d", parallel),
+					"-count=1",
+					packageName,
+					"-skip",
+					exactRunnablePattern(isolatedNames),
+				)
+				ordinaryIsolated = append(ordinaryIsolated, testJob{
+					label: fmt.Sprintf("%s ordinary tests (isolated names skipped)", packageName),
+					args:  args,
+				})
+			}
+			exclusive := exclusiveRunnableNamesForPackage(packageName)
+			for _, name := range isolatedNames {
+				args := []string{"test"}
+				if race {
+					args = append(args, "-race")
+				}
+				args = append(args,
+					fmt.Sprintf("-timeout=%s", testTimeout),
+					fmt.Sprintf("-parallel=%d", parallel),
+					"-count=1",
+					packageName,
+					"-run",
+					exactRunnablePattern([]string{name}),
+				)
+				ordinaryIsolated = append(ordinaryIsolated, testJob{
+					label:     fmt.Sprintf("%s isolated test %s", packageName, name),
+					args:      args,
+					exclusive: exclusive[name],
+				})
+			}
 			continue
 		}
 		names, err := listRunnableNames(packageName, race)
@@ -361,6 +434,8 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 		args = append(args, ordinary...)
 		jobs = append(jobs, testJob{label: "ordinary packages", args: args})
 	}
+	sort.Slice(ordinaryIsolated, func(i, j int) bool { return ordinaryIsolated[i].label < ordinaryIsolated[j].label })
+	jobs = append(jobs, ordinaryIsolated...)
 	planTotals := make(map[string]int)
 	for _, plan := range plans {
 		planTotals[plan.packageName]++
@@ -409,6 +484,9 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	if strings.HasSuffix(packageName, "/internal/tui") {
 		return isolatedRunnableNames["./internal/tui"]
 	}
+	if strings.HasSuffix(packageName, "/internal/cli") {
+		return isolatedRunnableNames["./internal/cli"]
+	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return isolatedRunnableNames["./internal/teams/store"]
 	}
@@ -424,6 +502,9 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	}
 	if strings.HasSuffix(packageName, "/internal/tui") {
 		return exclusiveRunnableNames["./internal/tui"]
+	}
+	if strings.HasSuffix(packageName, "/internal/cli") {
+		return exclusiveRunnableNames["./internal/cli"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return exclusiveRunnableNames["./internal/teams/store"]
@@ -635,6 +716,14 @@ func validateShardCoverage(names []string, buckets []prefixBucket) error {
 
 func joinPatterns(prefixes []string) string {
 	return strings.Join(prefixes, "|")
+}
+
+func exactRunnablePattern(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, regexp.QuoteMeta(name))
+	}
+	return "^(?:" + joinPatterns(quoted) + ")$"
 }
 
 func planPattern(plan shardPlan) string {

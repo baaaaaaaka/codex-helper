@@ -176,6 +176,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         full_end = workflow.index("  race-test:\n", full_start)
         full = workflow[full_start:full_end]
         self.assertIn('tail -n +2 "$isolated_profile" >> coverage.out', full)
+        self.assertIn("migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'", full)
+        self.assertIn("-skip \"$isolated_skip_pattern\"", full)
+        self.assertIn('go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern"', full)
         self.assertIn("Upload full-suite diagnostics", full)
         self.assertNotIn("full-go-test-cli-retry", full)
         self.assertNotIn("isolated internal/cli retry", full)
@@ -226,6 +229,17 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 2,
                 f"{fixture_name} must be both process-isolated and host-exclusive",
             )
+
+    def test_full_go_runner_isolates_cli_process_group_fixture(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_name = "TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup"
+        self.assertEqual(
+            runner.count(f'"{fixture_name}"'),
+            2,
+            f"{fixture_name} must be both process-isolated and host-exclusive",
+        )
+        self.assertIn('strings.HasSuffix(packageName, "/internal/cli")', runner)
+        self.assertIn('"-skip"', runner)
 
     def test_every_non_setup_step_selects_exactly_one_shard(self):
         for name, block in step_blocks(targeted_job()).items():
