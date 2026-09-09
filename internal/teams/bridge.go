@@ -801,6 +801,11 @@ type Bridge struct {
 	// phase. It observes one completed chat attempt and never participates in
 	// scheduling or durable state.
 	pollChatTraceHook func(string, time.Duration, error)
+	// pollAttemptBeforeTerminalCommitHook is a test-only seam for the narrow
+	// window after handler work has finished and before the terminal capability
+	// CAS. It lets recovery tests place a legitimate retained-capability
+	// scheduler update at that boundary without adding a production sleep.
+	pollAttemptBeforeTerminalCommitHook func(string, teamstore.ChatPollAttemptCapability, uint64)
 	// outboxSendHook is a narrow test seam used to stop immediately before a
 	// Graph side effect. Production bridges leave it nil; recovery tests use it
 	// to make a durable restart boundary deterministic without manufacturing an
@@ -4472,6 +4477,9 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		return result.Handled, nil
 	} else {
 		expectedRevision = refreshed
+	}
+	if b.pollAttemptBeforeTerminalCommitHook != nil {
+		b.pollAttemptBeforeTerminalCommitHook(chatID, attemptCapability, expectedRevision)
 	}
 	if handlerErr != nil {
 		if errors.Is(handlerErr, teamstore.ErrControlLeaseNotHeld) {

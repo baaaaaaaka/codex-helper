@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1606,6 +1607,30 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		called: make(chan string),
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	// Arm a deterministic barrier only after the continuation request has
+	// started. The hook pauses the second page after handler work has completed
+	// but before terminal CAS, so the explicit final-answer boost below cannot be
+	// mistaken for a timing-dependent sleep experiment.
+	var terminalBarrierArmed atomic.Bool
+	terminalCommitEntered := make(chan struct{})
+	terminalCommitRelease := make(chan struct{})
+	var terminalCommitOnce sync.Once
+	bridge.pollAttemptBeforeTerminalCommitHook = func(hChatID string, _ teamstore.ChatPollAttemptCapability, _ uint64) {
+		if hChatID != chatID || !terminalBarrierArmed.Load() {
+			return
+		}
+		terminalCommitOnce.Do(func() {
+			close(terminalCommitEntered)
+			<-terminalCommitRelease
+		})
+	}
+	t.Cleanup(func() {
+		select {
+		case <-terminalCommitRelease:
+		default:
+			close(terminalCommitRelease)
+		}
+	})
 	// Keep the real listener's history-watch phase out of the host user's
 	// Codex directory.  This test is about a stateful Graph frontier; inheriting
 	// CODEX_HOME (or the default user home) can make an unrelated session scan
@@ -1742,7 +1767,30 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	} else if boosted.Attempt == nil || boosted.Attempt.ExpectedPollRevision != boosted.PollRevision {
 		t.Fatalf("stateful poll boost did not merge the live attempt revision: %#v", boosted)
 	}
+	terminalBarrierArmed.Store(true)
 	close(continuationRelease)
+	select {
+	case <-terminalCommitEntered:
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+		t.Fatal("stateful terminal CAS barrier was not reached")
+	}
+	// Advance the retained capability after the handler has read its revision.
+	// The terminal commit must adopt this safe scheduler revision atomically;
+	// an old strict CAS would leave the pending page and attempt stranded.
+	boosted, changed, err = store.BoostChatPollAfterFinalAnswer(context.Background(), teamstore.FinalAnswerPollBoostRequest{
+		SessionID:      "s-stateful",
+		TeamsChatID:    chatID,
+		NextPollAt:     time.Now().UTC().Add(5 * time.Second),
+		LastActivityAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("advance terminal-boundary poll revision: %v", err)
+	} else if !changed {
+		t.Fatal("terminal-boundary poll revision was not advanced")
+	} else if boosted.Attempt == nil || boosted.Attempt.ExpectedPollRevision != boosted.PollRevision {
+		t.Fatalf("terminal-boundary poll boost did not merge the live attempt revision: %#v", boosted)
+	}
+	close(terminalCommitRelease)
 	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()

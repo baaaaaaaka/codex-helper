@@ -104,6 +104,11 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
 	)
 
+	windowsLifecycle := workflowJobBlock(t, workflow, "windows-proxy-lifecycle")
+	requireStepContains(t, windowsLifecycle,
+		"go test -p=1 ./internal/helperruntime -count=1 -run '^TestRuntimeProcessIdentityWindows$' -v",
+	)
+
 	fullJob := workflowJobBlock(t, workflow, "full-go-test")
 	requireStepContains(t, fullJob,
 		"name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})",
@@ -118,7 +123,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"shell: bash",
 		"frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'",
 		"go test -timeout=20m -parallel=16 -skip \"$frontier_recovery_pattern\" -coverprofile=coverage.out ./...",
-		"go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\" -v",
+		"go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\" -coverprofile=\"$isolated_profile\" -v",
 	)
 
 	nonLinuxTest := workflowStepBlock(t, fullJob, "go test (without coverage, non-Linux)")
@@ -165,7 +170,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 
 	aggregateJob := workflowJobBlock(t, workflow, "test")
 	requireStepContains(t, aggregateJob,
-		"name: Test (${{ matrix.os }})",
+		"name: Test",
 		"- targeted-test",
 		"- full-go-test",
 		"- race-test",

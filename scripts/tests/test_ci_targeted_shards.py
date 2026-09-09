@@ -166,6 +166,38 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             race,
         )
 
+    def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(
+            "concurrency:\n  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: true",
+            workflow,
+        )
+        full_start = workflow.index("  full-go-test:\n")
+        full_end = workflow.index("  race-test:\n", full_start)
+        full = workflow[full_start:full_end]
+        self.assertIn('tail -n +2 "$isolated_profile" >> coverage.out', full)
+        self.assertIn("Upload full-suite diagnostics", full)
+        self.assertNotIn("full-go-test-cli-retry", full)
+        self.assertNotIn("isolated internal/cli retry", full)
+
+        race_start = workflow.index("  race-test:\n")
+        race_end = workflow.index("  runtime-env-contract:\n", race_start)
+        race = workflow[race_start:race_end]
+        self.assertIn('tee "$RUNNER_TEMP/race-test.log"', race)
+        self.assertIn("Upload race diagnostics", race)
+
+        aggregate = workflow[workflow.index("  test:\n") :]
+        self.assertIn("    name: Test\n", aggregate)
+        self.assertNotIn("name: Test (${{ matrix.os }})", aggregate)
+
+        windows_start = workflow.index("  windows-proxy-lifecycle:\n")
+        windows_end = workflow.index("  proxy-recovery-docker:\n", windows_start)
+        windows = workflow[windows_start:windows_end]
+        self.assertIn(
+            "go test -p=1 ./internal/helperruntime -count=1 -run '^TestRuntimeProcessIdentityWindows$' -v",
+            windows,
+        )
+
     def test_partition_flags_have_exactly_once_runner_selection_support(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
         self.assertIn('flag.Int("partition-count", 1', runner)

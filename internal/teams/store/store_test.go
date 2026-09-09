@@ -3433,6 +3433,88 @@ func TestChatPollAttemptLifecyclePersistsAndRejectsStaleWriter(t *testing.T) {
 	}
 }
 
+func TestChatPollAttemptCommitAdoptsRetainedCapabilityRevision(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			const chatID = "chat-retained-capability"
+			if _, changed, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
+				poll.Seeded = true
+				poll.PollState = chatPollStateWarm
+				poll.ContinuationPath = "/chats/chat-retained-capability/messages?$skiptoken=one"
+				return nil
+			}); err != nil || !changed {
+				t.Fatalf("seed poll: changed=%v err=%v", changed, err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			first, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:             chatID,
+				Owner:              "owner-a",
+				ProcessIncarnation: "process-a",
+				LeaseGeneration:    7,
+				ExpectedFrontier:   "continuation:/chats/chat-retained-capability/messages?$skiptoken=one",
+				ExpectedPollRole:   "work",
+				Now:                time.Now().UTC(),
+			})
+			if err != nil || !acquired || first.Attempt == nil {
+				t.Fatalf("begin attempt: acquired=%v attempt=%#v err=%v", acquired, first.Attempt, err)
+			}
+			capability := ChatPollAttemptCapability{
+				ID:                 first.Attempt.ID,
+				Owner:              first.Attempt.Owner,
+				ProcessIncarnation: first.Attempt.ProcessIncarnation,
+				LeaseGeneration:    first.Attempt.LeaseGeneration,
+			}
+			staleRevision := first.PollRevision
+
+			// This mirrors BoostChatPollAfterFinalAnswer: a scheduler side effect
+			// retains the attempt, advances both revisions, and records the new
+			// expected revision before the handler's terminal CAS runs.
+			advanced, applied, err := store.MutateChatPollAttemptWithCapability(ctx, chatID, capability, staleRevision, func(poll *ChatPollState) error {
+				poll.NextPollAt = time.Now().UTC()
+				poll.ScheduleRevision++
+				poll.Attempt.ExpectedScheduleRevision = poll.ScheduleRevision
+				return nil
+			})
+			if err != nil || !applied || advanced.PollRevision <= staleRevision || advanced.Attempt == nil || advanced.Attempt.ExpectedPollRevision != advanced.PollRevision {
+				t.Fatalf("retained capability revision advance: applied=%v state=%#v err=%v", applied, advanced, err)
+			}
+
+			committed, ok, err := store.CommitChatPollAttemptWithCapability(ctx, chatID, capability, staleRevision, func(poll *ChatPollState) error {
+				poll.LastError = "terminal result committed after retained revision advance"
+				return nil
+			})
+			if err != nil || !ok || committed.Attempt != nil || committed.LastError == "" {
+				t.Fatalf("stale terminal CAS was not safely adopted: committed=%v state=%#v err=%v", ok, committed, err)
+			}
+
+			// A capability from another process must remain fenced even when the
+			// row revision is newer; identity is the safety boundary, not retrying.
+			if _, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID:             chatID,
+				Owner:              "owner-b",
+				ProcessIncarnation: "process-b",
+				LeaseGeneration:    8,
+				ExpectedFrontier:   "continuation:/chats/chat-retained-capability/messages?$skiptoken=one",
+				ExpectedPollRole:   "work",
+				Now:                time.Now().UTC(),
+			}); err != nil {
+				t.Fatalf("begin replacement attempt: %v", err)
+			} else if !acquired {
+				t.Fatal("replacement attempt was not acquired after terminal commit")
+			}
+		})
+	}
+}
+
 func TestChatPollAttemptRejectsExpectedFrontierMismatch(t *testing.T) {
 	ctx := context.Background()
 	for _, useSQLite := range []bool{false, true} {
