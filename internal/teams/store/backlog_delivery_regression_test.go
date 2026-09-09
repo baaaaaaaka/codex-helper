@@ -8,6 +8,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 )
 
 func TestStoreJSONSQLiteDispositionParity(t *testing.T) {
@@ -535,7 +537,19 @@ func TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends(t *testin
 	ctx := context.Background()
 	for _, useSQLite := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
-			store := newTestStore(t)
+			backend := map[bool]string{false: "json", true: "sqlite"}[useSQLite]
+			testphase.Emit("backend_start", map[string]string{"backend": backend})
+			var store *Store
+			if useSQLite {
+				// This test verifies owner-bound admission semantics.  Use a
+				// native current-schema SQLite fixture so migration durability is
+				// covered by its dedicated tests instead of sharing this test's
+				// short semantic watchdog.
+				store = newSQLiteTestStore(t)
+			} else {
+				store = newTestStore(t)
+			}
+			testphase.Emit("owner_admission_start", map[string]string{"backend": backend})
 			now := time.Now().UTC().Truncate(time.Microsecond)
 			scope := ScopeIdentity{ID: "scope:outbox-owner-admission", AccountID: "user-1", OSUser: "tester", Profile: "default"}
 			machineA := MachineRecord{ID: "machine:outbox-owner-a", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
@@ -544,10 +558,7 @@ func TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends(t *testin
 			if err != nil || leaseA.Mode != LeaseModeActive {
 				t.Fatalf("claim owner A = %#v err=%v", leaseA, err)
 			}
-			if useSQLite {
-				migrateStoreToSQLiteForTest(t, store)
-			}
-
+			testphase.Emit("owner_a_committed", map[string]string{"backend": backend, "generation": fmt.Sprint(leaseA.Lease.Generation)})
 			if _, created, err := store.QueueOutboxForOwner(ctx, OutboxMessage{
 				ID: "outbox:stale-before-takeover", TeamsChatID: "chat:owner-admission", Kind: "helper", Body: "must not be admitted",
 			}, machineB.ID, leaseA.Lease.Generation); !errors.Is(err, ErrControlLeaseNotHeld) || created {
@@ -559,6 +570,7 @@ func TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends(t *testin
 			if err != nil || !created || fresh.MachineID != machineA.ID || fresh.LeaseGeneration != leaseA.Lease.Generation {
 				t.Fatalf("owner A admission = %#v created=%v err=%v", fresh, created, err)
 			}
+			testphase.Emit("owner_a_outbox_committed", map[string]string{"backend": backend})
 
 			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
 				t.Fatalf("release owner A = %v err=%v", released, err)
@@ -578,6 +590,7 @@ func TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends(t *testin
 			if err != nil || !created || replacement.MachineID != machineB.ID || replacement.LeaseGeneration != leaseB.Lease.Generation {
 				t.Fatalf("owner B admission = %#v created=%v err=%v", replacement, created, err)
 			}
+			testphase.Emit("owner_b_outbox_committed", map[string]string{"backend": backend, "generation": fmt.Sprint(leaseB.Lease.Generation)})
 		})
 	}
 }

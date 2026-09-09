@@ -53,3 +53,13 @@ Windows 原生 runner 和远端完整矩阵尚未在本地执行，因此不能�
 ## 验收边界
 
 测试覆盖没有删除：大套件的精确 test-name 分片和 race 参数保留，隔离 frontier 测试补回 coverage；汇总 job 只减少重复观察，不减少依赖的实际执行。修复保证的是已定位竞态和夹具协议不再把合法时序误判为失败；未知失败仍需按日志建立新的回归和修复。
+
+## 本轮根因方案执行（2026-09-09）
+
+上一轮修复之后，最新红灯仍落在 `TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends/sqlite` 的 10 秒 watchdog 内，栈顶是 Windows `FlushFileBuffers`。这说明 owner admission 语义被一个不相关的 legacy-to-SQLite 迁移夹具包住了；迁移的持久化边界和 owner CAS 边界必须分别验收。
+
+本轮把该语义回归改为当前 schema 的原生 SQLite fixture，仍通过真实 `Store`、SQLite 连接、事务和 JSON/SQLite 两个 backend 子测试；迁移、指针发布和 durability 继续由专门的 migration/reopen 测试覆盖。SQLite schema fixture 的 DDL 也在一个事务内创建，减少 Windows 上无意义的逐条 flush。恢复 manifest 升级为 version 2，为每个条目声明 `pure_cpu`、`listener_async`、`sqlite_fsync` 或 `host_exclusive`，runner 按类别限制同一 hosted runner 上的并发；Windows 仍按独立 partition 串行执行。
+
+runner 为每个 manifest test 生成独立 JSONL phase trace 和汇总报告，记录启动、fixture、owner admission、listener stop 等已埋点事件。诊断文件缺失或损坏会进入报告，但不会把语义通过改成重试或跳过；因此首个失败仍是权威结果，同时可以区分测试失败、夹具未就绪、子进程未退出和诊断路径本身异常。
+
+本地验证包括完整 `go test ./... -count=1`、恢复 manifest selector、脚本和 workflow 静态检查，以及 owner-admission 回归 50 次重复；Linux 不能证明 Windows 的 `FlushFileBuffers` 行为，最终验收必须看同一提交的 Windows normal/race 首轮矩阵和保留的 phase artifact。若出现新的红灯，继续按报告建立对应回归，不通过增加重跑次数掩盖未知竞态。

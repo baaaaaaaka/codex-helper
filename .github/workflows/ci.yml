@@ -2218,6 +2218,8 @@ jobs:
   teams-recovery-test:
     name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
+    env:
+      CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
     strategy:
       fail-fast: false
       matrix:
@@ -2273,6 +2275,14 @@ jobs:
             partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           fi
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
+
+      - name: Upload Teams recovery phase diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teams-recovery-phases-${{ matrix.os }}-${{ matrix.mode }}-${{ matrix.partition }}
+          path: ${{ runner.temp }}/teams-recovery-phases
+          if-no-files-found: ignore
 
   codex-runtime-contract:
     name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})

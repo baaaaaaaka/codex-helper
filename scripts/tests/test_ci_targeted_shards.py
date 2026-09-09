@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 import unittest
@@ -136,6 +137,23 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             'check teams-recovery-test "${{ needs.teams-recovery-test.result }}"',
             aggregate,
         )
+
+    def test_recovery_jobs_keep_phase_diagnostics_and_resource_contract(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  teams-recovery-test:\n")
+        end = workflow.index("  codex-runtime-contract:\n", start)
+        job = workflow[start:end]
+        self.assertIn("CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases", job)
+        self.assertIn("name: Upload Teams recovery phase diagnostics", job)
+        self.assertIn("if: always()", job)
+        self.assertIn("if-no-files-found: ignore", job)
+
+        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], 2)
+        allowed = {"pure_cpu", "listener_async", "sqlite_fsync", "host_exclusive"}
+        self.assertTrue(manifest["tests"])
+        for item in manifest["tests"]:
+            self.assertIn(item.get("resource_class"), allowed, item["name"])
 
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")

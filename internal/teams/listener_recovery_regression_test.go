@@ -28,6 +28,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 	_ "modernc.org/sqlite"
 )
 
@@ -946,7 +947,10 @@ func startListenerRecovery(t *testing.T, bridge *Bridge, options BridgeOptions) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Listen(ctx, options) }()
+	go func() {
+		testphase.Emit("listener_goroutine_started", nil)
+		done <- bridge.Listen(ctx, options)
+	}()
 	handle := &listenerRecoveryHandle{cancel: cancel, done: done}
 	t.Cleanup(func() { handle.stop(t) })
 	return handle
@@ -973,6 +977,7 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 		h.cancel()
 		select {
 		case h.err = <-h.done:
+			testphase.Emit("listener_stopped", nil)
 		case <-time.After(5 * time.Second):
 			t.Errorf("listener recovery test listener did not stop within 5s")
 		}
