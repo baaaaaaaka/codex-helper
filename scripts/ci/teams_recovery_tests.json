@@ -271,6 +271,7 @@
       "once": false,
       "fake_graph": true,
       "resource_class": "listener_async",
+      "exclusive": true,
       "max_seconds": 120,
       "oracle": "a real polled Teams prompt reaches the durable executor, staged task_started does not create a manual history gate, and the later final is delivered once",
       "baseline": "pre-fix inbound-to-executor vertical path can turn normal task/prompt ordering into a blocked or duplicate recovery path"
@@ -1743,6 +1744,7 @@
       "real_listener": false,
       "fake_graph": true,
       "resource_class": "sqlite_fsync",
+      "exclusive": true,
       "max_seconds": 15,
       "oracle": "bounded main-loop outbox delivery gives distinct chats a head slot and rotates a third chat into a later cycle while retaining per-chat FIFO",
       "baseline": "pre-fix the first two continuously-active chats could starve every later chat"

@@ -408,8 +408,8 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 			continue
 		}
 		var isolatedNames []string
-		isolated := isolatedRunnableNamesForPackage(packageName)
-		exclusive := exclusiveRunnableNamesForPackage(packageName)
+		isolated := runnableIsolationMap(packageName, names)
+		exclusive := runnableExclusivityMap(packageName, names)
 		for _, name := range names {
 			if isolated[name] {
 				isolatedNames = append(isolatedNames, name)
@@ -512,6 +512,42 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	return nil
 }
 
+// runnableIsolationMap combines the reviewed exact-name list with bounded
+// semantic families whose members are expected to grow as regressions are
+// added. Keeping the family rule here means a newly-added listener liveness
+// case cannot silently fall back into a broad shard until someone remembers
+// to edit a second static map.
+func runnableIsolationMap(packageName string, names []string) map[string]bool {
+	base := isolatedRunnableNamesForPackage(packageName)
+	isolated := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		isolated[name] = true
+	}
+	for _, name := range names {
+		if autoIsolatedRunnableName(packageName, name) {
+			isolated[name] = true
+		}
+	}
+	return isolated
+}
+
+func autoIsolatedRunnableName(packageName, name string) bool {
+	if !isTeamsRecoveryPackage(packageName) {
+		return false
+	}
+	// These tests observe the first real listener admission or bounded outbox
+	// rotation. Their short semantic windows are sensitive to unrelated
+	// process and filesystem pressure, while the assertions themselves remain
+	// unchanged when run in a dedicated process.
+	return strings.HasPrefix(name, "TestTeamsListenFalseTaskStartedPromptRace") ||
+		strings.HasPrefix(name, "TestTeamsMainLoopOutbox")
+}
+
+func isTeamsRecoveryPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/teams" || strings.HasSuffix(packageName, "/internal/teams")
+}
+
 func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	if names, ok := exclusiveRunnableNames[packageName]; ok {
 		return names
@@ -529,6 +565,20 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 		return exclusiveRunnableNames["./internal/teams"]
 	}
 	return nil
+}
+
+func runnableExclusivityMap(packageName string, names []string) map[string]bool {
+	base := exclusiveRunnableNamesForPackage(packageName)
+	exclusive := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		exclusive[name] = true
+	}
+	for _, name := range names {
+		if autoIsolatedRunnableName(packageName, name) {
+			exclusive[name] = true
+		}
+	}
+	return exclusive
 }
 
 func plansForPackage(plans []shardPlan, packageName string) []shardPlan {

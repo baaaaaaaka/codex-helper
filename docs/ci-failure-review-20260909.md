@@ -67,3 +67,13 @@ runner 为每个 manifest test 生成独立 JSONL phase trace 和汇总报告，
 PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery normal 的两个 partition 都通过，包含此前失败的 owner-admission SQLite 条目；同一首轮的 Windows full-suite partition 0 却在 `TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown` 和 `TestRunAppGatewayDaemonRestartReusesStablePort` 中失败。它们不是 Teams 业务断言，而是 `go test` 多包调度把短 registration/cooldown/restart 观察与大量 Teams/store 子进程放在同一 hosted runner 上，导致临时 registration 文件仍被占用、daemon stop 观察超时。
 
 这次首轮红灯没有通过重跑掩盖。`run_full_go_test_shards.go` 现将全部六个 App Gateway daemon timing fixtures 从普通 `internal/cli` 包池拆成独立 test process，并标为 host-exclusive；普通 CLI 测试仍 exact-once 执行，六个 fixture 的所有断言和 timeout 保持不变。该补强把同一类“跨包 runner 压力污染有限 liveness 观察”的根因纳入通用调度边界，随后必须重新跑完整首轮矩阵确认没有新的资源类别遗漏。
+
+## 第二轮根因修复与验收
+
+后续 Windows race artifact 进一步定位到另一条未被隔离解决的路径：listener 在第一次轮询前同步执行 legacy JSON→SQLite 迁移，迁移中的 SQLite schema 初始化逐条执行几十个 DDL/索引语句。Windows modernc SQLite 会为这些语句反复进入 `FlushFileBuffers`；因此测试只能看到 control-chat 的一次读取，60 秒后 watchdog 才能取消 listener。单纯把该测试标成 host-exclusive 只能去掉同机并发，不能消除迁移协议本身的长串 durable 边界。
+
+本轮把生产迁移链路改成可取消的 context-aware 路径：基础表/索引、兼容列和最终索引分别以原子事务批量提交，schema trigger 重建也使用单次事务；临时库写入、校验读取和 WAL checkpoint 不再偷偷切回 `context.Background()`。这样仍保留每个 DDL、backfill、校验和 durable replace 的语义，但把 Windows 的逐条 flush 放大器移除。listener phase trace 增加 migration start/finish 和 startup-ready 事件，用于证明首次轮询前是否仍卡在迁移。
+
+测试边界同步修正为生产 phase budget，继续由外层有限 progress watchdog 约束；manifest 为两个此前漏掉的 `TaskStartedPromptRace` 和 `MainLoopOutbox` 语义族声明独立调度，完整 runner 根据语义族自动生成隔离/host-exclusive job，避免新增同类回归再次落入普通包池。没有删除测试、跳过失败或把失败转成重试。
+
+本地验收：`go test ./... -count=1`、关键 listener normal/race 重复、Store 全套、Windows Store 与 Darwin Teams 交叉编译、manifest/runner exact-once 计划、workflow/JSON/Python 静态检查均通过。修复前 PR #114 首轮仍保留为失败基线；最终是否根治必须由包含该生产迁移修复的同一提交完成 Windows normal/race、macOS 和 Ubuntu full/race 首轮矩阵来确认。

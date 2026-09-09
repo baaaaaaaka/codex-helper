@@ -184,6 +184,20 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             race,
         )
 
+    def test_full_runner_keeps_new_listener_liveness_families_isolated(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn("func autoIsolatedRunnableName", runner)
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsListenFalseTaskStartedPromptRace")',
+            runner,
+        )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsMainLoopOutbox")',
+            runner,
+        )
+        self.assertIn("runnableIsolationMap(packageName, names)", runner)
+        self.assertIn("runnableExclusivityMap(packageName, names)", runner)
+
     def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(

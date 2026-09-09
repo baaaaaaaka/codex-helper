@@ -5040,7 +5040,12 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	}
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 5 * time.Second
+	// The first page is observed after real listener startup, including the
+	// legacy JSON-to-SQLite compatibility migration that production performs on
+	// every new owner. Keep the production phase budget here so a slow durable
+	// startup cannot cancel the first page before the restart boundary is even
+	// reached; the outer progress watchdog still fails a genuinely stuck owner.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
 	// This fixture intentionally suppresses the next cycle until the
 	// continuation is interrupted. Keep the worker budget at the production
 	// value so a slow Windows durable transition cannot cancel the only first

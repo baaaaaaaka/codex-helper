@@ -31,6 +31,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 	xhtml "golang.org/x/net/html"
 )
 
@@ -2029,8 +2030,15 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 	if deferMigration, err := b.shouldDeferTeamsStoreSQLiteMigration(ownerWorkCtx); err != nil {
 		return err
 	} else if !deferMigration {
-		if err := b.migrateTeamsStoreToSQLiteOrFallback(ownerWorkCtx); err != nil {
-			return err
+		testphase.Emit("bridge_startup_migration_started", nil)
+		migrationStarted := time.Now()
+		migrationErr := b.migrateTeamsStoreToSQLiteOrFallback(ownerWorkCtx)
+		testphase.Emit("bridge_startup_migration_finished", map[string]string{
+			"duration_ms": fmt.Sprintf("%d", time.Since(migrationStarted).Milliseconds()),
+			"success":     fmt.Sprintf("%t", migrationErr == nil),
+		})
+		if migrationErr != nil {
+			return migrationErr
 		}
 	}
 	// Keep all active-owner phases under a context that the heartbeat can
@@ -2062,6 +2070,7 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
+	testphase.Emit("bridge_startup_ready", nil)
 	for {
 		if teamsStartupFallbackStopRequested() {
 			if b.out != nil {
