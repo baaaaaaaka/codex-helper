@@ -132,3 +132,11 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 - 新增 `scripts/ci/apt_update.sh`。Ubuntu 主机安装前只在有限更新期间暂时移开明确不需要的 `google-chrome*.list/.sources`，保留 Ubuntu/Microsoft 源，严格检查不完整索引并清理 partial lists 后有限重试，最后无论成功或失败都恢复源文件。NFS smoke 和 release/targeted 主机安装步骤统一使用该 helper，包安装仍是有限重试；Docker 内独立的 Ubuntu glibc smoke 源保持原样。
 
 本轮本地先验证了 helper 的源文件恢复、重试和官方源保留，CLI 探针回归 20 次、manifest/runner 单元、脚本和 workflow 静态检查通过；随后必须以新提交的 Windows normal/race、Windows full、Ubuntu targeted 和完整矩阵首轮结果验收。Linux 只能证明语义回归和 runner 计划，不能替代 Windows `.cmd`、SQLite `FlushFileBuffers` 或 hosted scheduler 的远端证据。
+
+## 第八轮失败复盘与修复
+
+提交 `7bb4b32` 的首轮矩阵（run `34388874839`）已经通过此前四类关键路径：Windows full 两个 partition、Windows recovery normal/race、Ubuntu full/race（除最后一个仍运行的 partition）以及 macOS full；Ubuntu race partition 1 最终唯一的实际测试失败是 `TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup`。它在子进程已经退出、`/proc/<pid>/stat` 条目消失后，仍被测试的 `proc.IsAlive` 判为存活；随后诊断中的 `start_err=open /proc/...: no such file or directory` 和 `pgid=-1` 证明这是 liveness 观测窗口竞态，而不是进程组清理真的失败。汇总 `Test` job 只是随该失败而失败。
+
+本轮修复 `internal/proc.IsAlive` 的 Linux 实现：先保留 `kill(pid, 0)` 的权限/存在性检查，再只在 Linux 读取 procfs；如果 stat 条目在非原子检查间隙消失，明确按已结束处理；Darwin 继续使用原有无 procfs 的行为，格式异常或其他读取错误仍保持保守的存活结果。新增缺失 proc 条目的回归测试，并在 Linux race 下将进程组测试重复 100 次；完整 `go test ./... -count=1`、`internal/proc` normal/race 均通过。
+
+这个改动没有缩短清理等待、删除 descendant 断言或把失败变成重试；真实存活进程和 PID 复用仍会被启动时间/存活检查捕获。下一轮必须重新观察同一完整矩阵，确认 procfs 观测修复不会在其他 Unix 进程清理路径产生副作用。
