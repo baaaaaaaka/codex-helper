@@ -77,3 +77,7 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 测试边界同步修正为生产 phase budget，继续由外层有限 progress watchdog 约束；manifest 为两个此前漏掉的 `TaskStartedPromptRace` 和 `MainLoopOutbox` 语义族声明独立调度，完整 runner 根据语义族自动生成隔离/host-exclusive job，避免新增同类回归再次落入普通包池。没有删除测试、跳过失败或把失败转成重试。
 
 本地验收：`go test ./... -count=1`、关键 listener normal/race 重复、Store 全套、Windows Store 与 Darwin Teams 交叉编译、manifest/runner exact-once 计划、workflow/JSON/Python 静态检查均通过。修复前 PR #114 首轮仍保留为失败基线；最终是否根治必须由包含该生产迁移修复的同一提交完成 Windows normal/race、macOS 和 Ubuntu full/race 首轮矩阵来确认。
+
+第二轮首轮矩阵（commit `2a84f04`）验证了 Windows 迁移修复：Windows normal/race 的八个 recovery job 全部通过，phase trace 中 legacy migration 为约 0.15–0.52 秒；此前 60 秒卡死的 JSON listener 路径已恢复。与此同时，Ubuntu race 的 full-suite partition 1 暴露出同一调度根因的另一个成员：`TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat` 被放进包含 254 个测试名的普通 shard，在 28 秒 phase 后被 context cancel，Graph 只有 control-chat 一次读取。该失败不是业务断言回归，而是尚未纳入隔离族的 continuous listener liveness fixture，说明只补两个具体测试仍会继续“打地鼠”。
+
+因此 runner 的语义族规则扩大为所有 `TestTeamsListenFalse*` 以及 `TestTeamsMainLoopOutbox*`：每个测试仍执行一次、保留原始 race/timeout/断言，但在独立 test process 中运行，并在 full runner 的 host-exclusive phase 中避开同机 shard 压力。这样新增同类 listener 回归会自动获得相同资源边界；未知类别仍不会被静默跳过，首轮失败继续阻断验收。该补强之后需要重新跑完整首轮矩阵，不能用第二轮中已通过的 Windows 结果替代第三轮验收。

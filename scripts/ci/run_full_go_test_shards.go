@@ -535,11 +535,13 @@ func autoIsolatedRunnableName(packageName, name string) bool {
 	if !isTeamsRecoveryPackage(packageName) {
 		return false
 	}
-	// These tests observe the first real listener admission or bounded outbox
-	// rotation. Their short semantic windows are sensitive to unrelated
-	// process and filesystem pressure, while the assertions themselves remain
-	// unchanged when run in a dedicated process.
-	return strings.HasPrefix(name, "TestTeamsListenFalseTaskStartedPromptRace") ||
+	// Every TestTeamsListenFalse case drives the continuous listener through a
+	// finite readiness/recovery window. Keeping the family rule broad prevents
+	// a newly-added listener regression (for example a SQLite admission flood)
+	// from silently joining a shard with unrelated test processes. The outbox
+	// family has the same bounded scheduler observation even without a real
+	// listener.
+	return strings.HasPrefix(name, "TestTeamsListenFalse") ||
 		strings.HasPrefix(name, "TestTeamsMainLoopOutbox")
 }
 

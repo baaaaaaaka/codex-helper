@@ -188,7 +188,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
         self.assertIn("func autoIsolatedRunnableName", runner)
         self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsListenFalseTaskStartedPromptRace")',
+            'strings.HasPrefix(name, "TestTeamsListenFalse")',
             runner,
         )
         self.assertIn(
