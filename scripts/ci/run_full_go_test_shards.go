@@ -34,11 +34,12 @@ const (
 
 var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$`)
 
-// A small number of tests intentionally exercise long-lived listener state,
-// timing-sensitive error isolation, or process-wide performance fixtures. These
-// tests are independently correct but share process-global test plumbing with
-// older package fixtures. Keep them in their own test process rather than
-// allowing unrelated tests to make their timing assertions nondeterministic.
+// Host-sensitive test families intentionally exercise long-lived listener
+// state, timing-sensitive error isolation, or process-wide performance
+// fixtures. These tests are independently correct but share process-global
+// test plumbing with older package fixtures. Keep them in their own test
+// process rather than allowing unrelated tests to make their timing assertions
+// nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/cli": {
 		// This fixture starts a real Codex-shaped process tree and asserts
@@ -551,13 +552,18 @@ func autoIsolatedRunnableName(packageName, name string) bool {
 		// prevents a newly-added listener regression (for example a SQLite
 		// admission flood) from silently joining a shard with unrelated test
 		// processes. The outbox family has the same bounded scheduler observation
-		// even without a real listener. Cache-stress and audience-admission
-		// fixtures also make short async or Graph-budget observations; their
-		// temporary stores and request harness must start without unrelated shard
-		// processes consuming the hosted runner.
+		// even without a real listener. Ownership and Graph-429 stress families make
+		// the same host-scheduler observation at a larger fan-out; keeping each
+		// family together prevents a newly-added stress regression from silently
+		// joining a broad shard. Cache-stress and audience-admission fixtures also
+		// make short async or Graph-budget observations; their temporary stores and
+		// request harness must start without unrelated shard processes consuming the
+		// hosted runner.
 		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
 			strings.HasPrefix(name, "TestTeamsMainLoopOutbox") ||
 			strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress") ||
+			strings.HasPrefix(name, "TestTeamsOwnershipStress") ||
+			strings.HasPrefix(name, "TestTeamsGraph429Stress") ||
 			name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"
 	}
 	if isCodexRunnerPackage(packageName) {

@@ -21,7 +21,6 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -680,6 +679,22 @@ func (w synchronizedManifestWriter) Write(data []byte) (int, error) {
 	return w.w.Write(data)
 }
 
+// manifestRunBudget returns the finite process budget for one manifest entry.
+// max_seconds describes the budget for each declared backend, while many
+// entries exercise all backends from one top-level Go test and therefore run
+// those subtests sequentially in one process. Reserve one budget per declared
+// backend so a slow SQLite tail cannot consume the JSON budget before its own
+// required subtest starts. The validator still requires every backend to run
+// and pass; this only models the work that the manifest already promises to
+// execute.
+func manifestRunBudget(item manifestTest) time.Duration {
+	backendCount := len(item.Backends)
+	if backendCount < 1 {
+		backendCount = 1
+	}
+	return time.Duration(item.MaxSeconds) * time.Second * time.Duration(backendCount)
+}
+
 func runManifestTest(item manifestTest, binaryPath string, packageDir string, outputMu *sync.Mutex) (runErr error) {
 	started := time.Now()
 	phaseFile, phaseDir := manifestPhaseFile(item)
@@ -718,7 +733,7 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 		binaryPath,
 		"-test.v",
 		"-test.timeout",
-		strconv.Itoa(item.MaxSeconds) + "s",
+		manifestRunBudget(item).String(),
 		"-test.run",
 		selector,
 	}
@@ -726,9 +741,9 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 	// process. This preserves process isolation and each test's watchdog
 	// without paying the large package compile/link cost 109 times. The small
 	// runtime grace covers process startup; the test binary itself has the
-	// exact manifest timeout and therefore still reports a useful stack if it
+	// finite per-backend budget and therefore still reports a useful stack if it
 	// fails to return.
-	watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestRuntimeGrace
+	watchdog := manifestRunBudget(item) + manifestRuntimeGrace
 	ctx, cancel := context.WithTimeout(context.Background(), watchdog)
 	defer cancel()
 	var output bytes.Buffer

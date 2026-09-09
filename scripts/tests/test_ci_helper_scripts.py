@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -71,6 +72,74 @@ class CIHelperScriptTests(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("attempts must be >= 1", proc.stderr)
+
+    def test_apt_update_isolates_optional_chrome_source_and_restores_it(self) -> None:
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("bash not available")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bin_dir = root / "bin"
+            source_dir = root / "sources.list.d"
+            bin_dir.mkdir()
+            source_dir.mkdir()
+            chrome_source = source_dir / "google-chrome.list"
+            chrome_source.write_text("deb https://dl.google.com/linux/chrome/deb stable main\n", encoding="utf-8")
+            (source_dir / "ubuntu.sources").write_text("official\n", encoding="utf-8")
+            state = root / "apt-update-attempts"
+            fake_apt = bin_dir / "apt-get"
+            fake_apt.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    case "${1:-}" in
+                      clean)
+                        exit 0
+                        ;;
+                      update)
+                        count=0
+                        if [[ -f "$APT_FAKE_STATE" ]]; then
+                          count="$(cat "$APT_FAKE_STATE")"
+                        fi
+                        count=$((count + 1))
+                        printf '%s' "$count" > "$APT_FAKE_STATE"
+                        if [[ -e "$APT_UPDATE_SOURCE_DIR/google-chrome.list" ]]; then
+                          echo "optional Chrome source was not isolated" >&2
+                          exit 9
+                        fi
+                        [[ "$count" -ge 2 ]]
+                        ;;
+                      *)
+                        echo "unexpected apt-get command: $*" >&2
+                        exit 10
+                        ;;
+                    esac
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_apt.chmod(0o755)
+
+            subprocess.run(
+                [bash, str(CI_DIR / "apt_update.sh")],
+                check=True,
+                text=True,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                    "APT_UPDATE_SOURCE_DIR": str(source_dir),
+                    "APT_UPDATE_LISTS_DIR": str(root / "lists"),
+                    "APT_UPDATE_ATTEMPTS": "2",
+                    "APT_UPDATE_SLEEP_SECONDS": "0",
+                    "APT_FAKE_STATE": str(state),
+                },
+            )
+            self.assertEqual(state.read_text(encoding="utf-8"), "2")
+            self.assertEqual(chrome_source.read_text(encoding="utf-8"), "deb https://dl.google.com/linux/chrome/deb stable main\n")
+            self.assertEqual((source_dir / "ubuntu.sources").read_text(encoding="utf-8"), "official\n")
 
     def test_retry_ps1_retries_until_success(self) -> None:
         powershell = shutil.which("pwsh") or shutil.which("powershell")

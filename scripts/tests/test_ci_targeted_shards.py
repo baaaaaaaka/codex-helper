@@ -207,8 +207,22 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             'strings.HasPrefix(name, "TestTeamsMainLoopOutbox")',
             runner,
         )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsOwnershipStress")',
+            runner,
+        )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsGraph429Stress")',
+            runner,
+        )
         self.assertIn("runnableIsolationMap(packageName, names)", runner)
         self.assertIn("runnableExclusivityMap(packageName, names)", runner)
+
+    def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
+        targeted = targeted_job()
+        self.assertIn("sudo bash scripts/ci/apt_update.sh", targeted)
+        release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("sudo bash scripts/ci/apt_update.sh", release)
 
     def test_full_runner_isolates_process_tree_lifecycle_family(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")

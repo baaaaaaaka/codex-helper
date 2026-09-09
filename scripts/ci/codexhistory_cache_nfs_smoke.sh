@@ -28,8 +28,8 @@ cleanup() {
 trap cleanup EXIT
 
 if ! command -v exportfs >/dev/null 2>&1 || ! command -v mount.nfs >/dev/null 2>&1; then
-  sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nfs-kernel-server nfs-common
+  sudo bash "$repo_root/scripts/ci/apt_update.sh"
+  sudo env DEBIAN_FRONTEND=noninteractive bash "$repo_root/scripts/ci/retry.sh" 5 5 apt-get install -y nfs-kernel-server nfs-common
 fi
 
 mkdir -p "$export_dir" "$mount_dir"

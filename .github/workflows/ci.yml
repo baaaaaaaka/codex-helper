@@ -348,7 +348,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo bash scripts/ci/apt_update.sh
           sudo env DEBIAN_FRONTEND=noninteractive bash scripts/ci/retry.sh 5 5 apt-get install -y --no-install-recommends zsh fish csh tcsh
           CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
 
@@ -1127,7 +1127,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo bash scripts/ci/apt_update.sh
           sudo bash scripts/ci/retry.sh 5 5 apt-get install -y openssh-server
           sudo mkdir -p /run/sshd
           SSH_TEST_USER="ssh-test"

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateTestJSONOutputAcceptsRequiredTestPass(t *testing.T) {
@@ -156,6 +157,18 @@ func TestManifestTestWorkerCountForSerializesWindows(t *testing.T) {
 	}
 	if got := manifestTestWorkerCountFor(true, "linux", 0); got != 1 {
 		t.Fatalf("zero-GOMAXPROCS manifest workers = %d, want 1", got)
+	}
+}
+
+func TestManifestRunBudgetAccountsForDeclaredBackends(t *testing.T) {
+	if got, want := manifestRunBudget(manifestTest{MaxSeconds: 20, Backends: []string{"json", "sqlite"}}), 40*time.Second; got != want {
+		t.Fatalf("two-backend manifest budget = %s, want %s", got, want)
+	}
+	if got, want := manifestRunBudget(manifestTest{MaxSeconds: 20, Backends: []string{"json"}}), 20*time.Second; got != want {
+		t.Fatalf("single-backend manifest budget = %s, want %s", got, want)
+	}
+	if got, want := manifestRunBudget(manifestTest{MaxSeconds: 20}), 20*time.Second; got != want {
+		t.Fatalf("metadata-free manifest budget = %s, want %s", got, want)
 	}
 }
 

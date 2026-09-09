@@ -119,3 +119,16 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 候选发现、安装重检和 root upgrade 结果探测另外采用 5 秒总上下文内最多三次、每次间隔 250ms 的有限重试。任何一次成功才算通过，三次失败仍返回最后一次原始错误；新增跨平台真实子进程 fixture 覆盖“首次失败后恢复”和“永久失败仍失败”，并把这些测试加入 Windows targeted root regression。该重试只吸收外部 CLI 发布后的短暂启动尾延，不改变断言、跳过测试或无限重试策略。
 
 本地验证包含 CLI root/探测回归、完整 `internal/cli`、Windows amd64 交叉编译、workflow 静态检查和 `git diff --check`。旧提交的失败 job 在同一 run 的第二次尝试（job `102564026305`）成功，确认该错误确实具有间歇性；这次 rerun 只用于建立根因证据，不能替代新修复提交的首次结果。新提交仍需观察 Windows system npm job 和完整 normal/race 矩阵。Linux 测试不能证明 Windows npm/批处理 shim 和文件系统行为，最终验收继续以 Windows artifact 为准。
+
+## 第七轮失败复盘与修复
+
+提交 `bcb188b9` 的首轮矩阵（run `34382692434`）把前一轮的 Codex 修复路径验证为通过，但又暴露了四个可复现的边界。Windows targeted/full 日志中的探针测试失败不是探针重试次数错误：`.cmd` 夹具用 `echo` 写入 CRLF，断言把字节数误当成调用次数，三次调用被错误算成九次。Windows recovery 的 `TestTeamsListenFalsePolledTurnOutboxSurvivesReopen` 则在一个进程内顺序执行 JSON、SQLite 两个声明后端，20 秒总 watchdog 在 SQLite 子测试启动前耗尽。Windows full suite 的 ownership/Graph-429 压力回归被放进 252 个测试名的普通 Teams shard，有限的 worker/readiness 观察受同机进程调度压力影响；Linux 重复运行并没有复现。Ubuntu 两个安装步骤的首次失败来自不相关的 Google Chrome CDN `Hash Sum mismatch`，重试同一个 apt 源不会改变这个外部状态。
+
+本轮修复保持测试语义和失败门槛：
+
+- Windows 探针计数按 marker 出现次数统计，仍要求恰好三次有限探测；生产探测重试和永久失败断言没有放宽。
+- recovery runner 将 `max_seconds` 明确定义为每个声明后端的有限预算。一个顶层测试若顺序覆盖两个后端，Go watchdog 和外层 watchdog 都按后端数量保留预算；manifest 仍解析 JSONL 并要求每个后端实际 `pass`，没有把超时改成通过或跳过。
+- full runner 自动将 `TestTeamsOwnershipStress*` 和 `TestTeamsGraph429Stress*` 语义族拆成独立、host-exclusive 进程。所有测试名仍 exact-once 执行，普通 shard 用精确 `-skip`，原始 `-race`、断言和测试内部预算不变；新增同族回归也会自动获得该边界。
+- 新增 `scripts/ci/apt_update.sh`。Ubuntu 主机安装前只在有限更新期间暂时移开明确不需要的 `google-chrome*.list/.sources`，保留 Ubuntu/Microsoft 源，严格检查不完整索引并清理 partial lists 后有限重试，最后无论成功或失败都恢复源文件。NFS smoke 和 release/targeted 主机安装步骤统一使用该 helper，包安装仍是有限重试；Docker 内独立的 Ubuntu glibc smoke 源保持原样。
+
+本轮本地先验证了 helper 的源文件恢复、重试和官方源保留，CLI 探针回归 20 次、manifest/runner 单元、脚本和 workflow 静态检查通过；随后必须以新提交的 Windows normal/race、Windows full、Ubuntu targeted 和完整矩阵首轮结果验收。Linux 只能证明语义回归和 runner 计划，不能替代 Windows `.cmd`、SQLite `FlushFileBuffers` 或 hosted scheduler 的远端证据。

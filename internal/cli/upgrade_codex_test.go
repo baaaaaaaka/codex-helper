@@ -370,8 +370,11 @@ func TestProbeManagedCodexUpgradeCandidatePreservesPermanentFailure(t *testing.T
 	if readErr != nil {
 		t.Fatal(readErr)
 	}
-	if len(attempts) != managedCodexProbeAttempts {
-		t.Fatalf("probe attempts = %d, want %d", len(attempts), managedCodexProbeAttempts)
+	// The Windows .cmd fixture uses `echo`, which writes CRLF. Count the
+	// marker rather than bytes so the assertion describes invocations on both
+	// platforms instead of treating each Windows line ending as two attempts.
+	if got := strings.Count(string(attempts), "x"); got != managedCodexProbeAttempts {
+		t.Fatalf("probe attempts = %d, want %d", got, managedCodexProbeAttempts)
 	}
 }
 
