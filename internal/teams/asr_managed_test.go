@@ -1954,6 +1954,26 @@ func TestManagedASRDiskPreflightReportsActionableSpace(t *testing.T) {
 	}
 }
 
+func TestManagedASRPublishRenameUsesDurableReplacement(t *testing.T) {
+	previousReplace := durableReplaceFile
+	t.Cleanup(func() { durableReplaceFile = previousReplace })
+
+	wantErr := errors.New("durable replacement failed")
+	var gotSrc, gotDst string
+	durableReplaceFile = func(src, dst string) error {
+		gotSrc, gotDst = src, dst
+		return wantErr
+	}
+
+	err := defaultManagedASRPublishRename("staging", "target")
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("default publish rename error = %v, want %v", err, wantErr)
+	}
+	if gotSrc != "staging" || gotDst != "target" {
+		t.Fatalf("durable replacement paths = (%q, %q), want (staging, target)", gotSrc, gotDst)
+	}
+}
+
 func TestManagedASRPublishDirRestoresOldTargetOnPublishFailure(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "runtime")

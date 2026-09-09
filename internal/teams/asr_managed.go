@@ -924,8 +924,17 @@ func writePrivateFileReplacing(path string, data []byte, mode os.FileMode) error
 	return nil
 }
 
-var managedASRPublishRename = os.Rename
+// managedASRPublishRename uses the same durable replacement path as marker
+// files.  On Windows that path retries transient sharing/access errors from
+// MoveFileEx while scanners or extractors still have a newly unpacked file
+// open.  Directory moves use the same OS primitive, so publishing a runtime
+// must get that retry behavior as well.
+var managedASRPublishRename = defaultManagedASRPublishRename
 var managedASRPublishRemoveAll = os.RemoveAll
+
+func defaultManagedASRPublishRename(src string, dst string) error {
+	return durableReplaceFile(src, dst)
+}
 
 func managedASRPublishDir(label string, staging string, target string) error {
 	return managedASRPublishDirWithPostPublish(label, staging, target, nil)
