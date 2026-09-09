@@ -1290,8 +1290,9 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "resource_class": "sqlite_fsync",
-      "max_seconds": 90,
+      "max_seconds": 180,
       "oracle": "a new Store and owner generation replays a staged page without a Graph refetch and commits the terminal poll frontier",
       "baseline": "pre-fix a poll page or attempt tied to the prior process could be lost, replayed unsafely, or left active after reopen"
     },

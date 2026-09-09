@@ -155,6 +155,18 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         for item in manifest["tests"]:
             self.assertIn(item.get("resource_class"), allowed, item["name"])
 
+    def test_frontier_reopen_fixture_has_durable_io_budget_and_exclusive_phase(self):
+        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
+        item = next(
+            entry
+            for entry in manifest["tests"]
+            if entry["name"] == "TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover"
+        )
+        self.assertEqual(item["backends"], ["json", "sqlite"])
+        self.assertEqual(item["resource_class"], "sqlite_fsync")
+        self.assertTrue(item["exclusive"])
+        self.assertGreaterEqual(item["max_seconds"], 180)
+
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         full_start = workflow.index("  full-go-test:\n")

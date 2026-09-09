@@ -99,3 +99,13 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 - `TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup` 的 shell-child readiness 等待从 2 秒改为 5 秒，并明确说明这是 race instrumentation 下的有限启动预算；进程组取消、leader fallback、descendant 存活和最终清理断言保持不变。该改动针对实际的 marker 发布竞态，不是把清理断言改成宽松等待。
 
 本地 Linux 重复验证：hot-chat 20 次、long continuation 5 次、legacy owner JSON/SQLite 10 次、audience budget 20 次、migration process-group race 20 次全部通过；完整 `internal/teams` 与 `internal/teams/store` normal suite 通过，脚本静态测试 32 项通过，Teams/store Windows amd64 交叉编译通过。Linux 不能证明 Windows `FlushFileBuffers`，因此这些改动只有在同一提交的 Windows normal/race、macOS 和 Linux full/race 首轮矩阵全部通过后，才可以确认本轮类别已经覆盖；若仍有红灯，继续根据首次 artifact 建立新的资源类别或生产边界，不增加无条件重跑。
+
+## 第五轮失败复盘与修复
+
+提交 `7c8f292` 的首轮矩阵（run `34373744549`）只剩一个恢复测试红灯：Windows race partition 0 的 `TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover/json` 在 41 秒后报告“first generation drained Graph continuation”超时，随后 TempDir 清理还遇到 SQLite 文件锁。phase trace 显示 listener 已在约 1 秒完成 migration 和 startup-ready，失败发生在真实两消息轮询、outbox 发布和 durable frontier drain；SQLite backend 随后的子测试通过。因而这不是 migration 未就绪或 Graph admission 未执行，而是该跨 backend fixture 仍使用 20 秒的短进度预算，恰好把 Windows durable-I/O 尾延误判成语义失败，并让清理在未结束的 worker 上进行。
+
+本轮将该 helper 的有限进度预算改为已有的 `listenerRecoveryDurableIOProgressTimeout`（60 秒），并把 manifest 外层窗口从 90 秒扩为 180 秒以覆盖首代执行、frontier drain 和 reopen owner takeover 三个独立等待；测试仍由 Go watchdog 和 manifest runtime grace 共同限制。条目同时进入 manifest 的 exclusive phase，避免在 Unix runner 或未来并行度调整下与其他 SQLite/listener fixture 共享同机压力。JSON、SQLite、Graph continuation、exactly-once final、store reopen 和 owner takeover 断言全部保留，未增加重试、skip 或宽松成功条件。
+
+该修复针对已观测的 Windows durable-I/O 尾延，并把内部等待与外层 watchdog 对齐；它不能由 Linux 单独证明。提交后必须重新查看同一提交的 Windows normal/race、macOS 和 Ubuntu full/race 首轮结果及 phase artifact；若仍出现红灯，按新的首次 trace 判断是另一种资源类别、生产边界还是诊断问题。
+
+本轮新增的 manifest 元数据护栏要求该测试继续声明 JSON/SQLite 双 backend、`sqlite_fsync`、exclusive phase 和至少 180 秒外层窗口；本地脚本检查共 33 项（2 项按环境跳过）通过。
