@@ -214,6 +214,27 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             runner,
         )
 
+    def test_full_runner_isolates_async_cache_and_audience_budget_fixtures(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress")',
+            runner,
+        )
+        self.assertIn(
+            'name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"',
+            runner,
+        )
+        self.assertIn("Cache-stress and audience-admission", runner)
+
+    def test_full_runner_isolates_cross_backend_legacy_owner_fixture(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_name = "TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks"
+        self.assertEqual(
+            runner.count(f'"{fixture_name}"'),
+            2,
+            f"{fixture_name} must be both process-isolated and host-exclusive",
+        )
+
     def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(

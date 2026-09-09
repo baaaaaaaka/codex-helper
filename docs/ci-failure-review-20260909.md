@@ -85,3 +85,17 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 第三轮的恢复矩阵和 Linux/macOS full/race 分片均通过；Windows full-suite partition 0 又暴露了同一调度类别的遗漏：`TestAppServerProcessCloseTerminatesWindowsDescendants` 在普通 `internal/codexrunner` 包进程中启动 PowerShell 和 `ping.exe`，与 Teams 分片并发时在 10 秒内没有读到第一个 descendant PID 行。日志没有显示产品断言或进程树清理失败，而是 fixture readiness 超时。这是一个跨平台进程树生命周期族，不能靠增加全局重试或延长断言隐藏。
 
 当前补强让普通包也经过候选测试名发现和语义族映射；`TestAppServerProcessCloseTerminates*`（Unix wrapper 和 Windows PowerShell 两个 build-tag 变体）会各自执行一次独立且 host-exclusive 的 test process，普通 `internal/codexrunner` 测试以精确 `-skip` 执行。这样把有限的 PID/readiness 和 tasklist 清理观察从全量包池的无关进程压力中隔离，同时保留原始 10 秒读取边界、5 秒 descendant 清理边界和全部断言。Linux 本地重复与 Windows amd64 交叉编译通过；修复提交后的完整 Windows 矩阵仍是最终验收条件。
+
+## 第四轮失败复盘与修复
+
+提交 `b44dbfd` 的矩阵（run `34368088055`）没有出现上一轮的进程树失败，但首轮仍发现四类同一系统问题：Windows recovery normal/race 的 SQLite 或长 continuation 条目在短 watchdog 内卡在 `FlushFileBuffers`；Windows full-suite 的多聊天 async cache 压力测试在普通 Teams shard 中等待 worker 超时；macOS full-suite 的 audience budget 测试在 40ms Graph admission budget 到期前没有进入真实 loopback server。随后 Ubuntu race 的完整 runner 又在已经独立的 migration process-group fixture 中报告子进程未在 2 秒内发布 marker。它们分别来自生产 schema 初始化、测试 Graph 传输、异步持久化压力、runner 资源边界和 fixture 启动预算，不能合并成一个“偶发断言”。
+
+本轮做了以下修复：
+
+- `ensureGlobalOutboundSQLite` 用一个 context-aware SQLite 事务创建两张表和索引。原先三条独立 DDL 会在 Windows modernc SQLite 上产生三次 durable flush；现在仍以一个原子 schema 边界提交，失败时整体回滚。
+- `TestTeamsOwnershipStressDueHotChatsRotateBeyondCycleCapCI` 和 `TestTeamsWorkChatAudienceLookupUsesPollBudget` 的 fake Graph 改用进程内 `RoundTripper`。这两个断言观察的是 scheduler/admission 语义，不需要操作系统 loopback；请求路径、方法、上下文取消和响应解析仍经过 `GraphClient`，但不会把 TCP listener 启动排队误判成产品失败。
+- full runner 自动隔离 `TestTeamsThirdPartyCacheStress*`、audience budget 测试，并把 legacy owner cross-backend fixture 从普通 store shard 拆出且标为 host-exclusive。每个测试仍只执行一次，普通包通过精确 `-skip` 排除，隔离 job 使用原来的 race、断言和测试内部 timeout。
+- recovery manifest 将 legacy owner fixture 的最大运行窗口设为 30 秒并置于 exclusive phase，将 long continuation 条目标为 `sqlite_fsync` 并使用 30 秒窗口。该窗口仍由单测试进程的 Go watchdog 和外层 runtime grace 共同限制；它反映 Windows 文件系统真实 durable commit 成本，不会跳过 65 页 continuation 或把失败转成重试。
+- `TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup` 的 shell-child readiness 等待从 2 秒改为 5 秒，并明确说明这是 race instrumentation 下的有限启动预算；进程组取消、leader fallback、descendant 存活和最终清理断言保持不变。该改动针对实际的 marker 发布竞态，不是把清理断言改成宽松等待。
+
+本地 Linux 重复验证：hot-chat 20 次、long continuation 5 次、legacy owner JSON/SQLite 10 次、audience budget 20 次、migration process-group race 20 次全部通过；完整 `internal/teams` 与 `internal/teams/store` normal suite 通过，脚本静态测试 32 项通过，Teams/store Windows amd64 交叉编译通过。Linux 不能证明 Windows `FlushFileBuffers`，因此这些改动只有在同一提交的 Windows normal/race、macOS 和 Linux full/race 首轮矩阵全部通过后，才可以确认本轮类别已经覆盖；若仍有红灯，继续根据首次 artifact 建立新的资源类别或生产边界，不增加无条件重跑。

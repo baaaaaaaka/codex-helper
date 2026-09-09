@@ -119,6 +119,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// unrelated store shards share the hosted runner. Keep the migration
 		// observation isolated instead of weakening its finite assertions.
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends": true,
+		// This cross-backend legacy-owner test performs the same durable lease
+		// migration and can spend its whole short budget in a Windows SQLite
+		// commit. Keep its two backend assertions in a clean process as well.
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks": true,
 	},
 }
 
@@ -171,6 +175,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
 	},
 }
 
@@ -546,9 +551,14 @@ func autoIsolatedRunnableName(packageName, name string) bool {
 		// prevents a newly-added listener regression (for example a SQLite
 		// admission flood) from silently joining a shard with unrelated test
 		// processes. The outbox family has the same bounded scheduler observation
-		// even without a real listener.
+		// even without a real listener. Cache-stress and audience-admission
+		// fixtures also make short async or Graph-budget observations; their
+		// temporary stores and request harness must start without unrelated shard
+		// processes consuming the hosted runner.
 		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
-			strings.HasPrefix(name, "TestTeamsMainLoopOutbox")
+			strings.HasPrefix(name, "TestTeamsMainLoopOutbox") ||
+			strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress") ||
+			name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"
 	}
 	if isCodexRunnerPackage(packageName) {
 		// These fixtures start an OS wrapper and a long-lived descendant, then

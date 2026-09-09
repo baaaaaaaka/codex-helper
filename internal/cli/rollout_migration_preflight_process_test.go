@@ -54,7 +54,12 @@ exit 64
 		}, nil, "11111111-2222-3333-4444-555555555555")
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	// The child is a shell fixture, so readiness is not the process-group
+	// invariant itself. Give the hosted race binary a finite startup margin;
+	// otherwise race instrumentation can spend the whole two-second window
+	// before the shell publishes its child PID and turn a valid cleanup check
+	// into a false "did not start" failure.
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(childPIDPath); err == nil {
 			break

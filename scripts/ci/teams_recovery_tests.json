@@ -605,8 +605,9 @@
       "vertical": "turn-owner-legacy-bind",
       "real_listener": false,
       "fake_graph": false,
-      "resource_class": "sqlite_fsync",
-      "max_seconds": 10,
+      "exclusive": true,
+      "resource_class": "host_exclusive",
+      "max_seconds": 30,
       "oracle": "a legacy unbound queued turn is bound exactly once to the claiming owner and stale callbacks cannot mutate it after takeover",
       "baseline": "pre-fix legacy queued rows could accept callbacks from a previous owner after a replacement claim"
     },
@@ -1533,8 +1534,8 @@
       "vertical": "outbox-long-graph-continuation",
       "real_listener": false,
       "fake_graph": true,
-      "resource_class": "pure_cpu",
-      "max_seconds": 10,
+      "resource_class": "sqlite_fsync",
+      "max_seconds": 30,
       "oracle": "an exact marker beyond 64 Graph continuation pages is reached across bounded recovery passes without a replacement POST",
       "baseline": "pre-fix a durable 64-page lifetime cap reset the continuation to head and made old accepted messages unreachable"
     },
