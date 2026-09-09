@@ -407,6 +407,18 @@ func (s *Store) commitChatPollAttempt(ctx context.Context, chatID, attemptID str
 	}
 	var committed bool
 	poll, _, err := s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
+		// A final-answer delivery can advance only the scheduling fields while
+		// deliberately retaining the live poll capability. That writer updates
+		// Attempt.ExpectedPollRevision in the same row mutation, so a terminal
+		// callback that read the old revision may safely adopt the newer token
+		// while the exact owner/process/lease and frontier checks below still
+		// fence takeovers and unrelated writers. Legacy ID-only callers remain
+		// strict and cannot use this adoption path.
+		if capability != nil && !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
+			if chatPollAttemptRevisionCanBeAdopted(poll, attemptID, expectedRevision, capability, time.Now()) {
+				expectedRevision = poll.PollRevision
+			}
+		}
 		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
@@ -444,6 +456,15 @@ func (s *Store) abandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 	}
 	var abandoned bool
 	poll, _, err := s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
+		// Cleanup follows the same safe revision-adoption rule as terminal
+		// commits. If a retained-capability scheduler update won the race, do not
+		// leave the receipt stranded until the attempt TTL; a takeover or frontier
+		// change still fails the exact capability checks below.
+		if capability != nil && !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
+			if chatPollAttemptRevisionCanBeAdopted(poll, attemptID, expectedRevision, capability, time.Now()) {
+				expectedRevision = poll.PollRevision
+			}
+		}
 		if !chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, capability, time.Now()) {
 			return errStoreNoChange
 		}
@@ -456,6 +477,31 @@ func (s *Store) abandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 
 func chatPollAttemptMatches(poll *ChatPollState, attemptID string, expectedRevision uint64, now time.Time) bool {
 	return chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, nil, now)
+}
+
+// chatPollAttemptRevisionCanBeAdopted recognizes the one durable revision
+// advance that a live capability may safely absorb: the same unexpired
+// attempt is still present, its owner identity is unchanged, and the attempt
+// itself explicitly adopted the current row revision while preserving the
+// current schedule/frontier/receipt state. Generic writers invalidate the
+// attempt, and a replacement owner has a different identity, so neither can
+// pass this predicate.
+func chatPollAttemptRevisionCanBeAdopted(poll *ChatPollState, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, now time.Time) bool {
+	if capability == nil || poll == nil || poll.Attempt == nil || expectedRevision == 0 || poll.PollRevision <= expectedRevision {
+		return false
+	}
+	if strings.TrimSpace(poll.Attempt.ID) != strings.TrimSpace(attemptID) ||
+		strings.TrimSpace(capability.ID) == "" || strings.TrimSpace(capability.ID) != strings.TrimSpace(poll.Attempt.ID) ||
+		strings.TrimSpace(capability.Owner) != strings.TrimSpace(poll.Attempt.Owner) ||
+		strings.TrimSpace(capability.ProcessIncarnation) != strings.TrimSpace(poll.Attempt.ProcessIncarnation) ||
+		capability.LeaseGeneration != poll.Attempt.LeaseGeneration {
+		return false
+	}
+	if !poll.Attempt.ExpiresAt.After(now) || poll.Attempt.ExpectedPollRevision != poll.PollRevision {
+		return false
+	}
+	return poll.Attempt.ExpectedScheduleRevision == poll.ScheduleRevision &&
+		chatPollAttemptExpectedStateMatches(poll, poll.Attempt.ExpectedFrontier, poll.Attempt.ExpectedReceiptID, poll.Attempt.ExpectedPollRole)
 }
 
 func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, now time.Time) bool {

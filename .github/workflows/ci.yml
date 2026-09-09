@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# A pull request can otherwise leave several generations of the same expensive
+# matrix running at once. Canceling superseded revisions keeps hosted runners
+# available for the current commit and removes stale callbacks from the CI
+# signal that reviewers use to make a decision.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   teams-math-runtime:
     name: Teams math and managed font runtime (${{ matrix.os }})
@@ -128,6 +136,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test -p=1 ./internal/helperruntime -count=1 -run 'Test(ShouldActivateEntryVersionDoesNotUndoSameBasePrerelease|LaunchKeepsExplicitSameBasePrereleaseActive|Current|EnsureStableEntry|InstallVersion|PublishDownloaded)' -v
+          # Keep the process-identity fixture in the native Windows gate. Its
+          # child publishes a readiness marker and inspects Windows process
+          # metadata; a Linux cross-compile cannot exercise either behavior.
+          go test -p=1 ./internal/helperruntime -count=1 -run '^TestRuntimeProcessIdentityWindows$' -v
           go test -p=1 ./internal/candidateupdate -count=1 -run 'Test(WindowsCandidateOwned|WindowsDeferred|Reconcile|ResumePending|StableReplacement|Apply|SamePath)' -v
           go test -p=1 ./internal/update -count=1 -run 'Test(PerformUpdate|ReplaceBinary|Probe)' -v
           go test -p=1 ./internal/cli -count=1 -run 'Test(StartDetachedProcessWaitsForExitedChild|ProxyStart|StartCodexAppProxyDaemon|AppProxyLaunchConfiguresDetachedCommand|ModelAdapterLaunchConfiguresDetachedCommand|WindowsProxy|TeamsServiceDetachedCommandSetsHideWindowAndPreservesSysProcAttr|DetachedDaemonSurvivesConsoleControlEvent|CurrentRuntimeOwnsUpdateTarget)' -v
@@ -2380,14 +2392,18 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
-          # This fixture is intentionally isolated from the package-wide
-          # coverage process.  It exercises a real listener/store reopen and
-          # owner takeover; running it beside the full Teams test corpus can
-          # make the SQLite fsync path miss its finite progress watchdog.
-          # Run it separately below so the regression remains mandatory while
-          # the coverage profile still covers every other package test.
+          # These fixtures are intentionally isolated from the package-wide
+          # coverage process. The listener case exercises a real
+          # store-reopen/owner-takeover boundary, while the CLI case starts a
+          # real process tree and observes signal cleanup. Running either
+          # beside the full package corpus can make its finite liveness
+          # observation inherit unrelated scheduler and process pressure.
+          # Run them separately below so both regressions remain mandatory
+          # while the coverage profile still covers every other package test.
           frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'
-          if ! go test -timeout=20m -parallel=16 -skip "$frontier_recovery_pattern" -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
+          migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'
+          isolated_skip_pattern='^(?:TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover|TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup)$'
+          if ! go test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
@@ -2396,11 +2412,24 @@ jobs:
             exit 1
           fi
           isolated_log="$RUNNER_TEMP/frontier-recovery-isolated.log"
-          if ! go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run "$frontier_recovery_pattern" -v 2>&1 | tee "$isolated_log"; then
+          isolated_profile="$RUNNER_TEMP/frontier-recovery-coverage.out"
+          if ! go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run "$frontier_recovery_pattern" -coverprofile="$isolated_profile" -v 2>&1 | tee "$isolated_log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$isolated_log" | tail -80 | tr '\n' ' ' || true)"
             echo "::error title=Isolated frontier recovery failure::${summary:-isolated recovery test failed; inspect the retained step log}"
             exit 1
           fi
+          # Keep the fixture isolated for liveness, but do not silently remove
+          # its statements from the coverage gate. Profiles with the same mode
+          # can be concatenated; go tool cover merges duplicate blocks.
+          tail -n +2 "$isolated_profile" >> coverage.out
+          migration_log="$RUNNER_TEMP/migration-process-isolated.log"
+          migration_profile="$RUNNER_TEMP/migration-process-coverage.out"
+          if ! go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern" -coverprofile="$migration_profile" -v 2>&1 | tee "$migration_log"; then
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$migration_log" | tail -80 | tr '\n' ' ' || true)"
+            echo "::error title=Isolated migration process failure::${summary:-isolated migration process test failed; inspect the retained step log}"
+            exit 1
+          fi
+          tail -n +2 "$migration_profile" >> coverage.out
 
       - name: go test (without coverage, non-Linux)
         if: runner.os != 'Linux'
@@ -2418,20 +2447,19 @@ jobs:
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
             echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
-            retry_log="$RUNNER_TEMP/full-go-test-cli-retry.log"
-            set +e
-            go test -v -count=1 ./internal/cli 2>&1 | tee "$retry_log"
-            retry_status="${PIPESTATUS[0]}"
-            set -e
-            retry_summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$retry_log" | tail -80 | tr '\n' ' ' || true)"
-            if [ "$retry_status" = 0 ]; then
-              retry_summary="isolated internal/cli retry passed; the original failure depends on full-suite concurrency or ambient runner state"
-            elif [ -z "$retry_summary" ]; then
-              retry_summary="$(tail -40 "$retry_log" | tr '\n' ' ')"
-            fi
-            echo "::error title=Isolated CLI retry after full-suite failure::$retry_summary"
             exit 1
           fi
+
+      - name: Upload full-suite diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-go-test-diagnostics-${{ matrix.os }}-${{ matrix.partition }}
+          path: |
+            ${{ runner.temp }}/full-go-test*.log
+            ${{ runner.temp }}/frontier-recovery-isolated.log
+            ${{ runner.temp }}/migration-process-isolated.log
+          if-no-files-found: ignore
 
       - name: Coverage gate (Linux only)
         if: runner.os == 'Linux'
@@ -2469,7 +2497,18 @@ jobs:
           cache: true
 
       - name: go test -race (Linux only)
-        run: go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}"
+        shell: bash
+        run: |
+          set -o pipefail
+          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
+
+      - name: Upload race diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-test-diagnostics-${{ matrix.partition }}
+          path: ${{ runner.temp }}/race-test.log
+          if-no-files-found: ignore
 
   runtime-env-contract:
     name: Runtime environment contract (${{ matrix.os }})
@@ -3027,7 +3066,7 @@ jobs:
             '
 
   test:
-    name: Test (${{ matrix.os }})
+    name: Test
     runs-on: ubuntu-latest
     needs:
       - targeted-test
@@ -3043,10 +3082,6 @@ jobs:
       - linux-distro-smoke-build
       - linux-distro-smoke
     if: ${{ always() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Verify parallel CI shards

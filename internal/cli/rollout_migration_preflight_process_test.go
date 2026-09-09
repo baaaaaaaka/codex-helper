@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -63,6 +64,37 @@ exit 64
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	pidRaw, err := os.ReadFile(childPIDPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidRaw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childStartTime := ""
+	if runtime.GOOS == "linux" {
+		childStartTime, err = teamsLocalSupervisorProcessStartTime(pid)
+		if err != nil {
+			t.Fatalf("read migration child process %d start time: %v", pid, err)
+		}
+	}
+	childIsOriginalProcess := func() bool {
+		if !proc.IsAlive(pid) {
+			return false
+		}
+		if childStartTime == "" {
+			return true
+		}
+		currentStartTime, startErr := teamsLocalSupervisorProcessStartTime(pid)
+		if startErr != nil {
+			// Keep the assertion conservative while the original process is
+			// still reported alive. A disappearing /proc entry is observed as
+			// dead by proc.IsAlive on the next iteration.
+			return true
+		}
+		return currentStartTime == childStartTime
+	}
 	cancel()
 
 	select {
@@ -74,20 +106,15 @@ exit 64
 		t.Fatal("migration did not stop after context cancellation")
 	}
 
-	pidRaw, err := os.ReadFile(childPIDPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidRaw)))
-	if err != nil {
-		t.Fatal(err)
-	}
 	deadline = time.Now().Add(2 * time.Second)
-	for proc.IsAlive(pid) && time.Now().Before(deadline) {
+	for childIsOriginalProcess() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if proc.IsAlive(pid) {
+	if childIsOriginalProcess() {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
-		t.Fatalf("migration child process %d survived process-group cancellation", pid)
+		currentStartTime, startErr := teamsLocalSupervisorProcessStartTime(pid)
+		currentPGID, pgidErr := syscall.Getpgid(pid)
+		commandLine, commandLineErr := proc.CommandLine(pid)
+		t.Fatalf("migration child process %d survived process-group cancellation (start=%q current_start=%q start_err=%v pgid=%d pgid_err=%v command=%q command_err=%v)", pid, childStartTime, currentStartTime, startErr, currentPGID, pgidErr, commandLine, commandLineErr)
 	}
 }
