@@ -172,3 +172,15 @@ PR #114 合并后的 main 首轮矩阵（run `34433840848`，merge commit `48774
 本轮将 CentOS repo 的每个 `baseurl` 改成完整的、按仓库路径展开的 URL 列表，默认依次使用 CERN、阿里云、瑞典 NSC 和 kernel.org 的归档；列表可由 `CENTOS_VAULT_BASEURLS` 在受限网络环境中覆盖。脚本同时识别原始 mirror.centos.org、vault.centos.org 和此前生成的 archive.kernel.org 行，并为 `os`、`updates`、`extras` 等后缀把同一路径附加到每一个候选 URL。Yum 的 `baseurl` 解析本身支持空格分隔的 URL 列表，因此单个镜像不可达时会继续选择下一个候选。
 
 新增脚本回归检查完整路径、旧单镜像迁移和环境覆盖；包安装仍然失败即失败，ASR 扫描仍要求正数 native 文件及完整的库/版本覆盖，没有跳过扫描、降低断言或把重试成功伪装成测试通过。该修复的远端验收仍需查看同一提交的 CentOS7 job 以及完整矩阵；本地 Linux 的脚本测试不能证明 GitHub runner 到每个公共归档的网络可达性。
+
+## 第十三轮长尾治理与分区计划复盘
+
+此前最长的 race 作业来自 `TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix`：它为 260 个 chat 重复调用 Bridge preflight，每一轮都持久化 fairness cursor，在 hosted 文件系统上形成约 130 次 durable commit。该测试的语义问题是 keyset 分页和 cursor 边界，不需要用持久化写入次数来证明；现在 Store 层一次性验证 JSON/SQLite 的 256+4 两页、严格顺序、无重复和无遗漏，Bridge 层只验证 256/257、reopen 后 258/259、回绕 000/001，以及 stale owner generation 被拒绝。SQLite 先迁移空库再批量 seed，避免把迁移和大批量写入叠加。这样保留了生产边界和双 backend 覆盖，同时把该回归从分钟级 durable 写放大降到 race 下约 1.6 秒。
+
+仅把 jobs 按总权重分配也会制造新的尾部：当前 17 个重 Teams regular shard 在四分区下不可避免地成为 5/4/4/4，某一 runner 会多出一轮四进程并行波；exclusive 阶段也可能出现 193/159/189/167 的估计偏斜。runner 现在按下降权重分别平衡 serial exclusive phase 和四 worker parallel phase，并按同样的最长作业优先顺序投递并行队列；`-list-only` 输出估计权重和 exclusivity，Python 护栏检查 normal 两分区和 race 四分区的 exact-once 集合、selector 非空、exclusive 负载、四 worker 并行跨度、critical path 和总负载。race 保留四个 hosted runner，使三个 runner 只承担一轮重 Teams shard，另一个 runner 只多承担一个第二波；护栏明确限制为至多两轮最大作业，而不是用百分比检查掩盖不可避免的离散分配。测试仍以原有 `-race`、timeout、selector 和断言执行，没有 skip、retry 或降低 watchdog。
+
+full runner 为每个 job 输出实际 `duration=`，便于在同一提交的远端首轮结果中按 phase 检查估计是否失真。Linux coverage 仍保留单一完整 profile runner，避免把覆盖率合并和跨 runner artifact 变成新的正确性边界；race 分区独立验证并发安全。最终验收必须查看同一提交的 Windows normal、Windows recovery/race、macOS、Ubuntu full/race 和 CentOS 任务的首轮结果及耗时，不能用 Linux 单独通过替代 Windows 文件系统和宿主调度证据。
+
+在首次按新计划执行一个 Linux race 分区时，普通 CLI job 还暴露了 `TestProxyStartBackgroundReapsExitedDetachedChild` 的 `/proc` 短窗口竞态；单独重跑可通过，但并发 Teams shard 时失败。该进程树回归随后也加入 CLI 的 isolated 和 host-exclusive 映射，并以 race 五次重复验证通过；没有修改进程清理断言或增加重试。这个观测说明调度护栏必须覆盖所有 host-liveness 族，而不是只覆盖 Teams/SQLite 长尾。
+
+加入该边界后，Linux race partition 0 的完整分片 41 个 job 全部通过，最长实际 job 为 CLI 普通包 `1m41.877s`、Teams regular shard `1m6.823s`；包含第五个 Teams regular shard 的 partition 2 也全部通过，最长 job 为 store shard `1m3.512s`、Teams regular shard `40.245s`。这些是本地 Linux 的分片证据，不能替代 Windows/macOS 首轮矩阵，但已确认新的队列顺序和 durable fairness 回归没有再产生分钟级写放大。

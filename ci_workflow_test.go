@@ -132,7 +132,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, nonLinuxTest,
 		"if: runner.os != 'Linux'",
 		"shell: bash",
-		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
 		"Test/Example/Fuzz",
 	)
 	if strings.Contains(nonLinuxTest, "go test -timeout=20m -parallel=16 ./...") {
@@ -151,9 +151,9 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	raceJob := workflowJobBlock(t, workflow, "race-test")
 	requireStepContains(t, raceJob,
 		"name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
-		"partition: [0, 1]",
+		"partition: [0, 1, 2, 3]",
 		"timeout-minutes: 45",
-		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=4 -partition-index=\"${{ matrix.partition }}\"",
 	)
 
 	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")
