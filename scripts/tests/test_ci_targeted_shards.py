@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 import unittest
@@ -137,6 +138,35 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             aggregate,
         )
 
+    def test_recovery_jobs_keep_phase_diagnostics_and_resource_contract(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  teams-recovery-test:\n")
+        end = workflow.index("  codex-runtime-contract:\n", start)
+        job = workflow[start:end]
+        self.assertIn("CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases", job)
+        self.assertIn("name: Upload Teams recovery phase diagnostics", job)
+        self.assertIn("if: always()", job)
+        self.assertIn("if-no-files-found: ignore", job)
+
+        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], 2)
+        allowed = {"pure_cpu", "listener_async", "sqlite_fsync", "host_exclusive"}
+        self.assertTrue(manifest["tests"])
+        for item in manifest["tests"]:
+            self.assertIn(item.get("resource_class"), allowed, item["name"])
+
+    def test_frontier_reopen_fixture_has_durable_io_budget_and_exclusive_phase(self):
+        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
+        item = next(
+            entry
+            for entry in manifest["tests"]
+            if entry["name"] == "TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover"
+        )
+        self.assertEqual(item["backends"], ["json", "sqlite"])
+        self.assertEqual(item["resource_class"], "sqlite_fsync")
+        self.assertTrue(item["exclusive"])
+        self.assertGreaterEqual(item["max_seconds"], 180)
+
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         full_start = workflow.index("  full-go-test:\n")
@@ -164,6 +194,71 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn(
             "-partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
             race,
+        )
+
+    def test_full_runner_keeps_new_listener_liveness_families_isolated(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn("func autoIsolatedRunnableName", runner)
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsListenFalse")',
+            runner,
+        )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsMainLoopOutbox")',
+            runner,
+        )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsOwnershipStress")',
+            runner,
+        )
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsGraph429Stress")',
+            runner,
+        )
+        self.assertIn("runnableIsolationMap(packageName, names)", runner)
+        self.assertIn("runnableExclusivityMap(packageName, names)", runner)
+
+    def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
+        targeted = targeted_job()
+        self.assertIn("sudo bash scripts/ci/apt_update.sh", targeted)
+        release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("sudo bash scripts/ci/apt_update.sh", release)
+
+    def test_full_runner_isolates_process_tree_lifecycle_family(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn("isCodexRunnerPackage(packageName)", runner)
+        self.assertIn(
+            'strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")',
+            runner,
+        )
+        self.assertIn(
+            "Ordinary packages may still contain a small, reviewed family",
+            runner,
+        )
+        self.assertIn(
+            "exclusive := runnableExclusivityMap(packageName, names)",
+            runner,
+        )
+
+    def test_full_runner_isolates_async_cache_and_audience_budget_fixtures(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        self.assertIn(
+            'strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress")',
+            runner,
+        )
+        self.assertIn(
+            'name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"',
+            runner,
+        )
+        self.assertIn("Cache-stress and audience-admission", runner)
+
+    def test_full_runner_isolates_cross_backend_legacy_owner_fixture(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_name = "TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks"
+        self.assertEqual(
+            runner.count(f'"{fixture_name}"'),
+            2,
+            f"{fixture_name} must be both process-isolated and host-exclusive",
         )
 
     def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
@@ -238,6 +333,23 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             2,
             f"{fixture_name} must be both process-isolated and host-exclusive",
         )
+
+    def test_full_go_runner_isolates_app_gateway_daemon_fixtures(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_names = (
+            "TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns",
+            "TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget",
+            "TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort",
+            "TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown",
+            "TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort",
+            "TestRunAppGatewayDaemonRestartReusesStablePort",
+        )
+        for fixture_name in fixture_names:
+            self.assertEqual(
+                runner.count(f'"{fixture_name}"'),
+                2,
+                f"{fixture_name} must be both process-isolated and host-exclusive",
+            )
         self.assertIn('strings.HasSuffix(packageName, "/internal/cli")', runner)
         self.assertIn('"-skip"', runner)
 

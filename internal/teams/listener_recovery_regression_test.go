@@ -28,6 +28,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 	_ "modernc.org/sqlite"
 )
 
@@ -946,7 +947,10 @@ func startListenerRecovery(t *testing.T, bridge *Bridge, options BridgeOptions) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Listen(ctx, options) }()
+	go func() {
+		testphase.Emit("listener_goroutine_started", nil)
+		done <- bridge.Listen(ctx, options)
+	}()
 	handle := &listenerRecoveryHandle{cancel: cancel, done: done}
 	t.Cleanup(func() { handle.stop(t) })
 	return handle
@@ -973,6 +977,7 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 		h.cancel()
 		select {
 		case h.err = <-h.done:
+			testphase.Emit("listener_stopped", nil)
 		case <-time.After(5 * time.Second):
 			t.Errorf("listener recovery test listener did not stop within 5s")
 		}
@@ -4859,12 +4864,12 @@ func TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover(t *test
 // staging, attempt ownership, or the first generation's durable commit.
 func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool) {
 	t.Helper()
-	// The SQLite-backed first generation performs a durable continuation
-	// transition while the full hosted package is under load. Keep this bound
-	// finite so a real liveness failure still fails, but give the complete
-	// Graph/outbox/state transition the same backlog budget as the other
-	// recovery fixtures.
-	progressTimeout := listenerRecoveryExtendedProgressTimeout
+	// Both backend variants perform a complete production listener cycle and
+	// then reopen the durable frontier. On hosted Windows the JSON variant can
+	// spend tens of seconds in the two-message/outbox drain even after startup
+	// is ready. Use the existing finite durable-I/O budget so the assertion
+	// measures frontier completion rather than an unrelated short watchdog.
+	progressTimeout := listenerRecoveryDurableIOProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
@@ -5035,7 +5040,12 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	}
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 5 * time.Second
+	// The first page is observed after real listener startup, including the
+	// legacy JSON-to-SQLite compatibility migration that production performs on
+	// every new owner. Keep the production phase budget here so a slow durable
+	// startup cannot cancel the first page before the restart boundary is even
+	// reached; the outer progress watchdog still fails a genuinely stuck owner.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
 	// This fixture intentionally suppresses the next cycle until the
 	// continuation is interrupted. Keep the worker budget at the production
 	// value so a slow Windows durable transition cannot cancel the only first

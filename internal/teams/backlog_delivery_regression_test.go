@@ -107,19 +107,19 @@ func TestBoundedTeamsPhaseJobContextCutsWorkerBudgetFromPhaseDeadline(t *testing
 
 func TestTeamsWorkChatAudienceLookupUsesPollBudget(t *testing.T) {
 	started := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		select {
 		case <-started:
 		default:
 			close(started)
 		}
 		<-r.Context().Done()
-	}))
-	t.Cleanup(server.Close)
+		return nil, r.Context().Err()
+	})}
 	graph := &GraphClient{
 		auth:       &fakeGraphAuth{token: "audience-budget-token"},
-		client:     server.Client(),
-		baseURL:    server.URL,
+		client:     client,
+		baseURL:    "https://graph.example.test",
 		maxRetries: 0,
 		sleep:      sleepContext,
 		jitter:     func(delay time.Duration) time.Duration { return delay },

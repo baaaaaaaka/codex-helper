@@ -1191,11 +1191,11 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 			return err
 		}
 		_ = os.Remove(tmpPath)
-		if err := s.writeSQLiteStateFile(tmpPath, state); err != nil {
+		if err := s.writeSQLiteStateFile(ctx, tmpPath, state); err != nil {
 			_ = os.Remove(tmpPath)
 			return err
 		}
-		got, err := loadSQLiteStateFile(tmpPath)
+		got, err := loadSQLiteStateFileContext(ctx, tmpPath)
 		if err != nil {
 			_ = os.Remove(tmpPath)
 			return err
@@ -1223,7 +1223,7 @@ func (s *Store) MigrateLargeStateToSQLite(ctx context.Context, minSourceSize int
 			return err
 		}
 		_ = os.Chmod(dbPath, fileMode)
-		if _, err := loadSQLiteStateFile(dbPath); err != nil {
+		if _, err := loadSQLiteStateFileContext(ctx, dbPath); err != nil {
 			return err
 		}
 		if err := s.writeSQLitePointerUnlocked(pointer); err != nil {
@@ -2617,12 +2617,19 @@ func (s *Store) CheckpointSQLiteWAL(ctx context.Context, minSizeBytes int64) (SQ
 }
 
 func loadSQLiteStateFile(path string) (State, error) {
-	db, err := openExistingSQLiteStore(path)
+	return loadSQLiteStateFileContext(context.Background(), path)
+}
+
+func loadSQLiteStateFileContext(ctx context.Context, path string) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err := openExistingSQLiteStoreContext(ctx, path)
 	if err != nil {
 		return State{}, err
 	}
 	defer db.Close()
-	return loadSQLiteState(context.Background(), db)
+	return loadSQLiteState(ctx, db)
 }
 
 func loadSQLiteStateFileReadOnly(ctx context.Context, path string) (State, error) {
@@ -3464,20 +3471,23 @@ func (r *sqliteOfflineRecoveryReader) Close() error {
 	return first
 }
 
-func (s *Store) writeSQLiteStateFile(path string, state State) error {
-	db, err := openSQLiteStore(path, true)
+func (s *Store) writeSQLiteStateFile(ctx context.Context, path string, state State) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	db, err := openSQLiteStoreContext(ctx, path, true)
 	if err != nil {
 		return err
 	}
-	if err := ensureSQLiteSchema(db); err != nil {
+	if err := ensureSQLiteSchemaContext(ctx, db); err != nil {
 		_ = db.Close()
 		return err
 	}
-	if err := writeSQLiteState(context.Background(), db, state); err != nil {
+	if err := writeSQLiteState(ctx, db, state); err != nil {
 		_ = db.Close()
 		return err
 	}
-	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		_ = db.Close()
 		return err
 	}
@@ -3501,6 +3511,13 @@ func removeSQLiteSidecarFiles(path string) error {
 }
 
 func openExistingSQLiteStore(path string) (*sql.DB, error) {
+	return openExistingSQLiteStoreContext(context.Background(), path)
+}
+
+func openExistingSQLiteStoreContext(ctx context.Context, path string) (*sql.DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := validateExistingSQLiteStorePath(path); err != nil {
 		return nil, err
 	}
@@ -3508,19 +3525,19 @@ func openExistingSQLiteStore(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := validateSQLiteStoreInitialized(db); err != nil {
+	if err := validateSQLiteStoreInitializedContext(ctx, db); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := validateSQLiteRequiredTables(db); err != nil {
+	if err := validateSQLiteRequiredTablesContext(ctx, db); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := configureSQLiteStore(db, path); err != nil {
+	if err := configureSQLiteStoreContext(ctx, db, path); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -3571,11 +3588,18 @@ func validateExistingSQLiteStorePath(path string) error {
 }
 
 func openSQLiteStore(path string, create bool) (*sql.DB, error) {
+	return openSQLiteStoreContext(context.Background(), path, create)
+}
+
+func openSQLiteStoreContext(ctx context.Context, path string, create bool) (*sql.DB, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	db, err := openSQLiteHandle(path, create)
 	if err != nil {
 		return nil, err
 	}
-	if err := configureSQLiteStore(db, path); err != nil {
+	if err := configureSQLiteStoreContext(ctx, db, path); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -3629,6 +3653,13 @@ func sqliteWindowsFileURL(path string) url.URL {
 }
 
 func configureSQLiteStore(db *sql.DB, path string) error {
+	return configureSQLiteStoreContext(context.Background(), db, path)
+}
+
+func configureSQLiteStoreContext(ctx context.Context, db *sql.DB, path string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for _, stmt := range []string{
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA synchronous = NORMAL`,
@@ -3636,7 +3667,7 @@ func configureSQLiteStore(db *sql.DB, path string) error {
 		`PRAGMA temp_store = MEMORY`,
 		`PRAGMA busy_timeout = 5000`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
@@ -3654,8 +3685,15 @@ func chmodSQLiteStoreFiles(path string) {
 }
 
 func validateSQLiteStoreInitialized(db *sql.DB) error {
+	return validateSQLiteStoreInitializedContext(context.Background(), db)
+}
+
+func validateSQLiteStoreInitializedContext(ctx context.Context, db *sql.DB) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var raw []byte
-	err := db.QueryRow(`SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw)
+	err := db.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errors.New("sqlite teams store is missing state metadata")
@@ -3728,6 +3766,23 @@ func sqliteChatSequencesEmpty(db *sql.DB) (bool, error) {
 }
 
 func ensureSQLiteSchema(db *sql.DB) error {
+	return ensureSQLiteSchemaContext(context.Background(), db)
+}
+
+func ensureSQLiteSchemaContext(ctx context.Context, db *sql.DB) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Schema creation used to execute every CREATE/INDEX statement directly on
+	// the connection.  On Windows modernc SQLite can flush the database file
+	// for each statement, turning listener startup into an unbounded series of
+	// FlushFileBuffers calls.  Keep the schema change atomic and pay one commit
+	// for the base schema instead of one durable write per object.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
@@ -3768,14 +3823,22 @@ func ensureSQLiteSchema(db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS fork_history_items (id TEXT PRIMARY KEY, operation_id TEXT, ordinal INTEGER, delivery_status TEXT, updated_at INTEGER, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS fork_history_operation_idx ON fork_history_items(operation_id, ordinal, id)`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	// Keep a tiny durable epoch for the cold state row. The trigger is part of
 	// the SQLite file, so an older helper that only knows state_json still bumps
 	// the epoch and cannot silently leave a newer history-watch projection in
 	// front of its write.
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`CREATE TRIGGER IF NOT EXISTS state_json_revision_insert
 AFTER INSERT ON state_meta
@@ -3793,20 +3856,28 @@ BEGIN
 END`,
 		`INSERT OR IGNORE INTO state_meta(key, value) VALUES ('state_json_revision', '1')`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN teams_message_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN turn_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE outbox_messages ADD COLUMN post_send_effects_pending INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE outbox_messages ADD COLUMN teams_message_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`UPDATE outbox_messages
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE outbox_messages ADD COLUMN turn_id TEXT`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE outbox_messages ADD COLUMN post_send_effects_pending INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE outbox_messages
 SET post_send_effects_pending = CASE
   WHEN CASE WHEN json_valid(json) THEN COALESCE(json_extract(json, '$.post_send_effects_pending'), 0) ELSE 0 END = 1 THEN 1
   ELSE 0
@@ -3814,28 +3885,31 @@ END
 WHERE post_send_effects_pending IS NULL`); err != nil {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE inbound_events ADD COLUMN received_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE inbound_events ADD COLUMN received_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN park_notice_sent_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN park_notice_sent_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN parked_skip_eligible INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN parked_skip_eligible INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN last_activity_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN last_activity_at INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN frontier_active INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN frontier_active INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN blocked_until INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN blocked_until INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE chat_polls ADD COLUMN admission_valid INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE chat_polls ADD COLUMN admission_valid INTEGER`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 		return err
 	}
-	if err := ensureSQLiteChatPollFrontierHintTriggers(db); err != nil {
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if err := ensureSQLiteChatPollFrontierHintTriggersContext(ctx, db); err != nil {
 		return err
 	}
 	if err := backfillSQLiteSessionDerivedColumns(db); err != nil {
@@ -3853,6 +3927,11 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 	if err := backfillSQLiteChatSequences(db); err != nil {
 		return err
 	}
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`CREATE INDEX IF NOT EXISTS inbound_session_created_idx ON inbound_events(session_id, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS inbound_session_received_idx ON inbound_events(session_id, received_at, id) WHERE received_at > 0`,
@@ -3870,9 +3949,12 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 		`CREATE INDEX IF NOT EXISTS helper_deliveries_outbox_idx ON helper_deliveries(outbox_id)`,
 		`CREATE INDEX IF NOT EXISTS artifact_records_outbox_idx ON artifact_records(outbox_id)`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3884,7 +3966,14 @@ WHERE post_send_effects_pending IS NULL`); err != nil {
 // helper-owned triggers so an old helper cannot turn a dormant gap back into
 // an operational frontier after the migration backfill.
 func ensureSQLiteChatPollFrontierHintTriggers(db *sql.DB) error {
-	current, err := sqliteChatPollFrontierHintTriggersCurrent(db)
+	return ensureSQLiteChatPollFrontierHintTriggersContext(context.Background(), db)
+}
+
+func ensureSQLiteChatPollFrontierHintTriggersContext(ctx context.Context, db *sql.DB) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	current, err := sqliteChatPollFrontierHintTriggersCurrentContext(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -3895,6 +3984,11 @@ func ensureSQLiteChatPollFrontierHintTriggers(db *sql.DB) error {
 		return nil
 	}
 	frontierHint := sqliteChatPollOperationalFrontierSQL("NEW.json")
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`DROP TRIGGER IF EXISTS chat_polls_frontier_hint_repair_insert`,
 		`DROP TRIGGER IF EXISTS chat_polls_frontier_hint_repair_update`,
@@ -3917,15 +4011,22 @@ BEGIN
   WHERE chat_id = NEW.chat_id;
 END`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func sqliteChatPollFrontierHintTriggersCurrent(db *sql.DB) (bool, error) {
-	rows, err := db.Query(`SELECT name, COALESCE(sql, '') FROM sqlite_master
+	return sqliteChatPollFrontierHintTriggersCurrentContext(context.Background(), db)
+}
+
+func sqliteChatPollFrontierHintTriggersCurrentContext(ctx context.Context, db *sql.DB) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name, COALESCE(sql, '') FROM sqlite_master
 WHERE type = 'trigger' AND name IN (?, ?)
 ORDER BY name`, "chat_polls_frontier_hint_repair_insert", "chat_polls_frontier_hint_repair_update")
 	if err != nil {
@@ -5648,7 +5749,10 @@ ORDER BY entries.key LIMIT ?`, cursor, sqliteProjectionBackfillBatchSize)
 }
 
 func loadSQLiteState(ctx context.Context, db *sql.DB) (State, error) {
-	if err := ensureSQLiteSchema(db); err != nil {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ensureSQLiteSchemaContext(ctx, db); err != nil {
 		return State{}, err
 	}
 	return loadSQLiteStateRows(ctx, db)

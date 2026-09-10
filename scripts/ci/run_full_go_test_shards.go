@@ -34,11 +34,12 @@ const (
 
 var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$`)
 
-// A small number of tests intentionally exercise long-lived listener state,
-// timing-sensitive error isolation, or process-wide performance fixtures. These
-// tests are independently correct but share process-global test plumbing with
-// older package fixtures. Keep them in their own test process rather than
-// allowing unrelated tests to make their timing assertions nondeterministic.
+// Host-sensitive test families intentionally exercise long-lived listener
+// state, timing-sensitive error isolation, or process-wide performance
+// fixtures. These tests are independently correct but share process-global
+// test plumbing with older package fixtures. Keep them in their own test
+// process rather than allowing unrelated tests to make their timing assertions
+// nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
 	"./internal/cli": {
 		// This fixture starts a real Codex-shaped process tree and asserts
@@ -46,6 +47,16 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// package pool, where unrelated test processes can make the PID and
 		// signal observation nondeterministic.
 		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+		// App Gateway daemon tests observe short registration, cooldown, and
+		// restart windows. Running the package beside Teams/store shards can
+		// delay those observations on hosted Windows runners even though the
+		// daemon fixture itself is isolated in a temporary directory.
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
 	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
@@ -109,6 +120,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// unrelated store shards share the hosted runner. Keep the migration
 		// observation isolated instead of weakening its finite assertions.
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends": true,
+		// This cross-backend legacy-owner test performs the same durable lease
+		// migration and can spend its whole short budget in a Windows SQLite
+		// commit. Keep its two backend assertions in a clean process as well.
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks": true,
 	},
 }
 
@@ -119,7 +134,13 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
 	"./internal/cli": {
-		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup":     true,
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
 	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
@@ -155,6 +176,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
 	},
 }
 
@@ -316,14 +338,22 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 	var plans []shardPlan
 	for _, packageName := range packages {
 		if !isLargePackage(packageName) {
-			isolated := isolatedRunnableNamesForPackage(packageName)
-			if len(isolated) == 0 {
+			if len(isolatedRunnableNamesForPackage(packageName)) == 0 && !isCodexRunnerPackage(packageName) {
 				ordinary = append(ordinary, packageName)
 				continue
 			}
+			// Ordinary packages may still contain a small, reviewed family of
+			// host-sensitive tests. Discover the names before constructing the
+			// ordinary job so semantic families receive the same exact-once
+			// process/resource boundary as large packages.
 			names, err := listRunnableNames(packageName, race)
 			if err != nil {
 				return nil, err
+			}
+			isolated := runnableIsolationMap(packageName, names)
+			if len(isolated) == 0 {
+				ordinary = append(ordinary, packageName)
+				continue
 			}
 			var isolatedNames []string
 			var regularNames []string
@@ -359,7 +389,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 					args:  args,
 				})
 			}
-			exclusive := exclusiveRunnableNamesForPackage(packageName)
+			exclusive := runnableExclusivityMap(packageName, names)
 			for _, name := range isolatedNames {
 				args := []string{"test"}
 				if race {
@@ -392,8 +422,8 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 			continue
 		}
 		var isolatedNames []string
-		isolated := isolatedRunnableNamesForPackage(packageName)
-		exclusive := exclusiveRunnableNamesForPackage(packageName)
+		isolated := runnableIsolationMap(packageName, names)
+		exclusive := runnableExclusivityMap(packageName, names)
 		for _, name := range names {
 			if isolated[name] {
 				isolatedNames = append(isolatedNames, name)
@@ -496,6 +526,67 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	return nil
 }
 
+// runnableIsolationMap combines the reviewed exact-name list with bounded
+// semantic families whose members are expected to grow as regressions are
+// added. Keeping the family rule here means a newly-added listener liveness
+// case cannot silently fall back into a broad shard until someone remembers
+// to edit a second static map.
+func runnableIsolationMap(packageName string, names []string) map[string]bool {
+	base := isolatedRunnableNamesForPackage(packageName)
+	isolated := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		isolated[name] = true
+	}
+	for _, name := range names {
+		if autoIsolatedRunnableName(packageName, name) {
+			isolated[name] = true
+		}
+	}
+	return isolated
+}
+
+func autoIsolatedRunnableName(packageName, name string) bool {
+	if isTeamsRecoveryPackage(packageName) {
+		// Every TestTeamsListenFalse case drives the continuous listener through
+		// a finite readiness/recovery window. Keeping the family rule broad
+		// prevents a newly-added listener regression (for example a SQLite
+		// admission flood) from silently joining a shard with unrelated test
+		// processes. The outbox family has the same bounded scheduler observation
+		// even without a real listener. Ownership and Graph-429 stress families make
+		// the same host-scheduler observation at a larger fan-out; keeping each
+		// family together prevents a newly-added stress regression from silently
+		// joining a broad shard. Cache-stress and audience-admission fixtures also
+		// make short async or Graph-budget observations; their temporary stores and
+		// request harness must start without unrelated shard processes consuming the
+		// hosted runner.
+		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
+			strings.HasPrefix(name, "TestTeamsMainLoopOutbox") ||
+			strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress") ||
+			strings.HasPrefix(name, "TestTeamsOwnershipStress") ||
+			strings.HasPrefix(name, "TestTeamsGraph429Stress") ||
+			name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"
+	}
+	if isCodexRunnerPackage(packageName) {
+		// These fixtures start an OS wrapper and a long-lived descendant, then
+		// assert that Close tears down the whole tree. Their short PID/readiness
+		// and cleanup windows are real host observations; unrelated full-suite
+		// processes can delay PowerShell/tasklist without changing the product
+		// behavior under test.
+		return strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")
+	}
+	return false
+}
+
+func isCodexRunnerPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/codexrunner" || strings.HasSuffix(packageName, "/internal/codexrunner")
+}
+
+func isTeamsRecoveryPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/teams" || strings.HasSuffix(packageName, "/internal/teams")
+}
+
 func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	if names, ok := exclusiveRunnableNames[packageName]; ok {
 		return names
@@ -513,6 +604,20 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 		return exclusiveRunnableNames["./internal/teams"]
 	}
 	return nil
+}
+
+func runnableExclusivityMap(packageName string, names []string) map[string]bool {
+	base := exclusiveRunnableNamesForPackage(packageName)
+	exclusive := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		exclusive[name] = true
+	}
+	for _, name := range names {
+		if autoIsolatedRunnableName(packageName, name) {
+			exclusive[name] = true
+		}
+	}
+	return exclusive
 }
 
 func plansForPackage(plans []shardPlan, packageName string) []shardPlan {

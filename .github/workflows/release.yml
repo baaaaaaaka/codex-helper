@@ -184,7 +184,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo bash scripts/ci/apt_update.sh
           sudo env DEBIAN_FRONTEND=noninteractive bash scripts/ci/retry.sh 5 5 apt-get install -y --no-install-recommends zsh fish csh tcsh
 
       - name: Install account shells (macOS)

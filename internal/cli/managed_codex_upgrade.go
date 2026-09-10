@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 )
@@ -14,6 +15,9 @@ import (
 var upgradeCodexInstalledForTargetRun = upgradeCodexInstalledWithOptions
 var ensureCodexInstalledForTargetRun = ensureCodexInstalledWithOptions
 var probeManagedCodexUpgradeCandidateForRun = probeManagedCodexUpgradeCandidate
+var managedCodexProbeRetryDelay = 250 * time.Millisecond
+
+const managedCodexProbeAttempts = 3
 
 type managedCodexUpgradeTarget struct {
 	path        string
@@ -78,12 +82,29 @@ func probeManagedCodexUpgradeCandidate(ctx context.Context, path string, environ
 	if identity != nil && identity.UID != 0 {
 		return probeCodexForAppAuthIdentity(probeCtx, path, identity)
 	}
-	cmd := exec.CommandContext(probeCtx, path, "--version")
-	cmd.Env = environment
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("codex at %s is not functional: %w: %s", path, err, strings.TrimSpace(string(out)))
+	var lastErr error
+	for attempt := 0; attempt < managedCodexProbeAttempts; attempt++ {
+		cmd := exec.CommandContext(probeCtx, path, "--version")
+		cmd.Env = environment
+		if out, err := cmd.CombinedOutput(); err == nil {
+			return nil
+		} else {
+			lastErr = fmt.Errorf("codex at %s is not functional: %w: %s", path, err, strings.TrimSpace(string(out)))
+		}
+		if attempt+1 == managedCodexProbeAttempts || probeCtx.Err() != nil {
+			break
+		}
+		timer := time.NewTimer(managedCodexProbeRetryDelay)
+		select {
+		case <-probeCtx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return lastErr
+		case <-timer.C:
+		}
 	}
-	return nil
+	return lastErr
 }
 
 func managedCodexUpgradeInstallOptions(target managedCodexUpgradeTarget) codexInstallOptions {
@@ -96,11 +117,11 @@ func codexUpgradeTargetInstallOptions(target managedCodexUpgradeTarget, requireM
 		upgradeCodexPath: target.path,
 		installerEnv:     target.environment,
 		requireManaged:   requireManaged,
+		probeManagedCodex: func(ctx context.Context, path string, environment []string) error {
+			return probeManagedCodexUpgradeCandidate(ctx, path, environment, target.identity)
+		},
 	}
 	if target.identity != nil {
-		opts.probeManagedCodex = func(ctx context.Context, path string, environment []string) error {
-			return probeManagedCodexUpgradeCandidate(ctx, path, environment, target.identity)
-		}
 		opts.configureInstallerCommand = func(cmd *exec.Cmd) error {
 			updated, err := applyExecIdentity(cmd, cmd.Env, target.identity)
 			if err != nil {

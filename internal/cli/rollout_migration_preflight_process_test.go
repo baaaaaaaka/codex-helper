@@ -54,7 +54,12 @@ exit 64
 		}, nil, "11111111-2222-3333-4444-555555555555")
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
+	// The child is a shell fixture, so readiness is not the process-group
+	// invariant itself. Give the hosted race binary a finite startup margin;
+	// otherwise race instrumentation can spend the whole two-second window
+	// before the shell publishes its child PID and turn a valid cleanup check
+	// into a false "did not start" failure.
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(childPIDPath); err == nil {
 			break
@@ -88,9 +93,14 @@ exit 64
 		}
 		currentStartTime, startErr := teamsLocalSupervisorProcessStartTime(pid)
 		if startErr != nil {
-			// Keep the assertion conservative while the original process is
-			// still reported alive. A disappearing /proc entry is observed as
-			// dead by proc.IsAlive on the next iteration.
+			// The liveness and /proc identity reads are not atomic. If the
+			// original process exits between them, ENOENT is definitive evidence
+			// that this PID no longer names the original process. Keep other
+			// errors conservative so permission or malformed procfs failures do
+			// not turn a cleanup assertion into a false pass.
+			if errors.Is(startErr, os.ErrNotExist) {
+				return false
+			}
 			return true
 		}
 		return currentStartTime == childStartTime

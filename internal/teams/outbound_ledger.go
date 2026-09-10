@@ -541,16 +541,21 @@ func readGlobalOutboundSQLite(path string) (globalOutboundLedger, bool, error) {
 }
 
 func ensureGlobalOutboundSQLite(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS outbound_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS outbound_ledger (key TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_id TEXT NOT NULL, updated_at INTEGER NOT NULL, recorded_at INTEGER NOT NULL, teams_created_at INTEGER NOT NULL, json BLOB NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS outbound_ledger_prune_idx ON outbound_ledger(updated_at, recorded_at, teams_created_at, key)`,
 	} {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func importLegacyGlobalOutboundJSON(ctx context.Context, db *sql.DB, path string, now time.Time) error {

@@ -348,7 +348,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo bash scripts/ci/apt_update.sh
           sudo env DEBIAN_FRONTEND=noninteractive bash scripts/ci/retry.sh 5 5 apt-get install -y --no-install-recommends zsh fish csh tcsh
           CODEX_PROXY_REQUIRE_SHELL_MATRIX=1 bash scripts/ci/install_path_activation_matrix.sh
 
@@ -1127,7 +1127,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo bash scripts/ci/retry.sh 5 5 apt-get update
+          sudo bash scripts/ci/apt_update.sh
           sudo bash scripts/ci/retry.sh 5 5 apt-get install -y openssh-server
           sudo mkdir -p /run/sshd
           SSH_TEST_USER="ssh-test"
@@ -1310,7 +1310,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          pattern='Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|ProbeManagedCodexUpgradeCandidate.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run "$pattern"
 
       - name: Root/home/identity regressions (Windows)
@@ -1319,7 +1319,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
+          $pattern = 'Test(DefaultPathForHome|ResolveEffectivePaths(_|$)|ResolveEffectiveLaunchPaths(_|$)|NewRootStore_PathOnlyAllowsForeignHomeWithoutRunnableIdentity|RootUpgradeCodex.*|ProbeManagedCodexUpgradeCandidate.*|CodexUpgradeTargetInstallOptionsUsesTargetIdentity|EnsureManagedCodexHonorsTargetIdentityProbeDuringInstallRecheck|CodexExecutionContextForRun(RequiresRunnableIdentityForForeignHome|UsesResolvedForeignHomeAndExecIdentity)|ExecIdentityFor(HomeRejectsUnknownNonRootOwner|UserResolvesSupplementaryGroups)|ApplyExecIdentitySetsCommandCredentialAndEnv|PrepareCodexSelfUpdateGuardEnv(PrependsWrapper|SkipsUnknownSource|ReownsWrapperForExecIdentity)|ProxyStartBackgroundPassesResolvedConfigPathToDaemon|ResolveCodexDirSelection_).*$'
           go test ./internal/cli ./internal/codexhistory ./internal/config -count=1 -run $pattern
 
       - name: Config and standard runtime resilience regressions (Linux/macOS)
@@ -2255,6 +2255,16 @@ jobs:
       - name: Run Teams recovery manifest (normal)
         if: matrix.mode == 'normal'
         shell: bash
+        env:
+          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
+          # Go on Windows otherwise places t.TempDir and go-build files under
+          # the user profile's C: temp directory.  The hosted runner's
+          # RUNNER_TEMP is the isolated per-job workspace; keeping SQLite WAL,
+          # phase traces, and compiler scratch on that volume avoids unrelated
+          # profile/antivirus I/O from changing durable test latency.
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
@@ -2266,6 +2276,14 @@ jobs:
       - name: Run Teams recovery manifest (race)
         if: matrix.mode == 'race'
         shell: bash
+        env:
+          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
+          # Keep Windows test files on the isolated per-job runner volume; see
+          # the normal-mode step above for why this matters to SQLite WAL
+          # durability observations.
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
@@ -2273,6 +2291,14 @@ jobs:
             partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           fi
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
+
+      - name: Upload Teams recovery phase diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: teams-recovery-phases-${{ matrix.os }}-${{ matrix.mode }}-${{ matrix.partition }}
+          path: ${{ runner.temp }}/teams-recovery-phases
+          if-no-files-found: ignore
 
   codex-runtime-contract:
     name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})

@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
+
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
@@ -21181,6 +21183,11 @@ func officialReleaseUpgradeFixtureState(tag string, schemaVersion int, includePr
 }
 
 func createOfficialReleaseSQLiteSchemaForTest(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, stmt := range []string{
 		`CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, json BLOB NOT NULL)`,
@@ -21216,11 +21223,11 @@ func createOfficialReleaseSQLiteSchemaForTest(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS outbox_turn_idx ON outbox_messages(turn_id, status, created_at, id)`,
 		`CREATE INDEX IF NOT EXISTS outbox_message_lookup_idx ON outbox_messages(teams_chat_id, teams_message_id, status)`,
 	} {
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := tx.Exec(stmt); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func createOfficialReleaseLegacyOutboxSchemaForTest(db *sql.DB) error {
@@ -21779,6 +21786,52 @@ func newTestStore(t *testing.T) *Store {
 			t.Fatalf("Close test store: %v", err)
 		}
 	})
+	return store
+}
+
+// newSQLiteTestStore creates a minimal, current-schema SQLite store without
+// exercising the legacy migration path.  Backend contract tests should not
+// make migration, pointer publication, and owner admission one timing
+// sensitive operation: migration has its own durability and recovery tests,
+// while the contract tests need a stable SQLite backend to exercise their
+// transaction semantics.  Building the fixture in one transaction keeps the
+// backend boundary real (including the SQLite connection and projections)
+// without making every owner-fencing assertion pay the migration's full
+// filesystem flush cost on hosted Windows runners.
+func newSQLiteTestStore(t *testing.T) *Store {
+	t.Helper()
+	store := newTestStore(t)
+	ctx := context.Background()
+	testphase.Emit("fixture_start", map[string]string{"backend": "sqlite"})
+	state := newState()
+	if err := os.MkdirAll(filepath.Dir(store.Path()), 0o700); err != nil {
+		t.Fatalf("create sqlite fixture directory: %v", err)
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), storeSQLiteFileName)
+	db, err := openSQLiteStore(dbPath, true)
+	if err != nil {
+		t.Fatalf("open sqlite test fixture: %v", err)
+	}
+	if err := createOfficialReleaseSQLiteSchemaForTest(db); err != nil {
+		_ = db.Close()
+		t.Fatalf("create sqlite test fixture schema: %v", err)
+	}
+	if err := insertOfficialReleaseSQLiteStateForTest(db, state); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert sqlite test fixture state: %v", err)
+	}
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("checkpoint sqlite test fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close sqlite test fixture: %v", err)
+	}
+	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+	testphase.Emit("fixture_ready", map[string]string{"backend": "sqlite", "path": dbPath})
+	if _, err := store.Load(ctx); err != nil {
+		t.Fatalf("load sqlite test fixture through store: %v", err)
+	}
 	return store
 }
 

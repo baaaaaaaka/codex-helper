@@ -73,9 +73,11 @@ func runUpgradeCodexFromRoot(cmd *cobra.Command, root *rootOptions) error {
 		if !executableExists(target.path) {
 			return fmt.Errorf("codex not found at %s", explicitPath)
 		}
-		if err := probeManagedCodexUpgradeCandidate(cmd.Context(), target.path, target.environment, target.identity); err != nil {
-			return err
-		}
+		// An explicit upgrade is also a repair path: the executable may be
+		// present but temporarily or permanently broken before npm replaces it.
+		// Source detection below still fails closed for an unrecognized path, and
+		// upgradeCodexInstalledWithOptions probes the resulting executable after
+		// npm completes.
 	}
 
 	installOpts := codexUpgradeTargetInstallOptions(target, managedTarget)

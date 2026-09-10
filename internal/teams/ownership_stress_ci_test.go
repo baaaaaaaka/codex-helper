@@ -896,23 +896,25 @@ func TestTeamsOwnershipStressDueHotChatsRotateBeyondCycleCapCI(t *testing.T) {
 	bridge.reg.Sessions = sessions
 	var mu sync.Mutex
 	reads := make(map[string]int)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		if len(parts) < 3 || parts[0] != "chats" || parts[2] != "messages" {
-			http.Error(w, "unexpected request", http.StatusNotFound)
-			return
+		if r.Method != http.MethodGet || len(parts) < 3 || parts[0] != "chats" || parts[2] != "messages" {
+			response := jsonResponse(http.StatusNotFound, `{"error":"unexpected request"}`)
+			response.Request = r
+			return response, nil
 		}
 		mu.Lock()
 		reads[parts[1]]++
 		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprint(w, `{"value":[]}`)
-	}))
-	t.Cleanup(server.Close)
+		response := jsonResponse(http.StatusOK, `{"value":[]}`)
+		response.Header.Set("Content-Type", "application/json")
+		response.Request = r
+		return response, nil
+	})}
 	bridge.readGraph = &GraphClient{
 		auth:       &fakeGraphAuth{token: "access"},
-		client:     server.Client(),
-		baseURL:    server.URL,
+		client:     client,
+		baseURL:    "https://graph.example.test",
 		maxRetries: 0,
 		sleep:      func(context.Context, time.Duration) error { return nil },
 		jitter:     func(d time.Duration) time.Duration { return d },

@@ -21,9 +21,9 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/scripts/ci/manifestprocess"
@@ -34,6 +34,9 @@ const (
 	manifestBuildTimeout          = 10 * time.Minute
 	manifestRuntimeGrace          = 30 * time.Second
 	teamsOwnershipStressStrictEnv = "CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT"
+	manifestPhaseDirEnv           = "CODEX_HELPER_CI_PHASE_DIR"
+	manifestPhaseFileEnv          = "CODEX_HELPER_CI_PHASE_FILE"
+	manifestTestNameEnv           = "CODEX_HELPER_CI_TEST_NAME"
 )
 
 type manifest struct {
@@ -42,20 +45,21 @@ type manifest struct {
 }
 
 type manifestTest struct {
-	Name         string   `json:"name"`
-	Package      string   `json:"package"`
-	Job          string   `json:"job"`
-	Tier         string   `json:"tier"`
-	Backends     []string `json:"backends"`
-	Vertical     string   `json:"vertical"`
-	RealListener bool     `json:"real_listener"`
-	ListenerMode string   `json:"listener_mode"`
-	Once         *bool    `json:"once"`
-	FakeGraph    bool     `json:"fake_graph"`
-	Exclusive    bool     `json:"exclusive"`
-	MaxSeconds   int      `json:"max_seconds"`
-	Oracle       string   `json:"oracle"`
-	Baseline     string   `json:"baseline"`
+	Name          string   `json:"name"`
+	Package       string   `json:"package"`
+	Job           string   `json:"job"`
+	Tier          string   `json:"tier"`
+	Backends      []string `json:"backends"`
+	Vertical      string   `json:"vertical"`
+	RealListener  bool     `json:"real_listener"`
+	ListenerMode  string   `json:"listener_mode"`
+	Once          *bool    `json:"once"`
+	FakeGraph     bool     `json:"fake_graph"`
+	Exclusive     bool     `json:"exclusive"`
+	ResourceClass string   `json:"resource_class,omitempty"`
+	MaxSeconds    int      `json:"max_seconds"`
+	Oracle        string   `json:"oracle"`
+	Baseline      string   `json:"baseline"`
 }
 
 type goTestJSONEvent struct {
@@ -63,6 +67,27 @@ type goTestJSONEvent struct {
 	Package string `json:"Package"`
 	Test    string `json:"Test"`
 }
+
+type manifestRunReport struct {
+	Schema        int    `json:"schema"`
+	Kind          string `json:"kind"`
+	Test          string `json:"test"`
+	Package       string `json:"package"`
+	ResourceClass string `json:"resource_class"`
+	StartedAt     string `json:"started_at"`
+	FinishedAt    string `json:"finished_at"`
+	DurationMS    int64  `json:"duration_ms"`
+	Passed        bool   `json:"passed"`
+	PhaseFile     string `json:"phase_file,omitempty"`
+	PhaseEvents   int    `json:"phase_events,omitempty"`
+	PhaseError    string `json:"phase_error,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+var (
+	manifestPhaseSequence atomic.Uint64
+	manifestReportMu      sync.Mutex
+)
 
 var testNamePattern = regexp.MustCompile(`^Test[A-Za-z0-9_]+$`)
 
@@ -132,11 +157,18 @@ func readManifest(path string) (manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return manifest{}, fmt.Errorf("decode recovery manifest %q: %w", path, err)
 	}
-	if m.Version != 1 {
+	if m.Version != 1 && m.Version != 2 {
 		return manifest{}, fmt.Errorf("unsupported recovery manifest version %d", m.Version)
 	}
 	if len(m.Tests) == 0 {
 		return manifest{}, errors.New("recovery manifest has no tests")
+	}
+	if m.Version == 2 {
+		for _, item := range m.Tests {
+			if strings.TrimSpace(item.ResourceClass) == "" {
+				return manifest{}, fmt.Errorf("recovery test %q is missing resource_class", item.Name)
+			}
+		}
 	}
 	return m, nil
 }
@@ -182,6 +214,9 @@ func validateSelectors(tests []manifestTest) error {
 		}
 		if strings.TrimSpace(item.Oracle) == "" || strings.TrimSpace(item.Baseline) == "" {
 			return fmt.Errorf("recovery test %q must document oracle and baseline", item.Name)
+		}
+		if class := strings.TrimSpace(strings.ToLower(item.ResourceClass)); class != "" && !manifestResourceClassAllowed(class) {
+			return fmt.Errorf("recovery test %q has unsupported resource_class %q", item.Name, item.ResourceClass)
 		}
 		if item.RealListener && !item.FakeGraph {
 			return fmt.Errorf("real listener test %q must use the isolated fake Graph", item.Name)
@@ -477,6 +512,7 @@ func runManifestTestPool(ordered []manifestTest, binaries map[string]string, pac
 	// recovery corpus is deliberately expensive, but an unbounded process burst
 	// would trade wall time for memory pressure and scheduler contention.
 	workerCount := manifestTestWorkerCount(race)
+	resources := newManifestResourceLimiter(race, runtime.GOOS, workerCount)
 	jobs := make(chan manifestTestJob)
 	results := make(chan manifestTestResult, len(ordered))
 	var workers sync.WaitGroup
@@ -485,7 +521,9 @@ func runManifestTestPool(ordered []manifestTest, binaries map[string]string, pac
 		go func() {
 			defer workers.Done()
 			for job := range jobs {
+				release := resources.acquire(manifestResourceClass(job.item))
 				err := runManifestTest(job.item, binaries[job.item.Package], packageDirs[job.item.Package], outputMu)
+				release()
 				results <- manifestTestResult{index: job.index, err: err}
 			}
 		}()
@@ -511,6 +549,113 @@ func runManifestTestPool(ordered []manifestTest, binaries map[string]string, pac
 }
 
 const maxManifestTestWorkers = 4
+
+// manifestResourceLimiter prevents the manifest's worker pool from creating
+// a second, hidden concurrency multiplier for file-backed SQLite and real
+// listener fixtures.  It is intentionally scoped to one hosted job: GitHub
+// matrix jobs run on different machines and cannot share a process semaphore.
+type manifestResourceLimiter struct {
+	mu    sync.Mutex
+	sems  map[string]chan struct{}
+	limit map[string]int
+}
+
+func newManifestResourceLimiter(race bool, goos string, workerCount int) *manifestResourceLimiter {
+	limits := map[string]int{
+		"pure_cpu": workerCount,
+		// SQLite sync and listener work contend on the same hosted filesystem and
+		// scheduler. They therefore share one host-I/O lane below; separate class
+		// semaphores alone would still let one SQLite process run beside one
+		// listener process and recreate the very pressure this limiter is meant to
+		// prevent.
+		"sqlite_fsync":   2,
+		"listener_async": 2,
+		"host_exclusive": 1,
+		"host_io":        2,
+	}
+	if race {
+		limits["sqlite_fsync"] = 1
+		limits["listener_async"] = 1
+		limits["host_io"] = 1
+	}
+	if strings.EqualFold(strings.TrimSpace(goos), "windows") {
+		for class := range limits {
+			limits[class] = 1
+		}
+	}
+	return &manifestResourceLimiter{sems: make(map[string]chan struct{}), limit: limits}
+}
+
+func (l *manifestResourceLimiter) acquire(class string) func() {
+	class = strings.TrimSpace(strings.ToLower(class))
+	if class == "" {
+		class = "host_exclusive"
+	}
+	keys := []string{class}
+	if class == "sqlite_fsync" || class == "listener_async" {
+		// These classes have independent per-class caps for normal-mode
+		// throughput, but must also consume the same host-I/O token.  Acquire in
+		// a fixed order so a future multi-resource class cannot deadlock with
+		// another worker waiting on the reverse order.
+		keys = []string{"host_io", class}
+	}
+	l.mu.Lock()
+	sems := make([]chan struct{}, 0, len(keys))
+	for _, key := range keys {
+		sem := l.sems[key]
+		if sem == nil {
+			limit := l.limit[key]
+			if limit <= 0 {
+				// An undeclared resource is fail-safe: one process at a time.
+				limit = 1
+			}
+			sem = make(chan struct{}, limit)
+			l.sems[key] = sem
+		}
+		sems = append(sems, sem)
+	}
+	l.mu.Unlock()
+	for _, sem := range sems {
+		sem <- struct{}{}
+	}
+	return func() {
+		for index := len(sems) - 1; index >= 0; index-- {
+			<-sems[index]
+		}
+	}
+}
+
+func manifestResourceClass(item manifestTest) string {
+	if class := strings.TrimSpace(strings.ToLower(item.ResourceClass)); class != "" {
+		return class
+	}
+	if item.Exclusive {
+		return "host_exclusive"
+	}
+	hasSQLite := false
+	for _, backend := range item.Backends {
+		if strings.EqualFold(strings.TrimSpace(backend), "sqlite") {
+			hasSQLite = true
+			break
+		}
+	}
+	if hasSQLite {
+		return "sqlite_fsync"
+	}
+	if item.RealListener {
+		return "listener_async"
+	}
+	return "pure_cpu"
+}
+
+func manifestResourceClassAllowed(class string) bool {
+	switch strings.TrimSpace(strings.ToLower(class)) {
+	case "pure_cpu", "listener_async", "sqlite_fsync", "host_exclusive":
+		return true
+	default:
+		return false
+	}
+}
 
 type manifestTestJob struct {
 	index int
@@ -556,7 +701,50 @@ func (w synchronizedManifestWriter) Write(data []byte) (int, error) {
 	return w.w.Write(data)
 }
 
-func runManifestTest(item manifestTest, binaryPath string, packageDir string, outputMu *sync.Mutex) error {
+// manifestRunBudget returns the finite process budget for one manifest entry.
+// max_seconds describes the budget for each declared backend, while many
+// entries exercise all backends from one top-level Go test and therefore run
+// those subtests sequentially in one process. Reserve one budget per declared
+// backend so a slow SQLite tail cannot consume the JSON budget before its own
+// required subtest starts. The validator still requires every backend to run
+// and pass; this only models the work that the manifest already promises to
+// execute.
+func manifestRunBudget(item manifestTest) time.Duration {
+	backendCount := len(item.Backends)
+	if backendCount < 1 {
+		backendCount = 1
+	}
+	return time.Duration(item.MaxSeconds) * time.Second * time.Duration(backendCount)
+}
+
+func runManifestTest(item manifestTest, binaryPath string, packageDir string, outputMu *sync.Mutex) (runErr error) {
+	started := time.Now()
+	phaseFile, phaseDir := manifestPhaseFile(item)
+	defer func() {
+		if phaseDir == "" {
+			return
+		}
+		finished := time.Now()
+		report := manifestRunReport{
+			Schema:        1,
+			Kind:          "teams_recovery_manifest_test",
+			Test:          item.Name,
+			Package:       item.Package,
+			ResourceClass: manifestResourceClass(item),
+			StartedAt:     started.UTC().Format(time.RFC3339Nano),
+			FinishedAt:    finished.UTC().Format(time.RFC3339Nano),
+			DurationMS:    finished.Sub(started).Milliseconds(),
+			Passed:        runErr == nil,
+			PhaseFile:     phaseFile,
+		}
+		if phaseFile != "" {
+			report.PhaseEvents, report.PhaseError = inspectManifestPhaseFile(phaseFile, item.Name)
+		}
+		if runErr != nil {
+			report.Error = runErr.Error()
+		}
+		appendManifestRunReport(phaseDir, report)
+	}()
 	selector := "^" + regexp.QuoteMeta(item.Name) + "$"
 	args := []string{
 		"tool",
@@ -567,7 +755,7 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 		binaryPath,
 		"-test.v",
 		"-test.timeout",
-		strconv.Itoa(item.MaxSeconds) + "s",
+		manifestRunBudget(item).String(),
 		"-test.run",
 		selector,
 	}
@@ -575,9 +763,9 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 	// process. This preserves process isolation and each test's watchdog
 	// without paying the large package compile/link cost 109 times. The small
 	// runtime grace covers process startup; the test binary itself has the
-	// exact manifest timeout and therefore still reports a useful stack if it
+	// finite per-backend budget and therefore still reports a useful stack if it
 	// fails to return.
-	watchdog := time.Duration(item.MaxSeconds)*time.Second + manifestRuntimeGrace
+	watchdog := manifestRunBudget(item) + manifestRuntimeGrace
 	ctx, cancel := context.WithTimeout(context.Background(), watchdog)
 	defer cancel()
 	var output bytes.Buffer
@@ -590,6 +778,10 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 	// environment. Do not inherit a developer's exploratory diagnostic setting
 	// into the CI manifest.
 	cmd.Env = manifestChildEnvironment()
+	if phaseFile != "" {
+		cmd.Env = setManifestEnvironment(cmd.Env, manifestPhaseFileEnv, phaseFile)
+		cmd.Env = setManifestEnvironment(cmd.Env, manifestTestNameEnv, item.Name)
+	}
 	stdout := synchronizedManifestWriter{mu: outputMu, w: os.Stdout}
 	stderr := synchronizedManifestWriter{mu: outputMu, w: os.Stderr}
 	cmd.Stdout = io.MultiWriter(stdout, &output)
@@ -605,6 +797,102 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 		return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
 	}
 	return nil
+}
+
+func manifestPhaseFile(item manifestTest) (string, string) {
+	dir := strings.TrimSpace(os.Getenv(manifestPhaseDirEnv))
+	if dir == "" {
+		return "", ""
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", ""
+	}
+	seq := manifestPhaseSequence.Add(1)
+	name := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, strings.TrimSpace(item.Name))
+	if name == "" {
+		name = "unnamed"
+	}
+	return filepath.Join(dir, fmt.Sprintf("%06d-%s-%d.jsonl", seq, name, os.Getpid())), dir
+}
+
+type manifestPhaseEvent struct {
+	Schema int    `json:"schema"`
+	Seq    uint64 `json:"seq"`
+	Phase  string `json:"phase"`
+	Test   string `json:"test"`
+}
+
+// inspectManifestPhaseFile validates the optional diagnostic stream after the
+// child process exits.  A missing or malformed stream is recorded in the
+// report, while the test result remains authoritative: diagnostics must never
+// turn a semantic pass into a retryable failure.  The runner can therefore
+// distinguish "the test passed without instrumentation" from "the test
+// produced a complete phase trace" when a hosted failure needs triage.
+func inspectManifestPhaseFile(path, expectedTest string) (int, string) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Sprintf("open phase file: %v", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 16*1024), 4*1024*1024)
+	count := 0
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var event manifestPhaseEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			return count, fmt.Sprintf("decode phase event %d: %v", count+1, err)
+		}
+		if event.Schema != 1 || event.Seq == 0 || strings.TrimSpace(event.Phase) == "" {
+			return count, fmt.Sprintf("invalid phase event %d", count+1)
+		}
+		if test := strings.TrimSpace(event.Test); test != "" && test != expectedTest {
+			return count, fmt.Sprintf("phase event %d belongs to %q, want %q", count+1, test, expectedTest)
+		}
+		count++
+	}
+	if err := scanner.Err(); err != nil {
+		return count, fmt.Sprintf("scan phase file: %v", err)
+	}
+	if count == 0 {
+		return 0, "phase file contains no events"
+	}
+	return count, ""
+}
+
+func setManifestEnvironment(env []string, key, value string) []string {
+	prefix := strings.TrimSpace(key) + "="
+	for index, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			env[index] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func appendManifestRunReport(dir string, report manifestRunReport) {
+	data, err := json.Marshal(report)
+	if err != nil {
+		return
+	}
+	data = append(data, '\n')
+	manifestReportMu.Lock()
+	defer manifestReportMu.Unlock()
+	file, err := os.OpenFile(filepath.Join(dir, "manifest-runs.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_, _ = file.Write(data)
 }
 
 func resolveManifestPackageDir(packageName string) (string, error) {
@@ -664,14 +952,30 @@ func buildManifestTestBinary(packageName string, race bool, binaryPath string) e
 
 func manifestChildEnvironment() []string {
 	const required = teamsOwnershipStressStrictEnv + "=1"
-	env := os.Environ()
-	for index, entry := range env {
-		if strings.HasPrefix(entry, teamsOwnershipStressStrictEnv+"=") {
-			env[index] = required
-			return env
+	parent := os.Environ()
+	env := make([]string, 0, len(parent)+1)
+	strictSet := false
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case manifestPhaseFileEnv, manifestTestNameEnv:
+			// A manifest child gets a unique phase file below.  Do not leak a
+			// developer's stale file/test name into binary compilation or a run
+			// that did not request diagnostics.
+			continue
+		case teamsOwnershipStressStrictEnv:
+			if !strictSet {
+				env = append(env, required)
+				strictSet = true
+			}
+		default:
+			env = append(env, entry)
 		}
 	}
-	return append(env, required)
+	if !strictSet {
+		env = append(env, required)
+	}
+	return env
 }
 
 func validateTestJSONOutput(data []byte, name string, expectedBackends ...[]string) error {
