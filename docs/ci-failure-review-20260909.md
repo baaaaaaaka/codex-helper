@@ -156,3 +156,11 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 这里剩下的是测试身份观察器自己的非原子窗口：`childIsOriginalProcess` 在 `proc.IsAlive` 与启动时间读取之间遇到进程退出时，把明确的 procfs `ENOENT` 仍按“保守存活”处理；这会在最终 deadline 检查中把已经结束的子进程误报为存活。现在只有明确的 `os.ErrNotExist` 被视为原始进程已结束，权限、格式或其他未知读取错误继续保守返回存活；进程组取消、leader fallback、descendant 清理和启动时间匹配断言都保持不变。
 
 该修复不删除进程树断言，也不增加重试或放宽清理等待，而是把“PID 对应的 procfs 条目已消失”这个确定事实纳入身份检查。修复后必须重新执行完整矩阵并重点查看 Ubuntu race 两个分区，以确认本处与 `internal/proc.IsAlive` 的边界共同覆盖所有 liveness 观测窗口。
+
+## 第十一轮失败复盘与修复
+
+提交 `f2e324f` 的首轮矩阵（run `34427386261`）再次证明进程身份修复有效，但 Windows race partition 0 的 recovery job 出现了另一种宿主机尾延：`TestTeamsListenFalsePolledTurnOutboxSurvivesReopen/sqlite` 在 40 秒外层 watchdog 内卡在 modernc SQLite 的 `FlushFileBuffers`，没有到达 Graph poll/executor；同一作业随后报告的 recovery 断言是这个未结束进程的连带结果。失败堆栈位于 `updateChatPollSQLiteWithCapability` 的事务提交，不是测试把超时判成成功，也不是 listener 的语义断言失败。此前相同提交族的 Windows job 曾在 4 秒左右通过该 SQLite 子测试，说明 C: 用户临时目录的文件系统/扫描尾延会改变同一持久化提交的调度。
+
+恢复步骤现在把 `TMPDIR`、`TMP` 和 `TEMP` 统一指向每个 GitHub job 自带的 `${{ runner.temp }}`。在 Windows 上，Go 默认会把 `t.TempDir` 和编译临时文件放在用户 profile 的 C: 临时目录；显式使用 runner 的隔离临时卷后，SQLite WAL、phase trace 和 test binary scratch 不再与 profile/antivirus 扫描共享路径。这个改动只改变 fixture 的文件位置，仍执行真实 file-backed SQLite、WAL/synchronous 配置、store reopen、Graph poll、Codex executor 和 exactly-once outbox 断言；外层 40 秒 watchdog、各测试内部预算和失败门槛保持不变。它针对的是已观察到的宿主机 I/O 根因，没有加入重试、skip 或降低 durability。
+
+该提交还需要重新观察 Windows normal/race recovery、Windows full、Ubuntu/macOS full/race 的完整首轮结果。Linux 可以验证 workflow 语法和测试语义，但不能替代 Windows `FlushFileBuffers` 路径；只有同一修复提交在远端矩阵中稳定通过，才可继续合并到 main。

@@ -2257,6 +2257,14 @@ jobs:
         shell: bash
         env:
           CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
+          # Go on Windows otherwise places t.TempDir and go-build files under
+          # the user profile's C: temp directory.  The hosted runner's
+          # RUNNER_TEMP is the isolated per-job workspace; keeping SQLite WAL,
+          # phase traces, and compiler scratch on that volume avoids unrelated
+          # profile/antivirus I/O from changing durable test latency.
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
@@ -2270,6 +2278,12 @@ jobs:
         shell: bash
         env:
           CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
+          # Keep Windows test files on the isolated per-job runner volume; see
+          # the normal-mode step above for why this matters to SQLite WAL
+          # durability observations.
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
           partition_flags=("-partition-count=1" "-partition-index=0")
