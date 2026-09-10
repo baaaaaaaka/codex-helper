@@ -93,9 +93,14 @@ exit 64
 		}
 		currentStartTime, startErr := teamsLocalSupervisorProcessStartTime(pid)
 		if startErr != nil {
-			// Keep the assertion conservative while the original process is
-			// still reported alive. A disappearing /proc entry is observed as
-			// dead by proc.IsAlive on the next iteration.
+			// The liveness and /proc identity reads are not atomic. If the
+			// original process exits between them, ENOENT is definitive evidence
+			// that this PID no longer names the original process. Keep other
+			// errors conservative so permission or malformed procfs failures do
+			// not turn a cleanup assertion into a false pass.
+			if errors.Is(startErr, os.ErrNotExist) {
+				return false
+			}
 			return true
 		}
 		return currentStartTime == childStartTime

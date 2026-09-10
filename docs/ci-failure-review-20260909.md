@@ -148,3 +148,11 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 修复将 `listener_async` 与 `sqlite_fsync` 放入共享的 `host_io` lane：race 模式下两类测试共用一个 token，普通模式保留两个 token，Windows 仍由单 worker 串行执行。每个类别仍保留自己的吞吐上限，并以固定顺序取得多个 token，避免引入新的死锁。新增限流器测试明确验证 race 模式下 listener 持有 token 时 SQLite 不能启动。测试断言、Graph 精确 marker 校验、无重复 POST 约束和每个 manifest entry 的外部 watchdog 都保持不变。
 
 本轮失败说明之前的“按资源类别分别限流”并没有真正隔离共享的 hosted runner 资源；修复后必须重新执行完整 Windows/macOS/Linux recovery 矩阵，并特别确认 Ubuntu race 两个分区和 Windows full/recovery 路径。
+
+## 第十轮失败复盘与修复
+
+提交 `287fe8a3` 的完整矩阵 run `34425115603` 验证了共享 `host_io` lane：上一轮失败的 Ubuntu race recovery partition 0、Windows recovery/full、macOS recovery 以及其他 58 个作业均通过。唯一实际失败转移到 Ubuntu race partition 1 的 `TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup`。失败日志再次给出 `kill(pid, 0)` 成功后，`/proc/<pid>/stat` 读取返回 `ENOENT`，并且 PGID/命令行也已经不存在。
+
+这里剩下的是测试身份观察器自己的非原子窗口：`childIsOriginalProcess` 在 `proc.IsAlive` 与启动时间读取之间遇到进程退出时，把明确的 procfs `ENOENT` 仍按“保守存活”处理；这会在最终 deadline 检查中把已经结束的子进程误报为存活。现在只有明确的 `os.ErrNotExist` 被视为原始进程已结束，权限、格式或其他未知读取错误继续保守返回存活；进程组取消、leader fallback、descendant 清理和启动时间匹配断言都保持不变。
+
+该修复不删除进程树断言，也不增加重试或放宽清理等待，而是把“PID 对应的 procfs 条目已消失”这个确定事实纳入身份检查。修复后必须重新执行完整矩阵并重点查看 Ubuntu race 两个分区，以确认本处与 `internal/proc.IsAlive` 的边界共同覆盖所有 liveness 观测窗口。
