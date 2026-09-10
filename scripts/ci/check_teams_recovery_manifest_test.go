@@ -270,13 +270,13 @@ func TestManifestResourceLimiterUsesHostAndModeCaps(t *testing.T) {
 		want map[string]int
 	}{
 		{name: "linux normal", goos: "linux", want: map[string]int{
-			"pure_cpu": 4, "sqlite_fsync": 2, "listener_async": 2, "host_exclusive": 1,
+			"pure_cpu": 4, "sqlite_fsync": 2, "listener_async": 2, "host_exclusive": 1, "host_io": 2,
 		}},
 		{name: "linux race", race: true, goos: "linux", want: map[string]int{
-			"pure_cpu": 4, "sqlite_fsync": 1, "listener_async": 1, "host_exclusive": 1,
+			"pure_cpu": 4, "sqlite_fsync": 1, "listener_async": 1, "host_exclusive": 1, "host_io": 1,
 		}},
 		{name: "windows normal", goos: "windows", want: map[string]int{
-			"pure_cpu": 1, "sqlite_fsync": 1, "listener_async": 1, "host_exclusive": 1,
+			"pure_cpu": 1, "sqlite_fsync": 1, "listener_async": 1, "host_exclusive": 1, "host_io": 1,
 		}},
 	}
 	for _, tc := range cases {
@@ -297,6 +297,32 @@ func TestManifestResourceLimiterUsesHostAndModeCaps(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestManifestResourceLimiterSharesRaceHostIOLane(t *testing.T) {
+	limiter := newManifestResourceLimiter(true, "linux", 4)
+	releaseListener := limiter.acquire("listener_async")
+
+	acquired := make(chan struct{})
+	releaseSQLite := make(chan struct{})
+	go func() {
+		release := limiter.acquire("sqlite_fsync")
+		close(acquired)
+		<-releaseSQLite
+		release()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("sqlite lane acquired while listener lane was active")
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseListener()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("sqlite lane did not acquire after listener lane released")
+	}
+	close(releaseSQLite)
 }
 
 func equalStrings(got, want []string) bool {

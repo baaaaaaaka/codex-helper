@@ -140,3 +140,11 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 本轮修复 `internal/proc.IsAlive` 的 Linux 实现：先保留 `kill(pid, 0)` 的权限/存在性检查，再只在 Linux 读取 procfs；如果 stat 条目在非原子检查间隙消失，明确按已结束处理；Darwin 继续使用原有无 procfs 的行为，格式异常或其他读取错误仍保持保守的存活结果。新增缺失 proc 条目的回归测试，并在 Linux race 下将进程组测试重复 100 次；完整 `go test ./... -count=1`、`internal/proc` normal/race 均通过。
 
 这个改动没有缩短清理等待、删除 descendant 断言或把失败变成重试；真实存活进程和 PID 复用仍会被启动时间/存活检查捕获。下一轮必须重新观察同一完整矩阵，确认 procfs 观测修复不会在其他 Unix 进程清理路径产生副作用。
+
+## 第九轮失败复盘与修复
+
+合并提交 `a4a3b40575a689ad32c654a1cbea8191886b992d` 的完整矩阵 run `34396041530` 暴露了一个新的调度层问题：59 个作业中 58 个作业本身通过，唯一失败是 Ubuntu race 的 `TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost`。失败诊断显示测试的 500ms phase 在 outbox 恢复期间超时，Graph GET 还没有开始，最终没有产生 POST；同一时间另一个 SQLite 压力测试进程正在同一 hosted runner 上运行。测试资源类别分别标记为 `listener_async` 和 `sqlite_fsync`，现有 manifest 限流器只分别限制每个类别，因此两个类别仍能并发，调度压力把一个有意较短的 phase budget 变成了环境相关的超时。
+
+修复将 `listener_async` 与 `sqlite_fsync` 放入共享的 `host_io` lane：race 模式下两类测试共用一个 token，普通模式保留两个 token，Windows 仍由单 worker 串行执行。每个类别仍保留自己的吞吐上限，并以固定顺序取得多个 token，避免引入新的死锁。新增限流器测试明确验证 race 模式下 listener 持有 token 时 SQLite 不能启动。测试断言、Graph 精确 marker 校验、无重复 POST 约束和每个 manifest entry 的外部 watchdog 都保持不变。
+
+本轮失败说明之前的“按资源类别分别限流”并没有真正隔离共享的 hosted runner 资源；修复后必须重新执行完整 Windows/macOS/Linux recovery 矩阵，并特别确认 Ubuntu race 两个分区和 Windows full/recovery 路径。

@@ -563,16 +563,20 @@ type manifestResourceLimiter struct {
 func newManifestResourceLimiter(race bool, goos string, workerCount int) *manifestResourceLimiter {
 	limits := map[string]int{
 		"pure_cpu": workerCount,
-		// SQLite sync and listener work contend on the same hosted filesystem.
-		// Keep one lane in race mode and two in normal mode on Unix; Windows is
-		// already serialized by manifestTestWorkerCountFor.
+		// SQLite sync and listener work contend on the same hosted filesystem and
+		// scheduler. They therefore share one host-I/O lane below; separate class
+		// semaphores alone would still let one SQLite process run beside one
+		// listener process and recreate the very pressure this limiter is meant to
+		// prevent.
 		"sqlite_fsync":   2,
 		"listener_async": 2,
 		"host_exclusive": 1,
+		"host_io":        2,
 	}
 	if race {
 		limits["sqlite_fsync"] = 1
 		limits["listener_async"] = 1
+		limits["host_io"] = 1
 	}
 	if strings.EqualFold(strings.TrimSpace(goos), "windows") {
 		for class := range limits {
@@ -587,20 +591,38 @@ func (l *manifestResourceLimiter) acquire(class string) func() {
 	if class == "" {
 		class = "host_exclusive"
 	}
+	keys := []string{class}
+	if class == "sqlite_fsync" || class == "listener_async" {
+		// These classes have independent per-class caps for normal-mode
+		// throughput, but must also consume the same host-I/O token.  Acquire in
+		// a fixed order so a future multi-resource class cannot deadlock with
+		// another worker waiting on the reverse order.
+		keys = []string{"host_io", class}
+	}
 	l.mu.Lock()
-	sem := l.sems[class]
-	if sem == nil {
-		limit := l.limit[class]
-		if limit <= 0 {
-			// An undeclared resource is fail-safe: one process at a time.
-			limit = 1
+	sems := make([]chan struct{}, 0, len(keys))
+	for _, key := range keys {
+		sem := l.sems[key]
+		if sem == nil {
+			limit := l.limit[key]
+			if limit <= 0 {
+				// An undeclared resource is fail-safe: one process at a time.
+				limit = 1
+			}
+			sem = make(chan struct{}, limit)
+			l.sems[key] = sem
 		}
-		sem = make(chan struct{}, limit)
-		l.sems[class] = sem
+		sems = append(sems, sem)
 	}
 	l.mu.Unlock()
-	sem <- struct{}{}
-	return func() { <-sem }
+	for _, sem := range sems {
+		sem <- struct{}{}
+	}
+	return func() {
+		for index := len(sems) - 1; index >= 0; index-- {
+			<-sems[index]
+		}
+	}
 }
 
 func manifestResourceClass(item manifestTest) string {
