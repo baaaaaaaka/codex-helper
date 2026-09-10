@@ -33,12 +33,20 @@ configure_centos_vault() {
   repo_file="$(root_path /etc/yum.repos.d/CentOS-Base.repo)"
   if [[ -f "$repo_file" ]]; then
     sed_in_place 's/^mirrorlist=/#mirrorlist=/g' "$repo_file"
-    # GitHub-hosted runners receive 403 responses from vault.centos.org for
-    # CentOS 7 repodata. Use the static kernel.org mirror instead; it keeps
-    # the same archived CentOS 7.9.2009 tree without relying on that endpoint.
-    sed_in_place_ext 's|^#?baseurl=https?://mirror\.centos\.org/centos/\$releasever/|baseurl=https://archive.kernel.org/centos-vault/7.9.2009/|g' "$repo_file"
-    sed_in_place_ext 's|^#?baseurl=https?://vault\.centos\.org/centos/\$releasever/|baseurl=https://archive.kernel.org/centos-vault/7.9.2009/|g' "$repo_file"
-    sed_in_place_ext 's|^#?baseurl=https?://vault\.centos\.org/7\.9\.2009/|baseurl=https://archive.kernel.org/centos-vault/7.9.2009/|g' "$repo_file"
+    # CentOS 7 is archived, so no single endpoint is a reliable CI source.
+    # Yum's baseurl option accepts a whitespace-separated URL list and fails
+    # over between entries. Keep the fallback order configurable for a hosted
+    # environment while retaining several independent public archives.
+    local baseurls
+    baseurls="${CENTOS_VAULT_BASEURLS:-https://linuxsoft.cern.ch/centos-vault/7.9.2009/ https://mirrors.aliyun.com/centos-vault/7.9.2009/ https://mirror.nsc.liu.se/centos-store/7.9.2009/ https://archive.kernel.org/centos-vault/7.9.2009/}"
+    # Capture the repository-specific suffix and append it to every fallback;
+    # yum expects each baseurl entry to point at the same repository path.
+    local fallback_baseurls
+    fallback_baseurls="${baseurls// /\\1 }\\1"
+    sed_in_place_ext "s|^#?baseurl=https?://mirror\\.centos\\.org/centos/\\\$releasever/(.*)$|baseurl=${fallback_baseurls}|g" "$repo_file"
+    sed_in_place_ext "s|^#?baseurl=https?://vault\\.centos\\.org/centos/\\\$releasever/(.*)$|baseurl=${fallback_baseurls}|g" "$repo_file"
+    sed_in_place_ext "s|^#?baseurl=https?://vault\.centos\.org/7\.9\.2009/(.*)$|baseurl=${fallback_baseurls}|g" "$repo_file"
+    sed_in_place_ext "s|^#?baseurl=https?://archive\.kernel\.org/centos-vault/7\.9\.2009/(.*)$|baseurl=${fallback_baseurls}|g" "$repo_file"
   fi
 }
 

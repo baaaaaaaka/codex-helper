@@ -164,3 +164,11 @@ PR #114 的首轮矩阵验证了这个验收边界：Windows Teams recovery norm
 恢复步骤现在把 `TMPDIR`、`TMP` 和 `TEMP` 统一指向每个 GitHub job 自带的 `${{ runner.temp }}`。在 Windows 上，Go 默认会把 `t.TempDir` 和编译临时文件放在用户 profile 的 C: 临时目录；显式使用 runner 的隔离临时卷后，SQLite WAL、phase trace 和 test binary scratch 不再与 profile/antivirus 扫描共享路径。这个改动只改变 fixture 的文件位置，仍执行真实 file-backed SQLite、WAL/synchronous 配置、store reopen、Graph poll、Codex executor 和 exactly-once outbox 断言；外层 40 秒 watchdog、各测试内部预算和失败门槛保持不变。它针对的是已观察到的宿主机 I/O 根因，没有加入重试、skip 或降低 durability。
 
 该提交还需要重新观察 Windows normal/race recovery、Windows full、Ubuntu/macOS full/race 的完整首轮结果。Linux 可以验证 workflow 语法和测试语义，但不能替代 Windows `FlushFileBuffers` 路径；只有同一修复提交在远端矩阵中稳定通过，才可继续合并到 main。
+
+## 第十二轮失败复盘与修复
+
+PR #114 合并后的 main 首轮矩阵（run `34433840848`，merge commit `48774c887`）中 59 个 job 只有 CentOS7 失败。`Teams managed ASR native dependency scan` 的五次 `yum -y makecache` 都访问同一个 `archive.kernel.org` URL，并在约 30 秒后超时；安装脚本随后按 fail-closed 语义生成空的 setup-failed 报告，依赖覆盖断言正确地拒绝了 `native_files_scanned=0`。日志没有产品测试断言失败，真正的问题是把已归档的 CentOS 7 软件源固定成了一个网络单点。
+
+本轮将 CentOS repo 的每个 `baseurl` 改成完整的、按仓库路径展开的 URL 列表，默认依次使用 CERN、阿里云、瑞典 NSC 和 kernel.org 的归档；列表可由 `CENTOS_VAULT_BASEURLS` 在受限网络环境中覆盖。脚本同时识别原始 mirror.centos.org、vault.centos.org 和此前生成的 archive.kernel.org 行，并为 `os`、`updates`、`extras` 等后缀把同一路径附加到每一个候选 URL。Yum 的 `baseurl` 解析本身支持空格分隔的 URL 列表，因此单个镜像不可达时会继续选择下一个候选。
+
+新增脚本回归检查完整路径、旧单镜像迁移和环境覆盖；包安装仍然失败即失败，ASR 扫描仍要求正数 native 文件及完整的库/版本覆盖，没有跳过扫描、降低断言或把重试成功伪装成测试通过。该修复的远端验收仍需查看同一提交的 CentOS7 job 以及完整矩阵；本地 Linux 的脚本测试不能证明 GitHub runner 到每个公共归档的网络可达性。
